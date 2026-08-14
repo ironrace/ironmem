@@ -503,10 +503,30 @@ pub fn save_session(conn: &Connection, session: &CollabSession) -> Result<(), Me
 /// `updated_at` is stamped here from the server clock and deliberately ignored
 /// from the caller's payload — otherwise a caller could backdate a checkpoint
 /// and make a stale one look fresh.
+///
+/// Calls [`CollabCheckpoint::validate`] before writing anything. Every field
+/// on `CollabCheckpoint` is `pub`, so a caller can build one directly (as
+/// `load_current_checkpoint` itself must, reconstructing from a row) without
+/// going through `from_json`'s checks — and migration 020's CHECK on
+/// `acknowledged_divergence` is one-directional, permitting
+/// `attested_by = 'operator'` with the column left NULL. Without this call an
+/// invalid struct — e.g. that exact operator/no-divergence combination —
+/// would insert cleanly and then permanently fail every subsequent
+/// `load_current_checkpoint` for that session: a write-succeeds,
+/// read-always-fails poison row keyed by `session_id`, with no way to read or
+/// fix it back out. [`CollabCheckpoint::validate`]'s doc comment names both
+/// entry points as owing this call; this is the write side.
 pub fn upsert_checkpoint(
     conn: &Connection,
     checkpoint: &CollabCheckpoint,
 ) -> Result<(), MemoryError> {
+    checkpoint.validate().map_err(|err| {
+        MemoryError::Validation(format!(
+            "checkpoint for session {}: {err}",
+            checkpoint.session_id
+        ))
+    })?;
+
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -591,6 +611,15 @@ fn parse_stored_completed_task_ids(raw: &str, session_id: &str) -> Result<Vec<u3
                  non-numeric entry {piece:?} in stored value {raw:?}"
             ))
         })?;
+        // Task ids are 1-based, mirroring `checkpoint.rs::parse_completed_task_ids`'s
+        // own zero rejection. Without this a corrupted "0,1" would load as a
+        // phantom task id 0 that from_json's write path would have refused.
+        if id == 0 {
+            return Err(MemoryError::Validation(format!(
+                "checkpoint for session {session_id}: completed_task_ids entries must be \
+                 task ids of 1 or greater, got 0 in stored value {raw:?}"
+            )));
+        }
         ids.push(id);
     }
     ids.sort_unstable();
@@ -607,17 +636,29 @@ fn parse_stored_completed_task_ids(raw: &str, session_id: &str) -> Result<Vec<u3
 /// already refuses one on the write path via `u32::try_from`, so the loader
 /// owes the same refusal rather than quietly reinterpreting corrupt data as
 /// some other task id.
+///
+/// Also rejects `0`, mirroring `optional_task_id`'s *other* rejection ground
+/// (task ids are 1-based). Range and zero are the parser's full refusal set
+/// for this field — matching only range here would still let a phantom task
+/// id `0` reach the `implementation_done` gate.
 fn checked_task_id_column(
     raw: Option<i64>,
     field: &str,
     session_id: &str,
 ) -> Result<Option<u32>, MemoryError> {
     raw.map(|n| {
-        u32::try_from(n).map_err(|_| {
+        let id = u32::try_from(n).map_err(|_| {
             MemoryError::Validation(format!(
                 "checkpoint for session {session_id}: {field} value {n} does not fit in u32"
             ))
-        })
+        })?;
+        if id == 0 {
+            return Err(MemoryError::Validation(format!(
+                "checkpoint for session {session_id}: {field} must be a task id of 1 or \
+                 greater, got 0"
+            )));
+        }
+        Ok(id)
     })
     .transpose()
 }
@@ -2150,6 +2191,19 @@ mod tests {
 
         upsert_checkpoint(&db, &checkpoint_fixture("s1", "aaa111")).unwrap();
 
+        // Force the row's stamp far into the past via raw SQL, so the second
+        // upsert below — which must hit the ON CONFLICT DO UPDATE branch,
+        // since the row already exists — is the only thing that can move it.
+        // This isolates the UPDATE branch's `updated_at = excluded.updated_at`
+        // clause: without it, a checkpoint could advance status/head_sha/etc.
+        // on this branch while its timestamp stayed frozen at `1`, which is
+        // #273's exact failure mode (a stale checkpoint presented as current).
+        db.execute(
+            "UPDATE collab_checkpoints SET updated_at = 1 WHERE session_id = 's1'",
+            [],
+        )
+        .unwrap();
+
         let mut advanced = checkpoint_fixture("s1", "bbb222");
         advanced.status = CheckpointStatus::Completed;
         advanced.completed_task_ids = vec![1];
@@ -2167,6 +2221,10 @@ mod tests {
         let loaded = load_current_checkpoint(&db, "s1").unwrap().unwrap();
         assert_eq!(loaded.head_sha, "bbb222");
         assert_eq!(loaded.completed_task_ids, vec![1]);
+        assert_ne!(
+            loaded.updated_at, 1,
+            "the UPDATE branch must refresh updated_at, not leave the forced-stale value"
+        );
     }
 
     #[test]
@@ -2213,6 +2271,7 @@ mod tests {
             "head_sha": "ccc333",
             "commit_sha": "ccc333",
             "completed_task_ids": "1,2,3,4",
+            "next_task_id": 5,
             "gates_result": "passed",
             "gates_sha": "ccc333",
             "gates_commands": "cargo fmt --all -- --check && cargo test --workspace",
@@ -2230,8 +2289,18 @@ mod tests {
         assert_eq!(loaded.status, CheckpointStatus::BatchComplete);
         assert_eq!(loaded.commit_sha.as_deref(), Some("ccc333"));
         assert_eq!(loaded.completed_task_ids, vec![1, 2, 3, 4]);
+        // The resume pointer: a dropped column here would silently strand a
+        // resumer with no next task to pick up.
+        assert_eq!(loaded.next_task_id, Some(5));
         assert_eq!(loaded.gates_result, "passed");
         assert_eq!(loaded.gates_sha.as_deref(), Some("ccc333"));
+        // The exact gate command set: this is what lets a resumer tell a
+        // reusable gate proof from one invalidated by a changed gate set.
+        assert_eq!(
+            loaded.gates_commands.as_deref(),
+            Some("cargo fmt --all -- --check && cargo test --workspace")
+        );
+        assert_eq!(loaded.summary.as_deref(), Some("batch done"));
         assert_eq!(loaded.attested_by, AttestedBy::Operator);
         assert_eq!(
             loaded.acknowledged_divergence.as_deref(),
@@ -2355,5 +2424,128 @@ mod tests {
             err.to_string().contains("task_id") && err.to_string().contains("-1"),
             "got: {err}"
         );
+    }
+
+    /// `optional_task_id` in `checkpoint.rs` refuses `task_id = 0` on two
+    /// grounds — out of range, and zero, task ids being 1-based —
+    /// `checked_task_id_column` mirroring only the first would still let a
+    /// phantom task id `0` written by a corrupted row reach the
+    /// `implementation_done` gate.
+    #[test]
+    fn load_current_checkpoint_rejects_a_zero_task_id() {
+        let db = open();
+        create_session(
+            &db,
+            "s1",
+            "/repo",
+            "main",
+            None,
+            CollabRoles {
+                pilot: Agent::Claude,
+                implementer: Agent::Claude,
+            },
+        )
+        .unwrap();
+
+        db.execute(
+            "INSERT INTO collab_checkpoints
+               (session_id, task_id, status, head_sha, updated_at)
+             VALUES ('s1', 0, 'started', 'aaa111', 1)",
+            [],
+        )
+        .unwrap();
+
+        let err = load_current_checkpoint(&db, "s1").unwrap_err();
+        assert!(
+            err.to_string().contains("task_id") && err.to_string().contains('0'),
+            "got: {err}"
+        );
+    }
+
+    /// The `completed_task_ids` mirror of the test above: `checkpoint.rs`'s
+    /// parser rejects a `0` entry the same way it rejects a non-numeric one,
+    /// so `parse_stored_completed_task_ids` must refuse `"0,1"`, not load it
+    /// as `[0, 1]`.
+    #[test]
+    fn load_current_checkpoint_rejects_a_zero_entry_in_completed_task_ids() {
+        let db = open();
+        create_session(
+            &db,
+            "s1",
+            "/repo",
+            "main",
+            None,
+            CollabRoles {
+                pilot: Agent::Claude,
+                implementer: Agent::Claude,
+            },
+        )
+        .unwrap();
+
+        db.execute(
+            "INSERT INTO collab_checkpoints
+               (session_id, status, head_sha, completed_task_ids, updated_at)
+             VALUES ('s1', 'started', 'aaa111', '0,1', 1)",
+            [],
+        )
+        .unwrap();
+
+        let err = load_current_checkpoint(&db, "s1").unwrap_err();
+        assert!(
+            err.to_string().contains("completed_task_ids") && err.to_string().contains('0'),
+            "got: {err}"
+        );
+    }
+
+    /// The write-side twin of
+    /// `load_current_checkpoint_rejects_an_operator_row_with_no_acknowledged_divergence`.
+    /// Every field on `CollabCheckpoint` is `pub`, so a caller can build one
+    /// directly — exactly the field-by-field construction
+    /// `checkpoint_upsert_replaces_rather_than_accumulates` above uses via
+    /// `checkpoint_fixture` plus mutation — and hand `upsert_checkpoint` a
+    /// struct that never went through `from_json`'s checks. Without a
+    /// `validate()` call at the top of `upsert_checkpoint`, this exact
+    /// operator/no-divergence combination would insert cleanly (migration
+    /// 020's CHECK is one-directional and permits it) and then permanently
+    /// fail every subsequent `load_current_checkpoint` for the session: a
+    /// write-succeeds, read-always-fails poison row with no way to read or
+    /// fix it back out.
+    #[test]
+    fn upsert_checkpoint_rejects_an_operator_struct_with_no_acknowledged_divergence() {
+        let db = open();
+        create_session(
+            &db,
+            "s1",
+            "/repo",
+            "main",
+            None,
+            CollabRoles {
+                pilot: Agent::Claude,
+                implementer: Agent::Claude,
+            },
+        )
+        .unwrap();
+
+        let mut poisoned = checkpoint_fixture("s1", "aaa111");
+        poisoned.attested_by = AttestedBy::Operator;
+        // acknowledged_divergence left None: the combination validate() must
+        // refuse.
+
+        let err = upsert_checkpoint(&db, &poisoned).unwrap_err();
+        assert!(
+            err.to_string().contains("acknowledged_divergence"),
+            "got: {err}"
+        );
+
+        // And confirm the reject was real, not merely reported: no row was
+        // written at all, so there is no poison row to strand the session.
+        let count: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM collab_checkpoints WHERE session_id = 's1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0, "an invalid checkpoint must not be written at all");
     }
 }
