@@ -815,21 +815,27 @@ produces wrong expectations:
 
 The two vocabularies overlap but are not the same set.
 `codex_dispatch_failed:` and `checkpoint_drift:` are in both —
-off-turn-admissible *and* Tooling. Every prefix in that intersection is
-**phase-scoped** in `off_turn_failure_is_admissible`, and that is not
-incidental: a recoverable report installs a new `current_owner`, so an
-unscoped off-turn clause on a Tooling prefix would be a turn-seizure
-primitive. `checkpoint_drift:` is admissible off-turn only from
-`CodeImplementPending` — the one phase where a checkpoint is a live ledger
-rather than frozen proof of what was built.
+off-turn-admissible *and* Tooling — and **both are phase-scoped**, which is
+not a coincidence. A Tooling report parks the session and installs a *new*
+`current_owner`, so an unscoped off-turn clause on a recoverable prefix
+would be a turn-seizure primitive: the copilot could park the pilot's audit
+turn, take it, and audit its own commits. `checkpoint_drift:` is therefore
+admissible off-turn only from `CodeImplementPending`, the one phase in
+which a checkpoint is under construction and where handing recovery to the
+observer is the intended remedy.
 
 `branch_drift:` is in only the first: **off-turn-admissible but always
-Terminal**, because it is not in `RECOVERABLE_FAILURE_PREFIXES` — which is
-exactly what lets its clause be unscoped. Either agent may report drift at
+Terminal**, because it is not in `RECOVERABLE_FAILURE_PREFIXES`. That is
+exactly what lets its clause stay unscoped — admitting it ends the session
+rather than handing anyone a live turn. Either agent may report drift at
 any time, and every such report ends the session in `CodingFailed` — drift
-means the two agents disagree about what is on the branch, which no in-place
-recovery turn can reconcile. The remaining five recoverable prefixes are
-Tooling but owner-only.
+means the two agents disagree about what is on the branch, which no
+in-place recovery turn can reconcile.
+
+The discriminator to reuse when adding a prefix is therefore
+Terminal-vs-Tooling, not observability: an off-turn-admissible prefix may
+be left unscoped only if admitting it cannot leave anyone holding a live
+turn. The remaining five recoverable prefixes are Tooling but owner-only.
 
 `collab_end` is **rejected** in every coding-active phase
 (`CodeImplementPending`, `CodeReviewFixGlobalPending`,
@@ -2034,7 +2040,7 @@ orchestrator from steering the reviewer's conclusion.
 
 | Topic | Sender | Payload | Notes |
 |---|---|---|---|
-| `task_list` | `pilot` | `{"plan_hash","base_sha","head_sha","plan_file_path"?,"execution_mode"?,"tasks":[{"id","title","timebox_minutes","acceptance":[...]}]}` | `plan_hash` must equal `final_plan_hash`; `tasks` must contain **1–15** strictly ordered entries; each task requires `timebox_minutes <= 20` and ≥1 `acceptance` entry. A 16+ task issue must be split into child issues before this message is sent. Optional `plan_file_path` (repo-relative; no leading `/`; no `..` segments) points at the approved task markdown driving subagent execution. Optional `execution_mode` — see below. |
+| `task_list` | `pilot` | `{"plan_hash","base_sha","head_sha","plan_file_path"?,"execution_mode"?,"tasks":[{"id","title","timebox_minutes","acceptance":[...]}]}` | `plan_hash` must equal `final_plan_hash`; `tasks` must contain **1–15** strictly ordered entries; ids must be exactly **1..=N**, not merely increasing — the `implementation_done` checkpoint gate derives the id set from the task *count*, so a gap or a non-1-based id would make the batch either permanently unfinishable or falsely reportable as complete; each task requires `timebox_minutes <= 20` and ≥1 `acceptance` entry. A 16+ task issue must be split into child issues before this message is sent. Optional `plan_file_path` (repo-relative; no leading `/`; no `..` segments) points at the approved task markdown driving subagent execution. Optional `execution_mode` — see below. |
 | `implementation_done` | `claude` or `codex` (per session `implementer`) | `{"head_sha"}` | In `CodeImplementPending` only. Fired once after the subagent batch completes and gates pass. Carries only `head_sha` — no prose, no subagent notes. **Gated on checkpoint proof**: refused with a `checkpoint_drift:` message unless the session's stored checkpoint exists, records this exact `head_sha`, is `batch_complete` covering every task in the accepted task list, and carries a green gate proof at that same sha. A refusal leaves the session in `CodeImplementPending` with nothing written. |
 | `review_fix_global` | `copilot` (or the counterpart agent as recovery owner under the delegated-completion override) | `{"head_sha"}` | In `CodeReviewFixGlobalPending` only. The copilot ran `/pr-review-toolkit:review-pr` on the raw post-implementation diff (no pre-clean by the pilot), used parallel fix subagents for confirmed partitionable findings, merged/cherry-picked the resulting fixes, and pushed the branch-level fix commit(s). |
 | `review_local` | `pilot` (or the counterpart agent as recovery owner under the delegated-completion override) | `{"head_sha"}` | In `CodeReviewLocalPending` only. The pilot ran full or reduced audit of the copilot's `review_fix_global` commits + caught issues both agents missed, used parallel fix subagents for confirmed partitionable findings, merged/cherry-picked the resulting fixes, and pushed. |
@@ -2111,8 +2117,7 @@ exactly one event variant — there is no phase overloading.
 phase. `branch_drift:` with real detail is also accepted off-turn from either
 agent; `checkpoint_drift:` with real detail is accepted off-turn from either
 agent but only in `CodeImplementPending`; `codex_dispatch_failed:` with real
-detail is accepted off-turn only
-from Claude against a Codex-owned turn. A **Terminal**-classified report
+detail is accepted off-turn only from Claude against a Codex-owned turn. A **Terminal**-classified report
 transitions the session to `CodingFailed`; a **Tooling**-classified report
 (one of the seven recoverable prefixes, with detail — see "Failure + terminal"
 above) instead keeps the session in its current phase and hands recovery to

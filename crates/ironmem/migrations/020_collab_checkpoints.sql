@@ -54,6 +54,13 @@
 --   gates_commands            the exact gate command set, " && "-joined, so a
 --                             resumer can tell a changed gate set from a
 --                             reusable gate proof.
+--   summary                   optional free-text note describing what this
+--                             checkpoint represents ("Task 3 done", "Batch
+--                             complete"). Valid on every status and never
+--                             required by any of them: it is operator- and
+--                             resumer-facing prose, carrying no protocol
+--                             meaning, so nothing gates on it and no reader
+--                             may infer state from it.
 --   attested_by               implementer | operator. `operator` marks a
 --                             human-attested backfill over a divergence the
 --                             protocol never witnessed. The distinction is
