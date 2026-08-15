@@ -1409,8 +1409,8 @@ mod tests {
     /// The SHA-shaped fields get the tighter cap, including the operator
     /// range built out of two of them. This type still cannot tell a real SHA
     /// from any other word — that is `verify_acknowledged_range`'s job — but
-    /// 128 chars is far more than any object id or revision expression needs
-    /// and far less than a payload.
+    /// [`MAX_CHECKPOINT_SHA_CHARS`] is far more than any object id or revision
+    /// expression needs and far less than a payload.
     #[test]
     fn sha_shaped_fields_are_capped() {
         for field in ["head_sha", "commit_sha", "gates_sha"] {
