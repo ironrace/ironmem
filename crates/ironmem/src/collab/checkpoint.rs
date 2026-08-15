@@ -370,6 +370,15 @@ impl CollabCheckpoint {
     /// the right count and the wrong contents, and must not pass. A `total` of
     /// zero is not "vacuously covered" — a batch with no tasks is a
     /// malformed task list, not a finished one.
+    ///
+    /// Treating a *count* as the id range `1..=total` is only sound because
+    /// `collab::task_list::validate_task_list_body` requires task ids to be
+    /// exactly `1..=N` in order, so the count and the id set are the same
+    /// fact. That is an invariant this type cannot check and does not own: if
+    /// task lists are ever allowed sparse or non-1-based ids again, this
+    /// method must take the id set instead, or a batch numbered `4,5,6` can
+    /// never satisfy it while one numbered `1,5,9` is satisfied by a ledger
+    /// that skipped two tasks.
     pub fn covers_all_tasks(&self, total: u32) -> bool {
         if total == 0 {
             return false;
