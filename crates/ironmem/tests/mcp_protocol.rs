@@ -4375,6 +4375,13 @@ fn collab_start_code_review_rejects_non_descendant_head() {
     assert!(blocked.contains("last_head_sha"));
 }
 
+/// The shas here are deliberately well-shaped (full 40-char hex) even though
+/// no commit by those names exists anywhere. The ancestry gate rejects a
+/// malformed revision as `branch_drift:` *before* it shells out, so a
+/// short/symbolic placeholder would never reach git and this test would pass
+/// for the wrong reason — asserting the shape guard rather than the thing it
+/// is named for, which is that a git call that fails *operationally* (here:
+/// a repo path that does not exist) must not be reported as branch drift.
 #[test]
 fn collab_start_code_review_operational_git_failure_is_not_branch_drift() {
     let app = App::open_for_test().unwrap();
@@ -4384,8 +4391,8 @@ fn collab_start_code_review_operational_git_failure_is_not_branch_drift() {
         json!({
             "repo_path": "/definitely/not/a/repo",
             "branch": "feat/review-shortcut",
-            "base_sha": "abc123",
-            "head_sha": "def456",
+            "base_sha": "abc123abc123abc123abc123abc123abc123abc1",
+            "head_sha": "def456def456def456def456def456def456def4",
             "initiator": "claude",
             "task": "review completed branch"
         }),
@@ -4399,7 +4406,7 @@ fn collab_start_code_review_operational_git_failure_is_not_branch_drift() {
             "session_id": session_id,
             "sender": "codex",
             "topic": "review_fix_global",
-            "content": json!({ "head_sha": "def457" }).to_string()
+            "content": json!({ "head_sha": "def457def457def457def457def457def457def4" }).to_string()
         }),
     );
     assert!(blocked.contains("git ancestry validation failed"));
@@ -6256,6 +6263,54 @@ fn drive_to_code_implement_pending(app: &App, tasks: usize) -> (tempfile::TempDi
     (temp, session_id)
 }
 
+/// The same drive, with a task list declaring exactly `ids` rather than the
+/// dense `1..=n` the shared [`task_list_payload`] fixture emits.
+///
+/// Spelled out here instead of widening that fixture because a *dense* task
+/// list is exactly what these tests must not assume: `validate_task_list_body`
+/// requires task ids to be strictly increasing and nothing more, so `1, 2, 4`
+/// (a task dropped while the plan was edited) and `0, 1, 2` are both storable
+/// plans, and a fixture that can only produce `1..=n` cannot exercise what the
+/// gate does with them.
+fn drive_to_code_implement_pending_with_ids(app: &App, ids: &[i64]) -> (tempfile::TempDir, String) {
+    let (temp, repo_path, base_sha) = gate_head_repo();
+    let session_id = drive_to_plan_locked_in_repo(app, "gate plan", &repo_path);
+    let hash = plan_hash(app, &session_id);
+    let tasks: Vec<serde_json::Value> = ids
+        .iter()
+        .map(|id| {
+            json!({
+                "id": id,
+                "title": format!("task {id}"),
+                "acceptance": [format!("criterion {id}")]
+            })
+        })
+        .collect();
+    call_tool(
+        app,
+        "collab_send",
+        json!({
+            "session_id": &session_id,
+            "sender": "claude",
+            "topic": "task_list",
+            "content": json!({
+                "plan_hash": hash,
+                "base_sha": "b0",
+                "head_sha": base_sha,
+                "tasks": tasks,
+            })
+            .to_string()
+        }),
+    );
+    let status = call_tool(app, "collab_status", json!({ "session_id": &session_id }));
+    assert_eq!(
+        status["phase"], "CodeImplementPending",
+        "a task list with ids {ids:?} must be accepted — the gate's behaviour on it is what \
+         these tests are about, so a rejection upstream would silently void them"
+    );
+    (temp, session_id)
+}
+
 /// A checkpoint payload that satisfies *every* condition of the gate, so each
 /// test can break exactly one of them and know which condition it is
 /// exercising. Deliberately built as a full payload rather than by mutating a
@@ -6541,6 +6596,129 @@ fn implementation_done_refused_when_the_covered_ids_have_a_gap() {
     implementation_done_refused(&app, &session_id);
 }
 
+/// Condition 3b's bar is the ids the accepted task list *declares*, not
+/// `1..=count`.
+///
+/// The two only coincide on a dense plan, and nothing upstream makes a plan
+/// dense: a plan whose task 3 was dropped during editing stores ids `1, 2, 4`,
+/// and an implementer that finished all three of those tasks files exactly
+/// that ledger. Measured against `1..=3` it is refused forever for missing a
+/// task the plan does not contain, leaving "file a ledger claiming task 3" —
+/// the fabricated progress report this whole gate exists to prevent — as the
+/// only way through.
+#[test]
+fn implementation_done_accepts_a_ledger_covering_a_gapped_task_list() {
+    let app = App::open_for_test().unwrap();
+    let (_temp, session_id) = drive_to_code_implement_pending_with_ids(&app, &[1, 2, 4]);
+    let mut cp = passing_checkpoint(&session_id, 3);
+    cp["completed_task_ids"] = json!("1,2,4");
+    call_tool(&app, "collab_checkpoint", cp);
+
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": &session_id,
+            "sender": "claude",
+            "topic": "implementation_done",
+            "content": json!({ "head_sha": GATE_HEAD }).to_string()
+        }),
+    );
+    let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+    assert_eq!(
+        status["phase"], "CodeReviewFixGlobalPending",
+        "a ledger covering every task the plan declares must satisfy the gate"
+    );
+}
+
+/// The remedy stays machine-followable on a plan whose ids are not dense.
+///
+/// A hint of `1,2,3` for a plan declaring `1, 2, 4` is worse than useless: an
+/// agent copying it verbatim files a checkpoint for a task that does not exist
+/// and is refused again. The refusal must also name the id that is actually
+/// missing, since `of the 3` alone does not say which.
+#[test]
+fn the_refusal_remedy_names_the_declared_task_ids() {
+    let app = App::open_for_test().unwrap();
+    let (_temp, session_id) = drive_to_code_implement_pending_with_ids(&app, &[1, 2, 4]);
+    let mut cp = passing_checkpoint(&session_id, 3);
+    cp["completed_task_ids"] = json!("1,2");
+    call_tool(&app, "collab_checkpoint", cp);
+
+    let err = implementation_done_refused(&app, &session_id);
+    assert!(
+        err.contains("missing task ids: 4"),
+        "the refusal must name the declared id that is missing, got: {err}"
+    );
+    assert_eq!(
+        remedy_field(&err, "completed_task_ids"),
+        "1,2,4",
+        "the remedy must ask for the ids the plan declares, got: {err}"
+    );
+
+    follow_the_remedy(&app, &err);
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": &session_id,
+            "sender": "claude",
+            "topic": "implementation_done",
+            "content": json!({ "head_sha": GATE_HEAD }).to_string()
+        }),
+    );
+    let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+    assert_eq!(
+        status["phase"], "CodeReviewFixGlobalPending",
+        "following the remedy verbatim must satisfy the gate on a gapped task list too"
+    );
+}
+
+/// A plan declaring an id no ledger can ever name is a corrupt session record,
+/// and is diagnosed as one.
+///
+/// `0, 1, 2` satisfies the strictly-increasing rule `validate_task_list_body`
+/// applies, while `collab_checkpoint` refuses `0` in `completed_task_ids` — so
+/// no checkpoint can cover task 0 and no amount of retrying produces one. The
+/// refusal therefore drops the `checkpoint_drift:` prefix (which promises a
+/// better checkpoint would help, and grades the failure recoverable) and sends
+/// the caller to an operator instead.
+#[test]
+fn implementation_done_refused_when_the_task_list_declares_an_uncoverable_id() {
+    let app = App::open_for_test().unwrap();
+    let (_temp, session_id) = drive_to_code_implement_pending_with_ids(&app, &[0, 1, 2]);
+    call_tool(
+        &app,
+        "collab_checkpoint",
+        passing_checkpoint(&session_id, 2),
+    );
+
+    let err = call_tool_expect_error(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": &session_id,
+            "sender": "claude",
+            "topic": "implementation_done",
+            "content": json!({ "head_sha": GATE_HEAD }).to_string()
+        }),
+    );
+    assert!(
+        !err.contains("checkpoint_drift:"),
+        "an unfixable plan record must not wear the prefix that means \"write a better \
+         checkpoint\", got: {err}"
+    );
+    assert!(
+        err.contains("operator"),
+        "the refusal must send the caller to an operator, got: {err}"
+    );
+    let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+    assert_eq!(
+        status["phase"], "CodeImplementPending",
+        "a refused implementation_done must not advance the session: {err}"
+    );
+}
+
 /// Condition 4: green gates at an older sha describe a tree that no longer
 /// exists.
 #[test]
@@ -6796,6 +6974,92 @@ fn batch_flow_implementation_done_rejects_non_descendant_head() {
         json!(orphan_sha),
         "a refused implementation_done must not record the reported head: {err}"
     );
+}
+
+/// The self-consistent lie that ancestry alone would have waved through: a
+/// checkpoint and a report that both say `head_sha: "HEAD"`.
+///
+/// Every one of Task 7's four conditions is satisfied — the two strings are
+/// equal, the ledger covers every task, `gates_sha == head_sha` — and the
+/// ancestry shell-out would have *passed* too, because `HEAD` resolves to a
+/// real commit that genuinely descends from the session's `last_head_sha`.
+/// The damage is what gets recorded: `apply_event` would store the literal
+/// `"HEAD"` as `last_head_sha`, and every later ancestry check would re-resolve
+/// it against whatever HEAD had become by then, silently turning the drift
+/// detection off for the rest of the session. So the gate must refuse the
+/// *shape* of the value, before git is asked to resolve it.
+#[test]
+fn batch_flow_implementation_done_rejects_a_symbolic_head_sha() {
+    let (app, _temp, repo_path, shas) = test_app_with_git_repo(1);
+    let base_sha = shas[0].clone();
+    let session_id = drive_to_plan_locked_in_repo(&app, "batch plan", &repo_path);
+    let hash = plan_hash(&app, &session_id);
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": &session_id,
+            "sender": "claude",
+            "topic": "task_list",
+            "content": task_list_payload(&hash, &base_sha, &base_sha, 1)
+        }),
+    );
+    assert_eq!(phase_of(&app, &session_id), "CodeImplementPending");
+
+    // Real work on the real branch, so `HEAD` here names a commit that does
+    // descend from `base_sha`. Without this the refusal could be the git call
+    // failing rather than the shape check firing.
+    let real_head = commit_file(&repo_path, "task1.rs", "done\n", "task 1");
+
+    checkpoint_batch_complete(&app, &session_id, "claude", "HEAD");
+    let sends_before = wal_row_count(&app, &session_id, "collab_send");
+    let err = call_tool_expect_error(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": &session_id,
+            "sender": "claude",
+            "topic": "implementation_done",
+            "content": json!({ "head_sha": "HEAD" }).to_string()
+        }),
+    );
+    assert!(
+        err.contains("branch_drift:") && err.contains("is not a git object name"),
+        "expected the object-name shape refusal for a symbolic head_sha, got: {err}"
+    );
+    assert_eq!(
+        wal_row_count(&app, &session_id, "collab_send"),
+        sends_before,
+        "a refused implementation_done must write no audit row: {err}"
+    );
+    let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+    assert_eq!(
+        status["phase"], "CodeImplementPending",
+        "a refused implementation_done must not advance the phase: {err}"
+    );
+    assert_eq!(
+        status["last_head_sha"],
+        json!(base_sha),
+        "the session must still be anchored to the object name it was seeded \
+         with, never to the symbolic revision the caller reported: {err}"
+    );
+
+    // And the same send spelled as an object name is accepted, which is what
+    // makes the assertions above about `HEAD` specifically rather than about
+    // the session being wedged.
+    checkpoint_batch_complete(&app, &session_id, "claude", &real_head);
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": &session_id,
+            "sender": "claude",
+            "topic": "implementation_done",
+            "content": json!({ "head_sha": &real_head }).to_string()
+        }),
+    );
+    let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+    assert_eq!(status["last_head_sha"], json!(real_head));
 }
 
 // ── checkpoint divergence at handoff, resume, and status (issue #273 Task 9) ──
@@ -7285,6 +7549,69 @@ fn collab_status_checkpoint_is_null_without_a_checkpoint() {
         "collab_status must always carry a checkpoint field: {status}"
     );
     assert_eq!(status["checkpoint"], serde_json::Value::Null);
+}
+
+/// A checkpoint row the loader refuses must not take `collab_status` down with
+/// it. Status is what an operator (or a polling dispatcher) reads to find out
+/// what a session is doing, so a row that fails `validate()` — here
+/// `attested_by = 'operator'` with no acknowledged range, the combination
+/// migration 020's one-directional CHECK permits and only `validate` rejects —
+/// has to be *reported*, not propagated: propagating it makes the session
+/// completely unobservable, leaving raw SQL as the only repair.
+/// `session_handoff` degrades the same way, under the same `error` key.
+///
+/// The degraded block is neither `null` — which means "never checkpointed", a
+/// different fact — nor `diverged: false`, which would present a check that
+/// never ran as one that passed.
+#[test]
+fn collab_status_reports_an_unloadable_checkpoint_row_instead_of_failing() {
+    let (app, _temp, repo, _shas) = test_app_with_git_repo(1);
+    let session_id = start_batch_session_in(&app, &repo, 3);
+    // Raw SQL, deliberately bypassing `collab_checkpoint` (and therefore
+    // `CollabCheckpoint::validate`) — the row the schema permits but the domain
+    // rules forbid, as a partial restore or a direct edit could leave.
+    app.db
+        .with_connection(|conn| {
+            conn.execute(
+                "INSERT INTO collab_checkpoints
+                   (session_id, status, head_sha, attested_by, updated_at)
+                 VALUES (?1, 'started', 'aaa111', 'operator', 1)",
+                rusqlite::params![&session_id],
+            )
+            .map_err(ironmem::error::MemoryError::from)?;
+            Ok(())
+        })
+        .unwrap();
+
+    let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+    let checkpoint = &status["checkpoint"];
+    assert!(
+        !checkpoint.is_null(),
+        "a row that could not be read is not the same fact as never having \
+         checkpointed: {status}"
+    );
+    assert!(
+        checkpoint["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("acknowledged_divergence"),
+        "status must say what is wrong with the row, in words: {status}"
+    );
+    assert_eq!(checkpoint["head_check"], json!("unreadable"));
+    assert_eq!(
+        checkpoint["diverged"],
+        serde_json::Value::Null,
+        "an unreadable row must never answer diverged: false: {status}"
+    );
+    // Nothing may be asserted about the contents of a row we could not read.
+    for key in ["status", "task_id", "head_sha", "attested_by", "updated_at"] {
+        assert!(
+            checkpoint.get(key).is_none(),
+            "unreadable must render no checkpoint content ({key}): {status}"
+        );
+    }
+    // The rest of the session stays observable — the point of degrading.
+    assert_eq!(status["phase"], json!("CodeImplementPending"));
 }
 
 // ── operator-attested checkpoint backfill (issue #273 Task 10) ────────────────

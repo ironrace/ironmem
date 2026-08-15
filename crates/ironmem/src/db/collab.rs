@@ -36,13 +36,18 @@ impl Database {
         queue::save_session(&self.conn, session)
     }
 
-    pub fn collab_upsert_checkpoint(
-        &self,
-        checkpoint: &CollabCheckpoint,
-    ) -> Result<(), MemoryError> {
-        queue::upsert_checkpoint(&self.conn, checkpoint)
-    }
-
+    /// There is deliberately no `collab_upsert_checkpoint` sibling to this
+    /// reader. A checkpoint write is not a bare row write: the
+    /// `collab_checkpoint` tool handler takes the generation lease, runs the
+    /// `HeadCheck`, and stamps `attestation_check` from
+    /// `verify_acknowledged_range`'s own git reads before it ever reaches
+    /// `queue::upsert_checkpoint`. A convenience accessor here would offer a
+    /// one-liner that skips all three — `validate()` accepts an operator row
+    /// with a plausible-looking range — so what landed would be an unleased,
+    /// unresolved operator attestation that every reader surface then renders
+    /// as `unrecorded`. Writers go through the tool handler; the rare test
+    /// that needs the raw primitive names `queue::upsert_checkpoint` through
+    /// `with_connection`, so the bypass is visible at the call site.
     pub fn collab_load_current_checkpoint(
         &self,
         session_id: &str,
@@ -160,11 +165,16 @@ mod tests {
             .contains("does not reference an existing drawer"));
     }
 
-    /// Wires `collab_upsert_checkpoint` / `collab_load_current_checkpoint`
+    /// Wires `queue::upsert_checkpoint` / `collab_load_current_checkpoint`
     /// through `Database::open_in_memory`'s full migration chain (not
     /// `queue::tests::open`'s hand-picked subset), so a future migration that
     /// changes migration 020's shape but not `queue.rs`'s test fixture would
     /// still be caught here.
+    ///
+    /// The write side reaches for `queue::upsert_checkpoint` through
+    /// `with_connection` rather than a `Database` accessor because no such
+    /// accessor exists — see the note on `collab_load_current_checkpoint` for
+    /// why the write path is the tool handler's alone.
     #[test]
     fn collab_checkpoint_accessors_round_trip_through_database() {
         let db = Database::open_in_memory().unwrap();
@@ -194,7 +204,8 @@ mod tests {
             "head_sha": "abc123",
         }))
         .unwrap();
-        db.collab_upsert_checkpoint(&checkpoint).unwrap();
+        db.with_connection(|c| queue::upsert_checkpoint(c, &checkpoint))
+            .unwrap();
 
         let loaded = db
             .collab_load_current_checkpoint("session")

@@ -17,6 +17,8 @@ use std::str::FromStr;
 
 use serde_json::Value;
 
+use super::MAX_TASKS_PER_COLLAB_ISSUE;
+
 /// How far the batch has got, as recorded at a task boundary.
 ///
 /// The variants and their [`CheckpointStatus::as_str`] spellings are one half
@@ -149,9 +151,15 @@ pub enum AttestationCheck {
     /// The endpoint rules held, but **coverage of the gap was not
     /// established** — the checkpoint being replaced is not behind this one in
     /// a way that defines a gap to cover (its head no longer resolves, or it is
-    /// not an ancestor of this checkpoint's head). Both are branch-drift
+    /// not an ancestor of this checkpoint's head). Those two are branch-drift
     /// shapes; the attestation is well-formed but nobody has checked that it
     /// leaves no commits unaccounted for.
+    ///
+    /// A third producer is not a repository shape but a race: the span is
+    /// judged against the checkpoint read before the write transaction opens,
+    /// and if the row the write actually replaces is not that one, the verdict
+    /// is re-qualified down to this label inside the transaction rather than
+    /// reporting a `Verified` that describes a checkpoint no longer there.
     VerifiedWithoutSpan,
     /// Live HEAD could not be read at all, so **only the range's syntax was
     /// checked**. The write is accepted — a transient filesystem problem must
@@ -291,6 +299,35 @@ pub struct CollabCheckpoint {
     pub updated_at: i64,
 }
 
+/// Maximum length (chars) for a checkpoint's free-text fields, the same 2048 as
+/// `mcp::tools::collab_events::MAX_CODING_FAILURE_CHARS` — the sibling cap on
+/// the other unbounded string an agent files about its own run.
+///
+/// The cost of an uncapped field here is not the one write. The row is re-read
+/// and re-rendered by `collab_status`, `collab_resume` and the
+/// `session_handoff` block on every poll for the rest of the session, so a
+/// pasted-in gate log is paid for again at each of them. `gates_result` is the
+/// field this is really about: `failed: <reason>` invites a paste of the whole
+/// test output, which is exactly the shape `MAX_CODING_FAILURE_CHARS` exists to
+/// stop next door.
+const MAX_CHECKPOINT_TEXT_CHARS: usize = 2048;
+
+/// Maximum length (chars) for the SHA-shaped fields, and for the
+/// `<from_sha>..<to_sha>` range built out of two of them.
+///
+/// Generous next to the 130 chars two full object ids and a `..` take, because
+/// the rule this type enforces on these fields is requiredness rather than
+/// shape (see [`CollabCheckpoint::validate`]) and git accepts revision
+/// expressions as well as object ids — but far below the size at which a "SHA"
+/// is really a payload.
+///
+/// The 130 is sha256 arithmetic (64 + 2 + 64), not sha1's 82. A cap derived
+/// from sha1 would sit *below* a legitimate `acknowledged_divergence` range in
+/// a sha256 repository, so the tool's own paste-ready attestation template
+/// would be refused by this very constant — a cap must not be narrower than
+/// the widest value the code that reads it emits.
+const MAX_CHECKPOINT_SHA_CHARS: usize = 160;
+
 impl CollabCheckpoint {
     /// Parse and validate a checkpoint from the MCP tool payload.
     ///
@@ -307,6 +344,9 @@ impl CollabCheckpoint {
     /// cannot backdate a checkpoint to make a stale one look fresh. That is a
     /// direct defense against the incident in issue #273, where a frozen
     /// checkpoint was presented as a current progress report.
+    ///
+    /// This is also the one place the per-field size caps are applied — see
+    /// [`CollabCheckpoint::check_payload_caps`] for why here and nowhere else.
     pub fn from_json(value: &Value) -> Result<Self, CheckpointError> {
         let checkpoint = Self {
             session_id: parse_session_id(value)?,
@@ -337,8 +377,94 @@ impl CollabCheckpoint {
             attestation_check: None,
             updated_at: 0,
         };
+        checkpoint.check_payload_caps()?;
         checkpoint.validate()?;
         Ok(checkpoint)
+    }
+
+    /// Refuse a payload field that is longer than its cap.
+    ///
+    /// Called from [`CollabCheckpoint::from_json`] and deliberately **not**
+    /// from [`CollabCheckpoint::validate`], which is the rule that matters
+    /// here. `validate` also runs on the *load* path
+    /// (`queue::load_current_checkpoint`), where a refusal is fatal to every
+    /// reader at once: a cap there would make an over-long row that is already
+    /// in the table permanently unloadable, so `collab_status`,
+    /// `collab_resume` and `session_handoff` would each refuse the session and
+    /// leave no surface from which to see the row, let alone replace it. A cap
+    /// belongs where the value can still be refused — at the parse of the
+    /// payload that would create it.
+    ///
+    /// Refusing rather than truncating, for the same reason the sibling
+    /// `coding_failure` cap refuses: a truncated field is a stored row
+    /// misstating what the caller sent, and every later reader renders it as
+    /// though the caller had sent that. Note that the MCP layer *may* compact
+    /// a long failure log before it reaches its own cap
+    /// (`mcp::compact::compact_failure_log`); no equivalent runs here, because
+    /// this module is a pure parse/validate unit and reaching up into the MCP
+    /// layer for it would invert the dependency the module doc turns on.
+    ///
+    /// Two payload fields are absent from the list below, both deliberately.
+    /// `completed_task_ids` is bounded in [`parse_completed_task_ids`], which
+    /// is where its raw wire form still exists and where its *domain* bound
+    /// ([`MAX_TASKS_PER_COLLAB_ISSUE`]) can be stated. `session_id` is a
+    /// lookup key rather than content: `handle_collab_checkpoint` resolves it
+    /// through `queue::ensure_active` before anything is written, so an
+    /// oversized one names no session and is refused there.
+    fn check_payload_caps(&self) -> Result<(), CheckpointError> {
+        for (field, value, cap) in [
+            (
+                "task_title",
+                self.task_title.as_deref(),
+                MAX_CHECKPOINT_TEXT_CHARS,
+            ),
+            (
+                "gates_result",
+                Some(self.gates_result.as_str()),
+                MAX_CHECKPOINT_TEXT_CHARS,
+            ),
+            (
+                "gates_commands",
+                self.gates_commands.as_deref(),
+                MAX_CHECKPOINT_TEXT_CHARS,
+            ),
+            (
+                "summary",
+                self.summary.as_deref(),
+                MAX_CHECKPOINT_TEXT_CHARS,
+            ),
+            (
+                "head_sha",
+                Some(self.head_sha.as_str()),
+                MAX_CHECKPOINT_SHA_CHARS,
+            ),
+            (
+                "commit_sha",
+                self.commit_sha.as_deref(),
+                MAX_CHECKPOINT_SHA_CHARS,
+            ),
+            (
+                "gates_sha",
+                self.gates_sha.as_deref(),
+                MAX_CHECKPOINT_SHA_CHARS,
+            ),
+            (
+                "acknowledged_divergence",
+                self.acknowledged_divergence.as_deref(),
+                MAX_CHECKPOINT_SHA_CHARS,
+            ),
+        ] {
+            let Some(value) = value else { continue };
+            let length = value.chars().count();
+            if length > cap {
+                return Err(CheckpointError(format!(
+                    "{field} is {length} chars, over the {cap}-char limit: the checkpoint is \
+                     refused rather than truncated, so the stored row cannot misstate what you \
+                     sent"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Check the cross-field rules that hold for every checkpoint, however it
@@ -666,7 +792,25 @@ pub(crate) fn optional_task_id(value: &Value, field: &str) -> Result<Option<u32>
 /// progress round-trip to the same string, so an equality or diff over stored
 /// checkpoints reflects real progress rather than the order the ids were
 /// appended in.
+///
+/// Bounded twice, because the two bounds answer different questions. The
+/// [`MAX_CHECKPOINT_TEXT_CHARS`] cap on the raw string bounds the *work*: a
+/// list of one id repeated a million times normalizes to `"1"`, so a bound on
+/// the parsed set alone would leave the scan of the payload unbounded. The
+/// [`MAX_TASKS_PER_COLLAB_ISSUE`] cap on the distinct ids is the *domain*
+/// bound — a checkpoint claiming more finished tasks than a collab session may
+/// contain is describing a session that cannot exist — and is checked as the
+/// set grows so an id-per-task flood stops at the sixteenth entry rather than
+/// at the end of the string. Both refuse rather than truncate, for the reason
+/// [`CollabCheckpoint::check_payload_caps`] gives.
 fn parse_completed_task_ids(raw: &str) -> Result<Vec<u32>, CheckpointError> {
+    let length = raw.chars().count();
+    if length > MAX_CHECKPOINT_TEXT_CHARS {
+        return Err(CheckpointError(format!(
+            "completed_task_ids is {length} chars, over the {MAX_CHECKPOINT_TEXT_CHARS}-char \
+             limit: at most {MAX_TASKS_PER_COLLAB_ISSUE} task ids can legitimately appear"
+        )));
+    }
     let mut ids = BTreeSet::new();
     for piece in raw.split(',') {
         let piece = piece.trim();
@@ -684,6 +828,12 @@ fn parse_completed_task_ids(raw: &str) -> Result<Vec<u32>, CheckpointError> {
             ));
         }
         ids.insert(id);
+        if ids.len() > MAX_TASKS_PER_COLLAB_ISSUE as usize {
+            return Err(CheckpointError(format!(
+                "completed_task_ids names more than {MAX_TASKS_PER_COLLAB_ISSUE} distinct tasks, \
+                 which is the most one collab session may contain"
+            )));
+        }
     }
     Ok(ids.into_iter().collect())
 }
@@ -1081,7 +1231,7 @@ mod tests {
     /// permits the row below. Nothing else stands between a fabricated
     /// operator attestation and the head-consistency gate it exempts.
     ///
-    /// Written as a full struct literal naming all fifteen fields rather than
+    /// Written as a full struct literal naming all sixteen fields rather than
     /// as a mutation of a parsed value, because the openness of the type is
     /// the thing under test — this is the construction Task 3's loader will
     /// perform. It therefore also stops compiling if a field is later made
@@ -1221,6 +1371,120 @@ mod tests {
                 "from_json must report its own parse error, not validate's"
             );
         }
+    }
+
+    /// Every free-text field a caller fills is capped, at the same 2048 chars
+    /// as the sibling `coding_failure` field. `gates_result` is the one that
+    /// invites the abuse — `failed: <paste of the whole test output>` — and
+    /// the cost is not the one write: the row is re-read and re-rendered by
+    /// `collab_status`, `collab_resume` and the `session_handoff` block on
+    /// every poll for the rest of the session.
+    #[test]
+    fn free_text_fields_are_capped() {
+        for field in ["task_title", "gates_result", "gates_commands", "summary"] {
+            let mut v = valid();
+            v[field] = json!("x".repeat(MAX_CHECKPOINT_TEXT_CHARS + 1));
+            let err = CollabCheckpoint::from_json(&v).unwrap_err();
+            assert!(err.to_string().contains(field), "got: {err}");
+
+            // And the boundary is a limit rather than an off-by-one: a field
+            // of exactly the cap is a legitimate value, not a refusal.
+            v[field] = json!("x".repeat(MAX_CHECKPOINT_TEXT_CHARS));
+            assert!(
+                CollabCheckpoint::from_json(&v).is_ok(),
+                "{field} at exactly {MAX_CHECKPOINT_TEXT_CHARS} chars must parse"
+            );
+        }
+    }
+
+    /// The SHA-shaped fields get the tighter cap, including the operator
+    /// range built out of two of them. This type still cannot tell a real SHA
+    /// from any other word — that is `verify_acknowledged_range`'s job — but
+    /// 128 chars is far more than any object id or revision expression needs
+    /// and far less than a payload.
+    #[test]
+    fn sha_shaped_fields_are_capped() {
+        for field in ["head_sha", "commit_sha", "gates_sha"] {
+            let mut v = valid();
+            v[field] = json!("a".repeat(MAX_CHECKPOINT_SHA_CHARS + 1));
+            let err = CollabCheckpoint::from_json(&v).unwrap_err();
+            assert!(err.to_string().contains(field), "got: {err}");
+
+            v[field] = json!("a".repeat(MAX_CHECKPOINT_SHA_CHARS));
+            assert!(
+                CollabCheckpoint::from_json(&v).is_ok(),
+                "{field} at exactly {MAX_CHECKPOINT_SHA_CHARS} chars must parse"
+            );
+        }
+
+        let mut v = valid();
+        v["attested_by"] = json!("operator");
+        v["acknowledged_divergence"] = json!(format!(
+            "{}..{}",
+            "b".repeat(MAX_CHECKPOINT_SHA_CHARS),
+            "c".repeat(MAX_CHECKPOINT_SHA_CHARS)
+        ));
+        let err = CollabCheckpoint::from_json(&v).unwrap_err();
+        assert!(
+            err.to_string().contains("acknowledged_divergence"),
+            "got: {err}"
+        );
+    }
+
+    /// The id list is bounded by the session's own task limit, and separately
+    /// by the raw string's length — a list of one id repeated normalizes to a
+    /// single entry, so the domain bound alone would leave the scan of a
+    /// multi-megabyte payload unbounded.
+    #[test]
+    fn completed_task_ids_is_bounded_by_the_sessions_task_limit() {
+        let ids = |through: u32| {
+            (1..=through)
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+
+        let mut v = valid();
+        v["completed_task_ids"] = json!(ids(MAX_TASKS_PER_COLLAB_ISSUE + 1));
+        let err = CollabCheckpoint::from_json(&v).unwrap_err();
+        assert!(err.to_string().contains("completed_task_ids"), "got: {err}");
+
+        // A batch that legitimately finished every task the limit allows must
+        // still be able to record it.
+        v["completed_task_ids"] = json!(ids(MAX_TASKS_PER_COLLAB_ISSUE));
+        assert_eq!(
+            CollabCheckpoint::from_json(&v)
+                .unwrap()
+                .completed_task_ids
+                .len(),
+            MAX_TASKS_PER_COLLAB_ISSUE as usize
+        );
+
+        // The duplicate flood: one distinct id, so the domain bound never
+        // fires and only the length cap stands between this and a full scan.
+        v["completed_task_ids"] = json!("1,".repeat(MAX_CHECKPOINT_TEXT_CHARS));
+        let err = CollabCheckpoint::from_json(&v).unwrap_err();
+        assert!(err.to_string().contains("completed_task_ids"), "got: {err}");
+    }
+
+    /// The caps are enforced in `from_json` and *nowhere else*, which is the
+    /// load-bearing half of the fix. `validate` also runs on the load path in
+    /// `queue::load_current_checkpoint`, so a cap there would make an
+    /// over-long row that is already stored permanently unloadable —
+    /// `collab_status`, `collab_resume` and `session_handoff` would each
+    /// refuse the session, leaving no surface from which to see the row, let
+    /// alone replace it. A row this parser would refuse today must still load.
+    #[test]
+    fn the_caps_do_not_reach_the_load_path() {
+        let mut stored = CollabCheckpoint::from_json(&valid()).unwrap();
+        stored.gates_result = "x".repeat(MAX_CHECKPOINT_TEXT_CHARS * 4);
+        stored.summary = Some("y".repeat(MAX_CHECKPOINT_TEXT_CHARS * 4));
+        stored.head_sha = "z".repeat(MAX_CHECKPOINT_SHA_CHARS * 4);
+        stored.completed_task_ids = (1..=MAX_TASKS_PER_COLLAB_ISSUE * 4).collect();
+        assert!(
+            stored.validate().is_ok(),
+            "an over-long row already in the table must stay loadable"
+        );
     }
 
     /// The mirror image: an implementer row carrying a range. The schema does

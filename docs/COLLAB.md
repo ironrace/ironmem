@@ -705,8 +705,17 @@ Invariants that still apply:
   `collab_start_code_review` shortcut and the normal full-flow v3 batch:
   `ImplementationDone{head_sha}`, `CodeReviewFixGlobal{head_sha}`,
   `ReviewLocal{head_sha}`, and `FinalReview{head_sha, ...}` are all validated
-  with a `git merge-base --is-ancestor` shell-out against the session's
-  prior `last_head_sha` before the event is applied. This does not depend on
+  against the session's prior `last_head_sha` before the event is applied. The
+  validation runs in two stages. First, without touching git, the reported
+  `head_sha` must *look like* an object name (7–64 hex characters): a revision
+  expression such as `HEAD` or a branch name is not a fixed commit, and
+  recording one would silently disable drift detection for the rest of the
+  session rather than fail it — so it is refused as Terminal `branch_drift:`.
+  Then the `git merge-base --is-ancestor` shell-out decides existence and
+  reachability. A *stored* `last_head_sha` that fails the shape check is the
+  one case that skips rather than refuses: it is server-held and the caller
+  cannot correct it, so refusing would wedge the session behind an error naming
+  a field its reader does not own. This does not depend on
   whether `task_list` is set — it is unconditional, so a full v3 batch
   (`SubmitTaskList` → `ImplementationDone` → ... → `CodingComplete`) is
   checked exactly as the shortcut is. A non-descendant head is refused with
@@ -806,8 +815,15 @@ These are separate questions decided by separate code, and conflating them
 produces wrong expectations:
 
 - **Admissibility** — *may a non-owner send this report at all?* Decided by
-  `off_turn_failure_is_admissible` against `OFF_TURN_FAILURE_PREFIXES`
-  (`branch_drift:`, `checkpoint_drift:`, `codex_dispatch_failed:`).
+  `off_turn_failure_is_admissible`, which spells out one clause per prefix:
+  `branch_drift:` unconditionally, `checkpoint_drift:` only from
+  `CodeImplementPending`, and `codex_dispatch_failed:` only from Claude against
+  a Codex-owned turn in a phase Claude could have dispatched. The
+  `OFF_TURN_FAILURE_PREFIXES` constant lists the same three prefixes but is
+  **documentation only — nothing reads it at runtime**, so adding a prefix
+  there grants no carve-out until it also gets its own clause in that function.
+  The three scoping rules are irreconcilable in a flat list, which is why the
+  function is the authority whenever the two disagree.
 - **Classification** — *does this report recover or kill the session?*
   Decided by `failure_class::classify` against
   `RECOVERABLE_FAILURE_PREFIXES` (the seven prefixes above). The reporter's
@@ -1404,7 +1420,13 @@ continuing).
 **`checkpoint`.** The session's current `collab_checkpoints` row plus the
 live-HEAD comparison, or JSON `null` when the session has never checkpointed.
 This is the same information the `session_handoff` block carries, exposed
-without needing a handoff so drift is visible while a batch is still running.
+without needing a handoff so drift is visible while a batch is still running —
+but it is **spelled differently**. The block has no JSON `null` to spend on "the
+check did not run", so it folds the live-HEAD answer into one three-valued
+`checkpoint.head_check` (`matches` | `diverged` | `unverified`); here the same
+answer is split across `head_check` (`"checked"` | `"unreadable"`) and
+`diverged` (`true` | `false` | `null`). Same question, two renderings: a
+consumer that learned one spelling must not apply it to the other surface.
 
 Fields: every column the checkpoint row stores — `status`, `task_id`,
 `task_title`, `head_sha`, `commit_sha`, `completed_task_ids` (an array of
@@ -1422,10 +1444,41 @@ server's anti-backdating stamp), and the comparison:
   reporting `false` for a check that never ran would be an unverified claim
   presented as verified. Read `head_check` first.
 - `repo_head_sha` — the HEAD actually read, `null` when it could not be.
-- `divergence` — the `checkpoint_drift:` diagnostic, present only when
-  `diverged` is `true`.
-- `head_check_error` — why the check could not run, present only when
-  `head_check` is `"unreadable"`.
+- `divergence` — the `checkpoint_drift:` diagnostic; the key is **absent
+  unless** `diverged` is `true`.
+- `head_check_error` — why the check could not run; the key is **absent
+  unless** `head_check` is `"unreadable"`.
+- `error` — why the stored **row** could not be read; the key is absent
+  outside the degraded block described next, and never appears together with
+  the row's own fields.
+
+These three are genuinely absent keys, not em-dash placeholders. That is the
+other half of the difference from the `session_handoff` block, whose key set is
+fixed and which renders the unset case as an em-dash — test for the key here,
+test for the value there.
+
+**A row that cannot be loaded degrades the block, it does not fail the call.**
+A `collab_checkpoints` row that the schema permits but the domain rules forbid
+(`attested_by=operator` with no `acknowledged_divergence`, say — see
+"Operator-attested checkpoint backfill") is refused by the loader.
+`collab_status` then returns `checkpoint` as exactly three keys:
+
+```json
+{ "error": "<why the row was refused>", "head_check": "unreadable", "diverged": null }
+```
+
+No field of the row is echoed, because nothing may be asserted about a row that
+could not be read; `error` (not `head_check_error`) is what says the *row* was
+unreadable rather than the repo. It is deliberately not `null`, which would
+claim the session never checkpointed — the one thing a reader must not conclude
+from a poisoned row. `session_handoff` degrades the same way (`checkpoint:
+unreadable` plus `checkpoint.error`).
+
+The tools that *consume* the row as proof — `collab_resume`,
+`collab_checkpoint`'s `inspect_divergence` mode, and the
+`implementation_done` gate — keep failing hard on such a row instead:
+degrading a gate would fail the divergence refusal open. The repair is the
+same in both cases: file an accurate checkpoint with `collab_checkpoint`.
 
 `gates_commands` is what the gate-proof reuse rule under "Implementation
 checkpoints" compares against the current required gate set; it and
@@ -1590,10 +1643,18 @@ checks before accepting it.
 
 A checkpoint that could not be compared against git at all does not refuse — a
 transient filesystem problem must not strand a recoverable session — but the
-success response then carries `checkpoint.head_check: "unreadable"` rather
-than implying a check that never ran. A session with no checkpoint row does
-not refuse either; `implementation_done`'s own gate is what refuses a batch
-that reaches the end without one.
+success response's `checkpoint.head_check` field is then `"unreadable"` (the
+JSON spelling; the `session_handoff` block says `unverified` for the same
+state) rather than implying a check that never ran. A session with no
+checkpoint row does not refuse either; `implementation_done`'s own gate is what
+refuses a batch that reaches the end without one.
+
+A checkpoint row that could not be **loaded** — one the loader refuses, see
+`collab_status`'s `checkpoint` field — is different again: this call fails
+with that validation error rather than resuming onto a row it cannot read.
+`collab_status` and `session_handoff` still render the session (degraded, with
+the error under `checkpoint.error`), so the failure is diagnosable; the repair
+is to file an accurate checkpoint with `collab_checkpoint`.
 
 On success: `phase` is restored to `failed_from_phase`, `current_owner`
 becomes the caller (`agent`), `coding_failure` clears, and the prior
@@ -1645,7 +1706,17 @@ the successor who reads the row later are shown one story), plus:
   The subjects are the point: an override that shows only a sha range is a
   rubber stamp, which is worse than no override because it launders a
   fabrication through a human. Capped at 200, with `commits_truncated` saying
-  so rather than the list quietly ending.
+  so rather than the list quietly ending. Because the walk is newest-first, the
+  retained window is the 200 **newest** commits, so a truncated listing is
+  missing the ones nearest the stale checkpoint; `commit_range` and
+  `attestation` still name the full span, which is why the flag matters.
+  Each `subject` is rendered for display, not passed through verbatim: runs of
+  whitespace, control characters and the invisible bidi/zero-width formatters
+  collapse to a single space, and a subject over 160 characters is cut with a
+  trailing `…`. That stops a commit message from visually reordering or hiding
+  the response around it, or from burying the other entries. It is **not** a
+  safety claim about the text — a subject is written by whoever landed the
+  commit, so the listing is untrusted input that a human judges.
 - `attestable` — whether there is a range here to attest to at all.
 - `attestation` — the exact `collab_checkpoint(...)` call that would attest to
   what was just shown, present only when `attestable`.
@@ -1654,13 +1725,21 @@ the successor who reads the row later are shown one story), plus:
   - `listed` — a real run of commits after the checkpoint. The only
     `attestable` answer.
   - `no_divergence` — checked, and the checkpoint already describes live HEAD.
-  - `not_checked` — live HEAD could not be read, so drift is **unknown**. Never
-    reported as `no_divergence`: an unreadable repo is precisely where a
-    checkpoint is most likely stale.
-  - `checkpoint_head_unreachable` — the checkpoint's `head_sha` is not
-    reachable from live HEAD (history rewritten, a different branch, or a sha
-    that never existed). That is **branch drift, not a checkpoint gap**, and it
-    is not offered as an attestable range. Note `git log <cp>..<HEAD>`
+  - `not_checked` — the comparison could not be made, so drift is **unknown**:
+    live HEAD could not be read, git could not decide the ancestry (a sha
+    naming no commit in this repository lands here), or the listing itself
+    failed. Never reported as `no_divergence` — an unreadable repo is precisely
+    where a checkpoint is most likely stale — and never as
+    `checkpoint_head_unreachable`, which is the *decided* verdict below.
+  - `checkpoint_head_unreachable` — git answered, and the checkpoint's
+    `head_sha` is not reachable from live HEAD (history rewritten, or the
+    worktree is on a different branch). The one case decided without asking git
+    is a `head_sha` git would read as an option rather than a revision: the
+    checkpoint is malformed on its face, so the verdict rests on the payload
+    rather than on a git that was asked and stayed silent. That is **branch
+    drift, not a checkpoint gap**, and it is not offered as an attestable
+    range. Note
+    `git log <cp>..<HEAD>`
     *succeeds* for an unrelated branch and would list every commit on it, none
     of which is post-checkpoint work — so the reachability is asked directly,
     not inferred from git failing.
@@ -1670,7 +1749,10 @@ the successor who reads the row later are shown one story), plus:
     resolving to the very same commit. Not attestable.
   - `no_checkpoint` — the session never checkpointed, so there is no claim to
     reconcile and nothing to attest over.
-- `commit_range_error` — why, for the three answers that have no range.
+- `commit_range_error` — why the range is missing. Five of the six answers
+  carry no range, but only three explain themselves here: `not_checked`,
+  `checkpoint_head_unreachable`, and `empty_range`. The other two need no
+  sentence — `no_divergence` and `no_checkpoint` are self-describing.
 
 #### 2. Attest
 
@@ -1709,11 +1791,16 @@ never resolved must not read, on those three surfaces, exactly like one it did.
 
 - `verified` — every rule ran and held.
 - `verified_without_span` — the endpoints held, but **coverage of the gap was
-  not established**. Two triggers, and the second is much the more reachable:
+  not established**. Three triggers, and the second is much the more reachable:
   the replaced checkpoint's head no longer resolves (history rewritten out from
   under it), **or** it resolves but is not an ancestor of the new head — most
   simply, the new checkpoint is on an orphan or unrelated branch, so the two
-  bound no linear run of commits to demand coverage of. An operator can
+  bound no linear run of commits to demand coverage of. The third is a race
+  rather than a repository shape: the span is judged against the checkpoint read
+  *before* the write transaction opens, and if the row the write actually
+  replaces turns out not to be that one, the verdict is re-qualified down to
+  this label inside the transaction — rather than reporting a `verified` that
+  describes a checkpoint no longer there. An operator can
   therefore file a well-formed attestation over a narrow range on an unrelated
   branch and have every endpoint rule pass; this label is what tells a reader
   nobody checked what it leaves out.
@@ -1781,22 +1868,46 @@ live-HEAD comparison:
   values, never two.** `unverified` means git could not be read at all
   (missing from `PATH`, unreadable repo, not a repo), which is exactly where a
   checkpoint is most likely to be stale; reporting it as `matches` would
-  present an unverified claim as verified.
+  present an unverified claim as verified. The JSON surfaces (`collab_status`,
+  `collab_resume`, `collab_checkpoint`) state the same answer under the same
+  name but in **different words**: `head_check` (`"checked"` | `"unreadable"`)
+  plus a separate `diverged` (`true` | `false` | `null`). They have a JSON
+  `null` to spend on "the check did not run" and this block does not, so the
+  three states are folded into one word here. Do not carry a spelling learned
+  on one surface to the other. When there is no checkpoint row to compare, this
+  key renders as an em-dash, like every other row-derived `checkpoint.*` key
+  (`checkpoint` and `checkpoint.legacy_drawer` say `none` instead — they
+  answer an existence question, which always has an answer).
 - `checkpoint.repo_head_sha` — the HEAD actually read, so a successor filing a
   corrected checkpoint need not shell out to git itself.
 - `checkpoint.divergence` — the full `checkpoint_drift:` diagnostic when the
   two disagree, naming both SHAs and what the checkpoint claims.
-- `checkpoint.head_check_error` — why the check could not run, present exactly
-  when `head_check` is `unverified`.
+- `checkpoint.head_check_error` — why the check could not run; carries the
+  reason when `head_check` is `unverified`, an em-dash otherwise. The key
+  itself is always emitted, like every key in this block.
+- `checkpoint.error` — why the stored row could not be read; carries the
+  validation message when `checkpoint` is `unreadable`, an em-dash otherwise.
+  Always emitted too.
+
+`checkpoint` itself is three-valued, and the third value is the point: a row
+that exists but fails `validate()` renders as `unreadable`, never as `none`.
+Reporting a poisoned row as "no checkpoint" would tell a successor the session
+has no progress to reconcile, which is the one thing it must not conclude. The
+block degrades to `unreadable` rather than failing the whole tool, because a
+handoff block is a diagnostic and a diagnostic that refuses to render is worth
+less than one that names what it could not read.
 
 Every key is emitted on every call, unset ones as an em-dash, so the key set
-is fixed. The block remains timestamp-free: the row's `updated_at` is exposed
-through `collab_status` and `collab_resume` instead, `head_check` being a
+is fixed. "Unset" includes a value that is only whitespace: it flattens to
+nothing and renders as the em-dash, so a successor never sees a third spelling
+of "no value". The block remains timestamp-free: the row's `updated_at` is
+exposed through `collab_status` and `collab_resume` instead, `head_check` being a
 better staleness signal than a clock in any case.
 
-**The block is unforgeable.** Every line is written through one renderer that
-collapses its value onto a single line, so no field can inject additional
-`key: value` lines. This matters because several rendered values are
+**The block is unforgeable.** Every `key: value` line is written through one
+renderer that collapses its value onto a single line — the opening and closing
+fence lines are the only writes that are not, and they carry no value — so no
+field can inject additional `key: value` lines. This matters because several rendered values are
 agent-supplied free text — `coding_failure` and its `pending_failure` clone
 arrive from a `failure_report` and are *expected* to be multi-line — and a
 successor routes off this block. Long values therefore appear with internal

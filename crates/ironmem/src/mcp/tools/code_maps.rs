@@ -104,7 +104,13 @@ fn validate_repo(raw: &str) -> Result<String, MemoryError> {
         )));
     }
 
-    let output = std::process::Command::new("git")
+    // Scrubbed for the reason `scrub_git_environment` documents: an ambient
+    // `GIT_DIR`/`GIT_WORK_TREE` overrides `current_dir`, so without this the
+    // probe answers about whatever repo the environment names rather than the
+    // one the caller asked about.
+    let mut command = std::process::Command::new("git");
+    crate::mcp::tools::collab_session::scrub_git_environment(&mut command);
+    let output = command
         .args(["rev-parse", "--show-toplevel"])
         .current_dir(&canonical)
         .output()
@@ -436,6 +442,37 @@ mod tests {
         Arc::new(App::open_for_test_with_mode(McpAccessMode::ReadOnly).unwrap())
     }
 
+    /// Run one git command in `root` with the environment scrubbed.
+    ///
+    /// The scrub is not decoration. `collab_session`'s test fixtures set
+    /// `GIT_DIR`/`GIT_WORK_TREE` process-wide (see `ScopedGitEnv`), `cargo
+    /// test` runs this binary's tests on parallel threads, and those variables
+    /// override `current_dir` — so an unscrubbed `git init`/`add`/`commit`
+    /// here intermittently built its repository inside the *other* test's
+    /// fixture, leaving this one with no commits and failing it at random.
+    /// The mutex `ScopedGitEnv` holds serializes the tests that set the
+    /// variables, not the unrelated ones that merely inherit them.
+    ///
+    /// `commit.gpgsign=false` and `core.hooksPath=/dev/null` are pinned for a
+    /// second, unrelated reason: a developer whose global git config signs
+    /// commits or installs hooks would otherwise see these tests fail on a
+    /// clean checkout.
+    fn git_in(root: &std::path::Path, args: &[&str]) -> std::process::Output {
+        let mut command = std::process::Command::new("git");
+        crate::mcp::tools::scrub_git_environment(&mut command);
+        command
+            .args([
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+            ])
+            .args(args)
+            .current_dir(root)
+            .output()
+            .unwrap()
+    }
+
     // Set up a real git repo with a committed file and return (TempDir, root, sha).
     fn make_git_repo_with_file(
         filename: &str,
@@ -444,44 +481,24 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_path_buf();
 
-        std::process::Command::new("git")
-            .args(["init"])
-            .current_dir(&root)
-            .output()
-            .unwrap();
-        std::process::Command::new("git")
-            .args(["config", "user.email", "test@test.com"])
-            .current_dir(&root)
-            .output()
-            .unwrap();
-        std::process::Command::new("git")
-            .args(["config", "user.name", "Test"])
-            .current_dir(&root)
-            .output()
-            .unwrap();
+        git_in(&root, &["init"]);
+        git_in(&root, &["config", "user.email", "test@test.com"]);
+        git_in(&root, &["config", "user.name", "Test"]);
 
         let file_path = root.join(filename);
         if let Some(parent) = file_path.parent() {
             std::fs::create_dir_all(parent).unwrap();
         }
         std::fs::write(&file_path, content).unwrap();
-        std::process::Command::new("git")
-            .args(["add", "."])
-            .current_dir(&root)
-            .output()
-            .unwrap();
-        std::process::Command::new("git")
-            .args(["commit", "-m", "initial"])
-            .current_dir(&root)
-            .output()
-            .unwrap();
+        git_in(&root, &["add", "."]);
+        git_in(&root, &["commit", "-m", "initial"]);
 
-        let out = std::process::Command::new("git")
-            .args(["rev-parse", "HEAD"])
-            .current_dir(&root)
-            .output()
-            .unwrap();
+        let out = git_in(&root, &["rev-parse", "HEAD"]);
         let sha = String::from_utf8(out.stdout).unwrap().trim().to_string();
+        assert!(
+            !sha.is_empty(),
+            "fixture repo has no HEAD — the git environment leaked from a parallel test"
+        );
 
         (dir, root, sha)
     }

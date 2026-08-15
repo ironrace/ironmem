@@ -28,6 +28,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Schema-enforced collab checkpoints and a head-consistency gate on
+  `implementation_done` (#273).** Schema goes **v19 -> v21** (migrations 020
+  and 021), adding a `collab_checkpoints` table that stores one row per
+  session: reporting agent, status, `task_id`, `completed_task_ids`,
+  `head_sha`, `gates_sha`/`gates_result`, and (for operator-attested rewrites)
+  `attested_by`/`acknowledged_divergence`/`attestation_check`. A new
+  `collab_checkpoint` MCP tool writes and upserts this row. `implementation_done`
+  now hard-gates on `require_checkpoint_proof`: every task id the accepted task
+  list declares must be covered by `completed_task_ids`, and the checkpoint's
+  `head_sha` must equal the head the call reports, with gates recorded green at
+  that same sha, before the call is admitted. The comparison against **live**
+  git HEAD is a separate layer, on the `session_handoff` and `collab_resume`
+  paths and at the checkpoint write — which is also where an operator
+  attestation's `acknowledged_divergence` is resolved against the repository
+  and labelled `verified` / `verified_without_span` /
+  `unverified_repo_unreadable`. The legacy convention of
+  recording batch progress in an `add_drawer` note is retired in favor of this
+  schema-enforced record; `collab_status`, `collab_resume`, and the
+  `session_handoff` block all render the checkpoint's state. See
+  `docs/COLLAB.md` for the full checkpoint/attestation semantics.
+
 - **Opt-in hybrid prompt recall (#235).** The UserPromptSubmit hook can ask an
   already-running shared daemon for vector candidates over its Unix socket and
   fuse them with local BM25 through weighted RRF. Off by default; enable with

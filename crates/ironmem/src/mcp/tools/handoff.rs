@@ -206,8 +206,19 @@ fn task_list_str_field(raw: Option<&str>, key: &str) -> Option<String> {
 #[derive(Default)]
 pub(super) struct CheckpointSection {
     /// The verified `collab_checkpoints` row and what comparing it against
-    /// live git HEAD established. `None` means this session has no row.
+    /// live git HEAD established. `None` means this session has no row **or**
+    /// that the row could not be loaded — the two are told apart by
+    /// `load_error`, never by this field alone.
     pub current: Option<(crate::collab::CollabCheckpoint, HeadCheck)>,
+    /// Why the row could not be loaded, when a row exists but
+    /// `load_current_checkpoint` refused it (a `validate()` failure or an
+    /// unparseable column — see [`handle_session_handoff`]). The constructor
+    /// leaves `current` as `None` whenever this is `Some`: there is no
+    /// checkpoint content to render, and "unreadable" is the one thing this
+    /// block may say about it. Never rendered as `checkpoint: none`, which
+    /// would assert the session has no progress record when what happened is
+    /// that we could not read one.
+    pub load_error: Option<String>,
     /// Whether a pre-#273 checkpoint drawer exists for this session. Its
     /// contents are deliberately not carried — see the type's doc comment.
     pub legacy_drawer_present: bool,
@@ -252,7 +263,9 @@ const EM_DASH: &str = "\u{2014}";
 /// Write one `key: value` line of the block, rendering `None`/empty as an
 /// em-dash and flattening the value onto a single line.
 ///
-/// **Every line in the block goes through here, and that is the point.** The
+/// **Every `key: value` line in the block goes through here, and that is the
+/// point** — the opening and closing fence lines are the only writes that are
+/// not, and they carry no value. The
 /// block is line-oriented `key: value` inside a fence, and a newline embedded
 /// in any value splits it across two lines — the tail then parses as a key a
 /// successor has no reason to distrust. That is not hypothetical:
@@ -272,14 +285,19 @@ const EM_DASH: &str = "\u{2014}";
 ///
 /// Flatten rather than truncate or escape: the whole message still reaches the
 /// reader, and collapsing runs of whitespace keeps the result stable to render.
+///
+/// The flattening happens *before* the emptiness test, not after: a value that
+/// is only whitespace (`"   "`, `"\n\n"` — a `failure_report` body is free text
+/// and can be either) collapses to nothing, and writing `key: ` for it would
+/// hand a successor a third spelling of "no value" beside the em-dash. The
+/// fixed key set exists precisely so no such distinction has to be made.
 fn kv(out: &mut String, key: &str, value: Option<&str>) {
-    match value.filter(|v| !v.is_empty()) {
+    let flat = value
+        .map(|v| v.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|v| !v.is_empty());
+    match flat {
         Some(v) => {
-            let _ = writeln!(
-                out,
-                "{key}: {}",
-                v.split_whitespace().collect::<Vec<_>>().join(" ")
-            );
+            let _ = writeln!(out, "{key}: {v}");
         }
         None => {
             let _ = writeln!(out, "{key}: {EM_DASH}");
@@ -327,15 +345,39 @@ fn attestation_check_line(verdict: &'static str) -> String {
 /// unreadable repo as anything resembling "no divergence" would present an
 /// unverified claim as verified — the same failure, one level down, as the
 /// stale checkpoint that caused the incident.
+///
+/// `checkpoint` itself is three-valued for the same reason: `present`, `none`,
+/// and `unreadable`. A row that exists but fails `validate()` is not the same
+/// fact as a session that never checkpointed, and rendering it as `none` would
+/// be this block asserting the second while the first is true.
+///
+/// Those three `head_check` words are deliberately NOT the ones the JSON
+/// surfaces use. `collab_status`, `collab_resume` and `collab_checkpoint`
+/// answer the same question through [`HeadCheck::label`]
+/// (`"checked"`/`"unreadable"`) plus a separate `diverged`
+/// (`true`/`false`/`null`), because JSON has a `null` to spend on "the check
+/// did not run" and this block does not — every key here always carries a
+/// value, so the three states fold into one word. Same information, two
+/// renderings; COLLAB.md's `collab_status` and `session_handoff` sections
+/// cross-reference each other so no reader carries one spelling to the other.
 fn render_checkpoint(out: &mut String, section: &CheckpointSection) {
     let current = section.current.as_ref();
-    let _ = writeln!(
+    kv(
         out,
-        "checkpoint: {}",
+        "checkpoint",
         // "present" means a server-verified `collab_checkpoints` row, and only
-        // that. A legacy drawer never makes this say "present".
-        if current.is_some() { "present" } else { "none" }
+        // that. A legacy drawer never makes this say "present", and neither
+        // does a row we could not load — that is `unreadable`, below.
+        Some(match (current, section.load_error.as_deref()) {
+            (Some(_), _) => "present",
+            (None, Some(_)) => "unreadable",
+            (None, None) => "none",
+        }),
     );
+    // Emitted on every call like every other key, em-dash when the row loaded
+    // cleanly. Routed through `kv` because the validation message embeds
+    // stored column values, which have no newline validation of their own.
+    kv(out, "checkpoint.error", section.load_error.as_deref());
 
     let status = current.map(|(cp, _)| cp.status.to_string());
     let task_id = current
@@ -386,8 +428,9 @@ fn render_checkpoint(out: &mut String, section: &CheckpointSection) {
     // is the reader with the least context and the most reason to trust this
     // block, so this line carries the caveat in prose rather than only a label:
     // `head_check` is a bare word because a successor already knows what
-    // "diverged" means, whereas "verified_without_span" is a term of art from
-    // one function.
+    // "diverged" means, whereas "verified_without_span" is a term of art —
+    // produced by the pre-transaction span check and by the in-transaction
+    // re-qualification that can weaken its verdict.
     kv(
         out,
         "checkpoint.attestation_check",
@@ -466,8 +509,10 @@ fn render_checkpoint(out: &mut String, section: &CheckpointSection) {
 /// `agent` is the agent role whose session context is being transferred (the
 /// vacating actor).
 ///
-/// **Every line is written by [`kv`]/[`kv_display`], never by a bare
-/// `writeln!`.** The block's whole value is that it is a server-composed,
+/// **Every `key: value` line is written by [`kv`]/[`kv_display`], never by a
+/// bare `writeln!`** — the opening and closing fence lines are the only writes
+/// that are not, and they carry no value.
+/// The block's whole value is that it is a server-composed,
 /// unforgeable statement of session state: a successor routes off it. Several
 /// of the values it renders are agent-supplied free text — `coding_failure`
 /// and its `pending_failure` clone most of all, which arrive from a
@@ -613,14 +658,40 @@ pub(super) fn handle_session_handoff(app: &App, args: &Value) -> Result<Value, M
     // `with_transaction` replays on `SQLITE_BUSY_SNAPSHOT`, and a
     // `Command::output()` there holds the transaction open across a process
     // spawn. Same reasoning `collab_checkpoint` records at its own git read.
-    let current = app
+    //
+    // A row that `load_current_checkpoint` refuses degrades to
+    // `checkpoint: unreadable` rather than failing the whole tool. This is a
+    // pure diagnostic surface: it is what an operator calls to find out *why*
+    // a session is stuck, and a checkpoint row that fails `validate()` — say
+    // `attested_by = 'operator'` with no acknowledged range, which migration
+    // 020's deliberately one-directional CHECK permits and only `validate()`
+    // rejects — would otherwise take down the reader that has to diagnose it,
+    // leaving raw SQL as the only repair. The gate surfaces
+    // (`require_checkpoint_proof`, `collab_resume`) keep hard-failing: they
+    // *consume* the row as proof, and degrading them would fail the divergence
+    // refusal open. `load_current_checkpoint` itself is untouched — its
+    // refusal is what stops an unrecognised stored verdict reaching a reader
+    // that would render it verbatim, and this degrade preserves that by
+    // rendering the error instead of the row.
+    //
+    // Only `Validation` degrades. A `Db`/`Io` failure is not a poisoned row
+    // but a broken connection, and reporting that as "unreadable checkpoint"
+    // beside session fields read from the same database would be its own false
+    // claim.
+    let loaded = app
         .db
-        .with_connection(|conn| crate::collab::queue::load_current_checkpoint(conn, session_id))?;
+        .with_connection(|conn| crate::collab::queue::load_current_checkpoint(conn, session_id));
+    let (current, load_error) = match loaded {
+        Ok(current) => (current, None),
+        Err(MemoryError::Validation(msg)) => (None, Some(msg)),
+        Err(other) => return Err(other),
+    };
     let section = CheckpointSection {
         current: current.map(|cp| {
             let check = HeadCheck::read(&record.repo_path, &cp);
             (cp, check)
         }),
+        load_error,
         legacy_drawer_present: legacy_checkpoint_drawer_exists(&app.db, session_id)?,
     };
     let block = compose_handoff_block(&record, agent, issued.pending_generation, section);
@@ -670,6 +741,7 @@ mod tests {
         assert!(!a.contains("created_at") && !a.contains("updated_at") && !a.contains("ended_at"));
         assert!(a.contains("phase: CodeImplementPending"));
         assert!(a.contains("checkpoint: none"));
+        assert!(a.contains("checkpoint.error: \u{2014}"));
         assert!(a.contains("checkpoint.gates_result: \u{2014}"));
         assert!(a.contains("checkpoint.head_check: \u{2014}"));
         assert!(a.contains("checkpoint.legacy_drawer: none"));
@@ -1045,6 +1117,7 @@ mod tests {
                     divergence: None,
                 },
             )),
+            load_error: None,
             legacy_drawer_present: false,
         }
     }
@@ -1107,6 +1180,70 @@ mod tests {
             assert!(
                 !block.contains(claimed),
                 "drawer content must never be rendered as checkpoint content ({claimed}): {block}"
+            );
+        }
+    }
+
+    /// A checkpoint row the loader refuses must not take down the handoff
+    /// block. `session_handoff` is a pure diagnostic — the tool an operator
+    /// reaches for to find out why a session is stuck — so a row that fails
+    /// `validate()` (here `attested_by = 'operator'` with no acknowledged
+    /// range, the combination migration 020's one-directional CHECK permits
+    /// and only `validate` rejects) has to be *reported*, not propagated:
+    /// propagating it makes the block unreadable for exactly the session that
+    /// most needs reading, leaving raw SQL as the only repair.
+    ///
+    /// It must also not be reported as `checkpoint: none`, which would be this
+    /// block asserting the session never checkpointed when the truth is that
+    /// its checkpoint could not be read.
+    #[test]
+    fn an_unloadable_checkpoint_row_degrades_the_block_instead_of_failing_the_tool() {
+        let (app, _dir) = test_handoff_app();
+        let session_id = seed_active_session(&app);
+        // Raw SQL, deliberately bypassing upsert_checkpoint (and therefore
+        // `CollabCheckpoint::validate`) — the row the schema permits but the
+        // domain rules forbid, as a partial restore or direct edit could leave.
+        app.db
+            .with_connection(|conn| {
+                conn.execute(
+                    "INSERT INTO collab_checkpoints
+                       (session_id, status, head_sha, attested_by, updated_at)
+                     VALUES (?1, 'started', 'aaa111', 'operator', 1)",
+                    rusqlite::params![session_id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let out =
+            handle_session_handoff(&app, &json!({"session_id": session_id, "agent": "claude"}))
+                .expect("a poisoned checkpoint row must not fail the diagnostic tool");
+        let block = out["handoff_block"].as_str().unwrap();
+
+        assert!(
+            block.contains("checkpoint: unreadable"),
+            "a row that exists and could not be read is neither present nor none: {block}"
+        );
+        let error_lines: Vec<_> = block
+            .lines()
+            .filter(|l| l.starts_with("checkpoint.error: "))
+            .collect();
+        assert_eq!(error_lines.len(), 1, "block was:\n{block}");
+        assert!(
+            error_lines[0].contains("acknowledged_divergence"),
+            "the operator must be told what is wrong with the row: {}",
+            error_lines[0]
+        );
+        // Nothing may be asserted about the contents of a row we could not read.
+        for empty in [
+            "checkpoint.status: \u{2014}",
+            "checkpoint.head_sha: \u{2014}",
+            "checkpoint.attested_by: \u{2014}",
+            "checkpoint.head_check: \u{2014}",
+        ] {
+            assert!(
+                block.contains(empty),
+                "unreadable must render no checkpoint content ({empty}): {block}"
             );
         }
     }
@@ -1189,6 +1326,29 @@ mod tests {
         }
     }
 
+    /// A value that is only whitespace must render as the em-dash, not as an
+    /// empty value. The block promises a fixed key set where "unset" has
+    /// exactly one spelling; `coding_failure` is agent-supplied free text, so
+    /// `"   "` and `"\n\n"` are inputs a `failure_report` can really produce.
+    #[test]
+    fn a_whitespace_only_value_renders_the_em_dash_not_an_empty_value() {
+        for blank in ["   ", "\n\n", "\t \n"] {
+            let mut r = sample_record(Phase::CodeImplementPending);
+            r.session.coding_failure = Some(blank.to_string());
+            let block = compose_handoff_block(&r, Agent::Claude, 1, CheckpointSection::default());
+
+            let lines: Vec<_> = block
+                .lines()
+                .filter(|l| l.starts_with("coding_failure"))
+                .collect();
+            assert_eq!(
+                lines,
+                vec![format!("coding_failure: {EM_DASH}")],
+                "a whitespace-only value must be indistinguishable from unset:\n{block}"
+            );
+        }
+    }
+
     /// A multi-line git error must not split the block into a bogus extra key.
     /// `git rev-parse` can emit several lines of stderr, and the block is
     /// line-oriented `key: value` — a raw newline in a value would make the
@@ -1204,6 +1364,7 @@ mod tests {
                         .to_string(),
                 },
             )),
+            load_error: None,
             legacy_drawer_present: false,
         };
         let r = sample_record(Phase::CodeImplementPending);

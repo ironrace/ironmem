@@ -20,6 +20,11 @@ mod symbol_graph;
 #[cfg(test)]
 mod test_support;
 
+/// Re-exported so every `Command::new("git")` in the crate can reach the one
+/// scrub, rather than a module outside `mcp::tools` growing a second spelling
+/// of it. See the function's own doc for why an unscrubbed spawn is a defect.
+pub(crate) use collab_session::scrub_git_environment;
+
 use code_maps::{handle_code_map_load, handle_code_map_status, handle_code_map_write};
 use collab_caps::{handle_collab_get_caps, handle_collab_register_caps};
 use collab_checkpoint::handle_collab_checkpoint;
