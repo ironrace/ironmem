@@ -316,6 +316,67 @@ fn test_task_list_rejects_invalid_task_body_from_direct_caller() {
     assert_eq!(err, CollabError::InvalidTaskList);
 }
 
+/// Ids must be `1..=N`, not merely increasing (issue #273 Task 7).
+///
+/// Both fixtures below are *strictly ordered*, so both were accepted before
+/// this rule — and each breaks the `implementation_done` checkpoint gate in a
+/// different direction, because that gate derives the id set from the task
+/// *count*. `4,5,6` yields `total = 3` and demands ids 1..3 that the list does
+/// not contain, so the batch can never satisfy the gate. `1,5,9` also yields
+/// `total = 3`, so a checkpoint listing `1,2,3` passes while tasks 5 and 9
+/// were never done — a false progress report of exactly the kind issue #273
+/// exists to prevent. Pinned together so a future loosening back to
+/// strict-ordering-only fails here rather than silently at the gate.
+#[test]
+fn test_task_list_rejects_ordered_but_non_contiguous_ids_from_direct_caller() {
+    for tasks in [
+        serde_json::json!([
+            {"id": 4, "acceptance": ["ok"]},
+            {"id": 5, "acceptance": ["ok"]},
+            {"id": 6, "acceptance": ["ok"]},
+        ]),
+        serde_json::json!([
+            {"id": 1, "acceptance": ["ok"]},
+            {"id": 5, "acceptance": ["ok"]},
+            {"id": 9, "acceptance": ["ok"]},
+        ]),
+    ] {
+        let s = locked_session("hash-final");
+        let err = apply_event(
+            &s,
+            Agent::Claude,
+            &CollabEvent::SubmitTaskList {
+                plan_hash: "hash-final".to_string(),
+                base_sha: "base".to_string(),
+                task_list_json: serde_json::json!({ "tasks": tasks }).to_string(),
+                tasks_count: 3,
+                head_sha: "h".to_string(),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err, CollabError::InvalidTaskList, "tasks: {tasks}");
+    }
+}
+
+/// The contiguous 1-based shape the rule above demands still passes, so the
+/// tightening rejects the broken shapes rather than the canonical one.
+#[test]
+fn test_task_list_accepts_contiguous_one_based_ids() {
+    let s = locked_session("hash-final");
+    apply_event(
+        &s,
+        Agent::Claude,
+        &CollabEvent::SubmitTaskList {
+            plan_hash: "hash-final".to_string(),
+            base_sha: "base".to_string(),
+            task_list_json: canonical_task_list(3),
+            tasks_count: 3,
+            head_sha: "h".to_string(),
+        },
+    )
+    .expect("ids 1,2,3 must remain valid");
+}
+
 #[test]
 fn test_task_list_rejects_unsafe_plan_file_path_from_direct_caller() {
     let s = locked_session("hash-final");

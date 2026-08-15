@@ -1346,25 +1346,30 @@ fn accepted_task_ids(task_list: Option<&str>) -> Option<Vec<u32>> {
 /// repo problem.
 ///
 /// What that buys is *internal consistency*, and it is worth being precise
-/// about where the rest comes from. Nothing here proves the reported head
-/// exists — but nothing has to, because
-/// [`validate_global_review_head_advance`] runs immediately after this gate on
-/// the same `implementation_done` send, in the batch flow as well as the
-/// shortcut (Task 8 dropped the old `task_list.is_none()` guard). By the time
-/// the send is accepted, the reported head has been proven to name a real
-/// commit — a fabricated sha exits git 128 and is refused `branch_drift:` —
-/// and to descend from `last_head_sha`. So a checkpoint filed at a head the
-/// batch never reached does not survive the turn just because the report
-/// agrees with it.
+/// about the limit — and about who covers it. Nothing in *this function*
+/// proves the reported head exists in the repo, so on its own a caller could
+/// file a checkpoint at a head it never reached, report that same head, and
+/// have both agree.
 ///
-/// The residual limit is narrower, and it is specifically *this* function's:
-/// it never reads live HEAD. A checkpoint and a report that agree with each
-/// other, at a real ancestor-respecting commit that is simply *behind* the
-/// working tree, pass here — the pair is internally consistent and the history
-/// is sound, so neither gate has anything to object to. Catching that needs a
-/// comparison against the repo's current HEAD, which belongs on the handoff
-/// and resume paths — where a *reader* is being shown a progress report nobody
-/// is currently vouching for, and where a transient git failure costs a
+/// That is covered, but by the caller rather than here: since Task 8,
+/// [`validate_global_review_head_advance`] runs on every head-advancing coding
+/// event including `implementation_done` — the v3 batch flow and the
+/// `collab_start_code_review` shortcut alike — immediately after this function
+/// returns, and refuses a head that is not a git-verified descendant of
+/// `last_head_sha`. A fabricated sha does not even reach that comparison: it
+/// names no commit, git exits 128, and the refusal is `branch_drift:`. Note
+/// the ordering — the ancestry check runs *after* this one, deliberately (see
+/// the comment at the call site), so within this function's own body
+/// `head_sha` is still unvalidated caller input. Do not read "the caller
+/// checks it" as license to depend on it here.
+///
+/// What remains genuinely uncovered on this path is a head that is a real
+/// descendant but was never actually built or gated — including one that is
+/// simply *behind* the working tree, where the checkpoint and the report agree
+/// with each other and the history is sound, so neither gate has anything to
+/// object to. Catching that needs a live-HEAD comparison, which belongs on the
+/// handoff and resume paths, where a *reader* is being shown a progress report
+/// nobody is currently vouching for, and where a transient git failure costs a
 /// diagnostic rather than a turn.
 ///
 /// # Why `attested_by` is not consulted

@@ -540,6 +540,18 @@ pub fn save_session(conn: &Connection, session: &CollabSession) -> Result<(), Me
 /// entry points as owing this call; this is the write side. It is also what
 /// keeps a blank `head_sha` out of the table, migration 020 having `NOT NULL`
 /// on that column and no `CHECK (head_sha <> '')`.
+///
+/// `validate()` alone is not enough to close that poison-row hole, because it
+/// covers only the three `String` fields and the attestation correlation — it
+/// never looks at the task id fields, and migration 020 has no CHECK on either
+/// column. The loader is stricter: [`checked_task_id_column`] refuses a
+/// `task_id` or `next_task_id` of `0` and [`parse_stored_completed_task_ids`]
+/// refuses a `0` entry, both mirroring `from_json`'s 1-based rule. So the
+/// write path runs the loader's own helpers over what it is about to store,
+/// keeping the write gate at least as strict as the read gate: a struct built
+/// field-by-field with a `0` in any of them would otherwise insert cleanly and
+/// then permanently fail every subsequent `load_current_checkpoint` for that
+/// session, which is the same poison row by a different field.
 pub fn upsert_checkpoint(
     conn: &Connection,
     checkpoint: &CollabCheckpoint,
@@ -551,12 +563,27 @@ pub fn upsert_checkpoint(
         ))
     })?;
 
+    checked_task_id_column(
+        checkpoint.task_id.map(i64::from),
+        "task_id",
+        &checkpoint.session_id,
+    )?;
+    checked_task_id_column(
+        checkpoint.next_task_id.map(i64::from),
+        "next_task_id",
+        &checkpoint.session_id,
+    )?;
+
     let completed = checkpoint
         .completed_task_ids
         .iter()
         .map(u32::to_string)
         .collect::<Vec<_>>()
         .join(",");
+    // Run the stored form through the loader's parser rather than the `Vec`
+    // through a second zero check, so what is written is exactly what the read
+    // path is willing to take back.
+    parse_stored_completed_task_ids(&completed, &checkpoint.session_id)?;
 
     conn.execute(
         "INSERT INTO collab_checkpoints (
@@ -2736,6 +2763,83 @@ mod tests {
                 assert!(err.contains(field) && err.contains("s1"), "got: {err}");
             }
         }
+    }
+
+    /// The write gate must be at least as strict as the read gate, for every
+    /// field — otherwise a value the loader refuses can still be written, and
+    /// the row is a poison pill: written once, unreadable forever, and
+    /// unrepairable through any load-then-write path because the load is what
+    /// errors.
+    ///
+    /// `validate()` does not close this on its own. It covers the three
+    /// `String` fields and the attestation correlation and never looks at the
+    /// task ids, while `checked_task_id_column` and
+    /// `parse_stored_completed_task_ids` both refuse a `0` on load, and
+    /// migration 020 has no CHECK on either column. `from_json` refuses these
+    /// too, so only a struct built field-by-field reaches them — which is
+    /// exactly the construction all-`pub` fields exist for, and what the
+    /// loader itself does.
+    ///
+    /// Asserting the row count is the load-bearing half: an error return that
+    /// still wrote the row would leave the session poisoned regardless of what
+    /// the caller was told.
+    #[test]
+    fn upsert_checkpoint_refuses_every_value_the_loader_would_refuse() {
+        let db = open();
+        create_session(
+            &db,
+            "s1",
+            "/repo",
+            "main",
+            None,
+            CollabRoles {
+                pilot: Agent::Claude,
+                implementer: Agent::Claude,
+            },
+        )
+        .unwrap();
+
+        // Each case mutates one field of an otherwise-valid checkpoint to a
+        // value `from_json` would have refused, so no case is carried by
+        // another.
+        for field in ["task_id", "next_task_id", "completed_task_ids"] {
+            let mut cp = checkpoint_fixture("s1", "aaa111");
+            match field {
+                "task_id" => cp.task_id = Some(0),
+                "next_task_id" => cp.next_task_id = Some(0),
+                _ => cp.completed_task_ids = vec![0, 2],
+            }
+
+            let err = match upsert_checkpoint(&db, &cp) {
+                Ok(()) => panic!("{field} = 0 must not be writable"),
+                Err(err) => err.to_string(),
+            };
+            assert!(
+                err.contains(field) && err.contains("s1"),
+                "{field}: got {err}"
+            );
+
+            let count: i64 = db
+                .query_row("SELECT COUNT(*) FROM collab_checkpoints", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(
+                count, 0,
+                "{field} = 0 was rejected but a row was written anyway"
+            );
+        }
+
+        // The other direction, so the rule above cannot be satisfied by a
+        // writer that refuses everything: the same fields at legal values
+        // write and load back.
+        let mut ok = checkpoint_fixture("s1", "aaa111");
+        ok.task_id = Some(1);
+        ok.next_task_id = Some(2);
+        ok.completed_task_ids = vec![1];
+        upsert_checkpoint(&db, &ok).unwrap();
+        let loaded = load_current_checkpoint(&db, "s1").unwrap().unwrap();
+        assert_eq!(loaded.task_id, Some(1));
+        assert_eq!(loaded.next_task_id, Some(2));
+        assert_eq!(loaded.completed_task_ids, vec![1]);
     }
 
     /// The write half of the blank-range rule. Distinct from
