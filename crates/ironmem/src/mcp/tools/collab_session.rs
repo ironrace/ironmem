@@ -1299,16 +1299,25 @@ fn checkpoint_drift(detail: String) -> MemoryError {
 /// repo problem.
 ///
 /// What that buys is *internal consistency*, and it is worth being precise
-/// about the limit. Nothing here proves the reported head exists in the repo:
-/// the ancestry check above runs only for shortcut-started sessions (it is
-/// guarded on `task_list.is_none()` and matches only the two review events),
-/// so an `implementation_done` head is unvalidated caller input at this point.
-/// A caller could file a checkpoint at a head it never reached and then report
-/// that same head, and both would agree. Closing that needs a comparison
-/// against the repo itself, which belongs on the handoff and resume paths —
-/// where a *reader* is being shown a progress report nobody is currently
-/// vouching for, and where a transient git failure costs a diagnostic rather
-/// than a turn.
+/// about the limit — and about who covers it. Nothing in *this function*
+/// proves the reported head exists in the repo, so on its own a caller could
+/// file a checkpoint at a head it never reached, report that same head, and
+/// have both agree.
+///
+/// That is covered, but by the caller rather than here: since Task 8,
+/// [`validate_global_review_head_advance`] runs on every head-advancing coding
+/// event including `implementation_done`, immediately after this function
+/// returns, and refuses a head that is not a git-verified descendant of
+/// `last_head_sha`. Note the ordering — the ancestry check runs *after* this
+/// one, deliberately (see the comment at the call site), so within this
+/// function's own body `head_sha` is still unvalidated caller input. Do not
+/// read "the caller checks it" as license to depend on it here.
+///
+/// What remains genuinely uncovered on this path is a head that is a real
+/// descendant but was never actually built or gated — a live-HEAD comparison,
+/// which belongs on the handoff and resume paths, where a *reader* is being
+/// shown a progress report nobody is currently vouching for, and where a
+/// transient git failure costs a diagnostic rather than a turn.
 ///
 /// # Why `attested_by` is not consulted
 ///
