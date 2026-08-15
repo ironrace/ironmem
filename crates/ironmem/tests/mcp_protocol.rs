@@ -5515,3 +5515,590 @@ fn collab_role_safety_full_verification_sweep_reversed_role_scenario() {
         "at CodeImplementPending",
     );
 }
+
+// ── collab_checkpoint (issue #273 Task 5) ───────────────────────────────────
+
+/// Start a session bound to `repo_path`/`branch` and return its id.
+///
+/// `collab_checkpoint` is phase-independent — it records progress, it does not
+/// advance the state machine — so these tests deliberately skip the drive to
+/// `CodeImplementPending` and check the checkpoint path on its own.
+fn start_checkpoint_session(app: &App, repo_path: &str, branch: &str) -> String {
+    let started = call_tool(
+        app,
+        "collab_start",
+        json!({ "repo_path": repo_path, "branch": branch, "initiator": "claude" }),
+    );
+    started["session_id"]
+        .as_str()
+        .expect("collab_start returns a session_id")
+        .to_string()
+}
+
+/// The stored checkpoint row, read back through the same loader the gate in
+/// Tasks 7-10 will use — so these tests assert on what a later reader sees,
+/// not merely on what the tool returned.
+fn stored_checkpoint(app: &App, session_id: &str) -> Option<ironmem::collab::CollabCheckpoint> {
+    app.db
+        .with_connection(|conn| ironmem::collab::queue::load_current_checkpoint(conn, session_id))
+        .expect("checkpoint load must not error")
+}
+
+/// A repo whose HEAD is a known SHA, plus that SHA.
+fn checkpoint_repo() -> (tempfile::TempDir, String, String) {
+    let temp = tempfile::tempdir().expect("temp repo must be creatable");
+    let repo_path = temp.path().to_path_buf();
+    git(&["init"], &repo_path);
+    git(&["config", "user.name", "Ironmem Test"], &repo_path);
+    git(&["config", "user.email", "ironmem@example.com"], &repo_path);
+    let head = commit_file(&repo_path, "a.txt", "one\n", "first commit");
+    let path = repo_path.to_string_lossy().to_string();
+    (temp, path, head)
+}
+
+#[test]
+fn collab_checkpoint_persists_and_is_readable_back() {
+    let app = App::open_for_test().unwrap();
+    let (_repo, repo_path, head) = checkpoint_repo();
+    let session_id = start_checkpoint_session(&app, &repo_path, "main");
+
+    let written = call_tool(
+        &app,
+        "collab_checkpoint",
+        json!({
+            "session_id": &session_id,
+            "agent": "claude",
+            "task_id": 3,
+            "task_title": "Add the gate",
+            "status": "completed",
+            "head_sha": &head,
+            "commit_sha": &head,
+            "completed_task_ids": "1,2,3",
+            "next_task_id": 4,
+            "gates_result": "passed",
+            "gates_sha": &head,
+            "gates_commands": "cargo test --workspace",
+            "summary": "task 3 done"
+        }),
+    );
+    assert_eq!(written["session_id"], session_id);
+    assert_eq!(written["status"], "completed");
+    assert_eq!(written["head_sha"], head);
+
+    let stored = stored_checkpoint(&app, &session_id).expect("checkpoint row must exist");
+    assert_eq!(stored.status, ironmem::collab::CheckpointStatus::Completed);
+    assert_eq!(stored.head_sha, head);
+    assert_eq!(stored.task_id, Some(3));
+    assert_eq!(stored.completed_task_ids, vec![1, 2, 3]);
+    assert_eq!(stored.next_task_id, Some(4));
+    assert_eq!(stored.gates_result, "passed");
+    assert_eq!(stored.attested_by, ironmem::collab::AttestedBy::Implementer);
+    assert!(
+        stored.updated_at > 0,
+        "the server must stamp updated_at at write time, got {}",
+        stored.updated_at
+    );
+    // Echoed back, and echoed as what the ROW says: a caller checking that its
+    // checkpoint landed fresh must be reading the server's stamp, not a value
+    // the response computed on its own.
+    assert_eq!(
+        written["updated_at"],
+        json!(stored.updated_at),
+        "the response must echo the stamp the row carries"
+    );
+    assert_eq!(written["agent"], "claude");
+
+    let (params, result) = last_wal_row(&app, "collab_checkpoint");
+    assert_eq!(params["session_id"], session_id);
+    assert_eq!(params["agent"], "claude");
+    assert_eq!(params["head_sha"], head);
+    assert_eq!(params["attested_by"], "implementer");
+    assert_eq!(result["completed_task_ids"], json!([1, 2, 3]));
+}
+
+/// A second checkpoint replaces the first: the contract is exactly one
+/// *current* checkpoint per session, so a stale row must never survive
+/// alongside a fresher one.
+#[test]
+fn collab_checkpoint_overwrites_the_previous_checkpoint() {
+    let app = App::open_for_test().unwrap();
+    let (_repo, repo_path, head) = checkpoint_repo();
+    let session_id = start_checkpoint_session(&app, &repo_path, "main");
+
+    call_tool(
+        &app,
+        "collab_checkpoint",
+        json!({
+            "session_id": &session_id,
+            "agent": "claude",
+            "task_id": 1,
+            "status": "started",
+            "head_sha": "b9c2ce0"
+        }),
+    );
+    call_tool(
+        &app,
+        "collab_checkpoint",
+        json!({
+            "session_id": &session_id,
+            "agent": "claude",
+            "status": "batch_complete",
+            "head_sha": &head,
+            "completed_task_ids": "1,2"
+        }),
+    );
+
+    let stored = stored_checkpoint(&app, &session_id).expect("checkpoint row must exist");
+    assert_eq!(
+        stored.status,
+        ironmem::collab::CheckpointStatus::BatchComplete
+    );
+    assert_eq!(stored.head_sha, head);
+    assert_eq!(stored.completed_task_ids, vec![1, 2]);
+    assert_eq!(stored.task_id, None);
+}
+
+/// `CollabCheckpoint::from_json`'s rejection must reach the caller as a
+/// validation error naming the field — not as a raw SQL CHECK violation from
+/// migration 020, and not as a silently-accepted write.
+#[test]
+fn collab_checkpoint_rejects_an_unknown_status() {
+    let app = App::open_for_test().unwrap();
+    let (_repo, repo_path, head) = checkpoint_repo();
+    let session_id = start_checkpoint_session(&app, &repo_path, "main");
+
+    let err = call_tool_expect_error(
+        &app,
+        "collab_checkpoint",
+        json!({
+            "session_id": &session_id,
+            "agent": "claude",
+            "status": "nearly_done",
+            "head_sha": &head
+        }),
+    );
+    assert!(
+        err.contains("status") && err.contains("nearly_done"),
+        "an unknown status must surface as a validation error naming the field \
+         and the offending value: {err}"
+    );
+    // `tool_error_response` renders `MemoryError::Db` as the opaque "Internal
+    // server error" and only a `Validation`/`NotFound`/`Permission` message
+    // verbatim. So this is the assertion that the *parser* rejected: had the
+    // payload reached migration 020's `CHECK (status IN (...))` instead, the
+    // caller would be told nothing at all.
+    assert_ne!(
+        err, "Internal server error",
+        "a bad status must not surface as a raw SQL error"
+    );
+    assert!(
+        stored_checkpoint(&app, &session_id).is_none(),
+        "a rejected checkpoint must persist nothing"
+    );
+    assert_eq!(
+        wal_row_count(&app, &session_id, "collab_checkpoint"),
+        0,
+        "a rejected checkpoint must write no audit row"
+    );
+}
+
+/// The operator-attestation rule (D1): only a human may vouch for commits the
+/// protocol never witnessed, so an implementer-attested payload carrying
+/// `acknowledged_divergence` is refused outright.
+#[test]
+fn collab_checkpoint_rejects_an_implementer_attested_divergence() {
+    let app = App::open_for_test().unwrap();
+    let (_repo, repo_path, head) = checkpoint_repo();
+    let session_id = start_checkpoint_session(&app, &repo_path, "main");
+
+    let err = call_tool_expect_error(
+        &app,
+        "collab_checkpoint",
+        json!({
+            "session_id": &session_id,
+            "agent": "claude",
+            "status": "batch_complete",
+            "head_sha": &head,
+            "acknowledged_divergence": "b9c2ce0..75a4ea3"
+        }),
+    );
+    assert!(
+        err.contains("acknowledged_divergence") && err.contains("implementer"),
+        "an implementer self-attestation over a divergence must be refused with \
+         a validation message naming the rule: {err}"
+    );
+    // As above: migration 020's one-directional CHECK also refuses this row,
+    // but as an opaque "Internal server error". The named message is the proof
+    // the parser got there first.
+    assert_ne!(
+        err, "Internal server error",
+        "the rule must be enforced in Rust, not only by the schema"
+    );
+    assert!(
+        stored_checkpoint(&app, &session_id).is_none(),
+        "a rejected checkpoint must persist nothing"
+    );
+}
+
+/// The escape hatch, end to end: an operator naming the range they vouch for
+/// may checkpoint over a divergence. The write is still *reported* as diverged
+/// — reporting is not refusing — because a checkpoint write is how drift gets
+/// fixed, and refusing on drift would make the recovery path unreachable.
+#[test]
+fn collab_checkpoint_accepts_an_operator_attested_divergence() {
+    let app = App::open_for_test().unwrap();
+    let (_repo, repo_path, head) = checkpoint_repo();
+    let session_id = start_checkpoint_session(&app, &repo_path, "main");
+
+    let written = call_tool(
+        &app,
+        "collab_checkpoint",
+        json!({
+            "session_id": &session_id,
+            "agent": "claude",
+            "status": "batch_complete",
+            "head_sha": "b9c2ce0",
+            "attested_by": "operator",
+            "acknowledged_divergence": format!("b9c2ce0..{head}")
+        }),
+    );
+    assert_eq!(written["diverged"], json!(true));
+
+    let stored = stored_checkpoint(&app, &session_id).expect("checkpoint row must exist");
+    assert_eq!(stored.attested_by, ironmem::collab::AttestedBy::Operator);
+    assert_eq!(
+        stored.acknowledged_divergence.as_deref(),
+        Some(format!("b9c2ce0..{head}").as_str())
+    );
+}
+
+/// The happy case for the head check: live HEAD equals the checkpoint's
+/// `head_sha`, so the answer is a *verified* "no drift" — `head_check` says the
+/// check ran, and `repo_head_sha` names what it read.
+#[test]
+fn collab_checkpoint_reports_a_verified_match_against_live_head() {
+    let app = App::open_for_test().unwrap();
+    let (_repo, repo_path, head) = checkpoint_repo();
+    let session_id = start_checkpoint_session(&app, &repo_path, "main");
+
+    let written = call_tool(
+        &app,
+        "collab_checkpoint",
+        json!({
+            "session_id": &session_id,
+            "agent": "claude",
+            "status": "completed",
+            "task_id": 1,
+            "head_sha": &head
+        }),
+    );
+    assert_eq!(written["diverged"], json!(false));
+    assert_eq!(written["head_check"], "checked");
+    assert_eq!(written["repo_head_sha"], head);
+}
+
+/// Issue #273 itself: the checkpoint names an older SHA than the branch has.
+/// The write must still land — this is how an operator files an accurate
+/// checkpoint — while the response says so.
+#[test]
+fn collab_checkpoint_reports_divergence_without_refusing_the_write() {
+    let app = App::open_for_test().unwrap();
+    let (_repo, repo_path, head) = checkpoint_repo();
+    let session_id = start_checkpoint_session(&app, &repo_path, "main");
+
+    let written = call_tool(
+        &app,
+        "collab_checkpoint",
+        json!({
+            "session_id": &session_id,
+            "agent": "claude",
+            "status": "started",
+            "task_id": 1,
+            "head_sha": "b9c2ce0"
+        }),
+    );
+    assert_eq!(written["diverged"], json!(true));
+    assert_eq!(written["head_check"], "checked");
+    assert_eq!(
+        written["repo_head_sha"], head,
+        "the response must name the HEAD it actually read, so the caller can \
+         file an accurate checkpoint"
+    );
+    assert_eq!(
+        stored_checkpoint(&app, &session_id)
+            .expect("a diverged checkpoint must still be written")
+            .head_sha,
+        "b9c2ce0"
+    );
+
+    let (_params, result) = last_wal_row(&app, "collab_checkpoint");
+    assert_eq!(result["diverged"], json!(true));
+}
+
+/// The constraint-1 case. When git cannot be read at all, "no drift" is not a
+/// finding — it is an unrun check. Reporting `diverged: false` there would
+/// present an unverified claim as verified, which is the exact failure #273
+/// exists to end, so the third state is reported as such.
+#[test]
+fn collab_checkpoint_does_not_report_unverified_head_as_undiverged() {
+    let app = App::open_for_test().unwrap();
+    // A path that is not a git repo (and does not exist), so `git rev-parse`
+    // fails: the "could not check" case, not the "no drift" case.
+    let session_id = start_checkpoint_session(&app, "/nonexistent/ironmem-repo", "main");
+
+    let written = call_tool(
+        &app,
+        "collab_checkpoint",
+        json!({
+            "session_id": &session_id,
+            "agent": "claude",
+            "status": "started",
+            "task_id": 1,
+            "head_sha": "b9c2ce0"
+        }),
+    );
+    assert_eq!(
+        written["diverged"],
+        json!(null),
+        "an unrun check must not answer false: {written}"
+    );
+    assert_eq!(written["head_check"], "unreadable");
+    assert_eq!(written["repo_head_sha"], json!(null));
+    assert!(
+        written["head_check_error"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("git")),
+        "the caller must be told why the check could not run: {written}"
+    );
+    assert!(
+        stored_checkpoint(&app, &session_id).is_some(),
+        "an unreadable repo must not block the checkpoint write"
+    );
+
+    // The audit trail must not record the unverified claim as verified either.
+    let (_params, result) = last_wal_row(&app, "collab_checkpoint");
+    assert_eq!(result["diverged"], json!(null));
+    assert_eq!(result["head_check"], "unreadable");
+}
+
+/// The tool has exactly ONE session id: the parsed, trimmed one. It addresses
+/// the session-existence check, keys the row, and is echoed back — so the
+/// session whose liveness was checked is always the session the row is written
+/// under. A padded value is the case that pulls those apart if a second,
+/// unparsed reading of the argument ever creeps back in: the existence check
+/// would miss (`NotFound`) or the row would be keyed by a string no session
+/// has, which migration 020's foreign key refuses.
+#[test]
+fn collab_checkpoint_uses_one_session_id_for_lookup_and_row() {
+    let app = App::open_for_test().unwrap();
+    let (_repo, repo_path, head) = checkpoint_repo();
+    let session_id = start_checkpoint_session(&app, &repo_path, "main");
+
+    let written = call_tool(
+        &app,
+        "collab_checkpoint",
+        json!({
+            "session_id": format!("  {session_id}  "),
+            "agent": "claude",
+            "status": "started",
+            "task_id": 1,
+            "head_sha": &head
+        }),
+    );
+    assert_eq!(written["session_id"], session_id);
+    assert!(
+        stored_checkpoint(&app, &session_id).is_some(),
+        "the row must be keyed by the same session id the existence check used"
+    );
+}
+
+/// The payload parser is the ONLY reader of `session_id` here, which is what
+/// lets the diagnosis survive: it can tell a wrong-typed value from an absent
+/// one. `shared::require_str`, the helper the neighbouring handlers reach for,
+/// collapses both into "session_id is required" — true but useless to a caller
+/// that sent a number and needs to be told so.
+#[test]
+fn collab_checkpoint_names_a_wrong_typed_session_id() {
+    let app = App::open_for_test().unwrap();
+
+    let err = call_tool_expect_error(
+        &app,
+        "collab_checkpoint",
+        json!({ "session_id": 42, "agent": "claude", "status": "started", "head_sha": "b9c2ce0" }),
+    );
+    assert_eq!(err, "session_id must be a string", "got: {err}");
+
+    let absent = call_tool_expect_error(
+        &app,
+        "collab_checkpoint",
+        json!({ "agent": "claude", "status": "started", "head_sha": "b9c2ce0" }),
+    );
+    assert_eq!(
+        absent, "session_id is required and must be a non-empty string",
+        "got: {absent}"
+    );
+}
+
+/// The generation lease, driven across two `App` instances over one on-disk
+/// DB — the real deployment topology, where each agent runs its own `ironmem`
+/// MCP server process (see `open_second_disk_app`).
+///
+/// A superseded process must not be able to land its stale view of progress.
+/// Nothing downstream could catch it if it did: `updated_at` is server-stamped,
+/// so the stale content would arrive carrying a *fresh* timestamp, and a Task 7
+/// gate asking "is this checkpoint recent?" would be answered by the very
+/// anti-backdating stamp that exists to prevent this. Hence the check at the
+/// write.
+///
+/// The final assertion is on the stored ROW, not on the error string: an
+/// error message proves the call was answered, only the row proves nothing
+/// was written.
+#[test]
+fn collab_checkpoint_refuses_a_superseded_process() {
+    let (_dir_a, db_path, app_a) = open_disk_app_for_dashboard_sweep();
+    let (_repo, repo_path, head) = checkpoint_repo();
+    let session_id = start_checkpoint_session(&app_a, &repo_path, "main");
+
+    // The incumbent process files a checkpoint tokenlessly, binding itself to
+    // the session's current generation.
+    call_tool(
+        &app_a,
+        "collab_checkpoint",
+        json!({
+            "session_id": &session_id,
+            "agent": "claude",
+            "task_id": 1,
+            "status": "started",
+            "head_sha": &head
+        }),
+    );
+
+    // A successor process takes the session over: mint a handoff token and
+    // spend it on its own checkpoint, which advances claude's generation.
+    let (_dir_b, app_b) = open_second_disk_app(&db_path);
+    let issued = call_tool(
+        &app_b,
+        "session_handoff",
+        json!({ "session_id": &session_id, "agent": "claude" }),
+    );
+    let token = issued["handoff_token"]
+        .as_str()
+        .expect("session_handoff must return a token")
+        .to_string();
+    let successor = call_tool(
+        &app_b,
+        "collab_checkpoint",
+        json!({
+            "session_id": &session_id,
+            "agent": "claude",
+            "status": "batch_complete",
+            "head_sha": &head,
+            "completed_task_ids": "1,2,3",
+            "handoff_token": &token
+        }),
+    );
+    assert_eq!(successor["status"], "batch_complete");
+
+    // The superseded process now tries to file its stale "task 1 / started"
+    // progress — the issue #273 shape, one process behind.
+    let err = call_tool_expect_error(
+        &app_a,
+        "collab_checkpoint",
+        json!({
+            "session_id": &session_id,
+            "agent": "claude",
+            "task_id": 1,
+            "status": "started",
+            "head_sha": &head
+        }),
+    );
+    assert!(
+        err.contains("stale collab generation"),
+        "the superseded process must be refused by the generation lease: {err}"
+    );
+
+    let stored = stored_checkpoint(&app_b, &session_id).expect("checkpoint row must exist");
+    assert_eq!(
+        stored.status,
+        ironmem::collab::CheckpointStatus::BatchComplete,
+        "the successor's progress must survive the superseded process's write"
+    );
+    assert_eq!(stored.completed_task_ids, vec![1, 2, 3]);
+    assert_eq!(stored.task_id, None);
+}
+
+/// `agent` is required, not optional-and-checked-when-present: a superseded
+/// process would simply omit an optional one, and an authorization check the
+/// caller can decline is not a check. Pinned separately from the lease test
+/// because the lease is only reachable once an agent has been named.
+#[test]
+fn collab_checkpoint_requires_an_agent() {
+    let app = App::open_for_test().unwrap();
+    let (_repo, repo_path, head) = checkpoint_repo();
+    let session_id = start_checkpoint_session(&app, &repo_path, "main");
+
+    let err = call_tool_expect_error(
+        &app,
+        "collab_checkpoint",
+        json!({ "session_id": &session_id, "status": "started", "head_sha": &head }),
+    );
+    assert_eq!(err, "agent is required", "got: {err}");
+    assert!(
+        stored_checkpoint(&app, &session_id).is_none(),
+        "an unauthenticated checkpoint must persist nothing"
+    );
+
+    let bad = call_tool_expect_error(
+        &app,
+        "collab_checkpoint",
+        json!({
+            "session_id": &session_id,
+            "agent": "operator",
+            "status": "started",
+            "head_sha": &head
+        }),
+    );
+    assert_eq!(bad, "agent must be 'claude' or 'codex'", "got: {bad}");
+    assert!(stored_checkpoint(&app, &session_id).is_none());
+}
+
+/// A checkpoint is session-scoped state, so it needs a live session: an
+/// unknown id is a `NotFound`, and an ended one a validation error. Without
+/// this the FK would still refuse the unknown id, but as a raw SQL error.
+#[test]
+fn collab_checkpoint_requires_a_live_session() {
+    let app = App::open_for_test().unwrap();
+    let head = "b9c2ce0";
+
+    let unknown = call_tool_expect_error(
+        &app,
+        "collab_checkpoint",
+        json!({ "session_id": "no-such-session", "agent": "claude", "status": "started", "head_sha": head }),
+    );
+    assert!(
+        unknown.contains("not found"),
+        "an unknown session must be a NotFound: {unknown}"
+    );
+
+    // `collab_end` is only legal from a few phases, so this one is driven to
+    // PlanLocked first.
+    let session_id = drive_to_plan_locked(&app, "final plan text");
+    call_tool(
+        &app,
+        "collab_end",
+        json!({ "session_id": &session_id, "agent": "claude" }),
+    );
+    let ended = call_tool_expect_error(
+        &app,
+        "collab_checkpoint",
+        json!({ "session_id": &session_id, "agent": "claude", "status": "started", "head_sha": head }),
+    );
+    assert!(
+        ended.contains("has ended"),
+        "an ended session must be refused: {ended}"
+    );
+    assert!(
+        stored_checkpoint(&app, &session_id).is_none(),
+        "a refused checkpoint must persist nothing"
+    );
+}
