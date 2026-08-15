@@ -109,7 +109,7 @@ fn validate_repo(raw: &str) -> Result<String, MemoryError> {
     // probe answers about whatever repo the environment names rather than the
     // one the caller asked about.
     let mut command = std::process::Command::new("git");
-    crate::mcp::tools::collab_session::scrub_git_environment(&mut command);
+    crate::mcp::tools::scrub_git_environment(&mut command);
     let output = command
         .args(["rev-parse", "--show-toplevel"])
         .current_dir(&canonical)

@@ -6263,51 +6263,57 @@ fn drive_to_code_implement_pending(app: &App, tasks: usize) -> (tempfile::TempDi
     (temp, session_id)
 }
 
-/// The same drive, with a task list declaring exactly `ids` rather than the
-/// dense `1..=n` the shared [`task_list_payload`] fixture emits.
+/// The same drive, with the session's *stored* task list rewritten to declare
+/// exactly `ids` rather than the dense `1..=n` a `task_list` send produces.
 ///
-/// Spelled out here instead of widening that fixture because a *dense* task
-/// list is exactly what these tests must not assume: `validate_task_list_body`
-/// requires task ids to be strictly increasing and nothing more, so `1, 2, 4`
-/// (a task dropped while the plan was edited) and `0, 1, 2` are both storable
-/// plans, and a fixture that can only produce `1..=n` cannot exercise what the
-/// gate does with them.
+/// A non-dense list cannot be sent any more: issue #273 Task 7 tightened
+/// `validate_task_list_body` from "strictly increasing" to "exactly
+/// `1..=tasks.len()`, in order", so `1, 2, 4` (a task dropped while the plan
+/// was edited) and `0, 1, 2` are both refused at the door now. That tightening
+/// is deliberately a *send-time* check — it never re-validates a stored row —
+/// so sessions written before it still carry those shapes, and they are
+/// exactly the population condition 3b's declared-ids reading protects.
+/// Rewriting the row directly is the only way left to reconstruct one; driving
+/// it through `collab_send` would be refused upstream and these tests would be
+/// exercising nothing.
+///
+/// Only the ids are patched, in place, so every other field of the stored
+/// payload stays whatever `SubmitTaskList` actually wrote.
 fn drive_to_code_implement_pending_with_ids(app: &App, ids: &[i64]) -> (tempfile::TempDir, String) {
-    let (temp, repo_path, base_sha) = gate_head_repo();
-    let session_id = drive_to_plan_locked_in_repo(app, "gate plan", &repo_path);
-    let hash = plan_hash(app, &session_id);
-    let tasks: Vec<serde_json::Value> = ids
-        .iter()
-        .map(|id| {
-            json!({
-                "id": id,
-                "title": format!("task {id}"),
-                "acceptance": [format!("criterion {id}")]
-            })
+    let (temp, session_id) = drive_to_code_implement_pending(app, ids.len());
+    let stored: String = app
+        .db
+        .with_transaction(|tx| {
+            Ok(tx.query_row(
+                "SELECT task_list FROM collab_sessions WHERE id = ?1",
+                rusqlite::params![&session_id],
+                |row| row.get(0),
+            )?)
         })
-        .collect();
-    call_tool(
-        app,
-        "collab_send",
-        json!({
-            "session_id": &session_id,
-            "sender": "claude",
-            "topic": "task_list",
-            "content": json!({
-                "plan_hash": hash,
-                "base_sha": "b0",
-                "head_sha": base_sha,
-                "tasks": tasks,
-            })
-            .to_string()
-        }),
-    );
-    let status = call_tool(app, "collab_status", json!({ "session_id": &session_id }));
+        .expect("a session at CodeImplementPending has a stored task_list");
+    let mut task_list: serde_json::Value =
+        serde_json::from_str(&stored).expect("the stored task_list is JSON");
+    let tasks = task_list["tasks"]
+        .as_array_mut()
+        .expect("the stored task_list has a tasks array");
     assert_eq!(
-        status["phase"], "CodeImplementPending",
-        "a task list with ids {ids:?} must be accepted — the gate's behaviour on it is what \
-         these tests are about, so a rejection upstream would silently void them"
+        tasks.len(),
+        ids.len(),
+        "the drive must have stored one task per requested id"
     );
+    for (task, id) in tasks.iter_mut().zip(ids) {
+        task["id"] = json!(id);
+        task["title"] = json!(format!("task {id}"));
+    }
+    let rewritten = task_list.to_string();
+    app.db
+        .with_transaction(|tx| {
+            Ok(tx.execute(
+                "UPDATE collab_sessions SET task_list = ?1 WHERE id = ?2",
+                rusqlite::params![&rewritten, &session_id],
+            )?)
+        })
+        .expect("the stored task list must be rewritable");
     (temp, session_id)
 }
 
@@ -6599,13 +6605,14 @@ fn implementation_done_refused_when_the_covered_ids_have_a_gap() {
 /// Condition 3b's bar is the ids the accepted task list *declares*, not
 /// `1..=count`.
 ///
-/// The two only coincide on a dense plan, and nothing upstream makes a plan
-/// dense: a plan whose task 3 was dropped during editing stores ids `1, 2, 4`,
-/// and an implementer that finished all three of those tasks files exactly
-/// that ledger. Measured against `1..=3` it is refused forever for missing a
-/// task the plan does not contain, leaving "file a ledger claiming task 3" —
-/// the fabricated progress report this whole gate exists to prevent — as the
-/// only way through.
+/// The two coincide on a dense plan, which is all `validate_task_list_body`
+/// admits since Task 7 — but only at the door. A session stored under the old
+/// strictly-increasing rule still holds ids `1, 2, 4` (a plan whose task 3 was
+/// dropped during editing), and an implementer that finished all three of
+/// those tasks files exactly that ledger. Measured against `1..=3` it is
+/// refused forever for missing a task the plan does not contain, leaving "file
+/// a ledger claiming task 3" — the fabricated progress report this whole gate
+/// exists to prevent — as the only way through.
 #[test]
 fn implementation_done_accepts_a_ledger_covering_a_gapped_task_list() {
     let app = App::open_for_test().unwrap();
@@ -6677,8 +6684,10 @@ fn the_refusal_remedy_names_the_declared_task_ids() {
 /// A plan declaring an id no ledger can ever name is a corrupt session record,
 /// and is diagnosed as one.
 ///
-/// `0, 1, 2` satisfies the strictly-increasing rule `validate_task_list_body`
-/// applies, while `collab_checkpoint` refuses `0` in `completed_task_ids` — so
+/// `0, 1, 2` satisfied the strictly-increasing rule `validate_task_list_body`
+/// applied before Task 7 — the door is shut now, but the rows admitted through
+/// it are still there — while `collab_checkpoint` refuses `0` in
+/// `completed_task_ids` — so
 /// no checkpoint can cover task 0 and no amount of retrying produces one. The
 /// refusal therefore drops the `checkpoint_drift:` prefix (which promises a
 /// better checkpoint would help, and grades the failure recoverable) and sends

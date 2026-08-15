@@ -1260,26 +1260,30 @@ fn checkpoint_drift(detail: String) -> MemoryError {
 /// [`require_checkpoint_proof`] needs the *ids*, not the count.
 /// [`crate::collab::CollabSession::tasks_count`] answers "how many", and the
 /// two questions only have the same answer when the plan's ids are exactly
-/// `1..=len`. Nothing upstream enforces that: `collab::validate_task_list_body`
-/// requires task ids to be strictly increasing integers and no more, so a plan
-/// whose task 3 was dropped during editing is accepted with ids `1, 2, 4`.
-/// Measuring that batch against `1..=3` demands a ledger covering a task the
-/// plan does not contain, which is unsatisfiable except by claiming a task
-/// that does not exist — the fabricated progress report this gate exists to
-/// prevent. So the bar is the ids the plan declares, which is also how
-/// `docs/COLLAB.md` states the rule: "covers every task id in the accepted
-/// task list". [`crate::collab::CollabCheckpoint::covers_all_tasks`] remains
-/// the type-level statement of the dense-plan case — the same predicate
-/// whenever the declared ids happen to be `1..=len` — but it cannot express
+/// `1..=len`. Task 7 made `collab::validate_task_list_body` require exactly
+/// that, so on any plan stored since then the two coincide and this function
+/// agrees with a count by construction. It reads the declared ids anyway,
+/// because that check lands at *send* time and never re-validates a stored
+/// row: a session written when the rule was merely "strictly increasing" can
+/// still be carrying ids `1, 2, 4` — a plan whose task 3 was dropped during
+/// editing — and measuring that batch against `1..=3` demands a ledger
+/// covering a task the plan does not contain, which is unsatisfiable except by
+/// claiming a task that does not exist: the fabricated progress report this
+/// gate exists to prevent. So the bar is the ids the plan declares, which is
+/// also how `docs/COLLAB.md` states the rule: "covers every task id in the
+/// accepted task list". [`crate::collab::CollabCheckpoint::covers_all_tasks`]
+/// remains the type-level statement of the dense-plan case — the same
+/// predicate whenever the declared ids are `1..=len` — but it cannot express
 /// the general one, because a `total` is all it is given.
 ///
 /// `None` covers every payload whose ids cannot be read *or* cannot be
 /// covered: a non-canonical shape (the same narrow reading
 /// [`crate::collab::tasks_count_from_list`] does), an empty `tasks` array, and
-/// any id outside `1..=u32::MAX`. That last case is a storable payload rather
-/// than a theoretical one — ids `0, 1, 2` satisfy the strictly-increasing rule
-/// on the way in, while `checkpoint::parse_completed_task_ids` refuses `0` on
-/// the way in to the ledger, so no checkpoint can ever name that task.
+/// any id outside `1..=u32::MAX`. That last case is a stored payload rather
+/// than a theoretical one — ids `0, 1, 2` satisfied the strictly-increasing
+/// rule sessions were admitted under before Task 7, while
+/// `checkpoint::parse_completed_task_ids` refuses `0` on the way in to the
+/// ledger, so no checkpoint can ever name that task.
 /// Collapsing it into "unreadable" is deliberate: both are a malformed plan
 /// record that no checkpoint repairs, and both deserve
 /// [`require_checkpoint_proof`]'s operator refusal rather than another lap of
@@ -1346,25 +1350,30 @@ fn accepted_task_ids(task_list: Option<&str>) -> Option<Vec<u32>> {
 /// repo problem.
 ///
 /// What that buys is *internal consistency*, and it is worth being precise
-/// about where the rest comes from. Nothing here proves the reported head
-/// exists — but nothing has to, because
-/// [`validate_global_review_head_advance`] runs immediately after this gate on
-/// the same `implementation_done` send, in the batch flow as well as the
-/// shortcut (Task 8 dropped the old `task_list.is_none()` guard). By the time
-/// the send is accepted, the reported head has been proven to name a real
-/// commit — a fabricated sha exits git 128 and is refused `branch_drift:` —
-/// and to descend from `last_head_sha`. So a checkpoint filed at a head the
-/// batch never reached does not survive the turn just because the report
-/// agrees with it.
+/// about the limit — and about who covers it. Nothing in *this function*
+/// proves the reported head exists in the repo, so on its own a caller could
+/// file a checkpoint at a head it never reached, report that same head, and
+/// have both agree.
 ///
-/// The residual limit is narrower, and it is specifically *this* function's:
-/// it never reads live HEAD. A checkpoint and a report that agree with each
-/// other, at a real ancestor-respecting commit that is simply *behind* the
-/// working tree, pass here — the pair is internally consistent and the history
-/// is sound, so neither gate has anything to object to. Catching that needs a
-/// comparison against the repo's current HEAD, which belongs on the handoff
-/// and resume paths — where a *reader* is being shown a progress report nobody
-/// is currently vouching for, and where a transient git failure costs a
+/// That is covered, but by the caller rather than here: since Task 8,
+/// [`validate_global_review_head_advance`] runs on every head-advancing coding
+/// event including `implementation_done` — the v3 batch flow and the
+/// `collab_start_code_review` shortcut alike — immediately after this function
+/// returns, and refuses a head that is not a git-verified descendant of
+/// `last_head_sha`. A fabricated sha does not even reach that comparison: it
+/// names no commit, git exits 128, and the refusal is `branch_drift:`. Note
+/// the ordering — the ancestry check runs *after* this one, deliberately (see
+/// the comment at the call site), so within this function's own body
+/// `head_sha` is still unvalidated caller input. Do not read "the caller
+/// checks it" as license to depend on it here.
+///
+/// What remains genuinely uncovered on this path is a head that is a real
+/// descendant but was never actually built or gated — including one that is
+/// simply *behind* the working tree, where the checkpoint and the report agree
+/// with each other and the history is sound, so neither gate has anything to
+/// object to. Catching that needs a live-HEAD comparison, which belongs on the
+/// handoff and resume paths, where a *reader* is being shown a progress report
+/// nobody is currently vouching for, and where a transient git failure costs a
 /// diagnostic rather than a turn.
 ///
 /// # Why `attested_by` is not consulted
@@ -1508,12 +1517,14 @@ fn require_checkpoint_proof(
     //
     // It has one reachable cause and one unreachable one, and they share the
     // diagnosis because they share the remedy. Reachable: a stored plan
-    // declaring an id no ledger can ever name — `0, 1, 2` satisfies
-    // `validate_task_list_body`'s strictly-increasing rule while
-    // `checkpoint::parse_completed_task_ids` refuses `0`. Unreachable: a
-    // `task_list` that will not parse at all, since the only path into this
-    // phase is a `task_list` send that already validated — defense in depth,
-    // kept for the day another writer reaches the column.
+    // declaring an id no ledger can ever name — `0, 1, 2` satisfied the
+    // strictly-increasing rule `validate_task_list_body` applied before Task 7
+    // tightened it to `1..=len`, while `checkpoint::parse_completed_task_ids`
+    // refuses `0`; that tightening guards the door, not the rows already
+    // behind it. Unreachable: a `task_list` that will not parse at all, since
+    // the only path into this phase is a `task_list` send that already
+    // validated — defense in depth, kept for the day another writer reaches
+    // the column.
     //
     // This is the one refusal that does NOT carry `CHECKPOINT_DRIFT_PREFIX`,
     // and dropping it is the point rather than an oversight. That prefix is a
@@ -3840,9 +3851,10 @@ mod tests {
     }
 
     /// The whole point of reading ids instead of a count: `1, 2, 4` is a plan
-    /// `validate_task_list_body` accepts (ids need only be strictly
-    /// increasing), and measuring it against `1..=3` would demand a ledger for
-    /// a task that does not exist.
+    /// `validate_task_list_body` accepted before Task 7 (ids needed only to be
+    /// strictly increasing) and one a session stored then still carries, and
+    /// measuring it against `1..=3` would demand a ledger for a task that does
+    /// not exist.
     #[test]
     fn accepted_task_ids_returns_the_declared_ids_not_a_dense_range() {
         let raw = task_list_with_ids(&[1, 2, 4]);
@@ -3860,7 +3872,8 @@ mod tests {
     /// An id no `completed_task_ids` can ever name is a malformed plan, not a
     /// requirement of zero tasks — the gate must reach its operator refusal
     /// rather than wave the batch through or ask for the impossible forever.
-    /// `0` and a negative id both pass the strictly-increasing rule upstream.
+    /// `0` and a negative id both passed the strictly-increasing rule upstream
+    /// before Task 7 tightened it, so both are shapes a stored plan can hold.
     #[test]
     fn accepted_task_ids_rejects_an_id_no_checkpoint_could_cover() {
         for ids in [vec![0, 1, 2], vec![-1, 1]] {

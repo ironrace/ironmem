@@ -651,6 +651,15 @@ impl CollabCheckpoint {
     /// the right count and the wrong contents, and must not pass. A `total` of
     /// zero is not "vacuously covered" — a batch with no tasks is a
     /// malformed task list, not a finished one.
+    ///
+    /// Treating a *count* as the id range `1..=total` is only sound because
+    /// `collab::task_list::validate_task_list_body` requires task ids to be
+    /// exactly `1..=N` in order, so the count and the id set are the same
+    /// fact. That is an invariant this type cannot check and does not own: if
+    /// task lists are ever allowed sparse or non-1-based ids again, this
+    /// method must take the id set instead, or a batch numbered `4,5,6` can
+    /// never satisfy it while one numbered `1,5,9` is satisfied by a ledger
+    /// that skipped two tasks.
     pub fn covers_all_tasks(&self, total: u32) -> bool {
         if total == 0 {
             return false;
@@ -1400,8 +1409,8 @@ mod tests {
     /// The SHA-shaped fields get the tighter cap, including the operator
     /// range built out of two of them. This type still cannot tell a real SHA
     /// from any other word — that is `verify_acknowledged_range`'s job — but
-    /// 128 chars is far more than any object id or revision expression needs
-    /// and far less than a payload.
+    /// [`MAX_CHECKPOINT_SHA_CHARS`] is far more than any object id or revision
+    /// expression needs and far less than a payload.
     #[test]
     fn sha_shaped_fields_are_capped() {
         for field in ["head_sha", "commit_sha", "gates_sha"] {
