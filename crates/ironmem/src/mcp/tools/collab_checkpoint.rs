@@ -28,7 +28,7 @@ use std::process::Command;
 
 use serde_json::{json, Value};
 
-use crate::collab::{AttestedBy, CollabCheckpoint};
+use crate::collab::{AttestationCheck, AttestedBy, CollabCheckpoint};
 use crate::error::MemoryError;
 use crate::mcp::app::App;
 
@@ -100,9 +100,10 @@ pub(super) fn handle_collab_checkpoint(app: &App, args: &Value) -> Result<Value,
     // into one session id and be looked up under another. Keeping a single
     // reading makes the session whose liveness is checked the same session the
     // row is keyed by, by construction rather than by a comparison.
-    let checkpoint = CollabCheckpoint::from_json(args)
+    let mut checkpoint = CollabCheckpoint::from_json(args)
         .map_err(|err| MemoryError::Validation(err.to_string()))?;
-    let session_id = checkpoint.session_id.as_str();
+    let session_id = checkpoint.session_id.clone();
+    let session_id = session_id.as_str();
 
     // The git reads sit OUTSIDE the transaction on purpose. `with_transaction`
     // replays its closure on `SQLITE_BUSY_SNAPSHOT`, and its doc comment
@@ -123,12 +124,22 @@ pub(super) fn handle_collab_checkpoint(app: &App, args: &Value) -> Result<Value,
         Ok((record, previous))
     })?;
     let head_check = HeadCheck::read(&record.repo_path, &checkpoint);
-    let attestation_check = verify_acknowledged_range(
+    let outcome = verify_acknowledged_range(
         &record.repo_path,
         &checkpoint,
         previous.as_ref().map(|cp| cp.head_sha.as_str()),
         &head_check,
     )?;
+    // Stamped onto the row rather than only returned, so the finding survives
+    // into `collab_status`, `collab_resume` and the `session_handoff` block.
+    // `from_json` leaves this `None` and `validate` refuses it on an
+    // implementer row, so a caller cannot label its own attestation.
+    checkpoint.attestation_check = outcome.check;
+    if let Some(canonical) = outcome.canonical_range {
+        checkpoint.acknowledged_divergence = Some(canonical);
+    }
+    let attestation_check = outcome.check;
+    let checkpoint = checkpoint;
 
     let (claim, updated_at) = app.db.with_transaction(|tx| {
         // Inside the transaction because a token claim is itself a DB write
@@ -196,7 +207,7 @@ pub(super) fn handle_collab_checkpoint(app: &App, args: &Value) -> Result<Value,
                 "diverged": head_check.diverged(),
                 "head_check": head_check.label(),
                 "acknowledged_divergence": checkpoint.acknowledged_divergence,
-                "attestation_check": attestation_check.label(),
+                "attestation_check": attestation_check.map(AttestationCheck::as_str),
             })),
         )?;
 
@@ -225,11 +236,15 @@ pub(super) fn handle_collab_checkpoint(app: &App, args: &Value) -> Result<Value,
         // check could not run, not left to infer it from a missing verdict.
         response["head_check_error"] = json!(detail);
     }
-    if attestation_check != AttestationCheck::NotApplicable {
+    if let Some(check) = attestation_check {
         // Present only for an operator attestation, so an implementer write's
         // response bytes are unchanged and no reader can mistake a routine
-        // checkpoint for one carrying a human's signature.
-        response["attestation_check"] = json!(attestation_check.label());
+        // checkpoint for one carrying a human's signature. The stored
+        // `acknowledged_divergence` is echoed beside it because the write path
+        // may have canonicalized it (see `AttestationOutcome`), and a caller
+        // told only "ok" would not know which form became the audit record.
+        response["attestation_check"] = json!(check.as_str());
+        response["acknowledged_divergence"] = json!(checkpoint.acknowledged_divergence);
     }
     Ok(response)
 }
@@ -250,38 +265,32 @@ fn wal_operation(checkpoint: &CollabCheckpoint) -> &'static str {
     }
 }
 
-/// What resolving an `acknowledged_divergence` against the repo established.
+/// What resolving an `acknowledged_divergence` against the repo established,
+/// plus the form of the range that should be stored.
 ///
-/// Three states for the same reason [`HeadCheck`] has three: "the server
-/// checked this range and it holds" and "the server could not check" must never
-/// render as the same word. An attestation is a claim that a human inspected
-/// specific commits; a label that conflated a verified range with an unchecked
-/// one would let the unchecked case inherit the verified one's credibility.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AttestationCheck {
-    /// Not an operator attestation — nothing to resolve.
-    NotApplicable,
-    /// Every endpoint resolved and every rule held.
-    Verified,
-    /// The endpoints held, but the previous checkpoint's `head_sha` no longer
-    /// resolves, so whether the range *covers* the divergence is unknown.
-    VerifiedWithoutSpan,
-    /// Live HEAD could not be read at all, so only the range's syntax was
-    /// checked. The write is still accepted — a transient filesystem problem
-    /// must not make a legitimate attestation unwritable — but it is labelled
-    /// as what it is.
-    UnverifiedRepoUnreadable,
-}
-
-impl AttestationCheck {
-    fn label(self) -> &'static str {
-        match self {
-            Self::NotApplicable => "not_applicable",
-            Self::Verified => "verified",
-            Self::VerifiedWithoutSpan => "verified_without_span",
-            Self::UnverifiedRepoUnreadable => "unverified_repo_unreadable",
-        }
-    }
+/// The verdict itself is [`AttestationCheck`], which lives in
+/// `collab::checkpoint` beside the column it is persisted in — this task's
+/// review found that a verdict reaching only the write response and the
+/// `wal_log` never reaches `session_handoff`, `collab_status` or
+/// `collab_resume`, which is precisely where a fabricated range gets rendered
+/// to a human as `attested_by: operator`.
+struct AttestationOutcome {
+    /// `None` for an implementer checkpoint: there is no range to resolve, so
+    /// there is no finding. Deliberately not a `NotApplicable` variant — see
+    /// [`AttestationCheck`].
+    check: Option<AttestationCheck>,
+    /// The range in **resolved** form (`<full oid>..<full oid>`), present only
+    /// when both endpoints resolved.
+    ///
+    /// `acknowledged_divergence` is the durable audit record of what a human
+    /// vouched for, and git accepts revision *expressions* — `HEAD~1..HEAD`,
+    /// `main..feature` — which resolve to different commits next week. An audit
+    /// record that means something different later is barely an audit record,
+    /// so the resolved form is what gets stored. When the endpoints could not
+    /// be resolved at all the operator's own expression is kept verbatim, and
+    /// the `unverified_repo_unreadable` verdict beside it says why it is not
+    /// canonical.
+    canonical_range: Option<String>,
 }
 
 /// Resolve an operator's `acknowledged_divergence` against the repository.
@@ -346,11 +355,27 @@ impl AttestationCheck {
 ///   repo-backed check is skipped and the write is labelled
 ///   `unverified_repo_unreadable`. The alternative — refusing — would make the
 ///   recovery path unreachable in exactly the environment that most needs it.
-/// - **The previous checkpoint's head no longer resolves** (history rewritten
-///   out from under it): the span check alone is skipped and the write is
-///   labelled `verified_without_span`. That state is branch drift rather than a
-///   checkpoint gap, and an operator repairing after a history rewrite is the
-///   one person who can, so refusing would strand the repair.
+/// - **The gap is not a gap.** The span check needs the checkpoint being
+///   replaced to sit *behind* this one, and there are **two** ways for that to
+///   fail — the second far more reachable than the first, and the one an
+///   attacker uses:
+///
+///   1. the previous checkpoint's head no longer resolves (history rewritten
+///      out from under it);
+///   2. it resolves but is **not an ancestor** of this checkpoint's head — most
+///      simply, the new checkpoint is on an orphan or unrelated branch, so
+///      `<previous>..<new>` bounds no linear run of commits to demand coverage
+///      of.
+///
+///   Either way the span check alone is skipped and the write is labelled
+///   `verified_without_span`. Both are branch-drift shapes rather than
+///   checkpoint gaps, and an operator repairing after a history rewrite is the
+///   one person who can, so refusing would strand the repair. Case 2 means an
+///   operator can file a well-formed attestation over a *narrow* range on an
+///   unrelated branch and have the endpoint rules all pass — which is exactly
+///   why the label has to reach every reader (see
+///   [`CollabCheckpoint::attestation_verdict`]) rather than stopping at the
+///   write response.
 ///
 /// Both are labelled rather than silent, and both reach the `wal_log` row, so
 /// an audit can tell an attestation the server resolved from one it merely
@@ -360,7 +385,7 @@ fn verify_acknowledged_range(
     checkpoint: &CollabCheckpoint,
     previous_head_sha: Option<&str>,
     head_check: &HeadCheck,
-) -> Result<AttestationCheck, MemoryError> {
+) -> Result<AttestationOutcome, MemoryError> {
     let range = match (
         checkpoint.attested_by,
         checkpoint.acknowledged_divergence.as_deref(),
@@ -370,7 +395,12 @@ fn verify_acknowledged_range(
         // `CollabCheckpoint::validate` (an operator without a range, an
         // implementer with one), so this arm is only ever the ordinary
         // implementer write.
-        _ => return Ok(AttestationCheck::NotApplicable),
+        _ => {
+            return Ok(AttestationOutcome {
+                check: None,
+                canonical_range: None,
+            })
+        }
     };
 
     let (from, to) = parse_range(range)?;
@@ -394,7 +424,13 @@ fn verify_acknowledged_range(
     // spawning git again to ask it a second time and possibly get a different
     // one.
     let HeadCheck::Checked { .. } = head_check else {
-        return Ok(AttestationCheck::UnverifiedRepoUnreadable);
+        return Ok(AttestationOutcome {
+            check: Some(AttestationCheck::UnverifiedRepoUnreadable),
+            // Nothing resolved, so the operator's expression is stored as
+            // typed rather than silently normalized into something the server
+            // never actually looked up.
+            canonical_range: None,
+        });
     };
 
     let from_oid = resolve_commit(repo_path, from).map_err(|detail| {
@@ -449,17 +485,27 @@ fn verify_acknowledged_range(
     // The span check. Skipped when there is no previous checkpoint (nothing was
     // frozen, so there is no gap to under-cover) or when its head no longer
     // resolves (see the escape valves in this function's doc comment).
+    let canonical_range = Some(format!("{from_oid}..{to_oid}"));
     let Some(previous_head) = previous_head_sha else {
-        return Ok(AttestationCheck::Verified);
+        return Ok(AttestationOutcome {
+            check: Some(AttestationCheck::Verified),
+            canonical_range,
+        });
     };
     if resolve_commit(repo_path, previous_head).is_err() {
-        return Ok(AttestationCheck::VerifiedWithoutSpan);
+        return Ok(AttestationOutcome {
+            check: Some(AttestationCheck::VerifiedWithoutSpan),
+            canonical_range,
+        });
     }
     // Only meaningful when the previous head is actually behind this one. If it
     // is not, the divergence is branch drift rather than a run of commits after
     // the checkpoint, and there is no linear gap for the range to cover.
     if !is_ancestor(repo_path, previous_head, to)? {
-        return Ok(AttestationCheck::VerifiedWithoutSpan);
+        return Ok(AttestationOutcome {
+            check: Some(AttestationCheck::VerifiedWithoutSpan),
+            canonical_range,
+        });
     }
     if !is_ancestor(repo_path, from, previous_head)? {
         return Err(range_refusal(
@@ -471,7 +517,10 @@ fn verify_acknowledged_range(
             ),
         ));
     }
-    Ok(AttestationCheck::Verified)
+    Ok(AttestationOutcome {
+        check: Some(AttestationCheck::Verified),
+        canonical_range,
+    })
 }
 
 /// One spelling of every `acknowledged_divergence` refusal, so each names the
@@ -645,7 +694,14 @@ fn inspect_divergence(
                 .to_string(),
         ));
     }
-    let session_id = require_str(args, "session_id")?;
+    // The same reading the write path performs, through the checkpoint
+    // parser's own helper rather than `shared::require_str`: that helper
+    // neither trims nor rejects the `none` absent-sentinel, so a `" <id> "`
+    // transcribed out of a turn template would inspect one session and be
+    // looked up under another.
+    let session_id = crate::collab::checkpoint::parse_session_id(args)
+        .map_err(|err| MemoryError::Validation(err.to_string()))?;
+    let session_id = session_id.as_str();
 
     let (record, checkpoint) = app.db.with_connection(|conn| {
         crate::collab::queue::ensure_active(conn, session_id)?;
@@ -718,7 +774,7 @@ fn inspect_divergence(
 
 /// The post-checkpoint commit listing, or the reason there isn't one.
 struct CommitRange {
-    /// Which of the five answers this is. A single machine-readable field so a
+    /// Which of the six answers this is. A single machine-readable field so a
     /// caller never has to infer the state from which optional keys are
     /// present.
     status: &'static str,
@@ -749,7 +805,7 @@ impl CommitRange {
 /// List the commits that landed after the checkpoint, or say why that is not
 /// the question.
 ///
-/// Five outcomes, and the separation between the last three is the whole point:
+/// Six outcomes, and the separation between them is the whole point:
 ///
 /// - `not_checked` — live HEAD could not be read, so drift is **unknown**. Never
 ///   rendered as "no divergence": an unreadable repo is precisely where a
@@ -769,10 +825,14 @@ impl CommitRange {
 ///   — where both commits exist but are unrelated — it **succeeds**, and reading
 ///   its success as "here is the gap" is exactly the misreport this arm exists
 ///   to prevent.
-/// - `empty_range` — defensive: ancestry held but nothing was listed. Not
-///   reachable through the checks above (a strict ancestor with a different sha
-///   implies at least one commit), and reported rather than shown as an empty
-///   attestable range if it ever becomes so.
+/// - `empty_range` — ancestry held but nothing was listed. **Reachable**, and
+///   the route is one this tool's own schema warns about: the divergence check
+///   is string equality, so an *abbreviated* `head_sha` is unequal to live HEAD
+///   (hence `diverged: true`) while resolving to the very same commit — an
+///   ancestor of itself, bounding nothing. `attestable: false` makes the
+///   behavior safe either way, but a client switching on
+///   `commit_range_status` must not meet an undocumented value, so this is the
+///   sixth answer rather than an internal fallback.
 /// - `listed` — a real run of commits after the checkpoint, on the same
 ///   history. The only attestable answer.
 fn inspect_commit_range(

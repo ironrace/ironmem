@@ -1862,6 +1862,16 @@ pub(super) fn checkpoint_json(
         "summary": cp.summary,
         "attested_by": cp.attested_by.as_str(),
         "acknowledged_divergence": cp.acknowledged_divergence,
+        // Rendered right beside the two fields it qualifies, and never omitted
+        // for an operator row. Without it these two lines describe a fabricated
+        // range in exactly the same words as a server-resolved one — which is
+        // what a reader of this block would have been shown for an attestation
+        // filed while the repo was unreadable. `attestation_verdict` supplies
+        // the fail-safe `unrecorded` for a row that carries no verdict, so an
+        // unstamped operator attestation reads as unchecked rather than absent.
+        // `null` here means `attested_by: implementer`, which makes no
+        // attestation claim at all.
+        "attestation_check": cp.attestation_verdict(),
         // The anti-backdating server stamp — the field that tells a fresh
         // checkpoint from a frozen one.
         "updated_at": cp.updated_at,

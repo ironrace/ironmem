@@ -7931,9 +7931,27 @@ fn inspect_divergence_refuses_to_offer_a_range_across_branch_drift() {
             .contains("branch drift"),
         "the operator must be told this is branch drift, not a checkpoint gap: {out}"
     );
+    // The independent thing, and the one the exploit turns on: with the
+    // ancestry guard removed, the response hands the operator a ready-to-paste
+    // `collab_checkpoint(... acknowledged_divergence=<checkpoint>..<orphan>)`
+    // naming the orphan range. An `|| commits.is_null()` disjunct here would be
+    // unconditionally true — `commits` is asserted Null three lines up — and
+    // the assertion could never fail.
+    //
+    // Deliberately NOT "the orphan sha appears nowhere in the response": it
+    // legitimately appears as `repo_head_sha` and inside the drift diagnostic,
+    // which is live HEAD being reported accurately. What must not exist is an
+    // *invitation* to attest to it.
     assert!(
-        !out.to_string().contains(&orphan[..12]) || out["commits"].is_null(),
-        "no orphan-branch commit may be offered as post-checkpoint work: {out}"
+        out.get("attestation").is_none(),
+        "branch drift must offer no attestation call to paste: {out}"
+    );
+    assert!(
+        !out["commit_range_error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(&format!("{on_branch}..{orphan}")),
+        "not even the diagnostic may spell the orphan range as an attestable one: {out}"
     );
 }
 
@@ -7949,6 +7967,122 @@ fn inspect_divergence_reports_a_session_with_no_checkpoint() {
     assert_eq!(out["checkpoint"], serde_json::Value::Null, "{out}");
     assert_eq!(out["commit_range_status"], json!("no_checkpoint"), "{out}");
     assert_eq!(out["attestable"], json!(false), "{out}");
+}
+
+/// The requiredness rule moved from the client to the server when `status` and
+/// `head_sha` left the schema's `required` list, so it has to be tested at the
+/// boundary. The schema test asserts only that their descriptions carry the
+/// rule, which restates the schema rather than executing it — a build that
+/// dropped the parser's check entirely would leave that assertion green while
+/// silently accepting a checkpoint with no head.
+#[test]
+fn a_write_still_requires_status_and_head_sha_even_though_the_schema_cannot_say_so() {
+    for omitted in ["status", "head_sha"] {
+        let (app, _temp, repo, _shas) = test_app_with_git_repo(1);
+        let session_id = start_batch_session_in(&app, &repo, 3);
+        let head = commit_file(&repo, "task1.rs", "done\n", "task 1");
+
+        let mut args = json!({
+            "session_id": &session_id,
+            "agent": "claude",
+            "status": "started",
+            "head_sha": head,
+        });
+        args.as_object_mut().unwrap().remove(omitted);
+
+        let err = call_tool_expect_error(&app, "collab_checkpoint", args);
+        assert!(
+            err.contains(omitted),
+            "a write omitting {omitted} must be refused by name, got: {err}"
+        );
+        assert!(
+            stored_checkpoint(&app, &session_id).is_none(),
+            "a refused write must persist nothing ({omitted})"
+        );
+    }
+}
+
+/// The listing is capped, and a truncated listing must SAY so. An operator
+/// shown a partial range and told nothing would attest to more commits than
+/// they saw — the rubber stamp in its quietest form.
+///
+/// The cap is 200; this makes 205 commits past the checkpoint with one `git`
+/// invocation (empty commits, so no file churn) rather than 205 spawns.
+#[test]
+fn inspect_divergence_caps_and_flags_a_very_long_commit_range() {
+    let (app, _temp, repo, _shas) = test_app_with_git_repo(1);
+    let session_id = start_batch_session_in(&app, &repo, 3);
+    let stale = commit_file(&repo, "task1.rs", "done\n", "task 1");
+    checkpoint(
+        &app,
+        &session_id,
+        json!({ "status": "started", "task_id": 1, "head_sha": stale }),
+    );
+
+    let mut command = Command::new("bash");
+    // Same scrub every other git call in this file performs: an inherited
+    // GIT_DIR would land these commits in a different repository and the test
+    // would pass against an unchanged fixture.
+    for (key, _) in std::env::vars_os() {
+        if key
+            .to_string_lossy()
+            .to_ascii_uppercase()
+            .starts_with("GIT_")
+        {
+            command.env_remove(key);
+        }
+    }
+    let status = command
+        .arg("-c")
+        .arg("for i in $(seq 1 205); do git commit -q --allow-empty -m \"filler $i\" || exit 1; done")
+        .current_dir(&repo)
+        .status()
+        .expect("bash must run");
+    assert!(status.success(), "fixture must create the filler commits");
+
+    let out = inspect(&app, &session_id);
+    assert_eq!(out["commit_range_status"], json!("listed"), "{out}");
+    let commits = out["commits"].as_array().expect("commits must be listed");
+    assert_eq!(
+        commits.len(),
+        200,
+        "the listing must be capped at MAX_INSPECTED_COMMITS"
+    );
+    assert_eq!(
+        out["commits_truncated"],
+        json!(true),
+        "a capped listing must say it is capped: {out}"
+    );
+    // The range itself is NOT truncated — it still ends at live HEAD, so the
+    // attestation covers every commit whether or not all of them were shown.
+    // That is exactly why the flag has to be there.
+    assert_eq!(
+        out["commit_range"],
+        json!(format!(
+            "{stale}..{}",
+            out["checkpoint"]["repo_head_sha"].as_str().unwrap()
+        )),
+        "{out}"
+    );
+}
+
+/// The other half of the cap: an ordinary range is NOT flagged, so the test
+/// above cannot pass against a build that reports `commits_truncated: true`
+/// unconditionally.
+#[test]
+fn inspect_divergence_does_not_flag_a_short_commit_range_as_truncated() {
+    let (app, _temp, repo, _shas) = test_app_with_git_repo(1);
+    let session_id = start_batch_session_in(&app, &repo, 3);
+    let stale = commit_file(&repo, "task1.rs", "done\n", "task 1");
+    checkpoint(
+        &app,
+        &session_id,
+        json!({ "status": "started", "task_id": 1, "head_sha": stale }),
+    );
+    commit_file(&repo, "task2.rs", "done\n", "task 2");
+
+    let out = inspect(&app, &session_id);
+    assert_eq!(out["commits_truncated"], json!(false), "{out}");
 }
 
 /// `agent` stays REQUIRED for inspection too. An operator backfill *is* a
@@ -8308,9 +8442,16 @@ fn inspect_then_attest_ends_the_divergence_and_is_logged_distinctly() {
 }
 
 /// The write half of constraint 5. A repo that cannot be read at all must not
-/// make a legitimate attestation unwritable — but the row must then record that
-/// the range was never verified, rather than carrying the same `verified` label
-/// a checked one does.
+/// make a legitimate attestation unwritable — but the **row** must then record
+/// that the range was never verified, rather than carrying the same `verified`
+/// label a checked one does.
+///
+/// Asserted on the stored row, not on the write response. The response is
+/// consumed at the moment of the write and read by nobody afterwards; the row
+/// is what `session_handoff`, `collab_status` and `collab_resume` render to a
+/// human later. An earlier version of this test asserted only the response
+/// while its name promised the row — the exact gap the exploit below walks
+/// through.
 #[test]
 fn an_attestation_written_against_an_unreadable_repo_records_that_it_was_unverified() {
     let (app, _temp, repo, _shas) = test_app_with_git_repo(1);
@@ -8342,11 +8483,395 @@ fn an_attestation_written_against_an_unreadable_repo_records_that_it_was_unverif
         json!("unverified_repo_unreadable"),
         "an unreadable repo must not be reported as a verified range: {written}"
     );
-    assert_ne!(written["attestation_check"], json!("verified"), "{written}");
     assert!(
         stored_checkpoint(&app, &session_id).is_some(),
         "a transient repo problem must not make a legitimate attestation unwritable"
     );
+    assert_eq!(
+        stored_checkpoint(&app, &session_id)
+            .unwrap()
+            .attestation_verdict(),
+        Some("unverified_repo_unreadable"),
+        "the ROW must record the verdict — the write response is gone by the time \
+         anybody reads this checkpoint"
+    );
+}
+
+// ── the verdict has to reach the readers, not just the writer ────────────────
+//
+// The exploit this closes, end to end: break the repo, file
+// `attested_by=operator` with a real `head_sha` and a pure-fiction
+// `acknowledged_divergence`, restore the repo. The write correctly answers
+// `unverified_repo_unreadable` — and then every later reader was shown
+// `attested_by: operator` beside a fabricated range in exactly the same words
+// it would use for a range the server had resolved. The verdict lived only in
+// the write response (already consumed) and the `wal_log` detail blob.
+//
+// The argument for verifying at the write rather than at the
+// `implementation_done` gate is precisely that a fabricated range must not sit
+// in the table where these three surfaces render it. That argument is only
+// satisfied once the three surfaces say what the server actually established.
+
+/// Set up the exploit: an operator attestation over a fabricated range, filed
+/// while the repo could not be read, with the repo restored afterwards so every
+/// reader's own live-HEAD check comes back clean and nothing else looks wrong.
+/// Returns the session id.
+fn unresolved_operator_attestation(app: &App, repo: &Path, temp: &tempfile::TempDir) -> String {
+    let session_id = failed_batch_session_in(app, repo, 3);
+    let head = commit_file(repo, "task1.rs", "done\n", "task 1");
+
+    // Move `.git` aside rather than deleting it, so it can come back.
+    let stash = temp.path().parent().unwrap().join("stashed-git");
+    std::fs::rename(repo.join(".git"), &stash).expect("fixture .git must be movable");
+    let written = call_tool(
+        app,
+        "collab_checkpoint",
+        json!({
+            "session_id": &session_id,
+            "agent": "claude",
+            "status": "batch_complete",
+            "head_sha": &head,
+            "completed_task_ids": "1,2,3",
+            "gates_result": "passed",
+            "gates_sha": &head,
+            "attested_by": "operator",
+            "acknowledged_divergence": FABRICATED_RANGE,
+        }),
+    );
+    assert_eq!(
+        written["attestation_check"],
+        json!("unverified_repo_unreadable"),
+        "fixture precondition: the write must have been unable to resolve the range"
+    );
+    std::fs::rename(&stash, repo.join(".git")).expect("fixture .git must be restorable");
+    session_id
+}
+
+/// Two commits that exist in no repository anywhere.
+const FABRICATED_RANGE: &str =
+    "1111111111111111111111111111111111111111..9999999999999999999999999999999999999999";
+
+/// Reader surface 1 of 3.
+#[test]
+fn collab_status_labels_an_attestation_the_server_never_resolved() {
+    let (app, temp, repo, _shas) = test_app_with_git_repo(1);
+    let session_id = unresolved_operator_attestation(&app, &repo, &temp);
+
+    let cp = &call_tool(&app, "collab_status", json!({ "session_id": &session_id }))["checkpoint"];
+    // Everything else about this row looks impeccable, which is the point.
+    assert_eq!(cp["attested_by"], json!("operator"), "{cp}");
+    assert_eq!(
+        cp["acknowledged_divergence"],
+        json!(FABRICATED_RANGE),
+        "{cp}"
+    );
+    assert_eq!(cp["diverged"], json!(false), "{cp}");
+    assert_eq!(cp["head_check"], json!("checked"), "{cp}");
+
+    assert_eq!(
+        cp["attestation_check"],
+        json!("unverified_repo_unreadable"),
+        "collab_status must say the range was never resolved: {cp}"
+    );
+    assert_ne!(cp["attestation_check"], json!("verified"), "{cp}");
+}
+
+/// Reader surface 2 of 3. `collab_resume` is the one an unattended successor
+/// calls, so it is the reader with the least opportunity to ask a human.
+#[test]
+fn collab_resume_labels_an_attestation_the_server_never_resolved() {
+    let (app, temp, repo, _shas) = test_app_with_git_repo(1);
+    let session_id = unresolved_operator_attestation(&app, &repo, &temp);
+
+    let out = call_tool(
+        &app,
+        "collab_resume",
+        json!({ "session_id": &session_id, "agent": "claude" }),
+    );
+    // The resume is ADMITTED — there is no live divergence to refuse on. That
+    // is exactly why the label has to be here: nothing else about this response
+    // suggests the attestation was never checked.
+    assert_eq!(out["ok"], json!(true), "{out}");
+    assert_eq!(out["checkpoint"]["attested_by"], json!("operator"), "{out}");
+    assert_eq!(
+        out["checkpoint"]["attestation_check"],
+        json!("unverified_repo_unreadable"),
+        "collab_resume must say the range was never resolved: {out}"
+    );
+}
+
+/// Reader surface 3 of 3, and the one the incident actually happened on. The
+/// handoff block spells the caveat out rather than emitting a bare label,
+/// because a successor reading it has the least context of any reader.
+#[test]
+fn the_handoff_block_labels_an_attestation_the_server_never_resolved() {
+    let (app, temp, repo, _shas) = test_app_with_git_repo(1);
+    let session_id = unresolved_operator_attestation(&app, &repo, &temp);
+
+    let block = handoff_block(&app, &session_id);
+    assert!(
+        block.contains("checkpoint.attested_by: operator")
+            && block.contains(&format!(
+                "checkpoint.acknowledged_divergence: {FABRICATED_RANGE}"
+            )),
+        "fixture precondition — the block must be carrying the fabricated attestation: {block}"
+    );
+    assert!(
+        block.contains("checkpoint.attestation_check: unverified_repo_unreadable"),
+        "the handoff block must say the range was never resolved: {block}"
+    );
+    assert!(
+        block.contains("treat it as unchecked"),
+        "a successor must be told what the label means for what it may conclude: {block}"
+    );
+}
+
+/// The contrast case, without which the three tests above would pass just as
+/// well against a build that stamped `unverified_repo_unreadable` on every
+/// operator attestation. A genuinely resolved range says so, on all three.
+#[test]
+fn the_readers_report_a_resolved_attestation_as_verified() {
+    let (app, _temp, repo, _shas) = test_app_with_git_repo(1);
+    let session_id = failed_batch_session_in(&app, &repo, 3);
+    let stale = commit_file(&repo, "task1.rs", "done\n", "task 1");
+    checkpoint(
+        &app,
+        &session_id,
+        json!({ "status": "started", "task_id": 1, "head_sha": stale }),
+    );
+    let live = commit_file(&repo, "task2.rs", "done\n", "task 2");
+    checkpoint(
+        &app,
+        &session_id,
+        json!({
+            "status": "batch_complete",
+            "head_sha": &live,
+            "completed_task_ids": "1,2,3",
+            "attested_by": "operator",
+            "acknowledged_divergence": format!("{stale}..{live}"),
+        }),
+    );
+
+    let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+    assert_eq!(status["checkpoint"]["attestation_check"], json!("verified"));
+    let block = handoff_block(&app, &session_id);
+    assert!(
+        block.contains("checkpoint.attestation_check: verified"),
+        "{block}"
+    );
+    assert!(
+        !block.contains("treat it as unchecked"),
+        "a resolved attestation must carry no caveat: {block}"
+    );
+    let out = call_tool(
+        &app,
+        "collab_resume",
+        json!({ "session_id": &session_id, "agent": "claude" }),
+    );
+    assert_eq!(out["checkpoint"]["attestation_check"], json!("verified"));
+}
+
+/// An implementer checkpoint makes no attestation claim, so it must carry no
+/// verdict — `null`, never a word a reader could take for a finding. Without
+/// this, a build that labelled every checkpoint `verified` would satisfy every
+/// test above.
+#[test]
+fn an_implementer_checkpoint_carries_no_attestation_verdict() {
+    let (app, _temp, repo, _shas) = test_app_with_git_repo(1);
+    let session_id = start_batch_session_in(&app, &repo, 3);
+    let head = commit_file(&repo, "task1.rs", "done\n", "task 1");
+    let written = checkpoint(
+        &app,
+        &session_id,
+        json!({ "status": "started", "task_id": 1, "head_sha": head }),
+    );
+    assert!(
+        written.get("attestation_check").is_none(),
+        "an implementer write's response must be unchanged: {written}"
+    );
+
+    let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+    assert_eq!(
+        status["checkpoint"]["attestation_check"],
+        serde_json::Value::Null,
+        "{status}"
+    );
+    let block = handoff_block(&app, &session_id);
+    assert!(
+        block.contains("checkpoint.attestation_check: \u{2014}"),
+        "the key is emitted on every call, unset as an em-dash: {block}"
+    );
+}
+
+/// The partial verdict has to reach readers too, and it is the more reachable
+/// of the two: the range is well-formed and fully resolvable, so nothing about
+/// it looks wrong — only the *coverage* of the gap went unchecked. Filed on an
+/// orphan branch, where the checkpoint being replaced is not an ancestor of the
+/// new head and so bounds no gap.
+#[test]
+fn the_readers_report_an_unspanned_attestation_as_such() {
+    let (app, _temp, repo, _shas) = test_app_with_git_repo(1);
+    let session_id = start_batch_session_in(&app, &repo, 3);
+    let on_branch = commit_file(&repo, "task1.rs", "done\n", "task 1");
+    checkpoint(
+        &app,
+        &session_id,
+        json!({ "status": "started", "task_id": 1, "head_sha": on_branch }),
+    );
+
+    git(&["checkout", "--orphan", "unrelated"], &repo);
+    let o1 = commit_file(&repo, "o1.txt", "one\n", "orphan 1");
+    let o2 = commit_file(&repo, "o2.txt", "two\n", "orphan 2");
+
+    let written = checkpoint(
+        &app,
+        &session_id,
+        json!({
+            "status": "batch_complete",
+            "head_sha": &o2,
+            "completed_task_ids": "1,2,3",
+            "attested_by": "operator",
+            "acknowledged_divergence": format!("{o1}..{o2}"),
+        }),
+    );
+    assert_eq!(
+        written["attestation_check"],
+        json!("verified_without_span"),
+        "{written}"
+    );
+
+    let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+    assert_eq!(
+        status["checkpoint"]["attestation_check"],
+        json!("verified_without_span"),
+        "collab_status must not report a partial check as a full one: {status}"
+    );
+    let block = handoff_block(&app, &session_id);
+    assert!(
+        block.contains("checkpoint.attestation_check: verified_without_span"),
+        "{block}"
+    );
+    assert!(
+        block.contains("was not checked"),
+        "the successor must be told which half went unchecked: {block}"
+    );
+}
+
+/// `acknowledged_divergence` is the durable audit record of what a human
+/// vouched for, and git accepts revision *expressions* — `HEAD~1..HEAD`,
+/// `main..feature` — that resolve to different commits later. An audit record
+/// that means something different next week is barely an audit record, so a
+/// resolvable range is stored in resolved form.
+#[test]
+fn a_resolvable_range_is_stored_in_resolved_form() {
+    let (app, _temp, repo, _shas) = test_app_with_git_repo(1);
+    let (session_id, stale, live) = diverged_batch_session(&app, &repo);
+
+    let written = call_tool(
+        &app,
+        "collab_checkpoint",
+        json!({
+            "session_id": &session_id,
+            "agent": "claude",
+            "status": "batch_complete",
+            "head_sha": &live,
+            "completed_task_ids": "1,2,3",
+            "attested_by": "operator",
+            // A branch-relative expression: correct today, meaningless once
+            // HEAD moves.
+            "acknowledged_divergence": "HEAD~1..HEAD",
+        }),
+    );
+    let resolved = format!("{stale}..{live}");
+    assert_eq!(
+        written["acknowledged_divergence"],
+        json!(&resolved),
+        "the write must echo the form that became the audit record: {written}"
+    );
+    assert_eq!(
+        stored_checkpoint(&app, &session_id)
+            .unwrap()
+            .acknowledged_divergence
+            .as_deref(),
+        Some(resolved.as_str()),
+        "a resolvable range must be stored as object names, not as an expression \
+         that resolves differently later"
+    );
+
+    // And the same range read back through a reader surface.
+    let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+    assert_eq!(
+        status["checkpoint"]["acknowledged_divergence"],
+        json!(&resolved)
+    );
+    assert!(
+        !status.to_string().contains("HEAD~1"),
+        "the expression must not survive anywhere on a reader surface: {status}"
+    );
+}
+
+/// The other half: when nothing could be resolved there is no canonical form to
+/// store, so the operator's own expression is kept verbatim rather than being
+/// silently normalized into something the server never looked up. The
+/// `unverified_repo_unreadable` verdict beside it is what tells a reader the
+/// stored string is unresolved.
+#[test]
+fn an_unresolvable_range_is_stored_exactly_as_the_operator_wrote_it() {
+    let (app, _temp, repo, _shas) = test_app_with_git_repo(1);
+    let session_id = start_batch_session_in(&app, &repo, 3);
+    let head = commit_file(&repo, "task1.rs", "done\n", "task 1");
+    break_git_repo(&repo);
+
+    call_tool(
+        &app,
+        "collab_checkpoint",
+        json!({
+            "session_id": &session_id,
+            "agent": "claude",
+            "status": "batch_complete",
+            "head_sha": &head,
+            "completed_task_ids": "1,2,3",
+            "attested_by": "operator",
+            "acknowledged_divergence": "HEAD~1..HEAD",
+        }),
+    );
+    let stored = stored_checkpoint(&app, &session_id).unwrap();
+    assert_eq!(
+        stored.acknowledged_divergence.as_deref(),
+        Some("HEAD~1..HEAD")
+    );
+    assert_eq!(
+        stored.attestation_verdict(),
+        Some("unverified_repo_unreadable")
+    );
+}
+
+/// The sixth `commit_range_status`, reached exactly as the schema warns: the
+/// divergence check is string equality, so an abbreviated `head_sha` reads as
+/// drift on a repo that has not moved — while resolving to live HEAD, leaving a
+/// range that spans nothing. Documented as reachable rather than defensive,
+/// because a client switching on this field must not meet an undocumented
+/// value. `attestable: false` is what makes the behavior safe either way.
+#[test]
+fn inspect_divergence_reports_an_empty_range_for_an_abbreviated_checkpoint_head() {
+    let (app, _temp, repo, _shas) = test_app_with_git_repo(1);
+    let session_id = start_batch_session_in(&app, &repo, 3);
+    let head = commit_file(&repo, "task1.rs", "done\n", "task 1");
+    checkpoint(
+        &app,
+        &session_id,
+        json!({ "status": "started", "task_id": 1, "head_sha": &head[..8] }),
+    );
+
+    let out = inspect(&app, &session_id);
+    assert_eq!(
+        out["checkpoint"]["diverged"],
+        json!(true),
+        "string equality against the full sha: an abbreviated head always reads as drift: {out}"
+    );
+    assert_eq!(out["commit_range_status"], json!("empty_range"), "{out}");
+    assert_eq!(out["attestable"], json!(false), "{out}");
+    assert_eq!(out["commits"], serde_json::Value::Null, "{out}");
 }
 
 /// Syntax is checked WITHOUT a repo, so the one escape valve above (an

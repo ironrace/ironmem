@@ -22,10 +22,13 @@ preconditions: phase == CodeImplementPending, current_owner == claude, implement
    non-null `pending_failure` means you are the **recovery owner** for an
    interrupted turn, not simply the next-in-line owner — see "Recoverable vs
    terminal failures" below before proceeding.
-2. Fetch the one logical-keyed current drawer deterministically with
-   `get_drawer(wing=ironrace-memory, room=collab-checkpoints,
-   logical_key=collab-checkpoint:<session_id>)`; resume at the first unfinished
-   task; scan the diff vs acceptance criteria.
+2. Read the current checkpoint from `collab_status`'s `checkpoint` block. If
+   it reports `diverged: true` or `diverged: null` (unreadable is not "no
+   divergence"), do NOT resume on that progress claim: inspect first with
+   `collab_checkpoint(session_id=$SESSION_ID, agent="claude",
+   inspect_divergence=true)`, then file an accurate checkpoint or escalate
+   for an operator-attested backfill per `docs/COLLAB.md`. Otherwise resume
+   at the first unfinished task; scan the diff vs acceptance criteria.
 
 ## Load area maps first
 
@@ -55,13 +58,13 @@ actual source code. Never trust a map entry alone for contract-level claims.
 ## Recoverable vs terminal failures
 
 The server classifies `failure_report`, not you — send an accurate
-`coding_failure` prefix and let it decide. Six prefixes recover the turn
+`coding_failure` prefix and let it decide. Seven prefixes recover the turn
 instead of ending the session: `git_commit_failed:`, `git_push_failed:`,
 `sandbox_denied:`, `disk_full:`, `network_failed:`,
-`codex_dispatch_failed:` (each needs real detail after the colon, e.g.
-`git_commit_failed: index.lock EPERM`); everything else (including
-`branch_drift:`/`subagent_failure:`) is terminal. If you are acting as
-**recovery owner** — control was handed to you after Codex's recoverable
+`codex_dispatch_failed:`, `checkpoint_drift:` (each needs real detail after
+the colon, e.g. `git_commit_failed: index.lock EPERM`); everything else
+(including `branch_drift:`/`subagent_failure:`) is terminal. If you are
+acting as **recovery owner** — control was handed to you after Codex's recoverable
 `failure_report`, or you resumed via `collab_resume` — inspect the
 preserved diff, run this turn's gates yourself, commit + push, then send
 the normal `implementation_done` (never a new `failure_report`).
@@ -69,9 +72,10 @@ the normal `implementation_done` (never a new `failure_report`).
 ## Actions
 1. Invoke `Skill('iron-build')` on `plan_file_path`. Auto-proceed
    between tasks (no per-task user gate). Write started/completed/blocked/
-   batch_complete checkpoints per the `docs/COLLAB.md` checkpoint rule, always
-   with `logical_key: collab-checkpoint:<session_id>` and cumulative
-   `completed_task_ids` in the one logical-keyed current drawer. STOP
+   batch_complete checkpoints per the `docs/COLLAB.md` checkpoint rule with
+   `collab_checkpoint(session_id=$SESSION_ID, agent="claude", ...)`, carrying
+   the full cumulative `completed_task_ids` forward on every write since each
+   write replaces the session's one current checkpoint row. STOP
    before `iron-build`'s *Finishing the Branch* step (no PR here).
 2. Verify the local boundary invariant: the skill stopped after the final
    task's approval+commit, did not run the *Finishing the Branch* step,
@@ -84,8 +88,14 @@ the normal `implementation_done` (never a new `failure_report`).
 3. Run gates: `cargo fmt --all -- --check`,
    `cargo clippy --workspace --all-targets --all-features -- -D warnings`,
    `cargo test --workspace`.
-4. On green: `collab_send(sender="claude", topic="implementation_done",
-   content=<JSON {"head_sha":"<HEAD>"}>)`. On failure/overrun:
+4. On green: write the final `status: batch_complete` checkpoint at the
+   current HEAD — `completed_task_ids` covering every task,
+   `gates_result=passed`, `gates_sha=<HEAD>` — **before** sending. Without a
+   matching `batch_complete` checkpoint at this exact `head_sha`,
+   `implementation_done` is refused with a `checkpoint_drift:` error naming
+   the exact remedy call. Then `collab_send(sender="claude",
+   topic="implementation_done", content=<JSON {"head_sha":"<HEAD>"}>)`. On
+   failure/overrun:
    `collab_send(topic="failure_report", content=<JSON {"coding_failure":"..."}>)`.
 
 ## Verdict

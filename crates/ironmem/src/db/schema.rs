@@ -33,11 +33,13 @@ const MCP_RESPONSE_COMPACTION_METRICS_SQL: &str =
     include_str!("../../migrations/018_mcp_response_compaction_metrics.sql");
 const COLLAB_PILOT_SQL: &str = include_str!("../../migrations/019_collab_pilot.sql");
 const COLLAB_CHECKPOINTS_SQL: &str = include_str!("../../migrations/020_collab_checkpoints.sql");
+const CHECKPOINT_ATTESTATION_CHECK_SQL: &str =
+    include_str!("../../migrations/021_checkpoint_attestation_check.sql");
 
 /// Highest schema version a fully-migrated database reports. Bump alongside the
 /// `run_version_gated_migrations` ladder below so `ironmem doctor` can tell a
 /// behind-migration database from an up-to-date one.
-pub const LATEST_SCHEMA_VERSION: i64 = 20;
+pub const LATEST_SCHEMA_VERSION: i64 = 21;
 
 /// Total attempts (first try included) `with_transaction` makes when every
 /// attempt fails with `SQLITE_BUSY_SNAPSHOT`. See the retry-policy section of
@@ -447,6 +449,14 @@ impl Database {
         // an enforceable table so `implementation_done` can demand proof.
         if current_version < 20 {
             self.conn.execute_batch(COLLAB_CHECKPOINTS_SQL)?;
+        }
+
+        // v21: what the server established about an operator attestation's
+        // acknowledged range (issue #273 Task 10). One nullable column; NULL
+        // means "no verdict recorded", which is every pre-021 row and every
+        // implementer-attested row.
+        if current_version < 21 {
+            self.conn.execute_batch(CHECKPOINT_ATTESTATION_CHECK_SQL)?;
         }
 
         Ok(())
@@ -878,7 +888,7 @@ mod tests {
         // fully-migrated database reports — doctor compares against it.
         let db = Database::open_in_memory().unwrap();
         assert_eq!(LATEST_SCHEMA_VERSION, db.schema_version().unwrap());
-        assert_eq!(LATEST_SCHEMA_VERSION, 20);
+        assert_eq!(LATEST_SCHEMA_VERSION, 21);
     }
 
     #[test]
@@ -2311,7 +2321,7 @@ mod tests {
     fn migration_020_creates_collab_checkpoints_table() {
         let db = Database::open_in_memory().unwrap();
         assert_eq!(schema_version_of(&db), LATEST_SCHEMA_VERSION);
-        assert_eq!(LATEST_SCHEMA_VERSION, 20);
+        assert_eq!(LATEST_SCHEMA_VERSION, 21);
 
         // The table exists and carries every column the checkpoint contract
         // needs, at the declared affinity the header argues for. Asserting the
@@ -2345,6 +2355,13 @@ mod tests {
             ("summary", "TEXT"),
             ("attested_by", "TEXT"),
             ("acknowledged_divergence", "TEXT"),
+            // Added by migration 021, not 020. Asserted here rather than in a
+            // separate test because the contract this list states is "every
+            // column the checkpoint contract needs" — a reader checking whether
+            // the verdict is persisted at all should find the answer in one
+            // place. `test_v20_to_v21_adds_attestation_check` is what pins the
+            // upgrade path itself.
+            ("attestation_check", "TEXT"),
             // The one integer timestamp in the schema, deliberately not the
             // TEXT/datetime('now') convention the other `_at` columns use.
             ("updated_at", "INTEGER"),
@@ -2806,6 +2823,88 @@ mod tests {
         );
     }
 
+    fn open_at_v20() -> Database {
+        let db = open_at_v19();
+        db.conn.execute_batch(COLLAB_CHECKPOINTS_SQL).unwrap();
+        db
+    }
+
+    /// The upgrade path for migration 021, and the reason it is a separate
+    /// migration rather than an edit to 020: a database can already report
+    /// schema_version 20, and 020's `CREATE TABLE IF NOT EXISTS` would silently
+    /// skip such a database — leaving a table this code then queries a missing
+    /// column on. Every checkpoint read and write would fail at runtime.
+    ///
+    /// The pre-existing row must survive with a NULL verdict, which is what
+    /// makes "no verdict recorded" a real state rather than a theoretical one,
+    /// and why `CollabCheckpoint::attestation_verdict` renders NULL on an
+    /// operator row as unchecked.
+    #[test]
+    fn test_v20_to_v21_adds_attestation_check_and_preserves_legacy_checkpoints() {
+        let db = open_at_v20();
+        assert_eq!(schema_version_of(&db), 20);
+        assert!(
+            !column_exists(&db, "collab_checkpoints", "attestation_check"),
+            "attestation_check should not exist at v20"
+        );
+
+        db.conn
+            .execute(
+                "INSERT INTO collab_sessions (id, repo_path, branch)
+                 VALUES ('legacy-v20-session', '/repo', 'main')",
+                [],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO collab_checkpoints
+                     (session_id, status, head_sha, attested_by,
+                      acknowledged_divergence, updated_at)
+                 VALUES ('legacy-v20-session', 'started', 'aaa111', 'operator',
+                         'aaa000..aaa111', 1760000000)",
+                [],
+            )
+            .unwrap();
+
+        db.migrate().unwrap();
+        assert_eq!(schema_version_of(&db), LATEST_SCHEMA_VERSION);
+        assert!(column_exists(
+            &db,
+            "collab_checkpoints",
+            "attestation_check"
+        ));
+
+        let (survived, verdict): (i64, Option<String>) = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*), MAX(attestation_check) FROM collab_checkpoints
+                 WHERE session_id = 'legacy-v20-session'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            survived, 1,
+            "the pre-021 checkpoint must survive the upgrade"
+        );
+        assert_eq!(
+            verdict, None,
+            "a pre-021 operator attestation carries no verdict, and must read as \
+             unchecked rather than be back-filled with one the server never made"
+        );
+
+        // The vocabulary CHECK is live on the added column.
+        let bogus = db.conn.execute(
+            "UPDATE collab_checkpoints SET attestation_check = 'totally_fine'
+             WHERE session_id = 'legacy-v20-session'",
+            [],
+        );
+        assert!(
+            bogus.is_err(),
+            "migration 021's CHECK must reject a verdict outside the vocabulary"
+        );
+    }
+
     #[test]
     fn test_v19_to_v20_adds_collab_checkpoints_table_and_preserves_legacy_sessions() {
         let db = open_at_v19();
@@ -2825,7 +2924,7 @@ mod tests {
 
         db.migrate().unwrap();
         assert_eq!(schema_version_of(&db), LATEST_SCHEMA_VERSION);
-        assert_eq!(LATEST_SCHEMA_VERSION, 20);
+        assert_eq!(LATEST_SCHEMA_VERSION, 21);
         assert!(table_exists(&db, "collab_checkpoints"));
 
         // The pre-upgrade session must survive the migration intact.

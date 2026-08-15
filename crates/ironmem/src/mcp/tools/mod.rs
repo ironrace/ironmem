@@ -927,14 +927,26 @@ pub(crate) const MUTATING_TOOLS: &[&str] = &[
     "collab_resume",
     // Persists a row in `collab_checkpoints` on every call EXCEPT
     // `inspect_divergence`, which is read-only (Task 10). Classified as
-    // unconditionally mutating anyway: the alternative is a
-    // `ConditionalMutation` entry keyed on a caller-supplied boolean, which
-    // would let that boolean decide a read-only-mode authorization outcome for
-    // the one tool that can write `attested_by=operator`. The cost is that an
-    // operator cannot inspect in restricted mode; `collab_status` still shows
-    // them the checkpoint and its divergence there. NOT in
-    // `WRITE_SHAPED_TOOLS`: it needs no embedder, so it must not park on the
-    // readiness gate.
+    // unconditionally mutating anyway, and the reason is a cost/benefit call
+    // rather than a safety one: `CONDITIONALLY_MUTATING_TOOLS` is built for
+    // exactly this shape — `collab_recv`'s predicate is keyed on the
+    // caller-supplied `auto_ack`, with `mutating_witnesses`/`read_witnesses`
+    // pinning the predicate against the handler — so "a caller-supplied boolean
+    // decides it" is not itself an objection.
+    //
+    // What it costs to stay here, stated plainly: in restricted mode an
+    // operator can see the checkpoint and its divergence through
+    // `collab_status`, but NOT the commit listing with subjects — the half that
+    // is the difference between an informed override and a rubber stamp. That
+    // is a real gap. It is accepted for now because restricted mode is not the
+    // operator-recovery path (the attested write it exists to inform is itself
+    // a write, and impossible there), so an operator who can act on an
+    // inspection can already reach trusted mode. Move this into
+    // `CONDITIONALLY_MUTATING_TOOLS` if a read-only inspection surface is ever
+    // wanted on its own; the framework is ready for it.
+    //
+    // NOT in `WRITE_SHAPED_TOOLS`: it needs no embedder, so it must not park on
+    // the readiness gate.
     "collab_checkpoint",
     "session_handoff",
     "code_map_write",

@@ -119,6 +119,90 @@ impl FromStr for AttestedBy {
     }
 }
 
+/// What the server actually established about an operator attestation's
+/// `acknowledged_divergence`, resolved against the repository at write time.
+///
+/// **Three states, deliberately not two**, for the same reason
+/// `mcp::tools::collab_session::HeadCheck` has three: "the server checked this
+/// range and it holds" and "the server could not check" must never render as
+/// the same word. An attestation is a claim that a human inspected specific
+/// commits; a label that conflated a resolved range with an unresolved one
+/// would let the unresolved case inherit the resolved one's credibility.
+///
+/// There is no `NotApplicable` variant, and its absence is the point. "No
+/// verdict" is `Option::None` — an implementer row (no range to resolve) and a
+/// row written before migration 021 are both genuinely verdict-less, and a
+/// literal spelling would make them indistinguishable from a positive finding.
+/// [`CollabCheckpoint::attestation_verdict`] is the single place the fail-safe
+/// default for `None` on an *operator* row is stated.
+///
+/// The spellings are pinned to migration 021's `CHECK` list by
+/// `attestation_check_variants_match_migration_021`, exactly as
+/// [`CheckpointStatus`] and [`AttestedBy`] are pinned to 020's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttestationCheck {
+    /// Every rule ran and held: both endpoints resolve, the range ends at the
+    /// checkpoint's own `head_sha`, it covers at least one commit, `from` is an
+    /// ancestor of `to`, and it spans the gap left by the checkpoint it
+    /// replaced.
+    Verified,
+    /// The endpoint rules held, but **coverage of the gap was not
+    /// established** — the checkpoint being replaced is not behind this one in
+    /// a way that defines a gap to cover (its head no longer resolves, or it is
+    /// not an ancestor of this checkpoint's head). Both are branch-drift
+    /// shapes; the attestation is well-formed but nobody has checked that it
+    /// leaves no commits unaccounted for.
+    VerifiedWithoutSpan,
+    /// Live HEAD could not be read at all, so **only the range's syntax was
+    /// checked**. The write is accepted — a transient filesystem problem must
+    /// not make a legitimate attestation unwritable — and labelled as what it
+    /// is.
+    UnverifiedRepoUnreadable,
+}
+
+impl AttestationCheck {
+    /// The wire and storage spelling. Must appear verbatim in migration 021's
+    /// `attestation_check` CHECK list.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Verified => "verified",
+            Self::VerifiedWithoutSpan => "verified_without_span",
+            Self::UnverifiedRepoUnreadable => "unverified_repo_unreadable",
+        }
+    }
+}
+
+impl fmt::Display for AttestationCheck {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for AttestationCheck {
+    type Err = CheckpointError;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw {
+            "verified" => Ok(Self::Verified),
+            "verified_without_span" => Ok(Self::VerifiedWithoutSpan),
+            "unverified_repo_unreadable" => Ok(Self::UnverifiedRepoUnreadable),
+            other => Err(CheckpointError(format!(
+                "attestation_check must be one of verified|verified_without_span|\
+                 unverified_repo_unreadable, got {other:?}"
+            ))),
+        }
+    }
+}
+
+/// What a reader is told about an operator attestation whose verdict was never
+/// recorded — a row from before migration 021, or one a future write path
+/// forgot to stamp.
+///
+/// It reads as *unchecked*, never as absent, and that direction is the whole
+/// safety property: an unstamped operator attestation must not be mistaken for
+/// a verified one. See [`CollabCheckpoint::attestation_verdict`].
+pub const ATTESTATION_UNRECORDED: &str = "unrecorded";
+
 /// A checkpoint that failed validation. A newtype rather than a bare `String`
 /// so the MCP layer converts it once, at the boundary, into
 /// `MemoryError::Validation`.
@@ -186,6 +270,19 @@ pub struct CollabCheckpoint {
     /// checkpoint that has been through [`CollabCheckpoint::validate`], which
     /// is why that method exists and why every builder owes a call to it.
     pub acknowledged_divergence: Option<String>,
+    /// What the server established about `acknowledged_divergence` by resolving
+    /// it against the repository — see [`AttestationCheck`].
+    ///
+    /// Server-derived, never parsed from the payload, exactly like
+    /// `updated_at`: [`CollabCheckpoint::from_json`] leaves this `None` and the
+    /// MCP handler stamps it from its own git reads, so a caller cannot label
+    /// its own attestation `verified`.
+    ///
+    /// `None` means no verdict was recorded. Read it through
+    /// [`CollabCheckpoint::attestation_verdict`] rather than directly, so the
+    /// fail-safe default for an unstamped *operator* row is applied once rather
+    /// than at each of the three reader surfaces.
+    pub attestation_check: Option<AttestationCheck>,
     /// Unix seconds, server-stamped at write time rather than parsed from the
     /// payload. `0` means "not yet stamped": that is what
     /// [`CollabCheckpoint::from_json`] leaves here, and
@@ -212,7 +309,7 @@ impl CollabCheckpoint {
     /// checkpoint was presented as a current progress report.
     pub fn from_json(value: &Value) -> Result<Self, CheckpointError> {
         let checkpoint = Self {
-            session_id: require_str(value, "session_id")?,
+            session_id: parse_session_id(value)?,
             task_id: optional_task_id(value, "task_id")?,
             task_title: optional_string(value, "task_title")?,
             status: CheckpointStatus::from_str(&require_str(value, "status")?)?,
@@ -234,7 +331,10 @@ impl CollabCheckpoint {
                 AttestedBy::Implementer.as_str(),
             )?)?,
             acknowledged_divergence: optional_string(value, "acknowledged_divergence")?,
-            // Not read from the payload; see this function's doc comment.
+            // Neither of the two below is read from the payload; see this
+            // function's doc comment. A caller that could stamp its own
+            // `attestation_check` could label a fabricated range `verified`.
+            attestation_check: None,
             updated_at: 0,
         };
         checkpoint.validate()?;
@@ -334,24 +434,72 @@ impl CollabCheckpoint {
         }
 
         match (self.attested_by, self.acknowledged_divergence.as_deref()) {
-            (AttestedBy::Implementer, Some(_)) => Err(CheckpointError(
-                "acknowledged_divergence is only valid with attested_by=operator: an \
-                 implementer cannot self-attest over commits the protocol never witnessed"
-                    .to_string(),
-            )),
-            (AttestedBy::Operator, None) => Err(CheckpointError(
-                "attested_by=operator requires acknowledged_divergence naming the range \
-                 being vouched for, as <from_sha>..<to_sha>"
-                    .to_string(),
-            )),
+            (AttestedBy::Implementer, Some(_)) => {
+                return Err(CheckpointError(
+                    "acknowledged_divergence is only valid with attested_by=operator: an \
+                     implementer cannot self-attest over commits the protocol never witnessed"
+                        .to_string(),
+                ))
+            }
+            (AttestedBy::Operator, None) => {
+                return Err(CheckpointError(
+                    "attested_by=operator requires acknowledged_divergence naming the range \
+                     being vouched for, as <from_sha>..<to_sha>"
+                        .to_string(),
+                ))
+            }
             (AttestedBy::Operator, Some(range)) if is_blank(range) => {
-                Err(CheckpointError(format!(
+                return Err(CheckpointError(format!(
                     "attested_by=operator requires acknowledged_divergence naming the \
                      range being vouched for, as <from_sha>..<to_sha>: {range:?} names \
                      nothing, so the checkpoint claims a human vouched for no commits at all"
                 )))
             }
-            _ => Ok(()),
+            _ => {}
+        }
+
+        // The same one-directional rule, for the server's own verdict.
+        // Migration 021 cannot express it — SQLite's ALTER TABLE ADD COLUMN
+        // takes no table-level CHECK spanning two columns — so this is the only
+        // thing standing between a row and a claim it cannot have earned. An
+        // implementer checkpoint has no range to resolve, so a verdict on one
+        // describes a check that never happened, and every reader surface would
+        // render it beside `attested_by: implementer` as though the server had
+        // vouched for something.
+        if self.attested_by == AttestedBy::Implementer && self.attestation_check.is_some() {
+            return Err(CheckpointError(format!(
+                "attestation_check is only valid with attested_by=operator: an implementer \
+                 checkpoint names no range for the server to resolve, so {:?} describes a \
+                 check that never ran",
+                self.attestation_check.map(AttestationCheck::as_str)
+            )));
+        }
+        Ok(())
+    }
+
+    /// What a **reader** should be told about this row's attestation, or `None`
+    /// when the row makes no attestation claim at all.
+    ///
+    /// The one statement of the fail-safe default, so the three reader surfaces
+    /// (`collab_status`, `collab_resume`, the `session_handoff` block) cannot
+    /// drift apart on it: an operator attestation whose verdict was never
+    /// recorded reads as [`ATTESTATION_UNRECORDED`] — *unchecked* — never as
+    /// absent and never as verified.
+    ///
+    /// This exists because storing the verdict is only half the fix. The
+    /// argument for resolving the range at the write rather than at the
+    /// `implementation_done` gate is that otherwise a fabricated range sits in
+    /// the table while `session_handoff`, `collab_status` and `collab_resume`
+    /// render `attested_by: operator` to a human as though it meant something.
+    /// A verdict that reached the `wal_log` and nothing else would leave that
+    /// argument one step short of the readers it is written about.
+    pub fn attestation_verdict(&self) -> Option<&'static str> {
+        match self.attested_by {
+            AttestedBy::Implementer => None,
+            AttestedBy::Operator => Some(
+                self.attestation_check
+                    .map_or(ATTESTATION_UNRECORDED, AttestationCheck::as_str),
+            ),
         }
     }
 
@@ -453,6 +601,20 @@ fn require_str(value: &Value, field: &str) -> Result<String, CheckpointError> {
         })
 }
 
+/// Read the `session_id` a checkpoint tool call is about.
+///
+/// Exists so `collab_checkpoint`'s read-only `inspect_divergence` mode — which
+/// parses no checkpoint and so never reaches [`CollabCheckpoint::from_json`] —
+/// reads the key through the *same* rule the write path does, rather than
+/// through `mcp::tools::shared::require_str`, which neither trims nor rejects
+/// the [`ABSENT_SENTINEL`]. Two readings of one key in one tool is exactly the
+/// asymmetry `handle_collab_checkpoint`'s own comment argues against: a
+/// `" <id> "` transcribed out of a turn template would inspect one session and
+/// be looked up under another.
+pub(crate) fn parse_session_id(value: &Value) -> Result<String, CheckpointError> {
+    require_str(value, "session_id")
+}
+
 /// Read an optional string field.
 fn optional_string(value: &Value, field: &str) -> Result<Option<String>, CheckpointError> {
     Ok(optional_str(value, field)?.map(str::to_string))
@@ -546,6 +708,12 @@ mod tests {
     /// drift from the migration that actually ships.
     const MIGRATION_020: &str = include_str!("../../migrations/020_collab_checkpoints.sql");
 
+    /// Migration 021 owns the `attestation_check` vocabulary, on the same
+    /// terms: read at compile time so the lockstep test below cannot drift from
+    /// the migration that actually ships.
+    const MIGRATION_021: &str =
+        include_str!("../../migrations/021_checkpoint_attestation_check.sql");
+
     /// Every [`CheckpointStatus`] variant. The exhaustiveness guard in
     /// [`status_variants_match_migration_020`] is what keeps this list honest:
     /// adding a variant to the enum without adding it here stops that test
@@ -560,6 +728,14 @@ mod tests {
     /// Every [`AttestedBy`] variant. See [`ALL_STATUSES`] for why the list is
     /// spelled out rather than derived.
     const ALL_ATTESTATIONS: &[AttestedBy] = &[AttestedBy::Implementer, AttestedBy::Operator];
+
+    /// Every [`AttestationCheck`] variant. See [`ALL_STATUSES`] for why the
+    /// list is spelled out rather than derived.
+    const ALL_ATTESTATION_CHECKS: &[AttestationCheck] = &[
+        AttestationCheck::Verified,
+        AttestationCheck::VerifiedWithoutSpan,
+        AttestationCheck::UnverifiedRepoUnreadable,
+    ];
 
     /// Pull the quoted literals out of `CHECK (<column> IN ('a', 'b'))` in the
     /// migration source. Deliberately a dumb textual scan rather than a SQL
@@ -937,6 +1113,7 @@ mod tests {
             summary: Some("Batch complete".to_string()),
             attested_by: AttestedBy::Operator,
             acknowledged_divergence: None,
+            attestation_check: None,
             updated_at: 1_760_000_000,
         };
 
@@ -1104,6 +1281,107 @@ mod tests {
                 "migration 020 permits status {value:?}, which CheckpointStatus cannot parse"
             );
         }
+    }
+
+    /// The `attestation_check` half, against migration 021. Same reasoning as
+    /// [`status_variants_match_migration_020`]: the enum and the SQL CHECK are
+    /// two independent statements of one vocabulary, and a variant added to
+    /// only one of them fails as a constraint violation on a live session at
+    /// the moment an operator files an attestation.
+    #[test]
+    fn attestation_check_variants_match_migration_021() {
+        let sql_values: Vec<String> = {
+            let needle = "attestation_check IN (";
+            let start = MIGRATION_021
+                .rfind(needle)
+                .expect("migration 021 must CHECK the attestation_check vocabulary")
+                + needle.len();
+            let end = start
+                + MIGRATION_021[start..]
+                    .find(')')
+                    .expect("unterminated attestation_check IN ( in migration 021");
+            MIGRATION_021[start..end]
+                .split(',')
+                .map(|piece| piece.trim().trim_matches('\'').to_string())
+                .collect()
+        };
+
+        for check in ALL_ATTESTATION_CHECKS {
+            // Exhaustiveness guard: a new variant stops this match compiling.
+            match check {
+                AttestationCheck::Verified
+                | AttestationCheck::VerifiedWithoutSpan
+                | AttestationCheck::UnverifiedRepoUnreadable => {}
+            }
+            assert!(
+                sql_values.iter().any(|v| v == check.as_str()),
+                "AttestationCheck::{check:?} serializes to {:?}, which migration 021's \
+                 CHECK list {sql_values:?} would reject",
+                check.as_str()
+            );
+        }
+
+        for value in &sql_values {
+            assert!(
+                value.parse::<AttestationCheck>().is_ok(),
+                "migration 021 permits attestation_check {value:?}, which AttestationCheck \
+                 cannot parse"
+            );
+        }
+    }
+
+    /// The verdict is server-derived, exactly like `updated_at`. A caller that
+    /// could stamp its own would label a fabricated range `verified` on all
+    /// three reader surfaces at once — the single most valuable field to forge
+    /// in this whole type.
+    #[test]
+    fn attestation_check_is_never_read_from_the_payload() {
+        let mut v = valid();
+        v["attested_by"] = json!("operator");
+        v["acknowledged_divergence"] = json!("b9c2ce0..75a4ea3");
+        v["attestation_check"] = json!("verified");
+        assert_eq!(
+            CollabCheckpoint::from_json(&v).unwrap().attestation_check,
+            None
+        );
+    }
+
+    /// The mirror of the `acknowledged_divergence` rule, for the server's own
+    /// finding: an implementer checkpoint names no range to resolve, so a
+    /// verdict on one describes a check that never ran. Migration 021 cannot
+    /// express this (ALTER TABLE ADD COLUMN takes no two-column CHECK), so
+    /// `validate` is the only thing enforcing it.
+    #[test]
+    fn validate_catches_an_attestation_check_on_an_implementer_row() {
+        let mut cp = CollabCheckpoint::from_json(&valid()).unwrap();
+        cp.attestation_check = Some(AttestationCheck::Verified);
+        let err = cp.validate().unwrap_err();
+        assert!(err.to_string().contains("attestation_check"), "got: {err}");
+    }
+
+    /// What every reader surface is told, and the fail-safe that matters: an
+    /// operator attestation carrying no stored verdict reads as *unchecked*,
+    /// never as absent and never as verified. Pre-021 rows and any future write
+    /// path that forgets to stamp both land here.
+    #[test]
+    fn an_unstamped_operator_attestation_reads_as_unchecked() {
+        let mut cp = CollabCheckpoint::from_json(&valid()).unwrap();
+        assert_eq!(
+            cp.attestation_verdict(),
+            None,
+            "an implementer row makes no attestation claim at all"
+        );
+
+        cp.attested_by = AttestedBy::Operator;
+        cp.acknowledged_divergence = Some("b9c2ce0..75a4ea3".to_string());
+        cp.attestation_check = None;
+        assert_eq!(cp.attestation_verdict(), Some(ATTESTATION_UNRECORDED));
+        assert_ne!(cp.attestation_verdict(), Some("verified"));
+
+        cp.attestation_check = Some(AttestationCheck::UnverifiedRepoUnreadable);
+        assert_eq!(cp.attestation_verdict(), Some("unverified_repo_unreadable"));
+        cp.attestation_check = Some(AttestationCheck::Verified);
+        assert_eq!(cp.attestation_verdict(), Some("verified"));
     }
 
     /// The `attested_by` half of the same lockstep contract. See

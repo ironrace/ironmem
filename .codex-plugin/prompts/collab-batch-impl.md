@@ -81,45 +81,53 @@ gate.
 
 ## Checkpoints
 
-Before implementation, fetch the one logical-keyed current drawer
-deterministically with `get_drawer(wing=ironrace-memory,
-room=collab-checkpoints, logical_key=collab-checkpoint:<session_id>)`. Use that
-checkpoint plus git history to resume the first unfinished or interrupted task
-and verify already-completed criteria.
-If a `batch_complete` checkpoint proves clean pushed HEAD, matching gate SHA,
-passing gate result, and the exact current gate commands, reuse it and send
-`implementation_done` without rerunning work.
+Before implementation, read the current checkpoint from `collab_status`'s
+`checkpoint` block (a `collab_checkpoints` row, not a drawer). If it reports
+`diverged: true`, or `diverged: null` (unreadable is not "no divergence"), do
+NOT resume on that progress claim: inspect first with
+`collab_checkpoint(session_id=<session id>, agent="codex",
+inspect_divergence=true)`, which lists the commits that landed after it
+without writing anything, then either file an accurate checkpoint at the
+current HEAD or escalate for an operator-attested backfill per
+`docs/COLLAB.md`. Otherwise use that checkpoint plus git history to resume
+the first unfinished or interrupted task and verify already-completed
+criteria. If a `batch_complete` checkpoint proves clean pushed HEAD, matching
+gate SHA, passing gate result, and the exact current gate commands, reuse it
+and send `implementation_done` without rerunning work.
 
-Write durable drawers in that wing/room before each task (`started`), after
-each task has been implemented, reviewed, committed, and pushed (`completed`),
-before an unrecoverable failure (`blocked`), and after final gates
-(`batch_complete`). Each write uses
-`logical_key: collab-checkpoint:<session_id>`, replacing the one logical-keyed
-current drawer while preserving cumulative `completed_task_ids`. Each drawer
-contains:
+Write a checkpoint with `collab_checkpoint(session_id=<session id>,
+agent="codex", ...)` before each task (`status="started"`), after each task
+has been implemented, reviewed, committed, and pushed (`status="completed"`),
+before an unrecoverable failure (`status="blocked"`), and after final gates
+(`status="batch_complete"`). Each write **replaces** the session's one
+current checkpoint row — carry the full cumulative `completed_task_ids`
+forward on every write, or the replacement loses tasks an earlier write
+already reported done. `head_sha` must be the full 40-char HEAD: the
+divergence check is exact string equality, so an abbreviated sha reads as
+permanent drift. Named args for each write:
 
 ```text
-collab_checkpoint
 session_id: <session id>
-phase: CodeImplementPending
-implementer: codex
-repo_path: <session repository>
-branch: <session branch>
-plan_file_path: <approved plan path>
+agent: codex
 task_id: <N|none>
 task_title: <title|none>
 status: <started|completed|blocked|batch_complete>
-head_sha: <current HEAD>
+head_sha: <current HEAD, full 40 chars>
 commit_sha: <task commit|none>
-completed_task_ids: <comma-separated ids>
+completed_task_ids: <comma-separated ids, cumulative>
 next_task_id: <N|none>
-gates: <not_run|passed|failed: reason>
 gates_sha: <HEAD|none>
 gates_commands: <exact commands joined by &&|none>
 gates_result: <not_run|passed|failed: reason>
 summary: <one concise sentence>
-resume_hint: /collab join <session id>
 ```
+
+The **final `batch_complete` checkpoint must be written before**
+`implementation_done` is sent, at the exact `head_sha` about to be reported,
+with `completed_task_ids` covering every task and `gates_result=passed` at
+`gates_sha == head_sha`. Without it, `implementation_done` is refused with a
+`checkpoint_drift:` error naming the exact remedy call — the phase stays at
+`CodeImplementPending` with nothing sent.
 
 ## Mechanical-direct execution
 
@@ -155,11 +163,11 @@ JSON string containing only `{"head_sha":"<current HEAD>"}`. It advances to
 Codex's separate global-review turn. Exit after a successful send.
 
 All v3 payloads are JSON strings. A detailed `git_commit_failed:`,
-`git_push_failed:`, `sandbox_denied:`, `disk_full:`, `network_failed:`, or
-`codex_dispatch_failed:` report is recoverable; leave its working tree intact
-for the counterpart. Bare prefixes, `branch_drift:`, a subagent failure, or
-any other failure is terminal. On a send error, refresh status and correct the
-content rather than changing the topic.
+`git_push_failed:`, `sandbox_denied:`, `disk_full:`, `network_failed:`,
+`codex_dispatch_failed:`, or `checkpoint_drift:` report is recoverable; leave
+its working tree intact for the counterpart. Bare prefixes, `branch_drift:`,
+a subagent failure, or any other failure is terminal. On a send error,
+refresh status and correct the content rather than changing the topic.
 
 ## Invocation
 
