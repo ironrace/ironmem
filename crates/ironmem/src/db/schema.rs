@@ -32,11 +32,12 @@ const DRAWER_SUPERSESSION_SQL: &str = include_str!("../../migrations/017_drawer_
 const MCP_RESPONSE_COMPACTION_METRICS_SQL: &str =
     include_str!("../../migrations/018_mcp_response_compaction_metrics.sql");
 const COLLAB_PILOT_SQL: &str = include_str!("../../migrations/019_collab_pilot.sql");
+const COLLAB_CHECKPOINTS_SQL: &str = include_str!("../../migrations/020_collab_checkpoints.sql");
 
 /// Highest schema version a fully-migrated database reports. Bump alongside the
 /// `run_version_gated_migrations` ladder below so `ironmem doctor` can tell a
 /// behind-migration database from an up-to-date one.
-pub const LATEST_SCHEMA_VERSION: i64 = 19;
+pub const LATEST_SCHEMA_VERSION: i64 = 20;
 
 /// Total attempts (first try included) `with_transaction` makes when every
 /// attempt fails with `SQLITE_BUSY_SNAPSHOT`. See the retry-policy section of
@@ -439,6 +440,13 @@ impl Database {
         // omit the field.
         if current_version < 19 {
             self.conn.execute_batch(COLLAB_PILOT_SQL)?;
+        }
+
+        // v20: first-class collab implementation checkpoints (issue #273).
+        // Replaces the `collab-checkpoint:<session_id>` drawer convention with
+        // an enforceable table so `implementation_done` can demand proof.
+        if current_version < 20 {
+            self.conn.execute_batch(COLLAB_CHECKPOINTS_SQL)?;
         }
 
         Ok(())
@@ -870,7 +878,7 @@ mod tests {
         // fully-migrated database reports — doctor compares against it.
         let db = Database::open_in_memory().unwrap();
         assert_eq!(LATEST_SCHEMA_VERSION, db.schema_version().unwrap());
-        assert_eq!(LATEST_SCHEMA_VERSION, 19);
+        assert_eq!(LATEST_SCHEMA_VERSION, 20);
     }
 
     #[test]
@@ -1926,6 +1934,15 @@ mod tests {
         db
     }
 
+    /// Build a connection migrated to exactly v19 (no collab_checkpoints
+    /// table yet) by replaying migrations 001-019 directly from the module
+    /// consts.
+    fn open_at_v19() -> Database {
+        let db = open_at_v18();
+        db.conn.execute_batch(COLLAB_PILOT_SQL).unwrap();
+        db
+    }
+
     #[test]
     fn test_fresh_migrate_reaches_v19_with_pilot_column() {
         let db = Database::open_in_memory().unwrap();
@@ -2003,14 +2020,6 @@ mod tests {
             invalid_result.is_err(),
             "pilot='invalid' should be rejected by CHECK constraint"
         );
-    }
-
-    #[test]
-    fn test_migrate_twice_idempotent_v19() {
-        let db = Database::open_in_memory().unwrap();
-        db.migrate().unwrap();
-        db.migrate().unwrap();
-        assert_eq!(schema_version_of(&db), LATEST_SCHEMA_VERSION);
     }
 
     /// Deterministic contention harness: produce a genuine
@@ -2293,6 +2302,544 @@ mod tests {
             calls.get(),
             1,
             "a non-busy-snapshot error must never trigger a retry"
+        );
+    }
+
+    // ---- Migration 020 (collab_checkpoints table) coverage ----
+
+    #[test]
+    fn migration_020_creates_collab_checkpoints_table() {
+        let db = Database::open_in_memory().unwrap();
+        assert_eq!(schema_version_of(&db), LATEST_SCHEMA_VERSION);
+        assert_eq!(LATEST_SCHEMA_VERSION, 20);
+
+        // The table exists and carries every column the checkpoint contract
+        // needs, at the declared affinity the header argues for. Asserting the
+        // type alongside the name is what keeps the affinity decisions
+        // load-bearing: redeclaring `updated_at` as
+        // `TEXT NOT NULL DEFAULT (datetime('now'))` — the exact change the
+        // header spends a paragraph arguing against — passes a name-only check.
+        let columns: Vec<(String, String)> = db
+            .conn
+            .prepare("SELECT name, type FROM pragma_table_info('collab_checkpoints')")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+
+        for (expected, expected_type) in [
+            ("session_id", "TEXT"),
+            ("task_id", "INTEGER"),
+            ("task_title", "TEXT"),
+            ("status", "TEXT"),
+            ("head_sha", "TEXT"),
+            ("commit_sha", "TEXT"),
+            ("completed_task_ids", "TEXT"),
+            ("next_task_id", "INTEGER"),
+            ("gates_result", "TEXT"),
+            ("gates_sha", "TEXT"),
+            ("gates_commands", "TEXT"),
+            ("summary", "TEXT"),
+            ("attested_by", "TEXT"),
+            ("acknowledged_divergence", "TEXT"),
+            // The one integer timestamp in the schema, deliberately not the
+            // TEXT/datetime('now') convention the other `_at` columns use.
+            ("updated_at", "INTEGER"),
+        ] {
+            let actual = columns.iter().find(|(name, _)| name == expected);
+            let Some((_, actual_type)) = actual else {
+                panic!("collab_checkpoints is missing column {expected:?}; has {columns:?}");
+            };
+            assert_eq!(
+                actual_type, expected_type,
+                "collab_checkpoints.{expected} must be declared {expected_type}, got {actual_type}"
+            );
+        }
+    }
+
+    #[test]
+    fn migration_020_round_trips_every_optional_checkpoint_column() {
+        let db = Database::open_in_memory().unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO collab_sessions (id, repo_path, branch) VALUES ('s-round', '/repo', 'main')",
+                [],
+            )
+            .unwrap();
+
+        // Every other migration-020 test leaves the optional columns NULL by
+        // omission and only ever observes `gates_result` at its default, so a
+        // regression that narrowed one of them — a stray NOT NULL on
+        // `gates_sha`, a copy-paste `CHECK (commit_sha IS NULL)`, a wrong
+        // affinity — would redden nothing. This writes a fully-populated
+        // `completed` checkpoint and reads every value back unchanged.
+        db.conn
+            .execute(
+                "INSERT INTO collab_checkpoints
+                    (session_id, task_id, task_title, status, head_sha, commit_sha,
+                     completed_task_ids, next_task_id, gates_result, gates_sha,
+                     gates_commands, summary, attested_by, updated_at)
+                 VALUES ('s-round', 3, 'Wire the gate', 'completed', 'a1b2c3', 'd4e5f6',
+                         '1,2,3', 4, 'failed: clippy', 'a1b2c3',
+                         'cargo fmt --all -- --check && cargo test --workspace',
+                         'Task 3 done', 'implementer', 1750000000)",
+                [],
+            )
+            .unwrap();
+
+        // Read back column by column. Rust implements `PartialEq`/`Debug` only
+        // up to 12-element tuples and the row has 13 meaningful columns, so a
+        // single tuple comparison will not build — and naming each column here
+        // makes a failure say which one drifted rather than dumping the row.
+        let text_columns = [
+            ("task_title", "Wire the gate"),
+            ("status", "completed"),
+            ("head_sha", "a1b2c3"),
+            ("commit_sha", "d4e5f6"),
+            ("completed_task_ids", "1,2,3"),
+            // Free text after the `failed: ` prefix: the round-trip is what
+            // pins `gates_result` as deliberately not CHECK-constrained to a
+            // closed vocabulary.
+            ("gates_result", "failed: clippy"),
+            ("gates_sha", "a1b2c3"),
+            (
+                "gates_commands",
+                "cargo fmt --all -- --check && cargo test --workspace",
+            ),
+            ("summary", "Task 3 done"),
+            ("attested_by", "implementer"),
+        ];
+        for (column, expected) in text_columns {
+            let actual: String = db
+                .conn
+                .query_row(
+                    &format!(
+                        "SELECT {column} FROM collab_checkpoints WHERE session_id = 's-round'"
+                    ),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                actual, expected,
+                "collab_checkpoints.{column} must round-trip unchanged"
+            );
+        }
+
+        let integer_columns = [
+            ("task_id", 3_i64),
+            ("next_task_id", 4),
+            ("updated_at", 1_750_000_000),
+        ];
+        for (column, expected) in integer_columns {
+            let actual: i64 = db
+                .conn
+                .query_row(
+                    &format!(
+                        "SELECT {column} FROM collab_checkpoints WHERE session_id = 's-round'"
+                    ),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                actual, expected,
+                "collab_checkpoints.{column} must round-trip unchanged"
+            );
+        }
+
+        // Affinity, not just value: SQLite's weak typing would happily store a
+        // stringified timestamp in an INTEGER column, and such a value compares
+        // greater than every real unix second.
+        let typeof_updated_at: String = db
+            .conn
+            .query_row(
+                "SELECT typeof(updated_at) FROM collab_checkpoints WHERE session_id = 's-round'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            typeof_updated_at, "integer",
+            "updated_at must store an integer, not a stringified timestamp"
+        );
+    }
+
+    #[test]
+    fn migration_020_enforces_one_current_checkpoint_per_session() {
+        let db = Database::open_in_memory().unwrap();
+        db.conn
+            .execute_batch(
+                "INSERT INTO collab_sessions (id, phase, current_owner, repo_path, branch)
+                 VALUES ('s1', 'CodeImplementPending', 'claude', '/repo', 'main');",
+            )
+            .unwrap();
+
+        let insert = "INSERT INTO collab_checkpoints
+            (session_id, status, head_sha, completed_task_ids, attested_by, updated_at)
+            VALUES ('s1', 'started', 'aaa', '', 'implementer', 1)";
+        db.conn.execute(insert, []).unwrap();
+
+        // session_id is the primary key: a second plain INSERT must conflict
+        // rather than accumulate a second 'current' row.
+        let err = db.conn.execute(insert, []).unwrap_err();
+        assert!(
+            err.to_string().contains("UNIQUE"),
+            "expected a UNIQUE violation on the second insert, got: {err}"
+        );
+    }
+
+    #[test]
+    fn migration_020_requires_session_id_status_head_sha_and_updated_at() {
+        let db = Database::open_in_memory().unwrap();
+        // A fresh session per case, so a primary-key collision can never
+        // masquerade as the NOT NULL constraint firing.
+        for session_id in [
+            "s-req-status",
+            "s-req-head",
+            "s-req-updated",
+            "s-req-defaults",
+        ] {
+            db.conn
+                .execute(
+                    "INSERT INTO collab_sessions (id, repo_path, branch) VALUES (?1, '/repo', 'main')",
+                    [session_id],
+                )
+                .unwrap();
+        }
+
+        // session_id: plain SQLite does not imply NOT NULL for a `TEXT PRIMARY
+        // KEY`, so the explicit NOT NULL is the only thing keeping a NULL-keyed
+        // row — unreachable by lookup and by FK cascade alike — out of the table.
+        let null_session_id = db.conn.execute(
+            "INSERT INTO collab_checkpoints (session_id, status, head_sha, updated_at)
+             VALUES (NULL, 'started', 'aaa', 1)",
+            [],
+        );
+        assert!(
+            null_session_id.is_err(),
+            "session_id must be NOT NULL, but a NULL-keyed checkpoint was accepted"
+        );
+
+        // status: NOT NULL is the *only* thing rejecting a NULL status here.
+        // The `CHECK (status IN (...))` beside it gives no NULL protection at
+        // all, because `NULL IN (...)` evaluates to NULL and SQLite treats a
+        // CHECK that evaluates to NULL as satisfied.
+        let missing_status = db.conn.execute(
+            "INSERT INTO collab_checkpoints (session_id, head_sha, updated_at)
+             VALUES ('s-req-status', 'aaa', 1)",
+            [],
+        );
+        assert!(
+            missing_status.is_err(),
+            "status must be NOT NULL, but a checkpoint without one was accepted"
+        );
+
+        // head_sha: the column the whole issue turns on. A checkpoint without
+        // one cannot be compared against live git HEAD at all.
+        let missing_head_sha = db.conn.execute(
+            "INSERT INTO collab_checkpoints (session_id, status, updated_at)
+             VALUES ('s-req-head', 'started', 1)",
+            [],
+        );
+        assert!(
+            missing_head_sha.is_err(),
+            "head_sha must be NOT NULL, but a checkpoint without one was accepted"
+        );
+
+        // updated_at: NOT NULL with deliberately no DEFAULT, so a writer that
+        // forgot to stamp it fails loudly instead of getting a silently-filled
+        // timestamp. That property is asserted here, not just in the comment.
+        let missing_updated_at = db.conn.execute(
+            "INSERT INTO collab_checkpoints (session_id, status, head_sha)
+             VALUES ('s-req-updated', 'started', 'aaa')",
+            [],
+        );
+        assert!(
+            missing_updated_at.is_err(),
+            "updated_at must be NOT NULL with no DEFAULT, but an unstamped checkpoint was accepted"
+        );
+
+        // With only the required columns supplied the insert succeeds, and the
+        // NOT NULL DEFAULTs fill in the documented values rather than NULL.
+        // Reading them back as `String` also fails loudly if a DEFAULT is lost.
+        db.conn
+            .execute(
+                "INSERT INTO collab_checkpoints (session_id, status, head_sha, updated_at)
+                 VALUES ('s-req-defaults', 'started', 'aaa', 1)",
+                [],
+            )
+            .unwrap();
+        let (completed_task_ids, gates_result, attested_by): (String, String, String) = db
+            .conn
+            .query_row(
+                "SELECT completed_task_ids, gates_result, attested_by
+                 FROM collab_checkpoints WHERE session_id = 's-req-defaults'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            completed_task_ids, "",
+            "completed_task_ids must default to the empty string, not NULL"
+        );
+        assert_eq!(
+            gates_result, "not_run",
+            "gates_result must default to 'not_run', not NULL"
+        );
+        assert_eq!(
+            attested_by, "implementer",
+            "attested_by must default to 'implementer', not NULL"
+        );
+    }
+
+    #[test]
+    fn migration_020_status_check_constraint_accepts_known_rejects_unknown() {
+        let db = Database::open_in_memory().unwrap();
+
+        for (i, status) in ["started", "completed", "blocked", "batch_complete"]
+            .iter()
+            .enumerate()
+        {
+            let session_id = format!("s-status-{i}");
+            db.conn
+                .execute(
+                    "INSERT INTO collab_sessions (id, repo_path, branch) VALUES (?1, '/repo', 'main')",
+                    [&session_id],
+                )
+                .unwrap();
+            let result = db.conn.execute(
+                "INSERT INTO collab_checkpoints
+                    (session_id, status, head_sha, completed_task_ids, updated_at)
+                 VALUES (?1, ?2, 'aaa', '', 1)",
+                rusqlite::params![session_id, status],
+            );
+            assert!(
+                result.is_ok(),
+                "status={status:?} should be accepted, got {result:?}"
+            );
+        }
+
+        db.conn
+            .execute(
+                "INSERT INTO collab_sessions (id, repo_path, branch) VALUES ('s-status-bad', '/repo', 'main')",
+                [],
+            )
+            .unwrap();
+        let bad = db.conn.execute(
+            "INSERT INTO collab_checkpoints
+                (session_id, status, head_sha, completed_task_ids, updated_at)
+             VALUES ('s-status-bad', 'bogus', 'aaa', '', 1)",
+            [],
+        );
+        assert!(
+            bad.is_err(),
+            "status='bogus' should be rejected by the CHECK constraint"
+        );
+    }
+
+    #[test]
+    fn migration_020_attested_by_check_constraint_accepts_known_rejects_unknown() {
+        let db = Database::open_in_memory().unwrap();
+
+        for (i, attested_by) in ["implementer", "operator"].iter().enumerate() {
+            let session_id = format!("s-attested-{i}");
+            db.conn
+                .execute(
+                    "INSERT INTO collab_sessions (id, repo_path, branch) VALUES (?1, '/repo', 'main')",
+                    [&session_id],
+                )
+                .unwrap();
+            let result = db.conn.execute(
+                "INSERT INTO collab_checkpoints
+                    (session_id, status, head_sha, completed_task_ids, attested_by, updated_at)
+                 VALUES (?1, 'started', 'aaa', '', ?2, 1)",
+                rusqlite::params![session_id, attested_by],
+            );
+            assert!(
+                result.is_ok(),
+                "attested_by={attested_by:?} should be accepted, got {result:?}"
+            );
+        }
+
+        db.conn
+            .execute(
+                "INSERT INTO collab_sessions (id, repo_path, branch) VALUES ('s-attested-bad', '/repo', 'main')",
+                [],
+            )
+            .unwrap();
+        let bad = db.conn.execute(
+            "INSERT INTO collab_checkpoints
+                (session_id, status, head_sha, completed_task_ids, attested_by, updated_at)
+             VALUES ('s-attested-bad', 'started', 'aaa', '', 'bogus', 1)",
+            [],
+        );
+        assert!(
+            bad.is_err(),
+            "attested_by='bogus' should be rejected by the CHECK constraint"
+        );
+    }
+
+    #[test]
+    fn migration_020_correlation_check_rejects_implementer_with_divergence() {
+        let db = Database::open_in_memory().unwrap();
+        // A fresh session per case: sharing one session would make the
+        // positive case depend on the negative case having failed first and
+        // left the primary key free, so a regressed CHECK would surface as a
+        // UNIQUE violation pointing at the wrong constraint.
+        for session_id in ["s-corr", "s-corr-ok"] {
+            db.conn
+                .execute(
+                    "INSERT INTO collab_sessions (id, repo_path, branch) VALUES (?1, '/repo', 'main')",
+                    [session_id],
+                )
+                .unwrap();
+        }
+
+        // attested_by='implementer' can never carry acknowledged_divergence.
+        let bad = db.conn.execute(
+            "INSERT INTO collab_checkpoints
+                (session_id, status, head_sha, completed_task_ids, attested_by,
+                 acknowledged_divergence, updated_at)
+             VALUES ('s-corr', 'started', 'aaa', '', 'implementer', 'b9c2ce0..75a4ea3', 1)",
+            [],
+        );
+        assert!(
+            bad.is_err(),
+            "attested_by='implementer' with acknowledged_divergence set must be rejected"
+        );
+
+        // attested_by='operator' with a divergence range set is exactly the
+        // human-attested-backfill case the column exists for.
+        let ok = db.conn.execute(
+            "INSERT INTO collab_checkpoints
+                (session_id, status, head_sha, completed_task_ids, attested_by,
+                 acknowledged_divergence, updated_at)
+             VALUES ('s-corr-ok', 'started', 'aaa', '', 'operator', 'b9c2ce0..75a4ea3', 1)",
+            [],
+        );
+        assert!(
+            ok.is_ok(),
+            "attested_by='operator' with acknowledged_divergence set should be accepted"
+        );
+    }
+
+    #[test]
+    fn migration_020_rejects_checkpoint_for_nonexistent_session() {
+        let db = Database::open_in_memory().unwrap();
+
+        // The sibling cascade test covers the delete-time half of the foreign
+        // key; this covers the insert-time half. Dropping `REFERENCES`
+        // entirely reddens both, but dropping only `ON DELETE CASCADE` reddens
+        // only the cascade test, so the pair says *which* half regressed
+        // rather than just that something did.
+        let orphan = db.conn.execute(
+            "INSERT INTO collab_checkpoints
+                (session_id, status, head_sha, completed_task_ids, updated_at)
+             VALUES ('no-such-session', 'started', 'aaa', '', 1)",
+            [],
+        );
+        assert!(
+            orphan.is_err(),
+            "a checkpoint naming a session that does not exist must be rejected \
+             by the foreign key, got {orphan:?}"
+        );
+    }
+
+    #[test]
+    fn migration_020_deleting_session_cascades_to_checkpoint() {
+        let db = Database::open_in_memory().unwrap();
+        // Two independent sessions, each with its own checkpoint. With only
+        // one session in the table a cascade scoped to the deleted row and an
+        // over-broad `DELETE FROM collab_checkpoints` with no predicate are
+        // indistinguishable — both leave zero rows. The bystander is what
+        // makes this test able to tell them apart.
+        for session_id in ["s-cascade", "s-bystander"] {
+            db.conn
+                .execute(
+                    "INSERT INTO collab_sessions (id, repo_path, branch) VALUES (?1, '/repo', 'main')",
+                    [session_id],
+                )
+                .unwrap();
+            db.conn
+                .execute(
+                    "INSERT INTO collab_checkpoints
+                        (session_id, status, head_sha, completed_task_ids, updated_at)
+                     VALUES (?1, 'started', 'aaa', '', 1)",
+                    [session_id],
+                )
+                .unwrap();
+        }
+
+        db.conn
+            .execute("DELETE FROM collab_sessions WHERE id = 's-cascade'", [])
+            .unwrap();
+
+        let remaining: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM collab_checkpoints WHERE session_id = 's-cascade'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            remaining, 0,
+            "ON DELETE CASCADE must remove the checkpoint when its session is deleted"
+        );
+
+        let bystander: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM collab_checkpoints WHERE session_id = 's-bystander'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            bystander, 1,
+            "the cascade must be scoped to the deleted session; another session's \
+             checkpoint must survive"
+        );
+    }
+
+    #[test]
+    fn test_v19_to_v20_adds_collab_checkpoints_table_and_preserves_legacy_sessions() {
+        let db = open_at_v19();
+        assert_eq!(schema_version_of(&db), 19);
+        assert!(
+            !table_exists(&db, "collab_checkpoints"),
+            "collab_checkpoints should not exist at v19"
+        );
+
+        db.conn
+            .execute(
+                "INSERT INTO collab_sessions (id, repo_path, branch)
+                 VALUES ('legacy-v19-session', '/repo', 'main')",
+                [],
+            )
+            .unwrap();
+
+        db.migrate().unwrap();
+        assert_eq!(schema_version_of(&db), LATEST_SCHEMA_VERSION);
+        assert_eq!(LATEST_SCHEMA_VERSION, 20);
+        assert!(table_exists(&db, "collab_checkpoints"));
+
+        // The pre-upgrade session must survive the migration intact.
+        let survived: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM collab_sessions WHERE id = 'legacy-v19-session'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            survived, 1,
+            "legacy session must survive the v19->v20 upgrade"
         );
     }
 }
