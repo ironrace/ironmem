@@ -210,9 +210,18 @@ pub(super) fn parse_task_list_event(content: &str) -> Result<CollabEvent, Memory
             "task_list content must be JSON shaped like {{\"plan_hash\":\"…\",\"base_sha\":\"…\",\"head_sha\":\"…\",\"plan_file_path\":\"docs/…\",\"tasks\":[{{\"id\":1,\"title\":\"…\",\"acceptance\":[\"…\"]}}]}} (parse error: {e})"
         ))
     })?;
+    // All three trimmed before the emptiness check, for the reason
+    // `extract_required_str` records: they are transcribed out of a turn
+    // template, and `head_sha` in particular is stored as the session's
+    // `last_head_sha`, which `validate_global_review_head_advance` re-checks
+    // against `is_hex_sha` on every later advance. A padded sha fails that
+    // shape guard, so every subsequent turn in the session would be refused
+    // with a Terminal `branch_drift:` naming a commit that is in fact on the
+    // branch — and terminal means there is no recovery from it.
     let plan_hash = payload
         .get("plan_hash")
         .and_then(Value::as_str)
+        .map(str::trim)
         .filter(|v| !v.is_empty())
         .ok_or_else(|| {
             MemoryError::Validation("task_list missing non-empty plan_hash".to_string())
@@ -221,12 +230,14 @@ pub(super) fn parse_task_list_event(content: &str) -> Result<CollabEvent, Memory
     let base_sha = payload
         .get("base_sha")
         .and_then(Value::as_str)
+        .map(str::trim)
         .filter(|v| !v.is_empty())
         .ok_or_else(|| MemoryError::Validation("task_list missing non-empty base_sha".to_string()))?
         .to_string();
     let head_sha = payload
         .get("head_sha")
         .and_then(Value::as_str)
+        .map(str::trim)
         .filter(|v| !v.is_empty())
         .ok_or_else(|| MemoryError::Validation("task_list missing non-empty head_sha".to_string()))?
         .to_string();
@@ -253,6 +264,17 @@ pub(super) fn parse_required_head_sha(content: &str, topic: &str) -> Result<Stri
 
 /// Pull a non-empty string field out of a parsed JSON payload with a uniform
 /// validation error.
+///
+/// Trimmed before the emptiness check, which makes a whitespace-only value a
+/// rejection rather than a stored blank. The trim also has to match
+/// `checkpoint::optional_str`, the other route by which a `head_sha` reaches
+/// the server: these values arrive transcribed out of a turn template, so a
+/// trailing space is a normal transcription slip, and `require_checkpoint_proof`
+/// compares the checkpoint's `head_sha` against this one with raw string
+/// equality. Trimming on only one of the two paths would make `"abc123 "` and
+/// `"abc123"` — the same commit, filed twice by the same agent — refuse each
+/// other, and the refusal's paste-ready remedy would carry the padded value
+/// straight back into the next attempt.
 pub(super) fn extract_required_str(
     payload: &Value,
     field: &str,
@@ -261,6 +283,7 @@ pub(super) fn extract_required_str(
     payload
         .get(field)
         .and_then(Value::as_str)
+        .map(str::trim)
         .filter(|v| !v.is_empty())
         .map(str::to_string)
         .ok_or_else(|| {
@@ -737,6 +760,83 @@ mod tests {
             err.to_string().contains("not allowed"),
             "error must say 'not allowed', got: {err}"
         );
+    }
+
+    /// The two paths that supply a `head_sha` must normalize it identically.
+    /// `CollabCheckpoint::from_json` trims (values arrive transcribed out of a
+    /// turn template), and `require_checkpoint_proof` then compares the two
+    /// with raw string equality — so an untrimmed value here would make a
+    /// `collab_checkpoint(head_sha="<sha> ")` and an
+    /// `implementation_done{"head_sha":"<sha> "}` naming the same commit
+    /// refuse each other as different commits.
+    #[test]
+    fn a_padded_head_sha_is_trimmed_to_match_the_checkpoint_path() {
+        const SHA: &str = "b9c2ce0f4d3a2b1c8e7f6a5b4c3d2e1f0a9b8c7d";
+        let padded = format!("  {SHA}\t\n");
+
+        let from_event = parse_required_head_sha(
+            &json!({ "head_sha": padded }).to_string(),
+            "implementation_done",
+        )
+        .expect("a padded head_sha must be accepted, not rejected");
+        let from_checkpoint = crate::collab::CollabCheckpoint::from_json(&json!({
+            "session_id": "s1",
+            "status": "batch_complete",
+            "head_sha": padded,
+        }))
+        .expect("the checkpoint path already trims")
+        .head_sha;
+
+        assert_eq!(from_event, SHA);
+        assert_eq!(
+            from_event, from_checkpoint,
+            "the two head_sha paths must agree byte-for-byte — require_checkpoint_proof \
+             compares them with ==",
+        );
+    }
+
+    /// Trimming must not turn a whitespace-only value into a stored blank: it
+    /// is checked *before* the emptiness test, so `" "` is still a rejection.
+    #[test]
+    fn a_whitespace_only_required_field_is_still_rejected() {
+        let err = parse_required_head_sha(
+            &json!({ "head_sha": "   " }).to_string(),
+            "implementation_done",
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("non-empty \"head_sha\""),
+            "got: {err}"
+        );
+    }
+
+    /// The `task_list` header is the path by which a padded sha reaches
+    /// storage as the session's `last_head_sha`, which
+    /// `validate_global_review_head_advance` re-checks against `is_hex_sha` on
+    /// every later advance — a padded value fails that shape guard and refuses
+    /// the turn with a Terminal, unrecoverable `branch_drift:` naming a commit
+    /// that is on the branch. All three header fields are trimmed alike.
+    #[test]
+    fn task_list_header_shas_are_trimmed() {
+        let mut payload = base_task_list();
+        let object = payload.as_object_mut().unwrap();
+        object.insert("plan_hash".to_string(), json!(" h "));
+        object.insert("base_sha".to_string(), json!(" b\n"));
+        object.insert("head_sha".to_string(), json!("\thead "));
+
+        let event = parse_task_list_event(&payload.to_string()).expect("padding must be tolerated");
+        let CollabEvent::SubmitTaskList {
+            plan_hash,
+            base_sha,
+            head_sha,
+            ..
+        } = event
+        else {
+            panic!("expected SubmitTaskList");
+        };
+        assert_eq!(plan_hash, "h");
+        assert_eq!(base_sha, "b");
+        assert_eq!(head_sha, "head");
     }
 
     #[test]

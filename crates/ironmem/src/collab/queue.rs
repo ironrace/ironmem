@@ -2329,12 +2329,21 @@ mod tests {
     /// Every field must survive the round trip — a dropped column here would
     /// silently weaken the `implementation_done` gate downstream.
     ///
-    /// "Every" is meant literally: all fifteen fields of `CollabCheckpoint`
+    /// "Every" is meant literally: all sixteen fields of `CollabCheckpoint`
     /// are asserted below, `updated_at` as "the server restamped it" rather
     /// than as a value, since `upsert_checkpoint` deliberately overwrites
     /// whatever the caller held. A test whose doc claims total coverage while
     /// leaving a field unasserted is worse than one that claims less: it stops
     /// the next reader looking.
+    ///
+    /// The fixture is a full struct literal rather than a `from_json` parse
+    /// for exactly that reason. `from_json` leaves `attestation_check` `None`
+    /// by design — the verdict is server-derived, stamped by the MCP handler
+    /// from its own git reads — so a parsed fixture can only ever round-trip
+    /// the `None` case, and this layer's persistence of a real verdict would
+    /// go untested while the paragraph above claimed otherwise. Naming the
+    /// fields is also what makes the count enforceable: a field gained or lost
+    /// stops this compiling rather than quietly slipping past the assertions.
     #[test]
     fn checkpoint_round_trips_every_field() {
         let db = open();
@@ -2351,23 +2360,26 @@ mod tests {
         )
         .unwrap();
 
-        let full = CollabCheckpoint::from_json(&serde_json::json!({
-            "session_id": "s1",
-            "task_id": 4,
-            "task_title": "Wire the gate",
-            "status": "batch_complete",
-            "head_sha": "ccc333",
-            "commit_sha": "ccc333",
-            "completed_task_ids": "1,2,3,4",
-            "next_task_id": 5,
-            "gates_result": "passed",
-            "gates_sha": "ccc333",
-            "gates_commands": "cargo fmt --all -- --check && cargo test --workspace",
-            "summary": "batch done",
-            "attested_by": "operator",
-            "acknowledged_divergence": "aaa111..ccc333",
-        }))
-        .unwrap();
+        let full = CollabCheckpoint {
+            session_id: "s1".to_string(),
+            task_id: Some(4),
+            task_title: Some("Wire the gate".to_string()),
+            status: CheckpointStatus::BatchComplete,
+            head_sha: "ccc333".to_string(),
+            commit_sha: Some("ccc333".to_string()),
+            completed_task_ids: vec![1, 2, 3, 4],
+            next_task_id: Some(5),
+            gates_result: "passed".to_string(),
+            gates_sha: Some("ccc333".to_string()),
+            gates_commands: Some(
+                "cargo fmt --all -- --check && cargo test --workspace".to_string(),
+            ),
+            summary: Some("batch done".to_string()),
+            attested_by: AttestedBy::Operator,
+            acknowledged_divergence: Some("aaa111..ccc333".to_string()),
+            attestation_check: Some(AttestationCheck::Verified),
+            updated_at: 0,
+        };
 
         upsert_checkpoint(&db, &full).unwrap();
         let loaded = load_current_checkpoint(&db, "s1").unwrap().unwrap();
@@ -2400,9 +2412,15 @@ mod tests {
             loaded.acknowledged_divergence.as_deref(),
             Some("aaa111..ccc333")
         );
+        // The server's own verdict on that range. It reaches the row only
+        // through this column, and `attestation_verdict` renders an operator
+        // row whose verdict is missing as `unrecorded` — so a loader that
+        // dropped this would quietly downgrade every verified attestation to
+        // "unchecked" with no error anywhere.
+        assert_eq!(loaded.attestation_check, Some(AttestationCheck::Verified));
         assert!(
             loaded.updated_at > 0,
-            "the server stamps updated_at; `full` was parsed and so carried 0"
+            "the server stamps updated_at; `full` was built carrying 0"
         );
         assert!(loaded.gates_are_green_at_head());
     }

@@ -55,7 +55,13 @@ fn changed_files(repo_root: &Path, build_sha: &str) -> Result<Vec<String>, Strin
     // `-c core.quotepath=false` keeps non-ASCII paths un-C-quoted so they match
     // the stored (forward-slash, unquoted) source_files; otherwise a quoted path
     // would fail to intersect and falsely report Fresh (fail-open).
-    let output = std::process::Command::new("git")
+    // Scrubbed for the reason `scrub_git_environment` documents: an ambient
+    // `GIT_DIR`/`GIT_WORK_TREE` overrides `current_dir`, and a diff taken
+    // against the wrong repository would report freshness about work this map
+    // was never built from.
+    let mut command = std::process::Command::new("git");
+    crate::mcp::tools::scrub_git_environment(&mut command);
+    let output = command
         .args(["-c", "core.quotepath=false", "diff", "--name-only", &range])
         .current_dir(repo_root)
         .output()

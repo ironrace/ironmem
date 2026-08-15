@@ -103,13 +103,24 @@ pub const CODEX_DISPATCH_FAILED_PREFIX: &str = "codex_dispatch_failed:";
 /// primitive.
 pub const CHECKPOINT_DRIFT_PREFIX: &str = "checkpoint_drift:";
 
-/// Prefixes considered for non-owner `failure_report`s. Branch drift is
-/// admissible for either reporter from any coding-active phase; checkpoint
-/// drift is admissible for either reporter but only from
-/// `CodeImplementPending`; Codex dispatch failure is admissible only from
-/// Claude, against a Codex-owned turn, in a phase Claude could have
-/// dispatched. Use [`off_turn_failure_is_admissible`] rather than treating
-/// membership here as sufficient authorization.
+/// The vocabulary of prefixes that have an off-turn carve-out at all: branch
+/// drift, checkpoint drift, and Codex dispatch failure.
+///
+/// **This array is documentation only. Nothing reads it at runtime.** The gate
+/// is [`off_turn_failure_is_admissible`], which spells out one clause per
+/// prefix — branch drift unconditionally, checkpoint drift only from
+/// `CodeImplementPending`, Codex dispatch failure only from Claude against a
+/// Codex-owned turn in a phase Claude could have dispatched — and never
+/// consults this constant. Adding a prefix here therefore changes nothing:
+/// the new prefix stays off-turn-inadmissible until it also gets its own
+/// clause in that function.
+///
+/// It is a list and not a match arm on purpose. The three scoping rules are
+/// irreconcilable — one is unconditional, one is phase-scoped, one is scoped
+/// on reporter *and* owner *and* phase *and* implementer — and a `&[&str]`
+/// cannot carry any of that, so an iteration over this array could only ever
+/// re-implement the loosest of the three. Keep the two in sync by hand, and
+/// treat the function as the authority whenever they disagree.
 pub const OFF_TURN_FAILURE_PREFIXES: &[&str] = &[
     BRANCH_DRIFT_PREFIX,
     CHECKPOINT_DRIFT_PREFIX,

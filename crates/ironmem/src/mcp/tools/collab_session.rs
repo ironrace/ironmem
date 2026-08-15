@@ -1253,6 +1253,55 @@ fn checkpoint_drift(detail: String) -> MemoryError {
     ))
 }
 
+/// The task ids the session's accepted task list actually declares, sorted and
+/// deduplicated — or `None` when the stored payload is not a plan whose
+/// coverage a checkpoint could ever prove.
+///
+/// [`require_checkpoint_proof`] needs the *ids*, not the count.
+/// [`crate::collab::CollabSession::tasks_count`] answers "how many", and the
+/// two questions only have the same answer when the plan's ids are exactly
+/// `1..=len`. Task 7 made `collab::validate_task_list_body` require exactly
+/// that, so on any plan stored since then the two coincide and this function
+/// agrees with a count by construction. It reads the declared ids anyway,
+/// because that check lands at *send* time and never re-validates a stored
+/// row: a session written when the rule was merely "strictly increasing" can
+/// still be carrying ids `1, 2, 4` — a plan whose task 3 was dropped during
+/// editing — and measuring that batch against `1..=3` demands a ledger
+/// covering a task the plan does not contain, which is unsatisfiable except by
+/// claiming a task that does not exist: the fabricated progress report this
+/// gate exists to prevent. So the bar is the ids the plan declares, which is
+/// also how `docs/COLLAB.md` states the rule: "covers every task id in the
+/// accepted task list". [`crate::collab::CollabCheckpoint::covers_all_tasks`]
+/// remains the type-level statement of the dense-plan case — the same
+/// predicate whenever the declared ids are `1..=len` — but it cannot express
+/// the general one, because a `total` is all it is given.
+///
+/// `None` covers every payload whose ids cannot be read *or* cannot be
+/// covered: a non-canonical shape (the same narrow reading
+/// [`crate::collab::tasks_count_from_list`] does), an empty `tasks` array, and
+/// any id outside `1..=u32::MAX`. That last case is a stored payload rather
+/// than a theoretical one — ids `0, 1, 2` satisfied the strictly-increasing
+/// rule sessions were admitted under before Task 7, while
+/// `checkpoint::parse_completed_task_ids` refuses `0` on the way in to the
+/// ledger, so no checkpoint can ever name that task.
+/// Collapsing it into "unreadable" is deliberate: both are a malformed plan
+/// record that no checkpoint repairs, and both deserve
+/// [`require_checkpoint_proof`]'s operator refusal rather than another lap of
+/// the recovery loop.
+fn accepted_task_ids(task_list: Option<&str>) -> Option<Vec<u32>> {
+    let value: Value = serde_json::from_str(task_list?).ok()?;
+    let tasks = value.get("tasks")?.as_array()?;
+    if tasks.is_empty() {
+        return None;
+    }
+    let mut ids = std::collections::BTreeSet::new();
+    for task in tasks {
+        let id = task.get("id")?.as_i64()?;
+        ids.insert(u32::try_from(id).ok().filter(|id| *id != 0)?);
+    }
+    Some(ids.into_iter().collect())
+}
+
 /// Refuse `implementation_done` unless the session's stored checkpoint proves
 /// the batch actually reached the head being reported.
 ///
@@ -1278,13 +1327,15 @@ fn checkpoint_drift(detail: String) -> MemoryError {
 ///
 /// **3. `status == BatchComplete` and `completed_task_ids` covers every task.**
 /// A batch reported done while the ledger shows 2 of 3 is a false progress
-/// report even when the shas agree. The total comes from
-/// [`crate::collab::CollabSession::tasks_count`] — the same single source of
-/// truth `collab_status` reads — never from anything the caller supplied,
-/// which would let the reporter choose the bar it is measured against. Its
-/// `None` (an unreadable task list) gets its own refusal — see the comment at
-/// that arm for why it is separate, why it is unreachable, and why it is the
-/// one refusal here that does not carry the `checkpoint_drift:` prefix.
+/// report even when the shas agree. The bar comes from the session's own
+/// accepted task list via [`accepted_task_ids`] — the stored plan, never
+/// anything the caller supplied, which would let the reporter choose the bar
+/// it is measured against — and it is the set of ids that plan *declares*,
+/// not `1..=tasks_count()`; see that function for why those are different
+/// questions. Its `None` (a task list whose ids cannot be read, or cannot be
+/// covered by any checkpoint) gets its own refusal — see the comment at that
+/// arm for why it is separate and why it is the one refusal here that does
+/// not carry the `checkpoint_drift:` prefix.
 ///
 /// **4. The gates are green at the checkpoint's own head.** Green gates at an
 /// older sha describe a tree that no longer exists.
@@ -1306,18 +1357,24 @@ fn checkpoint_drift(detail: String) -> MemoryError {
 ///
 /// That is covered, but by the caller rather than here: since Task 8,
 /// [`validate_global_review_head_advance`] runs on every head-advancing coding
-/// event including `implementation_done`, immediately after this function
+/// event including `implementation_done` — the v3 batch flow and the
+/// `collab_start_code_review` shortcut alike — immediately after this function
 /// returns, and refuses a head that is not a git-verified descendant of
-/// `last_head_sha`. Note the ordering — the ancestry check runs *after* this
-/// one, deliberately (see the comment at the call site), so within this
-/// function's own body `head_sha` is still unvalidated caller input. Do not
-/// read "the caller checks it" as license to depend on it here.
+/// `last_head_sha`. A fabricated sha does not even reach that comparison: it
+/// names no commit, git exits 128, and the refusal is `branch_drift:`. Note
+/// the ordering — the ancestry check runs *after* this one, deliberately (see
+/// the comment at the call site), so within this function's own body
+/// `head_sha` is still unvalidated caller input. Do not read "the caller
+/// checks it" as license to depend on it here.
 ///
 /// What remains genuinely uncovered on this path is a head that is a real
-/// descendant but was never actually built or gated — a live-HEAD comparison,
-/// which belongs on the handoff and resume paths, where a *reader* is being
-/// shown a progress report nobody is currently vouching for, and where a
-/// transient git failure costs a diagnostic rather than a turn.
+/// descendant but was never actually built or gated — including one that is
+/// simply *behind* the working tree, where the checkpoint and the report agree
+/// with each other and the history is sound, so neither gate has anything to
+/// object to. Catching that needs a live-HEAD comparison, which belongs on the
+/// handoff and resume paths, where a *reader* is being shown a progress report
+/// nobody is currently vouching for, and where a transient git failure costs a
+/// diagnostic rather than a turn.
 ///
 /// # Why `attested_by` is not consulted
 ///
@@ -1362,7 +1419,7 @@ fn require_checkpoint_proof(
     head_sha: &str,
 ) -> Result<(), MemoryError> {
     let session_id = session.id.as_str();
-    let total = session.tasks_count();
+    let required = accepted_task_ids(session.task_list.as_deref());
     // The remedy is a *machine-followable* instruction — an agent that hits
     // this gate is expected to copy it verbatim — so `completed_task_ids` must
     // render the literal list rather than an ellipsis. `1,..,3` looks like an
@@ -1372,15 +1429,16 @@ fn require_checkpoint_proof(
     // round trip through the very recovery loop this gate exists to open.
     // Task lists are capped at 15 entries, so the literal list is always short.
     //
-    // The `None` arm cannot produce a valid list because it does not know the
-    // count; it says so in words instead of emitting something that would
-    // parse into the wrong claim. It is unreachable in practice — see the
-    // `total` refusal below.
-    let completed_hint = match total {
-        Some(count) => (1..=count)
-            .map(|id| id.to_string())
-            .collect::<Vec<_>>()
-            .join(","),
+    // It renders the *declared* ids for the same reason the coverage check
+    // measures against them: on a plan whose ids are `1, 2, 4`, a hint of
+    // `1,2,3` tells the caller to file a ledger for a task that does not exist
+    // and would still not clear the gate.
+    //
+    // The `None` arm cannot produce a valid list because it does not know
+    // which ids are wanted; it says so in words instead of emitting something
+    // that would parse into the wrong claim. See the `required` refusal below.
+    let completed_hint = match required.as_deref() {
+        Some(ids) => ids.iter().map(u32::to_string).collect::<Vec<_>>().join(","),
         None => "<every task id, comma-separated>".to_string(),
     };
     let remedy = format!(
@@ -1450,46 +1508,63 @@ fn require_checkpoint_proof(
 
     // Condition 3, second half: and the ledger must cover every task.
     //
-    // `None` is a refusal rather than a zero: "cannot check" and "checked and
-    // clean" must not collapse into one answer, the same distinction
-    // `collab_checkpoint`'s `HeadCheck` draws. Note the direction is not
-    // load-bearing on its own — `covers_all_tasks(0)` is already `false`, so
-    // an `unwrap_or(0)` here would still refuse the send, just with the
-    // coverage wording below. The value of the separate arm is the *diagnosis*
-    // (a corrupt session record, not an incomplete batch), which is why no
-    // test pins it: reaching it needs a `CodeImplementPending` session whose
-    // `task_list` will not parse, and the only path into that phase is a
-    // `task_list` send that already validated. Deliberate defense in depth,
-    // deliberately unreachable, deliberately unpinned.
+    // `None` is a refusal rather than an empty set: "cannot check" and
+    // "checked and clean" must not collapse into one answer, the same
+    // distinction `collab_checkpoint`'s `HeadCheck` draws. Treating it as
+    // "nothing required" would wave the batch straight through, which is the
+    // inverse of what an unreadable plan deserves. The value of the separate
+    // arm is the *diagnosis*: a corrupt plan record, not an incomplete batch.
+    //
+    // It has one reachable cause and one unreachable one, and they share the
+    // diagnosis because they share the remedy. Reachable: a stored plan
+    // declaring an id no ledger can ever name — `0, 1, 2` satisfied the
+    // strictly-increasing rule `validate_task_list_body` applied before Task 7
+    // tightened it to `1..=len`, while `checkpoint::parse_completed_task_ids`
+    // refuses `0`; that tightening guards the door, not the rows already
+    // behind it. Unreachable: a `task_list` that will not parse at all, since
+    // the only path into this phase is a `task_list` send that already
+    // validated — defense in depth, kept for the day another writer reaches
+    // the column.
     //
     // This is the one refusal that does NOT carry `CHECKPOINT_DRIFT_PREFIX`,
     // and dropping it is the point rather than an oversight. That prefix is a
     // promise with two halves the protocol acts on: `failure_class::classify`
     // grades it Tooling (recoverable — park the phase, hand the turn over) and
     // `off_turn_failure_is_admissible` lets the counterpart report it. Both
-    // halves are false here. No checkpoint fixes an unparseable task list, and
-    // no counterpart's turn repairs it, so a message telling the caller it
-    // "needs an operator, not another checkpoint" while wearing a prefix that
-    // means "write a better checkpoint" would contradict itself — and would
-    // route an agent keying on the prefix into a retry loop that cannot
-    // terminate. Unprefixed, it classifies Terminal, which is what a corrupt
-    // session record deserves.
-    let Some(total) = total else {
+    // halves are false here. No checkpoint fixes a plan whose ids cannot be
+    // read or cannot be covered, and no counterpart's turn repairs it either,
+    // so a message telling the caller it "needs an operator, not another
+    // checkpoint" while wearing a prefix that means "write a better
+    // checkpoint" would contradict itself — and would route an agent keying on
+    // the prefix into a retry loop that cannot terminate. Unprefixed, it
+    // classifies Terminal, which is what a corrupt session record deserves.
+    let Some(required) = required else {
         return Err(MemoryError::Validation(format!(
-            "session {session_id} reports implementation_done, but its accepted task list cannot \
-             be read, so how many tasks the checkpoint must cover is unknown and the batch's \
-             completeness cannot be verified ({ledger}). This is a corrupt session record rather \
-             than a checkpoint problem; it needs an operator, not another checkpoint."
+            "session {session_id} reports implementation_done, but its accepted task list does \
+             not declare a usable set of task ids (a task id must be 1 or greater, since that is \
+             what a checkpoint's completed_task_ids can name), so which tasks the checkpoint must \
+             cover is unknown and the batch's completeness cannot be verified ({ledger}). This is \
+             a corrupt session record rather than a checkpoint problem; it needs an operator, not \
+             another checkpoint."
         )));
     };
-    if !checkpoint.covers_all_tasks(total) {
+    let total = required.len();
+    let missing: Vec<u32> = required
+        .iter()
+        .copied()
+        .filter(|id| !checkpoint.completed_task_ids.contains(id))
+        .collect();
+    if !missing.is_empty() {
         return Err(checkpoint_drift(format!(
             "session {session_id} reports implementation_done, but its current checkpoint covers \
-             tasks {} of the {total} in the accepted task list ({ledger}) — coverage is checked \
-             as set membership, so every id from 1 to {total} must appear. Reporting the batch \
-             done over an incomplete ledger is a false progress report even when the shas agree. \
-             Finish the remaining tasks, then file {remedy}.",
+             tasks {} of the {total} in the accepted task list ({ledger}) — missing task ids: \
+             {}. Coverage is checked as set membership against the ids that list declares ({}), \
+             so every one of them must appear. Reporting the batch done over an incomplete ledger \
+             is a false progress report even when the shas agree. Finish the remaining tasks, \
+             then file {remedy}.",
             format_task_id_list(&checkpoint.completed_task_ids),
+            format_task_id_list(&missing),
+            format_task_id_list(&required),
         )));
     }
 
@@ -1506,6 +1581,49 @@ fn require_checkpoint_proof(
     }
 
     Ok(())
+}
+
+/// Strip every inherited `GIT_*` variable before spawning git.
+///
+/// `git -C <path>` is not enough on its own: an inherited `GIT_DIR` /
+/// `GIT_WORK_TREE` (and friends) silently redirects the command at a
+/// *different* repository, so a checkpoint would be compared against the wrong
+/// HEAD — and could be reported `head_check: matches` while the session's real
+/// repo has drifted. That is an unverified claim presented as verified, the
+/// exact failure issue #273 exists to end, arriving through the environment
+/// rather than through a stale record.
+///
+/// Not hypothetical, and not novel here: `review::diff`'s helper of the same
+/// name says these overrides "can redirect a command away from `request.repo`",
+/// the review hook does the same, and this file's own test fixtures already
+/// scrub — the production path was the one left exposed. PATH and the rest of
+/// the environment are deliberately preserved; only git's process controls go.
+///
+/// `pub(crate)` so every git shell-out in the crate goes through the same
+/// scrub rather than growing a second, unscrubbed spelling — `collab_checkpoint`'s
+/// inspection and range-verification shell-outs (Task 10), and `code_maps`'
+/// worktree probe and freshness diff. Every `Command::new("git")` in the crate
+/// must call it before `.output()`.
+///
+/// Widened from `pub(super)` because the two `code_maps` spawns were the
+/// remaining exposure, and it was not theoretical: this module's own test
+/// fixtures set `GIT_DIR`/`GIT_WORK_TREE` process-wide (see `ScopedGitEnv`),
+/// and `cargo test` runs the lib binary's tests on parallel threads — so an
+/// unscrubbed `git rev-parse --show-toplevel` beside them intermittently
+/// resolved to the fixture's repo instead of its own `current_dir`, failing
+/// two `code_maps` tests at random. The mutex `ScopedGitEnv` holds cannot help
+/// there: it serializes the tests that *set* the variables, not the unrelated
+/// ones that merely inherit them.
+pub(crate) fn scrub_git_environment(command: &mut Command) {
+    for (key, _) in std::env::vars_os() {
+        if key
+            .to_string_lossy()
+            .to_ascii_uppercase()
+            .starts_with("GIT_")
+        {
+            command.env_remove(key);
+        }
+    }
 }
 
 /// Refuse a reported head that is not a real, git-verified descendant of the
@@ -1528,43 +1646,78 @@ fn require_checkpoint_proof(
 /// `final_review` turns. Treating the batch flow's `implementation_done`
 /// differently — recoverable there, terminal everywhere else — would draw a
 /// distinction the underlying git fact does not support.
-/// Strip every inherited `GIT_*` variable before spawning git.
 ///
-/// `git -C <path>` is not enough on its own: an inherited `GIT_DIR` /
-/// `GIT_WORK_TREE` (and friends) silently redirects the command at a
-/// *different* repository, so a checkpoint would be compared against the wrong
-/// HEAD — and could be reported `head_check: matches` while the session's real
-/// repo has drifted. That is an unverified claim presented as verified, the
-/// exact failure issue #273 exists to end, arriving through the environment
-/// rather than through a stale record.
-///
-/// Not hypothetical, and not novel here: `review::diff`'s helper of the same
-/// name says these overrides "can redirect a command away from `request.repo`",
-/// the review hook does the same, and this file's own test fixtures already
-/// scrub — the production path was the one left exposed. PATH and the rest of
-/// the environment are deliberately preserved; only git's process controls go.
-///
-/// `pub(super)` so `collab_checkpoint`'s inspection and range-verification
-/// shell-outs (Task 10) go through the same scrub rather than growing a second,
-/// unscrubbed spelling. Every `Command::new("git")` in this module tree must
-/// call it before `.output()`.
-pub(super) fn scrub_git_environment(command: &mut Command) {
-    for (key, _) in std::env::vars_os() {
-        if key
-            .to_string_lossy()
-            .to_ascii_uppercase()
-            .starts_with("GIT_")
-        {
-            command.env_remove(key);
-        }
-    }
-}
-
+/// It refuses in two stages, and the first one never runs git: the reported
+/// `head_sha` must *look like* an object name before it is handed to a revision
+/// parser that would happily accept `HEAD`. See the comment on that check for
+/// why a symbolic revision is worse than a wrong one here, and for why a
+/// malformed *stored* `last_head_sha` skips the comparison instead of refusing.
 fn validate_global_review_head_advance(
     repo_path: &str,
     last_head_sha: &str,
     head_sha: &str,
 ) -> Result<(), MemoryError> {
+    // Both revisions must *look like* object names before git is allowed to
+    // resolve them. `git merge-base --is-ancestor` accepts any revision
+    // expression — `HEAD`, `main`, `HEAD~3` — and a symbolic one is not a fact
+    // about a commit, it is a lookup that answers differently every time it is
+    // run. The concrete hole: an implementer reporting `head_sha: "HEAD"` over
+    // a checkpoint also written at `"HEAD"` satisfies every condition
+    // [`require_checkpoint_proof`] asks (string equality against itself), and
+    // `--is-ancestor <last_head_sha> HEAD` then resolves against the live tree
+    // and passes. `apply_event` records `last_head_sha = "HEAD"`, so every
+    // later ancestry check in the session compares against whatever HEAD is at
+    // *that* moment — the drift detection this function exists to provide is
+    // silently off for the rest of the run.
+    //
+    // The shape check is [`crate::code_maps::is_hex_sha`] (7-64 hex chars), the
+    // same single source of truth `code_map_write` applies to its own
+    // `head_sha`, rather than a second spelling of the rule. Like that one it
+    // is deliberately only a *shape* check — existence and reachability are
+    // exactly what the shell-out below decides.
+    //
+    // It refuses with `branch_drift:` because that is the condition it is:
+    // a reported head that names no commit is the same unfixable-in-place
+    // defect the exit-128 arm below already classifies that way, and grading it
+    // `Tooling` would invite a retry loop against a sha that will never resolve.
+    if !crate::code_maps::is_hex_sha(head_sha) {
+        return Err(MemoryError::Validation(format!(
+            "branch_drift: head_sha {head_sha} is not a git object name (7-64 hex characters). A \
+             revision expression such as HEAD, a branch name, or an abbreviation shorter than 7 \
+             characters is not a fixed commit — it resolves to a different one every time it is \
+             read — so recording it would disable this session's drift detection rather than pass \
+             it. Report the full sha the work actually landed at."
+        )));
+    }
+
+    // The stored `last_head_sha` is deliberately NOT refused, and the asymmetry
+    // is the whole point. `head_sha` above is the caller's own report, so a
+    // refusal names a value they are holding and can correct. `last_head_sha`
+    // is server-stored and unreachable from here: nothing rewrites it but a
+    // successful head-advancing send, which is precisely what a refusal would
+    // block. Refusing on it would wedge the session permanently behind an error
+    // whose remedy — "report the full sha" — addresses a field the reader does
+    // not own.
+    //
+    // The `task_list` send and the `collab_start_code_review` shortcut both
+    // still seed this field from caller input without a shape check, so a
+    // session can be carrying `"HEAD"`. For those the honest reading is that
+    // there is no fixed commit here to measure an advance *from*, so the
+    // ancestry question has no subject rather than a failing answer. Skipping
+    // restores exactly what those sessions did before this guard existed:
+    // `--is-ancestor HEAD <new sha>` resolved against the live tree and passed.
+    //
+    // Hoisting the shape check to those two seed sites — where the refusal is
+    // recoverable and names a value the caller owns — is the real close, and it
+    // is deliberately left as a follow-up: the seed sites are exercised by ~34
+    // tests whose fixtures use placeholder shas, and that sweep does not belong
+    // in a review round on a branch about to merge. Until then the reported
+    // `head_sha` above is checked on every advance, which is the half of the
+    // hole an implementer can actually walk into.
+    if !crate::code_maps::is_hex_sha(last_head_sha) {
+        return Ok(());
+    }
+
     let mut command = Command::new("git");
     scrub_git_environment(&mut command);
     let output = command
@@ -1763,6 +1916,14 @@ impl HeadCheck {
 
     /// Whether the check ran at all — the field that keeps `diverged: null`
     /// from being read as "no drift".
+    ///
+    /// Deliberately NOT the same words the `session_handoff` block prints under
+    /// `checkpoint.head_check`. That block folds this and `diverged` into one
+    /// three-valued `matches|diverged|unverified` because it has no JSON `null`
+    /// to spend on "the check did not run"; here the two halves are reported
+    /// separately. Same answer, two renderings — a reader that has learned one
+    /// spelling must not apply it to the other surface. Do not "unify" them
+    /// without moving both COLLAB.md sections that cross-reference this.
     pub(super) fn label(&self) -> &'static str {
         match self {
             Self::Checked { .. } => "checked",
@@ -1822,6 +1983,14 @@ fn checkpoint_drift_message(head: &str, checkpoint: &crate::collab::CollabCheckp
 /// distinct answer from a checkpoint that exists but could not be compared
 /// against git, which reports `diverged: null` with `head_check:
 /// "unreadable"`. Neither is ever rendered as `diverged: false`.
+///
+/// A row that could not be *loaded* at all never reaches this function. The
+/// two diagnostic surfaces render that case themselves and in their own
+/// vocabularies — `collab_status` as its own `{"error": …}` block (see
+/// [`handle_collab_status`]), the `session_handoff` block as
+/// `checkpoint: unreadable` with a `checkpoint.error` line — while the callers
+/// that consume the row as proof hard-fail on it instead. `diverged: null` on
+/// both, for the same reason.
 ///
 /// Takes the [`HeadCheck`] rather than performing it, so a caller that also
 /// needs to *act* on the result (`collab_resume` refuses on it) decides from
@@ -2193,11 +2362,45 @@ pub(super) fn handle_collab_status(app: &App, args: &Value) -> Result<Value, Mem
     // false progress report. The git read only happens for a session that has
     // a checkpoint row at all, so the common polling case — a session still in
     // planning — costs nothing.
-    let checkpoint = app.db.collab_load_current_checkpoint(session_id)?;
+    //
+    // A row `load_current_checkpoint` refuses degrades to an error block rather
+    // than failing the whole call, exactly as `session_handoff` does (see
+    // `handle_session_handoff`, which states the reasoning in full). Both are
+    // pure diagnostics: a row that fails `validate()` — say
+    // `attested_by = 'operator'` with no acknowledged range, the combination
+    // migration 020's one-directional CHECK permits and only `validate()`
+    // rejects — would otherwise make the session completely unobservable, with
+    // raw SQL as the only repair. The gate surfaces (`collab_resume`,
+    // `require_checkpoint_proof`) keep hard-failing: they *consume* the row as
+    // proof, and degrading them would fail the divergence refusal open.
+    //
+    // Only `Validation` degrades. A `Db`/`Io` failure is not a poisoned row but
+    // a broken connection, and reporting that as an unreadable checkpoint
+    // beside session fields read from the same database would be its own false
+    // claim.
+    let (checkpoint, load_error) = match app.db.collab_load_current_checkpoint(session_id) {
+        Ok(checkpoint) => (checkpoint, None),
+        Err(MemoryError::Validation(msg)) => (None, Some(msg)),
+        Err(other) => return Err(other),
+    };
     let head_check = checkpoint
         .as_ref()
         .map(|cp| HeadCheck::read(&record.repo_path, cp));
-    status["checkpoint"] = checkpoint_json(checkpoint.as_ref().zip(head_check.as_ref()));
+    status["checkpoint"] = match load_error {
+        // Never `null` (which this block reserves for "never checkpointed") and
+        // never `diverged: false` (which would present a check that never ran
+        // as a passed one). `error` — not `head_check_error` — is what says the
+        // *row* could not be read rather than the repo, the same split
+        // `session_handoff` renders as `checkpoint: unreadable` plus
+        // `checkpoint.error`. No field of the row is echoed: nothing may be
+        // asserted about the contents of a row we could not read.
+        Some(msg) => json!({
+            "error": msg,
+            "head_check": "unreadable",
+            "diverged": Value::Null,
+        }),
+        None => checkpoint_json(checkpoint.as_ref().zip(head_check.as_ref())),
+    };
     for ag in [Agent::Claude, Agent::Codex] {
         let g = app
             .db
@@ -2637,6 +2840,13 @@ pub(super) fn handle_collab_resume(app: &App, args: &Value) -> Result<Value, Mem
     // already-ended session is told that rather than being handed a drift
     // diagnostic about a session it can no longer resume for a different
     // reason. The transaction below repeats it against its own snapshot.
+    //
+    // The generation lease deliberately does *not* get hoisted alongside it: a
+    // lease claim is itself a write (see `handoff::ensure_actor_generation_current`),
+    // so it has to stay inside the transaction that authorizes. The visible
+    // consequence is ordering only — a superseded process may be told about
+    // checkpoint drift before it is told its lease is stale — and it costs
+    // nothing, because neither path writes anything before refusing.
     let current_checkpoint = app.db.with_connection(|conn| {
         crate::collab::queue::ensure_active(conn, session_id)?;
         crate::collab::queue::load_current_checkpoint(conn, session_id)
@@ -3521,6 +3731,67 @@ mod tests {
     #[test]
     fn execution_mode_from_task_list_returns_none_for_null_task_list() {
         assert_eq!(execution_mode_from_task_list(None), None);
+    }
+
+    // ── accepted_task_ids ─────────────────────────────────────────────────────
+
+    fn task_list_with_ids(ids: &[i64]) -> String {
+        let tasks: Vec<Value> = ids
+            .iter()
+            .map(|id| json!({ "id": id, "title": "t", "acceptance": ["a"] }))
+            .collect();
+        json!({ "plan_hash": "h", "base_sha": "b", "head_sha": "x", "tasks": tasks }).to_string()
+    }
+
+    /// The whole point of reading ids instead of a count: `1, 2, 4` is a plan
+    /// `validate_task_list_body` accepted before Task 7 (ids needed only to be
+    /// strictly increasing) and one a session stored then still carries, and
+    /// measuring it against `1..=3` would demand a ledger for a task that does
+    /// not exist.
+    #[test]
+    fn accepted_task_ids_returns_the_declared_ids_not_a_dense_range() {
+        let raw = task_list_with_ids(&[1, 2, 4]);
+        assert_eq!(accepted_task_ids(Some(&raw)), Some(vec![1, 2, 4]));
+    }
+
+    /// Sorted and deduplicated, so the coverage check and the remedy hint do
+    /// not inherit whatever order the plan happened to be written in.
+    #[test]
+    fn accepted_task_ids_sorts_and_deduplicates() {
+        let raw = task_list_with_ids(&[3, 1, 3, 2]);
+        assert_eq!(accepted_task_ids(Some(&raw)), Some(vec![1, 2, 3]));
+    }
+
+    /// An id no `completed_task_ids` can ever name is a malformed plan, not a
+    /// requirement of zero tasks — the gate must reach its operator refusal
+    /// rather than wave the batch through or ask for the impossible forever.
+    /// `0` and a negative id both passed the strictly-increasing rule upstream
+    /// before Task 7 tightened it, so both are shapes a stored plan can hold.
+    #[test]
+    fn accepted_task_ids_rejects_an_id_no_checkpoint_could_cover() {
+        for ids in [vec![0, 1, 2], vec![-1, 1]] {
+            let raw = task_list_with_ids(&ids);
+            assert_eq!(
+                accepted_task_ids(Some(&raw)),
+                None,
+                "task ids {ids:?} name a task no checkpoint can claim"
+            );
+        }
+    }
+
+    /// The same narrow reading `tasks_count_from_list` does: anything that is
+    /// not the canonical non-empty `{"tasks":[…]}` shape is unreadable rather
+    /// than empty.
+    #[test]
+    fn accepted_task_ids_returns_none_for_an_unusable_payload() {
+        assert_eq!(accepted_task_ids(None), None);
+        assert_eq!(accepted_task_ids(Some("not json")), None);
+        assert_eq!(accepted_task_ids(Some(r#"{"tasks":[]}"#)), None);
+        assert_eq!(accepted_task_ids(Some(r#"{"tasks":{}}"#)), None);
+        assert_eq!(
+            accepted_task_ids(Some(r#"{"tasks":[{"title":"t"}]}"#)),
+            None
+        );
     }
 
     // ── session_record_json exposes execution_mode ────────────────────────────
@@ -5576,10 +5847,12 @@ mod tests {
 
     /// Run a fixture git command and assert it succeeded. Mirrors
     /// `tests/review_diff.rs`'s `git()` helper: a fixture step that silently
-    /// fails (e.g. a global `commit.gpgsign`/`core.hooksPath` misconfiguration
-    /// on the developer's machine) must fail the test loudly rather than leave
-    /// `first`/`second` as git's literal `"HEAD"` unborn-branch fallback — see
-    /// `git_output` below, which is what actually reads a value back out.
+    /// fails must fail the test loudly rather than leave `first`/`second` as
+    /// git's literal `"HEAD"` unborn-branch fallback — see `git_output` below,
+    /// which is what actually reads a value back out. The commonest cause of
+    /// such a failure — an inherited `commit.gpgsign`/`core.hooksPath` — is
+    /// eliminated rather than merely reported: both fixtures below pin those
+    /// off, as `test_support`'s `git_ancestor_chain` does.
     fn git(repo: &std::path::Path, args: &[&str]) {
         let mut command = std::process::Command::new("git");
         scrub_git_environment(&mut command);
@@ -5621,6 +5894,13 @@ mod tests {
         git(path, &["init", "-q"]);
         git(path, &["config", "user.email", "t@example.com"]);
         git(path, &["config", "user.name", "T"]);
+        // Pinned off rather than inherited, exactly as `test_support`'s
+        // `git_ancestor_chain` does: a developer machine with a working signing
+        // key masks what fails on a CI runner with a global
+        // `commit.gpgsign=true` and no key, and an inherited `core.hooksPath`
+        // risks running someone's real hooks against a throwaway repo.
+        git(path, &["config", "commit.gpgsign", "false"]);
+        git(path, &["config", "core.hooksPath", "/dev/null"]);
         std::fs::write(path.join("a.txt"), "1").unwrap();
         git(path, &["add", "."]);
         git(path, &["commit", "-qm", "first"]);
@@ -5706,6 +5986,9 @@ mod tests {
         git(path, &["init", "-q"]);
         git(path, &["config", "user.email", "hostile@example.com"]);
         git(path, &["config", "user.name", "Hostile"]);
+        // Same global-config isolation as `git_repo_with_two_commits` above.
+        git(path, &["config", "commit.gpgsign", "false"]);
+        git(path, &["config", "core.hooksPath", "/dev/null"]);
         std::fs::write(path.join("hostile.txt"), "hostile\n").unwrap();
         git(path, &["add", "."]);
         git(path, &["commit", "-qm", "hostile commit"]);
@@ -5778,6 +6061,54 @@ mod tests {
             &second,
         )
         .expect("the repo_path argument must win over inherited Git overrides");
+    }
+
+    /// A revision *expression* is refused on shape, before git is asked to
+    /// resolve it.
+    ///
+    /// The fixture is deliberately one where the shell-out would have
+    /// succeeded: `HEAD` names `second` here, so `merge-base --is-ancestor
+    /// first HEAD` exits 0 and — without this guard — the send would be
+    /// accepted and `"HEAD"` recorded as the session's `last_head_sha`, at
+    /// which point every later ancestry check in that session re-resolves it
+    /// against whatever HEAD has become. A test that used a repo where the
+    /// command failed anyway would pass without proving any of that.
+    #[test]
+    fn ancestry_validation_refuses_a_revision_expression() {
+        let (dir, first, second) = git_repo_with_two_commits();
+        let repo = dir.path().to_string_lossy().to_string();
+
+        // Sanity: with both sides spelled as object names this repo answers
+        // "yes", so every refusal below is the shape check and not the repo.
+        validate_global_review_head_advance(&repo, &first, &second)
+            .expect("fixture precondition: second must descend from first");
+
+        // `HEAD` and a branch name resolve today and differently tomorrow;
+        // `HEAD~1` is relative to whatever HEAD is; a 6-char abbreviation is
+        // below the 7-char floor `is_hex_sha` sets.
+        for bad in ["HEAD", "main", "HEAD~1", &first[..6]] {
+            let err = validate_global_review_head_advance(&repo, &first, bad)
+                .expect_err("a revision expression must not be accepted as head_sha")
+                .to_string();
+            assert!(
+                err.contains("branch_drift:") && err.contains("is not a git object name"),
+                "expected the shape refusal for head_sha {bad}, got: {err}"
+            );
+            assert!(
+                err.contains(&format!("head_sha {bad}")),
+                "the refusal must name the offending value, got: {err}"
+            );
+        }
+
+        // The stored side is deliberately NOT refused. `last_head_sha` is
+        // server-held and unreachable from the caller, and nothing rewrites it
+        // but a successful send — so refusing here would wedge a session
+        // predating the `task_list` shape check permanently, behind an error
+        // naming a field its reader cannot correct. The advance is allowed and
+        // the ancestry comparison is skipped, which is exactly what these
+        // sessions did before the guard existed.
+        validate_global_review_head_advance(&repo, "HEAD", &second)
+            .expect("a malformed stored last_head_sha must skip, not wedge the session");
     }
 
     #[test]
