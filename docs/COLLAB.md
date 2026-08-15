@@ -745,14 +745,17 @@ with nothing after it — like every other unrecognized string — classifies
 | `codex_dispatch_failed:` | `codex_dispatch_failed: process exited 137` |
 | `checkpoint_drift:` | `checkpoint_drift: HEAD 75a4ea3 differs from the current checkpoint's head_sha b9c2ce0` |
 
-`checkpoint_drift:` is the one the *server itself* also emits: the
-`implementation_done` gate refuses the send with this prefix when the
-session's stored checkpoint does not back the claim that the batch is
-finished. It is recoverable rather than Terminal on purpose — the ledger is
-merely behind the work, and writing an accurate checkpoint fixes it, unlike
-`branch_drift:` where the work is on the wrong branch and cannot be
-reconciled in place. Every such refusal names the `collab_checkpoint(...)`
-call that would satisfy it.
+`checkpoint_drift:` is the one the *server itself* also emits, from two
+places. The `implementation_done` gate refuses the send with this prefix when
+the session's stored checkpoint does not back the claim that the batch is
+finished — a comparison against the *reported* head, which never reads the
+repo. `collab_resume` refuses with it when the stored checkpoint disagrees
+with **live git HEAD**, so a successor cannot restore normal progression onto
+a progress claim the repo has already outrun. It is recoverable rather than
+Terminal on purpose — the ledger is merely behind the work, and writing an
+accurate checkpoint fixes it, unlike `branch_drift:` where the work is on the
+wrong branch and cannot be reconciled in place. Every such refusal names the
+`collab_checkpoint(...)` call that would satisfy it.
 
 Everything else classifies **Terminal**: a bare recoverable prefix with no
 suffix, `branch_drift:` (see the drift check in "Harness-Side
@@ -949,13 +952,15 @@ names) MUST:
 
 `collab_resume` (a separate MCP tool — see below — not a `collab_send`
 topic) lets either agent restore a `CodingFailed` session back to its
-`failed_from_phase`. It is eligible only when ALL THREE hold:
+`failed_from_phase`. It is eligible only when ALL FOUR hold:
 
 - the stored `coding_failure` classifies **Tooling**,
-- `failed_from_phase` was actually recorded, and
+- `failed_from_phase` was actually recorded,
 - `total_recovery_attempts < MAX_TOTAL_RECOVERY_ATTEMPTS` (5) — the
   monotonic lifetime budget is what makes resume terminate rather than
-  refill itself forever.
+  refill itself forever, and
+- the session's stored checkpoint, if it has one, agrees with live git HEAD
+  (issue #273) — otherwise the call is refused with `checkpoint_drift:`.
 
 A session that predates this feature has `failed_from_phase = NULL` and
 `collab_resume` returns a deterministic `NotResumable` error naming that
@@ -1369,6 +1374,38 @@ resets; `total_recovery_attempts` is the monotonic lifetime count and never
 resets, so it is the field to read when judging whether a session is worth
 continuing).
 
+**`checkpoint`.** The session's current `collab_checkpoints` row plus the
+live-HEAD comparison, or JSON `null` when the session has never checkpointed.
+This is the same information the `session_handoff` block carries, exposed
+without needing a handoff so drift is visible while a batch is still running.
+
+Fields: every column the checkpoint row stores — `status`, `task_id`,
+`task_title`, `head_sha`, `commit_sha`, `completed_task_ids` (an array of
+integers), `next_task_id`, `gates_result`, `gates_sha`, `gates_commands`,
+`summary`, `attested_by`,
+`acknowledged_divergence`, `updated_at` (the server's anti-backdating stamp),
+and the comparison:
+
+- `head_check` — `"checked"` or `"unreadable"`.
+- `diverged` — `true`, `false`, or **`null`** when `head_check` is
+  `"unreadable"`. A consumer that treats `diverged` as a plain boolean reads
+  `null` as falsy, which is exactly why the label is reported beside it:
+  reporting `false` for a check that never ran would be an unverified claim
+  presented as verified. Read `head_check` first.
+- `repo_head_sha` — the HEAD actually read, `null` when it could not be.
+- `divergence` — the `checkpoint_drift:` diagnostic, present only when
+  `diverged` is `true`.
+- `head_check_error` — why the check could not run, present only when
+  `head_check` is `"unreadable"`.
+
+`gates_commands` is what the gate-proof reuse rule under "Implementation
+checkpoints" compares against the current required gate set; it and
+`commit_sha`, `task_title`, and `summary` are readable here rather than only
+from the checkpoint drawer, so that rule survives the drawer going away.
+
+The git read only happens for a session that has a checkpoint row at all, so
+polling a session still in planning costs nothing.
+
 **`recovery_origin_owner`** names the agent that owned the turn the failure
 interrupted. Control is **not** handed back to it: the recovery owner
 (`recovery_owner`) completes the interrupted turn itself, and the phase's
@@ -1504,6 +1541,31 @@ not exhausted. An ineligible call rejects with `NotResumable { reason }`:
 - A session whose `failed_from_phase` is `NULL` predates this feature;
   `reason` says the session "predates resume support."
 
+**Checkpoint head-consistency (issue #273).** Before any of the above,
+`collab_resume` refuses with a `checkpoint_drift:` message when the session's
+stored checkpoint disagrees with live git HEAD. This is the one surface of the
+three that refuses rather than reports: `collab_resume` is agent-callable and
+allowlisted for unattended successors, so without it a successor silently
+resumes onto a false progress claim — the #273 scenario, one process later. A
+refused resume writes nothing: no audit row, no phase change.
+
+An `attested_by=operator` checkpoint does **not** exempt a resume. An
+attestation names a *closed* range ending at the checkpoint's own `head_sha`;
+a live divergence is by construction drift past that range, which no existing
+attestation has seen. The escape hatch works by *ending* the divergence rather
+than forgiving it — the operator files a fresh checkpoint at the current HEAD
+carrying the range it vouches for, at which point there is no divergence left
+to find and the attestation stays on the row for audit. See "Operator-attested
+checkpoint backfill" below for how that range is inspected and what the server
+checks before accepting it.
+
+A checkpoint that could not be compared against git at all does not refuse — a
+transient filesystem problem must not strand a recoverable session — but the
+success response then carries `checkpoint.head_check: "unreadable"` rather
+than implying a check that never ran. A session with no checkpoint row does
+not refuse either; `implementation_done`'s own gate is what refuses a batch
+that reaches the end without one.
+
 On success: `phase` is restored to `failed_from_phase`, `current_owner`
 becomes the caller (`agent`), `coding_failure` clears, and the prior
 terminal diagnostic moves into `pending_failure` for audit.
@@ -1511,12 +1573,120 @@ terminal diagnostic moves into `pending_failure` for audit.
 per-resume retry budget. `total_recovery_attempts` is **not** reset — it
 carries the session's whole recovery history across every resume, and is
 what eventually makes the session permanently non-resumable.
-`failed_from_phase` itself is left set as a historical record. This path
+`failed_from_phase` itself is left set as a historical record. The response
+also carries the same `checkpoint` block `collab_status` returns, so a
+successor sees what it resumed onto. This path
 is for when the retry ceiling was exceeded, or a fresh process wants to
 pick a dead-but-recoverable session back up — it is not needed for the
 normal in-flight recovery path (staying in-phase after a Tooling
 `failure_report`), which never calls `collab_resume` since that session
 never leaves its phase in the first place.
+
+### Operator-attested checkpoint backfill (issue #273)
+
+When a batch has committed work its checkpoint never recorded, the recorded
+progress is behind the repo and every reader — `session_handoff`,
+`collab_status`, `collab_resume` — is being shown a false progress report. The
+recovery is **not** for the server to write the missing checkpoint itself.
+
+**The server never synthesizes a checkpoint from post-checkpoint commits.** It
+can see the commits; it cannot know which *tasks* they completed, and inferring
+that from commit messages would manufacture exactly the false provenance this
+issue exists to prevent. An auto-backfill would replace a stale-but-honest
+report with a fresh-and-fabricated one. So the operator **inspects** the range,
+then explicitly **attests** to it.
+
+#### 1. Inspect (read-only)
+
+```
+collab_checkpoint(session_id=<id>, agent=<you>, inspect_divergence=true)
+```
+
+Writes nothing: no checkpoint row, no audit row, no session change. `agent` is
+still required — there is no `agent`-less operator entry point onto the one
+tool that can write `attested_by=operator` — but this mode takes no generation
+lease, so an operator can look *before* taking the session over. A
+`handoff_token` is refused rather than ignored, claiming one being a write.
+
+Returns the same `checkpoint` block `collab_status` does (so the operator and
+the successor who reads the row later are shown one story), plus:
+
+- `commit_range` — `<checkpoint head_sha>..<live HEAD>`, or `null`.
+- `commits` — the commits in that range, newest first, each `{ sha, subject }`.
+  The subjects are the point: an override that shows only a sha range is a
+  rubber stamp, which is worse than no override because it launders a
+  fabrication through a human. Capped at 200, with `commits_truncated` saying
+  so rather than the list quietly ending.
+- `attestable` — whether there is a range here to attest to at all.
+- `attestation` — the exact `collab_checkpoint(...)` call that would attest to
+  what was just shown, present only when `attestable`.
+- `commit_range_status` — **five** answers, and the distinctions are the
+  substance:
+  - `listed` — a real run of commits after the checkpoint. The only
+    `attestable` answer.
+  - `no_divergence` — checked, and the checkpoint already describes live HEAD.
+  - `not_checked` — live HEAD could not be read, so drift is **unknown**. Never
+    reported as `no_divergence`: an unreadable repo is precisely where a
+    checkpoint is most likely stale.
+  - `checkpoint_head_unreachable` — the checkpoint's `head_sha` is not
+    reachable from live HEAD (history rewritten, a different branch, or a sha
+    that never existed). That is **branch drift, not a checkpoint gap**, and it
+    is not offered as an attestable range. Note `git log <cp>..<HEAD>`
+    *succeeds* for an unrelated branch and would list every commit on it, none
+    of which is post-checkpoint work — so the reachability is asked directly,
+    not inferred from git failing.
+  - `no_checkpoint` — the session never checkpointed, so there is no claim to
+    reconcile and nothing to attest over.
+- `commit_range_error` — why, for the three answers that have no range.
+
+#### 2. Attest
+
+```
+collab_checkpoint(session_id=<id>, agent=<you>, status=<...>,
+                  head_sha=<live HEAD>, completed_task_ids=<cumulative>,
+                  attested_by=operator, acknowledged_divergence=<from>..<to>)
+```
+
+`attested_by=operator` **requires** `acknowledged_divergence`, and an
+implementer may never carry one — an agent that could set the field itself
+would be writing its own permission slip. Beyond that presence rule, the range
+is resolved **against the repository** before the write lands:
+
+- both endpoints must name real commits;
+- the range must **end at this checkpoint's own `head_sha`** — the closed-range
+  property `collab_resume` relies on, without which one inspection could be
+  pasted onto any later checkpoint;
+- it must cover at least one commit (`X..X` vouches for nothing);
+- `from` must be an ancestor of `to`;
+- and it must **span the divergence**: `from` must be an ancestor-or-equal of
+  the head of the checkpoint being replaced, so the tail of the gap cannot be
+  attested while the commits nearest the stale checkpoint go uncovered.
+
+A refused attestation persists nothing. Two states are labelled rather than
+refused, so a legitimate attestation stays writable when the repo momentarily
+cannot answer — the response and the audit row both carry
+`attestation_check`:
+
+- `verified` — every check ran and held.
+- `verified_without_span` — the endpoints held, but the replaced checkpoint's
+  head no longer resolves (history rewritten out from under it), so coverage of
+  the gap is unknown.
+- `unverified_repo_unreadable` — live HEAD could not be read, so only the
+  range's *syntax* was checked. A malformed range is still refused here; an
+  unresolvable one is recorded as unverified rather than dressed as verified.
+
+Operator attestations are logged under their own `wal_log` operation,
+`collab_checkpoint_operator_attested`, rather than as ordinary
+`collab_checkpoint` rows. This is the one path that knowingly covers commits
+the protocol never witnessed, so an audit finds every one of them by operation
+name without parsing payloads.
+
+**What this does not do.** The attestation is a *human's* claim, checked for
+consistency against the repo — it is not proof the human looked. `attested_by`
+is caller-asserted like every other collab identity, and an agent holding the
+session's generation lease can set it. What the checks above buy is that the
+range it names cannot be fiction: the commits exist, they end where the
+checkpoint is filed, and they cover the whole gap.
 
 ### `session_handoff` (fallback succession)
 
@@ -1531,12 +1701,53 @@ generation, handoff_token, handoff_block }` where `generation` is the
 **pending (to-be-claimed) generation** = active_generation + 1, not the
 caller's current active generation.
 
-**What it does.** The server reads persisted session state and the one
-logical-keyed current `collab-checkpoints` drawer for the session (falling back
-to the newest legacy checkpoint only during rollout) and composes a deterministic,
-model-free fenced markdown block (` ```ironrace-session-handoff `) — it
-NEVER asks a model to summarize. This tool is a WRITE tool and is denied in
-read-only / restricted MCP mode.
+**What it does.** The server reads persisted session state and the session's
+current `collab_checkpoints` row, and composes a deterministic, model-free
+fenced markdown block (` ```ironrace-session-handoff `) — it NEVER asks a
+model to summarize. This tool is a WRITE tool and is denied in read-only /
+restricted MCP mode.
+
+**Checkpoint lines.** The block carries `checkpoint` (`present` only for a
+verified `collab_checkpoints` row), `checkpoint.status`, `.task_id`,
+`.completed_task_ids`, `.next_task_id`, `.head_sha`, `.gates_result`,
+`.attested_by`, and `.acknowledged_divergence`, plus the live-HEAD comparison:
+
+- `checkpoint.head_check` — `matches`, `diverged`, or `unverified`. **Three
+  values, never two.** `unverified` means git could not be read at all
+  (missing from `PATH`, unreadable repo, not a repo), which is exactly where a
+  checkpoint is most likely to be stale; reporting it as `matches` would
+  present an unverified claim as verified.
+- `checkpoint.repo_head_sha` — the HEAD actually read, so a successor filing a
+  corrected checkpoint need not shell out to git itself.
+- `checkpoint.divergence` — the full `checkpoint_drift:` diagnostic when the
+  two disagree, naming both SHAs and what the checkpoint claims.
+- `checkpoint.head_check_error` — why the check could not run, present exactly
+  when `head_check` is `unverified`.
+
+Every key is emitted on every call, unset ones as an em-dash, so the key set
+is fixed. The block remains timestamp-free: the row's `updated_at` is exposed
+through `collab_status` and `collab_resume` instead, `head_check` being a
+better staleness signal than a clock in any case.
+
+**The block is unforgeable.** Every line is written through one renderer that
+collapses its value onto a single line, so no field can inject additional
+`key: value` lines. This matters because several rendered values are
+agent-supplied free text — `coding_failure` and its `pending_failure` clone
+arrive from a `failure_report` and are *expected* to be multi-line — and a
+successor routes off this block. Long values therefore appear with internal
+newlines and runs of whitespace collapsed to single spaces; nothing is
+truncated.
+
+**The legacy checkpoint drawer.** Before issue #273 this block was rendered
+from the `collab-checkpoint:<session_id>` drawer — the artifact the incident
+turned on, where a frozen drawer was presented to a successor as current
+progress. That drawer's *contents* are no longer rendered anywhere in the
+block. Its existence is reported on its own line, `checkpoint.legacy_drawer`,
+described as unverified and naming the `get_drawer` call that reads it. It
+records no `head_sha`, so nothing can check it against git; showing its values
+beside a verified row's would be exactly the conflation that caused the
+incident. A successor can still find the legacy record, and can never mistake
+it for a verified one.
 
 **Recovery-state lines.** The block mirrors the `collab_status` recovery
 fields — `pending_failure`, `failed_from_phase`, `recovery_phase`,

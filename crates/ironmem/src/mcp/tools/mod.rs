@@ -516,6 +516,15 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "session_id": { "type": "string" },
+                    // The read-only mode (Task 10). Advertised with `status`
+                    // and `head_sha` dropped from `required` below, because
+                    // this is the call an operator makes in order to LEARN what
+                    // to put in them — a schema that demanded them would have a
+                    // validating client reject the inspection outright.
+                    "inspect_divergence": {
+                        "type": "boolean",
+                        "description": "Read-only: report the commits after the checkpoint instead of writing. Writes nothing."
+                    },
                     // Required, like every other session-scoped collab write:
                     // it names the identity the generation lease is checked
                     // against, so a superseded process cannot land stale
@@ -531,7 +540,8 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
                     "task_title": { "type": "string" },
                     "status": {
                         "type": "string",
-                        "enum": ["started", "completed", "blocked", "batch_complete"]
+                        "enum": ["started", "completed", "blocked", "batch_complete"],
+                        "description": "Required for a write; omit only with inspect_divergence"
                     },
                     "head_sha": {
                         "type": "string",
@@ -539,7 +549,7 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
                         // divergence check is string equality against
                         // `git rev-parse HEAD`, so an abbreviated sha reads as
                         // permanent drift on a repo that has not moved.
-                        "description": "Full 40-char repo HEAD at checkpoint time; matched verbatim, so a short sha always reads as drift"
+                        "description": "Full 40-char repo HEAD at checkpoint time; matched verbatim, so a short sha always reads as drift. Required for a write; omit only with inspect_divergence"
                     },
                     "commit_sha": { "type": "string" },
                     "completed_task_ids": {
@@ -559,11 +569,18 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
                     "attested_by": { "type": "string", "enum": ["implementer", "operator"] },
                     "acknowledged_divergence": {
                         "type": "string",
-                        "description": "Operator-only: SHA range vouched for, <from>..<to>"
+                        "description": "Operator-only: SHA range vouched for, <from>..<to>. Resolved against the repo: must end at head_sha and cover the divergence"
                     },
                     "handoff_token": { "type": "string" }
                 },
-                "required": ["session_id", "agent", "status", "head_sha"]
+                // `status` and `head_sha` are required for a WRITE and refused
+                // by the parser when missing — they are not listed here because
+                // JSON Schema cannot express "required unless
+                // inspect_divergence", and the wrong half of that trade is the
+                // one that makes a documented call unrepresentable. Their
+                // descriptions carry the rule; `handle_collab_checkpoint`
+                // enforces it.
+                "required": ["session_id", "agent"]
             }
         }),
         json!({
@@ -908,8 +925,14 @@ pub(crate) const MUTATING_TOOLS: &[&str] = &[
     "collab_register_caps",
     "collab_end",
     "collab_resume",
-    // Persists a row in `collab_checkpoints` on every call, so it is disabled
-    // in read-only mode and takes the framing loop's ordering barrier. NOT in
+    // Persists a row in `collab_checkpoints` on every call EXCEPT
+    // `inspect_divergence`, which is read-only (Task 10). Classified as
+    // unconditionally mutating anyway: the alternative is a
+    // `ConditionalMutation` entry keyed on a caller-supplied boolean, which
+    // would let that boolean decide a read-only-mode authorization outcome for
+    // the one tool that can write `attested_by=operator`. The cost is that an
+    // operator cannot inspect in restricted mode; `collab_status` still shows
+    // them the checkpoint and its divergence there. NOT in
     // `WRITE_SHAPED_TOOLS`: it needs no embedder, so it must not park on the
     // readiness gate.
     "collab_checkpoint",
@@ -1333,6 +1356,40 @@ mod tests {
             "agent must be REQUIRED: a superseded process would simply omit an \
              optional one, and a check a caller can opt out of is not a check"
         );
+
+        // The read-only mode has to be *representable* by a client that honors
+        // the schema, which means `status`/`head_sha` cannot be in `required` —
+        // they are exactly the values an inspecting operator does not have yet.
+        // The rule they lose from `required` has to survive somewhere, so it
+        // moves into their descriptions; without both halves this is either an
+        // unrepresentable call or an undocumented requirement.
+        assert_eq!(
+            properties["inspect_divergence"]["type"],
+            json!("boolean"),
+            "the read-only inspection mode must be advertised"
+        );
+        assert!(
+            properties["inspect_divergence"]["description"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Writes nothing"),
+            "the one thing a caller must not have to infer about an override's \
+             inspection step is whether calling it changed anything"
+        );
+        for field in ["status", "head_sha"] {
+            assert!(
+                !required.contains(&json!(field)),
+                "{field} must not be required, or a validating client cannot make an \
+                 inspect_divergence call at all"
+            );
+            assert!(
+                properties[field]["description"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("Required for a write"),
+                "{field} left the required list, so its description must carry the rule"
+            );
+        }
     }
 
     /// Raised 3_500 -> 3_550 for the v17 supersession surface (#211): `search`
@@ -1365,6 +1422,21 @@ mod tests {
     /// addition, leaving ~39 tokens of headroom, in line with the previous
     /// raise.
     ///
+    /// Raised 4_085 -> 4_170 for `collab_checkpoint`'s `inspect_divergence`
+    /// mode (#273 Task 10) — the read-only half of the operator-attested
+    /// backfill. A new property plus the two "required for a write; omit only
+    /// with inspect_divergence" clauses is ~330 bytes, and none of it is
+    /// trimmable prose: `inspect_divergence`'s own description is the only
+    /// place the surface says the mode writes nothing, and the two clauses
+    /// exist because `status`/`head_sha` had to leave the `required` list (JSON
+    /// Schema cannot express "required unless") — so without them a caller
+    /// reads the schema as saying a write may omit them. The
+    /// `acknowledged_divergence` description gained the repo-backed rule for
+    /// the same reason: a caller that learns only at the refusal that the range
+    /// must end at `head_sha` has already filed a wrong one. The listing
+    /// measured 4_128 tokens after the addition, leaving ~42 tokens of
+    /// headroom, in line with the previous raises.
+    ///
     /// The budget is deliberately a whole-listing ceiling with no per-tool
     /// allocation, so the cheapest way to land a new field is to delete prose
     /// from whichever unrelated tool happens to be wordiest. That trade is not
@@ -1377,7 +1449,7 @@ mod tests {
         let bytes = serde_json::to_vec(&tool_definitions(&app)).unwrap().len();
         let estimated_tokens = bytes.div_ceil(4);
         assert!(
-            estimated_tokens <= 4_085,
+            estimated_tokens <= 4_170,
             "tool listing is ~{estimated_tokens} tokens ({bytes} bytes); trim descriptions that duplicate their schemas"
         );
     }

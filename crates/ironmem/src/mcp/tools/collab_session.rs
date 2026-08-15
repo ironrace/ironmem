@@ -1321,8 +1321,9 @@ fn checkpoint_drift(detail: String) -> MemoryError {
 ///
 /// # Why `attested_by` is not consulted
 ///
-/// [`checkpoint_divergence`]'s doc comment warns that a caller wiring it in as
-/// an unconditional block would defeat the operator-attestation escape hatch.
+/// The live-HEAD comparison ([`HeadCheck`]) is deliberately a detector rather
+/// than a policy, precisely so that each caller decides for itself whether the
+/// operator-attestation escape hatch bears on it.
 /// This gate does not consult `attested_by` in *either* direction, and the
 /// reason is the paragraph above: a divergence is by definition a
 /// checkpoint-versus-live-HEAD disagreement, and this function never reads
@@ -1339,9 +1340,13 @@ fn checkpoint_drift(detail: String) -> MemoryError {
 /// caller-asserted like every other collab identity. Refusing them outright
 /// would leave the escape hatch with nothing to build on. Ignoring the field
 /// does neither: an operator-attested checkpoint that satisfies these four
-/// conditions passes here today, and the live-HEAD comparison plus the range
-/// verification that actually honors the attestation belong on the handoff
-/// and resume paths, *outside* this function.
+/// conditions passes here today, and the two checks that actually honor the
+/// attestation live outside this function — the live-HEAD comparison on the
+/// handoff and resume paths, and the range verification at the checkpoint
+/// *write*
+/// (`super::collab_checkpoint::verify_acknowledged_range`, Task 10), which is
+/// where the range is asserted and the only place a false one can be refused
+/// before it becomes a stored row every later reader trusts.
 ///
 /// **Binding constraint on the next author.** All of the above holds only
 /// because this function never reads live git HEAD. If a live-HEAD comparison
@@ -1523,12 +1528,46 @@ fn require_checkpoint_proof(
 /// `final_review` turns. Treating the batch flow's `implementation_done`
 /// differently — recoverable there, terminal everywhere else — would draw a
 /// distinction the underlying git fact does not support.
+/// Strip every inherited `GIT_*` variable before spawning git.
+///
+/// `git -C <path>` is not enough on its own: an inherited `GIT_DIR` /
+/// `GIT_WORK_TREE` (and friends) silently redirects the command at a
+/// *different* repository, so a checkpoint would be compared against the wrong
+/// HEAD — and could be reported `head_check: matches` while the session's real
+/// repo has drifted. That is an unverified claim presented as verified, the
+/// exact failure issue #273 exists to end, arriving through the environment
+/// rather than through a stale record.
+///
+/// Not hypothetical, and not novel here: `review::diff`'s helper of the same
+/// name says these overrides "can redirect a command away from `request.repo`",
+/// the review hook does the same, and this file's own test fixtures already
+/// scrub — the production path was the one left exposed. PATH and the rest of
+/// the environment are deliberately preserved; only git's process controls go.
+///
+/// `pub(super)` so `collab_checkpoint`'s inspection and range-verification
+/// shell-outs (Task 10) go through the same scrub rather than growing a second,
+/// unscrubbed spelling. Every `Command::new("git")` in this module tree must
+/// call it before `.output()`.
+pub(super) fn scrub_git_environment(command: &mut Command) {
+    for (key, _) in std::env::vars_os() {
+        if key
+            .to_string_lossy()
+            .to_ascii_uppercase()
+            .starts_with("GIT_")
+        {
+            command.env_remove(key);
+        }
+    }
+}
+
 fn validate_global_review_head_advance(
     repo_path: &str,
     last_head_sha: &str,
     head_sha: &str,
 ) -> Result<(), MemoryError> {
-    let output = Command::new("git")
+    let mut command = Command::new("git");
+    scrub_git_environment(&mut command);
+    let output = command
         .args([
             "-C",
             repo_path,
@@ -1603,14 +1642,16 @@ fn validate_global_review_head_advance(
 /// `pub(super)` so the `collab_checkpoint` tool can report divergence on write
 /// without duplicating the shell-out.
 ///
-/// `collab_checkpoint` calls this **directly** rather than going through
-/// [`checkpoint_divergence`], and that is the point of it being reachable:
-/// that function's `None` is ambiguous between "no drift" and "could not
-/// check", and a tool that answered `diverged: false` for an unreadable repo
-/// would report an unverified claim as verified. See
-/// `mcp::tools::collab_checkpoint::HeadCheck`.
+/// Every caller that needs to compare a checkpoint against live HEAD goes
+/// through [`HeadCheck::read`] rather than calling this directly, and the
+/// reason is that this function's `Err` is the third state: a caller that
+/// discarded it with `.ok()` would collapse "checked, no drift" and "could not
+/// check" into one answer and report `diverged: false` for an unreadable repo.
+/// See [`HeadCheck`].
 pub(super) fn git_head_sha(repo_path: &str) -> Result<String, MemoryError> {
-    let output = Command::new("git")
+    let mut command = Command::new("git");
+    scrub_git_environment(&mut command);
+    let output = command
         .args(["-C", repo_path, "rev-parse", "HEAD"])
         .output()
         .map_err(|err| {
@@ -1636,59 +1677,134 @@ pub(super) fn git_head_sha(repo_path: &str) -> Result<String, MemoryError> {
     Ok(sha)
 }
 
-/// Compare a checkpoint against live git HEAD, returning a `checkpoint_drift:`
-/// diagnostic when they disagree.
+/// What comparing a checkpoint against live git HEAD actually established.
 ///
-/// Returns `None` — deliberately not an error and not a drift report — when
-/// git itself cannot be read. An unreadable repo is an *operational* failure,
-/// a different condition from a stale checkpoint. Same category distinction
+/// **Three states, deliberately not two.** The obvious shape for this is a
+/// `-> Option<String>` detector returning the drift diagnostic or `None`, and
+/// that is what issue #273 Task 6 first built. It is the wrong shape for every
+/// caller that exists: git missing from `PATH`, an unreadable repo, or a path
+/// that is not a repo at all are exactly the environments where a checkpoint
+/// is most likely stale, and a `None` that means both "checked, no drift" and
+/// "could not check" lets a surface answer `diverged: false` — an unverified
+/// claim presented as verified, a smaller instance of the failure this issue
+/// exists to end. So the third state is reported as itself, and every surface
+/// (`collab_checkpoint`, `session_handoff`, `collab_resume`, `collab_status`)
+/// renders all three.
+///
+/// **Not an error.** [`Self::Unreadable`] is an *operational* failure, a
+/// different condition from a stale checkpoint — the same category distinction
 /// `validate_global_review_head_advance` draws between exit code 1 and any
-/// other git failure — but not the same disposal: that function returns a
-/// distinct error for each case, so its operational failure still reaches the
-/// caller. This function is called from paths (the gate, handoff, and resume)
-/// that must not fail a turn on a transient filesystem problem, so it
-/// swallows the operational case into `None` instead. That means `None` here
-/// is ambiguous between "no drift" and "could not check" — **a caller that
-/// needs to tell those apart must call [`git_head_sha`] directly**, not infer
-/// it from this function's `None`.
+/// other git failure. The callers here (a write that must stay retryable, and
+/// three read/report paths) must not fail a turn on a transient filesystem
+/// problem, so the operational case is carried rather than raised.
 ///
 /// **Direction.** The diagnostic says HEAD "differs from" the checkpoint's
-/// `head_sha`, not "is ahead of" it. This function only proves the two SHAs
-/// are unequal — it does not run an ancestry check, so it cannot tell a normal
-/// forward advance (the issue #273 case) from HEAD having moved *behind* the
+/// `head_sha`, not "is ahead of" it. This only proves the two SHAs are
+/// unequal — it runs no ancestry check, so it cannot tell a normal forward
+/// advance (the issue #273 case) from HEAD having moved *behind* the
 /// checkpoint (a reset) or onto an unrelated commit entirely. Asserting "ahead
 /// of" here would be exactly the kind of claim-outrunning-evidence this issue
 /// is about; a caller that needs the direction can run its own ancestry check
-/// (see `validate_global_review_head_advance`) against the two SHAs this
+/// (see `validate_global_review_head_advance`) against the two SHAs the
 /// diagnostic already names. An ancestry check would also be the wrong tool
 /// here regardless: a stale checkpoint's `head_sha` can name a commit that has
 /// since been rebased away, and `merge-base --is-ancestor` needs both SHAs to
-/// still resolve in the repo — exactly the input this detector exists to
-/// catch would make that check fail before it could report anything.
+/// still resolve in the repo — exactly the input this exists to catch would
+/// make that check fail before it could report anything.
 ///
-/// **Not a gate.** This is a pure detector: it reports drift regardless of
-/// `attested_by`/`acknowledged_divergence`. The operator-attestation escape
-/// hatch — the deliberate, auditable way a human can vouch for a divergence
-/// the protocol never witnessed — is enforced by [`CollabCheckpoint::validate`]
-/// and belongs at the Task 10 gate that decides what to *do* with this
-/// function's result, not here. A caller that wires this in as an
-/// unconditional block would silently defeat that hatch.
-///
-/// No production caller lands until Tasks 7-10 wire this into the gate,
-/// handoff, and resume paths, so it is test-only for now — hence
-/// `allow(dead_code)` outside `cfg(test)`, the same pattern
-/// `ToolMeta::mutating_witnesses` uses in `mcp/tools/mod.rs`. `git_head_sha`
-/// above no longer needs it: `collab_checkpoint` calls that one.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(super) fn checkpoint_divergence(
-    repo_path: &str,
-    checkpoint: &crate::collab::CollabCheckpoint,
-) -> Option<String> {
-    let head = git_head_sha(repo_path).ok()?;
-    if head == checkpoint.head_sha {
-        return None;
+/// **A detector, not a policy.** Drift is reported regardless of
+/// `attested_by`/`acknowledged_divergence`. What to *do* about it is each
+/// caller's decision — `collab_checkpoint` reports and writes anyway (a
+/// checkpoint write is how drift gets *fixed*), `session_handoff` and
+/// `collab_status` report, and only `handle_collab_resume` refuses. See that
+/// handler for why refusing there does not defeat the operator-attestation
+/// escape hatch.
+pub(super) enum HeadCheck {
+    /// Live HEAD was read, so `divergence` is a real finding either way:
+    /// `Some` carries the `checkpoint_drift:` diagnostic, `None` means the
+    /// checkpoint genuinely describes the current HEAD.
+    Checked {
+        repo_head_sha: String,
+        divergence: Option<String>,
+    },
+    /// Live HEAD could not be read, so nothing about drift is known.
+    Unreadable { detail: String },
+}
+
+impl HeadCheck {
+    pub(super) fn read(repo_path: &str, checkpoint: &crate::collab::CollabCheckpoint) -> Self {
+        match git_head_sha(repo_path) {
+            Ok(head) => Self::Checked {
+                divergence: (head != checkpoint.head_sha)
+                    .then(|| checkpoint_drift_message(&head, checkpoint)),
+                repo_head_sha: head,
+            },
+            // `git_head_sha` reports every failure as `Validation`, whose
+            // `Display` prefixes "Validation error:" — misleading for what is
+            // an environment problem, and about the repo rather than the
+            // caller's arguments. Unwrap that one variant; anything else keeps
+            // its full rendering rather than being silently reshaped.
+            Err(MemoryError::Validation(detail)) => Self::Unreadable { detail },
+            Err(other) => Self::Unreadable {
+                detail: other.to_string(),
+            },
+        }
     }
-    Some(format!(
+
+    /// `true`, `false`, or JSON `null` for "the check did not run". A caller
+    /// that treats the value as a plain boolean reads `null` as falsy, which is
+    /// why [`Self::label`] is reported beside it in words.
+    pub(super) fn diverged(&self) -> Value {
+        match self {
+            Self::Checked { divergence, .. } => json!(divergence.is_some()),
+            Self::Unreadable { .. } => Value::Null,
+        }
+    }
+
+    /// Whether the check ran at all — the field that keeps `diverged: null`
+    /// from being read as "no drift".
+    pub(super) fn label(&self) -> &'static str {
+        match self {
+            Self::Checked { .. } => "checked",
+            Self::Unreadable { .. } => "unreadable",
+        }
+    }
+
+    /// The HEAD actually read, so a caller told it has drifted can file an
+    /// accurate checkpoint without shelling out to git itself.
+    pub(super) fn repo_head_sha(&self) -> Value {
+        match self {
+            Self::Checked { repo_head_sha, .. } => json!(repo_head_sha),
+            Self::Unreadable { .. } => Value::Null,
+        }
+    }
+
+    /// The `checkpoint_drift:` diagnostic, present only when live HEAD was
+    /// read *and* disagreed.
+    pub(super) fn divergence(&self) -> Option<&str> {
+        match self {
+            Self::Checked { divergence, .. } => divergence.as_deref(),
+            Self::Unreadable { .. } => None,
+        }
+    }
+
+    /// Why the check could not run. Always rendered beside
+    /// `head_check: "unreadable"`, so a reader is told why rather than left to
+    /// infer it from a missing verdict.
+    pub(super) fn unreadable_detail(&self) -> Option<&str> {
+        match self {
+            Self::Checked { .. } => None,
+            Self::Unreadable { detail } => Some(detail),
+        }
+    }
+}
+
+/// The operator-facing `checkpoint_drift:` diagnostic for a checkpoint whose
+/// `head_sha` disagrees with the `head` git actually reports. Names both SHAs
+/// and what the checkpoint claims, so a reader can tell what happened without
+/// re-deriving it.
+fn checkpoint_drift_message(head: &str, checkpoint: &crate::collab::CollabCheckpoint) -> String {
+    format!(
         "{} HEAD {head} differs from the current checkpoint's head_sha {} \
          (checkpoint: task {}, status {}, completed {}); \
          file an accurate checkpoint with collab_checkpoint before proceeding",
@@ -1697,7 +1813,77 @@ pub(super) fn checkpoint_divergence(
         format_task_id(checkpoint.task_id),
         checkpoint.status,
         format_task_id_list(&checkpoint.completed_task_ids),
-    ))
+    )
+}
+
+/// The `checkpoint` block shared by `collab_status` and `collab_resume`.
+///
+/// `Value::Null` means "this session has never written a checkpoint" — a
+/// distinct answer from a checkpoint that exists but could not be compared
+/// against git, which reports `diverged: null` with `head_check:
+/// "unreadable"`. Neither is ever rendered as `diverged: false`.
+///
+/// Takes the [`HeadCheck`] rather than performing it, so a caller that also
+/// needs to *act* on the result (`collab_resume` refuses on it) decides from
+/// the same single git read this block reports.
+///
+/// `pub(super)` so `collab_checkpoint`'s read-only inspection mode (Task 10)
+/// shows an operator the *same* checkpoint rendering `collab_status` and
+/// `collab_resume` do. An inspection that described the checkpoint in its own
+/// words would be a second, drifting statement of what the row says — and the
+/// operator about to attest is exactly the reader who must not be shown a
+/// different story from the successor who reads it afterwards.
+pub(super) fn checkpoint_json(
+    checkpoint: Option<(&crate::collab::CollabCheckpoint, &HeadCheck)>,
+) -> Value {
+    let Some((cp, head_check)) = checkpoint else {
+        return Value::Null;
+    };
+    let mut block = json!({
+        "status": cp.status.as_str(),
+        "task_id": cp.task_id,
+        "head_sha": cp.head_sha,
+        "completed_task_ids": cp.completed_task_ids,
+        "next_task_id": cp.next_task_id,
+        "gates_result": cp.gates_result,
+        "gates_sha": cp.gates_sha,
+        // The rest of the stored row. Every column the table accepts is
+        // readable from *some* tool, or it is write-only state: a resumer
+        // reads `gates_commands` to decide whether a recorded gate proof
+        // covers the gate set it would otherwise re-run (COLLAB.md's
+        // "Implementation checkpoints" requires exactly that comparison),
+        // `commit_sha` to find the commit a task landed on, and
+        // `task_title`/`summary` to say what the batch was doing. Those all
+        // used to come from the checkpoint drawer; once the drawer stops being
+        // written, this is the only place they exist.
+        "gates_commands": cp.gates_commands,
+        "commit_sha": cp.commit_sha,
+        "task_title": cp.task_title,
+        "summary": cp.summary,
+        "attested_by": cp.attested_by.as_str(),
+        "acknowledged_divergence": cp.acknowledged_divergence,
+        // The anti-backdating server stamp — the field that tells a fresh
+        // checkpoint from a frozen one.
+        "updated_at": cp.updated_at,
+        "diverged": head_check.diverged(),
+        "head_check": head_check.label(),
+        "repo_head_sha": head_check.repo_head_sha(),
+    });
+    if let Some(divergence) = head_check.divergence() {
+        block["divergence"] = json!(divergence);
+    }
+    if let Some(detail) = head_check.unreadable_detail() {
+        // Deliberately NOT the same string `collab_checkpoint` returns under
+        // this key: that tool emits the bare git detail, and its response
+        // bytes are a shipped contract (Task 5). The prefix belongs here,
+        // where the reader is a successor or an operator looking at session
+        // state rather than the caller of a write it just made. Do not
+        // "unify" the two spellings without moving Task 5's contract too.
+        block["head_check_error"] = json!(format!(
+            "checkpoint could not be verified against git HEAD: {detail}"
+        ));
+    }
+    block
 }
 
 /// Render an optional task id for an operator-facing message: `"3"` or
@@ -1991,6 +2177,17 @@ pub(super) fn handle_collab_status(app: &App, args: &Value) -> Result<Value, Mem
     )? {
         status["plan_file_path"] = Value::String(plan_file_path);
     }
+    // Issue #273: the checkpoint has to be visible without waiting for a
+    // handoff, so an operator (or a polling dispatcher) can see drift while
+    // the batch is still running rather than discovering it from a successor's
+    // false progress report. The git read only happens for a session that has
+    // a checkpoint row at all, so the common polling case — a session still in
+    // planning — costs nothing.
+    let checkpoint = app.db.collab_load_current_checkpoint(session_id)?;
+    let head_check = checkpoint
+        .as_ref()
+        .map(|cp| HeadCheck::read(&record.repo_path, cp));
+    status["checkpoint"] = checkpoint_json(checkpoint.as_ref().zip(head_check.as_ref()));
     for ag in [Agent::Claude, Agent::Codex] {
         let g = app
             .db
@@ -2372,11 +2569,76 @@ pub(super) fn handle_collab_end(app: &App, args: &Value) -> Result<Value, Memory
 /// `IRONMEM_METRICS`: the kill switch may have been enabled after the terminal
 /// failure wrote its outcome, and resuming must not leave that stale failed
 /// outcome behind.
+///
+/// # Refusing on checkpoint drift (issue #273, required fix #1)
+///
+/// This is the one surface of the three that *refuses* rather than reports.
+/// `collab_resume` is agent-callable and sits on the unattended successor's
+/// permission allowlist, so a successor that resumes while the checkpoint
+/// disagrees with the repo silently adopts a false progress claim and carries
+/// on from it — the incident, one process later. Handoff and status only show
+/// a reader the discrepancy; resume actually restores normal progression, so
+/// it is the only one where reporting is not enough.
+///
+/// **Why an operator attestation does not exempt a resume.** The obvious
+/// worry is that refusing unconditionally strands the operator escape hatch
+/// Task 10 builds. It does not, because the hatch does not work by marking a
+/// divergence forgiven — it works by *ending* it: the operator inspects the
+/// commits that landed after the checkpoint and files a new checkpoint at the
+/// current HEAD carrying `attested_by=operator` and the
+/// `acknowledged_divergence` range it covers. At that point live HEAD and the
+/// checkpoint's `head_sha` agree, there is no divergence left for this check
+/// to find, and the resume is admitted with the attestation preserved on the
+/// row for audit.
+///
+/// Consulting `attested_by` here instead would be actively wrong. An
+/// attestation names a *closed* range ending at the checkpoint's own
+/// `head_sha`; a live divergence is by construction drift *past* that range,
+/// which no existing attestation has seen, let alone vouched for. Treating the
+/// field as a standing waiver would turn one operator inspection into
+/// permanent immunity for every commit that follows — and
+/// [`crate::collab::CollabCheckpoint::validate`] only checks that the
+/// acknowledged range is non-blank, not that it is real, so that waiver would
+/// be one caller-asserted string away from disabling the check entirely. The
+/// escape hatch stays reachable and stays auditable precisely because it costs
+/// a fresh attestation each time the repo moves on without the ledger.
+///
+/// A checkpoint that could not be compared against git at all does **not**
+/// refuse — a transient filesystem problem must not strand a recoverable
+/// session — but the success response then carries `checkpoint.head_check:
+/// "unreadable"` rather than implying a check that never ran. A session with
+/// no checkpoint row does not refuse either: resume also serves phases where a
+/// checkpoint never exists, and `implementation_done`'s own gate
+/// ([`require_checkpoint_proof`]) is what refuses a batch that reaches the end
+/// without one.
 pub(super) fn handle_collab_resume(app: &App, args: &Value) -> Result<Value, MemoryError> {
     let session_id = require_str(args, "session_id")?;
     let (repo_path, branch) = scope_for_session(app, session_id)?;
     ensure_no_conflicting_process_session(app, session_id, &repo_path, &branch)?;
     let agent = require_agent(require_str(args, "agent")?)?;
+
+    // Required fix #1 of issue #273. Read outside the write transaction below:
+    // the git shell-out inside `HeadCheck::read` must not be held across
+    // `with_transaction`, which replays on `SQLITE_BUSY_SNAPSHOT` and would be
+    // holding the write transaction open across a process spawn. Refusing here
+    // also means a refused resume opens no transaction at all, so it cannot
+    // write a `collab_resume` audit row or advance the phase.
+    // `ensure_active` runs here too, ahead of the checkpoint check, so an
+    // already-ended session is told that rather than being handed a drift
+    // diagnostic about a session it can no longer resume for a different
+    // reason. The transaction below repeats it against its own snapshot.
+    let current_checkpoint = app.db.with_connection(|conn| {
+        crate::collab::queue::ensure_active(conn, session_id)?;
+        crate::collab::queue::load_current_checkpoint(conn, session_id)
+    })?;
+    // `repo_path` is the session's own, from `scope_for_session` above.
+    let head_check = current_checkpoint
+        .as_ref()
+        .map(|cp| HeadCheck::read(&repo_path, cp));
+    if let Some(divergence) = head_check.as_ref().and_then(HeadCheck::divergence) {
+        return Err(MemoryError::Validation(divergence.to_string()));
+    }
+    let checkpoint_block = checkpoint_json(current_checkpoint.as_ref().zip(head_check.as_ref()));
 
     let (phase, current_owner, claim) = app.db.with_transaction(|tx| {
         let claim = super::handoff::ensure_actor_generation_current(
@@ -2446,6 +2708,12 @@ pub(super) fn handle_collab_resume(app: &App, args: &Value) -> Result<Value, Mem
         "session_id": session_id,
         "phase": phase.to_string(),
         "current_owner": current_owner.to_string(),
+        // Echoed on success, not only on refusal. A resume admitted because
+        // git could not be read is NOT a resume onto a verified checkpoint,
+        // and the block says so (`head_check: "unreadable"`, `diverged:
+        // null`) rather than letting a silent success imply a check that never
+        // ran.
+        "checkpoint": checkpoint_block,
     }))
 }
 
@@ -5294,23 +5562,7 @@ mod tests {
         assert!(!inbox_topics(&app, &sid, Agent::Codex).contains(&"canonical".to_string()));
     }
 
-    // ── git_head_sha / checkpoint_divergence (Task 6, issue #273) ──────────────
-
-    /// Scrub inherited `GIT_*` environment variables before spawning a fixture
-    /// git command, same shape as `tests/review_diff.rs`'s helper of the same
-    /// name — a fixture command must not pick up ambient `GIT_DIR`/`GIT_WORK_TREE`
-    /// (etc.) from whatever process launched the test.
-    fn scrub_git_environment(command: &mut std::process::Command) {
-        for (key, _) in std::env::vars_os() {
-            if key
-                .to_string_lossy()
-                .to_ascii_uppercase()
-                .starts_with("GIT_")
-            {
-                command.env_remove(key);
-            }
-        }
-    }
+    // ── git_head_sha / HeadCheck (Task 6, issue #273) ──────────────────────────
 
     /// Run a fixture git command and assert it succeeded. Mirrors
     /// `tests/review_diff.rs`'s `git()` helper: a fixture step that silently
@@ -5385,6 +5637,139 @@ mod tests {
         crate::collab::CollabCheckpoint::from_json(&payload).unwrap()
     }
 
+    /// Serializes the tests below that mutate `GIT_*` process-wide. Separate
+    /// from `METRICS_ENV_LOCK` because it guards a different variable family;
+    /// sharing one lock would couple two unrelated suites.
+    static GIT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Sets `GIT_*` overrides for the duration of a test and restores them on
+    /// drop, holding [`GIT_ENV_LOCK`] throughout — `std::env::set_var` is
+    /// process-global, so an unsynchronized test would leak into whatever runs
+    /// beside it.
+    struct ScopedGitEnv {
+        previous: Vec<(String, Option<std::ffi::OsString>)>,
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl ScopedGitEnv {
+        fn set(vars: &[(&str, &str)]) -> Self {
+            let guard = GIT_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let previous = vars
+                .iter()
+                .map(|(key, value)| {
+                    let old = std::env::var_os(key);
+                    std::env::set_var(key, value);
+                    ((*key).to_string(), old)
+                })
+                .collect();
+            Self {
+                previous,
+                _guard: guard,
+            }
+        }
+    }
+
+    impl Drop for ScopedGitEnv {
+        fn drop(&mut self) {
+            for (key, old) in &self.previous {
+                match old {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    /// A second repo whose history is genuinely disjoint from
+    /// [`git_repo_with_two_commits`]'s.
+    ///
+    /// Two calls to that fixture produce **byte-identical SHAs** — same file
+    /// contents, same messages, same author, and the commit timestamps land in
+    /// the same second — so using one as the "hostile" repo would make every
+    /// assertion below true whether or not the environment was scrubbed. The
+    /// distinct file content is what makes these tests able to fail.
+    fn hostile_git_repo() -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        git(path, &["init", "-q"]);
+        git(path, &["config", "user.email", "hostile@example.com"]);
+        git(path, &["config", "user.name", "Hostile"]);
+        std::fs::write(path.join("hostile.txt"), "hostile\n").unwrap();
+        git(path, &["add", "."]);
+        git(path, &["commit", "-qm", "hostile commit"]);
+        let head = git_output(path, &["rev-parse", "HEAD"]);
+        (dir, head)
+    }
+
+    /// An inherited `GIT_DIR`/`GIT_WORK_TREE` must not redirect the HEAD read
+    /// at a different repository.
+    ///
+    /// This is the environment-borne form of the issue #273 failure: pointed
+    /// at the wrong repo, `git rev-parse HEAD` succeeds and returns a sha, so
+    /// `HeadCheck` would report `checked` / `matches` — an unverified claim
+    /// presented as verified — for a session whose real repo has drifted.
+    /// Mirrors `tests/review_diff.rs`'s hostile-`GIT_DIR` test.
+    #[test]
+    fn git_head_sha_ignores_an_inherited_hostile_git_dir() {
+        let (intended_dir, _first, intended_head) = git_repo_with_two_commits();
+        let (hostile_dir, hostile_head) = hostile_git_repo();
+        assert_ne!(
+            intended_head, hostile_head,
+            "fixture precondition: the two repos must have different HEADs, or a \
+             redirected read would return the right answer by accident"
+        );
+
+        let hostile_git_dir = hostile_dir.path().join(".git");
+        let _overrides = ScopedGitEnv::set(&[
+            ("GIT_DIR", hostile_git_dir.to_string_lossy().as_ref()),
+            (
+                "GIT_WORK_TREE",
+                hostile_dir.path().to_string_lossy().as_ref(),
+            ),
+        ]);
+
+        let read = git_head_sha(&intended_dir.path().to_string_lossy()).unwrap();
+        assert_eq!(
+            read, intended_head,
+            "the repo_path argument must win over inherited Git overrides"
+        );
+        assert_ne!(read, hostile_head);
+    }
+
+    /// The same hazard on the ancestry spawn: an inherited `GIT_DIR` would
+    /// have `merge-base --is-ancestor` answer about the wrong repository's
+    /// history, turning a real `branch_drift:` into a pass (or the reverse).
+    #[test]
+    fn ancestry_validation_ignores_an_inherited_hostile_git_dir() {
+        let (intended_dir, first, second) = git_repo_with_two_commits();
+        let (hostile_dir, hostile_head) = hostile_git_repo();
+        assert!(
+            hostile_head != first && hostile_head != second,
+            "fixture precondition: the hostile repo must not share history"
+        );
+
+        let hostile_git_dir = hostile_dir.path().join(".git");
+        let _overrides = ScopedGitEnv::set(&[
+            ("GIT_DIR", hostile_git_dir.to_string_lossy().as_ref()),
+            (
+                "GIT_WORK_TREE",
+                hostile_dir.path().to_string_lossy().as_ref(),
+            ),
+        ]);
+
+        // `second` descends from `first` in the intended repo. Neither sha
+        // exists in the hostile one, so a redirected command cannot answer
+        // this correctly — it errors on an unknown revision instead.
+        validate_global_review_head_advance(
+            &intended_dir.path().to_string_lossy(),
+            &first,
+            &second,
+        )
+        .expect("the repo_path argument must win over inherited Git overrides");
+    }
+
     #[test]
     fn git_head_sha_reads_current_head() {
         let (dir, _first, second) = git_repo_with_two_commits();
@@ -5410,8 +5795,13 @@ mod tests {
     fn stale_checkpoint_behind_head_is_reported_as_drift() {
         let (dir, first, second) = git_repo_with_two_commits();
         let checkpoint = checkpoint_at(&first);
-        let diagnostic = checkpoint_divergence(&dir.path().to_string_lossy(), &checkpoint)
-            .expect("a checkpoint filed at an earlier commit must be reported as drift");
+        let check = HeadCheck::read(&dir.path().to_string_lossy(), &checkpoint);
+        assert_eq!(check.label(), "checked");
+        assert_eq!(check.diverged(), json!(true));
+        let diagnostic = check
+            .divergence()
+            .expect("a checkpoint filed at an earlier commit must be reported as drift")
+            .to_string();
         assert!(
             diagnostic.starts_with(crate::collab::CHECKPOINT_DRIFT_PREFIX),
             "diagnostic must start with CHECKPOINT_DRIFT_PREFIX, got: {diagnostic}"
@@ -5445,32 +5835,83 @@ mod tests {
     fn checkpoint_at_head_has_no_divergence() {
         let (dir, _first, second) = git_repo_with_two_commits();
         // Prove git was actually read and landed on `second` before asserting
-        // `checkpoint_divergence` returns `None` for it. Without this,
-        // `None` from a failed git read (indistinguishable from an unborn
-        // HEAD's literal `"HEAD"`) and `None` from genuinely equal SHAs are
-        // the same observation, and this test would pass vacuously either
-        // way — see `checkpoint_divergence`'s doc comment on why `None` is
-        // ambiguous by design.
+        // there is no divergence. `label()` is what distinguishes this from
+        // the unreadable case — asserting only `divergence().is_none()` would
+        // pass identically for a repo git could not read at all.
         assert_eq!(git_head_sha(&dir.path().to_string_lossy()).unwrap(), second);
         let checkpoint = checkpoint_at(&second);
+        let check = HeadCheck::read(&dir.path().to_string_lossy(), &checkpoint);
+        assert_eq!(check.label(), "checked");
+        assert_eq!(check.diverged(), json!(false));
+        assert_eq!(check.divergence(), None);
+        assert_eq!(check.repo_head_sha(), json!(second));
+    }
+
+    /// An unreadable repo (git itself cannot be read) must report the third
+    /// state as itself — not a drift report, and above all not "no
+    /// divergence". A transient filesystem problem must not park a live
+    /// session in recovery, but answering `diverged: false` where nothing was
+    /// checked is an unverified claim presented as verified.
+    #[test]
+    fn unreadable_repo_is_reported_as_unreadable_not_as_no_divergence() {
+        let dir = tempfile::tempdir().unwrap();
+        let checkpoint = checkpoint_at("deadbeef");
+        let check = HeadCheck::read(&dir.path().to_string_lossy(), &checkpoint);
+        assert_eq!(check.label(), "unreadable");
         assert_eq!(
-            checkpoint_divergence(&dir.path().to_string_lossy(), &checkpoint),
-            None
+            check.diverged(),
+            Value::Null,
+            "an unread repo must never answer diverged: false"
+        );
+        assert_eq!(check.repo_head_sha(), Value::Null);
+        assert_eq!(check.divergence(), None);
+        assert!(
+            check.unreadable_detail().is_some(),
+            "the reader must be told why the check could not run"
         );
     }
 
-    /// An unreadable repo (git itself cannot be read) must yield `None`, not a
-    /// drift report — a transient filesystem problem must not park a live
-    /// session in recovery. This is the mutation most likely to be
-    /// under-tested and matters most: see the doc comment on
-    /// `checkpoint_divergence`.
+    /// `checkpoint_json`'s three states, which `collab_status` and
+    /// `collab_resume` both render. The one that matters is the middle row:
+    /// an unreadable repo reports `diverged: null` + `head_check:
+    /// "unreadable"`, never `diverged: false`.
     #[test]
-    fn unreadable_repo_yields_none_not_a_drift_report() {
-        let dir = tempfile::tempdir().unwrap();
-        let checkpoint = checkpoint_at("deadbeef");
-        assert_eq!(
-            checkpoint_divergence(&dir.path().to_string_lossy(), &checkpoint),
-            None
+    fn checkpoint_json_never_reports_an_unchecked_repo_as_undiverged() {
+        let (dir, first, second) = git_repo_with_two_commits();
+        let repo = dir.path().to_string_lossy().to_string();
+
+        assert_eq!(checkpoint_json(None), Value::Null);
+
+        let matching = checkpoint_at(&second);
+        let check = HeadCheck::read(&repo, &matching);
+        let block = checkpoint_json(Some((&matching, &check)));
+        assert_eq!(block["diverged"], json!(false));
+        assert_eq!(block["head_check"], json!("checked"));
+        assert_eq!(block["repo_head_sha"], json!(second));
+        assert!(block.get("divergence").is_none());
+        assert!(block.get("head_check_error").is_none());
+
+        let stale = checkpoint_at(&first);
+        let check = HeadCheck::read(&repo, &stale);
+        let block = checkpoint_json(Some((&stale, &check)));
+        assert_eq!(block["diverged"], json!(true));
+        assert_eq!(block["head_sha"], json!(first));
+        assert!(block["divergence"]
+            .as_str()
+            .unwrap()
+            .starts_with(crate::collab::CHECKPOINT_DRIFT_PREFIX));
+
+        let nowhere = tempfile::tempdir().unwrap();
+        let check = HeadCheck::read(&nowhere.path().to_string_lossy(), &stale);
+        let block = checkpoint_json(Some((&stale, &check)));
+        assert_eq!(block["diverged"], Value::Null);
+        assert_eq!(block["head_check"], json!("unreadable"));
+        assert!(
+            block["head_check_error"]
+                .as_str()
+                .unwrap()
+                .contains("checkpoint could not be verified against git HEAD"),
+            "block was: {block}"
         );
     }
 }
