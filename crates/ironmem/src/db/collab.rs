@@ -1,7 +1,7 @@
 use crate::collab::queue::{self, Capability, Message, SessionRecord};
 #[cfg(test)]
 use crate::collab::Agent;
-use crate::collab::{CollabRoles, CollabSession};
+use crate::collab::{CollabCheckpoint, CollabRoles, CollabSession};
 use crate::db::schema::Database;
 use crate::error::MemoryError;
 
@@ -34,6 +34,20 @@ impl Database {
 
     pub fn collab_save_session(&self, session: &CollabSession) -> Result<(), MemoryError> {
         queue::save_session(&self.conn, session)
+    }
+
+    pub fn collab_upsert_checkpoint(
+        &self,
+        checkpoint: &CollabCheckpoint,
+    ) -> Result<(), MemoryError> {
+        queue::upsert_checkpoint(&self.conn, checkpoint)
+    }
+
+    pub fn collab_load_current_checkpoint(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<CollabCheckpoint>, MemoryError> {
+        queue::load_current_checkpoint(&self.conn, session_id)
     }
 
     pub fn collab_send_message(
@@ -144,5 +158,49 @@ mod tests {
         assert!(err
             .to_string()
             .contains("does not reference an existing drawer"));
+    }
+
+    /// Wires `collab_upsert_checkpoint` / `collab_load_current_checkpoint`
+    /// through `Database::open_in_memory`'s full migration chain (not
+    /// `queue::tests::open`'s hand-picked subset), so a future migration that
+    /// changes migration 020's shape but not `queue.rs`'s test fixture would
+    /// still be caught here.
+    #[test]
+    fn collab_checkpoint_accessors_round_trip_through_database() {
+        let db = Database::open_in_memory().unwrap();
+        db.collab_create_session(
+            "session",
+            "/repo",
+            "main",
+            None,
+            CollabRoles {
+                pilot: Agent::Claude,
+                implementer: Agent::Claude,
+            },
+        )
+        .unwrap();
+
+        assert!(
+            db.collab_load_current_checkpoint("session")
+                .unwrap()
+                .is_none(),
+            "no checkpoint written yet"
+        );
+
+        let checkpoint = CollabCheckpoint::from_json(&serde_json::json!({
+            "session_id": "session",
+            "task_id": 2,
+            "status": "started",
+            "head_sha": "abc123",
+        }))
+        .unwrap();
+        db.collab_upsert_checkpoint(&checkpoint).unwrap();
+
+        let loaded = db
+            .collab_load_current_checkpoint("session")
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.head_sha, "abc123");
+        assert_eq!(loaded.task_id, Some(2));
     }
 }

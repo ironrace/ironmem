@@ -160,11 +160,13 @@ pub(super) fn parse_failure_report_event(content: &str) -> Result<CollabEvent, M
 }
 
 /// Best-effort check for a contextually authorized off-turn report. Branch
-/// drift is observable by either agent; a Codex-dispatch failure requires
-/// Claude reporting against a Codex-owned turn in a phase whose Codex turn
-/// Claude dispatches. Returns false on any JSON parse failure so malformed
-/// payloads still fall through to the main `parse_failure_report_event`
-/// validation.
+/// drift is admissible from either agent in any coding-active phase (it is
+/// Terminal, so admitting it ends the session rather than handing over a
+/// turn); checkpoint drift is admissible from either agent but only from
+/// `CodeImplementPending`; a Codex-dispatch failure requires Claude reporting
+/// against a Codex-owned turn in a phase whose Codex turn Claude dispatches.
+/// Returns false on any JSON parse failure so malformed payloads still fall
+/// through to the main `parse_failure_report_event` validation.
 pub(super) fn failure_report_is_off_turn_admissible(
     content: &str,
     reporter: crate::collab::Agent,
@@ -411,6 +413,69 @@ mod tests {
             crate::collab::Agent::Codex,
             Phase::CodeImplementPending,
             crate::collab::Agent::Claude,
+        ));
+    }
+
+    /// The MCP send gate is a second, independently reachable admission
+    /// surface (`collab_session.rs` computes `turn_exempt` from this same
+    /// predicate), so the checkpoint-drift scope is pinned here too. Unlike
+    /// `branch_drift:` — Terminal, and therefore safe to admit anywhere —
+    /// `checkpoint_drift:` is recoverable: admitting it parks the session and
+    /// hands the reporter the turn, so it is confined to the one phase where
+    /// a checkpoint is under construction.
+    #[test]
+    fn off_turn_checkpoint_drift_admission_is_phase_scoped() {
+        let drift = json!({"coding_failure": "checkpoint_drift: HEAD 75a4ea3 is ahead of b9c2ce0"})
+            .to_string();
+
+        // In scope: either agent may report the implementer's stale ledger.
+        for (reporter, owner, implementer) in [
+            (
+                crate::collab::Agent::Claude,
+                crate::collab::Agent::Codex,
+                crate::collab::Agent::Codex,
+            ),
+            (
+                crate::collab::Agent::Codex,
+                crate::collab::Agent::Claude,
+                crate::collab::Agent::Claude,
+            ),
+        ] {
+            assert!(failure_report_is_off_turn_admissible(
+                &drift,
+                reporter,
+                owner,
+                Phase::CodeImplementPending,
+                implementer,
+            ));
+        }
+
+        // Out of scope: every phase past implementation, including the
+        // pilot's own audit and PR turns.
+        for frozen in [
+            Phase::CodeReviewFixGlobalPending,
+            Phase::CodeReviewLocalPending,
+            Phase::CodeReviewFinalPending,
+        ] {
+            assert!(
+                !failure_report_is_off_turn_admissible(
+                    &drift,
+                    crate::collab::Agent::Claude,
+                    crate::collab::Agent::Codex,
+                    frozen,
+                    crate::collab::Agent::Codex,
+                ),
+                "{frozen} freezes the checkpoint and must not be off-turn admissible"
+            );
+        }
+
+        // A bare prefix is never admissible, even in scope.
+        assert!(!failure_report_is_off_turn_admissible(
+            &json!({"coding_failure": "checkpoint_drift:"}).to_string(),
+            crate::collab::Agent::Claude,
+            crate::collab::Agent::Codex,
+            Phase::CodeImplementPending,
+            crate::collab::Agent::Codex,
         ));
     }
 

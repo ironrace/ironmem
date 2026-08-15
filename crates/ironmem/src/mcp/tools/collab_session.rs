@@ -1003,10 +1003,13 @@ pub(super) fn handle_collab_send(app: &App, args: &Value) -> Result<Value, Memor
         //      independently; current_owner there is a "next-expected" hint
         //      and the state-machine arm uses its own "already-submitted"
         //      guard.
-        //   2. `failure_report` with a `branch_drift:` prefix — either agent
-        //      must be able to abort the session when they detect branch
-        //      drift, even if it is not their turn. The deeper check in
-        //      `apply_event` validates the prefix and rejects generic
+        //   2. `failure_report` with an off-turn-admissible prefix —
+        //      `branch_drift:` from any coding-active phase, plus the
+        //      phase-scoped `checkpoint_drift:` and `codex_dispatch_failed:`
+        //      carve-outs. Each names a condition the non-owner is the one
+        //      positioned to detect. `failure_report_is_off_turn_admissible`
+        //      applies the same scoping the state machine does; the deeper
+        //      check in `apply_event` re-validates and rejects generic
         //      off-turn failure reports as NotYourTurn.
         let turn_exempt = matches!(session.phase, crate::collab::Phase::PlanParallelDrafts)
             || (topic == "failure_report"

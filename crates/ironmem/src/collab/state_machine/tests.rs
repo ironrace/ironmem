@@ -947,6 +947,138 @@ fn test_failure_report_branch_drift_from_codex_during_batch_phase() {
     assert_eq!(s.current_owner, Agent::Codex);
 }
 
+// ── checkpoint drift is off-turn admissible, but recoverable and phase-scoped ──
+// (issue #273, Task 4)
+//
+// Unlike branch drift, checkpoint drift does not send the session to
+// `CodingFailed`: the remedy is filing an accurate checkpoint, not
+// abandoning the session. Being recoverable is exactly why its off-turn
+// carve-out is scoped to `CodeImplementPending` while branch drift's is
+// unconditional — a `Tooling` report parks the session and installs a new
+// `current_owner`, so an unscoped clause would be a turn-seizure primitive.
+// Detectability is what makes an off-turn carve-out *possible*; being
+// Terminal is what makes one safe to leave unscoped.
+
+#[test]
+fn test_failure_report_rejects_bare_checkpoint_drift_prefix() {
+    // Mirror of `test_failure_report_rejects_bare_branch_drift_prefix`: the
+    // off-turn carve-out demands diagnostic content after the prefix, so a
+    // bare `"checkpoint_drift:"` from a non-owner must still be rejected.
+    let s = locked_session("hf");
+    let s = submit_task_list(&s, "hf", 1);
+    assert_eq!(s.current_owner, Agent::Claude);
+
+    let err = apply_event(
+        &s,
+        Agent::Codex,
+        &CollabEvent::FailureReport {
+            coding_failure: "checkpoint_drift:".to_string(),
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(err, CollabError::NotYourTurn { .. }));
+}
+
+#[test]
+fn test_failure_report_checkpoint_drift_from_codex_during_batch_phase() {
+    // Checkpoint drift is off-turn admissible like branch drift, but
+    // recoverable: the phase holds and recovery hands the turn to the
+    // reporting non-owner instead of transitioning to `CodingFailed`.
+    let s = locked_session("hf");
+    let s = submit_task_list(&s, "hf", 1);
+    assert_eq!(s.current_owner, Agent::Claude);
+
+    let s = apply_event(
+        &s,
+        Agent::Codex,
+        &CollabEvent::FailureReport {
+            coding_failure: "checkpoint_drift: HEAD 75a4ea3 is ahead of checkpoint b9c2ce0"
+                .to_string(),
+        },
+    )
+    .unwrap();
+    assert_eq!(s.phase, Phase::CodeImplementPending);
+    assert_eq!(s.recovery_owner, Some(Agent::Codex));
+    assert_eq!(s.recovery_origin_owner, Some(Agent::Claude));
+}
+
+#[test]
+fn checkpoint_drift_off_turn_admission_is_scoped_to_the_implementation_phase() {
+    // Direct coverage of `off_turn_failure_is_admissible` in both directions.
+    // Admitted at `CodeImplementPending` — the only phase where a checkpoint
+    // is under construction — for either reporter against either owner.
+    // Refused everywhere else, including the pilot-owned review turns where
+    // admitting a `Tooling` report would hand the copilot the audit and PR.
+    let failure = "checkpoint_drift: HEAD 75a4ea3 is ahead of checkpoint b9c2ce0";
+
+    for implementing in [
+        code_implement_pending_for(Agent::Codex),
+        code_implement_pending_for(Agent::Claude),
+    ] {
+        assert_eq!(implementing.phase, Phase::CodeImplementPending);
+        assert!(
+            off_turn_failure_is_admissible(
+                failure,
+                counterpart(implementing.current_owner),
+                implementing.current_owner,
+                implementing.phase,
+                implementing.implementer,
+            ),
+            "the non-implementer must be able to report a stale checkpoint \
+             against a {} turn",
+            implementing.current_owner,
+        );
+
+        // A bare prefix (no detail) is never admissible, even in-scope.
+        assert!(!off_turn_failure_is_admissible(
+            "checkpoint_drift:",
+            counterpart(implementing.current_owner),
+            implementing.current_owner,
+            implementing.phase,
+            implementing.implementer,
+        ));
+    }
+
+    // Past `implementation_done` the checkpoint is frozen proof, and the two
+    // review turns after the global fix belong to the pilot. Refuse there.
+    for frozen in [
+        review_fix_global_pending_for(Agent::Codex),
+        review_local_pending_for(Agent::Codex),
+        review_final_pending_for(Agent::Codex),
+        review_fix_global_pending_for(Agent::Claude),
+        review_local_pending_for(Agent::Claude),
+        review_final_pending_for(Agent::Claude),
+    ] {
+        assert!(
+            !off_turn_failure_is_admissible(
+                failure,
+                counterpart(frozen.current_owner),
+                frozen.current_owner,
+                frozen.phase,
+                frozen.implementer,
+            ),
+            "{} is past implementation and must refuse an off-turn \
+             checkpoint_drift report",
+            frozen.phase,
+        );
+    }
+
+    // Scoping must not have caught branch drift by accident: it stays
+    // admissible from those same phases because it is Terminal.
+    for frozen in [
+        review_local_pending_for(Agent::Codex),
+        review_final_pending_for(Agent::Codex),
+    ] {
+        assert!(off_turn_failure_is_admissible(
+            "branch_drift: head_sha abc not found",
+            counterpart(frozen.current_owner),
+            frozen.current_owner,
+            frozen.phase,
+            frozen.implementer,
+        ));
+    }
+}
+
 #[test]
 fn test_failure_report_rejected_outside_coding_active_phase() {
     let s = locked_session("hf");
@@ -3520,6 +3652,81 @@ fn pilot_codex_claude_may_not_seize_the_pilots_pr_turn_with_a_dispatch_failure()
 
     assert!(matches!(err, CollabError::NotYourTurn { .. }));
     assert_session_untouched(&before, &s);
+}
+
+// ── the same seizure, one prefix over: checkpoint drift (issue #273, Task 4) ──
+//
+// `checkpoint_drift:` is off-turn admissible AND recoverable, so an unscoped
+// carve-out reopens the #246 hole verbatim: under `pilot=codex` the copilot
+// (Claude, which authored the `CodeReviewFixGlobal` commits) parks the
+// pilot's audit turn with a fabricated report, `require_actor_or_recovery`
+// then lets it run `ReviewLocal` on its own commits, and the same move takes
+// the PR turn. `checkpoint_drift_phase_admits` confines the carve-out to
+// `CodeImplementPending` to close it.
+
+#[test]
+fn pilot_codex_claude_may_not_seize_the_pilots_audit_turn_with_checkpoint_drift() {
+    let s = review_local_pending_for(Agent::Codex);
+    assert_eq!(s.phase, Phase::CodeReviewLocalPending);
+    assert_eq!(s.current_owner, Agent::Codex);
+    let before = s.clone();
+
+    let err = apply_event(
+        &s,
+        Agent::Claude,
+        &CollabEvent::FailureReport {
+            coding_failure: "checkpoint_drift: fabricated".to_string(),
+        },
+    )
+    .unwrap_err();
+
+    assert!(matches!(err, CollabError::NotYourTurn { .. }));
+    assert_session_untouched(&before, &s);
+}
+
+#[test]
+fn pilot_codex_claude_may_not_seize_the_pilots_pr_turn_with_checkpoint_drift() {
+    let s = review_final_pending_for(Agent::Codex);
+    assert_eq!(s.phase, Phase::CodeReviewFinalPending);
+    assert_eq!(s.current_owner, Agent::Codex);
+    let before = s.clone();
+
+    let err = apply_event(
+        &s,
+        Agent::Claude,
+        &CollabEvent::FailureReport {
+            coding_failure: "checkpoint_drift: fabricated".to_string(),
+        },
+    )
+    .unwrap_err();
+
+    assert!(matches!(err, CollabError::NotYourTurn { .. }));
+    assert_session_untouched(&before, &s);
+}
+
+#[test]
+fn pilot_codex_checkpoint_drift_stays_admissible_from_the_implementation_turn() {
+    // The legitimate case the carve-out exists for: the non-implementer runs
+    // the HEAD-vs-checkpoint comparison and finds the implementer's ledger
+    // stale, so recovery hands it the turn to refile an accurate checkpoint.
+    let s = code_implement_pending_for(Agent::Codex);
+    assert_eq!(s.phase, Phase::CodeImplementPending);
+    assert_eq!(s.current_owner, Agent::Codex);
+
+    let s = apply_event(
+        &s,
+        Agent::Claude,
+        &CollabEvent::FailureReport {
+            coding_failure: "checkpoint_drift: HEAD 75a4ea3 is ahead of checkpoint b9c2ce0"
+                .to_string(),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(s.phase, Phase::CodeImplementPending);
+    assert_eq!(s.current_owner, Agent::Claude);
+    assert_eq!(s.recovery_owner, Some(Agent::Claude));
+    assert_eq!(s.recovery_origin_owner, Some(Agent::Codex));
 }
 
 #[test]

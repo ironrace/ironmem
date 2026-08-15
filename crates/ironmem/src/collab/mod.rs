@@ -83,13 +83,35 @@ pub const BRANCH_DRIFT_PREFIX: &str = "branch_drift:";
 /// dispatches — see [`dispatch_failure_phase_admits`].
 pub const CODEX_DISPATCH_FAILED_PREFIX: &str = "codex_dispatch_failed:";
 
+/// A `coding_failure` reporting that the session's current checkpoint no
+/// longer describes the repo: git HEAD has advanced past
+/// `checkpoint.head_sha`, so the checkpoint's task-progress claim is stale.
+///
+/// Recoverable (`FailureClass::Tooling`), which is the deliberate asymmetry
+/// with [`BRANCH_DRIFT_PREFIX`]: branch drift means the work is on the wrong
+/// branch and cannot be fixed in place, while checkpoint drift means the
+/// ledger is merely behind the work and is fixed by writing an accurate
+/// checkpoint.
+///
+/// Off-turn admissible, but only from `CodeImplementPending` — see
+/// [`checkpoint_drift_phase_admits`]. Being recoverable is exactly why the
+/// scope is needed: admitting a Tooling report parks the session and hands
+/// the turn to a new owner, so an unscoped carve-out would be a turn-seizure
+/// primitive.
+pub const CHECKPOINT_DRIFT_PREFIX: &str = "checkpoint_drift:";
+
 /// Prefixes considered for non-owner `failure_report`s. Branch drift is
-/// admissible for either reporter from any coding-active phase; Codex
-/// dispatch failure is admissible only from Claude, against a Codex-owned
-/// turn, in a phase Claude could have dispatched. Use
-/// [`off_turn_failure_is_admissible`] rather than treating membership here as
-/// sufficient authorization.
-pub const OFF_TURN_FAILURE_PREFIXES: &[&str] = &[BRANCH_DRIFT_PREFIX, CODEX_DISPATCH_FAILED_PREFIX];
+/// admissible for either reporter from any coding-active phase; checkpoint
+/// drift is admissible for either reporter but only from
+/// `CodeImplementPending`; Codex dispatch failure is admissible only from
+/// Claude, against a Codex-owned turn, in a phase Claude could have
+/// dispatched. Use [`off_turn_failure_is_admissible`] rather than treating
+/// membership here as sufficient authorization.
+pub const OFF_TURN_FAILURE_PREFIXES: &[&str] = &[
+    BRANCH_DRIFT_PREFIX,
+    CHECKPOINT_DRIFT_PREFIX,
+    CODEX_DISPATCH_FAILED_PREFIX,
+];
 
 /// Phases from which a `codex_dispatch_failed:` report can possibly be
 /// legitimate — the ones whose Codex-owned turn Claude spawns as an MCP
@@ -126,9 +148,74 @@ fn dispatch_failure_phase_admits(phase: Phase, implementer: Agent) -> bool {
     }
 }
 
+/// Phases from which a `checkpoint_drift:` report can be legitimate while the
+/// reporter is off-turn: only `CodeImplementPending`.
+///
+/// `CodeImplementPending` is the one phase in which a checkpoint is *under
+/// construction* — the implementer commits as it works and files checkpoints
+/// as it goes, so its ledger is the thing that can fall behind HEAD (batch
+/// commits 28 changes, checkpoint still frozen at task 1). That is also where
+/// the off-turn carve-out earns its keep: the non-implementer is the one
+/// positioned to run the HEAD-vs-checkpoint comparison, and handing recovery
+/// to it so the ledger gets refiled is the intended behavior.
+///
+/// The three review phases are deliberately excluded. Past
+/// `implementation_done` the checkpoint is frozen proof of what was built, not
+/// a live ledger; drift observed there is the `implementation_done` gate's
+/// business and the handoff/resume diagnostics' business, not a live off-turn
+/// `failure_report`'s. Admitting it there buys nothing and costs the
+/// pilot/copilot separation: `CodeReviewLocalPending` and
+/// `CodeReviewFinalPending` are the *pilot's* audit and PR turns, and since
+/// `checkpoint_drift:` classifies `Tooling`, admitting it there would park the
+/// session and hand those turns to the copilot — who may well have authored
+/// the commits under audit. Planning and terminal phases have no checkpoint
+/// activity at all.
+///
+/// The match is exhaustive on purpose, mirroring
+/// [`dispatch_failure_phase_admits`]: a new `Phase` must make an explicit
+/// admit/deny decision here rather than inheriting a wildcard.
+fn checkpoint_drift_phase_admits(phase: Phase) -> bool {
+    match phase {
+        Phase::CodeImplementPending => true,
+        Phase::PlanParallelDrafts
+        | Phase::PlanSynthesisPending
+        | Phase::PlanCopilotReviewPending
+        | Phase::PlanFinalizePending
+        | Phase::PlanLocked
+        | Phase::CodeReviewFixGlobalPending
+        | Phase::CodeReviewLocalPending
+        | Phase::CodeReviewFinalPending
+        | Phase::CodingComplete
+        | Phase::CodingFailed => false,
+    }
+}
+
 /// Whether an agent may report this failure while it is not the current
-/// owner. Branch drift is independently observable by either participant, in
-/// any phase, so its clause is unconditional.
+/// owner.
+///
+/// **Branch drift** is the one unconditional clause, and detectability is not
+/// why. Either participant can run a git comparison without owning the turn,
+/// but that is a *necessary* condition for an off-turn carve-out, never a
+/// sufficient one. What makes an unscoped clause safe is that admitting it
+/// cannot hand anyone a live turn: `branch_drift:` classifies
+/// [`failure_class::FailureClass::Terminal`], so `apply_event` sends the
+/// session straight to `CodingFailed` and there is no turn left to seize. Any
+/// reporter, any phase, same outcome — a dead session.
+///
+/// **Checkpoint drift** is equally detectable off-turn and is nonetheless
+/// scoped, because it classifies `Tooling`. A recoverable report parks the
+/// session in-phase and installs a *new* `current_owner` (the counterpart of
+/// the interrupted owner, i.e. the off-turn reporter), who may then execute
+/// the phase's advancing event via `require_actor_or_recovery`. Unscoped, that
+/// is a turn-seizure primitive: the copilot could park the pilot's
+/// `/ultrareview-local` audit turn, take it, audit its own commits, and repeat
+/// for the PR turn. [`checkpoint_drift_phase_admits`] confines it to
+/// `CodeImplementPending`, the only phase where a stale checkpoint is a live
+/// problem and where handing recovery over is the intended remedy.
+///
+/// The discriminator to reuse when adding a prefix here is therefore
+/// Terminal-vs-Tooling, not observability: an off-turn-admissible prefix may
+/// be unscoped only if admitting it cannot leave anyone holding a live turn.
 ///
 /// A Codex-dispatch failure is narrower on two independent axes.
 ///
@@ -176,6 +263,7 @@ pub fn off_turn_failure_is_admissible(
     };
 
     has_detail(BRANCH_DRIFT_PREFIX)
+        || (checkpoint_drift_phase_admits(phase) && has_detail(CHECKPOINT_DRIFT_PREFIX))
         || (reporter == Agent::Claude
             && current_owner == Agent::Codex
             && dispatch_failure_phase_admits(phase, implementer)
@@ -209,11 +297,21 @@ pub const NETWORK_FAILED_PREFIX: &str = "network_failed:";
 /// failures worth retrying rather than aborting the collab session. See
 /// [`failure_class::classify`].
 ///
-/// `CODEX_DISPATCH_FAILED_PREFIX` is deliberately in both this set and
-/// `OFF_TURN_FAILURE_PREFIXES` above: it is both off-turn-admissible and
-/// recoverable. The two prefix vocabularies overlap but are not identical —
+/// `CODEX_DISPATCH_FAILED_PREFIX` and `CHECKPOINT_DRIFT_PREFIX` are
+/// deliberately in both this set and `OFF_TURN_FAILURE_PREFIXES` above: each
+/// is both off-turn-admissible and recoverable. Every prefix in that
+/// intersection is phase-scoped in [`off_turn_failure_is_admissible`], and
+/// that is not a coincidence — a recoverable report installs a new
+/// `current_owner`, so an unscoped off-turn clause on a `Tooling` prefix hands
+/// the reporter a live turn.
+///
+/// The two prefix vocabularies overlap but are not identical —
 /// `BRANCH_DRIFT_PREFIX` is off-turn-admissible but classifies as
-/// `FailureClass::Terminal`, not `Tooling`.
+/// `FailureClass::Terminal`, not `Tooling`, which is what lets its clause be
+/// unscoped. That contrast is deliberate: branch drift means the work is on
+/// the wrong branch, which cannot be fixed in place, while checkpoint drift
+/// means the ledger is merely behind the work and is fixed by writing an
+/// accurate checkpoint — recoverable, not session-ending.
 pub const RECOVERABLE_FAILURE_PREFIXES: &[&str] = &[
     GIT_COMMIT_FAILED_PREFIX,
     GIT_PUSH_FAILED_PREFIX,
@@ -221,4 +319,5 @@ pub const RECOVERABLE_FAILURE_PREFIXES: &[&str] = &[
     DISK_FULL_PREFIX,
     NETWORK_FAILED_PREFIX,
     CODEX_DISPATCH_FAILED_PREFIX,
+    CHECKPOINT_DRIFT_PREFIX,
 ];
