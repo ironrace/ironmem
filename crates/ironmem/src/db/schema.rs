@@ -2313,38 +2313,159 @@ mod tests {
         assert_eq!(schema_version_of(&db), LATEST_SCHEMA_VERSION);
         assert_eq!(LATEST_SCHEMA_VERSION, 20);
 
-        // The table exists and carries every column the checkpoint contract needs.
-        let columns: Vec<String> = db
+        // The table exists and carries every column the checkpoint contract
+        // needs, at the declared affinity the header argues for. Asserting the
+        // type alongside the name is what keeps the affinity decisions
+        // load-bearing: redeclaring `updated_at` as
+        // `TEXT NOT NULL DEFAULT (datetime('now'))` — the exact change the
+        // header spends a paragraph arguing against — passes a name-only check.
+        let columns: Vec<(String, String)> = db
             .conn
-            .prepare("SELECT name FROM pragma_table_info('collab_checkpoints')")
+            .prepare("SELECT name, type FROM pragma_table_info('collab_checkpoints')")
             .unwrap()
-            .query_map([], |row| row.get::<_, String>(0))
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
             .unwrap()
             .map(Result::unwrap)
             .collect();
 
-        for expected in [
-            "session_id",
-            "task_id",
-            "task_title",
-            "status",
-            "head_sha",
-            "commit_sha",
-            "completed_task_ids",
-            "next_task_id",
-            "gates_result",
-            "gates_sha",
-            "gates_commands",
-            "summary",
-            "attested_by",
-            "acknowledged_divergence",
-            "updated_at",
+        for (expected, expected_type) in [
+            ("session_id", "TEXT"),
+            ("task_id", "INTEGER"),
+            ("task_title", "TEXT"),
+            ("status", "TEXT"),
+            ("head_sha", "TEXT"),
+            ("commit_sha", "TEXT"),
+            ("completed_task_ids", "TEXT"),
+            ("next_task_id", "INTEGER"),
+            ("gates_result", "TEXT"),
+            ("gates_sha", "TEXT"),
+            ("gates_commands", "TEXT"),
+            ("summary", "TEXT"),
+            ("attested_by", "TEXT"),
+            ("acknowledged_divergence", "TEXT"),
+            // The one integer timestamp in the schema, deliberately not the
+            // TEXT/datetime('now') convention the other `_at` columns use.
+            ("updated_at", "INTEGER"),
         ] {
-            assert!(
-                columns.iter().any(|c| c == expected),
-                "collab_checkpoints is missing column {expected:?}; has {columns:?}"
+            let actual = columns.iter().find(|(name, _)| name == expected);
+            let Some((_, actual_type)) = actual else {
+                panic!("collab_checkpoints is missing column {expected:?}; has {columns:?}");
+            };
+            assert_eq!(
+                actual_type, expected_type,
+                "collab_checkpoints.{expected} must be declared {expected_type}, got {actual_type}"
             );
         }
+    }
+
+    #[test]
+    fn migration_020_round_trips_every_optional_checkpoint_column() {
+        let db = Database::open_in_memory().unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO collab_sessions (id, repo_path, branch) VALUES ('s-round', '/repo', 'main')",
+                [],
+            )
+            .unwrap();
+
+        // Every other migration-020 test leaves the optional columns NULL by
+        // omission and only ever observes `gates_result` at its default, so a
+        // regression that narrowed one of them — a stray NOT NULL on
+        // `gates_sha`, a copy-paste `CHECK (commit_sha IS NULL)`, a wrong
+        // affinity — would redden nothing. This writes a fully-populated
+        // `completed` checkpoint and reads every value back unchanged.
+        db.conn
+            .execute(
+                "INSERT INTO collab_checkpoints
+                    (session_id, task_id, task_title, status, head_sha, commit_sha,
+                     completed_task_ids, next_task_id, gates_result, gates_sha,
+                     gates_commands, summary, attested_by, updated_at)
+                 VALUES ('s-round', 3, 'Wire the gate', 'completed', 'a1b2c3', 'd4e5f6',
+                         '1,2,3', 4, 'failed: clippy', 'a1b2c3',
+                         'cargo fmt --all -- --check && cargo test --workspace',
+                         'Task 3 done', 'implementer', 1750000000)",
+                [],
+            )
+            .unwrap();
+
+        // Read back column by column. Rust implements `PartialEq`/`Debug` only
+        // up to 12-element tuples and the row has 13 meaningful columns, so a
+        // single tuple comparison will not build — and naming each column here
+        // makes a failure say which one drifted rather than dumping the row.
+        let text_columns = [
+            ("task_title", "Wire the gate"),
+            ("status", "completed"),
+            ("head_sha", "a1b2c3"),
+            ("commit_sha", "d4e5f6"),
+            ("completed_task_ids", "1,2,3"),
+            // Free text after the `failed: ` prefix: the round-trip is what
+            // pins `gates_result` as deliberately not CHECK-constrained to a
+            // closed vocabulary.
+            ("gates_result", "failed: clippy"),
+            ("gates_sha", "a1b2c3"),
+            (
+                "gates_commands",
+                "cargo fmt --all -- --check && cargo test --workspace",
+            ),
+            ("summary", "Task 3 done"),
+            ("attested_by", "implementer"),
+        ];
+        for (column, expected) in text_columns {
+            let actual: String = db
+                .conn
+                .query_row(
+                    &format!(
+                        "SELECT {column} FROM collab_checkpoints WHERE session_id = 's-round'"
+                    ),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                actual, expected,
+                "collab_checkpoints.{column} must round-trip unchanged"
+            );
+        }
+
+        let integer_columns = [
+            ("task_id", 3_i64),
+            ("next_task_id", 4),
+            ("updated_at", 1_750_000_000),
+        ];
+        for (column, expected) in integer_columns {
+            let actual: i64 = db
+                .conn
+                .query_row(
+                    &format!(
+                        "SELECT {column} FROM collab_checkpoints WHERE session_id = 's-round'"
+                    ),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                actual, expected,
+                "collab_checkpoints.{column} must round-trip unchanged"
+            );
+        }
+
+        // Affinity, not just value: SQLite's weak typing would happily store a
+        // stringified timestamp in an INTEGER column, and such a value compares
+        // greater than every real unix second.
+        let typeof_updated_at: String = db
+            .conn
+            .query_row(
+                "SELECT typeof(updated_at) FROM collab_checkpoints WHERE session_id = 's-round'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            typeof_updated_at, "integer",
+            "updated_at must store an integer, not a stringified timestamp"
+        );
     }
 
     #[test]
@@ -2631,20 +2752,27 @@ mod tests {
     #[test]
     fn migration_020_deleting_session_cascades_to_checkpoint() {
         let db = Database::open_in_memory().unwrap();
-        db.conn
-            .execute(
-                "INSERT INTO collab_sessions (id, repo_path, branch) VALUES ('s-cascade', '/repo', 'main')",
-                [],
-            )
-            .unwrap();
-        db.conn
-            .execute(
-                "INSERT INTO collab_checkpoints
-                    (session_id, status, head_sha, completed_task_ids, updated_at)
-                 VALUES ('s-cascade', 'started', 'aaa', '', 1)",
-                [],
-            )
-            .unwrap();
+        // Two independent sessions, each with its own checkpoint. With only
+        // one session in the table a cascade scoped to the deleted row and an
+        // over-broad `DELETE FROM collab_checkpoints` with no predicate are
+        // indistinguishable — both leave zero rows. The bystander is what
+        // makes this test able to tell them apart.
+        for session_id in ["s-cascade", "s-bystander"] {
+            db.conn
+                .execute(
+                    "INSERT INTO collab_sessions (id, repo_path, branch) VALUES (?1, '/repo', 'main')",
+                    [session_id],
+                )
+                .unwrap();
+            db.conn
+                .execute(
+                    "INSERT INTO collab_checkpoints
+                        (session_id, status, head_sha, completed_task_ids, updated_at)
+                     VALUES (?1, 'started', 'aaa', '', 1)",
+                    [session_id],
+                )
+                .unwrap();
+        }
 
         db.conn
             .execute("DELETE FROM collab_sessions WHERE id = 's-cascade'", [])
@@ -2661,6 +2789,20 @@ mod tests {
         assert_eq!(
             remaining, 0,
             "ON DELETE CASCADE must remove the checkpoint when its session is deleted"
+        );
+
+        let bystander: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM collab_checkpoints WHERE session_id = 's-bystander'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            bystander, 1,
+            "the cascade must be scoped to the deleted session; another session's \
+             checkpoint must survive"
         );
     }
 
