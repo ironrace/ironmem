@@ -979,6 +979,71 @@ fn a_poisoned_checkpoint_row_can_still_be_repaired_by_writing_a_new_one() {
     );
 }
 
+/// **Degrading on a poisoned row must not launder the check it skipped.**
+///
+/// The repair above is an *implementer* checkpoint, which carries no verdict at
+/// all, so it cannot see what the degrade costs an operator attestation. Here it
+/// is one: the write path reads no previous checkpoint (the stored row fails
+/// `validate()`), so `verify_acknowledged_range` takes its "there is no gap to
+/// cover" branch and returns `verified` — the span rule having never run. Stamping
+/// that label would render a check that could not run as a check that passed, on
+/// every reader surface that shows `attested_by: operator`.
+///
+/// `verified_without_span` is the label the two branch-drift shapes already carry
+/// for exactly this, and this is the third route to it. Asserting `!= verified` as
+/// well as `== verified_without_span` is what pins the direction: a build that
+/// dropped the degrade-aware downgrade would produce `verified` here, and one that
+/// refused the write outright would fail the call rather than this assertion.
+#[test]
+fn an_operator_attestation_over_a_poisoned_previous_row_is_not_labelled_verified() {
+    let (app, _temp, repo, _shas) = test_app_with_git_repo(1);
+    let session_id = start_batch_session_in(&app, &repo, 3);
+    let stale = commit_file(&repo, "task1.rs", "task 1\n", "task 1");
+    let live = commit_file(&repo, "task2.rs", "task 2\n", "task 2");
+
+    // The same raw-SQL poisoning as above — `attested_by = 'operator'` with no
+    // acknowledged range, which the schema permits and `validate()` refuses.
+    app.db
+        .with_transaction(|tx| {
+            tx.execute(
+                "INSERT INTO collab_checkpoints
+                   (session_id, status, head_sha, attested_by, updated_at)
+                 VALUES (?1, 'started', 'aaa111', 'operator', 1)",
+                rusqlite::params![&session_id],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+    // A range that passes every endpoint rule: it resolves at both ends, ends at
+    // this checkpoint's own head_sha, covers a commit, and is a real span. The
+    // only rule it cannot be judged by is the span check, because the row it is
+    // being judged against could not be read.
+    let out = checkpoint(
+        &app,
+        &session_id,
+        json!({
+            "status": "batch_complete",
+            "head_sha": &live,
+            "completed_task_ids": "1,2,3",
+            "attested_by": "operator",
+            "acknowledged_divergence": format!("{stale}..{live}"),
+        }),
+    );
+    assert_eq!(
+        out["attestation_check"],
+        json!("verified_without_span"),
+        "an attestation whose predecessor was never read cannot claim the span rule \
+         ran: {out}"
+    );
+    assert_eq!(
+        stored_checkpoint(&app, &session_id)["attestation_check"],
+        json!("verified_without_span"),
+        "...and the row every later reader renders must carry the same weakened \
+         verdict, not the one computed before the degrade: {out}"
+    );
+}
+
 // ── Scenario 7: whitespace on a head_sha cannot desynchronize the two paths ──
 
 /// **A padded `head_sha` must survive both routes identically.**

@@ -1603,7 +1603,22 @@ fn require_checkpoint_proof(
 /// two `code_maps` tests at random. The mutex `ScopedGitEnv` holds cannot help
 /// there: it serializes the tests that *set* the variables, not the unrelated
 /// ones that merely inherit them.
+///
+/// The removal is recorded in two passes, and the first one is what makes the
+/// guarantee unconditional. `Command` applies recorded removals against the
+/// environment as it exists at *spawn* time, so a sweep of `vars_os()` alone
+/// only strips what happened to be set at scrub time — a `GIT_DIR` that
+/// appears between the sweep and `.output()` is inherited, which is exactly
+/// the race this module's own `ScopedGitEnv` fixtures run: they set `GIT_*`
+/// process-wide while `cargo test` runs other threads' git calls beside them.
+/// `env_remove` records the removal whether or not the variable is currently
+/// set, so naming the redirecting variables outright ([`REDIRECTING_GIT_VARS`])
+/// closes that window. The sweep still runs afterward, for anything outside
+/// that list that is already set.
 pub(crate) fn scrub_git_environment(command: &mut Command) {
+    for key in REDIRECTING_GIT_VARS {
+        command.env_remove(key);
+    }
     for (key, _) in std::env::vars_os() {
         if key
             .to_string_lossy()
@@ -1614,6 +1629,31 @@ pub(crate) fn scrub_git_environment(command: &mut Command) {
         }
     }
 }
+
+/// The `GIT_*` variables that decide *which* repository or configuration a
+/// command reads — the ones whose inheritance is a correctness problem rather
+/// than a cosmetic one. Removed unconditionally by [`scrub_git_environment`]
+/// so the removal is in effect at spawn time no matter when the variable is
+/// set. `GIT_CONFIG_COUNT` covers the whole `GIT_CONFIG_KEY_<n>` /
+/// `GIT_CONFIG_VALUE_<n>` family: git ignores those without the count, and the
+/// family is unbounded, so it cannot be enumerated here.
+const REDIRECTING_GIT_VARS: [&str; 15] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    "GIT_PREFIX",
+    "GIT_CONFIG",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_CONFIG_NOSYSTEM",
+    "GIT_CONFIG_COUNT",
+];
 
 /// Refuse a reported head that is not a real, git-verified descendant of the
 /// session's last recorded head.
@@ -1692,19 +1732,25 @@ fn validate_global_review_head_advance(
     // still seed this field from caller input without a shape check, so a
     // session can be carrying `"HEAD"`. For those the honest reading is that
     // there is no fixed commit here to measure an advance *from*, so the
-    // ancestry question has no subject rather than a failing answer. Skipping
-    // restores exactly what those sessions did before this guard existed:
-    // `--is-ancestor HEAD <new sha>` resolved against the live tree and passed.
+    // ancestry question has no subject rather than a failing answer.
+    //
+    // What is skipped is *only* the ancestry comparison. The reported
+    // `head_sha` must still name a commit that exists, because that question
+    // has a subject regardless of what the stored side holds, and it is the
+    // caller's own value — so the refusal names something they can correct and
+    // no session is wedged. Skipping it too would silently turn the exit-128
+    // "this sha names nothing" arm below off for these sessions, which is the
+    // half of the guarantee [`require_checkpoint_proof`] leans on: its four
+    // conditions are satisfied by construction when a fabricated head is both
+    // checkpointed and reported, and this call is what proves the head real.
     //
     // Hoisting the shape check to those two seed sites — where the refusal is
     // recoverable and names a value the caller owns — is the real close, and it
     // is deliberately left as a follow-up: the seed sites are exercised by ~34
     // tests whose fixtures use placeholder shas, and that sweep does not belong
-    // in a review round on a branch about to merge. Until then the reported
-    // `head_sha` above is checked on every advance, which is the half of the
-    // hole an implementer can actually walk into.
+    // in a review round on a branch about to merge.
     if !crate::code_maps::is_hex_sha(last_head_sha) {
-        return Ok(());
+        return validate_head_sha_exists(repo_path, head_sha);
     }
 
     let mut command = Command::new("git");
@@ -1769,6 +1815,67 @@ fn validate_global_review_head_advance(
         )));
     }
 
+    let detail = if stderr.is_empty() {
+        format!("git exited with status {:?}", output.status.code())
+    } else {
+        stderr.to_string()
+    };
+    Err(MemoryError::Validation(format!(
+        "git ancestry validation failed: {detail}"
+    )))
+}
+
+/// Refuse a reported `head_sha` that names no commit in `repo_path`.
+///
+/// The existence half of [`validate_global_review_head_advance`], run on the
+/// one path where the ancestry comparison cannot: a stored `last_head_sha`
+/// that is not an object name. See the comment at that skip for why the two
+/// questions separate.
+///
+/// `head_sha` has already passed `is_hex_sha`, so it is 7-64 hex characters —
+/// which is why the revision is passed without the ancestry call's `--`
+/// separator (there `--` guards a leading `-`; here it would make git read the
+/// argument as a pathspec and report every sha as unresolvable) and why
+/// `^{commit}` cannot be caller-supplied syntax.
+fn validate_head_sha_exists(repo_path: &str, head_sha: &str) -> Result<(), MemoryError> {
+    let revision = format!("{head_sha}^{{commit}}");
+    let mut command = Command::new("git");
+    scrub_git_environment(&mut command);
+    let output = command
+        .args([
+            "-C",
+            repo_path,
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &revision,
+        ])
+        .output()
+        .map_err(|err| {
+            MemoryError::Validation(format!(
+                "git ancestry validation failed: unable to execute git: {err}"
+            ))
+        })?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    // Under `--quiet`, exit 1 means exactly "that revision does not resolve to
+    // a commit in this repository" and prints nothing. Any other status (128
+    // for a `repo_path` that is missing or not a repo) is operational, and
+    // must keep the operational wording for the reason the exit-128 arm above
+    // documents: a Terminal `branch_drift:` for broken tooling ends a session
+    // that has done nothing wrong.
+    if output.status.code() == Some(1) {
+        return Err(MemoryError::Validation(format!(
+            "branch_drift: head_sha {head_sha} does not name a commit that exists in this \
+             repository"
+        )));
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = stderr.trim();
     let detail = if stderr.is_empty() {
         format!("git exited with status {:?}", output.status.code())
     } else {
