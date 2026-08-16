@@ -552,7 +552,7 @@ mod tests {
         let mut payload = json!({
             "plan_hash": "h",
             "base_sha": "b",
-            "head_sha": "head",
+            "head_sha": "1111111111111111111111111111111111111111",
             "tasks": [{ "id": 1, "title": "t", "acceptance": ["ok"] }],
         });
         payload
@@ -658,7 +658,7 @@ mod tests {
         json!({
             "plan_hash": "h",
             "base_sha": "b",
-            "head_sha": "head",
+            "head_sha": "1111111111111111111111111111111111111111",
             "tasks": [{ "id": 1, "title": "t", "acceptance": ["ok"] }],
         })
     }
@@ -822,7 +822,10 @@ mod tests {
         let object = payload.as_object_mut().unwrap();
         object.insert("plan_hash".to_string(), json!(" h "));
         object.insert("base_sha".to_string(), json!(" b\n"));
-        object.insert("head_sha".to_string(), json!("\thead "));
+        object.insert(
+            "head_sha".to_string(),
+            json!("\t1111111111111111111111111111111111111111 "),
+        );
 
         let event = parse_task_list_event(&payload.to_string()).expect("padding must be tolerated");
         let CollabEvent::SubmitTaskList {
@@ -836,7 +839,7 @@ mod tests {
         };
         assert_eq!(plan_hash, "h");
         assert_eq!(base_sha, "b");
-        assert_eq!(head_sha, "head");
+        assert_eq!(head_sha, "1111111111111111111111111111111111111111");
     }
 
     #[test]

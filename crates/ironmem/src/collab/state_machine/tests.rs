@@ -834,12 +834,21 @@ fn test_code_review_fix_global_wrong_sender_rejected() {
 
 #[test]
 fn start_global_review_session_seeds_codex_owned_review_phase() {
-    let session = start_global_review_session("s1", "basesha", "headsha", Agent::Claude).unwrap();
+    let session = start_global_review_session(
+        "s1",
+        "basesha",
+        "1111111111111111111111111111111111111111",
+        Agent::Claude,
+    )
+    .unwrap();
     assert_eq!(session.id, "s1");
     assert_eq!(session.phase, Phase::CodeReviewFixGlobalPending);
     assert_eq!(session.current_owner, Agent::Codex);
     assert_eq!(session.base_sha.as_deref(), Some("basesha"));
-    assert_eq!(session.last_head_sha.as_deref(), Some("headsha"));
+    assert_eq!(
+        session.last_head_sha.as_deref(),
+        Some("1111111111111111111111111111111111111111")
+    );
     assert!(session.task_list.is_none());
     assert!(session.final_plan_hash.is_none());
     assert_eq!(session.review_round, 0);
@@ -847,7 +856,13 @@ fn start_global_review_session_seeds_codex_owned_review_phase() {
 
 #[test]
 fn start_global_review_session_rejects_empty_base_sha() {
-    let err = start_global_review_session("s1", "", "headsha", Agent::Claude).unwrap_err();
+    let err = start_global_review_session(
+        "s1",
+        "",
+        "1111111111111111111111111111111111111111",
+        Agent::Claude,
+    )
+    .unwrap_err();
     assert!(matches!(err, CollabError::MissingBaseSha));
 }
 
@@ -859,7 +874,13 @@ fn start_global_review_session_rejects_empty_head_sha() {
 
 #[test]
 fn start_global_review_session_flows_into_final_review() {
-    let session = start_global_review_session("s1", "basesha", "h0", Agent::Claude).unwrap();
+    let session = start_global_review_session(
+        "s1",
+        "basesha",
+        "1111111111111111111111111111111111111111",
+        Agent::Claude,
+    )
+    .unwrap();
 
     // Under v3 reorder: Codex review_fix_global advances to CodeReviewLocalPending
     // (Claude's audit turn) before reaching CodeReviewFinalPending.
@@ -903,7 +924,13 @@ fn start_global_review_session_flows_into_final_review() {
 
 #[test]
 fn start_global_review_session_accepts_branch_drift_failure_from_non_owner() {
-    let session = start_global_review_session("s1", "basesha", "h0", Agent::Claude).unwrap();
+    let session = start_global_review_session(
+        "s1",
+        "basesha",
+        "1111111111111111111111111111111111111111",
+        Agent::Claude,
+    )
+    .unwrap();
 
     let failed = apply_event(
         &session,
@@ -2153,7 +2180,13 @@ fn test_resume_resets_retry_budget_for_a_subsequent_tooling_failure() {
 
 #[test]
 fn test_resume_coding_rejected_for_branch_drift_session() {
-    let s = start_global_review_session("s1", "basesha", "h0", Agent::Claude).unwrap();
+    let s = start_global_review_session(
+        "s1",
+        "basesha",
+        "1111111111111111111111111111111111111111",
+        Agent::Claude,
+    )
+    .unwrap();
     let s = apply_event(
         &s,
         Agent::Claude,
@@ -2983,7 +3016,13 @@ fn pilot_claude_new_global_review_seeds_owner_and_implementer() {
     // `Agent::Claude` today (see the comment at that call site in
     // `collab_session.rs`). `new_global_review` derives
     // `current_owner = counterpart(pilot)` and `implementer = pilot`.
-    let session = start_global_review_session("s1", "basesha", "headsha", Agent::Claude).unwrap();
+    let session = start_global_review_session(
+        "s1",
+        "basesha",
+        "1111111111111111111111111111111111111111",
+        Agent::Claude,
+    )
+    .unwrap();
     assert_eq!(session.pilot, Agent::Claude);
     assert_eq!(session.current_owner, Agent::Codex);
     assert_eq!(session.implementer, Agent::Claude);
@@ -3498,7 +3537,13 @@ fn pilot_codex_new_global_review_seeds_mirrored_owner_and_implementer() {
     // `new_global_review` derives `current_owner = counterpart(pilot)` and
     // `implementer = pilot`, so a codex-piloted shortcut session opens on
     // Claude's global-fix turn.
-    let session = start_global_review_session("s1", "basesha", "headsha", Agent::Codex).unwrap();
+    let session = start_global_review_session(
+        "s1",
+        "basesha",
+        "1111111111111111111111111111111111111111",
+        Agent::Codex,
+    )
+    .unwrap();
     assert_eq!(session.pilot, Agent::Codex);
     assert_eq!(session.current_owner, Agent::Claude);
     assert_eq!(session.implementer, Agent::Codex);
@@ -3508,7 +3553,13 @@ fn pilot_codex_new_global_review_seeds_mirrored_owner_and_implementer() {
 fn pilot_codex_global_review_shortcut_flows_to_coding_complete() {
     // End-to-end mirror of the shortcut flow: copilot (Claude) applies global
     // fixes, then the pilot (Codex) audits and opens the PR.
-    let s = start_global_review_session("s1", "basesha", "h0", Agent::Codex).unwrap();
+    let s = start_global_review_session(
+        "s1",
+        "basesha",
+        "1111111111111111111111111111111111111111",
+        Agent::Codex,
+    )
+    .unwrap();
     let s = apply_event(
         &s,
         Agent::Claude,

@@ -3166,7 +3166,7 @@ mod tests {
     /// later batch-flow head, since issue #273 Task 8 made those
     /// git-ancestry-checked against it. A session that stops at
     /// `CodeImplementPending` doesn't care, so most callers keep passing the
-    /// historical placeholder `"b"` via [`drive_to_implement`].
+    /// synthetic 40-hex placeholder via [`drive_to_implement`].
     fn drive_to_implement_with_head(
         app: &crate::mcp::app::App,
         sid: &str,
@@ -3181,7 +3181,7 @@ mod tests {
     }
 
     fn drive_to_implement(app: &crate::mcp::app::App, sid: &str) -> String {
-        drive_to_implement_with_head(app, sid, "b")
+        drive_to_implement_with_head(app, sid, "1111111111111111111111111111111111111111")
     }
 
     /// Drive the normal v3 lifecycle through its terminal success phase while
@@ -4517,7 +4517,7 @@ mod tests {
         let task_list = json!({
             "plan_hash": final_hash,
             "base_sha": "base",
-            "head_sha": "base",
+            "head_sha": "1111111111111111111111111111111111111111",
             "tasks": [{
                 "id": 1,
                 "title": big_title,
@@ -4558,7 +4558,7 @@ mod tests {
         let task_list = json!({
             "plan_hash": final_hash,
             "base_sha": "base",
-            "head_sha": "base",
+            "head_sha": "1111111111111111111111111111111111111111",
             "tasks": [{
                 "id": 1,
                 "title": "task title",
