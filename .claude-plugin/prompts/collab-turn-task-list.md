@@ -46,8 +46,13 @@ preconditions: phase == PlanLocked, current_owner == pilot (claude or codex), pa
    requiring the original issue to be split into independently executable child
    issues. Do not merge unrelated tasks or remove acceptance criteria to evade
    the limit.
-4. Build the manifest `{plan_hash: final_plan_hash, base_sha:<HEAD>,
-   head_sha:<HEAD>, plan_file_path:<path>, tasks:[...]}`. Add
+4. Run `git rev-parse HEAD` and substitute the full 40-character sha it
+   prints for both `base_sha` and `head_sha` below — do not write the
+   literal string `HEAD`. The server refuses `head_sha` unless it is 7-64
+   hex characters: a revision expression is not a fixed commit, so the
+   session would have nothing to detect drift against. Build the manifest
+   `{plan_hash: final_plan_hash, base_sha:<sha>, head_sha:<sha>,
+   plan_file_path:<path>, tasks:[...]}`. Add
    `execution_mode:"mechanical_direct"` only if the single-task eligibility rule
    in `docs/COLLAB.md` holds.
 5. `collab_send(sender="$SENDER", topic="task_list", content=<JSON string>)`.

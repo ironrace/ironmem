@@ -136,7 +136,7 @@ to, not instead of, the normal `review_fix_global`.
 Return EXACTLY these ≤3 lines, nothing else:
 ```
 result: review_fix_global sent (<n> fixes)
-ref: head_sha:<HEAD>
+ref: head_sha:<sha>
 blocker: <one line | none>
 ```
 If you sent a `failure_report` instead of the normal completion, report

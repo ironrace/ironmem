@@ -51,6 +51,11 @@ pub use checkpoint::{
     ATTESTATION_UNRECORDED,
 };
 pub use error::CollabError;
+/// Refusal-formatting helpers shared by the two `head_sha` seed sites.
+/// Exported alongside [`CollabError`] because the bound is observable in
+/// `MalformedHeadSha`'s payload: a caller comparing that field against what it
+/// sent needs to know it may have been cut.
+pub use error::{echo_head_sha, MAX_ECHOED_HEAD_SHA_CHARS};
 pub use event::CollabEvent;
 pub use failure_class::{classify, FailureClass};
 #[cfg(test)]

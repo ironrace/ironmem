@@ -212,12 +212,12 @@ pub(super) fn parse_task_list_event(content: &str) -> Result<CollabEvent, Memory
     })?;
     // All three trimmed before the emptiness check, for the reason
     // `extract_required_str` records: they are transcribed out of a turn
-    // template, and `head_sha` in particular is stored as the session's
-    // `last_head_sha`, which `validate_global_review_head_advance` re-checks
-    // against `is_hex_sha` on every later advance. A padded sha fails that
-    // shape guard, so every subsequent turn in the session would be refused
-    // with a Terminal `branch_drift:` naming a commit that is in fact on the
-    // branch — and terminal means there is no recovery from it.
+    // template, so a leading tab or trailing space is an ordinary
+    // transcription slip rather than a different value. For `head_sha` the
+    // trim is load-bearing at this very call — the `is_hex_sha` guard below
+    // refuses anything that is not 7-64 hex characters, and padding is
+    // exactly that, so an untrimmed sha would be refused here despite naming
+    // the commit the branch is actually at.
     let plan_hash = payload
         .get("plan_hash")
         .and_then(Value::as_str)
@@ -241,6 +241,49 @@ pub(super) fn parse_task_list_event(content: &str) -> Result<CollabEvent, Memory
         .filter(|v| !v.is_empty())
         .ok_or_else(|| MemoryError::Validation("task_list missing non-empty head_sha".to_string()))?
         .to_string();
+    // Shape-checked here, at the seed site, rather than only where the value
+    // is later read back. `head_sha` becomes the session's `last_head_sha`,
+    // and `validate_global_review_head_advance` cannot refuse a malformed
+    // *stored* value without wedging the session — nothing rewrites that
+    // field but a successful head-advancing send, which is exactly what the
+    // refusal would block. Here the refusal is recoverable: it names a value
+    // the caller is holding, in a phase where nothing has been written yet.
+    //
+    // Same `is_hex_sha` (7-64 hex chars) the advance guard applies, rather
+    // than a second spelling of the rule. Shape only — whether the commit
+    // exists is the git shell-out's question, and there is no repo path in
+    // scope at this layer to ask it with.
+    if !crate::code_maps::is_hex_sha(&head_sha) {
+        // Bounded echo, shared with the other seed site's refusal
+        // (`CollabError::MalformedHeadSha`) so the two cannot diverge — see
+        // [`crate::collab::MAX_ECHOED_HEAD_SHA_CHARS`].
+        let echoed = crate::collab::echo_head_sha(&head_sha);
+        // The remedy leads, and it is a command rather than a description:
+        // the reader here is an agent with a shell, and `git rev-parse HEAD`
+        // is the whole fix. The template is referred to generically on
+        // purpose — quoting its placeholder literally would couple this
+        // string to a file that is being rewritten for the same reason this
+        // check exists. The causes are listed rather than assumed, because a
+        // short abbreviation reaches this refusal just as a revision
+        // expression does and is not the same mistake.
+        //
+        // "most branch names", not "a branch name": this is a shape check, so
+        // a branch whose name happens to be 7-64 hex characters passes it and
+        // is stored. Claiming otherwise would invite a reader to treat the
+        // check as stronger than it is — see the residual-hole note in
+        // `docs/COLLAB.md`.
+        return Err(MemoryError::Validation(format!(
+            "task_list head_sha {echoed} is not a git object name. Run \
+             `git rev-parse HEAD` in the session's repo and send the full \
+             sha it prints. This field must be 7-64 hex characters: a \
+             revision expression such as HEAD, most branch names, a \
+             placeholder copied out of the turn template, and an \
+             abbreviation shorter than 7 characters are all refused here, \
+             because none of them pins one commit — and this value becomes \
+             the fixed point every later drift check in the session measures \
+             against."
+        )));
+    }
     let tasks_count = validate_task_list_body(&payload)
         .map_err(|error| MemoryError::Validation(error.to_string()))?;
     // Canonicalize the task_list JSON we store on the session so downstream
@@ -325,7 +368,13 @@ pub(super) fn parse_final_payload(content: &str) -> Result<String, MemoryError> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::collab::MAX_ECHOED_HEAD_SHA_CHARS;
     use serde_json::json;
+
+    /// A representative 40-hex head sha, shared by every fixture in this
+    /// module that needs a well-formed `head_sha` placeholder — real enough
+    /// to satisfy `is_hex_sha`, not tied to any actual commit.
+    const SHA: &str = "b9c2ce0f4d3a2b1c8e7f6a5b4c3d2e1f0a9b8c7d";
 
     #[test]
     fn final_rejection_uses_the_stable_wire_phase_name() {
@@ -552,7 +601,7 @@ mod tests {
         let mut payload = json!({
             "plan_hash": "h",
             "base_sha": "b",
-            "head_sha": "head",
+            "head_sha": SHA,
             "tasks": [{ "id": 1, "title": "t", "acceptance": ["ok"] }],
         });
         payload
@@ -658,7 +707,7 @@ mod tests {
         json!({
             "plan_hash": "h",
             "base_sha": "b",
-            "head_sha": "head",
+            "head_sha": SHA,
             "tasks": [{ "id": 1, "title": "t", "acceptance": ["ok"] }],
         })
     }
@@ -771,7 +820,6 @@ mod tests {
     /// refuse each other as different commits.
     #[test]
     fn a_padded_head_sha_is_trimmed_to_match_the_checkpoint_path() {
-        const SHA: &str = "b9c2ce0f4d3a2b1c8e7f6a5b4c3d2e1f0a9b8c7d";
         let padded = format!("  {SHA}\t\n");
 
         let from_event = parse_required_head_sha(
@@ -810,19 +858,18 @@ mod tests {
         );
     }
 
-    /// The `task_list` header is the path by which a padded sha reaches
-    /// storage as the session's `last_head_sha`, which
-    /// `validate_global_review_head_advance` re-checks against `is_hex_sha` on
-    /// every later advance — a padded value fails that shape guard and refuses
-    /// the turn with a Terminal, unrecoverable `branch_drift:` naming a commit
-    /// that is on the branch. All three header fields are trimmed alike.
+    /// Trimming runs before the `is_hex_sha` guard `head_sha` now faces at
+    /// this seed site, so a sha padded in transcription is still accepted as
+    /// the object name it is. Drop the trim and it would be refused here as
+    /// malformed while naming a commit that is on the branch. All three
+    /// header fields are trimmed alike.
     #[test]
     fn task_list_header_shas_are_trimmed() {
         let mut payload = base_task_list();
         let object = payload.as_object_mut().unwrap();
         object.insert("plan_hash".to_string(), json!(" h "));
         object.insert("base_sha".to_string(), json!(" b\n"));
-        object.insert("head_sha".to_string(), json!("\thead "));
+        object.insert("head_sha".to_string(), json!(format!("\t{SHA} ")));
 
         let event = parse_task_list_event(&payload.to_string()).expect("padding must be tolerated");
         let CollabEvent::SubmitTaskList {
@@ -836,7 +883,7 @@ mod tests {
         };
         assert_eq!(plan_hash, "h");
         assert_eq!(base_sha, "b");
-        assert_eq!(head_sha, "head");
+        assert_eq!(head_sha, SHA);
     }
 
     #[test]
@@ -850,6 +897,144 @@ mod tests {
         assert!(
             err.to_string().contains("execution_mode must be a string"),
             "error must say execution_mode must be a string, got: {err}"
+        );
+    }
+
+    /// The `head_sha` a `task_list` reports becomes the session's
+    /// `last_head_sha`, so it must be a fixed commit rather than a revision
+    /// expression. The turn template shows this field with a `HEAD`
+    /// placeholder, so the literal string "HEAD" is the reachable mistake
+    /// rather than a theoretical one: stored, it would make every later
+    /// ancestry check in the session compare against whatever HEAD happened
+    /// to be at that moment.
+    #[test]
+    fn task_list_rejects_a_head_sha_that_is_a_revision_expression() {
+        let mut payload = base_task_list();
+        payload
+            .as_object_mut()
+            .unwrap()
+            .insert("head_sha".to_string(), json!("HEAD"));
+
+        let err = parse_task_list_event(&payload.to_string())
+            .expect_err("a revision expression must not be storable as last_head_sha");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("head_sha"),
+            "the refusal must name the field the caller has to correct: {message}"
+        );
+        assert!(
+            message.contains("7-64 hex characters"),
+            "the refusal must state the shape it wants: {message}"
+        );
+    }
+
+    /// An abbreviation below the 7-character floor is refused for the same
+    /// reason a branch name is: it is not a unique object name.
+    #[test]
+    fn task_list_rejects_a_head_sha_below_the_seven_character_floor() {
+        let mut payload = base_task_list();
+        payload
+            .as_object_mut()
+            .unwrap()
+            .insert("head_sha".to_string(), json!("abc123"));
+
+        let err = parse_task_list_event(&payload.to_string())
+            .expect_err("a 6-character abbreviation is not an object name");
+
+        // Pinned to the same contract its sibling asserts, so this cannot
+        // pass on an unrelated rejection — a later field added to
+        // `base_task_list`, or some other guard that happens to dislike
+        // `"abc123"` once this one is gone.
+        let message = err.to_string();
+        assert!(
+            message.contains("7-64 hex characters"),
+            "the refusal must be the shape check, stating the shape it wants: {message}"
+        );
+    }
+
+    /// The refusal echoes the offending `head_sha` back, on a path where that
+    /// value has *not* passed `is_hex_sha` — so the shape check's 64-character
+    /// ceiling is not available to it and [`MAX_ECHOED_HEAD_SHA_CHARS`]
+    /// supplies one instead. Both seed-site refusals share that bound through
+    /// [`crate::collab::echo_head_sha`]; this pins it from the `task_list`
+    /// side, where a caller-controlled value of any length can reach it.
+    ///
+    /// The cut is `chars().take()` rather than a byte slice because the bound
+    /// lands in the middle of bytes the caller chose, and slicing there panics
+    /// inside the error path. The multibyte fixture below is deliberately a
+    /// *three*-byte character: with a two-byte one, byte 80 would happen to
+    /// fall on a char boundary and a byte slice would survive, so the test
+    /// would assert char-counting without exercising the panic that motivates
+    /// it. None of this is reached by the ordinary refusals, whose values
+    /// (`"HEAD"`, `"abc123"`) sit far below the bound.
+    #[test]
+    fn task_list_bounds_the_head_sha_it_echoes_back_in_a_refusal() {
+        let refuse = |head_sha: &str| -> String {
+            let mut payload = base_task_list();
+            payload
+                .as_object_mut()
+                .unwrap()
+                .insert("head_sha".to_string(), json!(head_sha));
+            parse_task_list_event(&payload.to_string())
+                .expect_err("a head_sha this long is not an object name")
+                .to_string()
+        };
+
+        // Past the bound the message stops growing: its length is the
+        // constant's to decide, not the caller's. Two inputs an order of
+        // magnitude apart must produce byte-identical messages.
+        let long = refuse(&"a".repeat(500));
+        let longer = refuse(&"a".repeat(5000));
+        assert_eq!(
+            long, longer,
+            "the echo must be capped, not passed through — a 10x longer \
+             head_sha produced a different message"
+        );
+        assert!(
+            !long.contains(&"a".repeat(MAX_ECHOED_HEAD_SHA_CHARS + 1)),
+            "at most {MAX_ECHOED_HEAD_SHA_CHARS} characters may survive: {long}"
+        );
+        assert!(
+            long.contains('…'),
+            "a value that was cut must say so: {long}"
+        );
+
+        // Exactly at the bound is not a cut. Such a value is still refused —
+        // `is_hex_sha` tops out at 64, well below 80 — so it reaches this
+        // same message with nothing removed, which is the branch the ordinary
+        // refusals never reach and the one most able to rot unnoticed.
+        let at_bound = refuse(&"a".repeat(MAX_ECHOED_HEAD_SHA_CHARS));
+        assert!(
+            at_bound.contains(&"a".repeat(MAX_ECHOED_HEAD_SHA_CHARS)),
+            "a value at the bound must be echoed whole: {at_bound}"
+        );
+        assert!(
+            !at_bound.contains('…'),
+            "a value that was not cut must not be marked as cut: {at_bound}"
+        );
+
+        // Multibyte, spelled as an escape so nothing in this source file's
+        // encoding can quietly change its width. U+20AC is three bytes, so
+        // byte 80 lands two bytes into the 27th character: `head_sha[..80]`
+        // would panic here, which is exactly why the implementation counts
+        // characters instead.
+        const EURO: char = '\u{20ac}';
+        assert_ne!(
+            MAX_ECHOED_HEAD_SHA_CHARS % EURO.len_utf8(),
+            0,
+            "the bound must fall mid-character for this fixture to exercise \
+             the panic that `chars().take()` avoids"
+        );
+        let multibyte = refuse(&EURO.to_string().repeat(500));
+        assert!(
+            multibyte.contains('…'),
+            "a cut multibyte value must say so: {multibyte}"
+        );
+        assert_eq!(
+            multibyte.matches(EURO).count(),
+            MAX_ECHOED_HEAD_SHA_CHARS,
+            "the cap counts characters, not bytes: {multibyte}"
         );
     }
 }

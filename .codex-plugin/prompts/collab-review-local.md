@@ -162,7 +162,7 @@ Report exactly these three lines and nothing else:
 
 ```text
 result: review_local sent (<n> fixes)
-ref: head_sha:<HEAD>
+ref: head_sha:<sha>
 blocker: <one line | none>
 ```
 

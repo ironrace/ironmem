@@ -284,6 +284,37 @@ mod tests {
         }
     }
 
+    /// The rejecting edges above are pinned at 5 and 65 characters, which
+    /// leaves `>= 7` and `<= 64` free to drift inward by one without any test
+    /// noticing. These are the accepting edges of the same bounds. They matter
+    /// beyond code maps: `is_hex_sha` is the single source of truth the collab
+    /// `head_sha` guards apply (both seed sites and the advance guard), and
+    /// their refusals advertise "7-64 hex characters" to agents as a contract.
+    /// Uppercase is included because `is_ascii_hexdigit` accepts `A-F` and the
+    /// collab retirement criterion in `docs/COLLAB.md` is written to match.
+    #[test]
+    fn is_hex_sha_accepts_both_ends_of_the_seven_to_sixty_four_range() {
+        for good in [
+            "a".repeat(7),
+            "a".repeat(64),
+            "A".repeat(40),
+            "0123456F".to_string(),
+        ] {
+            assert!(
+                is_hex_sha(&good),
+                "{good:?} ({} chars) is inside the advertised 7-64 hex range",
+                good.len()
+            );
+        }
+        for bad in ["a".repeat(6), "a".repeat(65)] {
+            assert!(
+                !is_hex_sha(&bad),
+                "{} chars is outside the advertised 7-64 hex range",
+                bad.len()
+            );
+        }
+    }
+
     /// A non-ASCII tracked path must round-trip through `git diff` and match the
     /// stored `source_files`. Guards the `-c core.quotepath=false` arg against
     /// regression: without it git C-quotes the path and the intersection misses,

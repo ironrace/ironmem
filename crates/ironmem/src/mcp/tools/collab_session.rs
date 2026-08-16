@@ -1739,11 +1739,46 @@ fn validate_global_review_head_advance(
     // whose remedy — "report the full sha" — addresses a field the reader does
     // not own.
     //
-    // The `task_list` send and the `collab_start_code_review` shortcut both
-    // still seed this field from caller input without a shape check, so a
-    // session can be carrying `"HEAD"`. For those the honest reading is that
-    // there is no fixed commit here to measure an advance *from*, so the
-    // ancestry question has no subject rather than a failing answer.
+    // Both seed sites — the `task_list` send (`parse_task_list_event`) and the
+    // `collab_start_code_review` shortcut (`start_global_review_session`) —
+    // now apply this same `is_hex_sha` check to their own input, where the
+    // refusal is recoverable and names a value the caller owns (#284). So a
+    // session seeded after that change cannot reach here with a malformed
+    // `last_head_sha`, and this arm is unreachable for it.
+    //
+    // It stays for the sessions that were already in flight when the seed
+    // checks landed. Those can be carrying `"HEAD"` in a stored row, and for
+    // them the honest reading is unchanged: there is no fixed commit here to
+    // measure an advance *from*, so the ancestry question has no subject
+    // rather than a failing answer. Removing this arm today would refuse them
+    // instead, on a field their caller cannot rewrite.
+    //
+    // So it is deletable, not permanent: once no session predating the seed
+    // checks is still live, nothing can reach it. Collab sessions run for
+    // hours and are bounded by `collab_end`, so that population drains in
+    // days. The retirement criterion is that no *active* session holds a
+    // malformed head:
+    //
+    //     SELECT id, last_head_sha FROM collab_sessions
+    //      WHERE ended_at IS NULL
+    //        AND NOT (length(last_head_sha) BETWEEN 7 AND 64
+    //                 AND lower(last_head_sha) NOT GLOB '*[^0-9a-f]*');
+    //
+    // returning no rows. Three details that a looser spelling gets wrong:
+    // `ended_at IS NULL` is load-bearing because `collab_end` only stamps
+    // `ended_at` (`collab::queue::end_session`) and nothing ever deletes a
+    // row, so an unscoped sweep would count long-finished sessions forever
+    // and never come back empty. `GLOB` rather than `REGEXP` because SQLite
+    // ships no `REGEXP` implementation and this crate registers none, so a
+    // `REGEXP` query fails outright rather than returning an answer. And
+    // `lower(...)` because `is_hex_sha` accepts `A-F` via `is_ascii_hexdigit`
+    // — a criterion spelled `[0-9a-f]` only would flag an uppercase sha that
+    // this function is perfectly happy with.
+    //
+    // The `tracing::warn!` below is what makes the criterion checkable
+    // against reality rather than inferred from it: a session that took this
+    // arm and has since ended leaves no trace in the table, so the log is the
+    // only record that drift detection ever ran degraded.
     //
     // What is skipped is *only* the ancestry comparison. The reported
     // `head_sha` must still name a commit that exists, because that question
@@ -1754,13 +1789,23 @@ fn validate_global_review_head_advance(
     // half of the guarantee [`require_checkpoint_proof`] leans on: its four
     // conditions are satisfied by construction when a fabricated head is both
     // checkpointed and reported, and this call is what proves the head real.
-    //
-    // Hoisting the shape check to those two seed sites — where the refusal is
-    // recoverable and names a value the caller owns — is the real close, and it
-    // is deliberately left as a follow-up: the seed sites are exercised by ~34
-    // tests whose fixtures use placeholder shas, and that sweep does not belong
-    // in a review round on a branch about to merge.
     if !crate::code_maps::is_hex_sha(last_head_sha) {
+        // Downgrading a check must not look like passing one. `Ok(())` from
+        // `validate_head_sha_exists` is indistinguishable at every call site
+        // from "ancestry verified", and this file already refuses that
+        // collapse elsewhere — see the `git_head_sha` note on why `.ok()`
+        // there would report `diverged: false` for an unreadable repo, and
+        // `handle_collab_resume`'s checkpoint block, echoed on success
+        // "rather than letting a silent success imply a check that never
+        // ran". Warn rather than refuse, for the reason above.
+        tracing::warn!(
+            repo_path = %repo_path,
+            last_head_sha = %last_head_sha,
+            head_sha = %head_sha,
+            "collab: stored last_head_sha is not a git object name; ancestry \
+             comparison skipped, existence check only (session seeded before \
+             the #284 seed-site shape checks)"
+        );
         return validate_head_sha_exists(repo_path, head_sha);
     }
 
@@ -3159,14 +3204,29 @@ mod tests {
         final_plan_hash
     }
 
+    /// Placeholder `head_sha` for tests that stop at `CodeImplementPending`
+    /// and never advance the head again — see [`drive_to_implement`] and the
+    /// warning on [`drive_to_implement_with_head`].
+    const PLACEHOLDER_HEAD: &str = "af4a19a954b359e9ee83f5c1a13795af57221c72";
+
     /// Drive to CodeImplementPending and return the final_plan_hash.
     /// `head_sha` becomes the task list's reported head (and thus
     /// `last_head_sha`) — pass a real, existing commit sha in the session's
     /// repo for any test that will go on to report `implementation_done` or a
     /// later batch-flow head, since issue #273 Task 8 made those
     /// git-ancestry-checked against it. A session that stops at
-    /// `CodeImplementPending` doesn't care, so most callers keep passing the
-    /// historical placeholder `"b"` via [`drive_to_implement`].
+    /// `CodeImplementPending` doesn't care, so most callers keep passing
+    /// [`PLACEHOLDER_HEAD`] via [`drive_to_implement`]. That placeholder is
+    /// well-formed 40-hex now (issue #284's seed-site shape check), so it no
+    /// longer skips `validate_global_review_head_advance`'s ancestry check on
+    /// the *stored* side either — a test that goes on to advance the head
+    /// must call this function directly with real, existing commit shas on
+    /// both sides, or the stored placeholder itself fails
+    /// `git merge-base --is-ancestor` and refuses the turn with a Terminal
+    /// `branch_drift:`. That refusal does name the right side — git puts the
+    /// unresolvable revision in its stderr and the exit-128 arm attributes it
+    /// to `last_head_sha` — but it arrives on a send the test expected to
+    /// succeed, from a fixture that looks unrelated to the seeded head.
     fn drive_to_implement_with_head(
         app: &crate::mcp::app::App,
         sid: &str,
@@ -3181,7 +3241,7 @@ mod tests {
     }
 
     fn drive_to_implement(app: &crate::mcp::app::App, sid: &str) -> String {
-        drive_to_implement_with_head(app, sid, "b")
+        drive_to_implement_with_head(app, sid, PLACEHOLDER_HEAD)
     }
 
     /// Drive the normal v3 lifecycle through its terminal success phase while
@@ -3233,7 +3293,7 @@ mod tests {
                 "repo_path": "/tmp/repo",
                 "branch": "main",
                 "base_sha": "base",
-                "head_sha": "head",
+                "head_sha": PLACEHOLDER_HEAD,
                 "initiator": "claude",
                 "task": "review-only test",
                 "pilot": pilot,
@@ -3254,6 +3314,54 @@ mod tests {
             app.active_collab_session_snapshot_for_scope("/tmp/repo", "main")
                 .is_none(),
             "invalid pilot must not bind an active collab session"
+        );
+    }
+
+    /// `start_global_review_session` refuses a `head_sha` that is not an
+    /// object name (#284), and its own unit test pins that. This pins the
+    /// wiring above it: that `CollabError::MalformedHeadSha` actually reaches
+    /// the caller through `collab_error_to_memory_error` rather than being
+    /// swallowed or remapped, and that the refusal leaves nothing behind.
+    ///
+    /// The no-row half is safe by construction today — the constructor runs
+    /// before `with_transaction` — but that ordering is exactly the kind of
+    /// thing a later edit reorders silently, and a half-created review session
+    /// bound to the scope would block the retry the refusal is asking for.
+    #[test]
+    fn collab_start_code_review_rejects_a_head_sha_that_is_not_an_object_name() {
+        let app = test_app();
+        let before = collab_session_count(&app);
+        let err = handle_collab_start_code_review(
+            &app,
+            &json!({
+                "repo_path": "/tmp/repo",
+                "branch": "main",
+                "base_sha": "base",
+                "head_sha": "HEAD",
+                "initiator": "claude",
+                "task": "review-only test",
+            }),
+        )
+        .unwrap_err();
+
+        let message = err.to_string();
+        assert!(
+            message.contains("head_sha"),
+            "the refusal must name the field the caller has to correct: {message}"
+        );
+        assert!(
+            message.contains("7-64 hex characters"),
+            "the refusal must state the shape it wants: {message}"
+        );
+        assert_eq!(
+            collab_session_count(&app),
+            before,
+            "a malformed head_sha must not create a collab session"
+        );
+        assert!(
+            app.active_collab_session_snapshot_for_scope("/tmp/repo", "main")
+                .is_none(),
+            "a malformed head_sha must not bind an active collab session"
         );
     }
 
@@ -4517,7 +4625,7 @@ mod tests {
         let task_list = json!({
             "plan_hash": final_hash,
             "base_sha": "base",
-            "head_sha": "base",
+            "head_sha": PLACEHOLDER_HEAD,
             "tasks": [{
                 "id": 1,
                 "title": big_title,
@@ -4558,7 +4666,7 @@ mod tests {
         let task_list = json!({
             "plan_hash": final_hash,
             "base_sha": "base",
-            "head_sha": "base",
+            "head_sha": PLACEHOLDER_HEAD,
             "tasks": [{
                 "id": 1,
                 "title": "task title",
@@ -4901,7 +5009,7 @@ mod tests {
     /// break on the third report is reported by claude (the session's
     /// implementer and `current_owner` right after `task_list`).
     fn drive_to_tooling_coding_failed(app: &crate::mcp::app::App, sid: &str) {
-        drive_to_tooling_coding_failed_with_head(app, sid, "b");
+        drive_to_tooling_coding_failed_with_head(app, sid, PLACEHOLDER_HEAD);
     }
 
     /// Same as [`drive_to_tooling_coding_failed`], but threads a real
@@ -6216,6 +6324,46 @@ mod tests {
         // sessions did before the guard existed.
         validate_global_review_head_advance(&repo, "HEAD", &second)
             .expect("a malformed stored last_head_sha must skip, not wedge the session");
+    }
+
+    /// The skip arm drops *only* the ancestry comparison — the reported head
+    /// must still name a commit that exists. That half is what
+    /// `require_checkpoint_proof` leans on: its four conditions are all
+    /// satisfied by construction when a fabricated head is both checkpointed
+    /// and reported, so this existence check is the only thing standing
+    /// between a made-up sha and an accepted `implementation_done`.
+    ///
+    /// Pinned separately from the `Ok` path above because the two are one
+    /// `if` apart: widening the skip to cover existence as well would leave
+    /// that test green while turning this guarantee off for exactly the
+    /// legacy sessions the arm exists to serve.
+    #[test]
+    fn a_skipped_ancestry_check_still_refuses_a_head_that_names_no_commit() {
+        let (dir, _first, _second) = git_repo_with_two_commits();
+        let repo = dir.path().to_string_lossy().to_string();
+        let fabricated = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+
+        let err = validate_global_review_head_advance(&repo, "HEAD", fabricated)
+            .expect_err("a fabricated head must be refused even when ancestry is skipped")
+            .to_string();
+
+        assert!(
+            err.contains("branch_drift:"),
+            "a head that names no commit is drift, not tooling: {err}"
+        );
+        assert!(
+            err.contains("does not name a commit that exists"),
+            "the refusal must say the sha resolves to nothing: {err}"
+        );
+        assert!(
+            err.contains(fabricated),
+            "the refusal must name the offending value: {err}"
+        );
+        assert!(
+            !err.contains("git ancestry validation failed"),
+            "this must be the existence refusal, not the generic operational \
+             one that invites a Tooling-class failure_report: {err}"
+        );
     }
 
     #[test]

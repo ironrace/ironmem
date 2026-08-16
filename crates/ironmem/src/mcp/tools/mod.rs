@@ -303,7 +303,7 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
                     "repo_path": { "type": "string" },
                     "branch": { "type": "string" },
                     "base_sha": { "type": "string" },
-                    "head_sha": { "type": "string" },
+                    "head_sha": { "type": "string", "description": "Full sha from `git rev-parse HEAD`, 7-64 hex chars. Seeds last_head_sha, so `HEAD` is refused." },
                     "initiator": { "type": "string", "enum": ["claude"] },
                     "task": { "type": "string" },
                     "pilot": { "type": "string", "enum": ["claude", "codex"] }

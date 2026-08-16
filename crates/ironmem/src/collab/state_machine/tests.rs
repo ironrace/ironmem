@@ -3,6 +3,16 @@ use super::super::session::tasks_count_from_list;
 use super::*;
 use crate::db::schema::Database;
 
+/// The head sha every `start_global_review_session` fixture in this module
+/// seeds `last_head_sha` with. That constructor is one of the two seed sites
+/// issue #284 shape-checked, so this must satisfy `is_hex_sha` (7-64 hex
+/// characters) or every fixture below refuses with
+/// `CollabError::MalformedHeadSha` before reaching the transition under test.
+/// 40-hex, matching the style of the other sha constants in this file (see
+/// `PR_CREATE_PUSHED_HEAD` below). Nothing here shells out to git, so it
+/// needs to be well-shaped rather than a commit that exists.
+const SEED_HEAD: &str = "5b175bbc33302a8cf08c3f83b245a52914dd6e27";
+
 fn session() -> CollabSession {
     CollabSession::new("test-session")
 }
@@ -834,12 +844,12 @@ fn test_code_review_fix_global_wrong_sender_rejected() {
 
 #[test]
 fn start_global_review_session_seeds_codex_owned_review_phase() {
-    let session = start_global_review_session("s1", "basesha", "headsha", Agent::Claude).unwrap();
+    let session = start_global_review_session("s1", "basesha", SEED_HEAD, Agent::Claude).unwrap();
     assert_eq!(session.id, "s1");
     assert_eq!(session.phase, Phase::CodeReviewFixGlobalPending);
     assert_eq!(session.current_owner, Agent::Codex);
     assert_eq!(session.base_sha.as_deref(), Some("basesha"));
-    assert_eq!(session.last_head_sha.as_deref(), Some("headsha"));
+    assert_eq!(session.last_head_sha.as_deref(), Some(SEED_HEAD));
     assert!(session.task_list.is_none());
     assert!(session.final_plan_hash.is_none());
     assert_eq!(session.review_round, 0);
@@ -847,7 +857,7 @@ fn start_global_review_session_seeds_codex_owned_review_phase() {
 
 #[test]
 fn start_global_review_session_rejects_empty_base_sha() {
-    let err = start_global_review_session("s1", "", "headsha", Agent::Claude).unwrap_err();
+    let err = start_global_review_session("s1", "", SEED_HEAD, Agent::Claude).unwrap_err();
     assert!(matches!(err, CollabError::MissingBaseSha));
 }
 
@@ -857,9 +867,82 @@ fn start_global_review_session_rejects_empty_head_sha() {
     assert!(matches!(err, CollabError::MissingHeadSha));
 }
 
+/// The shortcut supplies `head_sha` directly instead of via an
+/// `implementation_done` send, so this constructor is the only gate between
+/// caller input and a stored `last_head_sha`.
+#[test]
+fn start_global_review_session_rejects_a_revision_expression_head() {
+    let err = start_global_review_session("s1", "basesha", "HEAD", Agent::Claude)
+        .expect_err("a revision expression must not seed last_head_sha");
+
+    assert_eq!(
+        err,
+        CollabError::MalformedHeadSha {
+            head_sha: "HEAD".to_string()
+        }
+    );
+}
+
+/// `handle_collab_start_code_review` reads both shas with `require_str`, which
+/// does not trim, and `.claude-plugin/commands/collab.md` resolves them from
+/// the *output* of `git rev-parse HEAD` / `git merge-base` — output that ends
+/// in a newline. Once `head_sha` is shape-checked, an untrimmed value is
+/// refused despite naming the commit the branch is actually at, so the trim is
+/// load-bearing here exactly as it is at the `task_list` seed site.
+#[test]
+fn start_global_review_session_trims_both_shas_before_validating() {
+    let session = start_global_review_session(
+        "s1",
+        "  basesha\n",
+        &format!("\t{SEED_HEAD}\n"),
+        Agent::Claude,
+    )
+    .expect("a sha pasted from git output must be accepted");
+
+    assert_eq!(session.base_sha.as_deref(), Some("basesha"));
+    assert_eq!(session.last_head_sha.as_deref(), Some(SEED_HEAD));
+}
+
+/// Whitespace-only is empty once trimmed, and must read as the omission it is
+/// rather than as a malformed value.
+#[test]
+fn start_global_review_session_treats_whitespace_only_shas_as_missing() {
+    assert!(matches!(
+        start_global_review_session("s1", "   ", SEED_HEAD, Agent::Claude).unwrap_err(),
+        CollabError::MissingBaseSha
+    ));
+    assert!(matches!(
+        start_global_review_session("s1", "basesha", " \n\t ", Agent::Claude).unwrap_err(),
+        CollabError::MissingHeadSha
+    ));
+}
+
+/// The refusal echoes the offending value back, and that value arrives through
+/// `require_str` with no upstream cap at all — so the bound is this error's
+/// own to enforce. Shares `echo_head_sha` with the `task_list` refusal.
+#[test]
+fn start_global_review_session_bounds_the_head_sha_it_echoes_back() {
+    let CollabError::MalformedHeadSha { head_sha } =
+        start_global_review_session("s1", "basesha", &"z".repeat(5000), Agent::Claude)
+            .expect_err("a 5000-character head_sha is not an object name")
+    else {
+        panic!("expected MalformedHeadSha");
+    };
+
+    assert_eq!(
+        head_sha.chars().count(),
+        crate::collab::MAX_ECHOED_HEAD_SHA_CHARS + 1,
+        "the echo must be capped at the bound plus the ellipsis: {head_sha}"
+    );
+    assert!(
+        head_sha.ends_with('…'),
+        "a value that was cut must say so: {head_sha}"
+    );
+}
+
 #[test]
 fn start_global_review_session_flows_into_final_review() {
-    let session = start_global_review_session("s1", "basesha", "h0", Agent::Claude).unwrap();
+    let session = start_global_review_session("s1", "basesha", SEED_HEAD, Agent::Claude).unwrap();
 
     // Under v3 reorder: Codex review_fix_global advances to CodeReviewLocalPending
     // (Claude's audit turn) before reaching CodeReviewFinalPending.
@@ -903,13 +986,13 @@ fn start_global_review_session_flows_into_final_review() {
 
 #[test]
 fn start_global_review_session_accepts_branch_drift_failure_from_non_owner() {
-    let session = start_global_review_session("s1", "basesha", "h0", Agent::Claude).unwrap();
+    let session = start_global_review_session("s1", "basesha", SEED_HEAD, Agent::Claude).unwrap();
 
     let failed = apply_event(
         &session,
         Agent::Claude,
         &CollabEvent::FailureReport {
-            coding_failure: "branch_drift: last_head_sha=h0 not found".to_string(),
+            coding_failure: format!("branch_drift: last_head_sha={SEED_HEAD} not found"),
         },
     )
     .unwrap();
@@ -2153,12 +2236,12 @@ fn test_resume_resets_retry_budget_for_a_subsequent_tooling_failure() {
 
 #[test]
 fn test_resume_coding_rejected_for_branch_drift_session() {
-    let s = start_global_review_session("s1", "basesha", "h0", Agent::Claude).unwrap();
+    let s = start_global_review_session("s1", "basesha", SEED_HEAD, Agent::Claude).unwrap();
     let s = apply_event(
         &s,
         Agent::Claude,
         &CollabEvent::FailureReport {
-            coding_failure: "branch_drift: last_head_sha=h0 not found".to_string(),
+            coding_failure: format!("branch_drift: last_head_sha={SEED_HEAD} not found"),
         },
     )
     .unwrap();
@@ -2983,7 +3066,7 @@ fn pilot_claude_new_global_review_seeds_owner_and_implementer() {
     // `Agent::Claude` today (see the comment at that call site in
     // `collab_session.rs`). `new_global_review` derives
     // `current_owner = counterpart(pilot)` and `implementer = pilot`.
-    let session = start_global_review_session("s1", "basesha", "headsha", Agent::Claude).unwrap();
+    let session = start_global_review_session("s1", "basesha", SEED_HEAD, Agent::Claude).unwrap();
     assert_eq!(session.pilot, Agent::Claude);
     assert_eq!(session.current_owner, Agent::Codex);
     assert_eq!(session.implementer, Agent::Claude);
@@ -3498,7 +3581,7 @@ fn pilot_codex_new_global_review_seeds_mirrored_owner_and_implementer() {
     // `new_global_review` derives `current_owner = counterpart(pilot)` and
     // `implementer = pilot`, so a codex-piloted shortcut session opens on
     // Claude's global-fix turn.
-    let session = start_global_review_session("s1", "basesha", "headsha", Agent::Codex).unwrap();
+    let session = start_global_review_session("s1", "basesha", SEED_HEAD, Agent::Codex).unwrap();
     assert_eq!(session.pilot, Agent::Codex);
     assert_eq!(session.current_owner, Agent::Claude);
     assert_eq!(session.implementer, Agent::Codex);
@@ -3508,7 +3591,7 @@ fn pilot_codex_new_global_review_seeds_mirrored_owner_and_implementer() {
 fn pilot_codex_global_review_shortcut_flows_to_coding_complete() {
     // End-to-end mirror of the shortcut flow: copilot (Claude) applies global
     // fixes, then the pilot (Codex) audits and opens the PR.
-    let s = start_global_review_session("s1", "basesha", "h0", Agent::Codex).unwrap();
+    let s = start_global_review_session("s1", "basesha", SEED_HEAD, Agent::Codex).unwrap();
     let s = apply_event(
         &s,
         Agent::Claude,

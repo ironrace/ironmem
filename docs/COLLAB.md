@@ -712,15 +712,40 @@ Invariants that still apply:
   recording one would silently disable drift detection for the rest of the
   session rather than fail it — so it is refused as Terminal `branch_drift:`.
   Then the `git merge-base --is-ancestor` shell-out decides existence and
-  reachability. A *stored* `last_head_sha` that fails the shape check is the
-  one case that skips rather than refuses: it is server-held and the caller
-  cannot correct it, so refusing would wedge the session behind an error naming
-  a field its reader does not own. This does not depend on
-  whether `task_list` is set — it is unconditional, so a full v3 batch
-  (`SubmitTaskList` → `ImplementationDone` → ... → `CodingComplete`) is
-  checked exactly as the shortcut is. A non-descendant head is refused with
-  a **Terminal** `branch_drift:` error: the reported commit isn't reachable
-  from where the batch was known to start (wrong branch, force-reset, or a
+  reachability. The same shape check now runs at both sites that seed
+  `last_head_sha` — the `task_list` send and the `collab_start_code_review`
+  shortcut — so a session can never be recorded against a head that is not
+  an object name in the first place; there the refusal is recoverable, since
+  it names a value the caller is holding, before anything is written. The
+  stored-side skip remains the one case that skips rather than refuses, and
+  after the seed checks it is reachable only by a session that was already
+  in flight when they landed. Collab sessions run for hours and are bounded
+  by `collab_end`, so that population drains within days; the retirement
+  criterion is that no **active** session holds a malformed head —
+
+  ```sql
+  SELECT id, last_head_sha FROM collab_sessions
+   WHERE ended_at IS NULL
+     AND NOT (length(last_head_sha) BETWEEN 7 AND 64
+              AND lower(last_head_sha) NOT GLOB '*[^0-9a-f]*');
+  ```
+
+  returning no rows. The `ended_at IS NULL` scope matters: `collab_end` only
+  stamps `ended_at` and nothing deletes the row, so an unscoped sweep counts
+  long-finished sessions forever and never comes back empty. `GLOB` rather
+  than `REGEXP` because SQLite ships no `REGEXP` implementation and ironmem
+  registers none. `lower(...)` because the shape check accepts uppercase
+  `A–F`. Whether the arm was *ever* taken is a log question, not a table
+  question — it emits a `tracing::warn!` naming the session's repo and both
+  shas each time it fires. The reason it still skips is unchanged: the stored value
+  is server-held and the caller cannot correct it, so refusing would wedge
+  the session behind an error naming a field its reader does not own. This
+  does not depend on whether `task_list` is set — it is unconditional, so a
+  full v3 batch (`SubmitTaskList` → `ImplementationDone` → ... →
+  `CodingComplete`) is checked exactly as the shortcut is. A non-descendant
+  head is refused with a **Terminal** `branch_drift:` error: the reported
+  commit isn't reachable from where the batch was known to start (wrong
+  branch, force-reset, or a
   fabricated/nonexistent sha), which is not something a retry or a corrected
   checkpoint can fix in place.
 - **Rebasing or amending during an in-flight batch produces `branch_drift:`.**
@@ -1249,8 +1274,8 @@ surviving flow.
 {
   "repo_path": "/path/to/repo",
   "branch": "feat/landing-page",
-  "base_sha": "abc123",
-  "head_sha": "def456",
+  "base_sha": "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
+  "head_sha": "b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1",
   "initiator": "claude",
   "task": "add landing page",
   "pilot": "claude"
@@ -1262,7 +1287,20 @@ and is readable via `collab_status`. `pilot` is optional, defaults to
 `"claude"`, and must be one of `{"claude","codex"}` — same DB CHECK as
 `collab_start` (migration 019). `initiator` stays fixed to `"claude"`
 regardless of `pilot`: it names the dispatcher invoking the shortcut, not
-the review-flow lead (§ Runtime Model → Roles).
+the review-flow lead (§ Runtime Model → Roles). `head_sha` must be a git
+object name (7–64 hex characters), because it seeds the session's
+`last_head_sha`, so a revision expression is refused rather than stored.
+`base_sha` is only required to be non-empty — it is recorded for reporting
+and never handed to git, so there is no ancestry question for it to answer.
+Both are trimmed before validation, so a value pasted straight from the
+output of `git rev-parse HEAD` is accepted with its trailing newline.
+
+The `head_sha` rule is a **shape** check and nothing more. A branch or tag
+whose name happens to be 7–64 hex characters (`deadbeef`) satisfies it, gets
+stored, and then re-resolves on every later ancestry check — the moving-target
+defect the rule exists to prevent. Nothing in the protocol closes that residual
+hole; the mitigation is that agents are told to send `git rev-parse HEAD`
+output rather than any name they chose. Uppercase `A–F` is likewise accepted.
 
 ### Authorization / Phase / Ownership Matrix
 
@@ -2158,7 +2196,7 @@ orchestrator from steering the reviewer's conclusion.
 
 | Topic | Sender | Payload | Notes |
 |---|---|---|---|
-| `task_list` | `pilot` | `{"plan_hash","base_sha","head_sha","plan_file_path"?,"execution_mode"?,"tasks":[{"id","title","timebox_minutes","acceptance":[...]}]}` | `plan_hash` must equal `final_plan_hash`; `tasks` must contain **1–15** strictly ordered entries; ids must be exactly **1..=N**, not merely increasing, so that the task *count* and the id set are the same fact for every consumer that treats one as the other; the `implementation_done` checkpoint gate reads the ids the stored list declares (which is what makes it correct on a session stored before this rule), and a gap or a non-1-based id anywhere else would make the batch either permanently unfinishable or falsely reportable as complete; each task requires `timebox_minutes <= 20` and ≥1 `acceptance` entry. A 16+ task issue must be split into child issues before this message is sent. Optional `plan_file_path` (repo-relative; no leading `/`; no `..` segments) points at the approved task markdown driving subagent execution. Optional `execution_mode` — see below. |
+| `task_list` | `pilot` | `{"plan_hash","base_sha","head_sha","plan_file_path"?,"execution_mode"?,"tasks":[{"id","title","timebox_minutes","acceptance":[...]}]}` | `plan_hash` must equal `final_plan_hash`; `head_sha` must be a git object name (7–64 hex characters), because it becomes the session's `last_head_sha` and every later head in the session is checked for descent from it — a revision expression such as `HEAD` is refused here rather than stored; `tasks` must contain **1–15** strictly ordered entries; ids must be exactly **1..=N**, not merely increasing, so that the task *count* and the id set are the same fact for every consumer that treats one as the other; the `implementation_done` checkpoint gate reads the ids the stored list declares (which is what makes it correct on a session stored before this rule), and a gap or a non-1-based id anywhere else would make the batch either permanently unfinishable or falsely reportable as complete; each task requires `timebox_minutes <= 20` and ≥1 `acceptance` entry. A 16+ task issue must be split into child issues before this message is sent. Optional `plan_file_path` (repo-relative; no leading `/`; no `..` segments) points at the approved task markdown driving subagent execution. Optional `execution_mode` — see below. |
 | `implementation_done` | `claude` or `codex` (per session `implementer`) | `{"head_sha"}` | In `CodeImplementPending` only. Fired once after the subagent batch completes and gates pass. Carries only `head_sha` — no prose, no subagent notes. **Gated on checkpoint proof**: refused with a `checkpoint_drift:` message unless the session's stored checkpoint exists, records this exact `head_sha`, is `batch_complete` covering every task in the accepted task list, and carries a green gate proof at that same sha. A refusal leaves the session in `CodeImplementPending` with nothing written. |
 | `review_fix_global` | `copilot` (or the counterpart agent as recovery owner under the delegated-completion override) | `{"head_sha"}` | In `CodeReviewFixGlobalPending` only. The copilot ran `/pr-review-toolkit:review-pr` on the raw post-implementation diff (no pre-clean by the pilot), used parallel fix subagents for confirmed partitionable findings, merged/cherry-picked the resulting fixes, and pushed the branch-level fix commit(s). |
 | `review_local` | `pilot` (or the counterpart agent as recovery owner under the delegated-completion override) | `{"head_sha"}` | In `CodeReviewLocalPending` only. The pilot ran full or reduced audit of the copilot's `review_fix_global` commits + caught issues both agents missed, used parallel fix subagents for confirmed partitionable findings, merged/cherry-picked the resulting fixes, and pushed. |
