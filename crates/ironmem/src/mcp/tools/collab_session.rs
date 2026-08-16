@@ -1750,8 +1750,14 @@ fn validate_global_review_head_advance(
     // checks landed. Those can be carrying `"HEAD"` in a stored row, and for
     // them the honest reading is unchanged: there is no fixed commit here to
     // measure an advance *from*, so the ancestry question has no subject
-    // rather than a failing answer. Removing this arm would refuse them
+    // rather than a failing answer. Removing this arm today would refuse them
     // instead, on a field their caller cannot rewrite.
+    //
+    // So it is deletable, not permanent: once no session predating the seed
+    // checks is still live, nothing can reach it. Collab sessions run for
+    // hours and are bounded by `collab_end`, so that condition arrives in
+    // days — a `last_head_sha NOT REGEXP '^[0-9a-f]{7,64}$'` sweep of
+    // `collab_sessions` returning empty is the whole check.
     //
     // What is skipped is *only* the ancestry comparison. The reported
     // `head_sha` must still name a commit that exists, because that question

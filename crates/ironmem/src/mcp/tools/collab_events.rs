@@ -16,6 +16,15 @@ const MAX_CODING_FAILURE_CHARS: usize = 2048;
 /// CHECK constraint in migration 005.
 const MAX_PR_URL_CHARS: usize = 2048;
 
+/// Maximum characters of a rejected `head_sha` echoed back in the refusal
+/// `parse_task_list_event` raises. Everywhere else a `head_sha` reaches a
+/// message it has already passed `is_hex_sha` and is therefore at most 64
+/// characters; that refusal is the one path where it did *not*, so it is the
+/// one place an unbounded caller string would land verbatim in an MCP
+/// response. Wide enough to show a full 64-char object name and still signal
+/// that something followed it.
+const MAX_ECHOED_HEAD_SHA_CHARS: usize = 80;
+
 /// Translate a `(topic, content)` send into a `CollabEvent`. Dispatch is
 /// split into v1 planning and v3 coding groups so each sub-function stays
 /// under the file's 50-line function guideline. Phase disambiguation is
@@ -254,14 +263,32 @@ pub(super) fn parse_task_list_event(content: &str) -> Result<CollabEvent, Memory
     // exists is the git shell-out's question, and there is no repo path in
     // scope at this layer to ask it with.
     if !crate::code_maps::is_hex_sha(&head_sha) {
+        // Bounded echo: see [`MAX_ECHOED_HEAD_SHA_CHARS`]. `echoed` is a
+        // prefix of `head_sha`, so comparing byte lengths detects the cut.
+        let echoed: String = head_sha.chars().take(MAX_ECHOED_HEAD_SHA_CHARS).collect();
+        let ellipsis = if echoed.len() < head_sha.len() {
+            "…"
+        } else {
+            ""
+        };
+        // The remedy leads, and it is a command rather than a description:
+        // the reader here is an agent with a shell, and `git rev-parse HEAD`
+        // is the whole fix. The template is referred to generically on
+        // purpose — quoting its placeholder literally would couple this
+        // string to a file that is being rewritten for the same reason this
+        // check exists. The causes are listed rather than assumed, because a
+        // short abbreviation reaches this refusal just as a revision
+        // expression does and is not the same mistake.
         return Err(MemoryError::Validation(format!(
-            "task_list head_sha {head_sha} is not a git object name (7-64 hex \
-             characters). The turn template writes this field as \
-             `head_sha:<HEAD>` — substitute the full sha the branch is \
-             actually at, not the placeholder and not a revision expression \
-             such as HEAD or a branch name, which resolve to a different \
-             commit every time they are read and would leave this session \
-             with no fixed point to detect drift against."
+            "task_list head_sha {echoed}{ellipsis} is not a git object name. Run \
+             `git rev-parse HEAD` in the session's repo and send the full \
+             40-character sha it prints. This field must be 7-64 hex \
+             characters: a revision expression such as HEAD or a branch name, \
+             a placeholder copied out of the turn template, and an \
+             abbreviation shorter than 7 characters are all refused here, \
+             because none of them pins one commit — and this value becomes \
+             the fixed point every later drift check in the session measures \
+             against."
         )));
     }
     let tasks_count = validate_task_list_body(&payload)
@@ -881,10 +908,11 @@ mod tests {
 
     /// The `head_sha` a `task_list` reports becomes the session's
     /// `last_head_sha`, so it must be a fixed commit rather than a revision
-    /// expression. The turn template spells the field `head_sha:<HEAD>`, so
-    /// the literal string "HEAD" is the reachable mistake, not a theoretical
-    /// one: stored, it would make every later ancestry check in the session
-    /// compare against whatever HEAD happened to be at that moment.
+    /// expression. The turn template shows this field with a `HEAD`
+    /// placeholder, so the literal string "HEAD" is the reachable mistake
+    /// rather than a theoretical one: stored, it would make every later
+    /// ancestry check in the session compare against whatever HEAD happened
+    /// to be at that moment.
     #[test]
     fn task_list_rejects_a_head_sha_that_is_a_revision_expression() {
         let mut payload = base_task_list();
@@ -917,7 +945,17 @@ mod tests {
             .unwrap()
             .insert("head_sha".to_string(), json!("abc123"));
 
-        parse_task_list_event(&payload.to_string())
+        let err = parse_task_list_event(&payload.to_string())
             .expect_err("a 6-character abbreviation is not an object name");
+
+        // Pinned to the same contract its sibling asserts, so this cannot
+        // pass on an unrelated rejection — a later field added to
+        // `base_task_list`, or some other guard that happens to dislike
+        // `"abc123"` once this one is gone.
+        let message = err.to_string();
+        assert!(
+            message.contains("7-64 hex characters"),
+            "the refusal must be the shape check, stating the shape it wants: {message}"
+        );
     }
 }
