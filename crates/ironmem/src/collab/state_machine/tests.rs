@@ -4,12 +4,13 @@ use super::*;
 use crate::db::schema::Database;
 
 /// The head sha every `start_global_review_session` fixture in this module
-/// seeds `last_head_sha` with. The state machine itself has no shape check
-/// and gains none (only the two seed sites the tool layer wraps it in are
-/// about to — see issue #284), so any string would do here; it is 40-hex
-/// anyway, matching the shape those seed sites will soon require and the
-/// style of the other sha constants in this file (see
-/// `PR_CREATE_PUSHED_HEAD` below).
+/// seeds `last_head_sha` with. That constructor is one of the two seed sites
+/// issue #284 shape-checked, so this must satisfy `is_hex_sha` (7-64 hex
+/// characters) or every fixture below refuses with
+/// `CollabError::MalformedHeadSha` before reaching the transition under test.
+/// 40-hex, matching the style of the other sha constants in this file (see
+/// `PR_CREATE_PUSHED_HEAD` below). Nothing here shells out to git, so it
+/// needs to be well-shaped rather than a commit that exists.
 const SEED_HEAD: &str = "5b175bbc33302a8cf08c3f83b245a52914dd6e27";
 
 fn session() -> CollabSession {
@@ -864,6 +865,22 @@ fn start_global_review_session_rejects_empty_base_sha() {
 fn start_global_review_session_rejects_empty_head_sha() {
     let err = start_global_review_session("s1", "basesha", "", Agent::Claude).unwrap_err();
     assert!(matches!(err, CollabError::MissingHeadSha));
+}
+
+/// The shortcut supplies `head_sha` directly instead of via an
+/// `implementation_done` send, so this constructor is the only gate between
+/// caller input and a stored `last_head_sha`.
+#[test]
+fn start_global_review_session_rejects_a_revision_expression_head() {
+    let err = start_global_review_session("s1", "basesha", "HEAD", Agent::Claude)
+        .expect_err("a revision expression must not seed last_head_sha");
+
+    assert_eq!(
+        err,
+        CollabError::MalformedHeadSha {
+            head_sha: "HEAD".to_string()
+        }
+    );
 }
 
 #[test]

@@ -45,6 +45,16 @@ pub enum CollabError {
     #[error("head_sha is required but missing or empty")]
     MissingHeadSha,
 
+    /// A `head_sha` that is present but not a git object name. Distinct from
+    /// [`CollabError::MissingHeadSha`] because the remedies differ: that one
+    /// says "you omitted it", this one says "what you sent will not identify
+    /// a commit". Raised only at the shortcut's seed site, where the value is
+    /// still the caller's to correct — see the skip arm in
+    /// `validate_global_review_head_advance` for why the same condition on a
+    /// *stored* `last_head_sha` is not an error there.
+    #[error("head_sha {head_sha} is not a git object name (7-64 hex characters)")]
+    MalformedHeadSha { head_sha: String },
+
     /// `ResumeCoding` was rejected: either the `CodingFailed` session's
     /// stored `coding_failure` does not classify as a recoverable tooling
     /// failure, or `failed_from_phase` was never recorded (a pre-migration

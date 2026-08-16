@@ -9,8 +9,10 @@ use super::{
 };
 
 /// Construct a fresh `CollabSession` positioned at the v3 global-review
-/// stage, for the coding-review shortcut. Rejects empty SHAs so the
-/// session never enters the review flow with unset drift-detection state.
+/// stage, for the coding-review shortcut. Rejects an empty `base_sha`, and an
+/// empty or non-object-name `head_sha`, so the session never enters the review
+/// flow with drift-detection state that is unset or cannot be compared
+/// against.
 /// `pilot` is the agent leading the review session; `new_global_review`
 /// derives `current_owner = counterpart(pilot)` and `implementer = pilot`
 /// from it. The MCP layer (`handle_collab_start_code_review`) resolves and
@@ -28,6 +30,18 @@ pub fn start_global_review_session(
     }
     if head_sha.is_empty() {
         return Err(CollabError::MissingHeadSha);
+    }
+    // The emptiness check above is not enough: this value is written straight
+    // to `last_head_sha` by `CollabSession::new_global_review`, and a session
+    // seeded with a revision expression carries no fixed commit for any later
+    // ancestry check to measure an advance from. The check sits here rather
+    // than in `handle_collab_start_code_review` because this is the only
+    // constructor path to `new_global_review` — the MCP layer is one caller,
+    // not the boundary.
+    if !crate::code_maps::is_hex_sha(head_sha) {
+        return Err(CollabError::MalformedHeadSha {
+            head_sha: head_sha.to_string(),
+        });
     }
     Ok(CollabSession::new_global_review(
         id, base_sha, head_sha, pilot,

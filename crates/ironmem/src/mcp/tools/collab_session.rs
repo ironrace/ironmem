@@ -1739,11 +1739,19 @@ fn validate_global_review_head_advance(
     // whose remedy — "report the full sha" — addresses a field the reader does
     // not own.
     //
-    // The `task_list` send and the `collab_start_code_review` shortcut both
-    // still seed this field from caller input without a shape check, so a
-    // session can be carrying `"HEAD"`. For those the honest reading is that
-    // there is no fixed commit here to measure an advance *from*, so the
-    // ancestry question has no subject rather than a failing answer.
+    // Both seed sites — the `task_list` send (`parse_task_list_event`) and the
+    // `collab_start_code_review` shortcut (`start_global_review_session`) —
+    // now apply this same `is_hex_sha` check to their own input, where the
+    // refusal is recoverable and names a value the caller owns (#284). So a
+    // session seeded after that change cannot reach here with a malformed
+    // `last_head_sha`, and this arm is unreachable for it.
+    //
+    // It stays for the sessions that were already in flight when the seed
+    // checks landed. Those can be carrying `"HEAD"` in a stored row, and for
+    // them the honest reading is unchanged: there is no fixed commit here to
+    // measure an advance *from*, so the ancestry question has no subject
+    // rather than a failing answer. Removing this arm would refuse them
+    // instead, on a field their caller cannot rewrite.
     //
     // What is skipped is *only* the ancestry comparison. The reported
     // `head_sha` must still name a commit that exists, because that question
@@ -1754,12 +1762,6 @@ fn validate_global_review_head_advance(
     // half of the guarantee [`require_checkpoint_proof`] leans on: its four
     // conditions are satisfied by construction when a fabricated head is both
     // checkpointed and reported, and this call is what proves the head real.
-    //
-    // Hoisting the shape check to those two seed sites — where the refusal is
-    // recoverable and names a value the caller owns — is the real close, and it
-    // is deliberately left as a follow-up: the seed sites are exercised by ~34
-    // tests whose fixtures use placeholder shas, and that sweep does not belong
-    // in a review round on a branch about to merge.
     if !crate::code_maps::is_hex_sha(last_head_sha) {
         return validate_head_sha_exists(repo_path, head_sha);
     }
@@ -4914,7 +4916,7 @@ mod tests {
     /// break on the third report is reported by claude (the session's
     /// implementer and `current_owner` right after `task_list`).
     fn drive_to_tooling_coding_failed(app: &crate::mcp::app::App, sid: &str) {
-        drive_to_tooling_coding_failed_with_head(app, sid, "b");
+        drive_to_tooling_coding_failed_with_head(app, sid, PLACEHOLDER_HEAD);
     }
 
     /// Same as [`drive_to_tooling_coding_failed`], but threads a real

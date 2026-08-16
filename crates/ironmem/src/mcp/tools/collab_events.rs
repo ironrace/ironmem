@@ -212,12 +212,12 @@ pub(super) fn parse_task_list_event(content: &str) -> Result<CollabEvent, Memory
     })?;
     // All three trimmed before the emptiness check, for the reason
     // `extract_required_str` records: they are transcribed out of a turn
-    // template, and `head_sha` in particular is stored as the session's
-    // `last_head_sha`, which `validate_global_review_head_advance` re-checks
-    // against `is_hex_sha` on every later advance. A padded sha fails that
-    // shape guard, so every subsequent turn in the session would be refused
-    // with a Terminal `branch_drift:` naming a commit that is in fact on the
-    // branch — and terminal means there is no recovery from it.
+    // template, so a leading tab or trailing space is an ordinary
+    // transcription slip rather than a different value. For `head_sha` the
+    // trim is load-bearing at this very call — the `is_hex_sha` guard below
+    // refuses anything that is not 7-64 hex characters, and padding is
+    // exactly that, so an untrimmed sha would be refused here despite naming
+    // the commit the branch is actually at.
     let plan_hash = payload
         .get("plan_hash")
         .and_then(Value::as_str)
@@ -241,6 +241,29 @@ pub(super) fn parse_task_list_event(content: &str) -> Result<CollabEvent, Memory
         .filter(|v| !v.is_empty())
         .ok_or_else(|| MemoryError::Validation("task_list missing non-empty head_sha".to_string()))?
         .to_string();
+    // Shape-checked here, at the seed site, rather than only where the value
+    // is later read back. `head_sha` becomes the session's `last_head_sha`,
+    // and `validate_global_review_head_advance` cannot refuse a malformed
+    // *stored* value without wedging the session — nothing rewrites that
+    // field but a successful head-advancing send, which is exactly what the
+    // refusal would block. Here the refusal is recoverable: it names a value
+    // the caller is holding, in a phase where nothing has been written yet.
+    //
+    // Same `is_hex_sha` (7-64 hex chars) the advance guard applies, rather
+    // than a second spelling of the rule. Shape only — whether the commit
+    // exists is the git shell-out's question, and there is no repo path in
+    // scope at this layer to ask it with.
+    if !crate::code_maps::is_hex_sha(&head_sha) {
+        return Err(MemoryError::Validation(format!(
+            "task_list head_sha {head_sha} is not a git object name (7-64 hex \
+             characters). The turn template writes this field as \
+             `head_sha:<HEAD>` — substitute the full sha the branch is \
+             actually at, not the placeholder and not a revision expression \
+             such as HEAD or a branch name, which resolve to a different \
+             commit every time they are read and would leave this session \
+             with no fixed point to detect drift against."
+        )));
+    }
     let tasks_count = validate_task_list_body(&payload)
         .map_err(|error| MemoryError::Validation(error.to_string()))?;
     // Canonicalize the task_list JSON we store on the session so downstream
@@ -814,12 +837,11 @@ mod tests {
         );
     }
 
-    /// The `task_list` header is the path by which a padded sha reaches
-    /// storage as the session's `last_head_sha`, which
-    /// `validate_global_review_head_advance` re-checks against `is_hex_sha` on
-    /// every later advance — a padded value fails that shape guard and refuses
-    /// the turn with a Terminal, unrecoverable `branch_drift:` naming a commit
-    /// that is on the branch. All three header fields are trimmed alike.
+    /// Trimming runs before the `is_hex_sha` guard `head_sha` now faces at
+    /// this seed site, so a sha padded in transcription is still accepted as
+    /// the object name it is. Drop the trim and it would be refused here as
+    /// malformed while naming a commit that is on the branch. All three
+    /// header fields are trimmed alike.
     #[test]
     fn task_list_header_shas_are_trimmed() {
         let mut payload = base_task_list();
@@ -855,5 +877,47 @@ mod tests {
             err.to_string().contains("execution_mode must be a string"),
             "error must say execution_mode must be a string, got: {err}"
         );
+    }
+
+    /// The `head_sha` a `task_list` reports becomes the session's
+    /// `last_head_sha`, so it must be a fixed commit rather than a revision
+    /// expression. The turn template spells the field `head_sha:<HEAD>`, so
+    /// the literal string "HEAD" is the reachable mistake, not a theoretical
+    /// one: stored, it would make every later ancestry check in the session
+    /// compare against whatever HEAD happened to be at that moment.
+    #[test]
+    fn task_list_rejects_a_head_sha_that_is_a_revision_expression() {
+        let mut payload = base_task_list();
+        payload
+            .as_object_mut()
+            .unwrap()
+            .insert("head_sha".to_string(), json!("HEAD"));
+
+        let err = parse_task_list_event(&payload.to_string())
+            .expect_err("a revision expression must not be storable as last_head_sha");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("head_sha"),
+            "the refusal must name the field the caller has to correct: {message}"
+        );
+        assert!(
+            message.contains("7-64 hex characters"),
+            "the refusal must state the shape it wants: {message}"
+        );
+    }
+
+    /// An abbreviation below the 7-character floor is refused for the same
+    /// reason a branch name is: it is not a unique object name.
+    #[test]
+    fn task_list_rejects_a_head_sha_below_the_seven_character_floor() {
+        let mut payload = base_task_list();
+        payload
+            .as_object_mut()
+            .unwrap()
+            .insert("head_sha".to_string(), json!("abc123"));
+
+        parse_task_list_event(&payload.to_string())
+            .expect_err("a 6-character abbreviation is not an object name");
     }
 }
