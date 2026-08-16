@@ -958,4 +958,77 @@ mod tests {
             "the refusal must be the shape check, stating the shape it wants: {message}"
         );
     }
+
+    /// The refusal echoes the offending `head_sha` back, and it is the one
+    /// path on which that value has *not* passed `is_hex_sha` — so it is the
+    /// one place an unbounded caller string would reach an MCP response body
+    /// verbatim. [`MAX_ECHOED_HEAD_SHA_CHARS`] is what stops it.
+    ///
+    /// The cut is `chars().take()` rather than a byte slice because the bound
+    /// lands in the middle of bytes the caller chose: slicing a multibyte
+    /// value at byte 80 would panic inside the error path. That case is the
+    /// reason the implementation looks the way it does, so it is the one most
+    /// worth pinning — and none of it is exercised by the ordinary refusals,
+    /// whose values (`"HEAD"`, `"abc123"`) sit far below the bound.
+    #[test]
+    fn task_list_bounds_the_head_sha_it_echoes_back_in_a_refusal() {
+        let refuse = |head_sha: &str| -> String {
+            let mut payload = base_task_list();
+            payload
+                .as_object_mut()
+                .unwrap()
+                .insert("head_sha".to_string(), json!(head_sha));
+            parse_task_list_event(&payload.to_string())
+                .expect_err("a head_sha this long is not an object name")
+                .to_string()
+        };
+
+        // Past the bound the message stops growing: its length is the
+        // constant's to decide, not the caller's. Two inputs an order of
+        // magnitude apart must produce byte-identical messages.
+        let long = refuse(&"a".repeat(500));
+        let longer = refuse(&"a".repeat(5000));
+        assert_eq!(
+            long, longer,
+            "the echo must be capped, not passed through — a 10x longer \
+             head_sha produced a different message"
+        );
+        assert!(
+            !long.contains(&"a".repeat(MAX_ECHOED_HEAD_SHA_CHARS + 1)),
+            "at most {MAX_ECHOED_HEAD_SHA_CHARS} characters may survive: {long}"
+        );
+        assert!(
+            long.contains('…'),
+            "a value that was cut must say so: {long}"
+        );
+
+        // Exactly at the bound is not a cut. Such a value is still refused —
+        // `is_hex_sha` tops out at 64, well below 80 — so it reaches this
+        // same message with nothing removed, which is the branch the ordinary
+        // refusals never reach and the one most able to rot unnoticed.
+        let at_bound = refuse(&"a".repeat(MAX_ECHOED_HEAD_SHA_CHARS));
+        assert!(
+            at_bound.contains(&"a".repeat(MAX_ECHOED_HEAD_SHA_CHARS)),
+            "a value at the bound must be echoed whole: {at_bound}"
+        );
+        assert!(
+            !at_bound.contains('…'),
+            "a value that was not cut must not be marked as cut: {at_bound}"
+        );
+
+        // Multibyte, spelled as an escape so a decomposed `e` + combining
+        // accent in this source file cannot quietly make it two chars. The
+        // cut falls mid-character by byte count; `chars().take()` is why this
+        // yields a valid String instead of panicking.
+        let multibyte = refuse(&'\u{00e9}'.to_string().repeat(500));
+        assert!(
+            multibyte.contains('…'),
+            "a cut multibyte value must say so: {multibyte}"
+        );
+        assert_eq!(
+            multibyte.matches('\u{00e9}').count(),
+            MAX_ECHOED_HEAD_SHA_CHARS,
+            "the cap counts characters, not bytes: {multibyte}"
+        );
+    }
 }
