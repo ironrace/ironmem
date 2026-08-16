@@ -3159,14 +3159,27 @@ mod tests {
         final_plan_hash
     }
 
+    /// Placeholder `head_sha` for tests that stop at `CodeImplementPending`
+    /// and never advance the head again — see [`drive_to_implement`] and the
+    /// warning on [`drive_to_implement_with_head`].
+    const PLACEHOLDER_HEAD: &str = "af4a19a954b359e9ee83f5c1a13795af57221c72";
+
     /// Drive to CodeImplementPending and return the final_plan_hash.
     /// `head_sha` becomes the task list's reported head (and thus
     /// `last_head_sha`) — pass a real, existing commit sha in the session's
     /// repo for any test that will go on to report `implementation_done` or a
     /// later batch-flow head, since issue #273 Task 8 made those
     /// git-ancestry-checked against it. A session that stops at
-    /// `CodeImplementPending` doesn't care, so most callers keep passing the
-    /// synthetic 40-hex placeholder via [`drive_to_implement`].
+    /// `CodeImplementPending` doesn't care, so most callers keep passing
+    /// [`PLACEHOLDER_HEAD`] via [`drive_to_implement`]. That placeholder is
+    /// well-formed 40-hex now (issue #284's seed-site shape check), so it no
+    /// longer skips `validate_global_review_head_advance`'s ancestry check on
+    /// the *stored* side either — a test that goes on to advance the head
+    /// must call this function directly with real, existing commit shas on
+    /// both sides, or the stored placeholder itself fails
+    /// `git merge-base --is-ancestor` and refuses the turn with a Terminal
+    /// `branch_drift:` that looks like it's about the reported head when it
+    /// is actually about the seeded one.
     fn drive_to_implement_with_head(
         app: &crate::mcp::app::App,
         sid: &str,
@@ -3181,7 +3194,7 @@ mod tests {
     }
 
     fn drive_to_implement(app: &crate::mcp::app::App, sid: &str) -> String {
-        drive_to_implement_with_head(app, sid, "1111111111111111111111111111111111111111")
+        drive_to_implement_with_head(app, sid, PLACEHOLDER_HEAD)
     }
 
     /// Drive the normal v3 lifecycle through its terminal success phase while
@@ -4517,7 +4530,7 @@ mod tests {
         let task_list = json!({
             "plan_hash": final_hash,
             "base_sha": "base",
-            "head_sha": "1111111111111111111111111111111111111111",
+            "head_sha": PLACEHOLDER_HEAD,
             "tasks": [{
                 "id": 1,
                 "title": big_title,
@@ -4558,7 +4571,7 @@ mod tests {
         let task_list = json!({
             "plan_hash": final_hash,
             "base_sha": "base",
-            "head_sha": "1111111111111111111111111111111111111111",
+            "head_sha": PLACEHOLDER_HEAD,
             "tasks": [{
                 "id": 1,
                 "title": "task title",

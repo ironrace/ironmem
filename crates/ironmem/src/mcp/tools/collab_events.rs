@@ -327,6 +327,11 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// A representative 40-hex head sha, shared by every fixture in this
+    /// module that needs a well-formed `head_sha` placeholder — real enough
+    /// to satisfy `is_hex_sha`, not tied to any actual commit.
+    const SHA: &str = "b9c2ce0f4d3a2b1c8e7f6a5b4c3d2e1f0a9b8c7d";
+
     #[test]
     fn final_rejection_uses_the_stable_wire_phase_name() {
         let error = build_v1_final_event(
@@ -552,7 +557,7 @@ mod tests {
         let mut payload = json!({
             "plan_hash": "h",
             "base_sha": "b",
-            "head_sha": "1111111111111111111111111111111111111111",
+            "head_sha": SHA,
             "tasks": [{ "id": 1, "title": "t", "acceptance": ["ok"] }],
         });
         payload
@@ -658,7 +663,7 @@ mod tests {
         json!({
             "plan_hash": "h",
             "base_sha": "b",
-            "head_sha": "1111111111111111111111111111111111111111",
+            "head_sha": SHA,
             "tasks": [{ "id": 1, "title": "t", "acceptance": ["ok"] }],
         })
     }
@@ -771,7 +776,6 @@ mod tests {
     /// refuse each other as different commits.
     #[test]
     fn a_padded_head_sha_is_trimmed_to_match_the_checkpoint_path() {
-        const SHA: &str = "b9c2ce0f4d3a2b1c8e7f6a5b4c3d2e1f0a9b8c7d";
         let padded = format!("  {SHA}\t\n");
 
         let from_event = parse_required_head_sha(
@@ -822,10 +826,7 @@ mod tests {
         let object = payload.as_object_mut().unwrap();
         object.insert("plan_hash".to_string(), json!(" h "));
         object.insert("base_sha".to_string(), json!(" b\n"));
-        object.insert(
-            "head_sha".to_string(),
-            json!("\t1111111111111111111111111111111111111111 "),
-        );
+        object.insert("head_sha".to_string(), json!(format!("\t{SHA} ")));
 
         let event = parse_task_list_event(&payload.to_string()).expect("padding must be tolerated");
         let CollabEvent::SubmitTaskList {
@@ -839,7 +840,7 @@ mod tests {
         };
         assert_eq!(plan_hash, "h");
         assert_eq!(base_sha, "b");
-        assert_eq!(head_sha, "1111111111111111111111111111111111111111");
+        assert_eq!(head_sha, SHA);
     }
 
     #[test]
