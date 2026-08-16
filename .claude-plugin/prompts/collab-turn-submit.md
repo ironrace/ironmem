@@ -75,7 +75,11 @@ Actions below — sending `$TOPIC` (e.g. `final_review`) via the normal
   `gh pr create --base <base_branch>
   --head $BRANCH --title <title> --body <body>`; capture `pr_url`;
   `collab_send(sender="$SENDER", topic="final_review",
-  content=<JSON {"head_sha":"<HEAD>","pr_url":"<url>"}>)`. On `gh` failure or
+  content=<JSON {"head_sha":"<sha>","pr_url":"<url>"}>)`, where `<sha>` is the
+  full sha printed by `git rev-parse HEAD` — never the literal string `HEAD`.
+  The server refuses a `head_sha` that is not 7-64 hex characters, and on this
+  topic that refusal is a **Terminal** `branch_drift:` there is no recovery
+  from. On `gh` failure or
   base-branch resolution failure, `collab_send(sender="$SENDER",
   topic="failure_report",
   content=<JSON {"coding_failure":"pr_create_failed: <error>"}>)` (no silent

@@ -510,6 +510,52 @@ fn collab_turn_task_list_template_is_sender_parameterized() {
     );
 }
 
+/// The `<HEAD>` placeholder is what actually caused issue #284: a template
+/// spelling the field `head_sha:<HEAD>` reads as "write the string HEAD" often
+/// enough that agents did, and the server then stored a revision expression as
+/// the session's fixed drift-detection point. The seed-site shape checks refuse
+/// that now, and the reported-head guard refuses it as a **Terminal**
+/// `branch_drift:` — so the placeholder no longer merely degrades a session, it
+/// ends one.
+///
+/// This pins the templates against regressing to it. Substituting a sha is the
+/// agent's job, and `<sha>` says so where `<HEAD>` invites the literal. The
+/// scan is over every prompt on both plugins rather than the five that were
+/// fixed, because a new turn template is exactly where this comes back.
+#[test]
+fn no_turn_template_spells_head_sha_with_a_head_placeholder() {
+    let mut offenders = Vec::new();
+    for dir in [".claude-plugin/prompts", ".codex-plugin/prompts"] {
+        let root = workspace_root().join(dir);
+        for entry in std::fs::read_dir(&root)
+            .unwrap_or_else(|e| panic!("Could not list {}: {e}", root.display()))
+        {
+            let path = entry.expect("readable dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                continue;
+            }
+            let body = std::fs::read_to_string(&path).expect("readable template");
+            for (idx, line) in body.lines().enumerate() {
+                // Both spellings the field appears in: the JSON payload
+                // (`"head_sha":"<HEAD>"`) and the verdict ref line
+                // (`head_sha:<HEAD>`). `<current HEAD>` is prose describing
+                // which commit to read, not a placeholder to copy, and is
+                // left alone deliberately.
+                if line.contains("head_sha\":\"<HEAD>") || line.contains("head_sha:<HEAD>") {
+                    offenders.push(format!("{}:{}: {}", path.display(), idx + 1, line.trim()));
+                }
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "turn templates must not spell head_sha with a bare <HEAD> placeholder — \
+         an agent that copies it literally gets a Terminal branch_drift: refusal. \
+         Use <sha> and tell the worker to run `git rev-parse HEAD`:\n{}",
+        offenders.join("\n")
+    );
+}
+
 #[test]
 fn claude_plugin_json_has_required_fields() {
     let json = read_json(".claude-plugin/plugin.json");

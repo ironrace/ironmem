@@ -94,7 +94,11 @@ the normal `implementation_done` (never a new `failure_report`).
    matching `batch_complete` checkpoint at this exact `head_sha`,
    `implementation_done` is refused with a `checkpoint_drift:` error naming
    the exact remedy call. Then `collab_send(sender="claude",
-   topic="implementation_done", content=<JSON {"head_sha":"<HEAD>"}>)`. On
+   topic="implementation_done", content=<JSON {"head_sha":"<sha>"}>)`, where
+   `<sha>` is the full sha printed by `git rev-parse HEAD` — never the literal
+   string `HEAD`. The server refuses a `head_sha` that is not 7-64 hex
+   characters, and on this topic that refusal is a **Terminal**
+   `branch_drift:` there is no recovery from. On
    failure/overrun:
    `collab_send(topic="failure_report", content=<JSON {"coding_failure":"..."}>)`.
 
@@ -102,6 +106,6 @@ the normal `implementation_done` (never a new `failure_report`).
 Return EXACTLY these ≤3 lines, nothing else:
 ```
 result: <implementation_done sent | failure_report sent>
-ref: head_sha:<HEAD>
+ref: head_sha:<sha>
 blocker: <one line | none>
 ```

@@ -129,12 +129,16 @@ to, not instead of, the normal `review_local`.
    runtime files changed; otherwise use pushed-head proof and this turn's
    step-1 gate results as the gate evidence.
 9. `collab_send(sender="claude", topic="review_local",
-   content=<JSON {"head_sha":"<HEAD>"}>)`.
+   content=<JSON {"head_sha":"<sha>"}>)`, where `<sha>` is the full sha
+   printed by `git rev-parse HEAD` — never the literal string `HEAD`. The
+   server refuses a `head_sha` that is not 7-64 hex characters, and on this
+   topic that refusal is a **Terminal** `branch_drift:` there is no recovery
+   from.
 
 ## Verdict
 Return EXACTLY these ≤3 lines, nothing else:
 ```
 result: review_local sent (<n> fixes)
-ref: head_sha:<HEAD>
+ref: head_sha:<sha>
 blocker: <one line | none>
 ```
