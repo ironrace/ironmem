@@ -5,10 +5,11 @@ use crate::db::schema::Database;
 
 /// The head sha every `start_global_review_session` fixture in this module
 /// seeds `last_head_sha` with. The state machine itself has no shape check
-/// (only the two seed sites the tool layer wraps it in do — see issue
-/// #284), so any string would do here; it is 40-hex anyway, matching the
-/// shape those real seed sites now require and the style of the other sha
-/// constants in this file (see `PR_CREATE_PUSHED_HEAD` below).
+/// and gains none (only the two seed sites the tool layer wraps it in are
+/// about to — see issue #284), so any string would do here; it is 40-hex
+/// anyway, matching the shape those seed sites will soon require and the
+/// style of the other sha constants in this file (see
+/// `PR_CREATE_PUSHED_HEAD` below).
 const SEED_HEAD: &str = "5b175bbc33302a8cf08c3f83b245a52914dd6e27";
 
 fn session() -> CollabSession {

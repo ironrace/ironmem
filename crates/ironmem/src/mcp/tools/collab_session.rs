@@ -3246,7 +3246,7 @@ mod tests {
                 "repo_path": "/tmp/repo",
                 "branch": "main",
                 "base_sha": "base",
-                "head_sha": "head",
+                "head_sha": PLACEHOLDER_HEAD,
                 "initiator": "claude",
                 "task": "review-only test",
                 "pilot": pilot,
