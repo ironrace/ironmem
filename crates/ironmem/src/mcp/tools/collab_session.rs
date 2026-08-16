@@ -1755,9 +1755,30 @@ fn validate_global_review_head_advance(
     //
     // So it is deletable, not permanent: once no session predating the seed
     // checks is still live, nothing can reach it. Collab sessions run for
-    // hours and are bounded by `collab_end`, so that condition arrives in
-    // days — a `last_head_sha NOT REGEXP '^[0-9a-f]{7,64}$'` sweep of
-    // `collab_sessions` returning empty is the whole check.
+    // hours and are bounded by `collab_end`, so that population drains in
+    // days. The retirement criterion is that no *active* session holds a
+    // malformed head:
+    //
+    //     SELECT id, last_head_sha FROM collab_sessions
+    //      WHERE ended_at IS NULL
+    //        AND NOT (length(last_head_sha) BETWEEN 7 AND 64
+    //                 AND lower(last_head_sha) NOT GLOB '*[^0-9a-f]*');
+    //
+    // returning no rows. Three details that a looser spelling gets wrong:
+    // `ended_at IS NULL` is load-bearing because `collab_end` only stamps
+    // `ended_at` (`collab::queue::end_session`) and nothing ever deletes a
+    // row, so an unscoped sweep would count long-finished sessions forever
+    // and never come back empty. `GLOB` rather than `REGEXP` because SQLite
+    // ships no `REGEXP` implementation and this crate registers none, so a
+    // `REGEXP` query fails outright rather than returning an answer. And
+    // `lower(...)` because `is_hex_sha` accepts `A-F` via `is_ascii_hexdigit`
+    // — a criterion spelled `[0-9a-f]` only would flag an uppercase sha that
+    // this function is perfectly happy with.
+    //
+    // The `tracing::warn!` below is what makes the criterion checkable
+    // against reality rather than inferred from it: a session that took this
+    // arm and has since ended leaves no trace in the table, so the log is the
+    // only record that drift detection ever ran degraded.
     //
     // What is skipped is *only* the ancestry comparison. The reported
     // `head_sha` must still name a commit that exists, because that question
@@ -1769,6 +1790,22 @@ fn validate_global_review_head_advance(
     // conditions are satisfied by construction when a fabricated head is both
     // checkpointed and reported, and this call is what proves the head real.
     if !crate::code_maps::is_hex_sha(last_head_sha) {
+        // Downgrading a check must not look like passing one. `Ok(())` from
+        // `validate_head_sha_exists` is indistinguishable at every call site
+        // from "ancestry verified", and this file already refuses that
+        // collapse elsewhere — see the `git_head_sha` note on why `.ok()`
+        // there would report `diverged: false` for an unreadable repo, and
+        // `handle_collab_resume`'s checkpoint block, echoed on success
+        // "rather than letting a silent success imply a check that never
+        // ran". Warn rather than refuse, for the reason above.
+        tracing::warn!(
+            repo_path = %repo_path,
+            last_head_sha = %last_head_sha,
+            head_sha = %head_sha,
+            "collab: stored last_head_sha is not a git object name; ancestry \
+             comparison skipped, existence check only (session seeded before \
+             the #284 seed-site shape checks)"
+        );
         return validate_head_sha_exists(repo_path, head_sha);
     }
 
@@ -3186,8 +3223,10 @@ mod tests {
     /// must call this function directly with real, existing commit shas on
     /// both sides, or the stored placeholder itself fails
     /// `git merge-base --is-ancestor` and refuses the turn with a Terminal
-    /// `branch_drift:` that looks like it's about the reported head when it
-    /// is actually about the seeded one.
+    /// `branch_drift:`. That refusal does name the right side — git puts the
+    /// unresolvable revision in its stderr and the exit-128 arm attributes it
+    /// to `last_head_sha` — but it arrives on a send the test expected to
+    /// succeed, from a fixture that looks unrelated to the seeded head.
     fn drive_to_implement_with_head(
         app: &crate::mcp::app::App,
         sid: &str,
@@ -6285,6 +6324,46 @@ mod tests {
         // sessions did before the guard existed.
         validate_global_review_head_advance(&repo, "HEAD", &second)
             .expect("a malformed stored last_head_sha must skip, not wedge the session");
+    }
+
+    /// The skip arm drops *only* the ancestry comparison — the reported head
+    /// must still name a commit that exists. That half is what
+    /// `require_checkpoint_proof` leans on: its four conditions are all
+    /// satisfied by construction when a fabricated head is both checkpointed
+    /// and reported, so this existence check is the only thing standing
+    /// between a made-up sha and an accepted `implementation_done`.
+    ///
+    /// Pinned separately from the `Ok` path above because the two are one
+    /// `if` apart: widening the skip to cover existence as well would leave
+    /// that test green while turning this guarantee off for exactly the
+    /// legacy sessions the arm exists to serve.
+    #[test]
+    fn a_skipped_ancestry_check_still_refuses_a_head_that_names_no_commit() {
+        let (dir, _first, _second) = git_repo_with_two_commits();
+        let repo = dir.path().to_string_lossy().to_string();
+        let fabricated = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+
+        let err = validate_global_review_head_advance(&repo, "HEAD", fabricated)
+            .expect_err("a fabricated head must be refused even when ancestry is skipped")
+            .to_string();
+
+        assert!(
+            err.contains("branch_drift:"),
+            "a head that names no commit is drift, not tooling: {err}"
+        );
+        assert!(
+            err.contains("does not name a commit that exists"),
+            "the refusal must say the sha resolves to nothing: {err}"
+        );
+        assert!(
+            err.contains(fabricated),
+            "the refusal must name the offending value: {err}"
+        );
+        assert!(
+            !err.contains("git ancestry validation failed"),
+            "this must be the existence refusal, not the generic operational \
+             one that invites a Tooling-class failure_report: {err}"
+        );
     }
 
     #[test]

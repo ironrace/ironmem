@@ -720,10 +720,24 @@ Invariants that still apply:
   stored-side skip remains the one case that skips rather than refuses, and
   after the seed checks it is reachable only by a session that was already
   in flight when they landed. Collab sessions run for hours and are bounded
-  by `collab_end`, so that population is gone within days; the retirement
-  criterion is a `last_head_sha NOT REGEXP '^[0-9a-f]{7,64}$'` sweep of
-  `collab_sessions` returning empty — once it does, no session can still
-  reach this arm. The reason it still skips is unchanged: the stored value
+  by `collab_end`, so that population drains within days; the retirement
+  criterion is that no **active** session holds a malformed head —
+
+  ```sql
+  SELECT id, last_head_sha FROM collab_sessions
+   WHERE ended_at IS NULL
+     AND NOT (length(last_head_sha) BETWEEN 7 AND 64
+              AND lower(last_head_sha) NOT GLOB '*[^0-9a-f]*');
+  ```
+
+  returning no rows. The `ended_at IS NULL` scope matters: `collab_end` only
+  stamps `ended_at` and nothing deletes the row, so an unscoped sweep counts
+  long-finished sessions forever and never comes back empty. `GLOB` rather
+  than `REGEXP` because SQLite ships no `REGEXP` implementation and ironmem
+  registers none. `lower(...)` because the shape check accepts uppercase
+  `A–F`. Whether the arm was *ever* taken is a log question, not a table
+  question — it emits a `tracing::warn!` naming the session's repo and both
+  shas each time it fires. The reason it still skips is unchanged: the stored value
   is server-held and the caller cannot correct it, so refusing would wedge
   the session behind an error naming a field its reader does not own. This
   does not depend on whether `task_list` is set — it is unconditional, so a
@@ -1276,6 +1290,17 @@ regardless of `pilot`: it names the dispatcher invoking the shortcut, not
 the review-flow lead (§ Runtime Model → Roles). `head_sha` must be a git
 object name (7–64 hex characters), because it seeds the session's
 `last_head_sha`, so a revision expression is refused rather than stored.
+`base_sha` is only required to be non-empty — it is recorded for reporting
+and never handed to git, so there is no ancestry question for it to answer.
+Both are trimmed before validation, so a value pasted straight from the
+output of `git rev-parse HEAD` is accepted with its trailing newline.
+
+The `head_sha` rule is a **shape** check and nothing more. A branch or tag
+whose name happens to be 7–64 hex characters (`deadbeef`) satisfies it, gets
+stored, and then re-resolves on every later ancestry check — the moving-target
+defect the rule exists to prevent. Nothing in the protocol closes that residual
+hole; the mitigation is that agents are told to send `git rev-parse HEAD`
+output rather than any name they chose. Uppercase `A–F` is likewise accepted.
 
 ### Authorization / Phase / Ownership Matrix
 
