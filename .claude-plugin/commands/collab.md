@@ -716,8 +716,11 @@ single human planning gate and takes it in step 0, before any worker runs.
    - the existing plan file's SHA-256 differs from the approved hash
    PlanLocked is pre-coding, so `failure_report` is not valid here; the worker
    returns the concrete issue on `blocker:` and sends nothing.
-3. On success, the worker builds the manifest
-   `{plan_hash:final_plan_hash, base_sha:<HEAD>, head_sha:<HEAD>,
+3. On success, the worker runs `git rev-parse HEAD` and substitutes the
+   full 40-character sha it prints for both `base_sha` and `head_sha` —
+   never the literal `HEAD`, since the server refuses `head_sha` unless it
+   is 7-64 hex characters — then builds the manifest
+   `{plan_hash:final_plan_hash, base_sha:<sha>, head_sha:<sha>,
    plan_file_path:<path>, tasks:[...]}` (adding
    `execution_mode:"mechanical_direct"` only when the single-task eligibility
    rule in `docs/COLLAB.md` holds) and `collab_send`s `topic="task_list"`.
