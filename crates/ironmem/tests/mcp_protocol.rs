@@ -66,6 +66,15 @@ impl Drop for CompactResponsesEnvGuard {
     }
 }
 
+/// A well-formed 40-hex `head_sha` placeholder, shared by every fixture in
+/// this file that seeds `last_head_sha` (via `task_list` or
+/// `collab_start_code_review`) and never advances it through a
+/// git-ancestry-checked send afterward. Real enough to satisfy `is_hex_sha`
+/// (issue #284's seed-site shape check), not tied to any actual commit —
+/// see `GATE_HEAD` below for the deterministic, real-commit counterpart the
+/// checkpoint-gate tests need instead.
+const PLACEHOLDER_HEAD: &str = "c471e0a8935bf62d1a7c40e6b9832f5d0e64ba21";
+
 fn git_repo_fixture() -> (tempfile::TempDir, PathBuf, String, String, String, String) {
     let temp = tempfile::tempdir().expect("temp repo must be creatable");
     let repo_path = temp.path().to_path_buf();
@@ -1069,7 +1078,7 @@ fn collab_start_code_review_roundtrips_via_status() {
             "repo_path": "/repo",
             "branch": "feat/landing-page",
             "base_sha": "abc123",
-            "head_sha": "def456",
+            "head_sha": PLACEHOLDER_HEAD,
             "initiator": "claude",
             "task": "review landing page branch"
         }),
@@ -1088,7 +1097,7 @@ fn collab_start_code_review_roundtrips_via_status() {
     assert_eq!(status["current_owner"], "codex");
     assert_eq!(status["pilot"], "claude");
     assert_eq!(status["base_sha"], "abc123");
-    assert_eq!(status["last_head_sha"], "def456");
+    assert_eq!(status["last_head_sha"], PLACEHOLDER_HEAD);
     assert!(status["task_list"].is_null());
 }
 
@@ -1102,7 +1111,7 @@ fn collab_start_code_review_rejects_codex_initiator() {
             "repo_path": "/repo",
             "branch": "feat/landing-page",
             "base_sha": "abc123",
-            "head_sha": "def456",
+            "head_sha": PLACEHOLDER_HEAD,
             "initiator": "codex",
             "task": "review landing page branch"
         }),
@@ -1123,7 +1132,7 @@ fn collab_start_code_review_rejects_codex_initiator_even_with_pilot_codex() {
             "repo_path": "/repo",
             "branch": "feat/landing-page",
             "base_sha": "abc123",
-            "head_sha": "def456",
+            "head_sha": PLACEHOLDER_HEAD,
             "initiator": "codex",
             "pilot": "codex",
             "task": "review landing page branch"
@@ -1783,7 +1792,7 @@ fn collab_end_blocks_subsequent_writes() {
             "topic": "task_list",
             // Payload values are irrelevant — the session-ended gate must
             // reject before parsing.
-            "content": task_list_payload("unused_plan_hash", "unused_base", "unused_head", 1)
+            "content": task_list_payload("unused_plan_hash", "unused_base", PLACEHOLDER_HEAD, 1)
         }),
     );
     assert!(blocked["error"]
@@ -2164,7 +2173,7 @@ fn collab_v3_unknown_per_task_topics_rejected() {
             "session_id": session_id,
             "sender": "claude",
             "topic": "task_list",
-            "content": task_list_payload(&hash, "b0", "h0", 1)
+            "content": task_list_payload(&hash, "b0", PLACEHOLDER_HEAD, 1)
         }),
     );
 
@@ -2756,7 +2765,7 @@ fn collab_set_implementer_before_task_list_routes_batch_owner() {
             "session_id": session_id,
             "sender": "claude",
             "topic": "task_list",
-            "content": task_list_payload(&hash, "b0", "h0", 1)
+            "content": task_list_payload(&hash, "b0", PLACEHOLDER_HEAD, 1)
         }),
     );
     let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
@@ -2777,7 +2786,7 @@ fn collab_set_implementer_during_batch_moves_current_owner() {
             "session_id": session_id,
             "sender": "claude",
             "topic": "task_list",
-            "content": task_list_payload(&hash, "b0", "h0", 1)
+            "content": task_list_payload(&hash, "b0", PLACEHOLDER_HEAD, 1)
         }),
     );
     let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
@@ -3817,7 +3826,7 @@ fn collab_v2_wait_my_turn_dynamic_terminal_set() {
             "session_id": session_id,
             "sender": "claude",
             "topic": "task_list",
-            "content": task_list_payload(&hash, "b0", "h0", 1)
+            "content": task_list_payload(&hash, "b0", PLACEHOLDER_HEAD, 1)
         }),
     );
     // CodeImplementPending is NOT terminal — wait for claude returns is_my_turn=true.
@@ -3842,7 +3851,7 @@ fn collab_v2_failure_report_transitions_to_coding_failed() {
             "session_id": session_id,
             "sender": "claude",
             "topic": "task_list",
-            "content": task_list_payload(&hash, "b0", "h0", 1)
+            "content": task_list_payload(&hash, "b0", PLACEHOLDER_HEAD, 1)
         }),
     );
     // Codex detects drift and emits failure_report.
@@ -4061,7 +4070,7 @@ fn collab_start_code_review_end_rejected_during_active_review() {
             "repo_path": "/repo",
             "branch": "feat/review-shortcut",
             "base_sha": "base0",
-            "head_sha": "head0",
+            "head_sha": PLACEHOLDER_HEAD,
             "initiator": "claude",
             "task": "review completed branch"
         }),
@@ -4086,7 +4095,7 @@ fn collab_start_code_review_failure_report_reaches_coding_failed() {
             "repo_path": "/repo",
             "branch": "feat/review-shortcut",
             "base_sha": "base0",
-            "head_sha": "head0",
+            "head_sha": PLACEHOLDER_HEAD,
             "initiator": "claude",
             "task": "review completed branch"
         }),
@@ -4100,7 +4109,10 @@ fn collab_start_code_review_failure_report_reaches_coding_failed() {
             "session_id": session_id,
             "sender": "codex",
             "topic": "failure_report",
-            "content": json!({ "coding_failure": "branch_drift: expected=head0 got=headX" }).to_string()
+            "content": json!({
+                "coding_failure": format!("branch_drift: expected={PLACEHOLDER_HEAD} got=headX")
+            })
+            .to_string()
         }),
     );
     let status = call_tool(&app, "collab_status", json!({ "session_id": session_id }));
@@ -4490,7 +4502,7 @@ fn collab_v2_task_list_rejects_wrong_plan_hash() {
             "session_id": session_id,
             "sender": "claude",
             "topic": "task_list",
-            "content": task_list_payload("deadbeef", "b0", "h0", 1)
+            "content": task_list_payload("deadbeef", "b0", PLACEHOLDER_HEAD, 1)
         }),
     );
     assert!(bad["error"]
@@ -4507,7 +4519,7 @@ fn collab_v2_task_list_rejects_empty_acceptance() {
     let bad_payload = json!({
         "plan_hash": hash,
         "base_sha": "b0",
-        "head_sha": "h0",
+        "head_sha": PLACEHOLDER_HEAD,
         "tasks": [ { "id": 1, "title": "t", "acceptance": [] } ],
     })
     .to_string();
@@ -5504,7 +5516,7 @@ fn collab_role_safety_full_verification_sweep_reversed_role_scenario() {
             "session_id": &session_id,
             "sender": "claude",
             "topic": "task_list",
-            "content": task_list_payload(&final_plan_hash, "base0", "head0", 1)
+            "content": task_list_payload(&final_plan_hash, "base0", PLACEHOLDER_HEAD, 1)
         }),
     );
     let status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
