@@ -2081,6 +2081,13 @@ An unattended `claude -p` successor needs at minimum:
 - `mcp__ironmem__collab_resume` — resume a tooling-class `CodingFailed` session
 - `mcp__ironmem__session_handoff` — re-handoff if needed
 - `mcp__ironmem__collab_status` — read session state
+- `mcp__ironmem__collab_checkpoint` — file batch progress. **Required, not
+  optional**, for any successor that may own `CodeImplementPending`:
+  `implementation_done` is refused without a checkpoint at the reported head
+  (see "Implementation checkpoints"), and filing one is also the only remedy
+  for `collab_resume`'s `checkpoint_drift:` refusal. A successor without this
+  permission is dead-ended — it can neither advance the phase nor repair the
+  ledger, and both refusals name a tool it is not allowed to call.
 - `Bash(claude -p "join ironmem collab *":*)` — re-spawn a further successor if
   needed. Scope the wildcard to the known join-command form; avoid the broader
   `Bash(claude -p:*)`, which would let the successor spawn arbitrarily-prompted
