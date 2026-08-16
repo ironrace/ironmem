@@ -25,6 +25,18 @@ pub fn start_global_review_session(
     head_sha: &str,
     pilot: Agent,
 ) -> Result<CollabSession, CollabError> {
+    // Trimmed before every check below, and it is the trimmed values that are
+    // stored. `handle_collab_start_code_review` reads both through
+    // `require_str`, which does not trim, and `.claude-plugin/commands/collab.md`
+    // resolves them from the *output* of `git rev-parse HEAD` and
+    // `git merge-base` — output that ends in a newline. Without this, the shape
+    // check below would refuse the correct sha for the branch on the strength
+    // of a trailing `\n`, which is a transcription artifact rather than a
+    // different value. The `task_list` seed site trims all three of its header
+    // fields for exactly this reason (see `parse_task_list_event`); this is the
+    // same rule at the other seed site.
+    let base_sha = base_sha.trim();
+    let head_sha = head_sha.trim();
     if base_sha.is_empty() {
         return Err(CollabError::MissingBaseSha);
     }
@@ -38,9 +50,13 @@ pub fn start_global_review_session(
     // than in `handle_collab_start_code_review` because this is the only
     // constructor path to `new_global_review` — the MCP layer is one caller,
     // not the boundary.
+    //
+    // Only `head_sha` is shape-checked. `base_sha` is recorded for reporting
+    // and is never handed to git, so there is no ancestry question for it to
+    // have a subject for — see the note in `docs/COLLAB.md`.
     if !crate::code_maps::is_hex_sha(head_sha) {
         return Err(CollabError::MalformedHeadSha {
-            head_sha: head_sha.to_string(),
+            head_sha: super::echo_head_sha(head_sha),
         });
     }
     Ok(CollabSession::new_global_review(

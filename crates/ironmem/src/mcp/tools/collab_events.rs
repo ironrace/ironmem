@@ -16,20 +16,6 @@ const MAX_CODING_FAILURE_CHARS: usize = 2048;
 /// CHECK constraint in migration 005.
 const MAX_PR_URL_CHARS: usize = 2048;
 
-/// Maximum characters of a rejected `head_sha` echoed back in the refusal
-/// `parse_task_list_event` raises. That refusal formats a value which just
-/// failed `is_hex_sha`, so the 64-character ceiling a passing shape check
-/// would have guaranteed is not available there. Wide enough to show a full
-/// 64-char object name and still signal that something followed it.
-///
-/// Defense in depth on the one path this constant guards — not a closure
-/// property of the codebase, and it must not be read as one. The reported-head
-/// refusal in `validate_global_review_head_advance` echoes an unbounded
-/// `head_sha` too (bounded only by the outer `content` cap), and
-/// `CollabError::MalformedHeadSha` echoes one that `require_str` never caps at
-/// all. Both remain open; capping here does not cover the field.
-const MAX_ECHOED_HEAD_SHA_CHARS: usize = 80;
-
 /// Translate a `(topic, content)` send into a `CollabEvent`. Dispatch is
 /// split into v1 planning and v3 coding groups so each sub-function stays
 /// under the file's 50-line function guideline. Phase disambiguation is
@@ -268,14 +254,10 @@ pub(super) fn parse_task_list_event(content: &str) -> Result<CollabEvent, Memory
     // exists is the git shell-out's question, and there is no repo path in
     // scope at this layer to ask it with.
     if !crate::code_maps::is_hex_sha(&head_sha) {
-        // Bounded echo: see [`MAX_ECHOED_HEAD_SHA_CHARS`]. `echoed` is a
-        // prefix of `head_sha`, so comparing byte lengths detects the cut.
-        let echoed: String = head_sha.chars().take(MAX_ECHOED_HEAD_SHA_CHARS).collect();
-        let ellipsis = if echoed.len() < head_sha.len() {
-            "…"
-        } else {
-            ""
-        };
+        // Bounded echo, shared with the other seed site's refusal
+        // (`CollabError::MalformedHeadSha`) so the two cannot diverge — see
+        // [`crate::collab::MAX_ECHOED_HEAD_SHA_CHARS`].
+        let echoed = crate::collab::echo_head_sha(&head_sha);
         // The remedy leads, and it is a command rather than a description:
         // the reader here is an agent with a shell, and `git rev-parse HEAD`
         // is the whole fix. The template is referred to generically on
@@ -284,12 +266,18 @@ pub(super) fn parse_task_list_event(content: &str) -> Result<CollabEvent, Memory
         // check exists. The causes are listed rather than assumed, because a
         // short abbreviation reaches this refusal just as a revision
         // expression does and is not the same mistake.
+        //
+        // "most branch names", not "a branch name": this is a shape check, so
+        // a branch whose name happens to be 7-64 hex characters passes it and
+        // is stored. Claiming otherwise would invite a reader to treat the
+        // check as stronger than it is — see the residual-hole note in
+        // `docs/COLLAB.md`.
         return Err(MemoryError::Validation(format!(
-            "task_list head_sha {echoed}{ellipsis} is not a git object name. Run \
+            "task_list head_sha {echoed} is not a git object name. Run \
              `git rev-parse HEAD` in the session's repo and send the full \
-             40-character sha it prints. This field must be 7-64 hex \
-             characters: a revision expression such as HEAD or a branch name, \
-             a placeholder copied out of the turn template, and an \
+             sha it prints. This field must be 7-64 hex characters: a \
+             revision expression such as HEAD, most branch names, a \
+             placeholder copied out of the turn template, and an \
              abbreviation shorter than 7 characters are all refused here, \
              because none of them pins one commit — and this value becomes \
              the fixed point every later drift check in the session measures \
@@ -380,6 +368,7 @@ pub(super) fn parse_final_payload(content: &str) -> Result<String, MemoryError> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::collab::MAX_ECHOED_HEAD_SHA_CHARS;
     use serde_json::json;
 
     /// A representative 40-hex head sha, shared by every fixture in this
@@ -967,16 +956,18 @@ mod tests {
     /// The refusal echoes the offending `head_sha` back, on a path where that
     /// value has *not* passed `is_hex_sha` — so the shape check's 64-character
     /// ceiling is not available to it and [`MAX_ECHOED_HEAD_SHA_CHARS`]
-    /// supplies one instead. See that constant's doc for why this is defense
-    /// in depth on a single path rather than a bound the codebase holds
-    /// everywhere a `head_sha` is echoed.
+    /// supplies one instead. Both seed-site refusals share that bound through
+    /// [`crate::collab::echo_head_sha`]; this pins it from the `task_list`
+    /// side, where a caller-controlled value of any length can reach it.
     ///
     /// The cut is `chars().take()` rather than a byte slice because the bound
-    /// lands in the middle of bytes the caller chose: slicing a multibyte
-    /// value at byte 80 would panic inside the error path. That case is the
-    /// reason the implementation looks the way it does, so it is the one most
-    /// worth pinning — and none of it is exercised by the ordinary refusals,
-    /// whose values (`"HEAD"`, `"abc123"`) sit far below the bound.
+    /// lands in the middle of bytes the caller chose, and slicing there panics
+    /// inside the error path. The multibyte fixture below is deliberately a
+    /// *three*-byte character: with a two-byte one, byte 80 would happen to
+    /// fall on a char boundary and a byte slice would survive, so the test
+    /// would assert char-counting without exercising the panic that motivates
+    /// it. None of this is reached by the ordinary refusals, whose values
+    /// (`"HEAD"`, `"abc123"`) sit far below the bound.
     #[test]
     fn task_list_bounds_the_head_sha_it_echoes_back_in_a_refusal() {
         let refuse = |head_sha: &str| -> String {
@@ -1023,17 +1014,25 @@ mod tests {
             "a value that was not cut must not be marked as cut: {at_bound}"
         );
 
-        // Multibyte, spelled as an escape so a decomposed `e` + combining
-        // accent in this source file cannot quietly make it two chars. The
-        // cut falls mid-character by byte count; `chars().take()` is why this
-        // yields a valid String instead of panicking.
-        let multibyte = refuse(&'\u{00e9}'.to_string().repeat(500));
+        // Multibyte, spelled as an escape so nothing in this source file's
+        // encoding can quietly change its width. U+20AC is three bytes, so
+        // byte 80 lands two bytes into the 27th character: `head_sha[..80]`
+        // would panic here, which is exactly why the implementation counts
+        // characters instead.
+        const EURO: char = '\u{20ac}';
+        assert_ne!(
+            MAX_ECHOED_HEAD_SHA_CHARS % EURO.len_utf8(),
+            0,
+            "the bound must fall mid-character for this fixture to exercise \
+             the panic that `chars().take()` avoids"
+        );
+        let multibyte = refuse(&EURO.to_string().repeat(500));
         assert!(
             multibyte.contains('…'),
             "a cut multibyte value must say so: {multibyte}"
         );
         assert_eq!(
-            multibyte.matches('\u{00e9}').count(),
+            multibyte.matches(EURO).count(),
             MAX_ECHOED_HEAD_SHA_CHARS,
             "the cap counts characters, not bytes: {multibyte}"
         );

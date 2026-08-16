@@ -883,6 +883,63 @@ fn start_global_review_session_rejects_a_revision_expression_head() {
     );
 }
 
+/// `handle_collab_start_code_review` reads both shas with `require_str`, which
+/// does not trim, and `.claude-plugin/commands/collab.md` resolves them from
+/// the *output* of `git rev-parse HEAD` / `git merge-base` — output that ends
+/// in a newline. Once `head_sha` is shape-checked, an untrimmed value is
+/// refused despite naming the commit the branch is actually at, so the trim is
+/// load-bearing here exactly as it is at the `task_list` seed site.
+#[test]
+fn start_global_review_session_trims_both_shas_before_validating() {
+    let session = start_global_review_session(
+        "s1",
+        "  basesha\n",
+        &format!("\t{SEED_HEAD}\n"),
+        Agent::Claude,
+    )
+    .expect("a sha pasted from git output must be accepted");
+
+    assert_eq!(session.base_sha.as_deref(), Some("basesha"));
+    assert_eq!(session.last_head_sha.as_deref(), Some(SEED_HEAD));
+}
+
+/// Whitespace-only is empty once trimmed, and must read as the omission it is
+/// rather than as a malformed value.
+#[test]
+fn start_global_review_session_treats_whitespace_only_shas_as_missing() {
+    assert!(matches!(
+        start_global_review_session("s1", "   ", SEED_HEAD, Agent::Claude).unwrap_err(),
+        CollabError::MissingBaseSha
+    ));
+    assert!(matches!(
+        start_global_review_session("s1", "basesha", " \n\t ", Agent::Claude).unwrap_err(),
+        CollabError::MissingHeadSha
+    ));
+}
+
+/// The refusal echoes the offending value back, and that value arrives through
+/// `require_str` with no upstream cap at all — so the bound is this error's
+/// own to enforce. Shares `echo_head_sha` with the `task_list` refusal.
+#[test]
+fn start_global_review_session_bounds_the_head_sha_it_echoes_back() {
+    let CollabError::MalformedHeadSha { head_sha } =
+        start_global_review_session("s1", "basesha", &"z".repeat(5000), Agent::Claude)
+            .expect_err("a 5000-character head_sha is not an object name")
+    else {
+        panic!("expected MalformedHeadSha");
+    };
+
+    assert_eq!(
+        head_sha.chars().count(),
+        crate::collab::MAX_ECHOED_HEAD_SHA_CHARS + 1,
+        "the echo must be capped at the bound plus the ellipsis: {head_sha}"
+    );
+    assert!(
+        head_sha.ends_with('…'),
+        "a value that was cut must say so: {head_sha}"
+    );
+}
+
 #[test]
 fn start_global_review_session_flows_into_final_review() {
     let session = start_global_review_session("s1", "basesha", SEED_HEAD, Agent::Claude).unwrap();
