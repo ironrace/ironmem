@@ -17,12 +17,17 @@ const MAX_CODING_FAILURE_CHARS: usize = 2048;
 const MAX_PR_URL_CHARS: usize = 2048;
 
 /// Maximum characters of a rejected `head_sha` echoed back in the refusal
-/// `parse_task_list_event` raises. Everywhere else a `head_sha` reaches a
-/// message it has already passed `is_hex_sha` and is therefore at most 64
-/// characters; that refusal is the one path where it did *not*, so it is the
-/// one place an unbounded caller string would land verbatim in an MCP
-/// response. Wide enough to show a full 64-char object name and still signal
-/// that something followed it.
+/// `parse_task_list_event` raises. That refusal formats a value which just
+/// failed `is_hex_sha`, so the 64-character ceiling a passing shape check
+/// would have guaranteed is not available there. Wide enough to show a full
+/// 64-char object name and still signal that something followed it.
+///
+/// Defense in depth on the one path this constant guards — not a closure
+/// property of the codebase, and it must not be read as one. The reported-head
+/// refusal in `validate_global_review_head_advance` echoes an unbounded
+/// `head_sha` too (bounded only by the outer `content` cap), and
+/// `CollabError::MalformedHeadSha` echoes one that `require_str` never caps at
+/// all. Both remain open; capping here does not cover the field.
 const MAX_ECHOED_HEAD_SHA_CHARS: usize = 80;
 
 /// Translate a `(topic, content)` send into a `CollabEvent`. Dispatch is
@@ -959,10 +964,12 @@ mod tests {
         );
     }
 
-    /// The refusal echoes the offending `head_sha` back, and it is the one
-    /// path on which that value has *not* passed `is_hex_sha` — so it is the
-    /// one place an unbounded caller string would reach an MCP response body
-    /// verbatim. [`MAX_ECHOED_HEAD_SHA_CHARS`] is what stops it.
+    /// The refusal echoes the offending `head_sha` back, on a path where that
+    /// value has *not* passed `is_hex_sha` — so the shape check's 64-character
+    /// ceiling is not available to it and [`MAX_ECHOED_HEAD_SHA_CHARS`]
+    /// supplies one instead. See that constant's doc for why this is defense
+    /// in depth on a single path rather than a bound the codebase holds
+    /// everywhere a `head_sha` is echoed.
     ///
     /// The cut is `chars().take()` rather than a byte slice because the bound
     /// lands in the middle of bytes the caller chose: slicing a multibyte

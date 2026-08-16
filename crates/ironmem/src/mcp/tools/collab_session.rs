@@ -3278,6 +3278,54 @@ mod tests {
         );
     }
 
+    /// `start_global_review_session` refuses a `head_sha` that is not an
+    /// object name (#284), and its own unit test pins that. This pins the
+    /// wiring above it: that `CollabError::MalformedHeadSha` actually reaches
+    /// the caller through `collab_error_to_memory_error` rather than being
+    /// swallowed or remapped, and that the refusal leaves nothing behind.
+    ///
+    /// The no-row half is safe by construction today — the constructor runs
+    /// before `with_transaction` — but that ordering is exactly the kind of
+    /// thing a later edit reorders silently, and a half-created review session
+    /// bound to the scope would block the retry the refusal is asking for.
+    #[test]
+    fn collab_start_code_review_rejects_a_head_sha_that_is_not_an_object_name() {
+        let app = test_app();
+        let before = collab_session_count(&app);
+        let err = handle_collab_start_code_review(
+            &app,
+            &json!({
+                "repo_path": "/tmp/repo",
+                "branch": "main",
+                "base_sha": "base",
+                "head_sha": "HEAD",
+                "initiator": "claude",
+                "task": "review-only test",
+            }),
+        )
+        .unwrap_err();
+
+        let message = err.to_string();
+        assert!(
+            message.contains("head_sha"),
+            "the refusal must name the field the caller has to correct: {message}"
+        );
+        assert!(
+            message.contains("7-64 hex characters"),
+            "the refusal must state the shape it wants: {message}"
+        );
+        assert_eq!(
+            collab_session_count(&app),
+            before,
+            "a malformed head_sha must not create a collab session"
+        );
+        assert!(
+            app.active_collab_session_snapshot_for_scope("/tmp/repo", "main")
+                .is_none(),
+            "a malformed head_sha must not bind an active collab session"
+        );
+    }
+
     #[test]
     fn collab_start_code_review_rejects_numeric_pilot() {
         assert_code_review_rejects_non_string_pilot(json!(42));
