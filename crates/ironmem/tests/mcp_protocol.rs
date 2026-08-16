@@ -66,13 +66,32 @@ impl Drop for CompactResponsesEnvGuard {
     }
 }
 
-/// A well-formed 40-hex `head_sha` placeholder, shared by every fixture in
-/// this file that seeds `last_head_sha` (via `task_list` or
-/// `collab_start_code_review`) and never advances it through a
-/// git-ancestry-checked send afterward. Real enough to satisfy `is_hex_sha`
-/// (issue #284's seed-site shape check), not tied to any actual commit —
-/// see `GATE_HEAD` below for the deterministic, real-commit counterpart the
-/// checkpoint-gate tests need instead.
+/// The default placeholder for fixtures in this file that seed
+/// `last_head_sha` (via `task_list` or `collab_start_code_review`) and never
+/// advance the head again afterward. Well-formed enough to satisfy
+/// `is_hex_sha` (issue #284's seed-site shape check), not tied to any actual
+/// commit — see [`GATE_HEAD`] below for the deterministic, real-commit
+/// counterpart the checkpoint-gate tests need instead.
+///
+/// Do not use it in a fixture that goes on to advance the head:
+/// `validate_global_review_head_advance` (`collab_session.rs`) skips the
+/// *stored*-side ancestry comparison only while `last_head_sha` fails
+/// `is_hex_sha` — true of the old placeholders (`"h0"`, `"head0"`,
+/// `"def456"`) this constant replaced, false of this one. So the comparison
+/// now runs, `git merge-base --is-ancestor` finds a stored sha that names no
+/// commit, and that exits 128 and refuses the turn as a Terminal
+/// `branch_drift:` on a send the test expected to succeed. Git's stderr does
+/// echo the offending sha back, so the refusal at least names
+/// `last_head_sha` rather than being blind about which side is at fault —
+/// still a confusing one to hit by accident. Such a fixture needs real
+/// commits from `git_repo_fixture` (or `test_app_with_git_repo`) on both
+/// sides instead.
+///
+/// A sibling `PLACEHOLDER_HEAD` with a different value lives in
+/// `collab_session.rs`'s in-crate tests. That is fine as-is: the two
+/// constants are in separate compilation units, neither importable from the
+/// other, and the differing values are an asset — a `branch_drift:` message
+/// quoting one or the other tells you instantly which suite produced it.
 const PLACEHOLDER_HEAD: &str = "c471e0a8935bf62d1a7c40e6b9832f5d0e64ba21";
 
 fn git_repo_fixture() -> (tempfile::TempDir, PathBuf, String, String, String, String) {
@@ -1791,7 +1810,9 @@ fn collab_end_blocks_subsequent_writes() {
             "sender": "claude",
             "topic": "task_list",
             // Payload values are irrelevant — the session-ended gate must
-            // reject before parsing.
+            // reject before parsing — except that `head_sha` stays
+            // well-shaped, so this test doesn't depend on where #284's shape
+            // check lands.
             "content": task_list_payload("unused_plan_hash", "unused_base", PLACEHOLDER_HEAD, 1)
         }),
     );
