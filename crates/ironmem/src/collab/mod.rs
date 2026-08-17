@@ -223,6 +223,14 @@ pub fn session_is_dead(session_id: &str, last_activity: Option<i64>, now: i64) -
 /// It is also **not** in [`OFF_TURN_FAILURE_PREFIXES`]: it never arrives as a
 /// `failure_report` at all. It is written directly by `handle_collab_end`'s
 /// abandon arm, so the off-turn admissibility question does not apply to it.
+///
+/// That last sentence is an *enforced* property, not an intent.
+/// [`crate::mcp::tools::collab_events::parse_failure_report_event`] refuses a
+/// caller-supplied report carrying this prefix. Without that refusal an agent
+/// could mint a `coding_failure` indistinguishable from a real abandon in every
+/// later audit, in `collab_status`, and in the seal message
+/// [`queue::ensure_active`] echoes — the prefix is the *only* thing that marks
+/// the row as an operator's decision rather than an agent's.
 pub const ABANDONED_PREFIX: &str = "abandoned:";
 
 /// Prefix on `coding_failure` that marks a failure as "branch drift" — a

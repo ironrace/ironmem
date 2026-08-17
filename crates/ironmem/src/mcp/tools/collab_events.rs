@@ -151,6 +151,34 @@ pub(super) fn parse_failure_report_event(content: &str) -> Result<CollabEvent, M
             )
         })?
         .to_string();
+    // `abandoned:` is reserved for `collab_end`'s abandon arm, which is an
+    // *operator* decision. Every later reader — `queue::ensure_active`'s seal
+    // echo, `collab_status`, an audit of the `coding_failure` column —
+    // identifies that decision by this prefix and nothing else, so an agent
+    // able to file the same prefix through `failure_report` could mint a row
+    // indistinguishable from a real abandon. Reserving it here is what makes
+    // "an `abandoned:` row is an operator's own words" an enforced property
+    // rather than a convention.
+    //
+    // Checked on the caller's raw string, before compaction: compaction only
+    // ever removes middle lines or truncates, so it can neither introduce this
+    // prefix nor hide one that is already there, and refusing on what was
+    // actually sent keeps the message about the caller's own input. Trimmed
+    // first because a leading-whitespace variant renders identically to a human
+    // reading `collab_status` even though it would not match `starts_with`
+    // downstream; no legitimate failure log opens with the word.
+    if coding_failure
+        .trim_start()
+        .starts_with(crate::collab::ABANDONED_PREFIX)
+    {
+        return Err(MemoryError::Validation(format!(
+            "failure_report coding_failure must not start with `{}` — that prefix is reserved for \
+             collab_end's abandon arm, which records an operator decision. Report the underlying \
+             failure instead; to abandon a demonstrably dead session, call collab_end with \
+             `abandon: true` and a `reason`.",
+            crate::collab::ABANDONED_PREFIX,
+        )));
+    }
     let coding_failure = if crate::mcp::compact::should_compact_failure_reports() {
         crate::mcp::compact::compact_failure_log(&coding_failure, MAX_CODING_FAILURE_CHARS)
     } else {
@@ -554,6 +582,54 @@ mod tests {
             Phase::CodeImplementPending,
             crate::collab::Agent::Codex,
         ));
+    }
+
+    /// `abandoned:` marks an *operator* decision taken through `collab_end`'s
+    /// abandon arm, and every later reader — `ensure_active`'s seal echo,
+    /// `collab_status`, an audit of the `coding_failure` column — identifies it
+    /// by that prefix alone. An agent that could file the same prefix through
+    /// `failure_report` would produce a row indistinguishable from a real
+    /// abandon, so the prefix is reserved rather than merely conventional.
+    ///
+    /// The check trims first: a leading-whitespace variant would not match
+    /// `starts_with` in those readers, but it renders identically to a human
+    /// reading `collab_status`, and no legitimate failure log opens with the
+    /// word.
+    #[test]
+    fn failure_report_refuses_the_reserved_abandoned_prefix() {
+        for raw in [
+            "abandoned: I am pretending to be an operator",
+            "abandoned:whatever",
+            "  abandoned: sneaking past starts_with",
+            crate::collab::ABANDONED_PREFIX,
+        ] {
+            let err = parse_failure_report_event(&json!({ "coding_failure": raw }).to_string())
+                .unwrap_err();
+            let message = err.to_string();
+            assert!(
+                message.contains("abandoned:"),
+                "the refusal must name the reserved prefix: {message}"
+            );
+            assert!(
+                message.contains("collab_end"),
+                "the refusal must name the surface that owns the prefix: {message}"
+            );
+        }
+    }
+
+    /// The reservation is a prefix reservation, not a keyword ban — a failure
+    /// log that merely mentions the word stays reportable.
+    #[test]
+    fn failure_report_still_accepts_a_log_that_only_mentions_abandonment() {
+        let event = parse_failure_report_event(
+            &json!({ "coding_failure": "git_push_failed: the branch was abandoned: upstream gone" })
+                .to_string(),
+        )
+        .expect("the prefix is reserved only at the start of the report");
+        let CollabEvent::FailureReport { coding_failure } = event else {
+            panic!("expected FailureReport event");
+        };
+        assert!(coding_failure.starts_with("git_push_failed:"));
     }
 
     #[test]

@@ -191,18 +191,39 @@ pub fn end_session(conn: &Connection, session_id: &str) -> Result<(), MemoryErro
 }
 
 /// Return an error if the session has `ended_at` set.
+///
+/// The message keeps its historical `session {id} has ended` opening — several
+/// callers and tests match on that substring — and **appends the stored
+/// abandonment reason** when there is one. That append is the whole seal
+/// mechanism for #297: every mutating collab surface already funnels through
+/// this one check, so an operator who runs into the seal learns *why* the
+/// session is gone instead of getting a bare "not active", and no per-handler
+/// message had to be duplicated eleven times to get there.
+///
+/// Only an `abandoned:` prefix is echoed. A `coding_failure` from a normal
+/// `failure_report` is already visible through `collab_status` on a session
+/// that is merely failed rather than ended, and echoing arbitrary failure text
+/// into every refusal on every surface would be noise. The prefix is reserved
+/// against caller input in
+/// [`crate::mcp::tools::collab_events::parse_failure_report_event`], so what
+/// this echoes is always an operator's own words.
 pub fn ensure_active(conn: &Connection, session_id: &str) -> Result<(), MemoryError> {
-    let ended: Option<String> = conn
+    let (ended, coding_failure): (Option<String>, Option<String>) = conn
         .query_row(
-            "SELECT ended_at FROM collab_sessions WHERE id = ?1",
+            "SELECT ended_at, coding_failure FROM collab_sessions WHERE id = ?1",
             params![session_id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?
         .ok_or_else(|| MemoryError::NotFound(format!("session {session_id} not found")))?;
     if ended.is_some() {
+        let detail = coding_failure
+            .as_deref()
+            .filter(|failure| failure.starts_with(super::ABANDONED_PREFIX))
+            .map(|failure| format!(" ({failure})"))
+            .unwrap_or_default();
         return Err(MemoryError::Validation(format!(
-            "session {session_id} has ended"
+            "session {session_id} has ended{detail}"
         )));
     }
     Ok(())
@@ -300,6 +321,63 @@ pub fn session_last_activity(
     .optional()
     .map(Option::flatten)
     .map_err(MemoryError::from)
+}
+
+/// A session's staleness snapshot: the database's current time and the
+/// session's newest activity, both read from **one** `conn`.
+///
+/// The two halves of the staleness comparison are only meaningful together. If
+/// [`db_now_epoch_secs`] and [`session_last_activity`] are called on different
+/// connections, the comparison mixes two clocks, and skew between them can make
+/// a live session read dead — the destructive direction for the one caller that
+/// consumes this. Both primitives stay public and independently testable; this
+/// type exists so the *call site* cannot pair them wrong.
+///
+/// `now` is read **before** the activity, deliberately. Outside a transaction
+/// the two reads are not atomic, and this order is the conservative one: an
+/// activity write landing between them yields `last_activity > now`, a negative
+/// idle, and therefore "live". The reverse order could report a session
+/// staler than it is.
+pub struct SessionStaleness {
+    session_id: String,
+    /// The database clock at the moment of the read, in Unix epoch seconds.
+    pub now: i64,
+    /// The session's newest activity in Unix epoch seconds, or `None` when the
+    /// session row does not exist — see [`session_last_activity`].
+    pub last_activity: Option<i64>,
+}
+
+impl SessionStaleness {
+    /// Seconds since the session's newest activity. See [`super::idle_secs`].
+    pub fn idle_secs(&self) -> Option<i64> {
+        super::idle_secs(self.last_activity, self.now)
+    }
+
+    /// Whether the session has been silent long enough to be abandoned. See
+    /// [`super::session_is_dead`], which owns the threshold and the
+    /// missing-signal warning.
+    pub fn is_dead(&self) -> bool {
+        super::session_is_dead(&self.session_id, self.last_activity, self.now)
+    }
+}
+
+/// Read a session's [`SessionStaleness`] snapshot.
+///
+/// Pass an open write `Transaction` to evaluate staleness in the same
+/// transaction as the state change it authorizes (D6) — a predicate read
+/// outside the write transaction is a TOCTOU window in which a session goes
+/// live between "is it dead?" and "end it".
+pub fn session_staleness(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<SessionStaleness, MemoryError> {
+    let now = db_now_epoch_secs(conn)?;
+    let last_activity = session_last_activity(conn, session_id)?;
+    Ok(SessionStaleness {
+        session_id: session_id.to_string(),
+        now,
+        last_activity,
+    })
 }
 
 /// Find the session that currently *reserves the start slot* for a
@@ -3319,5 +3397,57 @@ mod tests {
             record.session.coding_failure.as_deref(),
             Some(stored.as_str())
         );
+    }
+
+    /// [`session_staleness`] is the pairing the abandon gate actually calls.
+    /// Both verdicts are asserted through it, not through the two primitives,
+    /// so a future edit that lets the snapshot's halves drift apart — a `now`
+    /// from one connection against activity from another — fails here rather
+    /// than only in the handler.
+    #[test]
+    fn session_staleness_agrees_with_its_primitives_on_both_verdicts() {
+        let db = open();
+        db.execute(
+            "INSERT INTO collab_sessions (id, repo_path, branch, updated_at)
+             VALUES ('live', '/repo', 'main', datetime('now'))",
+            [],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO collab_sessions (id, repo_path, branch, updated_at)
+             VALUES ('dead', '/repo', 'other', datetime('now', '-2 days'))",
+            [],
+        )
+        .unwrap();
+
+        let live = session_staleness(&db, "live").unwrap();
+        assert!(!live.is_dead(), "a session written just now must read live");
+        assert!(
+            live.idle_secs().is_some_and(|idle| idle.abs() <= 5),
+            "a fresh session's idle must be ~0; got {:?}",
+            live.idle_secs()
+        );
+
+        let dead = session_staleness(&db, "dead").unwrap();
+        assert!(dead.is_dead(), "a two-day-stale session must read dead");
+        assert!(
+            dead.idle_secs()
+                .is_some_and(|idle| idle >= crate::collab::COLLAB_DEAD_SESSION_SECS),
+            "a dead session's idle must clear the threshold; got {:?}",
+            dead.idle_secs()
+        );
+    }
+
+    /// A missing row has no signal at all. `session_is_dead` deliberately
+    /// treats that as dead (refusing would recreate the wedge abandon exists to
+    /// clear), and the snapshot must carry that through rather than smoothing
+    /// it into a live-looking zero.
+    #[test]
+    fn session_staleness_of_a_missing_session_has_no_signal_and_reads_dead() {
+        let db = open();
+        let staleness = session_staleness(&db, "nope").unwrap();
+        assert_eq!(staleness.last_activity, None);
+        assert_eq!(staleness.idle_secs(), None);
+        assert!(staleness.is_dead());
     }
 }

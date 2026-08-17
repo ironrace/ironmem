@@ -2835,9 +2835,77 @@ pub(super) fn handle_collab_wait_my_turn(app: &App, args: &Value) -> Result<Valu
     }
 }
 
+/// The phases plain (non-abandon) `collab_end` admits.
+///
+/// Single source of truth for two consumers that must never disagree: the
+/// allowlist in [`handle_collab_end`] and the remedy the duplicate-session
+/// guard recommends. #283 remedy 5 exists precisely because those two drifted —
+/// the guard told callers to run `collab_end` in phases the handler rejects.
+fn collab_end_admits(phase: Phase) -> bool {
+    matches!(
+        phase,
+        Phase::PlanFinalizePending
+            | Phase::PlanLocked
+            | Phase::CodingComplete
+            | Phase::CodingFailed
+    )
+}
+
 pub(super) fn handle_collab_end(app: &App, args: &Value) -> Result<Value, MemoryError> {
     let session_id = require_str(args, "session_id")?;
     let agent = require_agent(require_str(args, "agent")?)?;
+
+    // `abandon` is parsed strictly rather than with `as_bool().unwrap_or(false)`:
+    // a caller who sends `"true"` or `1` meaning to abandon must be told the
+    // flag was malformed, not silently given a plain end that the phase
+    // allowlist then rejects for an unrelated-looking reason.
+    let abandon = match args.get("abandon") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(flag)) => *flag,
+        Some(_) => {
+            return Err(MemoryError::Validation(
+                "collab_end `abandon` must be a boolean".to_string(),
+            ))
+        }
+    };
+
+    // `reason` without `abandon: true` is a refusal, never a silent drop.
+    let reason_supplied = !matches!(args.get("reason"), None | Some(Value::Null));
+    if reason_supplied && !abandon {
+        return Err(MemoryError::Validation(
+            "collab_end `reason` is only accepted with `abandon: true`; a plain end records no reason"
+                .to_string(),
+        ));
+    }
+
+    if abandon {
+        let raw = args
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim();
+        if raw.is_empty() {
+            return Err(MemoryError::Validation(
+                "collab_end abandon requires a non-blank `reason` recording why the session is \
+                 being abandoned; it is stored on the session as its permanent epitaph"
+                    .to_string(),
+            ));
+        }
+        if raw.len() > crate::collab::MAX_ABANDON_REASON_BYTES {
+            return Err(MemoryError::Validation(format!(
+                "collab_end `reason` is {} bytes and exceeds the maximum of {} bytes \
+                 (the stored `coding_failure` is `{} <reason>` and the column caps at {})",
+                raw.len(),
+                crate::collab::MAX_ABANDON_REASON_BYTES,
+                crate::collab::ABANDONED_PREFIX,
+                crate::collab::MAX_CODING_FAILURE_CHARS,
+            )));
+        }
+        // Runs after our own two checks so the taxonomy above owns the
+        // messages; this call rejects null bytes and normalizes the trim.
+        let reason = sanitize::sanitize_content(raw, crate::collab::MAX_ABANDON_REASON_BYTES)?;
+        return handle_collab_abandon(app, session_id, agent, reason);
+    }
 
     let (phase, repo_path, branch, claim) = app.db.with_transaction(|tx| {
         let claim = super::handoff::ensure_actor_generation_current(
@@ -2861,16 +2929,9 @@ pub(super) fn handle_collab_end(app: &App, args: &Value) -> Result<Value, Memory
                 session.current_owner, agent
             )));
         }
-        let allowed = matches!(
-            session.phase,
-            Phase::PlanFinalizePending
-                | Phase::PlanLocked
-                | Phase::CodingComplete
-                | Phase::CodingFailed
-        );
-        if !allowed {
+        if !collab_end_admits(session.phase) {
             return Err(MemoryError::Validation(format!(
-                "collab_end rejected in active phase {}; end is only valid from PlanClaudeFinalizePending (by the current owner), PlanLocked (pre-task_list), CodingComplete, or CodingFailed",
+                "collab_end rejected in active phase {}; end is only valid from PlanClaudeFinalizePending (by the current owner), PlanLocked (pre-task_list), CodingComplete, or CodingFailed. If this session is demonstrably dead, use collab_end with `abandon: true` and a `reason`",
                 session.phase
             )));
         }
@@ -2914,6 +2975,135 @@ pub(super) fn handle_collab_end(app: &App, args: &Value) -> Result<Value, Memory
     app.clear_active_collab_session_for_scope_if_matches(session_id, &repo_path, &branch);
 
     Ok(json!({ "ok": true, "session_id": session_id }))
+}
+
+/// End a demonstrably dead session from any phase, bypassing both the
+/// generation lease and the phase allowlist. #297 defect A.
+///
+/// # Why no `ensure_actor_generation_current` (D5)
+///
+/// Abandon is the one collab write that deliberately skips the lease. It has
+/// to: #283's second defect is a *dead generation lease*, and a lease-gated
+/// abandon would let that defect block the fix for this one — the two failures
+/// are individually survivable and jointly terminal precisely because each
+/// blocks the other's remedy.
+///
+/// The bypass is safe for the same reason `branch_drift:` is the single
+/// unscoped off-turn carve-out (see `off_turn_failure_is_admissible` in
+/// `collab/mod.rs`): a lease exists to stop a stale process from *acting*, and
+/// ending a session leaves no live turn for anyone to seize. There is no
+/// post-abandon state in which a caller holds a turn it did not own before.
+///
+/// # Why staleness is the only remaining gate (D4)
+///
+/// Ungated, this would be a griefing primitive — the counterpart could kill a
+/// live session mid-turn, exactly what the `PlanFinalizePending` owner check
+/// exists to prevent. #283 remedy 1 scopes it to a *demonstrably dead*
+/// session, and `session_is_dead` is that demonstration. If that gate is ever
+/// softened, the lease bypass has to be re-argued together with it.
+///
+/// That `PlanFinalizePending` owner check is the third thing this path skips,
+/// and it is skipped for the same reason and only that reason: staleness
+/// *replaces* it. The check guards an in-flight finalization turn, and a
+/// session with six hours of silence across all three activity sources has no
+/// in-flight turn to guard. The three bypasses therefore all rest on the one
+/// predicate — soften it and none of them survive.
+///
+/// # Ordering inside the transaction (D6, D7)
+///
+/// 1. `ensure_active` — the already-ended check runs **before** staleness, so a
+///    second abandon is refused with the stable ended-session message (carrying
+///    the first abandonment's reason) rather than being re-evaluated against a
+///    staleness clock. This is what makes double-abandon a no-op.
+/// 2. staleness — read inside the same `with_transaction` that ends the
+///    session, via [`crate::collab::queue::session_staleness`]. A predicate
+///    read outside the write transaction is a TOCTOU window in which a session
+///    goes live between "is it dead?" and "end it".
+/// 3. write — `coding_failure`, then `end_session` (which stamps `ended_at` and
+///    thereby releases the `(repo_path, branch)` start slot).
+///
+/// `recovery_attempts` and `total_recovery_attempts` are written back exactly
+/// as loaded: #283's acceptance requires the wedge be cleared *without spending
+/// a recovery attempt*, and abandon is not a recovery.
+///
+/// The `abandoned:` prefix this writes is reserved against caller input in
+/// [`super::collab_events::parse_failure_report_event`], so a row carrying it
+/// is always an operator decision taken here and never an agent's
+/// `failure_report` wearing the same costume.
+fn handle_collab_abandon(
+    app: &App,
+    session_id: &str,
+    agent: Agent,
+    reason: &str,
+) -> Result<Value, MemoryError> {
+    let coding_failure = format!("{} {}", crate::collab::ABANDONED_PREFIX, reason);
+
+    let (ended_phase, repo_path, branch) = app.db.with_transaction(|tx| {
+        // (1) already-ended before staleness — see the doc comment.
+        crate::collab::queue::ensure_active(tx, session_id)?;
+
+        let record = crate::collab::queue::load_session_record(tx, session_id)?;
+        let mut session = record.session;
+
+        // (2) staleness, inside the write transaction (D6).
+        let staleness = crate::collab::queue::session_staleness(tx, session_id)?;
+        if !staleness.is_dead() {
+            let idle = staleness.idle_secs().unwrap_or(0);
+            return Err(MemoryError::Validation(format!(
+                "collab_end abandon refused: session {session_id} is still live (idle {idle}s in \
+                 phase {}). Abandon requires {}s of no activity across the session row, its \
+                 checkpoint, and its messages; {}s remaining. Abandon exists only for a \
+                 demonstrably dead session — to end a live one, drive it to a terminal phase.",
+                session.phase,
+                crate::collab::COLLAB_DEAD_SESSION_SECS,
+                crate::collab::COLLAB_DEAD_SESSION_SECS - idle,
+            )));
+        }
+
+        // (3) write. `save_session` round-trips every other column, including
+        // both recovery counters, exactly as loaded.
+        let ended_phase = session.phase;
+        session.coding_failure = Some(coding_failure.clone());
+        crate::collab::queue::save_session(tx, &session)?;
+        crate::collab::queue::end_session(tx, session_id)?;
+        crate::db::schema::Database::wal_log_tx(
+            tx,
+            "collab_end",
+            &json!({
+                "session_id": session_id,
+                "agent": agent.as_str(),
+                "phase": ended_phase.to_string(),
+                "abandoned": true,
+                "reason": reason,
+            }),
+            Some(&json!({ "ok": true })),
+        )?;
+        Ok((ended_phase, record.repo_path, record.branch))
+    })?;
+
+    tracing::warn!(
+        session_id = %session_id,
+        agent = %agent.as_str(),
+        phase = %ended_phase,
+        reason = %reason,
+        "collab: session abandoned as demonstrably dead"
+    );
+
+    // Unlike the plain end, the outcome is `abandoned` from EVERY phase. The
+    // plain path's match only covers the two planning phases because those are
+    // the only ones it can reach; abandon reaches all of them.
+    if crate::search::tunables::metrics_enabled() {
+        let now = crate::metrics::now_rfc3339();
+        if let Err(e) =
+            app.db
+                .mark_task_outcome_done(session_id, Some(&now), Some("abandoned"), None)
+        {
+            tracing::warn!(session_id = %session_id, error = %e, "metrics: task_outcome abandon attestation failed");
+        }
+    }
+    app.clear_active_collab_session_for_scope_if_matches(session_id, &repo_path, &branch);
+
+    Ok(json!({ "ok": true, "session_id": session_id, "abandoned": true }))
 }
 
 /// Resume a tooling-class `CodingFailed` session back to the phase it failed
@@ -3276,6 +3466,50 @@ mod tests {
         );
     }
 
+    /// Backdate every activity source for `sid` by `secs`, so the staleness
+    /// gate sees a dead session. Writes all three sources, not just the
+    /// session row, because the liveness signal is their max.
+    fn age_session(app: &crate::mcp::app::App, sid: &str, secs: i64) {
+        app.db
+            .with_transaction(|tx| {
+                tx.execute(
+                    "UPDATE collab_sessions SET updated_at = datetime('now', ?2) WHERE id = ?1",
+                    rusqlite::params![sid, format!("-{secs} seconds")],
+                )?;
+                tx.execute(
+                    "UPDATE messages SET created_at = datetime('now', ?2) WHERE session_id = ?1",
+                    rusqlite::params![sid, format!("-{secs} seconds")],
+                )?;
+                tx.execute(
+                    "UPDATE collab_checkpoints SET updated_at = strftime('%s','now') - ?2
+                      WHERE session_id = ?1",
+                    rusqlite::params![sid, secs],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    fn end_args(sid: &str, agent: &str) -> Value {
+        json!({ "session_id": sid, "agent": agent })
+    }
+
+    /// `end_args` plus an `abandon: true` / `reason` pair — the shape an
+    /// operator sends to clear a wedged session.
+    fn abandon_args(sid: &str, agent: &str, reason: &str) -> Value {
+        let mut args = end_args(sid, agent);
+        args["abandon"] = json!(true);
+        args["reason"] = json!(reason);
+        args
+    }
+
+    fn session_phase(app: &crate::mcp::app::App, sid: &str) -> String {
+        handle_collab_status(app, &json!({ "session_id": sid })).unwrap()["phase"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
     fn collab_session_count(app: &crate::mcp::app::App) -> i64 {
         app.db
             .with_connection(|conn| {
@@ -3604,6 +3838,356 @@ mod tests {
                 "collab_end from PlanClaudeFinalizePending requires current owner claude"
             ),
             "unexpected error: {err}"
+        );
+    }
+
+    // ── collab_end abandon (#297 defect A) ───────────────────────────────────
+
+    /// D4: abandon is gated on staleness. Ungated it is a griefing primitive —
+    /// the counterpart could end a live session mid-turn.
+    #[test]
+    fn abandon_refused_while_the_session_is_still_live() {
+        let app = test_app();
+        let sid = start_session(&app);
+        drive_to_implement(&app, &sid);
+
+        let err = handle_collab_end(
+            &app,
+            &abandon_args(&sid, "claude", "implementer process died"),
+        )
+        .unwrap_err();
+
+        let message = err.to_string();
+        assert!(
+            message.contains("still live"),
+            "the refusal must say the session is still live: {message}"
+        );
+        assert!(
+            message.contains("idle"),
+            "the refusal must report how idle the session actually is: {message}"
+        );
+        assert_eq!(
+            session_phase(&app, &sid),
+            "CodeImplementPending",
+            "a refused abandon must leave the session exactly where it was"
+        );
+    }
+
+    /// The whole point of #297: the phase allowlist refuses a wedged coding
+    /// session, and abandon is the escape hatch that clears it. Abandon
+    /// *seals* the session in place — it stamps `ended_at` and a Terminal
+    /// `abandoned:` epitaph without transitioning the phase, so the record of
+    /// where the session died survives.
+    #[test]
+    fn abandon_admitted_once_stale_and_seals_the_session() {
+        let app = test_app();
+        let sid = start_session(&app);
+        drive_to_implement(&app, &sid);
+
+        let plain = handle_collab_end(&app, &end_args(&sid, "claude")).unwrap_err();
+        assert!(
+            plain.to_string().contains("rejected in active phase"),
+            "a plain end must still be refused here: {plain}"
+        );
+
+        age_session(&app, &sid, crate::collab::COLLAB_DEAD_SESSION_SECS + 60);
+        handle_collab_end(
+            &app,
+            &abandon_args(&sid, "claude", "implementer process died"),
+        )
+        .expect("a demonstrably dead session must be abandonable");
+
+        let record = app.db.collab_load_session_record(&sid).unwrap();
+        assert!(
+            record.ended_at.is_some(),
+            "abandon must release the (repo_path, branch) start slot by ending the session"
+        );
+        assert_eq!(
+            record.session.coding_failure.as_deref(),
+            Some("abandoned: implementer process died"),
+            "the reason is the session's permanent epitaph"
+        );
+        assert_eq!(
+            crate::collab::classify(record.session.coding_failure.as_deref().unwrap()),
+            crate::collab::FailureClass::Terminal,
+            "an abandoned session must be sealed, never resumable"
+        );
+        assert_eq!(
+            record.session.phase,
+            Phase::CodeImplementPending,
+            "abandon seals in place; it must not transition the phase"
+        );
+    }
+
+    /// #283's acceptance: the wedge is cleared *without* spending a recovery
+    /// attempt. Abandon is not a recovery.
+    #[test]
+    fn abandon_spends_no_recovery_attempt() {
+        let app = test_app();
+        let sid = start_session(&app);
+        drive_to_implement(&app, &sid);
+        age_session(&app, &sid, crate::collab::COLLAB_DEAD_SESSION_SECS + 60);
+
+        let before = app.db.collab_load_session_record(&sid).unwrap().session;
+        handle_collab_end(&app, &abandon_args(&sid, "claude", "wedged batch turn")).unwrap();
+        let after = app.db.collab_load_session_record(&sid).unwrap().session;
+
+        assert_eq!(
+            before.recovery_attempts, after.recovery_attempts,
+            "abandon must not spend the recovery budget"
+        );
+        assert_eq!(
+            before.total_recovery_attempts, after.total_recovery_attempts,
+            "abandon must not spend the lifetime recovery budget"
+        );
+    }
+
+    #[test]
+    fn reason_without_abandon_is_refused_rather_than_ignored() {
+        let app = test_app();
+        let sid = start_session(&app);
+        drive_to_plan_locked(&app, &sid);
+
+        let mut args = end_args(&sid, "claude");
+        args["reason"] = json!("I meant to abandon this");
+        let err = handle_collab_end(&app, &args).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("`reason` is only accepted with `abandon: true`"),
+            "a dropped reason must be a refusal, not a silent drop: {err}"
+        );
+        assert!(
+            app.db
+                .collab_load_session_record(&sid)
+                .unwrap()
+                .ended_at
+                .is_none(),
+            "the refused end must not have ended the session"
+        );
+    }
+
+    #[test]
+    fn abandon_requires_a_non_blank_reason() {
+        for reason in [Some(""), Some("   "), Some("\n\t "), None] {
+            let app = test_app();
+            let sid = start_session(&app);
+            drive_to_implement(&app, &sid);
+            age_session(&app, &sid, crate::collab::COLLAB_DEAD_SESSION_SECS + 60);
+
+            let mut args = end_args(&sid, "claude");
+            args["abandon"] = json!(true);
+            if let Some(reason) = reason {
+                args["reason"] = json!(reason);
+            }
+            let err = handle_collab_end(&app, &args).unwrap_err();
+
+            assert!(
+                err.to_string().contains("requires a non-blank `reason`"),
+                "reason {reason:?} must be refused as blank: {err}"
+            );
+            assert!(
+                app.db
+                    .collab_load_session_record(&sid)
+                    .unwrap()
+                    .ended_at
+                    .is_none(),
+                "a blank reason must not end the session"
+            );
+        }
+    }
+
+    /// The cap must be ours, not the column's: a caller who overshoots gets a
+    /// message naming the limit, never a raw SQLite CHECK failure.
+    #[test]
+    fn abandon_reason_is_capped_below_the_column_check() {
+        let app = test_app();
+        let sid = start_session(&app);
+        drive_to_implement(&app, &sid);
+        age_session(&app, &sid, crate::collab::COLLAB_DEAD_SESSION_SECS + 60);
+
+        let too_long = "x".repeat(crate::collab::MAX_ABANDON_REASON_BYTES + 1);
+        let err = handle_collab_end(&app, &abandon_args(&sid, "claude", &too_long)).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("exceeds the maximum"),
+            "the refusal must name the cap: {message}"
+        );
+        assert!(
+            !message.contains("CHECK constraint"),
+            "the cap must be ours, not the column's: {message}"
+        );
+
+        let exact = "x".repeat(crate::collab::MAX_ABANDON_REASON_BYTES);
+        handle_collab_end(&app, &abandon_args(&sid, "claude", &exact))
+            .expect("a reason at exactly the cap must be accepted");
+
+        let stored = app
+            .db
+            .collab_load_session_record(&sid)
+            .unwrap()
+            .session
+            .coding_failure
+            .unwrap();
+        assert_eq!(
+            stored.chars().count(),
+            crate::collab::MAX_CODING_FAILURE_CHARS,
+            "the cap must sit exactly at the column's CHECK, not below it"
+        );
+    }
+
+    /// D7: abandon is terminal and idempotent. The second attempt is refused
+    /// with the stable ended-session message, and that message carries the
+    /// first abandonment's reason so the operator learns why it is gone.
+    #[test]
+    fn abandon_of_an_already_ended_session_is_refused_with_the_stored_reason() {
+        let app = test_app();
+        let sid = start_session(&app);
+        drive_to_implement(&app, &sid);
+        age_session(&app, &sid, crate::collab::COLLAB_DEAD_SESSION_SECS + 60);
+
+        handle_collab_end(&app, &abandon_args(&sid, "claude", "first")).unwrap();
+        let err = handle_collab_end(&app, &abandon_args(&sid, "claude", "second")).unwrap_err();
+
+        let message = err.to_string();
+        assert!(
+            message.contains("has ended"),
+            "the second abandon must be refused with the stable ended message: {message}"
+        );
+        assert!(
+            message.contains("abandoned: first"),
+            "the refusal must carry the stored epitaph: {message}"
+        );
+        assert_eq!(
+            app.db
+                .collab_load_session_record(&sid)
+                .unwrap()
+                .session
+                .coding_failure
+                .as_deref(),
+            Some("abandoned: first"),
+            "the second abandon must not overwrite the first epitaph"
+        );
+    }
+
+    /// The plain path is load-bearing and must be byte-for-byte unaffected by
+    /// the new flag, both when `abandon` is omitted and when it is `false`.
+    #[test]
+    fn plain_end_is_unchanged_for_every_endable_and_rejected_phase() {
+        for (index, abandon) in [None, Some(false)].into_iter().enumerate() {
+            let app = test_app();
+
+            let endable = start_session_in_scope(&app, "/tmp/repo", &format!("endable-{index}"));
+            drive_to_plan_locked(&app, &endable);
+            let mut args = end_args(&endable, "claude");
+            if let Some(abandon) = abandon {
+                args["abandon"] = json!(abandon);
+            }
+            handle_collab_end(&app, &args).expect("PlanLocked must still end plainly");
+            assert!(
+                app.db
+                    .collab_load_session_record(&endable)
+                    .unwrap()
+                    .ended_at
+                    .is_some(),
+                "a plain end from PlanLocked must end the session"
+            );
+
+            let active = start_session_in_scope(&app, "/tmp/repo", &format!("active-{index}"));
+            drive_to_implement(&app, &active);
+            let mut args = end_args(&active, "claude");
+            if let Some(abandon) = abandon {
+                args["abandon"] = json!(abandon);
+            }
+            let err = handle_collab_end(&app, &args).unwrap_err();
+            assert!(
+                err.to_string().contains("rejected in active phase"),
+                "abandon={abandon:?} must not change the plain path's refusal: {err}"
+            );
+            assert_eq!(
+                session_phase(&app, &active),
+                "CodeImplementPending",
+                "a refused plain end must leave the phase alone"
+            );
+        }
+    }
+
+    /// The abandon path skips three checks the plain path runs: the generation
+    /// lease (D5), the phase allowlist, and — pinned here — the
+    /// `PlanFinalizePending` owner check. All three rest on the staleness gate
+    /// replacing them, so the bypass has to be an asserted behaviour rather
+    /// than only a documented one: the non-owner is refused while the session
+    /// is live and admitted once it is demonstrably dead.
+    #[test]
+    fn abandon_bypasses_the_finalize_pending_owner_check_once_stale() {
+        let app = test_app();
+        let sid = start_session(&app);
+        drive_to_plan_finalize_pending(&app, &sid);
+
+        let live =
+            handle_collab_end(&app, &abandon_args(&sid, "codex", "pilot went away")).unwrap_err();
+        assert!(
+            live.to_string().contains("still live"),
+            "the non-owner must be refused while the session is live: {live}"
+        );
+
+        age_session(&app, &sid, crate::collab::COLLAB_DEAD_SESSION_SECS + 60);
+        handle_collab_end(&app, &abandon_args(&sid, "codex", "pilot went away")).expect(
+            "staleness replaces the owner check, so the non-owner may abandon a dead session",
+        );
+
+        let record = app.db.collab_load_session_record(&sid).unwrap();
+        assert!(record.ended_at.is_some());
+        assert_eq!(
+            record.session.coding_failure.as_deref(),
+            Some("abandoned: pilot went away")
+        );
+    }
+
+    /// The plain path attests `abandoned` only from the two planning phases,
+    /// because those are the only non-terminal phases it can reach. Abandon
+    /// reaches every phase, so its attestation must not inherit that match.
+    #[test]
+    fn abandon_attests_the_outcome_from_a_coding_phase() {
+        let _g = metrics_on_guard();
+        let app = test_app();
+        let sid = start_session(&app);
+        drive_to_implement(&app, &sid);
+        age_session(&app, &sid, crate::collab::COLLAB_DEAD_SESSION_SECS + 60);
+
+        handle_collab_end(
+            &app,
+            &abandon_args(&sid, "claude", "implementer process died"),
+        )
+        .unwrap();
+
+        let row = app.db.get_task_outcome(&sid).unwrap().unwrap();
+        assert_eq!(
+            row.outcome.as_deref(),
+            Some("abandoned"),
+            "abandon must attest from a coding phase, not only from planning"
+        );
+        assert!(row.done_at.is_some(), "abandoned must set done_at");
+    }
+
+    /// Parsed strictly rather than with `as_bool().unwrap_or(false)`: a caller
+    /// who sends `"yes"` meaning to abandon must be told the flag was
+    /// malformed, not silently given a plain end that the phase allowlist then
+    /// rejects for an unrelated-looking reason.
+    #[test]
+    fn abandon_rejects_a_non_boolean_flag() {
+        let app = test_app();
+        let sid = start_session(&app);
+        drive_to_implement(&app, &sid);
+
+        let mut args = end_args(&sid, "claude");
+        args["abandon"] = json!("yes");
+        args["reason"] = json!("implementer process died");
+        let err = handle_collab_end(&app, &args).unwrap_err();
+
+        assert!(
+            err.to_string().contains("`abandon` must be a boolean"),
+            "a malformed flag must be named as such: {err}"
         );
     }
 
