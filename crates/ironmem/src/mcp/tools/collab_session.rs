@@ -180,10 +180,21 @@ pub(super) fn session_record_json(record: &SessionRecord) -> Value {
         // the diagnostic for an in-flight *recoverable* failure — set only
         // by the `Tooling` arm of `apply_event`'s `FailureReport` handling
         // (state_machine/mod.rs), which never also sets `coding_failure`;
-        // the two are mutually exclusive by construction, enforced there
-        // and covered by `state_machine::tests`. `failed_from_phase`/
+        // the two are mutually exclusive **within `apply_event`**, enforced
+        // there and covered by `state_machine::tests`. `failed_from_phase`/
         // `recovery_phase` serialize via `Phase::to_string()` like the
         // top-level `phase` field.
+        //
+        // That exclusivity is a property of `apply_event`, NOT an invariant of
+        // the row, and #297's abandon arm is the one writer that breaks it:
+        // `handle_collab_abandon` writes `coding_failure` directly, bypassing
+        // `apply_event`, so abandoning a session mid-recovery leaves both
+        // fields set. That is deliberate — the abandon epitaph says the
+        // operator gave up, `pending_failure` says what it was stuck on, and
+        // both are worth keeping. Nothing may branch on their exclusivity:
+        // this surface emits them independently and `handoff.rs` prints them
+        // as two separate `kv` lines, which is exactly why preserving both is
+        // free. A reader wanting "the" failure must decide which it means.
         //
         // `recovery_origin_owner` and `total_recovery_attempts` were both
         // added by review. Without the origin, nothing on this surface
@@ -2869,9 +2880,25 @@ pub(super) fn handle_collab_end(app: &App, args: &Value) -> Result<Value, Memory
         }
     };
 
+    // `reason` is type-checked as strictly as `abandon`, and for the same
+    // reason. A `.and_then(Value::as_str).unwrap_or_default()` would turn
+    // `{"abandon": true, "reason": 42}` into the empty string and report it as
+    // a *blank* reason — telling the caller their text was missing when it was
+    // really the wrong type, which is the exact misdirection the strict
+    // `abandon` parse above exists to avoid. Type before pairing: a value that
+    // is not a string is malformed whatever `abandon` says.
+    let reason = match args.get("reason") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(reason)) => Some(reason.as_str()),
+        Some(_) => {
+            return Err(MemoryError::Validation(
+                "collab_end `reason` must be a string".to_string(),
+            ))
+        }
+    };
+
     // `reason` without `abandon: true` is a refusal, never a silent drop.
-    let reason_supplied = !matches!(args.get("reason"), None | Some(Value::Null));
-    if reason_supplied && !abandon {
+    if reason.is_some() && !abandon {
         return Err(MemoryError::Validation(
             "collab_end `reason` is only accepted with `abandon: true`; a plain end records no reason"
                 .to_string(),
@@ -2879,11 +2906,7 @@ pub(super) fn handle_collab_end(app: &App, args: &Value) -> Result<Value, Memory
     }
 
     if abandon {
-        let raw = args
-            .get("reason")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .trim();
+        let raw = reason.unwrap_or_default().trim();
         if raw.is_empty() {
             return Err(MemoryError::Validation(
                 "collab_end abandon requires a non-blank `reason` recording why the session is \
@@ -2994,6 +3017,15 @@ pub(super) fn handle_collab_end(app: &App, args: &Value) -> Result<Value, Memory
 /// ending a session leaves no live turn for anyone to seize. There is no
 /// post-abandon state in which a caller holds a turn it did not own before.
 ///
+/// A `handoff_token` argument is therefore **accepted and ignored** here, where
+/// the plain path feeds it to `ensure_actor_generation_current`. It is not
+/// refused the way a `reason` without `abandon: true` is: that refusal exists
+/// because a dropped `reason` would lose the caller's *data*, while a dropped
+/// `handoff_token` only skips a check this path has already argued it must not
+/// run. Refusing it would also be actively harmful — the operator most likely
+/// to send one is the one whose lease is dead, which is the case abandon
+/// exists to rescue.
+///
 /// # Why staleness is the only remaining gate (D4)
 ///
 /// Ungated, this would be a griefing primitive — the counterpart could kill a
@@ -3025,6 +3057,21 @@ pub(super) fn handle_collab_end(app: &App, args: &Value) -> Result<Value, Memory
 /// `recovery_attempts` and `total_recovery_attempts` are written back exactly
 /// as loaded: #283's acceptance requires the wedge be cleared *without spending
 /// a recovery attempt*, and abandon is not a recovery.
+///
+/// # The epitaph replaces any prior `coding_failure`
+///
+/// Abandoning a `CodingFailed` session **overwrites** its existing diagnostic
+/// (say `gh_auth: token expired`) rather than appending to it. Overwriting is
+/// forced, not preferred: `failure_class::classify` dispatches on the string's
+/// *prefix*, so anything that left the old text in front would classify the
+/// abandoned session by the old failure — and a recoverable one such as
+/// `git_commit_failed:` would classify `Tooling`, leaving the sealed session
+/// resumable. The seal depends on `abandoned:` being the first thing in the
+/// column. The displaced text is not lost to the audit trail: the abandoning
+/// `wal_log` row records the phase and reason, and `pending_failure` (which
+/// this path leaves untouched) still carries an in-flight recoverable
+/// diagnostic. Pinned by
+/// `tests::abandoning_a_failed_session_replaces_its_diagnostic_with_the_epitaph`.
 ///
 /// The `abandoned:` prefix this writes is reserved against caller input in
 /// [`super::collab_events::parse_failure_report_event`], so a row carrying it
@@ -3464,6 +3511,109 @@ mod tests {
             "final_review",
             &json!({ "head_sha": heads[4], "pr_url": "https://github.com/x/y/pull/9" }).to_string(),
         );
+    }
+
+    /// Every `Phase`, in transition order, paired with whether a plain
+    /// `collab_end` is expected to end a session sitting in it.
+    ///
+    /// The `bool` is spelled out here **independently of
+    /// [`collab_end_admits`]**, and that independence is the whole value of
+    /// the table. Asserting the handler against the helper it already calls
+    /// would be a tautology that passes even if a phase were dropped from the
+    /// helper — verified by mutation, not assumed. This list is the second
+    /// opinion: change the helper without changing this, and the row fails.
+    const PHASE_ENDABILITY: [(Phase, bool); 11] = [
+        (Phase::PlanParallelDrafts, false),
+        (Phase::PlanSynthesisPending, false),
+        (Phase::PlanCopilotReviewPending, false),
+        (Phase::PlanFinalizePending, true),
+        (Phase::PlanLocked, true),
+        (Phase::CodeImplementPending, false),
+        (Phase::CodeReviewFixGlobalPending, false),
+        (Phase::CodeReviewLocalPending, false),
+        (Phase::CodeReviewFinalPending, false),
+        (Phase::CodingComplete, true),
+        (Phase::CodingFailed, true),
+    ];
+
+    /// Start a session in its own `(repo_path, branch)` scope, drive it to
+    /// `phase` through the real handlers, and return its id.
+    ///
+    /// `heads` must be 5 real, order-respecting commit shas in `repo_path` —
+    /// every transition past `CodeImplementPending` is git-ancestry-checked
+    /// (issue #273 Task 8). The arrival is asserted rather than assumed: a
+    /// driver that silently stopped one phase short would turn a per-phase
+    /// table into several duplicate rows testing the same phase.
+    fn drive_to_phase(
+        app: &crate::mcp::app::App,
+        repo_path: &str,
+        branch: &str,
+        phase: Phase,
+        heads: &[String],
+    ) -> String {
+        let sid = start_session_in_scope(app, repo_path, branch);
+        // Each arm is the prefix of the next, so the order mirrors the state
+        // machine's own progression.
+        match phase {
+            Phase::PlanParallelDrafts => {}
+            Phase::PlanSynthesisPending => {
+                send(app, &sid, "claude", "draft", "claude draft");
+                send(app, &sid, "codex", "draft", "codex draft");
+            }
+            Phase::PlanCopilotReviewPending => {
+                send(app, &sid, "claude", "draft", "claude draft");
+                send(app, &sid, "codex", "draft", "codex draft");
+                send(app, &sid, "claude", "canonical", "canonical plan");
+            }
+            Phase::PlanFinalizePending => drive_to_plan_finalize_pending(app, &sid),
+            Phase::PlanLocked => {
+                drive_to_plan_locked(app, &sid);
+            }
+            Phase::CodeImplementPending => {
+                drive_to_implement_with_head(app, &sid, &heads[0]);
+            }
+            Phase::CodeReviewFixGlobalPending => {
+                drive_to_implement_with_head(app, &sid, &heads[0]);
+                send_implementation_done(app, &sid, "claude", &heads[1]);
+            }
+            Phase::CodeReviewLocalPending => {
+                drive_to_implement_with_head(app, &sid, &heads[0]);
+                send_implementation_done(app, &sid, "claude", &heads[1]);
+                send(
+                    app,
+                    &sid,
+                    "codex",
+                    "review_fix_global",
+                    &json!({ "head_sha": heads[2] }).to_string(),
+                );
+            }
+            Phase::CodeReviewFinalPending => {
+                drive_to_implement_with_head(app, &sid, &heads[0]);
+                send_implementation_done(app, &sid, "claude", &heads[1]);
+                send(
+                    app,
+                    &sid,
+                    "codex",
+                    "review_fix_global",
+                    &json!({ "head_sha": heads[2] }).to_string(),
+                );
+                send(
+                    app,
+                    &sid,
+                    "claude",
+                    "review_local",
+                    &json!({ "head_sha": heads[3] }).to_string(),
+                );
+            }
+            Phase::CodingComplete => drive_to_coding_complete(app, &sid, heads),
+            Phase::CodingFailed => drive_to_tooling_coding_failed_with_head(app, &sid, &heads[0]),
+        }
+        assert_eq!(
+            session_phase(app, &sid),
+            phase.to_string(),
+            "the driver for {phase} must actually arrive there"
+        );
+        sid
     }
 
     /// Backdate every activity source for `sid` by `secs`, so the staleness
@@ -4070,45 +4220,77 @@ mod tests {
         );
     }
 
-    /// The plain path is load-bearing and must be byte-for-byte unaffected by
-    /// the new flag, both when `abandon` is omitted and when it is `false`.
+    /// The plain path is load-bearing and must be unaffected by the new flag,
+    /// both when `abandon` is omitted and when it is explicitly `false`, in
+    /// **every** phase — not a sample of one endable and one rejected.
+    ///
+    /// Expectations come from [`PHASE_ENDABILITY`], which restates the
+    /// allowlist independently of [`collab_end_admits`]. That matters now that
+    /// the helper is shared: Task 4 reuses it to generate the
+    /// duplicate-session guard's operator advice, and #283 remedy 5 exists
+    /// precisely because the handler's allowlist and that advice drifted
+    /// apart. Drop `CodingComplete` or `CodingFailed` from the helper and the
+    /// corresponding rows here fail.
     #[test]
-    fn plain_end_is_unchanged_for_every_endable_and_rejected_phase() {
+    fn plain_end_admits_exactly_the_documented_phases_under_both_abandon_shapes() {
+        // One repo, distinct branch labels per session: git shells out against
+        // `repo_path` only, never the session's branch, so the ancestry checks
+        // past `CodeImplementPending` all resolve against this one chain while
+        // each session still gets its own start slot.
+        let (_temp, repo_path, heads) = git_ancestor_chain(5);
+
         for (index, abandon) in [None, Some(false)].into_iter().enumerate() {
             let app = test_app();
+            for (phase, endable) in PHASE_ENDABILITY {
+                assert_eq!(
+                    collab_end_admits(phase),
+                    endable,
+                    "collab_end_admits disagrees with the documented allowlist for {phase}"
+                );
 
-            let endable = start_session_in_scope(&app, "/tmp/repo", &format!("endable-{index}"));
-            drive_to_plan_locked(&app, &endable);
-            let mut args = end_args(&endable, "claude");
-            if let Some(abandon) = abandon {
-                args["abandon"] = json!(abandon);
-            }
-            handle_collab_end(&app, &args).expect("PlanLocked must still end plainly");
-            assert!(
-                app.db
-                    .collab_load_session_record(&endable)
-                    .unwrap()
-                    .ended_at
-                    .is_some(),
-                "a plain end from PlanLocked must end the session"
-            );
+                let branch = format!("{}-{index}", phase.to_string().to_lowercase());
+                let sid = drive_to_phase(&app, &repo_path, &branch, phase, &heads);
 
-            let active = start_session_in_scope(&app, "/tmp/repo", &format!("active-{index}"));
-            drive_to_implement(&app, &active);
-            let mut args = end_args(&active, "claude");
-            if let Some(abandon) = abandon {
-                args["abandon"] = json!(abandon);
+                let mut args = end_args(&sid, "claude");
+                if let Some(abandon) = abandon {
+                    args["abandon"] = json!(abandon);
+                }
+                let outcome = handle_collab_end(&app, &args);
+
+                if endable {
+                    outcome.unwrap_or_else(|err| {
+                        panic!("{phase} is endable but abandon={abandon:?} was refused: {err}")
+                    });
+                    assert!(
+                        app.db
+                            .collab_load_session_record(&sid)
+                            .unwrap()
+                            .ended_at
+                            .is_some(),
+                        "a plain end from {phase} must actually end the session"
+                    );
+                } else {
+                    let err = outcome.expect_err(&format!("{phase} must refuse a plain end"));
+                    assert!(
+                        err.to_string().contains("rejected in active phase"),
+                        "abandon={abandon:?} must not change the plain path's refusal in \
+                         {phase}: {err}"
+                    );
+                    assert_eq!(
+                        session_phase(&app, &sid),
+                        phase.to_string(),
+                        "a refused plain end must leave {phase} alone"
+                    );
+                    assert!(
+                        app.db
+                            .collab_load_session_record(&sid)
+                            .unwrap()
+                            .ended_at
+                            .is_none(),
+                        "a refused plain end must not end the session in {phase}"
+                    );
+                }
             }
-            let err = handle_collab_end(&app, &args).unwrap_err();
-            assert!(
-                err.to_string().contains("rejected in active phase"),
-                "abandon={abandon:?} must not change the plain path's refusal: {err}"
-            );
-            assert_eq!(
-                session_phase(&app, &active),
-                "CodeImplementPending",
-                "a refused plain end must leave the phase alone"
-            );
         }
     }
 
@@ -4168,6 +4350,106 @@ mod tests {
             "abandon must attest from a coding phase, not only from planning"
         );
         assert!(row.done_at.is_some(), "abandoned must set done_at");
+    }
+
+    /// A non-string `reason` must be named as a *type* error. Coercing it
+    /// would report "requires a non-blank `reason`" — telling the caller their
+    /// text was missing when it was really the wrong type, the same
+    /// misdirection the strict `abandon` parse exists to avoid. Asserting the
+    /// blank-reason wording is *absent* is the half that would catch a
+    /// regression to `.and_then(Value::as_str).unwrap_or_default()`.
+    #[test]
+    fn abandon_rejects_a_non_string_reason() {
+        for reason in [json!(42), json!(true), json!(["a"]), json!({"text": "x"})] {
+            let app = test_app();
+            let sid = start_session(&app);
+            drive_to_implement(&app, &sid);
+            age_session(&app, &sid, crate::collab::COLLAB_DEAD_SESSION_SECS + 60);
+
+            let mut args = end_args(&sid, "claude");
+            args["abandon"] = json!(true);
+            args["reason"] = reason.clone();
+            let err = handle_collab_end(&app, &args).unwrap_err();
+
+            let message = err.to_string();
+            assert!(
+                message.contains("`reason` must be a string"),
+                "reason {reason} must be refused as a type error: {message}"
+            );
+            assert!(
+                !message.contains("non-blank"),
+                "a wrongly-typed reason must not be reported as a blank one: {message}"
+            );
+            assert!(
+                app.db
+                    .collab_load_session_record(&sid)
+                    .unwrap()
+                    .ended_at
+                    .is_none(),
+                "a wrongly-typed reason must not end the session"
+            );
+        }
+    }
+
+    /// The type check runs before the pairing check, so a wrongly-typed
+    /// `reason` is named as such even without `abandon: true`. Both refusals
+    /// are correct for that input; this pins which one the caller gets.
+    #[test]
+    fn a_non_string_reason_is_a_type_error_even_without_abandon() {
+        let app = test_app();
+        let sid = start_session(&app);
+        drive_to_plan_locked(&app, &sid);
+
+        let mut args = end_args(&sid, "claude");
+        args["reason"] = json!(42);
+        let err = handle_collab_end(&app, &args).unwrap_err();
+
+        assert!(
+            err.to_string().contains("`reason` must be a string"),
+            "type errors outrank the abandon-pairing refusal: {err}"
+        );
+    }
+
+    /// Abandoning a `CodingFailed` session replaces its diagnostic rather than
+    /// appending to it, because `classify` dispatches on the *prefix*: leaving
+    /// the recoverable `git_commit_failed:` in front would classify the sealed
+    /// session `Tooling` and leave it resumable. This pins both halves — the
+    /// old text is gone, and the result is Terminal.
+    #[test]
+    fn abandoning_a_failed_session_replaces_its_diagnostic_with_the_epitaph() {
+        let app = test_app();
+        let sid = start_session(&app);
+        drive_to_tooling_coding_failed(&app, &sid);
+
+        let before = app.db.collab_load_session_record(&sid).unwrap().session;
+        assert_eq!(before.phase, Phase::CodingFailed);
+        let displaced = before
+            .coding_failure
+            .clone()
+            .expect("a failed session must carry a diagnostic to displace");
+        assert!(
+            displaced.starts_with("git_commit_failed:"),
+            "fixture must leave a recoverable-prefixed diagnostic: {displaced}"
+        );
+
+        age_session(&app, &sid, crate::collab::COLLAB_DEAD_SESSION_SECS + 60);
+        handle_collab_end(
+            &app,
+            &abandon_args(&sid, "claude", "gave up on the tooling"),
+        )
+        .unwrap();
+
+        let after = app.db.collab_load_session_record(&sid).unwrap().session;
+        assert_eq!(
+            after.coding_failure.as_deref(),
+            Some("abandoned: gave up on the tooling"),
+            "the epitaph must replace the prior diagnostic, not wrap it"
+        );
+        assert_eq!(
+            crate::collab::classify(after.coding_failure.as_deref().unwrap()),
+            crate::collab::FailureClass::Terminal,
+            "the seal depends on `abandoned:` being the leading prefix"
+        );
     }
 
     /// Parsed strictly rather than with `as_bool().unwrap_or(false)`: a caller
