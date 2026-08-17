@@ -119,10 +119,27 @@ pub const MAX_ABANDON_REASON_BYTES: usize = MAX_CODING_FAILURE_BYTES - ABANDONED
 pub const COLLAB_DEAD_SESSION_SECS: i64 = 21_600;
 
 /// Seconds since the session's newest activity, or `None` when there is no
-/// signal at all (missing session row, or an unparseable timestamp).
+/// signal at all — i.e. the session row does not exist
+/// ([`queue::session_last_activity`] returns `None` for that case, and
+/// nothing else does).
 ///
 /// May be negative if the server clock moved backwards between the write and
 /// this read; [`session_is_dead`] treats that as live.
+///
+/// **A malformed timestamp does not produce `None` here.** SQLite's
+/// `strftime('%s', ...)` returns NULL for an unparseable value, but
+/// [`queue::session_last_activity`]'s mandated `coalesce(..., 0)` around every
+/// term turns that NULL into `0` before it ever reaches `max()` — so a
+/// corrupt `collab_sessions.updated_at` reads as epoch 0, not as a missing
+/// signal, and this function returns `Some(huge_number)`, comfortably over
+/// [`COLLAB_DEAD_SESSION_SECS`]. The practical effect: a session whose *only*
+/// activity source is a corrupt timestamp reads dead **without** going
+/// through `session_is_dead`'s `None` arm, so its `tracing::warn` never
+/// fires — the corruption is silent. This is narrow in practice:
+/// `collab_sessions.updated_at` is only ever written by `datetime('now')`, so
+/// reaching this case requires direct DB corruption, and a session with any
+/// live message or checkpoint still reads live off those terms regardless of
+/// what the session row's timestamp says.
 pub fn idle_secs(last_activity: Option<i64>, now: i64) -> Option<i64> {
     last_activity.map(|last| now - last)
 }
