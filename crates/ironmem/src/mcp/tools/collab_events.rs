@@ -1,16 +1,21 @@
 use serde_json::Value;
 
-use crate::collab::{validate_task_list_body, CollabEvent, Phase};
+use crate::collab::{
+    validate_task_list_body, CollabEvent, Phase, MAX_CODING_FAILURE_CHARS as DB_CHECK_CHARS,
+};
 use crate::error::MemoryError;
 
 use super::shared::sha256_hex;
 
-/// Maximum length (chars) for `coding_failure` on a failure_report. Matches
-/// the CHECK constraint in migration 005 so the DB and MCP layer agree. The
-/// outer `content` cap (MAX_COLLAB_CONTENT_CHARS) is larger — this per-field
-/// cap prevents a caller from filling the whole content budget with one
-/// unbounded string.
-const MAX_CODING_FAILURE_CHARS: usize = 2048;
+/// Maximum length (chars) for `coding_failure` on a failure_report. Derived
+/// from [`crate::collab::MAX_CODING_FAILURE_CHARS`] — the single place that
+/// number is defined — rather than restated, so the DB CHECK, the abandon
+/// path's byte cap, and this MCP-layer char cap cannot drift apart. The outer
+/// `content` cap (`MAX_COLLAB_CONTENT_CHARS`) is larger — this per-field cap
+/// prevents a caller from filling the whole content budget with one
+/// unbounded string. Still measured with `.chars().count()` below, matching
+/// SQLite's character-counted `length()` — do not switch this path to bytes.
+const MAX_CODING_FAILURE_CHARS: usize = DB_CHECK_CHARS;
 
 /// Maximum length (chars) for `pr_url` on a final_review event. Matches the
 /// CHECK constraint in migration 005.

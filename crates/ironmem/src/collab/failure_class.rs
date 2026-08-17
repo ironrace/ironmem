@@ -112,6 +112,20 @@ mod tests {
         assert_eq!(classify(&failure), FailureClass::Terminal);
     }
 
+    /// Pins the invariant `ABANDONED_PREFIX`'s doc claims but does not
+    /// enforce: it is not in `RECOVERABLE_FAILURE_PREFIXES`, so it classifies
+    /// Terminal by the unrecognized-string rule, which is what makes
+    /// `collab_end { "abandon": true }` irreversible. A future edit that adds
+    /// `ABANDONED_PREFIX` to the recoverable set would make abandon resumable
+    /// and silently defeat the whole gate; this test is what breaks first.
+    #[test]
+    fn abandoned_prefix_classifies_terminal() {
+        assert_eq!(
+            classify(&format!("{} x", crate::collab::ABANDONED_PREFIX)),
+            FailureClass::Terminal
+        );
+    }
+
     #[test]
     fn subagent_failure_classifies_terminal() {
         assert_eq!(

@@ -78,34 +78,43 @@ pub(crate) use task_list::{
 pub const MAX_TASKS_PER_COLLAB_ISSUE: u32 = 15;
 
 /// The `coding_failure` column's hard bound, mirrored from
-/// `migrations/005_collab_v2.sql:26-27` (`CHECK (length(coding_failure) <= 2048)`).
-/// Named here so the application-layer cap below is derived from the DB
-/// constraint rather than restated next to it.
-pub const MAX_CODING_FAILURE_BYTES: usize = 2048;
+/// `migrations/005_collab_v2.sql:26-27`:
+/// `CHECK (coding_failure IS NULL OR length(coding_failure) <= 2048)`.
+///
+/// **Characters, not bytes.** SQLite's `length()` on a TEXT value counts
+/// characters, so this bound and the CHECK it mirrors are both
+/// character-counted. Two callers derive from this single `2048` rather than
+/// each restating it:
+///
+/// * [`crate::mcp::tools::collab_events::parse_failure_report_event`]
+///   enforces it with `.chars().count()` — the correct measurement for a
+///   character-counted CHECK — and that measurement is unchanged by this
+///   constant's existence; do not switch it to bytes.
+/// * [`MAX_ABANDON_REASON_BYTES`] below derives a *byte*-counted cap from
+///   this same number — see its doc for why that unit mismatch is
+///   deliberate and still safe.
+pub const MAX_CODING_FAILURE_CHARS: usize = 2048;
 
-/// Prefix on `coding_failure` that marks a session an operator abandoned via
-/// `collab_end { "abandon": true }`.
+/// The largest `reason` an abandon may carry, in **bytes** — deliberately a
+/// different unit from [`MAX_CODING_FAILURE_CHARS`], which this is derived
+/// from.
 ///
-/// **Deliberately absent from [`RECOVERABLE_FAILURE_PREFIXES`].**
-/// [`failure_class::classify`] therefore returns
-/// [`failure_class::FailureClass::Terminal`] for it by the unrecognized-string
-/// rule, which is exactly the intent: an abandoned session is sealed, and
-/// nothing — `collab_resume` least of all — may resurrect it. Adding it to the
-/// recoverable set would make abandon reversible and defeat the whole gate.
-///
-/// It is also **not** in [`OFF_TURN_FAILURE_PREFIXES`]: it never arrives as a
-/// `failure_report` at all. It is written directly by `handle_collab_end`'s
-/// abandon arm, so the off-turn admissibility question does not apply to it.
-pub const ABANDONED_PREFIX: &str = "abandoned:";
-
-/// The largest `reason` an abandon may carry, in bytes.
-///
-/// Exact, not "well under": the stored value is
-/// `ABANDONED_PREFIX + " " + reason`, so the reason's ceiling is the column's
-/// ceiling minus the prefix and the one-byte separator. Byte semantics match
-/// [`crate::sanitize::sanitize_content`], which also measures `str::len()`, so
-/// a reason this cap admits can never be the thing that trips the DB `CHECK`.
-pub const MAX_ABANDON_REASON_BYTES: usize = MAX_CODING_FAILURE_BYTES - ABANDONED_PREFIX.len() - 1;
+/// The DB CHECK and [`crate::mcp::tools::collab_events::parse_failure_report_event`]
+/// both measure `coding_failure` in *characters* (`.chars().count()`, matching
+/// SQLite's character-counted `length()`). This cap measures the `reason`
+/// half of that string in *bytes* instead, via
+/// [`crate::sanitize::sanitize_content`], which measures `str::len()`. That is
+/// the conservative side: a UTF-8 string's byte count is always `>=` its char
+/// count, so `bytes(reason) <= MAX_ABANDON_REASON_BYTES` implies
+/// `chars(reason) <= MAX_ABANDON_REASON_BYTES` too. The stored value is
+/// `ABANDONED_PREFIX + " " + reason`, and `ABANDONED_PREFIX` and the
+/// separator are pure ASCII (byte count == char count for both), so
+/// `chars(stored) = chars(reason) + 11 <= MAX_ABANDON_REASON_BYTES + 11 ==
+/// MAX_CODING_FAILURE_CHARS` — a reason this cap admits can never be the
+/// thing that trips the DB `CHECK`, exactly at the boundary as well as under
+/// it. See `queue::tests::max_length_abandon_reason_clears_the_coding_failure_check`
+/// for the exact-boundary case exercised against the real DB.
+pub const MAX_ABANDON_REASON_BYTES: usize = MAX_CODING_FAILURE_CHARS - ABANDONED_PREFIX.len() - 1;
 
 /// How long a collab session must show no activity before `collab_end`'s
 /// abandon arm will end it: six hours.
@@ -126,6 +135,21 @@ pub const COLLAB_DEAD_SESSION_SECS: i64 = 21_600;
 /// May be negative if the server clock moved backwards between the write and
 /// this read; [`session_is_dead`] treats that as live.
 ///
+/// Uses `saturating_sub`, not plain subtraction. `collab_checkpoints.updated_at`
+/// is `INTEGER NOT NULL` with no range `CHECK`, so a hand-repaired row could in
+/// principle hold `i64::MIN`; `now - i64::MIN` overflows `i64::MAX`, which
+/// panics under debug assertions and wraps under release ones. Wrapping is the
+/// dangerous direction here: two's-complement wraparound turns that overflow
+/// into a large *negative* result, which reads as a session whose activity is
+/// far in the future — live, on data that is actually nonsense. `saturating_sub`
+/// removes both failure modes at once: it cannot panic, and it clamps toward
+/// `i64::MAX` instead of wrapping past it, so pathologically-ancient input
+/// reads as maximally idle (dead) rather than accidentally masquerading as
+/// live. That is the correct classification for `i64::MIN` on its own
+/// merits, not merely the safe fallback — there is no legitimate story in
+/// which a session's true newest activity is the smallest representable
+/// integer.
+///
 /// **A malformed timestamp does not produce `None` here.** SQLite's
 /// `strftime('%s', ...)` returns NULL for an unparseable value, but
 /// [`queue::session_last_activity`]'s mandated `coalesce(..., 0)` around every
@@ -141,7 +165,7 @@ pub const COLLAB_DEAD_SESSION_SECS: i64 = 21_600;
 /// live message or checkpoint still reads live off those terms regardless of
 /// what the session row's timestamp says.
 pub fn idle_secs(last_activity: Option<i64>, now: i64) -> Option<i64> {
-    last_activity.map(|last| now - last)
+    last_activity.map(|last| now.saturating_sub(last))
 }
 
 /// Whether a session has been silent long enough to be abandoned.
@@ -153,11 +177,25 @@ pub fn idle_secs(last_activity: Option<i64>, now: i64) -> Option<i64> {
 ///
 /// **A missing signal counts as dead**, and fires a `tracing::warn` so the
 /// degrade is observable rather than silent (repo convention:
-/// `mcp/tools/collab_session.rs:1801`). This direction is safe because the
-/// caller has already established the session row exists — `ensure_active`
-/// runs first on the abandon path — so `None` here means the activity query
-/// itself degraded, and refusing to abandon on a degraded read would recreate
-/// the wedge this feature exists to clear.
+/// `mcp/tools/collab_session.rs:1801`). `None` here does not mean the
+/// activity query degraded — a degraded query returns `Err`, which the
+/// caller propagates, never reaching this function at all.
+/// [`queue::session_last_activity`] returns `Ok(None)` for exactly one
+/// reason: the session row itself is gone. The only way to reach this arm on
+/// the abandon path, where `ensure_active` establishes the row exists first,
+/// is a delete racing in between that read and this one — the row vanishing
+/// mid-flight, not a read that failed.
+///
+/// This direction is safe regardless: refusing to abandon on a row that no
+/// longer exists would recreate the wedge this feature exists to clear, and
+/// there is no session left to wrongly end. Once Task 2 wires this check to
+/// run inside the same write transaction as the state change it authorizes
+/// (D6), the race disappears entirely — `ensure_active` and
+/// `session_last_activity` observe the same snapshot, so the row cannot
+/// vanish between them, and this `None` arm becomes effectively unreachable
+/// in practice. It stays here as the correct handling for the case, not as
+/// dead code: the fail-safe direction (dead, loudly) is right even if the
+/// case that reaches it becomes vanishingly rare.
 pub fn session_is_dead(session_id: &str, last_activity: Option<i64>, now: i64) -> bool {
     match idle_secs(last_activity, now) {
         Some(idle) => idle >= COLLAB_DEAD_SESSION_SECS,
@@ -170,6 +208,22 @@ pub fn session_is_dead(session_id: &str, last_activity: Option<i64>, now: i64) -
         }
     }
 }
+
+/// Prefix on `coding_failure` that marks a session an operator abandoned via
+/// `collab_end { "abandon": true }`.
+///
+/// **Deliberately absent from [`RECOVERABLE_FAILURE_PREFIXES`].**
+/// [`failure_class::classify`] therefore returns
+/// [`failure_class::FailureClass::Terminal`] for it by the unrecognized-string
+/// rule, which is exactly the intent: an abandoned session is sealed, and
+/// nothing — `collab_resume` least of all — may resurrect it. Adding it to the
+/// recoverable set would make abandon reversible and defeat the whole gate.
+/// [`failure_class::tests::abandoned_prefix_classifies_terminal`] pins this.
+///
+/// It is also **not** in [`OFF_TURN_FAILURE_PREFIXES`]: it never arrives as a
+/// `failure_report` at all. It is written directly by `handle_collab_end`'s
+/// abandon arm, so the off-turn admissibility question does not apply to it.
+pub const ABANDONED_PREFIX: &str = "abandoned:";
 
 /// Prefix on `coding_failure` that marks a failure as "branch drift" — a
 /// mismatch the non-owner may detect via its own git ops.
@@ -470,5 +524,17 @@ mod dead_session_tests {
     fn a_future_timestamp_is_live() {
         assert!(!session_is_dead("s", Some(NOW + 60), NOW));
         assert_eq!(idle_secs(Some(NOW + 60), NOW), Some(-60));
+    }
+
+    /// A pathologically corrupt `last_activity` (the smallest representable
+    /// `i64`, reachable only via direct DB repair of `collab_checkpoints
+    /// .updated_at`, which carries no range CHECK) must not panic
+    /// `now - last`'s overflow, and — unlike the two's-complement wraparound
+    /// plain subtraction would produce in release builds — must not
+    /// misclassify the corruption as live either.
+    #[test]
+    fn i64_min_last_activity_does_not_panic_and_reads_dead() {
+        assert_eq!(idle_secs(Some(i64::MIN), NOW), Some(i64::MAX));
+        assert!(session_is_dead("s", Some(i64::MIN), NOW));
     }
 }

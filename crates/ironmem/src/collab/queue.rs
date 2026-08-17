@@ -233,12 +233,25 @@ pub fn db_now_epoch_secs(conn: &Connection) -> Result<i64, MemoryError> {
 /// live batch dead. Messages are the third source because a planning phase
 /// advances through `collab_send`, which writes a `messages` row.
 ///
-/// Enumerated against the phases at `4d1249c`: every phase advances through
-/// `apply_event` → `save_session` (session row), the coding phases additionally
-/// write `collab_checkpoints`, and every phase's normal traffic writes
-/// `messages`. No phase writes none of the three for six hours in normal
-/// operation. If that ever changes, [`super::COLLAB_DEAD_SESSION_SECS`] is what
-/// needs raising, not this signal.
+/// Enumerated against the phases at `4d1249c`: every *agent-driven* phase
+/// advances through `apply_event` → `save_session` (session row), the coding
+/// phases additionally write `collab_checkpoints`, and every phase's normal
+/// traffic writes `messages`. No agent-driven phase writes none of the three
+/// for six hours in normal operation. If that ever changes,
+/// [`super::COLLAB_DEAD_SESSION_SECS`] is what needs raising, not this signal.
+///
+/// **This claim does not extend to the two human-gated phases.**
+/// `PlanLocked` (waiting on the pilot's `task_list` send) and
+/// `CodingComplete` (terminal, waiting on operator attestation) can sit
+/// perfectly live with zero writes to any of the three sources for far longer
+/// than six hours while an operator is simply away — nothing is wedged, a
+/// human just hasn't acted yet. That is harmless for *this* feature's abandon
+/// gate: abandon is operator-invoked (`collab_end { "abandon": true }`), and
+/// nobody abandons their own paused session out from under themselves. But
+/// [`super::COLLAB_DEAD_SESSION_SECS`] is also earmarked for #298's lease
+/// recovery, which may act *without* an operator in the loop — #298 must
+/// treat `PlanLocked` and `CodingComplete` as a case this signal cannot
+/// distinguish from genuinely wedged, not reuse this claim as-is.
 ///
 /// # Why the CASTs and the coalesces are load-bearing
 ///
@@ -250,7 +263,10 @@ pub fn db_now_epoch_secs(conn: &Connection) -> Result<i64, MemoryError> {
 /// uncast TEXT term would win every comparison regardless of its value — the
 /// same `max()` also returns NULL if *any* argument is NULL, which a session
 /// with no messages and no checkpoint would hit. Hence one `CAST(... AS
-/// INTEGER)` and one `coalesce(..., 0)` per term.
+/// INTEGER)` and one `coalesce(..., 0)` per term — including the already-INTEGER
+/// checkpoint term: it relies on column affinity today rather than a stray
+/// TEXT write making the rule "one CAST per term" merely true-by-affinity
+/// instead of true by construction.
 ///
 /// `strftime('%s', ...)` rather than `unixepoch(...)`: it is the convention
 /// already used by [`upsert_checkpoint`], and the explicit CAST around it is
@@ -267,7 +283,7 @@ pub fn session_last_activity(
     conn.query_row(
         "SELECT max(
                     coalesce(CAST(strftime('%s', s.updated_at) AS INTEGER), 0),
-                    coalesce(c.updated_at, 0),
+                    coalesce(CAST(c.updated_at AS INTEGER), 0),
                     coalesce(
                         (SELECT max(CAST(strftime('%s', m.created_at) AS INTEGER))
                            FROM messages m
@@ -3168,6 +3184,26 @@ mod tests {
             "a newer message must win; got {with_message}"
         );
 
+        // A second, newer message must win over the first. With only one
+        // message row (the assertion above), the inner subquery's `max(...)`
+        // and a mutated `min(...)` agree — both return the sole row's
+        // timestamp — so that assertion alone cannot catch the aggregate
+        // being flipped. A second, more recent row is what forces `max` and
+        // `min` to disagree, and `min` is the dangerous direction: it would
+        // move the signal *older*, which is the false-positive direction
+        // that ends a live session.
+        db.execute(
+            "INSERT INTO messages (id, session_id, sender, receiver, topic, content, created_at)
+             VALUES ('m2', 's1', 'claude', 'codex', 'draft', 'y', datetime('now', '-10 minutes'))",
+            [],
+        )
+        .unwrap();
+        let with_newer_message = session_last_activity(&db, "s1").unwrap().unwrap();
+        assert!(
+            (now - with_newer_message - 600).abs() <= 5,
+            "the newest of several messages must win, not the oldest; got {with_newer_message}"
+        );
+
         // A newer INTEGER checkpoint must win over both TEXT columns. This is
         // the assertion that fails if the query lets SQLite compare storage
         // classes: TEXT sorts above INTEGER, so an uncast term always wins.
@@ -3214,5 +3250,74 @@ mod tests {
     fn session_last_activity_is_none_for_a_missing_session() {
         let db = open();
         assert_eq!(session_last_activity(&db, "nope").unwrap(), None);
+    }
+
+    /// Complements `session_whose_only_recent_write_is_a_checkpoint_reads_live`:
+    /// every DB-level test so far has asserted *live*. This drives all three
+    /// sources stale through the real database and asserts the other side —
+    /// `session_is_dead` returning `true`.
+    #[test]
+    fn session_with_all_sources_stale_reads_dead() {
+        let db = open();
+        db.execute(
+            "INSERT INTO collab_sessions (id, repo_path, branch, updated_at)
+             VALUES ('s3', '/repo', 'main', datetime('now', '-2 days'))",
+            [],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO messages (id, session_id, sender, receiver, topic, content, created_at)
+             VALUES ('m3', 's3', 'claude', 'codex', 'draft', 'x', datetime('now', '-2 days'))",
+            [],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO collab_checkpoints (session_id, status, head_sha, updated_at)
+             VALUES ('s3', 'started', 'abc', strftime('%s', datetime('now', '-2 days')))",
+            [],
+        )
+        .unwrap();
+        let now = db_now_epoch_secs(&db).unwrap();
+        let last = session_last_activity(&db, "s3").unwrap();
+        assert!(
+            crate::collab::session_is_dead("s3", last, now),
+            "all three sources two days stale must read dead"
+        );
+    }
+
+    /// Pins that a maximal abandon reason —
+    /// `ABANDONED_PREFIX + " " + "x".repeat(MAX_ABANDON_REASON_BYTES)` —
+    /// actually clears migration 005's `length(coding_failure) <= 2048` CHECK
+    /// against the real database, rather than merely appearing to by
+    /// arithmetic. `save_session` returning `Ok` here is the proof: if
+    /// `MAX_ABANDON_REASON_BYTES`'s derivation ever drifted from the CHECK's
+    /// bound, this would be a rusqlite `Error` (CHECK constraint failed), not
+    /// a silently truncated write.
+    #[test]
+    fn max_length_abandon_reason_clears_the_coding_failure_check() {
+        let db = open();
+        create_session(
+            &db,
+            "sess-abandon",
+            "/repo",
+            "main",
+            None,
+            CollabRoles {
+                pilot: Agent::Claude,
+                implementer: Agent::Claude,
+            },
+        )
+        .unwrap();
+        let mut session = load_session(&db, "sess-abandon").unwrap();
+        let reason = "x".repeat(crate::collab::MAX_ABANDON_REASON_BYTES);
+        let stored = format!("{} {reason}", crate::collab::ABANDONED_PREFIX);
+        session.coding_failure = Some(stored.clone());
+        save_session(&db, &session).unwrap();
+
+        let record = load_session_record(&db, "sess-abandon").unwrap();
+        assert_eq!(
+            record.session.coding_failure.as_deref(),
+            Some(stored.as_str())
+        );
     }
 }
