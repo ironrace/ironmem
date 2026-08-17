@@ -77,6 +77,83 @@ pub(crate) use task_list::{
 /// planning is approved.
 pub const MAX_TASKS_PER_COLLAB_ISSUE: u32 = 15;
 
+/// The `coding_failure` column's hard bound, mirrored from
+/// `migrations/005_collab_v2.sql:26-27` (`CHECK (length(coding_failure) <= 2048)`).
+/// Named here so the application-layer cap below is derived from the DB
+/// constraint rather than restated next to it.
+pub const MAX_CODING_FAILURE_BYTES: usize = 2048;
+
+/// Prefix on `coding_failure` that marks a session an operator abandoned via
+/// `collab_end { "abandon": true }`.
+///
+/// **Deliberately absent from [`RECOVERABLE_FAILURE_PREFIXES`].**
+/// [`failure_class::classify`] therefore returns
+/// [`failure_class::FailureClass::Terminal`] for it by the unrecognized-string
+/// rule, which is exactly the intent: an abandoned session is sealed, and
+/// nothing — `collab_resume` least of all — may resurrect it. Adding it to the
+/// recoverable set would make abandon reversible and defeat the whole gate.
+///
+/// It is also **not** in [`OFF_TURN_FAILURE_PREFIXES`]: it never arrives as a
+/// `failure_report` at all. It is written directly by `handle_collab_end`'s
+/// abandon arm, so the off-turn admissibility question does not apply to it.
+pub const ABANDONED_PREFIX: &str = "abandoned:";
+
+/// The largest `reason` an abandon may carry, in bytes.
+///
+/// Exact, not "well under": the stored value is
+/// `ABANDONED_PREFIX + " " + reason`, so the reason's ceiling is the column's
+/// ceiling minus the prefix and the one-byte separator. Byte semantics match
+/// [`crate::sanitize::sanitize_content`], which also measures `str::len()`, so
+/// a reason this cap admits can never be the thing that trips the DB `CHECK`.
+pub const MAX_ABANDON_REASON_BYTES: usize = MAX_CODING_FAILURE_BYTES - ABANDONED_PREFIX.len() - 1;
+
+/// How long a collab session must show no activity before `collab_end`'s
+/// abandon arm will end it: six hours.
+///
+/// Deliberately generous (D2). The false positive — ending a session that is
+/// merely slow — is destructive and unrecoverable; the false negative costs
+/// only a wait. The field case in #283 had been wedged for three days.
+///
+/// One constant serves both abandon here and lease recovery in #298; do not
+/// fork a second threshold for that.
+pub const COLLAB_DEAD_SESSION_SECS: i64 = 21_600;
+
+/// Seconds since the session's newest activity, or `None` when there is no
+/// signal at all (missing session row, or an unparseable timestamp).
+///
+/// May be negative if the server clock moved backwards between the write and
+/// this read; [`session_is_dead`] treats that as live.
+pub fn idle_secs(last_activity: Option<i64>, now: i64) -> Option<i64> {
+    last_activity.map(|last| now - last)
+}
+
+/// Whether a session has been silent long enough to be abandoned.
+///
+/// The signal is [`queue::session_last_activity`] — the newest of
+/// `collab_sessions.updated_at`, `collab_checkpoints.updated_at`, and the
+/// session's newest `messages.created_at`. See that function for why all three
+/// are needed and why no migration was required.
+///
+/// **A missing signal counts as dead**, and fires a `tracing::warn` so the
+/// degrade is observable rather than silent (repo convention:
+/// `mcp/tools/collab_session.rs:1801`). This direction is safe because the
+/// caller has already established the session row exists — `ensure_active`
+/// runs first on the abandon path — so `None` here means the activity query
+/// itself degraded, and refusing to abandon on a degraded read would recreate
+/// the wedge this feature exists to clear.
+pub fn session_is_dead(session_id: &str, last_activity: Option<i64>, now: i64) -> bool {
+    match idle_secs(last_activity, now) {
+        Some(idle) => idle >= COLLAB_DEAD_SESSION_SECS,
+        None => {
+            tracing::warn!(
+                session_id = %session_id,
+                "collab: no liveness signal for session; treating it as dead for abandon"
+            );
+            true
+        }
+    }
+}
+
 /// Prefix on `coding_failure` that marks a failure as "branch drift" — a
 /// mismatch the non-owner may detect via its own git ops.
 pub const BRANCH_DRIFT_PREFIX: &str = "branch_drift:";
@@ -340,3 +417,41 @@ pub const RECOVERABLE_FAILURE_PREFIXES: &[&str] = &[
     CODEX_DISPATCH_FAILED_PREFIX,
     CHECKPOINT_DRIFT_PREFIX,
 ];
+
+#[cfg(test)]
+mod dead_session_tests {
+    use super::{idle_secs, session_is_dead, COLLAB_DEAD_SESSION_SECS};
+
+    const NOW: i64 = 1_800_000_000;
+
+    #[test]
+    fn a_missing_signal_is_dead() {
+        assert!(session_is_dead("s", None, NOW));
+        assert_eq!(idle_secs(None, NOW), None);
+    }
+
+    #[test]
+    fn boundary_is_inclusive_at_the_threshold() {
+        let at = NOW - COLLAB_DEAD_SESSION_SECS;
+        assert!(
+            session_is_dead("s", Some(at), NOW),
+            "exactly at the threshold is dead"
+        );
+        assert!(
+            !session_is_dead("s", Some(at + 1), NOW),
+            "one second under the threshold is live"
+        );
+        assert!(
+            session_is_dead("s", Some(at - 1), NOW),
+            "one second over the threshold is dead"
+        );
+    }
+
+    /// A clock that moved backwards must fail safe toward "live" — the false
+    /// positive (ending a live session) is the destructive one (D2).
+    #[test]
+    fn a_future_timestamp_is_live() {
+        assert!(!session_is_dead("s", Some(NOW + 60), NOW));
+        assert_eq!(idle_secs(Some(NOW + 60), NOW), Some(-60));
+    }
+}

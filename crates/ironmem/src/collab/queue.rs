@@ -208,6 +208,84 @@ pub fn ensure_active(conn: &Connection, session_id: &str) -> Result<(), MemoryEr
     Ok(())
 }
 
+/// The database's current time in Unix epoch seconds.
+///
+/// Read from the same connection as [`session_last_activity`] on purpose: both
+/// halves of the staleness comparison then come from one clock, so a skew
+/// between SQLite's `now` and the process clock cannot make a live session look
+/// dead.
+pub fn db_now_epoch_secs(conn: &Connection) -> Result<i64, MemoryError> {
+    conn.query_row("SELECT CAST(strftime('%s','now') AS INTEGER)", [], |row| {
+        row.get(0)
+    })
+    .map_err(MemoryError::from)
+}
+
+/// The newest activity timestamp for a session, in Unix epoch seconds, or
+/// `None` when the session row does not exist.
+///
+/// # Why three sources
+///
+/// `collab_sessions.updated_at` alone is insufficient. [`save_session`] does
+/// advance it (see its `updated_at = datetime('now')` clause), but a long
+/// `CodeImplementPending` batch turn files `collab_checkpoints` rows without
+/// touching the session row at all, so a session-row-only signal would call a
+/// live batch dead. Messages are the third source because a planning phase
+/// advances through `collab_send`, which writes a `messages` row.
+///
+/// Enumerated against the phases at `4d1249c`: every phase advances through
+/// `apply_event` → `save_session` (session row), the coding phases additionally
+/// write `collab_checkpoints`, and every phase's normal traffic writes
+/// `messages`. No phase writes none of the three for six hours in normal
+/// operation. If that ever changes, [`super::COLLAB_DEAD_SESSION_SECS`] is what
+/// needs raising, not this signal.
+///
+/// # Why the CASTs and the coalesces are load-bearing
+///
+/// The three columns are heterogeneous: `collab_sessions.updated_at` and
+/// `messages.created_at` are TEXT `datetime('now')` values, while
+/// `collab_checkpoints.updated_at` is INTEGER unix seconds (migration 020's one
+/// deliberate exception to the TEXT convention). SQLite's multi-argument
+/// `max()` compares by storage class and sorts TEXT *above* INTEGER, so an
+/// uncast TEXT term would win every comparison regardless of its value — the
+/// same `max()` also returns NULL if *any* argument is NULL, which a session
+/// with no messages and no checkpoint would hit. Hence one `CAST(... AS
+/// INTEGER)` and one `coalesce(..., 0)` per term.
+///
+/// `strftime('%s', ...)` rather than `unixepoch(...)`: it is the convention
+/// already used by [`upsert_checkpoint`], and the explicit CAST around it is
+/// what makes the comparison type-safe. No `REGEXP` anywhere — this SQLite
+/// build ships none.
+///
+/// Takes a `&Connection` so callers can pass their open write `Transaction`
+/// and evaluate staleness in the same transaction as the state change it
+/// authorizes (D6).
+pub fn session_last_activity(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Option<i64>, MemoryError> {
+    conn.query_row(
+        "SELECT max(
+                    coalesce(CAST(strftime('%s', s.updated_at) AS INTEGER), 0),
+                    coalesce(c.updated_at, 0),
+                    coalesce(
+                        (SELECT max(CAST(strftime('%s', m.created_at) AS INTEGER))
+                           FROM messages m
+                          WHERE m.session_id = s.id),
+                        0
+                    )
+                )
+           FROM collab_sessions s
+           LEFT JOIN collab_checkpoints c ON c.session_id = s.id
+          WHERE s.id = ?1",
+        params![session_id],
+        |row| row.get::<_, Option<i64>>(0),
+    )
+    .optional()
+    .map(Option::flatten)
+    .map_err(MemoryError::from)
+}
+
 /// Find the session that currently *reserves the start slot* for a
 /// `repo_path` + `branch`, if any, returning `(id, phase)`.
 ///
@@ -3055,5 +3133,86 @@ mod tests {
             load_current_checkpoint(&db, "s1").unwrap().is_none(),
             "a rolled-back transaction must leave no checkpoint"
         );
+    }
+
+    /// The three activity sources are heterogeneous — two TEXT
+    /// `datetime('now')` columns and one INTEGER unix-seconds column — so the
+    /// normalization is the thing under test, not the max.
+    #[test]
+    fn session_last_activity_normalizes_all_three_sources() {
+        let db = open();
+        db.execute(
+            "INSERT INTO collab_sessions (id, repo_path, branch, updated_at)
+             VALUES ('s1', '/repo', 'main', datetime('now', '-3 hours'))",
+            [],
+        )
+        .unwrap();
+        // Only source: the session row itself.
+        let now = db_now_epoch_secs(&db).unwrap();
+        let only_session = session_last_activity(&db, "s1").unwrap().unwrap();
+        assert!(
+            (now - only_session - 10_800).abs() <= 5,
+            "session updated_at must normalize to epoch seconds; got {only_session} against now {now}"
+        );
+
+        // A newer message must win over the older session row.
+        db.execute(
+            "INSERT INTO messages (id, session_id, sender, receiver, topic, content, created_at)
+             VALUES ('m1', 's1', 'claude', 'codex', 'draft', 'x', datetime('now', '-1 hours'))",
+            [],
+        )
+        .unwrap();
+        let with_message = session_last_activity(&db, "s1").unwrap().unwrap();
+        assert!(
+            (now - with_message - 3_600).abs() <= 5,
+            "a newer message must win; got {with_message}"
+        );
+
+        // A newer INTEGER checkpoint must win over both TEXT columns. This is
+        // the assertion that fails if the query lets SQLite compare storage
+        // classes: TEXT sorts above INTEGER, so an uncast term always wins.
+        db.execute(
+            "INSERT INTO collab_checkpoints
+                 (session_id, status, head_sha, updated_at)
+             VALUES ('s1', 'started', 'abc', strftime('%s','now'))",
+            [],
+        )
+        .unwrap();
+        let with_checkpoint = session_last_activity(&db, "s1").unwrap().unwrap();
+        assert!(
+            (now - with_checkpoint).abs() <= 5,
+            "the newest checkpoint must win over both TEXT columns; got {with_checkpoint}"
+        );
+    }
+
+    /// D1's load-bearing case: a long batch turn advances only the checkpoint
+    /// table, and must still read live.
+    #[test]
+    fn session_whose_only_recent_write_is_a_checkpoint_reads_live() {
+        let db = open();
+        db.execute(
+            "INSERT INTO collab_sessions (id, repo_path, branch, updated_at)
+             VALUES ('s2', '/repo', 'main', datetime('now', '-2 days'))",
+            [],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO collab_checkpoints (session_id, status, head_sha, updated_at)
+             VALUES ('s2', 'started', 'abc', strftime('%s','now'))",
+            [],
+        )
+        .unwrap();
+        let now = db_now_epoch_secs(&db).unwrap();
+        let last = session_last_activity(&db, "s2").unwrap();
+        assert!(
+            !crate::collab::session_is_dead("s2", last, now),
+            "a fresh checkpoint keeps a stale session row alive"
+        );
+    }
+
+    #[test]
+    fn session_last_activity_is_none_for_a_missing_session() {
+        let db = open();
+        assert_eq!(session_last_activity(&db, "nope").unwrap(), None);
     }
 }
