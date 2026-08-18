@@ -7,7 +7,7 @@
 
 ## Executive decision
 
-**Broader rollout: BLOCKED.** A pilot is **PERMITTED** only for public, synthetic, or demonstrably public-equivalent material in one disposable selected GitHub repository, subject to every mandatory control in this document. Private, internal, confidential, regulated, customer-data, production-connected, secret-bearing, signing, deployment, and infrastructure-administration repositories are **PROHIBITED**.
+**Broader rollout: BLOCKED.** A pilot is **PERMITTED** only for public or synthetic material in one disposable selected GitHub repository, subject to every mandatory control in this document. Private, internal, confidential, regulated, customer-data, production-connected, secret-bearing, signing, deployment, and infrastructure-administration repositories are **PROHIBITED**.
 
 This decision is an inference from a daemon whose agent has the authority of its OS user, cloud task/session/artifact flow, GitHub write permissions, non-subtractive default file copying, and unresolved vendor/model evidence. It is not an assertion that HumanLayer is unsafe in every context.
 
@@ -46,14 +46,15 @@ IronMem evidence is local and repository-relative: [local SQLite and shared stor
 ```mermaid
 flowchart LR
   subgraph H[Local pilot host]
-    P[Pilot owner / dedicated OS account]
+    P[Pilot owner]
+    CL[HumanLayer client / dedicated OS account]
     D[HumanLayer daemon + agent subprocess]
     W[Sanitized precreated worktree]
-    P -->|task/session commands| D
+    P -->|out-of-band approval| CL
     D -->|source, diffs, tool calls/results| W
   end
-  subgraph C[HumanLayer cloud]
-    API[API, task/session service, artifact sync]
+  subgraph C[HumanLayer cloud / authorization boundary]
+    API[Authorized API, task/session service, artifact sync]
   end
   subgraph G[GitHub]
     R[One disposable repository]
@@ -64,13 +65,19 @@ flowchart LR
   subgraph MP[Model provider]
     X[Selected provider account]
   end
-  D <-->|session events| API
+  subgraph AP[Anthropic optional LLM provider]
+    A[Anthropic account / endpoint]
+  end
+  CL -->|task/session commands and authentication| API
+  API -->|authorized task/session commands| D
+  D -->|session events| API
+  API -->|session status/events| CL
   D <-->|task artifact sync| API
   API <-->|issue/import/comment/PR traffic| R
   D <-->|agent prompts/source/tool results| X
   D <-->|MCP calls| M
   M <-->|local SQLite| M
-  M -. disabled optional IronMem-to-Anthropic path .-> X
+  M -. disabled optional IronMem-to-Anthropic path .-> A
 ```
 
 The host is the primary authority boundary. HumanLayer cloud, GitHub, IronMem’s local Unix-socket/SQLite boundary, and the selected model provider are distinct controllers/processors. Every arrow is a potential disclosure or command path; untrusted content does not become authority by crossing a boundary.
@@ -136,6 +143,7 @@ GitHub issues/comments, repository files, task artifacts, web results, tool outp
 |---|---|---|---|---|---|---|
 | HOST-01 | Daemon agent inherits OS-user file/network authority | Critical | Dedicated non-admin host/account, allowlist, canaries | Host operator | Host isolation limits but does not prove agent policy | Pilot-only |
 | HOST-02 | `setupCommand` executes shell code after copies | High | `disabled: true`; no local override; manual worktree | Host operator | Official config confirms `sh -c`; no automatic setup | BLOCKED otherwise |
+| HOST-03 | Additive default `.env`/workspace copy globs copy source files into a generated worktree | Critical | Shared `disabled: true`, no local override, and manual precreated sanitized worktree | Host operator | Official config says defaults append/deduplicate and cannot be subtracted | BLOCKED until subtractive control or independently verified equivalent containment |
 | CRED-01 | Inherited env, SSH, `gh`, cloud, or `.env` credentials leak | Critical | Clean account, `env -i`, name-only preflight, no personal auth | Host operator | Normal shell failed negative control | Pilot-only |
 | CRED-02 | HumanLayer launch/refresh token is stolen | High | Treat as credential; pilot-only storage, revoke/rotate | Vendor owner | Token-path fact, storage controls unknown | BLOCKED for broad use |
 | GH-01 | GitHub App content/issue/PR write scope is abused | High | One disposable repo; draft PR only; ruleset | GitHub administrator | Official requested scope is broad within repo | Pilot-only |
@@ -209,12 +217,14 @@ No box is pre-checked without captured evidence.
 
 - [ ] Pilot owner: repository classification and disposable-repo URL; evidence: ______
 - [ ] Host operator: clean non-admin account/host and name-only environment review; evidence: ______
+- [ ] Host operator: configured network allowlist applied and captured; evidence: ______
 - [ ] Host operator: `env -i` allowlist, no `.env`, SSH, personal GitHub/cloud auth; evidence: ______
 - [ ] GitHub administrator: one-repo permission capture and branch protection/ruleset; evidence: ______
 - [ ] Security reviewer: package pins/integrities and no update drift; evidence: ______
 - [ ] Model-provider administrator: account-class/data-control record and short-lived credential; evidence: ______
 - [ ] Host operator: `IRONMEM_DB_PATH`/`IRONMEM_DAEMON_SOCKET` isolated; rerank/preferences off; evidence: ______
 - [ ] Security reviewer: workspace shared disable/no local override/manual sanitized worktree; evidence: ______
+- [ ] Security reviewer: containment canaries completed and passed (out-of-workspace read/write, network egress, merge/deploy, and permission-broadening/approval behavior as applicable); evidence: ______
 
 ### Per-session
 
@@ -236,7 +246,7 @@ No box is pre-checked without captured evidence.
 
 | Classification | Decision | Conditions |
 |---|---|---|
-| Public, synthetic, or public-equivalent data in one disposable repo | PERMITTED | Every pilot checklist item, draft-only workflow, and canary passes. |
+| Public or synthetic data in one disposable repo | PERMITTED | Every pilot checklist item, draft-only workflow, and canary passes. |
 | Private/internal/confidential/customer/regulated | PROHIBITED | May change only after all critical vendor/provider/sandbox/incident gates have evidence and accountable approval. |
 | Production-connected, secret-bearing, signing, deployment, infrastructure administration | PROHIBITED | Requires separate security architecture and approved issue; this threat model cannot approve it. |
 
