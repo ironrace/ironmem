@@ -5630,17 +5630,28 @@ mod tests {
         // a phase name attached, not just a length mismatch: the four
         // `is_coding_active()` coding phases (#283's acceptance) plus the
         // three planning phases plain `collab_end` refuses today.
+        //
+        // Compared as sorted-by-name views, not as `Vec`s in `PHASE_ENDABILITY`
+        // order: `Phase`'s own doc comment says declaration order is
+        // "otherwise cosmetic" and explicitly flags two variants as "legacy
+        // order, not transition order" — i.e. it invites a future reorder. An
+        // order-sensitive `assert_eq!` here would fail a pure reorder with
+        // "the set... changed", which is false — nothing about *which*
+        // phases need abandon coverage would have moved.
+        let mut sorted_phases = phases.clone();
+        sorted_phases.sort_by_key(|p| p.to_string());
+        let mut expected = vec![
+            Phase::PlanParallelDrafts,
+            Phase::PlanSynthesisPending,
+            Phase::PlanCopilotReviewPending,
+            Phase::CodeImplementPending,
+            Phase::CodeReviewLocalPending,
+            Phase::CodeReviewFixGlobalPending,
+            Phase::CodeReviewFinalPending,
+        ];
+        expected.sort_by_key(|p| p.to_string());
         assert_eq!(
-            phases,
-            vec![
-                Phase::PlanParallelDrafts,
-                Phase::PlanSynthesisPending,
-                Phase::PlanCopilotReviewPending,
-                Phase::CodeImplementPending,
-                Phase::CodeReviewLocalPending,
-                Phase::CodeReviewFixGlobalPending,
-                Phase::CodeReviewFinalPending,
-            ],
+            sorted_phases, expected,
             "the set of phases plain collab_end refuses changed; update this test's coverage"
         );
         assert_eq!(
@@ -5707,7 +5718,7 @@ mod tests {
                 crate::collab::load_or_init_actor_generation(tx, &sid, Agent::Claude)?;
                 tx.execute(
                     "UPDATE collab_actor_generations SET generation = generation + 5 \
-                     WHERE session_id = ?1",
+                     WHERE session_id = ?1 AND agent = 'claude'",
                     rusqlite::params![sid],
                 )?;
                 Ok(())
