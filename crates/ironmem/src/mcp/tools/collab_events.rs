@@ -151,14 +151,19 @@ pub(super) fn parse_failure_report_event(content: &str) -> Result<CollabEvent, M
             )
         })?
         .to_string();
-    // `abandoned:` is reserved for `collab_end`'s abandon arm, which is an
-    // *operator* decision. Every later reader — `queue::ensure_active`'s seal
-    // echo, `collab_status`, an audit of the `coding_failure` column —
-    // identifies that decision by this prefix and nothing else, so an agent
-    // able to file the same prefix through `failure_report` could mint a row
-    // indistinguishable from a real abandon. Reserving it here is what makes
-    // "an `abandoned:` row is an operator's own words" an enforced property
-    // rather than a convention.
+    // `abandoned:` is reserved for `collab_end`'s abandon arm. Every later
+    // reader — `queue::ensure_active`'s seal echo, `collab_status`, an audit of
+    // the `coding_failure` column — identifies an abandonment by this prefix
+    // and nothing else, so an agent able to file the same prefix through
+    // `failure_report` could mint a row indistinguishable from a real one.
+    //
+    // What reserving it here buys is exactly one property: a row carrying this
+    // prefix was written by `handle_collab_abandon` and by no other code path.
+    // It does **not** make the row an operator's own words. `collab_end` has no
+    // operator authentication, is in `MUTATING_TOOLS`, and is on the
+    // unattended-successor permission allowlist, so the abandon and its reason
+    // text may equally have been composed by an agent. This bounds the door,
+    // not the hand — see `crate::collab::ABANDONED_PREFIX`.
     //
     // Checked on the caller's raw string, before compaction: compaction only
     // ever removes middle lines or truncates, so it can neither introduce this
@@ -173,9 +178,9 @@ pub(super) fn parse_failure_report_event(content: &str) -> Result<CollabEvent, M
     {
         return Err(MemoryError::Validation(format!(
             "failure_report coding_failure must not start with `{}` — that prefix is reserved for \
-             collab_end's abandon arm, which records an operator decision. Report the underlying \
-             failure instead; to abandon a demonstrably dead session, call collab_end with \
-             `abandon: true` and a `reason`.",
+             collab_end's abandon arm, which is the only code path permitted to write it. Report \
+             the underlying failure instead; to abandon a demonstrably dead session, call \
+             collab_end with `abandon: true` and a `reason`.",
             crate::collab::ABANDONED_PREFIX,
         )));
     }
@@ -584,12 +589,14 @@ mod tests {
         ));
     }
 
-    /// `abandoned:` marks an *operator* decision taken through `collab_end`'s
-    /// abandon arm, and every later reader — `ensure_active`'s seal echo,
-    /// `collab_status`, an audit of the `coding_failure` column — identifies it
-    /// by that prefix alone. An agent that could file the same prefix through
+    /// `abandoned:` marks a session ended through `collab_end`'s abandon arm,
+    /// and every later reader — `ensure_active`'s seal echo, `collab_status`,
+    /// an audit of the `coding_failure` column — identifies it by that prefix
+    /// alone. An agent that could file the same prefix through
     /// `failure_report` would produce a row indistinguishable from a real
     /// abandon, so the prefix is reserved rather than merely conventional.
+    /// (Reserved to that *code path* — not to a human: `collab_end` is itself
+    /// agent-callable. See `crate::collab::ABANDONED_PREFIX`.)
     ///
     /// The check trims first: a leading-whitespace variant would not match
     /// `starts_with` in those readers, but it renders identically to a human

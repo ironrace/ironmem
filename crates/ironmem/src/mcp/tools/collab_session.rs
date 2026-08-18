@@ -2846,6 +2846,32 @@ pub(super) fn handle_collab_wait_my_turn(app: &App, args: &Value) -> Result<Valu
     }
 }
 
+/// Characters an abandon `reason` may not contain.
+///
+/// The reason is echoed verbatim by `queue::ensure_active` in every later
+/// refusal for the session, which an agent reads as authoritative server
+/// output. The attribution framing around that echo only works if the reader
+/// can tell where the untrusted text starts and stops, so anything able to
+/// forge a line break or reorder the surrounding prose is refused.
+///
+/// [`char::is_control`] alone is **not** sufficient, which is the whole reason
+/// this is a named function rather than a closure: it covers the Cc block
+/// only, so U+2028 LINE SEPARATOR and U+2029 PARAGRAPH SEPARATOR pass it. Both
+/// are line terminators to JavaScript and to several terminals and log
+/// viewers, and `serde_json` does not escape them — so on the wire they are a
+/// real newline to the consumer even though Rust does not consider them
+/// control characters. The bidi overrides and isolates are refused for the
+/// adjacent reason: U+202E can visually reorder the `treat as data`
+/// attribution that precedes the echo, which defeats the framing without
+/// changing a byte of it.
+fn reason_char_is_forbidden(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{2028}' | '\u{2029}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+        )
+}
+
 /// The phases plain (non-abandon) `collab_end` admits.
 ///
 /// Single source of truth for two consumers that must never disagree: the
@@ -2941,11 +2967,11 @@ pub(super) fn handle_collab_end(app: &App, args: &Value) -> Result<Value, Memory
         // `sanitize_content`, which reports them as "content contains null
         // bytes" — naming neither `collab_end` nor `reason`, and so failing the
         // taxonomy every other refusal on this path keeps.
-        if let Some(bad) = raw.chars().find(|c| c.is_control()) {
+        if let Some(bad) = raw.chars().find(|c| reason_char_is_forbidden(*c)) {
             return Err(MemoryError::Validation(format!(
-                "collab_end `reason` must not contain control characters (found {bad:?}); it is \
-                 echoed verbatim in every later refusal for this session, so it has to stay a \
-                 single plain line",
+                "collab_end `reason` must not contain control, line-separator, or bidi-override \
+                 characters (found {bad:?}); it is echoed verbatim in every later refusal for \
+                 this session, so it has to stay a single plain left-to-right line",
             )));
         }
         // Runs after our own checks so the taxonomy above owns every message
@@ -3125,8 +3151,11 @@ pub(super) fn handle_collab_end(app: &App, args: &Value) -> Result<Value, Memory
 ///
 /// The `abandoned:` prefix this writes is reserved against caller input in
 /// [`super::collab_events::parse_failure_report_event`], so a row carrying it
-/// is always an operator decision taken here and never an agent's
-/// `failure_report` wearing the same costume.
+/// was written *here* and never by an agent's `failure_report` wearing the same
+/// costume. That is a statement about the code path only — `collab_end` has no
+/// operator authentication and is on the unattended-successor allowlist, so
+/// neither the abandon nor its `reason` is necessarily a human's. Everything
+/// downstream treats the reason as untrusted data accordingly.
 fn handle_collab_abandon(
     app: &App,
     session_id: &str,
@@ -3213,11 +3242,21 @@ fn handle_collab_abandon(
     // `abandoning_a_failed_session_does_not_overwrite_its_failed_outcome` pins
     // it here. The session is still sealed either way — this governs only what
     // the metrics row remembers about *why* it ended.
+    // `done_at` follows the plain path phase for phase rather than being
+    // stamped unconditionally. At `CodingComplete` the row already carries the
+    // timestamp `final_review` wrote when the PR was opened, and that is the
+    // moment the work actually finished; the plain end passes `None` there for
+    // exactly this reason. Abandoning such a session changes *why* it ended
+    // (`merged` never happened) but not *when* the work stopped, so only the
+    // outcome moves. Everywhere else — the coding-active phases and the two
+    // planning phases — there is no prior timestamp to preserve and the
+    // abandonment itself is the end.
     if crate::search::tunables::metrics_enabled() && ended_phase != Phase::CodingFailed {
         let now = crate::metrics::now_rfc3339();
-        if let Err(e) =
-            app.db
-                .mark_task_outcome_done(session_id, Some(&now), Some("abandoned"), None)
+        let done_at = (ended_phase != Phase::CodingComplete).then_some(now.as_str());
+        if let Err(e) = app
+            .db
+            .mark_task_outcome_done(session_id, done_at, Some("abandoned"), None)
         {
             tracing::warn!(session_id = %session_id, error = %e, "metrics: task_outcome abandon attestation failed");
         }
@@ -4526,6 +4565,16 @@ mod tests {
             "overwrite\rthe line",
             "null\u{0}byte",
             "vertical\u{b}tab",
+            // Not Cc, so `char::is_control()` alone lets these through — but
+            // JavaScript and several terminals treat U+2028/U+2029 as line
+            // terminators and `serde_json` does not escape them, so on the
+            // wire they are a real newline to the consumer.
+            "line\u{2028}separator",
+            "paragraph\u{2029}separator",
+            // U+202E can visually reorder the attribution that precedes the
+            // echo, defeating the framing without changing a byte of it.
+            "override\u{202e}reversed",
+            "isolate\u{2066}fragment",
         ];
         for reason in hostile {
             let app = test_app();
@@ -4536,7 +4585,7 @@ mod tests {
             let err = handle_collab_end(&app, &abandon_args(&sid, "claude", reason)).unwrap_err();
             let message = err.to_string();
             assert!(
-                message.contains("`reason` must not contain control characters"),
+                message.contains("must not contain control, line-separator, or bidi-override"),
                 "reason {reason:?} must be refused: {message}"
             );
             // The null-byte case must land in this taxonomy too, not in
@@ -4633,6 +4682,47 @@ mod tests {
                 .ended_at
                 .is_some(),
             "the session is still sealed; only the metrics row is left alone"
+        );
+    }
+
+    /// At `CodingComplete` the row already carries the `done_at` that
+    /// `final_review` wrote when the PR was opened — the moment the work
+    /// actually finished. Abandoning changes *why* the session ended, never
+    /// *when* the work stopped, so the outcome moves to `abandoned` and the
+    /// timestamp stays put. The plain path passes `None` for `done_at` in this
+    /// phase for the same reason; an unconditional `Some(now)` here would
+    /// silently drag the metric off the PR clock.
+    #[test]
+    fn abandoning_a_complete_session_keeps_the_pr_done_at() {
+        let _g = metrics_on_guard();
+        let (_temp, repo_path, heads) = git_ancestor_chain(5);
+        let app = test_app();
+        let sid = start_session_in_scope(&app, &repo_path, "main");
+        drive_to_coding_complete(&app, &sid, &heads);
+
+        let before = app.db.get_task_outcome(&sid).unwrap().unwrap();
+        let pr_done_at = before
+            .done_at
+            .clone()
+            .expect("CodingComplete must already carry the PR-open timestamp");
+
+        age_session(&app, &sid, crate::collab::COLLAB_DEAD_SESSION_SECS + 60);
+        handle_collab_end(
+            &app,
+            &abandon_args(&sid, "claude", "PR was closed unmerged"),
+        )
+        .unwrap();
+
+        let after = app.db.get_task_outcome(&sid).unwrap().unwrap();
+        assert_eq!(
+            after.outcome.as_deref(),
+            Some("abandoned"),
+            "the outcome must record that the session was abandoned, not merged"
+        );
+        assert_eq!(
+            after.done_at.as_deref(),
+            Some(pr_done_at.as_str()),
+            "abandon must not move done_at off the PR clock"
         );
     }
 

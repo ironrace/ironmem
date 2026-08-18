@@ -192,10 +192,13 @@ pub fn end_session(conn: &Connection, session_id: &str) -> Result<(), MemoryErro
 
 /// Return an error if the session has `ended_at` set.
 ///
-/// The message keeps its historical `session {id} has ended` opening — two
-/// test assertions match on that substring (`tests::
-/// test_ensure_active_rejects_ended_session` and `tests/mcp_protocol.rs`) —
-/// and **appends the stored abandonment reason** when there is one. That
+/// The message keeps its historical `session {id} has ended` opening, which is
+/// load-bearing: assertions across this crate's tests and `tests/mcp_protocol.rs`
+/// match on that substring, so it must stay a prefix rather than move or gain
+/// anything in front of it. (Deliberately not a count — the number grew twice
+/// while this task was being reviewed, and a tally that drifts on every new
+/// assertion is worse than no tally.) It **appends the stored abandonment
+/// reason** when there is one. That
 /// append is the whole seal mechanism for #297: every mutating collab surface
 /// already funnels through this one check, so a caller who runs into the seal
 /// learns *why* the session is gone instead of getting a bare "not active",
