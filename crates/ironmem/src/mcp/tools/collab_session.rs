@@ -2277,8 +2277,8 @@ pub(super) fn handle_collab_recv(app: &App, args: &Value) -> Result<Value, Memor
         // whose successor lands on a sealed session should be told the session
         // is gone (and why) rather than handed a stale-lease diagnostic about a
         // session it could not have taken over regardless.
-        let claims_token = super::handoff::opt_handoff_token(args).is_some();
-        if auto_ack || claims_token {
+        let maybe_token = super::handoff::opt_handoff_token(args);
+        if auto_ack || maybe_token.is_some() {
             crate::collab::queue::ensure_active(tx, session_id)?;
         }
         let claim = super::handoff::ensure_actor_generation_current(
@@ -2286,7 +2286,7 @@ pub(super) fn handle_collab_recv(app: &App, args: &Value) -> Result<Value, Memor
             tx,
             session_id,
             receiver,
-            super::handoff::opt_handoff_token(args).as_deref(),
+            maybe_token.as_deref(),
         )?;
         // Blind-drafts invariant: during PlanParallelDrafts, an agent must not
         // see the counterpart's draft until it has submitted its own. This
@@ -5078,6 +5078,16 @@ mod tests {
             .to_string()
     }
 
+    /// How many messages are still waiting for `receiver`, read straight from
+    /// the queue rather than through `collab_recv` — the seal tests need this
+    /// on a session whose `collab_recv` may itself be refusing.
+    fn pending_message_count(app: &crate::mcp::app::App, sid: &str, receiver: &str) -> usize {
+        app.db
+            .with_connection(|conn| crate::collab::queue::recv_messages(conn, sid, receiver, 50))
+            .unwrap()
+            .len()
+    }
+
     #[test]
     fn sealed_session_refuses_collab_send() {
         let app = test_app();
@@ -5339,16 +5349,6 @@ mod tests {
                 .is_ok(),
             "collab_get_caps is read-only and must survive the seal"
         );
-    }
-
-    /// How many messages are still waiting for `receiver`, read straight from
-    /// the queue rather than through `collab_recv` — the seal tests need this
-    /// on a session whose `collab_recv` may itself be refusing.
-    fn pending_message_count(app: &crate::mcp::app::App, sid: &str, receiver: &str) -> usize {
-        app.db
-            .with_connection(|conn| crate::collab::queue::recv_messages(conn, sid, receiver, 50))
-            .unwrap()
-            .len()
     }
 
     #[test]
