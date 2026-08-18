@@ -125,6 +125,17 @@ pub const MAX_ABANDON_REASON_BYTES: usize = MAX_CODING_FAILURE_CHARS - ABANDONED
 ///
 /// One constant serves both abandon here and lease recovery in #298; do not
 /// fork a second threshold for that.
+///
+/// **Lowering this later widens more than an operator-invoked path.** Abandon
+/// is agent-reachable — `collab_end` has no operator authentication and is on
+/// the unattended-successor permission allowlist — so this bound already
+/// gates an unattended caller today, not only a human running `collab_end
+/// { "abandon": true }` by hand. #298's lease recovery is stated to act
+/// *without* an operator in the loop, so it inherits that property rather
+/// than introducing it: a smaller value here shortens the window before an
+/// autonomous process, not just an operator, can end or reclaim a session
+/// that is merely paused (see [`queue::session_last_activity`]'s doc on
+/// `PlanLocked` and `CodingComplete` for the concrete false-positive case).
 pub const COLLAB_DEAD_SESSION_SECS: i64 = 21_600;
 
 /// Seconds since the session's newest activity, or `None` when there is no
@@ -188,14 +199,17 @@ pub fn idle_secs(last_activity: Option<i64>, now: i64) -> Option<i64> {
 ///
 /// This direction is safe regardless: refusing to abandon on a row that no
 /// longer exists would recreate the wedge this feature exists to clear, and
-/// there is no session left to wrongly end. Once Task 2 wires this check to
-/// run inside the same write transaction as the state change it authorizes
-/// (D6), the race disappears entirely — `ensure_active` and
-/// `session_last_activity` observe the same snapshot, so the row cannot
-/// vanish between them, and this `None` arm becomes effectively unreachable
-/// in practice. It stays here as the correct handling for the case, not as
-/// dead code: the fail-safe direction (dead, loudly) is right even if the
-/// case that reaches it becomes vanishingly rare.
+/// there is no session left to wrongly end. This check runs inside the same
+/// write transaction as the state change it authorizes (D6) —
+/// `handle_collab_abandon` calls `ensure_active` and reads staleness on the
+/// same `Transaction` handle (`crates/ironmem/src/mcp/tools/collab_session.rs`,
+/// the `ensure_active` and `session_staleness` calls inside its
+/// `with_transaction` closure) — so the race is closed entirely:
+/// `ensure_active` and `session_last_activity` observe the same snapshot, the
+/// row cannot vanish between them, and this `None` arm is effectively
+/// unreachable in practice. It stays here as the correct handling for the
+/// case, not as dead code: the fail-safe direction (dead, loudly) is right
+/// even if the case that reaches it is vanishingly rare.
 pub fn session_is_dead(session_id: &str, last_activity: Option<i64>, now: i64) -> bool {
     match idle_secs(last_activity, now) {
         Some(idle) => idle >= COLLAB_DEAD_SESSION_SECS,

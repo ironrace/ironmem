@@ -2953,11 +2953,13 @@ fn collab_end_requires_owner(phase: Phase) -> bool {
 
 /// [`crate::collab::COLLAB_DEAD_SESSION_SECS`] rendered for an operator: the
 /// exact number a script or log line can match, paired with a duration a
-/// person can parse at a glance. Shared by [`duplicate_session_refusal`]'s two
-/// staleness-mentioning arms and `handle_collab_abandon`'s live-session
-/// refusal, so all three descriptions of "how stale is stale enough" render
-/// the same way. `COLLAB_DEAD_SESSION_SECS` is 21_600 by construction (see its
-/// own doc comment); if that ever changes, "6 hours" must change with it.
+/// person can parse at a glance. Shared by all three of
+/// [`duplicate_session_refusal`]'s arms (the endable, non-endable, and
+/// unparseable-phase cases each mention staleness) and by
+/// `handle_collab_abandon`'s live-session refusal, so all four descriptions of
+/// "how stale is stale enough" render the same way. `COLLAB_DEAD_SESSION_SECS`
+/// is 21_600 by construction (see its own doc comment); if that ever changes,
+/// "6 hours" must change with it.
 fn dead_session_threshold_human() -> String {
     format!("{}s (6 hours)", crate::collab::COLLAB_DEAD_SESSION_SECS)
 }
@@ -3210,9 +3212,17 @@ pub(super) fn handle_collab_end(app: &App, args: &Value) -> Result<Value, Memory
             )));
         }
         if !collab_end_admits(session.phase) {
+            // Routed through the same two helpers `duplicate_session_refusal`
+            // uses, rather than a hand-rolled "abandon: true and a reason" —
+            // this is the exact refusal a caller hits in the wedge case
+            // (#283's field incident), so it owes the caller the same
+            // threshold and call shape those helpers exist to guarantee, not
+            // a paraphrase that could drift from them.
             return Err(MemoryError::Validation(format!(
-                "collab_end rejected in active phase {}; end is only valid from PlanClaudeFinalizePending (by the current owner), PlanLocked (pre-task_list), CodingComplete, or CodingFailed. If this session is demonstrably dead, use collab_end with `abandon: true` and a `reason`",
-                session.phase
+                "collab_end rejected in active phase {}; end is only valid from PlanClaudeFinalizePending (by the current owner), PlanLocked (pre-task_list), CodingComplete, or CodingFailed. If this session is demonstrably dead (no activity for {}), end it with collab_end {}.",
+                session.phase,
+                dead_session_threshold_human(),
+                abandon_recipe_json(session_id),
             )));
         }
         let ended_phase = session.phase;

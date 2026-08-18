@@ -1238,18 +1238,39 @@ has not been ended remains resumable and continues to own its scope.
 
 **This guard is #297's own field incident, so its refusal carries the
 abandon remedy.** `duplicate_session_refusal` — shared by both callers —
-always tells the caller to `/collab join` the existing session, and then, in
-all three of its arms (a recognized endable phase, a recognized
-non-endable/coding-active phase, and an unparseable phase string), names
-`collab_end` with `abandon: true` as the fallback: "if plain `collab_end` is
-refused because the generation lease is stale and the session is
-demonstrably dead (no activity for 6h), end it with `collab_end
-{"session_id": "<id>", "agent": "claude|codex", "abandon": true, "reason":
-"..."}`." This is the exact remedy `collab_end_requires_owner` (below) is
-shared with: for a still-endable phase the message additionally names the
-owner requirement, so a counterpart reading it knows not to try. This is
-what closes the wedge #283 described — a duplicate-session refusal that used
-to point at a plain `collab_end` the server would then reject.
+always tells the caller to `/collab join` the existing session, and then
+names `collab_end` with `abandon: true` as a fallback in all three of its
+arms, but the wording differs per arm because *why* plain `collab_end` fails
+differs, and the difference matters — the middle case below is #283's actual
+field incident:
+
+- **Recognized, endable phase** (`PlanFinalizePending`/`PlanLocked`/
+  `CodingComplete`/`CodingFailed`): "...or if it is finished call
+  `collab_end` on it before starting a new session here." — plus the owner
+  clause when the phase is `PlanClaudeFinalizePending` — "If plain
+  `collab_end` is refused because the generation lease is stale and the
+  session is demonstrably dead (no activity for 21600s (6 hours)), end it
+  with `collab_end {"session_id": "<id>", "agent": "claude|codex", "abandon":
+  true, "reason": "..."}`." Plain `collab_end` genuinely can work here;
+  abandon is named only for the case where the generation lease itself is
+  dead (#283 defect B).
+- **Recognized, non-endable/coding-active phase — this is #283's own field
+  incident**: "Plain `collab_end` is rejected in this phase; if the session
+  is demonstrably dead (no activity for 21600s (6 hours)) end it with
+  `collab_end {...}`." The blame here is the phase allowlist, not the lease —
+  plain `collab_end` never had a chance regardless of the lease's state. The
+  old message's flaw was recommending it anyway.
+- **Unparseable phase string**: "This phase could not be identified; if the
+  session is demonstrably dead (no activity for 21600s (6 hours)) end it with
+  `collab_end {...}`." The conservative fallback: it never claims `collab_end`
+  is rejected for a phase it could not identify.
+
+This is the exact remedy `collab_end_requires_owner` (below) is shared with:
+for a still-endable phase the message additionally names the owner
+requirement, so a counterpart reading it knows not to try. This is what
+closes the wedge #283 described — a duplicate-session refusal that used to
+point at a plain `collab_end` the server would then reject in exactly the
+coding-active phases where the wedge actually happens.
 
 **Scoped attribution guard.** `collab_start`, `collab_start_code_review`,
 `collab_send`, `collab_recv`, `collab_wait_my_turn`, and `collab_resume` only
@@ -1825,6 +1846,19 @@ any other detail.
   `collab_end_requires_owner`, shared by the plain path, the abandon path,
   and the duplicate-session guard's remedy text, so the three cannot drift
   out of agreement with each other again.
+- **No scope or membership check.** Abandon takes only `session_id` and
+  `agent`; it does not verify the caller is operating in the session's
+  `repo_path`/`branch`, or has any prior relationship to the session at all.
+  Any caller holding a valid session id can abandon that session regardless
+  of repo — this is inherited from the plain `collab_end` path, not new to
+  abandon. The mitigation is that session ids are UUIDv4, not guessable or
+  enumerable — **except** that the duplicate-session refusal above
+  (`duplicate_session_refusal`) publishes the existing session's id verbatim
+  to any caller who tries to start a second session in the same
+  `(repo_path, branch)` scope. A counterpart working the same branch
+  therefore gets the id for free; nothing beyond staleness and the
+  `PlanClaudeFinalizePending` owner check stands between having that id and
+  ending the session it names.
 - **`reason` is required**: non-blank after trimming, capped at 2037 bytes,
   and free of control characters, U+2028/U+2029 line/paragraph separators,
   and bidi override/isolate characters (`\u{202a}`–`\u{202e}`,

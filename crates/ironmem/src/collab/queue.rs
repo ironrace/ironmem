@@ -403,13 +403,23 @@ pub fn db_now_epoch_secs(conn: &Connection) -> Result<i64, MemoryError> {
 /// `CodingComplete` (terminal, waiting on operator attestation) can sit
 /// perfectly live with zero writes to any of the three sources for far longer
 /// than six hours while an operator is simply away — nothing is wedged, a
-/// human just hasn't acted yet. That is harmless for *this* feature's abandon
-/// gate: abandon is operator-invoked (`collab_end { "abandon": true }`), and
-/// nobody abandons their own paused session out from under themselves. But
-/// [`super::COLLAB_DEAD_SESSION_SECS`] is also earmarked for #298's lease
-/// recovery, which may act *without* an operator in the loop — #298 must
-/// treat `PlanLocked` and `CodingComplete` as a case this signal cannot
-/// distinguish from genuinely wedged, not reuse this claim as-is.
+/// human just hasn't acted yet. **This is a real, un-mitigated false-positive
+/// risk for this feature's abandon gate, not a harmless case.** `collab_end`
+/// has no operator authentication, `agent` is caller-asserted, and
+/// `collab_end` is on the unattended-successor permission allowlist (see
+/// `handle_collab_abandon`'s own doc and [`super::ABANDONED_PREFIX`]) — so the
+/// caller ending a six-hour-idle `PlanLocked` or `CodingComplete` session need
+/// not be the operator waiting on it, and need not be a human at all. An
+/// autonomous successor (or the counterpart agent) that reads this signal at
+/// face value can abandon a session that is merely paused. #297 does not add
+/// a mitigation for it — no owner check, no longer threshold for these two
+/// phases specifically — that is deliberately out of scope here; see D4 in
+/// `handle_collab_abandon`'s doc for why the six-hour bound was accepted
+/// as-is instead. [`super::COLLAB_DEAD_SESSION_SECS`] is also earmarked for
+/// #298's lease recovery, which may act *without* an operator in the loop —
+/// #298 inherits this exact risk, undiminished, and must treat `PlanLocked`
+/// and `CodingComplete` as a case this signal cannot distinguish from
+/// genuinely wedged, not reuse this claim as evidence it is safe.
 ///
 /// # Why the CASTs and the coalesces are load-bearing
 ///
