@@ -4111,12 +4111,13 @@ fn collab_start_code_review_end_rejected_during_active_review() {
 ///
 /// A local copy rather than a reuse: the library's `age_session` lives in
 /// `collab_session.rs`'s `#[cfg(test)]` module, which an integration binary
-/// linking `ironmem` as an ordinary dependency cannot see. Keep all three
+/// linking `ironmem` as an ordinary dependency cannot see. Keep all **four**
 /// writes. `session_last_activity` takes the **max** of the session row, its
-/// checkpoints, and its messages, so backdating only one leaves the session
-/// live and the abandon below refused for a reason this test never meant to
-/// exercise. Note the column types differ: `collab_checkpoints.updated_at` is
-/// INTEGER unix seconds, the other two are `datetime()` text.
+/// checkpoints, its messages, and its handoff lease, so backdating only one
+/// leaves the session live and the abandon below refused for a reason this
+/// test never meant to exercise. Note the column types differ:
+/// `collab_checkpoints.updated_at` is INTEGER unix seconds, the other three
+/// are `datetime()` text.
 fn age_collab_session(app: &App, session_id: &str, secs: i64) {
     let shift = format!("-{secs} seconds");
     app.db
@@ -4133,6 +4134,16 @@ fn age_collab_session(app: &App, session_id: &str, secs: i64) {
                 "UPDATE collab_checkpoints SET updated_at = strftime('%s','now') - ?2
                    WHERE session_id = ?1",
                 rusqlite::params![session_id, secs],
+            )?;
+            // The fourth source. `datetime(NULL, ...)` is NULL, so a lease row
+            // that never carried a handoff stays NULL rather than acquiring a
+            // timestamp out of nowhere.
+            tx.execute(
+                "UPDATE collab_actor_generations
+                    SET pending_handoff_issued_at = datetime(pending_handoff_issued_at, ?2),
+                        pending_handoff_claimed_at = datetime(pending_handoff_claimed_at, ?2)
+                  WHERE session_id = ?1",
+                rusqlite::params![session_id, &shift],
             )?;
             Ok(())
         })

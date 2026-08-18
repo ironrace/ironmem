@@ -116,6 +116,46 @@ pub const MAX_CODING_FAILURE_CHARS: usize = 2048;
 /// for the exact-boundary case exercised against the real DB.
 pub const MAX_ABANDON_REASON_BYTES: usize = MAX_CODING_FAILURE_CHARS - ABANDONED_PREFIX.len() - 1;
 
+/// Characters an abandon `reason` may not contain.
+///
+/// The reason is echoed by [`queue::ensure_active`] in every later refusal for
+/// the session, which an agent reads as authoritative server output. The
+/// attribution framing around that echo only works if the reader can tell
+/// where the untrusted text starts and stops, so anything able to forge a line
+/// break or reorder the surrounding prose is refused.
+///
+/// [`char::is_control`] alone is **not** sufficient, which is the whole reason
+/// this is a named function rather than a closure: it covers the Cc block
+/// only, so U+2028 LINE SEPARATOR and U+2029 PARAGRAPH SEPARATOR pass it. Both
+/// are line terminators to JavaScript and to several terminals and log
+/// viewers, and `serde_json` does not escape them — so on the wire they are a
+/// real newline to the consumer even though Rust does not consider them
+/// control characters. The bidi overrides and isolates are refused for the
+/// adjacent reason: U+202E can visually reorder the `treat as data`
+/// attribution that precedes the echo, which defeats the framing without
+/// changing a byte of it.
+///
+/// # Why this lives here rather than beside the `collab_end` handler
+///
+/// It has **two** callers now, on opposite sides of the same boundary, and
+/// they must agree by construction rather than by two copies of one character
+/// set. `crate::mcp::tools::collab_session::handle_collab_end` uses it to
+/// *refuse* a reason at write time; [`queue::ensure_active`] uses it to
+/// *strip* the same characters at read time, because a database that ran an
+/// earlier ironmem can hold an `abandoned:` row that predates the write-side
+/// rule (the prefix was only reserved against caller input by
+/// `crate::mcp::tools::collab_events::parse_failure_report_event` in #297).
+/// The write-side check is the fix for future rows; the read-side strip is the
+/// fix for the ones already on disk. Widening this set therefore hardens both
+/// at once — which is the point. Do not restate the set at either call site.
+pub(crate) fn reason_char_is_forbidden(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{2028}' | '\u{2029}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+        )
+}
+
 /// How long a collab session must show no activity before `collab_end`'s
 /// abandon arm will end it: six hours.
 ///
@@ -182,9 +222,11 @@ pub fn idle_secs(last_activity: Option<i64>, now: i64) -> Option<i64> {
 /// Whether a session has been silent long enough to be abandoned.
 ///
 /// The signal is [`queue::session_last_activity`] — the newest of
-/// `collab_sessions.updated_at`, `collab_checkpoints.updated_at`, and the
-/// session's newest `messages.created_at`. See that function for why all three
-/// are needed and why no migration was required.
+/// `collab_sessions.updated_at`, `collab_checkpoints.updated_at`, the
+/// session's newest `messages.created_at`, and the session's newest handoff
+/// timestamp in `collab_actor_generations`. See that function for why all
+/// four are needed — in particular why the recovery path counts as liveness —
+/// and why no migration was required.
 ///
 /// **A missing signal counts as dead**, and fires a `tracing::warn` so the
 /// degrade is observable rather than silent (repo convention:

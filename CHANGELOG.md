@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The duplicate-session refusal now recommends a remedy the server will
+  actually accept (#297).** `collab_start` / `collab_start_code_review`
+  previously told every caller to "call `collab_end` on it", which the server
+  rejects in exactly the coding-active phases where a wedged session is most
+  likely to be sitting — a guard recommending an action that cannot work. The
+  message is now phase-dependent and is generated from the same predicates the
+  `collab_end` handler gates on, so the two cannot drift apart again: an
+  endable phase gets `/collab join` or a plain end (naming the current-owner
+  restriction where `PlanClaudeFinalizePending` imposes one), a non-endable
+  phase is told plainly that a plain end is rejected there, and an
+  unrecognized phase falls to the conservative wording rather than claiming
+  anything about endability. Each arm also spells the abandon call out in full
+  — `session_id` and `agent` included, not just the `abandon`/`reason` pair —
+  because a caller who copied the short form got a `session_id` refusal
+  instead of the rescue the message promised. **Naming the recipe is not a
+  verdict that the session is dead**, and the surfaces that read these
+  refusals now say so: `/collab` reports a wedged duplicate and asks the
+  operator before abandoning anything, and the Codex plan-draft prompt — a
+  one-shot background agent with nobody to ask — never sends `collab_end` at
+  all.
+
 - **`collab_set_implementer` is now restricted to the session's current pilot
   (#264).** The tool previously gated only on phase, so either agent could
   rebind the implementer; it now runs the same caller-identity check as
@@ -27,6 +48,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   § Authorization / Phase / Ownership Matrix in `docs/COLLAB.md`.
 
 ### Added
+
+- **`collab_end` can abandon a demonstrably dead collab session (#297).**
+  A session wedged in a coding-active phase previously had no exit at all: the
+  start slot reserves `(repo_path, branch)` for as long as the session stays
+  open, and a session stuck mid-recovery with a dead generation lease could
+  satisfy neither plain `collab_end`'s phase allowlist nor its lease check —
+  the field case sat wedged for three days. `collab_end` now accepts
+  `{"abandon": true, "reason": "..."}` (both newly advertised in the tool's
+  input schema, so the arm is discoverable rather than folklore), ends the
+  session from **any** phase, and seals it with `coding_failure = "abandoned:
+  <reason>"`, a Terminal classification that no `collab_resume` can undo. The
+  response carries `abandoned: true` so a real abandon is distinguishable from
+  a plain end.
+
+  **What holds it back is staleness, and only staleness.** Abandon is refused
+  unless the session has shown no activity for the new
+  `COLLAB_DEAD_SESSION_SECS` (21,600s / 6 hours), measured as the newest of
+  four sources — the session row, its checkpoint, its messages, and its
+  handoff lease — because each of them can advance alone: a long batch turn
+  files checkpoints without touching the session row, and the recovery path
+  (`session_handoff` and a successor's token claim) writes nothing but the
+  lease row, so a session actively being rescued must not read dead. The
+  threshold is deliberately generous: the false positive is destructive and
+  unrecoverable, the false negative costs a wait. The check runs **inside the
+  write transaction that ends the session**, so there is no read-then-write
+  window for activity to land in, and the refusal names both the elapsed idle
+  seconds and the seconds remaining.
+
+  Abandon skips exactly two things relative to a plain end — the generation
+  lease and the phase allowlist — and nothing else. The lease is skipped
+  because ending a session leaves no live turn for anyone to seize, and
+  refusing a supplied `handoff_token` would be actively hostile to the one
+  operator most likely to send one; the token is accepted and ignored. The
+  `PlanClaudeFinalizePending` current-owner check is still enforced, so
+  staleness never becomes a way for the counterpart to seal a session
+  mid-turn. `reason` is required, capped, and refused if it carries control,
+  line-separator, or bidi-override characters, because it is echoed back in
+  every later refusal for that session and an agent reads a server refusal as
+  authoritative output; the same characters are now stripped again on the way
+  *out*, since a database that ran an earlier ironmem can hold an `abandoned:`
+  row written before the prefix was reserved against caller input. Abandon
+  spends no recovery attempt — it is not a recovery. See § "The `collab_end`
+  abandon contract" in `docs/COLLAB.md`, including who is expected to call it.
 
 - **Schema-enforced collab checkpoints and a head-consistency gate on
   `implementation_done` (#273).** Schema goes **v19 -> v21** (migrations 020
@@ -61,6 +125,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   BM25/KG/diary result. Vector IDs are filtered against locally fetched drawers
   before fusion, so a daemon serving another database cannot consume injection
   slots.
+
+### Fixed
+
+- **A repeat `collab_end` is now literally a no-op (#297).** `docs/COLLAB.md`
+  has always specified a second `collab_end` on an already-ended session as a
+  no-op success, and the handler did return the same response — but it got
+  there by doing the work again. Endedness is now read first, before any write,
+  and the handler returns early, which closes three things a call specified to
+  do nothing was still doing: it appended a second `collab_end` WAL audit row;
+  it re-attested the metrics outcome, which could flip a `CodingComplete`
+  session's recorded outcome back from `abandoned` to `merged` if
+  `collab_end` were called again after an abandon; and it claimed a supplied
+  `handoff_token`. That last one is a security fix rather than a tidiness one:
+  `ensure_actor_generation_current` runs before anything on the plain path can
+  decline, so a no-op call was burning a one-time recovery credential and
+  advancing the generation lease. The docs promise the *end* is a no-op; they
+  grant no entitlement to spend a lease. The wire response is byte-identical
+  either way, so no caller can tell which case it hit.
 
 ### Documentation
 

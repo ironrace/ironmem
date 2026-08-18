@@ -1807,11 +1807,20 @@ any other detail.
   merely slow rather than stale is refused.
 - **Staleness gate.** Refused unless the session has shown no activity for
   `COLLAB_DEAD_SESSION_SECS` (21,600s / 6 hours). Activity is the newest of
-  `collab_sessions.updated_at`, `collab_checkpoints.updated_at`, and the
-  session's newest `messages.created_at` — the checkpoint term matters
-  because a long batch turn can file checkpoints without touching the
-  session row, and reading only the session row would misread that turn as
-  dead. The refusal names the idle seconds elapsed and the seconds
+  four sources: `collab_sessions.updated_at`,
+  `collab_checkpoints.updated_at`, the session's newest
+  `messages.created_at`, and the session's newest handoff timestamp
+  (`collab_actor_generations.pending_handoff_issued_at` /
+  `pending_handoff_claimed_at`, aggregated across both agents' lease rows).
+  The checkpoint term matters because a long batch turn can file checkpoints
+  without touching the session row, and reading only the session row would
+  misread that turn as dead. **The handoff term matters because the recovery
+  path writes nothing else** — `session_handoff` and a successor's token
+  claim touch only the lease row, so without it a session in the middle of
+  being recovered still reads dead and could be abandoned out from under the
+  process rescuing it. Recovery and abandon are both responses to a session
+  that has gone quiet, so that race is the normal case, not an unlucky one.
+  The refusal names the idle seconds elapsed and the seconds
   remaining before abandon becomes eligible. This check runs **inside the
   same transaction** that ends the session (`session_staleness`, called from
   within the write transaction), so no session can transition to live
@@ -1876,6 +1885,21 @@ any other detail.
   old text in front would classify the session by the old failure instead.
   **The phase is not changed** by abandon; only `ended_at` is stamped,
   which releases the `(repo_path, branch)` start slot.
+- **Who is expected to call it: an operator, not an autonomous prompt.**
+  The server cannot enforce this — `collab_end` has no operator
+  authentication and `agent` is caller-asserted — so it is a rule the
+  command and prompt surfaces carry instead. The reason is the gap between
+  what the staleness gate can see and what "dead" means: six hours of
+  silence is compatible with a session merely waiting on a human, and
+  `PlanLocked` is exactly that (see the staleness bullet above and
+  `queue::session_last_activity`'s doc). Deciding that no one is coming back
+  is a judgement about the world outside the database, which is why the
+  duplicate-session refusal *names* the abandon recipe without ever
+  asserting the session is dead. Accordingly: `/collab` reports a wedged
+  duplicate and asks the operator before abandoning, and
+  `.codex-plugin/prompts/collab-plan-draft.md` — a one-shot background agent
+  that cannot ask anyone — never sends `collab_end` at all. Do not add a new
+  autonomous caller without a way for it to establish the same judgement.
 - **Spends no recovery attempt.** `recovery_attempts` and
   `total_recovery_attempts` are written back exactly as loaded — #283's
   acceptance criterion is that the wedge clears without spending the
@@ -1931,6 +1955,22 @@ override could otherwise forge a fake system line or visually reorder the
 attribution itself. **Any future surface that embeds a stored reason in its
 own output must preserve reason-last** — moving it into the middle of a
 sentence reopens exactly the injection surface the ordering closes.
+
+**The same rule is applied again on the way out, and that is not
+redundancy.** The write-time refusal binds rows written by `collab_end`'s
+abandon arm; it cannot bind rows already on disk. On a database that ran an
+earlier ironmem — before `parse_failure_report_event` reserved the
+`abandoned:` prefix — an agent could file `collab_send {"topic":
+"failure_report", "content": {"coding_failure": "abandoned: …"}}` carrying
+newlines and a forged `=== SYSTEM NOTICE ===`, and that row is echoed into
+every mutating surface's refusal exactly like a real epitaph. So
+`ensure_active` strips the same character set (and caps the length) at read
+time before echoing, using the very same predicate the write path refuses
+on, and **says when it had to**: an altered echo is introduced with
+"follows with forbidden characters removed and any excess truncated (the
+stored row predates the write-time check)" instead of "follows verbatim".
+A refusal that still says *verbatim* is a promise that the bytes are the
+stored bytes.
 
 ### `collab_resume`
 

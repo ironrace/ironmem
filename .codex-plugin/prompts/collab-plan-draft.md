@@ -65,12 +65,24 @@ sender `codex`, topic `draft`, and the plan text. Exit immediately after a
 successful send.
 
 If a duplicate active session is reported for the same repository and branch,
-join the reported session instead of retrying start — unless the refusal
-itself says the session is demonstrably dead (no activity for
-`COLLAB_DEAD_SESSION_SECS`, 6h) and names the `collab_end { "abandon": true,
-"reason": "..." }` remedy, in which case end it that way instead of joining a
-session with no one left to answer. If a send is rejected, correct content
-only after reading the current status; do not invent topics.
+join the reported session instead of retrying start. If you cannot join it,
+report the session id and the refusal and exit.
+
+**Never send `collab_end` — with or without `abandon: true` — from this
+prompt.** Every arm of the duplicate-session refusal now names the
+`collab_end { "abandon": true, "reason": "..." }` recipe, including the arm
+where the session is perfectly healthy and the recipe is only a conditional
+fallback; the message text does not tell you which arm you are reading, so
+treating the recipe as licence would let a one-shot background agent seal a
+session that is merely waiting on a human. `PlanLocked` is the single human
+planning gate and can sit live and silent overnight. Abandon is an operator
+action on a session with no live worker, taken by someone who can check
+that; it is not a decision this prompt gets to make. Do not re-relax this
+into "unless the refusal says it is dead" — that condition is not
+observable from here.
+
+If a send is rejected, correct content only after reading the current
+status; do not invent topics.
 
 ## Invocation
 
