@@ -4193,11 +4193,22 @@ fn collab_abandon_frees_a_wedged_branch_end_to_end_via_mcp() {
         before["phase"], "CodeImplementPending",
         "the fixture must wedge the session in a coding-active phase"
     );
+    // Both counters get an explicit baseline, not just the per-resume one: the
+    // "unchanged across the abandon" assertions below compare two
+    // `serde_json::Value`s, and `[]` on a missing key yields `Null` — so a
+    // counter that stopped being emitted at all would compare `Null == Null`
+    // and pass while proving nothing.
     assert_eq!(
         before["recovery_attempts"],
         json!(1),
         "a recoverable failure report must have spent one recovery attempt, so the \
          'no attempt spent' assertion below is not trivially 0 == 0"
+    );
+    assert_eq!(
+        before["total_recovery_attempts"],
+        json!(1),
+        "the lifetime counter needs the same non-zero baseline, or its 'unchanged' \
+         assertion below can pass on two absent fields"
     );
 
     // 1 — the wedge is real: the phase allowlist refuses a plain end.
@@ -4328,6 +4339,19 @@ fn collab_abandon_frees_a_wedged_branch_end_to_end_via_mcp() {
     assert_eq!(
         persisted["phase"], "CodeImplementPending",
         "abandon seals in place — the record of where the session died must survive"
+    );
+    // Abandon is the one writer that leaves `pending_failure` and
+    // `coding_failure` set at once: it writes the epitaph directly rather than
+    // through `apply_event`, which keeps the two mutually exclusive. That is
+    // deliberate — the epitaph says the operator gave up, `pending_failure`
+    // says what the session was stuck on — and `collab_session.rs` documents it
+    // as an exception nothing may branch on. This is the only test that reaches
+    // that state over real dispatch, so it is the one place the exception can
+    // be pinned at the protocol surface.
+    assert_eq!(
+        persisted["pending_failure"],
+        json!("git_commit_failed: index.lock EPERM"),
+        "abandon must preserve the in-flight recoverable diagnostic alongside its epitaph"
     );
 
     // And the seal still refuses writes, carrying the stored reason with it,
