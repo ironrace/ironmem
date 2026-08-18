@@ -2936,6 +2936,53 @@ fn collab_end_admits(phase: Phase) -> bool {
     )
 }
 
+/// The phases where `collab_end` (plain or abandon) additionally requires the
+/// caller be the session's `current_owner`.
+///
+/// Single source of truth for a rule that was independently hand-coded three
+/// times before this existed: the owner check in [`handle_collab_end`], the
+/// identical check in [`handle_collab_abandon`], and the duplicate-session
+/// guard's remedy in [`duplicate_session_refusal`]. Three restatements of one
+/// rule is the exact drift shape #283 remedy 5 exists to prevent — a fourth
+/// `Phase` variant with an owner rule could otherwise be added to the two
+/// handlers while the guard's message stayed silent about it, with nothing to
+/// catch the gap.
+fn collab_end_requires_owner(phase: Phase) -> bool {
+    matches!(phase, Phase::PlanFinalizePending)
+}
+
+/// [`crate::collab::COLLAB_DEAD_SESSION_SECS`] rendered for an operator: the
+/// exact number a script or log line can match, paired with a duration a
+/// person can parse at a glance. Shared by [`duplicate_session_refusal`]'s two
+/// staleness-mentioning arms and `handle_collab_abandon`'s live-session
+/// refusal, so all three descriptions of "how stale is stale enough" render
+/// the same way. `COLLAB_DEAD_SESSION_SECS` is 21_600 by construction (see its
+/// own doc comment); if that ever changes, "6 hours" must change with it.
+fn dead_session_threshold_human() -> String {
+    format!("{}s (6 hours)", crate::collab::COLLAB_DEAD_SESSION_SECS)
+}
+
+/// The abandon call shape shown to an operator who has just been told to use
+/// it: `session_id` and `agent` spelled out, not just the `abandon`/`reason`
+/// pair. `collab_end` requires `session_id` and `agent` on every call, plain
+/// or abandon, so a caller who copies only `{"abandon": true, "reason":
+/// "..."}` gets a `session_id` refusal instead of the rescue this message
+/// promised.
+///
+/// Deliberately silent on what `reason` must look like (non-blank,
+/// length-capped, free of control/bidi characters — see
+/// `reason_char_is_forbidden` and its neighbours): those refusals are
+/// self-describing and name their constraint precisely, so restating them
+/// here would just be a second copy to keep in sync. If a future edit is
+/// tempted to "complete" this recipe with those rules, don't — the two-step
+/// is intentional.
+fn abandon_recipe_json(existing_id: &str) -> String {
+    format!(
+        "`{{\"session_id\": \"{existing_id}\", \"agent\": \"claude|codex\", \"abandon\": true, \
+         \"reason\": \"...\"}}`"
+    )
+}
+
 /// The duplicate-session refusal shared by `handle_collab_start` and
 /// `handle_collab_start_code_review`.
 ///
@@ -2948,20 +2995,30 @@ fn collab_end_admits(phase: Phase) -> bool {
 ///
 /// `PlanFinalizePending` is endable but not unconditionally: `handle_collab_end`
 /// additionally requires the caller be the session's `current_owner` there
-/// (see the check just above `collab_end_admits`'s call site in
-/// `handle_collab_end`). This function is not handed the caller's agent or the
-/// session's owner — widening its signature to fetch them would cost a second
-/// query for a message — so it names the constraint rather than evaluating it.
-/// Naming it is enough: a counterpart who reads "only the current owner" knows
-/// not to try, instead of getting a second refusal after following the advice.
+/// ([`collab_end_requires_owner`]). This function is not handed the caller's
+/// agent or the session's owner — widening its signature to fetch them would
+/// cost a second query for a message — so it names the constraint rather than
+/// evaluating it. Naming it is enough: a counterpart who reads "only the
+/// current owner" knows not to try, instead of getting a second refusal after
+/// following the advice.
+///
+/// The endable arm also names abandon, **conditionally**: `handle_collab_end`
+/// runs `ensure_actor_generation_current` before the phase allowlist, so a
+/// session in an endable phase with a dead generation lease (#283 defect B)
+/// still refuses a plain end. Naming abandon only as a fallback — not as a
+/// flat alternative — matters because an endable phase can be merely paused
+/// rather than dead: `PlanLocked` is human-gated, and `session_last_activity`
+/// warns it can sit live with zero writes for far longer than the staleness
+/// window. A flat "or abandon it" would invite ending a session that is only
+/// waiting on a person.
 ///
 /// `phase` arrives as the raw column string from
 /// `find_active_session_by_repo_branch`, which does not parse it. An
 /// unparseable value falls to the conservative branch: it does not claim
 /// `collab_end` is rejected (that was never established for a phase we
 /// couldn't identify) — it says the phase is unrecognized and points to the
-/// same safe moves, `/collab join` or, if the session is demonstrably dead,
-/// abandon.
+/// same safe move, `/collab join`, or abandon if the session is demonstrably
+/// dead.
 ///
 /// Which phases admit a plain end is read from [`collab_end_admits`], the same
 /// predicate `handle_collab_end` gates on, so the two cannot disagree again.
@@ -2971,9 +3028,11 @@ fn duplicate_session_refusal(
     existing_id: &str,
     phase: &str,
 ) -> String {
+    let recipe = abandon_recipe_json(existing_id);
+    let threshold = dead_session_threshold_human();
     let remedy = match phase.parse::<Phase>() {
         Ok(parsed) if collab_end_admits(parsed) => {
-            let owner_clause = if parsed == Phase::PlanFinalizePending {
+            let owner_clause = if collab_end_requires_owner(parsed) {
                 " Only the session's current owner may end it from this phase — the \
                  counterpart will be refused."
             } else {
@@ -2981,21 +3040,21 @@ fn duplicate_session_refusal(
             };
             format!(
                 "Resume it with `/collab join {existing_id}`, or if it is finished call \
-                 collab_end on it before starting a new session here.{owner_clause}"
+                 collab_end on it before starting a new session here.{owner_clause} If plain \
+                 collab_end is refused because the generation lease is stale and the session is \
+                 demonstrably dead (no activity for {threshold}), end it with collab_end \
+                 {recipe}."
             )
         }
         Ok(_) => format!(
-            "Resume it with `/collab join {existing_id}`. collab_end is rejected in this phase; \
-             if the session is demonstrably dead (no activity for {}s) end it with collab_end \
-             `{{\"abandon\": true, \"reason\": \"...\"}}`.",
-            crate::collab::COLLAB_DEAD_SESSION_SECS
+            "Resume it with `/collab join {existing_id}`. Plain collab_end is rejected in this \
+             phase; if the session is demonstrably dead (no activity for {threshold}) end it \
+             with collab_end {recipe}."
         ),
         Err(_) => format!(
-            "Resume it with `/collab join {existing_id}`. This phase could not be identified, \
-             so the safe move is `/collab join`; if the session is demonstrably dead (no \
-             activity for {}s) end it with collab_end `{{\"abandon\": true, \"reason\": \
-             \"...\"}}`.",
-            crate::collab::COLLAB_DEAD_SESSION_SECS
+            "Resume it with `/collab join {existing_id}`. This phase could not be identified; \
+             if the session is demonstrably dead (no activity for {threshold}) end it with \
+             collab_end {recipe}."
         ),
     };
     format!(
@@ -3144,7 +3203,7 @@ pub(super) fn handle_collab_end(app: &App, args: &Value) -> Result<Value, Memory
         // endable phases are PlanLocked (pre-task_list) and the two v3
         // terminal phases.
         let session = record.session;
-        if session.phase == Phase::PlanFinalizePending && agent != session.current_owner {
+        if collab_end_requires_owner(session.phase) && agent != session.current_owner {
             return Err(MemoryError::Validation(format!(
                 "collab_end from PlanClaudeFinalizePending requires current owner {}; got {}",
                 session.current_owner, agent
@@ -3347,7 +3406,7 @@ fn handle_collab_abandon(
         // (2) the one authorization gate abandon keeps — see the doc comment.
         // Identical to the plain path's check, deliberately: abandon's whole
         // authorization difference from a plain end is the lease, nothing else.
-        if session.phase == Phase::PlanFinalizePending && agent != session.current_owner {
+        if collab_end_requires_owner(session.phase) && agent != session.current_owner {
             return Err(MemoryError::Validation(format!(
                 "collab_end abandon from PlanClaudeFinalizePending requires current owner {}; got \
                  {}. Staleness does not widen who may end this phase — abandon lifts the \
@@ -3362,11 +3421,11 @@ fn handle_collab_abandon(
             let idle = staleness.idle_secs().unwrap_or(0);
             return Err(MemoryError::Validation(format!(
                 "collab_end abandon refused: session {session_id} is still live (idle {idle}s in \
-                 phase {}). Abandon requires {}s of no activity across the session row, its \
+                 phase {}). Abandon requires {} of no activity across the session row, its \
                  checkpoint, and its messages; {}s remaining. Abandon exists only for a \
                  demonstrably dead session — to end a live one, drive it to a terminal phase.",
                 session.phase,
-                crate::collab::COLLAB_DEAD_SESSION_SECS,
+                dead_session_threshold_human(),
                 crate::collab::COLLAB_DEAD_SESSION_SECS - idle,
             )));
         }
@@ -4708,10 +4767,18 @@ mod tests {
                 !err.contains("call collab_end on it"),
                 "{surface} must not recommend an action the server rejects: {err}"
             );
-            assert!(err.contains("/collab join"), "{surface}: {err}");
+            assert!(
+                err.contains(&format!("/collab join {sid}")),
+                "{surface} must name the actually-conflicting session's id: {err}"
+            );
             assert!(
                 err.contains("abandon"),
                 "{surface} must name the abandon recipe: {err}"
+            );
+            assert!(
+                err.contains(&crate::collab::COLLAB_DEAD_SESSION_SECS.to_string()),
+                "{surface} must state the staleness threshold, not just say the word \
+                 'abandon': {err}"
             );
         }
         assert_eq!(
@@ -4723,7 +4790,13 @@ mod tests {
     /// The counterpart to the coding-active case above: `PlanLocked` (reached
     /// via `drive_to_plan_locked`) IS in `PHASE_ENDABILITY`, so the guard must
     /// keep recommending `collab_end` there — the remedy is phase-dependent,
-    /// not simply removed.
+    /// not simply removed. It must also name abandon as a *conditional*
+    /// fallback (for the dead-generation-lease case, #283 defect B) rather
+    /// than a flat alternative — `PlanLocked` is human-gated and can sit idle
+    /// far longer than the staleness window, so a flat "or abandon it" would
+    /// invite ending a merely-paused session. And `PlanLocked` has no owner
+    /// restriction, so the message must not claim one (that clause is
+    /// `PlanFinalizePending`-only — see the next test).
     #[test]
     fn duplicate_guard_in_an_endable_phase_still_recommends_collab_end() {
         let app = test_app();
@@ -4739,7 +4812,21 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("call collab_end on it"), "got: {err}");
-        assert!(err.contains("/collab join"), "got: {err}");
+        assert!(err.contains(&format!("/collab join {sid}")), "got: {err}");
+        assert!(
+            !err.contains("current owner"),
+            "the owner constraint is PlanFinalizePending-only: {err}"
+        );
+        assert!(
+            err.contains("If plain collab_end is refused because the generation lease is stale"),
+            "must name abandon as a conditional fallback (dead lease + dead session), not a \
+             flat alternative that would invite ending a merely-paused session: {err}"
+        );
+        assert!(err.contains("abandon"), "got: {err}");
+        assert!(
+            err.contains(&crate::collab::COLLAB_DEAD_SESSION_SECS.to_string()),
+            "must state the staleness threshold: {err}"
+        );
     }
 
     /// `PlanFinalizePending` is endable (`collab_end_admits` says so) but not
@@ -4763,7 +4850,7 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("call collab_end on it"), "got: {err}");
-        assert!(err.contains("/collab join"), "got: {err}");
+        assert!(err.contains(&format!("/collab join {sid}")), "got: {err}");
         assert!(
             err.contains("current owner"),
             "must name the owner constraint so a counterpart doesn't get a second refusal: {err}"
@@ -4795,8 +4882,17 @@ mod tests {
             msg.contains("could not be identified"),
             "must say the phase itself is unrecognized, not just refuse collab_end: {msg}"
         );
-        assert!(msg.contains("/collab join"), "got: {msg}");
+        assert!(msg.contains("/collab join some-id"), "got: {msg}");
+        assert_eq!(
+            msg.matches("/collab join").count(),
+            1,
+            "must not say `/collab join` twice in consecutive sentences: {msg}"
+        );
         assert!(msg.contains("abandon"), "got: {msg}");
+        assert!(
+            msg.contains(&crate::collab::COLLAB_DEAD_SESSION_SECS.to_string()),
+            "must state the staleness threshold: {msg}"
+        );
     }
 
     /// Abandon skips the generation lease and the phase allowlist. It does
