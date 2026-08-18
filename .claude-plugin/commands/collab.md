@@ -1449,7 +1449,8 @@ anywhere they act as wire values — `preconditions:` lines, dispatch-matrix row
 keys, and state checks.
 
 - **Never** call `mcp__ironmem__collab_end` during an active phase except for
-  the current-owner finalization-abort rule. Rejected in:
+  the current-owner finalization-abort rule, or the demonstrably-dead-session
+  exception below. Rejected in:
   - v1 active: `PlanParallelDrafts`, `PlanSynthesisPending`, and
     `PlanCodexReviewPending`.
   - v3 active: `CodeImplementPending`, `CodeReviewFixGlobalPending`,
@@ -1458,6 +1459,15 @@ keys, and state checks.
   Valid from `PlanClaudeFinalizePending` only when called by its current owner
   to abort an unfinalizable plan; otherwise valid from `PlanLocked`
   pre-`task_list` (abandon plan), `CodingComplete`, or `CodingFailed`.
+
+  **The one exception, and it carries its own precondition:** a session with
+  no activity for `COLLAB_DEAD_SESSION_SECS` (6h — across the session row,
+  its checkpoint, and its messages) may be ended from **any** phase,
+  including every active one above, via `collab_end { "session_id": ...,
+  "agent": ..., "abandon": true, "reason": "..." }`. This is not a general
+  licence to end an active-phase session — a call against a session that is
+  merely slow rather than stale is refused, naming the remaining wait. See
+  `docs/COLLAB.md` § "The `collab_end` abandon contract" for the full rule.
 - **Never** peek at Codex's draft before sending your own during
   `PlanParallelDrafts`. The server enforces blind-draft in `recv`.
 - **Duplicate-session guard.** `collab_start` / `collab_start_code_review`
@@ -1466,6 +1476,10 @@ keys, and state checks.
   same `repo_path` + `branch`; the error names the existing `session_id`. On
   that error, do **not** retry — resume the named session with
   `/collab join <id>`, or `collab_end` it first if it is genuinely finished.
+  If the existing session is stuck in an active phase and demonstrably dead
+  (no activity for 6h — see the abandon exception above), end it instead with
+  `collab_end { "session_id": "<id>", "agent": "claude|codex", "abandon":
+  true, "reason": "..." }`; a plain `collab_end` stays rejected there.
 - **Process attribution guard.** On error `"another active collab session is
   already bound to this MCP process for metrics attribution: <id>"`, do not
   retry blindly — `collab_end` the named session if it is finished, or run the
