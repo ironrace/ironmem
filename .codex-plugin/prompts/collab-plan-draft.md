@@ -77,7 +77,9 @@ treating the recipe as licence would let a one-shot background agent seal a
 session that is merely waiting on a human. `PlanLocked` is the single human
 planning gate and can sit live and silent overnight. Abandon is an operator
 action on a session with no live worker, taken by someone who can check
-that; it is not a decision this prompt gets to make. Do not re-relax this
+that — `collab_status` reports `idle_secs` and `dead_session_secs` for exactly
+that check, and even a session over the threshold is only *abandonable*, never
+provably dead. It is not a decision this prompt gets to make. Do not re-relax this
 into "unless the refusal says it is dead" — that condition is not
 observable from here.
 

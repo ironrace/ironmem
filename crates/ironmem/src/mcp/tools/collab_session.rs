@@ -2287,16 +2287,44 @@ pub(super) fn handle_collab_recv(app: &App, args: &Value) -> Result<Value, Memor
         // whose successor lands on a sealed session should be told the session
         // is gone (and why) rather than handed a stale-lease diagnostic about a
         // session it could not have taken over regardless.
-        if super::collab_recv_mutates(args) {
+        let sealed = crate::collab::queue::session_is_ended(tx, session_id)?;
+        if sealed && super::collab_recv_mutates(args) {
             crate::collab::queue::ensure_active(tx, session_id)?;
         }
-        let claim = super::handoff::ensure_actor_generation_current(
-            app,
-            tx,
-            session_id,
-            receiver,
-            super::handoff::opt_handoff_token(args).as_deref(),
-        )?;
+        // On a sealed session the generation guard is SKIPPED, and that is what
+        // makes "the seal is a write gate, not a quarantine" true rather than
+        // merely intended.
+        //
+        // Reaching this line at all means the call writes nothing: the branch
+        // above refused every mutating shape. The remaining call is a plain
+        // read, and the guard would still refuse it — `read_actor_generation`
+        // returns a non-zero generation for any session that was ever handed
+        // off, and the tokenless arm answers that with "present a
+        // session_handoff token to claim it". The token-bearing arm is a write
+        // (it burns the one-time token and bumps the generation), so the seal
+        // refuses it. Between them an abandoned session that had been handed
+        // off — a successor that died mid-batch, i.e. the exact wedge abandon
+        // exists to clear — had NO reachable read path for its message queue,
+        // and `session_handoff` is itself sealed, so no fresh token could be
+        // minted to open one.
+        //
+        // Skipping the guard here is safe for the same reason
+        // `handle_collab_abandon` may bypass the lease (see its D3 doc): a
+        // lease exists to stop a stale process from *acting*, and an ended
+        // session leaves no live turn for anyone to seize. Nothing downstream
+        // of this point writes on a sealed session, so there is no turn to take
+        // and no split-brain to create — only evidence to read.
+        let claim = if sealed {
+            super::handoff::GenerationClaim::Unchanged
+        } else {
+            super::handoff::ensure_actor_generation_current(
+                app,
+                tx,
+                session_id,
+                receiver,
+                super::handoff::opt_handoff_token(args).as_deref(),
+            )?
+        };
         // Blind-drafts invariant: during PlanParallelDrafts, an agent must not
         // see the counterpart's draft until it has submitted its own. This
         // enforces the "parallel" in parallel drafts at the server boundary so
@@ -2509,6 +2537,33 @@ pub(super) fn handle_collab_status(app: &App, args: &Value) -> Result<Value, Mem
     status["orphans_recovered"] = json!(app.db.with_connection(|conn| {
         crate::collab::queue::count_incidents(conn, session_id, ORPHAN_RECOVERED_TOPIC)
     })?);
+    // The staleness snapshot `handle_collab_abandon`'s gate evaluates, exposed
+    // read-only so the precondition is *checkable* before the irreversible call
+    // rather than only discoverable by making it.
+    //
+    // Without this, both agent-facing surfaces asked for something no surface
+    // answered: `.claude-plugin/commands/collab.md` and
+    // `.codex-plugin/prompts/collab-plan-draft.md` tell a caller to abandon a
+    // session with "no activity for 6h", `duplicate_session_refusal` names the
+    // same threshold, and the only activity signal on this record was
+    // `updated_at` — which `queue::session_last_activity`'s own doc explains is
+    // insufficient, because a long `CodeImplementPending` batch files
+    // checkpoints without touching the session row. An agent reading
+    // `updated_at` would call a live batch dead and attempt the destructive
+    // call; the server refuses correctly, but a client contract that can only
+    // be evaluated by invoking the operation it gates is not a contract.
+    //
+    // Read through `session_staleness` rather than by re-deriving `now - x`
+    // here, so the number an operator checks and the number the gate enforces
+    // come from one paired read of one clock. `idle_secs` is `null` only when
+    // the session row is absent, which cannot happen here — the record load
+    // above would already have returned `NotFound`.
+    let staleness = app
+        .db
+        .with_connection(|conn| crate::collab::queue::session_staleness(conn, session_id))?;
+    status["last_activity"] = json!(staleness.last_activity());
+    status["idle_secs"] = json!(staleness.idle_secs());
+    status["dead_session_secs"] = json!(crate::collab::COLLAB_DEAD_SESSION_SECS);
     // `verbose` remains accepted for backwards-compatible requests, but plans
     // are always references: large plan bodies must never transit status.
     let include_task_list = args
@@ -2782,19 +2837,41 @@ fn wait_my_turn_claim_and_capture_baseline(
     //
     // Without a token this stays a read, and a read must keep returning
     // `session_ended: true` rather than an error: that frame is how an agent's
-    // wait loop learns to exit (`mcp_protocol.rs`'s
-    // `collab_end_blocks_further_sends`), and turning it into a refusal would
-    // strand the loop it exists to release.
+    // wait loop learns to exit, and turning it into a refusal would strand the
+    // loop it exists to release. Pinned for a plainly-ended session by
+    // `mcp_protocol.rs`'s `collab_end_blocks_subsequent_writes`, and for an
+    // abandon-sealed one — including the handed-off case the generation guard
+    // used to refuse — by
+    // `tests::a_tokenless_wait_on_a_sealed_session_still_settles_the_loop`.
     if super::claims_handoff_token(args) {
         crate::collab::queue::ensure_active(tx, session_id)?;
     }
-    let claim = super::handoff::ensure_actor_generation_current(
-        app,
-        tx,
-        session_id,
-        agent,
-        super::handoff::opt_handoff_token(args).as_deref(),
-    )?;
+    // Reaching here on a sealed session means the call is tokenless, i.e. the
+    // read the paragraph above promises keeps working — and the generation
+    // guard is what was quietly breaking that promise. `read_actor_generation`
+    // returns a non-zero generation for any session that was ever handed off,
+    // and the tokenless arm answers that with "present a session_handoff token
+    // to claim it"; the token arm is the write the seal just refused. So on a
+    // sealed, previously-handed-off session the wait loop got an error from one
+    // arm or the other and never the `session_ended: true` frame it exits on —
+    // the loop-stranding this gate's own comment says must not happen.
+    //
+    // Skipping the guard rather than widening it, for the reason
+    // `handle_collab_abandon` may bypass the lease (see its D3 doc): the lease
+    // stops a stale process from *acting*, and an ended session leaves no live
+    // turn to seize. This path claims nothing, writes nothing, and returns the
+    // settled frame.
+    let claim = if crate::collab::queue::session_is_ended(tx, session_id)? {
+        super::handoff::GenerationClaim::Unchanged
+    } else {
+        super::handoff::ensure_actor_generation_current(
+            app,
+            tx,
+            session_id,
+            agent,
+            super::handoff::opt_handoff_token(args).as_deref(),
+        )?
+    };
     let record = crate::collab::queue::load_session_record(tx, session_id)?;
     Ok((wait_turn_snapshot(&record, agent).baseline, claim))
 }
@@ -3006,31 +3083,49 @@ fn duplicate_session_refusal(
 ) -> String {
     let recipe = abandon_recipe_json(existing_id);
     let threshold = dead_session_threshold_human();
+    // "Demonstrably dead" has to name the surface that demonstrates it. Every
+    // arm below states the threshold, and until `collab_status` carried
+    // `idle_secs` the only way for a caller to evaluate it was to make the
+    // irreversible call and read the refusal — or to read the session row's
+    // `updated_at`, which `queue::session_last_activity`'s doc explains is the
+    // wrong signal (a long coding batch files checkpoints without touching the
+    // session row, so `updated_at` calls a live batch dead). One sentence,
+    // shared by all three arms, because the claim they make is the same one.
+    let checkable = "Check it with collab_status's `idle_secs`, which is the same paired read \
+                     this gate evaluates — the session row's `updated_at` alone is not.";
     let remedy = match phase.parse::<Phase>() {
         Ok(parsed) if collab_end_admits(parsed) => {
+            // The owner clause goes AFTER the abandon recipe and speaks for
+            // both shapes. Placed before it, as it first was, the message read
+            // "only the owner may end it ... if that is refused, abandon it" —
+            // recommending to a counterpart an action `handle_collab_abandon`
+            // refuses on the same ownership grounds, which is precisely the
+            // guard-recommends-what-the-server-rejects shape (#283 remedy 5)
+            // that `collab_end_requires_owner` was extracted to prevent.
             let owner_clause = if collab_end_requires_owner(parsed) {
-                " Only the session's current owner may end it from this phase — the \
-                 counterpart will be refused."
+                " Only the session's current owner may end it from this phase, plain or \
+                 abandoned — abandon lifts the generation lease, not the owner check, so the \
+                 counterpart will be refused either way."
             } else {
                 ""
             };
             format!(
                 "Resume it with `/collab join {existing_id}`, or if it is finished call \
-                 collab_end on it before starting a new session here.{owner_clause} If plain \
-                 collab_end is refused because the generation lease is stale and the session is \
-                 demonstrably dead (no activity for {threshold}), end it with collab_end \
-                 {recipe}."
+                 collab_end on it before starting a new session here. If plain collab_end is \
+                 refused because the generation lease is stale and the session is demonstrably \
+                 dead (no activity for {threshold}), end it with collab_end {recipe}. \
+                 {checkable}{owner_clause}"
             )
         }
         Ok(_) => format!(
             "Resume it with `/collab join {existing_id}`. Plain collab_end is rejected in this \
              phase; if the session is demonstrably dead (no activity for {threshold}) end it \
-             with collab_end {recipe}."
+             with collab_end {recipe}. {checkable}"
         ),
         Err(_) => format!(
             "Resume it with `/collab join {existing_id}`. This phase could not be identified; \
              if the session is demonstrably dead (no activity for {threshold}) end it with \
-             collab_end {recipe}."
+             collab_end {recipe}. {checkable}"
         ),
     };
     format!(
@@ -3123,9 +3218,11 @@ pub(super) fn handle_collab_end(app: &App, args: &Value) -> Result<Value, Memory
             .find(|c| crate::collab::reason_char_is_forbidden(*c))
         {
             return Err(MemoryError::Validation(format!(
-                "collab_end `reason` must not contain control, line-separator, or bidi-override \
-                 characters (found {bad:?}); it is echoed verbatim in every later refusal for \
-                 this session, so it has to stay a single plain left-to-right line",
+                "collab_end `reason` must not contain control, line-separator, bidi-override, or \
+                 zero-width/invisible-format characters (found {bad:?}); its first {} characters \
+                 are echoed back in every later refusal for this session, so it has to stay a \
+                 single plain left-to-right line that renders what it contains",
+                crate::collab::MAX_ECHOED_EPITAPH_CHARS,
             )));
         }
         // Runs after our own checks so the taxonomy above owns every message
@@ -3336,7 +3433,18 @@ pub(super) fn handle_collab_end(app: &App, args: &Value) -> Result<Value, Memory
 /// 1. `ensure_active` — the already-ended check runs **before** staleness, so a
 ///    second abandon is refused with the stable ended-session message (carrying
 ///    the first abandonment's reason) rather than being re-evaluated against a
-///    staleness clock. This is what makes double-abandon a no-op.
+///    staleness clock. A second abandon is therefore a **refusal that writes
+///    nothing**, not a success — the deliberate divergence from the plain
+///    path's documented idempotent no-op, so the first epitaph can never be
+///    overwritten by a later one. That divergence has a retry cost worth
+///    stating plainly, because this is the call most likely to be retried: a
+///    caller whose response is lost re-sends and is told the operation failed
+///    when it committed. The refusal is distinguishable — only an abandoned
+///    session's ended-message carries the `caller-supplied abandon reason
+///    follows` clause, so a retrying caller can tell "I already did this" from
+///    "someone else ended it" — and `docs/COLLAB.md`'s abandon contract
+///    documents that check alongside the plain path's no-op. Pinned by
+///    `tests::abandon_of_an_already_ended_session_is_refused_and_writes_nothing`.
 /// 2. the `PlanFinalizePending` owner check — **before** staleness, because it
 ///    is the refusal the caller can act on. A counterpart told "still live"
 ///    would wait six hours and be refused again on ownership; told the truth
@@ -3349,9 +3457,12 @@ pub(super) fn handle_collab_end(app: &App, args: &Value) -> Result<Value, Memory
 /// 4. write — `coding_failure`, then `end_session` (which stamps `ended_at` and
 ///    thereby releases the `(repo_path, branch)` start slot).
 ///
-/// `recovery_attempts` and `total_recovery_attempts` are written back exactly
-/// as loaded: #283's acceptance requires the wedge be cleared *without spending
-/// a recovery attempt*, and abandon is not a recovery.
+/// `recovery_attempts` and `total_recovery_attempts` are **not written at
+/// all**: #283's acceptance requires the wedge be cleared *without spending a
+/// recovery attempt*, and abandon is not a recovery. The write is
+/// [`crate::collab::queue::set_coding_failure`], which touches `coding_failure`
+/// and `updated_at` and nothing else, so that requirement holds by statement
+/// rather than by a 27-column round trip happening to preserve two of them.
 ///
 /// # The epitaph replaces any prior `coding_failure`
 ///
@@ -3383,22 +3494,38 @@ fn handle_collab_abandon(
 ) -> Result<Value, MemoryError> {
     let coding_failure = format!("{} {}", crate::collab::ABANDONED_PREFIX, reason);
 
-    let (ended_phase, repo_path, branch) = app.db.with_transaction(|tx| {
+    let (ended_phase, ended_phase_raw, repo_path, branch) = app.db.with_transaction(|tx| {
         // (1) already-ended before staleness — see the doc comment.
         crate::collab::queue::ensure_active(tx, session_id)?;
 
-        let record = crate::collab::queue::load_session_record(tx, session_id)?;
-        let mut session = record.session;
+        // Read leniently, and *not* through `load_session_record` — see
+        // [`crate::collab::queue::AbandonTarget`]. A row whose `phase` no enum
+        // recognises is precisely a row that needs ending, and the record load
+        // would refuse the rescue with an opaque `FromSqlConversionFailure`
+        // while `duplicate_session_refusal`'s unparseable-phase arm was
+        // recommending it.
+        let target = crate::collab::queue::load_abandon_target(tx, session_id)?;
+        let phase = target.phase_raw.parse::<Phase>().ok();
+        let current_owner = target.current_owner_raw.parse::<Agent>().ok();
 
         // (2) the one authorization gate abandon keeps — see the doc comment.
         // Identical to the plain path's check, deliberately: abandon's whole
         // authorization difference from a plain end is the lease, nothing else.
-        if collab_end_requires_owner(session.phase) && agent != session.current_owner {
+        //
+        // An unidentifiable `phase` or `current_owner` does not gate: the check
+        // applies to one named phase, and a value no enum recognises is not
+        // that phase. Refusing instead would be the conservative-looking wrong
+        // answer — it would make a corrupted row unabandonable by *everyone*,
+        // which is the wedge, not a defence against it. Nothing is lost: the
+        // rule this enforces is least-privilege against an honest counterpart
+        // (`agent` is caller-asserted, so it never stopped a determined one),
+        // and it is not reachable on a row the protocol itself wrote.
+        if phase.is_some_and(collab_end_requires_owner) && Some(agent) != current_owner {
             return Err(MemoryError::Validation(format!(
                 "collab_end abandon from PlanClaudeFinalizePending requires current owner {}; got \
                  {}. Staleness does not widen who may end this phase — abandon lifts the \
                  generation lease, not the owner check.",
-                session.current_owner, agent
+                target.current_owner_raw, agent
             )));
         }
 
@@ -3406,23 +3533,38 @@ fn handle_collab_abandon(
         let staleness = crate::collab::queue::session_staleness(tx, session_id)?;
         if !staleness.is_dead() {
             let idle = staleness.idle_secs().unwrap_or(0);
+            // `saturating_sub`, and then clamped at zero, for the reason
+            // `crate::collab::idle_secs` saturates on the way in: `idle` is
+            // caller-influenced only through the clock, but
+            // `collab_checkpoints.updated_at` is `INTEGER NOT NULL` with no
+            // range CHECK, so a hand-repaired row can hold `i64::MAX` — an
+            // activity timestamp far in the future — and `idle_secs` then
+            // saturates to `i64::MIN`. Plain subtraction of that panics under
+            // debug assertions (unwinding out of the `with_transaction`
+            // closure) and wraps to a nonsensical negative "remaining" under
+            // release ones. The `max(0)` covers the other end: a small
+            // negative `idle` (clock moved backwards) would otherwise render a
+            // remaining larger than the threshold itself, which reads as a
+            // longer wait than the gate actually imposes.
+            let remaining = crate::collab::COLLAB_DEAD_SESSION_SECS
+                .saturating_sub(idle)
+                .max(0);
             return Err(MemoryError::Validation(format!(
                 "collab_end abandon refused: session {session_id} is still live (idle {idle}s in \
                  phase {}). Abandon requires {} of no activity across the session row, its \
-                 checkpoint, its messages, and its handoff lease; {}s remaining. A session being \
-                 recovered — a handoff issued or claimed — counts as live. Abandon exists only for a \
-                 demonstrably dead session — to end a live one, drive it to a terminal phase.",
-                session.phase,
+                 checkpoint, its messages, and its handoff lease; {remaining}s remaining. A session \
+                 being recovered — a handoff issued or claimed — counts as live. Abandon exists only \
+                 for a demonstrably dead session — to end a live one, drive it to a terminal phase.",
+                target.phase_raw,
                 dead_session_threshold_human(),
-                crate::collab::COLLAB_DEAD_SESSION_SECS - idle,
             )));
         }
 
-        // (4) write. `save_session` round-trips every other column, including
-        // both recovery counters, exactly as loaded.
-        let ended_phase = session.phase;
-        session.coding_failure = Some(coding_failure.clone());
-        crate::collab::queue::save_session(tx, &session)?;
+        // (4) write. Only `coding_failure` moves; every other column —
+        // including both recovery counters — is untouched rather than
+        // round-tripped, which is what makes "abandon spends no recovery
+        // attempt" a property of the statement instead of of the read.
+        crate::collab::queue::set_coding_failure(tx, session_id, &coding_failure)?;
         // Always a real transition, never `AlreadyEnded`: step (1) above ran
         // `ensure_active` in this same transaction, so an already-ended
         // session was refused before reaching here and nothing else can end it
@@ -3442,19 +3584,22 @@ fn handle_collab_abandon(
             &json!({
                 "session_id": session_id,
                 "agent": agent.as_str(),
-                "phase": ended_phase.to_string(),
+                // The raw column, not a re-rendered enum: for a recognised
+                // phase these are the same string, and for an unrecognised one
+                // the audit row records what was actually there.
+                "phase": target.phase_raw,
                 "abandoned": true,
                 "reason": reason,
             }),
             Some(&json!({ "ok": true })),
         )?;
-        Ok((ended_phase, record.repo_path, record.branch))
+        Ok((phase, target.phase_raw, target.repo_path, target.branch))
     })?;
 
     tracing::warn!(
         session_id = %session_id,
         agent = %agent.as_str(),
-        phase = %ended_phase,
+        phase = %ended_phase_raw,
         reason = %reason,
         "collab: session abandoned as demonstrably dead"
     );
@@ -3483,9 +3628,14 @@ fn handle_collab_abandon(
     // outcome moves. Everywhere else — the coding-active phases and the two
     // planning phases — there is no prior timestamp to preserve and the
     // abandonment itself is the end.
-    if crate::search::tunables::metrics_enabled() && ended_phase != Phase::CodingFailed {
+    // An unidentifiable phase (`None`) attests like a coding phase: it is not
+    // `CodingFailed`, so there is no prior `outcome='failed'` this could
+    // overwrite, and it is not `CodingComplete`, so there is no PR timestamp to
+    // preserve. Both exclusions name a specific phase; neither can be true of a
+    // string no enum recognises.
+    if crate::search::tunables::metrics_enabled() && ended_phase != Some(Phase::CodingFailed) {
         let now = crate::metrics::now_rfc3339();
-        let done_at = (ended_phase != Phase::CodingComplete).then_some(now.as_str());
+        let done_at = (ended_phase != Some(Phase::CodingComplete)).then_some(now.as_str());
         if let Err(e) = app
             .db
             .mark_task_outcome_done(session_id, done_at, Some("abandoned"), None)
@@ -5046,6 +5196,18 @@ mod tests {
             // echo, defeating the framing without changing a byte of it.
             "override\u{202e}reversed",
             "isolate\u{2066}fragment",
+            // The rest of the same `Cf` family, which the hand-listed ranges
+            // once missed while the doc argued against exactly this class:
+            // characters that render as nothing and hide or reorder what
+            // follows. `reason_char_is_forbidden` now delegates to
+            // `sanitize::is_forgeable_invisible`, the crate's one definition of
+            // the set, so these cannot drift apart again.
+            "zero\u{200b}width",
+            "joiner\u{200d}hidden",
+            "mark\u{200f}rtl",
+            "word\u{2060}joiner",
+            "invisible\u{2063}separator",
+            "bom\u{feff}prefixed",
         ];
         for reason in hostile {
             let app = test_app();
@@ -5056,7 +5218,10 @@ mod tests {
             let err = handle_collab_end(&app, &abandon_args(&sid, "claude", reason)).unwrap_err();
             let message = err.to_string();
             assert!(
-                message.contains("must not contain control, line-separator, or bidi-override"),
+                message.contains(
+                    "must not contain control, line-separator, bidi-override, or \
+                     zero-width/invisible-format"
+                ),
                 "reason {reason:?} must be refused: {message}"
             );
             // The null-byte case must land in this taxonomy too, not in
@@ -6422,6 +6587,489 @@ mod tests {
             super::super::collab_caps::handle_collab_get_caps(&app, &json!({ "session_id": sid }))
                 .is_ok(),
             "collab_get_caps is read-only and must survive the seal"
+        );
+    }
+
+    /// The seal is a write gate on a session that was **handed off**, too —
+    /// which is the case it was quietly failing.
+    ///
+    /// `sealed_session_stays_readable` proves the read survives on a session
+    /// that never left generation 0. Every wedge abandon actually exists to
+    /// clear looks different: a successor claimed the lease and then died. On
+    /// such a session the generation guard answers a tokenless `collab_recv`
+    /// with "present a session_handoff token to claim it", the token-bearing
+    /// call is a write and hits the seal, and `session_handoff` is itself
+    /// sealed — so the message queue of the one session shape most likely to be
+    /// abandoned had no reachable read path at all.
+    #[test]
+    fn a_sealed_session_that_was_handed_off_stays_readable() {
+        let app = test_app();
+        let sid = start_session(&app);
+        drive_to_implement(&app, &sid);
+        // Claim the lease, so codex's generation is genuinely past 0 — the
+        // state a tokenless read used to be refused for.
+        let token = issue_handoff_token(&app, &sid, "codex");
+        handle_collab_recv(
+            &app,
+            &json!({ "session_id": sid, "receiver": "codex", "handoff_token": token }),
+        )
+        .expect("the successor must be able to claim the lease while the session is live");
+        let (generation, _, _) = lease_row(&app, &sid, "codex");
+        assert!(
+            generation > 0,
+            "the fixture must leave codex past generation 0, or this proves nothing"
+        );
+
+        age_session(&app, &sid, crate::collab::COLLAB_DEAD_SESSION_SECS + 60);
+        handle_collab_end(&app, &abandon_args(&sid, "claude", SEAL_REASON))
+            .expect("a demonstrably dead session must be abandonable after a handoff");
+
+        let read = handle_collab_recv(
+            &app,
+            &json!({ "session_id": sid, "receiver": "codex", "auto_ack": false }),
+        )
+        .expect("a plain read of a sealed, handed-off session must still be permitted");
+        assert!(
+            read["messages"].is_array(),
+            "the read must return the queue, not a degraded frame: {read}"
+        );
+
+        // The skip must not have granted a claim: nothing was written, so the
+        // lease row is exactly where the abandon left it.
+        let after = lease_row(&app, &sid, "codex");
+        assert_eq!(
+            after.0, generation,
+            "a permitted read must not have advanced the generation"
+        );
+    }
+
+    /// The tokenless wait keeps settling the loop on a sealed session — the
+    /// frame `wait_my_turn_claim_and_capture_baseline`'s own comment says must
+    /// never become an error, asserted for the handed-off case that used to
+    /// produce one.
+    #[test]
+    fn a_tokenless_wait_on_a_sealed_session_still_settles_the_loop() {
+        let app = test_app();
+        let sid = start_session(&app);
+        drive_to_implement(&app, &sid);
+        let token = issue_handoff_token(&app, &sid, "claude");
+        handle_collab_recv(
+            &app,
+            &json!({ "session_id": sid, "receiver": "claude", "handoff_token": token }),
+        )
+        .expect("the successor must be able to claim the lease while the session is live");
+        age_session(&app, &sid, crate::collab::COLLAB_DEAD_SESSION_SECS + 60);
+        handle_collab_end(&app, &abandon_args(&sid, "claude", SEAL_REASON))
+            .expect("a demonstrably dead session must be abandonable");
+
+        let body = handle_collab_wait_my_turn(
+            &app,
+            &json!({ "session_id": sid, "agent": "claude", "timeout_secs": 1 }),
+        )
+        .expect("a tokenless wait must settle rather than error on a sealed session");
+        assert_eq!(
+            body["session_ended"],
+            json!(true),
+            "the loop's exit condition must be present: {body}"
+        );
+        assert_eq!(body["is_my_turn"], json!(false), "{body}");
+    }
+
+    /// The seal gates on `ended_at`, not on the abandoned epitaph, so a
+    /// *normally* ended session refuses a token-bearing call for the same
+    /// reason — burning a one-time credential on a session nobody can act in.
+    /// Pinned because it is a contract change for plain `collab_end` too, not
+    /// only for abandon, and nothing else covered it.
+    #[test]
+    fn a_normally_ended_session_also_refuses_a_token_bearing_recv() {
+        let app = test_app();
+        let sid = start_session(&app);
+        drive_to_plan_locked(&app, &sid);
+        let token = issue_handoff_token(&app, &sid, "codex");
+        handle_collab_end(&app, &json!({ "session_id": sid, "agent": "claude" }))
+            .expect("a plain end at PlanLocked must succeed");
+        let before = lease_row(&app, &sid, "codex");
+
+        let err = handle_collab_recv(
+            &app,
+            &json!({ "session_id": sid, "receiver": "codex", "handoff_token": token }),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("has ended"),
+            "a token-bearing recv on a plainly-ended session must be refused: {err}"
+        );
+        // No epitaph clause: only an *abandoned* session's refusal carries the
+        // reason, which is what lets a retrying caller tell the two apart.
+        assert!(
+            !err.to_string().contains("caller-supplied abandon reason"),
+            "a plain end has no epitaph to echo: {err}"
+        );
+        assert_eq!(
+            lease_row(&app, &sid, "codex"),
+            before,
+            "the refusal must leave the token unspent"
+        );
+    }
+
+    /// `idle_secs` saturates to `i64::MIN` for an activity timestamp far in the
+    /// future — the symmetric case of the `i64::MIN` corruption
+    /// `crate::collab::idle_secs` documents. The refusal's "{}s remaining"
+    /// arithmetic must not panic on it.
+    ///
+    /// `collab_checkpoints.updated_at` is `INTEGER NOT NULL` with no range
+    /// CHECK, so this is reachable by the same hand-repair path that doc
+    /// contemplates. Under debug assertions the unfixed subtraction panics
+    /// *inside* the `with_transaction` closure; under release it wraps and
+    /// renders a nonsensical negative.
+    #[test]
+    fn abandon_refusal_survives_an_activity_timestamp_from_the_future() {
+        let app = test_app();
+        let sid = start_session(&app);
+        drive_to_implement(&app, &sid);
+        app.db
+            .with_transaction(|tx| {
+                tx.execute(
+                    "UPDATE collab_checkpoints SET updated_at = ?2 WHERE session_id = ?1",
+                    rusqlite::params![sid, i64::MAX],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let err = handle_collab_end(&app, &abandon_args(&sid, "claude", "x")).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("is still live"),
+            "a session whose newest activity is in the future is live: {message}"
+        );
+        assert!(
+            message.contains("0s remaining"),
+            "the remaining seconds must clamp at zero rather than wrap: {message}"
+        );
+        assert!(
+            app.db
+                .collab_load_session_record(&sid)
+                .unwrap()
+                .ended_at
+                .is_none(),
+            "the refusal must not have sealed the session"
+        );
+    }
+
+    /// Abandon must clear a session whose stored `phase` no build recognises —
+    /// the row `duplicate_session_refusal`'s unparseable-phase arm sends
+    /// callers here for.
+    ///
+    /// Before `queue::load_abandon_target`, the record load's
+    /// `parse_text_column::<Phase>` failed the whole row scan, so the rescue
+    /// died with an opaque `FromSqlConversionFailure` and the start slot stayed
+    /// reserved forever — a guard recommending an action the server refuses,
+    /// which is the exact #283 remedy 5 shape this branch exists to remove.
+    #[test]
+    fn abandon_clears_a_session_whose_phase_no_longer_parses() {
+        let app = test_app();
+        let sid = start_session(&app);
+        drive_to_implement(&app, &sid);
+        age_session(&app, &sid, crate::collab::COLLAB_DEAD_SESSION_SECS + 60);
+        app.db
+            .with_transaction(|tx| {
+                tx.execute(
+                    "UPDATE collab_sessions SET phase = 'PhaseFromANewerBuild' WHERE id = ?1",
+                    rusqlite::params![sid],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        // The precondition, stated rather than assumed: the ordinary record
+        // load genuinely cannot read this row.
+        assert!(
+            app.db.collab_load_session_record(&sid).is_err(),
+            "the fixture must leave a row the record loader rejects, or this proves nothing"
+        );
+
+        handle_collab_end(
+            &app,
+            &abandon_args(&sid, "claude", "phase column corrupted"),
+        )
+        .expect("abandon must clear a session whose phase cannot be identified");
+
+        let (ended_at, phase, coding_failure): (Option<String>, String, Option<String>) = app
+            .db
+            .with_connection(|conn| {
+                Ok(conn.query_row(
+                    "SELECT ended_at, phase, coding_failure FROM collab_sessions WHERE id = ?1",
+                    rusqlite::params![sid],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )?)
+            })
+            .unwrap();
+        assert!(ended_at.is_some(), "the slot must actually be released");
+        assert_eq!(
+            phase, "PhaseFromANewerBuild",
+            "the unreadable phase must be preserved, not rewritten from a lossy parse"
+        );
+        assert_eq!(
+            coding_failure.as_deref(),
+            Some("abandoned: phase column corrupted"),
+            "the epitaph must still be written"
+        );
+
+        // The audit row records what was actually in the column.
+        let conn = rusqlite::Connection::open(&app.config.db_path).unwrap();
+        let params: String = conn
+            .query_row(
+                "SELECT params FROM wal_log WHERE operation = 'collab_end' \
+                 ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let params: Value = serde_json::from_str(&params).unwrap();
+        assert_eq!(
+            params["phase"],
+            json!("PhaseFromANewerBuild"),
+            "the wal row must record the raw phase, not a re-rendered enum"
+        );
+    }
+
+    /// D7: the abandon transaction commits **exactly once** when
+    /// `with_transaction` replays it on `SQLITE_BUSY_SNAPSHOT`.
+    ///
+    /// The closure performs three writes (`set_coding_failure`, `end_session`,
+    /// `wal_log_tx`), and `with_transaction` re-runs the *whole* closure on a
+    /// stale read snapshot. The sibling guarantee is already pinned for
+    /// `collab_register_caps`; without the same test here, an edit that moved
+    /// any part of the abandon's side effects outside the rollback boundary
+    /// would double-append the audit row under real contention and no test
+    /// would notice.
+    #[test]
+    fn abandon_commits_exactly_once_under_busy_snapshot_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("mem.sqlite3");
+        let app = test_app_with_db_path(db_path.clone(), dir.path());
+        let sid = start_session(&app);
+        drive_to_implement(&app, &sid);
+        age_session(&app, &sid, crate::collab::COLLAB_DEAD_SESSION_SECS + 60);
+
+        // Armed after the fixture is built, so the contender interferes with
+        // the abandon transaction and nothing before it.
+        let probe = app.db.arm_busy_snapshot_once(&db_path).unwrap();
+
+        handle_collab_end(&app, &abandon_args(&sid, "claude", "wedged"))
+            .expect("the replayed attempt must succeed, not surface the busy snapshot");
+
+        assert_eq!(
+            probe.contentions_injected(),
+            1,
+            "the contending commit never fired — this test proved nothing"
+        );
+        assert_eq!(
+            probe.transactions_begun(),
+            2,
+            "expected one busy-snapshot failure plus one replay; \
+             1 means the closure never hit contention"
+        );
+
+        // Read back over a fresh connection so only *committed* state counts.
+        let verify = rusqlite::Connection::open(&db_path).unwrap();
+        let wal_rows: i64 = verify
+            .query_row(
+                "SELECT COUNT(*) FROM wal_log
+                  WHERE operation = 'collab_end' AND params LIKE '%' || ?1 || '%'",
+                [&sid],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            wal_rows, 1,
+            "the rolled-back first attempt must not have left an audit row behind"
+        );
+        let (ended_at, coding_failure): (Option<String>, Option<String>) = verify
+            .query_row(
+                "SELECT ended_at, coding_failure FROM collab_sessions WHERE id = ?1",
+                [&sid],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(
+            ended_at.is_some(),
+            "the session must be sealed exactly once"
+        );
+        assert_eq!(coding_failure.as_deref(), Some("abandoned: wedged"));
+    }
+
+    /// D6, asserted rather than only claimed: the staleness predicate is
+    /// evaluated **in the same transaction** as the write it authorizes, so a
+    /// session that goes live between the check and the write is refused.
+    ///
+    /// The contender bumps the session row's `updated_at` at the interleave
+    /// point — after the closure's staleness read has been stepped, before its
+    /// first write. The read→write upgrade then fails with
+    /// `SQLITE_BUSY_SNAPSHOT`, `with_transaction` replays the whole closure,
+    /// and the *re-read* staleness now says live, so the abandon is refused.
+    ///
+    /// This is the test that discriminates. Hoist the staleness read out of
+    /// `with_transaction` — the plausible "cheaper error messages" refactor the
+    /// D6 doc warns about — and the replay reuses the stale answer, the abandon
+    /// succeeds, and a session that went live mid-turn is sealed. Every other
+    /// abandon test stays green through that change; this one does not.
+    #[test]
+    fn abandon_refuses_a_session_that_goes_live_inside_its_own_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("mem.sqlite3");
+        let app = test_app_with_db_path(db_path.clone(), dir.path());
+        let sid = start_session(&app);
+        drive_to_implement(&app, &sid);
+        age_session(&app, &sid, crate::collab::COLLAB_DEAD_SESSION_SECS + 60);
+
+        let probe = app
+            .db
+            .arm_busy_snapshot_once_with(
+                &db_path,
+                "UPDATE collab_sessions SET updated_at = datetime('now')
+                  WHERE id = (SELECT id FROM collab_sessions ORDER BY created_at DESC LIMIT 1)",
+            )
+            .unwrap();
+
+        let err = handle_collab_end(&app, &abandon_args(&sid, "claude", "wedged")).unwrap_err();
+
+        assert_eq!(
+            probe.contentions_injected(),
+            1,
+            "the contending commit never fired — this test proved nothing"
+        );
+        assert_eq!(
+            probe.transactions_begun(),
+            2,
+            "expected one busy-snapshot failure plus one replay"
+        );
+        assert!(
+            err.to_string().contains("is still live"),
+            "the replay must re-read staleness and refuse the now-live session: {err}"
+        );
+
+        let verify = rusqlite::Connection::open(&db_path).unwrap();
+        let ended_at: Option<String> = verify
+            .query_row(
+                "SELECT ended_at FROM collab_sessions WHERE id = ?1",
+                [&sid],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            ended_at.is_none(),
+            "a session that went live between the check and the write must not be sealed"
+        );
+    }
+
+    /// The abandon gate's precondition has to be checkable without invoking the
+    /// gate. `collab_status` reports the same paired read
+    /// `handle_collab_abandon` evaluates, so a caller told to abandon a session
+    /// "with no activity for 6h" has a surface that answers that question.
+    ///
+    /// The `updated_at` assertion is the point: it is the field a caller would
+    /// otherwise reach for, and it is the wrong one — a coding batch files
+    /// checkpoints without touching the session row, so the two disagree
+    /// exactly where it matters.
+    #[test]
+    fn status_reports_the_staleness_the_abandon_gate_evaluates() {
+        let app = test_app();
+        let sid = start_session(&app);
+        drive_to_implement(&app, &sid);
+
+        let live = handle_collab_status(&app, &json!({ "session_id": sid })).unwrap();
+        assert_eq!(
+            live["dead_session_secs"],
+            json!(crate::collab::COLLAB_DEAD_SESSION_SECS),
+            "the threshold must be reported beside the measurement, not left to be \
+             hardcoded by every caller: {live}"
+        );
+        let idle = live["idle_secs"]
+            .as_i64()
+            .expect("idle_secs must be a number");
+        assert!(
+            idle < crate::collab::COLLAB_DEAD_SESSION_SECS,
+            "a session that just checkpointed must read live: {live}"
+        );
+        assert!(
+            live["last_activity"].as_i64().is_some_and(|t| t > 0),
+            "last_activity must be a real epoch: {live}"
+        );
+
+        // Age only the checkpoint back, leaving the session row fresh — the
+        // case where `updated_at` and the real signal diverge. Here the gate
+        // must still say live, and `updated_at` alone would have agreed by
+        // accident; the reverse case below is the one that discriminates.
+        age_session(&app, &sid, crate::collab::COLLAB_DEAD_SESSION_SECS + 60);
+        let stale = handle_collab_status(&app, &json!({ "session_id": sid })).unwrap();
+        assert!(
+            stale["idle_secs"].as_i64().unwrap() >= crate::collab::COLLAB_DEAD_SESSION_SECS,
+            "an aged session must report itself over the threshold: {stale}"
+        );
+
+        // And the reported number agrees with the gate: the abandon that this
+        // status licenses actually succeeds.
+        handle_collab_end(
+            &app,
+            &abandon_args(&sid, "claude", "checked idle_secs first"),
+        )
+        .expect("a session status reports as over-threshold must be abandonable");
+    }
+
+    /// The other direction, and the reason `updated_at` cannot stand in: a
+    /// session whose only recent write is a checkpoint reads live here even
+    /// though the session row is hours old.
+    #[test]
+    fn status_idle_secs_counts_the_checkpoint_the_session_row_misses() {
+        let (_temp, repo_path, heads) = git_ancestor_chain(2);
+        let app = test_app();
+        let sid = start_session_in_scope(&app, &repo_path, "main");
+        drive_to_implement_with_head(&app, &sid, &heads[0]);
+        // Age everything, then let the implementer file one checkpoint — a long
+        // batch turn filing progress without touching the session row.
+        age_session(&app, &sid, crate::collab::COLLAB_DEAD_SESSION_SECS + 600);
+        super::super::collab_checkpoint::handle_collab_checkpoint(
+            &app,
+            &json!({
+                "session_id": sid, "agent": "claude",
+                "task_id": 1, "task_title": "first task",
+                "status": "started",
+                "head_sha": heads[1], "completed_task_ids": "",
+            }),
+        )
+        .expect("a live batch turn must be able to file progress");
+
+        let status = handle_collab_status(&app, &json!({ "session_id": sid })).unwrap();
+        assert!(
+            status["idle_secs"].as_i64().unwrap() < crate::collab::COLLAB_DEAD_SESSION_SECS,
+            "a live batch must not read dead just because the session row is old: {status}"
+        );
+        // The session row really is old, so a caller reading `updated_at`
+        // instead would have concluded the opposite.
+        let row_age: i64 = app
+            .db
+            .with_connection(|conn| {
+                Ok(conn.query_row(
+                    "SELECT CAST(strftime('%s','now') AS INTEGER)
+                          - CAST(strftime('%s', updated_at) AS INTEGER)
+                       FROM collab_sessions WHERE id = ?1",
+                    rusqlite::params![sid],
+                    |row| row.get(0),
+                )?)
+            })
+            .unwrap();
+        assert!(
+            row_age >= crate::collab::COLLAB_DEAD_SESSION_SECS,
+            "the fixture must leave the session row past the threshold, or the \
+             disagreement this test is about does not exist"
+        );
+
+        let err = handle_collab_end(&app, &abandon_args(&sid, "claude", "x")).unwrap_err();
+        assert!(
+            err.to_string().contains("is still live"),
+            "the gate must agree with the status it published: {err}"
         );
     }
 

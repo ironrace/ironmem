@@ -49,6 +49,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`collab_status` reports the staleness the abandon gate evaluates (#297).**
+  New `last_activity` (Unix epoch seconds), `idle_secs`, and
+  `dead_session_secs` fields, read through the same paired `session_staleness`
+  snapshot `collab_end`'s abandon arm gates on. Until now the precondition
+  every surface told callers to check — "no activity for 6 hours" — was
+  answerable only by invoking the irreversible operation and reading the
+  refusal, or by reading the session record's `updated_at`, which is the wrong
+  signal: a long `CodeImplementPending` batch files checkpoints without
+  touching the session row, so `updated_at` alone reports a live batch as hours
+  idle. The duplicate-session refusal, `/collab`, and the Codex plan-draft
+  prompt now all point at `idle_secs` instead. Being over the threshold makes a
+  session *abandonable*, never provably dead — `PlanLocked` and
+  `CodingComplete` are human-gated and can sit healthy and silent much longer.
+
 - **`collab_end` can abandon a demonstrably dead collab session (#297).**
   A session wedged in a coding-active phase previously had no exit at all: the
   start slot reserves `(repo_path, branch)` for as long as the session stays
@@ -84,13 +98,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `PlanClaudeFinalizePending` current-owner check is still enforced, so
   staleness never becomes a way for the counterpart to seal a session
   mid-turn. `reason` is required, capped, and refused if it carries control,
-  line-separator, or bidi-override characters, because it is echoed back in
-  every later refusal for that session and an agent reads a server refusal as
-  authoritative output; the same characters are now stripped again on the way
-  *out*, since a database that ran an earlier ironmem can hold an `abandoned:`
-  row written before the prefix was reserved against caller input. Abandon
-  spends no recovery attempt — it is not a recovery. See § "The `collab_end`
-  abandon contract" in `docs/COLLAB.md`, including who is expected to call it.
+  line-separator, bidi-override, or zero-width/invisible-format characters,
+  because it is echoed back in every later refusal for that session and an
+  agent reads a server refusal as authoritative output; the same characters are
+  now stripped again on the way *out*, since a database that ran an earlier
+  ironmem can hold an `abandoned:` row written before the prefix was reserved
+  against caller input, and the echo is capped at 240 characters — the
+  attribution bounds the echo's format, the cap bounds its volume, and only the
+  second stops an agent-composed paragraph of directive prose from being
+  replayed as server output on every later call (the full text stays on
+  `collab_status`). Abandon spends no recovery attempt — it is not a
+  recovery, and the write touches `coding_failure` alone rather than
+  round-tripping the whole row. It also survives a `phase` column no build
+  recognises, which is exactly the row the duplicate-session guard's
+  unrecognized-phase arm sends callers here for.
+
+  **A repeat abandon is refused, not a no-op** — the one end shape that is not
+  idempotent, so the first epitaph can never be overwritten. That has a retry
+  cost worth planning around: a caller whose response was lost is told the
+  operation failed. Only an abandoned session's refusal carries the
+  `caller-supplied abandon reason follows` clause, which is how a retrying
+  caller tells "my seal is in place" from "someone else ended it". See § "The
+  `collab_end` abandon contract" in `docs/COLLAB.md`, including who is expected
+  to call it, and the permission-allowlist note: MCP grants are per tool name,
+  so an existing `mcp__ironmem__collab_end` allowance now confers the abandon
+  arm too and is worth re-reviewing.
 
 - **Schema-enforced collab checkpoints and a head-consistency gate on
   `implementation_done` (#273).** Schema goes **v19 -> v21** (migrations 020
@@ -127,6 +159,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   slots.
 
 ### Fixed
+
+- **A sealed collab session stays readable after a handoff (#297).** The write
+  seal on an abandoned session left its message queue unreachable in exactly
+  the case abandon exists for — a successor that claimed the generation lease
+  and then died. A tokenless `collab_recv` was answered by the lease guard
+  ("present a `session_handoff` token"), a token-bearing one is a write and hit
+  the seal, and `session_handoff` is sealed too, so no fresh token could be
+  minted. Read-only calls on an **ended** session now skip the lease guard, for
+  the same reason the abandon arm may bypass it: the lease stops a stale
+  process from *acting*, and an ended session leaves no live turn to seize. A
+  tokenless `collab_wait_my_turn` likewise settles with `session_ended: true`
+  rather than erroring, so a successor's wait loop exits instead of stranding.
+  Mutating shapes (`auto_ack`, a presented `handoff_token`) stay refused on any
+  ended session, abandoned or not.
+
+- **The abandon refusal no longer overflows on a corrupted activity stamp
+  (#297).** `collab_checkpoints.updated_at` is `INTEGER NOT NULL` with no range
+  CHECK, so a hand-repaired row can hold a timestamp far in the future; the
+  "seconds remaining" arithmetic in the still-live refusal was plain
+  subtraction over an intentionally-saturating value, which panicked under
+  debug assertions and wrapped to a nonsensical negative under release ones. It
+  now saturates and clamps at zero. Relatedly, an activity timestamp SQLite
+  cannot parse — restored from a dump in another format, or hand-repaired —
+  still degrades toward "dead" as before, but now warns rather than doing it
+  silently, since that single predicate authorizes an irreversible operation.
 
 - **A repeat `collab_end` is now literally a no-op (#297).** `docs/COLLAB.md`
   has always specified a second `collab_end` on an already-ended session as a

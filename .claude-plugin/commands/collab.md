@@ -668,7 +668,9 @@ single human planning gate and takes it in step 0, before any worker runs.
      `handle_collab_end` in `crates/ironmem/src/mcp/tools/collab_session.rs`),
      so this is the one *immediate* clean abandon point in the session; a
      session that wedges past this gate still has the staleness-gated
-     `abandon: true` arm (§ Invariants) once it is demonstrably dead. Report
+     `abandon: true` arm (§ Invariants) once it is demonstrably dead —
+     `collab_status`'s `idle_secs` against its `dead_session_secs` is how
+     that is established, and an operator decides it, not this loop. Report
      the rejection and exit the loop; never work around the gate by sending
      `task_list` anyway.
 

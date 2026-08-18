@@ -4413,6 +4413,104 @@ fn collab_abandon_frees_a_wedged_branch_end_to_end_via_mcp() {
     );
 }
 
+/// Abandon-as-slot-transfer, across two *different* agents — the composed
+/// property that carries this feature's security weight, pinned so any future
+/// narrowing or widening of it is a visible test change rather than a silent
+/// behaviour shift.
+///
+/// By D5 the abandon arm is deliberately neither scope- nor membership-gated:
+/// any caller who can name a valid `Agent` may abandon a demonstrably dead
+/// session it never participated in, and the freed `(repo_path, branch)` start
+/// slot is then claimable by anyone, who picks their own pilot and implementer
+/// roles. `collab_abandon_frees_a_wedged_branch_end_to_end_via_mcp` covers the
+/// mechanism but has the *same* agent abandon and reclaim, so it cannot see
+/// this boundary at all.
+///
+/// The assertions below record today's behaviour rather than endorsing it.
+/// `agent` is caller-asserted — `require_agent` only parses the string — so the
+/// enum value is a claim, not an identity, and the real bound on this is the
+/// six-hour staleness gate plus who can reach the MCP socket. If a later change
+/// adds a membership or ownership check to the abandon arm, or lets the
+/// abandoning caller inherit `current_owner` on the successor session, this
+/// test is where that shows up.
+#[test]
+fn abandon_by_a_nonparticipant_transfers_the_start_slot_with_attacker_chosen_roles() {
+    let (_db_dir, _db_path, app) = open_disk_app();
+    let (_repo, repo_path, _shas) = git_batch_repo(2);
+    let branch = "main";
+
+    // Session A: started, piloted and implemented entirely by claude. Codex
+    // never touches it.
+    let wedged = start_batch_session_in(&app, &repo_path, 2);
+    let before = call_tool(&app, "collab_status", json!({ "session_id": &wedged }));
+    assert_eq!(before["phase"], "CodeImplementPending");
+    assert_eq!(
+        before["pilot"], "claude",
+        "the fixture must leave codex a non-participant, or this proves nothing"
+    );
+    assert_eq!(before["implementer"], "claude");
+
+    age_collab_session(
+        &app,
+        &wedged,
+        ironmem::collab::COLLAB_DEAD_SESSION_SECS + 60,
+    );
+
+    // Codex — which never participated — abandons it. No membership check
+    // stands between the caller and the seal; only staleness does.
+    let abandoned = call_tool(
+        &app,
+        "collab_end",
+        json!({
+            "session_id": &wedged,
+            "agent": "codex",
+            "abandon": true,
+            "reason": "claude's implementer process is gone"
+        }),
+    );
+    assert_eq!(
+        abandoned,
+        json!({ "ok": true, "session_id": &wedged, "abandoned": true }),
+        "abandon is not membership-gated: a non-participant may seal a dead session"
+    );
+
+    // And the freed slot is claimable with roles the abandoning caller chose
+    // for itself — codex as both pilot and implementer, on a branch claude held.
+    let successor = call_tool(
+        &app,
+        "collab_start",
+        json!({
+            "repo_path": &repo_path,
+            "branch": branch,
+            "initiator": "codex",
+            "pilot": "codex",
+            "implementer": "codex",
+            "task": "codex takes over the branch claude was holding"
+        }),
+    );
+    let successor_id = successor["session_id"].as_str().unwrap_or_else(|| {
+        panic!("the abandoned slot must be claimable by the abandoning caller: {successor}")
+    });
+    assert_ne!(successor_id, wedged);
+
+    let taken = call_tool(&app, "collab_status", json!({ "session_id": successor_id }));
+    assert_eq!(
+        taken["pilot"], "codex",
+        "the reclaiming caller chooses its own roles — nothing carries over from the \
+         session it abandoned"
+    );
+    assert_eq!(taken["implementer"], "codex");
+
+    // The sealed session is untouched by the transfer: its epitaph names who
+    // abandoned it, which is the only audit trail this boundary leaves.
+    let sealed = call_tool(&app, "collab_status", json!({ "session_id": &wedged }));
+    assert!(sealed["ended_at"].is_string());
+    assert_eq!(
+        sealed["pilot"], "claude",
+        "the abandoned session must keep its own record of who ran it"
+    );
+}
+
 #[test]
 fn collab_start_code_review_failure_report_reaches_coding_failed() {
     let app = App::open_for_test().unwrap();

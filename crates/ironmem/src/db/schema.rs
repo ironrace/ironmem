@@ -210,10 +210,37 @@ impl Database {
     /// `path` must be the path this database was opened from. The armed
     /// authorizer owns the contending connection and lives until this
     /// `Database` is dropped.
+    ///
+    /// The contender writes to a scratch table, so it advances the WAL without
+    /// changing anything a test asserts on — the right default when the
+    /// property under test is "the replayed closure commits exactly once".
+    /// Use [`Self::arm_busy_snapshot_once_with`] when the point is instead that
+    /// the replay **re-reads** something: point the contender at a table the
+    /// closure's predicate depends on, and a predicate hoisted out of the
+    /// transaction stops noticing the change.
     #[cfg(test)]
     pub(crate) fn arm_busy_snapshot_once(
         &self,
         path: &Path,
+    ) -> Result<BusySnapshotProbe, MemoryError> {
+        self.arm_busy_snapshot_once_with(
+            path,
+            "INSERT INTO busy_snapshot_contention DEFAULT VALUES",
+        )
+    }
+
+    /// [`Self::arm_busy_snapshot_once`] with the contending statement chosen by
+    /// the caller.
+    ///
+    /// `contending_sql` runs on a second connection at the interleave point and
+    /// must take no parameters. It commits on its own connection, so it sees
+    /// only committed state — it cannot observe or depend on the closure's
+    /// in-flight transaction.
+    #[cfg(test)]
+    pub(crate) fn arm_busy_snapshot_once_with(
+        &self,
+        path: &Path,
+        contending_sql: &str,
     ) -> Result<BusySnapshotProbe, MemoryError> {
         use rusqlite::hooks::{AuthAction, AuthContext, Authorization, TransactionOperation};
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -225,6 +252,7 @@ impl Database {
             "CREATE TABLE IF NOT EXISTS busy_snapshot_contention (id INTEGER PRIMARY KEY);",
         )?;
         let contender = Connection::open(path)?;
+        let contending_sql = contending_sql.to_string();
 
         let transactions = Arc::new(AtomicUsize::new(0));
         let contentions = Arc::new(AtomicUsize::new(0));
@@ -250,10 +278,7 @@ impl Database {
                     // authorizer failure. Count only commits that landed, and
                     // let the test's `contentions_injected()` assertion report
                     // a fixture that failed to fire.
-                    if contender
-                        .execute("INSERT INTO busy_snapshot_contention DEFAULT VALUES", [])
-                        .is_ok()
-                    {
+                    if contender.execute(&contending_sql, []).is_ok() {
                         contention_counter.fetch_add(1, Ordering::SeqCst);
                     }
                 }
