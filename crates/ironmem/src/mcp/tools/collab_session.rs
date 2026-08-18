@@ -3015,7 +3015,30 @@ pub(super) fn handle_collab_end(app: &App, args: &Value) -> Result<Value, Memory
         return handle_collab_abandon(app, session_id, agent, reason);
     }
 
-    let (phase, repo_path, branch, claim, end_outcome) = app.db.with_transaction(|tx| {
+    let ended = app.db.with_transaction(|tx| {
+        // Endedness is read FIRST, before anything with a side effect, and as
+        // a plain read rather than through `ensure_active` — an already-ended
+        // `collab_end` is a documented no-op *success* (`docs/COLLAB.md`:
+        // "calling from a terminal phase or an already-ended session is a
+        // no-op"), so this must not raise.
+        //
+        // The claim below is the reason the order matters. With a
+        // `handoff_token`, `ensure_actor_generation_current` calls
+        // `claim_handoff_token` — a write that consumes the one-time token and
+        // bumps `collab_actor_generations.generation`. Nothing afterward
+        // refuses in an endable phase, so on an already-ended session that
+        // transaction used to commit: a call specified to do nothing burned a
+        // recovery credential and advanced the lease. A no-op that spends a
+        // one-time token is no more a no-op than one that appends an audit
+        // row. The docs promise the *end* is a no-op success; they say nothing
+        // entitling it to claim a lease, so the token is left unspent — the
+        // session is dead, the token is worthless here, and the operator may
+        // still need it elsewhere.
+        let record = crate::collab::queue::load_session_record(tx, session_id)?;
+        if record.ended_at.is_some() {
+            return Ok(None);
+        }
+
         let claim = super::handoff::ensure_actor_generation_current(
             app,
             tx,
@@ -3029,7 +3052,6 @@ pub(super) fn handle_collab_end(app: &App, args: &Value) -> Result<Value, Memory
         // counterpart from killing an in-flight finalization turn. The other
         // endable phases are PlanLocked (pre-task_list) and the two v3
         // terminal phases.
-        let record = crate::collab::queue::load_session_record(tx, session_id)?;
         let session = record.session;
         if session.phase == Phase::PlanFinalizePending && agent != session.current_owner {
             return Err(MemoryError::Validation(format!(
@@ -3044,38 +3066,43 @@ pub(super) fn handle_collab_end(app: &App, args: &Value) -> Result<Value, Memory
             )));
         }
         let ended_phase = session.phase;
-        // `collab_end` is documented idempotent: "calling from a terminal
-        // phase or an already-ended session is a no-op" (`docs/COLLAB.md`).
-        // Honouring that means more than returning `ok` — the audit row and
-        // the metrics attestation below are side effects of *ending*, and
-        // repeating them on a call that changed nothing is how a session
-        // abandoned as "PR was closed unmerged" came back reporting `merged`.
-        // `end_session` reports which case this is; both are successes and the
-        // response is identical either way.
+        // Always a real transition: the endedness read at the top of this same
+        // transaction already returned for the already-ended case, so nothing
+        // can have ended the session in between. Asserted rather than branched
+        // on, for the same reason the abandon arm does — the assert is what
+        // catches a future edit that removes that read and silently restores
+        // the double-write.
         let outcome = crate::collab::queue::end_session(tx, session_id)?;
-        if outcome == crate::collab::queue::SessionEndOutcome::Ended {
-            crate::db::schema::Database::wal_log_tx(
-                tx,
-                "collab_end",
-                &json!({
-                    "session_id": session_id,
-                    "agent": agent.as_str(),
-                    "phase": ended_phase.to_string(),
-                }),
-                Some(&json!({ "ok": true })),
-            )?;
-        }
-        Ok((ended_phase, record.repo_path, record.branch, claim, outcome))
+        debug_assert_eq!(
+            outcome,
+            crate::collab::queue::SessionEndOutcome::Ended,
+            "the endedness read above must have returned for an already-ended session"
+        );
+        crate::db::schema::Database::wal_log_tx(
+            tx,
+            "collab_end",
+            &json!({
+                "session_id": session_id,
+                "agent": agent.as_str(),
+                "phase": ended_phase.to_string(),
+            }),
+            Some(&json!({ "ok": true })),
+        )?;
+        Ok(Some((ended_phase, record.repo_path, record.branch, claim)))
     })?;
+
+    // Already ended: nothing was claimed, written, or attested, and there is
+    // no claim to publish. The response is byte-identical to a real end.
+    let Some((phase, repo_path, branch, claim)) = ended else {
+        return Ok(json!({ "ok": true, "session_id": session_id }));
+    };
     claim.publish(app);
 
     // Operator attestation (METRICS_SPEC §12 amendment): the operator ends a
     // CodingComplete session after the PR lands, or abandons a pre-coding
-    // session during finalization / after the plan locks. Skipped entirely
-    // when this call ended nothing — see the note above `end_session`.
-    if crate::search::tunables::metrics_enabled()
-        && end_outcome == crate::collab::queue::SessionEndOutcome::Ended
-    {
+    // session during finalization / after the plan locks. Unreachable when the
+    // session was already ended — that case returned above.
+    if crate::search::tunables::metrics_enabled() {
         let now = crate::metrics::now_rfc3339();
         let attested = match phase {
             Phase::CodingComplete => {
@@ -4834,16 +4861,127 @@ mod tests {
         );
     }
 
-    /// Count the `collab_end` audit rows written for any session.
-    fn collab_end_wal_count(app: &crate::mcp::app::App) -> i64 {
-        rusqlite::Connection::open(&app.config.db_path)
+    /// The full generation-lease row for `(sid, agent)`, as
+    /// `(generation, pending_token, pending_generation)`. Read directly so a
+    /// test can assert the row is byte-identical across a call that must not
+    /// touch it.
+    fn lease_row(
+        app: &crate::mcp::app::App,
+        sid: &str,
+        agent: &str,
+    ) -> (i64, Option<String>, Option<i64>) {
+        app.db
+            .with_connection(|conn| {
+                Ok(conn
+                    .query_row(
+                        "SELECT generation, pending_handoff_token, pending_handoff_generation
+                           FROM collab_actor_generations
+                          WHERE session_id = ?1 AND agent = ?2",
+                        rusqlite::params![sid, agent],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .optional()?
+                    .expect("the lease row must exist"))
+            })
             .unwrap()
-            .query_row(
-                "SELECT COUNT(*) FROM wal_log WHERE operation = 'collab_end'",
-                [],
-                |row| row.get(0),
+    }
+
+    /// A `handoff_token` on an already-ended session must be left unspent.
+    ///
+    /// `ensure_actor_generation_current` consumes the one-time token and bumps
+    /// the generation, and it runs *before* anything on the plain path can
+    /// decline — so an end that is contractually a no-op was burning a
+    /// recovery credential and advancing the lease. The docs promise the end
+    /// is a no-op success; they grant no entitlement to claim a lease. The
+    /// token stays valid because the operator may still need it elsewhere.
+    ///
+    /// Parameterised over how the session got ended so the property is pinned
+    /// as being about *endedness*, not about abandonment specifically.
+    fn assert_end_with_token_leaves_the_lease_untouched(abandoned: bool) {
+        let app = test_app();
+        let sid = start_session(&app);
+        drive_to_plan_locked(&app, &sid);
+
+        // Issue while live — this is the state an operator holds when a
+        // successor is standing by.
+        let token = issue_handoff_token(&app, &sid, "claude");
+
+        if abandoned {
+            age_session(&app, &sid, crate::collab::COLLAB_DEAD_SESSION_SECS + 60);
+            handle_collab_end(
+                &app,
+                &abandon_args(&sid, "claude", "successor never arrived"),
             )
-            .unwrap()
+            .unwrap();
+        } else {
+            handle_collab_end(&app, &end_args(&sid, "claude")).unwrap();
+        }
+
+        let before = lease_row(&app, &sid, "claude");
+        assert_eq!(
+            before.1.as_deref(),
+            Some(token.as_str()),
+            "the token must still be pending on the ended session"
+        );
+
+        let mut args = end_args(&sid, "claude");
+        args["handoff_token"] = json!(token);
+        let response = handle_collab_end(&app, &args)
+            .expect("ending an already-ended session stays a documented no-op success");
+        assert_eq!(
+            response,
+            json!({ "ok": true, "session_id": sid }),
+            "the wire response must be unchanged"
+        );
+
+        assert_eq!(
+            lease_row(&app, &sid, "claude"),
+            before,
+            "a no-op end must not consume the token or bump the generation \
+             (abandoned={abandoned})"
+        );
+    }
+
+    #[test]
+    fn a_plain_end_with_a_token_on_an_abandoned_session_leaves_the_lease_untouched() {
+        assert_end_with_token_leaves_the_lease_untouched(true);
+    }
+
+    #[test]
+    fn a_plain_end_with_a_token_on_a_normally_ended_session_leaves_the_lease_untouched() {
+        assert_end_with_token_leaves_the_lease_untouched(false);
+    }
+
+    /// The other side of the fix: skipping the claim must be scoped to ended
+    /// sessions only. A token supplied on a *live* endable session is still
+    /// claimed exactly as before — this is the path the lease exists for, and
+    /// disabling it silently would be the worse regression.
+    #[test]
+    fn a_plain_end_with_a_token_on_a_live_session_still_claims_the_lease() {
+        let app = test_app();
+        let sid = start_session(&app);
+        drive_to_plan_locked(&app, &sid);
+
+        let token = issue_handoff_token(&app, &sid, "claude");
+        let before = lease_row(&app, &sid, "claude");
+        assert_eq!(before.1.as_deref(), Some(token.as_str()));
+
+        let mut args = end_args(&sid, "claude");
+        args["handoff_token"] = json!(token);
+        handle_collab_end(&app, &args).expect("a live PlanLocked session ends normally");
+
+        let after = lease_row(&app, &sid, "claude");
+        assert_eq!(
+            after.1, None,
+            "a real end must still consume the one-time token"
+        );
+        assert_eq!(after.2, None, "and clear the pending generation");
+        assert!(
+            after.0 > before.0,
+            "and advance the generation: {} -> {}",
+            before.0,
+            after.0
+        );
     }
 
     /// `collab_end` is documented idempotent, and this pins the half that was
@@ -4860,7 +4998,7 @@ mod tests {
         drive_to_plan_locked(&app, &sid);
 
         handle_collab_end(&app, &end_args(&sid, "claude")).unwrap();
-        let wal_after_first = collab_end_wal_count(&app);
+        let wal_after_first = collab_end_wal_row_count(&app);
         let first = app.db.get_task_outcome(&sid).unwrap().unwrap();
         assert_eq!(wal_after_first, 1, "the real end writes exactly one row");
 
@@ -4874,7 +5012,7 @@ mod tests {
         );
 
         assert_eq!(
-            collab_end_wal_count(&app),
+            collab_end_wal_row_count(&app),
             wal_after_first,
             "a no-op must not append a second audit row"
         );
@@ -4910,7 +5048,7 @@ mod tests {
         .unwrap();
 
         let abandoned = app.db.get_task_outcome(&sid).unwrap().unwrap();
-        let wal_after_abandon = collab_end_wal_count(&app);
+        let wal_after_abandon = collab_end_wal_row_count(&app);
         assert_eq!(abandoned.outcome.as_deref(), Some("abandoned"));
 
         // `CodingComplete` is an endable phase, so this plain end is admitted
@@ -4929,7 +5067,7 @@ mod tests {
             "nor re-stamp when the work stopped"
         );
         assert_eq!(
-            collab_end_wal_count(&app),
+            collab_end_wal_row_count(&app),
             wal_after_abandon,
             "nor append a second audit row"
         );
