@@ -35,7 +35,7 @@ The current CLI help exposes provider/model/thinking choices but no sandbox/appr
 
 ### Provider and IronMem evidence
 
-[OpenAI’s agent approvals/security](https://learn.chatgpt.com/docs/agent-approvals-security) and [sandboxing](https://learn.chatgpt.com/docs/sandboxing) describe Codex’s own OS sandbox, approvals, and prompt-injection considerations. They are capabilities of Codex, not proof that HumanLayer launches Codex with those defaults. [OpenAI API data controls](https://developers.openai.com/api/docs/guides/your-data#default-usage-policies-by-endpoint) establish API no-training-by-default unless opted in and conditional abuse-log/application-state retention; Zero Data Retention and Modified Abuse Monitoring require eligibility/configuration.
+[OpenAI’s agent approvals/security](https://learn.chatgpt.com/docs/agent-approvals-security) and [sandboxing](https://learn.chatgpt.com/docs/sandboxing) describe Codex’s own OS sandbox, approvals, and prompt-injection considerations. They are capabilities of Codex, not proof that HumanLayer launches Codex with those defaults. [OpenAI API data controls](https://developers.openai.com/api/docs/guides/your-data#storage-requirements-and-retention-controls-per-endpoint) establish API no-training-by-default unless opted in and conditional abuse-log/application-state retention; Zero Data Retention and Modified Abuse Monitoring require eligibility/configuration.
 
 [Anthropic consumer retention](https://privacy.claude.com/en/articles/10023548-how-long-do-you-store-my-data), [training use](https://privacy.claude.com/en/articles/7996885-how-do-you-use-personal-data-in-model-training), and the [Claude Code FAQ](https://support.claude.com/en/articles/14554922-claude-code-user-faq) distinguish consumer settings/retention from commercial Team, Enterprise, and API no-training-by-default unless opted into a program.
 
@@ -51,7 +51,7 @@ flowchart LR
     D[HumanLayer daemon + agent subprocess]
     W[Sanitized precreated worktree]
     P -->|out-of-band approval| CL
-    D -->|source, diffs, tool calls/results| W
+    D <-->|source, diffs, tool calls/results| W
   end
   subgraph C[HumanLayer cloud / authorization boundary]
     API[Authorized API, task/session service, artifact sync]
@@ -101,9 +101,9 @@ The host is the primary authority boundary. HumanLayer cloud, GitHub, IronMem’
 
 1. Use a dedicated non-admin OS account or isolated host, clean home, restricted filesystem, and explicit network allowlist. The normal developer environment is **PROHIBITED**.
 2. Use one disposable selected GitHub repository containing only public/synthetic material. Protect its default branch/ruleset; create draft PRs only; no merge or deployment.
-3. Do not use computer control for permission changes or destructive actions. Those actions require out-of-band human confirmation by the **Pilot owner**.
+3. The **Pilot owner** may give out-of-band confirmation only for an explicitly allowed, bounded human-gated action within this public/synthetic, draft-only pilot (for example, beginning an otherwise compliant session or creating an allowed draft PR). Computer control for permission changes or destructive actions is not human-gated: it is **PROHIBITED**.
 4. Pin package versions and integrity; disable automatic workspace setup; forbid a local override; manually precreate and sanitize the worktree.
-5. Launch with `env -i` plus an approved allowlist. No production secrets, `.env` defaults, personal GitHub/cloud auth, SSH identities, or inherited credential helpers.
+5. Launch with `/usr/bin/env -i` plus an approved allowlist. No production secrets, `.env` defaults, personal GitHub/cloud auth, SSH identities, or inherited credential helpers.
 6. Set pilot-specific `IRONMEM_DB_PATH` and `IRONMEM_DAEMON_SOCKET`. Keep `IRONMEM_MCP_MODE` least-privilege for the task, with IronMem LLM rerank and LLM preference extraction off.
 7. Back up the pilot SQLite/worktree only to approved pilot storage and review every diff/artifact before any external action.
 
@@ -123,7 +123,7 @@ The normal review shell failed a negative control because secret-shaped names we
 
 The **Host operator** records only names/classes and presence, never values. Use an audited absolute-path interpreter or helper with environment and site-startup isolation that enumerates keys directly, for example `/usr/bin/python3 -I -S -c 'import os; print("\\n".join(sorted(os.environ.keys())))'`; it must never serialize `os.environ` values to output. Record only the resulting key names, then inspect `ssh-add -l` without key material, GitHub/credential-helper status, and expected pilot credential-file presence/permissions. Do not use commands that print environment values, tokens, `.env` contents, or credentials.
 
-Run this synthetic negative control before approving the enumerator; it contains no real secret. It places one sentinel after a newline in a synthetic value and another in a synthetic `sitecustomize` startup hook reachable only through `PYTHONPATH`. It uses the exact approved `/usr/bin/python3 -I -S -c` invocation, prints only keys, and fails if either sentinel appears in the enumerator output:
+Run this synthetic negative control before approving the enumerator; it contains no real secret. It places distinct sentinels on both lines of a synthetic value and another in a synthetic `sitecustomize` startup hook reachable only through `PYTHONPATH`. It uses the exact approved `/usr/bin/python3 -I -S -c` invocation. The approved path must emit neither value sentinel nor the startup sentinel; the control also proves that full-value serialization, first-line-only serialization, and startup-hook execution are each detected and fail closed:
 
 ```sh
 set -eu
@@ -131,24 +131,51 @@ test_dir="$(/usr/bin/mktemp -d)"
 export test_dir
 trap '/usr/bin/python3 -I -S -c '"'"'import os; p = os.environ["test_dir"]; os.unlink(p + "/sitecustomize.py"); os.rmdir(p)'"'"'' EXIT HUP INT TERM
 /usr/bin/printf '%s\n' 'import sys; print("PYTHON_STARTUP_SENTINEL")' > "$test_dir/sitecustomize.py"
-enum_output="$(
+synthetic_value="$(/usr/bin/printf 'SYNTHETIC_FIRST_LINE_SENTINEL\nSYNTHETIC_SECOND_LINE_SENTINEL')"
+require_absent() {
+  output="$1"
+  sentinel="$2"
+  label="$3"
+  if /usr/bin/printf '%s\n' "$output" | /usr/bin/grep -Fq "$sentinel"; then
+    /usr/bin/printf '%s\n' "$label leaked a synthetic sentinel" >&2
+    exit 1
+  fi
+}
+require_detected() {
+  output="$1"
+  sentinel="$2"
+  label="$3"
+  if ! /usr/bin/printf '%s\n' "$output" | /usr/bin/grep -Fq "$sentinel"; then
+    /usr/bin/printf '%s\n' "$label was not detected" >&2
+    exit 1
+  fi
+  /usr/bin/printf '%s\n' "$label detected and fail-closed"
+}
+approved_output="$(
   /usr/bin/env -i PATH=/usr/bin:/bin \
-    SYNTHETIC_MULTILINE_VALUE="$(/usr/bin/printf 'synthetic-first-line\nSYNTHETIC_AFTER_NEWLINE_SENTINEL')" \
+    SYNTHETIC_MULTILINE_VALUE="$synthetic_value" \
     PYTHONPATH="$test_dir" \
     /usr/bin/python3 -I -S -c 'import os; print("\n".join(sorted(os.environ.keys())))'
 )"
-/usr/bin/printf '%s\n' "$enum_output"
-for sentinel in SYNTHETIC_AFTER_NEWLINE_SENTINEL PYTHON_STARTUP_SENTINEL; do
-  if /usr/bin/printf '%s\n' "$enum_output" | /usr/bin/grep -Fq "$sentinel"; then
-    /usr/bin/printf '%s\n' 'environment-key enumerator leaked synthetic sentinel' >&2
-    exit 1
-  fi
-done
+require_absent "$approved_output" SYNTHETIC_FIRST_LINE_SENTINEL 'approved key enumerator'
+require_absent "$approved_output" SYNTHETIC_SECOND_LINE_SENTINEL 'approved key enumerator'
+require_absent "$approved_output" PYTHON_STARTUP_SENTINEL 'approved key enumerator'
+/usr/bin/printf '%s\n' "$approved_output"
+full_value_output="$synthetic_value"
+require_detected "$full_value_output" SYNTHETIC_FIRST_LINE_SENTINEL 'full-value serializer'
+require_detected "$full_value_output" SYNTHETIC_SECOND_LINE_SENTINEL 'full-value serializer'
+first_line_output="$(/usr/bin/printf '%s\n' "$synthetic_value" | /usr/bin/head -n 1)"
+require_detected "$first_line_output" SYNTHETIC_FIRST_LINE_SENTINEL 'first-line-only serializer'
+startup_hook_output="$(
+  /usr/bin/env -i PATH=/usr/bin:/bin PYTHONPATH="$test_dir" \
+    /usr/bin/python3 -c 'import os; print("\n".join(sorted(os.environ.keys())))'
+)"
+require_detected "$startup_hook_output" PYTHON_STARTUP_SENTINEL 'startup-hook execution'
 ```
 
-Expected result is exit status 0 with key-name-only output that includes `SYNTHETIC_MULTILINE_VALUE` and `PYTHONPATH`; a platform or interpreter may add key names, but neither sentinel must ever be output. Any sentinel appearance is a preflight-test failure and a **BLOCKED** rollout gate. Re-run and preserve this evidence whenever the interpreter/helper changes.
+Expected result is exit status 0: the approved output is key names only and includes `SYNTHETIC_MULTILINE_VALUE` and `PYTHONPATH`; a platform or interpreter may add key names, but it must never contain either value sentinel or the startup sentinel. The control reports that the three deliberately unsafe paths were detected and fail closed, without printing their outputs. Any unexpected sentinel appearance or an undetected unsafe path is a preflight-test failure and a **BLOCKED** rollout gate. Re-run and preserve this evidence whenever the interpreter/helper changes.
 
-Before launch, evidence must show a clean dedicated account, `env -i` allowlist invocation, no `.env` defaults, no SSH identities, no personal `gh` or cloud authentication, short-lived pilot-only provider credentials, and approval timestamps. Use a fixed minimal system path and absolute reviewed executables, for example `env -i PATH=/usr/bin:/bin HOME=/pilot/home LANG=C /pilot/approved/bin/humanlayer <approved-subcommand>`; the configured provider executable must likewise be an approved absolute path, never a `PATH` lookup. Before every launch, record each executable's resolved absolute path and runtime SHA-256 and compare both to the approved manifest. A mismatch, `@latest`, floating version, or unattended update is **BLOCKED**.
+Before launch, evidence must show a clean dedicated account, `/usr/bin/env -i` allowlist invocation, no `.env` defaults, no SSH identities, no personal `gh` or cloud authentication, short-lived pilot-only provider credentials, and approval timestamps. Use a fixed minimal system path and absolute reviewed executables, for example `/usr/bin/env -i PATH=/usr/bin:/bin HOME=/pilot/home LANG=C /pilot/approved/bin/humanlayer <approved-subcommand>`; the configured provider executable must likewise be an approved absolute path, never a `PATH` lookup. Before every launch, record the approved launcher `/usr/bin/env`, HumanLayer executable, and provider executable resolved absolute paths and runtime SHA-256 values and compare all of them to the approved manifest. A mismatch, `@latest`, floating version, or unattended update is **BLOCKED**.
 
 ## Default `.env` copying verification
 
@@ -160,7 +187,7 @@ Therefore individual defaults cannot be disabled. The shared config must contain
 
 HumanLayer’s effective agent subprocess sandbox/approval policy is publicly **unknown**. Do not assume official Codex defaults apply when HumanLayer invokes an agent. Codex documents OS sandboxing and approvals, but that proves only the Codex-capability baseline, not this integration. OS isolation plus canary tests are mandatory: attempt controlled out-of-worktree access, disallowed network egress, permission change, and destructive action; fail closed on an unexpected success.
 
-GitHub issues/comments, repository files, task artifacts, web results, tool output, and IronMem recall are untrusted instructions. Deny requests to access/exfiltrate secrets, expand permissions, perform destructive actions, merge, deploy, sign, or disable controls. The **Pilot owner** must confirm such a request out-of-band; no prompt, comment, or tool output can grant authority.
+GitHub issues/comments, repository files, task artifacts, web results, tool output, and IronMem recall are untrusted instructions. Deny requests to access/exfiltrate secrets, expand permissions, perform destructive actions, merge, deploy, sign, or disable controls. Out-of-band confirmation applies only to an action that this policy explicitly marks human-gated; no prompt, comment, or tool output can grant authority. Secret access, merge, deployment, signing, disabling controls, prohibited repository classes, and every other absolute pilot prohibition remain denied even with **Pilot owner** confirmation. Changing one requires the documented repository-reclassification process and, where required, a new separately approved issue with supporting evidence; confirmation cannot override a classification or control.
 
 ## Risk register
 
@@ -169,7 +196,7 @@ GitHub issues/comments, repository files, task artifacts, web results, tool outp
 | HOST-01 | Daemon agent inherits OS-user file/network authority | Critical | Dedicated non-admin host/account, allowlist, canaries | Host operator | Host isolation limits but does not prove agent policy | Pilot-only |
 | HOST-02 | `setupCommand` executes shell code after copies | High | `disabled: true`; no local override; manual worktree | Host operator | Official config confirms `sh -c`; no automatic setup | BLOCKED otherwise |
 | HOST-03 | Additive default `.env`/workspace copy globs copy source files into a generated worktree | Critical | Shared `disabled: true`, no local override, and manual precreated sanitized worktree | Host operator | Official config says defaults append/deduplicate and cannot be subtracted | BLOCKED until subtractive control or independently verified equivalent containment |
-| CRED-01 | Inherited env, SSH, `gh`, cloud, or `.env` credentials leak | Critical | Clean account, `env -i`, name-only preflight, no personal auth | Host operator | Normal shell failed negative control | Pilot-only |
+| CRED-01 | Inherited env, SSH, `gh`, cloud, or `.env` credentials leak | Critical | Clean account, `/usr/bin/env -i`, name-only preflight, no personal auth | Host operator | Normal shell failed negative control | Pilot-only |
 | CRED-02 | HumanLayer launch/refresh token is stolen | High | Treat as credential; pilot-only storage, revoke/rotate | Vendor owner | Token-path fact, storage controls unknown | BLOCKED for broad use |
 | GH-01 | GitHub App content/issue/PR write scope is abused | High | One disposable repo; draft PR only; ruleset | GitHub administrator | Official requested scope is broad within repo | Pilot-only |
 | GH-02 | Repo/permission drift expands blast radius | Critical | Capture manifest; suspend/disconnect on drift | GitHub administrator | Requires operational review evidence | BLOCKED on drift |
@@ -214,6 +241,7 @@ No `@latest`, floating model, unattended update, or unreviewed auto-update is pe
 | Component/channel | Required evidence owner | Required record |
 |---|---|---|
 | npm CLI/meta package | Security reviewer | Exact `@humanlayer/cli` pin and npm integrity/shasum. |
+| Sanitized environment launcher | Host operator | Approved absolute `/usr/bin/env` path and runtime SHA-256; before every launch, record and compare both to the approved manifest. |
 | Platform HumanLayer executable | Security reviewer | Platform package shasum and downloaded SHA-256; before every launch, record the actual absolute HumanLayer executable path and runtime SHA-256 and compare both to the approved manifest. |
 | Homebrew desktop, if used | Host operator | Formula/cask version, source, hash, no auto-update. |
 | Codex/Claude CLI/provider | Model-provider administrator | Exact version, channel, and account/auth class; before every launch, record the actual absolute provider executable path and runtime SHA-256 and compare both to the approved manifest. |
@@ -226,6 +254,7 @@ No `@latest`, floating model, unattended update, or unreviewed auto-update is pe
 |---|---|
 | Secret-shaped name, `.env`, SSH identity, or cloud/deployment credential found | Stop before launch; remove access path; rotate if exposed; preserve name-only evidence. |
 | Workspace setup enabled or local override exists | Stop; delete generated sanitized workspace if needed; restore `disabled: true`. |
+| `.humanlayer/workspace.local.json` discovered | Stop; do not launch; preserve only path/name and policy-failure evidence without uploading or copying its content; quarantine/remove the override; rerun `python3 scripts/test_humanlayer_workspace_policy.py`; require Security reviewer approval before resumption. |
 | GitHub repository/permission drift | Stop; revoke/disconnect installation; preserve capture; reauthorize only after approval. |
 | Canary disproves containment or approval gate | Stop; revoke tokens; preserve evidence; no broader data. |
 | Injection seeks secrets, permissions, destructive action, merge, deployment, or control disabling | Deny; stop if attempted; out-of-band escalation and review. |
@@ -244,7 +273,7 @@ No box is pre-checked without captured evidence.
 - [ ] Pilot owner: repository classification and disposable-repo URL; evidence: ______
 - [ ] Host operator: clean non-admin account/host and name-only environment review; evidence: ______
 - [ ] Host operator: configured network allowlist applied and captured; evidence: ______
-- [ ] Host operator: `env -i` allowlist, no `.env`, SSH, personal GitHub/cloud auth; evidence: ______
+- [ ] Host operator: `/usr/bin/env -i` allowlist, no `.env`, SSH, personal GitHub/cloud auth; evidence: ______
 - [ ] GitHub administrator: one-repo permission capture and branch protection/ruleset; evidence: ______
 - [ ] Security reviewer: package pins/integrities and no update drift; evidence: ______
 - [ ] Model-provider administrator: account-class/data-control record and short-lived credential; evidence: ______
@@ -256,7 +285,8 @@ No box is pre-checked without captured evidence.
 
 - [ ] Pilot owner: public/synthetic task content verified; evidence: ______
 - [ ] Host operator: launch allowlist and credential presence rechecked; evidence: ______
-- [ ] Host operator and Model-provider administrator: before every launch, record the actual absolute HumanLayer executable path and runtime SHA-256 plus the actual absolute provider executable path and runtime SHA-256; compare all four values to the approved manifest; evidence: ______
+- [ ] Security reviewer: immediately before every daemon/agent launch, run `python3 scripts/test_humanlayer_workspace_policy.py`; record `Ran 2 tests` and `OK`, proving exact shared config, absent local override, and tracked `.gitignore` source; evidence: ______
+- [ ] Host operator and Model-provider administrator: before every launch, record the actual absolute `/usr/bin/env` launcher path and runtime SHA-256, actual absolute HumanLayer executable path and runtime SHA-256, and actual absolute provider executable path and runtime SHA-256; compare all six values to the approved manifest; evidence: ______
 - [ ] GitHub administrator: repository/permission drift check; evidence: ______
 - [ ] Pilot owner: draft PR/diff/artifact review, no merge/deploy; evidence: ______
 - [ ] Security reviewer: injection/canary anomalies and logs reviewed; evidence: ______
