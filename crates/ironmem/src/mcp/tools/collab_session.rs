@@ -2263,6 +2263,24 @@ pub(super) fn handle_collab_recv(app: &App, args: &Value) -> Result<Value, Memor
     let full = args.get("full").and_then(Value::as_bool).unwrap_or(false);
 
     let (result, claim) = app.db.with_transaction(|tx| {
+        // The seal (#297 Task 3) runs exactly where this tool mutates, which is
+        // the same predicate `CONDITIONALLY_MUTATING_TOOLS`' `collab_recv` entry
+        // uses: `auto_ack` acks the rows it returns, and a `handoff_token`
+        // claims the generation lease. A plain read stays permitted, so an
+        // operator can still inspect what a sealed session contains — that is
+        // the "permitted diagnostics stay read-only" half of the audit, and
+        // pinning both halves to one predicate is what stops the seal and the
+        // write classification from drifting apart.
+        //
+        // Ahead of the generation guard rather than after it, for the reason
+        // `handle_collab_resume` hoists its own `ensure_active`: an operator
+        // whose successor lands on a sealed session should be told the session
+        // is gone (and why) rather than handed a stale-lease diagnostic about a
+        // session it could not have taken over regardless.
+        let claims_token = super::handoff::opt_handoff_token(args).is_some();
+        if auto_ack || claims_token {
+            crate::collab::queue::ensure_active(tx, session_id)?;
+        }
         let claim = super::handoff::ensure_actor_generation_current(
             app,
             tx,
@@ -2740,12 +2758,29 @@ fn wait_my_turn_claim_and_capture_baseline(
     agent: Agent,
     args: &Value,
 ) -> Result<(WaitTurnBaseline, GenerationClaim), MemoryError> {
+    let maybe_token = super::handoff::opt_handoff_token(args);
+    // The seal (#297 Task 3), on the same predicate
+    // `CONDITIONALLY_MUTATING_TOOLS` classifies this tool by: with a
+    // `handoff_token` the call claims the generation lease, which is a write,
+    // and claiming a lease on a session that has been abandoned is exactly the
+    // "successor silently re-enters a dead session" hazard the seal exists to
+    // stop — it would burn the one-time token and bump the generation on a
+    // session nobody can ever act in again.
+    //
+    // Without a token this stays a read, and a read must keep returning
+    // `session_ended: true` rather than an error: that frame is how an agent's
+    // wait loop learns to exit (`mcp_protocol.rs`'s
+    // `collab_end_blocks_further_sends`), and turning it into a refusal would
+    // strand the loop it exists to release.
+    if maybe_token.is_some() {
+        crate::collab::queue::ensure_active(tx, session_id)?;
+    }
     let claim = super::handoff::ensure_actor_generation_current(
         app,
         tx,
         session_id,
         agent,
-        super::handoff::opt_handoff_token(args).as_deref(),
+        maybe_token.as_deref(),
     )?;
     let record = crate::collab::queue::load_session_record(tx, session_id)?;
     Ok((wait_turn_snapshot(&record, agent).baseline, claim))
@@ -4344,14 +4379,28 @@ mod tests {
     /// D7: abandon is terminal and idempotent. The second attempt is refused
     /// with the stable ended-session message, and that message carries the
     /// first abandonment's reason so the operator learns why it is gone.
+    ///
+    /// "Refused" is asserted as *wrote nothing*, not merely as `Err`. The three
+    /// things `handle_collab_end`'s abandon arm writes live in three different
+    /// places — the session row inside the transaction, the WAL row inside it,
+    /// and the metrics attestation deliberately *after* it commits — so an
+    /// `Err` alone would not tell you the last of them stayed put. It is the
+    /// post-commit one that needs saying: it is outside the rollback that
+    /// covers the other two, and only the early refusal keeps it from running.
     #[test]
-    fn abandon_of_an_already_ended_session_is_refused_with_the_stored_reason() {
+    fn abandon_of_an_already_ended_session_is_refused_and_writes_nothing() {
+        let _g = metrics_on_guard();
         let app = test_app();
         let sid = start_session(&app);
         drive_to_implement(&app, &sid);
         age_session(&app, &sid, crate::collab::COLLAB_DEAD_SESSION_SECS + 60);
 
         handle_collab_end(&app, &abandon_args(&sid, "claude", "first")).unwrap();
+
+        let before_row = app.db.collab_load_session_record(&sid).unwrap();
+        let before_wal = collab_end_wal_row_count(&app);
+        let before_outcome = app.db.get_task_outcome(&sid).unwrap().unwrap();
+
         let err = handle_collab_end(&app, &abandon_args(&sid, "claude", "second")).unwrap_err();
 
         let message = err.to_string();
@@ -4363,16 +4412,50 @@ mod tests {
             message.contains("abandoned: first"),
             "the refusal must carry the stored epitaph: {message}"
         );
+
+        let after_row = app.db.collab_load_session_record(&sid).unwrap();
         assert_eq!(
-            app.db
-                .collab_load_session_record(&sid)
-                .unwrap()
-                .session
-                .coding_failure
-                .as_deref(),
+            after_row.session.coding_failure.as_deref(),
             Some("abandoned: first"),
             "the second abandon must not overwrite the first epitaph"
         );
+        assert_eq!(
+            after_row.ended_at, before_row.ended_at,
+            "nor restamp when the session died"
+        );
+        assert_eq!(
+            collab_end_wal_row_count(&app),
+            before_wal,
+            "a refused abandon must not append a second collab_end audit row"
+        );
+        let after_outcome = app.db.get_task_outcome(&sid).unwrap().unwrap();
+        assert_eq!(
+            (
+                after_outcome.outcome.as_deref(),
+                after_outcome.done_at.as_deref()
+            ),
+            (
+                before_outcome.outcome.as_deref(),
+                before_outcome.done_at.as_deref()
+            ),
+            "a refused abandon must not re-attest the metrics outcome"
+        );
+    }
+
+    /// How many `collab_end` rows the WAL holds. Counted across the whole log
+    /// rather than per session: these tests each run one session in a fresh
+    /// database, and a count that ignored the key would still catch a stray row
+    /// written under the wrong one.
+    fn collab_end_wal_row_count(app: &crate::mcp::app::App) -> i64 {
+        app.db
+            .with_connection(|conn| {
+                Ok(conn.query_row(
+                    "SELECT COUNT(*) FROM wal_log WHERE operation = 'collab_end'",
+                    [],
+                    |row| row.get(0),
+                )?)
+            })
+            .unwrap()
     }
 
     /// The plain path is load-bearing and must be unaffected by the new flag,
@@ -4926,6 +5009,346 @@ mod tests {
             err.to_string().contains("`abandon` must be a boolean"),
             "a malformed flag must be named as such: {err}"
         );
+    }
+
+    // ── the seal (#297 Task 3) ────────────────────────────────────────────────
+    //
+    // Abandoning is only worth anything if the seal holds afterwards. Every
+    // mutating collab surface funnels through `queue::ensure_active`, so the
+    // refusal and its reason echo are one mechanism rather than eleven — and
+    // that is exactly why they need per-surface tests: a handler that stopped
+    // calling the choke point would still compile, still pass every test about
+    // what it writes, and silently accept writes into a dead session.
+    //
+    // Each test asserts BOTH halves: that the surface refuses, and that the
+    // refusal carries the stored epitaph back. A bare "not active" leaves the
+    // operator to guess whether the session was ended normally or abandoned.
+
+    /// The reason every seal test abandons with. A fixed string so
+    /// [`assert_sealed`] can check the refusal reproduces it verbatim.
+    const SEAL_REASON: &str = "wedged batch";
+
+    /// A session driven to `CodeImplementPending`, aged past the dead-session
+    /// threshold, and abandoned — the shape an operator actually clears.
+    ///
+    /// `CodeImplementPending` on purpose: it is the phase plain `collab_end`
+    /// refuses (see [`PHASE_ENDABILITY`]), so it is the wedge abandon exists
+    /// for, and it is *active*, so nothing here can pass merely because a
+    /// terminal phase would have refused anyway.
+    fn abandoned_session(app: &crate::mcp::app::App) -> String {
+        let sid = start_session(app);
+        drive_to_implement(app, &sid);
+        age_session(app, &sid, crate::collab::COLLAB_DEAD_SESSION_SECS + 60);
+        handle_collab_end(app, &abandon_args(&sid, "claude", SEAL_REASON))
+            .expect("a demonstrably dead session must be abandonable");
+        sid
+    }
+
+    /// Both halves of the seal, for one surface.
+    ///
+    /// The epitaph is matched with `ends_with`, not `contains`: the untrusted
+    /// reason is deliberately the last thing in the message so there is no
+    /// trailing structure for it to break out of (see
+    /// [`crate::collab::queue::ensure_active`]). A surface that wrapped the
+    /// refusal in its own suffix would still `contains`, and would still be a
+    /// regression.
+    fn assert_sealed(err: MemoryError, surface: &str) {
+        let text = err.to_string();
+        assert!(
+            text.contains("has ended"),
+            "{surface} must refuse a sealed session: {text}"
+        );
+        assert!(
+            text.ends_with(&format!("abandoned: {SEAL_REASON}")),
+            "{surface}'s refusal must end with the stored reason, verbatim and last: {text}"
+        );
+    }
+
+    /// Issue a handoff token while the session is still live, so a seal test
+    /// can present a *real* one afterwards. `session_handoff` is itself sealed,
+    /// so this has to happen before the abandon.
+    fn issue_handoff_token(app: &crate::mcp::app::App, sid: &str, agent: &str) -> String {
+        super::super::handoff::handle_session_handoff(
+            app,
+            &json!({ "session_id": sid, "agent": agent }),
+        )
+        .expect("a live session must issue a handoff token")["handoff_token"]
+            .as_str()
+            .expect("session_handoff must return a top-level handoff_token")
+            .to_string()
+    }
+
+    #[test]
+    fn sealed_session_refuses_collab_send() {
+        let app = test_app();
+        let sid = abandoned_session(&app);
+        let err = handle_collab_send(
+            &app,
+            &json!({ "session_id": sid, "sender": "claude", "topic": "draft", "content": "x" }),
+        )
+        .unwrap_err();
+        assert_sealed(err, "collab_send");
+    }
+
+    #[test]
+    fn sealed_session_refuses_collab_ack() {
+        let app = test_app();
+        let sid = abandoned_session(&app);
+        // A message id that does not exist: the seal must fire *before* the
+        // row lookup, so the operator learns the session is gone rather than
+        // being told their message id was bad.
+        let err = handle_collab_ack(
+            &app,
+            &json!({ "session_id": sid, "message_id": "no-such-message" }),
+        )
+        .unwrap_err();
+        assert_sealed(err, "collab_ack");
+    }
+
+    #[test]
+    fn sealed_session_refuses_collab_approve() {
+        let app = test_app();
+        let sid = abandoned_session(&app);
+        let err = handle_collab_approve(
+            &app,
+            &json!({ "session_id": sid, "agent": "codex", "content_hash": "deadbeef" }),
+        )
+        .unwrap_err();
+        assert_sealed(err, "collab_approve");
+    }
+
+    #[test]
+    fn sealed_session_refuses_collab_set_pilot() {
+        let app = test_app();
+        let sid = abandoned_session(&app);
+        // The session is past `PlanParallelDrafts`, which this tool also
+        // refuses — the assertion is that the *seal* wins, since a phase
+        // complaint would send an operator looking for the wrong problem.
+        let err = handle_collab_set_pilot(
+            &app,
+            &json!({ "session_id": sid, "agent": "claude", "pilot": "codex" }),
+        )
+        .unwrap_err();
+        assert_sealed(err, "collab_set_pilot");
+    }
+
+    #[test]
+    fn sealed_session_refuses_collab_set_implementer() {
+        let app = test_app();
+        let sid = abandoned_session(&app);
+        let err = handle_collab_set_implementer(
+            &app,
+            &json!({ "session_id": sid, "agent": "claude", "implementer": "codex" }),
+        )
+        .unwrap_err();
+        assert_sealed(err, "collab_set_implementer");
+    }
+
+    #[test]
+    fn sealed_session_refuses_collab_register_caps() {
+        let app = test_app();
+        let sid = abandoned_session(&app);
+        let err = super::super::collab_caps::handle_collab_register_caps(
+            &app,
+            &json!({
+                "session_id": sid,
+                "agent": "claude",
+                "capabilities": [{ "name": "cargo", "description": "builds" }],
+            }),
+        )
+        .unwrap_err();
+        assert_sealed(err, "collab_register_caps");
+    }
+
+    #[test]
+    fn sealed_session_refuses_collab_checkpoint() {
+        let app = test_app();
+        let sid = abandoned_session(&app);
+        let err = super::super::collab_checkpoint::handle_collab_checkpoint(
+            &app,
+            &json!({
+                "session_id": sid, "agent": "claude",
+                "task_id": 1, "task_title": "first task",
+                "status": "started",
+                "head_sha": PLACEHOLDER_HEAD, "completed_task_ids": "",
+            }),
+        )
+        .unwrap_err();
+        assert_sealed(err, "collab_checkpoint");
+    }
+
+    #[test]
+    fn sealed_session_refuses_session_handoff() {
+        let app = test_app();
+        let sid = abandoned_session(&app);
+        let err = super::super::handoff::handle_session_handoff(
+            &app,
+            &json!({ "session_id": sid, "agent": "claude" }),
+        )
+        .unwrap_err();
+        assert_sealed(err, "session_handoff");
+    }
+
+    /// `collab_resume` is the surface that would let an abandoned session
+    /// re-enter execution, so it gets its own test rather than a table row.
+    ///
+    /// The refusal is expected to come from `ensure_active` rather than from
+    /// the `abandoned:` epitaph's `Terminal` failure class. Asserting it — and
+    /// asserting that the phase did not move — is the point: "the epitaph
+    /// classifies as Terminal, so resume is impossible" is a chain of two
+    /// facts, and only one of them is checked anywhere else.
+    #[test]
+    fn sealed_session_refuses_collab_resume() {
+        let app = test_app();
+        let sid = abandoned_session(&app);
+
+        let err = handle_collab_resume(&app, &json!({ "session_id": sid, "agent": "claude" }))
+            .unwrap_err();
+        assert_sealed(err, "collab_resume");
+
+        let record = app.db.collab_load_session_record(&sid).unwrap();
+        assert_eq!(
+            record.session.phase,
+            Phase::CodeImplementPending,
+            "a refused resume must leave the sealed session exactly where it died"
+        );
+        assert!(
+            record.ended_at.is_some(),
+            "a refused resume must not reopen the session"
+        );
+        assert_eq!(
+            crate::collab::classify(record.session.coding_failure.as_deref().unwrap()),
+            crate::collab::FailureClass::Terminal,
+            "the epitaph must stay Terminal, so nothing downstream offers a retry"
+        );
+    }
+
+    /// `collab_recv` writes for exactly two argument shapes
+    /// (`tools::CONDITIONALLY_MUTATING_TOOLS`), and `auto_ack` is the one that
+    /// consumes queue state. Before the seal reached this handler it would
+    /// happily ack a dead session's backlog.
+    #[test]
+    fn sealed_session_refuses_collab_recv_with_auto_ack() {
+        let app = test_app();
+        let sid = abandoned_session(&app);
+        let before = pending_message_count(&app, &sid, "codex");
+        assert!(
+            before > 0,
+            "the fixture must leave a backlog, or this proves nothing"
+        );
+
+        let err = handle_collab_recv(
+            &app,
+            &json!({ "session_id": sid, "receiver": "codex", "auto_ack": true }),
+        )
+        .unwrap_err();
+        assert_sealed(err, "collab_recv(auto_ack)");
+
+        assert_eq!(
+            pending_message_count(&app, &sid, "codex"),
+            before,
+            "a refused auto_ack must not have acked the sealed session's backlog"
+        );
+    }
+
+    /// The other half of `collab_recv`'s write predicate: a `handoff_token`
+    /// claims the generation lease, which is how a successor process takes over
+    /// a session. Claiming one against a sealed session is precisely the
+    /// "silently re-enters execution" hazard the seal exists to stop.
+    #[test]
+    fn sealed_session_refuses_collab_recv_with_a_handoff_token() {
+        let app = test_app();
+        let sid = start_session(&app);
+        drive_to_implement(&app, &sid);
+        let token = issue_handoff_token(&app, &sid, "codex");
+        age_session(&app, &sid, crate::collab::COLLAB_DEAD_SESSION_SECS + 60);
+        handle_collab_end(&app, &abandon_args(&sid, "claude", SEAL_REASON)).unwrap();
+
+        let err = handle_collab_recv(
+            &app,
+            &json!({ "session_id": sid, "receiver": "codex", "handoff_token": token }),
+        )
+        .unwrap_err();
+        assert_sealed(err, "collab_recv(handoff_token)");
+    }
+
+    /// `collab_wait_my_turn` carries the *same* write predicate as
+    /// `collab_recv`'s token half (`claims_handoff_token`), so it is a mutating
+    /// surface too and inherits the same hazard: a successor spawned against a
+    /// sealed session would burn its one-time token and bump the generation.
+    #[test]
+    fn sealed_session_refuses_collab_wait_my_turn_with_a_handoff_token() {
+        let app = test_app();
+        let sid = start_session(&app);
+        drive_to_implement(&app, &sid);
+        let token = issue_handoff_token(&app, &sid, "claude");
+        age_session(&app, &sid, crate::collab::COLLAB_DEAD_SESSION_SECS + 60);
+        handle_collab_end(&app, &abandon_args(&sid, "claude", SEAL_REASON)).unwrap();
+
+        let err = handle_collab_wait_my_turn(
+            &app,
+            &json!({
+                "session_id": sid, "agent": "claude",
+                "timeout_secs": 1, "handoff_token": token,
+            }),
+        )
+        .unwrap_err();
+        assert_sealed(err, "collab_wait_my_turn(handoff_token)");
+    }
+
+    /// The seal is a write gate, not a quarantine. An operator clearing up
+    /// after an abandoned session still has to be able to read what it
+    /// contained — and `collab_recv` without `auto_ack` is classified a read
+    /// precisely so a reviewer can drain a queue's contents without consuming
+    /// it. Sealing that too would make the epitaph unreadable from the surface
+    /// that holds the evidence.
+    #[test]
+    fn sealed_session_stays_readable() {
+        let app = test_app();
+        let sid = abandoned_session(&app);
+
+        let status = handle_collab_status(&app, &json!({ "session_id": sid })).unwrap();
+        assert_eq!(status["id"], json!(sid));
+        assert_eq!(
+            status["coding_failure"],
+            json!(format!("abandoned: {SEAL_REASON}")),
+            "status must still surface the epitaph"
+        );
+
+        let read = handle_collab_recv(
+            &app,
+            &json!({ "session_id": sid, "receiver": "codex", "auto_ack": false }),
+        )
+        .expect("a plain read of a sealed session must still be permitted");
+        let before = read["messages"].as_array().unwrap().len();
+        assert!(before > 0, "the fixture must leave something to read");
+
+        let again = handle_collab_recv(
+            &app,
+            &json!({ "session_id": sid, "receiver": "codex", "auto_ack": false }),
+        )
+        .expect("a plain read must stay repeatable");
+        assert_eq!(
+            again["messages"].as_array().unwrap().len(),
+            before,
+            "a permitted read must have consumed nothing"
+        );
+
+        assert!(
+            super::super::collab_caps::handle_collab_get_caps(&app, &json!({ "session_id": sid }))
+                .is_ok(),
+            "collab_get_caps is read-only and must survive the seal"
+        );
+    }
+
+    /// How many messages are still waiting for `receiver`, read straight from
+    /// the queue rather than through `collab_recv` — the seal tests need this
+    /// on a session whose `collab_recv` may itself be refusing.
+    fn pending_message_count(app: &crate::mcp::app::App, sid: &str, receiver: &str) -> usize {
+        app.db
+            .with_connection(|conn| crate::collab::queue::recv_messages(conn, sid, receiver, 50))
+            .unwrap()
+            .len()
     }
 
     #[test]
