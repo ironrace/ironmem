@@ -121,9 +121,27 @@ Capture the installation repository list and permission screen before launch and
 
 The normal review shell failed a negative control because secret-shaped names were present; values were never read and exact names are not published. It is **PROHIBITED** for the pilot.
 
-The **Host operator** records only names/classes and presence, never values: run a name-only review such as `env | sed 's/=.*//'`, inspect `ssh-add -l` without key material, inspect the GitHub/credential-helper status, and record whether expected pilot credential files exist with permissions. Do not use commands that print environment values, tokens, `.env` contents, or credentials.
+The **Host operator** records only names/classes and presence, never values. Use an audited absolute-path interpreter or helper that enumerates keys directly, for example `/usr/bin/python3 -c 'import os; print("\\n".join(sorted(os.environ.keys())))'`; it must never serialize `os.environ` values to output. Record only the resulting key names, then inspect `ssh-add -l` without key material, GitHub/credential-helper status, and expected pilot credential-file presence/permissions. Do not use commands that print environment values, tokens, `.env` contents, or credentials.
 
-Before launch, evidence must show a clean dedicated account, `env -i` allowlist invocation, no `.env` defaults, no SSH identities, no personal `gh` or cloud authentication, short-lived pilot-only provider credentials, and approval timestamps. Example launch pattern: `env -i PATH="$PATH" HOME=/pilot/home LANG=C ...`; the precise approved allowlist is evidence-controlled and excludes credential variables by default.
+Run this synthetic negative control before approving the enumerator; it contains no real secret. It places a sentinel after a newline in a synthetic value, prints only keys, and fails if that sentinel appears in the enumerator output:
+
+```sh
+set -eu
+enum_output="$(
+  /usr/bin/env -i PATH=/usr/bin:/bin \
+    SYNTHETIC_MULTILINE_VALUE="$(/usr/bin/printf 'synthetic-first-line\nSYNTHETIC_AFTER_NEWLINE_SENTINEL')" \
+    /usr/bin/python3 -c 'import os; print("\n".join(sorted(os.environ.keys())))'
+)"
+/usr/bin/printf '%s\n' "$enum_output"
+if /usr/bin/printf '%s\n' "$enum_output" | /usr/bin/grep -Fq 'SYNTHETIC_AFTER_NEWLINE_SENTINEL'; then
+  /usr/bin/printf '%s\n' 'environment-key enumerator leaked synthetic sentinel' >&2
+  exit 1
+fi
+```
+
+Expected result is exit status 0 with key-name-only output that includes `SYNTHETIC_MULTILINE_VALUE`; a platform or interpreter may add key names, but the sentinel must never be output. Any sentinel appearance is a preflight-test failure and a **BLOCKED** rollout gate. Re-run and preserve this evidence whenever the interpreter/helper changes.
+
+Before launch, evidence must show a clean dedicated account, `env -i` allowlist invocation, no `.env` defaults, no SSH identities, no personal `gh` or cloud authentication, short-lived pilot-only provider credentials, and approval timestamps. Use a fixed minimal system path and absolute reviewed executables, for example `env -i PATH=/usr/bin:/bin HOME=/pilot/home LANG=C /pilot/approved/bin/humanlayer <approved-subcommand>`; the configured provider executable must likewise be an approved absolute path, never a `PATH` lookup. Before every launch, record each executable's resolved absolute path and runtime SHA-256 and compare both to the approved manifest. A mismatch, `@latest`, floating version, or unattended update is **BLOCKED**.
 
 ## Default `.env` copying verification
 
@@ -188,10 +206,10 @@ No `@latest`, floating model, unattended update, or unreviewed auto-update is pe
 
 | Component/channel | Required evidence owner | Required record |
 |---|---|---|
-| npm CLI/meta package | Security reviewer | Exact `@humanlayer/cli` pin and npm integrity/shasum. |
-| Platform binary | Security reviewer | Platform package shasum and downloaded SHA-256. |
+| npm CLI/meta package | Security reviewer | Exact `@humanlayer/cli` pin and npm integrity/shasum; reviewed absolute executable path and runtime SHA-256 before each launch. |
+| Platform binary | Security reviewer | Platform package shasum and downloaded SHA-256; runtime SHA-256/path comparison before each launch. |
 | Homebrew desktop, if used | Host operator | Formula/cask version, source, hash, no auto-update. |
-| Codex/Claude CLI/provider | Model-provider administrator | Exact version, channel, account/auth class. |
+| Codex/Claude CLI/provider | Model-provider administrator | Exact version, channel, account/auth class, approved absolute executable path, and runtime SHA-256 before each launch. |
 | HumanLayer workflows/skills | Vendor owner | Reviewed version/behavior and change record. |
 | GitHub App permissions | GitHub administrator | One-repo manifest and before/after capture. |
 
