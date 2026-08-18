@@ -2946,10 +2946,22 @@ fn collab_end_admits(phase: Phase) -> bool {
 /// exactly the coding-active phases where a wedged session is most likely to be
 /// sitting — a guard recommending an action the server refuses.
 ///
+/// `PlanFinalizePending` is endable but not unconditionally: `handle_collab_end`
+/// additionally requires the caller be the session's `current_owner` there
+/// (see the check just above `collab_end_admits`'s call site in
+/// `handle_collab_end`). This function is not handed the caller's agent or the
+/// session's owner — widening its signature to fetch them would cost a second
+/// query for a message — so it names the constraint rather than evaluating it.
+/// Naming it is enough: a counterpart who reads "only the current owner" knows
+/// not to try, instead of getting a second refusal after following the advice.
+///
 /// `phase` arrives as the raw column string from
 /// `find_active_session_by_repo_branch`, which does not parse it. An
-/// unparseable value falls to the conservative branch: never promise
-/// `collab_end` works for a phase we could not identify.
+/// unparseable value falls to the conservative branch: it does not claim
+/// `collab_end` is rejected (that was never established for a phase we
+/// couldn't identify) — it says the phase is unrecognized and points to the
+/// same safe moves, `/collab join` or, if the session is demonstrably dead,
+/// abandon.
 ///
 /// Which phases admit a plain end is read from [`collab_end_admits`], the same
 /// predicate `handle_collab_end` gates on, so the two cannot disagree again.
@@ -2959,19 +2971,32 @@ fn duplicate_session_refusal(
     existing_id: &str,
     phase: &str,
 ) -> String {
-    let endable = phase
-        .parse::<Phase>()
-        .map(collab_end_admits)
-        .unwrap_or(false);
-    let remedy = if endable {
-        format!("Resume it with `/collab join {existing_id}`, or if it is finished call collab_end on it before starting a new session here.")
-    } else {
-        format!(
+    let remedy = match phase.parse::<Phase>() {
+        Ok(parsed) if collab_end_admits(parsed) => {
+            let owner_clause = if parsed == Phase::PlanFinalizePending {
+                " Only the session's current owner may end it from this phase — the \
+                 counterpart will be refused."
+            } else {
+                ""
+            };
+            format!(
+                "Resume it with `/collab join {existing_id}`, or if it is finished call \
+                 collab_end on it before starting a new session here.{owner_clause}"
+            )
+        }
+        Ok(_) => format!(
             "Resume it with `/collab join {existing_id}`. collab_end is rejected in this phase; \
              if the session is demonstrably dead (no activity for {}s) end it with collab_end \
              `{{\"abandon\": true, \"reason\": \"...\"}}`.",
             crate::collab::COLLAB_DEAD_SESSION_SECS
-        )
+        ),
+        Err(_) => format!(
+            "Resume it with `/collab join {existing_id}`. This phase could not be identified, \
+             so the safe move is `/collab join`; if the session is demonstrably dead (no \
+             activity for {}s) end it with collab_end `{{\"abandon\": true, \"reason\": \
+             \"...\"}}`.",
+            crate::collab::COLLAB_DEAD_SESSION_SECS
+        ),
     };
     format!(
         "an active collab session already exists for repo {repo_path} branch {branch}: \
@@ -4717,6 +4742,34 @@ mod tests {
         assert!(err.contains("/collab join"), "got: {err}");
     }
 
+    /// `PlanFinalizePending` is endable (`collab_end_admits` says so) but not
+    /// unconditionally: `handle_collab_end` additionally requires the caller
+    /// be the session's current owner there. The guard must still recommend
+    /// `collab_end` (spec review, second pass) but must also name that
+    /// constraint, so a counterpart who follows the advice doesn't get a
+    /// second refusal after acting on the first one.
+    #[test]
+    fn duplicate_guard_in_plan_finalize_pending_names_the_owner_constraint() {
+        let app = test_app();
+        let sid = start_session_in_scope(&app, "/tmp/dup3", "main");
+        drive_to_plan_finalize_pending(&app, &sid);
+        let err = handle_collab_start(
+            &app,
+            &json!({
+                "repo_path": "/tmp/dup3", "branch": "main",
+                "initiator": "claude", "task": "second"
+            }),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("call collab_end on it"), "got: {err}");
+        assert!(err.contains("/collab join"), "got: {err}");
+        assert!(
+            err.contains("current owner"),
+            "must name the owner constraint so a counterpart doesn't get a second refusal: {err}"
+        );
+    }
+
     /// `find_active_session_by_repo_branch` hands `duplicate_session_refusal`
     /// the raw `phase` column string unparsed (see its doc comment), and the
     /// column carries no CHECK constraint — a row can hold a value that isn't
@@ -4728,10 +4781,19 @@ mod tests {
     /// could not identify.
     #[test]
     fn duplicate_guard_falls_back_conservatively_for_an_unparseable_phase() {
-        let msg = duplicate_session_refusal("/tmp/dup3", "main", "some-id", "NotARealPhase");
+        let msg = duplicate_session_refusal("/tmp/dup4", "main", "some-id", "NotARealPhase");
         assert!(
             !msg.contains("call collab_end on it"),
             "an unrecognized phase must not promise collab_end works: {msg}"
+        );
+        assert!(
+            !msg.contains("collab_end is rejected in this phase"),
+            "an unrecognized phase was never established to reject collab_end for that \
+             reason — the wording must not assert it as fact: {msg}"
+        );
+        assert!(
+            msg.contains("could not be identified"),
+            "must say the phase itself is unrecognized, not just refuse collab_end: {msg}"
         );
         assert!(msg.contains("/collab join"), "got: {msg}");
         assert!(msg.contains("abandon"), "got: {msg}");
