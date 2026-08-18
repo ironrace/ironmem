@@ -17,16 +17,18 @@ impl Database {
         queue::create_session(&self.conn, id, repo_path, branch, task, roles)
     }
 
-    /// Propagates [`queue::SessionEndOutcome`] rather than discarding it: a
-    /// caller that performs side effects on ending needs to know whether it
-    /// actually ended anything, and flattening that away here would hand the
-    /// next caller the same blind spot `handle_collab_end` had.
-    pub fn collab_end_session(
-        &self,
-        session_id: &str,
-    ) -> Result<queue::SessionEndOutcome, MemoryError> {
-        queue::end_session(&self.conn, session_id)
-    }
+    // There is deliberately no `collab_end_session` accessor, for the reason
+    // the `collab_load_current_checkpoint` note below spells out about its
+    // missing `collab_upsert_checkpoint` sibling: ending a session is not a
+    // bare row write. `handle_collab_end` reads endedness first so a repeat
+    // call stays a no-op, takes the generation lease, enforces the phase
+    // allowlist, writes the WAL row, attests the metrics outcome, and clears
+    // the attribution cell — and the abandon arm additionally stamps the
+    // `abandoned:` epitaph that `queue::ensure_active` echoes on every later
+    // refusal. A non-transactional one-liner here would skip all of it while
+    // looking like the supported way to end a session. It existed with zero
+    // callers until #297 Task 3 removed it; reach for `queue::end_session`
+    // inside a transaction that does the rest.
 
     pub fn collab_load_session(&self, session_id: &str) -> Result<CollabSession, MemoryError> {
         queue::load_session(&self.conn, session_id)

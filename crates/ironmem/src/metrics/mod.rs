@@ -672,7 +672,8 @@ mod tests {
     fn resolve_unstamps_and_clears_cell_for_ended_session() {
         let app = test_app();
         let sid = seed_collab_session(&app);
-        app.db
+        let _ = app
+            .db
             .with_transaction(|tx| crate::collab::queue::end_session(tx, &sid))
             .unwrap();
         app.set_active_collab_session_for_scope(&sid, "/tmp/repo", "main");
@@ -689,7 +690,8 @@ mod tests {
     fn resolve_does_not_fallback_to_task_tag_for_ended_active_session() {
         let app = test_app();
         let sid = seed_collab_session(&app);
-        app.db
+        let _ = app
+            .db
             .with_transaction(|tx| crate::collab::queue::end_session(tx, &sid))
             .unwrap();
         app.set_active_collab_session_for_scope(&sid, "/tmp/repo", "main");
@@ -783,7 +785,8 @@ mod tests {
         let app = test_app();
         let live = seed_collab_session_in_scope(&app, "live-session", "/tmp/live", "main");
         let ended = seed_collab_session_in_scope(&app, "ended-session", "/tmp/ended", "main");
-        app.db
+        let _ = app
+            .db
             .with_transaction(|tx| crate::collab::queue::end_session(tx, &ended))
             .unwrap();
         app.set_active_collab_session_for_scope(&live, "/tmp/live", "main");

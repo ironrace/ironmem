@@ -1703,7 +1703,8 @@ mod tests {
         let sid = seed_active_session(&app);
 
         // End the session directly via the queue layer.
-        app.db
+        let _ = app
+            .db
             .with_transaction(|tx| crate::collab::queue::end_session(tx, &sid))
             .unwrap();
 

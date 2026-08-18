@@ -172,7 +172,22 @@ pub fn set_pilot(
 /// promise honestly: a no-op that still appends an audit row and re-attests a
 /// metrics outcome is not a no-op. Callers with side effects to perform after
 /// ending must gate them on [`Self::Ended`].
+///
+/// `#[must_use]` is what makes that a contract rather than advice. Both
+/// production consumers are `debug_assert_eq!`, which compiles out in release —
+/// so without this attribute a release binary has zero consumers,
+/// [`Self::AlreadyEnded`] is unreachable from production code, and a future
+/// `end_session(tx, sid)?;` that drops the outcome compiles silently, restoring
+/// exactly the double-write this enum was introduced to stop. It costs a
+/// `let _ =` at the test call sites that end a session as fixture setup and
+/// genuinely do not care.
+///
+/// See [`ensure_active`]'s "the one deliberate non-caller" section: this type
+/// is the mechanism by which `collab_end`'s plain path keeps its documented
+/// no-op contract without refusing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "an already-ended session must not re-run the caller's side effects; \
+              gate them on SessionEndOutcome::Ended"]
 pub enum SessionEndOutcome {
     /// This call stamped `ended_at`; it owns the resulting side effects.
     Ended,
@@ -228,11 +243,54 @@ pub fn end_session(conn: &Connection, session_id: &str) -> Result<SessionEndOutc
 /// anything in front of it. (Deliberately not a count — the number grew twice
 /// while this task was being reviewed, and a tally that drifts on every new
 /// assertion is worse than no tally.) It **appends the stored abandonment
-/// reason** when there is one. That
-/// append is the whole seal mechanism for #297: every mutating collab surface
-/// already funnels through this one check, so a caller who runs into the seal
-/// learns *why* the session is gone instead of getting a bare "not active",
-/// and no per-handler message had to be duplicated eleven times to get there.
+/// reason** when there is one. That append is the whole seal mechanism for
+/// #297: a caller who runs into the seal learns *why* the session is gone
+/// instead of getting a bare "not active", and no per-handler message had to be
+/// duplicated a dozen times to get there.
+///
+/// # The seal has two arms, and adding a surface means picking one
+///
+/// It is tempting to read the paragraph above as "every mutating collab surface
+/// funnels through here, so the seal is free". It was written that way, and
+/// #297 Task 3's audit disproved it. Coverage is *not* automatic:
+///
+/// 1. **Inherited.** Most mutating handlers call `ensure_active` as part of
+///    work they had to do anyway — `collab_send`, `collab_ack`,
+///    `collab_approve`, `collab_checkpoint`, `collab_register_caps`,
+///    `collab_resume`, `session_handoff`, and (via
+///    `ensure_caller_is_current_pilot`) `collab_set_pilot` and
+///    `collab_set_implementer`. These needed no change and inherit the echo.
+///
+/// 2. **Hand-placed, keyed on a write predicate.** `collab_recv` and
+///    `collab_wait_my_turn` are *conditionally* mutating
+///    (`crate::mcp::tools::CONDITIONALLY_MUTATING_TOOLS`): they write only for
+///    certain arguments, and a plain call is a permitted read-only diagnostic
+///    that must keep working on a sealed session. Both had no gate at all until
+///    Task 3. Each now calls the classifier's own predicate —
+///    `collab_recv_mutates` and `claims_handoff_token` respectively — so the
+///    gate cannot drift away from the classification.
+///
+/// A new mutating surface therefore inherits nothing by default. Decide which
+/// arm it belongs to, and if it is arm 2, call the predicate rather than
+/// restate it.
+///
+/// # The one deliberate non-caller: `collab_end`'s plain path
+///
+/// `crate::mcp::tools::collab_session::handle_collab_end`'s non-abandon arm
+/// **must not** call this. `docs/COLLAB.md` specifies that end as idempotent —
+/// "calling from a terminal phase or an already-ended session is a no-op" — so
+/// a repeat call is a *success that does nothing*, not a refusal. It branches
+/// on [`session_is_ended`] and returns early instead, and `end_session` returns
+/// [`SessionEndOutcome`] so the side effects stay behind a real transition.
+///
+/// This divergence is intentional and is the kind of thing a later "make the
+/// surfaces consistent" cleanup would quietly undo, turning a spec'd no-op into
+/// an error. The three sites that implement it cross-reference each other on
+/// purpose: this doc, [`SessionEndOutcome`], and `handle_collab_end`'s plain
+/// arm. Change one and check the other two.
+///
+/// The `abandon: true` arm is the opposite case and *does* call this — a second
+/// abandon is refused, so the first epitaph can never be overwritten.
 ///
 /// Only an `abandoned:` prefix is echoed. A `coding_failure` from a normal
 /// `failure_report` is already visible through `collab_status` on a session
@@ -280,6 +338,32 @@ pub fn ensure_active(conn: &Connection, session_id: &str) -> Result<(), MemoryEr
         )));
     }
     Ok(())
+}
+
+/// Whether the session has `ended_at` set, as a plain boolean.
+///
+/// The read-only counterpart to [`ensure_active`], and the third of the three
+/// cross-referenced sites that implement the refuse-vs-no-op divergence
+/// described there. `handle_collab_end`'s plain arm needs to *branch* on
+/// endedness rather than refuse on it, because the docs specify that call as an
+/// idempotent no-op; using `ensure_active` there would turn a spec'd success
+/// into an error.
+///
+/// A dedicated scalar read rather than `load_session_record(..).ended_at`
+/// because the caller needs this answer *before* it takes the generation lease,
+/// and a full record read that early would have to be trusted to still be
+/// current after the claim. This reads one column and keeps the record load
+/// where it belongs. A missing session is `NotFound`, byte-identical to
+/// [`load_session_record`] and [`ensure_active`], so hoisting the check ahead of
+/// the record load cannot change what a caller sees for a bad id.
+pub fn session_is_ended(conn: &Connection, session_id: &str) -> Result<bool, MemoryError> {
+    conn.query_row(
+        "SELECT ended_at IS NOT NULL FROM collab_sessions WHERE id = ?1",
+        params![session_id],
+        |row| row.get(0),
+    )
+    .optional()?
+    .ok_or_else(|| MemoryError::NotFound(format!("session {session_id} not found")))
 }
 
 /// The database's current time in Unix epoch seconds.
@@ -1638,9 +1722,48 @@ mod tests {
         )
         .unwrap();
         ensure_active(&db, "sess-end").unwrap();
-        end_session(&db, "sess-end").unwrap();
+        let _ = end_session(&db, "sess-end").unwrap();
         let err = ensure_active(&db, "sess-end").unwrap_err();
         assert!(err.to_string().contains("has ended"));
+    }
+
+    /// `session_is_ended` is the branch `collab_end`'s documented no-op rests
+    /// on, so it is pinned against [`ensure_active`] on all three inputs: it
+    /// must answer where `ensure_active` refuses, stay quiet where it passes,
+    /// and agree with it byte-for-byte on a missing row — that last one is what
+    /// lets `handle_collab_end` hoist the check above its record load without
+    /// changing what a caller sees for a bad id.
+    #[test]
+    fn test_session_is_ended_tracks_ensure_active_on_all_three_inputs() {
+        let db = open();
+        create_session(
+            &db,
+            "sess-flag",
+            "/repo",
+            "main",
+            None,
+            CollabRoles {
+                pilot: Agent::Claude,
+                implementer: Agent::Claude,
+            },
+        )
+        .unwrap();
+
+        assert!(!session_is_ended(&db, "sess-flag").unwrap());
+        ensure_active(&db, "sess-flag").unwrap();
+
+        let _ = end_session(&db, "sess-flag").unwrap();
+        assert!(session_is_ended(&db, "sess-flag").unwrap());
+        assert!(ensure_active(&db, "sess-flag").is_err());
+
+        let missing = session_is_ended(&db, "no-such-session").unwrap_err();
+        let missing_via_ensure = ensure_active(&db, "no-such-session").unwrap_err();
+        assert!(matches!(missing, MemoryError::NotFound(_)));
+        assert_eq!(
+            missing.to_string(),
+            missing_via_ensure.to_string(),
+            "a missing session must read identically through either check"
+        );
     }
 
     #[test]
@@ -2245,7 +2368,7 @@ mod tests {
             },
         )
         .unwrap();
-        end_session(&db, "a-old").unwrap();
+        let _ = end_session(&db, "a-old").unwrap();
         create_session(
             &db,
             "a-active-1",
@@ -2311,8 +2434,8 @@ mod tests {
         assert_eq!(found.map(|(id, _)| id), Some("a-active-2".to_string()));
 
         // Branch with only ended sessions → None, even though the repo has others.
-        end_session(&db, "a-active-1").unwrap();
-        end_session(&db, "a-active-2").unwrap();
+        let _ = end_session(&db, "a-active-1").unwrap();
+        let _ = end_session(&db, "a-active-2").unwrap();
         assert!(
             find_active_session_by_repo_branch_including_terminal(&db, "/repo-a", "main")
                 .unwrap()
@@ -2405,7 +2528,7 @@ mod tests {
              would strand the failed session's plan and recovery state"
         );
 
-        end_session(&db, "coding-scope").unwrap();
+        let _ = end_session(&db, "coding-scope").unwrap();
         assert!(
             find_active_session_by_repo_branch(&db, "/repo", "main")
                 .unwrap()
@@ -2448,7 +2571,7 @@ mod tests {
              terminal-but-unended sessions, so the hook path has to agree"
         );
 
-        end_session(&db, "attested").unwrap();
+        let _ = end_session(&db, "attested").unwrap();
         assert!(
             find_active_session_by_repo_branch_including_terminal(&db, "/repo", "main")
                 .unwrap()
