@@ -809,9 +809,14 @@ def check_no_uninstalled_skill_references() -> None:
     test_sync_skills.py enforces the same denylist over the generated `skills/`
     tree; that gate stops at the skill boundary, so a stale name reintroduced
     into a prompt, the command file, or docs/COLLAB.md would otherwise ship
-    green. The skill resolves to nothing on a standalone install (the names are
-    in install-ironmem.sh's LEGACY_SHARED_SKILLS and are deleted on upgrade),
-    and the worker proceeds with its own approach with no protocol-level signal.
+    green. Every name resolves to nothing on a standalone install, and the
+    worker proceeds with its own approach with no protocol-level signal. Of
+    the 12 names, eight are also in `install-ironmem.sh`'s
+    `LEGACY_SHARED_SKILLS` as removal candidates. On upgrade, the installer
+    removes a candidate only when an ironmem base snapshot proves its
+    provenance; a copy without that snapshot is preserved. The remaining four
+    (`superpowers`, `brainstorming`, `git-worktree-manager`, and
+    `worktree_cleanup`) were never installed and have no removal entry.
     """
     for path in failure_prefix_surfaces():
         rel = path.relative_to(ROOT)

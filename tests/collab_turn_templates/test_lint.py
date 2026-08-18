@@ -1,4 +1,4 @@
-import os, pathlib, re, shutil, subprocess, sys
+import ast, os, pathlib, re, shutil, subprocess, sys
 
 import pytest
 
@@ -88,6 +88,29 @@ def mutate_once(path, snippet, replacement):
     text = path.read_text()
     assert snippet in text, f"target not found in {path.name}: {snippet!r}"
     path.write_text(text.replace(snippet, replacement, 1))
+
+
+def test_uninstalled_skill_guard_docstring_distinguishes_upgrade_paths():
+    module = ast.parse(LINT.read_text())
+    guard = next(
+        node for node in module.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "check_no_uninstalled_skill_references"
+    )
+    docstring = ast.get_docstring(guard)
+
+    assert "eight" in docstring
+    assert "base snapshot" in docstring
+    assert "provenance" in docstring
+    assert "preserved" in docstring
+    assert "never installed" in docstring
+    for name in (
+        "superpowers",
+        "brainstorming",
+        "git-worktree-manager",
+        "worktree_cleanup",
+    ):
+        assert f"`{name}`" in docstring
 
 
 # The lint's contract lists, duplicated here on purpose. Importing them from
