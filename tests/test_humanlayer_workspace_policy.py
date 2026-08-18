@@ -1,4 +1,4 @@
-"""Pytest discovery bridge for the authoritative HumanLayer policy check."""
+"""Pytest discovery bridge for the repository HumanLayer workspace policy regression check."""
 
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ def _run_policy(*arguments: str) -> subprocess.CompletedProcess[str]:
 
 def _assert_policy_passes(result: subprocess.CompletedProcess[str]) -> None:
     assert result.returncode == 0, (
-        "the authoritative HumanLayer workspace policy check failed "
+        "the CI HumanLayer workspace policy check failed "
         f"(exit {result.returncode})\n"
         f"stdout:\n{result.stdout}\n"
         f"stderr:\n{result.stderr}"
