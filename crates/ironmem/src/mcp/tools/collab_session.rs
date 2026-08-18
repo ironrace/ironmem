@@ -583,10 +583,11 @@ pub(super) fn handle_collab_start(app: &App, args: &Value) -> Result<Value, Memo
         if let Some((existing_id, phase)) =
             crate::collab::queue::find_active_session_by_repo_branch(tx, repo_path, branch)?
         {
-            return Err(MemoryError::Validation(format!(
-                "an active collab session already exists for repo {repo_path} branch {branch}: \
-                 {existing_id} (phase {phase}). Resume it with `/collab join {existing_id}`, or \
-                 if it is finished call collab_end on it before starting a new session here."
+            return Err(MemoryError::Validation(duplicate_session_refusal(
+                repo_path,
+                branch,
+                &existing_id,
+                &phase,
             )));
         }
         ensure_no_conflicting_process_session_tx(app, tx, &session_id, repo_path, branch)?;
@@ -923,10 +924,11 @@ pub(super) fn handle_collab_start_code_review(
         if let Some((existing_id, phase)) =
             crate::collab::queue::find_active_session_by_repo_branch(tx, repo_path, branch)?
         {
-            return Err(MemoryError::Validation(format!(
-                "an active collab session already exists for repo {repo_path} branch {branch}: \
-                 {existing_id} (phase {phase}). Resume it with `/collab join {existing_id}`, or \
-                 if it is finished call collab_end on it before starting a new session here."
+            return Err(MemoryError::Validation(duplicate_session_refusal(
+                repo_path,
+                branch,
+                &existing_id,
+                &phase,
             )));
         }
         ensure_no_conflicting_process_session_tx(app, tx, &session_id, repo_path, branch)?;
@@ -2934,6 +2936,49 @@ fn collab_end_admits(phase: Phase) -> bool {
     )
 }
 
+/// The duplicate-session refusal shared by `handle_collab_start` and
+/// `handle_collab_start_code_review`.
+///
+/// The two sites carried a byte-identical literal before #297 and must stay
+/// identical, so it lives here once rather than in two literals that can drift.
+/// The remedy half is phase-dependent (#283 remedy 5): the old message told
+/// every caller to "call `collab_end` on it", which the server rejects in
+/// exactly the coding-active phases where a wedged session is most likely to be
+/// sitting — a guard recommending an action the server refuses.
+///
+/// `phase` arrives as the raw column string from
+/// `find_active_session_by_repo_branch`, which does not parse it. An
+/// unparseable value falls to the conservative branch: never promise
+/// `collab_end` works for a phase we could not identify.
+///
+/// Which phases admit a plain end is read from [`collab_end_admits`], the same
+/// predicate `handle_collab_end` gates on, so the two cannot disagree again.
+fn duplicate_session_refusal(
+    repo_path: &str,
+    branch: &str,
+    existing_id: &str,
+    phase: &str,
+) -> String {
+    let endable = phase
+        .parse::<Phase>()
+        .map(collab_end_admits)
+        .unwrap_or(false);
+    let remedy = if endable {
+        format!("Resume it with `/collab join {existing_id}`, or if it is finished call collab_end on it before starting a new session here.")
+    } else {
+        format!(
+            "Resume it with `/collab join {existing_id}`. collab_end is rejected in this phase; \
+             if the session is demonstrably dead (no activity for {}s) end it with collab_end \
+             `{{\"abandon\": true, \"reason\": \"...\"}}`.",
+            crate::collab::COLLAB_DEAD_SESSION_SECS
+        )
+    };
+    format!(
+        "an active collab session already exists for repo {repo_path} branch {branch}: \
+         {existing_id} (phase {phase}). {remedy}"
+    )
+}
+
 pub(super) fn handle_collab_end(app: &App, args: &Value) -> Result<Value, MemoryError> {
     let session_id = require_str(args, "session_id")?;
     let agent = require_agent(require_str(args, "agent")?)?;
@@ -4601,6 +4646,75 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// #283 remedy 5: a duplicate-session refusal must never recommend an
+    /// action the server rejects. `CodeImplementPending` (reached via
+    /// `drive_to_implement`) is coding-active and not in `PHASE_ENDABILITY`,
+    /// so the old byte-identical literal at both `handle_collab_start` and
+    /// `handle_collab_start_code_review` was lying to the operator there.
+    #[test]
+    fn duplicate_guard_in_a_coding_active_phase_does_not_recommend_collab_end() {
+        let app = test_app();
+        let sid = start_session_in_scope(&app, "/tmp/dup", "main");
+        drive_to_implement(&app, &sid);
+
+        let start_err = handle_collab_start(
+            &app,
+            &json!({
+                "repo_path": "/tmp/dup", "branch": "main",
+                "initiator": "claude", "task": "second"
+            }),
+        )
+        .unwrap_err()
+        .to_string();
+        let review_err = handle_collab_start_code_review(
+            &app,
+            &json!({
+                "repo_path": "/tmp/dup", "branch": "main", "initiator": "claude",
+                "task": "second", "base_sha": PLACEHOLDER_HEAD, "head_sha": PLACEHOLDER_HEAD
+            }),
+        )
+        .unwrap_err()
+        .to_string();
+
+        for (surface, err) in [("collab_start", &start_err), ("review", &review_err)] {
+            assert!(
+                !err.contains("call collab_end on it"),
+                "{surface} must not recommend an action the server rejects: {err}"
+            );
+            assert!(err.contains("/collab join"), "{surface}: {err}");
+            assert!(
+                err.contains("abandon"),
+                "{surface} must name the abandon recipe: {err}"
+            );
+        }
+        assert_eq!(
+            start_err, review_err,
+            "the two guards must emit one identical string from one shared formatter"
+        );
+    }
+
+    /// The counterpart to the coding-active case above: `PlanLocked` (reached
+    /// via `drive_to_plan_locked`) IS in `PHASE_ENDABILITY`, so the guard must
+    /// keep recommending `collab_end` there — the remedy is phase-dependent,
+    /// not simply removed.
+    #[test]
+    fn duplicate_guard_in_an_endable_phase_still_recommends_collab_end() {
+        let app = test_app();
+        let sid = start_session_in_scope(&app, "/tmp/dup2", "main");
+        drive_to_plan_locked(&app, &sid);
+        let err = handle_collab_start(
+            &app,
+            &json!({
+                "repo_path": "/tmp/dup2", "branch": "main",
+                "initiator": "claude", "task": "second"
+            }),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("call collab_end on it"), "got: {err}");
+        assert!(err.contains("/collab join"), "got: {err}");
     }
 
     /// Abandon skips the generation lease and the phase allowlist. It does
