@@ -662,12 +662,15 @@ single human planning gate and takes it in step 0, before any worker runs.
    - **On approval:** proceed to step 1 and dispatch
      `collab-turn-task-list.md` as described there.
    - **On rejection:** do **not** send `task_list`. Offer
-     `mcp__ironmem__collab_end` instead: `collab_end` is legal precisely and
-     only at `PlanLocked` pre-`task_list` (plus the two terminal phases —
-     see **§ Invariants**, and `handle_collab_end` in
-     `crates/ironmem/src/mcp/tools/collab_session.rs`), which makes this the
-     one clean abandon point in the session. Report the rejection and exit the
-     loop; never work around the gate by sending `task_list` anyway.
+     `mcp__ironmem__collab_end` instead: for a plain (non-abandon) end,
+     `collab_end` is legal precisely and only at `PlanLocked` pre-`task_list`
+     (plus the two terminal phases — see **§ Invariants**, and
+     `handle_collab_end` in `crates/ironmem/src/mcp/tools/collab_session.rs`),
+     so this is the one *immediate* clean abandon point in the session; a
+     session that wedges past this gate still has the staleness-gated
+     `abandon: true` arm (§ Invariants) once it is demonstrably dead. Report
+     the rejection and exit the loop; never work around the gate by sending
+     `task_list` anyway.
 
    Under `pilot == "claude"` this is behavior-preserving in substance — the
    gate still sits between the approved plan and the task list, with only the
@@ -700,9 +703,10 @@ single human planning gate and takes it in step 0, before any worker runs.
    re-approval loop. Every step 2 rejection below is of that kind (a 16-task
    plan, a plan-file SHA-256 mismatch, non-contiguous task IDs, a missing
    timebox). Report the blocker verbatim to the user and offer
-   `mcp__ironmem__collab_end`, legal precisely and only at `PlanLocked`
-   pre-`task_list` exactly as on rejection in step 0; the work has to be
-   re-cut — usually split into child issues — in a new session. This mirrors
+   `mcp__ironmem__collab_end` — for a plain end, legal precisely and only at
+   `PlanLocked` pre-`task_list`, exactly as on rejection in step 0; the work
+   has to be re-cut — usually split into child issues — in a new session.
+   This mirrors
    the `TaskListBridge` arm in `benchmarks/abeval/src/collab_driver.rs`, which
    maps a bridge `blocker:` to `DriveError::Invalid` rather than retrying.
 2. The worker must reject the bridge before sending if:

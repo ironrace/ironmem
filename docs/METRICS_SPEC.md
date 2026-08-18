@@ -1047,3 +1047,46 @@ rows but no measured non-MCP collab token rows. Its empty `phase_totals` is
 intentional; estimated response-size proxies are not promoted to workflow
 tokens-to-done or savings evidence. A future genuinely recorded reference
 session may replace the artifact.
+
+### 2026-08-17 — issue #297: `collab_end { abandon: true }` becomes the `abandoned` outcome's second, agent-reachable writer (clarifies §5.4)
+
+`abandoned` has been in the `outcome` domain since the 2026-07-19 amendment
+above, but that amendment only declared the value — it never named a writer,
+because the only one that existed wrote it from exactly two phases
+(`PlanClaudeFinalizePending`, `PlanLocked`) via plain `collab_end`'s existing
+metrics-attestation block. Issue #297 adds a second writer,
+`handle_collab_abandon` (`crates/ironmem/src/mcp/tools/collab_session.rs`),
+reachable from `collab_end { "abandon": true, "reason": "..." }` — see
+`docs/COLLAB.md` § "The `collab_end` abandon contract" for the full
+operator-facing rule. This is a genuinely new capability from a metrics
+standpoint: an agent (not only a session that reached one of the two
+plain-end-eligible phases) can now write `abandoned` from **any** coding-active
+phase too, once the session is demonstrably dead.
+
+**Phase-dependent behavior, not a flat write.** Both writers call
+`mark_task_outcome_done(session_id, done_at, Some("abandoned"), None)`, but
+`handle_collab_abandon` chooses its arguments per the phase being abandoned,
+matching the rationale already established for plain `collab_end`'s two
+existing call sites:
+
+- **`CodingFailed` is skipped entirely** — no call is made. A terminal
+  `failure_report` already wrote the more specific `outcome = 'failed'` for
+  that row, and `mark_task_outcome_done`'s `COALESCE`-based writer would
+  otherwise let a later abandon of that same `CodingFailed` session silently
+  overwrite an accurate failure with a less specific abandonment. This
+  mirrors plain `collab_end`'s own `CodingFailed` exclusion, documented in
+  the 2026-07-19 amendment's note that `mark_task_outcome_done` can only ever
+  set a field, never clear or downgrade it.
+- **`CodingComplete` preserves the existing `done_at`** (passes `None`) —
+  the timestamp `final_review` stamped when the PR was opened is when the
+  work actually stopped; abandoning such a session changes *why* it ended
+  (`merged` never happened), not *when*.
+- **Every other phase stamps a fresh `done_at`** — there is no prior
+  timestamp to preserve, and the abandonment is itself the end.
+
+**No column, unit, or destination changed** — `outcome`'s domain was already
+three-valued as of 2026-07-19; this amendment only documents the second
+writer and its phase-dependent `done_at` rule. Best-effort and
+`IRONMEM_METRICS`-gated like every other collab metrics write: a failure is
+logged at warn and swallowed, never rolled back into the protocol
+transaction that already committed the seal.

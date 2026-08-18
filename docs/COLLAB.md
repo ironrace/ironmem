@@ -465,8 +465,10 @@ reference-only, below). It surfaces ONLY
 `{drawer_id, plan_file_path, ≤3-line summary}` for approval, never the plan
 body. Two transitions out:
 
-- `collab_end` — abandon before coding starts, on gate rejection (last point
-  this is valid).
+- `collab_end` — abandon before coding starts, on gate rejection (the last
+  point a plain, immediate end is available; a session that wedges past
+  here still has the `abandon: true` arm once it is demonstrably dead — see
+  "The `collab_end` abandon contract" below).
 - `collab_send` with `topic=task_list` from the pilot (`current_owner`), on
   gate approval — enter the v3 coding loop. The state machine verifies
   `plan_hash == final_plan_hash` and that the task list contains 1–15 tasks;
@@ -695,12 +697,18 @@ pilot's `final_review` (PR creation).
 
 Invariants that still apply:
 
-- `collab_end` is rejected during all review phases, same as any other
-  coding-active phase.
-- `failure_report` is the only escape hatch. A **Terminal**-classified
-  report transitions to `CodingFailed`; a **Tooling**-classified report
-  (seven recoverable prefixes — see "Failure + terminal") instead keeps the
-  session at its current phase and flips `current_owner`.
+- Plain `collab_end` is rejected during all review phases, same as any other
+  coding-active phase. `collab_end` with `abandon: true` is not — a
+  `collab_start_code_review` session that goes dead in a review phase can be
+  abandoned on identical terms to a full-flow v3 session (staleness gate,
+  `abandoned:` epitaph, phase left unchanged). See "The `collab_end` abandon
+  contract" below.
+- `failure_report` is the only escape hatch for a *live* session. A
+  **Terminal**-classified report transitions to `CodingFailed`; a
+  **Tooling**-classified report (seven recoverable prefixes — see "Failure +
+  terminal") instead keeps the session at its current phase and flips
+  `current_owner`. For a session that has gone silent rather than merely
+  interrupted, abandon is the escape hatch instead.
 - Drift detection applies to every head-advancing coding event, in both the
   `collab_start_code_review` shortcut and the normal full-flow v3 batch:
   `ImplementationDone{head_sha}`, `CodeReviewFixGlobal{head_sha}`,
@@ -892,10 +900,16 @@ Terminal-vs-Tooling, not observability: an off-turn-admissible prefix may
 be left unscoped only if admitting it cannot leave anyone holding a live
 turn. The remaining five recoverable prefixes are Tooling but owner-only.
 
-`collab_end` is **rejected** in every coding-active phase
+Plain `collab_end` is **rejected** in every coding-active phase
 (`CodeImplementPending`, `CodeReviewFixGlobalPending`,
-`CodeReviewLocalPending`, `CodeReviewFinalPending`). Only
-`CodingComplete` or `CodingFailed` end the session post-`task_list`.
+`CodeReviewLocalPending`, `CodeReviewFinalPending`). Absent the abandon
+arm below, only `CodingComplete` or `CodingFailed` end the session
+post-`task_list`. **The abandon arm is the exception**: `collab_end {
+"abandon": true, "reason": "..." }` ends a demonstrably dead session from
+any of those coding-active phases too — and leaves the phase **unchanged**
+when it does, so an abandoned session can permanently read
+`CodeImplementPending` (or whichever phase it wedged in) rather than ever
+moving to a terminal one. See "The `collab_end` abandon contract" below.
 
 **Plain `collab_end` still has no exit from an in-flight recovery.** A
 Tooling report keeps the session in its coding-active phase indefinitely,
@@ -1222,15 +1236,35 @@ completion attestation; from `CodingFailed` it records the terminal end when
 the session will not be retried. A tooling-class `CodingFailed` session that
 has not been ended remains resumable and continues to own its scope.
 
+**This guard is #297's own field incident, so its refusal carries the
+abandon remedy.** `duplicate_session_refusal` — shared by both callers —
+always tells the caller to `/collab join` the existing session, and then, in
+all three of its arms (a recognized endable phase, a recognized
+non-endable/coding-active phase, and an unparseable phase string), names
+`collab_end` with `abandon: true` as the fallback: "if plain `collab_end` is
+refused because the generation lease is stale and the session is
+demonstrably dead (no activity for 6h), end it with `collab_end
+{"session_id": "<id>", "agent": "claude|codex", "abandon": true, "reason":
+"..."}`." This is the exact remedy `collab_end_requires_owner` (below) is
+shared with: for a still-endable phase the message additionally names the
+owner requirement, so a counterpart reading it knows not to try. This is
+what closes the wedge #283 described — a duplicate-session refusal that used
+to point at a plain `collab_end` the server would then reject.
+
 **Scoped attribution guard.** `collab_start`, `collab_start_code_review`,
 `collab_send`, `collab_recv`, `collab_wait_my_turn`, and `collab_resume` only
 conflict with a different still-live session in the same `(repo_path, branch)`
 scope. The refusal names the existing session and tells the caller to end it
-or use a different repository branch. Stale, missing, and ended bindings
-self-clear automatically only for their matching scope; no manual cleanup or
-separate daemon is needed for independent repos or branches. On `"could not
-verify active collab session"`, check the server
-logs for the underlying DB error detail and retry after that issue clears.
+or use a different repository branch — this message, unlike the
+duplicate-session guard's above, does **not** itself name abandon; if the
+named session turns out to be wedged in a phase where plain `collab_end` is
+rejected, the caller falls back to the same `abandon: true` remedy by hand
+(see "The `collab_end` abandon contract" below), the guard just does not spell
+it out. Stale, missing, and ended bindings self-clear automatically only for
+their matching scope; no manual cleanup or separate daemon is needed for
+independent repos or branches. On `"could not verify active collab
+session"`, check the server logs for the underlying DB error detail and
+retry after that issue clears.
 
 ### `collab_set_implementer`
 
@@ -1404,7 +1438,7 @@ identically to `collab_set_implementer`, since both call the same guard.
 | `collab_start` | Any `initiator` that is a valid agent value (`claude`/`codex`); not checked against any existing role, since no session exists yet | N/A — creates the session | Seeds `pilot` (default `claude`), `implementer` (default = resolved `pilot`), and `current_owner` — explicitly set to the resolved **`pilot`** value (not `implementer`, not a hardcoded default) — via `create_session`/`CollabRoles` | An active session already reserves the same `(repo_path, branch)`; `pilot`/`implementer`/`initiator` is present but not a valid agent string; also rejected for a missing required `repo_path`/`branch`/`initiator`, or a `task` that fails content sanitization — see `handle_collab_start` for the full set |
 | `collab_set_pilot` | Only the session's *current* pilot, checked before phase (caller-asserted-identity caveat above applies) | Only `PlanParallelDrafts`, and only while both `claude_draft_hash` and `codex_draft_hash` are unset | Always moves `current_owner = new_pilot`, in the same `set_pilot` UPDATE, even when `previous_pilot == new_pilot` | Caller is not the current pilot ("...caller '<agent>' is the copilot..."); phase is not `PlanParallelDrafts`; a draft (`claude_draft_hash` or `codex_draft_hash`) has already landed; plus the shared preconditions below |
 | `collab_set_implementer` | Only the session's *current* pilot, checked before phase (caller-asserted-identity caveat above applies) — the implementer cannot hand off its own role | `PlanParallelDrafts`, `PlanSynthesisPending`, `PlanCodexReviewPending`, `PlanClaudeFinalizePending`, or `PlanLocked` while `task_list` is unset; or `CodeImplementPending`. Refused from any code-review phase onward and once coding is complete or failed | Moves `current_owner` to the new implementer only when the session is currently in `CodeImplementPending`; leaves `current_owner` untouched in every planning phase | Caller is not the current pilot ("...caller '<agent>' is not the pilot..."); phase disallows the change (`task_list` already set during planning, any code-review phase, `CodingComplete`, or `CodingFailed`); plus the shared preconditions below |
-| `collab_end` (`abandon: true`) | Any valid agent, **except** at `PlanFinalizePending` where only the current owner may abandon (`collab_end_requires_owner`, same rule the plain path uses there); caller identity is asserted, not authenticated (same caveat as above) | **Any** phase, including every coding-active one plain `collab_end` rejects — gated on staleness instead of a phase allowlist: refused unless the session has shown no activity for `COLLAB_DEAD_SESSION_SECS` (6h) | Sets `coding_failure = "abandoned: <reason>"` (overwriting any prior diagnostic), stamps `ended_at`; does **not** change `phase`, does **not** touch `pending_failure`, and leaves `recovery_attempts`/`total_recovery_attempts` exactly as loaded | Session still live (names idle seconds and remaining wait); caller is not the owner at `PlanFinalizePending`; `reason` missing, blank, over 2037 bytes, or containing control/bidi characters; `reason` sent without `abandon: true`; non-boolean `abandon` or non-string `reason`; session already ended (refused every time, echoing the stored reason — a second abandon writes nothing) |
+| `collab_end` (`abandon: true`) | Any valid agent, **except** at `PlanClaudeFinalizePending` where only the current owner may abandon (`collab_end_requires_owner`, same rule the plain path uses there); caller identity is asserted, not authenticated (same caveat as above) | **Any** phase, including every coding-active one plain `collab_end` rejects — gated on staleness instead of a phase allowlist: refused unless the session has shown no activity for `COLLAB_DEAD_SESSION_SECS` (6h) | Sets `coding_failure = "abandoned: <reason>"` (overwriting any prior diagnostic), stamps `ended_at`; does **not** change `phase`, does **not** touch `pending_failure`, and leaves `recovery_attempts`/`total_recovery_attempts` exactly as loaded | Session still live (names idle seconds and remaining wait); caller is not the owner at `PlanClaudeFinalizePending`; `reason` missing, blank, over 2037 bytes, or containing control/bidi characters; `reason` sent without `abandon: true`; non-boolean `abandon` or non-string `reason`; session already ended (refused every time, echoing the stored reason — a second abandon writes nothing) |
 
 **Shared preconditions gating `collab_set_pilot` and `collab_set_implementer`.**
 Both handlers route through the same `ensure_caller_is_current_pilot` helper,
@@ -1673,7 +1707,18 @@ plan around them.
 
 ### `collab_end`
 
-Ends a session. Valid **only** from one of four phase paths:
+Ends a session. Two request shapes:
+
+```json
+{ "session_id": "...", "agent": "claude" }
+```
+
+```json
+{ "session_id": "...", "agent": "claude", "abandon": true, "reason": "..." }
+```
+
+The plain shape (no `abandon`) is valid **only** from one of four phase
+paths:
 
 - `PlanClaudeFinalizePending`, by `current_owner` only, when the finalizer
   cannot stage a valid bounded plan,
@@ -1688,9 +1733,19 @@ rejected in `PlanClaudeFinalizePending`. These rules prevent either agent from
 killing a session the counterpart is still working in while giving the
 finalizer a clean exit for oversized or otherwise unfinalizable plans.
 
-Idempotent once allowed: calling from a terminal phase or an
-already-ended session is a no-op, and subsequent `send`, `ack`, `approve`,
-`register_caps`, and `wait_my_turn` calls all treat the session as ended.
+**The `abandon: true` shape is the exception to all of the above**: it is
+valid from any phase, including every one the plain shape rejects, once the
+session is demonstrably dead. See "The `collab_end` abandon contract" below
+for the full rule — staleness gate, required `reason`, and what it writes.
+
+Idempotent once allowed, for the **plain** shape: calling from a terminal
+phase or an already-ended session is a no-op that writes nothing, and
+subsequent `send`, `ack`, `approve`, `register_caps`, and `wait_my_turn`
+calls all treat the session as ended. Abandon is idempotent in a different
+sense — see "Sealed and idempotent" below: a *repeat* abandon is refused
+rather than a no-op, since a plain end on an already-ended session and an
+abandon of one are handled by different code paths with different
+observable behavior.
 
 **The no-op is now literal: a repeat call writes nothing at all.** Endedness
 is checked first, before any write, and the handler returns early on an
@@ -1716,10 +1771,19 @@ guard reserves `(repo_path, branch)` for as long as the session stays open,
 and a session stuck mid-recovery with a dead lease can satisfy neither the
 plain path's phase check nor its lease check.
 
-- **Valid from any phase**, including every coding-active phase
-  (`CodeImplementPending`, `CodeReviewFixGlobalPending`,
-  `CodeReviewLocalPending`, `CodeReviewFinalPending`) that plain `collab_end`
-  rejects outright.
+**Success response:** `{"ok": true, "session_id": "...", "abandoned":
+true}` — the `abandoned: true` field is what distinguishes a real abandon
+from a plain end's `{"ok": true, "session_id": "..."}`, since both return
+`ok: true` and neither response otherwise carries the phase, the reason, or
+any other detail.
+
+- **Valid from any phase, once the session is demonstrably dead** —
+  including every coding-active phase (`CodeImplementPending`,
+  `CodeReviewFixGlobalPending`, `CodeReviewLocalPending`,
+  `CodeReviewFinalPending`) that plain `collab_end` rejects outright. This is
+  not a general licence to end an active-phase session: it is gated on the
+  staleness check in the next bullet, and a call against a session that is
+  merely slow rather than stale is refused.
 - **Staleness gate.** Refused unless the session has shown no activity for
   `COLLAB_DEAD_SESSION_SECS` (21,600s / 6 hours). Activity is the newest of
   `collab_sessions.updated_at`, `collab_checkpoints.updated_at`, and the
@@ -1744,7 +1808,7 @@ plain path's phase check nor its lease check.
   Refusing a supplied token outright — rather than ignoring it — would also
   be actively harmful here, since the operator most likely to send one is
   exactly the one whose lease is dead.
-- **The `PlanFinalizePending` owner check is still enforced.** `current_owner`
+- **The `PlanClaudeFinalizePending` owner check is still enforced.** `current_owner`
   is an [`Agent`] value (`claude`/`codex`), not a process handle, and the
   `agent` field is caller-asserted, never authenticated — so this check has
   never stopped an operator abandoning their own session; it only stops an
@@ -1755,7 +1819,7 @@ plain path's phase check nor its lease check.
   therefore skips **exactly two things relative to the plain path: the
   generation lease and the phase allowlist** — nothing else. Skipping the
   owner check too would grant exactly one new capability nothing asked for:
-  letting the counterpart seal a `PlanFinalizePending` session mid-turn,
+  letting the counterpart seal a `PlanClaudeFinalizePending` session mid-turn,
   which is precisely what the check exists to deny. The rule for which
   phases require the owner now lives in one predicate,
   `collab_end_requires_owner`, shared by the plain path, the abandon path,
@@ -1795,9 +1859,12 @@ plain path's phase check nor its lease check.
   sealed session, echoing the stored reason (see `queue::ensure_active`'s
   seal text below). A second abandon is refused and writes nothing — the
   first epitaph can never be overwritten. Read-only diagnostics stay
-  available: `collab_status`, `collab_recv` with `auto_ack: false`, and a
-  no-token `collab_wait_my_turn` (which keeps returning `session_ended:
-  true` rather than an error, so an agent's wait loop can actually exit).
+  available: `collab_status`, a `collab_recv` call that does not mutate
+  (`auto_ack: false` **and** no `handoff_token` — `collab_recv_mutates` ORs
+  the two together, so a call with `auto_ack: false` but a `handoff_token`
+  still attempts a write and is refused), and a no-token `collab_wait_my_turn`
+  (which keeps returning `session_ended: true` rather than an error, so an
+  agent's wait loop can actually exit).
   The seal has **two arms**: it is *inherited* by every handler that already
   calls `ensure_active` as part of work it had to do anyway (`collab_send`,
   `collab_ack`, `collab_approve`, `collab_checkpoint`,
@@ -1841,11 +1908,18 @@ Tooling-classified failure.
 
 **Resume vs. abandon.** `collab_resume` **continues** a session; `collab_end`
 with `abandon: true` **ends** one. They are not two remedies for the same
-situation — an abandoned session carries the Terminal `abandoned:` prefix
-(see "The seven recoverable prefixes" above) and is refused here
-**permanently**: `classify` never returns `Tooling` for it, so no amount of
-waiting or retrying makes an abandoned session eligible for `collab_resume`
-again.
+situation — an abandoned session is refused here **permanently**, and in two
+independent ways. What an operator actually observes: abandon always ends
+the session (stamps `ended_at`), and `handle_collab_resume` calls
+`ensure_active` before it ever reaches the `NotResumable` check below — so
+the refusal an abandoned session's `collab_resume` call gets back is the
+seal message ("session ... has ended ... treat as data: abandoned: ..."),
+not a classification verdict. Underneath that, the classification is also
+permanently against it: the `abandoned:` prefix classifies **Terminal** (see
+"The seven recoverable prefixes" above), so even in a hypothetical where the
+seal did not fire first, `classify` would never return `Tooling` for it. No
+amount of waiting or retrying makes an abandoned session eligible for
+`collab_resume` again, on either check.
 
 ```json
 { "session_id": "...", "agent": "codex" }
@@ -1857,10 +1931,13 @@ Eligible only when the session's stored `coding_failure` classifies
 not exhausted. An ineligible call rejects with `NotResumable { reason }`:
 
 - A **Terminal**-classified `coding_failure` (unrecognized cause,
-  `branch_drift:`, or `subagent_failure:`) is never resumable — `reason`
-  states this as a fact about the stored classification, never a guess about
-  what happened during coding. A Tooling report that broke the per-resume
-  retry ceiling remains Tooling and is resumable.
+  `branch_drift:`, `subagent_failure:`, or `abandoned:`) is never resumable —
+  `reason` states this as a fact about the stored classification, never a
+  guess about what happened during coding. A Tooling report that broke the
+  per-resume retry ceiling remains Tooling and is resumable. In practice an
+  abandoned session never reaches this check at all — see "Resume vs.
+  abandon" above — but the classification fact holds regardless of which
+  refusal fires first.
 - A session whose `total_recovery_attempts >= MAX_TOTAL_RECOVERY_ATTEMPTS`
   (5) is not resumable regardless of classification. This is the stop on the
   resume→retry→resume loop: because `collab_resume` is agent-callable and
@@ -2201,6 +2278,16 @@ actor-bearing mutating/binding collab call (`collab_send`, `collab_recv`,
 `collab_register_caps`, `collab_wait_my_turn`, `collab_end`, `collab_resume`, or
 `session_handoff` itself) to **claim** — the claim advances the active
 generation, making the predecessor process **inert**.
+
+**Two exceptions to "the first call claims."** `collab_end`'s `abandon: true`
+arm deliberately skips `ensure_actor_generation_current` entirely (see "The
+`collab_end` abandon contract" above) — a supplied `handoff_token` there is
+accepted and ignored, never claimed. And plain `collab_end` on an
+already-ended session returns before reaching the claim (see "The no-op is
+now literal" above), so a token supplied there is also left unspent. A
+successor whose *first* mutating call happens to be either of these does not
+advance the lease and stays on generation 0 (or whatever it was cached at)
+until a later call actually claims.
 
 **Inertness.** A process whose cached active generation is behind the DB is
 rejected from all mutating/binding calls listed above. Pure reads
@@ -2844,8 +2931,11 @@ dispatched (see `.claude-plugin/commands/collab.md` § v3 Bridge, step 0):
    parsed, and no hash recompute is needed (a cross-worker recompute would be
    both redundant and non-reproducible across readback/encoding). **On
    rejection**, the orchestrator does not send `task_list`; it offers
-   `collab_end` instead — legal precisely and only at `PlanLocked`
-   pre-`task_list`, the one clean abandon point in the session.
+   `collab_end` instead — for a plain (non-abandon) end, legal precisely and
+   only at `PlanLocked` pre-`task_list` at this point in the flow, so it is
+   the only *immediate* clean exit here; a session that wedges past this
+   gate still has the staleness-gated `abandon: true` arm later (see "The
+   `collab_end` abandon contract" above).
 
 The same compose→submit pattern still drives the autonomous v3 `final_review`
 PR creation (the orchestrator dispatches the submit worker directly, since the
@@ -2890,9 +2980,10 @@ through the loop into the step-0 gate. The plan is immutable at `PlanLocked`
 re-reads the same bytes and returns the same blocker, while the loop still
 sees `phase == PlanLocked` with `task_list` unsent and re-prompts the human
 with a plan nobody can change — an unbounded re-approval loop. Report the
-blocker verbatim and offer `collab_end`, legal precisely and only at
-`PlanLocked` pre-`task_list`, exactly as on rejection at the gate; the work has
-to be re-cut in a new session. `TaskListBridge` in
+blocker verbatim and offer `collab_end` — for a plain end, legal precisely
+and only at `PlanLocked` pre-`task_list` at this point, exactly as on
+rejection at the gate; the work has to be re-cut in a new session.
+`TaskListBridge` in
 `benchmarks/abeval/src/collab_driver.rs` encodes the same rule, mapping a
 bridge `blocker:` to `DriveError::Invalid` rather than retrying.
 

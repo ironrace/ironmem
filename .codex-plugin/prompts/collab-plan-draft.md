@@ -65,8 +65,12 @@ sender `codex`, topic `draft`, and the plan text. Exit immediately after a
 successful send.
 
 If a duplicate active session is reported for the same repository and branch,
-join the reported session instead of retrying start. If a send is rejected,
-correct content only after reading the current status; do not invent topics.
+join the reported session instead of retrying start — unless the refusal
+itself says the session is demonstrably dead (no activity for
+`COLLAB_DEAD_SESSION_SECS`, 6h) and names the `collab_end { "abandon": true,
+"reason": "..." }` remedy, in which case end it that way instead of joining a
+session with no one left to answer. If a send is rejected, correct content
+only after reading the current status; do not invent topics.
 
 ## Invocation
 
