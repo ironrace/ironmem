@@ -3015,7 +3015,7 @@ pub(super) fn handle_collab_end(app: &App, args: &Value) -> Result<Value, Memory
         return handle_collab_abandon(app, session_id, agent, reason);
     }
 
-    let (phase, repo_path, branch, claim) = app.db.with_transaction(|tx| {
+    let (phase, repo_path, branch, claim, end_outcome) = app.db.with_transaction(|tx| {
         let claim = super::handoff::ensure_actor_generation_current(
             app,
             tx,
@@ -3044,25 +3044,38 @@ pub(super) fn handle_collab_end(app: &App, args: &Value) -> Result<Value, Memory
             )));
         }
         let ended_phase = session.phase;
-        crate::collab::queue::end_session(tx, session_id)?;
-        crate::db::schema::Database::wal_log_tx(
-            tx,
-            "collab_end",
-            &json!({
-                "session_id": session_id,
-                "agent": agent.as_str(),
-                "phase": ended_phase.to_string(),
-            }),
-            Some(&json!({ "ok": true })),
-        )?;
-        Ok((ended_phase, record.repo_path, record.branch, claim))
+        // `collab_end` is documented idempotent: "calling from a terminal
+        // phase or an already-ended session is a no-op" (`docs/COLLAB.md`).
+        // Honouring that means more than returning `ok` — the audit row and
+        // the metrics attestation below are side effects of *ending*, and
+        // repeating them on a call that changed nothing is how a session
+        // abandoned as "PR was closed unmerged" came back reporting `merged`.
+        // `end_session` reports which case this is; both are successes and the
+        // response is identical either way.
+        let outcome = crate::collab::queue::end_session(tx, session_id)?;
+        if outcome == crate::collab::queue::SessionEndOutcome::Ended {
+            crate::db::schema::Database::wal_log_tx(
+                tx,
+                "collab_end",
+                &json!({
+                    "session_id": session_id,
+                    "agent": agent.as_str(),
+                    "phase": ended_phase.to_string(),
+                }),
+                Some(&json!({ "ok": true })),
+            )?;
+        }
+        Ok((ended_phase, record.repo_path, record.branch, claim, outcome))
     })?;
     claim.publish(app);
 
     // Operator attestation (METRICS_SPEC §12 amendment): the operator ends a
     // CodingComplete session after the PR lands, or abandons a pre-coding
-    // session during finalization / after the plan locks.
-    if crate::search::tunables::metrics_enabled() {
+    // session during finalization / after the plan locks. Skipped entirely
+    // when this call ended nothing — see the note above `end_session`.
+    if crate::search::tunables::metrics_enabled()
+        && end_outcome == crate::collab::queue::SessionEndOutcome::Ended
+    {
         let now = crate::metrics::now_rfc3339();
         let attested = match phase {
             Phase::CodingComplete => {
@@ -3238,7 +3251,19 @@ fn handle_collab_abandon(
         let ended_phase = session.phase;
         session.coding_failure = Some(coding_failure.clone());
         crate::collab::queue::save_session(tx, &session)?;
-        crate::collab::queue::end_session(tx, session_id)?;
+        // Always a real transition, never `AlreadyEnded`: step (1) above ran
+        // `ensure_active` in this same transaction, so an already-ended
+        // session was refused before reaching here and nothing else can end it
+        // in between. The plain path has to branch on this because it
+        // deliberately skips `ensure_active` to stay idempotent; this arm gets
+        // the guarantee from the check it already runs, so the result is
+        // asserted rather than handled.
+        let outcome = crate::collab::queue::end_session(tx, session_id)?;
+        debug_assert_eq!(
+            outcome,
+            crate::collab::queue::SessionEndOutcome::Ended,
+            "ensure_active must have refused an already-ended session before this point"
+        );
         crate::db::schema::Database::wal_log_tx(
             tx,
             "collab_end",
@@ -4806,6 +4831,117 @@ mod tests {
             after.done_at.as_deref(),
             Some(pr_done_at.as_str()),
             "abandon must not move done_at off the PR clock"
+        );
+    }
+
+    /// Count the `collab_end` audit rows written for any session.
+    fn collab_end_wal_count(app: &crate::mcp::app::App) -> i64 {
+        rusqlite::Connection::open(&app.config.db_path)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM wal_log WHERE operation = 'collab_end'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    /// `collab_end` is documented idempotent, and this pins the half that was
+    /// missing: the repeat call must not merely *return* ok, it must actually
+    /// do nothing. `end_session`'s `WHERE ended_at IS NULL` already made the
+    /// row write a no-op, but the audit row and the metrics attestation ran
+    /// unconditionally afterward, so a second call appended a second WAL row
+    /// and re-attested the outcome.
+    #[test]
+    fn a_repeat_plain_end_is_a_no_op_not_merely_a_success() {
+        let _g = metrics_on_guard();
+        let app = test_app();
+        let sid = start_session(&app);
+        drive_to_plan_locked(&app, &sid);
+
+        handle_collab_end(&app, &end_args(&sid, "claude")).unwrap();
+        let wal_after_first = collab_end_wal_count(&app);
+        let first = app.db.get_task_outcome(&sid).unwrap().unwrap();
+        assert_eq!(wal_after_first, 1, "the real end writes exactly one row");
+
+        // The documented contract: this still succeeds.
+        let repeat = handle_collab_end(&app, &end_args(&sid, "claude"))
+            .expect("ending an already-ended session stays a documented no-op success");
+        assert_eq!(
+            repeat,
+            json!({ "ok": true, "session_id": sid }),
+            "the wire response must be unchanged"
+        );
+
+        assert_eq!(
+            collab_end_wal_count(&app),
+            wal_after_first,
+            "a no-op must not append a second audit row"
+        );
+        let second = app.db.get_task_outcome(&sid).unwrap().unwrap();
+        assert_eq!(
+            first.done_at, second.done_at,
+            "a no-op must not re-stamp done_at"
+        );
+        assert_eq!(
+            first.outcome, second.outcome,
+            "a no-op must not re-attest the outcome"
+        );
+    }
+
+    /// The hazard in its actual shape. A `CodingComplete` session abandoned
+    /// because the PR was closed unmerged would come back reporting `merged`
+    /// if a later plain `collab_end` re-ran the attestation — and the epitaph
+    /// on `coding_failure` would still say otherwise, so `collab_status` and
+    /// the metrics row would disagree with nothing downstream able to tell.
+    #[test]
+    fn a_plain_end_after_an_abandon_cannot_resurrect_the_merged_outcome() {
+        let _g = metrics_on_guard();
+        let (_temp, repo_path, heads) = git_ancestor_chain(5);
+        let app = test_app();
+        let sid = start_session_in_scope(&app, &repo_path, "main");
+        drive_to_coding_complete(&app, &sid, &heads);
+
+        age_session(&app, &sid, crate::collab::COLLAB_DEAD_SESSION_SECS + 60);
+        handle_collab_end(
+            &app,
+            &abandon_args(&sid, "claude", "PR was closed unmerged"),
+        )
+        .unwrap();
+
+        let abandoned = app.db.get_task_outcome(&sid).unwrap().unwrap();
+        let wal_after_abandon = collab_end_wal_count(&app);
+        assert_eq!(abandoned.outcome.as_deref(), Some("abandoned"));
+
+        // `CodingComplete` is an endable phase, so this plain end is admitted
+        // and returns ok — it just must not *do* anything.
+        handle_collab_end(&app, &end_args(&sid, "claude"))
+            .expect("a plain end on an ended session stays a no-op success");
+
+        let after = app.db.get_task_outcome(&sid).unwrap().unwrap();
+        assert_eq!(
+            after.outcome.as_deref(),
+            Some("abandoned"),
+            "a no-op end must not overwrite the abandonment with `merged`"
+        );
+        assert_eq!(
+            abandoned.done_at, after.done_at,
+            "nor re-stamp when the work stopped"
+        );
+        assert_eq!(
+            collab_end_wal_count(&app),
+            wal_after_abandon,
+            "nor append a second audit row"
+        );
+        assert_eq!(
+            app.db
+                .collab_load_session_record(&sid)
+                .unwrap()
+                .session
+                .coding_failure
+                .as_deref(),
+            Some("abandoned: PR was closed unmerged"),
+            "the epitaph is what makes the metric's disagreement detectable; it must survive"
         );
     }
 

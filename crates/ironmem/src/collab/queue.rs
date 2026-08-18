@@ -163,9 +163,37 @@ pub fn set_pilot(
     Ok(())
 }
 
+/// Whether [`end_session`] actually transitioned the session, or found it
+/// already ended.
+///
+/// Both are successes — `collab_end` is documented idempotent
+/// (`docs/COLLAB.md`: "calling from a terminal phase or an already-ended
+/// session is a no-op"). The distinction exists so a caller can keep that
+/// promise honestly: a no-op that still appends an audit row and re-attests a
+/// metrics outcome is not a no-op. Callers with side effects to perform after
+/// ending must gate them on [`Self::Ended`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionEndOutcome {
+    /// This call stamped `ended_at`; it owns the resulting side effects.
+    Ended,
+    /// The session was already ended; this call changed nothing.
+    AlreadyEnded,
+}
+
 /// Mark a session as ended. Subsequent mutating operations should check
 /// `ended_at` via `ensure_active` and refuse to proceed.
-pub fn end_session(conn: &Connection, session_id: &str) -> Result<(), MemoryError> {
+///
+/// Returns [`SessionEndOutcome`] rather than `()` so callers can tell an
+/// actual transition from a repeat call. The `WHERE ended_at IS NULL` guard
+/// has always made the *row* write idempotent, but that guard is invisible
+/// from outside, so callers appended their own side effects unconditionally
+/// and a second `collab_end` grew a second WAL row and a re-attested metrics
+/// outcome. Anything a caller does *because* a session ended belongs behind
+/// [`SessionEndOutcome::Ended`].
+///
+/// A missing session is still `NotFound`; that is a different case from a
+/// repeat call and keeps its error.
+pub fn end_session(conn: &Connection, session_id: &str) -> Result<SessionEndOutcome, MemoryError> {
     let updated = conn.execute(
         "UPDATE collab_sessions SET ended_at = datetime('now') WHERE id = ?1 AND ended_at IS NULL",
         params![session_id],
@@ -185,9 +213,11 @@ pub fn end_session(conn: &Connection, session_id: &str) -> Result<(), MemoryErro
                 "session {session_id} not found"
             )));
         }
-        // Already ended — idempotent success.
+        // Already ended — idempotent success, but the caller must not repeat
+        // whatever it does on a real transition.
+        return Ok(SessionEndOutcome::AlreadyEnded);
     }
-    Ok(())
+    Ok(SessionEndOutcome::Ended)
 }
 
 /// Return an error if the session has `ended_at` set.
@@ -1628,9 +1658,18 @@ mod tests {
             },
         )
         .unwrap();
-        end_session(&db, "sess-end2").unwrap();
-        // Calling end_session a second time must succeed (idempotent).
-        end_session(&db, "sess-end2").unwrap();
+        // Both calls succeed (idempotent), but they must be distinguishable:
+        // the second changed nothing, and a caller with side effects to run on
+        // ending needs to be able to tell.
+        assert_eq!(
+            end_session(&db, "sess-end2").unwrap(),
+            SessionEndOutcome::Ended
+        );
+        assert_eq!(
+            end_session(&db, "sess-end2").unwrap(),
+            SessionEndOutcome::AlreadyEnded,
+            "a repeat end must report that it ended nothing"
+        );
     }
 
     #[test]

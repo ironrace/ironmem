@@ -17,7 +17,14 @@ impl Database {
         queue::create_session(&self.conn, id, repo_path, branch, task, roles)
     }
 
-    pub fn collab_end_session(&self, session_id: &str) -> Result<(), MemoryError> {
+    /// Propagates [`queue::SessionEndOutcome`] rather than discarding it: a
+    /// caller that performs side effects on ending needs to know whether it
+    /// actually ended anything, and flattening that away here would hand the
+    /// next caller the same blind spot `handle_collab_end` had.
+    pub fn collab_end_session(
+        &self,
+        session_id: &str,
+    ) -> Result<queue::SessionEndOutcome, MemoryError> {
         queue::end_session(&self.conn, session_id)
     }
 
