@@ -4154,6 +4154,12 @@ fn age_collab_session(app: &App, session_id: &str, secs: i64) {
 /// a fresh `App`, because a seal that only lives in the writing process's
 /// caches is not a seal. An in-memory DB cannot express that difference.
 ///
+/// The numbered steps below run 1, 2, 3, 5, 4, 6 against #283's criteria, and
+/// deliberately so: criterion 5's "no recovery attempt was spent" has to be
+/// read while the abandoned session is still the only one on this scope, i.e.
+/// before criterion 1's successor exists. The numbers track the criteria, not
+/// the execution order.
+///
 /// Ordering is load-bearing in two places. The plain-end refusal must come
 /// *before* the abandon — plain `collab_end` on an already-abandoned session
 /// is a spec'd idempotent no-op success (`docs/COLLAB.md`), so afterwards it
@@ -4165,7 +4171,7 @@ fn age_collab_session(app: &App, session_id: &str, secs: i64) {
 #[test]
 fn collab_abandon_frees_a_wedged_branch_end_to_end_via_mcp() {
     const REASON: &str = "the implementer process was killed and never came back";
-    let (_db_dir, db_path, app) = open_disk_app_for_dashboard_sweep();
+    let (_db_dir, db_path, app) = open_disk_app();
     let (_repo, repo_path, shas) = git_batch_repo(2);
     // The branch `start_batch_session_in` seeds its session on, restated here
     // because every later call has to name the *same* scope for the start-slot
@@ -4234,6 +4240,21 @@ fn collab_abandon_frees_a_wedged_branch_end_to_end_via_mcp() {
             "initiator": "claude",
             "task": "second session on a held branch"
         }),
+    );
+    // Pin WHICH of `duplicate_session_refusal`'s three arms answered, first.
+    // Every other assertion in this block is satisfied just as well by the
+    // unparseable-phase fallback, which also omits the collab_end advice and
+    // carries the recipe and threshold — so a regression in phase parsing
+    // could drop the operator to the vague arm with this block still green.
+    // This sentence is emitted only by the parsed-but-not-endable arm.
+    //
+    // Note the `(phase CodeImplementPending)` prefix does NOT discriminate:
+    // it is interpolated by the shared wrapper around all three remedies, from
+    // the raw column string, whether or not the parse succeeded.
+    assert!(
+        duplicate.contains("Plain collab_end is rejected in this phase"),
+        "the guard must give the coding-active diagnosis, not the unparseable-phase \
+         fallback: {duplicate}"
     );
     assert!(
         !duplicate.contains("call collab_end on it"),
@@ -5412,10 +5433,16 @@ fn dashboard_session_summary(addr: &str, session_id: &str) -> serde_json::Value 
 }
 
 /// Open an on-disk `App` (noop embedder, trusted MCP mode) so a second,
-/// independent read-only connection — the real dashboard binary — can see
-/// the same committed rows. `App::open_for_test`'s in-memory DB cannot be
-/// shared this way.
-fn open_disk_app_for_dashboard_sweep() -> (tempfile::TempDir, PathBuf, App) {
+/// independent connection can see the same committed rows —
+/// `App::open_for_test`'s in-memory DB cannot be shared that way.
+///
+/// The second reader varies by caller: the real dashboard binary
+/// (`dashboard_reflects_a_full_collab_sweep`), a second MCP server process
+/// (`collab_checkpoint_refuses_a_superseded_process`), or a restarted one
+/// (`collab_abandon_frees_a_wedged_branch_end_to_end_via_mcp`). The returned
+/// `TempDir` owns both the DB file and the state dir, so callers must bind it
+/// for as long as any `App` over this path is in use.
+fn open_disk_app() -> (tempfile::TempDir, PathBuf, App) {
     let dir = tempfile::tempdir().expect("temp dir must be creatable");
     let db_path = dir.path().join("collab.sqlite3");
     let state_dir = dir.path().join("state");
@@ -5427,7 +5454,7 @@ fn open_disk_app_for_dashboard_sweep() -> (tempfile::TempDir, PathBuf, App) {
         mcp_access_mode: McpAccessMode::Trusted,
         embed_mode: EmbedMode::Noop,
     };
-    let app = App::new(config).expect("disk-backed App must open for Task 15's full sweep");
+    let app = App::new(config).expect("disk-backed App must open");
     (dir, db_path, app)
 }
 
@@ -5451,8 +5478,7 @@ fn open_second_disk_app(db_path: &Path) -> (tempfile::TempDir, App) {
         mcp_access_mode: McpAccessMode::Trusted,
         embed_mode: EmbedMode::Noop,
     };
-    let app = App::new(config)
-        .expect("second disk-backed App must open for the fresh-process workaround");
+    let app = App::new(config).expect("second disk-backed App must open over the shared DB");
     (dir, app)
 }
 
@@ -5542,7 +5568,7 @@ fn assert_dashboard_matches_status(
 /// neighbors).
 #[test]
 fn collab_role_safety_full_verification_sweep_reversed_role_scenario() {
-    let (_dir, db_path, app) = open_disk_app_for_dashboard_sweep();
+    let (_dir, db_path, app) = open_disk_app();
     let dashboard = spawn_dashboard(&db_path);
 
     // ── Step 1 ──────────────────────────────────────────────────────────
@@ -6295,7 +6321,7 @@ fn collab_checkpoint_names_a_wrong_typed_session_id() {
 /// was written.
 #[test]
 fn collab_checkpoint_refuses_a_superseded_process() {
-    let (_dir_a, db_path, app_a) = open_disk_app_for_dashboard_sweep();
+    let (_dir_a, db_path, app_a) = open_disk_app();
     let (_repo, repo_path, head) = checkpoint_repo();
     let session_id = start_checkpoint_session(&app_a, &repo_path, "main");
 

@@ -4609,6 +4609,22 @@ mod tests {
         let before_row = app.db.collab_load_session_record(&sid).unwrap();
         let before_wal = collab_end_wal_row_count(&app);
         let before_outcome = app.db.get_task_outcome(&sid).unwrap().unwrap();
+        // Baseline every `Option` the "unchanged" assertions below compare, so
+        // none of them can pass on `None == None` if the first abandon's
+        // writers stop — the metrics attestation swallows its own error.
+        assert!(
+            before_row.ended_at.is_some(),
+            "the first abandon must have sealed the session for the repeat to preserve"
+        );
+        assert_eq!(
+            before_outcome.outcome.as_deref(),
+            Some("abandoned"),
+            "the first abandon must have attested an outcome for the repeat to preserve"
+        );
+        assert!(
+            before_outcome.done_at.is_some(),
+            "the first abandon must have stamped done_at for the repeat to preserve"
+        );
 
         let err = handle_collab_end(&app, &abandon_args(&sid, "claude", "second")).unwrap_err();
         assert_sealed_with_reason(err, "a repeat abandon", "first");
@@ -5107,6 +5123,12 @@ mod tests {
             Some("failed"),
             "fixture must leave an attested failure to preserve"
         );
+        // `done_at` needs the same baseline `outcome` just got: it is an
+        // `Option`, so the comparison below would pass on `None == None`.
+        assert!(
+            before.done_at.is_some(),
+            "fixture must leave a stamped done_at to preserve"
+        );
 
         age_session(&app, &sid, crate::collab::COLLAB_DEAD_SESSION_SECS + 60);
         handle_collab_end(&app, &abandon_args(&sid, "claude", "gave up")).unwrap();
@@ -5312,6 +5334,20 @@ mod tests {
         let wal_after_first = collab_end_wal_row_count(&app);
         let first = app.db.get_task_outcome(&sid).unwrap().unwrap();
         assert_eq!(wal_after_first, 1, "the real end writes exactly one row");
+        // Baseline both fields the no-op assertions below compare. They are
+        // `Option`s, so a `None == None` comparison would pass while proving
+        // nothing — and the writer these observe (the `PlanLocked` attestation
+        // in `handle_collab_end`) logs and swallows its own error, so it could
+        // stop populating them without anything else in the suite failing.
+        assert_eq!(
+            first.outcome.as_deref(),
+            Some("abandoned"),
+            "the real end must have attested an outcome for the no-op to preserve"
+        );
+        assert!(
+            first.done_at.is_some(),
+            "the real end must have stamped done_at for the no-op to preserve"
+        );
 
         // The documented contract: this still succeeds.
         let repeat = handle_collab_end(&app, &end_args(&sid, "claude"))
@@ -6130,6 +6166,23 @@ mod tests {
         let before_row = app.db.collab_load_session_record(&sid).unwrap();
         let before_wal = collab_end_wal_row_count(&app);
         let before_outcome = app.db.get_task_outcome(&sid).unwrap().unwrap();
+
+        // Baseline every `Option` the "undisturbed" assertions below compare,
+        // so none of them can pass on `None == None` if the abandon's writers
+        // stop — the metrics attestation swallows its own error.
+        assert!(
+            before_row.ended_at.is_some(),
+            "the abandon must have sealed the session for the no-op to preserve"
+        );
+        assert_eq!(
+            before_outcome.outcome.as_deref(),
+            Some("abandoned"),
+            "the abandon must have attested an outcome for the no-op to preserve"
+        );
+        assert!(
+            before_outcome.done_at.is_some(),
+            "the abandon must have stamped done_at for the no-op to preserve"
+        );
 
         let response = handle_collab_end(&app, &end_args(&sid, "claude"))
             .expect("ending an already-abandoned session is a documented no-op success");
