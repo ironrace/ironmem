@@ -226,11 +226,20 @@ pub fn session_is_dead(session_id: &str, last_activity: Option<i64>, now: i64) -
 ///
 /// That last sentence is an *enforced* property, not an intent.
 /// [`crate::mcp::tools::collab_events::parse_failure_report_event`] refuses a
-/// caller-supplied report carrying this prefix. Without that refusal an agent
+/// caller-supplied report carrying this prefix. Without that refusal any agent
 /// could mint a `coding_failure` indistinguishable from a real abandon in every
 /// later audit, in `collab_status`, and in the seal message
-/// [`queue::ensure_active`] echoes — the prefix is the *only* thing that marks
-/// the row as an operator's decision rather than an agent's.
+/// [`queue::ensure_active`] echoes.
+///
+/// What the reservation buys is precise, and smaller than it first looks: a
+/// row carrying this prefix was written by `collab_end`'s abandon arm and by
+/// nothing else. It does **not** mean a human decided it. `collab_end` has no
+/// operator authentication, is in `MUTATING_TOOLS`, and is on the
+/// unattended-successor permission allowlist, so the abandon — and the reason
+/// text riding with it — may have been composed by an agent. Reserving the
+/// prefix bounds which *code path* can write it, not which *hand*. Anything
+/// downstream that treats the reason as trustworthy prose rather than as
+/// untrusted data is relying on a property this constant does not provide.
 pub const ABANDONED_PREFIX: &str = "abandoned:";
 
 /// Prefix on `coding_failure` that marks a failure as "branch drift" — a
