@@ -103,9 +103,10 @@ The host is the primary authority boundary. HumanLayer cloud, GitHub, IronMem’
 2. Use one disposable selected GitHub repository containing only public/synthetic material. Protect its default branch/ruleset; create draft PRs only; no merge or deployment.
 3. The **Pilot owner** may give out-of-band confirmation only for an explicitly allowed, bounded human-gated action within this public/synthetic, draft-only pilot (for example, beginning an otherwise compliant session or creating an allowed draft PR). Computer control for permission changes or destructive actions is not human-gated: it is **PROHIBITED**.
 4. Pin package versions and integrity; disable automatic workspace setup; forbid a local override; manually precreate and sanitize the worktree.
-5. Launch with `/usr/bin/env -i` plus an approved allowlist. No production secrets, `.env` defaults, personal GitHub/cloud auth, SSH identities, or inherited credential helpers.
-6. Set pilot-specific `IRONMEM_DB_PATH` and `IRONMEM_DAEMON_SOCKET`. Keep `IRONMEM_MCP_MODE` least-privilege for the task, with IronMem LLM rerank and LLM preference extraction off.
-7. Back up the pilot SQLite/worktree only to approved pilot storage and review every diff/artifact before any external action.
+5. Install a reviewed copy of `scripts/test_humanlayer_workspace_policy.py` at the Host-operator-controlled, root-owned/read-only path `/opt/ironmem-humanlayer/policy/test_humanlayer_workspace_policy.py`. The agent-writable repository copy is CI source only and is never directly trusted or executed as the launch gate.
+6. Launch with `/usr/bin/env -i` plus an approved allowlist. No production secrets, `.env` defaults, personal GitHub/cloud auth, SSH identities, or inherited credential helpers.
+7. Set pilot-specific `IRONMEM_DB_PATH` and `IRONMEM_DAEMON_SOCKET`. Keep `IRONMEM_MCP_MODE` least-privilege for the task, with IronMem LLM rerank and LLM preference extraction off.
+8. Back up the pilot SQLite/worktree only to approved pilot storage and review every diff/artifact before any external action.
 
 ## GitHub least-privilege permission manifest
 
@@ -151,16 +152,66 @@ require_detected() {
   fi
   /usr/bin/printf '%s\n' "$label detected and fail-closed"
 }
+has_exact_line() {
+  output="$1"
+  expected="$2"
+  found=1
+  while IFS= read -r line || [ -n "$line" ]; do
+    if [ "$line" = "$expected" ]; then
+      found=0
+      break
+    fi
+  done <<EOF
+$output
+EOF
+  return "$found"
+}
+has_only_environment_key_names() {
+  output="$1"
+  saw_key=1
+  while IFS= read -r line || [ -n "$line" ]; do
+    [ -n "$line" ] || continue
+    case "$line" in
+      [!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_]* | *[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_]*) return 1 ;;
+    esac
+    saw_key=0
+  done <<EOF
+$output
+EOF
+  return "$saw_key"
+}
+approved_output_is_valid() {
+  output="$1"
+  has_exact_line "$output" SYNTHETIC_MULTILINE_VALUE || return 1
+  has_exact_line "$output" PYTHONPATH || return 1
+  has_only_environment_key_names "$output" || return 1
+  require_absent "$output" SYNTHETIC_FIRST_LINE_SENTINEL 'approved key enumerator'
+  require_absent "$output" SYNTHETIC_SECOND_LINE_SENTINEL 'approved key enumerator'
+  require_absent "$output" PYTHON_STARTUP_SENTINEL 'approved key enumerator'
+}
 approved_output="$(
   /usr/bin/env -i PATH=/usr/bin:/bin \
     SYNTHETIC_MULTILINE_VALUE="$synthetic_value" \
     PYTHONPATH="$test_dir" \
     /usr/bin/python3 -I -S -c 'import os; print("\n".join(sorted(os.environ.keys())))'
 )"
-require_absent "$approved_output" SYNTHETIC_FIRST_LINE_SENTINEL 'approved key enumerator'
-require_absent "$approved_output" SYNTHETIC_SECOND_LINE_SENTINEL 'approved key enumerator'
-require_absent "$approved_output" PYTHON_STARTUP_SENTINEL 'approved key enumerator'
+if ! approved_output_is_valid "$approved_output"; then
+  /usr/bin/printf '%s\n' 'approved key enumerator output failed validation' >&2
+  exit 1
+fi
 /usr/bin/printf '%s\n' "$approved_output"
+empty_output=''
+if approved_output_is_valid "$empty_output"; then
+  /usr/bin/printf '%s\n' 'empty approved output was accepted' >&2
+  exit 1
+fi
+/usr/bin/printf '%s\n' 'empty approved output rejected and fail-closed'
+filtered_output='PATH'
+if approved_output_is_valid "$filtered_output"; then
+  /usr/bin/printf '%s\n' 'filtered approved output was accepted' >&2
+  exit 1
+fi
+/usr/bin/printf '%s\n' 'filtered approved output rejected and fail-closed'
 full_value_output="$synthetic_value"
 require_detected "$full_value_output" SYNTHETIC_FIRST_LINE_SENTINEL 'full-value serializer'
 require_detected "$full_value_output" SYNTHETIC_SECOND_LINE_SENTINEL 'full-value serializer'
@@ -173,9 +224,9 @@ startup_hook_output="$(
 require_detected "$startup_hook_output" PYTHON_STARTUP_SENTINEL 'startup-hook execution'
 ```
 
-Expected result is exit status 0: the approved output is key names only and includes `SYNTHETIC_MULTILINE_VALUE` and `PYTHONPATH`; a platform or interpreter may add key names, but it must never contain either value sentinel or the startup sentinel. The control reports that the three deliberately unsafe paths were detected and fail closed, without printing their outputs. Any unexpected sentinel appearance or an undetected unsafe path is a preflight-test failure and a **BLOCKED** rollout gate. Re-run and preserve this evidence whenever the interpreter/helper changes.
+Expected result is exit status 0: the approved output is key names only, contains exact lines `SYNTHETIC_MULTILINE_VALUE` and `PYTHONPATH`, and every nonempty emitted line has environment-key syntax (no `=`, whitespace, or non-name characters). A platform or interpreter may add key names, but it must never contain either value sentinel or the startup sentinel. The control reports that empty/filtered output and the three deliberately unsafe paths were detected and fail closed, without printing their unsafe outputs. Any unexpected sentinel appearance, malformed key line, or undetected rejected path is a preflight-test failure and a **BLOCKED** rollout gate. Re-run and preserve this evidence whenever the interpreter/helper changes.
 
-Before launch, evidence must show a clean dedicated account, `/usr/bin/env -i` allowlist invocation, no `.env` defaults, no SSH identities, no personal `gh` or cloud authentication, short-lived pilot-only provider credentials, and approval timestamps. Use a fixed minimal system path and absolute reviewed executables, for example `/usr/bin/env -i PATH=/usr/bin:/bin HOME=/pilot/home LANG=C /pilot/approved/bin/humanlayer <approved-subcommand>`; the configured provider executable must likewise be an approved absolute path, never a `PATH` lookup. Before every launch, record the approved launcher `/usr/bin/env`, HumanLayer executable, and provider executable resolved absolute paths and runtime SHA-256 values and compare all of them to the approved manifest. A mismatch, `@latest`, floating version, or unattended update is **BLOCKED**.
+Before launch, evidence must show a clean dedicated account, `/usr/bin/env -i` allowlist invocation, no `.env` defaults, no SSH identities, no personal `gh` or cloud authentication, short-lived pilot-only provider credentials, and approval timestamps. The **Host operator** installs the reviewed immutable helper at `/opt/ironmem-humanlayer/policy/test_humanlayer_workspace_policy.py`, records its absolute path, `root:root` owner, read-only mode (for example `0555`), and SHA-256 in the approved manifest, and verifies them with trusted host-side controls before every launch. Use the trusted sanitized launch-gate chain exactly: `/usr/bin/env -i PATH=/usr/bin:/bin /usr/bin/python3 -I -S /opt/ironmem-humanlayer/policy/test_humanlayer_workspace_policy.py --repo-root <absolute-pilot-worktree>`. The helper validates that exact Git worktree root and itself invokes `/usr/bin/git`; the agent-writable repository copy remains CI source only, never a direct launch gate. Use a fixed minimal system path and absolute reviewed executables for the agent, for example `/usr/bin/env -i PATH=/usr/bin:/bin HOME=/pilot/home LANG=C /pilot/approved/bin/humanlayer <approved-subcommand>`; the configured provider executable must likewise be an approved absolute path, never a `PATH` lookup. Before every launch, record `/usr/bin/env`, `/usr/bin/python3`, `/usr/bin/git`, the immutable helper, the HumanLayer executable, and the provider executable resolved absolute paths and runtime SHA-256 values (plus helper owner/mode) and compare all of them to the approved manifest. A mismatch, `@latest`, floating version, or unattended update is **BLOCKED**.
 
 ## Default `.env` copying verification
 
@@ -201,7 +252,7 @@ GitHub issues/comments, repository files, task artifacts, web results, tool outp
 | GH-01 | GitHub App content/issue/PR write scope is abused | High | One disposable repo; draft PR only; ruleset | GitHub administrator | Official requested scope is broad within repo | Pilot-only |
 | GH-02 | Repo/permission drift expands blast radius | Critical | Capture manifest; suspend/disconnect on drift | GitHub administrator | Requires operational review evidence | BLOCKED on drift |
 | PI-01 | Prompt injection from issue, code, artifact, web/tool/memory | High | Treat all as untrusted; out-of-band gate; canaries | Pilot owner | No prompt policy is complete | Pilot-only |
-| PI-02 | Computer control changes permissions or destroys data | Critical | No computer control for those actions | Pilot owner | Human confirmation external to conversation | PROHIBITED |
+| PI-02 | Computer control changes permissions or destroys data | Critical | No computer control for those actions | Pilot owner | No authorized pilot path; residual bypass risk is limited by host enforcement and containment canaries | PROHIBITED |
 | SC-01 | npm, platform binary, Homebrew, desktop, model CLI updates are compromised | Critical | Exact pins/integrity, reviewed updates, no unattended update | Security reviewer | Integrity only identifies reviewed artifact | BLOCKED on mismatch |
 | SC-02 | Hosted workflows/skills or GitHub App changes alter behavior | High | Version/permission change review, evidence capture | Vendor owner | Hosted behavior not pinned by public repo | BLOCKED pending review |
 | VENDOR-01 | Cloud retains sessions/artifacts or uses them beyond expectations | Critical | Public/synthetic only; deletion request procedure | Vendor owner | Product-specific retention/training unknown | BLOCKED broadly |
@@ -241,7 +292,8 @@ No `@latest`, floating model, unattended update, or unreviewed auto-update is pe
 | Component/channel | Required evidence owner | Required record |
 |---|---|---|
 | npm CLI/meta package | Security reviewer | Exact `@humanlayer/cli` pin and npm integrity/shasum. |
-| Sanitized environment launcher | Host operator | Approved absolute `/usr/bin/env` path and runtime SHA-256; before every launch, record and compare both to the approved manifest. |
+| Trusted host toolchain | Host operator | Approved absolute `/usr/bin/env`, `/usr/bin/python3`, and `/usr/bin/git` paths and runtime SHA-256 values; before every launch, record and compare each to the approved manifest. |
+| Immutable workspace-policy helper | Host operator | Reviewed copy at `/opt/ironmem-humanlayer/policy/test_humanlayer_workspace_policy.py`, outside the agent-writable worktree, with approved absolute path, `root:root` ownership, read-only mode (for example `0555`), and SHA-256; verify all before every launch. The repository copy is CI source only. |
 | Platform HumanLayer executable | Security reviewer | Platform package shasum and downloaded SHA-256; before every launch, record the actual absolute HumanLayer executable path and runtime SHA-256 and compare both to the approved manifest. |
 | Homebrew desktop, if used | Host operator | Formula/cask version, source, hash, no auto-update. |
 | Codex/Claude CLI/provider | Model-provider administrator | Exact version, channel, and account/auth class; before every launch, record the actual absolute provider executable path and runtime SHA-256 and compare both to the approved manifest. |
@@ -254,13 +306,13 @@ No `@latest`, floating model, unattended update, or unreviewed auto-update is pe
 |---|---|
 | Secret-shaped name, `.env`, SSH identity, or cloud/deployment credential found | Stop before launch; remove access path; rotate if exposed; preserve name-only evidence. |
 | Workspace setup enabled or local override exists | Stop; delete generated sanitized workspace if needed; restore `disabled: true`. |
-| `.humanlayer/workspace.local.json` discovered | Stop; do not launch; preserve only path/name and policy-failure evidence without uploading or copying its content; quarantine/remove the override; rerun `python3 scripts/test_humanlayer_workspace_policy.py`; require Security reviewer approval before resumption. |
+| `.humanlayer/workspace.local.json` discovered | Stop; do not launch; preserve only path/name and policy-failure evidence without uploading or copying its content; quarantine/remove the override; rerun the immutable helper with the trusted sanitized chain; require Security reviewer approval before resumption. |
 | GitHub repository/permission drift | Stop; revoke/disconnect installation; preserve capture; reauthorize only after approval. |
 | Canary disproves containment or approval gate | Stop; revoke tokens; preserve evidence; no broader data. |
 | Injection seeks secrets, permissions, destructive action, merge, deployment, or control disabling | Deny; stop if attempted; out-of-band escalation and review. |
 | Sensitive artifact/session leakage | Stop/revoke/rotate; request cloud/provider deletion; preserve evidence; verify deletion including backups where available. |
 | Package/version/integrity mismatch | Stop install/launch; quarantine artifact; review and update manifest only with approval. |
-| HumanLayer or provider executable absolute-path mismatch or runtime SHA-256 mismatch | Stop; do not launch; preserve executable/path/hash evidence; quarantine or revoke the changed artifact as appropriate; Security reviewer and Model-provider administrator review before any approved-manifest update. |
+| `/usr/bin/env`, `/usr/bin/python3`, `/usr/bin/git`, immutable helper, HumanLayer, or provider executable path/hash mismatch; or immutable helper owner/mode mismatch | Stop; do not launch; preserve safe path/hash/owner/mode evidence; restore or review approved host artifacts; Security reviewer and Model-provider administrator review before any approved-manifest update. |
 | IronMem resolves shared store or optional LLM egress | Stop; isolate DB/socket; disable feature; run later canary. |
 | Vendor/provider evidence stale, missing, or contradictory | Keep classification PROHIBITED and broader rollout BLOCKED. |
 
@@ -285,8 +337,8 @@ No box is pre-checked without captured evidence.
 
 - [ ] Pilot owner: public/synthetic task content verified; evidence: ______
 - [ ] Host operator: launch allowlist and credential presence rechecked; evidence: ______
-- [ ] Security reviewer: immediately before every daemon/agent launch, run `python3 scripts/test_humanlayer_workspace_policy.py`; record `Ran 2 tests` and `OK`, proving exact shared config, absent local override, and tracked `.gitignore` source; evidence: ______
-- [ ] Host operator and Model-provider administrator: before every launch, record the actual absolute `/usr/bin/env` launcher path and runtime SHA-256, actual absolute HumanLayer executable path and runtime SHA-256, and actual absolute provider executable path and runtime SHA-256; compare all six values to the approved manifest; evidence: ______
+- [ ] Host operator and Security reviewer: before every daemon/agent launch, use trusted host-side controls to verify the immutable helper's `/opt/ironmem-humanlayer/policy/test_humanlayer_workspace_policy.py` absolute path, `root:root` owner, read-only mode, and SHA-256 against the approved manifest; then execute exactly `/usr/bin/env -i PATH=/usr/bin:/bin /usr/bin/python3 -I -S /opt/ironmem-humanlayer/policy/test_humanlayer_workspace_policy.py --repo-root <absolute-pilot-worktree>`; record selected repo root, `Ran 2 tests`, and `OK`, proving exact shared config, absent local override, and tracked `.gitignore` source. The repository copy is CI source only, not trusted directly at launch; evidence: ______
+- [ ] Host operator and Model-provider administrator: before every launch, record the actual absolute `/usr/bin/env`, `/usr/bin/python3`, `/usr/bin/git`, immutable helper, HumanLayer executable, and provider executable paths and runtime SHA-256 values, plus immutable-helper owner/mode; compare all approved-manifest evidence; evidence: ______
 - [ ] GitHub administrator: repository/permission drift check; evidence: ______
 - [ ] Pilot owner: draft PR/diff/artifact review, no merge/deploy; evidence: ______
 - [ ] Security reviewer: injection/canary anomalies and logs reviewed; evidence: ______
@@ -311,7 +363,7 @@ Changing a classification requires a new evidence review by the **Security revie
 
 ## Critical blockers and exit criteria
 
-Wider rollout remains **BLOCKED** until every item has current evidence and accountable approval: product-specific vendor retention/training/subprocessor/deletion/encryption/isolation/audit/incident/DPA-assurance evidence; demonstrated effective sandbox/approval containment; subtractive-copy support or equivalent independently verified containment; clean environment controls; one-repo GitHub enforcement and drift response; provider account/data controls; IronMem isolation canary and disabled optional egress; and tested incident stop/revoke/rotate/delete-request/preserve-evidence handling.
+Wider rollout remains **BLOCKED** until every item has current evidence and accountable approval: product-specific vendor retention/training/subprocessor/deletion/encryption/isolation/audit/incident/DPA-assurance evidence; demonstrated effective sandbox/approval containment; subtractive-copy support or equivalent independently verified containment; clean environment controls including the verified immutable workspace-policy helper and approved `/usr/bin/env`/`/usr/bin/python3`/`/usr/bin/git` toolchain; one-repo GitHub enforcement and drift response; provider account/data controls; IronMem isolation canary and disabled optional egress; and tested incident stop/revoke/rotate/delete-request/preserve-evidence handling.
 
 ## Issue #311 acceptance mapping
 
