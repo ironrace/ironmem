@@ -29,6 +29,15 @@ impl Database {
     // looking like the supported way to end a session. It existed with zero
     // callers until #297 Task 3 removed it; reach for `queue::end_session`
     // inside a transaction that does the rest.
+    //
+    // The removal is a breaking change to a `pub` method on a `pub` type, and
+    // it ships without a `#[deprecated]` shim on purpose: `ironmem` is not
+    // published for out-of-tree use, so its only consumers are this
+    // repository's own binaries, MCP server, and tests, all updated in the
+    // same change. `CHANGELOG.md` records it (along with `end_session`'s new
+    // `SessionEndOutcome` return) so the decision is written down rather than
+    // inferred from a compile error. If the crate is ever published, that
+    // calculus changes and this is the note to revisit.
 
     pub fn collab_load_session(&self, session_id: &str) -> Result<CollabSession, MemoryError> {
         queue::load_session(&self.conn, session_id)

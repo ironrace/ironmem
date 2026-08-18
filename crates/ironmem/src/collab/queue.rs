@@ -462,6 +462,17 @@ pub fn session_is_ended(conn: &Connection, session_id: &str) -> Result<bool, Mem
 /// halves of the staleness comparison then come from one clock, so a skew
 /// between SQLite's `now` and the process clock cannot make a live session look
 /// dead.
+///
+/// **This half fails hard; the other half degrades.** `session_last_activity`
+/// documents at length why it folds an unparseable timestamp into epoch 0
+/// rather than refusing the read — taking the rescue away from exactly the
+/// rows most likely to need it would be the wrong trade, so it warns instead.
+/// No such trade exists here: `strftime('%s','now')` does not depend on stored
+/// data, so a NULL or missing row is a broken database rather than a damaged
+/// session, and the `?` propagates it as a `MemoryError` all the way out of
+/// [`session_staleness`]. An abandon then refuses with a read error rather
+/// than proceeding on a fabricated `now` — which, since `now` is the term that
+/// decides how *stale* everything looks, is the only safe direction.
 pub fn db_now_epoch_secs(conn: &Connection) -> Result<i64, MemoryError> {
     conn.query_row("SELECT CAST(strftime('%s','now') AS INTEGER)", [], |row| {
         row.get(0)
@@ -516,8 +527,12 @@ pub fn db_now_epoch_secs(conn: &Connection) -> Result<i64, MemoryError> {
 /// Enumerated against the phases at `4d1249c`: every *agent-driven* phase
 /// advances through `apply_event` → `save_session` (session row), the coding
 /// phases additionally write `collab_checkpoints`, and every phase's normal
-/// traffic writes `messages`. No agent-driven phase writes none of the four
-/// for six hours in normal operation. If that ever changes,
+/// traffic writes `messages`. No agent-driven phase *other than the two
+/// human-gated ones named below* writes none of the four for six hours in
+/// normal operation — the qualifier is carried in the sentence rather than
+/// left to the paragraph after it, because the unqualified form is exactly
+/// what a reader quotes back as "six hours is safe", and for `PlanLocked` and
+/// `CodingComplete` it is not. If that ever changes,
 /// [`super::COLLAB_DEAD_SESSION_SECS`] is what needs raising, not this signal.
 ///
 /// One gap inside the fourth term is known and left as-is, because it errs

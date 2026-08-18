@@ -47,6 +47,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   seeded from the resolved pilot rather than hardcoded to `claude`. See
   § Authorization / Phase / Ownership Matrix in `docs/COLLAB.md`.
 
+- **Two breaking changes to the `ironmem` library surface (#297).**
+  `Database::collab_end_session` is **removed**: every caller now ends a
+  session inside a transaction it already holds, via
+  `ironmem::collab::queue::end_session`, so the standalone connection-level
+  wrapper had no remaining in-tree user and keeping it would have offered a
+  second way to end a session outside the transaction the staleness predicate
+  is evaluated in. That same `queue::end_session` now returns
+  `Result<SessionEndOutcome, MemoryError>` rather than `Result<(), MemoryError>`
+  — the abandon and plain-end paths both need to distinguish "ended it" from
+  "it was already ended", and discarding the value now trips `#[must_use]`.
+  Both items are `pub` and therefore API, even though the only in-tree callers
+  are tests; no deprecation shim is provided, because the crate is consumed by
+  this repository's own binaries and MCP server rather than published for
+  out-of-tree use. `Database::mark_task_outcome_done` likewise returns a
+  `TaskOutcomeAttestation` instead of `()`: a 0-row UPDATE — metrics disabled
+  when the task started, or a row under a different `task_tag` — used to be
+  indistinguishable from a recorded attestation at every call site, and for
+  the abandon arm it is permanent, since the seal leaves no surface able to
+  re-attest the session. Attestation stays best-effort and still never fails
+  a turn; the two failures are now warned separately instead of one of them
+  being invisible to its caller.
+
 ### Added
 
 - **`collab_status` reports the staleness the abandon gate evaluates (#297).**
@@ -200,6 +222,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   advancing the generation lease. The docs promise the *end* is a no-op; they
   grant no entitlement to spend a lease. The wire response is byte-identical
   either way, so no caller can tell which case it hit.
+
+- **The `abandoned:` reservation now covers every spelling that renders as it
+  (#297).** `failure_report` refused a `coding_failure` beginning with a
+  byte-exact `abandoned:` after trimming whitespace, so `Abandoned:`,
+  `ABANDONED:` and `\u{200b}abandoned:` were all accepted and stored — rows
+  indistinguishable, to a human reading `collab_status` or a handoff block,
+  from an epitaph only `collab_end`'s abandon arm may write. The check now
+  folds ASCII case and removes the invisible-format characters
+  (`sanitize::is_forgeable_invisible`, shared with the abandon `reason`
+  filter) before comparing. The read side — the epitaph `ensure_active`
+  replays into refusals — stays byte-exact, because there the exactness is the
+  point.
+
+- **Smaller corrections on the same gate (#297).** The abandon recipe printed
+  in every refusal spelled its agent placeholder `"claude|codex"`, which
+  `require_agent` rejects — a caller copying the rescue verbatim got a second
+  refusal from the message meant to unblock it; it now reads
+  `"<claude or codex>"`. The owner-check refusals interpolate the session's
+  phase instead of naming `PlanClaudeFinalizePending` in text, so adding a
+  second owner-gated phase cannot make them misreport which rule fired. An
+  unparseable `phase` column — the one case the duplicate-session guard
+  tolerates rather than propagating — now logs a warning, so the underlying
+  data-integrity problem is recoverable after the fact instead of only ever
+  surfacing as "this phase could not be identified". The operator-facing
+  staleness threshold derives its "N hours" from `COLLAB_DEAD_SESSION_SECS`
+  rather than restating "6 hours". And a read-only call on a sealed session
+  (`collab_recv` without `auto_ack`, a tokenless `collab_wait_my_turn`) no
+  longer re-binds the process-scoped metrics attribution cell that the abandon
+  had just cleared.
 
 ### Documentation
 

@@ -24,6 +24,28 @@ use crate::error::MemoryError;
 // Typed enums
 // ---------------------------------------------------------------------------
 
+/// Whether a terminal-state attestation actually landed on a `task_outcomes`
+/// row.
+///
+/// [`Database::mark_task_outcome_done`] is best-effort by design — every
+/// caller runs it after its protocol transaction has committed, so a metrics
+/// failure can never roll back or fail a collab turn. Best-effort is not the
+/// same as unobservable, though: a 0-row UPDATE means the ledger and the
+/// session now disagree, and the caller is the only place that knows what that
+/// disagreement means. `#[must_use]` because ignoring the answer is exactly
+/// how the distinction was lost before this type existed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "a 0-row attestation leaves the metrics ledger disagreeing with the session; \
+              decide what that means rather than discarding it"]
+pub enum TaskOutcomeAttestation {
+    /// The UPDATE matched the task's row and wrote the terminal state.
+    Recorded,
+    /// No row carried this `task_tag` — metrics were disabled when the task
+    /// started, or the row was written under a different tag. Already warned
+    /// at the storage layer; the caller decides whether it is worth more.
+    NoRow,
+}
+
 /// Exploration-token verdict for one code-map MCP call (Phase 5 / issue #94).
 /// The ONLY two legal `token_usage.map_status` values. Confining the wire
 /// strings to the `ToSql`/`FromSql` impls below keeps `"map_hit"`/`"map_miss"`
@@ -837,13 +859,24 @@ impl Database {
     /// Partial terminal-state update for one task (METRICS_SPEC §5.4):
     /// only non-`None` fields are written (COALESCE keeps existing values),
     /// counters are never touched. Missing `task_tag` is a no-op `Ok`.
+    ///
+    /// Returns which of the two happened. It used to return `()`, so the
+    /// no-row case — metrics disabled when the session started, a row written
+    /// under a different `task_tag`, a row never created at all — was
+    /// indistinguishable from a recorded attestation at every call site, and
+    /// the only trace was the `warn` below. That is tolerable for the callers
+    /// that merely *stamp* an outcome; it is not for `collab_end`'s abandon
+    /// arm, which is the one caller that overwrites an outcome another path
+    /// already wrote and the one whose session no later surface can re-attest,
+    /// because the seal refuses every mutating call on it afterwards. Giving
+    /// the caller the fact lets it say so in its own terms.
     pub fn mark_task_outcome_done(
         &self,
         task_tag: &str,
         done_at: Option<&str>,
         outcome: Option<&str>,
         pr_url: Option<&str>,
-    ) -> Result<(), MemoryError> {
+    ) -> Result<TaskOutcomeAttestation, MemoryError> {
         let changed = self.conn.execute(
             "UPDATE task_outcomes SET
                 done_at = COALESCE(?2, done_at),
@@ -858,8 +891,9 @@ impl Database {
                 operation = "mark_task_outcome_done",
                 "metrics: UPDATE matched 0 rows — task_tag not found in task_outcomes"
             );
+            return Ok(TaskOutcomeAttestation::NoRow);
         }
-        Ok(())
+        Ok(TaskOutcomeAttestation::Recorded)
     }
 
     /// Clear a stale `outcome='failed'`/`done_at` row written by an earlier
@@ -2093,13 +2127,16 @@ mod tests {
         db.upsert_task_outcome(&t).unwrap();
 
         // First call: done_at + pr_url, no outcome (CodingComplete semantics).
-        db.mark_task_outcome_done(
-            "issue-83",
-            Some("2026-06-12T01:00:00Z"),
-            None,
-            Some("https://example/pr/5"),
-        )
-        .unwrap();
+        assert_eq!(
+            db.mark_task_outcome_done(
+                "issue-83",
+                Some("2026-06-12T01:00:00Z"),
+                None,
+                Some("https://example/pr/5"),
+            )
+            .unwrap(),
+            TaskOutcomeAttestation::Recorded
+        );
         let got = db.get_task_outcome("issue-83").unwrap().unwrap();
         assert_eq!(got.done_at.as_deref(), Some("2026-06-12T01:00:00Z"));
         assert!(got.outcome.is_none());
@@ -2107,8 +2144,11 @@ mod tests {
         assert_eq!(got.review_rounds, 3); // counters preserved
 
         // Second call: outcome only (collab_end attestation); earlier fields kept.
-        db.mark_task_outcome_done("issue-83", None, Some("merged"), None)
-            .unwrap();
+        assert_eq!(
+            db.mark_task_outcome_done("issue-83", None, Some("merged"), None)
+                .unwrap(),
+            TaskOutcomeAttestation::Recorded
+        );
         let got = db.get_task_outcome("issue-83").unwrap().unwrap();
         assert_eq!(got.outcome.as_deref(), Some("merged"));
         assert_eq!(got.done_at.as_deref(), Some("2026-06-12T01:00:00Z")); // not clobbered
@@ -2125,18 +2165,38 @@ mod tests {
             .is_err());
     }
 
+    /// A tag with no row is still `Ok` — attestation is best-effort and must
+    /// never fail the turn that triggered it — but it is now a *distinguishable*
+    /// `Ok`. `collab_end`'s abandon arm is the caller that needs the
+    /// difference: it is the only writer whose session no later surface can
+    /// re-attest, because the seal refuses every mutating call afterwards, so
+    /// a silently-missed attestation stands forever.
+    #[test]
+    fn mark_task_outcome_done_reports_a_missing_row_without_failing() {
+        let db = db();
+        assert_eq!(
+            db.mark_task_outcome_done("never-created", None, Some("abandoned"), None)
+                .unwrap(),
+            TaskOutcomeAttestation::NoRow,
+            "a 0-row UPDATE must be reported, not folded into a successful attestation"
+        );
+    }
+
     #[test]
     fn clear_failed_task_outcome_nulls_outcome_and_done_at() {
         let db = db();
         db.upsert_task_outcome(&sample_task_outcome("issue-83", "2026-06-12T00:00:00Z"))
             .unwrap();
-        db.mark_task_outcome_done(
-            "issue-83",
-            Some("2026-06-12T01:00:00Z"),
-            Some("failed"),
-            None,
-        )
-        .unwrap();
+        assert_eq!(
+            db.mark_task_outcome_done(
+                "issue-83",
+                Some("2026-06-12T01:00:00Z"),
+                Some("failed"),
+                None,
+            )
+            .unwrap(),
+            TaskOutcomeAttestation::Recorded
+        );
         let got = db.get_task_outcome("issue-83").unwrap().unwrap();
         assert_eq!(got.outcome.as_deref(), Some("failed"));
         assert!(got.done_at.is_some());
@@ -2153,13 +2213,16 @@ mod tests {
         let db = db();
         db.upsert_task_outcome(&sample_task_outcome("issue-83", "2026-06-12T00:00:00Z"))
             .unwrap();
-        db.mark_task_outcome_done(
-            "issue-83",
-            Some("2026-06-12T01:00:00Z"),
-            Some("merged"),
-            None,
-        )
-        .unwrap();
+        assert_eq!(
+            db.mark_task_outcome_done(
+                "issue-83",
+                Some("2026-06-12T01:00:00Z"),
+                Some("merged"),
+                None,
+            )
+            .unwrap(),
+            TaskOutcomeAttestation::Recorded
+        );
 
         db.clear_failed_task_outcome("issue-83").unwrap();
 

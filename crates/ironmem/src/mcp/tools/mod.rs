@@ -517,7 +517,13 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
                         // gap is conservative, not a defect: a multibyte
                         // reason within the character cap can still be
                         // refused as over-length before reaching it.
-                        "description": "Required with abandon; stored as the session's coding_failure. Refused without abandon. maxLength counts characters; the server enforces the cap in bytes, so a long multibyte reason may be refused before reaching maxLength characters."
+                        // "a reason containing multibyte characters", not "a
+                        // long multibyte reason": the cap is enforced in
+                        // bytes, so *any* non-ASCII character shrinks the
+                        // effective character budget below the advertised
+                        // maxLength. The earlier wording read as though only
+                        // unusually long inputs were affected.
+                        "description": "Required with abandon; stored as the session's coding_failure. Refused without abandon. maxLength counts characters; the server enforces the cap in bytes, so a reason containing multibyte characters may be refused well before reaching maxLength characters."
                     }
                 },
                 "required": ["session_id", "agent"]

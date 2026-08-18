@@ -4278,8 +4278,12 @@ fn collab_abandon_frees_a_wedged_branch_end_to_end_via_mcp() {
     );
     // The recipe verbatim, not just the word "abandon": a caller who cannot
     // copy the call shape out of the refusal is still stuck.
+    // `<claude or codex>`, not the `claude|codex` alternation this once
+    // carried: `require_agent` refuses both, and only the bracketed form reads
+    // as a placeholder to an agent copying the recipe verbatim off the rescue
+    // path (see `abandon_recipe_json`).
     let recipe = format!(
-        "`{{\"session_id\": \"{wedged}\", \"agent\": \"claude|codex\", \"abandon\": true, \
+        "`{{\"session_id\": \"{wedged}\", \"agent\": \"<claude or codex>\", \"abandon\": true, \
          \"reason\": \"...\"}}`"
     );
     assert!(
@@ -4316,6 +4320,25 @@ fn collab_abandon_frees_a_wedged_branch_end_to_end_via_mcp() {
     // 5 — no recovery attempt was spent (#283 criterion 2). Abandon gives up
     // on the session; it is not a retry, and must not bill the budget as one.
     let after = call_tool(&app, "collab_status", json!({ "session_id": &wedged }));
+    // The abandon write touches `coding_failure` and nothing else, so the
+    // "a terminal `coding_failure` implies a recorded `failed_from_phase`"
+    // pairing that held before this arm existed no longer does. Pinned here
+    // rather than left to a reader's assumption: the phase the session was
+    // ended in stays on the row (that is where `failed_from_phase` would have
+    // pointed), and docs/COLLAB.md's exclusivity section tells readers to use
+    // it. A future edit that starts stamping `failed_from_phase` would make
+    // this session look resumable to `resume_eligibility`, which only the seal
+    // is then stopping.
+    assert_eq!(
+        after["failed_from_phase"],
+        json!(null),
+        "abandon must not stamp failed_from_phase — the session was ended in a phase, not \
+         failed from one: {after}"
+    );
+    assert_eq!(
+        after["phase"], before["phase"],
+        "abandon must leave the phase exactly as it found it: {after}"
+    );
     assert_eq!(
         after["recovery_attempts"], before["recovery_attempts"],
         "abandon must not spend a per-resume recovery attempt"
@@ -8192,9 +8215,30 @@ fn inspect_divergence_writes_nothing() {
         before_wal,
         "inspection must write no audit row of any operation"
     );
+    // `idle_secs` is dropped from both sides before comparing, and it is the
+    // only field that may be: it is `now - last_activity`, recomputed per
+    // call, so it ticks with the wall clock whether or not anything was
+    // written. Comparing it would make this test fail whenever the two
+    // `collab_status` calls straddle a second boundary — a flake that says
+    // nothing about whether inspection wrote anything. The stored half of that
+    // pair, `last_activity`, stays in the comparison and is what actually
+    // carries the read-only claim: it moves if and only if a write touched one
+    // of the four activity sources.
+    let mut after_status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+    let mut before_status = before_status;
+    for status in [&mut before_status, &mut after_status] {
+        assert!(
+            status
+                .as_object_mut()
+                .expect("collab_status returns an object")
+                .remove("idle_secs")
+                .is_some(),
+            "collab_status must report idle_secs — if it stops, drop this removal rather than \
+             letting the comparison silently lose a field"
+        );
+    }
     assert_eq!(
-        call_tool(&app, "collab_status", json!({ "session_id": &session_id })),
-        before_status,
+        after_status, before_status,
         "inspection must leave the session record byte-identical"
     );
 }

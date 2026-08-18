@@ -744,6 +744,21 @@ DOCUMENTED_TERMINAL_PREFIXES = {
     "skill_overran_pr_boundary:",
     "pr_create_failed:",
 }
+# Prefixes the server declares as constants but REFUSES from caller input.
+# Without this set the cross-check is exactly inverted for them: `abandoned:`
+# matches RUST_PREFIX_RE, so it joins `known` and a template instructing an
+# agent to file `coding_failure: "abandoned: ..."` would pass the very gate
+# that exists to catch templates naming a value the server rejects.
+# `parse_failure_report_event` refuses that report — including near-miss
+# spellings — because the prefix marks a session `collab_end`'s abandon arm
+# sealed, and only that code path may write it.
+#
+# Removed from `known` rather than merely reported, so the two directions of
+# the cross-check stay independent: an instruction surface naming it fails,
+# while the "recognized prefix docs/COLLAB.md never mentions" direction below
+# still runs over the full `rust_prefixes` set and keeps requiring the
+# constant to be documented.
+RESERVED_PREFIXES = {"abandoned:"}
 # `coding_failure` in the surfaces is followed by the value across a few
 # punctuation shapes: `coding_failure: "git_push_failed: …"`,
 # `{"coding_failure":"branch_drift: …"}`, `coding_failure = 'disk_full: …'`.
@@ -780,14 +795,33 @@ def check_failure_prefixes() -> None:
         err("collab/mod.rs: no *_PREFIX constants parsed — the prefix "
             "cross-check would pass vacuously, so it fails instead")
         return
-    known = rust_prefixes | DOCUMENTED_TERMINAL_PREFIXES
+    missing_reserved = RESERVED_PREFIXES - rust_prefixes
+    if missing_reserved:
+        err(f"collab/mod.rs: reserved prefix(es) {sorted(missing_reserved)} no "
+            f"longer parse out of the *_PREFIX constants — RESERVED_PREFIXES "
+            f"has gone stale and the instruction-surface guard is now vacuous")
+    known = (rust_prefixes | DOCUMENTED_TERMINAL_PREFIXES) - RESERVED_PREFIXES
 
     for path in failure_prefix_surfaces():
         rel = path.relative_to(ROOT)
+        # docs/COLLAB.md is exempt from the reserved check, and only from that
+        # one. It is the reference, not an instruction: it has to be able to
+        # write `coding_failure = "abandoned: <reason>"` when describing what
+        # the abandon arm stores, and to quote the `failure_report` shape the
+        # server refuses when explaining the reservation. The prompt and
+        # command surfaces have no such need — everything they say about
+        # `coding_failure` is an instruction to send one.
+        reserved_is_an_instruction = path != DOC
         for line_no, line in enumerate(path.read_text().splitlines(), 1):
             for token in CODING_FAILURE_USE_RE.findall(line):
                 prefix = f"{token}:"
-                if prefix not in known:
+                if prefix in RESERVED_PREFIXES and reserved_is_an_instruction:
+                    err(f"{rel}:{line_no}: coding_failure prefix {prefix!r} is "
+                        f"RESERVED — the server refuses a failure_report "
+                        f"carrying it, so an agent following this would have "
+                        f"its turn rejected. Only collab_end's abandon arm "
+                        f"writes it")
+                elif prefix not in known and prefix not in RESERVED_PREFIXES:
                     err(f"{rel}:{line_no}: coding_failure prefix {prefix!r} "
                         f"is not declared in collab/mod.rs and is not a "
                         f"documented terminal prefix — the server would "

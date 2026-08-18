@@ -331,6 +331,16 @@ pub fn session_is_dead(session_id: &str, last_activity: Option<i64>, now: i64) -
 /// later audit, in `collab_status`, and in the seal message
 /// [`queue::ensure_active`] echoes.
 ///
+/// The write-side refusal is deliberately wider than this literal, because
+/// "indistinguishable" is a claim about rendering rather than about bytes:
+/// `Abandoned:`, `ABANDONED:` and `\u{200b}abandoned:` all reach a reader of
+/// `collab_status` looking exactly like the epitaph while sailing past a
+/// byte-exact prefix test. That parse refuses every spelling that renders as
+/// this one — ASCII case folded, leading whitespace skipped, and the
+/// [`crate::sanitize::is_forgeable_invisible`] family removed first. The
+/// *read* side ([`queue::ensure_active`]'s echo) stays byte-exact on purpose:
+/// there, only a row actually written by the abandon arm may be replayed.
+///
 /// What the reservation buys is precise, and smaller than it first looks: a
 /// row carrying this prefix was written by `collab_end`'s abandon arm and by
 /// nothing else. It does **not** mean a human decided it. `collab_end` has no

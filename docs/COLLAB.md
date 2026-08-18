@@ -1088,6 +1088,24 @@ on the row alongside *why it was ended*, which a clear-on-write would erase.
 Nothing may branch on `pending_failure` and `coding_failure` being mutually
 exclusive — that invariant is scoped to `apply_event`'s transitions only.
 
+**`failed_from_phase` breaks the same way, and for the same reason.** Before
+the abandon arm existed, `coding_failure IS NOT NULL` implied both
+`phase = CodingFailed` and `failed_from_phase IS NOT NULL`: the only writers
+were `apply_event`'s two Terminal arms, which set all three together. Abandon
+writes `coding_failure` alone — `phase` keeps whatever coding-active value it
+had, and `failed_from_phase` stays NULL. A reader that reconstructs "this
+session failed" from `coding_failure` and then reads `failed_from_phase` to
+report *where* (the dashboard session summary, `session_handoff`'s kv block)
+renders an abandoned session as failed-from-nowhere. That is correct as far as
+it goes — the session did not fail from a phase, it was ended in one, and the
+phase it was ended in is still on the row — but it is not what those readers
+were written to expect, so read `phase` rather than `failed_from_phase` when
+the `coding_failure` carries the `abandoned:` prefix. `resume_eligibility`
+branches on `failed_from_phase.is_some()` and therefore refuses an abandoned
+session on that ground too; the seal (`ensure_active`) refuses it first, and
+that ordering is what the seal is for — this is the belt behind it, not the
+mechanism.
+
 #### `collab_resume`
 
 `collab_resume` (a separate MCP tool — see below — not a `collab_send`
@@ -1249,8 +1267,8 @@ field incident:
   `collab_end` on it before starting a new session here. If plain
   `collab_end` is refused because the generation lease is stale and the
   session is demonstrably dead (no activity for 21600s (6 hours)), end it
-  with `collab_end {"session_id": "<id>", "agent": "claude|codex", "abandon":
-  true, "reason": "..."}`." — plus, when the phase is
+  with `collab_end {"session_id": "<id>", "agent": "<claude or codex>",
+  "abandon": true, "reason": "..."}`." — plus, when the phase is
   `PlanClaudeFinalizePending`, the owner clause **after** the abandon recipe
   and covering both shapes: "Only the session's current owner may end it from
   this phase, plain or abandoned — abandon lifts the generation lease, not the
@@ -2059,6 +2077,16 @@ override could otherwise forge a fake system line or visually reorder the
 attribution itself. **Any future surface that embeds a stored reason in its
 own output must preserve reason-last** — moving it into the middle of a
 sentence reopens exactly the injection surface the ordering closes.
+
+The write-time refusal matches on what the value *renders as*, not on its
+bytes: ASCII case is folded, leading whitespace is skipped, and the invisible
+`Cf` characters (`sanitize::is_forgeable_invisible`, the same family the
+`reason` filter refuses) are removed before the prefix is compared. `Abandoned:
+…`, `ABANDONED: …` and `\u{200b}abandoned: …` reach a reader of `collab_status`
+looking exactly like a real epitaph, so a byte-exact test would have reserved
+the prefix in name only. The read-side echo below deliberately does **not**
+widen: there the question is not "does this look like an epitaph" but "was
+this written by the one code path allowed to write one".
 
 **The same rule is applied again on the way out, and that is not
 redundancy.** The write-time refusal binds rows written by `collab_end`'s
