@@ -5596,6 +5596,161 @@ mod tests {
         );
     }
 
+    // ── phase-matrix and dead-lease coverage (#297 Task 5) ───────────────────
+
+    /// #283's acceptance: "A wedged session in any `is_coding_active()` phase
+    /// can be abandoned", plus this issue's Task 5 ask to additionally cover
+    /// the planning phases plain `collab_end` refuses today. The phase list
+    /// is derived from [`PHASE_ENDABILITY`] — compile-time proven above to
+    /// hold every `Phase` variant exactly once — filtered by
+    /// [`collab_end_admits`], the real predicate, rather than a hand-copied
+    /// name list. A future phase that starts being refused by plain
+    /// `collab_end` therefore lands in this table automatically instead of
+    /// silently going untested.
+    ///
+    /// `abandon_admitted_once_stale_and_seals_the_session` and
+    /// `abandon_attests_the_outcome_from_a_coding_phase` already cover
+    /// `CodeImplementPending` in depth (message wording, metrics
+    /// attestation); this test's job is breadth — the three things that must
+    /// hold in *every* phase abandon exists to rescue: plain `collab_end` is
+    /// refused, abandon then succeeds once stale, and the phase itself is
+    /// left exactly where it was.
+    #[test]
+    fn abandon_admits_every_phase_plain_collab_end_refuses() {
+        let (_temp, repo_path, heads) = git_ancestor_chain(5);
+        let app = test_app();
+
+        let phases: Vec<Phase> = PHASE_ENDABILITY
+            .into_iter()
+            .map(|(phase, _)| phase)
+            .filter(|phase| !collab_end_admits(*phase))
+            .collect();
+
+        // Spelled out so a silent shrink/grow of the filtered set fails with
+        // a phase name attached, not just a length mismatch: the four
+        // `is_coding_active()` coding phases (#283's acceptance) plus the
+        // three planning phases plain `collab_end` refuses today.
+        assert_eq!(
+            phases,
+            vec![
+                Phase::PlanParallelDrafts,
+                Phase::PlanSynthesisPending,
+                Phase::PlanCopilotReviewPending,
+                Phase::CodeImplementPending,
+                Phase::CodeReviewLocalPending,
+                Phase::CodeReviewFixGlobalPending,
+                Phase::CodeReviewFinalPending,
+            ],
+            "the set of phases plain collab_end refuses changed; update this test's coverage"
+        );
+        assert_eq!(
+            phases.iter().filter(|p| p.is_coding_active()).count(),
+            4,
+            "all four is_coding_active() phases must be covered here: {phases:?}"
+        );
+
+        for (index, phase) in phases.into_iter().enumerate() {
+            let branch = format!("{}-needs-abandon-{index}", phase.to_string().to_lowercase());
+            let sid = drive_to_phase(&app, &repo_path, &branch, phase, &heads);
+
+            let plain = handle_collab_end(&app, &end_args(&sid, "claude")).unwrap_err();
+            assert!(
+                plain.to_string().contains("rejected in active phase"),
+                "{phase}: plain collab_end must be refused here, or this phase does not belong \
+                 on abandon's worklist: {plain}"
+            );
+
+            age_session(&app, &sid, crate::collab::COLLAB_DEAD_SESSION_SECS + 60);
+            handle_collab_end(&app, &abandon_args(&sid, "claude", "wedged"))
+                .unwrap_or_else(|err| panic!("{phase}: abandon must succeed once stale: {err}"));
+
+            let record = app.db.collab_load_session_record(&sid).unwrap();
+            assert!(
+                record.ended_at.is_some(),
+                "{phase}: abandon must set ended_at"
+            );
+            assert_eq!(
+                record.session.phase, phase,
+                "{phase}: abandon seals in place; it must not transition the phase"
+            );
+        }
+    }
+
+    /// #283's acceptance: "Abandon succeeds even when the session's
+    /// generation lease is dead" — the defect-A/defect-B interlock #297
+    /// exists to prove doesn't reopen. A dead lease is not "some cached
+    /// number is old" — it's a **fresh process with no cache at all**,
+    /// reading a generation the DB has already advanced past. That is
+    /// deliberately reproduced here with a second `App` over the same
+    /// on-disk database rather than by poking the first `App`'s cache,
+    /// because the field failure this guards against is a *new process*
+    /// (a restarted server, a successor agent) attempting the rescue.
+    ///
+    /// `collab_send` is asserted refused first, on this same fresh app and
+    /// session, before abandon is attempted. That contrast is the whole
+    /// test: without it, a version of this test that only checked "abandon
+    /// returns Ok" would still pass if the lease were accidentally live (or
+    /// if abandon's own generation check happened to be satisfied some other
+    /// way), and would pin nothing about the dead-lease case #283 actually
+    /// asks for.
+    #[test]
+    fn abandon_succeeds_when_the_generation_lease_is_dead() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("mem.sqlite3");
+        let app = test_app_with_db_path(db_path.clone(), dir.path());
+        let sid = start_session(&app);
+        drive_to_implement(&app, &sid);
+
+        // Advance the generation past what any live process has cached.
+        app.db
+            .with_transaction(|tx| {
+                crate::collab::load_or_init_actor_generation(tx, &sid, Agent::Claude)?;
+                tx.execute(
+                    "UPDATE collab_actor_generations SET generation = generation + 5 \
+                     WHERE session_id = ?1",
+                    rusqlite::params![sid],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        age_session(&app, &sid, crate::collab::COLLAB_DEAD_SESSION_SECS + 60);
+        drop(app);
+
+        // A brand-new App reading the same on-disk DB: no cached generation
+        // at all — the dead-lease state, not merely a stale one.
+        let fresh = test_app_with_db_path(db_path, dir.path());
+
+        // Prove the lease is genuinely dead: a lease-gated surface refuses
+        // on this same session before abandon is even attempted.
+        let send_err = handle_collab_send(
+            &fresh,
+            &json!({ "session_id": sid, "sender": "claude", "topic": "draft", "content": "x" }),
+        )
+        .unwrap_err();
+        assert!(
+            send_err.to_string().contains("has been handed off"),
+            "collab_send must refuse on the dead generation lease, or this test is not \
+             exercising a dead lease at all: {send_err}"
+        );
+
+        handle_collab_end(
+            &fresh,
+            &abandon_args(&sid, "claude", "process died, lease is dead"),
+        )
+        .expect("abandon must succeed even though the generation lease is dead");
+
+        let record = fresh.db.collab_load_session_record(&sid).unwrap();
+        assert!(
+            record.ended_at.is_some(),
+            "abandon must seal the session despite the dead lease"
+        );
+        assert_eq!(
+            record.session.coding_failure.as_deref(),
+            Some("abandoned: process died, lease is dead"),
+            "the epitaph must carry the abandon reason"
+        );
+    }
+
     // ── the seal (#297 Task 3) ────────────────────────────────────────────────
     //
     // Abandoning is only worth anything if the seal holds afterwards. Every
