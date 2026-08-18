@@ -4717,6 +4717,26 @@ mod tests {
         assert!(err.contains("/collab join"), "got: {err}");
     }
 
+    /// `find_active_session_by_repo_branch` hands `duplicate_session_refusal`
+    /// the raw `phase` column string unparsed (see its doc comment), and the
+    /// column carries no CHECK constraint — a row can hold a value that isn't
+    /// any current `Phase` variant (e.g. left over from a removed phase, or
+    /// corrupted). `duplicate_session_refusal` is a pure function of its
+    /// arguments, so this is exercised directly rather than by writing a
+    /// garbage phase through the DB — cheaper, and it still proves the
+    /// conservative fallback: never promise `collab_end` works for a phase we
+    /// could not identify.
+    #[test]
+    fn duplicate_guard_falls_back_conservatively_for_an_unparseable_phase() {
+        let msg = duplicate_session_refusal("/tmp/dup3", "main", "some-id", "NotARealPhase");
+        assert!(
+            !msg.contains("call collab_end on it"),
+            "an unrecognized phase must not promise collab_end works: {msg}"
+        );
+        assert!(msg.contains("/collab join"), "got: {msg}");
+        assert!(msg.contains("abandon"), "got: {msg}");
+    }
+
     /// Abandon skips the generation lease and the phase allowlist. It does
     /// **not** skip the `PlanFinalizePending` owner check, and staleness does
     /// not widen it: a dead session is still only endable there by its owner.
