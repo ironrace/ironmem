@@ -485,13 +485,29 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
         }),
         json!({
             "name": "collab_end",
-            "description": "End an eligible collab session. The current owner may abort PlanClaudeFinalizePending; other active planning and all active coding phases are rejected.",
+            "description": "End an eligible collab session. The current owner may abort PlanClaudeFinalizePending; other active planning and all active coding phases are rejected unless abandon is set.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "session_id": { "type": "string" },
                     "agent": { "type": "string", "enum": ["claude", "codex"] },
-                    "handoff_token": { "type": "string" }
+                    "handoff_token": { "type": "string" },
+                    "abandon": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "End a demonstrably dead session from any phase. Refused unless the session has had no activity for 6 hours. Ignores the generation lease. Terminal and irreversible."
+                    },
+                    // Deliberately NOT documented here: that `reason` must be
+                    // non-blank and free of control/bidi characters. Those
+                    // refusals are self-describing and name their own
+                    // constraint precisely (see `handle_collab_end` in
+                    // collab_session.rs) — do not "complete" this at budget
+                    // cost by restating them in the schema.
+                    "reason": {
+                        "type": "string",
+                        "maxLength": 2037,
+                        "description": "Required with abandon; stored as the session's coding_failure. Refused without abandon."
+                    }
                 },
                 "required": ["session_id", "agent"]
             }
@@ -1454,6 +1470,23 @@ mod tests {
     /// measured 4_128 tokens after the addition, leaving ~42 tokens of
     /// headroom, in line with the previous raises.
     ///
+    /// Raised 4_170 -> 4_296 for `collab_end`'s `abandon`/`reason` pair
+    /// (#297) — the escape hatch for a session that can be neither reused nor
+    /// ended. Two properties plus their descriptions are ~460 bytes, and the
+    /// prose is not trimmable: `abandon`'s description is the only place the
+    /// surface says the op is refused on a live session and ignores the
+    /// generation lease — a caller that learns either at the refusal has
+    /// already made a destructive, irreversible call it believed was gated
+    /// differently — and `reason`'s is the only place it says the field is
+    /// refused *without* `abandon`, which JSON Schema cannot express as a
+    /// dependency the way it can express `required`. The two facts that could
+    /// move into schema keys did: `default: false` and `maxLength: 2037`
+    /// (2048 minus the `abandoned:` prefix and its separator) replace the
+    /// sentences that would otherwise state them. The listing measured 4_254
+    /// tokens after the addition, leaving ~42 tokens of headroom, in line with
+    /// the previous raises. No neighbouring tool's description was trimmed to
+    /// pay for it.
+    ///
     /// The budget is deliberately a whole-listing ceiling with no per-tool
     /// allocation, so the cheapest way to land a new field is to delete prose
     /// from whichever unrelated tool happens to be wordiest. That trade is not
@@ -1466,7 +1499,7 @@ mod tests {
         let bytes = serde_json::to_vec(&tool_definitions(&app)).unwrap().len();
         let estimated_tokens = bytes.div_ceil(4);
         assert!(
-            estimated_tokens <= 4_170,
+            estimated_tokens <= 4_296,
             "tool listing is ~{estimated_tokens} tokens ({bytes} bytes); trim descriptions that duplicate their schemas"
         );
     }
