@@ -672,6 +672,19 @@ pub(super) fn handle_session_handoff(app: &App, args: &Value) -> Result<Value, M
             //    live between "is it dead?" and "re-lease it" — the same D6
             //    argument abandon records.
             //
+            // # A `handoff_token` argument is accepted and IGNORED here
+            //
+            // `opt_handoff_token` is read only on the normal path below. The
+            // forced path takes the same position `handle_collab_abandon` does
+            // and for the same reason: the caller most likely to send a token
+            // is the one whose lease is dead, holding a token minted for a
+            // generation that no longer matches — and feeding it to
+            // `claim_handoff_token` would refuse the rescue with
+            // `handoff_token already claimed`, which is precisely the wedge.
+            // It is not *refused* the way a malformed argument would be,
+            // because dropping it loses the caller no data: it only skips a
+            // check this path has already argued it must not run.
+            //
             // # Why staleness is skipped when a token is already pending (D-P1)
             //
             // `issue_or_reuse_handoff` writes `pending_handoff_issued_at`, and
@@ -2490,6 +2503,58 @@ mod tests {
             db_generation(&rescuer, &sid, Agent::Claude),
             Some(1),
             "R1 holds across the echo too"
+        );
+    }
+
+    /// A `handoff_token` sent alongside `force_reissue` is accepted and
+    /// ignored, not refused. The caller most likely to send one is the caller
+    /// whose lease is dead — holding a token minted for a generation that no
+    /// longer matches — and routing it into `claim_handoff_token` would refuse
+    /// the rescue with `handoff_token already claimed`, which is the wedge
+    /// this path exists to clear.
+    #[test]
+    fn a_stale_token_alongside_force_reissue_is_ignored_not_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("mem.sqlite3");
+        let origin = test_app_with_db_path(db_path.clone(), dir.path());
+        let sid = seed_active_session(&origin);
+
+        // A token from generation 0→1 that has already been consumed, so
+        // presenting it on the normal path is a hard refusal.
+        let spent = origin
+            .db
+            .with_transaction(|tx| issue_or_reuse_handoff(tx, &sid, Agent::Claude))
+            .unwrap()
+            .token;
+        origin
+            .db
+            .with_transaction(|tx| claim_handoff_token(tx, &sid, Agent::Claude, &spent))
+            .unwrap();
+        age_session(&origin, &sid, crate::collab::COLLAB_DEAD_SESSION_SECS + 60);
+
+        let rescuer = test_app_with_db_path(db_path, dir.path());
+        let normal = handle_session_handoff(
+            &rescuer,
+            &json!({ "session_id": sid, "agent": "claude", "handoff_token": spent }),
+        );
+        assert!(
+            normal.is_err(),
+            "setup: the spent token must be refused on the normal path"
+        );
+
+        let mut args = force_args(&sid, "claude");
+        args["handoff_token"] = json!(spent);
+        let resp = handle_session_handoff(&rescuer, &args)
+            .expect("force_reissue must ignore the spent token rather than choke on it");
+        assert_eq!(resp["forced_reissue"], true);
+        assert_ne!(
+            resp["handoff_token"], json!(spent),
+            "the rescue must mint a fresh token, not echo the spent one"
+        );
+        assert_eq!(
+            db_generation(&rescuer, &sid, Agent::Claude),
+            Some(1),
+            "R1: ignoring the token must not turn into claiming it"
         );
     }
 
