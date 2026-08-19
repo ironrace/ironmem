@@ -2761,18 +2761,19 @@ pub(super) fn handle_collab_status(app: &App, args: &Value) -> Result<Value, Mem
         // reads `reclaimable: true` here while `force_reissue` refuses it
         // with "has ended" (pinned by `handoff.rs`'s
         // `forced_reissue_is_refused_on_an_ended_session`, and by the sibling
-        // test in this module's own test suite below). Neither seal gets
-        // there for free: a plain `collab_end` has no staleness precondition,
-        // so a freshly-ended session still reads `reclaimable: false`.
-        // Abandon does require 6h of idleness to *succeed* — but the abandon
-        // write is itself activity (`set_coding_failure` stamps
-        // `updated_at`), so a freshly-abandoned session also reads live and
-        // `reclaimable: false` for another six hours. Either way, the
-        // divergence appears once the sealed session has *also* gone quiet —
-        // which every abandoned session reliably becomes, since nothing can
-        // write to a sealed session afterward, and which a plainly-ended one
-        // may or may not. This field deliberately does not read `ended_at`
-        // to close that gap — doing so would make a read-only diagnostic
+        // test in this module's own test suite below). Ending a session does
+        // not itself make it stale: a plain `collab_end` carries no
+        // staleness precondition, so it can seal a session in either state.
+        // One that was active when ended reads `reclaimable: false` until it
+        // goes quiet on its own; one that was already quiet when ended reads
+        // `reclaimable: true` immediately — `end_session` writes only
+        // `ended_at`, so nothing resets the activity clock either way.
+        // Abandon differs: the abandon write is itself activity
+        // (`set_coding_failure` stamps `updated_at`), so an abandoned
+        // session always starts live and only goes quiet — flipping to
+        // `reclaimable: true` — after a further six hours. This field
+        // deliberately does not read `ended_at` to close that gap — doing so
+        // would make a read-only diagnostic
         // re-implement the seal check rather than name one specific route
         // in. A caller that needs the combined answer reads `reclaimable`
         // beside `ended_at`, which `session_record_json` already puts in

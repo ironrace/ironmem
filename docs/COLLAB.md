@@ -1679,23 +1679,23 @@ diverge for real, test-pinned reasons:
   runs `ensure_active` *before* the generation/staleness ladder, so a
   sealed session that is *also* dead by the staleness predicate reads
   `reclaimable: true` here while `force_reissue` refuses it with the "has
-  ended" seal message. Neither seal gets there for free: a plain
-  `collab_end` has no staleness precondition, so a freshly-ended session
-  still reads `reclaimable: false`. Abandon does require 6h of idleness to
-  *succeed* — but the abandon write is itself activity: `set_coding_failure`
-  stamps `updated_at` (it "touches `coding_failure` and `updated_at` and
-  nothing else," per "Spends no recovery attempt" under "The `collab_end`
-  abandon contract" below), so a freshly-abandoned session also reads live
-  and `reclaimable: false` for another six hours. Either way, the
-  disagreement appears once the sealed session has *also* gone quiet —
-  which every abandoned session reliably becomes, since nothing can write
-  to a sealed session afterward, and which a plainly-ended one may or may
-  not. This is the direction that matters most: an operator reads
-  `reclaimable` to decide whether a rescue is worth attempting, and for any
-  sealed-and-quiet session, this field over-promises. `ended_at` is on this
-  same `collab_status` response, so a caller that needs the combined answer
-  reads `reclaimable` alongside `ended_at` rather than trusting
-  `reclaimable` alone.
+  ended" seal message. Ending a session does not itself make it stale: a
+  plain `collab_end` carries no staleness precondition, so it can seal a
+  session in either state. One that was active when ended reads
+  `reclaimable: false` until it goes quiet on its own; one that was
+  already quiet when ended reads `reclaimable: true` immediately —
+  `end_session` writes only `ended_at`, so nothing resets the activity
+  clock either way. Abandon differs: the abandon write is itself activity
+  (`set_coding_failure` stamps `updated_at` — it "touches `coding_failure`
+  and `updated_at` and nothing else," per "Spends no recovery attempt"
+  under "The `collab_end` abandon contract" below), so an abandoned
+  session always starts live and only goes quiet — flipping to
+  `reclaimable: true` — after a further six hours. This is the direction
+  that matters most: an operator reads `reclaimable` to decide whether a
+  rescue is worth attempting, and for any sealed-and-quiet session, this
+  field over-promises. `ended_at` is on this same `collab_status`
+  response, so a caller that needs the combined answer reads `reclaimable`
+  alongside `ended_at` rather than trusting `reclaimable` alone.
 
 **Do not substitute `updated_at` for `idle_secs`.** The session row's
 timestamp is only one of five activity sources, and a long
