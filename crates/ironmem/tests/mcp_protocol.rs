@@ -10081,10 +10081,11 @@ fn a_recovered_lease_survives_a_fresh_app_over_the_same_db() {
 /// `idle_secs ≈ 0` and a `last_activity` of roughly now, and both assertions
 /// fail. Without them that refactor is invisible.
 ///
-/// `staleness_checked: true` is the Gap B half for this path: the flag exists
-/// so an auditor never has to infer from `reused` whether the liveness check
-/// actually ran, and an authorization-relevant record claiming a check that
-/// did not happen is the exact failure mode it prevents.
+/// `staleness_scope: "all_signals"` is the Gap B half for this path. The gate
+/// runs on every forced call, but on two different predicates — the full
+/// five-term signal, or the same minus the lease's own two timestamps — and
+/// `idle_secs` in the same row means a different measurement under each. An
+/// auditor must not have to infer which one from `reused`.
 #[test]
 fn the_forced_reissue_audit_row_records_the_lease_as_it_was_before_the_reissue() {
     let lease = session_wedged_at_generation(3, "claude");
@@ -10130,9 +10131,14 @@ fn the_forced_reissue_audit_row_records_the_lease_as_it_was_before_the_reissue()
         "the row must name the generation that was bypassed: {params}"
     );
     assert_eq!(
-        params["staleness_checked"],
-        json!(true),
-        "the staleness gate ran on this path and the row must say so: {params}"
+        params["staleness_scope"],
+        json!("all_signals"),
+        "nothing was pending, so the full five-term predicate gated this call: {params}"
+    );
+    assert!(
+        params["phase"].is_string(),
+        "the row must record the phase the reissue was granted from — the two \
+         human-gated phases are refused, so this can only ever be an eligible one: {params}"
     );
 
     // The ordering assertions.
@@ -10172,21 +10178,169 @@ fn the_forced_reissue_audit_row_records_the_lease_as_it_was_before_the_reissue()
     );
 }
 
+/// **The lease-takeover exploit, refused — written as the attack, because it
+/// is the regression test for a security control.**
+///
+/// The first version of `force_reissue` skipped the staleness gate whenever a
+/// token was already pending. The `else` made the gate unreachable on that
+/// path *regardless of who minted the token or whether the session was alive*,
+/// and the reasoning that admitted it — "the echo grants no more than the
+/// pending token already represented" — was false in one word: it grants it to
+/// a **different party**.
+///
+/// The attack, reproduced below step for step:
+///
+/// 1. A live incumbent hands off normally and holds token `T` for its intended
+///    successor.
+/// 2. A third process — separate `App`, empty advisory cache, never held the
+///    lease, never given `T` — reads `collab_status`, which is not lease-gated
+///    and advertises `handoff_pending: true`: an oracle for exactly when a
+///    token is in flight.
+/// 3. It calls `force_reissue` and, under the old design, was handed `T`
+///    verbatim at `idle_secs: 0`.
+/// 4. It claims `T`. The lease transfers. The intended successor sees only
+///    `handoff_token already claimed` — indistinguishable from an ordinary
+///    race.
+/// 5. The rightful operator's own `force_reissue` is then refused for six
+///    hours, because step 4 stamped `pending_handoff_claimed_at`. Re-stealing
+///    each cycle makes the lockout indefinite.
+///
+/// Step 3 is now refused, so steps 4 and 5 never happen. The comparison to
+/// `collab_end { abandon: true }` that was offered for the old design does not
+/// hold and is worth stating so it is not offered again: abandon is
+/// staleness-gated, loud, and terminal; this was un-gated, silent to the
+/// victim, and left the attacker holding a live lease.
+///
+/// Note what the fix does **not** rest on: caller identity. `agent` is
+/// caller-asserted everywhere in this protocol, so a check shaped like "did
+/// *you* mint this token?" would rest on nothing. It rests on the session
+/// being demonstrably alive, which the incumbent's own ordinary traffic
+/// establishes.
+#[test]
+fn a_third_process_cannot_steal_a_live_incumbents_pending_handoff_token() {
+    let (_dir, db_path, incumbent) = open_disk_app();
+    let (_repo, repo_path, _shas) = git_batch_repo(2);
+    let sid = start_batch_session_in(&incumbent, &repo_path, 3);
+
+    // Drive to generation 1 through the real mint→claim pair, so the lease is
+    // locked (force_reissue's `generation > 0` gate is what an attacker needs
+    // satisfied) and the incumbent carries that generation in its own cache.
+    let first = call_tool(
+        &incumbent,
+        "session_handoff",
+        json!({ "session_id": &sid, "agent": "claude" }),
+    );
+    let first_token = first["handoff_token"]
+        .as_str()
+        .unwrap_or_else(|| panic!("setup must mint a token: {first}"))
+        .to_string();
+
+    // (1) The live incumbent hands off normally. This single call claims the
+    // first token AND mints `T` for the intended successor — the mint→claim
+    // window the attack targets. Deliberately no aging anywhere in this test:
+    // the session is alive and busy.
+    let handed = call_tool(
+        &incumbent,
+        "session_handoff",
+        json!({ "session_id": &sid, "agent": "claude", "handoff_token": first_token }),
+    );
+    let stolen_prize = handed["handoff_token"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the normal handoff must mint T: {handed}"))
+        .to_string();
+
+    // (2) The attacker. A second `App` over the same database: no cached
+    // generation for this (session, agent), no token, and no legitimate way to
+    // obtain one.
+    let (_attacker_state, attacker) = open_second_disk_app(&db_path);
+
+    let oracle = call_tool(&attacker, "collab_status", json!({ "session_id": &sid }));
+    assert_eq!(
+        oracle["claude_lease"]["handoff_pending"],
+        json!(true),
+        "the oracle step is real and un-gated — the test is only honest if the attacker \
+         can in fact see that a token is in flight: {oracle}"
+    );
+
+    // (3) The theft. This is the assertion the whole scenario exists for.
+    let refused = call_tool_expect_error(
+        &attacker,
+        "session_handoff",
+        force_reissue_args(&sid, "claude"),
+    );
+    assert!(
+        refused.contains("still live"),
+        "a live session's pending token must never be handed to a process that did not \
+         mint it: {refused}"
+    );
+    assert!(
+        !refused.contains(&stolen_prize),
+        "the refusal must not leak the very token it refused to hand over: {refused}"
+    );
+
+    // Nothing moved: not the generation, not the pending token, not the audit
+    // trail. The whole transaction rolled back.
+    let after = call_tool(&attacker, "collab_status", json!({ "session_id": &sid }));
+    assert_eq!(
+        after["claude_generation"],
+        json!(1),
+        "a refused takeover must move no generation: {after}"
+    );
+    assert_eq!(
+        after["claude_lease"]["handoff_pending"],
+        json!(true),
+        "T must still be pending, still waiting for the successor it was minted for: {after}"
+    );
+    assert_eq!(
+        wal_row_count(&attacker, &sid, "session_handoff.force_reissue"),
+        0,
+        "a refused reissue writes no audit row — the row and the reissue share one \
+         transaction"
+    );
+
+    // (4) Without T the attacker still cannot act. The lease held before the
+    // attempt and it holds after.
+    let blocked = call_tool_expect_error(
+        &attacker,
+        "collab_register_caps",
+        register_caps_args(&sid, "claude", "attacker"),
+    );
+    assert!(
+        blocked.contains("this session has been handed off (generation 1)"),
+        "the attacker must be exactly where it started — outside the lease: {blocked}"
+    );
+
+    // And the intended successor, the one actually handed T, still gets it.
+    let (_successor_state, successor) = open_second_disk_app(&db_path);
+    claim_with_token(&successor, &sid, "claude", "intended", &stolen_prize);
+    let restored = call_tool(&successor, "collab_status", json!({ "session_id": &sid }));
+    assert_eq!(
+        restored["claude_generation"],
+        json!(2),
+        "the succession the incumbent intended must complete unaffected: {restored}"
+    );
+}
+
 /// **Gap B (echo path), Gap C (first direction) and Gap D, in the one state
 /// that produces all three.**
 ///
-/// D-P1: the staleness gate is skipped when a token is already pending. It has
-/// to be — the first forced reissue stamps `pending_handoff_issued_at`, itself
-/// one of the five liveness signals, so re-gating would refuse a caller's own
-/// retry using activity that caller just wrote. The skip grants nothing: the
-/// token is byte-identical and the generation does not move.
+/// D-P1: the first forced reissue stamps `pending_handoff_issued_at`, itself
+/// one of the five liveness signals, so gating a retry on the full signal would
+/// refuse the caller using activity that caller just wrote.
+///
+/// The remedy is to narrow the signal, **not** to skip the gate. Skipping it
+/// was the original design and it was a lease-takeover primitive — see
+/// [`a_third_process_cannot_steal_a_live_incumbents_pending_token`]. With the
+/// lease's own two timestamps excluded, a genuinely dead session is still dead
+/// on its three agent-driven signals, so the caller's own retry is admitted
+/// while a live session's pending token stays private.
 ///
 /// Three properties, none of which the other scenarios can see:
 ///
-/// - **Gap B.** `staleness_checked: false` on this path. The row must not
-///   claim a liveness check that was deliberately skipped; `idle_secs` sits
-///   beside it, measured but gating nothing, which is exactly why the flag has
-///   to be separate from it.
+/// - **Gap B.** `staleness_scope: "excluding_lease"` on this path. The gate
+///   ran, but on the narrowed predicate, and `idle_secs` beside it is that
+///   narrowed measurement — which is why the scope cannot be inferred from
+///   `reused`.
 /// - **Gap C, "not sufficient".** The lease now reads `reclaimable: false` —
 ///   and a forced reissue is admitted anyway. Anyone building a preflight on
 ///   that field (#299 will) who reads it as "force_reissue would be refused"
@@ -10195,7 +10349,7 @@ fn the_forced_reissue_audit_row_records_the_lease_as_it_was_before_the_reissue()
 ///   guard is what makes a pre-claim retry free; over real dispatch, not just
 ///   at the handler.
 #[test]
-fn a_repeated_forced_reissue_echoes_the_pending_token_without_a_second_staleness_check() {
+fn a_repeated_forced_reissue_echoes_the_pending_token_without_counting_its_own_footprint() {
     let lease = session_wedged_at_generation(2, "claude");
     let (successor, sid) = (&lease.successor, lease.session_id.as_str());
 
@@ -10269,8 +10423,8 @@ fn a_repeated_forced_reissue_echoes_the_pending_token_without_a_second_staleness
          hold through call_tool, not only at the handler"
     );
 
-    // Gap B: both calls are audited, and the second is honest about what it
-    // did not check.
+    // Gap B: both calls are audited, and the second names the predicate that
+    // actually admitted it.
     assert_eq!(
         wal_row_count(successor, sid, "session_handoff.force_reissue"),
         2,
@@ -10278,14 +10432,14 @@ fn a_repeated_forced_reissue_echoes_the_pending_token_without_a_second_staleness
     );
     let (params, result) = last_wal_row(successor, "session_handoff.force_reissue");
     assert_eq!(
-        params["staleness_checked"],
-        json!(false),
-        "the echo path skipped the liveness check and the row must not claim it ran: {params}"
+        params["staleness_scope"],
+        json!("excluding_lease"),
+        "the retry was gated on the narrowed predicate and the row must say which: {params}"
     );
     assert!(
         params["idle_secs"].is_number(),
-        "idle_secs is still measured on the echo path — it just gates nothing, which is \
-         precisely why `staleness_checked` cannot be inferred from it: {params}"
+        "idle_secs on this path is the narrowed measurement — the same field means a \
+         different thing under each scope, which is why the scope is recorded: {params}"
     );
     assert_eq!(
         result["reused"],

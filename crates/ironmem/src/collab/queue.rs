@@ -625,6 +625,93 @@ pub fn session_last_activity(
     conn: &Connection,
     session_id: &str,
 ) -> Result<Option<i64>, MemoryError> {
+    session_last_activity_with(conn, session_id, LeaseSignals::Include)
+}
+
+/// Which activity signals a staleness read counts.
+///
+/// The two `collab_actor_generations` handoff timestamps are the *lease's own*
+/// signals: they are stamped by [`super::issue_or_reuse_handoff`] and
+/// [`super::claim_handoff_token`] — by the recovery machinery, not by the
+/// session doing work. Every other term records something an agent did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeaseSignals {
+    /// All five terms. The abandon gate's predicate (#297) — a session being
+    /// recovered genuinely is a session someone is touching, and abandon is
+    /// terminal, so counting the lease there errs toward refusing to seal.
+    Include,
+    /// The three agent-driven terms only. See
+    /// [`session_last_activity_excluding_lease`].
+    Exclude,
+}
+
+impl LeaseSignals {
+    /// `1` keeps the two lease terms, `0` zeroes them.
+    ///
+    /// Zero is not an arbitrary sentinel: every term in the query is already
+    /// `coalesce(..., 0)` and they are combined with `max()`, so 0 is exactly
+    /// how an *absent* signal reads. Excluding a term therefore reuses the
+    /// encoding the query already has, which is why this is a bind parameter
+    /// on one query rather than a second query with two terms deleted. A
+    /// near-copy would be the drift hazard this module keeps eliminating: the
+    /// CAST/coalesce reasoning below is long and subtle, and a second copy
+    /// would have to be re-derived by whoever next edited either one.
+    fn sql_flag(self) -> i64 {
+        match self {
+            Self::Include => 1,
+            Self::Exclude => 0,
+        }
+    }
+}
+
+/// [`session_last_activity`] with the lease's own two timestamps excluded.
+///
+/// # Why this variant exists (#298 security fix)
+///
+/// `session_handoff { force_reissue: true }` re-leases a session whose
+/// generation holder died. It is gated on the session being demonstrably dead
+/// — but [`super::issue_or_reuse_handoff`] stamps `pending_handoff_issued_at`,
+/// which the full signal counts, so a *successful* forced reissue makes its own
+/// session read live and the caller's next retry would be refused for liveness
+/// the caller itself created.
+///
+/// The first fix for that skipped the staleness gate entirely whenever a token
+/// was already pending. That was a lease-takeover primitive: the gate became
+/// unreachable regardless of *who* minted the pending token, so any third
+/// process could call `force_reissue` during a live incumbent's ordinary
+/// mint→claim window, receive the incumbent's token verbatim, claim it, and
+/// take the lease — while the intended successor saw only
+/// `handoff_token already claimed`. The token was never a secret the protocol
+/// defended; the *gate* was.
+///
+/// Narrowing the signal fixes the retry problem at its root and closes that
+/// hole with it:
+///
+/// * On a genuinely dead session the three agent-driven terms are still dead,
+///   so a caller's own retry is admitted — the case the skip was written for.
+/// * On a live session mid-handoff, `collab_sessions.updated_at` and
+///   `messages.created_at` are fresh, so the echo is refused and the pending
+///   token stays private to whoever was handed it.
+///
+/// No caller identity is needed for either, which is what makes this workable:
+/// `agent` is caller-asserted everywhere in this protocol, so a fix resting on
+/// "was it *you* who minted it?" would rest on nothing.
+///
+/// **Not** a replacement for [`session_last_activity`]. The abandon gate keeps
+/// the full signal: `collab_end { abandon: true }` is terminal, and a session
+/// someone is actively trying to recover is one it should refuse to seal.
+pub fn session_last_activity_excluding_lease(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Option<i64>, MemoryError> {
+    session_last_activity_with(conn, session_id, LeaseSignals::Exclude)
+}
+
+fn session_last_activity_with(
+    conn: &Connection,
+    session_id: &str,
+    signals: LeaseSignals,
+) -> Result<Option<i64>, MemoryError> {
     let row: Option<(Option<i64>, i64)> = conn
         .query_row(
             "SELECT max(
@@ -641,13 +728,13 @@ pub fn session_last_activity(
                            FROM collab_actor_generations g
                           WHERE g.session_id = s.id),
                         0
-                    ),
+                    ) * ?2,
                     coalesce(
                         (SELECT max(CAST(strftime('%s', g.pending_handoff_claimed_at) AS INTEGER))
                            FROM collab_actor_generations g
                           WHERE g.session_id = s.id),
                         0
-                    )
+                    ) * ?2
                 ),
                 (CASE WHEN s.updated_at IS NOT NULL
                        AND strftime('%s', s.updated_at) IS NULL THEN 1 ELSE 0 END)
@@ -660,16 +747,16 @@ pub fn session_last_activity(
                                     WHERE g.session_id = s.id
                                       AND g.pending_handoff_issued_at IS NOT NULL
                                       AND strftime('%s', g.pending_handoff_issued_at) IS NULL)
-                      THEN 1 ELSE 0 END)
+                      THEN 1 ELSE 0 END) * ?2
               + (CASE WHEN EXISTS (SELECT 1 FROM collab_actor_generations g
                                     WHERE g.session_id = s.id
                                       AND g.pending_handoff_claimed_at IS NOT NULL
                                       AND strftime('%s', g.pending_handoff_claimed_at) IS NULL)
-                      THEN 1 ELSE 0 END)
+                      THEN 1 ELSE 0 END) * ?2
            FROM collab_sessions s
            LEFT JOIN collab_checkpoints c ON c.session_id = s.id
           WHERE s.id = ?1",
-            params![session_id],
+            params![session_id, signals.sql_flag()],
             |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, i64>(1)?)),
         )
         .optional()
@@ -849,8 +936,32 @@ pub fn session_staleness(
     conn: &Connection,
     session_id: &str,
 ) -> Result<SessionStaleness, MemoryError> {
+    staleness_with(conn, session_id, LeaseSignals::Include)
+}
+
+/// [`session_staleness`] over [`session_last_activity_excluding_lease`] — the
+/// same snapshot discipline, computed without the lease's own two timestamps.
+///
+/// Used by exactly one caller, `session_handoff`'s `force_reissue` gate, and
+/// that narrowness is the point: read
+/// [`session_last_activity_excluding_lease`] before adding a second one. A
+/// [`SessionStaleness`] value does not carry which signal set produced it, so
+/// mixing the two constructors across one decision would give two different
+/// answers to "is it dead?" with nothing at the type level to say why.
+pub fn session_staleness_excluding_lease(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<SessionStaleness, MemoryError> {
+    staleness_with(conn, session_id, LeaseSignals::Exclude)
+}
+
+fn staleness_with(
+    conn: &Connection,
+    session_id: &str,
+    signals: LeaseSignals,
+) -> Result<SessionStaleness, MemoryError> {
     let now = db_now_epoch_secs(conn)?;
-    let last_activity = session_last_activity(conn, session_id)?;
+    let last_activity = session_last_activity_with(conn, session_id, signals)?;
     Ok(SessionStaleness {
         session_id: session_id.to_string(),
         now,

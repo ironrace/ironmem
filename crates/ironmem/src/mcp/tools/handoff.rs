@@ -20,7 +20,7 @@ use rusqlite::OptionalExtension;
 use serde_json::{json, Value};
 
 use crate::collab::queue::SessionRecord;
-use crate::collab::{claim_handoff_token, read_actor_generation, Agent};
+use crate::collab::{claim_handoff_token, read_actor_generation, Agent, Phase};
 use crate::error::MemoryError;
 use crate::mcp::app::App;
 
@@ -208,6 +208,36 @@ pub(super) fn opt_handoff_token(args: &Value) -> Option<String> {
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .map(str::to_string)
+}
+
+/// The machine-readable name of the predicate that gated a forced reissue, for
+/// the audit row.
+///
+/// Two scopes exist because the lease's own timestamps are two of
+/// `session_last_activity`'s five terms, so counting them lets a caller's own
+/// rescue attempt make the session read live — see
+/// [`crate::collab::queue::session_last_activity_excluding_lease`]. `idle_secs`
+/// in the same row means a different measurement under each, which is why the
+/// scope is recorded beside it rather than inferred.
+pub(super) fn staleness_scope_key(pending_already: bool) -> &'static str {
+    if pending_already {
+        "excluding_lease"
+    } else {
+        "all_signals"
+    }
+}
+
+/// [`staleness_scope_key`] rendered for an operator refusal: the activity
+/// sources actually weighed, spelled out. Derived from the same boolean so the
+/// refusal and the audit row can never describe different checks.
+pub(super) fn staleness_scope_human(pending_already: bool) -> &'static str {
+    if pending_already {
+        "the session row, its checkpoint, and its messages (its handoff lease \
+         timestamps are excluded, because a token is already pending and a \
+         caller's own reissue must not count as activity)"
+    } else {
+        "the session row, its checkpoint, its messages, and its handoff lease"
+    }
 }
 
 /// Read the optional `force_reissue` flag. Absent, null, or a non-boolean
@@ -685,7 +715,7 @@ pub(super) fn handle_session_handoff(app: &App, args: &Value) -> Result<Value, M
 
     // Resurrection guard + active-session snapshot + issue, atomic in one transaction.
     let (claim, record, issued, forced_from) = app.db.with_transaction(|tx| {
-        let (claim, forced_from) = if force_reissue {
+        let (claim, forced_from, record) = if force_reissue {
             // ── The forced gate ladder (#298, #283 defect B) ─────────────────
             //
             // # Why this branch does NOT call `ensure_actor_generation_current`
@@ -715,7 +745,20 @@ pub(super) fn handle_session_handoff(app: &App, args: &Value) -> Result<Value, M
             //    tokenless call, so there is no severed chain to repair and the
             //    forced path would only be a way to skip the guard.
             //
-            // 3. Staleness, read INSIDE this write transaction. A predicate
+            // 3. The two human-gated phases. `PlanLocked` and
+            //    `CodingComplete` can sit perfectly live with zero writes to
+            //    any agent-driven signal for far longer than six hours while a
+            //    human simply has not acted yet — `session_last_activity`'s doc
+            //    says so outright and names #298 as inheriting the risk
+            //    "undiminished". Under #297 a false positive there sealed a
+            //    paused session: loud and terminal. Here it would hand a live
+            //    eviction capability to a caller acting against a process that
+            //    was never dead, silently. Refused before staleness for the
+            //    reason abandon puts its owner check before staleness: it is
+            //    the refusal the caller can act on, and no amount of waiting
+            //    will change it.
+            //
+            // 4. Staleness, read INSIDE this write transaction. A predicate
             //    read outside it is a TOCTOU window in which the session goes
             //    live between "is it dead?" and "re-lease it" — the same D6
             //    argument abandon records.
@@ -733,22 +776,50 @@ pub(super) fn handle_session_handoff(app: &App, args: &Value) -> Result<Value, M
             // because dropping it loses the caller no data: it only skips a
             // check this path has already argued it must not run.
             //
-            // # Why staleness is skipped when a token is already pending (D-P1)
+            // # Why the pending case narrows the signal instead of skipping
+            //   the gate (D-P1, and the security fix that replaced it)
             //
-            // `issue_or_reuse_handoff` writes `pending_handoff_issued_at`, and
-            // `session_last_activity` counts that column as one of its five
-            // activity signals. So the FIRST forced reissue makes its own
-            // session read live, and a retry seconds later would be refused
-            // with "21599s remaining" — a wait the server invented out of the
-            // caller's own rescue attempt. The skip costs nothing: that path
-            // mints no new token (byte-identical, `reused == true`) and moves
-            // no generation, so it grants no capability the pending token did
-            // not already represent. The accepted residual is that a token
-            // minted by a *normal* handoff can be echoed to a caller that did
-            // not mint it — accepted because the claim still advances the
-            // generation exactly once, so two holders of one token race to a
-            // single claim and the loser gets `handoff_token already claimed`;
-            // it is `tracing::warn`ed below so it stays observable.
+            // `issue_or_reuse_handoff` stamps `pending_handoff_issued_at`, one
+            // of `session_last_activity`'s five terms. So a *successful* forced
+            // reissue makes its own session read live, and the caller's retry
+            // seconds later would be refused with "21599s remaining" — a wait
+            // the server invented out of the caller's own rescue attempt.
+            //
+            // The first remedy skipped the staleness gate whenever a token was
+            // already pending. **That was a lease-takeover primitive and it is
+            // not coming back.** The gate became unreachable regardless of who
+            // minted the pending token or whether the session was alive, so any
+            // third process could wait for a live incumbent's ordinary
+            // mint→claim window (which `collab_status` advertises un-gated as
+            // `handoff_pending`), call `force_reissue`, receive the incumbent's
+            // token *verbatim*, and claim it. The intended successor then saw
+            // `handoff_token already claimed` — indistinguishable from an
+            // ordinary race — and the rightful operator's own `force_reissue`
+            // was refused for six hours because the theft had just stamped
+            // `pending_handoff_claimed_at`. Re-stealing each cycle made the
+            // lockout indefinite. The reasoning that admitted it ("the echo
+            // grants no more than the pending token already represented") was
+            // false in one word: it grants it *to a different party*.
+            //
+            // The real defect was never "a token is pending", it was that the
+            // lease's own timestamps are two of the five activity signals, so
+            // the recovery machinery counts as session activity. Fixed at that
+            // root: the pending case gates on
+            // `session_staleness_excluding_lease`, the same predicate minus the
+            // two `collab_actor_generations` terms.
+            //
+            // * Genuinely dead session: the three agent-driven signals are
+            //   still dead, so the caller's own retry is admitted — D-P1's
+            //   motivating case, preserved.
+            // * Live session mid-normal-handoff: `collab_sessions.updated_at`
+            //   and `messages.created_at` are fresh, so the echo is REFUSED and
+            //   the pending token stays private to whoever was handed it.
+            //
+            // Note what this does *not* rest on: caller identity. `agent` is
+            // caller-asserted throughout this protocol, so a fix shaped like
+            // "was it you who minted it?" would rest on nothing. The gate is
+            // reachable on every path now, which is the property that matters —
+            // the token was never a secret the protocol defended; the gate was.
             //
             // # R1: THIS PATH MUST NOT ADVANCE THE GENERATION
             //
@@ -794,29 +865,41 @@ pub(super) fn handle_session_handoff(app: &App, args: &Value) -> Result<Value, M
                 )));
             }
 
-            // One paired read, used for two things: the gate (below, and only
-            // when nothing is pending) and the audit evidence carried in
-            // `forced_from`. Read here, before `issue_or_reuse_handoff`, because
-            // that call stamps `pending_handoff_issued_at` — a read afterwards
+            // Loaded here, inside the forced ladder, so `phase` is available
+            // to the gate below. The normal path loads it after its own guard,
+            // as it always has.
+            let record = crate::collab::queue::load_session_record(tx, session_id)?;
+            if matches!(
+                record.session.phase,
+                Phase::PlanLocked | Phase::CodingComplete
+            ) {
+                return Err(MemoryError::Validation(format!(
+                    "session_handoff force_reissue refused: session {session_id} is in phase {}, \
+                     which waits on a human and produces no agent-driven activity while it does. \
+                     A session parked here reads as stale no matter how alive its holder is, so \
+                     the staleness gate cannot tell 'wedged' from 'waiting' — and force_reissue \
+                     would hand out an eviction capability against a process that never died. \
+                     If the holder really is gone, seal the session with \
+                     collab_end {{\"abandon\": true, \"reason\": \"...\"}}, which is \
+                     terminal and auditable, and start a fresh one.",
+                    record.session.phase
+                )));
+            }
+
+            // Which signal set gates this call. The `Exclude` variant on the
+            // pending path is the #298 security fix — see the long note above;
+            // it is not an optimisation and must not be collapsed back into one
+            // read. Both are read here, before `issue_or_reuse_handoff`, because
+            // that call stamps `pending_handoff_issued_at` and a read afterwards
             // would report the reissue's own timestamps as the "prior" ones it
             // is supposed to be evidence *about*.
-            let staleness = crate::collab::queue::session_staleness(tx, session_id)?;
-
-            // Named rather than inlined into the `if`, because it is also the
-            // audit trail's record of *which gate ladder ran*. A reader of the
-            // WAL row must not have to infer "the liveness check was skipped"
-            // from `reused` — see the warn and the audit row below.
             let pending_already = existing.as_ref().is_some_and(|a| a.pending.is_some());
-            if pending_already {
-                // D-P1: echo the already-pending token, no staleness check.
-                tracing::warn!(
-                    session_id = %session_id,
-                    agent = %agent.as_str(),
-                    generation = prior_generation,
-                    "collab: force_reissue echoing an already-pending handoff token without a \
-                     staleness check — the token was minted before this call and grants nothing new"
-                );
-            } else if !staleness.is_dead() {
+            let staleness = if pending_already {
+                crate::collab::queue::session_staleness_excluding_lease(tx, session_id)?
+            } else {
+                crate::collab::queue::session_staleness(tx, session_id)?
+            };
+            if !staleness.is_dead() {
                 // Destructured rather than `unwrap_or(0)`, for the reason
                 // `handle_collab_abandon` records at its twin: `session_is_dead`
                 // returns `true` for a missing signal, so `!is_dead()` implies
@@ -855,13 +938,19 @@ pub(super) fn handle_session_handoff(app: &App, args: &Value) -> Result<Value, M
                 return Err(MemoryError::Validation(format!(
                     "session_handoff force_reissue refused: session {session_id} is still live \
                      (idle {idle}s) and {} holds generation {prior_generation}. A forced reissue \
-                     requires {} of no activity across the session row, its checkpoint, its \
-                     messages, and its handoff lease; {remaining}s remaining. A session being \
-                     recovered — a handoff issued or claimed — counts as live. force_reissue \
+                     requires {} of no activity across {}; {remaining}s remaining. force_reissue \
                      exists only for a demonstrably dead lease; if the holder is alive, have it \
                      call session_handoff normally.",
                     agent.as_str(),
                     super::collab_session::dead_session_threshold_human(),
+                    // Naming the terms actually measured, not a fixed list.
+                    // With a token already pending the lease timestamps are
+                    // excluded, and a refusal that still claimed to have
+                    // weighed "its handoff lease" would misdescribe the very
+                    // check it is reporting — to the caller least able to
+                    // check, since the excluded terms are the ones its own
+                    // retry would have written.
+                    staleness_scope_human(pending_already),
                 )));
             }
 
@@ -875,13 +964,21 @@ pub(super) fn handle_session_handoff(app: &App, args: &Value) -> Result<Value, M
                     "prior_generation": prior_generation,
                     "last_activity": staleness.last_activity(),
                     "idle_secs": staleness.idle_secs(),
-                    // False on the D-P1 echo path, where the liveness check was
-                    // deliberately skipped. The `idle_secs` beside it was still
-                    // measured — it just did not gate anything — so without this
-                    // flag the audit row would read as though a dead session had
-                    // been proven when none was.
-                    "staleness_checked": !pending_already,
+                    // WHICH predicate admitted this call. It replaced a
+                    // `staleness_checked` boolean that could only ever be
+                    // `true` once the gate stopped being skippable; a field
+                    // with one reachable value reads as though the other were
+                    // possible. The scope is the thing a reader of this row
+                    // actually needs, because `idle_secs` beside it means a
+                    // different measurement in each case.
+                    "staleness_scope": staleness_scope_key(pending_already),
+                    // The phase the reissue was granted from. `PlanLocked` and
+                    // `CodingComplete` are refused above, so this can never
+                    // record one of them — which is exactly why it is worth
+                    // recording: the audit row shows the phase gate held.
+                    "phase": record.session.phase.to_string(),
                 })),
+                record,
             )
         } else {
             let claim = ensure_actor_generation_current(
@@ -892,10 +989,42 @@ pub(super) fn handle_session_handoff(app: &App, args: &Value) -> Result<Value, M
                 opt_handoff_token(args).as_deref(),
             )?;
             crate::collab::queue::ensure_active(tx, session_id)?;
-            (claim, None)
+            let record = crate::collab::queue::load_session_record(tx, session_id)?;
+            (claim, None, record)
         };
-        let record = crate::collab::queue::load_session_record(tx, session_id)?;
         let issued = crate::collab::issue_or_reuse_handoff(tx, session_id, agent)?;
+
+        // The audit row for a generation-guard bypass belongs in the same
+        // transaction as the bypass. Written post-commit and warn-and-continue
+        // (as it was), a log failure — or a crash in the window between commit
+        // and the write — left a completed bypass with no record at all, which
+        // is the one outcome an authorization record exists to prevent. A
+        // rolled-back reissue rolling back its own audit row is the correct
+        // pairing in the other direction too: there is nothing to attest.
+        //
+        // `?`, not warn-and-continue: unlike the handoff *metric* below, an
+        // unrecorded authorization decision is not a cosmetic loss, and
+        // failing the reissue leaves the caller able to retry into a state
+        // where both land together.
+        if let Some(forced) = forced_from.as_ref() {
+            crate::db::schema::Database::wal_log_tx(
+                tx,
+                "session_handoff.force_reissue",
+                &json!({
+                    "session_id": session_id,
+                    "agent": agent.as_str(),
+                    "prior_generation": forced["prior_generation"],
+                    "last_activity": forced["last_activity"],
+                    "idle_secs": forced["idle_secs"],
+                    "staleness_scope": forced["staleness_scope"],
+                    "phase": forced["phase"],
+                }),
+                Some(&json!({
+                    "pending_generation": issued.pending_generation,
+                    "reused": issued.reused,
+                })),
+            )?;
+        }
         Ok((claim, record, issued, forced_from))
     })?;
     claim.publish(app);
@@ -918,56 +1047,27 @@ pub(super) fn handle_session_handoff(app: &App, args: &Value) -> Result<Value, M
         }
     }
 
-    // A forced re-lease bypassed the generation guard, so it must leave a trace
-    // in both places an operator looks: the process log and the audit trail.
-    // `wal_log`, not `wal_log_tx` — the transaction above has already committed,
-    // and the audit row records what *did* happen rather than what was about to.
-    // Warn-and-continue, the same posture the handoff counter above takes: a
-    // failed audit write must not fail a reissue that already committed, which
-    // would leave the caller believing the rescue did not happen while the lease
-    // row says otherwise.
+    // The operator-log half of the trace. The audit half is the `wal_log_tx`
+    // row inside the transaction above; this one is deliberately *after* the
+    // commit, because it reports something that definitely happened.
+    //
+    // `staleness_scope` is on the line rather than a claim of deadness in the
+    // prose: the two scopes measure different things, and a message asserting
+    // more than the gate established is how the first version of this feature
+    // talked itself into a takeover primitive.
     if let Some(forced) = forced_from.as_ref() {
-        // The message must not assert a check that did not happen. On the D-P1
-        // echo path the staleness gate was skipped, so this line says
-        // "re-leased a generation lease" and lets `staleness_checked` carry
-        // whether deadness was actually demonstrated. Calling that "a dead
-        // generation" unconditionally would put a claim in the operator's log
-        // that the authorization path never established.
         tracing::warn!(
             session_id = %session_id,
             agent = %agent.as_str(),
+            phase = %forced["phase"],
             prior_generation = %forced["prior_generation"],
             idle_secs = %forced["idle_secs"],
-            staleness_checked = %forced["staleness_checked"],
+            staleness_scope = %forced["staleness_scope"],
             reused = issued.reused,
             "collab: session_handoff force_reissue re-leased a generation lease, bypassing the \
-             generation guard; staleness_checked=false means the already-pending token was \
-             echoed (D-P1) without a liveness check. The successor's claim of this token — not \
-             this call — advances the generation"
+             generation guard on a session that passed the staleness gate. The successor's claim \
+             of this token — not this call — advances the generation"
         );
-        let params = json!({
-            "session_id": session_id,
-            "agent": agent.as_str(),
-            "prior_generation": forced["prior_generation"],
-            "last_activity": forced["last_activity"],
-            "idle_secs": forced["idle_secs"],
-            "staleness_checked": forced["staleness_checked"],
-        });
-        let result = json!({
-            "pending_generation": issued.pending_generation,
-            "reused": issued.reused,
-        });
-        if let Err(e) = app
-            .db
-            .wal_log("session_handoff.force_reissue", &params, Some(&result))
-        {
-            tracing::warn!(
-                session_id = %session_id,
-                error = %e,
-                "audit: wal_log for session_handoff.force_reissue failed — the reissue \
-                 committed but is unrecorded in the audit trail"
-            );
-        }
     }
 
     // Issue #273: the handoff block is where a stale checkpoint did the most
@@ -2579,6 +2679,65 @@ mod tests {
         }
     }
 
+    /// A **live** incumbent that has just handed off normally: generation 1
+    /// committed, a fresh token pending, and nothing aged.
+    ///
+    /// This is the ordinary succession window — the state the takeover exploit
+    /// targeted — so it is built entirely through `handle_session_handoff`,
+    /// including the claim. `advance_to_generation_one` reaches generation 1
+    /// through the queue layer and so never publishes to the incumbent `App`'s
+    /// advisory cache, leaving it looking like a stale process rather than the
+    /// live holder; a fixture built that way cannot pose the question this
+    /// scenario asks.
+    struct LiveIncumbent {
+        incumbent: Arc<crate::mcp::app::App>,
+        session_id: String,
+        /// The token the incumbent minted for its intended successor. The
+        /// exploit's prize.
+        pending_token: String,
+        db_path: std::path::PathBuf,
+        dir: tempfile::TempDir,
+    }
+
+    /// Empty on purpose, for the reason [`DeadLease`] documents at length:
+    /// moving a field out would drop `dir` at the `let` and unlink the database
+    /// mid-test.
+    impl Drop for LiveIncumbent {
+        fn drop(&mut self) {}
+    }
+
+    fn live_incumbent_mid_handoff() -> LiveIncumbent {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("mem.sqlite3");
+        let incumbent = test_app_with_db_path(db_path.clone(), dir.path());
+        let session_id = seed_active_session(&incumbent);
+
+        // Bind at generation 0 and mint the first token.
+        let first = handle_session_handoff(
+            &incumbent,
+            &json!({ "session_id": session_id, "agent": "claude" }),
+        )
+        .unwrap();
+        let first_token = first["handoff_token"].as_str().unwrap().to_string();
+        // Claim it — this advances to generation 1, publishes that generation
+        // to this `App`'s cache, and mints the next token in one call, which is
+        // exactly the mint→claim window the attack aims at.
+        let handed = handle_session_handoff(
+            &incumbent,
+            &json!({ "session_id": session_id, "agent": "claude", "handoff_token": first_token }),
+        )
+        .unwrap();
+        let pending_token = handed["handoff_token"].as_str().unwrap().to_string();
+
+        LiveIncumbent {
+            incumbent,
+            session_id,
+            pending_token,
+            db_path,
+            dir,
+        }
+    }
+
     fn force_args(sid: &str, agent: &str) -> Value {
         json!({ "session_id": sid, "agent": agent, "force_reissue": true })
     }
@@ -2819,6 +2978,207 @@ mod tests {
             Some(1),
             "R1: ignoring the token must not turn into claiming it"
         );
+    }
+
+    /// **The lease-takeover exploit, refused.** This is the regression test for
+    /// a security control, so it reads as the attack.
+    ///
+    /// The first version of `force_reissue` skipped the staleness gate whenever
+    /// a token was already pending, regardless of who minted it. That made the
+    /// pending token reachable by anyone: a live incumbent hands off normally,
+    /// and in the mint→claim window a third process — separate `App`, empty
+    /// cache, never held the lease, never given the token — asks for a forced
+    /// reissue and is handed the incumbent's token verbatim. Claiming it
+    /// transfers the lease; the intended successor sees only
+    /// `handoff_token already claimed`.
+    ///
+    /// The gate is now reachable on every path, so the third process is
+    /// refused and the token stays private to whoever was handed it.
+    #[test]
+    fn a_third_process_cannot_obtain_a_live_incumbents_pending_token() {
+        let live = live_incumbent_mid_handoff();
+        let (incumbent, sid) = (&live.incumbent, live.session_id.as_str());
+        let token = live.pending_token.clone();
+
+        let attacker = test_app_with_db_path(live.db_path.clone(), live.dir.path());
+        let err = handle_session_handoff(&attacker, &force_args(sid, "claude")).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("still live"),
+            "a live session's pending token must not be handed to a third process: {message}"
+        );
+        assert!(
+            !message.contains(&token),
+            "the refusal must not leak the very token it refused to hand over: {message}"
+        );
+        assert_eq!(
+            read_actor_generation_pending(incumbent, sid, Agent::Claude).as_deref(),
+            Some(token.as_str()),
+            "the refused call must leave the incumbent's pending token exactly as it was"
+        );
+        assert_eq!(
+            db_generation(incumbent, sid, Agent::Claude),
+            Some(1),
+            "a refused takeover must move no generation"
+        );
+        assert_eq!(
+            force_reissue_audit_rows(incumbent),
+            0,
+            "a refused reissue must leave no audit row — the whole transaction rolled back"
+        );
+    }
+
+    /// The refusal above must name the signals it actually weighed. With a
+    /// token pending the lease timestamps are excluded, and a refusal still
+    /// claiming to have weighed "its handoff lease" would misdescribe its own
+    /// check to the caller least able to verify it.
+    #[test]
+    fn the_pending_path_refusal_names_the_narrowed_signal_set() {
+        let live = live_incumbent_mid_handoff();
+        let attacker = test_app_with_db_path(live.db_path.clone(), live.dir.path());
+        let message = handle_session_handoff(&attacker, &force_args(&live.session_id, "claude"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            message.contains("handoff lease timestamps are excluded"),
+            "the pending-path refusal must say the lease terms were excluded: {message}"
+        );
+    }
+
+    /// `PlanLocked` and `CodingComplete` wait on a human and write no
+    /// agent-driven activity while they do, so a session parked in either reads
+    /// as stale no matter how alive its holder is —
+    /// `session_last_activity`'s doc names #298 as inheriting that risk
+    /// "undiminished". Refused outright: here a false positive would hand an
+    /// eviction capability to a caller acting against a process that never
+    /// died.
+    #[test]
+    fn force_reissue_is_refused_in_the_human_gated_phases() {
+        for phase in [Phase::PlanLocked, Phase::CodingComplete] {
+            let (app, _dir) = test_handoff_app();
+            let sid = seed_active_session(&app);
+            advance_to_generation_one(&app, &sid, Agent::Claude);
+
+            // Through the real writer, so the row is one the protocol can
+            // produce — then aged, so the staleness gate would otherwise admit.
+            app.db
+                .with_transaction(|tx| {
+                    let mut record = crate::collab::queue::load_session_record(tx, &sid)?;
+                    record.session.phase = phase;
+                    crate::collab::queue::save_session(tx, &record.session)
+                })
+                .unwrap();
+            age_session(&app, &sid, crate::collab::COLLAB_DEAD_SESSION_SECS + 60);
+
+            let message = handle_session_handoff(&app, &force_args(&sid, "claude"))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                message.contains(&phase.to_string()),
+                "the refusal must name the phase it is refusing: {message}"
+            );
+            assert!(
+                message.contains("waits on a human"),
+                "the refusal must say why this phase cannot be judged by staleness: {message}"
+            );
+            assert_eq!(
+                read_actor_generation_pending(&app, &sid, Agent::Claude),
+                None,
+                "a phase refusal must mint nothing"
+            );
+        }
+    }
+
+    /// The audit row for a generation-guard bypass is written inside the same
+    /// transaction as the bypass, so the two cannot come apart: a committed
+    /// reissue always has its row, and a rolled-back one never does.
+    #[test]
+    fn the_forced_reissue_audit_row_commits_with_the_reissue() {
+        let lease = dead_lease_and_rescuer();
+        let (rescuer, sid) = (&lease.rescuer, lease.session_id.as_str());
+        assert_eq!(
+            force_reissue_audit_rows(rescuer),
+            0,
+            "the fixture's ordinary handoffs bypassed nothing and must write no forced row"
+        );
+
+        handle_session_handoff(rescuer, &force_args(sid, "claude")).unwrap();
+        assert_eq!(
+            force_reissue_audit_rows(rescuer),
+            1,
+            "the committed reissue must carry its audit row"
+        );
+        let (params, result) = last_force_reissue_row(rescuer);
+        assert_eq!(params["prior_generation"], json!(1), "{params}");
+        assert_eq!(
+            params["staleness_scope"],
+            json!("all_signals"),
+            "nothing was pending, so the full predicate gated this call: {params}"
+        );
+        assert!(
+            params["phase"].is_string(),
+            "the row must record the phase the reissue was granted from: {params}"
+        );
+        assert_eq!(result["pending_generation"], json!(2), "{result}");
+        assert_eq!(result["reused"], json!(false), "{result}");
+    }
+
+    /// The echo path records the *narrowed* scope. `idle_secs` means a
+    /// different measurement under each scope, so a reader of the row must not
+    /// have to guess which one produced it.
+    #[test]
+    fn the_echoed_reissue_audit_row_records_the_narrowed_scope() {
+        let lease = dead_lease_and_rescuer();
+        let (rescuer, sid) = (&lease.rescuer, lease.session_id.as_str());
+        handle_session_handoff(rescuer, &force_args(sid, "claude")).unwrap();
+        handle_session_handoff(rescuer, &force_args(sid, "claude")).unwrap();
+
+        assert_eq!(
+            force_reissue_audit_rows(rescuer),
+            2,
+            "the echo bypassed the guard too and must leave its own row"
+        );
+        let (params, result) = last_force_reissue_row(rescuer);
+        assert_eq!(
+            params["staleness_scope"],
+            json!("excluding_lease"),
+            "the retry was gated on the narrowed predicate and the row must say so: {params}"
+        );
+        assert_eq!(result["reused"], json!(true), "{result}");
+    }
+
+    /// How many `session_handoff.force_reissue` rows the audit trail holds.
+    fn force_reissue_audit_rows(app: &crate::mcp::app::App) -> i64 {
+        app.db
+            .with_connection(|conn| {
+                Ok(conn.query_row(
+                    "SELECT COUNT(*) FROM wal_log WHERE operation = 'session_handoff.force_reissue'",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap()
+    }
+
+    /// The newest `session_handoff.force_reissue` row, as `(params, result)`.
+    fn last_force_reissue_row(app: &crate::mcp::app::App) -> (Value, Value) {
+        app.db
+            .with_connection(|conn| {
+                let (params, result): (String, Option<String>) = conn.query_row(
+                    "SELECT params, result FROM wal_log \
+                     WHERE operation = 'session_handoff.force_reissue' ORDER BY id DESC LIMIT 1",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?;
+                Ok((
+                    serde_json::from_str(&params).unwrap(),
+                    serde_json::from_str(
+                        &result.expect("a forced reissue row must carry a result"),
+                    )
+                    .unwrap(),
+                ))
+            })
+            .unwrap()
     }
 
     /// The normal succession path must not carry a rescue-shaped key at all.

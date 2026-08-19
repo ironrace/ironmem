@@ -1667,9 +1667,11 @@ diverge for real, test-pinned reasons:
 
 - **`reclaimable: false` yet `force_reissue` succeeds.** A lease with a
   token already pending (`handoff_pending: true`) reads `claimable: true`,
-  hence `reclaimable: false` — but a repeated `force_reissue` call still
-  succeeds against it, by echoing the pending token without a staleness
-  check (see "Repeating the call" under § `session_handoff` below).
+  hence `reclaimable: false` — but on a *dead* session a repeated
+  `force_reissue` still succeeds against it, echoing the pending token
+  after a staleness check that excludes the lease's own timestamps (see
+  "Repeating the call" under § `session_handoff` below). On a live session
+  it is refused, so this divergence is confined to the dead-lease case.
   `reclaimable` deliberately does not cover this case: its whole job is to
   distinguish "usable right now" from "usable only via the dead-lease
   repair," and folding the echo path in would make `reclaimable: false`
@@ -2536,11 +2538,20 @@ than calling it, in this order:
 3. `generation > 0` — at generation 0 nothing is locked and a fresh process
    can already take the session with a plain tokenless call, so there is no
    severed chain to repair.
-4. A demonstrably dead session: idle past `COLLAB_DEAD_SESSION_SECS` (6
-   hours) by the same paired staleness read `collab_end`'s abandon gate
-   uses, read *inside* this call's own write transaction so there is no
+4. Not `PlanLocked` or `CodingComplete`. Both wait on a human and write no
+   agent-driven activity while they do, so a session parked in either reads
+   as stale no matter how alive its holder is. `collab_end`'s abandon gate
+   accepts that false-positive risk (a wrong seal is loud and terminal);
+   `force_reissue` cannot, because a wrong verdict here hands an eviction
+   capability to a caller acting against a process that never died. Refused
+   before staleness, since no amount of waiting changes the answer.
+5. A demonstrably dead session: idle past `COLLAB_DEAD_SESSION_SECS` (6
+   hours), read *inside* this call's own write transaction so there is no
    window between "is it dead?" and "re-lease it" for the session to go
-   live in.
+   live in. Two predicates, depending on whether a token is already
+   pending — see "Repeating the call" below. With nothing pending it is the
+   same five-signal read `collab_end`'s abandon gate uses; with a token
+   pending it is the same read minus the lease's own two timestamps.
 
 The precondition is checkable up front, without making the call, via
 `collab_status`'s `<agent>_lease.reclaimable` (see § `collab_status` above)
@@ -2568,22 +2579,37 @@ The key is **present only on this path, never `false` on an ordinary
 succession response** — a reader that skims for the key's presence, not its
 value, still gets the right answer. The call also writes a
 `session_handoff.force_reissue` audit row to the WAL, carrying
-`session_id`, `agent`, `prior_generation`, `last_activity`, `idle_secs`,
-`staleness_checked`, and the result (`pending_generation` and whether the
-token was freshly minted or `reused`).
+`session_id`, `agent`, `phase`, `prior_generation`, `last_activity`,
+`idle_secs`, `staleness_scope`, and the result (`pending_generation` and
+whether the token was freshly minted or `reused`). `staleness_scope` is
+`"all_signals"` or `"excluding_lease"` and names which of the two predicates
+above admitted the call — `idle_secs` beside it means a different
+measurement under each, so it cannot be inferred. The row is written
+**inside the same transaction as the reissue**, so a committed bypass always
+has its record and a refused one never leaves a stray.
 
 **Repeating the call.** A `force_reissue` call made before any claim, on a
 session that already has a token pending, returns the byte-identical token
-(`reused: true`) and does not double-count the handoff metric. It is also
-**not** re-checked against staleness: minting the pending token stamps
-`pending_handoff_issued_at`, which is itself one of the five signals
-`idle_secs` counts, so re-gating a retry would refuse a caller's own rescue
-using activity that same rescue just wrote. The accepted consequence: a
-token that was actually minted by a normal (non-forced) handoff can also be
-echoed back by a later forced call. That grants no more than the pending
-token already granted — the claim still advances the generation exactly
-once, and whichever caller loses the race to claim it gets `handoff_token
-already claimed`.
+(`reused: true`) and does not double-count the handoff metric. The staleness
+gate still runs, but on a **narrowed** signal: the session row, its
+checkpoint, and its messages, with the lease's own
+`pending_handoff_issued_at` / `pending_handoff_claimed_at` excluded. Minting
+a token stamps the first of those, so counting it would refuse a caller's
+own rescue using activity that same rescue just wrote — while the three
+agent-driven signals are unaffected by the rescue and so still answer the
+real question.
+
+This is a security boundary, not a convenience. An earlier design *skipped*
+the gate outright whenever a token was pending, and that made the pending
+token reachable by anyone: a third process could wait for a live incumbent's
+ordinary mint→claim window (which `collab_status` advertises un-gated as
+`handoff_pending: true`), call `force_reissue`, receive the incumbent's
+token verbatim, and claim it — while the intended successor saw only
+`handoff_token already claimed`. Narrowing the signal instead of skipping
+the gate keeps the retry working *and* refuses that call, because a live
+session is still live on its agent-driven signals. On a live session a
+forced reissue is refused whether or not a token is pending; the echo is
+reachable only on a session that is genuinely dead.
 
 **Alternative, not a sequence, to abandon.** `force_reissue` re-leases a
 dead session so a fresh process can continue it; `collab_end { abandon:
