@@ -730,6 +730,11 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
                     "handoff_token": {
                         "type": "string",
                         "description": "Required after a prior handoff claim; successor uses it to claim this generation."
+                    },
+                    "force_reissue": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Mint a token WITHOUT holding the lease, to recover a session whose holder died. Requires generation > 0 and no activity for the staleness threshold. Does not advance the generation — the successor's claim does."
                     }
                 },
                 "required": ["session_id", "agent"]
@@ -1511,6 +1516,35 @@ mod tests {
     /// headroom, in line with the previous raises. No neighbouring tool's
     /// description was trimmed to pay for it.
     ///
+    /// Raised 4_333 -> 4_407 for `session_handoff`'s `force_reissue` (#298) —
+    /// the dead-lease recovery hatch: mint a token without holding the
+    /// generation lease, for a session whose holder process died. Like
+    /// `collab_end.abandon` before it, the one fact this field's own boolean
+    /// nature already carries — that it defaults off — is a schema key
+    /// (`default: false`), not prose, matching this file's own rule that a
+    /// fact expressible as a key must be. What stays in the description is
+    /// only what no key can carry: that the call SKIPS the generation guard
+    /// it exists to repair (the ordinary meaning of a `session_handoff` call
+    /// is "obey the lease"; this argument inverts that, and nothing about a
+    /// boolean's name says which direction it inverts), the admission cost
+    /// (`generation > 0`, idle past the staleness threshold — stated without
+    /// a hardcoded number, so it cannot drift the way a copied "6 hours"
+    /// would), and that it does not advance the generation. That last clause
+    /// is the one a reader is most likely to guess wrong: "mints a token
+    /// without the lease" reads, absent this sentence, as "evicts the
+    /// incumbent," and a client that acted on that guess — or a future
+    /// implementation edit that made the guess true — would let a forced
+    /// reissue perform the eviction itself. That is exactly the property
+    /// issue #91 exists to prevent: eviction may happen only through a
+    /// successor's CLAIM, never through a bare reissue. `handoff.rs`'s R1
+    /// comment and its test,
+    /// `forced_reissue_on_a_dead_lease_does_not_advance_the_generation`, pin
+    /// the same fact on the implementation side; this sentence is its only
+    /// appearance on the advertised surface, so it earns its bytes. The
+    /// listing measured 4_367 tokens after the addition, leaving ~40 tokens
+    /// of headroom, in line with the previous raises. No neighbouring tool's
+    /// description was trimmed to pay for it.
+    ///
     /// The budget is deliberately a whole-listing ceiling with no per-tool
     /// allocation, so the cheapest way to land a new field is to delete prose
     /// from whichever unrelated tool happens to be wordiest. That trade is not
@@ -1523,7 +1557,7 @@ mod tests {
         let bytes = serde_json::to_vec(&tool_definitions(&app)).unwrap().len();
         let estimated_tokens = bytes.div_ceil(4);
         assert!(
-            estimated_tokens <= 4_333,
+            estimated_tokens <= 4_407,
             "tool listing is ~{estimated_tokens} tokens ({bytes} bytes); trim descriptions that duplicate their schemas"
         );
     }

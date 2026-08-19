@@ -71,6 +71,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`session_handoff` can recover a session whose generation holder died
+  (#298).** New `force_reissue: true` mints a handoff token without holding
+  the generation lease, for a lease-holder process that is gone and cannot
+  mint a successor token itself. It requires write access
+  (`IRONMEM_MCP_MODE=trusted`), `generation > 0`, and no activity across the
+  session for `COLLAB_DEAD_SESSION_SECS`, checked inside the write
+  transaction. The reissue does **not** advance the generation — only the
+  successor's claim does, which is what preserves the anti-resurrection
+  property from #91. `collab_status` also gains a per-agent `<agent>_lease`
+  block reporting a derived `claimable` / `reclaimable` verdict, so an
+  operator can tell "usable right now" from "usable only via the dead-lease
+  repair" without invoking the irreversible call to find out.
+
 - **`collab_status` reports the staleness the abandon gate evaluates (#297).**
   New `last_activity` (Unix epoch seconds), `idle_secs`, and
   `dead_session_secs` fields, read through the same paired `session_staleness`
