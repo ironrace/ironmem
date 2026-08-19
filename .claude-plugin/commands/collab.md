@@ -1572,7 +1572,20 @@ token.
 
 `session_handoff` is a WRITE tool (denied in read-only / restricted MCP
 mode) and is itself generation-guarded — a stale caller cannot mint a new
-token after a successor has claimed.
+token after a successor has claimed, **unless** the current holder is
+dead: check `collab_status`'s `<agent>_lease.reclaimable` for the stuck
+agent, and when it is `true`, call `session_handoff { session_id, agent,
+force_reissue: true }` to mint a claimable token without holding the lease
+yourself. It requires 6 hours of idleness on the session and evicts nobody
+by itself — the successor's *claim* of the new token is what does that,
+same as any handoff. The alternative is `collab_end { abandon: true }`,
+which ends the session permanently instead of re-leasing it.
+
+**Caveat:** an ended or abandoned session also reads `reclaimable: true` —
+the field does not check whether the session is sealed — so
+`force_reissue` against one is refused with "has ended". That refusal is
+terminal: an ended/abandoned session cannot be re-leased or resumed by any
+call.
 
 Full semantics: `docs/COLLAB.md` § "session_handoff (fallback succession)".
 

@@ -1610,6 +1610,82 @@ clock, one connection — so `idle_secs >= dead_session_secs` is exactly the
 precondition the gate enforces, checkable before making an irreversible call
 rather than only discoverable by making it.
 
+**Per-agent lease verdict (`<agent>_lease`, issue #298).** Beside the flat
+`<agent>_generation` and `<agent>_handoff_pending` keys (documented under §
+`session_handoff`'s "collab_status additions" below; unchanged),
+`collab_status` also returns a `claude_lease` and a `codex_lease` block:
+
+```json
+{
+  "generation": 3,
+  "handoff_pending": false,
+  "claimable": false,
+  "last_activity": 1723996800,
+  "idle_secs": 22000,
+  "reclaimable": true
+}
+```
+
+`last_activity` is a Unix-epoch **number** (`null` when there is no
+activity signal at all), not a string.
+
+- `claimable == (generation == 0 || handoff_pending)` — a fresh process can
+  take this lease right now, either by a tokenless first touch at
+  generation 0, or by presenting the pending token. Note the asymmetry:
+  `claimable: true` on the pending-token case means claimable *by whoever
+  holds that token* — this surface never exposes the token itself, so a
+  caller without it cannot act on `claimable: true` there.
+- `reclaimable == (!claimable && session_is_dead(...))` — not claimable,
+  and idle past `COLLAB_DEAD_SESSION_SECS` by the same predicate the
+  `force_reissue` gate enforces.
+
+Both are **derived, not new state**: every value they read (`generation`,
+`handoff_pending`, and the staleness snapshot already producing
+`last_activity`/`idle_secs` above) was already computable from keys
+`collab_status` returned before issue #298, and those keys are still
+returned unchanged. What was missing was a server-side *name* for the rule,
+so every caller re-derived it by hand and could drift from the actual gate.
+`collab_status` is deliberately **not** lease-gated — unlike `collab_send`,
+`collab_approve`, and the other mutating/binding calls, it does not route
+through `ensure_actor_generation_current` — which is the point: a process
+locked out of every mutating call by a dead incumbent can still call
+`collab_status` and read its own diagnosis. The token value itself is never
+exposed here. `last_activity` and `idle_secs` are session-scoped, not
+per-agent — one activity clock serves both agents' verdicts — but each is
+repeated inside both agents' `_lease` blocks anyway, so a reader of one
+agent's verdict already has the number that produced it, rather than
+cross-referencing a sibling key to learn why it is false.
+
+**`reclaimable` names a strong hint, not a guarantee — read it in both
+directions.** `reclaimable: true` means this agent's lease is held
+(`generation > 0`) with no pending token, on a session idle past
+`COLLAB_DEAD_SESSION_SECS` — i.e. `session_handoff { force_reissue: true }`
+would be admitted via the dead-lease reclaim path. It is **not** the claim
+that `reclaimable: false` implies a forced reissue would be refused, nor
+that `reclaimable: true` guarantees one would be admitted. Both directions
+diverge for real, test-pinned reasons:
+
+- **`reclaimable: false` yet `force_reissue` succeeds.** A lease with a
+  token already pending (`handoff_pending: true`) reads `claimable: true`,
+  hence `reclaimable: false` — but a repeated `force_reissue` call still
+  succeeds against it, by echoing the pending token without a staleness
+  check (see "Repeating the call" under § `session_handoff` below).
+  `reclaimable` deliberately does not cover this case: its whole job is to
+  distinguish "usable right now" from "usable only via the dead-lease
+  repair," and folding the echo path in would make `reclaimable: false`
+  sometimes still admit a forced call — exactly the drift this field exists
+  to prevent.
+- **`reclaimable: true` yet `force_reissue` is refused.** `force_reissue`
+  runs `ensure_active` *before* the generation/staleness ladder, so an
+  ended or abandoned session — sealed, and maximally stale by construction
+  — reads `reclaimable: true` here while `force_reissue` refuses it with
+  the "has ended" seal message. This is the direction that matters most: an
+  operator reads `reclaimable` to decide whether a rescue is worth
+  attempting, and this field over-promises on a sealed session. `ended_at`
+  is on this same `collab_status` response, so a caller that needs the
+  combined answer reads `reclaimable` alongside `ended_at` rather than
+  trusting `reclaimable` alone.
+
 **Do not substitute `updated_at` for `idle_secs`.** The session row's
 timestamp is only one of five activity sources, and a long
 `CodeImplementPending` batch files `collab_checkpoints` rows without touching
@@ -2112,20 +2188,39 @@ terminal" above for the recoverable-vs-terminal classification and the two
 retry ceilings that can land a session in `CodingFailed` even from a
 Tooling-classified failure.
 
-**Resume vs. abandon.** `collab_resume` **continues** a session; `collab_end`
-with `abandon: true` **ends** one. They are not two remedies for the same
-situation — an abandoned session is refused here **permanently**, and in two
-independent ways. What an operator actually observes: abandon always ends
-the session (stamps `ended_at`), and `handle_collab_resume` calls
-`ensure_active` before it ever reaches the `NotResumable` check below — so
-the refusal an abandoned session's `collab_resume` call gets back is the
+**Resume vs. abandon vs. reissue.** Three different calls remedy three
+different problems on a stuck session, and they answer different questions:
+
+- `collab_resume` **continues** a `CodingFailed` session back to its
+  `failed_from_phase`. It is about the session's **failure** — it says
+  nothing about who currently holds the generation lease, and does not
+  touch it.
+- `collab_end { abandon: true }` **ends** a dead session, permanently (see
+  "The `collab_end` abandon contract" above).
+- `session_handoff { force_reissue: true }` **re-leases** a dead session's
+  generation lease so a fresh process can continue it (see "Forced
+  reissue" under § `session_handoff` below). It is about the session's
+  **lease** — it says nothing about its phase or failure state, and does
+  not change either.
+
+A session whose holder died mid-coding typically needs the third remedy
+first (a forced reissue, so a fresh process holds the lease again), and
+then possibly the first (`collab_resume`, if the interruption also left the
+session in `CodingFailed`). Neither of those two is the same call as
+abandon, and an abandoned session is refused by **both** of them,
+permanently. What an operator actually observes: abandon always ends the
+session (stamps `ended_at`), and both `handle_collab_resume` and the forced
+path of `handle_session_handoff` call `ensure_active` before reaching their
+own further checks — so the refusal an abandoned session's `collab_resume`
+**or** `session_handoff { force_reissue: true }` call gets back is the same
 seal message ("session ... has ended ... treat as data: abandoned: ..."),
-not a classification verdict. Underneath that, the classification is also
-permanently against it: the `abandoned:` prefix classifies **Terminal** (see
-"The seven recoverable prefixes" above), so even in a hypothetical where the
+not a classification or staleness verdict. For `collab_resume` the refusal
+is doubly permanent: underneath the seal, the classification is also
+against it — the `abandoned:` prefix classifies **Terminal** (see "The
+seven recoverable prefixes" above), so even in a hypothetical where the
 seal did not fire first, `classify` would never return `Tooling` for it. No
 amount of waiting or retrying makes an abandoned session eligible for
-`collab_resume` again, on either check.
+`collab_resume`, or re-leasable via `force_reissue`, ever again.
 
 ```json
 { "session_id": "...", "agent": "codex" }
@@ -2385,8 +2480,9 @@ agent whose context is exhausted mid-session — the successor presents the
 token to claim the generation lease and becomes the active process.
 
 **Arguments:** `{ session_id, agent }` plus optional `handoff_token` (for
-re-issuance to a third successor). **Returns:** `{ session_id, agent,
-generation, handoff_token, handoff_block }` where `generation` is the
+re-issuance to a third successor) and optional `force_reissue` (boolean,
+default `false` — see "Forced reissue" below). **Returns:** `{ session_id,
+agent, generation, handoff_token, handoff_block }` where `generation` is the
 **pending (to-be-claimed) generation** = active_generation + 1, not the
 caller's current active generation.
 
@@ -2395,6 +2491,86 @@ current `collab_checkpoints` row, and composes a deterministic, model-free
 fenced markdown block (` ```ironrace-session-handoff `) — it NEVER asks a
 model to summarize. This tool is a WRITE tool and is denied in read-only /
 restricted MCP mode.
+
+**Forced reissue (`force_reissue`, issue #298).** `session_handoff` is the
+only tool that mints a handoff token, and on its normal path it calls the
+same generation guard every mutating collab call does
+(`ensure_actor_generation_current`) — so only a *live* holder of the current
+generation can mint the next token. If that process dies mid-session, the
+succession chain is severed: nothing can mint a new token, nothing
+server-side resets the generation, and the session is locked forever. Gating
+the repair behind the guard that caused the wedge would be the wedge, so
+`force_reissue: true` substitutes a different ladder for that guard rather
+than calling it, in this order:
+
+1. Write access (`IRONMEM_MCP_MODE=trusted`), checked before the transaction
+   even opens.
+2. `ensure_active` — an ended or abandoned session is refused with the
+   stable seal message ("session ... has ended ...") rather than
+   re-evaluated against staleness. This keeps a sealed session from ever
+   reading as re-leasable, the same guarantee "The `collab_end` abandon
+   contract" describes for other callers.
+3. `generation > 0` — at generation 0 nothing is locked and a fresh process
+   can already take the session with a plain tokenless call, so there is no
+   severed chain to repair.
+4. A demonstrably dead session: idle past `COLLAB_DEAD_SESSION_SECS` (6
+   hours) by the same paired staleness read `collab_end`'s abandon gate
+   uses, read *inside* this call's own write transaction so there is no
+   window between "is it dead?" and "re-lease it" for the session to go
+   live in.
+
+The precondition is checkable up front, without making the call, via
+`collab_status`'s `<agent>_lease.reclaimable` (see § `collab_status` above)
+— though see that section for the two ways the verdict and the call can
+disagree.
+
+**Forced reissue does not advance the generation.** A forced reissue mints
+(or byte-identically reuses) a *pending* token; it never writes
+`collab_actor_generations.generation`. It is the successor's **claim** of
+that token — the ordinary succession step every handoff has always
+required — that advances the generation and evicts the incumbent. So at the
+moment a forced reissue runs, a still-live incumbent is still valid: its
+generation was never touched, and its writes keep succeeding right up until
+a successor claims. A forced reissue is therefore not a new eviction
+mechanism layered on top of the lease — it is the existing one made
+reachable when the holder cannot mint the token that would trigger it. That
+is also why lease recovery is a `force_reissue` flag on `session_handoff`
+rather than a separate tool that reset the generation directly: resetting
+it outright would evict the incumbent unilaterally, with no successor
+guaranteed to take over, which is precisely the anti-resurrection property
+issue #91 closed.
+
+A successful forced reissue's response carries `"forced_reissue": true`.
+The key is **present only on this path, never `false` on an ordinary
+succession response** — a reader that skims for the key's presence, not its
+value, still gets the right answer. The call also writes a
+`session_handoff.force_reissue` audit row to the WAL, carrying
+`session_id`, `agent`, `prior_generation`, `last_activity`, `idle_secs`,
+`staleness_checked`, and the result (`pending_generation` and whether the
+token was freshly minted or `reused`).
+
+**Repeating the call.** A `force_reissue` call made before any claim, on a
+session that already has a token pending, returns the byte-identical token
+(`reused: true`) and does not double-count the handoff metric. It is also
+**not** re-checked against staleness: minting the pending token stamps
+`pending_handoff_issued_at`, which is itself one of the five signals
+`idle_secs` counts, so re-gating a retry would refuse a caller's own rescue
+using activity that same rescue just wrote. The accepted consequence: a
+token that was actually minted by a normal (non-forced) handoff can also be
+echoed back by a later forced call. That grants no more than the pending
+token already granted — the claim still advances the generation exactly
+once, and whichever caller loses the race to claim it gets `handoff_token
+already claimed`.
+
+**Alternative, not a sequence, to abandon.** `force_reissue` re-leases a
+dead session so a fresh process can continue it; `collab_end { abandon:
+true }` ends a dead session permanently. These are alternatives, not
+sequential steps: an abandoned session is sealed (see "The `collab_end`
+abandon contract" above), and `ensure_active` refuses `force_reissue` on it
+the same way it refuses every other mutating call, with the same "has
+ended" message. There is no sequence in which abandoning first and then
+forcing a reissue works — once a session is abandoned, it can never be
+re-leased.
 
 **Checkpoint lines.** The block carries `checkpoint` (`present` only for a
 verified `collab_checkpoints` row), `checkpoint.status`, `.task_id`,
@@ -2514,9 +2690,18 @@ is permitted only at generation 0 (a session that has never been handed off).
 resolves the actor from the target message's `receiver` field before
 applying the generation guard.
 
-**Self-guard.** `session_handoff` is itself generation-guarded. A stale or
-tokenless gen > 0 caller cannot mint a new token after a successor has
-claimed — resurrection is closed.
+**Self-guard.** `session_handoff` is itself generation-guarded: on its
+normal path, a stale or tokenless gen > 0 caller cannot mint a new token
+after a successor has claimed. `force_reissue: true` (see "Forced reissue"
+above) is the one documented way past that guard, and it does not reopen
+resurrection: a forced call mints a token but never advances the
+generation, so it evicts nobody by itself — a still-live incumbent (if any)
+keeps working exactly as before the call. Eviction still only ever happens
+at the successor's **claim**, which performs the same single ordinary
+eviction the lease has always performed, whether the token it claims was
+minted normally or by a forced reissue. Resurrection stays closed because
+that claim step is unchanged; `force_reissue` only adds a second way to
+reach it when the normal minting path is dead.
 
 **collab_status additions.** `collab_status` now returns `claude_generation`,
 `codex_generation`, `claude_handoff_pending`, and `codex_handoff_pending`
