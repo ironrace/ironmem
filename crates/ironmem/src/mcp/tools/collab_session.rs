@@ -2670,6 +2670,15 @@ pub(super) fn handle_collab_status(app: &App, args: &Value) -> Result<Value, Mem
         }),
         None => checkpoint_json(checkpoint.as_ref().zip(head_check.as_ref())),
     };
+    // Evaluated once, ahead of the loop, rather than once per agent inside
+    // it. `session_is_dead`'s `None` arm fires a `tracing::warn!` on every
+    // call — unreachable here in practice (the record load at the top of
+    // this handler already returns `NotFound` before `staleness` is ever
+    // read, so `last_activity` cannot be the missing-row `None` by the time
+    // this line runs), but calling it twice per status request would still
+    // warn twice for one read-only call if that invariant ever broke. One
+    // evaluation keeps the log honest either way.
+    let is_dead = staleness.is_dead();
     for ag in [Agent::Claude, Agent::Codex] {
         let g = app
             .db
@@ -2718,25 +2727,46 @@ pub(super) fn handle_collab_status(app: &App, args: &Value) -> Result<Value, Mem
         // locked against every successor, only against one without the token.
         let claimable = generation == 0 || pending;
 
-        // `reclaimable`: not claimable, but `session_handoff { force_reissue:
-        // true }` would be admitted for it — held at generation > 0 with no
-        // pending token, and dead by the exact predicate the gate enforces
+        // `reclaimable`: not claimable, and locked the way a dead-lease
+        // rescue targets — held at generation > 0 with no pending token, and
+        // dead by the exact predicate the gate enforces
         // (`crate::collab::session_is_dead`, read here through the same
         // `staleness` snapshot the gate itself reads inside its write
         // transaction; see `handle_session_handoff`'s forced-path comment for
         // why that read must be paired with the write there, and see this
         // function's own comment on `staleness` above for why a read-only
-        // diagnostic may read it a moment earlier instead).
+        // diagnostic may read it a moment earlier instead). It is neither a
+        // sufficient nor a necessary condition for `session_handoff
+        // { force_reissue: true }` actually succeeding — both gaps are named
+        // below, in one place, because a maintainer who trusts either
+        // direction unconditionally will ship a mis-diagnosis for exactly the
+        // caller this field exists to help.
         //
-        // This is deliberately narrower than "force_reissue would succeed":
-        // the gate also admits a force_reissue call when a token is already
-        // pending (it echoes that token without a staleness check — see
-        // `handle_session_handoff`'s "D-P1" comment). That is not a case this
-        // field claims to cover; a pending token already reads `claimable`,
-        // and this field's whole job is to distinguish "usable right now" from
-        // "usable only via the dead-lease repair". Folding the D-P1 echo in
-        // here would make `reclaimable: false` sometimes still admit a forced
-        // call, which is exactly the drift this field exists to prevent.
+        // Not sufficient — deliberately narrower than "force_reissue would
+        // succeed" in one direction: the gate also admits a force_reissue
+        // call when a token is already pending (it echoes that token without
+        // a staleness check — see `handle_session_handoff`'s "D-P1" comment).
+        // That is not a case this field claims to cover; a pending token
+        // already reads `claimable`, and this field's whole job is to
+        // distinguish "usable right now" from "usable only via the
+        // dead-lease repair". Folding the D-P1 echo in here would make
+        // `reclaimable: false` sometimes still admit a forced call, which is
+        // exactly the drift this field exists to prevent.
+        //
+        // Not necessary — and, in the opposite direction, actually *wider*:
+        // on the forced path `ensure_active` runs BEFORE the generation/
+        // staleness ladder (see `handle_session_handoff`'s comment on that
+        // ordering, which exists to keep #297's seal from being re-leasable).
+        // So an ended or abandoned session — maximally stale by construction
+        // — reads `reclaimable: true` here while `force_reissue` refuses it
+        // with "has ended" (pinned by `handoff.rs`'s
+        // `forced_reissue_is_refused_on_an_ended_session`, and by the sibling
+        // test in this module's own test suite below). This field
+        // deliberately does not read `ended_at` to close that gap — doing so
+        // would make a read-only diagnostic re-implement the seal check
+        // rather than name one specific route in. A caller that needs the
+        // combined answer reads `reclaimable` beside `ended_at`, which
+        // `session_record_json` already puts in this same response.
         status[format!("{}_lease", ag.as_str())] = json!({
             "generation": generation,
             "handoff_pending": pending,
@@ -2749,7 +2779,7 @@ pub(super) fn handle_collab_status(app: &App, args: &Value) -> Result<Value, Mem
             // it is false.
             "last_activity": staleness.last_activity(),
             "idle_secs": staleness.idle_secs(),
-            "reclaimable": !claimable && staleness.is_dead(),
+            "reclaimable": !claimable && is_dead,
         });
     }
     Ok(status)
@@ -7621,6 +7651,55 @@ mod tests {
         )
         .expect("reclaimable: true must agree with the gate it describes");
         assert_eq!(resp["forced_reissue"], json!(true), "{resp}");
+    }
+
+    /// The one direction `reclaimable` does NOT promise: an ended session is
+    /// maximally stale by construction, so a lease it still holds reads
+    /// `reclaimable: true` here — but the forced path checks `ensure_active`
+    /// BEFORE the staleness ladder (the same ordering
+    /// `forced_reissue_is_refused_on_an_ended_session` in `handoff.rs` pins,
+    /// for the same reason: #297's seal must not become re-leasable), so
+    /// `force_reissue` refuses with the seal message, not a claim. This is
+    /// the "not necessary" half of the comment above the `_lease` block; the
+    /// "not sufficient" half is `collab_status_lease_with_pending_token_is_
+    /// claimable_not_reclaimable`, which covers the D-P1 echo instead.
+    ///
+    /// The join this field expects of its caller — `reclaimable` alongside
+    /// `ended_at` — is asserted directly: `ended_at` really is non-null on
+    /// this same response, so a caller who reads both fields (as the comment
+    /// tells them to) never lands on the wrong verdict.
+    #[test]
+    fn collab_status_lease_reclaimable_on_ended_session_disagrees_with_force_reissue() {
+        let app = test_app();
+        let sid = start_session(&app);
+        advance_generation(&app, &sid, Agent::Claude);
+        age_session(&app, &sid, crate::collab::COLLAB_DEAD_SESSION_SECS + 60);
+        let _ = app
+            .db
+            .with_transaction(|tx| crate::collab::queue::end_session(tx, &sid))
+            .unwrap();
+
+        let status = handle_collab_status(&app, &json!({ "session_id": sid })).unwrap();
+        let lease = &status["claude_lease"];
+        assert_eq!(
+            lease["reclaimable"],
+            json!(true),
+            "the lease is dead by the same predicate the gate reads: {status}"
+        );
+        assert!(
+            status["ended_at"].is_string(),
+            "the caller's escape hatch out of this false positive must be present              on the very response that carries it: {status}"
+        );
+
+        let err = super::super::handoff::handle_session_handoff(
+            &app,
+            &json!({ "session_id": sid, "agent": "claude", "force_reissue": true }),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("has ended"),
+            "reclaimable: true must NOT be trusted unconditionally — an ended session              is refused by the seal, not admitted by the staleness ladder: {err}"
+        );
     }
 
     #[test]
