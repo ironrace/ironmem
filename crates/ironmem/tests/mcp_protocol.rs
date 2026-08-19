@@ -8215,27 +8215,56 @@ fn inspect_divergence_writes_nothing() {
         before_wal,
         "inspection must write no audit row of any operation"
     );
-    // `idle_secs` is dropped from both sides before comparing, and it is the
-    // only field that may be: it is `now - last_activity`, recomputed per
-    // call, so it ticks with the wall clock whether or not anything was
-    // written. Comparing it would make this test fail whenever the two
-    // `collab_status` calls straddle a second boundary — a flake that says
-    // nothing about whether inspection wrote anything. The stored half of that
-    // pair, `last_activity`, stays in the comparison and is what actually
-    // carries the read-only claim: it moves if and only if a write touched one
-    // of the four activity sources.
+    // THREE fields are dropped from both sides before comparing, and they are
+    // the only ones that may be: the top-level `idle_secs`, and the copy each
+    // `<agent>_lease` verdict block carries one level down. All three are
+    // `now - last_activity`, recomputed per call, so they tick with the wall
+    // clock whether or not anything was written. Comparing them makes this test
+    // fail whenever the two `collab_status` calls straddle a second boundary —
+    // a flake that says nothing about whether inspection wrote anything.
+    //
+    // The nested pair is why this is a loop over three sites rather than the
+    // single top-level removal it used to be. #298 Task 2 added the
+    // `<agent>_lease` blocks, each repeating `idle_secs` beside the verdict it
+    // produced (`docs/COLLAB.md`); the old scrub reached only the top-level
+    // key, so those two copies stayed in a byte-identical comparison and this
+    // test began failing intermittently under full-suite parallel load with
+    // `idle_secs` off by exactly one. That was first read as a pre-existing
+    // timing flake because the test pre-dates the change — it was not. Do not
+    // answer a recurrence by reshaping `collab_status`: this test adapts to the
+    // surface, not the reverse.
+    //
+    // The STORED half of the pair, `last_activity`, stays in the comparison at
+    // every level — top-level and inside both lease blocks — and it is what
+    // actually carries the read-only claim: it moves if and only if a write
+    // touched one of the activity sources. Dropping it would gut the test.
+    //
+    // Every removal asserts the key was present first, so a rename or a removal
+    // upstream surfaces here rather than silently shrinking both sides of a
+    // comparison that would then still pass.
+    fn drop_recomputed_idle_secs(owner: &mut serde_json::Value, what: &str) {
+        let object = owner
+            .as_object_mut()
+            .unwrap_or_else(|| panic!("{what} must be a JSON object"));
+        assert!(
+            object.remove("idle_secs").is_some(),
+            "{what} must report idle_secs — if it stops, drop this removal rather than \
+             letting the comparison silently lose a field"
+        );
+    }
     let mut after_status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
     let mut before_status = before_status;
     for status in [&mut before_status, &mut after_status] {
-        assert!(
-            status
-                .as_object_mut()
-                .expect("collab_status returns an object")
-                .remove("idle_secs")
-                .is_some(),
-            "collab_status must report idle_secs — if it stops, drop this removal rather than \
-             letting the comparison silently lose a field"
-        );
+        drop_recomputed_idle_secs(status, "collab_status");
+        for agent in ["claude", "codex"] {
+            let block = &mut status[format!("{agent}_lease")];
+            assert!(
+                block.is_object(),
+                "collab_status must carry a {agent}_lease verdict block — if it stops, drop \
+                 this removal rather than letting the comparison silently lose a field"
+            );
+            drop_recomputed_idle_secs(block, &format!("{agent}_lease"));
+        }
     }
     assert_eq!(
         after_status, before_status,
