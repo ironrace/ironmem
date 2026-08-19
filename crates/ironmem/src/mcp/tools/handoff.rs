@@ -2335,6 +2335,28 @@ mod tests {
     /// Task 4 layers a full refusal taxonomy on top of this shape: a setup
     /// that drifted between tests would have each of them exercising a
     /// slightly different wedge while all still passing.
+    ///
+    /// # Why this type implements `Drop` with an empty body
+    ///
+    /// `dir` owns the temp directory holding the SQLite file, and it must
+    /// outlive the whole test body. The obvious call-site shape —
+    /// `let DeadLease { rescuer, session_id, .. } = dead_lease_and_rescuer();`
+    /// — quietly breaks that: Rust drops the fields left under `..` at the end
+    /// of the `let` statement, so the directory and the database file are
+    /// deleted before the first assertion runs. Every such test still *passed*,
+    /// because POSIX keeps an already-open file alive after unlink and the
+    /// `rescuer` connection was open — but the next `App` opened over
+    /// `db_path` finds nothing, which is exactly what Task 4's durability
+    /// scenario does when it reopens the database after a forced reissue and a
+    /// claim. It would have failed looking like a bug in the feature.
+    ///
+    /// An empty `Drop` impl makes that shape a **compile error** (E0509,
+    /// "cannot move out of a type which implements `Drop`") rather than a
+    /// silent early delete. Binding `dir: _dir` at each call site would fix the
+    /// sites that exist today; this fixes the sites Task 4 has not written yet,
+    /// which is the property actually wanted. Access the fields by reference
+    /// (`&lease.rescuer`, `&lease.session_id`) and hold the `DeadLease` binding
+    /// for the length of the test.
     struct DeadLease {
         /// The fresh process attempting the rescue: a *second* `App` over the
         /// same database file, so it has no cached generation, no token, and
@@ -2346,9 +2368,17 @@ mod tests {
         /// claimed.
         spent_token: String,
         db_path: std::path::PathBuf,
-        /// Held for the lifetime of the test — dropping it deletes the
-        /// database out from under `rescuer`.
+        /// Owns the temp directory for as long as this value lives. Never read
+        /// on most paths — its whole job is to not be dropped early, which the
+        /// `Drop` impl above is what actually guarantees.
+        #[allow(dead_code)]
         dir: tempfile::TempDir,
+    }
+
+    /// Empty on purpose — see [`DeadLease`]. The impl exists so the type cannot
+    /// be partially moved out of, not to run anything at scope end.
+    impl Drop for DeadLease {
+        fn drop(&mut self) {}
     }
 
     /// An active session whose lease sits at generation 1 with every activity
@@ -2383,18 +2413,24 @@ mod tests {
     /// eviction primitive rather than the existing one made reachable.
     #[test]
     fn forced_reissue_on_a_dead_lease_does_not_advance_the_generation() {
-        let DeadLease {
-            rescuer,
-            session_id: sid,
-            ..
-        } = dead_lease_and_rescuer();
+        let lease = dead_lease_and_rescuer();
+        let (rescuer, sid) = (&lease.rescuer, lease.session_id.as_str());
+        // The fixture's database must still be on disk here. It is not merely
+        // a setup assertion: a call site that moved fields out of `DeadLease`
+        // would have deleted the directory at the `let`, and every assertion
+        // below would still pass on the unlinked-but-open file. See the
+        // `DeadLease` doc for why that shape is now a compile error.
+        assert!(
+            lease.db_path.exists(),
+            "the fixture must keep its database alive for the whole test"
+        );
         assert_eq!(
-            db_generation(&rescuer, &sid, Agent::Claude),
+            db_generation(rescuer, sid, Agent::Claude),
             Some(1),
             "setup: the lease must be at generation 1 before the rescue"
         );
 
-        let resp = handle_session_handoff(&rescuer, &force_args(&sid, "claude"))
+        let resp = handle_session_handoff(rescuer, &force_args(sid, "claude"))
             .expect("a demonstrably dead lease must be forcibly re-leasable");
 
         assert_eq!(
@@ -2411,12 +2447,12 @@ mod tests {
         );
 
         assert_eq!(
-            db_generation(&rescuer, &sid, Agent::Claude),
+            db_generation(rescuer, sid, Agent::Claude),
             Some(1),
             "R1: force_reissue must NOT advance collab_actor_generations.generation"
         );
         assert!(
-            rescuer.cached_generation(&sid, Agent::Claude).is_none(),
+            rescuer.cached_generation(sid, Agent::Claude).is_none(),
             "R1: the forced path claims nothing, so it must publish nothing to the \
              advisory cache — a published generation would admit this process as the actor"
         );
@@ -2428,25 +2464,22 @@ mod tests {
     /// bypass it.
     #[test]
     fn the_forced_token_still_advances_the_generation_when_claimed() {
-        let DeadLease {
-            rescuer,
-            session_id: sid,
-            ..
-        } = dead_lease_and_rescuer();
-        let token = handle_session_handoff(&rescuer, &force_args(&sid, "claude")).unwrap()
+        let lease = dead_lease_and_rescuer();
+        let (rescuer, sid) = (&lease.rescuer, lease.session_id.as_str());
+        let token = handle_session_handoff(rescuer, &force_args(sid, "claude")).unwrap()
             ["handoff_token"]
             .as_str()
             .unwrap()
             .to_string();
 
         handle_session_handoff(
-            &rescuer,
+            rescuer,
             &json!({ "session_id": sid, "agent": "claude", "handoff_token": token }),
         )
         .expect("the forced token must be claimable like any other");
 
         assert_eq!(
-            db_generation(&rescuer, &sid, Agent::Claude),
+            db_generation(rescuer, sid, Agent::Claude),
             Some(2),
             "the CLAIM — not the forced reissue — is what advances the generation"
         );
@@ -2550,14 +2583,11 @@ mod tests {
     /// true, and the generation has not moved.
     #[test]
     fn a_forced_reissue_can_be_retried_without_waiting_out_its_own_liveness() {
-        let DeadLease {
-            rescuer,
-            session_id: sid,
-            ..
-        } = dead_lease_and_rescuer();
-        let first = handle_session_handoff(&rescuer, &force_args(&sid, "claude")).unwrap();
+        let lease = dead_lease_and_rescuer();
+        let (rescuer, sid) = (&lease.rescuer, lease.session_id.as_str());
+        let first = handle_session_handoff(rescuer, &force_args(sid, "claude")).unwrap();
         // No aging in between: the session is now live *because of* the call above.
-        let second = handle_session_handoff(&rescuer, &force_args(&sid, "claude"))
+        let second = handle_session_handoff(rescuer, &force_args(sid, "claude"))
             .expect("a retry must not be refused for liveness the first call created");
 
         assert_eq!(
@@ -2567,7 +2597,7 @@ mod tests {
         assert_eq!(first["generation"], second["generation"]);
         assert_eq!(second["forced_reissue"], true);
         assert_eq!(
-            db_generation(&rescuer, &sid, Agent::Claude),
+            db_generation(rescuer, sid, Agent::Claude),
             Some(1),
             "R1 holds across the echo too"
         );
@@ -2581,15 +2611,12 @@ mod tests {
     /// this path exists to clear.
     #[test]
     fn a_stale_token_alongside_force_reissue_is_ignored_not_refused() {
-        let DeadLease {
-            rescuer,
-            session_id: sid,
-            spent_token: spent,
-            ..
-        } = dead_lease_and_rescuer();
+        let lease = dead_lease_and_rescuer();
+        let (rescuer, sid) = (&lease.rescuer, lease.session_id.as_str());
+        let spent = lease.spent_token.as_str();
 
         let normal = handle_session_handoff(
-            &rescuer,
+            rescuer,
             &json!({ "session_id": sid, "agent": "claude", "handoff_token": spent }),
         );
         assert!(
@@ -2597,9 +2624,9 @@ mod tests {
             "setup: the spent token must be refused on the normal path"
         );
 
-        let mut args = force_args(&sid, "claude");
+        let mut args = force_args(sid, "claude");
         args["handoff_token"] = json!(spent);
-        let resp = handle_session_handoff(&rescuer, &args)
+        let resp = handle_session_handoff(rescuer, &args)
             .expect("force_reissue must ignore the spent token rather than choke on it");
         assert_eq!(resp["forced_reissue"], true);
         assert_ne!(
@@ -2607,7 +2634,7 @@ mod tests {
             "the rescue must mint a fresh token, not echo the spent one"
         );
         assert_eq!(
-            db_generation(&rescuer, &sid, Agent::Claude),
+            db_generation(rescuer, sid, Agent::Claude),
             Some(1),
             "R1: ignoring the token must not turn into claiming it"
         );
@@ -2665,26 +2692,21 @@ mod tests {
     fn forced_reissue_requires_write_access() {
         use crate::config::{Config, EmbedMode, McpAccessMode};
 
-        let DeadLease {
-            rescuer: trusted,
-            session_id: sid,
-            db_path,
-            dir,
-            ..
-        } = dead_lease_and_rescuer();
+        let lease = dead_lease_and_rescuer();
+        let (trusted, sid) = (&lease.rescuer, lease.session_id.as_str());
 
         let ro_config = Config {
-            db_path: db_path.clone(),
-            model_dir: dir.path().join("model"),
+            db_path: lease.db_path.clone(),
+            model_dir: lease.dir.path().join("model"),
             model_dir_explicit: true,
-            state_dir: dir.path().join("state"),
+            state_dir: lease.dir.path().join("state"),
             mcp_access_mode: McpAccessMode::ReadOnly,
             embed_mode: EmbedMode::Noop,
         };
         #[allow(clippy::arc_with_non_send_sync)]
         let ro_app = std::sync::Arc::new(crate::mcp::app::App::new(ro_config).unwrap());
 
-        let err = handle_session_handoff(&ro_app, &force_args(&sid, "claude")).unwrap_err();
+        let err = handle_session_handoff(&ro_app, &force_args(sid, "claude")).unwrap_err();
         assert!(
             matches!(err, MemoryError::Permission(_)),
             "expected Permission, got: {err:?}"
@@ -2694,7 +2716,7 @@ mod tests {
             "the refusal must name the missing capability: {err}"
         );
         assert!(
-            read_actor_generation_pending(&trusted, &sid, Agent::Claude).is_none(),
+            read_actor_generation_pending(trusted, sid, Agent::Claude).is_none(),
             "a refused forced reissue must not have minted a pending token"
         );
     }
