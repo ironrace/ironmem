@@ -2390,7 +2390,11 @@ mod tests {
         let origin = test_app_with_db_path(db_path.clone(), dir.path());
         let session_id = seed_active_session(&origin);
         let spent_token = advance_to_generation_one(&origin, &session_id, Agent::Claude);
-        age_session(&origin, &session_id, crate::collab::COLLAB_DEAD_SESSION_SECS + 60);
+        age_session(
+            &origin,
+            &session_id,
+            crate::collab::COLLAB_DEAD_SESSION_SECS + 60,
+        );
         let rescuer = test_app_with_db_path(db_path.clone(), dir.path());
         DeadLease {
             rescuer,
@@ -2442,7 +2446,9 @@ mod tests {
             "the forced path must mark itself in the response"
         );
         assert!(
-            resp["handoff_token"].as_str().is_some_and(|t| !t.is_empty()),
+            resp["handoff_token"]
+                .as_str()
+                .is_some_and(|t| !t.is_empty()),
             "the rescue must hand back a usable token: {resp}"
         );
 
@@ -2630,7 +2636,8 @@ mod tests {
             .expect("force_reissue must ignore the spent token rather than choke on it");
         assert_eq!(resp["forced_reissue"], true);
         assert_ne!(
-            resp["handoff_token"], json!(spent),
+            resp["handoff_token"],
+            json!(spent),
             "the rescue must mint a fresh token, not echo the spent one"
         );
         assert_eq!(
