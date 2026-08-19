@@ -2678,8 +2678,79 @@ pub(super) fn handle_collab_status(app: &App, args: &Value) -> Result<Value, Mem
             Some(a) => (a.generation, a.pending.is_some()),
             None => (0, false),
         };
+        // The flat keys below are the documented `collab_status` surface
+        // (`docs/COLLAB.md`'s "collab_status additions" paragraph under
+        // § `session_handoff`) and are pinned by
+        // `collab_status_lease_at_generation_zero_is_claimable_not_reclaimable`
+        // and its siblings. This block *adds* a verdict beside them — it does
+        // not replace a contract, so it does not remove or reshape either key.
         status[format!("{}_generation", ag.as_str())] = json!(generation);
         status[format!("{}_handoff_pending", ag.as_str())] = json!(pending);
+
+        // D4: name the verdict rather than leave every caller to re-derive it.
+        // Both `claimable` and `reclaimable` were already answerable from the
+        // two flat keys just above — `claimable` is a one-line boolean over
+        // them, and `reclaimable` needs only the staleness snapshot this
+        // handler already read for the top-level `last_activity`/`idle_secs`
+        // keys. Nothing here is new information; what was missing was a
+        // server-side name for the answer, so each caller (today: an
+        // operator reading this block by eye; from #299 on: a command-surface
+        // preflight) re-derived the same rule instead of reading it.
+        //
+        // `collab_status` is the right home specifically because it is NOT
+        // lease-gated (unlike `collab_send`/`collab_approve`/etc., which all
+        // route through `ensure_actor_generation_current`). A process locked
+        // out of every mutating call by a dead incumbent can still read this
+        // block and learn that fact — which is the entire point of a
+        // diagnosis for a wedged session. An alternative considered and
+        // rejected: compute this in `handle_session_handoff` and have callers
+        // probe it with a dry run. That does not work here — the one caller
+        // who most needs the answer is exactly the one every lease-gated call
+        // refuses.
+        //
+        // `claimable`: a fresh process can take this lease right now, either
+        // by a tokenless first touch at generation 0, or by presenting the
+        // pending token. Note the asymmetry `handoff_pending` does not
+        // resolve on its own: "claimable" here means claimable *by whoever
+        // holds that token* — this surface never exposes the token itself,
+        // so a caller without it cannot act on `claimable: true` for the
+        // pending-token case. It is still the correct name: the lease is not
+        // locked against every successor, only against one without the token.
+        let claimable = generation == 0 || pending;
+
+        // `reclaimable`: not claimable, but `session_handoff { force_reissue:
+        // true }` would be admitted for it — held at generation > 0 with no
+        // pending token, and dead by the exact predicate the gate enforces
+        // (`crate::collab::session_is_dead`, read here through the same
+        // `staleness` snapshot the gate itself reads inside its write
+        // transaction; see `handle_session_handoff`'s forced-path comment for
+        // why that read must be paired with the write there, and see this
+        // function's own comment on `staleness` above for why a read-only
+        // diagnostic may read it a moment earlier instead).
+        //
+        // This is deliberately narrower than "force_reissue would succeed":
+        // the gate also admits a force_reissue call when a token is already
+        // pending (it echoes that token without a staleness check — see
+        // `handle_session_handoff`'s "D-P1" comment). That is not a case this
+        // field claims to cover; a pending token already reads `claimable`,
+        // and this field's whole job is to distinguish "usable right now" from
+        // "usable only via the dead-lease repair". Folding the D-P1 echo in
+        // here would make `reclaimable: false` sometimes still admit a forced
+        // call, which is exactly the drift this field exists to prevent.
+        status[format!("{}_lease", ag.as_str())] = json!({
+            "generation": generation,
+            "handoff_pending": pending,
+            "claimable": claimable,
+            // Session-scoped, not per-agent — one activity clock serves both
+            // agents' verdicts. Repeated inside each agent's block anyway (not
+            // left as a top-level join) so a caller reading one agent's
+            // verdict already has the number that produced `reclaimable`,
+            // rather than having to cross-reference a sibling key to learn why
+            // it is false.
+            "last_activity": staleness.last_activity(),
+            "idle_secs": staleness.idle_secs(),
+            "reclaimable": !claimable && staleness.is_dead(),
+        });
     }
     Ok(status)
 }
@@ -7390,6 +7461,166 @@ mod tests {
             err.to_string().contains("is still live"),
             "the gate must agree with the status it published: {err}"
         );
+    }
+
+    /// Drive `(session_id, agent)` to generation 1 through the real
+    /// issue-then-claim cycle, never a hand-set `UPDATE`. A hand-set
+    /// generation leaves the pending columns in a combination
+    /// `issue_or_reuse_handoff`/`claim_handoff_token` never produce, so a test
+    /// built on one would assert about a row shape production cannot reach.
+    /// `handoff.rs`'s test module has an identical helper
+    /// (`advance_to_generation_one`); it is private to that module's
+    /// `#[cfg(test)]` block, so this is a deliberate duplicate, not a
+    /// divergent implementation — both drive the same two public functions.
+    fn advance_generation(app: &crate::mcp::app::App, sid: &str, agent: Agent) {
+        let issued = app
+            .db
+            .with_transaction(|tx| crate::collab::issue_or_reuse_handoff(tx, sid, agent))
+            .unwrap();
+        app.db
+            .with_transaction(|tx| {
+                crate::collab::claim_handoff_token(tx, sid, agent, &issued.token)
+            })
+            .unwrap();
+    }
+
+    /// State 1 of the lease taxonomy: never handed off. A fresh process may
+    /// take this lease with a plain tokenless first touch, so it reads
+    /// claimable; there is nothing locked, so there is nothing to reclaim.
+    #[test]
+    fn collab_status_lease_at_generation_zero_is_claimable_not_reclaimable() {
+        let app = test_app();
+        let sid = start_session(&app);
+
+        let status = handle_collab_status(&app, &json!({ "session_id": sid })).unwrap();
+
+        // The flat keys are the documented, test-asserted surface — this
+        // block adds a verdict beside them, it does not replace them.
+        assert_eq!(status["claude_generation"], json!(0));
+        assert_eq!(status["claude_handoff_pending"], json!(false));
+
+        let lease = &status["claude_lease"];
+        assert_eq!(lease["generation"], json!(0));
+        assert_eq!(lease["handoff_pending"], json!(false));
+        assert_eq!(
+            lease["claimable"],
+            json!(true),
+            "gen 0 is a tokenless take: {status}"
+        );
+        assert_eq!(
+            lease["reclaimable"],
+            json!(false),
+            "nothing is locked, so there is nothing to reclaim: {status}"
+        );
+    }
+
+    /// State 2 of the lease taxonomy, and the one the plan calls out as
+    /// easiest to get backwards: a pending token exists on a lease already
+    /// past generation 0. It is claimable — by whoever holds the token — and
+    /// precisely because it is claimable, it must NOT also read reclaimable.
+    /// `force_reissue` and a claim are two different repairs for two
+    /// different situations; this block must not conflate them.
+    #[test]
+    fn collab_status_lease_with_pending_token_is_claimable_not_reclaimable() {
+        let app = test_app();
+        let sid = start_session(&app);
+        advance_generation(&app, &sid, Agent::Claude);
+        // A second handoff request, issued but not yet claimed — the pending
+        // state a live successor is mid-handoff on.
+        app.db
+            .with_transaction(|tx| crate::collab::issue_or_reuse_handoff(tx, &sid, Agent::Claude))
+            .unwrap();
+
+        let status = handle_collab_status(&app, &json!({ "session_id": sid })).unwrap();
+        assert_eq!(status["claude_generation"], json!(1));
+        assert_eq!(status["claude_handoff_pending"], json!(true));
+
+        let lease = &status["claude_lease"];
+        assert_eq!(lease["generation"], json!(1));
+        assert_eq!(lease["handoff_pending"], json!(true));
+        assert_eq!(
+            lease["claimable"],
+            json!(true),
+            "a pending token is claimable by whoever holds it: {status}"
+        );
+        assert_eq!(
+            lease["reclaimable"],
+            json!(false),
+            "a claimable lease does not also need reclaiming: {status}"
+        );
+    }
+
+    /// State 3 of the lease taxonomy: held, no pending token, session fresh.
+    /// Neither repair applies — the holder is presumed alive. Cross-checked
+    /// against the gate it describes: `session_handoff force_reissue` must
+    /// actually refuse here, or `reclaimable` would be naming a promise the
+    /// gate does not keep.
+    #[test]
+    fn collab_status_lease_held_and_fresh_is_neither_claimable_nor_reclaimable() {
+        let app = test_app();
+        let sid = start_session(&app);
+        advance_generation(&app, &sid, Agent::Claude);
+
+        let status = handle_collab_status(&app, &json!({ "session_id": sid })).unwrap();
+        let lease = &status["claude_lease"];
+        assert_eq!(lease["generation"], json!(1));
+        assert_eq!(lease["handoff_pending"], json!(false));
+        assert_eq!(lease["claimable"], json!(false), "{status}");
+        assert_eq!(lease["reclaimable"], json!(false), "{status}");
+
+        let err = super::super::handoff::handle_session_handoff(
+            &app,
+            &json!({ "session_id": sid, "agent": "claude", "force_reissue": true }),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("is still live"),
+            "reclaimable: false must agree with the gate it describes: {err}"
+        );
+    }
+
+    /// State 4 of the lease taxonomy: held, no pending token, session dead —
+    /// the wedge `force_reissue` exists to clear. Cross-checked the other
+    /// direction from state 3: `reclaimable: true` must agree with an actual
+    /// admission by the forced path, or the two would be free to drift apart.
+    ///
+    /// Also checks per-agent independence: codex was never touched on this
+    /// session, so codex's lease must still read claimable at generation 0
+    /// even though the *session* is dead — deadness alone does not make an
+    /// untouched agent's lease reclaimable, only a locked-and-dead one.
+    #[test]
+    fn collab_status_lease_held_and_dead_is_reclaimable() {
+        let app = test_app();
+        let sid = start_session(&app);
+        advance_generation(&app, &sid, Agent::Claude);
+        age_session(&app, &sid, crate::collab::COLLAB_DEAD_SESSION_SECS + 60);
+
+        let status = handle_collab_status(&app, &json!({ "session_id": sid })).unwrap();
+        let lease = &status["claude_lease"];
+        assert_eq!(lease["generation"], json!(1));
+        assert_eq!(lease["handoff_pending"], json!(false));
+        assert_eq!(lease["claimable"], json!(false), "{status}");
+        assert_eq!(lease["reclaimable"], json!(true), "{status}");
+        // The session-scoped clock is repeated inside the block so a reader
+        // of one agent's verdict never has to join against a top-level key.
+        assert_eq!(lease["last_activity"], status["last_activity"], "{status}");
+        assert_eq!(lease["idle_secs"], status["idle_secs"], "{status}");
+
+        let codex_lease = &status["codex_lease"];
+        assert_eq!(
+            codex_lease["claimable"],
+            json!(true),
+            "codex was never handed off; a dead session must not fabricate a lock \
+             on a lease nothing ever took: {status}"
+        );
+        assert_eq!(codex_lease["reclaimable"], json!(false), "{status}");
+
+        let resp = super::super::handoff::handle_session_handoff(
+            &app,
+            &json!({ "session_id": sid, "agent": "claude", "force_reissue": true }),
+        )
+        .expect("reclaimable: true must agree with the gate it describes");
+        assert_eq!(resp["forced_reissue"], json!(true), "{resp}");
     }
 
     #[test]
