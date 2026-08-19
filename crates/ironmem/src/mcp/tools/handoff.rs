@@ -754,7 +754,12 @@ pub(super) fn handle_session_handoff(app: &App, args: &Value) -> Result<Value, M
             // is supposed to be evidence *about*.
             let staleness = crate::collab::queue::session_staleness(tx, session_id)?;
 
-            if existing.as_ref().is_some_and(|a| a.pending.is_some()) {
+            // Named rather than inlined into the `if`, because it is also the
+            // audit trail's record of *which gate ladder ran*. A reader of the
+            // WAL row must not have to infer "the liveness check was skipped"
+            // from `reused` — see the warn and the audit row below.
+            let pending_already = existing.as_ref().is_some_and(|a| a.pending.is_some());
+            if pending_already {
                 // D-P1: echo the already-pending token, no staleness check.
                 tracing::warn!(
                     session_id = %session_id,
@@ -781,14 +786,21 @@ pub(super) fn handle_session_handoff(app: &App, args: &Value) -> Result<Value, M
                          the session row still exists."
                     )));
                 };
-                // `saturating_sub` for the hand-repaired-row case (an activity
+                // `saturating_sub` for the hand-repaired-row case: an activity
                 // timestamp of `i64::MAX` makes `idle_secs` saturate to
                 // `i64::MIN`, and plain subtraction of that panics under debug
-                // assertions, unwinding out of this closure), then `max(0)` for
-                // the clock-moved-backwards case (a small negative `idle` would
-                // otherwise render a remaining wait longer than the threshold
-                // itself). Both reasons are documented at
-                // `handle_collab_abandon`'s identical computation.
+                // assertions, unwinding out of this closure.
+                //
+                // `max(0)` is a FLOOR, not a cap. It does NOT bound the result
+                // by the threshold — it guards `idle >= COLLAB_DEAD_SESSION_SECS`,
+                // which would render a negative countdown, and which `!is_dead()`
+                // makes unreachable today. It is here for the same
+                // forward-looking reason the `let Some(idle) = ... else` arm
+                // above is. A clock that moved *backwards* still renders a
+                // remaining slightly larger than the threshold, and that is
+                // left alone on purpose: it is honest arithmetic on a bad
+                // clock. `handle_collab_abandon`'s identical computation
+                // carries the same two paragraphs.
                 let remaining = crate::collab::COLLAB_DEAD_SESSION_SECS
                     .saturating_sub(idle)
                     .max(0);
@@ -815,6 +827,12 @@ pub(super) fn handle_session_handoff(app: &App, args: &Value) -> Result<Value, M
                     "prior_generation": prior_generation,
                     "last_activity": staleness.last_activity(),
                     "idle_secs": staleness.idle_secs(),
+                    // False on the D-P1 echo path, where the liveness check was
+                    // deliberately skipped. The `idle_secs` beside it was still
+                    // measured — it just did not gate anything — so without this
+                    // flag the audit row would read as though a dead session had
+                    // been proven when none was.
+                    "staleness_checked": !pending_already,
                 })),
             )
         } else {
@@ -861,14 +879,23 @@ pub(super) fn handle_session_handoff(app: &App, args: &Value) -> Result<Value, M
     // would leave the caller believing the rescue did not happen while the lease
     // row says otherwise.
     if let Some(forced) = forced_from.as_ref() {
+        // The message must not assert a check that did not happen. On the D-P1
+        // echo path the staleness gate was skipped, so this line says
+        // "re-leased a generation lease" and lets `staleness_checked` carry
+        // whether deadness was actually demonstrated. Calling that "a dead
+        // generation" unconditionally would put a claim in the operator's log
+        // that the authorization path never established.
         tracing::warn!(
             session_id = %session_id,
             agent = %agent.as_str(),
             prior_generation = %forced["prior_generation"],
             idle_secs = %forced["idle_secs"],
+            staleness_checked = %forced["staleness_checked"],
             reused = issued.reused,
-            "collab: session_handoff force_reissue re-leased a dead generation; the successor's \
-             claim of this token — not this call — advances the generation"
+            "collab: session_handoff force_reissue re-leased a generation lease, bypassing the \
+             generation guard; staleness_checked=false means the already-pending token was \
+             echoed (D-P1) without a liveness check. The successor's claim of this token — not \
+             this call — advances the generation"
         );
         let params = json!({
             "session_id": session_id,
@@ -876,6 +903,7 @@ pub(super) fn handle_session_handoff(app: &App, args: &Value) -> Result<Value, M
             "prior_generation": forced["prior_generation"],
             "last_activity": forced["last_activity"],
             "idle_secs": forced["idle_secs"],
+            "staleness_checked": forced["staleness_checked"],
         });
         let result = json!({
             "pending_generation": issued.pending_generation,
@@ -2280,7 +2308,8 @@ mod tests {
     }
 
     /// Drive the lease to generation 1 the way production does: issue a token,
-    /// then claim it.
+    /// then claim it. Returns that token, now spent — presenting it again is a
+    /// hard refusal, which is what makes it useful to the tests that need one.
     ///
     /// Deliberately not an `UPDATE ... SET generation = 1`. The forced path
     /// branches on the *pending* columns as well as `generation`, and a
@@ -2289,7 +2318,7 @@ mod tests {
     /// built on one would be asserting about a row shape production cannot
     /// reach. Claiming also clears the pending token, which is what puts the
     /// staleness gate (rather than the already-pending echo) on the path.
-    fn advance_to_generation_one(app: &crate::mcp::app::App, sid: &str, agent: Agent) {
+    fn advance_to_generation_one(app: &crate::mcp::app::App, sid: &str, agent: Agent) -> String {
         let issued = app
             .db
             .with_transaction(|tx| issue_or_reuse_handoff(tx, sid, agent))
@@ -2297,6 +2326,49 @@ mod tests {
         app.db
             .with_transaction(|tx| claim_handoff_token(tx, sid, agent, &issued.token))
             .unwrap();
+        issued.token
+    }
+
+    /// The wedge #283 defect B describes, assembled end to end.
+    ///
+    /// One fixture rather than the same seven lines in every test, because
+    /// Task 4 layers a full refusal taxonomy on top of this shape: a setup
+    /// that drifted between tests would have each of them exercising a
+    /// slightly different wedge while all still passing.
+    struct DeadLease {
+        /// The fresh process attempting the rescue: a *second* `App` over the
+        /// same database file, so it has no cached generation, no token, and
+        /// no way to mint one through the normal guard — the situation that
+        /// arises when the generation holder dies.
+        rescuer: Arc<crate::mcp::app::App>,
+        session_id: String,
+        /// The token that carried the lease from generation 0 to 1, already
+        /// claimed.
+        spent_token: String,
+        db_path: std::path::PathBuf,
+        /// Held for the lifetime of the test — dropping it deletes the
+        /// database out from under `rescuer`.
+        dir: tempfile::TempDir,
+    }
+
+    /// An active session whose lease sits at generation 1 with every activity
+    /// signal back-dated past the death threshold, plus the fresh process that
+    /// arrives to rescue it.
+    fn dead_lease_and_rescuer() -> DeadLease {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("mem.sqlite3");
+        let origin = test_app_with_db_path(db_path.clone(), dir.path());
+        let session_id = seed_active_session(&origin);
+        let spent_token = advance_to_generation_one(&origin, &session_id, Agent::Claude);
+        age_session(&origin, &session_id, crate::collab::COLLAB_DEAD_SESSION_SECS + 60);
+        let rescuer = test_app_with_db_path(db_path.clone(), dir.path());
+        DeadLease {
+            rescuer,
+            session_id,
+            spent_token,
+            db_path,
+            dir,
+        }
     }
 
     fn force_args(sid: &str, agent: &str) -> Value {
@@ -2311,22 +2383,17 @@ mod tests {
     /// eviction primitive rather than the existing one made reachable.
     #[test]
     fn forced_reissue_on_a_dead_lease_does_not_advance_the_generation() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("mem.sqlite3");
-        let origin = test_app_with_db_path(db_path.clone(), dir.path());
-        let sid = seed_active_session(&origin);
-        advance_to_generation_one(&origin, &sid, Agent::Claude);
+        let DeadLease {
+            rescuer,
+            session_id: sid,
+            ..
+        } = dead_lease_and_rescuer();
         assert_eq!(
-            db_generation(&origin, &sid, Agent::Claude),
+            db_generation(&rescuer, &sid, Agent::Claude),
             Some(1),
             "setup: the lease must be at generation 1 before the rescue"
         );
 
-        age_session(&origin, &sid, crate::collab::COLLAB_DEAD_SESSION_SECS + 60);
-
-        // A *fresh* process — no cached generation, no token, and the holder
-        // of generation 1 is gone. This is the wedge #283 defect B describes.
-        let rescuer = test_app_with_db_path(db_path, dir.path());
         let resp = handle_session_handoff(&rescuer, &force_args(&sid, "claude"))
             .expect("a demonstrably dead lease must be forcibly re-leasable");
 
@@ -2361,14 +2428,11 @@ mod tests {
     /// bypass it.
     #[test]
     fn the_forced_token_still_advances_the_generation_when_claimed() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("mem.sqlite3");
-        let origin = test_app_with_db_path(db_path.clone(), dir.path());
-        let sid = seed_active_session(&origin);
-        advance_to_generation_one(&origin, &sid, Agent::Claude);
-        age_session(&origin, &sid, crate::collab::COLLAB_DEAD_SESSION_SECS + 60);
-
-        let rescuer = test_app_with_db_path(db_path, dir.path());
+        let DeadLease {
+            rescuer,
+            session_id: sid,
+            ..
+        } = dead_lease_and_rescuer();
         let token = handle_session_handoff(&rescuer, &force_args(&sid, "claude")).unwrap()
             ["handoff_token"]
             .as_str()
@@ -2461,8 +2525,14 @@ mod tests {
             .db
             .with_transaction(|tx| crate::collab::queue::end_session(tx, &sid))
             .unwrap();
-        age_session(&app, &sid, crate::collab::COLLAB_DEAD_SESSION_SECS + 60);
 
+        // Deliberately NOT aged, and do not "helpfully" add an `age_session`
+        // call here. The session must be ended-but-FRESH, because that is the
+        // only state in which the two candidate orderings disagree: with
+        // `ensure_active` first the seal message wins, and with staleness
+        // first this live session is refused with "is still live ... holds
+        // generation 1" instead. Aging it makes both orderings refuse, and the
+        // test then passes under the very reordering it exists to forbid.
         let err = handle_session_handoff(&app, &force_args(&sid, "claude")).unwrap_err();
         assert!(
             err.to_string().contains("has ended"),
@@ -2480,14 +2550,11 @@ mod tests {
     /// true, and the generation has not moved.
     #[test]
     fn a_forced_reissue_can_be_retried_without_waiting_out_its_own_liveness() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("mem.sqlite3");
-        let origin = test_app_with_db_path(db_path.clone(), dir.path());
-        let sid = seed_active_session(&origin);
-        advance_to_generation_one(&origin, &sid, Agent::Claude);
-        age_session(&origin, &sid, crate::collab::COLLAB_DEAD_SESSION_SECS + 60);
-
-        let rescuer = test_app_with_db_path(db_path, dir.path());
+        let DeadLease {
+            rescuer,
+            session_id: sid,
+            ..
+        } = dead_lease_and_rescuer();
         let first = handle_session_handoff(&rescuer, &force_args(&sid, "claude")).unwrap();
         // No aging in between: the session is now live *because of* the call above.
         let second = handle_session_handoff(&rescuer, &force_args(&sid, "claude"))
@@ -2514,25 +2581,13 @@ mod tests {
     /// this path exists to clear.
     #[test]
     fn a_stale_token_alongside_force_reissue_is_ignored_not_refused() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("mem.sqlite3");
-        let origin = test_app_with_db_path(db_path.clone(), dir.path());
-        let sid = seed_active_session(&origin);
+        let DeadLease {
+            rescuer,
+            session_id: sid,
+            spent_token: spent,
+            ..
+        } = dead_lease_and_rescuer();
 
-        // A token from generation 0→1 that has already been consumed, so
-        // presenting it on the normal path is a hard refusal.
-        let spent = origin
-            .db
-            .with_transaction(|tx| issue_or_reuse_handoff(tx, &sid, Agent::Claude))
-            .unwrap()
-            .token;
-        origin
-            .db
-            .with_transaction(|tx| claim_handoff_token(tx, &sid, Agent::Claude, &spent))
-            .unwrap();
-        age_session(&origin, &sid, crate::collab::COLLAB_DEAD_SESSION_SECS + 60);
-
-        let rescuer = test_app_with_db_path(db_path, dir.path());
         let normal = handle_session_handoff(
             &rescuer,
             &json!({ "session_id": sid, "agent": "claude", "handoff_token": spent }),
@@ -2610,12 +2665,13 @@ mod tests {
     fn forced_reissue_requires_write_access() {
         use crate::config::{Config, EmbedMode, McpAccessMode};
 
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("mem.sqlite3");
-        let trusted = test_app_with_db_path(db_path.clone(), dir.path());
-        let sid = seed_active_session(&trusted);
-        advance_to_generation_one(&trusted, &sid, Agent::Claude);
-        age_session(&trusted, &sid, crate::collab::COLLAB_DEAD_SESSION_SECS + 60);
+        let DeadLease {
+            rescuer: trusted,
+            session_id: sid,
+            db_path,
+            dir,
+            ..
+        } = dead_lease_and_rescuer();
 
         let ro_config = Config {
             db_path: db_path.clone(),

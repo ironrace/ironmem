@@ -3671,19 +3671,32 @@ fn handle_collab_abandon(
                      exists."
                 )));
             };
-            // `saturating_sub`, and then clamped at zero, for the reason
-            // `crate::collab::idle_secs` saturates on the way in: `idle` is
-            // caller-influenced only through the clock, but
-            // `collab_checkpoints.updated_at` is `INTEGER NOT NULL` with no
-            // range CHECK, so a hand-repaired row can hold `i64::MAX` — an
-            // activity timestamp far in the future — and `idle_secs` then
-            // saturates to `i64::MIN`. Plain subtraction of that panics under
-            // debug assertions (unwinding out of the `with_transaction`
-            // closure) and wraps to a nonsensical negative "remaining" under
-            // release ones. The `max(0)` covers the other end: a small
-            // negative `idle` (clock moved backwards) would otherwise render a
-            // remaining larger than the threshold itself, which reads as a
-            // longer wait than the gate actually imposes.
+            // `saturating_sub`, for the reason `crate::collab::idle_secs`
+            // saturates on the way in: `idle` is caller-influenced only
+            // through the clock, but `collab_checkpoints.updated_at` is
+            // `INTEGER NOT NULL` with no range CHECK, so a hand-repaired row
+            // can hold `i64::MAX` — an activity timestamp far in the future —
+            // and `idle_secs` then saturates to `i64::MIN`. Plain subtraction
+            // of that panics under debug assertions (unwinding out of the
+            // `with_transaction` closure) and wraps to a nonsensical negative
+            // "remaining" under release ones.
+            //
+            // `max(0)` is a FLOOR, not a cap, and it guards the opposite end:
+            // `idle >= COLLAB_DEAD_SESSION_SECS`, which would otherwise render
+            // a negative countdown. That is unreachable today — `!is_dead()`
+            // is exactly `idle < COLLAB_DEAD_SESSION_SECS` — and it sits here
+            // for the same forward-looking reason the `let Some(idle) = ...
+            // else` arm above does: nothing enforces the coupling between
+            // `session_is_dead` and this comparison, and an edit that loosens
+            // the predicate must not leave this line advertising a wait that
+            // has already elapsed.
+            //
+            // What neither guards, deliberately: a clock that moved
+            // *backwards* yields a small negative `idle`, and `21600 - (-5)`
+            // renders 21605s — slightly longer than the threshold itself.
+            // That is honest arithmetic on a bad clock (the gate really will
+            // not open for that long), so it is reported rather than clamped
+            // to a deadline the gate does not actually honour.
             let remaining = crate::collab::COLLAB_DEAD_SESSION_SECS
                 .saturating_sub(idle)
                 .max(0);
