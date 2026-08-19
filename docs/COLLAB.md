@@ -1679,19 +1679,23 @@ diverge for real, test-pinned reasons:
   runs `ensure_active` *before* the generation/staleness ladder, so a
   sealed session that is *also* dead by the staleness predicate reads
   `reclaimable: true` here while `force_reissue` refuses it with the "has
-  ended" seal message. An **abandoned** session is always in this state —
-  abandon itself requires 6h of idleness to succeed, and `end_session`
-  writes only `ended_at`, never `updated_at`, so nothing afterward revives
-  the activity signals. A **plainly-ended** session is not automatically in
-  this state: plain `collab_end` carries no staleness precondition, so a
-  freshly-ended session still reads `reclaimable: false` — the disagreement
-  only appears once such a session has also gone quiet past
-  `COLLAB_DEAD_SESSION_SECS`. Either way, this is the direction that
-  matters most: an operator reads `reclaimable` to decide whether a rescue
-  is worth attempting, and for any sealed-and-quiet session, this field
-  over-promises. `ended_at` is on this same `collab_status` response, so a
-  caller that needs the combined answer reads `reclaimable` alongside
-  `ended_at` rather than trusting `reclaimable` alone.
+  ended" seal message. Neither seal gets there for free: a plain
+  `collab_end` has no staleness precondition, so a freshly-ended session
+  still reads `reclaimable: false`. Abandon does require 6h of idleness to
+  *succeed* — but the abandon write is itself activity: `set_coding_failure`
+  stamps `updated_at` (it "touches `coding_failure` and `updated_at` and
+  nothing else," per "Spends no recovery attempt" under "The `collab_end`
+  abandon contract" below), so a freshly-abandoned session also reads live
+  and `reclaimable: false` for another six hours. Either way, the
+  disagreement appears once the sealed session has *also* gone quiet —
+  which every abandoned session reliably becomes, since nothing can write
+  to a sealed session afterward, and which a plainly-ended one may or may
+  not. This is the direction that matters most: an operator reads
+  `reclaimable` to decide whether a rescue is worth attempting, and for any
+  sealed-and-quiet session, this field over-promises. `ended_at` is on this
+  same `collab_status` response, so a caller that needs the combined answer
+  reads `reclaimable` alongside `ended_at` rather than trusting
+  `reclaimable` alone.
 
 **Do not substitute `updated_at` for `idle_secs`.** The session row's
 timestamp is only one of five activity sources, and a long
@@ -2202,12 +2206,13 @@ different problems on a stuck session, and they answer different questions:
   `failed_from_phase`. It is about the session's **failure** — but it is
   **not** lease-agnostic: `handle_collab_resume` calls
   `ensure_actor_generation_current` inside its own write transaction (with
-  the call's optional `handoff_token`), so a stale gen > 0 caller is
-  refused "this session has been handed off" exactly as any other mutating
-  call would be, and presenting a valid `handoff_token` **claims** the
-  lease and advances the generation, the same as any other claim (see
-  "Generation lease" below, which already lists `collab_resume` among the
-  claim-capable calls).
+  the call's optional `handoff_token`), so a caller behind the current
+  generation is refused exactly as any other mutating call would be — as
+  "stale collab generation" if it has a cached generation, or "this
+  session has been handed off" if it presents no token and has none — and
+  presenting a valid `handoff_token` **claims** the lease and advances the
+  generation, the same as any other claim (see "Generation lease" below,
+  which already lists `collab_resume` among the claim-capable calls).
 - `collab_end { abandon: true }` **ends** a dead session, permanently (see
   "The `collab_end` abandon contract" above).
 - `session_handoff { force_reissue: true }` **re-leases** a dead session's
@@ -2219,12 +2224,15 @@ different problems on a stuck session, and they answer different questions:
   lease itself.
 
 A session whose holder died mid-coding typically needs the third remedy
-first (a forced reissue, so a fresh process holds the lease again), and
-then possibly the first (`collab_resume`, if the interruption also left the
-session in `CodingFailed`). Neither of those two is the same call as
-abandon, and an abandoned session is refused by **both** of them,
-permanently. What an operator actually observes: abandon always ends the
-session (stamps `ended_at`), and both `handle_collab_resume` and the forced
+first — a forced reissue to mint a claimable token, followed by the fresh
+process's own claim of it, which is the step that actually transfers the
+lease (see "Forced reissue does not advance the generation" under §
+`session_handoff` below) — and then possibly the first (`collab_resume`, if
+the interruption also left the session in `CodingFailed`). Neither of those
+two is the same call as abandon, and an abandoned session is refused by
+**both** of them, permanently. What an operator actually observes: abandon
+always ends the session (stamps `ended_at`), and both `handle_collab_resume`
+and the forced
 path of `handle_session_handoff` call `ensure_active` before reaching their
 own further checks — so the refusal an abandoned session's `collab_resume`
 **or** `session_handoff { force_reissue: true }` call gets back is the same
