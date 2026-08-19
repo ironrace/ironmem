@@ -135,8 +135,12 @@ pub(super) fn ensure_actor_generation_current(
         } else {
             return Err(MemoryError::Validation(format!(
                 "stale collab generation for {}: local={cached} current={db_active}; \
-                 obtain a session_handoff token in a fresh process",
-                agent.as_str()
+                 obtain a session_handoff token in a fresh process — or, if the process \
+                 holding generation {db_active} is gone and cannot mint one, call \
+                 session_handoff with force_reissue=true (requires IRONMEM_MCP_MODE=trusted) \
+                 once the session has been idle {}",
+                agent.as_str(),
+                super::collab_session::dead_session_threshold_human(),
             )));
         }
     }
@@ -148,9 +152,51 @@ pub(super) fn ensure_actor_generation_current(
         app.set_cached_generation(session_id, agent, 0);
         return Ok(GenerationClaim::Unchanged);
     }
+    // Two preconditions of the `force_reissue` pointer named in both this
+    // refusal and the stale one above, and why only one of them is spelled
+    // out in the message text:
+    //
+    // 1. `generation > 0`. Both refusals are reachable only with
+    //    `db_active > 0` — the `db_active == 0` arm returns above, and the
+    //    stale arm requires `cached < db_active` with `cached: u64` — so
+    //    `force_reissue`'s own `generation > 0` gate is always satisfied by
+    //    the time either message is emitted. Not worth a word in the text:
+    //    it is simply always true here, never a reason force_reissue could
+    //    then be refused.
+    //
+    // 2. Write access. THIS one earned its mention in the message: unlike
+    //    the token-claim branch above (gated on `allows_writes` at its own
+    //    call site) and unlike a *plain* `session_handoff` mint (which needs
+    //    no write access at all), `force_reissue` demands
+    //    `IRONMEM_MCP_MODE=trusted` unconditionally — checked before this
+    //    guard even runs, in `handle_session_handoff`. And this guard's
+    //    tokenless arm is reachable from read-only callers: `handle_collab_recv`
+    //    (collab_session.rs) runs it on a plain, non-mutating read whenever the
+    //    session isn't sealed, so a ReadOnly- or Restricted-mode operator can
+    //    hit "handed off" here with no way to satisfy the fix it names unless
+    //    it says so. That is a static, always-true fact about `force_reissue`
+    //    itself, not a per-session maybe — worth stating plainly rather than
+    //    letting the operator discover it only after also clearing the idle
+    //    threshold.
+    //
+    // A third state — an ended/abandoned session — is NOT called out, on
+    // purpose. `ensure_active` runs before this guard on some call paths but
+    // after it on others (contrast `handle_collab_recv`'s hoisted seal check,
+    // ahead of the guard, with `ensure_caller_is_current_pilot`'s, after it),
+    // so a sealed session can land on either refusal here. But that is
+    // per-session state a static message cannot honestly summarize, and
+    // `force_reissue` itself checks it FIRST (before the generation and
+    // staleness gates) and reports it with the stable seal message — so an
+    // operator who tries the pointer and is sealed learns that from the very
+    // next call, accurately, rather than from a caveat here that would be
+    // true for some sessions and noise for the rest.
     Err(MemoryError::Validation(format!(
         "this session has been handed off (generation {db_active}); \
-         present a session_handoff token to claim it"
+         present a session_handoff token to claim it — or, if the process holding \
+         generation {db_active} is gone and cannot mint one, call session_handoff with \
+         force_reissue=true (requires IRONMEM_MCP_MODE=trusted) once the session has been \
+         idle {}; the claim that follows — not the reissue — is what advances the generation",
+        super::collab_session::dead_session_threshold_human(),
     )))
 }
 
@@ -1189,6 +1235,76 @@ mod tests {
         );
     }
 
+    /// #298: the stale-generation refusal must point at `force_reissue` as the
+    /// escape hatch for a holder that is gone, and must render the staleness
+    /// threshold from [`super::super::collab_session::dead_session_threshold_human`]
+    /// rather than a hardcoded literal — asserted against the derivation, not
+    /// against the string "6 hours", so raising `COLLAB_DEAD_SESSION_SECS`
+    /// cannot silently desync this test from the message it pins.
+    #[test]
+    fn stale_generation_refusal_names_force_reissue_and_the_derived_threshold() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("mem.sqlite3");
+
+        let pred = test_app_with_db_path(db_path.clone(), dir.path());
+        let succ = test_app_with_db_path(db_path, dir.path());
+        let session_id = "test-stale-pred-message";
+
+        pred.db
+            .with_transaction(|tx| {
+                create_session(
+                    tx,
+                    session_id,
+                    "/repo",
+                    "main",
+                    Some("t"),
+                    CollabRoles {
+                        pilot: Agent::Claude,
+                        implementer: Agent::Claude,
+                    },
+                )
+            })
+            .unwrap();
+        pred.db
+            .with_transaction(|tx| {
+                ensure_actor_generation_current(&pred, tx, session_id, Agent::Claude, None)
+            })
+            .unwrap()
+            .publish(&pred);
+        let token = pred
+            .db
+            .with_transaction(|tx| issue_or_reuse_handoff(tx, session_id, Agent::Claude))
+            .unwrap()
+            .token;
+        succ.db
+            .with_transaction(|tx| {
+                ensure_actor_generation_current(&succ, tx, session_id, Agent::Claude, Some(&token))
+            })
+            .unwrap()
+            .publish(&succ);
+
+        let err = pred
+            .db
+            .with_transaction(|tx| {
+                ensure_actor_generation_current(&pred, tx, session_id, Agent::Claude, None)
+            })
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains("force_reissue=true"),
+            "expected the force_reissue pointer, got: {err}"
+        );
+        assert!(
+            err.contains(&super::super::collab_session::dead_session_threshold_human()),
+            "expected the derived staleness threshold, got: {err}"
+        );
+        assert!(
+            err.contains("IRONMEM_MCP_MODE=trusted"),
+            "expected the write-access precondition, got: {err}"
+        );
+    }
+
     /// A token claim whose enclosing transaction later refuses the call must
     /// leave the advisory cache completely untouched.
     ///
@@ -2080,6 +2196,75 @@ mod tests {
         assert!(
             err.to_string().contains("handed off"),
             "expected 'handed off' in error, got: {err}"
+        );
+    }
+
+    /// #298: the handed-off refusal must point at `force_reissue`, render the
+    /// staleness threshold from the shared derivation (not a literal), name
+    /// its write-access precondition, and state that the successor's CLAIM —
+    /// not the reissue itself — is what advances the generation; a reader who
+    /// only reads this message must not conclude the reissue call alone
+    /// evicts the incumbent.
+    #[test]
+    fn handed_off_refusal_names_force_reissue_the_threshold_and_the_claim_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("mem.sqlite3");
+
+        let pred = test_app_with_db_path(db_path.clone(), dir.path());
+        let sid = uuid::Uuid::new_v4().to_string();
+        pred.db
+            .with_transaction(|tx| {
+                crate::collab::queue::create_session(
+                    tx,
+                    &sid,
+                    "/repo",
+                    "main",
+                    Some("t"),
+                    CollabRoles {
+                        pilot: Agent::Claude,
+                        implementer: Agent::Claude,
+                    },
+                )
+            })
+            .unwrap();
+
+        let token = pred
+            .db
+            .with_transaction(|tx| issue_or_reuse_handoff(tx, &sid, Agent::Claude))
+            .unwrap()
+            .token;
+        let succ = test_app_with_db_path(db_path.clone(), dir.path());
+        succ.db
+            .with_transaction(|tx| {
+                ensure_actor_generation_current(&succ, tx, &sid, Agent::Claude, Some(&token))
+            })
+            .unwrap()
+            .publish(&succ);
+
+        let fresh = test_app_with_db_path(db_path, dir.path());
+        let err = fresh
+            .db
+            .with_connection(|conn| {
+                ensure_actor_generation_current(&fresh, conn, &sid, Agent::Claude, None)
+            })
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains("force_reissue=true"),
+            "expected the force_reissue pointer, got: {err}"
+        );
+        assert!(
+            err.contains(&super::super::collab_session::dead_session_threshold_human()),
+            "expected the derived staleness threshold, got: {err}"
+        );
+        assert!(
+            err.contains("IRONMEM_MCP_MODE=trusted"),
+            "expected the write-access precondition, got: {err}"
+        );
+        assert!(
+            err.contains("the claim that follows") && err.contains("not the reissue"),
+            "expected the claim-advances-generation note, got: {err}"
         );
     }
 
