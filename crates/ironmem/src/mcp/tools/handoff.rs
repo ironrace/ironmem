@@ -210,6 +210,62 @@ pub(super) fn opt_handoff_token(args: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Whether `force_reissue` may act on a session in `phase`.
+///
+/// # Why this is an exhaustive `match` and not a `matches!`
+///
+/// The refused phases share one property: they wait on a **human** and write
+/// nothing to any agent-driven activity signal while they do, so a session
+/// parked in one reads as maximally stale no matter how alive its holder is.
+/// `collab_end`'s abandon gate accepts that false-positive risk because a wrong
+/// seal is loud and terminal. `force_reissue` cannot: a wrong verdict here hands
+/// an eviction capability to a caller acting against a process that never died,
+/// silently.
+///
+/// This began as `matches!(phase, PlanLocked | CodingComplete)`, and that shape
+/// is the bug rather than a style choice: a `matches!` against a two-variant
+/// pattern makes every **future** `Phase` default to *admitted* — the permissive
+/// answer, for a capability that evicts live processes — and it compiles clean.
+/// `CodingFailed` was already missing for exactly that reason. An exhaustive
+/// `match` that names every variant on both arms makes a new phase a compile
+/// error, which forces the question to be answered rather than defaulted. Do not
+/// collapse either arm into a `_`.
+///
+/// `collab_session.rs`'s `PHASE_ENDABILITY` / `PHASE_OWNER_REQUIRED` tables are
+/// the same discipline from the other side; the test-side twin of this function,
+/// `PHASE_FORCE_REISSUE_ADMITS`, spells the answers out independently so a typo
+/// here fails a row rather than silently redefining the rule.
+pub(super) fn force_reissue_admits_phase(phase: Phase) -> bool {
+    match phase {
+        // Waiting on the pilot's `task_list` send. `docs/COLLAB.md` is explicit
+        // that this phase is autonomous, but it is still a *wait*: nothing
+        // writes an agent-driven signal until the send lands.
+        Phase::PlanLocked => false,
+        // Terminal, waiting on operator attestation — a human step of unbounded
+        // duration by construction.
+        Phase::CodingComplete => false,
+        // `is_coding_terminal()` yet deliberately kept resumable
+        // (`collab/phase.rs`): it waits for a human to call `collab_resume` and
+        // writes nothing while it waits. Identical shape to the two above, and
+        // it was missed on the first pass — a genuine tooling-class failure,
+        // aged out, was admitted.
+        Phase::CodingFailed => false,
+        // Every remaining phase is agent-driven: it advances through
+        // `apply_event` → `save_session` (which stamps `collab_sessions.updated_at`),
+        // and its normal traffic writes `messages`. Six hours of silence in one
+        // of these really is anomalous, which is what makes the staleness gate
+        // meaningful here.
+        Phase::PlanParallelDrafts
+        | Phase::PlanSynthesisPending
+        | Phase::PlanCopilotReviewPending
+        | Phase::PlanFinalizePending
+        | Phase::CodeImplementPending
+        | Phase::CodeReviewLocalPending
+        | Phase::CodeReviewFixGlobalPending
+        | Phase::CodeReviewFinalPending => true,
+    }
+}
+
 /// The machine-readable name of the predicate that gated a forced reissue, for
 /// the audit row.
 ///
@@ -232,9 +288,10 @@ pub(super) fn staleness_scope_key(pending_already: bool) -> &'static str {
 /// refusal and the audit row can never describe different checks.
 pub(super) fn staleness_scope_human(pending_already: bool) -> &'static str {
     if pending_already {
-        "the session row, its checkpoint, and its messages (its handoff lease \
-         timestamps are excluded, because a token is already pending and a \
-         caller's own reissue must not count as activity)"
+        "the session row, its checkpoint, its messages, the other agent's handoff \
+         lease, and this agent's last handoff claim (only this agent's pending-token \
+         issue time is excluded, because a token is already pending and a caller's \
+         own reissue must not count as its own activity)"
     } else {
         "the session row, its checkpoint, its messages, and its handoff lease"
     }
@@ -745,18 +802,18 @@ pub(super) fn handle_session_handoff(app: &App, args: &Value) -> Result<Value, M
             //    tokenless call, so there is no severed chain to repair and the
             //    forced path would only be a way to skip the guard.
             //
-            // 3. The two human-gated phases. `PlanLocked` and
-            //    `CodingComplete` can sit perfectly live with zero writes to
-            //    any agent-driven signal for far longer than six hours while a
-            //    human simply has not acted yet — `session_last_activity`'s doc
-            //    says so outright and names #298 as inheriting the risk
-            //    "undiminished". Under #297 a false positive there sealed a
-            //    paused session: loud and terminal. Here it would hand a live
-            //    eviction capability to a caller acting against a process that
-            //    was never dead, silently. Refused before staleness for the
-            //    reason abandon puts its owner check before staleness: it is
-            //    the refusal the caller can act on, and no amount of waiting
-            //    will change it.
+            // 3. The human-gated phases, via `force_reissue_admits_phase` —
+            //    `PlanLocked`, `CodingComplete`, `CodingFailed`. Each can sit
+            //    perfectly live with zero writes to any agent-driven signal for
+            //    far longer than six hours while a human simply has not acted
+            //    yet — `session_last_activity`'s doc says so outright and names
+            //    #298 as inheriting the risk "undiminished". Under #297 a false
+            //    positive there sealed a paused session: loud and terminal. Here
+            //    it would hand a live eviction capability to a caller acting
+            //    against a process that was never dead, silently. Refused before
+            //    staleness for the reason abandon puts its owner check before
+            //    staleness: it is the refusal the caller can act on, and no
+            //    amount of waiting will change it.
             //
             // 4. Staleness, read INSIDE this write transaction. A predicate
             //    read outside it is a TOCTOU window in which the session goes
@@ -805,15 +862,30 @@ pub(super) fn handle_session_handoff(app: &App, args: &Value) -> Result<Value, M
             // lease's own timestamps are two of the five activity signals, so
             // the recovery machinery counts as session activity. Fixed at that
             // root: the pending case gates on
-            // `session_staleness_excluding_lease`, the same predicate minus the
-            // two `collab_actor_generations` terms.
+            // `session_staleness_excluding_lease`, the same predicate minus
+            // exactly ONE term: *this* agent's `pending_handoff_issued_at`.
             //
-            // * Genuinely dead session: the three agent-driven signals are
-            //   still dead, so the caller's own retry is admitted — D-P1's
-            //   motivating case, preserved.
-            // * Live session mid-normal-handoff: `collab_sessions.updated_at`
-            //   and `messages.created_at` are fresh, so the echo is REFUSED and
-            //   the pending token stays private to whoever was handed it.
+            // The exclusion is cut that narrow deliberately — it is a hole in a
+            // security predicate, and two wider versions of it were each a
+            // reproduced takeover. `pending_handoff_claimed_at` is never
+            // excluded (a forced reissue NULLs it, so a caller's own retry can
+            // never stamp it — excluding it protected nothing and threw away a
+            // claim, which is a live process taking the lease), and the *other*
+            // agent's lease is never excluded (the lease is per (session,
+            // agent); the counterpart's mint or claim is somebody else's
+            // liveness). See `session_last_activity_excluding_lease` for the
+            // full argument and for the residual this leaves.
+            //
+            // * Genuinely dead session: every remaining signal is still dead,
+            //   so the caller's own retry is admitted — D-P1's motivating case,
+            //   preserved. Note the full predicate *also* admits the case #298
+            //   exists to fix, where the holder died six hours ago; the
+            //   narrowing matters only when the pending token's issue time is
+            //   recent.
+            // * Live session: `collab_sessions.updated_at`, `messages`, the
+            //   checkpoint, and the counterpart's lease are all still counted,
+            //   so the echo is REFUSED and the pending token stays private to
+            //   whoever was handed it.
             //
             // Note what this does *not* rest on: caller identity. `agent` is
             // caller-asserted throughout this protocol, so a fix shaped like
@@ -869,10 +941,7 @@ pub(super) fn handle_session_handoff(app: &App, args: &Value) -> Result<Value, M
             // to the gate below. The normal path loads it after its own guard,
             // as it always has.
             let record = crate::collab::queue::load_session_record(tx, session_id)?;
-            if matches!(
-                record.session.phase,
-                Phase::PlanLocked | Phase::CodingComplete
-            ) {
+            if !force_reissue_admits_phase(record.session.phase) {
                 return Err(MemoryError::Validation(format!(
                     "session_handoff force_reissue refused: session {session_id} is in phase {}, \
                      which waits on a human and produces no agent-driven activity while it does. \
@@ -894,8 +963,20 @@ pub(super) fn handle_session_handoff(app: &App, args: &Value) -> Result<Value, M
             // would report the reissue's own timestamps as the "prior" ones it
             // is supposed to be evidence *about*.
             let pending_already = existing.as_ref().is_some_and(|a| a.pending.is_some());
+            // ── The provenance seam ──────────────────────────────────────────
+            // One `if`, deliberately, because one residual hangs off it. On a
+            // session quiet on all three agent-driven signals AND on the other
+            // agent's lease, the narrowed predicate cannot tell a token the
+            // forced path minted moments ago (D-P1: must be admitted) from one a
+            // live incumbent minted moments ago through a generation-authenticated
+            // call (must be refused) — the only column that differs is the one
+            // being excluded. Closing that needs *provenance*: a record of which
+            // path minted the pending token. Whatever form that takes — a
+            // `pending_handoff_forced` column, or something derived from state
+            // already on hand — it belongs in this condition and nowhere else, so
+            // the fix is one edit rather than an audit of the whole ladder.
             let staleness = if pending_already {
-                crate::collab::queue::session_staleness_excluding_lease(tx, session_id)?
+                crate::collab::queue::session_staleness_excluding_lease(tx, session_id, agent)?
             } else {
                 crate::collab::queue::session_staleness(tx, session_id)?
             };
@@ -3028,6 +3109,92 @@ mod tests {
         );
     }
 
+    /// **The cross-agent takeover, refused.** The second reproduced exploit
+    /// against the narrowing.
+    ///
+    /// The lease is per `(session, agent)`, but the excluded subqueries were
+    /// keyed on `session_id` alone — so excluding `claude`'s lease zeroed
+    /// `codex`'s too. Set up: all three agent-driven signals aged past the
+    /// threshold, `claude` holding an in-flight token, and `codex` performing a
+    /// real mint **and** claim right now. `collab_status` reports `idle_secs: 0`
+    /// — the server itself says the session is live — and the forced reissue was
+    /// admitted anyway, handing over `claude`'s token.
+    ///
+    /// The other agent's lease writes are somebody else's liveness. A claim in
+    /// particular is a live process taking the lease, which the abandon gate's
+    /// own docs call the most live state the protocol has.
+    #[test]
+    fn a_fresh_claim_by_the_other_agent_refuses_the_reissue() {
+        let (app, _dir) = test_handoff_app();
+        let sid = seed_active_session(&app);
+        advance_to_generation_one(&app, &sid, Agent::Claude);
+        // claude's in-flight token, minted before the aging so it is itself old.
+        app.db
+            .with_transaction(|tx| issue_or_reuse_handoff(tx, &sid, Agent::Claude))
+            .unwrap();
+        age_session(&app, &sid, crate::collab::COLLAB_DEAD_SESSION_SECS + 60);
+
+        // codex mints and claims NOW — after the aging, so these are the only
+        // fresh timestamps anywhere on the session.
+        let codex_token = advance_to_generation_one(&app, &sid, Agent::Codex);
+        assert!(
+            !codex_token.is_empty(),
+            "setup: codex must really have driven a mint+claim cycle"
+        );
+
+        let message = handle_session_handoff(&app, &force_args(&sid, "claude"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            message.contains("still live"),
+            "codex's just-committed claim is liveness — excluding claude's lease must not \
+             zero it: {message}"
+        );
+        assert_eq!(
+            db_generation(&app, &sid, Agent::Claude),
+            Some(1),
+            "a refused cross-agent takeover must move no generation"
+        );
+    }
+
+    /// The narrowing drops the target agent's `pending_handoff_issued_at` and
+    /// nothing else — in particular never a *claim*, not even its own.
+    ///
+    /// `issue_or_reuse_handoff`'s `UPDATE` sets `pending_handoff_claimed_at =
+    /// NULL`, so a caller's own forced reissue can never stamp that column.
+    /// Excluding it therefore protected nothing while discarding the strongest
+    /// liveness signal available, which is why the exclusion is one column wide.
+    #[test]
+    fn the_target_agents_own_fresh_claim_still_refuses_the_reissue() {
+        let (app, _dir) = test_handoff_app();
+        let sid = seed_active_session(&app);
+        advance_to_generation_one(&app, &sid, Agent::Claude);
+        app.db
+            .with_transaction(|tx| issue_or_reuse_handoff(tx, &sid, Agent::Claude))
+            .unwrap();
+        age_session(&app, &sid, crate::collab::COLLAB_DEAD_SESSION_SECS + 60);
+
+        // Re-stamp only claude's own claimed_at, leaving every other signal old.
+        app.db
+            .with_transaction(|tx| {
+                tx.execute(
+                    "UPDATE collab_actor_generations SET pending_handoff_claimed_at = \
+                     datetime('now') WHERE session_id = ?1 AND agent = 'claude'",
+                    rusqlite::params![sid],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let message = handle_session_handoff(&app, &force_args(&sid, "claude"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            message.contains("still live"),
+            "a claim is never excluded, not even the target agent's own: {message}"
+        );
+    }
+
     /// The refusal above must name the signals it actually weighed. With a
     /// token pending the lease timestamps are excluded, and a refusal still
     /// claiming to have weighed "its handoff lease" would misdescribe its own
@@ -3040,8 +3207,10 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            message.contains("handoff lease timestamps are excluded"),
-            "the pending-path refusal must say the lease terms were excluded: {message}"
+            message.contains("only this agent's pending-token issue time is excluded"),
+            "the pending-path refusal must name the one term that was excluded — the \
+             narrowing is one column for one agent, and a refusal claiming more was \
+             dropped would overstate the hole: {message}"
         );
     }
 
@@ -3052,9 +3221,84 @@ mod tests {
     /// "undiminished". Refused outright: here a false positive would hand an
     /// eviction capability to a caller acting against a process that never
     /// died.
+    /// Every `Phase`, in declaration order, paired with whether `force_reissue`
+    /// admits it.
+    ///
+    /// Spelled out here **independently of [`force_reissue_admits_phase`]**,
+    /// which is the whole value of the table: asserting the handler against the
+    /// helper it already calls is a tautology that passes even if a phase were
+    /// dropped from the helper. Same discipline as `collab_session.rs`'s
+    /// `PHASE_ENDABILITY` and `PHASE_OWNER_REQUIRED`, and for the sharper
+    /// reason here — the first version of this test iterated a hardcoded
+    /// two-item literal, so it could not have caught the missing `CodingFailed`
+    /// that a security review found, nor any future phase defaulting to
+    /// admitted.
+    const PHASE_FORCE_REISSUE_ADMITS: [(Phase, bool); 11] = [
+        (Phase::PlanParallelDrafts, true),
+        (Phase::PlanSynthesisPending, true),
+        (Phase::PlanCopilotReviewPending, true),
+        (Phase::PlanFinalizePending, true),
+        (Phase::PlanLocked, false),
+        (Phase::CodeImplementPending, true),
+        (Phase::CodeReviewLocalPending, true),
+        (Phase::CodeReviewFixGlobalPending, true),
+        (Phase::CodeReviewFinalPending, true),
+        (Phase::CodingComplete, false),
+        (Phase::CodingFailed, false),
+    ];
+
+    /// Completeness proof for [`PHASE_FORCE_REISSUE_ADMITS`], the idiom
+    /// `collab_session.rs` uses for its two phase tables. Each slot must hold
+    /// the variant whose discriminant equals its index, and the length must
+    /// equal the last variant's discriminant plus one — so adding or moving a
+    /// `Phase` variant breaks one of the two assertions at compile time rather
+    /// than silently leaving the new phase untested.
+    const _: () = {
+        assert!(
+            PHASE_FORCE_REISSUE_ADMITS.len() == Phase::CodingFailed as usize + 1,
+            "PHASE_FORCE_REISSUE_ADMITS must have one row per Phase variant \
+             (CodingFailed must stay last)"
+        );
+        let mut i = 0;
+        while i < PHASE_FORCE_REISSUE_ADMITS.len() {
+            assert!(
+                PHASE_FORCE_REISSUE_ADMITS[i].0 as usize == i,
+                "PHASE_FORCE_REISSUE_ADMITS must list every Phase variant once, in \
+                 declaration order"
+            );
+            i += 1;
+        }
+    };
+
+    /// The table is the second opinion on [`force_reissue_admits_phase`]. Change
+    /// the function without changing the table and a row fails.
+    #[test]
+    fn every_phase_agrees_with_the_force_reissue_admission_table() {
+        for (phase, admits) in PHASE_FORCE_REISSUE_ADMITS {
+            assert_eq!(
+                force_reissue_admits_phase(phase),
+                admits,
+                "force_reissue_admits_phase disagrees with the table for {phase}"
+            );
+        }
+    }
+
+    /// The refused phases, end to end through the handler — not just through
+    /// the predicate. Driven from [`PHASE_FORCE_REISSUE_ADMITS`] so a phase
+    /// that stops being refused fails here too.
     #[test]
     fn force_reissue_is_refused_in_the_human_gated_phases() {
-        for phase in [Phase::PlanLocked, Phase::CodingComplete] {
+        let refused: Vec<Phase> = PHASE_FORCE_REISSUE_ADMITS
+            .iter()
+            .filter(|(_, admits)| !admits)
+            .map(|(phase, _)| *phase)
+            .collect();
+        assert_eq!(
+            refused.len(),
+            3,
+            "three phases wait on a human; if that changed, this test's premise did too"
+        );
+        for phase in refused {
             let (app, _dir) = test_handoff_app();
             let sid = seed_active_session(&app);
             advance_to_generation_one(&app, &sid, Agent::Claude);

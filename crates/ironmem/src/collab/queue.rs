@@ -636,35 +636,59 @@ pub fn session_last_activity(
 /// session doing work. Every other term records something an agent did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LeaseSignals {
-    /// All five terms. The abandon gate's predicate (#297) — a session being
-    /// recovered genuinely is a session someone is touching, and abandon is
-    /// terminal, so counting the lease there errs toward refusing to seal.
+    /// Every term, every agent. The abandon gate's predicate (#297) — a session
+    /// being recovered genuinely is a session someone is touching, and abandon
+    /// is terminal, so counting the lease there errs toward refusing to seal.
     Include,
-    /// The three agent-driven terms only. See
-    /// [`session_last_activity_excluding_lease`].
-    Exclude,
+    /// Drop **one agent's** `pending_handoff_issued_at`, and nothing else. See
+    /// [`session_last_activity_excluding_lease`] for why the exclusion is
+    /// exactly this narrow.
+    ExcludeIssuedFor(super::Agent),
 }
 
 impl LeaseSignals {
-    /// `1` keeps the two lease terms, `0` zeroes them.
+    /// `1` keeps the excludable term, `0` zeroes it.
     ///
     /// Zero is not an arbitrary sentinel: every term in the query is already
     /// `coalesce(..., 0)` and they are combined with `max()`, so 0 is exactly
     /// how an *absent* signal reads. Excluding a term therefore reuses the
     /// encoding the query already has, which is why this is a bind parameter
-    /// on one query rather than a second query with two terms deleted. A
-    /// near-copy would be the drift hazard this module keeps eliminating: the
+    /// on one query rather than a second query with a term deleted. A near-copy
+    /// would be the drift hazard this module keeps eliminating: the
     /// CAST/coalesce reasoning below is long and subtle, and a second copy
     /// would have to be re-derived by whoever next edited either one.
     fn sql_flag(self) -> i64 {
         match self {
             Self::Include => 1,
-            Self::Exclude => 0,
+            Self::ExcludeIssuedFor(_) => 0,
+        }
+    }
+
+    /// The agent whose `pending_handoff_issued_at` may be zeroed.
+    ///
+    /// The query splits that term in two — `g.agent = ?3` (multiplied by
+    /// [`Self::sql_flag`]) and `g.agent <> ?3` (never multiplied) — so the
+    /// *other* agent's lease writes always count. That split is the fix for a
+    /// reproduced takeover: with a single unfiltered term, excluding it zeroed
+    /// both agents at once, and a session where `codex` had just claimed a
+    /// token — the most live state this protocol has — could still be read as
+    /// dead and re-leased out from under `claude`.
+    ///
+    /// [`Self::Include`] returns `""`, which no `agent` value equals, so the
+    /// `= ?3` half contributes 0 and the `<> ?3` half sees every row. The two
+    /// halves therefore recombine to the same `max()` the single term produced,
+    /// which is what keeps the abandon gate's predicate unchanged — pinned by
+    /// `include_is_unchanged_by_the_agent_split`.
+    fn excluded_agent(self) -> &'static str {
+        match self {
+            Self::Include => "",
+            Self::ExcludeIssuedFor(agent) => agent.as_str(),
         }
     }
 }
 
-/// [`session_last_activity`] with the lease's own two timestamps excluded.
+/// [`session_last_activity`] with **one agent's `pending_handoff_issued_at`**
+/// excluded, and nothing else.
 ///
 /// # Why this variant exists (#298 security fix)
 ///
@@ -685,17 +709,52 @@ impl LeaseSignals {
 /// defended; the *gate* was.
 ///
 /// Narrowing the signal fixes the retry problem at its root and closes that
-/// hole with it:
+/// hole for every session that is doing anything at all.
 ///
-/// * On a genuinely dead session the three agent-driven terms are still dead,
-///   so a caller's own retry is admitted — the case the skip was written for.
-/// * On a live session mid-handoff, `collab_sessions.updated_at` and
-///   `messages.created_at` are fresh, so the echo is refused and the pending
-///   token stays private to whoever was handed it.
+/// # Why the exclusion is exactly one column, for exactly one agent
 ///
-/// No caller identity is needed for either, which is what makes this workable:
-/// `agent` is caller-asserted everywhere in this protocol, so a fix resting on
-/// "was it *you* who minted it?" would rest on nothing.
+/// The narrowing is a hole in a security predicate, so it is cut to the
+/// smallest shape that solves D-P1 and no larger. Three separate reasons, each
+/// of which was a reproduced takeover before it was applied:
+///
+/// * **Only `pending_handoff_issued_at`.** `issue_or_reuse_handoff`'s `UPDATE`
+///   sets `pending_handoff_claimed_at = NULL`, so a caller's own forced reissue
+///   can never stamp that column — excluding it protected nothing and threw
+///   away the strongest liveness signal the protocol has. A claim is a live
+///   process taking the lease; the abandon gate's own docs call it the most
+///   live state there is.
+/// * **Only the agent under repair.** The lease is per `(session, agent)`. An
+///   unfiltered exclusion zeroed both agents, so a session where `codex` had
+///   just minted or claimed a token could be read as dead and re-leased out
+///   from under `claude`. The other agent's lease writes are somebody else's
+///   liveness and are always counted.
+/// * **Never the three agent-driven terms.** Those are what actually answer
+///   "is anyone working on this session".
+///
+/// What this does *not* rest on is caller identity: `agent` is caller-asserted
+/// everywhere in this protocol, so a check shaped like "was it *you* who minted
+/// it?" would rest on nothing.
+///
+/// # The residual, stated plainly
+///
+/// On a session that has been quiet on all three agent-driven signals for
+/// `COLLAB_DEAD_SESSION_SECS` and where the other agent's lease is also quiet,
+/// this predicate cannot distinguish
+///
+/// * a token the *forced path* minted moments ago (D-P1's case, must be
+///   admitted) from
+/// * a token a live incumbent minted moments ago through a
+///   generation-authenticated call (must be refused).
+///
+/// Both look identical here, because the only column that differs between them
+/// is the one being excluded. Telling them apart needs **provenance** — a
+/// record of which path minted the pending token — which is new state this
+/// function deliberately does not invent. `handle_session_handoff` isolates the
+/// pending-case decision at a single call site so that check has one place to
+/// go. Note the exposure is much narrower than it first reads: a session whose
+/// incumbent is alive enough to be minting handoff tokens has almost always
+/// written one of the three agent-driven signals inside the window, and if it
+/// has, this predicate refuses.
 ///
 /// **Not** a replacement for [`session_last_activity`]. The abandon gate keeps
 /// the full signal: `collab_end { abandon: true }` is terminal, and a session
@@ -703,8 +762,9 @@ impl LeaseSignals {
 pub fn session_last_activity_excluding_lease(
     conn: &Connection,
     session_id: &str,
+    agent: super::Agent,
 ) -> Result<Option<i64>, MemoryError> {
-    session_last_activity_with(conn, session_id, LeaseSignals::Exclude)
+    session_last_activity_with(conn, session_id, LeaseSignals::ExcludeIssuedFor(agent))
 }
 
 fn session_last_activity_with(
@@ -726,15 +786,21 @@ fn session_last_activity_with(
                     coalesce(
                         (SELECT max(CAST(strftime('%s', g.pending_handoff_issued_at) AS INTEGER))
                            FROM collab_actor_generations g
-                          WHERE g.session_id = s.id),
+                          WHERE g.session_id = s.id AND g.agent = ?3),
                         0
                     ) * ?2,
+                    coalesce(
+                        (SELECT max(CAST(strftime('%s', g.pending_handoff_issued_at) AS INTEGER))
+                           FROM collab_actor_generations g
+                          WHERE g.session_id = s.id AND g.agent <> ?3),
+                        0
+                    ),
                     coalesce(
                         (SELECT max(CAST(strftime('%s', g.pending_handoff_claimed_at) AS INTEGER))
                            FROM collab_actor_generations g
                           WHERE g.session_id = s.id),
                         0
-                    ) * ?2
+                    )
                 ),
                 (CASE WHEN s.updated_at IS NOT NULL
                        AND strftime('%s', s.updated_at) IS NULL THEN 1 ELSE 0 END)
@@ -744,19 +810,24 @@ fn session_last_activity_with(
                                       AND strftime('%s', m.created_at) IS NULL)
                       THEN 1 ELSE 0 END)
               + (CASE WHEN EXISTS (SELECT 1 FROM collab_actor_generations g
-                                    WHERE g.session_id = s.id
+                                    WHERE g.session_id = s.id AND g.agent = ?3
                                       AND g.pending_handoff_issued_at IS NOT NULL
                                       AND strftime('%s', g.pending_handoff_issued_at) IS NULL)
                       THEN 1 ELSE 0 END) * ?2
               + (CASE WHEN EXISTS (SELECT 1 FROM collab_actor_generations g
+                                    WHERE g.session_id = s.id AND g.agent <> ?3
+                                      AND g.pending_handoff_issued_at IS NOT NULL
+                                      AND strftime('%s', g.pending_handoff_issued_at) IS NULL)
+                      THEN 1 ELSE 0 END)
+              + (CASE WHEN EXISTS (SELECT 1 FROM collab_actor_generations g
                                     WHERE g.session_id = s.id
                                       AND g.pending_handoff_claimed_at IS NOT NULL
                                       AND strftime('%s', g.pending_handoff_claimed_at) IS NULL)
-                      THEN 1 ELSE 0 END) * ?2
+                      THEN 1 ELSE 0 END)
            FROM collab_sessions s
            LEFT JOIN collab_checkpoints c ON c.session_id = s.id
           WHERE s.id = ?1",
-            params![session_id, signals.sql_flag()],
+            params![session_id, signals.sql_flag(), signals.excluded_agent()],
             |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, i64>(1)?)),
         )
         .optional()
@@ -940,7 +1011,8 @@ pub fn session_staleness(
 }
 
 /// [`session_staleness`] over [`session_last_activity_excluding_lease`] — the
-/// same snapshot discipline, computed without the lease's own two timestamps.
+/// same snapshot discipline, computed without `agent`'s own
+/// `pending_handoff_issued_at`.
 ///
 /// Used by exactly one caller, `session_handoff`'s `force_reissue` gate, and
 /// that narrowness is the point: read
@@ -951,8 +1023,9 @@ pub fn session_staleness(
 pub fn session_staleness_excluding_lease(
     conn: &Connection,
     session_id: &str,
+    agent: super::Agent,
 ) -> Result<SessionStaleness, MemoryError> {
-    staleness_with(conn, session_id, LeaseSignals::Exclude)
+    staleness_with(conn, session_id, LeaseSignals::ExcludeIssuedFor(agent))
 }
 
 fn staleness_with(
@@ -4031,6 +4104,234 @@ mod tests {
             !crate::collab::session_is_dead("s5", last, now),
             "a freshly claimed handoff token keeps a stale session row alive, \
              and the newest of the two lease rows is the one that counts"
+        );
+    }
+
+    // ── LeaseSignals::ExcludeIssuedFor, at the query level (#298) ───────────
+    //
+    // The `Exclude` predicate is a hole cut in a security gate, so its exact
+    // shape is tested directly against the SQL rather than only through
+    // `session_handoff`. A misplaced `* ?2` — onto the messages term, say, or
+    // onto the `g.agent <> ?3` half — would be caught here and only indirectly
+    // anywhere else.
+
+    /// Insert a session row whose `updated_at` is `age_secs` old, plus nothing
+    /// else. `messages` and `collab_checkpoints` are left empty, so the three
+    /// agent-driven terms reduce to this one column and the lease terms are
+    /// what the assertions actually vary.
+    fn quiet_session(db: &Connection, id: &str, age_secs: i64) {
+        db.execute(
+            "INSERT INTO collab_sessions (id, repo_path, branch, updated_at)
+             VALUES (?1, '/repo', 'main', datetime('now', ?2))",
+            params![id, format!("-{age_secs} seconds")],
+        )
+        .unwrap();
+    }
+
+    /// A lease row for `agent` with the two handoff timestamps set as given,
+    /// each either `None` (SQL NULL) or an age in seconds.
+    fn lease_row(
+        db: &Connection,
+        id: &str,
+        agent: &str,
+        issued_age: Option<i64>,
+        claimed_age: Option<i64>,
+    ) {
+        let stamp = |age: Option<i64>| age.map(|a| format!("-{a} seconds"));
+        db.execute(
+            "INSERT INTO collab_actor_generations
+                 (session_id, agent, generation,
+                  pending_handoff_issued_at, pending_handoff_claimed_at)
+             VALUES (?1, ?2, 1,
+                     datetime('now', ?3), datetime('now', ?4))",
+            params![id, agent, stamp(issued_age), stamp(claimed_age)],
+        )
+        .unwrap();
+    }
+
+    fn is_dead_excluding(db: &Connection, id: &str, agent: Agent) -> bool {
+        let now = db_now_epoch_secs(db).unwrap();
+        let last = session_last_activity_excluding_lease(db, id, agent).unwrap();
+        crate::collab::session_is_dead(id, last, now)
+    }
+
+    fn is_dead_including(db: &Connection, id: &str) -> bool {
+        let now = db_now_epoch_secs(db).unwrap();
+        let last = session_last_activity(db, id).unwrap();
+        crate::collab::session_is_dead(id, last, now)
+    }
+
+    /// The one thing `Exclude` exists to do: a session dead on its
+    /// agent-driven signals, whose *only* fresh timestamp is the target
+    /// agent's `pending_handoff_issued_at`, reads dead. This is D-P1 — a
+    /// caller's own forced reissue must not make its own retry look live.
+    #[test]
+    fn exclude_ignores_the_target_agents_own_fresh_issue() {
+        let db = open();
+        let old = crate::collab::COLLAB_DEAD_SESSION_SECS + 60;
+        quiet_session(&db, "x1", old);
+        lease_row(&db, "x1", "claude", Some(0), None);
+
+        assert!(
+            is_dead_excluding(&db, "x1", Agent::Claude),
+            "the target agent's own fresh issue must not count as activity"
+        );
+        assert!(
+            !is_dead_including(&db, "x1"),
+            "the full signal must still see it — otherwise this test proves nothing \
+             about the exclusion, only that the row is old"
+        );
+    }
+
+    /// **The reproduced takeover.** `codex` mints or claims *now*; `claude`'s
+    /// lease is what is being repaired. An unfiltered exclusion zeroed both
+    /// agents, so this session — which the server itself reports as `idle 0s` —
+    /// read dead and `claude`'s in-flight token could be handed to a third
+    /// process.
+    ///
+    /// The other agent's lease writes are somebody else's liveness and must
+    /// always count, whichever agent is under repair.
+    #[test]
+    fn exclude_still_counts_the_other_agents_lease_writes() {
+        let old = crate::collab::COLLAB_DEAD_SESSION_SECS + 60;
+
+        // The other agent's fresh ISSUE.
+        let db = open();
+        quiet_session(&db, "x2", old);
+        lease_row(&db, "x2", "claude", Some(old), None);
+        lease_row(&db, "x2", "codex", Some(0), None);
+        assert!(
+            !is_dead_excluding(&db, "x2", Agent::Claude),
+            "codex minting a token right now is liveness, and excluding claude's lease \
+             must not zero it"
+        );
+
+        // The other agent's fresh CLAIM — the most live state the protocol has.
+        let db = open();
+        quiet_session(&db, "x3", old);
+        lease_row(&db, "x3", "claude", Some(old), None);
+        lease_row(&db, "x3", "codex", None, Some(0));
+        assert!(
+            !is_dead_excluding(&db, "x3", Agent::Claude),
+            "codex claiming a token right now is the strongest liveness signal there is"
+        );
+
+        // Symmetric: the filter must follow the agent argument, not be
+        // hardcoded to one of them.
+        let db = open();
+        quiet_session(&db, "x4", old);
+        lease_row(&db, "x4", "claude", Some(0), None);
+        lease_row(&db, "x4", "codex", Some(old), None);
+        assert!(
+            !is_dead_excluding(&db, "x4", Agent::Codex),
+            "excluding codex must not zero claude's fresh issue"
+        );
+    }
+
+    /// `pending_handoff_claimed_at` is **never** excluded, for either agent.
+    /// `issue_or_reuse_handoff`'s `UPDATE` sets it `NULL`, so a caller's own
+    /// forced reissue can never stamp it — excluding it protected nothing and
+    /// discarded a claim, which is a live process taking the lease.
+    #[test]
+    fn exclude_never_drops_a_claim_even_for_the_target_agent() {
+        let db = open();
+        let old = crate::collab::COLLAB_DEAD_SESSION_SECS + 60;
+        quiet_session(&db, "x5", old);
+        lease_row(&db, "x5", "claude", Some(old), Some(0));
+
+        assert!(
+            !is_dead_excluding(&db, "x5", Agent::Claude),
+            "the target agent's own CLAIM must still count — only its issue is excluded"
+        );
+    }
+
+    /// The exclusion must not reach the three agent-driven terms. One test per
+    /// term, because a misplaced `* ?2` lands on exactly one of them.
+    #[test]
+    fn exclude_never_touches_the_agent_driven_terms() {
+        let old = crate::collab::COLLAB_DEAD_SESSION_SECS + 60;
+
+        // The session row.
+        let db = open();
+        quiet_session(&db, "y1", 0);
+        lease_row(&db, "y1", "claude", Some(0), None);
+        assert!(
+            !is_dead_excluding(&db, "y1", Agent::Claude),
+            "a fresh collab_sessions.updated_at must survive the exclusion"
+        );
+
+        // Messages.
+        let db = open();
+        quiet_session(&db, "y2", old);
+        lease_row(&db, "y2", "claude", Some(0), None);
+        db.execute(
+            "INSERT INTO messages (id, session_id, sender, receiver, topic, content, created_at)
+             VALUES ('ym2', 'y2', 'claude', 'codex', 'draft', 'x', datetime('now'))",
+            [],
+        )
+        .unwrap();
+        assert!(
+            !is_dead_excluding(&db, "y2", Agent::Claude),
+            "a fresh message must survive the exclusion"
+        );
+
+        // The checkpoint.
+        let db = open();
+        quiet_session(&db, "y3", old);
+        lease_row(&db, "y3", "claude", Some(0), None);
+        db.execute(
+            "INSERT INTO collab_checkpoints
+               (session_id, status, head_sha, attested_by, updated_at)
+             VALUES ('y3', 'started', 'aaa111', 'operator', strftime('%s','now'))",
+            [],
+        )
+        .unwrap();
+        assert!(
+            !is_dead_excluding(&db, "y3", Agent::Claude),
+            "a fresh checkpoint must survive the exclusion"
+        );
+    }
+
+    /// The agent split must leave [`LeaseSignals::Include`] answering exactly
+    /// what it answered before the split existed.
+    ///
+    /// `Include` binds `""` as the excluded agent, so the `= ?3` half
+    /// contributes 0 and the `<> ?3` half sees every row — the two halves are
+    /// supposed to recombine to the same `max()` the single unfiltered term
+    /// produced. That is an arithmetic claim about a query the abandon gate
+    /// depends on, so it is pinned rather than argued: every combination of
+    /// which agent holds the fresh timestamp, and which column it is in.
+    #[test]
+    fn include_is_unchanged_by_the_agent_split() {
+        let old = crate::collab::COLLAB_DEAD_SESSION_SECS + 60;
+        let cases: [(&str, &str, Option<i64>, Option<i64>); 4] = [
+            ("z1", "claude", Some(0), None),
+            ("z2", "codex", Some(0), None),
+            ("z3", "claude", None, Some(0)),
+            ("z4", "codex", None, Some(0)),
+        ];
+        for (id, agent, issued, claimed) in cases {
+            let db = open();
+            quiet_session(&db, id, old);
+            lease_row(&db, id, agent, issued, claimed);
+            assert!(
+                !is_dead_including(&db, id),
+                "Include must see a fresh lease timestamp on {agent} whichever column it \
+                 is in — the agent split must not have narrowed the abandon gate's own \
+                 predicate ({id})"
+            );
+        }
+
+        // And the other direction: Include on an all-quiet session still reads
+        // dead, so the assertions above are not satisfied by a term that is
+        // simply always fresh.
+        let db = open();
+        quiet_session(&db, "z5", old);
+        lease_row(&db, "z5", "claude", Some(old), Some(old));
+        lease_row(&db, "z5", "codex", Some(old), Some(old));
+        assert!(
+            is_dead_including(&db, "z5"),
+            "Include must still read a genuinely quiet session as dead"
         );
     }
 

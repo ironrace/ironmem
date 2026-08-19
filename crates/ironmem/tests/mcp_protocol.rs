@@ -10083,7 +10083,8 @@ fn a_recovered_lease_survives_a_fresh_app_over_the_same_db() {
 ///
 /// `staleness_scope: "all_signals"` is the Gap B half for this path. The gate
 /// runs on every forced call, but on two different predicates — the full
-/// five-term signal, or the same minus the lease's own two timestamps — and
+/// five-term signal, or the same minus this agent's own pending-token issue
+/// time — and
 /// `idle_secs` in the same row means a different measurement under each. An
 /// auditor must not have to infer which one from `reused`.
 #[test]
@@ -10331,9 +10332,10 @@ fn a_third_process_cannot_steal_a_live_incumbents_pending_handoff_token() {
 /// The remedy is to narrow the signal, **not** to skip the gate. Skipping it
 /// was the original design and it was a lease-takeover primitive — see
 /// [`a_third_process_cannot_steal_a_live_incumbents_pending_token`]. With the
-/// lease's own two timestamps excluded, a genuinely dead session is still dead
-/// on its three agent-driven signals, so the caller's own retry is admitted
-/// while a live session's pending token stays private.
+/// caller's own pending-token issue time excluded — and nothing else, not the
+/// claim column and not the other agent's lease — a genuinely dead session is
+/// still dead on every remaining signal, so the caller's own retry is admitted
+/// while a session live on any of them keeps its pending token private.
 ///
 /// Three properties, none of which the other scenarios can see:
 ///
