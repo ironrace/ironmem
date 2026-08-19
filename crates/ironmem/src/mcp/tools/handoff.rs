@@ -167,14 +167,19 @@ pub(super) fn ensure_actor_generation_current(
     //    is an unconditional `MUTATING_TOOLS` member (`mod.rs`): minting,
     //    claiming, and force_reissue alike all require
     //    `IRONMEM_MCP_MODE=trusted`, which defaults to `ReadOnly`
-    //    (`session_handoff_is_write_gated_and_known` pins the gate). Scoping
-    //    the parenthetical to only the force_reissue clause would wrongly
-    //    imply the primary "obtain/present a token" remedy needs no write
-    //    access — it needs exactly the same one. This guard's tokenless arm
-    //    is reachable from a ReadOnly caller too: `handle_collab_recv`
-    //    (collab_session.rs) runs it on a plain, non-mutating read, so a
-    //    default-mode operator can land on either refusal with *neither*
-    //    remedy available until the message says so.
+    //    (`session_handoff_is_write_gated_and_known` pins the gate). For the
+    //    primary remedy specifically, that tool-level gate is backed up by an
+    //    independent, explicit `allows_writes` check on the token-claim
+    //    branch just above (this file, ~line 93) — so even a future
+    //    reclassification out of `MUTATING_TOOLS` would leave "present a
+    //    token" still gated, and this paragraph would need re-checking, not
+    //    this message. Scoping the parenthetical to only the force_reissue
+    //    clause would wrongly imply the primary "obtain/present a token"
+    //    remedy needs no write access — it needs exactly the same one. This
+    //    guard's tokenless arm is reachable from a ReadOnly caller too:
+    //    `handle_collab_recv` (collab_session.rs) runs it on a plain,
+    //    non-mutating read, so a default-mode operator can land on either
+    //    refusal with *neither* remedy available until the message says so.
     //
     // A third state — an ended/abandoned session — is deliberately NOT
     // named. `ensure_active` runs before this guard on some call paths but
@@ -1245,23 +1250,8 @@ mod tests {
 
         let pred = test_app_with_db_path(db_path.clone(), dir.path());
         let succ = test_app_with_db_path(db_path, dir.path());
-        let session_id = "test-stale-pred-message";
+        let session_id = &seed_active_session(&pred);
 
-        pred.db
-            .with_transaction(|tx| {
-                create_session(
-                    tx,
-                    session_id,
-                    "/repo",
-                    "main",
-                    Some("t"),
-                    CollabRoles {
-                        pilot: Agent::Claude,
-                        implementer: Agent::Claude,
-                    },
-                )
-            })
-            .unwrap();
         pred.db
             .with_transaction(|tx| {
                 ensure_actor_generation_current(&pred, tx, session_id, Agent::Claude, None)
@@ -2225,35 +2215,8 @@ mod tests {
         let db_path = dir.path().join("mem.sqlite3");
 
         let pred = test_app_with_db_path(db_path.clone(), dir.path());
-        let sid = uuid::Uuid::new_v4().to_string();
-        pred.db
-            .with_transaction(|tx| {
-                crate::collab::queue::create_session(
-                    tx,
-                    &sid,
-                    "/repo",
-                    "main",
-                    Some("t"),
-                    CollabRoles {
-                        pilot: Agent::Claude,
-                        implementer: Agent::Claude,
-                    },
-                )
-            })
-            .unwrap();
-
-        let token = pred
-            .db
-            .with_transaction(|tx| issue_or_reuse_handoff(tx, &sid, Agent::Claude))
-            .unwrap()
-            .token;
-        let succ = test_app_with_db_path(db_path.clone(), dir.path());
-        succ.db
-            .with_transaction(|tx| {
-                ensure_actor_generation_current(&succ, tx, &sid, Agent::Claude, Some(&token))
-            })
-            .unwrap()
-            .publish(&succ);
+        let sid = seed_active_session(&pred);
+        advance_to_generation_one(&pred, &sid, Agent::Claude);
 
         let fresh = test_app_with_db_path(db_path, dir.path());
         let err = fresh
