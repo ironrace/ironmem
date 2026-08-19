@@ -134,10 +134,10 @@ pub(super) fn ensure_actor_generation_current(
             app.clear_cached_generation(session_id, agent);
         } else {
             return Err(MemoryError::Validation(format!(
-                "stale collab generation for {}: local={cached} current={db_active}; \
-                 obtain a session_handoff token in a fresh process — or, if the process \
-                 holding generation {db_active} is gone and cannot mint one, call \
-                 session_handoff with force_reissue=true (requires IRONMEM_MCP_MODE=trusted) \
+                "stale collab generation for {}: local={cached} current={db_active}; both \
+                 remedies require IRONMEM_MCP_MODE=trusted: obtain a session_handoff token \
+                 in a fresh process, or — if the process holding generation {db_active} is \
+                 gone and cannot mint one — call session_handoff with force_reissue=true \
                  once the session has been idle {}",
                 agent.as_str(),
                 super::collab_session::dead_session_threshold_human(),
@@ -152,50 +152,47 @@ pub(super) fn ensure_actor_generation_current(
         app.set_cached_generation(session_id, agent, 0);
         return Ok(GenerationClaim::Unchanged);
     }
-    // Two preconditions of the `force_reissue` pointer named in both this
-    // refusal and the stale one above, and why only one of them is spelled
-    // out in the message text:
+    // Two preconditions worth naming in the two messages below, and one
+    // deliberately left out:
     //
-    // 1. `generation > 0`. Both refusals are reachable only with
-    //    `db_active > 0` — the `db_active == 0` arm returns above, and the
-    //    stale arm requires `cached < db_active` with `cached: u64` — so
-    //    `force_reissue`'s own `generation > 0` gate is always satisfied by
-    //    the time either message is emitted. Not worth a word in the text:
-    //    it is simply always true here, never a reason force_reissue could
-    //    then be refused.
+    // 1. `generation > 0`. Both refusals (this one and the stale one above)
+    //    are reachable only with `db_active > 0` — the `db_active == 0` arm
+    //    returns above, and the stale arm requires `cached < db_active` with
+    //    `cached: u64` — so `force_reissue`'s own `generation > 0` gate is
+    //    always satisfied by the time either message is emitted. Never a
+    //    reason force_reissue could then be refused, so not named.
     //
-    // 2. Write access. THIS one earned its mention in the message: unlike
-    //    the token-claim branch above (gated on `allows_writes` at its own
-    //    call site) and unlike a *plain* `session_handoff` mint (which needs
-    //    no write access at all), `force_reissue` demands
-    //    `IRONMEM_MCP_MODE=trusted` unconditionally — checked before this
-    //    guard even runs, in `handle_session_handoff`. And this guard's
-    //    tokenless arm is reachable from read-only callers: `handle_collab_recv`
-    //    (collab_session.rs) runs it on a plain, non-mutating read whenever the
-    //    session isn't sealed, so a ReadOnly- or Restricted-mode operator can
-    //    hit "handed off" here with no way to satisfy the fix it names unless
-    //    it says so. That is a static, always-true fact about `force_reissue`
-    //    itself, not a per-session maybe — worth stating plainly rather than
-    //    letting the operator discover it only after also clearing the idle
-    //    threshold.
+    // 2. Write access — named once, up front, covering BOTH remedies a
+    //    message offers, not appended only to force_reissue. `session_handoff`
+    //    is an unconditional `MUTATING_TOOLS` member (`mod.rs`): minting,
+    //    claiming, and force_reissue alike all require
+    //    `IRONMEM_MCP_MODE=trusted`, which defaults to `ReadOnly`
+    //    (`session_handoff_is_write_gated_and_known` pins the gate). Scoping
+    //    the parenthetical to only the force_reissue clause would wrongly
+    //    imply the primary "obtain/present a token" remedy needs no write
+    //    access — it needs exactly the same one. This guard's tokenless arm
+    //    is reachable from a ReadOnly caller too: `handle_collab_recv`
+    //    (collab_session.rs) runs it on a plain, non-mutating read, so a
+    //    default-mode operator can land on either refusal with *neither*
+    //    remedy available until the message says so.
     //
-    // A third state — an ended/abandoned session — is NOT called out, on
-    // purpose. `ensure_active` runs before this guard on some call paths but
-    // after it on others (contrast `handle_collab_recv`'s hoisted seal check,
-    // ahead of the guard, with `ensure_caller_is_current_pilot`'s, after it),
-    // so a sealed session can land on either refusal here. But that is
-    // per-session state a static message cannot honestly summarize, and
-    // `force_reissue` itself checks it FIRST (before the generation and
-    // staleness gates) and reports it with the stable seal message — so an
-    // operator who tries the pointer and is sealed learns that from the very
-    // next call, accurately, rather than from a caveat here that would be
-    // true for some sessions and noise for the rest.
+    // A third state — an ended/abandoned session — is deliberately NOT
+    // named. `ensure_active` runs before this guard on some call paths but
+    // after it on others (contrast `handle_collab_recv`'s hoisted seal
+    // check, ahead of the guard, with `ensure_caller_is_current_pilot`'s,
+    // after it), so a sealed session can land on either refusal here too.
+    // But that is per-session state a static message cannot honestly
+    // summarize, and `force_reissue` checks it FIRST (before the generation
+    // and staleness gates) and reports it with the stable seal message — so
+    // an operator who tries the pointer and is sealed learns that
+    // accurately from the very next call, rather than from a caveat here
+    // that is true for some sessions and noise for the rest.
     Err(MemoryError::Validation(format!(
-        "this session has been handed off (generation {db_active}); \
-         present a session_handoff token to claim it — or, if the process holding \
-         generation {db_active} is gone and cannot mint one, call session_handoff with \
-         force_reissue=true (requires IRONMEM_MCP_MODE=trusted) once the session has been \
-         idle {}; the claim that follows — not the reissue — is what advances the generation",
+        "this session has been handed off (generation {db_active}); both remedies require \
+         IRONMEM_MCP_MODE=trusted: present a session_handoff token to claim it, or — if the \
+         process holding generation {db_active} is gone and cannot mint one — call \
+         session_handoff with force_reissue=true once the session has been idle {}; the \
+         claim that follows — not the reissue — is what advances the generation",
         super::collab_session::dead_session_threshold_human(),
     )))
 }
@@ -1303,6 +1300,23 @@ mod tests {
             err.contains("IRONMEM_MCP_MODE=trusted"),
             "expected the write-access precondition, got: {err}"
         );
+        // The write-access precondition must cover BOTH remedies, not be
+        // scoped only to force_reissue — so it must appear before the
+        // primary "obtain a token" remedy in the text, not only alongside
+        // the fallback. A version that appended "(requires
+        // IRONMEM_MCP_MODE=trusted)" solely to the force_reissue clause
+        // would pass every assertion above while wrongly implying the
+        // primary remedy needs no write access; this ordering check is what
+        // catches that.
+        let trusted_idx = err.find("IRONMEM_MCP_MODE=trusted").expect("checked above");
+        let primary_remedy_idx = err
+            .find("obtain a session_handoff token")
+            .expect("primary remedy must be named");
+        assert!(
+            trusted_idx < primary_remedy_idx,
+            "the write-access precondition must precede (and thus cover) the primary \
+             remedy, not be scoped only to force_reissue; got: {err}"
+        );
     }
 
     /// A token claim whose enclosing transaction later refuses the call must
@@ -2265,6 +2279,18 @@ mod tests {
         assert!(
             err.contains("the claim that follows") && err.contains("not the reissue"),
             "expected the claim-advances-generation note, got: {err}"
+        );
+        // Same regression guard as the stale-generation test: the write-access
+        // precondition must precede (and thus cover) the primary "present a
+        // token" remedy, not be scoped only to the force_reissue fallback.
+        let trusted_idx = err.find("IRONMEM_MCP_MODE=trusted").expect("checked above");
+        let primary_remedy_idx = err
+            .find("present a session_handoff token")
+            .expect("primary remedy must be named");
+        assert!(
+            trusted_idx < primary_remedy_idx,
+            "the write-access precondition must precede (and thus cover) the primary \
+             remedy, not be scoped only to force_reissue; got: {err}"
         );
     }
 
