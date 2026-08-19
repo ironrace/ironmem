@@ -1,16 +1,21 @@
 use serde_json::Value;
 
-use crate::collab::{validate_task_list_body, CollabEvent, Phase};
+use crate::collab::{
+    validate_task_list_body, CollabEvent, Phase, MAX_CODING_FAILURE_CHARS as DB_CHECK_CHARS,
+};
 use crate::error::MemoryError;
 
 use super::shared::sha256_hex;
 
-/// Maximum length (chars) for `coding_failure` on a failure_report. Matches
-/// the CHECK constraint in migration 005 so the DB and MCP layer agree. The
-/// outer `content` cap (MAX_COLLAB_CONTENT_CHARS) is larger — this per-field
-/// cap prevents a caller from filling the whole content budget with one
-/// unbounded string.
-const MAX_CODING_FAILURE_CHARS: usize = 2048;
+/// Maximum length (chars) for `coding_failure` on a failure_report. Derived
+/// from [`crate::collab::MAX_CODING_FAILURE_CHARS`] — the single place that
+/// number is defined — rather than restated, so the DB CHECK, the abandon
+/// path's byte cap, and this MCP-layer char cap cannot drift apart. The outer
+/// `content` cap (`MAX_COLLAB_CONTENT_CHARS`) is larger — this per-field cap
+/// prevents a caller from filling the whole content budget with one
+/// unbounded string. Still measured with `.chars().count()` below, matching
+/// SQLite's character-counted `length()` — do not switch this path to bytes.
+const MAX_CODING_FAILURE_CHARS: usize = DB_CHECK_CHARS;
 
 /// Maximum length (chars) for `pr_url` on a final_review event. Matches the
 /// CHECK constraint in migration 005.
@@ -146,6 +151,59 @@ pub(super) fn parse_failure_report_event(content: &str) -> Result<CollabEvent, M
             )
         })?
         .to_string();
+    // `abandoned:` is reserved for `collab_end`'s abandon arm. Every later
+    // reader — `queue::ensure_active`'s seal echo, `collab_status`, an audit of
+    // the `coding_failure` column — identifies an abandonment by this prefix
+    // and nothing else, so an agent able to file the same prefix through
+    // `failure_report` could mint a row indistinguishable from a real one.
+    //
+    // What reserving it here buys is exactly one property: a row carrying this
+    // prefix was written by `handle_collab_abandon` and by no other code path.
+    // It does **not** make the row an operator's own words. `collab_end` has no
+    // operator authentication, is in `MUTATING_TOOLS`, and is on the
+    // unattended-successor permission allowlist, so the abandon and its reason
+    // text may equally have been composed by an agent. This bounds the door,
+    // not the hand — see `crate::collab::ABANDONED_PREFIX`.
+    //
+    // Checked on the caller's raw string, before compaction: compaction only
+    // ever removes middle lines or truncates, so it can neither introduce this
+    // prefix nor hide one that is already there, and refusing on what was
+    // actually sent keeps the message about the caller's own input.
+    //
+    // Compared against what the row will *render as*, not against its bytes.
+    // The property being defended is what a human or an agent sees on
+    // `collab_status` and in `handoff.rs`'s `coding_failure:` line, so the
+    // reservation has to cover every spelling that reaches that reader looking
+    // like the epitaph: leading whitespace, ASCII case (`Abandoned:`), and the
+    // `Cf` characters that render as nothing at all (`\u{200b}abandoned:`,
+    // `aban\u{200b}doned:`) — none of which `starts_with` on a `trim_start`ed
+    // byte string catches. `crate::sanitize::is_forgeable_invisible` is the
+    // crate's one definition of that family, shared with
+    // `crate::collab::reason_char_is_forbidden` so the write-side rules on
+    // both halves of the abandon epitaph agree by construction.
+    //
+    // Deliberately only the *write* side widens. `queue::ensure_active`'s echo
+    // stays a byte-exact `starts_with`, because there the exactness is the
+    // point: a row that does not carry the literal prefix was not written by
+    // `handle_collab_abandon` and must not be replayed as though it were. This
+    // check refuses the near-misses at the door; that one refuses to trust
+    // them if they are already on disk.
+    let rendered_head: String = coding_failure
+        .chars()
+        .filter(|c| !crate::sanitize::is_forgeable_invisible(*c))
+        .skip_while(|c| c.is_whitespace())
+        .take(crate::collab::ABANDONED_PREFIX.chars().count())
+        .collect();
+    if rendered_head.eq_ignore_ascii_case(crate::collab::ABANDONED_PREFIX) {
+        return Err(MemoryError::Validation(format!(
+            "failure_report coding_failure must not start with `{}` — nor with anything that \
+             renders as it, whatever the case or invisible characters. That prefix is reserved \
+             for collab_end's abandon arm, which is the only code path permitted to write it. \
+             Report the underlying failure instead; to abandon a demonstrably dead session, call \
+             collab_end with `abandon: true` and a `reason`.",
+            crate::collab::ABANDONED_PREFIX,
+        )));
+    }
     let coding_failure = if crate::mcp::compact::should_compact_failure_reports() {
         crate::mcp::compact::compact_failure_log(&coding_failure, MAX_CODING_FAILURE_CHARS)
     } else {
@@ -549,6 +607,66 @@ mod tests {
             Phase::CodeImplementPending,
             crate::collab::Agent::Codex,
         ));
+    }
+
+    /// `abandoned:` marks a session ended through `collab_end`'s abandon arm,
+    /// and every later reader — `ensure_active`'s seal echo, `collab_status`,
+    /// an audit of the `coding_failure` column — identifies it by that prefix
+    /// alone. An agent that could file the same prefix through
+    /// `failure_report` would produce a row indistinguishable from a real
+    /// abandon, so the prefix is reserved rather than merely conventional.
+    /// (Reserved to that *code path* — not to a human: `collab_end` is itself
+    /// agent-callable. See `crate::collab::ABANDONED_PREFIX`.)
+    ///
+    /// The check compares what the row *renders as*, not its bytes: leading
+    /// whitespace, ASCII case, and the invisible `Cf` characters all produce a
+    /// `collab_status` line indistinguishable from a real epitaph while
+    /// sailing past a byte-exact `starts_with`, and no legitimate failure log
+    /// opens with the word in any of those spellings.
+    #[test]
+    fn failure_report_refuses_the_reserved_abandoned_prefix() {
+        for raw in [
+            "abandoned: I am pretending to be an operator",
+            "abandoned:whatever",
+            "  abandoned: sneaking past starts_with",
+            // ASCII case: renders as the epitaph, does not match it.
+            "Abandoned: sneaking past case sensitivity",
+            "ABANDONED: sneaking past case sensitivity",
+            // `Cf` characters: `trim_start` removes `White_Space` only, so a
+            // zero-width space is neither trimmed nor visible — leading, and
+            // mid-word where it splits the token without splitting the render.
+            "\u{200b}abandoned: sneaking past trim_start",
+            "\u{feff}Abandoned: both at once",
+            "aban\u{200b}doned: splitting the token",
+            crate::collab::ABANDONED_PREFIX,
+        ] {
+            let err = parse_failure_report_event(&json!({ "coding_failure": raw }).to_string())
+                .unwrap_err();
+            let message = err.to_string();
+            assert!(
+                message.contains("abandoned:"),
+                "the refusal must name the reserved prefix: {message}"
+            );
+            assert!(
+                message.contains("collab_end"),
+                "the refusal must name the surface that owns the prefix: {message}"
+            );
+        }
+    }
+
+    /// The reservation is a prefix reservation, not a keyword ban — a failure
+    /// log that merely mentions the word stays reportable.
+    #[test]
+    fn failure_report_still_accepts_a_log_that_only_mentions_abandonment() {
+        let event = parse_failure_report_event(
+            &json!({ "coding_failure": "git_push_failed: the branch was abandoned: upstream gone" })
+                .to_string(),
+        )
+        .expect("the prefix is reserved only at the start of the report");
+        let CollabEvent::FailureReport { coding_failure } = event else {
+            panic!("expected FailureReport event");
+        };
+        assert!(coding_failure.starts_with("git_push_failed:"));
     }
 
     #[test]

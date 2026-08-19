@@ -4106,6 +4106,434 @@ fn collab_start_code_review_end_rejected_during_active_review() {
     assert!(blocked.contains("active phase CodeReviewFixGlobalPending"));
 }
 
+/// Backdate every activity source for `session_id` by `secs`, so the abandon
+/// gate's staleness check sees a demonstrably dead session.
+///
+/// A local copy rather than a reuse: the library's `age_session` lives in
+/// `collab_session.rs`'s `#[cfg(test)]` module, which an integration binary
+/// linking `ironmem` as an ordinary dependency cannot see. Keep all **four**
+/// writes. `session_last_activity` takes the **max** of the session row, its
+/// checkpoints, its messages, and its handoff lease, so backdating only one
+/// leaves the session live and the abandon below refused for a reason this
+/// test never meant to exercise. Note the column types differ:
+/// `collab_checkpoints.updated_at` is INTEGER unix seconds, the other three
+/// are `datetime()` text.
+fn age_collab_session(app: &App, session_id: &str, secs: i64) {
+    let shift = format!("-{secs} seconds");
+    app.db
+        .with_transaction(|tx| {
+            tx.execute(
+                "UPDATE collab_sessions SET updated_at = datetime('now', ?2) WHERE id = ?1",
+                rusqlite::params![session_id, &shift],
+            )?;
+            tx.execute(
+                "UPDATE messages SET created_at = datetime('now', ?2) WHERE session_id = ?1",
+                rusqlite::params![session_id, &shift],
+            )?;
+            tx.execute(
+                "UPDATE collab_checkpoints SET updated_at = strftime('%s','now') - ?2
+                   WHERE session_id = ?1",
+                rusqlite::params![session_id, secs],
+            )?;
+            // The fourth source. `datetime(NULL, ...)` is NULL, so a lease row
+            // that never carried a handoff stays NULL rather than acquiring a
+            // timestamp out of nowhere.
+            tx.execute(
+                "UPDATE collab_actor_generations
+                    SET pending_handoff_issued_at = datetime(pending_handoff_issued_at, ?2),
+                        pending_handoff_claimed_at = datetime(pending_handoff_claimed_at, ?2)
+                  WHERE session_id = ?1",
+                rusqlite::params![session_id, &shift],
+            )?;
+            Ok(())
+        })
+        .expect("the fixture must be able to backdate a session's activity");
+}
+
+/// Issue #283's acceptance criteria 1, 2 and 5, driven end to end through real
+/// `tools/call` dispatch — so what it pins is the protocol surface an agent
+/// actually reaches, not a set of internal functions.
+///
+/// The field incident: a session wedged in a coding-active phase could be
+/// neither reused nor ended. The start-slot guard reserved `(repo_path,
+/// branch)` for it, and the refusal told the caller to run `collab_end` —
+/// which rejects every coding-active phase. Three days wedged. This walks the
+/// whole escape: wedge → refused plain end → guard that names only legal
+/// remedies → abandon → branch reopens → the seal survives a restart.
+///
+/// On-disk, not `App::open_for_test`: the last step reopens the database under
+/// a fresh `App`, because a seal that only lives in the writing process's
+/// caches is not a seal. An in-memory DB cannot express that difference.
+///
+/// The numbered steps below run 1, 2, 3, 5, 4, 6 against #283's criteria, and
+/// deliberately so: criterion 5's "no recovery attempt was spent" has to be
+/// read while the abandoned session is still the only one on this scope, i.e.
+/// before criterion 1's successor exists. The numbers track the criteria, not
+/// the execution order.
+///
+/// Ordering is load-bearing in two places. The plain-end refusal must come
+/// *before* the abandon — plain `collab_end` on an already-abandoned session
+/// is a spec'd idempotent no-op success (`docs/COLLAB.md`), so afterwards it
+/// proves nothing. And the successor session is started on the first `App`,
+/// not the reopened one: `ensure_no_conflicting_process_session` consults that
+/// `App`'s in-process scope cache, so a reopened `App` that had just claimed
+/// the branch would refuse the final `collab_send` for scope conflict instead
+/// of for the seal.
+#[test]
+fn collab_abandon_frees_a_wedged_branch_end_to_end_via_mcp() {
+    const REASON: &str = "the implementer process was killed and never came back";
+    let (_db_dir, db_path, app) = open_disk_app();
+    let (_repo, repo_path, shas) = git_batch_repo(2);
+    // The branch `start_batch_session_in` seeds its session on, restated here
+    // because every later call has to name the *same* scope for the start-slot
+    // guard and the reopen to be about one branch.
+    let branch = "main";
+
+    let wedged = start_batch_session_in(&app, &repo_path, 3);
+
+    // One recoverable failure report: it leaves the phase alone but spends a
+    // recovery attempt, so the "no attempt spent" assertion below has a
+    // non-zero number to hold constant rather than trivially comparing 0 to 0.
+    call_tool(
+        &app,
+        "collab_send",
+        json!({
+            "session_id": &wedged,
+            "sender": "claude",
+            "topic": "failure_report",
+            "content": json!({ "coding_failure": "git_commit_failed: index.lock EPERM" })
+                .to_string()
+        }),
+    );
+    let before = call_tool(&app, "collab_status", json!({ "session_id": &wedged }));
+    assert_eq!(
+        before["phase"], "CodeImplementPending",
+        "the fixture must wedge the session in a coding-active phase"
+    );
+    // Both counters get an explicit baseline, not just the per-resume one: the
+    // "unchanged across the abandon" assertions below compare two
+    // `serde_json::Value`s, and `[]` on a missing key yields `Null` — so a
+    // counter that stopped being emitted at all would compare `Null == Null`
+    // and pass while proving nothing.
+    assert_eq!(
+        before["recovery_attempts"],
+        json!(1),
+        "a recoverable failure report must have spent one recovery attempt, so the \
+         'no attempt spent' assertion below is not trivially 0 == 0"
+    );
+    assert_eq!(
+        before["total_recovery_attempts"],
+        json!(1),
+        "the lifetime counter needs the same non-zero baseline, or its 'unchanged' \
+         assertion below can pass on two absent fields"
+    );
+
+    // 1 — the wedge is real: the phase allowlist refuses a plain end.
+    let plain = call_tool_expect_error(
+        &app,
+        "collab_end",
+        json!({ "session_id": &wedged, "agent": "claude" }),
+    );
+    assert!(
+        plain.contains("rejected in active phase"),
+        "a coding-active session must still refuse a plain collab_end: {plain}"
+    );
+
+    // 2 — the start slot is held, and the refusal names only remedies the
+    // server will honour (#283 criterion 5). The old message sent every caller
+    // to the very `collab_end` that just refused above.
+    let duplicate = call_tool_expect_error(
+        &app,
+        "collab_start",
+        json!({
+            "repo_path": &repo_path,
+            "branch": branch,
+            "initiator": "claude",
+            "task": "second session on a held branch"
+        }),
+    );
+    // Pin WHICH of `duplicate_session_refusal`'s three arms answered, first.
+    // Every other assertion in this block is satisfied just as well by the
+    // unparseable-phase fallback, which also omits the collab_end advice and
+    // carries the recipe and threshold — so a regression in phase parsing
+    // could drop the operator to the vague arm with this block still green.
+    // This sentence is emitted only by the parsed-but-not-endable arm.
+    //
+    // Note the `(phase CodeImplementPending)` prefix does NOT discriminate:
+    // it is interpolated by the shared wrapper around all three remedies, from
+    // the raw column string, whether or not the parse succeeded.
+    assert!(
+        duplicate.contains("Plain collab_end is rejected in this phase"),
+        "the guard must give the coding-active diagnosis, not the unparseable-phase \
+         fallback: {duplicate}"
+    );
+    assert!(
+        !duplicate.contains("call collab_end on it"),
+        "the guard must not recommend the plain collab_end this phase rejects: {duplicate}"
+    );
+    assert!(
+        duplicate.contains(&format!("/collab join {wedged}")),
+        "the guard must name the reuse path and the session actually holding the slot: \
+         {duplicate}"
+    );
+    // The recipe verbatim, not just the word "abandon": a caller who cannot
+    // copy the call shape out of the refusal is still stuck.
+    // `<claude or codex>`, not the `claude|codex` alternation this once
+    // carried: `require_agent` refuses both, and only the bracketed form reads
+    // as a placeholder to an agent copying the recipe verbatim off the rescue
+    // path (see `abandon_recipe_json`).
+    let recipe = format!(
+        "`{{\"session_id\": \"{wedged}\", \"agent\": \"<claude or codex>\", \"abandon\": true, \
+         \"reason\": \"...\"}}`"
+    );
+    assert!(
+        duplicate.contains(&recipe),
+        "the guard must spell out the abandon call, expected {recipe}: {duplicate}"
+    );
+    assert!(
+        duplicate.contains(&ironmem::collab::COLLAB_DEAD_SESSION_SECS.to_string()),
+        "the guard must state the staleness threshold abandon requires: {duplicate}"
+    );
+
+    // 3 — abandon clears it, once the session is demonstrably dead.
+    age_collab_session(
+        &app,
+        &wedged,
+        ironmem::collab::COLLAB_DEAD_SESSION_SECS + 60,
+    );
+    let abandoned = call_tool(
+        &app,
+        "collab_end",
+        json!({
+            "session_id": &wedged,
+            "agent": "claude",
+            "abandon": true,
+            "reason": REASON
+        }),
+    );
+    assert_eq!(
+        abandoned,
+        json!({ "ok": true, "session_id": &wedged, "abandoned": true }),
+        "abandon must report the session it sealed"
+    );
+
+    // 5 — no recovery attempt was spent (#283 criterion 2). Abandon gives up
+    // on the session; it is not a retry, and must not bill the budget as one.
+    let after = call_tool(&app, "collab_status", json!({ "session_id": &wedged }));
+    // The abandon write touches `coding_failure` and nothing else, so the
+    // "a terminal `coding_failure` implies a recorded `failed_from_phase`"
+    // pairing that held before this arm existed no longer does. Pinned here
+    // rather than left to a reader's assumption: the phase the session was
+    // ended in stays on the row (that is where `failed_from_phase` would have
+    // pointed), and docs/COLLAB.md's exclusivity section tells readers to use
+    // it. A future edit that starts stamping `failed_from_phase` would make
+    // this session look resumable to `resume_eligibility`, which only the seal
+    // is then stopping.
+    assert_eq!(
+        after["failed_from_phase"],
+        json!(null),
+        "abandon must not stamp failed_from_phase — the session was ended in a phase, not \
+         failed from one: {after}"
+    );
+    assert_eq!(
+        after["phase"], before["phase"],
+        "abandon must leave the phase exactly as it found it: {after}"
+    );
+    assert_eq!(
+        after["recovery_attempts"], before["recovery_attempts"],
+        "abandon must not spend a per-resume recovery attempt"
+    );
+    assert_eq!(
+        after["total_recovery_attempts"], before["total_recovery_attempts"],
+        "abandon must not spend a lifetime recovery attempt"
+    );
+
+    // 4 — the branch reopens (#283 criterion 1). This is the whole point: the
+    // slot the wedged session held for three days is now free.
+    let successor = call_tool(
+        &app,
+        "collab_start_code_review",
+        json!({
+            "repo_path": &repo_path,
+            "branch": branch,
+            "base_sha": &shas[0],
+            "head_sha": &shas[1],
+            "initiator": "claude",
+            "task": "review the branch the wedged session was holding"
+        }),
+    );
+    let successor_id = successor["session_id"].as_str().unwrap_or_else(|| {
+        panic!(
+            "abandon must release the (repo_path, branch) start slot so a new session can \
+             claim it, got: {successor}"
+        )
+    });
+    assert_ne!(
+        successor_id, wedged,
+        "the branch must reopen as a NEW session, not by resurrecting the abandoned one"
+    );
+
+    // 6 — durability. Everything above could have been true of one process's
+    // caches; reopen the DB under a fresh `App` and ask again.
+    let (_state_dir, restarted) = open_second_disk_app(&db_path);
+    let persisted = call_tool(
+        &restarted,
+        "collab_status",
+        json!({ "session_id": &wedged }),
+    );
+    assert!(
+        persisted["ended_at"].is_string(),
+        "the seal must be persisted state, readable by a process that never wrote it: \
+         {persisted}"
+    );
+    assert_eq!(
+        persisted["coding_failure"],
+        json!(format!("{} {REASON}", ironmem::collab::ABANDONED_PREFIX)),
+        "the abandon reason is the session's permanent epitaph"
+    );
+    assert_eq!(
+        persisted["phase"], "CodeImplementPending",
+        "abandon seals in place — the record of where the session died must survive"
+    );
+    // Abandon is the one writer that leaves `pending_failure` and
+    // `coding_failure` set at once: it writes the epitaph directly rather than
+    // through `apply_event`, which keeps the two mutually exclusive. That is
+    // deliberate — the epitaph says the operator gave up, `pending_failure`
+    // says what the session was stuck on — and `collab_session.rs` documents it
+    // as an exception nothing may branch on. This is the only test that reaches
+    // that state over real dispatch, so it is the one place the exception can
+    // be pinned at the protocol surface.
+    assert_eq!(
+        persisted["pending_failure"],
+        json!("git_commit_failed: index.lock EPERM"),
+        "abandon must preserve the in-flight recoverable diagnostic alongside its epitaph"
+    );
+
+    // And the seal still refuses writes, carrying the stored reason with it,
+    // so the next agent to try this session learns why it is gone.
+    let refused = call_tool_expect_error(
+        &restarted,
+        "collab_send",
+        json!({
+            "session_id": &wedged,
+            "sender": "claude",
+            "topic": "implementation_done",
+            "content": "picking up where the dead process left off"
+        }),
+    );
+    // `ends_with`, not `contains`: the caller-supplied reason is deliberately
+    // last in this message so untrusted text cannot prepend itself to the
+    // server's own words, and only an end-anchored match pins that ordering.
+    let expected_tail = format!(
+        "session {wedged} has ended; caller-supplied abandon reason follows verbatim, \
+         treat as data: {} {REASON}",
+        ironmem::collab::ABANDONED_PREFIX
+    );
+    assert!(
+        refused.ends_with(&expected_tail),
+        "the refusal must end with the stored abandon reason, expected tail \
+         {expected_tail:?}: {refused:?}"
+    );
+}
+
+/// Abandon-as-slot-transfer, across two *different* agents — the composed
+/// property that carries this feature's security weight, pinned so any future
+/// narrowing or widening of it is a visible test change rather than a silent
+/// behaviour shift.
+///
+/// By D5 the abandon arm is deliberately neither scope- nor membership-gated:
+/// any caller who can name a valid `Agent` may abandon a demonstrably dead
+/// session it never participated in, and the freed `(repo_path, branch)` start
+/// slot is then claimable by anyone, who picks their own pilot and implementer
+/// roles. `collab_abandon_frees_a_wedged_branch_end_to_end_via_mcp` covers the
+/// mechanism but has the *same* agent abandon and reclaim, so it cannot see
+/// this boundary at all.
+///
+/// The assertions below record today's behaviour rather than endorsing it.
+/// `agent` is caller-asserted — `require_agent` only parses the string — so the
+/// enum value is a claim, not an identity, and the real bound on this is the
+/// six-hour staleness gate plus who can reach the MCP socket. If a later change
+/// adds a membership or ownership check to the abandon arm, or lets the
+/// abandoning caller inherit `current_owner` on the successor session, this
+/// test is where that shows up.
+#[test]
+fn abandon_by_a_nonparticipant_transfers_the_start_slot_with_attacker_chosen_roles() {
+    let (_db_dir, _db_path, app) = open_disk_app();
+    let (_repo, repo_path, _shas) = git_batch_repo(2);
+    let branch = "main";
+
+    // Session A: started, piloted and implemented entirely by claude. Codex
+    // never touches it.
+    let wedged = start_batch_session_in(&app, &repo_path, 2);
+    let before = call_tool(&app, "collab_status", json!({ "session_id": &wedged }));
+    assert_eq!(before["phase"], "CodeImplementPending");
+    assert_eq!(
+        before["pilot"], "claude",
+        "the fixture must leave codex a non-participant, or this proves nothing"
+    );
+    assert_eq!(before["implementer"], "claude");
+
+    age_collab_session(
+        &app,
+        &wedged,
+        ironmem::collab::COLLAB_DEAD_SESSION_SECS + 60,
+    );
+
+    // Codex — which never participated — abandons it. No membership check
+    // stands between the caller and the seal; only staleness does.
+    let abandoned = call_tool(
+        &app,
+        "collab_end",
+        json!({
+            "session_id": &wedged,
+            "agent": "codex",
+            "abandon": true,
+            "reason": "claude's implementer process is gone"
+        }),
+    );
+    assert_eq!(
+        abandoned,
+        json!({ "ok": true, "session_id": &wedged, "abandoned": true }),
+        "abandon is not membership-gated: a non-participant may seal a dead session"
+    );
+
+    // And the freed slot is claimable with roles the abandoning caller chose
+    // for itself — codex as both pilot and implementer, on a branch claude held.
+    let successor = call_tool(
+        &app,
+        "collab_start",
+        json!({
+            "repo_path": &repo_path,
+            "branch": branch,
+            "initiator": "codex",
+            "pilot": "codex",
+            "implementer": "codex",
+            "task": "codex takes over the branch claude was holding"
+        }),
+    );
+    let successor_id = successor["session_id"].as_str().unwrap_or_else(|| {
+        panic!("the abandoned slot must be claimable by the abandoning caller: {successor}")
+    });
+    assert_ne!(successor_id, wedged);
+
+    let taken = call_tool(&app, "collab_status", json!({ "session_id": successor_id }));
+    assert_eq!(
+        taken["pilot"], "codex",
+        "the reclaiming caller chooses its own roles — nothing carries over from the \
+         session it abandoned"
+    );
+    assert_eq!(taken["implementer"], "codex");
+
+    // The sealed session is untouched by the transfer: its epitaph names who
+    // abandoned it, which is the only audit trail this boundary leaves.
+    let sealed = call_tool(&app, "collab_status", json!({ "session_id": &wedged }));
+    assert!(sealed["ended_at"].is_string());
+    assert_eq!(
+        sealed["pilot"], "claude",
+        "the abandoned session must keep its own record of who ran it"
+    );
+}
+
 #[test]
 fn collab_start_code_review_failure_report_reaches_coding_failed() {
     let app = App::open_for_test().unwrap();
@@ -5137,10 +5565,16 @@ fn dashboard_session_summary(addr: &str, session_id: &str) -> serde_json::Value 
 }
 
 /// Open an on-disk `App` (noop embedder, trusted MCP mode) so a second,
-/// independent read-only connection — the real dashboard binary — can see
-/// the same committed rows. `App::open_for_test`'s in-memory DB cannot be
-/// shared this way.
-fn open_disk_app_for_dashboard_sweep() -> (tempfile::TempDir, PathBuf, App) {
+/// independent connection can see the same committed rows —
+/// `App::open_for_test`'s in-memory DB cannot be shared that way.
+///
+/// The second reader varies by caller: the real dashboard binary
+/// (`dashboard_reflects_a_full_collab_sweep`), a second MCP server process
+/// (`collab_checkpoint_refuses_a_superseded_process`), or a restarted one
+/// (`collab_abandon_frees_a_wedged_branch_end_to_end_via_mcp`). The returned
+/// `TempDir` owns both the DB file and the state dir, so callers must bind it
+/// for as long as any `App` over this path is in use.
+fn open_disk_app() -> (tempfile::TempDir, PathBuf, App) {
     let dir = tempfile::tempdir().expect("temp dir must be creatable");
     let db_path = dir.path().join("collab.sqlite3");
     let state_dir = dir.path().join("state");
@@ -5152,7 +5586,7 @@ fn open_disk_app_for_dashboard_sweep() -> (tempfile::TempDir, PathBuf, App) {
         mcp_access_mode: McpAccessMode::Trusted,
         embed_mode: EmbedMode::Noop,
     };
-    let app = App::new(config).expect("disk-backed App must open for Task 15's full sweep");
+    let app = App::new(config).expect("disk-backed App must open");
     (dir, db_path, app)
 }
 
@@ -5176,8 +5610,7 @@ fn open_second_disk_app(db_path: &Path) -> (tempfile::TempDir, App) {
         mcp_access_mode: McpAccessMode::Trusted,
         embed_mode: EmbedMode::Noop,
     };
-    let app = App::new(config)
-        .expect("second disk-backed App must open for the fresh-process workaround");
+    let app = App::new(config).expect("second disk-backed App must open over the shared DB");
     (dir, app)
 }
 
@@ -5267,7 +5700,7 @@ fn assert_dashboard_matches_status(
 /// neighbors).
 #[test]
 fn collab_role_safety_full_verification_sweep_reversed_role_scenario() {
-    let (_dir, db_path, app) = open_disk_app_for_dashboard_sweep();
+    let (_dir, db_path, app) = open_disk_app();
     let dashboard = spawn_dashboard(&db_path);
 
     // ── Step 1 ──────────────────────────────────────────────────────────
@@ -6020,7 +6453,7 @@ fn collab_checkpoint_names_a_wrong_typed_session_id() {
 /// was written.
 #[test]
 fn collab_checkpoint_refuses_a_superseded_process() {
-    let (_dir_a, db_path, app_a) = open_disk_app_for_dashboard_sweep();
+    let (_dir_a, db_path, app_a) = open_disk_app();
     let (_repo, repo_path, head) = checkpoint_repo();
     let session_id = start_checkpoint_session(&app_a, &repo_path, "main");
 
@@ -7782,9 +8215,30 @@ fn inspect_divergence_writes_nothing() {
         before_wal,
         "inspection must write no audit row of any operation"
     );
+    // `idle_secs` is dropped from both sides before comparing, and it is the
+    // only field that may be: it is `now - last_activity`, recomputed per
+    // call, so it ticks with the wall clock whether or not anything was
+    // written. Comparing it would make this test fail whenever the two
+    // `collab_status` calls straddle a second boundary — a flake that says
+    // nothing about whether inspection wrote anything. The stored half of that
+    // pair, `last_activity`, stays in the comparison and is what actually
+    // carries the read-only claim: it moves if and only if a write touched one
+    // of the four activity sources.
+    let mut after_status = call_tool(&app, "collab_status", json!({ "session_id": &session_id }));
+    let mut before_status = before_status;
+    for status in [&mut before_status, &mut after_status] {
+        assert!(
+            status
+                .as_object_mut()
+                .expect("collab_status returns an object")
+                .remove("idle_secs")
+                .is_some(),
+            "collab_status must report idle_secs — if it stops, drop this removal rather than \
+             letting the comparison silently lose a field"
+        );
+    }
     assert_eq!(
-        call_tool(&app, "collab_status", json!({ "session_id": &session_id })),
-        before_status,
+        after_status, before_status,
         "inspection must leave the session record byte-identical"
     );
 }

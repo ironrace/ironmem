@@ -485,13 +485,46 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
         }),
         json!({
             "name": "collab_end",
-            "description": "End an eligible collab session. The current owner may abort PlanClaudeFinalizePending; other active planning and all active coding phases are rejected.",
+            "description": "End an eligible collab session. The current owner may abort PlanClaudeFinalizePending; other active planning and all active coding phases are rejected unless abandon is set.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "session_id": { "type": "string" },
                     "agent": { "type": "string", "enum": ["claude", "codex"] },
-                    "handoff_token": { "type": "string" }
+                    "handoff_token": { "type": "string" },
+                    "abandon": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": format!(
+                            "End a demonstrably dead session from any phase. Refused unless the \
+                             session has had no activity for {} hours. Ignores the generation \
+                             lease. Terminal and irreversible.",
+                            crate::collab::COLLAB_DEAD_SESSION_SECS / 3600
+                        )
+                    },
+                    // Deliberately NOT documented here: that `reason` must be
+                    // non-blank and free of control/bidi characters. Those
+                    // refusals are self-describing and name their own
+                    // constraint precisely (see `handle_collab_end` in
+                    // collab_session.rs) — do not "complete" this at budget
+                    // cost by restating them in the schema.
+                    "reason": {
+                        "type": "string",
+                        "maxLength": crate::collab::MAX_ABANDON_REASON_BYTES,
+                        // JSON Schema's `maxLength` counts characters; the
+                        // server enforces this cap in bytes (see
+                        // `MAX_ABANDON_REASON_BYTES`'s own doc for why). The
+                        // gap is conservative, not a defect: a multibyte
+                        // reason within the character cap can still be
+                        // refused as over-length before reaching it.
+                        // "a reason containing multibyte characters", not "a
+                        // long multibyte reason": the cap is enforced in
+                        // bytes, so *any* non-ASCII character shrinks the
+                        // effective character budget below the advertised
+                        // maxLength. The earlier wording read as though only
+                        // unusually long inputs were affected.
+                        "description": "Required with abandon; stored as the session's coding_failure. Refused without abandon. maxLength counts characters; the server enforces the cap in bytes, so a reason containing multibyte characters may be refused well before reaching maxLength characters."
+                    }
                 },
                 "required": ["session_id", "agent"]
             }
@@ -1454,6 +1487,30 @@ mod tests {
     /// measured 4_128 tokens after the addition, leaving ~42 tokens of
     /// headroom, in line with the previous raises.
     ///
+    /// Raised 4_170 -> 4_333 for `collab_end`'s `abandon`/`reason` pair
+    /// (#297) — the escape hatch for a session that can be neither reused nor
+    /// ended. Two properties plus their descriptions are ~570 bytes, and the
+    /// prose is not trimmable: `abandon`'s description is the only place the
+    /// surface says the op is refused on a live session and ignores the
+    /// generation lease — a caller that learns either at the refusal has
+    /// already made a destructive, irreversible call it believed was gated
+    /// differently — and `reason`'s is the only place it says the field is
+    /// refused *without* `abandon`, which JSON Schema cannot express as a
+    /// dependency the way it can express `required`, and the only place a
+    /// schema-honoring client learns that `maxLength` counts characters while
+    /// the server enforces the cap in bytes (a multibyte reason within the
+    /// character cap can still be refused as over-length). The two facts that
+    /// could move into schema keys did, and both now derive from the same
+    /// constants the rest of the branch derives from rather than restating
+    /// them: `default: false`, and `maxLength: MAX_ABANDON_REASON_BYTES`
+    /// (2037, i.e. 2048 minus the `abandoned:` prefix and its separator), with
+    /// `abandon`'s "N hours" computed from `COLLAB_DEAD_SESSION_SECS / 3600`
+    /// rather than hardcoded as "6 hours" — a hardcoded copy is exactly the
+    /// drift shape the rest of this branch derives constants to avoid. The
+    /// listing measured 4_291 tokens after the addition, leaving ~42 tokens of
+    /// headroom, in line with the previous raises. No neighbouring tool's
+    /// description was trimmed to pay for it.
+    ///
     /// The budget is deliberately a whole-listing ceiling with no per-tool
     /// allocation, so the cheapest way to land a new field is to delete prose
     /// from whichever unrelated tool happens to be wordiest. That trade is not
@@ -1466,8 +1523,40 @@ mod tests {
         let bytes = serde_json::to_vec(&tool_definitions(&app)).unwrap().len();
         let estimated_tokens = bytes.div_ceil(4);
         assert!(
-            estimated_tokens <= 4_170,
+            estimated_tokens <= 4_333,
             "tool listing is ~{estimated_tokens} tokens ({bytes} bytes); trim descriptions that duplicate their schemas"
+        );
+    }
+
+    /// The advertised `collab_end.reason` cap and "N hours" wording must track
+    /// their constants, not restate them by hand. Everywhere else this branch
+    /// derives from `MAX_ABANDON_REASON_BYTES` and `COLLAB_DEAD_SESSION_SECS`
+    /// rather than hardcoding a copy that can drift silently (see
+    /// `dead_session_threshold_human` and `MAX_ABANDON_REASON_BYTES`'s own doc
+    /// for the rest of that discipline); the schema is no exception.
+    #[test]
+    fn collab_end_schema_advertises_the_real_abandon_bounds() {
+        let app = App::open_for_test().unwrap();
+        let tool = tool_definitions(&app)
+            .into_iter()
+            .find(|tool| tool["name"] == "collab_end")
+            .expect("collab_end must be advertised");
+        let properties = &tool["inputSchema"]["properties"];
+
+        assert_eq!(
+            properties["reason"]["maxLength"],
+            json!(crate::collab::MAX_ABANDON_REASON_BYTES),
+            "the advertised cap must track MAX_ABANDON_REASON_BYTES, not a hardcoded copy of it"
+        );
+        let abandon_description = properties["abandon"]["description"]
+            .as_str()
+            .expect("abandon property needs a description");
+        assert!(
+            abandon_description.contains(&format!(
+                "{} hours",
+                crate::collab::COLLAB_DEAD_SESSION_SECS / 3600
+            )),
+            "the advertised staleness threshold must track COLLAB_DEAD_SESSION_SECS: {abandon_description}"
         );
     }
 

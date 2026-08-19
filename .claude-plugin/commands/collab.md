@@ -662,12 +662,17 @@ single human planning gate and takes it in step 0, before any worker runs.
    - **On approval:** proceed to step 1 and dispatch
      `collab-turn-task-list.md` as described there.
    - **On rejection:** do **not** send `task_list`. Offer
-     `mcp__ironmem__collab_end` instead: `collab_end` is legal precisely and
-     only at `PlanLocked` pre-`task_list` (plus the two terminal phases —
-     see **§ Invariants**, and `handle_collab_end` in
-     `crates/ironmem/src/mcp/tools/collab_session.rs`), which makes this the
-     one clean abandon point in the session. Report the rejection and exit the
-     loop; never work around the gate by sending `task_list` anyway.
+     `mcp__ironmem__collab_end` instead: for a plain (non-abandon) end,
+     `collab_end` is legal precisely and only at `PlanLocked` pre-`task_list`
+     (plus the two terminal phases — see **§ Invariants**, and
+     `handle_collab_end` in `crates/ironmem/src/mcp/tools/collab_session.rs`),
+     so this is the one *immediate* clean abandon point in the session; a
+     session that wedges past this gate still has the staleness-gated
+     `abandon: true` arm (§ Invariants) once it is demonstrably dead —
+     `collab_status`'s `idle_secs` against its `dead_session_secs` is how
+     that is established, and an operator decides it, not this loop. Report
+     the rejection and exit the loop; never work around the gate by sending
+     `task_list` anyway.
 
    Under `pilot == "claude"` this is behavior-preserving in substance — the
    gate still sits between the approved plan and the task list, with only the
@@ -700,9 +705,10 @@ single human planning gate and takes it in step 0, before any worker runs.
    re-approval loop. Every step 2 rejection below is of that kind (a 16-task
    plan, a plan-file SHA-256 mismatch, non-contiguous task IDs, a missing
    timebox). Report the blocker verbatim to the user and offer
-   `mcp__ironmem__collab_end`, legal precisely and only at `PlanLocked`
-   pre-`task_list` exactly as on rejection in step 0; the work has to be
-   re-cut — usually split into child issues — in a new session. This mirrors
+   `mcp__ironmem__collab_end` — for a plain end, legal precisely and only at
+   `PlanLocked` pre-`task_list`, exactly as on rejection in step 0; the work
+   has to be re-cut — usually split into child issues — in a new session.
+   This mirrors
    the `TaskListBridge` arm in `benchmarks/abeval/src/collab_driver.rs`, which
    maps a bridge `blocker:` to `DriveError::Invalid` rather than retrying.
 2. The worker must reject the bridge before sending if:
@@ -1449,7 +1455,8 @@ anywhere they act as wire values — `preconditions:` lines, dispatch-matrix row
 keys, and state checks.
 
 - **Never** call `mcp__ironmem__collab_end` during an active phase except for
-  the current-owner finalization-abort rule. Rejected in:
+  the current-owner finalization-abort rule, or the demonstrably-dead-session
+  exception below. Rejected in:
   - v1 active: `PlanParallelDrafts`, `PlanSynthesisPending`, and
     `PlanCodexReviewPending`.
   - v3 active: `CodeImplementPending`, `CodeReviewFixGlobalPending`,
@@ -1458,6 +1465,16 @@ keys, and state checks.
   Valid from `PlanClaudeFinalizePending` only when called by its current owner
   to abort an unfinalizable plan; otherwise valid from `PlanLocked`
   pre-`task_list` (abandon plan), `CodingComplete`, or `CodingFailed`.
+
+  **The one exception, and it carries its own precondition:** a session with
+  no activity for `COLLAB_DEAD_SESSION_SECS` (6h — across the session row,
+  its checkpoint, its messages, and its handoff lease, so a session being
+  recovered right now reads live) may be ended from **any** phase,
+  including every active one above, via `collab_end { "session_id": ...,
+  "agent": ..., "abandon": true, "reason": "..." }`. This is not a general
+  licence to end an active-phase session — a call against a session that is
+  merely slow rather than stale is refused, naming the remaining wait. See
+  `docs/COLLAB.md` § "The `collab_end` abandon contract" for the full rule.
 - **Never** peek at Codex's draft before sending your own during
   `PlanParallelDrafts`. The server enforces blind-draft in `recv`.
 - **Duplicate-session guard.** `collab_start` / `collab_start_code_review`
@@ -1466,6 +1483,17 @@ keys, and state checks.
   same `repo_path` + `branch`; the error names the existing `session_id`. On
   that error, do **not** retry — resume the named session with
   `/collab join <id>`, or `collab_end` it first if it is genuinely finished.
+  **Never abandon a session off the strength of that refusal alone.** Every
+  arm of the message names the `collab_end { "abandon": true, "reason": "..."
+  }` recipe, including the arm where a plain end would work and abandon is
+  only a conditional fallback — the text does not say which arm you are
+  reading, and staleness is not aliveness: `PlanLocked` is the single human
+  planning gate and a session can sit there live and silent overnight while
+  the operator is simply away. If the named session looks wedged, say so,
+  name the id and phase, and let the operator decide; abandon only on their
+  explicit go-ahead, and then with `collab_end { "session_id": "<id>",
+  "agent": "claude|codex", "abandon": true, "reason": "..." }` (a plain
+  `collab_end` stays rejected in an active phase).
 - **Process attribution guard.** On error `"another active collab session is
   already bound to this MCP process for metrics attribution: <id>"`, do not
   retry blindly — `collab_end` the named session if it is finished, or run the

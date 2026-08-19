@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The duplicate-session refusal now recommends a remedy the server will
+  actually accept (#297).** `collab_start` / `collab_start_code_review`
+  previously told every caller to "call `collab_end` on it", which the server
+  rejects in exactly the coding-active phases where a wedged session is most
+  likely to be sitting — a guard recommending an action that cannot work. The
+  message is now phase-dependent and is generated from the same predicates the
+  `collab_end` handler gates on, so the two cannot drift apart again: an
+  endable phase gets `/collab join` or a plain end (naming the current-owner
+  restriction where `PlanClaudeFinalizePending` imposes one), a non-endable
+  phase is told plainly that a plain end is rejected there, and an
+  unrecognized phase falls to the conservative wording rather than claiming
+  anything about endability. Each arm also spells the abandon call out in full
+  — `session_id` and `agent` included, not just the `abandon`/`reason` pair —
+  because a caller who copied the short form got a `session_id` refusal
+  instead of the rescue the message promised. **Naming the recipe is not a
+  verdict that the session is dead**, and the surfaces that read these
+  refusals now say so: `/collab` reports a wedged duplicate and asks the
+  operator before abandoning anything, and the Codex plan-draft prompt — a
+  one-shot background agent with nobody to ask — never sends `collab_end` at
+  all.
+
 - **`collab_set_implementer` is now restricted to the session's current pilot
   (#264).** The tool previously gated only on phase, so either agent could
   rebind the implementer; it now runs the same caller-identity check as
@@ -26,7 +47,104 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   seeded from the resolved pilot rather than hardcoded to `claude`. See
   § Authorization / Phase / Ownership Matrix in `docs/COLLAB.md`.
 
+- **Two breaking changes to the `ironmem` library surface (#297).**
+  `Database::collab_end_session` is **removed**: every caller now ends a
+  session inside a transaction it already holds, via
+  `ironmem::collab::queue::end_session`, so the standalone connection-level
+  wrapper had no remaining in-tree user and keeping it would have offered a
+  second way to end a session outside the transaction the staleness predicate
+  is evaluated in. That same `queue::end_session` now returns
+  `Result<SessionEndOutcome, MemoryError>` rather than `Result<(), MemoryError>`
+  — the abandon and plain-end paths both need to distinguish "ended it" from
+  "it was already ended", and discarding the value now trips `#[must_use]`.
+  Both items are `pub` and therefore API, even though the only in-tree callers
+  are tests; no deprecation shim is provided, because the crate is consumed by
+  this repository's own binaries and MCP server rather than published for
+  out-of-tree use. `Database::mark_task_outcome_done` likewise returns a
+  `TaskOutcomeAttestation` instead of `()`: a 0-row UPDATE — metrics disabled
+  when the task started, or a row under a different `task_tag` — used to be
+  indistinguishable from a recorded attestation at every call site, and for
+  the abandon arm it is permanent, since the seal leaves no surface able to
+  re-attest the session. Attestation stays best-effort and still never fails
+  a turn; the two failures are now warned separately instead of one of them
+  being invisible to its caller.
+
 ### Added
+
+- **`collab_status` reports the staleness the abandon gate evaluates (#297).**
+  New `last_activity` (Unix epoch seconds), `idle_secs`, and
+  `dead_session_secs` fields, read through the same paired `session_staleness`
+  snapshot `collab_end`'s abandon arm gates on. Until now the precondition
+  every surface told callers to check — "no activity for 6 hours" — was
+  answerable only by invoking the irreversible operation and reading the
+  refusal, or by reading the session record's `updated_at`, which is the wrong
+  signal: a long `CodeImplementPending` batch files checkpoints without
+  touching the session row, so `updated_at` alone reports a live batch as hours
+  idle. The duplicate-session refusal, `/collab`, and the Codex plan-draft
+  prompt now all point at `idle_secs` instead. Being over the threshold makes a
+  session *abandonable*, never provably dead — `PlanLocked` and
+  `CodingComplete` are human-gated and can sit healthy and silent much longer.
+
+- **`collab_end` can abandon a demonstrably dead collab session (#297).**
+  A session wedged in a coding-active phase previously had no exit at all: the
+  start slot reserves `(repo_path, branch)` for as long as the session stays
+  open, and a session stuck mid-recovery with a dead generation lease could
+  satisfy neither plain `collab_end`'s phase allowlist nor its lease check —
+  the field case sat wedged for three days. `collab_end` now accepts
+  `{"abandon": true, "reason": "..."}` (both newly advertised in the tool's
+  input schema, so the arm is discoverable rather than folklore), ends the
+  session from **any** phase, and seals it with `coding_failure = "abandoned:
+  <reason>"`, a Terminal classification that no `collab_resume` can undo. The
+  response carries `abandoned: true` so a real abandon is distinguishable from
+  a plain end.
+
+  **What holds it back is staleness, and only staleness.** Abandon is refused
+  unless the session has shown no activity for the new
+  `COLLAB_DEAD_SESSION_SECS` (21,600s / 6 hours), measured as the newest of
+  four sources — the session row, its checkpoint, its messages, and its
+  handoff lease — because each of them can advance alone: a long batch turn
+  files checkpoints without touching the session row, and the recovery path
+  (`session_handoff` and a successor's token claim) writes nothing but the
+  lease row, so a session actively being rescued must not read dead. The
+  threshold is deliberately generous: the false positive is destructive and
+  unrecoverable, the false negative costs a wait. The check runs **inside the
+  write transaction that ends the session**, so there is no read-then-write
+  window for activity to land in, and the refusal names both the elapsed idle
+  seconds and the seconds remaining.
+
+  Abandon skips exactly two things relative to a plain end — the generation
+  lease and the phase allowlist — and nothing else. The lease is skipped
+  because ending a session leaves no live turn for anyone to seize, and
+  refusing a supplied `handoff_token` would be actively hostile to the one
+  operator most likely to send one; the token is accepted and ignored. The
+  `PlanClaudeFinalizePending` current-owner check is still enforced, so
+  staleness never becomes a way for the counterpart to seal a session
+  mid-turn. `reason` is required, capped, and refused if it carries control,
+  line-separator, bidi-override, or zero-width/invisible-format characters,
+  because it is echoed back in every later refusal for that session and an
+  agent reads a server refusal as authoritative output; the same characters are
+  now stripped again on the way *out*, since a database that ran an earlier
+  ironmem can hold an `abandoned:` row written before the prefix was reserved
+  against caller input, and the echo is capped at 240 characters — the
+  attribution bounds the echo's format, the cap bounds its volume, and only the
+  second stops an agent-composed paragraph of directive prose from being
+  replayed as server output on every later call (the full text stays on
+  `collab_status`). Abandon spends no recovery attempt — it is not a
+  recovery, and the write touches `coding_failure` alone rather than
+  round-tripping the whole row. It also survives a `phase` column no build
+  recognises, which is exactly the row the duplicate-session guard's
+  unrecognized-phase arm sends callers here for.
+
+  **A repeat abandon is refused, not a no-op** — the one end shape that is not
+  idempotent, so the first epitaph can never be overwritten. That has a retry
+  cost worth planning around: a caller whose response was lost is told the
+  operation failed. Only an abandoned session's refusal carries the
+  `caller-supplied abandon reason follows` clause, which is how a retrying
+  caller tells "my seal is in place" from "someone else ended it". See § "The
+  `collab_end` abandon contract" in `docs/COLLAB.md`, including who is expected
+  to call it, and the permission-allowlist note: MCP grants are per tool name,
+  so an existing `mcp__ironmem__collab_end` allowance now confers the abandon
+  arm too and is worth re-reviewing.
 
 - **Schema-enforced collab checkpoints and a head-consistency gate on
   `implementation_done` (#273).** Schema goes **v19 -> v21** (migrations 020
@@ -61,6 +179,78 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   BM25/KG/diary result. Vector IDs are filtered against locally fetched drawers
   before fusion, so a daemon serving another database cannot consume injection
   slots.
+
+### Fixed
+
+- **A sealed collab session stays readable after a handoff (#297).** The write
+  seal on an abandoned session left its message queue unreachable in exactly
+  the case abandon exists for — a successor that claimed the generation lease
+  and then died. A tokenless `collab_recv` was answered by the lease guard
+  ("present a `session_handoff` token"), a token-bearing one is a write and hit
+  the seal, and `session_handoff` is sealed too, so no fresh token could be
+  minted. Read-only calls on an **ended** session now skip the lease guard, for
+  the same reason the abandon arm may bypass it: the lease stops a stale
+  process from *acting*, and an ended session leaves no live turn to seize. A
+  tokenless `collab_wait_my_turn` likewise settles with `session_ended: true`
+  rather than erroring, so a successor's wait loop exits instead of stranding.
+  Mutating shapes (`auto_ack`, a presented `handoff_token`) stay refused on any
+  ended session, abandoned or not.
+
+- **The abandon refusal no longer overflows on a corrupted activity stamp
+  (#297).** `collab_checkpoints.updated_at` is `INTEGER NOT NULL` with no range
+  CHECK, so a hand-repaired row can hold a timestamp far in the future; the
+  "seconds remaining" arithmetic in the still-live refusal was plain
+  subtraction over an intentionally-saturating value, which panicked under
+  debug assertions and wrapped to a nonsensical negative under release ones. It
+  now saturates and clamps at zero. Relatedly, an activity timestamp SQLite
+  cannot parse — restored from a dump in another format, or hand-repaired —
+  still degrades toward "dead" as before, but now warns rather than doing it
+  silently, since that single predicate authorizes an irreversible operation.
+
+- **A repeat `collab_end` is now literally a no-op (#297).** `docs/COLLAB.md`
+  has always specified a second `collab_end` on an already-ended session as a
+  no-op success, and the handler did return the same response — but it got
+  there by doing the work again. Endedness is now read first, before any write,
+  and the handler returns early, which closes three things a call specified to
+  do nothing was still doing: it appended a second `collab_end` WAL audit row;
+  it re-attested the metrics outcome, which could flip a `CodingComplete`
+  session's recorded outcome back from `abandoned` to `merged` if
+  `collab_end` were called again after an abandon; and it claimed a supplied
+  `handoff_token`. That last one is a security fix rather than a tidiness one:
+  `ensure_actor_generation_current` runs before anything on the plain path can
+  decline, so a no-op call was burning a one-time recovery credential and
+  advancing the generation lease. The docs promise the *end* is a no-op; they
+  grant no entitlement to spend a lease. The wire response is byte-identical
+  either way, so no caller can tell which case it hit.
+
+- **The `abandoned:` reservation now covers every spelling that renders as it
+  (#297).** `failure_report` refused a `coding_failure` beginning with a
+  byte-exact `abandoned:` after trimming whitespace, so `Abandoned:`,
+  `ABANDONED:` and `\u{200b}abandoned:` were all accepted and stored — rows
+  indistinguishable, to a human reading `collab_status` or a handoff block,
+  from an epitaph only `collab_end`'s abandon arm may write. The check now
+  folds ASCII case and removes the invisible-format characters
+  (`sanitize::is_forgeable_invisible`, shared with the abandon `reason`
+  filter) before comparing. The read side — the epitaph `ensure_active`
+  replays into refusals — stays byte-exact, because there the exactness is the
+  point.
+
+- **Smaller corrections on the same gate (#297).** The abandon recipe printed
+  in every refusal spelled its agent placeholder `"claude|codex"`, which
+  `require_agent` rejects — a caller copying the rescue verbatim got a second
+  refusal from the message meant to unblock it; it now reads
+  `"<claude or codex>"`. The owner-check refusals interpolate the session's
+  phase instead of naming `PlanClaudeFinalizePending` in text, so adding a
+  second owner-gated phase cannot make them misreport which rule fired. An
+  unparseable `phase` column — the one case the duplicate-session guard
+  tolerates rather than propagating — now logs a warning, so the underlying
+  data-integrity problem is recoverable after the fact instead of only ever
+  surfacing as "this phase could not be identified". The operator-facing
+  staleness threshold derives its "N hours" from `COLLAB_DEAD_SESSION_SECS`
+  rather than restating "6 hours". And a read-only call on a sealed session
+  (`collab_recv` without `auto_ack`, a tokenless `collab_wait_my_turn`) no
+  longer re-binds the process-scoped metrics attribution cell that the abandon
+  had just cleared.
 
 ### Documentation
 

@@ -11,7 +11,10 @@ CREATE TABLE IF NOT EXISTS collab_actor_generations (
     generation INTEGER NOT NULL DEFAULT 0 CHECK (generation >= 0),
     pending_handoff_token TEXT,
     pending_handoff_generation INTEGER CHECK (pending_handoff_generation IS NULL OR pending_handoff_generation >= 0),
-    -- audit trail: written by issue/claim ops, not read by the runtime.
+    -- Written by issue/claim ops. Originally audit-only; since #297 both are
+    -- also read by collab::queue::session_last_activity as the fourth
+    -- liveness source, so a session mid-recovery does not read dead to
+    -- collab_end's abandon arm. Do not repurpose or stop writing them.
     pending_handoff_issued_at TEXT,
     pending_handoff_claimed_at TEXT,
     PRIMARY KEY (session_id, agent)
