@@ -734,7 +734,7 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
                     "force_reissue": {
                         "type": "boolean",
                         "default": false,
-                        "description": "Mint a token WITHOUT holding the lease, to recover a session whose holder died. Requires generation > 0 and no activity for the staleness threshold. Does not advance the generation — the successor's claim does."
+                        "description": "Mint a token WITHOUT holding the lease, to recover a session whose holder died. Requires generation > 0 and no activity for the staleness threshold; refused in PlanLocked and CodingComplete, which can be human-idle while live. Does not advance the generation — the successor's claim does."
                     }
                 },
                 "required": ["session_id", "agent"]
@@ -1544,6 +1544,25 @@ mod tests {
     /// listing measured 4_367 tokens after the addition, leaving ~40 tokens
     /// of headroom, in line with the previous raises. No neighbouring tool's
     /// description was trimmed to pay for it.
+    ///
+    /// `force_reissue`'s description gained one more clause, cap unchanged,
+    /// when a security review of this branch (dabd0fb) found the D-P1
+    /// pending-token skip let a third process take over a live incumbent's
+    /// in-flight token, and fixed it by (among other things) refusing
+    /// `force_reissue` outright in `PlanLocked` and `CodingComplete` — the
+    /// two human-gated phases where a live process can legitimately write no
+    /// activity for arbitrarily long. That refusal is a precondition no
+    /// schema key expresses (JSON Schema has no "refused in these enum
+    /// values of a *different* field" shape), and omitting it is wrong in
+    /// the permissive direction: a caller who reads only the schema sees
+    /// `generation > 0` and staleness as the complete admission cost, tries
+    /// `force_reissue` in `PlanLocked`, and is refused by a rule the schema
+    /// never named — the same class of finding this plan's accuracy passes
+    /// have been correcting in prose elsewhere, now in the schema itself.
+    /// The listing measured 4_386 tokens after the addition, leaving ~21
+    /// tokens of headroom under the existing 4_407 cap — under it, so the
+    /// cap did not need to move. No neighbouring tool's description was
+    /// trimmed to pay for it.
     ///
     /// The budget is deliberately a whole-listing ceiling with no per-tool
     /// allocation, so the cheapest way to land a new field is to delete prose
