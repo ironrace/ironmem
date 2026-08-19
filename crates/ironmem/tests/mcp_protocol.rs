@@ -10260,10 +10260,32 @@ fn an_abandoned_lease_reads_reclaimable_yet_refuses_a_forced_reissue() {
             "reason": "gone for good"
         }),
     );
-    // The abandon is itself activity — it stamps `updated_at` — so the session
-    // reads live for a moment. Age it again: the interesting state is the
-    // sealed session that has since gone quiet, which is what any abandoned
-    // session becomes within a day.
+    // First, while the session is still FRESH. The abandon is itself activity
+    // — it stamps `updated_at` — so right now the session is sealed but live,
+    // and that is the only state in which the two candidate gate orderings
+    // disagree: with `ensure_active` first the seal answers, with staleness
+    // first this live session is refused with "is still live ... holds
+    // generation 2" instead. Once aged (below) both orderings refuse, and the
+    // assertion would pass under the very reordering it exists to forbid — so
+    // do not "tidy" this block by moving it after the aging.
+    let fresh = call_tool_expect_error(
+        successor,
+        "session_handoff",
+        force_reissue_args(sid, "claude"),
+    );
+    assert!(
+        fresh.contains("has ended"),
+        "a sealed session must get the seal message even while it still reads live — \
+         `ensure_active` runs ahead of the generation and staleness ladder: {fresh}"
+    );
+    assert!(
+        !fresh.contains("still live"),
+        "the staleness gate must never be the thing that answers for a sealed session: \
+         {fresh}"
+    );
+
+    // Now age it: the state Gap C is about is the sealed session that has since
+    // gone quiet, which is what every abandoned session becomes within a day.
     age_collab_session(
         &lease.incumbent,
         sid,
