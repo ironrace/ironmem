@@ -9326,3 +9326,984 @@ fn a_malformed_range_is_refused_even_when_the_repo_cannot_be_read() {
         "a malformed range must persist nothing even with git unreadable"
     );
 }
+
+// ── #298: recovering a dead generation lease, over real MCP dispatch ─────────
+//
+// Issue #283 defect B. The generation lease (#91) admits one live process per
+// (session, agent): a tokenless first touch is legal only at generation 0, and
+// past that a caller must present a `session_handoff` token.
+// `handle_session_handoff` is the ONLY tool that mints those tokens — and on
+// the normal path it runs the same guard first. So only a *live* holder of the
+// current generation can mint the next token. When that process dies the chain
+// is severed: nothing server-side resets the generation, and the session is
+// locked forever.
+//
+// `session_handoff { force_reissue: true }` is the hatch. Everything below is
+// driven through `call_tool` rather than the handlers, deliberately: the wedge
+// is one an operator hits over MCP dispatch, and calling the handler directly
+// bypasses the `MUTATING_TOOLS` mode filter and the dispatch table that are
+// part of the refusal. `handoff.rs`'s own `mod tests` already pins the gate
+// ladder unit-by-unit; this section pins what an operator actually reaches.
+
+/// A session whose generation lease is held at generation `n` by a process
+/// that is gone, plus the fresh process that arrives to rescue it.
+///
+/// # Why this type implements `Drop` with an empty body
+///
+/// `dir` owns the temp directory holding the SQLite file and it must outlive
+/// the whole test body. The obvious call-site shape — `let WedgedLease {
+/// successor, session_id, .. } = session_wedged_at_generation(3, "claude");` —
+/// quietly breaks that: Rust drops the fields left under `..` at the end of the
+/// `let` statement, so the database file is unlinked before the first
+/// assertion. Tests would still *pass*, because POSIX keeps an already-open
+/// file alive and the `successor` connection is open — but
+/// [`a_recovered_lease_survives_a_fresh_app_over_the_same_db`] opens a *new*
+/// `App` over `db_path` and would find nothing, failing in a way that looks
+/// exactly like a bug in the feature.
+///
+/// An empty `Drop` impl makes that shape a compile error (E0509, "cannot move
+/// out of a type which implements `Drop`") instead of a silent early delete.
+/// This is the same discipline `handoff.rs`'s `DeadLease` applies, and for the
+/// same reason. Access the fields by reference and hold the binding.
+struct WedgedLease {
+    /// The process that drove the lease to its current generation and still
+    /// carries that generation in its advisory cache — the incumbent a
+    /// successor's claim has to evict.
+    incumbent: App,
+    /// A second `App` over the same database file. **No cached generation**
+    /// for this (session, agent), no token, and — until `force_reissue` — no
+    /// way to mint one. That absence is what makes it a fresh process rather
+    /// than the incumbent; a successor is by definition a different process.
+    successor: App,
+    session_id: String,
+    /// The committed generation the fixture left the lease at.
+    generation: u64,
+    db_path: PathBuf,
+    /// Owns the temp dir holding the database, for as long as this value
+    /// lives. Never read on most paths — its whole job is to not be dropped
+    /// early, which the `Drop` impl above is what actually guarantees.
+    #[allow(dead_code)]
+    dir: tempfile::TempDir,
+    /// The successor `App`'s own state dir, held for the same reason.
+    #[allow(dead_code)]
+    successor_state: tempfile::TempDir,
+    /// The git repo the session is scoped to, held for the same reason.
+    #[allow(dead_code)]
+    repo: tempfile::TempDir,
+}
+
+/// Empty on purpose — see [`WedgedLease`]. The impl exists so the type cannot
+/// be partially moved out of, not to run anything at scope end.
+impl Drop for WedgedLease {
+    fn drop(&mut self) {}
+}
+
+/// A session whose `(session, agent)` lease sits at generation `generation`
+/// with every activity signal back-dated past the death threshold, plus the
+/// fresh process that arrives to rescue it.
+///
+/// The generations are built by driving **real** issue+claim cycles through
+/// MCP, never by `UPDATE`-ing `collab_actor_generations.generation`. A
+/// hand-set generation leaves the *pending* columns in a combination
+/// `issue_or_reuse_handoff`/`claim_handoff_token` never produce, and the forced
+/// path branches on those columns as well as on `generation` — a fixture built
+/// that way would be asserting about a row shape production cannot reach.
+/// `handoff.rs`'s `advance_to_generation_one` records the same argument at
+/// length; it is `#[cfg(test)]`-private to that module, so this is its
+/// integration-layer twin rather than a reuse.
+///
+/// The claim half of each cycle runs through `collab_register_caps` rather
+/// than through `session_handoff` itself. Both claim the token, but
+/// `session_handoff` also *mints the next one* — so a fixture built from
+/// paired `session_handoff` calls would leave a pending token behind, and a
+/// pending token reads `claimable: true` and routes `force_reissue` onto the
+/// D-P1 echo path. Every scenario below wants the opposite starting state: a
+/// lease locked with nothing pending. `collab_register_caps` is the right
+/// second half for one more reason — it is phase-independent, so the fixture
+/// works from any phase, and it is the shape a real successor uses (present
+/// the token on your first real call).
+fn session_wedged_at_generation(generation: u64, agent: &str) -> WedgedLease {
+    assert!(
+        generation > 0,
+        "a wedged lease is one held past generation 0; at 0 nothing is locked"
+    );
+    let (dir, db_path, incumbent) = open_disk_app();
+    let (repo, repo_path, _shas) = git_batch_repo(2);
+    // A coding-active phase, so the session is wedged the way #283 describes
+    // rather than merely lease-locked: `collab_end`'s phase allowlist refuses a
+    // plain end here, which is what makes the abandon branch below a real
+    // alternative remedy rather than a long way round to a permitted call.
+    let session_id = start_batch_session_in(&incumbent, &repo_path, 3);
+
+    for cycle in 1..=generation {
+        let issued = call_tool(
+            &incumbent,
+            "session_handoff",
+            json!({ "session_id": &session_id, "agent": agent }),
+        );
+        let token = issued["handoff_token"]
+            .as_str()
+            .unwrap_or_else(|| panic!("cycle {cycle} must mint a token: {issued}"))
+            .to_string();
+        call_tool(
+            &incumbent,
+            "collab_register_caps",
+            json!({
+                "session_id": &session_id,
+                "agent": agent,
+                "capabilities": [{ "name": format!("generation-{cycle}") }],
+                "handoff_token": token,
+            }),
+        );
+    }
+
+    age_collab_session(
+        &incumbent,
+        &session_id,
+        ironmem::collab::COLLAB_DEAD_SESSION_SECS + 60,
+    );
+    let (successor_state, successor) = open_second_disk_app(&db_path);
+
+    let status = call_tool(
+        &successor,
+        "collab_status",
+        json!({ "session_id": &session_id }),
+    );
+    assert_eq!(
+        status[format!("{agent}_generation")],
+        json!(generation),
+        "the fixture must leave the lease at generation {generation}: {status}"
+    );
+    assert_eq!(
+        status[format!("{agent}_handoff_pending")],
+        json!(false),
+        "the fixture must leave NOTHING pending — a pending token routes force_reissue \
+         onto the D-P1 echo path instead of the staleness gate: {status}"
+    );
+
+    WedgedLease {
+        incumbent,
+        successor,
+        session_id,
+        generation,
+        db_path,
+        dir,
+        successor_state,
+        repo,
+    }
+}
+
+/// `session_handoff { force_reissue: true }`, spelled once so no scenario
+/// below can drift into asserting about a slightly different call.
+fn force_reissue_args(session_id: &str, agent: &str) -> serde_json::Value {
+    json!({ "session_id": session_id, "agent": agent, "force_reissue": true })
+}
+
+/// A phase-independent, lease-gated write. Every scenario that needs to ask
+/// "can this process still act?" asks it with this call: `collab_send` answers
+/// the same question but drags a phase machine and a topic allowlist in with
+/// it, so a refusal there could come from three places and only one of them is
+/// the lease.
+fn register_caps_args(session_id: &str, agent: &str, name: &str) -> serde_json::Value {
+    json!({
+        "session_id": session_id,
+        "agent": agent,
+        "capabilities": [{ "name": name }],
+    })
+}
+
+/// The `<agent>_lease` verdict block from a `collab_status` read.
+fn lease_block(app: &App, session_id: &str, agent: &str) -> serde_json::Value {
+    let status = call_tool(app, "collab_status", json!({ "session_id": session_id }));
+    status[format!("{agent}_lease")].clone()
+}
+
+/// The whole wedge and the whole escape, end to end over `tools/call`.
+///
+/// Codex — pick the agent the fixture did *not* start the session as, so the
+/// lease under test is not incidentally the one `collab_start` touched — sits
+/// at generation 3, and the process holding it is gone. What this pins, in
+/// order: the lease really does lock every mutating call; the one tool that
+/// could repair it is itself gated behind the lease it would repair (that is
+/// defect B, stated as a test rather than as prose); the refusal now names the
+/// way out; the hatch mints a claimable token; and the claim restores ordinary
+/// write access at generation 4.
+///
+/// The middle assertion is the load-bearing one. Remove it and the file still
+/// tests a working `force_reissue` while saying nothing about *why* the flag
+/// has to exist — a reviewer could conclude the plain call would have done.
+#[test]
+fn a_dead_generation_lease_is_recoverable_through_force_reissue() {
+    let lease = session_wedged_at_generation(3, "codex");
+    let (successor, sid) = (&lease.successor, lease.session_id.as_str());
+    // Not merely a setup assertion: a call site that moved fields out of
+    // `WedgedLease` would have deleted the directory at the `let`, and every
+    // assertion below would still pass against the unlinked-but-open file.
+    assert!(
+        lease.db_path.exists(),
+        "the fixture must keep its database alive for the whole test"
+    );
+
+    // (a) The lease is locked: a fresh process cannot write, and cannot even
+    // read the message queue — `collab_recv` runs the same guard.
+    let locked = format!("this session has been handed off (generation {})", 3);
+    for (tool, args) in [
+        (
+            "collab_register_caps",
+            register_caps_args(sid, "codex", "rust"),
+        ),
+        (
+            "collab_send",
+            json!({
+                "session_id": sid,
+                "sender": "codex",
+                "topic": "implementation_done",
+                "content": "picking up where the dead process left off"
+            }),
+        ),
+        (
+            "collab_recv",
+            json!({ "session_id": sid, "receiver": "codex" }),
+        ),
+    ] {
+        let err = call_tool_expect_error(successor, tool, args);
+        assert!(
+            err.contains(&locked),
+            "{tool} must be refused by the generation lease, got: {err}"
+        );
+    }
+
+    // (b) Defect B itself: the only tool that mints a token is gated behind
+    // the lease it would repair. A plain `session_handoff` is refused — and
+    // the refusal now names the escape hatch instead of leaving the operator
+    // with a remedy that requires the dead process to still be alive.
+    let plain = call_tool_expect_error(
+        successor,
+        "session_handoff",
+        json!({ "session_id": sid, "agent": "codex" }),
+    );
+    assert!(
+        plain.contains(&locked),
+        "the token-minting tool must itself be lease-gated — that IS defect B: {plain}"
+    );
+    assert!(
+        plain.contains("force_reissue=true"),
+        "the refusal must name the remedy that does not require the dead holder: {plain}"
+    );
+
+    // (c) The hatch. R1: this mints the PENDING generation 4 and leaves the
+    // committed generation at 3 — see
+    // `recovery_evicts_the_previous_generation_holder` for the eviction half.
+    let reissued = call_tool(
+        successor,
+        "session_handoff",
+        force_reissue_args(sid, "codex"),
+    );
+    assert_eq!(
+        reissued["forced_reissue"],
+        json!(true),
+        "the forced path must mark itself in the response: {reissued}"
+    );
+    assert_eq!(
+        reissued["generation"],
+        json!(4),
+        "the reissue mints the pending generation N+1: {reissued}"
+    );
+    let token = reissued["handoff_token"]
+        .as_str()
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| panic!("the rescue must hand back a usable token: {reissued}"))
+        .to_string();
+    assert_eq!(
+        call_tool(successor, "collab_status", json!({ "session_id": sid }))["codex_generation"],
+        json!(3),
+        "R1: the reissue must not advance the committed generation — the claim does"
+    );
+
+    // (d) Claim, then write. The claim is presented on an ordinary mutating
+    // call, which is how a real successor takes over.
+    let mut claiming = register_caps_args(sid, "codex", "recovered");
+    claiming["handoff_token"] = json!(token);
+    let claimed = call_tool(successor, "collab_register_caps", claiming);
+    assert_eq!(
+        claimed["success"],
+        json!(true),
+        "the forced token must be claimable like any other: {claimed}"
+    );
+    // A *tokenless* write afterwards is the real proof: the successor is now
+    // the admitted actor, not merely a caller who once held a valid token.
+    let after = call_tool(
+        successor,
+        "collab_register_caps",
+        register_caps_args(sid, "codex", "still-writing"),
+    );
+    assert_eq!(
+        after["success"],
+        json!(true),
+        "after the claim the successor must write without a token: {after}"
+    );
+
+    // (e) 3 → 4, exactly once.
+    let status = call_tool(successor, "collab_status", json!({ "session_id": sid }));
+    assert_eq!(
+        status["codex_generation"],
+        json!(4),
+        "the claim must advance the generation exactly one step: {status}"
+    );
+}
+
+/// **R1, asserted rather than assumed.** A forced reissue evicts nobody; the
+/// successor's CLAIM does, and that ordering is the anti-resurrection property
+/// issue #91 rests on.
+///
+/// The distinction is invisible from the successor's side — both orders end
+/// with the successor able to write — so it can only be seen from the
+/// incumbent's. Here the incumbent is a process still cached at generation 3.
+/// It must keep writing across the reissue and stop at the claim.
+///
+/// What breaks if this test is deleted: an edit that "simplified"
+/// `handle_session_handoff` by claiming the generation on the forced path
+/// would evict the incumbent with **no successor to take over**, silently,
+/// leaving the session locked at a generation no live process holds — a worse
+/// wedge than the one the feature repairs, reachable by anyone who can pass the
+/// staleness gate. Most of this file stays green under that edit, because
+/// everything else exercises the normal succession path.
+#[test]
+fn recovery_evicts_the_previous_generation_holder() {
+    let lease = session_wedged_at_generation(3, "claude");
+    let (incumbent, successor) = (&lease.incumbent, &lease.successor);
+    let sid = lease.session_id.as_str();
+
+    // Baseline: the incumbent writes today. Without this the "still succeeds"
+    // assertion below could pass on a process that was never able to write.
+    let baseline = call_tool(
+        incumbent,
+        "collab_register_caps",
+        register_caps_args(sid, "claude", "incumbent-baseline"),
+    );
+    assert_eq!(baseline["success"], json!(true), "{baseline}");
+
+    let reissued = call_tool(
+        successor,
+        "session_handoff",
+        force_reissue_args(sid, "claude"),
+    );
+    let token = reissued["handoff_token"]
+        .as_str()
+        .expect("the rescue must hand back a token")
+        .to_string();
+
+    // The reissue evicted nobody. This is the assertion R1 lives or dies on.
+    let survives = call_tool(
+        incumbent,
+        "collab_register_caps",
+        register_caps_args(sid, "claude", "incumbent-after-reissue"),
+    );
+    assert_eq!(
+        survives["success"],
+        json!(true),
+        "R1: a forced reissue must not evict the incumbent — only the claim does: {survives}"
+    );
+
+    // The claim.
+    let mut claiming = register_caps_args(sid, "claude", "successor-claim");
+    claiming["handoff_token"] = json!(token);
+    call_tool(successor, "collab_register_caps", claiming);
+
+    // And now the incumbent is out. `local=3 current=4` is the whole story:
+    // the incumbent's advisory cache trails the committed generation.
+    let evicted = call_tool_expect_error(
+        incumbent,
+        "collab_register_caps",
+        register_caps_args(sid, "claude", "incumbent-after-claim"),
+    );
+    assert!(
+        evicted.contains("stale collab generation"),
+        "the claim must evict the previous holder: {evicted}"
+    );
+    assert!(
+        evicted.contains("local=3 current=4"),
+        "the refusal must name both sides of the drift it detected: {evicted}"
+    );
+
+    // Reads stay open to the evicted process throughout. This is not a
+    // courtesy: `collab_status` is deliberately NOT lease-gated, because the
+    // process every lease-gated call refuses is exactly the one that needs to
+    // read the diagnosis.
+    let readable = call_tool(incumbent, "collab_status", json!({ "session_id": sid }));
+    assert_eq!(
+        readable["claude_generation"],
+        json!(4),
+        "an evicted process must still be able to read why it was evicted: {readable}"
+    );
+    let caps = call_tool(incumbent, "collab_get_caps", json!({ "session_id": sid }));
+    assert!(
+        caps["capabilities"].is_array(),
+        "un-gated collab reads must stay available to an evicted process: {caps}"
+    );
+}
+
+/// #283 criterion 3, abandon branch: the two remedies are **alternatives**,
+/// not a sequence. An operator who has decided the session is finished must
+/// not first have to re-lease it in order to throw it away.
+///
+/// Abandon can do this because it deliberately skips the lease guard (D5 in
+/// `handle_collab_end`): #283's two defects — a wedged phase and a dead lease —
+/// are individually survivable and jointly terminal precisely because each
+/// blocks the other's remedy, so a lease-gated abandon would reintroduce the
+/// deadlock.
+///
+/// The second half is the ordering that keeps #297's seal meaningful: once
+/// abandoned, the session is **not** re-leasable. `force_reissue` runs
+/// `ensure_active` before the generation and staleness gates, so an abandoned
+/// session — maximally stale by construction — is refused with the seal
+/// message rather than re-evaluated against a staleness clock. Invert that
+/// order and every sealed session in the database becomes re-leasable, which
+/// is the one outcome #297 exists to prevent.
+#[test]
+fn the_same_wedged_session_is_abandonable_without_recovering_it_first() {
+    const REASON: &str = "the implementer process was killed and never came back";
+    let lease = session_wedged_at_generation(3, "claude");
+    let (successor, sid) = (&lease.successor, lease.session_id.as_str());
+
+    // No `force_reissue` anywhere above this line: the abandon is reached
+    // from the wedge directly.
+    let abandoned = call_tool(
+        successor,
+        "collab_end",
+        json!({
+            "session_id": sid,
+            "agent": "claude",
+            "abandon": true,
+            "reason": REASON
+        }),
+    );
+    assert_eq!(
+        abandoned,
+        json!({ "ok": true, "session_id": sid, "abandoned": true }),
+        "a dead lease must not stand between an operator and abandoning the session"
+    );
+
+    let status = call_tool(successor, "collab_status", json!({ "session_id": sid }));
+    assert!(
+        status["ended_at"].is_string(),
+        "the abandon must have sealed the session: {status}"
+    );
+    assert_eq!(
+        status["coding_failure"],
+        json!(format!("{} {REASON}", ironmem::collab::ABANDONED_PREFIX)),
+        "the abandon reason is the session's permanent epitaph: {status}"
+    );
+    // Abandon is not a recovery and not a succession: it must leave the lease
+    // exactly where it found it.
+    assert_eq!(
+        status["claude_generation"],
+        json!(lease.generation),
+        "abandon must not touch the generation it bypassed: {status}"
+    );
+
+    // The seal outranks the hatch.
+    let sealed = call_tool_expect_error(
+        successor,
+        "session_handoff",
+        force_reissue_args(sid, "claude"),
+    );
+    assert!(
+        sealed.contains("has ended"),
+        "an abandoned session must be refused with the seal, not re-leased: {sealed}"
+    );
+    assert!(
+        sealed.contains(REASON),
+        "the seal refusal must carry the stored abandon reason: {sealed}"
+    );
+    assert_eq!(
+        call_tool(successor, "collab_status", json!({ "session_id": sid }))
+            ["claude_handoff_pending"],
+        json!(false),
+        "a refused forced reissue must have minted nothing"
+    );
+}
+
+/// #283 criterion 4: `collab_status` must be able to answer "what is wrong
+/// with this lease, and what may I do about it" for the one caller every
+/// lease-gated call refuses.
+///
+/// The verdict moves three times across a recovery, and each reading is a
+/// different operator instruction: *reclaimable* (use the hatch) →
+/// *claimable* (a token is out there; whoever holds it may take the lease) →
+/// neither (a live process holds it, hands off).
+///
+/// The other agent's block is asserted at every step. `<agent>_lease` is
+/// per-agent, but `last_activity`/`idle_secs` inside it are session-scoped, so
+/// a regression that keyed the verdict on the session rather than on the
+/// (session, agent) row would light up `codex_lease` during a claude-only
+/// recovery — and nothing else in this file would notice.
+#[test]
+fn collab_status_reports_the_lease_verdict_across_a_recovery() {
+    let lease = session_wedged_at_generation(3, "claude");
+    let (successor, sid) = (&lease.successor, lease.session_id.as_str());
+
+    // The other agent never enters this story. Generation 0 means nothing is
+    // locked, so it is claimable by a plain tokenless call and there is
+    // nothing to reclaim.
+    let untouched = json!({
+        "generation": 0,
+        "handoff_pending": false,
+        "claimable": true,
+        "reclaimable": false,
+    });
+    let assert_codex_untouched = |stage: &str| {
+        let codex = lease_block(successor, sid, "codex");
+        for (key, want) in untouched.as_object().unwrap() {
+            assert_eq!(
+                &codex[key], want,
+                "the counterpart's lease must be unaffected {stage}: {codex}"
+            );
+        }
+    };
+
+    // Before: locked at generation 3, nothing pending, and dead — the one
+    // combination the hatch exists for.
+    let before = lease_block(successor, sid, "claude");
+    assert_eq!(before["generation"], json!(3), "{before}");
+    assert_eq!(before["handoff_pending"], json!(false), "{before}");
+    assert_eq!(
+        before["claimable"],
+        json!(false),
+        "a lease held past generation 0 with no pending token is not claimable: {before}"
+    );
+    assert_eq!(
+        before["reclaimable"],
+        json!(true),
+        "a dead, non-claimable lease is what `force_reissue` targets: {before}"
+    );
+    assert!(
+        before["idle_secs"].as_i64().unwrap_or(0) >= ironmem::collab::COLLAB_DEAD_SESSION_SECS,
+        "the verdict must ship the measurement that produced it: {before}"
+    );
+    assert_codex_untouched("before the reissue");
+
+    // After the reissue: a token is pending, so the lease is claimable — and
+    // `reclaimable` goes false, because it means "usable only via the
+    // dead-lease repair", not "a forced call would succeed". It would still
+    // succeed here, via the D-P1 echo path; see
+    // `a_repeated_forced_reissue_echoes_the_pending_token_without_a_second_staleness_check`.
+    let reissued = call_tool(
+        successor,
+        "session_handoff",
+        force_reissue_args(sid, "claude"),
+    );
+    let token = reissued["handoff_token"].as_str().unwrap().to_string();
+    let pending = lease_block(successor, sid, "claude");
+    assert_eq!(
+        pending["generation"],
+        json!(3),
+        "R1: the reissue must not move the committed generation: {pending}"
+    );
+    assert_eq!(pending["handoff_pending"], json!(true), "{pending}");
+    assert_eq!(
+        pending["claimable"],
+        json!(true),
+        "a pending token makes the lease claimable by whoever holds it: {pending}"
+    );
+    assert_eq!(
+        pending["reclaimable"],
+        json!(false),
+        "`reclaimable` names the dead-lease repair specifically, not 'force_reissue would \
+         be admitted': {pending}"
+    );
+    assert_codex_untouched("after the reissue");
+
+    // After the claim: generation 4, nothing pending, and a live holder.
+    let mut claiming = register_caps_args(sid, "claude", "recovered");
+    claiming["handoff_token"] = json!(token);
+    call_tool(successor, "collab_register_caps", claiming);
+    let after = lease_block(successor, sid, "claude");
+    assert_eq!(after["generation"], json!(4), "{after}");
+    assert_eq!(
+        after["handoff_pending"],
+        json!(false),
+        "the claim consumes the one-time token: {after}"
+    );
+    assert_eq!(after["claimable"], json!(false), "{after}");
+    assert_eq!(
+        after["reclaimable"],
+        json!(false),
+        "the claim is activity, so the session is no longer dead: {after}"
+    );
+    assert_codex_untouched("after the claim");
+}
+
+/// Durability. A successor is by definition a different process, so a recovery
+/// that lived only in the reissuing process's advisory generation cache would
+/// evaporate at exactly the moment it is needed.
+///
+/// Everything the other scenarios assert could, in principle, be true of one
+/// `App`'s in-memory caches. This reopens the database under a third `App` —
+/// one that saw neither the reissue nor the claim — and asks again.
+///
+/// The refusal is the sharpest of these assertions: a fresh process is told
+/// **generation 4**, the post-claim value. Had the advance lived in the
+/// rescuer's cache rather than in `collab_actor_generations`, this process
+/// would have been told 3.
+#[test]
+fn a_recovered_lease_survives_a_fresh_app_over_the_same_db() {
+    let lease = session_wedged_at_generation(3, "claude");
+    let (successor, sid) = (&lease.successor, lease.session_id.as_str());
+
+    let token = call_tool(
+        successor,
+        "session_handoff",
+        force_reissue_args(sid, "claude"),
+    )["handoff_token"]
+        .as_str()
+        .expect("the rescue must hand back a token")
+        .to_string();
+    let mut claiming = register_caps_args(sid, "claude", "recovered");
+    claiming["handoff_token"] = json!(token);
+    call_tool(successor, "collab_register_caps", claiming);
+
+    // A process that saw none of the above.
+    let (_state_dir, restarted) = open_second_disk_app(&lease.db_path);
+
+    let status = call_tool(&restarted, "collab_status", json!({ "session_id": sid }));
+    assert_eq!(
+        status["claude_generation"],
+        json!(4),
+        "the recovered generation must be persisted state, not a process cache: {status}"
+    );
+    assert_eq!(
+        status["claude_lease"]["handoff_pending"],
+        json!(false),
+        "the consumed token must be persisted as consumed: {status}"
+    );
+    assert_eq!(
+        status["claude_lease"]["claimable"],
+        json!(false),
+        "the recovered lease is held again — it must not read as free: {status}"
+    );
+
+    let refused = call_tool_expect_error(
+        &restarted,
+        "collab_register_caps",
+        register_caps_args(sid, "claude", "third-process"),
+    );
+    assert!(
+        refused.contains("this session has been handed off (generation 4)"),
+        "a process that never saw the reissue must be refused at the POST-claim \
+         generation — 3 here would mean the advance never left the rescuer's cache: {refused}"
+    );
+
+    // The audit trail survives too. A rescue that bypassed the lease guard and
+    // left no durable record would be a capability with no accountability.
+    let (params, result) = last_wal_row(&restarted, "session_handoff.force_reissue");
+    assert_eq!(params["session_id"], json!(sid), "{params}");
+    assert_eq!(params["prior_generation"], json!(3), "{params}");
+    assert_eq!(result["pending_generation"], json!(4), "{result}");
+}
+
+/// **Gap A + Gap B, gate path.** The forced path bypasses the generation
+/// guard, so the WAL row is the only durable record of a capability being
+/// exercised. Nothing pinned that the row is written, and nothing pinned what
+/// it says.
+///
+/// The load-bearing assertion is the pair `last_activity`/`idle_secs`. Those
+/// come from a staleness snapshot read **before** `issue_or_reuse_handoff`,
+/// and the ordering is not incidental: that call stamps
+/// `pending_handoff_issued_at`, which `session_last_activity` counts as one of
+/// its five activity signals. A read taken afterwards would report the
+/// reissue's *own* timestamps as the "prior" evidence it is supposed to be
+/// evidence about — an audit row asserting a dead session it never observed,
+/// on the strength of the observer's own footprint.
+///
+/// So the assertions are anchored to a `collab_status` read taken before the
+/// call: the row must report the lease **as it was**, not as the reissue left
+/// it. A refactor that moved the staleness read below the issue would produce
+/// `idle_secs ≈ 0` and a `last_activity` of roughly now, and both assertions
+/// fail. Without them that refactor is invisible.
+///
+/// `staleness_checked: true` is the Gap B half for this path: the flag exists
+/// so an auditor never has to infer from `reused` whether the liveness check
+/// actually ran, and an authorization-relevant record claiming a check that
+/// did not happen is the exact failure mode it prevents.
+#[test]
+fn the_forced_reissue_audit_row_records_the_lease_as_it_was_before_the_reissue() {
+    let lease = session_wedged_at_generation(3, "claude");
+    let (successor, sid) = (&lease.successor, lease.session_id.as_str());
+
+    // The fixture's three ordinary handoffs must leave no forced rows: this
+    // operation name means "the lease guard was bypassed", and a normal
+    // succession bypassed nothing.
+    assert_eq!(
+        wal_row_count(successor, sid, "session_handoff.force_reissue"),
+        0,
+        "an ordinary session_handoff must not write a force_reissue audit row"
+    );
+
+    // Ground truth for what the row is supposed to be evidence *about*, read
+    // from the same `session_staleness` snapshot the gate reads — through
+    // `collab_status`, which is not lease-gated and so is readable here.
+    let before = call_tool(successor, "collab_status", json!({ "session_id": sid }));
+    let prior_activity = before["last_activity"].clone();
+    assert!(
+        prior_activity.is_number(),
+        "the fixture must leave a readable activity timestamp: {before}"
+    );
+
+    call_tool(
+        successor,
+        "session_handoff",
+        force_reissue_args(sid, "claude"),
+    );
+
+    assert_eq!(
+        wal_row_count(successor, sid, "session_handoff.force_reissue"),
+        1,
+        "the bypass must be recorded exactly once"
+    );
+    let (params, result) = last_wal_row(successor, "session_handoff.force_reissue");
+
+    assert_eq!(params["session_id"], json!(sid), "{params}");
+    assert_eq!(params["agent"], json!("claude"), "{params}");
+    assert_eq!(
+        params["prior_generation"],
+        json!(3),
+        "the row must name the generation that was bypassed: {params}"
+    );
+    assert_eq!(
+        params["staleness_checked"],
+        json!(true),
+        "the staleness gate ran on this path and the row must say so: {params}"
+    );
+
+    // The ordering assertions.
+    assert_eq!(
+        params["last_activity"], prior_activity,
+        "the audit row must carry the PRIOR activity timestamp. This value equal to \
+         roughly now means the staleness snapshot was taken after \
+         issue_or_reuse_handoff stamped pending_handoff_issued_at — the row would then \
+         be reporting the reissue's own footprint as the evidence for it: {params}"
+    );
+    let idle = params["idle_secs"]
+        .as_i64()
+        .unwrap_or_else(|| panic!("idle_secs must be a number: {params}"));
+    assert!(
+        idle >= ironmem::collab::COLLAB_DEAD_SESSION_SECS,
+        "the recorded idle time must be the one that satisfied the gate ({} or more), \
+         not the near-zero value a post-issue read would produce: {params}",
+        ironmem::collab::COLLAB_DEAD_SESSION_SECS
+    );
+
+    assert_eq!(
+        result["pending_generation"],
+        json!(4),
+        "the result must record the token minted, not the generation committed: {result}"
+    );
+    assert_eq!(
+        result["reused"],
+        json!(false),
+        "the first forced call on a lease with nothing pending mints a fresh token: {result}"
+    );
+    // R1 once more, from the audit trail's own numbers: params say 3, result
+    // says 4, and the committed row still says 3.
+    assert_eq!(
+        call_tool(successor, "collab_status", json!({ "session_id": sid }))["claude_generation"],
+        json!(3),
+        "R1: the audit row's pending_generation is a mint, not a commit"
+    );
+}
+
+/// **Gap B (echo path), Gap C (first direction) and Gap D, in the one state
+/// that produces all three.**
+///
+/// D-P1: the staleness gate is skipped when a token is already pending. It has
+/// to be — the first forced reissue stamps `pending_handoff_issued_at`, itself
+/// one of the five liveness signals, so re-gating would refuse a caller's own
+/// retry using activity that caller just wrote. The skip grants nothing: the
+/// token is byte-identical and the generation does not move.
+///
+/// Three properties, none of which the other scenarios can see:
+///
+/// - **Gap B.** `staleness_checked: false` on this path. The row must not
+///   claim a liveness check that was deliberately skipped; `idle_secs` sits
+///   beside it, measured but gating nothing, which is exactly why the flag has
+///   to be separate from it.
+/// - **Gap C, "not sufficient".** The lease now reads `reclaimable: false` —
+///   and a forced reissue is admitted anyway. Anyone building a preflight on
+///   that field (#299 will) who reads it as "force_reissue would be refused"
+///   ships a mis-diagnosis for the retrying caller.
+/// - **Gap D.** One logical handoff, one metric increment. The `!issued.reused`
+///   guard is what makes a pre-claim retry free; over real dispatch, not just
+///   at the handler.
+#[test]
+fn a_repeated_forced_reissue_echoes_the_pending_token_without_a_second_staleness_check() {
+    let lease = session_wedged_at_generation(2, "claude");
+    let (successor, sid) = (&lease.successor, lease.session_id.as_str());
+
+    let handoffs = |stage: &str| {
+        successor
+            .db
+            .get_task_outcome(sid)
+            .unwrap()
+            .unwrap_or_else(|| panic!("collab_start must have seeded a task_outcomes row {stage}"))
+            .handoffs
+    };
+    // Non-zero by construction (the fixture's two real handoffs), so the
+    // "unchanged" assertion below is not trivially 0 == 0.
+    let baseline = handoffs("before the rescue");
+    assert_eq!(
+        baseline, 2,
+        "the fixture's two issue+claim cycles are two logical handoffs"
+    );
+
+    let first = call_tool(
+        successor,
+        "session_handoff",
+        force_reissue_args(sid, "claude"),
+    );
+    let after_first = handoffs("after the first forced reissue");
+    assert_eq!(
+        after_first,
+        baseline + 1,
+        "a fresh token issue is a handoff and must be counted once"
+    );
+
+    // Gap C: the verdict says the dead-lease repair is not what this lease
+    // needs — and the repair is admitted regardless.
+    let verdict = lease_block(successor, sid, "claude");
+    assert_eq!(
+        verdict["reclaimable"],
+        json!(false),
+        "a pending token is not the dead-lease case `reclaimable` names: {verdict}"
+    );
+
+    let second = call_tool(
+        successor,
+        "session_handoff",
+        force_reissue_args(sid, "claude"),
+    );
+    assert_eq!(
+        first["handoff_token"], second["handoff_token"],
+        "the retry must echo the pending token byte-for-byte, not mint a second one"
+    );
+    assert_eq!(
+        second["generation"], first["generation"],
+        "the echo grants no new capability, so it moves no generation"
+    );
+    assert_eq!(
+        second["forced_reissue"],
+        json!(true),
+        "the echo still went down the forced path and must still say so: {second}"
+    );
+
+    // Gap D: still one increment, over real dispatch.
+    assert_eq!(
+        handoffs("after the echo"),
+        after_first,
+        "a pre-claim retry is the same logical handoff — the !issued.reused guard must \
+         hold through call_tool, not only at the handler"
+    );
+
+    // Gap B: both calls are audited, and the second is honest about what it
+    // did not check.
+    assert_eq!(
+        wal_row_count(successor, sid, "session_handoff.force_reissue"),
+        2,
+        "the echo bypassed the guard too and must leave its own row"
+    );
+    let (params, result) = last_wal_row(successor, "session_handoff.force_reissue");
+    assert_eq!(
+        params["staleness_checked"],
+        json!(false),
+        "the echo path skipped the liveness check and the row must not claim it ran: {params}"
+    );
+    assert!(
+        params["idle_secs"].is_number(),
+        "idle_secs is still measured on the echo path — it just gates nothing, which is \
+         precisely why `staleness_checked` cannot be inferred from it: {params}"
+    );
+    assert_eq!(
+        result["reused"],
+        json!(true),
+        "the echo must record that it minted nothing: {result}"
+    );
+}
+
+/// **Gap C, second direction.** `reclaimable: true` does not promise a forced
+/// reissue will be admitted, and the gap is not theoretical: an abandoned
+/// session that has gone quiet reads exactly that way.
+///
+/// `force_reissue` runs `ensure_active` **before** the generation and staleness
+/// ladder, so a sealed session is refused with the seal message no matter how
+/// dead it is — see
+/// [`the_same_wedged_session_is_abandonable_without_recovering_it_first`] for
+/// why that order is load-bearing. `reclaimable` deliberately does not read
+/// `ended_at` to close the gap, because a read-only diagnostic re-implementing
+/// the seal check is worse than one that names a single route in; the callers
+/// that need the combined answer read `reclaimable` beside `ended_at`, which
+/// the same response already carries.
+///
+/// #299 builds a command-surface preflight on this field. It needs the real
+/// behaviour pinned at the protocol surface, not the intuitive reading.
+#[test]
+fn an_abandoned_lease_reads_reclaimable_yet_refuses_a_forced_reissue() {
+    let lease = session_wedged_at_generation(2, "claude");
+    let (successor, sid) = (&lease.successor, lease.session_id.as_str());
+
+    call_tool(
+        successor,
+        "collab_end",
+        json!({
+            "session_id": sid,
+            "agent": "claude",
+            "abandon": true,
+            "reason": "gone for good"
+        }),
+    );
+    // The abandon is itself activity — it stamps `updated_at` — so the session
+    // reads live for a moment. Age it again: the interesting state is the
+    // sealed session that has since gone quiet, which is what any abandoned
+    // session becomes within a day.
+    age_collab_session(
+        &lease.incumbent,
+        sid,
+        ironmem::collab::COLLAB_DEAD_SESSION_SECS + 60,
+    );
+
+    let status = call_tool(successor, "collab_status", json!({ "session_id": sid }));
+    assert!(
+        status["ended_at"].is_string(),
+        "the setup must leave the session sealed: {status}"
+    );
+    assert_eq!(
+        status["claude_lease"]["reclaimable"],
+        json!(true),
+        "an abandoned, quiet lease reads reclaimable — this is the gap, not a bug: {status}"
+    );
+
+    let refused = call_tool_expect_error(
+        successor,
+        "session_handoff",
+        force_reissue_args(sid, "claude"),
+    );
+    assert!(
+        refused.contains("has ended"),
+        "`ensure_active` runs first, so the seal answers before staleness ever does: \
+         {refused}"
+    );
+    assert!(
+        !refused.contains("still live"),
+        "a sealed session must not be re-evaluated against the staleness clock: {refused}"
+    );
+    assert_eq!(
+        wal_row_count(successor, sid, "session_handoff.force_reissue"),
+        0,
+        "a refused reissue must write no audit row — the bypass never happened"
+    );
+    assert_eq!(
+        call_tool(successor, "collab_status", json!({ "session_id": sid }))
+            ["claude_handoff_pending"],
+        json!(false),
+        "a refused reissue must mint nothing"
+    );
+}
