@@ -1676,15 +1676,22 @@ diverge for real, test-pinned reasons:
   sometimes still admit a forced call — exactly the drift this field exists
   to prevent.
 - **`reclaimable: true` yet `force_reissue` is refused.** `force_reissue`
-  runs `ensure_active` *before* the generation/staleness ladder, so an
-  ended or abandoned session — sealed, and maximally stale by construction
-  — reads `reclaimable: true` here while `force_reissue` refuses it with
-  the "has ended" seal message. This is the direction that matters most: an
-  operator reads `reclaimable` to decide whether a rescue is worth
-  attempting, and this field over-promises on a sealed session. `ended_at`
-  is on this same `collab_status` response, so a caller that needs the
-  combined answer reads `reclaimable` alongside `ended_at` rather than
-  trusting `reclaimable` alone.
+  runs `ensure_active` *before* the generation/staleness ladder, so a
+  sealed session that is *also* dead by the staleness predicate reads
+  `reclaimable: true` here while `force_reissue` refuses it with the "has
+  ended" seal message. An **abandoned** session is always in this state —
+  abandon itself requires 6h of idleness to succeed, and `end_session`
+  writes only `ended_at`, never `updated_at`, so nothing afterward revives
+  the activity signals. A **plainly-ended** session is not automatically in
+  this state: plain `collab_end` carries no staleness precondition, so a
+  freshly-ended session still reads `reclaimable: false` — the disagreement
+  only appears once such a session has also gone quiet past
+  `COLLAB_DEAD_SESSION_SECS`. Either way, this is the direction that
+  matters most: an operator reads `reclaimable` to decide whether a rescue
+  is worth attempting, and for any sealed-and-quiet session, this field
+  over-promises. `ended_at` is on this same `collab_status` response, so a
+  caller that needs the combined answer reads `reclaimable` alongside
+  `ended_at` rather than trusting `reclaimable` alone.
 
 **Do not substitute `updated_at` for `idle_secs`.** The session row's
 timestamp is only one of five activity sources, and a long
@@ -2192,16 +2199,24 @@ Tooling-classified failure.
 different problems on a stuck session, and they answer different questions:
 
 - `collab_resume` **continues** a `CodingFailed` session back to its
-  `failed_from_phase`. It is about the session's **failure** — it says
-  nothing about who currently holds the generation lease, and does not
-  touch it.
+  `failed_from_phase`. It is about the session's **failure** — but it is
+  **not** lease-agnostic: `handle_collab_resume` calls
+  `ensure_actor_generation_current` inside its own write transaction (with
+  the call's optional `handoff_token`), so a stale gen > 0 caller is
+  refused "this session has been handed off" exactly as any other mutating
+  call would be, and presenting a valid `handoff_token` **claims** the
+  lease and advances the generation, the same as any other claim (see
+  "Generation lease" below, which already lists `collab_resume` among the
+  claim-capable calls).
 - `collab_end { abandon: true }` **ends** a dead session, permanently (see
   "The `collab_end` abandon contract" above).
 - `session_handoff { force_reissue: true }` **re-leases** a dead session's
   generation lease so a fresh process can continue it (see "Forced
   reissue" under § `session_handoff` below). It is about the session's
-  **lease** — it says nothing about its phase or failure state, and does
-  not change either.
+  **lease**, not its phase or failure state — and unlike `collab_resume`,
+  which only ever *presents* a token it did not mint, `force_reissue`
+  *mints* a new pending token without the caller holding (or claiming) the
+  lease itself.
 
 A session whose holder died mid-coding typically needs the third remedy
 first (a forced reissue, so a fresh process holds the lease again), and
@@ -2237,8 +2252,8 @@ not exhausted. An ineligible call rejects with `NotResumable { reason }`:
   guess about what happened during coding. A Tooling report that broke the
   per-resume retry ceiling remains Tooling and is resumable. In practice an
   abandoned session never reaches this check at all — see "Resume vs.
-  abandon" above — but the classification fact holds regardless of which
-  refusal fires first.
+  abandon vs. reissue" above — but the classification fact holds regardless
+  of which refusal fires first.
 - A session whose `total_recovery_attempts >= MAX_TOTAL_RECOVERY_ATTEMPTS`
   (5) is not resumable regardless of classification. This is the stop on the
   resume→retry→resume loop: because `collab_resume` is agent-callable and

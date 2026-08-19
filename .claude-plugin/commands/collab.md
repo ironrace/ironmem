@@ -1475,6 +1475,10 @@ keys, and state checks.
   licence to end an active-phase session — a call against a session that is
   merely slow rather than stale is refused, naming the remaining wait. See
   `docs/COLLAB.md` § "The `collab_end` abandon contract" for the full rule.
+  **If only the lease is dead — the session itself is still worth
+  continuing — prefer `session_handoff { force_reissue: true }` instead**
+  (see "Session handoff" below): abandon ends the session permanently,
+  where a forced reissue re-leases it for a fresh process.
 - **Never** peek at Codex's draft before sending your own during
   `PlanParallelDrafts`. The server enforces blind-draft in `recv`.
 - **Duplicate-session guard.** `collab_start` / `collab_start_code_review`
@@ -1581,11 +1585,13 @@ by itself — the successor's *claim* of the new token is what does that,
 same as any handoff. The alternative is `collab_end { abandon: true }`,
 which ends the session permanently instead of re-leasing it.
 
-**Caveat:** an ended or abandoned session also reads `reclaimable: true` —
-the field does not check whether the session is sealed — so
-`force_reissue` against one is refused with "has ended". That refusal is
-terminal: an ended/abandoned session cannot be re-leased or resumed by any
-call.
+**Caveat:** `reclaimable: true` is a hint, not a guarantee — it means the
+lease is held with nothing pending and the session is stale, but it does
+not check whether the session is sealed. A sealed (ended or abandoned)
+session that has also gone quiet reads `reclaimable: true` too, and
+`force_reissue` against it is refused with "has ended" — terminal, nothing
+to recover. Check `ended_at` (also on `collab_status`) alongside
+`reclaimable` before attempting the rescue.
 
 Full semantics: `docs/COLLAB.md` § "session_handoff (fallback succession)".
 
