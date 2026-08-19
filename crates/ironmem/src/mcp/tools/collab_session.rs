@@ -3052,7 +3052,14 @@ fn collab_end_requires_owner(phase: Phase) -> bool {
 /// refusal contains the seconds, so the lie would have stayed green. Rendering
 /// the hours the same way the schema does is what makes the two agree by
 /// construction; `dead_session_threshold_human_derives_its_hours` pins it.
-fn dead_session_threshold_human() -> String {
+///
+/// Now also rendered by `session_handoff`'s `force_reissue` gate and by the two
+/// generation-lease refusals in [`super::handoff`] (#298), which is why it is
+/// `pub(super)` rather than module-private: every operator-facing statement of
+/// "how stale is stale enough" — abandon's, the duplicate-session guard's, and
+/// the lease-recovery ones — renders from this one derivation, so raising
+/// [`crate::collab::COLLAB_DEAD_SESSION_SECS`] moves all of them together.
+pub(super) fn dead_session_threshold_human() -> String {
     format!(
         "{}s ({} hours)",
         crate::collab::COLLAB_DEAD_SESSION_SECS,
