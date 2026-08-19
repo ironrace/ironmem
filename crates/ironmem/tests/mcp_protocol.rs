@@ -9445,15 +9445,12 @@ fn session_wedged_at_generation(generation: u64, agent: &str) -> WedgedLease {
             .as_str()
             .unwrap_or_else(|| panic!("cycle {cycle} must mint a token: {issued}"))
             .to_string();
-        call_tool(
+        claim_with_token(
             &incumbent,
-            "collab_register_caps",
-            json!({
-                "session_id": &session_id,
-                "agent": agent,
-                "capabilities": [{ "name": format!("generation-{cycle}") }],
-                "handoff_token": token,
-            }),
+            &session_id,
+            agent,
+            &format!("generation-{cycle}"),
+            &token,
         );
     }
 
@@ -9512,6 +9509,40 @@ fn register_caps_args(session_id: &str, agent: &str, name: &str) -> serde_json::
     })
 }
 
+/// Present `token` on an ordinary mutating call — the shape a real successor
+/// uses to take over — and assert the claim was admitted.
+///
+/// The `success` assertion is the reason this is a function, not the three
+/// lines it saves. `call_tool` does not assert `isError == false`; it parses
+/// and returns whatever body came back, so a *refused* claim flows on as
+/// `{"error": …}` and the next assertion downstream fails in its place. In the
+/// durability scenario that reads "the recovered generation must be persisted
+/// state, not a process cache" — accusing persistence of a fault that was
+/// actually the claim's, and pointing whoever debugs it at the wrong half of
+/// the feature. Failing here names the real one.
+///
+/// Deliberately NOT solved by making `call_tool` itself assert `isError ==
+/// false`: that helper is shared with every other test in this file and with
+/// `collab_checkpoint_consistency.rs`, and several of them read refusal bodies
+/// through it on purpose.
+fn claim_with_token(
+    app: &App,
+    session_id: &str,
+    agent: &str,
+    name: &str,
+    token: &str,
+) -> serde_json::Value {
+    let mut args = register_caps_args(session_id, agent, name);
+    args["handoff_token"] = json!(token);
+    let claimed = call_tool(app, "collab_register_caps", args);
+    assert_eq!(
+        claimed["success"],
+        json!(true),
+        "the handoff token must be claimable on an ordinary mutating call: {claimed}"
+    );
+    claimed
+}
+
 /// The `<agent>_lease` verdict block from a `collab_status` read.
 fn lease_block(app: &App, session_id: &str, agent: &str) -> serde_json::Value {
     let status = call_tool(app, "collab_status", json!({ "session_id": session_id }));
@@ -9536,9 +9567,13 @@ fn lease_block(app: &App, session_id: &str, agent: &str) -> serde_json::Value {
 fn a_dead_generation_lease_is_recoverable_through_force_reissue() {
     let lease = session_wedged_at_generation(3, "codex");
     let (successor, sid) = (&lease.successor, lease.session_id.as_str());
-    // Not merely a setup assertion: a call site that moved fields out of
-    // `WedgedLease` would have deleted the directory at the `let`, and every
-    // assertion below would still pass against the unlinked-but-open file.
+    // Insurance against `WedgedLease`'s `Drop` impl being *deleted*, not
+    // against the field-moving call site it forbids — with the impl present
+    // that shape does not compile, so it can never reach an assertion. Drop the
+    // impl and the shape compiles again, unlinking the database at the `let`;
+    // every assertion below would still pass against the unlinked-but-open
+    // file, and only `a_recovered_lease_survives_a_fresh_app_over_the_same_db`
+    // would notice, one scenario away from the cause.
     assert!(
         lease.db_path.exists(),
         "the fixture must keep its database alive for the whole test"
@@ -9624,14 +9659,7 @@ fn a_dead_generation_lease_is_recoverable_through_force_reissue() {
 
     // (d) Claim, then write. The claim is presented on an ordinary mutating
     // call, which is how a real successor takes over.
-    let mut claiming = register_caps_args(sid, "codex", "recovered");
-    claiming["handoff_token"] = json!(token);
-    let claimed = call_tool(successor, "collab_register_caps", claiming);
-    assert_eq!(
-        claimed["success"],
-        json!(true),
-        "the forced token must be claimable like any other: {claimed}"
-    );
+    claim_with_token(successor, sid, "codex", "recovered", &token);
     // A *tokenless* write afterwards is the real proof: the successor is now
     // the admitted actor, not merely a caller who once held a valid token.
     let after = call_tool(
@@ -9692,7 +9720,7 @@ fn recovery_evicts_the_previous_generation_holder() {
     );
     let token = reissued["handoff_token"]
         .as_str()
-        .expect("the rescue must hand back a token")
+        .unwrap_or_else(|| panic!("the rescue must hand back a token: {reissued}"))
         .to_string();
 
     // The reissue evicted nobody. This is the assertion R1 lives or dies on.
@@ -9707,10 +9735,10 @@ fn recovery_evicts_the_previous_generation_holder() {
         "R1: a forced reissue must not evict the incumbent — only the claim does: {survives}"
     );
 
-    // The claim.
-    let mut claiming = register_caps_args(sid, "claude", "successor-claim");
-    claiming["handoff_token"] = json!(token);
-    call_tool(successor, "collab_register_caps", claiming);
+    // The claim. Kept as its own step rather than folded into an assertion:
+    // the reissue → incumbent-write → claim → eviction ORDER is the property
+    // this test exists for, and it has to stay readable top to bottom.
+    claim_with_token(successor, sid, "claude", "successor-claim", &token);
 
     // And now the incumbent is out. `local=3 current=4` is the whole story:
     // the incumbent's advisory cache trails the committed generation.
@@ -9895,7 +9923,10 @@ fn collab_status_reports_the_lease_verdict_across_a_recovery() {
         "session_handoff",
         force_reissue_args(sid, "claude"),
     );
-    let token = reissued["handoff_token"].as_str().unwrap().to_string();
+    let token = reissued["handoff_token"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the rescue must hand back a token: {reissued}"))
+        .to_string();
     let pending = lease_block(successor, sid, "claude");
     assert_eq!(
         pending["generation"],
@@ -9917,9 +9948,7 @@ fn collab_status_reports_the_lease_verdict_across_a_recovery() {
     assert_codex_untouched("after the reissue");
 
     // After the claim: generation 4, nothing pending, and a live holder.
-    let mut claiming = register_caps_args(sid, "claude", "recovered");
-    claiming["handoff_token"] = json!(token);
-    call_tool(successor, "collab_register_caps", claiming);
+    claim_with_token(successor, sid, "claude", "recovered", &token);
     let after = lease_block(successor, sid, "claude");
     assert_eq!(after["generation"], json!(4), "{after}");
     assert_eq!(
@@ -9953,17 +9982,16 @@ fn a_recovered_lease_survives_a_fresh_app_over_the_same_db() {
     let lease = session_wedged_at_generation(3, "claude");
     let (successor, sid) = (&lease.successor, lease.session_id.as_str());
 
-    let token = call_tool(
+    let reissued = call_tool(
         successor,
         "session_handoff",
         force_reissue_args(sid, "claude"),
-    )["handoff_token"]
+    );
+    let token = reissued["handoff_token"]
         .as_str()
-        .expect("the rescue must hand back a token")
+        .unwrap_or_else(|| panic!("the rescue must hand back a token: {reissued}"))
         .to_string();
-    let mut claiming = register_caps_args(sid, "claude", "recovered");
-    claiming["handoff_token"] = json!(token);
-    call_tool(successor, "collab_register_caps", claiming);
+    claim_with_token(successor, sid, "claude", "recovered", &token);
 
     // A process that saw none of the above.
     let (_state_dir, restarted) = open_second_disk_app(&lease.db_path);
@@ -10142,6 +10170,12 @@ fn a_repeated_forced_reissue_echoes_the_pending_token_without_a_second_staleness
     let lease = session_wedged_at_generation(2, "claude");
     let (successor, sid) = (&lease.successor, lease.session_id.as_str());
 
+    // The one direct database read in this section, against its banner. There
+    // is no MCP surface for it: `task_outcomes.handoffs` is written by
+    // `increment_task_handoffs` (`handoff.rs`) and read only internally, by
+    // `collab_session.rs`'s own metrics tests — no tool renders it, so
+    // `call_tool` cannot reach it. Gap D is about that counter specifically, so
+    // the alternative to this read is not a cleaner test but no test.
     let handoffs = |stage: &str| {
         successor
             .db
