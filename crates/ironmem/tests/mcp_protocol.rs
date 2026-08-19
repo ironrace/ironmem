@@ -9546,7 +9546,9 @@ fn a_dead_generation_lease_is_recoverable_through_force_reissue() {
 
     // (a) The lease is locked: a fresh process cannot write, and cannot even
     // read the message queue — `collab_recv` runs the same guard.
-    let locked = format!("this session has been handed off (generation {})", 3);
+    // The generation the fixture left the lease at, quoted the way the guard
+    // renders it — a refusal naming any other number is not this wedge.
+    let locked = "this session has been handed off (generation 3)";
     for (tool, args) in [
         (
             "collab_register_caps",
@@ -9568,7 +9570,7 @@ fn a_dead_generation_lease_is_recoverable_through_force_reissue() {
     ] {
         let err = call_tool_expect_error(successor, tool, args);
         assert!(
-            err.contains(&locked),
+            err.contains(locked),
             "{tool} must be refused by the generation lease, got: {err}"
         );
     }
@@ -9583,7 +9585,7 @@ fn a_dead_generation_lease_is_recoverable_through_force_reissue() {
         json!({ "session_id": sid, "agent": "codex" }),
     );
     assert!(
-        plain.contains(&locked),
+        plain.contains(locked),
         "the token-minting tool must itself be lease-gated — that IS defect B: {plain}"
     );
     assert!(
