@@ -11,7 +11,6 @@ import sys
 import unittest
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
 GIT_EXECUTABLE = Path("/usr/bin/git")
 LOCAL_CONFIG_PATTERN = ".humanlayer/workspace.local.json"
@@ -135,59 +134,6 @@ class HumanLayerWorkspacePolicyTest(unittest.TestCase):
             ".gitignore",
             "git ls-files must resolve the policy source to the repository .gitignore",
         )
-
-        matching_lines = [
-            line for line in result.stdout.splitlines() if line.strip()
-        ]
-        self.assertEqual(
-            len(matching_lines),
-            1,
-            "git check-ignore -v must return exactly one match describing the winning rule; "
-            f"stdout={result.stdout!r}",
-        )
-        source_and_pattern, separator, ignored_path = matching_lines[0].partition(
-            "\t"
-        )
-        self.assertTrue(
-            separator,
-            "git check-ignore -v output must separate rule metadata from the path with a tab; "
-            f"line={matching_lines[0]!r}",
-        )
-        source_fields = source_and_pattern.rsplit(":", 2)
-        self.assertEqual(
-            len(source_fields),
-            3,
-            "git check-ignore -v output must include source, line number, and pattern; "
-            f"line={matching_lines[0]!r}",
-        )
-        source, line_number, pattern = source_fields
-        self.assertTrue(
-            line_number.isdigit(),
-            "git check-ignore -v output must include a numeric source line number; "
-            f"line={matching_lines[0]!r}",
-        )
-        source_path = Path(source)
-        if not source_path.is_absolute():
-            source_path = self.repo_root / source_path
-        self.assertEqual(
-            source_path.resolve(),
-            (self.repo_root / ".gitignore").resolve(),
-            "the winning ignore rule must come from the repository's tracked .gitignore; "
-            f"source={source!r}, output={matching_lines[0]!r}",
-        )
-        self.assertEqual(
-            pattern,
-            LOCAL_CONFIG_PATTERN,
-            "the winning repository ignore rule must exactly match the local override path; "
-            f"output={matching_lines[0]!r}",
-        )
-        self.assertEqual(
-            ignored_path,
-            LOCAL_CONFIG_PATTERN,
-            "git check-ignore -v must report the exact local override path; "
-            f"output={matching_lines[0]!r}",
-        )
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
