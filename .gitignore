@@ -42,3 +42,7 @@ benchmarks/abeval/target/
 
 # git worktrees (collab / feature isolation)
 .worktrees/
+
+# HumanLayer machine-local workspace overrides may contain paths, copy rules,
+# or setup commands and can re-enable the fail-closed shared policy.
+.humanlayer/workspace.local.json
