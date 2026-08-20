@@ -734,7 +734,7 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
                     "force_reissue": {
                         "type": "boolean",
                         "default": false,
-                        "description": "Mint a token WITHOUT holding the lease, to recover a session whose holder died. Requires generation > 0 and no activity for the staleness threshold; refused in PlanLocked and CodingComplete, which can be human-idle while live. Does not advance the generation — the successor's claim does."
+                        "description": "Mint a token WITHOUT holding the lease, to recover a session whose holder died. Requires generation > 0, a non-human-gated phase, and no activity for the staleness threshold — checked in full except against its own prior reissue's pending token. Does not advance the generation — the successor's claim does."
                     }
                 },
                 "required": ["session_id", "agent"]
@@ -1563,6 +1563,34 @@ mod tests {
     /// tokens of headroom under the existing 4_407 cap — under it, so the
     /// cap did not need to move. No neighbouring tool's description was
     /// trimmed to pay for it.
+    ///
+    /// Two more security-review rounds landed on this branch after that
+    /// (`011b4ca`, `d4ef1bb`) and each left the description one fact behind
+    /// again. `011b4ca` made the refused-phase set exhaustive — it was
+    /// `PlanLocked`/`CodingComplete` above, and is now those two plus
+    /// `CodingFailed` (same property: waits on a human, writes no
+    /// agent-driven activity) — which made naming exactly two phases in the
+    /// description actively wrong rather than merely incomplete. `d4ef1bb`
+    /// added migration 022's `pending_handoff_forced` column and made the
+    /// pending-token staleness check depend on it: only a pending token this
+    /// same forced path minted gets the narrowed check (excluding the lease's
+    /// own timestamps, so a caller's own retry is not refused for liveness it
+    /// just created); a pending token from a normal, lease-authenticated mint
+    /// gets the full check, which is what stops a third party taking a live
+    /// incumbent's in-flight token — the exact hole `011b4ca` and `d4ef1bb`
+    /// closed in two steps. Both facts are preconditions no schema key can
+    /// express, and both are wrong-in-the-permissive-direction if left out
+    /// for the same reason the phase clause was the first time: a caller who
+    /// trusts the schema's precondition list as complete will hit a refusal
+    /// it never mentioned. The description now says "a non-human-gated
+    /// phase" rather than naming three phases by hand, so a fourth
+    /// human-gated phase does not silently go undocumented the way
+    /// `CodingFailed` did — `force_reissue_admits_phase`'s exhaustive `match`
+    /// and its `PHASE_FORCE_REISSUE_ADMITS` completeness proof (`handoff.rs`)
+    /// are the enforcement; this sentence just has to stay true to the
+    /// concept, not to a list. The listing measured 4_391 tokens after this
+    /// pass, leaving ~16 tokens of headroom under the still-unmoved 4_407
+    /// cap. No neighbouring tool's description was trimmed to pay for it.
     ///
     /// The budget is deliberately a whole-listing ceiling with no per-tool
     /// allocation, so the cheapest way to land a new field is to delete prose

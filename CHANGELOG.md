@@ -77,10 +77,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mint a successor token itself. It requires write access
   (`IRONMEM_MCP_MODE=trusted`), `generation > 0`, and no activity across the
   session for `COLLAB_DEAD_SESSION_SECS` — the last two checked inside the
-  write transaction — and is refused outright in the two human-gated phases
-  (`PlanLocked`, `CodingComplete`) where a live process can legitimately go
-  quiet for arbitrarily long while waiting on a person, so staleness alone
-  cannot tell "wedged" from "waiting." The reissue does **not** advance the
+  write transaction — and is refused outright in the three human-gated
+  phases (`PlanLocked`, `CodingComplete`, `CodingFailed`) where a live
+  process can legitimately go quiet for arbitrarily long while waiting on a
+  person, so staleness alone cannot tell "wedged" from "waiting." Schema
+  goes **v21 -> v22** (migration 022), adding `pending_handoff_forced` to
+  `collab_actor_generations`: the staleness check on an already-pending
+  token is narrowed — excluding the lease's own timestamps, so a caller's
+  own retry is not refused for liveness it just created — only when that
+  token was minted by this same forced path; a pending token from a normal,
+  lease-authenticated mint still gets the full check, which is what stops a
+  third process taking a live incumbent's in-flight token. Unknown
+  provenance (a pre-022 row, or any path that forgets to set the flag) fails
+  closed to the full check. The reissue does **not** advance the
   generation — only the successor's claim does, which is what preserves the
   anti-resurrection property from #91. `collab_status` also gains a
   per-agent `<agent>_lease` block reporting a derived `claimable` /
