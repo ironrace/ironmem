@@ -641,7 +641,7 @@ pub enum LeaseSignals {
     /// is terminal, so counting the lease there errs toward refusing to seal.
     Include,
     /// Drop **one agent's** `pending_handoff_issued_at`, and nothing else. See
-    /// [`session_last_activity_excluding_lease`] for why the exclusion is
+    /// [`session_last_activity_excluding_own_issued_at`] for why the exclusion is
     /// exactly this narrow.
     ExcludeIssuedFor(super::Agent),
 }
@@ -749,20 +749,21 @@ impl LeaseSignals {
 /// is the one being excluded — and that is not a defect in this function, it is
 /// the reason it must not be used to answer that question. The caller decides
 /// *whether* to use this predicate from stored provenance:
-/// `collab_actor_generations.pending_handoff_forced` (migration 022) records
-/// which path minted the pending token, and `handle_session_handoff` reaches
-/// for this variant only when the flag says forced. `false` — including every
-/// pre-022 row — takes [`session_staleness`] instead.
+/// `collab_actor_generations.pending_handoff_forced_token` (migration 022)
+/// stores the token value the forced path minted, and `handle_session_handoff`
+/// reaches for this variant only when that value equals the token actually
+/// pending. Anything else — a normally-minted token, a pre-022 row, a token an
+/// older binary minted without touching provenance — takes [`session_staleness`]
+/// instead.
 ///
 /// So the invariant is: **call this only when the pending token's provenance
-/// says the forced path minted it.** Widening that condition, or defaulting the
-/// flag the other way, reopens a lease-takeover primitive that a security
-/// review reproduced end to end.
+/// names that same token.** Widening that condition reopens a lease-takeover
+/// primitive that a security review reproduced end to end.
 ///
 /// **Not** a replacement for [`session_last_activity`]. The abandon gate keeps
 /// the full signal: `collab_end { abandon: true }` is terminal, and a session
 /// someone is actively trying to recover is one it should refuse to seal.
-pub fn session_last_activity_excluding_lease(
+pub fn session_last_activity_excluding_own_issued_at(
     conn: &Connection,
     session_id: &str,
     agent: super::Agent,
@@ -1013,17 +1014,17 @@ pub fn session_staleness(
     staleness_with(conn, session_id, LeaseSignals::Include)
 }
 
-/// [`session_staleness`] over [`session_last_activity_excluding_lease`] — the
+/// [`session_staleness`] over [`session_last_activity_excluding_own_issued_at`] — the
 /// same snapshot discipline, computed without `agent`'s own
 /// `pending_handoff_issued_at`.
 ///
 /// Used by exactly one caller, `session_handoff`'s `force_reissue` gate, and
 /// that narrowness is the point: read
-/// [`session_last_activity_excluding_lease`] before adding a second one. A
+/// [`session_last_activity_excluding_own_issued_at`] before adding a second one. A
 /// [`SessionStaleness`] value does not carry which signal set produced it, so
 /// mixing the two constructors across one decision would give two different
 /// answers to "is it dead?" with nothing at the type level to say why.
-pub fn session_staleness_excluding_lease(
+pub fn session_staleness_excluding_own_issued_at(
     conn: &Connection,
     session_id: &str,
     agent: super::Agent,
@@ -4154,7 +4155,7 @@ mod tests {
 
     fn is_dead_excluding(db: &Connection, id: &str, agent: Agent) -> bool {
         let now = db_now_epoch_secs(db).unwrap();
-        let last = session_last_activity_excluding_lease(db, id, agent).unwrap();
+        let last = session_last_activity_excluding_own_issued_at(db, id, agent).unwrap();
         crate::collab::session_is_dead(id, last, now)
     }
 

@@ -272,12 +272,12 @@ pub(super) fn force_reissue_admits_phase(phase: Phase) -> bool {
 /// Two scopes exist because the lease's own timestamps are two of
 /// `session_last_activity`'s five terms, so counting them lets a caller's own
 /// rescue attempt make the session read live — see
-/// [`crate::collab::queue::session_last_activity_excluding_lease`]. `idle_secs`
+/// [`crate::collab::queue::session_last_activity_excluding_own_issued_at`]. `idle_secs`
 /// in the same row means a different measurement under each, which is why the
 /// scope is recorded beside it rather than inferred.
 pub(super) fn staleness_scope_key(pending_was_forced: bool) -> &'static str {
     if pending_was_forced {
-        "excluding_lease"
+        "excluding_own_issued_at"
     } else {
         "all_signals"
     }
@@ -862,7 +862,7 @@ pub(super) fn handle_session_handoff(app: &App, args: &Value) -> Result<Value, M
             // lease's own timestamps are two of the five activity signals, so
             // the recovery machinery counts as session activity. Fixed at that
             // root: the pending case gates on
-            // `session_staleness_excluding_lease`, the same predicate minus
+            // `session_staleness_excluding_own_issued_at`, the same predicate minus
             // exactly ONE term: *this* agent's `pending_handoff_issued_at`.
             //
             // The exclusion is cut that narrow deliberately — it is a hole in a
@@ -878,7 +878,7 @@ pub(super) fn handle_session_handoff(app: &App, args: &Value) -> Result<Value, M
             // token (migration 022) — without that last condition, a token a
             // live incumbent had just minted was indistinguishable from a
             // rescuer's own on any long-quiet session. See
-            // `session_last_activity_excluding_lease` for the full argument.
+            // `session_last_activity_excluding_own_issued_at` for the full argument.
             //
             // * Genuinely dead session: every remaining signal is still dead,
             //   so the caller's own retry is admitted — D-P1's motivating case,
@@ -965,7 +965,7 @@ pub(super) fn handle_session_handoff(app: &App, args: &Value) -> Result<Value, M
             // OWN forced reissue just stamped `pending_handoff_issued_at`, so
             // that its retry is not refused for liveness it created (D-P1). The
             // condition below is the statement of "own" — and it is a stored
-            // fact, `pending_handoff_forced` (migration 022), not an inference.
+            // fact, `pending_handoff_forced_token` (migration 022), not an inference.
             //
             // It cannot be inferred. Both paths write the same
             // `pending_handoff_generation`; the forced path deliberately leaves
@@ -993,7 +993,9 @@ pub(super) fn handle_session_handoff(app: &App, args: &Value) -> Result<Value, M
                 .and_then(|a| a.pending.as_ref())
                 .is_some_and(|p| p.forced);
             let staleness = if pending_was_forced {
-                crate::collab::queue::session_staleness_excluding_lease(tx, session_id, agent)?
+                crate::collab::queue::session_staleness_excluding_own_issued_at(
+                    tx, session_id, agent,
+                )?
             } else {
                 crate::collab::queue::session_staleness(tx, session_id)?
             };
@@ -1063,7 +1065,7 @@ pub(super) fn handle_session_handoff(app: &App, args: &Value) -> Result<Value, M
                     "last_activity": staleness.last_activity(),
                     "idle_secs": staleness.idle_secs(),
                     // WHICH predicate admitted this call, derived from the
-                    // stored `pending_handoff_forced` flag. It replaced a
+                    // stored `pending_handoff_forced_token` column. It replaced a
                     // `staleness_checked` boolean that could only ever be
                     // `true` once the gate stopped being skippable; a field
                     // with one reachable value reads as though the other were
@@ -3307,7 +3309,7 @@ mod tests {
             .db
             .with_transaction(|tx| {
                 tx.execute(
-                    "UPDATE collab_actor_generations SET pending_handoff_forced = 0
+                    "UPDATE collab_actor_generations SET pending_handoff_forced_token = NULL
                       WHERE session_id = ?1 AND agent = 'claude'",
                     rusqlite::params![sid],
                 )?;
@@ -3355,11 +3357,11 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(row.pending.is_none(), "the claim must clear the token");
-        let raw_flag: i64 = rescuer
+        let raw_provenance: Option<String> = rescuer
             .db
             .with_connection(|conn| {
                 Ok(conn.query_row(
-                    "SELECT pending_handoff_forced FROM collab_actor_generations
+                    "SELECT pending_handoff_forced_token FROM collab_actor_generations
                       WHERE session_id = ?1 AND agent = 'claude'",
                     rusqlite::params![sid],
                     |r| r.get(0),
@@ -3367,7 +3369,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(
-            raw_flag, 0,
+            raw_provenance, None,
             "the claim must clear provenance along with the token it described"
         );
 
@@ -3422,6 +3424,130 @@ mod tests {
             json!("all_signals"),
             "an echoed token this path did not mint keeps the strict predicate — the \
              `reused: true` + `all_signals` pair is the auditor's signature for it: {params}"
+        );
+    }
+
+    /// **The mixed-binary takeover, refused.** This is the regression test for
+    /// binding provenance to the token instead of to the row.
+    ///
+    /// Two `ironmem` processes against one repository database is the
+    /// documented topology, and during a rollout one of them is a build behind.
+    /// The moment any v22 process opens the database, migration 022 applies —
+    /// but the older process keeps executing its own SQL, which never mentions
+    /// the provenance column. With a boolean that fails open:
+    ///
+    ///   1. a legitimate rescue leaves provenance set, with a pending token;
+    ///   2. the OLD binary's `claim_handoff_token` clears the token and not the
+    ///      flag;
+    ///   3. six quiet hours;
+    ///   4. the live incumbent mints normally through the OLD binary's
+    ///      `issue_or_reuse_handoff`, which sets a token and not the flag — so
+    ///      a normally-minted token now sits under a stale "forced" flag;
+    ///   5. a third process calls `force_reissue`, gets the narrowed predicate,
+    ///      and is handed the incumbent's token.
+    ///
+    /// Steps 2 and 4 below execute the pre-022 statements **verbatim** from
+    /// `git show 011b4ca:crates/ironmem/src/collab/handoff.rs` rather than a
+    /// paraphrase of them, because the whole question is what an old writer
+    /// actually does. Storing the token makes step 5 impossible: the stored
+    /// provenance names the *rescue's* token, the pending token is the
+    /// incumbent's, they are unequal, and unequal reads as not forced.
+    ///
+    /// No version check could substitute for this. The vulnerable writes come
+    /// from a binary that predates any check we could add.
+    #[test]
+    fn an_old_binarys_writes_cannot_leave_stale_provenance_on_a_new_token() {
+        let lease = dead_lease_and_rescuer();
+        let (rescuer, sid) = (&lease.rescuer, lease.session_id.as_str());
+
+        // (1) A legitimate rescue. Provenance now names this token.
+        let rescued = handle_session_handoff(rescuer, &force_args(sid, "claude")).unwrap();
+        let rescue_token = rescued["handoff_token"].as_str().unwrap().to_string();
+        assert!(pending_is_forced(rescuer, sid, Agent::Claude));
+
+        rescuer
+            .db
+            .with_transaction(|tx| {
+                // (2) The v21 claim: clears the token, leaves provenance behind
+                // because it does not know the column exists.
+                tx.execute(
+                    "UPDATE collab_actor_generations
+                     SET generation = pending_handoff_generation,
+                         pending_handoff_token = NULL,
+                         pending_handoff_generation = NULL,
+                         pending_handoff_claimed_at = datetime('now')
+                     WHERE session_id = ?1 AND agent = ?2 AND pending_handoff_token = ?3",
+                    rusqlite::params![sid, "claude", rescue_token],
+                )?;
+                // (4) The v21 mint: sets a token, leaves provenance behind.
+                tx.execute(
+                    "UPDATE collab_actor_generations
+                     SET pending_handoff_token = ?3,
+                         pending_handoff_generation = generation + 1,
+                         pending_handoff_issued_at = datetime('now'),
+                         pending_handoff_claimed_at = NULL
+                     WHERE session_id = ?1 AND agent = ?2 AND pending_handoff_token IS NULL",
+                    rusqlite::params![sid, "claude", "V21-MINTED-TOKEN"],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        // The stale value really is still on the row — otherwise this test
+        // proves nothing about the mixed-binary case.
+        let stale: Option<String> = rescuer
+            .db
+            .with_connection(|conn| {
+                Ok(conn.query_row(
+                    "SELECT pending_handoff_forced_token FROM collab_actor_generations
+                      WHERE session_id = ?1 AND agent = 'claude'",
+                    rusqlite::params![sid],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(
+            stale.as_deref(),
+            Some(rescue_token.as_str()),
+            "setup: the old binary must have left the rescue's provenance behind"
+        );
+        assert!(
+            !pending_is_forced(rescuer, sid, Agent::Claude),
+            "provenance naming a consumed token is not provenance for the token now \
+             pending — the equality is what makes the record self-enforcing"
+        );
+
+        // (3) Six quiet hours: every agent-driven signal is dead, so only
+        // provenance stands between the incumbent's token and the caller.
+        age_session(rescuer, sid, crate::collab::COLLAB_DEAD_SESSION_SECS + 60);
+        rescuer
+            .db
+            .with_transaction(|tx| {
+                tx.execute(
+                    "UPDATE collab_actor_generations SET pending_handoff_issued_at = \
+                     datetime('now') WHERE session_id = ?1 AND agent = 'claude'",
+                    rusqlite::params![sid],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        // (5) The takeover attempt.
+        let message = handle_session_handoff(rescuer, &force_args(sid, "claude"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            message.contains("still live"),
+            "a token minted by an old binary carries no provenance, so it must take the \
+             strict predicate: {message}"
+        );
+        assert!(
+            message.contains("and its handoff lease"),
+            "the FULL signal set must be the one that ran: {message}"
+        );
+        assert!(
+            !message.contains("V21-MINTED-TOKEN"),
+            "the refusal must not leak the token it refused to hand over: {message}"
         );
     }
 
@@ -3605,7 +3731,7 @@ mod tests {
         let (params, result) = last_force_reissue_row(rescuer);
         assert_eq!(
             params["staleness_scope"],
-            json!("excluding_lease"),
+            json!("excluding_own_issued_at"),
             "the retry was gated on the narrowed predicate and the row must say so: {params}"
         );
         assert_eq!(result["reused"], json!(true), "{result}");

@@ -20,10 +20,15 @@ pub struct PendingHandoff {
     /// `session_handoff { force_reissue: true }` rather than by an ordinary,
     /// generation-authenticated call (migration 022, issue #298).
     ///
-    /// Describes the token, not the row and not the lease: it is rewritten on
-    /// every fresh issue and cleared by [`claim_handoff_token`], so it can
-    /// never outlive the token it is provenance for. `false` is the safe
-    /// reading — see [`HandoffProvenance`].
+    /// **Computed, not stored.** The column holds the token value the forced
+    /// path minted, and this is `true` only when that value equals `token`
+    /// above. A stored boolean would describe the *row*; binding it to the
+    /// token means any writer that mints without updating provenance — an
+    /// older binary mid-rollout, a hand-repaired row, a future path that
+    /// forgets — automatically reads `false`. Migration 022 records the
+    /// mixed-binary sequence that made that difference load-bearing.
+    ///
+    /// `false` is the safe reading: it selects the full staleness predicate.
     pub forced: bool,
 }
 
@@ -51,10 +56,16 @@ pub enum HandoffProvenance {
 }
 
 impl HandoffProvenance {
-    fn as_flag(self) -> i64 {
+    /// The value to store in `pending_handoff_forced_token` for a token whose
+    /// value is `minted`: the token itself when this path is the forced one,
+    /// `NULL` otherwise.
+    ///
+    /// Storing the token rather than a flag is what makes provenance
+    /// self-enforcing — see [`PendingHandoff::forced`] and migration 022.
+    fn forced_token_value(self, minted: &str) -> Option<&str> {
         match self {
-            Self::Normal => 0,
-            Self::Forced => 1,
+            Self::Normal => None,
+            Self::Forced => Some(minted),
         }
     }
 }
@@ -78,7 +89,7 @@ fn build_actor_generation(
     generation: i64,
     token: Option<String>,
     pending_gen: Option<i64>,
-    forced: bool,
+    forced_token: Option<String>,
 ) -> Result<ActorGeneration, MemoryError> {
     let generation = u64::try_from(generation).map_err(|_| {
         MemoryError::Validation(format!(
@@ -92,6 +103,10 @@ fn build_actor_generation(
                     "corrupt lease row: negative pending generation {g}"
                 ))
             })?;
+            // The equality is the whole provenance check: a stored value
+            // naming some other (already-consumed) token is not provenance for
+            // *this* one, and reads `false`. See migration 022.
+            let forced = forced_token.as_deref() == Some(token.as_str());
             Some(PendingHandoff {
                 token,
                 generation: g,
@@ -128,15 +143,15 @@ pub fn load_or_init_actor_generation(
     let row = conn
         .query_row(
             "SELECT generation, pending_handoff_token, pending_handoff_generation,
-                    pending_handoff_forced
+                    pending_handoff_forced_token
              FROM collab_actor_generations WHERE session_id = ?1 AND agent = ?2",
             params![session_id, agent.as_str()],
             |r| {
                 let generation: i64 = r.get(0)?;
                 let token: Option<String> = r.get(1)?;
                 let pending_gen: Option<i64> = r.get(2)?;
-                let forced: i64 = r.get(3)?;
-                Ok((generation, token, pending_gen, forced))
+                let forced_token: Option<String> = r.get(3)?;
+                Ok((generation, token, pending_gen, forced_token))
             },
         )
         .optional()?
@@ -146,8 +161,8 @@ pub fn load_or_init_actor_generation(
                 agent.as_str()
             ))
         })?;
-    let (generation, token, pending_gen, forced) = row;
-    build_actor_generation(generation, token, pending_gen, forced != 0)
+    let (generation, token, pending_gen, forced_token) = row;
+    build_actor_generation(generation, token, pending_gen, forced_token)
 }
 
 /// Read the (session, agent) lease row WITHOUT creating it. Returns `None` when
@@ -160,20 +175,20 @@ pub fn read_actor_generation(
 ) -> Result<Option<ActorGeneration>, MemoryError> {
     conn.query_row(
         "SELECT generation, pending_handoff_token, pending_handoff_generation,
-                pending_handoff_forced
+                pending_handoff_forced_token
          FROM collab_actor_generations WHERE session_id = ?1 AND agent = ?2",
         params![session_id, agent.as_str()],
         |r| {
             let generation: i64 = r.get(0)?;
             let token: Option<String> = r.get(1)?;
             let pending_gen: Option<i64> = r.get(2)?;
-            let forced: i64 = r.get(3)?;
-            Ok((generation, token, pending_gen, forced))
+            let forced_token: Option<String> = r.get(3)?;
+            Ok((generation, token, pending_gen, forced_token))
         },
     )
     .optional()?
-    .map(|(generation, token, pending_gen, forced)| {
-        build_actor_generation(generation, token, pending_gen, forced != 0)
+    .map(|(generation, token, pending_gen, forced_token)| {
+        build_actor_generation(generation, token, pending_gen, forced_token)
     })
     .transpose()
 }
@@ -206,11 +221,10 @@ pub fn issue_or_reuse_handoff(
 /// # Provenance (migration 022, issue #298)
 ///
 /// `provenance` is written **only on the fresh-issue path**, and it is written
-/// unconditionally there — `Forced` sets the flag, `Normal` clears it. Clearing
-/// is as load-bearing as setting: a row that once carried a forced token would
-/// otherwise leave a stale `1` behind for the next ordinary mint to inherit,
-/// which would hand the narrowed staleness predicate to a token that was never
-/// forced.
+/// unconditionally there — `Forced` stores the token just minted, `Normal`
+/// stores `NULL`. Both directions are written rather than only the interesting
+/// one, so a row that once carried a forced token cannot leave a stale value
+/// behind.
 ///
 /// The **reuse path writes nothing at all**, as it always has, and that
 /// includes provenance. The consequence is deliberate and is the attack path
@@ -236,21 +250,23 @@ pub fn issue_or_reuse_handoff_with(
     let candidate_token = Uuid::new_v4().to_string();
 
     // Atomic guarded UPDATE: only writes when no token is already pending.
-    // `pending_handoff_forced` is set in the same statement as the token, so a
-    // token and its provenance can never be written apart.
+    // `pending_handoff_forced_token` is set in the same statement as the token
+    // it describes, so the two can never be written apart — and because it
+    // stores the token *value*, a writer that sets one without the other leaves
+    // them unequal, which reads as "not forced".
     let rows = conn.execute(
         "UPDATE collab_actor_generations
          SET pending_handoff_token = ?3,
              pending_handoff_generation = generation + 1,
              pending_handoff_issued_at = datetime('now'),
              pending_handoff_claimed_at = NULL,
-             pending_handoff_forced = ?4
+             pending_handoff_forced_token = ?4
          WHERE session_id = ?1 AND agent = ?2 AND pending_handoff_token IS NULL",
         params![
             session_id,
             agent.as_str(),
             candidate_token,
-            provenance.as_flag()
+            provenance.forced_token_value(&candidate_token)
         ],
     )?;
     let reused = rows == 0;
@@ -331,16 +347,18 @@ pub fn claim_handoff_token(
 
     // Atomic guarded UPDATE: only commits if the token is still the expected one.
     let rows = conn.execute(
-        // `pending_handoff_forced = 0` alongside the other pending columns:
-        // provenance describes the pending token, so it must not outlive it. A
-        // claimed row that kept its `1` would hand the narrowed predicate to
-        // whatever token was minted next.
+        // `pending_handoff_forced_token = NULL` alongside the other pending
+        // columns: provenance describes the pending token, so it is cleared
+        // with it. Hygiene rather than load-bearing — a row that kept the old
+        // value would still read "not forced" for the *next* token, because
+        // the stored value would no longer equal it. That belt-and-braces is
+        // the point of storing the token instead of a flag.
         "UPDATE collab_actor_generations
          SET generation = pending_handoff_generation,
              pending_handoff_token = NULL,
              pending_handoff_generation = NULL,
              pending_handoff_claimed_at = datetime('now'),
-             pending_handoff_forced = 0
+             pending_handoff_forced_token = NULL
          WHERE session_id = ?1 AND agent = ?2 AND pending_handoff_token = ?3",
         params![session_id, agent.as_str(), token],
     )?;
@@ -381,9 +399,10 @@ mod tests {
     // it's safe to apply out of numeric sequence relative to 011-018.
     const COLLAB_PILOT_SQL: &str = include_str!("../../migrations/019_collab_pilot.sql");
     // Same out-of-sequence reasoning as 019: this ALTER TABLE depends only on
-    // `collab_actor_generations`, created in 010, and `pending_handoff_forced`
-    // is read by both `read_actor_generation` and `load_or_init_actor_generation`
-    // — the two functions this module's tests are entirely about.
+    // `collab_actor_generations`, created in 010, and
+    // `pending_handoff_forced_token` is read by both `read_actor_generation`
+    // and `load_or_init_actor_generation` — the two functions this module's
+    // tests are entirely about.
     const COLLAB_HANDOFF_PROVENANCE_SQL: &str =
         include_str!("../../migrations/022_collab_handoff_provenance.sql");
 

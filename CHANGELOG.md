@@ -81,11 +81,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   phases (`PlanLocked`, `CodingComplete`, `CodingFailed`) where a live
   process can legitimately go quiet for arbitrarily long while waiting on a
   person, so staleness alone cannot tell "wedged" from "waiting." Schema
-  goes **v21 -> v22** (migration 022), adding `pending_handoff_forced` to
-  `collab_actor_generations`: the staleness check on an already-pending
-  token is narrowed — excluding the lease's own timestamps, so a caller's
-  own retry is not refused for liveness it just created — only when that
-  token was minted by this same forced path; a pending token from a normal,
+  goes **v21 -> v22** (migration 022), adding `pending_handoff_forced_token`
+  to `collab_actor_generations`: the staleness check on an already-pending
+  token is narrowed — excluding exactly one term, this agent's own
+  `pending_handoff_issued_at`, so a caller's own retry is not refused for
+  liveness it just created; `pending_handoff_claimed_at` and the counterpart
+  agent's lease are never excluded — only when that token was minted by this
+  same forced path; a pending token from a normal,
   lease-authenticated mint still gets the full check, which is what stops a
   third process taking a live incumbent's in-flight token. Unknown
   provenance (a pre-022 row, or any path that forgets to set the flag) fails

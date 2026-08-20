@@ -10322,7 +10322,7 @@ fn a_third_process_cannot_steal_a_live_incumbents_pending_handoff_token() {
     );
 }
 
-/// **The last takeover, refused — the one `pending_handoff_forced` exists for.**
+/// **The last takeover, refused — the one `pending_handoff_forced_token` exists for.**
 ///
 /// The narrowed staleness predicate (which ignores this agent's own
 /// `pending_handoff_issued_at`, so a rescuer's retry is not refused for
@@ -10489,7 +10489,7 @@ fn a_forced_reissue_on_the_same_long_quiet_session_is_still_admitted_and_retryab
     let (params, result) = last_wal_row(successor, "session_handoff.force_reissue");
     assert_eq!(
         params["staleness_scope"],
-        json!("excluding_lease"),
+        json!("excluding_own_issued_at"),
         "the retry earned the narrowed predicate through stored provenance: {params}"
     );
     assert_eq!(result["reused"], json!(true), "{result}");
@@ -10512,7 +10512,7 @@ fn a_forced_reissue_on_the_same_long_quiet_session_is_still_admitted_and_retryab
 ///
 /// Three properties, none of which the other scenarios can see:
 ///
-/// - **Gap B.** `staleness_scope: "excluding_lease"` on this path. The gate
+/// - **Gap B.** `staleness_scope: "excluding_own_issued_at"` on this path. The gate
 ///   ran, but on the narrowed predicate, and `idle_secs` beside it is that
 ///   narrowed measurement — which is why the scope cannot be inferred from
 ///   `reused`.
@@ -10608,7 +10608,7 @@ fn a_repeated_forced_reissue_echoes_the_pending_token_without_counting_its_own_f
     let (params, result) = last_wal_row(successor, "session_handoff.force_reissue");
     assert_eq!(
         params["staleness_scope"],
-        json!("excluding_lease"),
+        json!("excluding_own_issued_at"),
         "the retry was gated on the narrowed predicate and the row must say which: {params}"
     );
     assert!(

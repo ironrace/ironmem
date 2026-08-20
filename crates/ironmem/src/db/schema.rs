@@ -2876,22 +2876,27 @@ mod tests {
     /// The upgrade path for migration 022, and — more importantly — the
     /// direction its default points.
     ///
-    /// `pending_handoff_forced` gates which staleness predicate
-    /// `session_handoff { force_reissue: true }` applies: `1` selects the
-    /// narrowed one that ignores the agent's own `pending_handoff_issued_at`,
-    /// `0` selects the full five-signal read that refuses on a live session. A
-    /// lease row that predates this migration has no provenance to report, and
-    /// the whole design rests on that unknown reading as **not forced** — the
-    /// strict answer. If the default were ever flipped to 1, every pre-022 row
-    /// on disk would silently become eligible for the narrowed gate, which is
-    /// the lease-takeover hole this column exists to close.
+    /// `pending_handoff_forced_token` gates which staleness predicate
+    /// `session_handoff { force_reissue: true }` applies: when it equals the
+    /// current `pending_handoff_token` the gate narrows, ignoring the agent's
+    /// own `pending_handoff_issued_at`; otherwise the full five-signal read
+    /// applies and refuses on a live session. A lease row that predates this
+    /// migration has no provenance to report, and the whole design rests on
+    /// that unknown reading as **not forced** — the strict answer. If the
+    /// default were ever anything but NULL, every legacy lease row on disk
+    /// would need its stored value to accidentally disagree with its token to
+    /// stay safe, which is not a property worth depending on.
     #[test]
     fn test_v21_to_v22_adds_handoff_provenance_defaulting_to_not_forced() {
         let db = open_at_v21();
         assert_eq!(schema_version_of(&db), 21);
         assert!(
-            !column_exists(&db, "collab_actor_generations", "pending_handoff_forced"),
-            "pending_handoff_forced should not exist at v21"
+            !column_exists(
+                &db,
+                "collab_actor_generations",
+                "pending_handoff_forced_token"
+            ),
+            "pending_handoff_forced_token should not exist at v21"
         );
 
         // A pre-022 lease row with a token pending, written the way v21 wrote
@@ -2919,13 +2924,13 @@ mod tests {
         assert!(column_exists(
             &db,
             "collab_actor_generations",
-            "pending_handoff_forced"
+            "pending_handoff_forced_token"
         ));
 
-        let (token, forced): (String, i64) = db
+        let (token, forced_token): (String, Option<String>) = db
             .conn
             .query_row(
-                "SELECT pending_handoff_token, pending_handoff_forced
+                "SELECT pending_handoff_token, pending_handoff_forced_token
                    FROM collab_actor_generations
                   WHERE session_id = 'legacy-v21-session' AND agent = 'claude'",
                 [],
@@ -2934,22 +2939,23 @@ mod tests {
             .unwrap();
         assert_eq!(token, "legacy-token", "the pre-existing row must survive");
         assert_eq!(
-            forced, 0,
+            forced_token, None,
             "a row that predates provenance must read NOT forced — the strict answer. \
-             Flipping this default would make every legacy lease row eligible for the \
-             narrowed staleness gate."
+             A non-NULL default would make every legacy lease row's safety depend on its \
+             stored value happening to disagree with its token."
         );
 
-        // The CHECK is what stops a third value appearing and being read as
-        // truthy by anything that compares against 0.
+        // The CHECK forbids the empty string: a blank is neither absent nor a
+        // real token, and it could compare equal to an equally blank
+        // `pending_handoff_token`, narrowing the gate on a pair of nothings.
         let bad = db.conn.execute(
-            "UPDATE collab_actor_generations SET pending_handoff_forced = 2
+            "UPDATE collab_actor_generations SET pending_handoff_forced_token = ''
               WHERE session_id = 'legacy-v21-session'",
             [],
         );
         assert!(
             bad.is_err(),
-            "pending_handoff_forced must be CHECK-constrained to 0 or 1"
+            "pending_handoff_forced_token must reject the empty string"
         );
     }
 

@@ -2743,9 +2743,16 @@ pub(super) fn handle_collab_status(app: &App, args: &Value) -> Result<Value, Mem
         // caller this field exists to help.
         //
         // Not sufficient — deliberately narrower than "force_reissue would
-        // succeed" in one direction: the gate also admits a force_reissue
-        // call when a token is already pending (it echoes that token without
-        // a staleness check — see `handle_session_handoff`'s "D-P1" comment).
+        // succeed" in one direction: a repeated forced call against a session
+        // that is dead by the *applicable* staleness predicate still succeeds
+        // when a token is already pending, echoing that token. Which predicate
+        // applies depends on the pending token's stored provenance — the full
+        // five-signal read, or that read minus this agent's own
+        // `pending_handoff_issued_at` when a prior forced reissue minted the
+        // token (migration 022). The gate itself runs on every path; see
+        // `handle_session_handoff`'s "D-P1" comment. An earlier version of
+        // this sentence said the echo happened "without a staleness check",
+        // which described a design two security reviews falsified.
         // That is not a case this field claims to cover; a pending token
         // already reads `claimable`, and this field's whole job is to
         // distinguish "usable right now" from "usable only via the

@@ -734,7 +734,7 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
                     "force_reissue": {
                         "type": "boolean",
                         "default": false,
-                        "description": "Mint a token WITHOUT holding the lease, to recover a session whose holder died. Requires generation > 0, a non-human-gated phase, and no activity for the staleness threshold — checked in full except against its own prior reissue's pending token. Does not advance the generation — the successor's claim does."
+                        "description": "Mint a token WITHOUT holding the lease, to recover a session whose holder died. Requires an active session, generation > 0, a non-human-gated phase, and no activity for the staleness threshold — checked in full except against a pending token a prior forced reissue minted. Does not advance the generation — the successor's claim does."
                     }
                 },
                 "required": ["session_id", "agent"]
@@ -1571,11 +1571,14 @@ mod tests {
     /// `CodingFailed` (same property: waits on a human, writes no
     /// agent-driven activity) — which made naming exactly two phases in the
     /// description actively wrong rather than merely incomplete. `d4ef1bb`
-    /// added migration 022's `pending_handoff_forced` column and made the
-    /// pending-token staleness check depend on it: only a pending token this
-    /// same forced path minted gets the narrowed check (excluding the lease's
-    /// own timestamps, so a caller's own retry is not refused for liveness it
-    /// just created); a pending token from a normal, lease-authenticated mint
+    /// added migration 022's `pending_handoff_forced_token` column and made
+    /// the pending-token staleness check depend on it: only a pending token
+    /// this same forced path minted gets the narrowed check, which excludes
+    /// exactly one term — this agent's own `pending_handoff_issued_at`, so a
+    /// caller's own retry is not refused for liveness it just created.
+    /// `pending_handoff_claimed_at` and the counterpart agent's lease are
+    /// never excluded; each was a reproduced takeover before `011b4ca` ruled
+    /// it out. A pending token from a normal, lease-authenticated mint
     /// gets the full check, which is what stops a third party taking a live
     /// incumbent's in-flight token — the exact hole `011b4ca` and `d4ef1bb`
     /// closed in two steps. Both facts are preconditions no schema key can
@@ -1588,9 +1591,25 @@ mod tests {
     /// `CodingFailed` did — `force_reissue_admits_phase`'s exhaustive `match`
     /// and its `PHASE_FORCE_REISSUE_ADMITS` completeness proof (`handoff.rs`)
     /// are the enforcement; this sentence just has to stay true to the
-    /// concept, not to a list. The listing measured 4_391 tokens after this
-    /// pass, leaving ~16 tokens of headroom under the still-unmoved 4_407
-    /// cap. No neighbouring tool's description was trimmed to pay for it.
+    /// concept, not to a list.
+    ///
+    /// The final security review corrected two more claims in it. It omitted
+    /// `ensure_active` — the session-not-ended check runs *first*, ahead of
+    /// generation, phase and staleness, so a caller trusting the list as
+    /// complete met a seal refusal the list never mentioned; "an active
+    /// session" now leads the requires-list. And it said the staleness check
+    /// ran in full "except against **its own** prior reissue's pending token",
+    /// which quietly asserted a caller-identity check that does not exist:
+    /// the gate keys on stored provenance, so *any* caller finding a
+    /// forced-provenance token pending gets the narrowed predicate. `agent`
+    /// is caller-asserted throughout this protocol, and `handoff.rs`'s own
+    /// comments are explicit that a "was it you who minted it?" fix would rest
+    /// on nothing — so the description must not imply one. It now reads "a
+    /// pending token a prior forced reissue minted".
+    ///
+    /// The listing measured 4_398 tokens after this pass, leaving ~9 tokens of
+    /// headroom under the still-unmoved 4_407 cap. No neighbouring tool's
+    /// description was trimmed to pay for it.
     ///
     /// The budget is deliberately a whole-listing ceiling with no per-tool
     /// allocation, so the cheapest way to land a new field is to delete prose

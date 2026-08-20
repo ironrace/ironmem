@@ -2587,9 +2587,9 @@ value, still gets the right answer. The call also writes a
 `session_id`, `agent`, `phase`, `prior_generation`, `last_activity`,
 `idle_secs`, `staleness_scope`, and the result (`pending_generation` and
 whether the token was freshly minted or `reused`). `staleness_scope` is
-`"all_signals"` or `"excluding_lease"` and names which of the two predicates
-above admitted the call, derived from the stored `pending_handoff_forced`
-flag — `idle_secs` beside it means a different measurement under each, so it
+`"all_signals"` or `"excluding_own_issued_at"` and names which of the two predicates
+above admitted the call, derived from the stored
+`pending_handoff_forced_token` column — `idle_secs` beside it means a different measurement under each, so it
 cannot be inferred. `reused: true` alongside `"all_signals"` is the one
 combination worth an auditor's attention: a forced call echoed a token it did
 not mint, which is only reachable on a session dead by the full predicate. The row is written
@@ -2602,8 +2602,8 @@ session that already has a token pending, returns the byte-identical token
 gate still runs, and which predicate it runs depends on **who minted the
 pending token**:
 
-- **This forced path minted it** (`collab_actor_generations.pending_handoff_forced
-  = 1`, migration 022) — the gate narrows by exactly one term, *this* agent's
+- **This forced path minted it** — `collab_actor_generations.pending_handoff_forced_token`
+  (migration 022) equals the pending token. The gate narrows by exactly one term, *this* agent's
   `pending_handoff_issued_at`. Minting stamps that column, so counting it
   would refuse a caller's own rescue using activity the same rescue just
   wrote. This is the only case the narrowing exists for.
@@ -2647,11 +2647,21 @@ made was a reproduced takeover before it was ruled out:
 - **The other agent's lease, both columns.** The lease is per `(session,
   agent)`; the counterpart's mint or claim is somebody else's liveness.
 
-Unknown provenance fails **closed**: `pending_handoff_forced` is `NOT NULL
-DEFAULT 0`, so every pre-022 row, and any row written by a path that does not
-set it, takes the strict predicate. The permissive answer is never the
-default — the same reason the phase gate is an exhaustive `match` rather than
-a `matches!`.
+Unknown provenance fails **closed**: `pending_handoff_forced_token` defaults
+to NULL, so every pre-022 row, and any row written by a path that does not set
+it, takes the strict predicate. The permissive answer is never the default —
+the same reason the phase gate is an exhaustive `match` rather than a
+`matches!`.
+
+Provenance stores the **token value**, not a boolean, and that is what makes it
+survive a mixed-binary rollout — two `ironmem` processes on one database, one a
+build behind. An older process still runs SQL that never mentions the column, so
+it can clear a token without clearing provenance and then mint a new one without
+setting it. A boolean would leave that freshly minted, normally-authenticated
+token sitting under a stale "forced" mark. Storing the token makes the record
+self-enforcing: the stored value names the *rescue's* token, the pending token is
+the incumbent's, they are unequal, and unequal reads as not forced. The same
+property covers hand-repaired rows and any future writer that forgets.
 
 **Alternative, not a sequence, to abandon.** `force_reissue` re-leases a
 dead session so a fresh process can continue it; `collab_end { abandon:
