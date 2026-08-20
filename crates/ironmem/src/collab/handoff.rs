@@ -16,6 +16,47 @@ use crate::error::MemoryError;
 pub struct PendingHandoff {
     pub token: String,
     pub generation: u64,
+    /// Whether *this* pending token was minted by
+    /// `session_handoff { force_reissue: true }` rather than by an ordinary,
+    /// generation-authenticated call (migration 022, issue #298).
+    ///
+    /// Describes the token, not the row and not the lease: it is rewritten on
+    /// every fresh issue and cleared by [`claim_handoff_token`], so it can
+    /// never outlive the token it is provenance for. `false` is the safe
+    /// reading — see [`HandoffProvenance`].
+    pub forced: bool,
+}
+
+/// Which path is minting a handoff token.
+///
+/// Threaded through [`issue_or_reuse_handoff_with`] rather than inferred,
+/// because it cannot be inferred: both paths write the same
+/// `pending_handoff_generation`, the forced path deliberately leaves the active
+/// `generation` alone (issue #91's anti-resurrection property), and neither
+/// touches `collab_sessions.updated_at`. Migration 022 carries the full
+/// argument.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandoffProvenance {
+    /// An ordinary `session_handoff`: the caller held the current generation,
+    /// or bound at generation 0, or presented a token. Selects the **full**
+    /// staleness predicate at the `force_reissue` gate, which refuses on a live
+    /// session — so this is the answer a forgotten call site gets, and it is
+    /// the strict one.
+    Normal,
+    /// `session_handoff { force_reissue: true }`. Selects the narrowed
+    /// predicate that ignores this agent's own `pending_handoff_issued_at`, so
+    /// the minting caller's own retry is not refused for liveness it just
+    /// created (D-P1).
+    Forced,
+}
+
+impl HandoffProvenance {
+    fn as_flag(self) -> i64 {
+        match self {
+            Self::Normal => 0,
+            Self::Forced => 1,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,6 +78,7 @@ fn build_actor_generation(
     generation: i64,
     token: Option<String>,
     pending_gen: Option<i64>,
+    forced: bool,
 ) -> Result<ActorGeneration, MemoryError> {
     let generation = u64::try_from(generation).map_err(|_| {
         MemoryError::Validation(format!(
@@ -53,6 +95,7 @@ fn build_actor_generation(
             Some(PendingHandoff {
                 token,
                 generation: g,
+                forced,
             })
         }
         (None, None) => None,
@@ -84,14 +127,16 @@ pub fn load_or_init_actor_generation(
     )?;
     let row = conn
         .query_row(
-            "SELECT generation, pending_handoff_token, pending_handoff_generation
+            "SELECT generation, pending_handoff_token, pending_handoff_generation,
+                    pending_handoff_forced
              FROM collab_actor_generations WHERE session_id = ?1 AND agent = ?2",
             params![session_id, agent.as_str()],
             |r| {
                 let generation: i64 = r.get(0)?;
                 let token: Option<String> = r.get(1)?;
                 let pending_gen: Option<i64> = r.get(2)?;
-                Ok((generation, token, pending_gen))
+                let forced: i64 = r.get(3)?;
+                Ok((generation, token, pending_gen, forced))
             },
         )
         .optional()?
@@ -101,8 +146,8 @@ pub fn load_or_init_actor_generation(
                 agent.as_str()
             ))
         })?;
-    let (generation, token, pending_gen) = row;
-    build_actor_generation(generation, token, pending_gen)
+    let (generation, token, pending_gen, forced) = row;
+    build_actor_generation(generation, token, pending_gen, forced != 0)
 }
 
 /// Read the (session, agent) lease row WITHOUT creating it. Returns `None` when
@@ -114,19 +159,40 @@ pub fn read_actor_generation(
     agent: Agent,
 ) -> Result<Option<ActorGeneration>, MemoryError> {
     conn.query_row(
-        "SELECT generation, pending_handoff_token, pending_handoff_generation
+        "SELECT generation, pending_handoff_token, pending_handoff_generation,
+                pending_handoff_forced
          FROM collab_actor_generations WHERE session_id = ?1 AND agent = ?2",
         params![session_id, agent.as_str()],
         |r| {
             let generation: i64 = r.get(0)?;
             let token: Option<String> = r.get(1)?;
             let pending_gen: Option<i64> = r.get(2)?;
-            Ok((generation, token, pending_gen))
+            let forced: i64 = r.get(3)?;
+            Ok((generation, token, pending_gen, forced))
         },
     )
     .optional()?
-    .map(|(generation, token, pending_gen)| build_actor_generation(generation, token, pending_gen))
+    .map(|(generation, token, pending_gen, forced)| {
+        build_actor_generation(generation, token, pending_gen, forced != 0)
+    })
     .transpose()
+}
+
+/// Issue a new handoff token (or reuse a pending one) on the **ordinary**,
+/// generation-authenticated path.
+///
+/// Thin wrapper over [`issue_or_reuse_handoff_with`] at
+/// [`HandoffProvenance::Normal`]. The default is deliberate rather than
+/// convenient: `Normal` selects the strict staleness predicate at the
+/// `force_reissue` gate, so a call site that never thought about provenance
+/// gets the refusing answer. A wrapper defaulting the other way would make
+/// forgetting equivalent to opening the hole migration 022 closed.
+pub fn issue_or_reuse_handoff(
+    conn: &Connection,
+    session_id: &str,
+    agent: Agent,
+) -> Result<HandoffIssue, MemoryError> {
+    issue_or_reuse_handoff_with(conn, session_id, agent, HandoffProvenance::Normal)
 }
 
 /// Issue a new handoff token (or reuse a pending one). Does NOT bump the active
@@ -136,10 +202,28 @@ pub fn read_actor_generation(
 /// Safe under any transaction isolation level: the issue decision is enforced by the
 /// atomic guarded `WHERE` clause (`WHERE pending_handoff_token IS NULL`, a single
 /// UPDATE), not by snapshot isolation.
-pub fn issue_or_reuse_handoff(
+///
+/// # Provenance (migration 022, issue #298)
+///
+/// `provenance` is written **only on the fresh-issue path**, and it is written
+/// unconditionally there — `Forced` sets the flag, `Normal` clears it. Clearing
+/// is as load-bearing as setting: a row that once carried a forced token would
+/// otherwise leave a stale `1` behind for the next ordinary mint to inherit,
+/// which would hand the narrowed staleness predicate to a token that was never
+/// forced.
+///
+/// The **reuse path writes nothing at all**, as it always has, and that
+/// includes provenance. The consequence is deliberate and is the attack path
+/// staying shut: when a *normal* handoff minted the pending token and a *forced*
+/// call then reuses it, the flag stays `0`, the full predicate applies, and the
+/// call is refused on a live session. A reuse that flipped the flag to `1` would
+/// let any caller launder an incumbent's token into a forced one simply by
+/// asking for it.
+pub fn issue_or_reuse_handoff_with(
     conn: &Connection,
     session_id: &str,
     agent: Agent,
+    provenance: HandoffProvenance,
 ) -> Result<HandoffIssue, MemoryError> {
     // Ensure the row exists at generation 0.
     conn.execute(
@@ -152,14 +236,22 @@ pub fn issue_or_reuse_handoff(
     let candidate_token = Uuid::new_v4().to_string();
 
     // Atomic guarded UPDATE: only writes when no token is already pending.
+    // `pending_handoff_forced` is set in the same statement as the token, so a
+    // token and its provenance can never be written apart.
     let rows = conn.execute(
         "UPDATE collab_actor_generations
          SET pending_handoff_token = ?3,
              pending_handoff_generation = generation + 1,
              pending_handoff_issued_at = datetime('now'),
-             pending_handoff_claimed_at = NULL
+             pending_handoff_claimed_at = NULL,
+             pending_handoff_forced = ?4
          WHERE session_id = ?1 AND agent = ?2 AND pending_handoff_token IS NULL",
-        params![session_id, agent.as_str(), candidate_token],
+        params![
+            session_id,
+            agent.as_str(),
+            candidate_token,
+            provenance.as_flag()
+        ],
     )?;
     let reused = rows == 0;
 
@@ -239,11 +331,16 @@ pub fn claim_handoff_token(
 
     // Atomic guarded UPDATE: only commits if the token is still the expected one.
     let rows = conn.execute(
+        // `pending_handoff_forced = 0` alongside the other pending columns:
+        // provenance describes the pending token, so it must not outlive it. A
+        // claimed row that kept its `1` would hand the narrowed predicate to
+        // whatever token was minted next.
         "UPDATE collab_actor_generations
          SET generation = pending_handoff_generation,
              pending_handoff_token = NULL,
              pending_handoff_generation = NULL,
-             pending_handoff_claimed_at = datetime('now')
+             pending_handoff_claimed_at = datetime('now'),
+             pending_handoff_forced = 0
          WHERE session_id = ?1 AND agent = ?2 AND pending_handoff_token = ?3",
         params![session_id, agent.as_str(), token],
     )?;
@@ -283,6 +380,12 @@ mod tests {
     // TABLE in 019 only depends on `collab_sessions` (created in 003), so
     // it's safe to apply out of numeric sequence relative to 011-018.
     const COLLAB_PILOT_SQL: &str = include_str!("../../migrations/019_collab_pilot.sql");
+    // Same out-of-sequence reasoning as 019: this ALTER TABLE depends only on
+    // `collab_actor_generations`, created in 010, and `pending_handoff_forced`
+    // is read by both `read_actor_generation` and `load_or_init_actor_generation`
+    // — the two functions this module's tests are entirely about.
+    const COLLAB_HANDOFF_PROVENANCE_SQL: &str =
+        include_str!("../../migrations/022_collab_handoff_provenance.sql");
 
     fn open() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -297,6 +400,7 @@ mod tests {
         conn.execute_batch(COLLAB_PLAN_DRAWERS_SQL).unwrap();
         conn.execute_batch(COLLAB_GENERATION_LEASE_SQL).unwrap();
         conn.execute_batch(COLLAB_PILOT_SQL).unwrap();
+        conn.execute_batch(COLLAB_HANDOFF_PROVENANCE_SQL).unwrap();
         conn
     }
 

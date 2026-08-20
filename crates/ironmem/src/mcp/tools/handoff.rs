@@ -275,8 +275,8 @@ pub(super) fn force_reissue_admits_phase(phase: Phase) -> bool {
 /// [`crate::collab::queue::session_last_activity_excluding_lease`]. `idle_secs`
 /// in the same row means a different measurement under each, which is why the
 /// scope is recorded beside it rather than inferred.
-pub(super) fn staleness_scope_key(pending_already: bool) -> &'static str {
-    if pending_already {
+pub(super) fn staleness_scope_key(pending_was_forced: bool) -> &'static str {
+    if pending_was_forced {
         "excluding_lease"
     } else {
         "all_signals"
@@ -286,8 +286,8 @@ pub(super) fn staleness_scope_key(pending_already: bool) -> &'static str {
 /// [`staleness_scope_key`] rendered for an operator refusal: the activity
 /// sources actually weighed, spelled out. Derived from the same boolean so the
 /// refusal and the audit row can never describe different checks.
-pub(super) fn staleness_scope_human(pending_already: bool) -> &'static str {
-    if pending_already {
+pub(super) fn staleness_scope_human(pending_was_forced: bool) -> &'static str {
+    if pending_was_forced {
         "the session row, its checkpoint, its messages, the other agent's handoff \
          lease, and this agent's last handoff claim (only this agent's pending-token \
          issue time is excluded, because a token is already pending and a caller's \
@@ -866,15 +866,19 @@ pub(super) fn handle_session_handoff(app: &App, args: &Value) -> Result<Value, M
             // exactly ONE term: *this* agent's `pending_handoff_issued_at`.
             //
             // The exclusion is cut that narrow deliberately — it is a hole in a
-            // security predicate, and two wider versions of it were each a
+            // security predicate, and three wider versions of it were each a
             // reproduced takeover. `pending_handoff_claimed_at` is never
             // excluded (a forced reissue NULLs it, so a caller's own retry can
             // never stamp it — excluding it protected nothing and threw away a
-            // claim, which is a live process taking the lease), and the *other*
+            // claim, which is a live process taking the lease); the *other*
             // agent's lease is never excluded (the lease is per (session,
             // agent); the counterpart's mint or claim is somebody else's
-            // liveness). See `session_last_activity_excluding_lease` for the
-            // full argument and for the residual this leaves.
+            // liveness); and the narrowed predicate is reached at all only when
+            // stored provenance says this same forced path minted the pending
+            // token (migration 022) — without that last condition, a token a
+            // live incumbent had just minted was indistinguishable from a
+            // rescuer's own on any long-quiet session. See
+            // `session_last_activity_excluding_lease` for the full argument.
             //
             // * Genuinely dead session: every remaining signal is still dead,
             //   so the caller's own retry is admitted — D-P1's motivating case,
@@ -955,27 +959,40 @@ pub(super) fn handle_session_handoff(app: &App, args: &Value) -> Result<Value, M
                 )));
             }
 
-            // Which signal set gates this call. The `Exclude` variant on the
-            // pending path is the #298 security fix — see the long note above;
-            // it is not an optimisation and must not be collapsed back into one
-            // read. Both are read here, before `issue_or_reuse_handoff`, because
+            // ── Which signal set gates this call ─────────────────────────────
+            //
+            // The narrowed predicate exists for exactly one caller: one whose
+            // OWN forced reissue just stamped `pending_handoff_issued_at`, so
+            // that its retry is not refused for liveness it created (D-P1). The
+            // condition below is the statement of "own" — and it is a stored
+            // fact, `pending_handoff_forced` (migration 022), not an inference.
+            //
+            // It cannot be inferred. Both paths write the same
+            // `pending_handoff_generation`; the forced path deliberately leaves
+            // the active `generation` untouched (issue #91's anti-resurrection
+            // property, R1 below); the advisory generation cache is per-process
+            // and so cannot answer for the freshly-started process a rescue is
+            // *for*; and neither path writes `collab_sessions.updated_at`. An
+            // earlier version keyed this on `pending.is_some()` alone, and that
+            // was the residual a security review closed: on a session quiet for
+            // six hours, a token a LIVE incumbent had just minted through a
+            // generation-authenticated call was indistinguishable from one the
+            // forced path minted, so a third process could ask for it and get it
+            // verbatim. The flag is what separates the two.
+            //
+            // `false` — no pending token, or a pending token this path did not
+            // mint, or a pre-022 row — takes the FULL predicate, which refuses on
+            // a live session. Unknown provenance therefore fails closed.
+            //
+            // Both are read here, before `issue_or_reuse_handoff_with`, because
             // that call stamps `pending_handoff_issued_at` and a read afterwards
             // would report the reissue's own timestamps as the "prior" ones it
             // is supposed to be evidence *about*.
-            let pending_already = existing.as_ref().is_some_and(|a| a.pending.is_some());
-            // ── The provenance seam ──────────────────────────────────────────
-            // One `if`, deliberately, because one residual hangs off it. On a
-            // session quiet on all three agent-driven signals AND on the other
-            // agent's lease, the narrowed predicate cannot tell a token the
-            // forced path minted moments ago (D-P1: must be admitted) from one a
-            // live incumbent minted moments ago through a generation-authenticated
-            // call (must be refused) — the only column that differs is the one
-            // being excluded. Closing that needs *provenance*: a record of which
-            // path minted the pending token. Whatever form that takes — a
-            // `pending_handoff_forced` column, or something derived from state
-            // already on hand — it belongs in this condition and nowhere else, so
-            // the fix is one edit rather than an audit of the whole ladder.
-            let staleness = if pending_already {
+            let pending_was_forced = existing
+                .as_ref()
+                .and_then(|a| a.pending.as_ref())
+                .is_some_and(|p| p.forced);
+            let staleness = if pending_was_forced {
                 crate::collab::queue::session_staleness_excluding_lease(tx, session_id, agent)?
             } else {
                 crate::collab::queue::session_staleness(tx, session_id)?
@@ -1031,7 +1048,7 @@ pub(super) fn handle_session_handoff(app: &App, args: &Value) -> Result<Value, M
                     // check it is reporting — to the caller least able to
                     // check, since the excluded terms are the ones its own
                     // retry would have written.
-                    staleness_scope_human(pending_already),
+                    staleness_scope_human(pending_was_forced),
                 )));
             }
 
@@ -1045,14 +1062,22 @@ pub(super) fn handle_session_handoff(app: &App, args: &Value) -> Result<Value, M
                     "prior_generation": prior_generation,
                     "last_activity": staleness.last_activity(),
                     "idle_secs": staleness.idle_secs(),
-                    // WHICH predicate admitted this call. It replaced a
+                    // WHICH predicate admitted this call, derived from the
+                    // stored `pending_handoff_forced` flag. It replaced a
                     // `staleness_checked` boolean that could only ever be
                     // `true` once the gate stopped being skippable; a field
                     // with one reachable value reads as though the other were
                     // possible. The scope is the thing a reader of this row
                     // actually needs, because `idle_secs` beside it means a
                     // different measurement in each case.
-                    "staleness_scope": staleness_scope_key(pending_already),
+                    //
+                    // Read it together with `reused` in the result. `reused:
+                    // true` with `"all_signals"` is the one combination worth
+                    // an auditor's attention: a forced call echoed a token it
+                    // did NOT mint. That is only reachable on a session dead by
+                    // the full predicate — on a live one it is refused — but it
+                    // is the shape a takeover attempt would leave behind.
+                    "staleness_scope": staleness_scope_key(pending_was_forced),
                     // The phase the reissue was granted from. `PlanLocked` and
                     // `CodingComplete` are refused above, so this can never
                     // record one of them — which is exactly why it is worth
@@ -1073,7 +1098,20 @@ pub(super) fn handle_session_handoff(app: &App, args: &Value) -> Result<Value, M
             let record = crate::collab::queue::load_session_record(tx, session_id)?;
             (claim, None, record)
         };
-        let issued = crate::collab::issue_or_reuse_handoff(tx, session_id, agent)?;
+        // The mint carries which path asked for it, so the NEXT call's gate can
+        // tell this token from one an incumbent minted. `Normal` on the ordinary
+        // path is not a formality: it CLEARS a `1` left by an earlier forced
+        // token, so provenance cannot be inherited across a mint.
+        let issued = crate::collab::handoff::issue_or_reuse_handoff_with(
+            tx,
+            session_id,
+            agent,
+            if force_reissue {
+                crate::collab::HandoffProvenance::Forced
+            } else {
+                crate::collab::HandoffProvenance::Normal
+            },
+        )?;
 
         // The audit row for a generation-guard bypass belongs in the same
         // transaction as the bypass. Written post-commit and warn-and-continue
@@ -3195,23 +3233,205 @@ mod tests {
         );
     }
 
-    /// The refusal above must name the signals it actually weighed. With a
-    /// token pending the lease timestamps are excluded, and a refusal still
-    /// claiming to have weighed "its handoff lease" would misdescribe its own
-    /// check to the caller least able to verify it.
+    /// Two properties in the one state that shows both.
+    ///
+    /// A forced reissue mints a *forced-provenance* token, so a retry gets the
+    /// narrowed predicate. But narrowed is not skipped: if the session comes
+    /// back to life in between — the holder was not dead after all, and writes
+    /// the session row — the retry is refused, and the refusal must name the
+    /// single term it actually dropped. A refusal claiming it had weighed "its
+    /// handoff lease" would overstate the check to the caller least able to
+    /// verify it.
     #[test]
-    fn the_pending_path_refusal_names_the_narrowed_signal_set() {
-        let live = live_incumbent_mid_handoff();
-        let attacker = test_app_with_db_path(live.db_path.clone(), live.dir.path());
-        let message = handle_session_handoff(&attacker, &force_args(&live.session_id, "claude"))
+    fn a_forced_token_still_loses_to_a_session_that_came_back_to_life() {
+        let lease = dead_lease_and_rescuer();
+        let (rescuer, sid) = (&lease.rescuer, lease.session_id.as_str());
+
+        // A real forced reissue: the pending token now carries forced provenance.
+        handle_session_handoff(rescuer, &force_args(sid, "claude")).unwrap();
+        assert!(
+            pending_is_forced(rescuer, sid, Agent::Claude),
+            "setup: the forced path must have recorded its own provenance"
+        );
+
+        // The holder wakes up and does something — the one write every
+        // agent-driven phase transition makes.
+        rescuer
+            .db
+            .with_transaction(|tx| {
+                tx.execute(
+                    "UPDATE collab_sessions SET updated_at = datetime('now') WHERE id = ?1",
+                    rusqlite::params![sid],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let message = handle_session_handoff(rescuer, &force_args(sid, "claude"))
             .unwrap_err()
             .to_string();
+        assert!(
+            message.contains("still live"),
+            "the narrowed predicate is narrowed, not skipped — a session that came back \
+             to life must still refuse: {message}"
+        );
         assert!(
             message.contains("only this agent's pending-token issue time is excluded"),
             "the pending-path refusal must name the one term that was excluded — the \
              narrowing is one column for one agent, and a refusal claiming more was \
              dropped would overstate the hole: {message}"
         );
+    }
+
+    /// **Fail-closed.** A pending token whose provenance says "not forced" —
+    /// which is every pre-022 row, and any row a future path forgets to stamp —
+    /// takes the FULL predicate.
+    ///
+    /// The state is chosen so the two predicates disagree: after a forced
+    /// reissue the session's *only* fresh signal is this agent's own
+    /// `pending_handoff_issued_at`. With provenance intact the retry is
+    /// admitted (D-P1). With the flag zeroed, as a legacy row reads, the full
+    /// predicate counts that timestamp and the call is refused. That asymmetry
+    /// is the whole point of the default: unknown provenance never buys the
+    /// narrower gate.
+    #[test]
+    fn a_pending_token_without_forced_provenance_takes_the_full_predicate() {
+        let lease = dead_lease_and_rescuer();
+        let (rescuer, sid) = (&lease.rescuer, lease.session_id.as_str());
+        handle_session_handoff(rescuer, &force_args(sid, "claude")).unwrap();
+
+        // Exactly what a pre-022 row looks like after migration: token pending,
+        // provenance 0. Written directly because no code path can produce it
+        // any more — which is the point, it is the legacy shape.
+        rescuer
+            .db
+            .with_transaction(|tx| {
+                tx.execute(
+                    "UPDATE collab_actor_generations SET pending_handoff_forced = 0
+                      WHERE session_id = ?1 AND agent = 'claude'",
+                    rusqlite::params![sid],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let message = handle_session_handoff(rescuer, &force_args(sid, "claude"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            message.contains("still live"),
+            "unknown provenance must take the strict gate: {message}"
+        );
+        assert!(
+            message.contains("and its handoff lease"),
+            "the refusal must report the FULL signal set, since that is what ran: {message}"
+        );
+    }
+
+    /// Provenance describes the token, not the row: a claim clears it, and the
+    /// next ordinary mint on the same row is not treated as forced.
+    ///
+    /// Without the clear, one legitimate rescue would leave a `1` behind that
+    /// every later normally-minted token on that lease would inherit — turning
+    /// a one-time repair into a permanent weakening of the gate for that
+    /// (session, agent).
+    #[test]
+    fn provenance_does_not_outlive_the_token_it_describes() {
+        let lease = dead_lease_and_rescuer();
+        let (rescuer, sid) = (&lease.rescuer, lease.session_id.as_str());
+
+        let forced = handle_session_handoff(rescuer, &force_args(sid, "claude")).unwrap();
+        assert!(pending_is_forced(rescuer, sid, Agent::Claude));
+
+        // The successor claims: pending columns clear, provenance with them.
+        let token = forced["handoff_token"].as_str().unwrap().to_string();
+        rescuer
+            .db
+            .with_transaction(|tx| claim_handoff_token(tx, sid, Agent::Claude, &token))
+            .unwrap();
+        let row = rescuer
+            .db
+            .with_connection(|conn| read_actor_generation(conn, sid, Agent::Claude))
+            .unwrap()
+            .unwrap();
+        assert!(row.pending.is_none(), "the claim must clear the token");
+        let raw_flag: i64 = rescuer
+            .db
+            .with_connection(|conn| {
+                Ok(conn.query_row(
+                    "SELECT pending_handoff_forced FROM collab_actor_generations
+                      WHERE session_id = ?1 AND agent = 'claude'",
+                    rusqlite::params![sid],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(
+            raw_flag, 0,
+            "the claim must clear provenance along with the token it described"
+        );
+
+        // A fresh ordinary mint on the same row must not inherit it. The
+        // claimant is a live holder now, so it mints the normal way.
+        rescuer.set_cached_generation(sid, Agent::Claude, row.generation);
+        handle_session_handoff(rescuer, &json!({ "session_id": sid, "agent": "claude" })).unwrap();
+        assert!(
+            !pending_is_forced(rescuer, sid, Agent::Claude),
+            "an ordinary mint must clear provenance, never inherit it"
+        );
+    }
+
+    /// A forced call that *reuses* a normally-minted token must not launder it
+    /// into a forced one. The reuse path writes nothing, provenance included,
+    /// so the flag stays 0 and the full predicate keeps applying — which is
+    /// precisely what keeps the takeover shut.
+    #[test]
+    fn a_forced_reuse_of_a_normally_minted_token_does_not_relabel_it() {
+        let lease = dead_lease_and_rescuer();
+        let (rescuer, sid) = (&lease.rescuer, lease.session_id.as_str());
+
+        // A normally-minted pending token on a dead session: the incumbent
+        // handed off, then died before the successor claimed.
+        rescuer
+            .db
+            .with_transaction(|tx| issue_or_reuse_handoff(tx, sid, Agent::Claude))
+            .unwrap();
+        // Age again *after* the mint: the incumbent handed off and then died,
+        // so its issued_at is six hours old like everything else. Without this
+        // the session is live by its own fresh issue time and the forced call
+        // is refused for a different reason than the one under test.
+        age_session(rescuer, sid, crate::collab::COLLAB_DEAD_SESSION_SECS + 60);
+        assert!(!pending_is_forced(rescuer, sid, Agent::Claude));
+
+        // The session is dead, so the forced call is admitted and echoes it.
+        let echoed = handle_session_handoff(rescuer, &force_args(sid, "claude")).unwrap();
+        assert_eq!(echoed["forced_reissue"], true);
+        assert!(
+            !pending_is_forced(rescuer, sid, Agent::Claude),
+            "the reuse path must not rewrite provenance — a forced call that merely \
+             echoed a token it did not mint must not be able to relabel it"
+        );
+        let (params, result) = last_force_reissue_row(rescuer);
+        assert_eq!(
+            result["reused"],
+            json!(true),
+            "setup: this must be the echo path: {result}"
+        );
+        assert_eq!(
+            params["staleness_scope"],
+            json!("all_signals"),
+            "an echoed token this path did not mint keeps the strict predicate — the \
+             `reused: true` + `all_signals` pair is the auditor's signature for it: {params}"
+        );
+    }
+
+    /// Whether the pending token on a lease row carries forced provenance.
+    fn pending_is_forced(app: &crate::mcp::app::App, sid: &str, agent: Agent) -> bool {
+        app.db
+            .with_connection(|conn| read_actor_generation(conn, sid, agent))
+            .unwrap()
+            .and_then(|a| a.pending)
+            .is_some_and(|p| p.forced)
     }
 
     /// `PlanLocked` and `CodingComplete` wait on a human and write no

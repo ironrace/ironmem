@@ -735,11 +735,10 @@ impl LeaseSignals {
 /// everywhere in this protocol, so a check shaped like "was it *you* who minted
 /// it?" would rest on nothing.
 ///
-/// # The residual, stated plainly
+/// # This predicate must only ever gate a caller's own forced reissue
 ///
-/// On a session that has been quiet on all three agent-driven signals for
-/// `COLLAB_DEAD_SESSION_SECS` and where the other agent's lease is also quiet,
-/// this predicate cannot distinguish
+/// On a session quiet on all three agent-driven signals and on the other
+/// agent's lease, this predicate cannot distinguish
 ///
 /// * a token the *forced path* minted moments ago (D-P1's case, must be
 ///   admitted) from
@@ -747,14 +746,18 @@ impl LeaseSignals {
 ///   generation-authenticated call (must be refused).
 ///
 /// Both look identical here, because the only column that differs between them
-/// is the one being excluded. Telling them apart needs **provenance** — a
-/// record of which path minted the pending token — which is new state this
-/// function deliberately does not invent. `handle_session_handoff` isolates the
-/// pending-case decision at a single call site so that check has one place to
-/// go. Note the exposure is much narrower than it first reads: a session whose
-/// incumbent is alive enough to be minting handoff tokens has almost always
-/// written one of the three agent-driven signals inside the window, and if it
-/// has, this predicate refuses.
+/// is the one being excluded — and that is not a defect in this function, it is
+/// the reason it must not be used to answer that question. The caller decides
+/// *whether* to use this predicate from stored provenance:
+/// `collab_actor_generations.pending_handoff_forced` (migration 022) records
+/// which path minted the pending token, and `handle_session_handoff` reaches
+/// for this variant only when the flag says forced. `false` — including every
+/// pre-022 row — takes [`session_staleness`] instead.
+///
+/// So the invariant is: **call this only when the pending token's provenance
+/// says the forced path minted it.** Widening that condition, or defaulting the
+/// flag the other way, reopens a lease-takeover primitive that a security
+/// review reproduced end to end.
 ///
 /// **Not** a replacement for [`session_last_activity`]. The abandon gate keeps
 /// the full signal: `collab_end { abandon: true }` is terminal, and a session

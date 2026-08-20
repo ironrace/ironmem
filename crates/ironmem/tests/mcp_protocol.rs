@@ -10322,6 +10322,179 @@ fn a_third_process_cannot_steal_a_live_incumbents_pending_handoff_token() {
     );
 }
 
+/// **The last takeover, refused — the one `pending_handoff_forced` exists for.**
+///
+/// The narrowed staleness predicate (which ignores this agent's own
+/// `pending_handoff_issued_at`, so a rescuer's retry is not refused for
+/// liveness it just created) left one state it could not judge. On a session
+/// quiet for six hours on every agent-driven signal, these two are identical to
+/// it, because the only column that differs is the excluded one:
+///
+///   (a) a token the FORCED path minted moments ago  -> must be admitted
+///   (b) a token a LIVE incumbent minted moments ago -> must be refused
+///
+/// So a third process could wait for an incumbent's ordinary mint→claim window
+/// on a long-quiet session, call `force_reissue`, and be handed the incumbent's
+/// token verbatim.
+///
+/// Migration 022 records which path minted the pending token, and the gate
+/// applies the narrowed predicate **only** when the flag says forced. This is
+/// (b), driven as the attack: the incumbent is alive and mints normally, but
+/// the session has been quiet long enough that every other signal reads dead.
+///
+/// Contrast with
+/// [`a_third_process_cannot_steal_a_live_incumbents_pending_handoff_token`],
+/// which is refused by the session's own freshness. Here freshness cannot save
+/// it — only provenance can.
+#[test]
+fn a_third_process_cannot_steal_a_pending_token_on_a_long_quiet_session() {
+    let (_dir, db_path, incumbent) = open_disk_app();
+    let (_repo, repo_path, _shas) = git_batch_repo(2);
+    let sid = start_batch_session_in(&incumbent, &repo_path, 3);
+
+    // Lock the lease at generation 1 through a real mint→claim pair.
+    let first = call_tool(
+        &incumbent,
+        "session_handoff",
+        json!({ "session_id": &sid, "agent": "claude" }),
+    );
+    let first_token = first["handoff_token"].as_str().unwrap().to_string();
+    claim_with_token(&incumbent, &sid, "claude", "generation-1", &first_token);
+
+    // Six hours pass with the session quiet on every signal. The incumbent is
+    // NOT dead — it simply has not written anything, which `PlanLocked`-style
+    // waits and long unattended runs both produce.
+    age_collab_session(
+        &incumbent,
+        &sid,
+        ironmem::collab::COLLAB_DEAD_SESSION_SECS + 60,
+    );
+
+    // The incumbent, alive, hands off normally. `T` is minted through a
+    // generation-authenticated call — it is NOT a rescue.
+    let handed = call_tool(
+        &incumbent,
+        "session_handoff",
+        json!({ "session_id": &sid, "agent": "claude" }),
+    );
+    let stolen_prize = handed["handoff_token"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the normal handoff must mint T: {handed}"))
+        .to_string();
+
+    // The attacker: never held the lease, never given `T`.
+    let (_attacker_state, attacker) = open_second_disk_app(&db_path);
+    let oracle = call_tool(&attacker, "collab_status", json!({ "session_id": &sid }));
+    assert_eq!(
+        oracle["claude_lease"]["handoff_pending"],
+        json!(true),
+        "the oracle step is real and un-gated — the test is only honest if the attacker \
+         can see a token is in flight: {oracle}"
+    );
+
+    let refused = call_tool_expect_error(
+        &attacker,
+        "session_handoff",
+        force_reissue_args(&sid, "claude"),
+    );
+    assert!(
+        refused.contains("still live"),
+        "a token minted by a generation-authenticated call must never be handed to a \
+         process that did not mint it, however quiet the session is: {refused}"
+    );
+    assert!(
+        refused.contains("and its handoff lease"),
+        "the strict predicate must be the one that ran — a normally-minted token does \
+         not buy the narrowed gate: {refused}"
+    );
+    assert!(
+        !refused.contains(&stolen_prize),
+        "the refusal must not leak the token it refused to hand over: {refused}"
+    );
+
+    let after = call_tool(&attacker, "collab_status", json!({ "session_id": &sid }));
+    assert_eq!(
+        after["claude_generation"],
+        json!(1),
+        "a refused takeover must move no generation: {after}"
+    );
+    assert_eq!(
+        after["claude_lease"]["handoff_pending"],
+        json!(true),
+        "T must still be pending for the successor it was minted for: {after}"
+    );
+    assert_eq!(
+        wal_row_count(&attacker, &sid, "session_handoff.force_reissue"),
+        0,
+        "a refused reissue writes no audit row"
+    );
+
+    let blocked = call_tool_expect_error(
+        &attacker,
+        "collab_register_caps",
+        register_caps_args(&sid, "claude", "attacker"),
+    );
+    assert!(
+        blocked.contains("this session has been handed off (generation 1)"),
+        "the attacker must be exactly where it started — outside the lease: {blocked}"
+    );
+
+    // The intended successor still completes the succession.
+    let (_successor_state, successor) = open_second_disk_app(&db_path);
+    claim_with_token(&successor, &sid, "claude", "intended", &stolen_prize);
+    assert_eq!(
+        call_tool(&successor, "collab_status", json!({ "session_id": &sid }))["claude_generation"],
+        json!(2),
+        "the succession the incumbent intended must complete unaffected"
+    );
+}
+
+/// The other half of the same column: a genuinely wedged session is still
+/// rescuable, and the rescuer's own retry still works.
+///
+/// The state is identical to the takeover above — long-quiet session, token
+/// pending — and the only difference is which path minted the token. If the
+/// provenance flag were ignored, or defaulted the wrong way, one of these two
+/// tests fails.
+#[test]
+fn a_forced_reissue_on_the_same_long_quiet_session_is_still_admitted_and_retryable() {
+    let lease = session_wedged_at_generation(2, "claude");
+    let (successor, sid) = (&lease.successor, lease.session_id.as_str());
+
+    let first = call_tool(
+        successor,
+        "session_handoff",
+        force_reissue_args(sid, "claude"),
+    );
+    assert_eq!(
+        first["forced_reissue"],
+        json!(true),
+        "a dead lease must still be rescuable: {first}"
+    );
+
+    // The retry: the session now reads live by the rescuer's own issued_at, and
+    // the narrowed predicate is what keeps that from refusing it. Provenance is
+    // what earns the narrowed predicate.
+    let second = call_tool(
+        successor,
+        "session_handoff",
+        force_reissue_args(sid, "claude"),
+    );
+    assert_eq!(
+        first["handoff_token"], second["handoff_token"],
+        "D-P1: the retry must echo the token byte-for-byte"
+    );
+    assert_eq!(second["generation"], first["generation"]);
+
+    let (params, result) = last_wal_row(successor, "session_handoff.force_reissue");
+    assert_eq!(
+        params["staleness_scope"],
+        json!("excluding_lease"),
+        "the retry earned the narrowed predicate through stored provenance: {params}"
+    );
+    assert_eq!(result["reused"], json!(true), "{result}");
+}
+
 /// **Gap B (echo path), Gap C (first direction) and Gap D, in the one state
 /// that produces all three.**
 ///

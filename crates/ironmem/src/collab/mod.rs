@@ -62,7 +62,7 @@ pub use failure_class::{classify, FailureClass};
 pub use handoff::load_or_init_actor_generation;
 pub use handoff::{
     claim_handoff_token, issue_or_reuse_handoff, read_actor_generation, ActorGeneration,
-    HandoffIssue, PendingHandoff,
+    HandoffIssue, HandoffProvenance, PendingHandoff,
 };
 pub use phase::Phase;
 pub use session::{tasks_count_from_list, CollabSession};

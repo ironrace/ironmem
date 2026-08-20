@@ -1668,10 +1668,10 @@ diverge for real, test-pinned reasons:
 - **`reclaimable: false` yet `force_reissue` succeeds.** A lease with a
   token already pending (`handoff_pending: true`) reads `claimable: true`,
   hence `reclaimable: false` — but on a *dead* session a repeated
-  `force_reissue` still succeeds against it, echoing the pending token
-  after a staleness check that excludes this agent's own pending-token issue
-  time (see "Repeating the call" under § `session_handoff` below, including
-  what that check does and does not guarantee).
+  `force_reissue` still succeeds against it, echoing the pending token (see
+  "Repeating the call" under § `session_handoff` below). Whether the check
+  that admits it is the full predicate or the narrowed one depends on which
+  path minted that token, but on a dead session both admit.
   `reclaimable` deliberately does not cover this case: its whole job is to
   distinguish "usable right now" from "usable only via the dead-lease
   repair," and folding the echo path in would make `reclaimable: false`
@@ -2553,10 +2553,10 @@ than calling it, in this order:
    hours), read *inside* this call's own write transaction so there is no
    window between "is it dead?" and "re-lease it" for the session to go
    live in. Two predicates, depending on whether a token is already
-   pending — see "Repeating the call" below. With nothing pending it is the
-   same five-signal read `collab_end`'s abandon gate uses; with a token
-   pending it is that same read minus exactly one term — *this* agent's
-   `pending_handoff_issued_at`.
+   pending **that this same forced path minted** — see "Repeating the call"
+   below. Normally it is the same five-signal read `collab_end`'s abandon gate
+   uses; only for a caller retrying its own forced reissue is it that read
+   minus exactly one term, *this* agent's `pending_handoff_issued_at`.
 
 The precondition is checkable up front, without making the call, via
 `collab_status`'s `<agent>_lease.reclaimable` (see § `collab_status` above)
@@ -2588,31 +2588,38 @@ value, still gets the right answer. The call also writes a
 `idle_secs`, `staleness_scope`, and the result (`pending_generation` and
 whether the token was freshly minted or `reused`). `staleness_scope` is
 `"all_signals"` or `"excluding_lease"` and names which of the two predicates
-above admitted the call — `idle_secs` beside it means a different
-measurement under each, so it cannot be inferred. The row is written
+above admitted the call, derived from the stored `pending_handoff_forced`
+flag — `idle_secs` beside it means a different measurement under each, so it
+cannot be inferred. `reused: true` alongside `"all_signals"` is the one
+combination worth an auditor's attention: a forced call echoed a token it did
+not mint, which is only reachable on a session dead by the full predicate. The row is written
 **inside the same transaction as the reissue**, so a committed bypass always
 has its record and a refused one never leaves a stray.
 
 **Repeating the call.** A `force_reissue` call made before any claim, on a
 session that already has a token pending, returns the byte-identical token
 (`reused: true`) and does not double-count the handoff metric. The staleness
-gate still runs, but on a signal narrowed by **exactly one term**: *this*
-agent's `pending_handoff_issued_at`. Minting a token stamps that column, so
-counting it would refuse a caller's own rescue using activity the same
-rescue just wrote.
+gate still runs, and which predicate it runs depends on **who minted the
+pending token**:
 
-Everything else still counts, and each exclusion that is *not* made was a
-reproduced takeover before it was ruled out:
+- **This forced path minted it** (`collab_actor_generations.pending_handoff_forced
+  = 1`, migration 022) — the gate narrows by exactly one term, *this* agent's
+  `pending_handoff_issued_at`. Minting stamps that column, so counting it
+  would refuse a caller's own rescue using activity the same rescue just
+  wrote. This is the only case the narrowing exists for.
+- **Anything else minted it** — an ordinary generation-authenticated
+  `session_handoff`, or a row that predates migration 022 — the **full**
+  five-signal predicate applies, unchanged. The token stays private to
+  whoever it was handed to.
 
-- **The three agent-driven signals** (`collab_sessions.updated_at`, the
-  checkpoint, `messages`) — these are what actually answer "is anyone
-  working on this session".
-- **`pending_handoff_claimed_at`, for either agent.** A forced reissue sets
-  this column to `NULL`, so a caller's own retry can never stamp it —
-  excluding it would protect nothing while discarding a claim, which is a
-  live process taking the lease.
-- **The other agent's lease, both columns.** The lease is per `(session,
-  agent)`; the other agent's mint or claim is somebody else's liveness.
+Provenance is written at mint time because it cannot be derived: both paths
+write the same `pending_handoff_generation`, the forced path deliberately
+leaves the active `generation` alone, and neither writes
+`collab_sessions.updated_at`. It is cleared by a claim, so it never outlives
+the token it describes, and an ordinary mint clears it too, so one rescue
+cannot leave a lease permanently on the narrower gate. The reuse path writes
+nothing at all — so a forced call that merely *echoes* a normally-minted
+token cannot relabel it as forced.
 
 This is a security boundary, not a convenience. An earlier design *skipped*
 the gate outright whenever a token was pending, which made the pending token
@@ -2622,20 +2629,29 @@ ordinary mint→claim window (which `collab_status` advertises un-gated as
 verbatim, and claim it — while the intended successor saw only
 `handoff_token already claimed`.
 
-**What this does and does not guarantee.** A forced reissue on a session with
-a token pending is refused whenever the session has written any of its three
-agent-driven signals, *or* the other agent's lease, within
-`COLLAB_DEAD_SESSION_SECS`. It is **not** guaranteed to refuse a session that
-is live *only* by virtue of this agent's own pending-token issue time: on a
-session otherwise quiet for six hours, a token a live incumbent minted
-moments ago through a generation-authenticated call is indistinguishable
-here from one the forced path minted moments ago, because the one column
-that differs between them is the excluded one. Telling them apart needs
-**provenance** — a record of which path minted the pending token — which
-does not exist today. In practice the exposure is narrow: an incumbent alive
-enough to be minting handoff tokens has almost always written one of the
-three agent-driven signals inside the window, and if it has, the call is
-refused.
+**What this guarantees.** A pending token is handed to a `force_reissue`
+caller only when the forced path itself minted it. A token minted by an
+ordinary `session_handoff` is never echoed to a caller that did not mint it
+while the full predicate says the session is live — and because provenance is
+a stored fact rather than an inference from timing, that holds however long
+the session has been quiet. Everything the full predicate weighs still counts
+on both paths except the one excluded term, and each exclusion that is *not*
+made was a reproduced takeover before it was ruled out:
+
+- **The three agent-driven signals** (`collab_sessions.updated_at`, the
+  checkpoint, `messages`) — these answer "is anyone working on this session".
+- **`pending_handoff_claimed_at`, for either agent.** A forced reissue sets
+  this column to `NULL`, so a caller's own retry can never stamp it —
+  excluding it would protect nothing while discarding a claim, which is a
+  live process taking the lease.
+- **The other agent's lease, both columns.** The lease is per `(session,
+  agent)`; the counterpart's mint or claim is somebody else's liveness.
+
+Unknown provenance fails **closed**: `pending_handoff_forced` is `NOT NULL
+DEFAULT 0`, so every pre-022 row, and any row written by a path that does not
+set it, takes the strict predicate. The permissive answer is never the
+default — the same reason the phase gate is an exhaustive `match` rather than
+a `matches!`.
 
 **Alternative, not a sequence, to abandon.** `force_reissue` re-leases a
 dead session so a fresh process can continue it; `collab_end { abandon:
