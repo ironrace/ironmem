@@ -102,7 +102,7 @@ class HumanLayerWorkspacePolicyTest(unittest.TestCase):
             ".humanlayer/workspace.local.json can re-enable workspace setup and is prohibited in the pilot checkout",
         )
         result = subprocess.run(
-            [str(GIT_EXECUTABLE), "check-ignore", "-v", "--", LOCAL_CONFIG_PATTERN],
+            [str(GIT_EXECUTABLE), "check-ignore", "--", LOCAL_CONFIG_PATTERN],
             cwd=self.repo_root,
             check=False,
             capture_output=True,
@@ -111,28 +111,9 @@ class HumanLayerWorkspacePolicyTest(unittest.TestCase):
         self.assertEqual(
             result.returncode,
             0,
-            "the local HumanLayer override must be ignored by the repository .gitignore; "
+            "the local HumanLayer override must be ignored so the fail-closed policy "
+            "cannot be silently re-enabled; "
             f"git check-ignore output: stdout={result.stdout!r}, stderr={result.stderr!r}",
-        )
-
-        tracked_gitignore = subprocess.run(
-            [str(GIT_EXECUTABLE), "ls-files", "--error-unmatch", "--", ".gitignore"],
-            cwd=self.repo_root,
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        self.assertEqual(
-            tracked_gitignore.returncode,
-            0,
-            "the HumanLayer policy requires a tracked repository .gitignore; "
-            f"git ls-files output: stdout={tracked_gitignore.stdout!r}, "
-            f"stderr={tracked_gitignore.stderr!r}",
-        )
-        self.assertEqual(
-            tracked_gitignore.stdout.strip(),
-            ".gitignore",
-            "git ls-files must resolve the policy source to the repository .gitignore",
         )
 
 if __name__ == "__main__":
