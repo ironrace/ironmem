@@ -77,7 +77,8 @@ Every arrow is a potential disclosure path. Untrusted content does not gain auth
 2. **One disposable repository.** Public or synthetic material only, selected-repositories installation, default branch protected, draft pull requests only, no merge and no deployment by automation.
 3. **No production secrets in the pilot environment.** Launch the pilot from a shell without production provider keys, deployment tokens, or signing keys. Use pilot-scoped, short-lived model-provider credentials.
 4. **Isolate IronMem.** Set pilot-specific `IRONMEM_DB_PATH` and `IRONMEM_DAEMON_SOCKET`; keep `IRONMEM_MCP_MODE` least-privilege for the task; leave LLM rerank and preference extraction off.
-5. **Human merge gate.** Review every diff and artifact before any external action. No agent merges, deploys, changes permissions, or disables a control.
+5. **Human merge gate.** Review every diff and artifact before any external action. No agent merges, deploys, changes permissions, or disables a control. **The gate is backend-dependent:** `permissions_mode: default` is enforced on `--coding-agent claude` and is *not* enforced on `codelayer`/`codex`, which executes tool calls unreviewed. Any session that writes code must run on a backend whose gate is verified working, and a session that produces no approvals when one was due is a launch-blocking condition, not a quiet success.
+6. **Deny the pilot session the host GitHub credential.** *Amended 2026-08-20 on the Pilot owner's approval, from finding P-09 in [`HUMANLAYER_PILOT_LOG.md`](HUMANLAYER_PILOT_LOG.md).* Run `gh auth logout` for the host account before launch, and `gh auth login` to restore it at teardown. `GH_TOKEN`/`GITHUB_TOKEN` absence and an isolated `GH_CONFIG_DIR` do **not** implement this control on this host: `gh` authenticates from a macOS Keychain item keyed by hostname, unaffected by either. The App installation scopes only the App's own token; it places no limit on a `gh` CLI credential the agent finds on the host. Without this control the repository restriction in control 2 is unenforced.
 
 ## GitHub permission manifest
 
@@ -89,6 +90,10 @@ Every arrow is a potential disclosure path. Untrusted content does not gain auth
 
 Capture the installation repository list and permission screen before launch. On repository or permission drift: suspend the app, revoke changed grants, preserve evidence, and re-approve before continuing.
 
+**What this manifest does and does not constrain.** *Amended 2026-08-20 on the Pilot owner's approval, from finding P-07 in [`HUMANLAYER_PILOT_LOG.md`](HUMANLAYER_PILOT_LOG.md).* Selected-repositories mode bounds **the App's token only**. It does not bound the agent. During the first pilot task a session read issues in `ironrace/ironmem` — a repository outside the installation — using the developer's `gh` CLI credential, which carries `repo` scope across every repository that account can see. It reached that repository after following a cross-repository pointer contained in issue text, so untrusted input is sufficient to direct it.
+
+Read the table above as the App's grant, not as the pilot's blast radius. The blast radius is bounded by control 6, by the material in the repositories the host credential can reach, and by the operator's review — not by this installation setting. The earlier reading, that selected-repositories mode keeps private and production-connected repositories out of reach, was wrong.
+
 ## Risk register
 
 | ID | Scenario | Severity | Mitigation | Status |
@@ -97,6 +102,8 @@ Capture the installation repository list and permission screen before launch. On
 | HOST-02 | `setupCommand` executes shell code after copies | High | Same control — disabling workspace setup prevents both | Mitigated |
 | GH-01 | GitHub App contents/issues/PR write scope is abused | High | One disposable repo, draft PRs only, branch protection | Mitigated for pilot scope |
 | GH-02 | Repository or permission drift expands blast radius | Critical | Capture manifest, suspend and re-approve on drift | Operational control |
+| GH-03 | Agent uses the host `gh` credential to reach repositories outside the installation | Critical | Control 6: `gh auth logout` for the pilot session's duration | **Observed in the pilot** (P-07); env/config-based version of the control failed verification (P-09), corrected before Task 2 |
+| GATE-01 | `permissions_mode` is accepted but unenforced on a backend, so tool calls run unreviewed while the operator believes review is active | Critical | Control 5: verify the gate with a mutating probe per backend before trusting it; treat a silent run as a blocker | **Observed in the pilot** (P-06); `claude` enforces, `codelayer`/`codex` does not |
 | PI-01 | Prompt injection from issue text, code, artifacts, web results, or recalled memory | High | Treat all as untrusted; public/synthetic material only; human review of every diff; no agent authority to merge, deploy, or change permissions | **Accepted residual.** No complete defense exists; containment is the control |
 | PI-02 | Computer control performs a destructive or permission-broadening action | Critical | Computer control for permission changes and destructive actions is prohibited in the pilot | Prohibited |
 | SC-01 | Compromised npm, platform binary, or model CLI update | High | Pin the version tuple above; review before any update; no unattended auto-update | Mitigated |
