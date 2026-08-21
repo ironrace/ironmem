@@ -777,8 +777,10 @@ impl Database {
                 ));
             }
             let embedding: Vec<f32> = blob
-                .chunks_exact(4)
-                .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|chunk| f32::from_le_bytes(*chunk))
                 .collect();
             if embedding.len() != EMBED_DIM {
                 return Err(rusqlite::Error::FromSqlConversionFailure(
@@ -1678,7 +1680,7 @@ mod tests {
                      cache_creation_input_tokens, cache_read_input_tokens,
                      estimated, chars)
                  VALUES (?1, 'transcript', ?2, 0, 0, 0, 0, 0, 0)",
-                rusqlite::params![format!("2026-06-29T13:00:00Z-bad"), bad],
+                rusqlite::params!["2026-06-29T13:00:00Z-bad", bad],
             );
             assert!(
                 tu_result.is_err(),
@@ -1688,7 +1690,7 @@ mod tests {
             let occ_result = db.conn.execute(
                 "INSERT INTO occupancy_samples (ts, harness, input_tokens, cache_read_input_tokens)
                  VALUES (?1, ?2, 0, 0)",
-                rusqlite::params![format!("2026-06-29T13:01:00Z-bad"), bad],
+                rusqlite::params!["2026-06-29T13:01:00Z-bad", bad],
             );
             assert!(
                 occ_result.is_err(),
