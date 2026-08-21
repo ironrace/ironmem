@@ -12,24 +12,70 @@ use uuid::Uuid;
 use super::Agent;
 use crate::error::MemoryError;
 
+/// A token minted and awaiting its claim, with the provenance verdict that
+/// decides which staleness predicate gates the next `force_reissue` against it.
+///
+/// **Every field is private, and `forced` is derived rather than assigned.**
+/// [`PendingHandoff::new`] is the only constructor, and it computes `forced`
+/// from the two values whose equality *is* the provenance check. With a `pub
+/// forced` field that equality was a rule this doc asserted and nothing
+/// enforced: any construction site — a test fixture, a future second reader of
+/// these columns, a hand-written value in a migration backfill — could set
+/// `forced: true` beside a token the forced path never minted, and the
+/// `force_reissue` gate would then select the narrowed staleness predicate on
+/// a token a live incumbent had just minted. That is precisely the
+/// lease-takeover a security review reproduced end to end, reintroduced
+/// through the type instead of through the query. See migration 022.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingHandoff {
-    pub token: String,
-    pub generation: u64,
+    token: String,
+    generation: u64,
+    forced: bool,
+}
+
+impl PendingHandoff {
+    /// Build a pending handoff, deriving [`Self::forced`] from
+    /// `forced_token` — the raw `pending_handoff_forced_token` column — against
+    /// `token`, the token actually pending.
+    ///
+    /// The equality is the whole provenance check: a stored value naming some
+    /// other (already-consumed) token is not provenance for *this* one, and a
+    /// row that has none at all — a pre-022 row, an older binary mid-rollout,
+    /// a hand-repaired row — reads `false`, which is the safe direction
+    /// because `false` selects the full staleness predicate.
+    fn new(token: String, generation: u64, forced_token: Option<&str>) -> Self {
+        let forced = forced_token == Some(token.as_str());
+        Self {
+            token,
+            generation,
+            forced,
+        }
+    }
+
+    /// The token value the successor must present to claim the lease.
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+
+    /// The generation a claim of [`Self::token`] will advance the lease to.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
     /// Whether *this* pending token was minted by
     /// `session_handoff { force_reissue: true }` rather than by an ordinary,
     /// generation-authenticated call (migration 022, issue #298).
     ///
     /// **Computed, not stored.** The column holds the token value the forced
-    /// path minted, and this is `true` only when that value equals `token`
-    /// above. A stored boolean would describe the *row*; binding it to the
-    /// token means any writer that mints without updating provenance — an
-    /// older binary mid-rollout, a hand-repaired row, a future path that
+    /// path minted, and this is `true` only when that value equals
+    /// [`Self::token`]. A stored boolean would describe the *row*; binding it
+    /// to the token means any writer that mints without updating provenance —
+    /// an older binary mid-rollout, a hand-repaired row, a future path that
     /// forgets — automatically reads `false`. Migration 022 records the
     /// mixed-binary sequence that made that difference load-bearing.
-    ///
-    /// `false` is the safe reading: it selects the full staleness predicate.
-    pub forced: bool,
+    pub fn forced(&self) -> bool {
+        self.forced
+    }
 }
 
 /// Which path is minting a handoff token.
@@ -103,15 +149,10 @@ fn build_actor_generation(
                     "corrupt lease row: negative pending generation {g}"
                 ))
             })?;
-            // The equality is the whole provenance check: a stored value
-            // naming some other (already-consumed) token is not provenance for
-            // *this* one, and reads `false`. See migration 022.
-            let forced = forced_token.as_deref() == Some(token.as_str());
-            Some(PendingHandoff {
-                token,
-                generation: g,
-                forced,
-            })
+            // `PendingHandoff::new` owns the provenance equality — see its
+            // doc, and migration 022, for why it is derived there rather than
+            // assigned here.
+            Some(PendingHandoff::new(token, g, forced_token.as_deref()))
         }
         (None, None) => None,
         // A token without its generation (or vice-versa) is a corrupt row — the
@@ -447,9 +488,9 @@ mod tests {
         assert!(!issued.reused);
         let g = load_or_init_actor_generation(&conn, "s1", Agent::Claude).unwrap();
         assert_eq!(g.generation, 0, "active generation must not bump on issue");
-        assert_eq!(g.pending.as_ref().map(|p| p.generation), Some(1));
+        assert_eq!(g.pending.as_ref().map(|p| p.generation()), Some(1));
         assert_eq!(
-            g.pending.as_ref().map(|p| p.token.as_str()),
+            g.pending.as_ref().map(|p| p.token()),
             Some(issued.token.as_str())
         );
     }

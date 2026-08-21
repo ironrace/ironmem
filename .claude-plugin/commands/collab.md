@@ -670,7 +670,10 @@ single human planning gate and takes it in step 0, before any worker runs.
      session that wedges past this gate still has the staleness-gated
      `abandon: true` arm (§ Invariants) once it is demonstrably dead —
      `collab_status`'s `idle_secs` against its `dead_session_secs` is how
-     that is established, and an operator decides it, not this loop. Report
+     that is established (check `activity_degraded` on the same response
+     first — when it is `true`, one of the session's timestamps is
+     unreadable and `idle_secs` is skewed toward *more* idle than the
+     session really is), and an operator decides it, not this loop. Report
      the rejection and exit the loop; never work around the gate by sending
      `task_list` anyway.
 
@@ -1582,16 +1585,31 @@ agent, and when it is `true`, call `session_handoff { session_id, agent,
 force_reissue: true }` to mint a claimable token without holding the lease
 yourself. It requires 6 hours of idleness on the session and evicts nobody
 by itself — the successor's *claim* of the new token is what does that,
-same as any handoff. The alternative is `collab_end { abandon: true }`,
-which ends the session permanently instead of re-leasing it.
+same as any handoff. It also refuses the phases that wait on a human
+(`PlanLocked`, `CodingComplete`, `CodingFailed`), which no amount of
+waiting changes. The alternative is `collab_end { abandon: true }`, which
+ends the session permanently instead of re-leasing it — and it is a real
+alternative in both directions: a forced reissue that nobody claims does
+not block a later abandon.
 
-**Caveat:** `reclaimable: true` is a hint, not a guarantee — it means the
-lease is held with nothing pending and the session is stale, but it does
-not check whether the session is sealed. A sealed (ended or abandoned)
-session that has also gone quiet reads `reclaimable: true` too, and
-`force_reissue` against it is refused with "has ended" — terminal, nothing
-to recover. Check `ended_at` (also on `collab_status`) alongside
-`reclaimable` before attempting the rescue.
+**Caveat:** `reclaimable: true` is a hint, not a guarantee. It now folds in
+every precondition that is a property of the *session* — the lease is held
+with nothing pending, the session is stale, the activity read was not
+degraded, and the phase is one `force_reissue` admits — but two things it
+cannot answer remain:
+
+- **The seal.** It does not check whether the session is sealed. A sealed
+  (ended or abandoned) session that has also gone quiet reads `reclaimable:
+  true`, and `force_reissue` against it is refused with "has ended" —
+  terminal, nothing to recover. Check `ended_at` (also on `collab_status`)
+  alongside `reclaimable` before attempting the rescue.
+- **Write access.** `collab_status` is readable in read-only mode; the
+  forced path is not. A read-only process reads `reclaimable: true`
+  truthfully for a call it cannot make.
+
+Every refused `force_reissue` is recorded in the WAL
+(`session_handoff.force_reissue_refused`), so a probe loop against a
+session you do not hold is visible. Don't poll it — read `reclaimable`.
 
 Full semantics: `docs/COLLAB.md` § "session_handoff (fallback succession)".
 
@@ -1634,9 +1652,12 @@ and a `pilot == "codex"` session hands off the Claude dispatcher just the same.
    and capture the **top-level** `handoff_token` and `handoff_block` (the
    token is NOT inside the fenced block).
 2. The `task_outcomes.handoffs` counter is incremented automatically inside
-   `handle_session_handoff` only when a **fresh** token is issued (gated on
-   `!issued.reused`); reusing an existing token does NOT increment it. The
-   count reflects handoff **intent** at fresh-issue time, not successor claim.
+   `handle_session_handoff` only when a **fresh** token is issued; reusing an
+   existing token does NOT increment it. The count reflects handoff **intent**
+   at fresh-issue time, not successor claim. The response's `reused` field is
+   which of the two happened — `false` means this call minted the token (and
+   bumped the counter), `true` means one was already pending and you were
+   handed it, so somebody else was mid-handoff on this lease.
 3. Spawn the successor via background Bash:
    ```
    claude -p "join ironmem collab <sid> with token <handoff_token>"

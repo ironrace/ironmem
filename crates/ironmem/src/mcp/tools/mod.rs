@@ -729,7 +729,7 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
                     "agent": { "type": "string", "enum": ["claude", "codex"] },
                     "handoff_token": {
                         "type": "string",
-                        "description": "Required after a prior handoff claim; successor uses it to claim this generation."
+                        "description": "Required after a prior handoff claim; successor uses it to claim this generation. Ignored (not an error) if force_reissue is also true."
                     },
                     "force_reissue": {
                         "type": "boolean",
@@ -1588,7 +1588,7 @@ mod tests {
     /// it never mentioned. The description now says "a non-human-gated
     /// phase" rather than naming three phases by hand, so a fourth
     /// human-gated phase does not silently go undocumented the way
-    /// `CodingFailed` did — `force_reissue_admits_phase`'s exhaustive `match`
+    /// `CodingFailed` did — `Phase::admits_forced_reissue`'s exhaustive `match`
     /// and its `PHASE_FORCE_REISSUE_ADMITS` completeness proof (`handoff.rs`)
     /// are the enforcement; this sentence just has to stay true to the
     /// concept, not to a list.
@@ -1611,20 +1611,60 @@ mod tests {
     /// headroom under the still-unmoved 4_407 cap. No neighbouring tool's
     /// description was trimmed to pay for it.
     ///
+    /// Raised 4_407 -> 4_450 when a review pass closed a gap on the *other*
+    /// side of the same call: `handoff_token`'s description said only when it
+    /// is REQUIRED, never what happens when a caller supplies one alongside
+    /// `force_reissue: true`. The forced path ignores it — accepted, not an
+    /// error, documented in `handoff.rs` and `docs/COLLAB.md` but nowhere on
+    /// the advertised surface — so a caller holding a valid pending token who
+    /// also sets `force_reissue: true` on a session it reads as dead gets
+    /// that same token echoed back with no claim performed, reads the
+    /// response's `generation` as "I hold it," and is refused on its next
+    /// mutating call. `default`/`enum`/`maximum` have no way to express "this
+    /// field is ignored, not validated, under a sibling field's condition,"
+    /// so the fact stays prose: `handoff_token`'s description gained "Ignored
+    /// (not an error) if force_reissue is also true." The listing measured
+    /// 4_412 tokens after the addition, 5 over the unmoved cap — this is the
+    /// deliberate raise, not a silent one, and 4_450 leaves ~38 tokens of
+    /// headroom, back in line with every raise before the ~9-token one two
+    /// paragraphs up. No neighbouring tool's description was trimmed to pay
+    /// for it.
+    ///
     /// The budget is deliberately a whole-listing ceiling with no per-tool
     /// allocation, so the cheapest way to land a new field is to delete prose
     /// from whichever unrelated tool happens to be wordiest. That trade is not
     /// acceptable: raise this constant when new capability genuinely needs the
     /// room, and pay for it by moving prose into real schema keys (`default`,
     /// `maximum`) — not by silently degrading a neighbour's description.
+    ///
+    /// **The failure message used to recommend exactly that trade** ("trim
+    /// descriptions that duplicate their schemas"), which is the one remedy
+    /// the paragraph above rules out, and it is the only guidance a failing
+    /// engineer actually reads. It now names the sanctioned remedies and
+    /// points here. It also reports the headroom on success as well as
+    /// failure: at ~9 tokens under the cap, "how close am I?" is a question
+    /// the next person needs answered *before* they write a description, and
+    /// a test that only speaks when it fails cannot answer it.
     #[test]
     fn tool_listing_stays_within_prompt_cache_schema_budget() {
+        const CAP: usize = 4_450;
         let app = App::open_for_test().unwrap();
         let bytes = serde_json::to_vec(&tool_definitions(&app)).unwrap().len();
         let estimated_tokens = bytes.div_ceil(4);
+        // Visible under `--nocapture`, which is how a maintainer sizing a new
+        // description finds the headroom without editing this test first.
+        println!(
+            "tool listing: ~{estimated_tokens} tokens ({bytes} bytes), cap {CAP}, headroom {}",
+            CAP.saturating_sub(estimated_tokens)
+        );
         assert!(
-            estimated_tokens <= 4_407,
-            "tool listing is ~{estimated_tokens} tokens ({bytes} bytes); trim descriptions that duplicate their schemas"
+            estimated_tokens <= CAP,
+            "tool listing is ~{estimated_tokens} tokens ({bytes} bytes), over the {CAP} cap. \
+             Do NOT pay for this by trimming a neighbouring tool's description — the budget is \
+             a whole-listing ceiling, so that silently degrades an unrelated tool to fund \
+             yours. Move prose into real schema keys (`default`, `maximum`, `enum`) where it \
+             fits, and otherwise raise the cap deliberately and record why in this test's doc, \
+             as every prior raise did."
         );
     }
 

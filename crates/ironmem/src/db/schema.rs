@@ -487,10 +487,19 @@ impl Database {
         }
 
         // v22: provenance for the pending handoff token (issue #298). One
-        // NOT NULL column defaulting to 0 — "not minted by the forced path" —
-        // which is the answer that selects the strict staleness predicate, so
-        // every pre-022 row fails closed. See the migration for why the bit
-        // cannot be derived from anything already stored.
+        // nullable TEXT column with no DEFAULT, holding the *token value* the
+        // forced path minted. NULL — every pre-022 row, and every row a normal
+        // mint touched — reads as "not minted by the forced path", which is the
+        // answer that selects the strict staleness predicate, so an unknown
+        // provenance fails closed.
+        //
+        // It stores the token rather than a bit deliberately, and the migration
+        // header spends its length on why: a boolean was tried first and fails
+        // *open* across a mixed-binary rollout, because an older binary minting
+        // a normal token leaves the flag standing from the previous forced one.
+        // Storing the value makes the check `forced_token == pending_token`, so
+        // a stranded value no longer equals the token it would have to describe.
+        // Do not "simplify" this back to a flag.
         if current_version < 22 {
             self.conn.execute_batch(COLLAB_HANDOFF_PROVENANCE_SQL)?;
         }
@@ -729,6 +738,16 @@ impl Database {
     /// [`Self::with_transaction`], this opens no transaction — use it for plain
     /// `SELECT`s (e.g. the session-start hook reading collab/diary state) so a
     /// read is not wrapped in a write-capable `BEGIN`/`COMMIT`.
+    ///
+    /// **One `SELECT`, or several whose answers need not agree.** A handler
+    /// that reads several rows and then composes *one* answer out of them
+    /// wants [`Self::with_transaction`] instead, even though it writes
+    /// nothing: without a transaction each statement gets its own snapshot, so
+    /// another **process** — this protocol runs two agents against one
+    /// database — can write between them and the composed answer describes a
+    /// state that never existed. `handle_collab_status`'s lease verdict is the
+    /// worked example. A deferred transaction takes no write lock, so the cost
+    /// is a `BEGIN`/`COMMIT` pair and nothing else.
     pub fn with_connection<T>(
         &self,
         f: impl FnOnce(&Connection) -> Result<T, MemoryError>,
@@ -2879,8 +2898,12 @@ mod tests {
     /// `pending_handoff_forced_token` gates which staleness predicate
     /// `session_handoff { force_reissue: true }` applies: when it equals the
     /// current `pending_handoff_token` the gate narrows, ignoring the agent's
-    /// own `pending_handoff_issued_at`; otherwise the full five-signal read
-    /// applies and refuses on a live session. A lease row that predates this
+    /// own `pending_handoff_issued_at`; otherwise the full read applies and
+    /// refuses on a live session. The same equality is read by the abandon
+    /// gate's full predicate, which drops a forced reissue's own stamp for
+    /// either agent (see `collab::queue::LeaseSignals`) — so the direction
+    /// this default points matters to both callers, not just the narrowed
+    /// one. A lease row that predates this
     /// migration has no provenance to report, and the whole design rests on
     /// that unknown reading as **not forced** — the strict answer. If the
     /// default were ever anything but NULL, every legacy lease row on disk

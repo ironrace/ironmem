@@ -82,6 +82,20 @@ pub(crate) fn request(method: &str, params: serde_json::Value) -> JsonRpcRequest
     .expect("request fixture must deserialize")
 }
 
+/// Call a tool and return its parsed JSON result, **failing the test if the
+/// tool refused**.
+///
+/// The `isError` assertion is not belt-and-braces. A tool refusal does not
+/// come back as the JSON-RPC `error` field — it is an `isError: true` success
+/// response carrying `{"error": "..."}` as its content text, exactly as
+/// [`call_tool_expect_error`] below documents. Without the check this helper
+/// parsed that payload and handed it back as an ordinary value, so any call
+/// site that did not go on to assert something about the *shape* of what it
+/// got passed silently on a refused call — and a setup step is precisely the
+/// call site that asserts nothing. Verified in practice: a `collab_recv`
+/// fixture that passed `agent` where the tool wants `receiver` refused with
+/// "receiver is required", and the test carried on and asserted its way to a
+/// wrong conclusion about the *next* call.
 pub(crate) fn call_tool(app: &App, name: &str, args: serde_json::Value) -> serde_json::Value {
     let req = request("tools/call", json!({ "name": name, "arguments": args }));
     let resp = dispatch(app, &req).expect("tools/call must return a response");
@@ -90,6 +104,12 @@ pub(crate) fn call_tool(app: &App, name: &str, args: serde_json::Value) -> serde
     let text = result["content"][0]["text"]
         .as_str()
         .expect("content[0].text must be a string");
+    assert_ne!(
+        result["isError"],
+        json!(true),
+        "tool {name} refused, but this call site expected success: {text}. \
+         If the refusal is what the test is about, use call_tool_expect_error."
+    );
     serde_json::from_str(text).expect("tool response text must be valid JSON")
 }
 

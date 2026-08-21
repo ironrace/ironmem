@@ -81,10 +81,17 @@
 -- # The default is the safe answer
 --
 -- NULL — every pre-022 row, and any row written by a path that does not set
--- this — selects the FULL five-signal staleness predicate, which refuses on a
--- live session. The permissive answer is never the default, which is the same
--- reason `force_reissue_admits_phase` is an exhaustive `match` rather than a
+-- this — selects the FULL staleness predicate, which refuses on a live
+-- session. The permissive answer is never the default, which is the same
+-- reason `Phase::admits_forced_reissue` is an exhaustive `match` rather than a
 -- `matches!`.
+--
+-- Note that this column is read by BOTH staleness scopes, not only the
+-- narrowed one: the abandon gate's full read also drops a
+-- `pending_handoff_issued_at` whose provenance names the token pending there,
+-- because a rescue attempt is not session work and counting it let one forced
+-- reissue block `collab_end { abandon: true }` for six hours. See
+-- `LeaseSignals` in `collab/queue.rs`. NULL is the safe answer under both.
 --
 -- The CHECK forbids the empty string. An empty value would be a third state
 -- that is neither "absent" nor a real token, and it could compare equal to an

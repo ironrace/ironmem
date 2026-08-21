@@ -858,7 +858,7 @@ fn collab_request_changes_advances_to_finalize_and_locks() {
     );
 
     // Wrong hash on approve is rejected (canonical_plan_hash mismatch).
-    let bad_approve = call_tool(
+    let bad_approve = call_tool_expect_error(
         &app,
         "collab_approve",
         json!({
@@ -867,10 +867,7 @@ fn collab_request_changes_advances_to_finalize_and_locks() {
             "content_hash": "deadbeef"
         }),
     );
-    assert!(bad_approve["error"]
-        .as_str()
-        .unwrap_or("")
-        .contains("content_hash does not match canonical_plan_hash"));
+    assert!(bad_approve.contains("content_hash does not match canonical_plan_hash"));
 
     // One-pass review (MAX_REVIEW_ROUNDS = 1): Codex requests changes, which no
     // longer returns to synthesis — it advances directly to
@@ -1802,7 +1799,7 @@ fn collab_end_blocks_subsequent_writes() {
     assert_eq!(ended["ok"], true);
 
     // Subsequent send must fail because the session has ended.
-    let blocked = call_tool(
+    let blocked = call_tool_expect_error(
         &app,
         "collab_send",
         json!({
@@ -1816,10 +1813,7 @@ fn collab_end_blocks_subsequent_writes() {
             "content": task_list_payload("unused_plan_hash", "unused_base", PLACEHOLDER_HEAD, 1)
         }),
     );
-    assert!(blocked["error"]
-        .as_str()
-        .unwrap_or("")
-        .contains("has ended"));
+    assert!(blocked.contains("has ended"));
 
     // wait_my_turn must surface session_ended=true so the agent loop exits.
     let wait = call_tool(
@@ -1933,16 +1927,13 @@ fn collab_end_rejects_ineligible_active_planning_calls() {
     let session_id = started["session_id"].as_str().unwrap().to_string();
 
     // Fresh session → PlanParallelDrafts. end must be rejected.
-    let blocked = call_tool(
+    let blocked = call_tool_expect_error(
         &app,
         "collab_end",
         json!({ "session_id": &session_id, "agent": "claude" }),
     );
     assert!(
-        blocked["error"]
-            .as_str()
-            .unwrap_or("")
-            .contains("active phase PlanParallelDrafts"),
+        blocked.contains("active phase PlanParallelDrafts"),
         "expected PlanParallelDrafts rejection, got: {blocked}"
     );
 
@@ -1959,16 +1950,13 @@ fn collab_end_rejects_ineligible_active_planning_calls() {
             }),
         );
     }
-    let blocked = call_tool(
+    let blocked = call_tool_expect_error(
         &app,
         "collab_end",
         json!({ "session_id": &session_id, "agent": "claude" }),
     );
     assert!(
-        blocked["error"]
-            .as_str()
-            .unwrap_or("")
-            .contains("active phase PlanSynthesisPending"),
+        blocked.contains("active phase PlanSynthesisPending"),
         "expected PlanSynthesisPending rejection, got: {blocked}"
     );
 
@@ -1985,16 +1973,13 @@ fn collab_end_rejects_ineligible_active_planning_calls() {
             "content": "canonical v1"
         }),
     );
-    let blocked = call_tool(
+    let blocked = call_tool_expect_error(
         &app,
         "collab_end",
         json!({ "session_id": &session_id, "agent": "codex" }),
     );
     assert!(
-        blocked["error"]
-            .as_str()
-            .unwrap_or("")
-            .contains("active phase PlanCodexReviewPending"),
+        blocked.contains("active phase PlanCodexReviewPending"),
         "expected PlanCodexReviewPending rejection, got: {blocked}"
     );
 
@@ -2008,16 +1993,13 @@ fn collab_end_rejects_ineligible_active_planning_calls() {
             "content": json!({ "verdict": "approve" }).to_string()
         }),
     );
-    let blocked = call_tool(
+    let blocked = call_tool_expect_error(
         &app,
         "collab_end",
         json!({ "session_id": &session_id, "agent": "codex" }),
     );
     assert!(
-        blocked["error"]
-            .as_str()
-            .unwrap_or("")
-            .contains("PlanClaudeFinalizePending requires current owner claude"),
+        blocked.contains("PlanClaudeFinalizePending requires current owner claude"),
         "expected non-owner PlanClaudeFinalizePending rejection, got: {blocked}"
     );
 
@@ -3797,15 +3779,12 @@ fn collab_v2_end_rejected_in_coding_active_phase() {
         }),
     );
     // Now in CodeImplementPending — collab_end must be rejected.
-    let blocked = call_tool(
+    let blocked = call_tool_expect_error(
         &app,
         "collab_end",
         json!({ "session_id": session_id, "agent": "claude" }),
     );
-    assert!(blocked["error"]
-        .as_str()
-        .unwrap_or("")
-        .contains("active phase CodeImplementPending"));
+    assert!(blocked.contains("active phase CodeImplementPending"));
 
     // Session still active — `implementation_done` should advance it.
     checkpoint_batch_complete(&app, &session_id, "claude", h1);
@@ -4944,7 +4923,7 @@ fn collab_v2_task_list_rejects_wrong_plan_hash() {
     let app = App::open_for_test().unwrap();
     let session_id = drive_to_plan_locked(&app, "fp");
 
-    let bad = call_tool(
+    let bad = call_tool_expect_error(
         &app,
         "collab_send",
         json!({
@@ -4954,10 +4933,7 @@ fn collab_v2_task_list_rejects_wrong_plan_hash() {
             "content": task_list_payload("deadbeef", "b0", PLACEHOLDER_HEAD, 1)
         }),
     );
-    assert!(bad["error"]
-        .as_str()
-        .unwrap_or("")
-        .contains("plan_hash mismatch"));
+    assert!(bad.contains("plan_hash mismatch"));
 }
 
 #[test]
@@ -4972,7 +4948,7 @@ fn collab_v2_task_list_rejects_empty_acceptance() {
         "tasks": [ { "id": 1, "title": "t", "acceptance": [] } ],
     })
     .to_string();
-    let bad = call_tool(
+    let bad = call_tool_expect_error(
         &app,
         "collab_send",
         json!({
@@ -4982,10 +4958,7 @@ fn collab_v2_task_list_rejects_empty_acceptance() {
             "content": bad_payload
         }),
     );
-    assert!(bad["error"]
-        .as_str()
-        .unwrap_or("")
-        .contains("acceptance criterion"));
+    assert!(bad.contains("acceptance criterion"));
 }
 
 // ── collab_recv auto_ack tests ────────────────────────────────────────────────
@@ -9883,6 +9856,117 @@ fn the_same_wedged_session_is_abandonable_without_recovering_it_first() {
     );
 }
 
+/// The **other** direction of "alternatives, not a sequence": a forced reissue
+/// nobody claims must not lock the abandon out for six hours.
+///
+/// `session_wedged_at_generation`'s sibling above proves abandon needs no
+/// prior rescue. This proves the reverse — that having *tried* the rescue does
+/// not cost the operator the terminal remedy. Minting stamps
+/// `pending_handoff_issued_at`, and the abandon gate counts lease writes as
+/// activity, so before #298's provenance carve-out this exact sequence
+/// answered `still live (idle 0s)` for liveness the rescue itself had
+/// manufactured — in the one situation the terminal remedy is *for*: the
+/// rescue was attempted and no successor ever took the token.
+///
+/// The claim direction is asserted too, in the same test, because the carve-out
+/// must not have widened into "lease writes never count": a successor that
+/// actually claims the token is a live process holding the lease, and abandon
+/// must go back to refusing.
+#[test]
+fn a_forced_reissue_nobody_claims_does_not_block_the_abandon() {
+    const REASON: &str = "forced a reissue, nothing ever claimed it";
+    let lease = session_wedged_at_generation(3, "claude");
+    let (successor, sid) = (&lease.successor, lease.session_id.as_str());
+
+    let forced = call_tool(
+        successor,
+        "session_handoff",
+        force_reissue_args(sid, "claude"),
+    );
+    assert_eq!(forced["forced_reissue"], json!(true), "setup: {forced}");
+    let token = forced["handoff_token"]
+        .as_str()
+        .expect("the rescue must have minted a token")
+        .to_string();
+    // The stamp that used to read as liveness is really there.
+    let status = call_tool(successor, "collab_status", json!({ "session_id": sid }));
+    assert_eq!(
+        status["claude_handoff_pending"],
+        json!(true),
+        "setup: a token is pending and unclaimed: {status}"
+    );
+
+    let abandoned = call_tool(
+        successor,
+        "collab_end",
+        json!({
+            "session_id": sid,
+            "agent": "claude",
+            "abandon": true,
+            "reason": REASON
+        }),
+    );
+    assert_eq!(
+        abandoned,
+        json!({ "ok": true, "session_id": sid, "abandoned": true }),
+        "a rescue attempt is not session work — trying the hatch must not cost \
+         the operator the terminal remedy for six hours"
+    );
+
+    // And the other direction, on a fresh wedge: a token that IS claimed makes
+    // the session live to the abandon gate, because someone took the lease.
+    let claimed_lease = session_wedged_at_generation(3, "claude");
+    let (claimant, claimed_sid) = (&claimed_lease.successor, claimed_lease.session_id.as_str());
+    let reissued = call_tool(
+        claimant,
+        "session_handoff",
+        force_reissue_args(claimed_sid, "claude"),
+    );
+    let fresh_token = reissued["handoff_token"].as_str().unwrap().to_string();
+    // Claiming is any actor-bearing mutating call presenting the token; a read
+    // that carries one is enough (`collab_recv` claims on presentation).
+    call_tool(
+        claimant,
+        "collab_recv",
+        json!({ "session_id": claimed_sid, "receiver": "claude", "handoff_token": fresh_token }),
+    );
+    let after = call_tool(
+        claimant,
+        "collab_status",
+        json!({ "session_id": claimed_sid }),
+    );
+    assert_eq!(
+        after["claude_handoff_pending"],
+        json!(false),
+        "setup: the token must be spent, i.e. actually claimed: {after}"
+    );
+    let refused = call_tool_expect_error(
+        claimant,
+        "collab_end",
+        json!({
+            "session_id": claimed_sid,
+            "agent": "claude",
+            "abandon": true,
+            "reason": "someone is mid-recovery here"
+        }),
+    );
+    assert!(
+        refused.contains("still live"),
+        "a CLAIMED token is a live process holding the lease and must still block \
+         the abandon: {refused}"
+    );
+    // The refusal must describe the predicate it actually ran, exclusion and
+    // all — the hand-written term list it used to carry stopped being true the
+    // moment the gate began dropping forced-rescue stamps.
+    assert!(
+        refused.contains("forced reissue minted"),
+        "the refusal must name what it excluded, not a list that no longer matches \
+         the check: {refused}"
+    );
+    // Not vacuous: the unclaimed token above really was never claimed.
+    assert!(!token.is_empty());
+}
+
 /// #283 criterion 4: `collab_status` must be able to answer "what is wrong
 /// with this lease, and what may I do about it" for the one caller every
 /// lease-gated call refuses.
@@ -10520,9 +10604,12 @@ fn a_forced_reissue_on_the_same_long_quiet_session_is_still_admitted_and_retryab
 ///   and a forced reissue is admitted anyway. Anyone building a preflight on
 ///   that field (#299 will) who reads it as "force_reissue would be refused"
 ///   ships a mis-diagnosis for the retrying caller.
-/// - **Gap D.** One logical handoff, one metric increment. The `!issued.reused`
-///   guard is what makes a pre-claim retry free; over real dispatch, not just
-///   at the handler.
+/// - **Gap D.** A forced reissue never increments the handoff counter, fresh
+///   mint or echo alike. `handoffs` measures handoff *intent* — a live
+///   process voluntarily stepping aside — and a rescue is the opposite
+///   signal: a process that died without handing off. Counting a rescue the
+///   same way would make repeated recoveries of one wedged lease read as
+///   clean successions in any report built on this metric.
 #[test]
 fn a_repeated_forced_reissue_echoes_the_pending_token_without_counting_its_own_footprint() {
     let lease = session_wedged_at_generation(2, "claude");
@@ -10557,9 +10644,9 @@ fn a_repeated_forced_reissue_echoes_the_pending_token_without_counting_its_own_f
     );
     let after_first = handoffs("after the first forced reissue");
     assert_eq!(
-        after_first,
-        baseline + 1,
-        "a fresh token issue is a handoff and must be counted once"
+        after_first, baseline,
+        "a forced reissue is a rescue, not a succession — a fresh mint on this path must \
+         not bump the handoff counter"
     );
 
     // Gap C: the verdict says the dead-lease repair is not what this lease
@@ -10590,12 +10677,13 @@ fn a_repeated_forced_reissue_echoes_the_pending_token_without_counting_its_own_f
         "the echo still went down the forced path and must still say so: {second}"
     );
 
-    // Gap D: still one increment, over real dispatch.
+    // Gap D: still no increment, over real dispatch — the echo is the same
+    // rescue as the first call, and neither counts.
     assert_eq!(
         handoffs("after the echo"),
         after_first,
-        "a pre-claim retry is the same logical handoff — the !issued.reused guard must \
-         hold through call_tool, not only at the handler"
+        "a pre-claim retry of the same rescue must not bump the counter either — the \
+         forced_from.is_none() guard must hold through call_tool, not only at the handler"
     );
 
     // Gap B: both calls are audited, and the second names the predicate that

@@ -2553,17 +2553,64 @@ fn render_plan(
 
 pub(super) fn handle_collab_status(app: &App, args: &Value) -> Result<Value, MemoryError> {
     let session_id = require_str(args, "session_id")?;
-    let record = app.db.collab_load_session_record(session_id)?;
+    // ── One read, one snapshot ───────────────────────────────────────────────
+    //
+    // The session row, the orphan count, the staleness pair, and both lease
+    // rows are read in a single transaction because the answer this handler
+    // composes out of them is a *conjunction* of all four, and each was a
+    // separate un-transacted read. `Database` owns one `Connection`, so these
+    // could not interleave with each other — but they interleave with the other
+    // process. That is not hypothetical here: this protocol's whole premise is
+    // two agents in two processes on one database, and the caller most likely
+    // to be reading this block is the one diagnosing a session the *other*
+    // process is still holding.
+    //
+    // Torn that way, `<agent>_lease` published verdicts about a state that
+    // never existed: `reclaimable` combines `generation`/`handoff_pending` from
+    // the lease read with `is_dead` from the staleness read, so a successor
+    // claiming the lease between the two — which stamps
+    // `pending_handoff_claimed_at`, an activity term — yielded
+    // `handoff_pending: false` (post-claim) beside a staleness computed before
+    // it, i.e. `reclaimable: true` on a lease somebody had just taken. This is
+    // the field an operator reads to decide whether to force a reissue against
+    // a live process.
+    //
+    // Deliberately *not* inside this transaction: the plan/checkpoint renders
+    // below. They dereference drawers and shell out to git, and a
+    // `Command::output()` inside a transaction holds it open across a process
+    // spawn — the reason `handle_session_handoff` keeps its own git read after
+    // its commit. Those are per-artifact diagnostics that no verdict is
+    // computed from; the four values a verdict *is* computed from are here.
+    // `with_transaction`, not `with_transaction_once`: the escape hatch
+    // documents "zero production call sites" as an audited invariant, and this
+    // closure has no business spending it. It is pure reads, so it is
+    // trivially repeatable — it satisfies the `Fn` bound and it *wants* the
+    // `SQLITE_BUSY_SNAPSHOT` retry, since the counterpart process writing
+    // underneath a diagnostic read is the ordinary case here, not the
+    // exceptional one.
+    let (record, orphans_recovered, staleness, leases) = app.db.with_transaction(|tx| {
+        let record = crate::collab::queue::load_session_record(tx, session_id)?;
+        // Turns that recovered work a previous turn left behind. Non-zero
+        // means a turn died without reporting, so the session's own history
+        // understates how much went wrong — see ORPHAN_RECOVERED_TOPIC.
+        let orphans_recovered =
+            crate::collab::queue::count_incidents(tx, session_id, ORPHAN_RECOVERED_TOPIC)?;
+        let staleness = crate::collab::queue::session_staleness(tx, session_id)?;
+        let mut leases = Vec::with_capacity(2);
+        for ag in [Agent::Claude, Agent::Codex] {
+            leases.push((
+                ag,
+                crate::collab::read_actor_generation(tx, session_id, ag)?,
+            ));
+        }
+        Ok((record, orphans_recovered, staleness, leases))
+    })?;
     let mut status = session_record_json(&record);
-    // Turns that recovered work a previous turn left behind. Non-zero means a
-    // turn died without reporting, so the session's own history understates
-    // how much went wrong — see ORPHAN_RECOVERED_TOPIC.
-    status["orphans_recovered"] = json!(app.db.with_connection(|conn| {
-        crate::collab::queue::count_incidents(conn, session_id, ORPHAN_RECOVERED_TOPIC)
-    })?);
-    // The staleness snapshot `handle_collab_abandon`'s gate evaluates, exposed
-    // read-only so the precondition is *checkable* before the irreversible call
-    // rather than only discoverable by making it.
+    status["orphans_recovered"] = json!(orphans_recovered);
+    // The staleness snapshot `handle_collab_abandon`'s gate evaluates (read in
+    // the transaction above), exposed read-only so the precondition is
+    // *checkable* before the irreversible call rather than only discoverable by
+    // making it.
     //
     // Without this, both agent-facing surfaces asked for something no surface
     // answered: `.claude-plugin/commands/collab.md` and
@@ -2580,14 +2627,25 @@ pub(super) fn handle_collab_status(app: &App, args: &Value) -> Result<Value, Mem
     // Read through `session_staleness` rather than by re-deriving `now - x`
     // here, so the number an operator checks and the number the gate enforces
     // come from one paired read of one clock. `idle_secs` is `null` only when
-    // the session row is absent, which cannot happen here — the record load
-    // above would already have returned `NotFound`.
-    let staleness = app
-        .db
-        .with_connection(|conn| crate::collab::queue::session_staleness(conn, session_id))?;
+    // the session row is absent, which cannot happen here — the record load in
+    // the same transaction would already have returned `NotFound`.
     status["last_activity"] = json!(staleness.last_activity());
     status["idle_secs"] = json!(staleness.idle_secs());
     status["dead_session_secs"] = json!(crate::collab::COLLAB_DEAD_SESSION_SECS);
+    // Whether any activity timestamp on this session was present but
+    // unparseable. On a degraded read `last_activity` above is not merely
+    // approximate, it is skewed one way: an unreadable term coalesces to epoch,
+    // so the session reads *more* idle than it is, up to maximally idle.
+    //
+    // Surfaced because the two gates answer it differently and an operator
+    // reading `idle_secs` cannot otherwise tell which answer applies:
+    // `collab_end { abandon: true }` proceeds on a degraded read (refusing
+    // would strand exactly the corrupted rows that need the rescue), while
+    // `session_handoff { force_reissue: true }` refuses (a corrupt timestamp is
+    // not evidence that anyone died, and that path evicts on that evidence).
+    // `reclaimable` below therefore reads `false` here, and this key is what
+    // says why.
+    status["activity_degraded"] = json!(staleness.is_degraded());
     // `verbose` remains accepted for backwards-compatible requests, but plans
     // are always references: large plan bodies must never transit status.
     let include_task_list = args
@@ -2679,10 +2737,15 @@ pub(super) fn handle_collab_status(app: &App, args: &Value) -> Result<Value, Mem
     // warn twice for one read-only call if that invariant ever broke. One
     // evaluation keeps the log honest either way.
     let is_dead = staleness.is_dead();
-    for ag in [Agent::Claude, Agent::Codex] {
-        let g = app
-            .db
-            .with_connection(|c| crate::collab::read_actor_generation(c, session_id, ag))?;
+    // Gate 3 of `reclaimable`, evaluated once for the same reason: it is
+    // session state, identical for both agents. Read through
+    // `Phase::admits_forced_reissue` itself rather than by re-listing the refused
+    // phases here, so a new `Phase` cannot be admitted by this diagnostic and
+    // refused by the gate — that function's exhaustive `match` makes adding one
+    // a compile error, and a `matches!` copy here would silently default it to
+    // "reclaimable".
+    let phase_admits = record.session.phase.admits_forced_reissue();
+    for (ag, g) in leases {
         let (generation, pending) = match g {
             Some(a) => (a.generation, a.pending.is_some()),
             None => (0, false),
@@ -2729,20 +2792,36 @@ pub(super) fn handle_collab_status(app: &App, args: &Value) -> Result<Value, Mem
 
         // `reclaimable`: not claimable, and locked the way a dead-lease
         // rescue targets — held at generation > 0 with no pending token, and
-        // dead by the exact predicate the gate enforces
-        // (`crate::collab::session_is_dead`, read here through the same
-        // `staleness` snapshot the gate itself reads inside its write
-        // transaction; see `handle_session_handoff`'s forced-path comment for
-        // why that read must be paired with the write there, and see this
-        // function's own comment on `staleness` above for why a read-only
-        // diagnostic may read it a moment earlier instead). It is neither a
-        // sufficient nor a necessary condition for `session_handoff
-        // { force_reissue: true }` actually succeeding — both gaps are named
+        // admitted by every precondition of `session_handoff
+        // { force_reissue: true }` that is a property of the *session* rather
+        // than of the caller or of a state this surface refuses to
+        // re-implement. Three, and they are the gate's own, read here through
+        // the same values the gate reads:
+        //
+        // 1. Dead by `crate::collab::session_is_dead`, over the same
+        //    `staleness` snapshot (read here a moment earlier, in this
+        //    handler's own read transaction, rather than inside the gate's
+        //    write transaction; see this function's comment on `staleness`
+        //    above for why a read-only diagnostic may).
+        // 2. Not a degraded read — see `activity_degraded` above and
+        //    `SessionStaleness::unreadable_terms`. Dropping this would make
+        //    `reclaimable: true` most confident on exactly the rows where the
+        //    number behind it is least trustworthy.
+        // 3. A phase the gate admits (`Phase::admits_forced_reissue`). Without
+        //    it a stale session parked in `PlanLocked`, `CodingComplete` or
+        //    `CodingFailed` read `reclaimable: true` while `force_reissue`
+        //    refused it unconditionally — and those are phases that wait on a
+        //    *human*, so they are the ones most likely to be long-idle and
+        //    least likely to be wedged. That is the mis-diagnosis this field
+        //    exists to prevent, aimed at the caller least able to check it.
+        //
+        // It is still neither a sufficient nor a necessary condition for a
+        // forced reissue actually succeeding — both remaining gaps are named
         // below, in one place, because a maintainer who trusts either
         // direction unconditionally will ship a mis-diagnosis for exactly the
         // caller this field exists to help.
         //
-        // Not sufficient — deliberately narrower than "force_reissue would
+        // Not necessary — deliberately narrower than "force_reissue would
         // succeed" in one direction: a repeated forced call against a session
         // that is dead by the *applicable* staleness predicate still succeeds
         // when a token is already pending, echoing that token. Which predicate
@@ -2760,7 +2839,7 @@ pub(super) fn handle_collab_status(app: &App, args: &Value) -> Result<Value, Mem
         // `reclaimable: false` sometimes still admit a forced call, which is
         // exactly the drift this field exists to prevent.
         //
-        // Not necessary — and, in the opposite direction, actually *wider*:
+        // Not sufficient — and, in the opposite direction, actually *wider*:
         // on the forced path `ensure_active` runs BEFORE the generation/
         // staleness ladder (see `handle_session_handoff`'s comment on that
         // ordering, which exists to keep #297's seal from being re-leasable).
@@ -2785,6 +2864,12 @@ pub(super) fn handle_collab_status(app: &App, args: &Value) -> Result<Value, Mem
         // in. A caller that needs the combined answer reads `reclaimable`
         // beside `ended_at`, which `session_record_json` already puts in
         // this same response.
+        //
+        // The other way it is wider is per-*caller*, not per-session, and so
+        // cannot be answered here at all: `force_reissue` requires
+        // `IRONMEM_MCP_MODE=trusted`, while `collab_status` is deliberately
+        // un-gated. A read-only process reads `reclaimable: true` truthfully
+        // and is refused the call.
         status[format!("{}_lease", ag.as_str())] = json!({
             "generation": generation,
             "handoff_pending": pending,
@@ -2797,7 +2882,7 @@ pub(super) fn handle_collab_status(app: &App, args: &Value) -> Result<Value, Mem
             // it is false.
             "last_activity": staleness.last_activity(),
             "idle_secs": staleness.idle_secs(),
-            "reclaimable": !claimable && is_dead,
+            "reclaimable": !claimable && is_dead && !staleness.is_degraded() && phase_admits,
         });
     }
     Ok(status)
@@ -3153,39 +3238,6 @@ fn collab_end_requires_owner(phase: Phase) -> bool {
     matches!(phase, Phase::PlanFinalizePending)
 }
 
-/// [`crate::collab::COLLAB_DEAD_SESSION_SECS`] rendered for an operator: the
-/// exact number a script or log line can match, paired with a duration a
-/// person can parse at a glance. Shared by all three of
-/// [`duplicate_session_refusal`]'s arms (the endable, non-endable, and
-/// unparseable-phase cases each mention staleness) and by
-/// `handle_collab_abandon`'s live-session refusal, so all four descriptions of
-/// "how stale is stale enough" render the same way.
-///
-/// Both halves are *derived* from the constant. The human half was written by
-/// hand — `"{}s (6 hours)"` — and nothing bound it to the seconds beside it,
-/// so raising `COLLAB_DEAD_SESSION_SECS` to 43_200 would have left all four
-/// operator-facing refusals saying "43200s (6 hours)" while the tool schema
-/// (which computes its own hours, and has
-/// `collab_end_schema_advertises_the_real_abandon_bounds` pinning that)
-/// correctly said twelve. The protocol tests assert only that the
-/// refusal contains the seconds, so the lie would have stayed green. Rendering
-/// the hours the same way the schema does is what makes the two agree by
-/// construction; `dead_session_threshold_human_derives_its_hours` pins it.
-///
-/// Now also rendered by `session_handoff`'s `force_reissue` gate and by the two
-/// generation-lease refusals in [`super::handoff`] (#298), which is why it is
-/// `pub(super)` rather than module-private: every operator-facing statement of
-/// "how stale is stale enough" — abandon's, the duplicate-session guard's, and
-/// the lease-recovery ones — renders from this one derivation, so raising
-/// [`crate::collab::COLLAB_DEAD_SESSION_SECS`] moves all of them together.
-pub(super) fn dead_session_threshold_human() -> String {
-    format!(
-        "{}s ({} hours)",
-        crate::collab::COLLAB_DEAD_SESSION_SECS,
-        crate::collab::COLLAB_DEAD_SESSION_SECS / 3600
-    )
-}
-
 /// The abandon call shape shown to an operator who has just been told to use
 /// it: `session_id` and `agent` spelled out, not just the `abandon`/`reason`
 /// pair. `collab_end` requires `session_id` and `agent` on every call, plain
@@ -3274,7 +3326,7 @@ fn duplicate_session_refusal(
     phase: &str,
 ) -> String {
     let recipe = abandon_recipe_json(existing_id);
-    let threshold = dead_session_threshold_human();
+    let threshold = crate::collab::dead_session_threshold_human();
     // "Demonstrably dead" has to name the surface that demonstrates it. Every
     // arm below states the threshold, and until `collab_status` carried
     // `idle_secs` the only way for a caller to evaluate it was to make the
@@ -3516,7 +3568,7 @@ pub(super) fn handle_collab_end(app: &App, args: &Value) -> Result<Value, Memory
             return Err(MemoryError::Validation(format!(
                 "collab_end rejected in active phase {}; end is only valid from PlanClaudeFinalizePending (by the current owner), PlanLocked (pre-task_list), CodingComplete, or CodingFailed. If this session is demonstrably dead (no activity for {}), end it with collab_end {}.",
                 session.phase,
-                dead_session_threshold_human(),
+                crate::collab::dead_session_threshold_human(),
                 abandon_recipe_json(session_id),
             )));
         }
@@ -3790,43 +3842,32 @@ fn handle_collab_abandon(
                      exists."
                 )));
             };
-            // `saturating_sub`, for the reason `crate::collab::idle_secs`
-            // saturates on the way in: `idle` is caller-influenced only
-            // through the clock, but `collab_checkpoints.updated_at` is
-            // `INTEGER NOT NULL` with no range CHECK, so a hand-repaired row
-            // can hold `i64::MAX` — an activity timestamp far in the future —
-            // and `idle_secs` then saturates to `i64::MIN`. Plain subtraction
-            // of that panics under debug assertions (unwinding out of the
-            // `with_transaction` closure) and wraps to a nonsensical negative
-            // "remaining" under release ones.
-            //
-            // `max(0)` is a FLOOR, not a cap, and it guards the opposite end:
-            // `idle >= COLLAB_DEAD_SESSION_SECS`, which would otherwise render
-            // a negative countdown. That is unreachable today — `!is_dead()`
-            // is exactly `idle < COLLAB_DEAD_SESSION_SECS` — and it sits here
-            // for the same forward-looking reason the `let Some(idle) = ...
-            // else` arm above does: nothing enforces the coupling between
-            // `session_is_dead` and this comparison, and an edit that loosens
-            // the predicate must not leave this line advertising a wait that
-            // has already elapsed.
-            //
-            // What neither guards, deliberately: a clock that moved
-            // *backwards* yields a small negative `idle`, and `21600 - (-5)`
-            // renders 21605s — slightly longer than the threshold itself.
-            // That is honest arithmetic on a bad clock (the gate really will
-            // not open for that long), so it is reported rather than clamped
-            // to a deadline the gate does not actually honour.
-            let remaining = crate::collab::COLLAB_DEAD_SESSION_SECS
-                .saturating_sub(idle)
-                .max(0);
+            // `session_handoff`'s forced-reissue refusal renders the
+            // identical countdown from the identical predicate; see
+            // `crate::collab::remaining_secs_before_dead` for the
+            // saturating-subtraction and floor-vs-cap reasoning shared by
+            // both.
+            let remaining = crate::collab::remaining_secs_before_dead(idle);
             return Err(MemoryError::Validation(format!(
                 "collab_end abandon refused: session {session_id} is still live (idle {idle}s in \
-                 phase {}). Abandon requires {} of no activity across the session row, its \
-                 checkpoint, its messages, and its handoff lease; {remaining}s remaining. A session \
-                 being recovered — a handoff issued or claimed — counts as live. Abandon exists only \
+                 phase {}). Abandon requires {} of no activity across {}; {remaining}s remaining. \
+                 A session \
+                 being recovered — a handoff claimed, or a token minted through the ordinary \
+                 generation-authenticated path — counts as live. Abandon exists only \
                  for a demonstrably dead session — to end a live one, drive it to a terminal phase.",
                 target.phase_raw,
-                dead_session_threshold_human(),
+                crate::collab::dead_session_threshold_human(),
+                // The terms actually weighed, rendered from the snapshot the
+                // gate just evaluated — the same helper `session_handoff`'s
+                // forced refusal uses, for the same reason. This used to be a
+                // hand-written list ending "and its handoff lease", which
+                // stopped being true when the abandon gate began dropping a
+                // forced reissue's own stamp (#298): a refusal that names the
+                // signals it weighed must not name one it does not, least of
+                // all to the caller deciding whether to wait six more hours.
+                // Sharing the renderer means the two gates cannot describe the
+                // same predicate differently.
+                super::handoff::staleness_scope_human(staleness.scope()),
             )));
         }
 
@@ -4432,27 +4473,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    /// The human half of the staleness threshold must be computed, not
-    /// written. Raising `COLLAB_DEAD_SESSION_SECS` used to leave all four
-    /// operator-facing refusals saying "6 hours" while the tool schema — which
-    /// derives its own hours and is pinned by
-    /// `collab_end_schema_advertises_the_real_abandon_bounds` — correctly said
-    /// otherwise. Asserted against the constant rather than against the string
-    /// "6 hours", so the test moves with the threshold instead of pinning it.
-    #[test]
-    fn dead_session_threshold_human_derives_its_hours() {
-        let rendered = dead_session_threshold_human();
-        assert_eq!(
-            rendered,
-            format!(
-                "{}s ({} hours)",
-                crate::collab::COLLAB_DEAD_SESSION_SECS,
-                crate::collab::COLLAB_DEAD_SESSION_SECS / 3600
-            ),
-            "the operator-facing threshold must derive both halves from the constant"
-        );
     }
 
     /// Start a session in its own `(repo_path, branch)` scope, drive it to
@@ -7678,9 +7698,10 @@ mod tests {
     /// `forced_reissue_is_refused_on_an_ended_session` in `handoff.rs` pins,
     /// for the same reason: #297's seal must not become re-leasable), so
     /// `force_reissue` refuses with the seal message, not a claim. This is
-    /// the "not necessary" half of the comment above the `_lease` block; the
-    /// "not sufficient" half is `collab_status_lease_with_pending_token_is_
-    /// claimable_not_reclaimable`, which covers the D-P1 echo instead.
+    /// the "not sufficient" half of the comment above the `_lease` block —
+    /// `reclaimable: true` and the call still refused; the "not necessary"
+    /// half is `collab_status_lease_with_pending_token_is_claimable_not_
+    /// reclaimable`, which covers the D-P1 echo instead.
     ///
     /// The join this field expects of its caller — `reclaimable` alongside
     /// `ended_at` — is asserted directly: `ended_at` really is non-null on
@@ -7718,6 +7739,165 @@ mod tests {
             err.to_string().contains("has ended"),
             "reclaimable: true must NOT be trusted unconditionally — an ended session              is refused by the seal, not admitted by the staleness ladder: {err}"
         );
+    }
+
+    /// `claimable` carries the same caveat as `reclaimable` in the same
+    /// direction, and only `reclaimable` was pinned for it.
+    ///
+    /// A sealed session keeps its lease rows verbatim — `end_session` writes
+    /// `ended_at` and nothing else — so a token pending when the seal landed
+    /// still reads `claimable: true` afterwards, while every call that would
+    /// claim it is refused by `ensure_active`. That is not a defect in the
+    /// field (it names the *lease* state, and the lease really is claimable by
+    /// whoever holds that token, for as long as the session lives), but it is
+    /// the same "read it beside `ended_at`" contract, and an unpinned contract
+    /// drifts: a future edit that folded the seal into `claimable` would flip
+    /// this with nothing failing.
+    #[test]
+    fn collab_status_lease_claimable_on_an_ended_session_disagrees_with_the_claim() {
+        let app = test_app();
+        let sid = start_session(&app);
+        advance_generation(&app, &sid, Agent::Claude);
+        let issued = app
+            .db
+            .with_transaction(|tx| crate::collab::issue_or_reuse_handoff(tx, &sid, Agent::Claude))
+            .unwrap();
+        let _ = app
+            .db
+            .with_transaction(|tx| crate::collab::queue::end_session(tx, &sid))
+            .unwrap();
+
+        let status = handle_collab_status(&app, &json!({ "session_id": sid })).unwrap();
+        let lease = &status["claude_lease"];
+        assert_eq!(
+            lease["claimable"],
+            json!(true),
+            "the seal does not clear the pending token, so the lease state is unchanged: \
+             {status}"
+        );
+        assert!(
+            status["ended_at"].is_string(),
+            "and the field that resolves it is on the same response: {status}"
+        );
+
+        let err = app
+            .db
+            .with_transaction(|tx| {
+                crate::collab::queue::ensure_active(tx, &sid)?;
+                crate::collab::claim_handoff_token(tx, &sid, Agent::Claude, &issued.token)
+            })
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("has ended"),
+            "claimable: true must not be trusted alone — the seal refuses the claim: {err}"
+        );
+    }
+
+    /// A stale session parked in a phase that waits on a *human* must not read
+    /// `reclaimable: true`.
+    ///
+    /// `PlanLocked`, `CodingComplete` and `CodingFailed` write no agent-driven
+    /// activity while they wait, so they read maximally stale however alive
+    /// their holder is — which is exactly why `Phase::admits_forced_reissue`
+    /// refuses them outright. Before `reclaimable` consulted that function, the
+    /// diagnostic said "reclaimable" loudest for the sessions the gate refuses
+    /// unconditionally, to the caller least able to check.
+    #[test]
+    fn collab_status_lease_in_a_human_gated_phase_is_not_reclaimable() {
+        for phase in ["PlanLocked", "CodingComplete", "CodingFailed"] {
+            let app = test_app();
+            let sid = start_session(&app);
+            advance_generation(&app, &sid, Agent::Claude);
+            app.db
+                .with_transaction(|tx| {
+                    tx.execute(
+                        "UPDATE collab_sessions SET phase = ?2 WHERE id = ?1",
+                        rusqlite::params![sid, phase],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+            age_session(&app, &sid, crate::collab::COLLAB_DEAD_SESSION_SECS + 60);
+
+            let status = handle_collab_status(&app, &json!({ "session_id": sid })).unwrap();
+            let lease = &status["claude_lease"];
+            // The lease itself is in state 4 — held, nothing pending, dead —
+            // so only the phase gate can be what makes this `false`.
+            assert_eq!(lease["claimable"], json!(false), "{phase}: {status}");
+            assert_eq!(
+                lease["reclaimable"],
+                json!(false),
+                "{phase} waits on a human and force_reissue refuses it outright: {status}"
+            );
+
+            let err = super::super::handoff::handle_session_handoff(
+                &app,
+                &json!({ "session_id": sid, "agent": "claude", "force_reissue": true }),
+            )
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("which waits on a human"),
+                "{phase}: reclaimable: false must agree with the gate it describes: {err}"
+            );
+        }
+    }
+
+    /// A session whose activity timestamps cannot be parsed must not read
+    /// `reclaimable: true` — and must say why.
+    ///
+    /// The degrade points one way: an unreadable timestamp coalesces to epoch,
+    /// so the session reads maximally idle whether or not anyone is working on
+    /// it. `force_reissue` refuses on that read (it evicts on the strength of
+    /// it); this diagnostic must not tell the caller the opposite, and
+    /// `activity_degraded` is what distinguishes this `false` from a live
+    /// session's.
+    #[test]
+    fn collab_status_lease_on_a_degraded_activity_read_is_not_reclaimable() {
+        let app = test_app();
+        let sid = start_session(&app);
+        advance_generation(&app, &sid, Agent::Claude);
+        age_session(&app, &sid, crate::collab::COLLAB_DEAD_SESSION_SECS + 60);
+        app.db
+            .with_transaction(|tx| {
+                tx.execute(
+                    "UPDATE collab_sessions SET updated_at = 'not-a-datetime' WHERE id = ?1",
+                    rusqlite::params![sid],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let status = handle_collab_status(&app, &json!({ "session_id": sid })).unwrap();
+        assert_eq!(
+            status["activity_degraded"],
+            json!(true),
+            "the caller must be able to tell this apart from a healthy read: {status}"
+        );
+        assert_eq!(
+            status["claude_lease"]["reclaimable"],
+            json!(false),
+            "a number the server could not read is not evidence the holder died: {status}"
+        );
+
+        let err = super::super::handoff::handle_session_handoff(
+            &app,
+            &json!({ "session_id": sid, "agent": "claude", "force_reissue": true }),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("cannot parse"),
+            "reclaimable: false must agree with the gate it describes: {err}"
+        );
+    }
+
+    /// A healthy session must read `activity_degraded: false`, or the
+    /// assertion above is satisfied by a key that is simply always `true`.
+    #[test]
+    fn collab_status_reports_a_healthy_activity_read_as_undegraded() {
+        let app = test_app();
+        let sid = start_session(&app);
+        let status = handle_collab_status(&app, &json!({ "session_id": sid })).unwrap();
+        assert_eq!(status["activity_degraded"], json!(false), "{status}");
     }
 
     #[test]
