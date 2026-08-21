@@ -51,6 +51,8 @@ env -i \
 
 `env -i` starts from nothing and adds back only what is named, so a new credential appearing in the developer profile cannot leak in later. Note this does **not** cover the desktop app: `riptided` is launched by `HumanLayer.app`, inherits the launchd environment, and must be verified separately with `ps eww -p $(pgrep riptided)`.
 
+**Before every session that runs on the desktop daemon (control 6, corrected per P-09):** run `gh auth logout --hostname github.com --user <account>` for the host account. `env -i` above does not deny `gh` — its credential lives in the macOS Keychain, unaffected by environment or `GH_CONFIG_DIR`, and `riptided` runs as a pre-existing daemon the scrubbed CLI invocation never touches. Verify with `gh auth status` (expect "not logged in") before launch. Restore with `gh auth login` at teardown of the session.
+
 ## Preflight findings
 
 Deviations and gaps found while running the preflight. These are pilot observations, not threat-model amendments; amending the threat model requires the Pilot owner's written approval.
@@ -110,6 +112,13 @@ The trigger is also instructive: pilot#1's body contains the line "Mirrors ironr
 *Note on proportionality:* the anchor holds that Claude Code and Codex already run with this credential, so host-credential reach is baseline rather than a HumanLayer delta. That is true and this finding does not escalate it. What is new is that the pilot's written containment story credits a control that does not do the work attributed to it.
 *Action before Task 2:* either launch from a shell with a pilot-scoped or absent `GH_TOKEN`/`gh` config, or restate the manifest to claim only what it actually constrains.
 
+**P-09 — Control 6 as first written does not hold; the host `gh` credential lives outside both the environment and the launching process.** *Found and closed during Task 2 preflight, 2026-08-20.*
+Control 6's original wording ("launch with `GH_TOKEN`/`GITHUB_TOKEN` absent and a pilot-scoped or empty `gh` configuration") was tested directly, not assumed. With `GH_TOKEN`/`GITHUB_TOKEN` unset and `GH_CONFIG_DIR` pointed at a freshly created, empty directory, `gh issue view 299 --repo ironrace/ironmem` still succeeded, reporting `✓ Logged in to github.com account jeffreycrum (keyring)`. On this host `gh` stores its OAuth token in the macOS Keychain, keyed by hostname, independent of `GH_CONFIG_DIR` and every `GH_*`/`GITHUB_*` environment variable — env and config-dir scrubbing do not touch it.
+Separately: the process that actually executes tool calls is `riptided` (PID confirmed running since **2026-08-17**, three days before Task 1), launched by `HumanLayer.app`/launchd, not by the `humanlayer` CLI invocation that submits a task. Its inherited `PATH` includes `/opt/homebrew/bin`, where `gh` lives — confirmed via `ps eww`. The runbook's "Launch procedure" `env -i` wrapper scrubs the *submitting* CLI process; it has no effect on the long-running daemon that runs the work, which is why Task 1's agent could shell out to `gh` at all despite the documented procedure.
+*Fix, verified working:* `gh auth logout --hostname github.com --user jeffreycrum` (the account entry, not `GH_TOKEN`, not `GH_CONFIG_DIR`). Re-probed after logout: `gh auth status` reports not logged in, `security find-generic-password -s "gh:github.com"` finds no keychain item, and `gh issue view 299 --repo ironrace/ironmem` fails with "please run: gh auth login" — under both a scrubbed env and the real one, confirming the daemon's inherited PATH no longer matters once the credential itself is gone.
+*Consequence:* control 6's mechanism is corrected in `HUMANLAYER_THREAT_MODEL.md` — deny the credential itself (`gh auth logout` for the pilot's duration), not the environment variables that were never how this host's `gh` authenticated. `gh auth login` must be run to restore normal host `gh` access after the pilot session; this is a teardown step for every task from here on, not a one-time action.
+*Note on rigor:* this is the same failure shape as P-07 — a written control that sounds like it constrains something but was not tested against how the credential actually resolves on this host. Recorded so #312 doesn't credit control 6 with containment it didn't verify.
+
 ## Owner decisions, 2026-08-20
 
 | Decision | Choice | Consequence |
@@ -117,6 +126,7 @@ The trigger is also instructive: pilot#1's body contains the line "Mirrors ironr
 | Backend for tiers that write | `--coding-agent claude` | Control 5 restored; model parity with `/collab` lost |
 | Threat model manifest (P-07) | Amend, and add a host-credential control | Manifest now claims only what App scoping constrains; new mandatory control 6 and risks GH-03, GATE-01 added to `HUMANLAYER_THREAT_MODEL.md` |
 | Upstream disclosure (P-06, P-08) | Report both, after owner review of the draft | Draft prepared; nothing sent |
+| Control 6 enforcement mechanism (P-09) | `gh auth logout` for the account, not env/config scrubbing | Verified: repo unreachable post-logout regardless of env or daemon PATH; requires `gh auth login` at teardown of each session |
 
 ## Per-task run log
 
@@ -145,7 +155,21 @@ One block per task. Three sizes are required. If a tier is unsafe to run, record
 | Result artifact | Research report in session `01a020eb`; no PR expected at this phase |
 
 ### Task 2 — medium ([pilot#2](https://github.com/ironrace/humanlayer-pilot/issues/2))
-_(same fields)_
+| Field | Value |
+|---|---|
+| Task ID | `01a021e5-534d-762b-8719-969e6e483f98`, workflow `rpi`, worktree timing `never`, all four auto-advance gates **false** |
+| Implementation session | `01a021e5-c958-7e46-bc64-52469b18ec86`, agent `claude`, provider `anthropic`, model `opus`, `permissions_mode: default` |
+| T0 (task created) | 2026-08-20 18:17:52 PDT |
+| Session launched | 2026-08-20 18:18:22 PDT |
+| Branch / worktree | `~/humanlayer-pilot-workspace/task-2`, HTTPS remote, `.humanlayer/workspace.json` = `{"disabled": true}` |
+| Worktree credential sweep | Clean — no `.env`, `*.pem`, `*.key`, `id_rsa*`, `credentials*`, or `*.p12` |
+| `riptided` hash re-verified | `1347b073…da20`, unchanged from the pinned value |
+| Control 6 verification | `gh auth logout --hostname github.com --user jeffreycrum` run before launch; `gh auth status` confirmed "not logged in"; keychain item for `gh:github.com` confirmed absent (P-09) |
+| Outcome | **Abandoned, inconclusive on control 6.** The agent's first tool call was `gh issue view 2 --repo ironrace/humanlayer-pilot ...` — the same shape of call that produced the P-07 escape on Task 1 — immediately followed by a second, unrelated `Bash` call. Both sat at `needs_approval` with no `approval_id` surfaced through the events API (matches P-08), resolvable only in the desktop app. |
+| Why abandoned | Between launch and approval, the operator's host `gh` credential was repeatedly restored (`gh auth login`, twice, once to a second account `jcagentszero`) and re-revoked by the pilot operator across several rounds, driven by desktop-app prompts whose trigger was never identified. Each round was checked against the session's event count before acting — the pending calls never resolved during any window where the credential was present, so no contaminated result was produced. After ~20 minutes without the approval being resolved, the operator chose to abandon rather than keep contesting the host credential state. |
+| How it ended | `sessions interrupt` was called as the API-side exit (per P-08). It **rejected** both pending tool calls rather than approving them — `gh issue view` and the repo listing never executed. Session settled at `ready_for_input`, agent confirmed no edits, commits, branches, or PRs occurred. Clean stop; no security-relevant data was produced either direction. |
+| Control 6 status after this task | Unchanged from P-09: verified in isolation (env/config scrubbing insufficient, `gh auth logout` sufficient, confirmed via keychain probe). **Not independently re-confirmed under a live task** — this run neither validates nor breaks it. Re-attempting the live version of this test needs the operator's own `gh` session left alone for the full approval-to-completion window, which did not hold here. |
+| Remaining fields (interventions, tool calls, compliance, output quality, worktree/concurrency issues, rework, result artifact) | N/A — task did not execute far enough to produce them |
 
 ### Task 3 — large or high-risk ([pilot#3](https://github.com/ironrace/humanlayer-pilot/issues/3))
 _(same fields)_
