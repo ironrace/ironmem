@@ -1,0 +1,122 @@
+-- Migration 022: record WHICH pending handoff token was minted by
+-- `session_handoff { force_reissue: true }` (issue #298).
+--
+-- # What this closes
+--
+-- `force_reissue` re-leases a session whose generation holder died. It is
+-- gated on the session being demonstrably dead — but minting a token stamps
+-- `pending_handoff_issued_at`, one of the five signals that gate reads, so a
+-- successful forced reissue makes its own session read live and the caller's
+-- own retry would be refused for liveness the caller itself created (D-P1).
+--
+-- The remedy is to exclude that one column from the staleness read. But the
+-- exclusion cannot be applied whenever *a* token is pending, because two states
+-- are then indistinguishable — the only column that differs between them is the
+-- excluded one:
+--
+--   (a) a token the FORCED path minted moments ago      -> must be admitted
+--   (b) a token a LIVE incumbent minted moments ago      -> must be refused
+--       through a generation-authenticated call
+--
+-- Left undistinguished, (b) was admitted on any session quiet for six hours: a
+-- third process could wait for an incumbent's ordinary mint->claim window
+-- (which `collab_status` advertises un-gated as `handoff_pending`), call
+-- `force_reissue`, receive the incumbent's token verbatim, and claim it. The
+-- intended successor saw only `handoff_token already claimed`.
+--
+-- Telling (a) from (b) needs *provenance*, and provenance has to be durable
+-- state written at mint time. It cannot be derived:
+-- `pending_handoff_generation` is `generation + 1` on both paths, the forced
+-- path deliberately leaves the active `generation` untouched (the
+-- anti-resurrection property of issue #91), the advisory generation cache is
+-- per-process and so cannot answer for the freshly-started process a rescue is
+-- *for*, and neither path writes `collab_sessions.updated_at`.
+--
+-- Reading it back out of the `session_handoff.force_reissue` wal_log row was
+-- considered and rejected: that inverts the usual direction by making an
+-- authorization decision depend on an audit table, and `wal_prune` deletes
+-- those rows on the retention window — which would silently turn a retention
+-- setting into a security parameter.
+--
+-- # Why this stores the TOKEN and not a boolean
+--
+--   pending_handoff_forced_token   NULL = the pending token (if any) was NOT
+--                                         minted by the forced path
+--                                  else = the exact token value the forced
+--                                         path minted
+--
+-- The gate narrows only when this column is non-NULL **and equal to the
+-- current `pending_handoff_token`**. A boolean was tried first and fails open
+-- across a mixed-binary rollout, which is the documented topology — two
+-- `ironmem` processes against one repository database, one of them a build
+-- behind. Once any v22 process opens the database this migration applies, but
+-- the older process keeps executing its own SQL, which never mentions this
+-- column:
+--
+--   1. a legitimate rescue leaves the flag set with a pending token;
+--   2. the OLD binary's `claim_handoff_token` clears the token and not the
+--      flag  ->  generation advanced, no token, flag still set;
+--   3. six quiet hours;
+--   4. the live incumbent mints normally through the OLD binary's
+--      `issue_or_reuse_handoff`, which sets a token and not the flag  ->  a
+--      normally-minted token now sits under a stale "forced" flag;
+--   5. a third process calls `force_reissue` against the current binary, gets
+--      the narrowed predicate, and is handed the incumbent's token.
+--
+-- Every step there is an old writer doing exactly what it was written to do.
+-- No version check can be relied on to prevent it, because the vulnerable
+-- writes come from a binary that predates the check.
+--
+-- Storing the token makes the record **self-enforcing**: any writer that mints
+-- a token without also writing this column leaves the two disagreeing, and a
+-- disagreement reads as "not forced". Step 4 above therefore produces
+-- `pending_handoff_token = 'V21-MINTED-TOKEN'` against a
+-- `pending_handoff_forced_token` naming some older, already-consumed token,
+-- the equality fails, and the strict predicate applies. The same property
+-- covers hand-repaired rows and any future path that forgets to write here —
+-- it needs no version check to be correct, because it does not ask *when* a
+-- row was written, only whether the provenance names the token actually
+-- pending.
+--
+-- # The default is the safe answer
+--
+-- NULL — every pre-022 row, and any row written by a path that does not set
+-- this — selects the FULL staleness predicate, which refuses on a live
+-- session. The permissive answer is never the default, which is the same
+-- reason `Phase::admits_forced_reissue` is an exhaustive `match` rather than a
+-- `matches!`.
+--
+-- Note that this column is read by BOTH staleness scopes, not only the
+-- narrowed one: the abandon gate's full read also drops a
+-- `pending_handoff_issued_at` whose provenance names the token pending there,
+-- because a rescue attempt is not session work and counting it let one forced
+-- reissue block `collab_end { abandon: true }` for six hours. See
+-- `LeaseSignals` in `collab/queue.rs`. NULL is the safe answer under both.
+--
+-- The CHECK forbids the empty string. An empty value would be a third state
+-- that is neither "absent" nor a real token, and it could compare equal to an
+-- equally malformed `pending_handoff_token` — narrowing the gate on a pair of
+-- blanks. Tokens are UUIDs, so nothing legitimate is excluded.
+--
+-- # Lifetime: provenance never outlives the token it describes
+--
+-- Written on a fresh issue (set to the minted token by the forced path,
+-- NULLed by the ordinary one, so a row that once carried a forced token cannot
+-- leave a stale value behind), untouched on the reuse path — which writes
+-- nothing at all and so cannot relabel a normally-minted token that a forced
+-- call merely echoed — and cleared by `claim_handoff_token` alongside the other
+-- pending columns. The equality check makes that clearing belt-and-braces
+-- rather than load-bearing, which is the point: correctness no longer depends
+-- on every writer remembering.
+--
+-- A separate migration rather than an edit to 010, for the reason 021 gives:
+-- 010 has long since shipped, its `CREATE TABLE IF NOT EXISTS` would silently
+-- skip an existing database, and this code would then query a missing column.
+-- The ladder is the mechanism that makes adding a column to an existing table
+-- safe.
+
+ALTER TABLE collab_actor_generations ADD COLUMN pending_handoff_forced_token TEXT
+    CHECK (pending_handoff_forced_token IS NULL
+           OR length(pending_handoff_forced_token) > 0);
+
+INSERT OR IGNORE INTO schema_version (version) VALUES (22);

@@ -12,10 +12,108 @@ use uuid::Uuid;
 use super::Agent;
 use crate::error::MemoryError;
 
+/// A token minted and awaiting its claim, with the provenance verdict that
+/// decides which staleness predicate gates the next `force_reissue` against it.
+///
+/// **Every field is private, and `forced` is derived rather than assigned.**
+/// [`PendingHandoff::new`] is the only constructor, and it computes `forced`
+/// from the two values whose equality *is* the provenance check. With a `pub
+/// forced` field that equality was a rule this doc asserted and nothing
+/// enforced: any construction site — a test fixture, a future second reader of
+/// these columns, a hand-written value in a migration backfill — could set
+/// `forced: true` beside a token the forced path never minted, and the
+/// `force_reissue` gate would then select the narrowed staleness predicate on
+/// a token a live incumbent had just minted. That is precisely the
+/// lease-takeover a security review reproduced end to end, reintroduced
+/// through the type instead of through the query. See migration 022.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingHandoff {
-    pub token: String,
-    pub generation: u64,
+    token: String,
+    generation: u64,
+    forced: bool,
+}
+
+impl PendingHandoff {
+    /// Build a pending handoff, deriving [`Self::forced`] from
+    /// `forced_token` — the raw `pending_handoff_forced_token` column — against
+    /// `token`, the token actually pending.
+    ///
+    /// The equality is the whole provenance check: a stored value naming some
+    /// other (already-consumed) token is not provenance for *this* one, and a
+    /// row that has none at all — a pre-022 row, an older binary mid-rollout,
+    /// a hand-repaired row — reads `false`, which is the safe direction
+    /// because `false` selects the full staleness predicate.
+    fn new(token: String, generation: u64, forced_token: Option<&str>) -> Self {
+        let forced = forced_token == Some(token.as_str());
+        Self {
+            token,
+            generation,
+            forced,
+        }
+    }
+
+    /// The token value the successor must present to claim the lease.
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+
+    /// The generation a claim of [`Self::token`] will advance the lease to.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Whether *this* pending token was minted by
+    /// `session_handoff { force_reissue: true }` rather than by an ordinary,
+    /// generation-authenticated call (migration 022, issue #298).
+    ///
+    /// **Computed, not stored.** The column holds the token value the forced
+    /// path minted, and this is `true` only when that value equals
+    /// [`Self::token`]. A stored boolean would describe the *row*; binding it
+    /// to the token means any writer that mints without updating provenance —
+    /// an older binary mid-rollout, a hand-repaired row, a future path that
+    /// forgets — automatically reads `false`. Migration 022 records the
+    /// mixed-binary sequence that made that difference load-bearing.
+    pub fn forced(&self) -> bool {
+        self.forced
+    }
+}
+
+/// Which path is minting a handoff token.
+///
+/// Threaded through [`issue_or_reuse_handoff_with`] rather than inferred,
+/// because it cannot be inferred: both paths write the same
+/// `pending_handoff_generation`, the forced path deliberately leaves the active
+/// `generation` alone (issue #91's anti-resurrection property), and neither
+/// touches `collab_sessions.updated_at`. Migration 022 carries the full
+/// argument.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandoffProvenance {
+    /// An ordinary `session_handoff`: the caller held the current generation,
+    /// or bound at generation 0, or presented a token. Selects the **full**
+    /// staleness predicate at the `force_reissue` gate, which refuses on a live
+    /// session — so this is the answer a forgotten call site gets, and it is
+    /// the strict one.
+    Normal,
+    /// `session_handoff { force_reissue: true }`. Selects the narrowed
+    /// predicate that ignores this agent's own `pending_handoff_issued_at`, so
+    /// the minting caller's own retry is not refused for liveness it just
+    /// created (D-P1).
+    Forced,
+}
+
+impl HandoffProvenance {
+    /// The value to store in `pending_handoff_forced_token` for a token whose
+    /// value is `minted`: the token itself when this path is the forced one,
+    /// `NULL` otherwise.
+    ///
+    /// Storing the token rather than a flag is what makes provenance
+    /// self-enforcing — see [`PendingHandoff::forced`] and migration 022.
+    fn forced_token_value(self, minted: &str) -> Option<&str> {
+        match self {
+            Self::Normal => None,
+            Self::Forced => Some(minted),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,6 +135,7 @@ fn build_actor_generation(
     generation: i64,
     token: Option<String>,
     pending_gen: Option<i64>,
+    forced_token: Option<String>,
 ) -> Result<ActorGeneration, MemoryError> {
     let generation = u64::try_from(generation).map_err(|_| {
         MemoryError::Validation(format!(
@@ -50,10 +149,10 @@ fn build_actor_generation(
                     "corrupt lease row: negative pending generation {g}"
                 ))
             })?;
-            Some(PendingHandoff {
-                token,
-                generation: g,
-            })
+            // `PendingHandoff::new` owns the provenance equality — see its
+            // doc, and migration 022, for why it is derived there rather than
+            // assigned here.
+            Some(PendingHandoff::new(token, g, forced_token.as_deref()))
         }
         (None, None) => None,
         // A token without its generation (or vice-versa) is a corrupt row — the
@@ -84,14 +183,16 @@ pub fn load_or_init_actor_generation(
     )?;
     let row = conn
         .query_row(
-            "SELECT generation, pending_handoff_token, pending_handoff_generation
+            "SELECT generation, pending_handoff_token, pending_handoff_generation,
+                    pending_handoff_forced_token
              FROM collab_actor_generations WHERE session_id = ?1 AND agent = ?2",
             params![session_id, agent.as_str()],
             |r| {
                 let generation: i64 = r.get(0)?;
                 let token: Option<String> = r.get(1)?;
                 let pending_gen: Option<i64> = r.get(2)?;
-                Ok((generation, token, pending_gen))
+                let forced_token: Option<String> = r.get(3)?;
+                Ok((generation, token, pending_gen, forced_token))
             },
         )
         .optional()?
@@ -101,8 +202,8 @@ pub fn load_or_init_actor_generation(
                 agent.as_str()
             ))
         })?;
-    let (generation, token, pending_gen) = row;
-    build_actor_generation(generation, token, pending_gen)
+    let (generation, token, pending_gen, forced_token) = row;
+    build_actor_generation(generation, token, pending_gen, forced_token)
 }
 
 /// Read the (session, agent) lease row WITHOUT creating it. Returns `None` when
@@ -114,19 +215,40 @@ pub fn read_actor_generation(
     agent: Agent,
 ) -> Result<Option<ActorGeneration>, MemoryError> {
     conn.query_row(
-        "SELECT generation, pending_handoff_token, pending_handoff_generation
+        "SELECT generation, pending_handoff_token, pending_handoff_generation,
+                pending_handoff_forced_token
          FROM collab_actor_generations WHERE session_id = ?1 AND agent = ?2",
         params![session_id, agent.as_str()],
         |r| {
             let generation: i64 = r.get(0)?;
             let token: Option<String> = r.get(1)?;
             let pending_gen: Option<i64> = r.get(2)?;
-            Ok((generation, token, pending_gen))
+            let forced_token: Option<String> = r.get(3)?;
+            Ok((generation, token, pending_gen, forced_token))
         },
     )
     .optional()?
-    .map(|(generation, token, pending_gen)| build_actor_generation(generation, token, pending_gen))
+    .map(|(generation, token, pending_gen, forced_token)| {
+        build_actor_generation(generation, token, pending_gen, forced_token)
+    })
     .transpose()
+}
+
+/// Issue a new handoff token (or reuse a pending one) on the **ordinary**,
+/// generation-authenticated path.
+///
+/// Thin wrapper over [`issue_or_reuse_handoff_with`] at
+/// [`HandoffProvenance::Normal`]. The default is deliberate rather than
+/// convenient: `Normal` selects the strict staleness predicate at the
+/// `force_reissue` gate, so a call site that never thought about provenance
+/// gets the refusing answer. A wrapper defaulting the other way would make
+/// forgetting equivalent to opening the hole migration 022 closed.
+pub fn issue_or_reuse_handoff(
+    conn: &Connection,
+    session_id: &str,
+    agent: Agent,
+) -> Result<HandoffIssue, MemoryError> {
+    issue_or_reuse_handoff_with(conn, session_id, agent, HandoffProvenance::Normal)
 }
 
 /// Issue a new handoff token (or reuse a pending one). Does NOT bump the active
@@ -136,10 +258,27 @@ pub fn read_actor_generation(
 /// Safe under any transaction isolation level: the issue decision is enforced by the
 /// atomic guarded `WHERE` clause (`WHERE pending_handoff_token IS NULL`, a single
 /// UPDATE), not by snapshot isolation.
-pub fn issue_or_reuse_handoff(
+///
+/// # Provenance (migration 022, issue #298)
+///
+/// `provenance` is written **only on the fresh-issue path**, and it is written
+/// unconditionally there — `Forced` stores the token just minted, `Normal`
+/// stores `NULL`. Both directions are written rather than only the interesting
+/// one, so a row that once carried a forced token cannot leave a stale value
+/// behind.
+///
+/// The **reuse path writes nothing at all**, as it always has, and that
+/// includes provenance. The consequence is deliberate and is the attack path
+/// staying shut: when a *normal* handoff minted the pending token and a *forced*
+/// call then reuses it, the flag stays `0`, the full predicate applies, and the
+/// call is refused on a live session. A reuse that flipped the flag to `1` would
+/// let any caller launder an incumbent's token into a forced one simply by
+/// asking for it.
+pub fn issue_or_reuse_handoff_with(
     conn: &Connection,
     session_id: &str,
     agent: Agent,
+    provenance: HandoffProvenance,
 ) -> Result<HandoffIssue, MemoryError> {
     // Ensure the row exists at generation 0.
     conn.execute(
@@ -152,14 +291,24 @@ pub fn issue_or_reuse_handoff(
     let candidate_token = Uuid::new_v4().to_string();
 
     // Atomic guarded UPDATE: only writes when no token is already pending.
+    // `pending_handoff_forced_token` is set in the same statement as the token
+    // it describes, so the two can never be written apart — and because it
+    // stores the token *value*, a writer that sets one without the other leaves
+    // them unequal, which reads as "not forced".
     let rows = conn.execute(
         "UPDATE collab_actor_generations
          SET pending_handoff_token = ?3,
              pending_handoff_generation = generation + 1,
              pending_handoff_issued_at = datetime('now'),
-             pending_handoff_claimed_at = NULL
+             pending_handoff_claimed_at = NULL,
+             pending_handoff_forced_token = ?4
          WHERE session_id = ?1 AND agent = ?2 AND pending_handoff_token IS NULL",
-        params![session_id, agent.as_str(), candidate_token],
+        params![
+            session_id,
+            agent.as_str(),
+            candidate_token,
+            provenance.forced_token_value(&candidate_token)
+        ],
     )?;
     let reused = rows == 0;
 
@@ -239,11 +388,18 @@ pub fn claim_handoff_token(
 
     // Atomic guarded UPDATE: only commits if the token is still the expected one.
     let rows = conn.execute(
+        // `pending_handoff_forced_token = NULL` alongside the other pending
+        // columns: provenance describes the pending token, so it is cleared
+        // with it. Hygiene rather than load-bearing — a row that kept the old
+        // value would still read "not forced" for the *next* token, because
+        // the stored value would no longer equal it. That belt-and-braces is
+        // the point of storing the token instead of a flag.
         "UPDATE collab_actor_generations
          SET generation = pending_handoff_generation,
              pending_handoff_token = NULL,
              pending_handoff_generation = NULL,
-             pending_handoff_claimed_at = datetime('now')
+             pending_handoff_claimed_at = datetime('now'),
+             pending_handoff_forced_token = NULL
          WHERE session_id = ?1 AND agent = ?2 AND pending_handoff_token = ?3",
         params![session_id, agent.as_str(), token],
     )?;
@@ -283,6 +439,13 @@ mod tests {
     // TABLE in 019 only depends on `collab_sessions` (created in 003), so
     // it's safe to apply out of numeric sequence relative to 011-018.
     const COLLAB_PILOT_SQL: &str = include_str!("../../migrations/019_collab_pilot.sql");
+    // Same out-of-sequence reasoning as 019: this ALTER TABLE depends only on
+    // `collab_actor_generations`, created in 010, and
+    // `pending_handoff_forced_token` is read by both `read_actor_generation`
+    // and `load_or_init_actor_generation` — the two functions this module's
+    // tests are entirely about.
+    const COLLAB_HANDOFF_PROVENANCE_SQL: &str =
+        include_str!("../../migrations/022_collab_handoff_provenance.sql");
 
     fn open() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -297,6 +460,7 @@ mod tests {
         conn.execute_batch(COLLAB_PLAN_DRAWERS_SQL).unwrap();
         conn.execute_batch(COLLAB_GENERATION_LEASE_SQL).unwrap();
         conn.execute_batch(COLLAB_PILOT_SQL).unwrap();
+        conn.execute_batch(COLLAB_HANDOFF_PROVENANCE_SQL).unwrap();
         conn
     }
 
@@ -324,9 +488,9 @@ mod tests {
         assert!(!issued.reused);
         let g = load_or_init_actor_generation(&conn, "s1", Agent::Claude).unwrap();
         assert_eq!(g.generation, 0, "active generation must not bump on issue");
-        assert_eq!(g.pending.as_ref().map(|p| p.generation), Some(1));
+        assert_eq!(g.pending.as_ref().map(|p| p.generation()), Some(1));
         assert_eq!(
-            g.pending.as_ref().map(|p| p.token.as_str()),
+            g.pending.as_ref().map(|p| p.token()),
             Some(issued.token.as_str())
         );
     }

@@ -729,7 +729,12 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
                     "agent": { "type": "string", "enum": ["claude", "codex"] },
                     "handoff_token": {
                         "type": "string",
-                        "description": "Required after a prior handoff claim; successor uses it to claim this generation."
+                        "description": "Required after a prior handoff claim; successor uses it to claim this generation. Ignored (not an error) if force_reissue is also true."
+                    },
+                    "force_reissue": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Mint a token WITHOUT holding the lease, to recover a session whose holder died. Requires an active session, generation > 0, a non-human-gated phase, and no activity for the staleness threshold — checked in full except against a pending token a prior forced reissue minted. Does not advance the generation — the successor's claim does."
                     }
                 },
                 "required": ["session_id", "agent"]
@@ -1511,20 +1516,155 @@ mod tests {
     /// headroom, in line with the previous raises. No neighbouring tool's
     /// description was trimmed to pay for it.
     ///
+    /// Raised 4_333 -> 4_407 for `session_handoff`'s `force_reissue` (#298) —
+    /// the dead-lease recovery hatch: mint a token without holding the
+    /// generation lease, for a session whose holder process died. Like
+    /// `collab_end.abandon` before it, the one fact this field's own boolean
+    /// nature already carries — that it defaults off — is a schema key
+    /// (`default: false`), not prose, matching this file's own rule that a
+    /// fact expressible as a key must be. What stays in the description is
+    /// only what no key can carry: that the call SKIPS the generation guard
+    /// it exists to repair (the ordinary meaning of a `session_handoff` call
+    /// is "obey the lease"; this argument inverts that, and nothing about a
+    /// boolean's name says which direction it inverts), the admission cost
+    /// (`generation > 0`, idle past the staleness threshold — stated without
+    /// a hardcoded number, so it cannot drift the way a copied "6 hours"
+    /// would), and that it does not advance the generation. That last clause
+    /// is the one a reader is most likely to guess wrong: "mints a token
+    /// without the lease" reads, absent this sentence, as "evicts the
+    /// incumbent," and a client that acted on that guess — or a future
+    /// implementation edit that made the guess true — would let a forced
+    /// reissue perform the eviction itself. That is exactly the property
+    /// issue #91 exists to prevent: eviction may happen only through a
+    /// successor's CLAIM, never through a bare reissue. `handoff.rs`'s R1
+    /// comment and its test,
+    /// `forced_reissue_on_a_dead_lease_does_not_advance_the_generation`, pin
+    /// the same fact on the implementation side; this sentence is its only
+    /// appearance on the advertised surface, so it earns its bytes. The
+    /// listing measured 4_367 tokens after the addition, leaving ~40 tokens
+    /// of headroom, in line with the previous raises. No neighbouring tool's
+    /// description was trimmed to pay for it.
+    ///
+    /// `force_reissue`'s description gained one more clause, cap unchanged,
+    /// when a security review of this branch (dabd0fb) found the D-P1
+    /// pending-token skip let a third process take over a live incumbent's
+    /// in-flight token, and fixed it by (among other things) refusing
+    /// `force_reissue` outright in `PlanLocked` and `CodingComplete` — the
+    /// two human-gated phases where a live process can legitimately write no
+    /// activity for arbitrarily long. That refusal is a precondition no
+    /// schema key expresses (JSON Schema has no "refused in these enum
+    /// values of a *different* field" shape), and omitting it is wrong in
+    /// the permissive direction: a caller who reads only the schema sees
+    /// `generation > 0` and staleness as the complete admission cost, tries
+    /// `force_reissue` in `PlanLocked`, and is refused by a rule the schema
+    /// never named — the same class of finding this plan's accuracy passes
+    /// have been correcting in prose elsewhere, now in the schema itself.
+    /// The listing measured 4_386 tokens after the addition, leaving ~21
+    /// tokens of headroom under the existing 4_407 cap — under it, so the
+    /// cap did not need to move. No neighbouring tool's description was
+    /// trimmed to pay for it.
+    ///
+    /// Two more security-review rounds landed on this branch after that
+    /// (`011b4ca`, `d4ef1bb`) and each left the description one fact behind
+    /// again. `011b4ca` made the refused-phase set exhaustive — it was
+    /// `PlanLocked`/`CodingComplete` above, and is now those two plus
+    /// `CodingFailed` (same property: waits on a human, writes no
+    /// agent-driven activity) — which made naming exactly two phases in the
+    /// description actively wrong rather than merely incomplete. `d4ef1bb`
+    /// added migration 022's `pending_handoff_forced_token` column and made
+    /// the pending-token staleness check depend on it: only a pending token
+    /// this same forced path minted gets the narrowed check, which excludes
+    /// exactly one term — this agent's own `pending_handoff_issued_at`, so a
+    /// caller's own retry is not refused for liveness it just created.
+    /// `pending_handoff_claimed_at` and the counterpart agent's lease are
+    /// never excluded; each was a reproduced takeover before `011b4ca` ruled
+    /// it out. A pending token from a normal, lease-authenticated mint
+    /// gets the full check, which is what stops a third party taking a live
+    /// incumbent's in-flight token — the exact hole `011b4ca` and `d4ef1bb`
+    /// closed in two steps. Both facts are preconditions no schema key can
+    /// express, and both are wrong-in-the-permissive-direction if left out
+    /// for the same reason the phase clause was the first time: a caller who
+    /// trusts the schema's precondition list as complete will hit a refusal
+    /// it never mentioned. The description now says "a non-human-gated
+    /// phase" rather than naming three phases by hand, so a fourth
+    /// human-gated phase does not silently go undocumented the way
+    /// `CodingFailed` did — `Phase::admits_forced_reissue`'s exhaustive `match`
+    /// and its `PHASE_FORCE_REISSUE_ADMITS` completeness proof (`handoff.rs`)
+    /// are the enforcement; this sentence just has to stay true to the
+    /// concept, not to a list.
+    ///
+    /// The final security review corrected two more claims in it. It omitted
+    /// `ensure_active` — the session-not-ended check runs *first*, ahead of
+    /// generation, phase and staleness, so a caller trusting the list as
+    /// complete met a seal refusal the list never mentioned; "an active
+    /// session" now leads the requires-list. And it said the staleness check
+    /// ran in full "except against **its own** prior reissue's pending token",
+    /// which quietly asserted a caller-identity check that does not exist:
+    /// the gate keys on stored provenance, so *any* caller finding a
+    /// forced-provenance token pending gets the narrowed predicate. `agent`
+    /// is caller-asserted throughout this protocol, and `handoff.rs`'s own
+    /// comments are explicit that a "was it you who minted it?" fix would rest
+    /// on nothing — so the description must not imply one. It now reads "a
+    /// pending token a prior forced reissue minted".
+    ///
+    /// The listing measured 4_398 tokens after this pass, leaving ~9 tokens of
+    /// headroom under the still-unmoved 4_407 cap. No neighbouring tool's
+    /// description was trimmed to pay for it.
+    ///
+    /// Raised 4_407 -> 4_450 when a review pass closed a gap on the *other*
+    /// side of the same call: `handoff_token`'s description said only when it
+    /// is REQUIRED, never what happens when a caller supplies one alongside
+    /// `force_reissue: true`. The forced path ignores it — accepted, not an
+    /// error, documented in `handoff.rs` and `docs/COLLAB.md` but nowhere on
+    /// the advertised surface — so a caller holding a valid pending token who
+    /// also sets `force_reissue: true` on a session it reads as dead gets
+    /// that same token echoed back with no claim performed, reads the
+    /// response's `generation` as "I hold it," and is refused on its next
+    /// mutating call. `default`/`enum`/`maximum` have no way to express "this
+    /// field is ignored, not validated, under a sibling field's condition,"
+    /// so the fact stays prose: `handoff_token`'s description gained "Ignored
+    /// (not an error) if force_reissue is also true." The listing measured
+    /// 4_412 tokens after the addition, 5 over the unmoved cap — this is the
+    /// deliberate raise, not a silent one, and 4_450 leaves ~38 tokens of
+    /// headroom, back in line with every raise before the ~9-token one two
+    /// paragraphs up. No neighbouring tool's description was trimmed to pay
+    /// for it.
+    ///
     /// The budget is deliberately a whole-listing ceiling with no per-tool
     /// allocation, so the cheapest way to land a new field is to delete prose
     /// from whichever unrelated tool happens to be wordiest. That trade is not
     /// acceptable: raise this constant when new capability genuinely needs the
     /// room, and pay for it by moving prose into real schema keys (`default`,
     /// `maximum`) — not by silently degrading a neighbour's description.
+    ///
+    /// **The failure message used to recommend exactly that trade** ("trim
+    /// descriptions that duplicate their schemas"), which is the one remedy
+    /// the paragraph above rules out, and it is the only guidance a failing
+    /// engineer actually reads. It now names the sanctioned remedies and
+    /// points here. It also reports the headroom on success as well as
+    /// failure: at ~9 tokens under the cap, "how close am I?" is a question
+    /// the next person needs answered *before* they write a description, and
+    /// a test that only speaks when it fails cannot answer it.
     #[test]
     fn tool_listing_stays_within_prompt_cache_schema_budget() {
+        const CAP: usize = 4_450;
         let app = App::open_for_test().unwrap();
         let bytes = serde_json::to_vec(&tool_definitions(&app)).unwrap().len();
         let estimated_tokens = bytes.div_ceil(4);
+        // Visible under `--nocapture`, which is how a maintainer sizing a new
+        // description finds the headroom without editing this test first.
+        println!(
+            "tool listing: ~{estimated_tokens} tokens ({bytes} bytes), cap {CAP}, headroom {}",
+            CAP.saturating_sub(estimated_tokens)
+        );
         assert!(
-            estimated_tokens <= 4_333,
-            "tool listing is ~{estimated_tokens} tokens ({bytes} bytes); trim descriptions that duplicate their schemas"
+            estimated_tokens <= CAP,
+            "tool listing is ~{estimated_tokens} tokens ({bytes} bytes), over the {CAP} cap. \
+             Do NOT pay for this by trimming a neighbouring tool's description — the budget is \
+             a whole-listing ceiling, so that silently degrades an unrelated tool to fund \
+             yours. Move prose into real schema keys (`default`, `maximum`, `enum`) where it \
+             fits, and otherwise raise the cap deliberately and record why in this test's doc, \
+             as every prior raise did."
         );
     }
 

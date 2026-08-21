@@ -71,6 +71,108 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`session_handoff` can recover a session whose generation holder died
+  (#298).** New `force_reissue: true` mints a handoff token without holding
+  the generation lease, for a lease-holder process that is gone and cannot
+  mint a successor token itself. It requires write access
+  (`IRONMEM_MCP_MODE=trusted`), `generation > 0`, and no activity across the
+  session for `COLLAB_DEAD_SESSION_SECS` — the last two checked inside the
+  write transaction — and is refused outright in the three human-gated
+  phases (`PlanLocked`, `CodingComplete`, `CodingFailed`) where a live
+  process can legitimately go quiet for arbitrarily long while waiting on a
+  person, so staleness alone cannot tell "wedged" from "waiting." Schema
+  goes **v21 -> v22** (migration 022), adding `pending_handoff_forced_token`
+  to `collab_actor_generations`: the staleness check on an already-pending
+  token is narrowed — excluding exactly one term, this agent's own
+  `pending_handoff_issued_at`, so a caller's own retry is not refused for
+  liveness it just created; `pending_handoff_claimed_at` and the counterpart
+  agent's lease are never excluded — only when that token was minted by this
+  same forced path; a pending token from a normal,
+  lease-authenticated mint still gets the full check, which is what stops a
+  third process taking a live incumbent's in-flight token. Unknown
+  provenance (a pre-022 row, or any path that forgets to set the flag) fails
+  closed to the full check. The reissue does **not** advance the
+  generation — only the successor's claim does, which is what preserves the
+  anti-resurrection property from #91. `collab_status` also gains a
+  per-agent `<agent>_lease` block reporting a derived `claimable` /
+  `reclaimable` verdict, so an operator can tell "usable right now" from
+  "usable only via the dead-lease repair" without invoking the mutating call
+  to find out.
+
+  Four further narrowings, each closing a way the feature answered a question
+  it had not actually asked:
+
+  - **A forced reissue no longer blocks `collab_end { abandon: true }`.**
+    Minting stamps `pending_handoff_issued_at`, and the abandon gate counts
+    lease writes as activity — so one rescue attempt made its own session read
+    live and locked the terminal remedy out for a further six hours, which is
+    exactly the remedy an operator reaches for when the rescue did not take.
+    The abandon gate now drops a `pending_handoff_issued_at` whose stored
+    provenance names the token pending there, for either agent. A *claim*, and
+    a token minted through the ordinary generation-authenticated path, both
+    still count — those are a live process taking or handing over the lease.
+    `docs/COLLAB.md` called the two remedies alternatives rather than a
+    sequence; now they are, in both directions.
+  - **A degraded staleness read is refused.** An activity timestamp that is
+    present but unparseable coalesces to epoch, i.e. maximally idle, i.e.
+    dead — a silent degrade pointing the dangerous way. `force_reissue` now
+    refuses it, naming the count, because it evicts on the strength of that
+    read. `collab_end { abandon: true }` deliberately still proceeds (refusing
+    would strand exactly the corrupted rows that need the rescue), and
+    `collab_status` gains `activity_degraded` so the two answers are
+    distinguishable before either call.
+  - **`reclaimable` consults the phase gate and the degraded-read check.** A
+    stale session parked in `PlanLocked`, `CodingComplete` or `CodingFailed`
+    read `reclaimable: true` while `force_reissue` refused it unconditionally
+    — and those are precisely the phases that legitimately sit idle past six
+    hours. The verdict now reads `false` there, derived from the gate's own
+    predicate rather than from a copy of it. The seal and write access remain
+    outside the verdict, for the reasons `docs/COLLAB.md` gives.
+  - **Refused forced reissues are audited.** Every refusal writes a
+    `session_handoff.force_reissue_refused` WAL row naming the gate that held.
+    Auditing only the grants left a process probing this gate — once a minute,
+    for a day, waiting for the incumbent to fall quiet — invisible, so the
+    attempt that finally succeeded read as a first attempt. The write-access
+    refusal is operator-log only: answering it with a database write would be
+    writing on behalf of a request refused for lack of write access.
+
+  A row this build cannot parse (a `phase` written by a newer ironmem, or
+  hand-repaired) is now refused with a message naming
+  `collab_end { abandon: true }` — which reads that row without parsing it —
+  rather than with an opaque column-conversion error. And `collab_status`
+  composes the session row, the orphan count, the staleness pair, and both
+  lease rows in one transaction, so the `<agent>_lease` verdict can no longer
+  be computed across a torn snapshot.
+
+  `session_handoff` responses now carry **`reused`** — `false` when the call
+  minted the token it is handing back, `true` when it found one already
+  pending and echoed it. The server recorded this in the audit row and the
+  operator log and returned it to nobody, so the one party that has to act on
+  the answer was the only one without it: "I hold a fresh token" and "somebody
+  else was mid-handoff and I was handed theirs" call for different next moves.
+  Present on both paths, unlike `forced_reissue` — an ordinary pre-claim retry
+  reuses too. The retry's *token* is byte-identical as always; the response is
+  not, and this field is the difference.
+
+  `collab_end { abandon: true }`'s liveness refusal now renders the terms it
+  weighed from the snapshot the gate evaluated, sharing one renderer with
+  `session_handoff`'s. It carried a hand-written list ending "and its handoff
+  lease", which stopped being true when the abandon gate began dropping
+  forced-rescue stamps — a refusal naming a signal it does not weigh, to the
+  caller deciding whether to wait six more hours.
+
+  **Known gap, deliberately deferred.** `Database::migrate()` has no guard
+  against opening a database whose `schema_version` is *newer* than this
+  binary's `LATEST_SCHEMA_VERSION` — the migration ladder only ever checks
+  `current_version < N` and never the reverse, so an older binary opening a
+  newer-schema database silently runs zero migrations and proceeds against
+  columns it does not know about, rather than refusing with a clear
+  version-mismatch error. The two-binary-versions-against-one-database
+  topology this PR's own migration 022 documents (and that `force_reissue`
+  exists partly to recover from) is exactly the shape that would trigger it.
+  Left out of this PR's scope; tracked here so it is not silently
+  rediscovered at the next migration.
+
 - **`collab_status` reports the staleness the abandon gate evaluates (#297).**
   New `last_activity` (Unix epoch seconds), `idle_secs`, and
   `dead_session_secs` fields, read through the same paired `session_staleness`
@@ -181,6 +283,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   slots.
 
 ### Fixed
+
+- **Test harness: `call_tool` silently accepted refused tool calls.** A tool
+  refusal comes back as an `isError: true` success response carrying
+  `{"error": ...}`, not as the JSON-RPC `error` field — which the sibling
+  helper `call_tool_expect_error` documents and `call_tool` did not check. Any
+  call site that did not go on to assert something about the shape of what it
+  got passed silently on a refused call, and a *setup* step is exactly the call
+  site that asserts nothing. Found in practice: a `collab_recv` fixture passing
+  `agent` where the tool wants `receiver` refused with "receiver is required",
+  and the test carried on to a wrong conclusion about the next call. `call_tool`
+  now fails the test and names the alternative helper; the nine existing call
+  sites that deliberately expected a refusal moved to `call_tool_expect_error`.
 
 - **A sealed collab session stays readable after a handoff (#297).** The write
   seal on an abandoned session left its message queue unreachable in exactly

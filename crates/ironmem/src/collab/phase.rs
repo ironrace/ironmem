@@ -183,6 +183,97 @@ impl Phase {
         )
     }
 
+    /// Whether `session_handoff { force_reissue: true }` may act on a session in
+    /// this phase.
+    ///
+    /// Phase *policy*, so it lives with the phase rather than in the MCP handler
+    /// that happens to enforce it — beside [`Self::is_coding_active`], which
+    /// `collab_end` reads for the same shape of question. It sat in
+    /// `mcp::tools::handoff` and had two readers already (the gate, and
+    /// `collab_status`'s `reclaimable` verdict, which reached across into a
+    /// sibling transport module to get it); the next reader would have been a
+    /// third, and a rule about phases answerable only by calling into the
+    /// transport layer is a rule that gets copied instead of called.
+    ///
+    /// # Why this is an exhaustive `match` and not a `matches!`
+    ///
+    /// The refused phases share one property: they wait on a **human** and write
+    /// nothing to any agent-driven activity signal while they do, so a session
+    /// parked in one reads as maximally stale no matter how alive its holder is.
+    /// `collab_end`'s abandon gate accepts that false-positive risk because a wrong
+    /// seal is loud and terminal. `force_reissue` cannot: a wrong verdict here hands
+    /// an eviction capability to a caller acting against a process that never died,
+    /// silently.
+    ///
+    /// This began as `matches!(phase, PlanLocked | CodingComplete)`, and that shape
+    /// is the bug rather than a style choice: a `matches!` against a two-variant
+    /// pattern makes every **future** `Phase` default to *admitted* — the permissive
+    /// answer, for a capability that evicts live processes — and it compiles clean.
+    /// `CodingFailed` was already missing for exactly that reason. An exhaustive
+    /// `match` that names every variant on both arms makes a new phase a compile
+    /// error, which forces the question to be answered rather than defaulted. Do not
+    /// collapse either arm into a `_`.
+    ///
+    /// `collab_session.rs`'s `PHASE_ENDABILITY` / `PHASE_OWNER_REQUIRED` tables are
+    /// the same discipline from the other side; the test-side twin of this function,
+    /// `PHASE_FORCE_REISSUE_ADMITS`, spells the answers out independently so a typo
+    /// here fails a row rather than silently redefining the rule.
+    pub fn admits_forced_reissue(&self) -> bool {
+        match self {
+            // Waiting on the pilot's `task_list` send. `docs/COLLAB.md` is explicit
+            // that this phase is autonomous, but it is still a *wait*: nothing
+            // writes an agent-driven signal until the send lands.
+            Self::PlanLocked => false,
+            // Terminal, waiting on operator attestation — a human step of unbounded
+            // duration by construction.
+            Self::CodingComplete => false,
+            // [`Self::is_coding_terminal`] yet deliberately kept resumable: it
+            // waits for a human to call `collab_resume` and writes nothing
+            // while it waits. Identical shape to the two above, and
+            // it was missed on the first pass — a genuine tooling-class failure,
+            // aged out, was admitted.
+            Self::CodingFailed => false,
+            // Every remaining phase is agent-driven: it advances through
+            // `apply_event` → `save_session` (which stamps
+            // `collab_sessions.updated_at`), and it waits on an *agent*, not on a
+            // human — so six hours of total silence in one of these is anomalous,
+            // which is what makes the staleness gate meaningful here.
+            //
+            // "Its normal traffic writes `messages`" was the rationale here, and it
+            // is not true of `CodeImplementPending`. `handle_collab_status`'s own
+            // comment says the opposite in as many words — a long
+            // `CodeImplementPending` batch "files checkpoints without touching the
+            // session row" — and that is the whole reason
+            // `session_last_activity` counts `collab_checkpoints.updated_at` as a
+            // term at all. The claim was load-bearing for the wrong reason: it made
+            // this arm look like it rested on a signal that fires continuously,
+            // when what it actually rests on is that *some* agent-driven term does.
+            //
+            // So the residual is named rather than argued away: an implementer that
+            // hangs — a subagent wedged on a network call, a review loop that never
+            // returns — writes no message, files no checkpoint, and stamps no
+            // session row, and after six hours a `force_reissue` against it is
+            // admitted while the process is still resident. That is a real
+            // false-positive window and it is accepted here, because it is the
+            // *rescue* case this feature exists for: an implementer silent for six
+            // hours is the single most common wedge, refusing it would leave the
+            // severed-chain lock with no remedy but `collab_end { abandon: true }`,
+            // and the eviction is still not this call's — the successor's claim is
+            // (R1). Narrowing it, if it ever needs narrowing, belongs in the
+            // checkpoint cadence (a batch that heartbeats cannot look dead), not in
+            // a longer threshold here: `COLLAB_DEAD_SESSION_SECS` is shared with
+            // the abandon gate.
+            Self::PlanParallelDrafts
+            | Self::PlanSynthesisPending
+            | Self::PlanCopilotReviewPending
+            | Self::PlanFinalizePending
+            | Self::CodeImplementPending
+            | Self::CodeReviewLocalPending
+            | Self::CodeReviewFixGlobalPending
+            | Self::CodeReviewFinalPending => true,
+        }
+    }
+
     /// The single `CollabEvent` variant each active phase expects. Used by the
     /// catch-all `WrongPhase` arm to build a uniform error message. Terminal
     /// phases return a placeholder that the catch-all never reaches because

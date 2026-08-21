@@ -62,7 +62,7 @@ pub use failure_class::{classify, FailureClass};
 pub use handoff::load_or_init_actor_generation;
 pub use handoff::{
     claim_handoff_token, issue_or_reuse_handoff, read_actor_generation, ActorGeneration,
-    HandoffIssue, PendingHandoff,
+    HandoffIssue, HandoffProvenance, PendingHandoff,
 };
 pub use phase::Phase;
 pub use session::{tasks_count_from_list, CollabSession};
@@ -222,6 +222,71 @@ pub const MAX_ECHOED_EPITAPH_CHARS: usize = 240;
 /// `PlanLocked` and `CodingComplete` for the concrete false-positive case).
 pub const COLLAB_DEAD_SESSION_SECS: i64 = 21_600;
 
+/// [`COLLAB_DEAD_SESSION_SECS`] rendered for an operator: the exact number a
+/// script or log line can match, paired with a duration a person can parse at
+/// a glance. Shared by `duplicate_session_refusal`'s three arms, the abandon
+/// gate's live-session refusal, `session_handoff`'s `force_reissue` gate, and
+/// the two generation-lease refusals in `mcp::tools::handoff` (#298) — every
+/// operator-facing statement of "how stale is stale enough" renders from this
+/// one derivation, so raising [`COLLAB_DEAD_SESSION_SECS`] moves all of them
+/// together.
+///
+/// Both halves are *derived* from the constant, deliberately: the human half
+/// used to be hand-written — `"{}s (6 hours)"` — with nothing binding it to
+/// the seconds beside it, so raising the constant to 43_200 would have left
+/// every operator-facing refusal saying "43200s (6 hours)" while the tool
+/// schema (which computes its own hours) correctly said twelve. Rendering the
+/// hours the same way the schema does is what makes the two agree by
+/// construction; `dead_session_threshold_human_derives_its_hours` pins it.
+///
+/// Lives beside [`COLLAB_DEAD_SESSION_SECS`] rather than in `mcp::tools`
+/// (where it lived through #298's first pass) for the same reason
+/// [`Phase::admits_forced_reissue`](phase::Phase::admits_forced_reissue) does:
+/// every one of its readers is a transport-layer module reaching into a
+/// sibling transport-layer module to get at a fact about the domain. Moving
+/// the fact next to the constant it derives from means a reader who already
+/// found `COLLAB_DEAD_SESSION_SECS` finds its rendering right there, instead
+/// of having to know which tool module happened to need it first.
+pub fn dead_session_threshold_human() -> String {
+    format!(
+        "{COLLAB_DEAD_SESSION_SECS}s ({} hours)",
+        COLLAB_DEAD_SESSION_SECS / 3600
+    )
+}
+
+/// Seconds remaining before `idle` (an [`idle_secs`] reading) crosses
+/// [`COLLAB_DEAD_SESSION_SECS`] — the countdown a refusal reports to a caller
+/// deciding whether to wait it out. `handoff.rs`'s forced-reissue refusal and
+/// `collab_session.rs`'s abandon refusal both render this number; it lived as
+/// an identical `saturating_sub(...).max(0)` with an identical justification
+/// hand-copied into each until this extraction.
+///
+/// `saturating_sub`: `idle` is caller-influenced only through the clock, but
+/// e.g. `collab_checkpoints.updated_at` is `INTEGER NOT NULL` with no range
+/// `CHECK`, so a hand-repaired row can hold `i64::MAX` — an activity
+/// timestamp far in the future — and [`idle_secs`] then saturates to
+/// `i64::MIN`. Plain subtraction of that panics under debug assertions
+/// (unwinding out of a `with_transaction` closure) and wraps to a
+/// nonsensical negative "remaining" under release ones.
+///
+/// `max(0)` is a FLOOR, not a cap: it guards `idle >= COLLAB_DEAD_SESSION_SECS`,
+/// which would otherwise render a negative countdown on an already-dead
+/// session. Both current callers only reach this after establishing
+/// `!session_is_dead(...)` (i.e. `idle < COLLAB_DEAD_SESSION_SECS`), so the
+/// floor is unreachable today — it stays here so a future caller that
+/// loosens that coupling does not silently advertise a wait that has already
+/// elapsed.
+///
+/// What it deliberately does NOT guard: a clock that moved *backwards*
+/// yields a small negative `idle`, and `21600 - (-5)` renders 21605s —
+/// slightly longer than the threshold itself. That is honest arithmetic on a
+/// bad clock (the gate really will not open for that long), so it is
+/// reported rather than clamped to a deadline the gate does not actually
+/// honour.
+pub fn remaining_secs_before_dead(idle: i64) -> i64 {
+    COLLAB_DEAD_SESSION_SECS.saturating_sub(idle).max(0)
+}
+
 /// Seconds since the session's newest activity, or `None` when there is no
 /// signal at all — i.e. the session row does not exist
 /// ([`queue::session_last_activity`] returns `None` for that case, and
@@ -300,9 +365,16 @@ pub fn session_is_dead(session_id: &str, last_activity: Option<i64>, now: i64) -
     match idle_secs(last_activity, now) {
         Some(idle) => idle >= COLLAB_DEAD_SESSION_SECS,
         None => {
+            // Deliberately caller-agnostic: this predicate now backs three
+            // decisions — `collab_end { abandon: true }`, `session_handoff
+            // { force_reissue: true }`'s staleness gate, and `collab_status`'s
+            // `reclaimable` verdict (#298) — not only abandon. A message naming
+            // one of them would send an operator investigating a force_reissue
+            // grepping the logs and finding a line that talks about abandon,
+            // which was never called.
             tracing::warn!(
                 session_id = %session_id,
-                "collab: no liveness signal for session; treating it as dead for abandon"
+                "collab: no liveness signal for session; treating it as dead"
             );
             true
         }
@@ -618,7 +690,10 @@ pub const RECOVERABLE_FAILURE_PREFIXES: &[&str] = &[
 
 #[cfg(test)]
 mod dead_session_tests {
-    use super::{idle_secs, session_is_dead, COLLAB_DEAD_SESSION_SECS};
+    use super::{
+        dead_session_threshold_human, idle_secs, remaining_secs_before_dead, session_is_dead,
+        COLLAB_DEAD_SESSION_SECS,
+    };
 
     const NOW: i64 = 1_800_000_000;
 
@@ -626,6 +701,62 @@ mod dead_session_tests {
     fn a_missing_signal_is_dead() {
         assert!(session_is_dead("s", None, NOW));
         assert_eq!(idle_secs(None, NOW), None);
+    }
+
+    /// The human half of the staleness threshold must be computed, not
+    /// written. Raising `COLLAB_DEAD_SESSION_SECS` used to leave every
+    /// operator-facing refusal saying "6 hours" while the tool schema — which
+    /// derives its own hours and is pinned by
+    /// `collab_end_schema_advertises_the_real_abandon_bounds` — correctly said
+    /// otherwise. Asserted against the constant rather than against the string
+    /// "6 hours", so the test moves with the threshold instead of pinning it.
+    #[test]
+    fn dead_session_threshold_human_derives_its_hours() {
+        let rendered = dead_session_threshold_human();
+        assert_eq!(
+            rendered,
+            format!(
+                "{COLLAB_DEAD_SESSION_SECS}s ({} hours)",
+                COLLAB_DEAD_SESSION_SECS / 3600
+            ),
+            "the operator-facing threshold must derive both halves from the constant"
+        );
+    }
+
+    #[test]
+    fn remaining_secs_before_dead_counts_down_to_the_threshold() {
+        assert_eq!(
+            remaining_secs_before_dead(0),
+            COLLAB_DEAD_SESSION_SECS,
+            "no idle time at all leaves the full threshold remaining"
+        );
+        assert_eq!(
+            remaining_secs_before_dead(COLLAB_DEAD_SESSION_SECS - 1),
+            1,
+            "one second before the threshold, one second remains"
+        );
+    }
+
+    /// The floor, not the saturating-subtraction: `idle` already at or past
+    /// the threshold must not render a negative countdown, even though every
+    /// current caller only reaches this after establishing `!is_dead()`.
+    #[test]
+    fn remaining_secs_before_dead_floors_at_zero_past_the_threshold() {
+        assert_eq!(remaining_secs_before_dead(COLLAB_DEAD_SESSION_SECS), 0);
+        assert_eq!(
+            remaining_secs_before_dead(COLLAB_DEAD_SESSION_SECS + 1_000),
+            0
+        );
+    }
+
+    /// `saturating_sub`, not plain subtraction: a hand-repaired row's
+    /// `idle_secs` can saturate to `i64::MIN` (see the function's own doc —
+    /// an activity timestamp far in the future does this). Plain subtraction
+    /// of `COLLAB_DEAD_SESSION_SECS - i64::MIN` overflows `i64::MAX` and
+    /// panics under debug assertions; `saturating_sub` clamps there instead.
+    #[test]
+    fn remaining_secs_before_dead_does_not_panic_on_i64_min() {
+        assert_eq!(remaining_secs_before_dead(i64::MIN), i64::MAX);
     }
 
     #[test]

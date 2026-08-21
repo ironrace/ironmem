@@ -35,11 +35,13 @@ const COLLAB_PILOT_SQL: &str = include_str!("../../migrations/019_collab_pilot.s
 const COLLAB_CHECKPOINTS_SQL: &str = include_str!("../../migrations/020_collab_checkpoints.sql");
 const CHECKPOINT_ATTESTATION_CHECK_SQL: &str =
     include_str!("../../migrations/021_checkpoint_attestation_check.sql");
+const COLLAB_HANDOFF_PROVENANCE_SQL: &str =
+    include_str!("../../migrations/022_collab_handoff_provenance.sql");
 
 /// Highest schema version a fully-migrated database reports. Bump alongside the
 /// `run_version_gated_migrations` ladder below so `ironmem doctor` can tell a
 /// behind-migration database from an up-to-date one.
-pub const LATEST_SCHEMA_VERSION: i64 = 21;
+pub const LATEST_SCHEMA_VERSION: i64 = 22;
 
 /// Total attempts (first try included) `with_transaction` makes when every
 /// attempt fails with `SQLITE_BUSY_SNAPSHOT`. See the retry-policy section of
@@ -484,6 +486,24 @@ impl Database {
             self.conn.execute_batch(CHECKPOINT_ATTESTATION_CHECK_SQL)?;
         }
 
+        // v22: provenance for the pending handoff token (issue #298). One
+        // nullable TEXT column with no DEFAULT, holding the *token value* the
+        // forced path minted. NULL — every pre-022 row, and every row a normal
+        // mint touched — reads as "not minted by the forced path", which is the
+        // answer that selects the strict staleness predicate, so an unknown
+        // provenance fails closed.
+        //
+        // It stores the token rather than a bit deliberately, and the migration
+        // header spends its length on why: a boolean was tried first and fails
+        // *open* across a mixed-binary rollout, because an older binary minting
+        // a normal token leaves the flag standing from the previous forced one.
+        // Storing the value makes the check `forced_token == pending_token`, so
+        // a stranded value no longer equals the token it would have to describe.
+        // Do not "simplify" this back to a flag.
+        if current_version < 22 {
+            self.conn.execute_batch(COLLAB_HANDOFF_PROVENANCE_SQL)?;
+        }
+
         Ok(())
     }
 
@@ -718,6 +738,16 @@ impl Database {
     /// [`Self::with_transaction`], this opens no transaction — use it for plain
     /// `SELECT`s (e.g. the session-start hook reading collab/diary state) so a
     /// read is not wrapped in a write-capable `BEGIN`/`COMMIT`.
+    ///
+    /// **One `SELECT`, or several whose answers need not agree.** A handler
+    /// that reads several rows and then composes *one* answer out of them
+    /// wants [`Self::with_transaction`] instead, even though it writes
+    /// nothing: without a transaction each statement gets its own snapshot, so
+    /// another **process** — this protocol runs two agents against one
+    /// database — can write between them and the composed answer describes a
+    /// state that never existed. `handle_collab_status`'s lease verdict is the
+    /// worked example. A deferred transaction takes no write lock, so the cost
+    /// is a `BEGIN`/`COMMIT` pair and nothing else.
     pub fn with_connection<T>(
         &self,
         f: impl FnOnce(&Connection) -> Result<T, MemoryError>,
@@ -747,8 +777,10 @@ impl Database {
                 ));
             }
             let embedding: Vec<f32> = blob
-                .chunks_exact(4)
-                .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|chunk| f32::from_le_bytes(*chunk))
                 .collect();
             if embedding.len() != EMBED_DIM {
                 return Err(rusqlite::Error::FromSqlConversionFailure(
@@ -913,7 +945,7 @@ mod tests {
         // fully-migrated database reports — doctor compares against it.
         let db = Database::open_in_memory().unwrap();
         assert_eq!(LATEST_SCHEMA_VERSION, db.schema_version().unwrap());
-        assert_eq!(LATEST_SCHEMA_VERSION, 21);
+        assert_eq!(LATEST_SCHEMA_VERSION, 22);
     }
 
     #[test]
@@ -1648,7 +1680,7 @@ mod tests {
                      cache_creation_input_tokens, cache_read_input_tokens,
                      estimated, chars)
                  VALUES (?1, 'transcript', ?2, 0, 0, 0, 0, 0, 0)",
-                rusqlite::params![format!("2026-06-29T13:00:00Z-bad"), bad],
+                rusqlite::params!["2026-06-29T13:00:00Z-bad", bad],
             );
             assert!(
                 tu_result.is_err(),
@@ -1658,7 +1690,7 @@ mod tests {
             let occ_result = db.conn.execute(
                 "INSERT INTO occupancy_samples (ts, harness, input_tokens, cache_read_input_tokens)
                  VALUES (?1, ?2, 0, 0)",
-                rusqlite::params![format!("2026-06-29T13:01:00Z-bad"), bad],
+                rusqlite::params!["2026-06-29T13:01:00Z-bad", bad],
             );
             assert!(
                 occ_result.is_err(),
@@ -2346,7 +2378,7 @@ mod tests {
     fn migration_020_creates_collab_checkpoints_table() {
         let db = Database::open_in_memory().unwrap();
         assert_eq!(schema_version_of(&db), LATEST_SCHEMA_VERSION);
-        assert_eq!(LATEST_SCHEMA_VERSION, 21);
+        assert_eq!(LATEST_SCHEMA_VERSION, 22);
 
         // The table exists and carries every column the checkpoint contract
         // needs, at the declared affinity the header argues for. Asserting the
@@ -2854,6 +2886,104 @@ mod tests {
         db
     }
 
+    fn open_at_v21() -> Database {
+        let db = open_at_v20();
+        db.conn
+            .execute_batch(CHECKPOINT_ATTESTATION_CHECK_SQL)
+            .unwrap();
+        db
+    }
+
+    /// The upgrade path for migration 022, and — more importantly — the
+    /// direction its default points.
+    ///
+    /// `pending_handoff_forced_token` gates which staleness predicate
+    /// `session_handoff { force_reissue: true }` applies: when it equals the
+    /// current `pending_handoff_token` the gate narrows, ignoring the agent's
+    /// own `pending_handoff_issued_at`; otherwise the full read applies and
+    /// refuses on a live session. The same equality is read by the abandon
+    /// gate's full predicate, which drops a forced reissue's own stamp for
+    /// either agent (see `collab::queue::LeaseSignals`) — so the direction
+    /// this default points matters to both callers, not just the narrowed
+    /// one. A lease row that predates this
+    /// migration has no provenance to report, and the whole design rests on
+    /// that unknown reading as **not forced** — the strict answer. If the
+    /// default were ever anything but NULL, every legacy lease row on disk
+    /// would need its stored value to accidentally disagree with its token to
+    /// stay safe, which is not a property worth depending on.
+    #[test]
+    fn test_v21_to_v22_adds_handoff_provenance_defaulting_to_not_forced() {
+        let db = open_at_v21();
+        assert_eq!(schema_version_of(&db), 21);
+        assert!(
+            !column_exists(
+                &db,
+                "collab_actor_generations",
+                "pending_handoff_forced_token"
+            ),
+            "pending_handoff_forced_token should not exist at v21"
+        );
+
+        // A pre-022 lease row with a token pending, written the way v21 wrote
+        // them — with no provenance column to write.
+        db.conn
+            .execute(
+                "INSERT INTO collab_sessions (id, repo_path, branch)
+                 VALUES ('legacy-v21-session', '/repo', 'main')",
+                [],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO collab_actor_generations
+                     (session_id, agent, generation, pending_handoff_token,
+                      pending_handoff_generation, pending_handoff_issued_at)
+                 VALUES ('legacy-v21-session', 'claude', 3, 'legacy-token', 4,
+                         datetime('now'))",
+                [],
+            )
+            .unwrap();
+
+        db.migrate().unwrap();
+        assert_eq!(schema_version_of(&db), LATEST_SCHEMA_VERSION);
+        assert!(column_exists(
+            &db,
+            "collab_actor_generations",
+            "pending_handoff_forced_token"
+        ));
+
+        let (token, forced_token): (String, Option<String>) = db
+            .conn
+            .query_row(
+                "SELECT pending_handoff_token, pending_handoff_forced_token
+                   FROM collab_actor_generations
+                  WHERE session_id = 'legacy-v21-session' AND agent = 'claude'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(token, "legacy-token", "the pre-existing row must survive");
+        assert_eq!(
+            forced_token, None,
+            "a row that predates provenance must read NOT forced — the strict answer. \
+             A non-NULL default would make every legacy lease row's safety depend on its \
+             stored value happening to disagree with its token."
+        );
+
+        // The CHECK forbids the empty string: a blank is neither absent nor a
+        // real token, and it could compare equal to an equally blank
+        // `pending_handoff_token`, narrowing the gate on a pair of nothings.
+        let bad = db.conn.execute(
+            "UPDATE collab_actor_generations SET pending_handoff_forced_token = ''
+              WHERE session_id = 'legacy-v21-session'",
+            [],
+        );
+        assert!(
+            bad.is_err(),
+            "pending_handoff_forced_token must reject the empty string"
+        );
+    }
+
     /// The upgrade path for migration 021, and the reason it is a separate
     /// migration rather than an edit to 020: a database can already report
     /// schema_version 20, and 020's `CREATE TABLE IF NOT EXISTS` would silently
@@ -2949,7 +3079,7 @@ mod tests {
 
         db.migrate().unwrap();
         assert_eq!(schema_version_of(&db), LATEST_SCHEMA_VERSION);
-        assert_eq!(LATEST_SCHEMA_VERSION, 21);
+        assert_eq!(LATEST_SCHEMA_VERSION, 22);
         assert!(table_exists(&db, "collab_checkpoints"));
 
         // The pre-upgrade session must survive the migration intact.

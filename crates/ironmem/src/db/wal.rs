@@ -7,8 +7,13 @@ use crate::error::MemoryError;
 const WAL_RETENTION_DAYS: i64 = 90;
 
 impl Database {
-    /// Log a write operation to the audit trail.
-    #[allow(dead_code)]
+    /// Log a write operation to the audit trail, in its own transaction.
+    ///
+    /// Prefer [`Self::wal_log_tx`] whenever the row belongs with a state change:
+    /// an audit row that can commit without the operation it attests to (or be
+    /// lost while the operation commits) is not an audit row. This variant is
+    /// for the cases where there is no such transaction to join — notably a
+    /// *refused* operation, whose own transaction has already rolled back.
     pub fn wal_log(
         &self,
         operation: &str,
