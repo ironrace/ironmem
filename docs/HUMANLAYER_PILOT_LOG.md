@@ -17,6 +17,8 @@ This is a spike. It produces evidence, not integration code. Findings here feed 
 | `IRONMEM_DB_PATH` | `~/.ironrace-memory/humanlayer-pilot/pilot.sqlite3` |
 | `IRONMEM_DAEMON_SOCKET` | `~/.ironrace-memory/humanlayer-pilot/daemon.sock` |
 | `IRONMEM_RERANK` | Unset. Strict string enum, so unset is off; `1`/`true` would not enable it either. |
+| Backend for writing tiers | **`--coding-agent claude`** (owner decision, 2026-08-20). Chosen because its approval gate is verified working (P-06). Accepted cost: model parity with `/collab` is lost, so #312 compares orchestration rather than models. The stored Codex OAuth credential remains for research-phase work and is revoked at teardown. |
+| Credential consequence of that choice | Claude-backend sessions authenticate from the existing Claude Code login, i.e. the operator's Pro/Max subscription — the same consumer-terms deviation from control 3 already accepted for Codex under P-05. No new exposure; recorded so #312 does not describe the pilot as running on API terms. |
 | Concurrency limit | 2 active implementation tasks |
 | Output constraint | Draft pull requests only. No merge, no deploy, no permission change. |
 
@@ -107,6 +109,14 @@ The trigger is also instructive: pilot#1's body contains the line "Mirrors ironr
 *Correction to the threat model's GitHub permission manifest, which requires owner approval:* the manifest presents selected-repositories installation as the control that keeps private and production-connected repositories out of reach. On this host it does not, and no reading of the manifest as written would have predicted otherwise. What actually kept `tenfourpro` untouched during this task was the agent's lack of interest in it.
 *Note on proportionality:* the anchor holds that Claude Code and Codex already run with this credential, so host-credential reach is baseline rather than a HumanLayer delta. That is true and this finding does not escalate it. What is new is that the pilot's written containment story credits a control that does not do the work attributed to it.
 *Action before Task 2:* either launch from a shell with a pilot-scoped or absent `GH_TOKEN`/`gh` config, or restate the manifest to claim only what it actually constrains.
+
+## Owner decisions, 2026-08-20
+
+| Decision | Choice | Consequence |
+|---|---|---|
+| Backend for tiers that write | `--coding-agent claude` | Control 5 restored; model parity with `/collab` lost |
+| Threat model manifest (P-07) | Amend, and add a host-credential control | Manifest now claims only what App scoping constrains; new mandatory control 6 and risks GH-03, GATE-01 added to `HUMANLAYER_THREAT_MODEL.md` |
+| Upstream disclosure (P-06, P-08) | Report both, after owner review of the draft | Draft prepared; nothing sent |
 
 ## Per-task run log
 
