@@ -91,9 +91,17 @@ The spawn path is largely already built. `launcher` validates the assistant bina
 
 Lead↔IC messaging uses the **harness-native `SendMessage`/`ListAgents` mesh**, which addresses other local Claude sessions by name. Explicitly *not* `collab_send`/`collab_recv`: that mailbox is a bespoke two-party (Claude↔Codex) protocol built for bounded human-gated turns, and bending it into an N-way supervision mesh would create a second messaging layer with none of the native one's addressing.
 
-> ⟨r3⟩ **VALIDATED 2026-08-23 — the assumption holds, with one caveat.** A headless `claude -p` process registers in the session registry (`~/.claude/sessions/<pid>.json`, keyed by PID), appears in `ListAgents` as an addressable peer, and `SendMessage` accepts it as a target and reports successful delivery. Supervision therefore does **not** need to degrade to drawer-polling.
+> ⟨r3⟩ **PARTIALLY VALIDATED 2026-08-23 — discovery works, delivery did not.**
 >
-> Residual caveat: delivery was confirmed, *processing* was not — the probe did not visibly alter the target's behavior, and the probe target had no `SendMessage` tool with which to reply. More importantly, `claude -p` is **one-shot**: it exits when its turn ends. So `-p` is addressable but is still the wrong primitive for an IC; the IC needs a genuinely long-lived session mode. Determining that mode is now the open transport question, rather than addressability itself.
+> **Confirmed:** a headless `claude -p` process registers in the session registry (`~/.claude/sessions/<pid>.json`, keyed by PID) and appears in `ListAgents` as an addressable peer. Discovery and addressing are real.
+>
+> **Refuted:** the message never arrived. `SendMessage` returned `success:true`, but that means *accepted for delivery*, not delivered — an asynchronous notice later reported the message was **held for the recipient user's approval and expired undelivered**. An unattended IC has no human present to grant that approval, so by default **push messaging to an unattended session silently fails.** Treating the `success:true` as proof of delivery was an error; the two are not the same claim.
+>
+> **Consequence:** the Lead must **not** depend on push messaging to ICs. v1 coordination defaults to the drawer-polling path this design already anticipated — ICs write checkpoints and dispatch-state drawers; the Lead polls them. Push messaging becomes an optimization, enabled only if the hypothesis below is confirmed.
+>
+> **Untested hypothesis worth one experiment:** the probe was launched with `--allowedTools Bash` and *without* `--dangerously-skip-permissions`. Real ICs run with skip-permissions per the blast-radius decision, which may also auto-accept inbound peer messages. If it does, push messaging is available after all. This is a cheap, decisive test and has not been run.
+>
+> Separately, `claude -p` is **one-shot** — it exits when its turn ends — so it remains the wrong IC primitive regardless of messaging. See Open Questions.
 
 ### Repo onboarding (gate discovery)
 
@@ -363,11 +371,13 @@ Two blocked states rather than one, because their resume semantics genuinely dif
 ⟨r3⟩ Both rev-2 blockers were run on 2026-08-23. One cleared; one surfaced a prerequisite.
 
 **Resolved by validation**
-1. ✅ **Headless addressability — CONFIRMED.** A `claude -p` process registers at `~/.claude/sessions/<pid>.json`, shows in `ListAgents`, and accepts `SendMessage` delivery. The transport design stands; no drawer-polling fallback needed.
+1. ⚠️ **Headless addressability — SPLIT RESULT.** Discovery works (registry entry + `ListAgents`). Delivery does **not**: the probe was held for recipient approval and expired undelivered, because an unattended session has no human to approve it. **v1 therefore defaults to drawer-polling coordination, not push messaging.** See *Transport*.
 2. ❌ **Transcript token ingestion — REGISTERED BUT NON-FUNCTIONING.** Zero `source='transcript'` rows exist in the live 525 MB DB despite metrics being enabled. See *Budget accounting*.
 
 **New, blocking — created by validation**
 3. ⟨r3⟩ **What is the long-lived IC session primitive?** `claude -p` is addressable but one-shot, so it cannot be an IC that survives a multi-hour task. Options: a persistent interactive-mode session driven programmatically, a supervised re-invocation loop where each turn is a fresh `-p` with lineage reloaded from drawers (cheaper, and the lineage store already makes it coherent), or an SDK-driven session. **This is now the highest-value open question** — it determines the IC lifecycle, the checkpoint cadence, and whether "restart from last checkpoint" is a special case or the normal mode of operation.
+
+   Bundled with it, because it is the same investigation: **does an IC launched with `--dangerously-skip-permissions` auto-accept inbound peer messages?** The 2026-08-23 probe ran *without* that flag and its message expired awaiting approval. Real ICs carry the flag anyway. One cheap experiment decides whether Lead→IC coordination is push (messaging) or pull (drawer-polling) — and the answer changes the supervision latency, cost, and failure modes.
 4. ⟨r3⟩ **Repair transcript ingestion, or accept a Lead-only ledger for v1?** Prerequisite work, outside this spec. File separately.
 
 **Tuning, deferred to implementation**
