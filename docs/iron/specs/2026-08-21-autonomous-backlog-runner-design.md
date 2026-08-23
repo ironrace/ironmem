@@ -3,7 +3,7 @@
 **Date:** 2026-08-21
 **Scope:** A new, self-contained ironmem subsystem that works labeled GitHub backlog issues to a mergeable state across all write-access repos, without a human dispatching each one. Does not touch `collab`, `iron-build`, `iron-spec`, or the HumanLayer epic.
 **Status:** Draft
-**Revision:** rev 2 — incorporates two review passes. Changes from rev 1 are marked ⟨r2⟩ where they alter a decision or add a mechanism.
+**Revision:** rev 3 — rev 2 incorporated two review passes (marked ⟨r2⟩); rev 3 folds in the results of running both blocking validations on 2026-08-23 (marked ⟨r3⟩). One cleared, one failed and produced a prerequisite. See *Open questions*.
 
 > Working name: **Autopilot**. Provisional — see Open Questions.
 
@@ -91,7 +91,9 @@ The spawn path is largely already built. `launcher` validates the assistant bina
 
 Lead↔IC messaging uses the **harness-native `SendMessage`/`ListAgents` mesh**, which addresses other local Claude sessions by name. Explicitly *not* `collab_send`/`collab_recv`: that mailbox is a bespoke two-party (Claude↔Codex) protocol built for bounded human-gated turns, and bending it into an N-way supervision mesh would create a second messaging layer with none of the native one's addressing.
 
-> ⟨r2⟩ **Load-bearing assumption, not yet validated:** that an *unattended, long-running* IC process is simultaneously addressable via `SendMessage`/`ListAgents`. A one-shot `claude -p` is not an addressable session. If this proves false, supervision degrades to polling the dispatch-state drawers (below) instead of pinging, which the design supports but which changes latency and cost. **Validate before implementation** — see Open Questions.
+> ⟨r3⟩ **VALIDATED 2026-08-23 — the assumption holds, with one caveat.** A headless `claude -p` process registers in the session registry (`~/.claude/sessions/<pid>.json`, keyed by PID), appears in `ListAgents` as an addressable peer, and `SendMessage` accepts it as a target and reports successful delivery. Supervision therefore does **not** need to degrade to drawer-polling.
+>
+> Residual caveat: delivery was confirmed, *processing* was not — the probe did not visibly alter the target's behavior, and the probe target had no `SendMessage` tool with which to reply. More importantly, `claude -p` is **one-shot**: it exits when its turn ends. So `-p` is addressable but is still the wrong primitive for an IC; the IC needs a genuinely long-lived session mode. Determining that mode is now the open transport question, rather than addressability itself.
 
 ### Repo onboarding (gate discovery)
 
@@ -231,7 +233,11 @@ Verified against `crates/ironmem/src/hook.rs`:
 - **It is best-effort by design** (`hook.rs:451` — "warns on failure, never fails the hook"), so a parse or upsert failure silently under-counts spend.
 - **It refuses incomplete data:** the Claude parser rejects any transcript lacking a terminal `result` event (`metrics/transcript.rs:108`). **A watchdog-killed or crashed IC therefore contributes zero recorded tokens** — the sessions most likely to have burned budget are precisely the ones invisible to `token_usage`.
 
-Consequence: the Lead maintains its **own** daily ledger drawer as the authoritative budget record, incremented at dispatch/completion boundaries, and treats `token_usage` as a reconciliation source rather than ground truth. Relying on `token_usage` alone would make the stop-condition unenforceable in exactly the failure cases that matter.
+⟨r3⟩ **EMPIRICALLY BROKEN — measured 2026-08-23.** The live database (`~/.ironrace-memory/memory.sqlite3`, 525 MB) contains **zero `source='transcript'` rows**. Not a reduced count — none, ever. Only `mcp_response` (11,754), `llm_rerank` (10), and `pref_extract` (10) are present. This is not the feature being switched off: `metrics_enabled()` defaults to true and `IRONMEM_METRICS` is unset, so the path is enabled, implemented, hook-registered — and has never once persisted a row.
+
+A likely contributing cause is visible in `~/.claude/settings.json`: the `Stop` hook is wrapped in `timeout --kill-after=2 5` and ends `2>/dev/null || true` — a **5-second cap with every error silenced**. `PreCompact`, by contrast, is given 60s. Parsing a large transcript within 5s is optimistic, and the silencing means no failure was ever surfaced.
+
+Consequence, strengthened: the Lead's **own** daily ledger drawer is not a hedge but the *only* viable budget record, incremented at dispatch/completion boundaries. `token_usage` cannot serve even as reconciliation until transcript ingestion is repaired — which is **prerequisite work outside this spec**, and should be filed as its own issue. Building the budget stop-condition on `token_usage` as it stands today would produce a ceiling that never triggers.
 
 ### Secret handling on the lineage write path ⟨r2⟩
 
@@ -354,17 +360,21 @@ Two blocked states rather than one, because their resume semantics genuinely dif
 
 ## Open questions
 
-Tuning parameters, naming, and two validations. Only the validations gate implementation:
+⟨r3⟩ Both rev-2 blockers were run on 2026-08-23. One cleared; one surfaced a prerequisite.
 
-**Must validate before building**
-1. ⟨r2⟩ **Is a headless, long-running IC addressable via `SendMessage`/`ListAgents`?** If not, supervision becomes drawer-polling. Affects the transport section directly.
-2. ⟨r2⟩ **Does the `stop` hook fire for unattended IC sessions with `transcript_path` populated?** Ingestion is registry-driven and not collab-gated, but hook firing in headless mode is unconfirmed.
+**Resolved by validation**
+1. ✅ **Headless addressability — CONFIRMED.** A `claude -p` process registers at `~/.claude/sessions/<pid>.json`, shows in `ListAgents`, and accepts `SendMessage` delivery. The transport design stands; no drawer-polling fallback needed.
+2. ❌ **Transcript token ingestion — REGISTERED BUT NON-FUNCTIONING.** Zero `source='transcript'` rows exist in the live 525 MB DB despite metrics being enabled. See *Budget accounting*.
+
+**New, blocking — created by validation**
+3. ⟨r3⟩ **What is the long-lived IC session primitive?** `claude -p` is addressable but one-shot, so it cannot be an IC that survives a multi-hour task. Options: a persistent interactive-mode session driven programmatically, a supervised re-invocation loop where each turn is a fresh `-p` with lineage reloaded from drawers (cheaper, and the lineage store already makes it coherent), or an SDK-driven session. **This is now the highest-value open question** — it determines the IC lifecycle, the checkpoint cadence, and whether "restart from last checkpoint" is a special case or the normal mode of operation.
+4. ⟨r3⟩ **Repair transcript ingestion, or accept a Lead-only ledger for v1?** Prerequisite work, outside this spec. File separately.
 
 **Tuning, deferred to implementation**
-3. **Name.** "Autopilot" is a working title.
-4. Concurrency cap — initial `N` for in-flight ICs.
-5. Daily token budget — the actual ceiling figure.
-6. ⟨r2⟩ Within-dispatch retry bound, thrash-detection threshold, and cross-dispatch per-issue attempt cap — three distinct numbers.
-7. Retention policy specifics — when attempt records compact to a summary.
-8. ⟨r2⟩ Whether ICs (not just the reviewer) should route to Codex for some task classes.
-9. Whether the Lead reuses `evaluate-issue` (DIRECT/IRON/COLLAB/SPLIT scoring, and its mandatory split above 15 tasks) for decomposition, or classifies independently.
+5. **Name.** "Autopilot" is a working title.
+6. Concurrency cap — initial `N` for in-flight ICs.
+7. Daily token budget — the actual ceiling figure.
+8. ⟨r2⟩ Within-dispatch retry bound, thrash-detection threshold, and cross-dispatch per-issue attempt cap — three distinct numbers.
+9. Retention policy specifics — when attempt records compact to a summary.
+10. ⟨r2⟩ Whether ICs (not just the reviewer) should route to Codex for some task classes.
+11. Whether the Lead reuses `evaluate-issue` (DIRECT/IRON/COLLAB/SPLIT scoring, and its mandatory split above 15 tasks) for decomposition, or classifies independently.
