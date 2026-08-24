@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-21
 **Scope:** A new, self-contained ironmem subsystem that works labeled GitHub backlog issues to a mergeable state across all write-access repos, without a human dispatching each one. Does not touch `collab`, `iron-build`, `iron-spec`, or the HumanLayer epic.
-**Status:** Draft
+**Status:** **Approved** — 2026-08-23, by Jeff Crum, at rev 4.
 **Revision:** rev 4 — rev 2 incorporated two review passes (marked ⟨r2⟩); rev 3 folded in the first validation round (⟨r3⟩); rev 4 folds in a second, controlled validation round on 2026-08-23 (marked ⟨r4⟩) that **reverses one rev-3 finding, retires one blocker, and settles the IC-primitive question**. See *Open questions*.
 
 > ⟨r4⟩ **Read this first if you read rev 3.** Rev 3 recorded that push messaging to an unattended session fails. That was an artifact of the probe's own configuration, not a property of the system. Re-run as a controlled A/B, push messaging **works**. Rev 3's *Transport* section was wrong and is replaced. Separately, the transcript-ingestion breakage rev 3 called a prerequisite is no longer on the critical path.
@@ -465,6 +465,8 @@ Two blocked states rather than one, because their resume semantics genuinely dif
 5. ⚠️ **Transcript token ingestion is non-functioning** — zero `source='transcript'` rows in the live DB. ⟨r4⟩ **Demoted from prerequisite to hygiene.** Autopilot now meters spend from each invocation's result JSON and does not depend on the hook, even for reconciliation. Still worth its own issue, because the metrics surface is broken for every other consumer.
 
 **Still open, and worth deciding before implementation**
+
+> **Approved 2026-08-23 at rev 4.** These three were explicitly *not* resolved by the approval — the design is approved, the tuning below is not yet decided. Each changes the shape of an implementation plan, so settle them before `/iron-plan` rather than during it.
 
 6. **Per-turn wall-clock bound.** The re-invocation loop needs a timeout after which a turn is considered wedged and killed. Distinct from `--max-budget-usd` (spend) and `--max-turns` (agentic iterations); nothing measured so far constrains it.
 7. **What the Lead actually puts in a turn prompt.** The primitive is settled; the prompt template is not. It must carry the issue, the gate results, the lineage of failed approaches, and any strategy redirect — cheaply enough that it does not defeat the cache economics.
