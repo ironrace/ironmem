@@ -2,8 +2,8 @@
 
 **Date:** 2026-08-21
 **Scope:** A new, self-contained ironmem subsystem that works labeled GitHub backlog issues to a mergeable state across all write-access repos, without a human dispatching each one. Does not touch `collab`, `iron-build`, `iron-spec`, or the HumanLayer epic.
-**Status:** **Approved** — 2026-08-23, by Jeff Crum, at rev 4. Rev-5 amendment approved 2026-08-24.
-**Revision:** rev 5 — rev 2 incorporated two review passes (⟨r2⟩); rev 3 folded in the first validation round (⟨r3⟩); rev 4 folded in a controlled second round (⟨r4⟩) that reversed one rev-3 finding, retired one blocker, and settled the IC primitive; rev 5 (⟨r5⟩) **generalises that primitive by one parameter** and adds model routing. See *Open questions*.
+**Status:** **Approved** — 2026-08-23, by Jeff Crum, at rev 4. Rev-5 amendment approved 2026-08-24. Rev 6 is validation-only (rung 0 of the `/goal` build ladder) and records measurement, not a design change requiring re-approval.
+**Revision:** rev 6 — rev 2 incorporated two review passes (⟨r2⟩); rev 3 folded in the first validation round (⟨r3⟩); rev 4 folded in a controlled second round (⟨r4⟩) that reversed one rev-3 finding, retired one blocker, and settled the IC primitive; rev 5 (⟨r5⟩) **generalises that primitive by one parameter** and adds model routing; rev 6 (⟨r6⟩) is rung 0 of the build ladder — it measures the ⟨r5-doc⟩ claims for real, closes open question 6a with a working mitigation, and writes the turn-prompt template rev 4/5 never tested. See *Open questions*.
 
 > ⟨r5⟩ **What changed from rev 4, in one line.** Rev 4 fixed the IC's supervision boundary at one process per *turn*. Rev 5 makes the number of turns per process a parameter, **N**, driven by a `/goal` condition inside the process. **Rev 4 is the N = 1 case and remains valid.** Nothing else about the architecture moves.
 
@@ -198,6 +198,83 @@ The reason N > 1 pays is that a Lead turn is not free. At N = 1 an Opus Lead spe
 2. ⟨r5⟩ **"Impossible" must be distinguishable from "met."** The evaluator can judge a condition unsatisfiable, which clears the goal and ends the invocation — a normal-looking exit. If the Lead cannot tell that from success it will treat abandonment as completion. Whether the result JSON distinguishes them is **unverified**; see *Open questions*.
 
 **Also unchanged from rev 4:** `--name` gives ICs deterministic addresses (`ic-ironmem-283`) for both `ListAgents` and the abort path, and `--json-schema` lets the Reviewer's verdict be schema-validated rather than parsed out of prose.
+
+### The turn-prompt template ⟨r6⟩
+
+⟨r6⟩ Rung 0 built and ran this template against a real gate command in this repo (`cargo fmt --all -- --check`, read-only), across two separate processes joined by `--resume`, and separately probed it with a deliberately unsatisfiable condition. It worked as designed, with one required addition — see *6a, closed* below.
+
+**The condition text (fills the `"..."` in the CLI invocation above):**
+
+```
+You are an IC dispatch for issue <repo>#<issue_number>: "<issue title>".
+
+<issue body, or a summary if it exceeds budget>
+
+Prior attempts on this issue (read before doing anything else):
+<lineage: one line per past attempt — approach, verdict, why_failed — or
+"none yet" for attempt 1>
+<if a strategy redirect is in force: state it explicitly here, e.g.
+"Do not retry <approach>; it failed for <reason>. Try <redirect> instead.">
+
+Constraints: feature-branch push only, never push to the default branch. Stay
+inside your worktree. Never touch credential or secret files.
+
+Checkpoint your progress (what you tried, current state, next step) after
+EVERY turn, not just at the end — you may be re-invoked as a fresh process
+with only this checkpoint and the transcript to resume from.
+
+The gate condition for this repo (generated from its approved gate config,
+never authored separately): <gate command(s) and their required exit
+status/output, verbatim from the approved config>.
+
+Report your verdict using the required output schema when, and only when,
+you have either satisfied the gate condition above or determined it cannot be
+satisfied. Do not guess; if you are unsure whether it is met, the verdict is
+not_met and you take another turn.
+
+or stop after N turns
+```
+
+**Required CLI addition, not optional:** `--json-schema
+'{"type":"object","properties":{"verdict":{"type":"string","enum":["met","impossible","not_met"]},"reason":{"type":"string"}},"required":["verdict","reason"],"additionalProperties":false}'`.
+This is what makes 6a mechanically answerable — see below. `reason` is what the
+Lead's dispatch-state drawer and the eventual lineage record quote verbatim; it
+does not need separate free-text summarization.
+
+**Measured 2026-08-24 ⟨r6⟩:** two dispatches on one session id, joined by
+`--resume`, driving the real `cargo fmt --all -- --check` gate in this repo:
+dispatch 1 (5 turns, first invocation) cost $0.187 and produced a checkpoint
+file; dispatch 2 (1 turn, `--resume`) recalled the gate command, its exit
+code, and the checkpoint's summary **verbatim, without re-running the gate**,
+for $0.036 — about 19% of dispatch 1's cost. This is the r4 resume-cost
+finding reproduced against the template's own phrasing rather than a planted
+secret, and against a real gate command rather than a synthetic one.
+
+### 6a, closed ⟨r6⟩
+
+**The base result JSON does not distinguish "met" from "impossible."**
+Confirmed by a controlled A/B: a trivially satisfiable condition and a
+deliberately unsatisfiable one (retrieve a CA root's private key) produced
+**identical** `terminal_reason` (`"completed"`), `stop_reason` (`"end_turn"`),
+`subtype` (`"success"`), and `is_error` (`false`). No field, at any depth of
+the JSON, names a verdict. A Lead reading only those fields cannot tell
+abandonment from completion, exactly as OQ6a warned.
+
+**Mitigation, tested and working: force the verdict through
+`--json-schema`.** Re-run with the schema above, both arms returned a
+top-level `structured_output` object — `{"verdict":"met","reason":"..."}` for
+the satisfiable arm, `{"verdict":"impossible","reason":"..."}` for the
+unsatisfiable one — cleanly distinguishable by exact string match, no
+transcript parsing or second LLM judgment required. `stop_reason` changes to
+`"tool_use"` under the schema (structured output is implemented as a forced
+final tool call), which does not interfere with the IC's normal tool use
+earlier in the dispatch. **This is now a required element of the turn-prompt
+template, not an optional nicety** — see above. Cost overhead was visible but
+not characterized: the schema-constrained satisfiable-arm probe cost $0.237
+against $0.128 for the unconstrained equivalent, plausibly fixed
+schema/tool-registration overhead rather than a per-turn cost; this needs
+re-measurement against a real (non-trivial) IC workload before being treated
+as a rate rather than a one-time cost.
 
 ### Model routing ⟨r5⟩
 
@@ -400,7 +477,7 @@ The lineage store is shaped so the AVO loop is additive: add a `score` field to 
 | Condition | Behavior |
 |---|---|
 | ⟨r5⟩ IC process exits at end of dispatch | **Normal, not a fault.** The Lead banks the dispatch's cost and re-invokes on the same session uuid. |
-| ⟨r5⟩ Goal evaluator returns **impossible** | The goal clears and the invocation ends — a normal-looking exit. The Lead **must** distinguish this from success before recording an outcome; treat an indistinguishable case as failure, never as completion. |
+| ⟨r5⟩ Goal evaluator returns **impossible** | The goal clears and the invocation ends — a normal-looking exit. ⟨r6⟩ **Mechanism, measured:** the base result JSON carries no verdict field — `terminal_reason`/`stop_reason`/`subtype`/`is_error` are identical for a met and an impossible dispatch. The Lead distinguishes them via the turn-prompt template's required `--json-schema`, reading `structured_output.verdict`. A dispatch with no `structured_output` field (schema not honored, e.g. an infrastructure failure mid-turn) is never treated as met. |
 | ⟨r5⟩ Goal condition and approved gates disagree | Cannot occur by construction: the condition is generated from the gate config. A test guards it. |
 | ⟨r5⟩ Loop halts on the no-tool-use anti-stall | Returns control with the goal still set. To the Lead this is a short dispatch; it counts as an attempt and the next dispatch resumes normally. |
 | ⟨r5⟩ Auth failure, exhausted credits, unrecoverable context overflow, or model unavailable | Clears the goal mid-dispatch. Distinguish from a completed dispatch; these are infrastructure failures, never attempts, and must not consume the per-issue attempt cap. |
@@ -452,6 +529,7 @@ The lineage store is shaped so the AVO loop is additive: add a `score` field to 
 | ⟨r4⟩ Dispatch N+1 resumed by a fresh process sees dispatch N's context | The session primitive actually persists across processes |
 | ⟨r5⟩ The `/goal` condition is generated from the approved gate config, never authored separately | One definition of "done" |
 | ⟨r5⟩ An evaluator verdict of *impossible* is recorded as a failure, not a completion | The normal-looking-exit trap |
+| ⟨r6⟩ Dispatch invoked without a valid `structured_output.verdict` (missing, malformed, or schema not honored) is never recorded as met | Guards the mechanism 6a's fix depends on — base JSON alone gives no signal, so its absence must fail closed |
 | ⟨r5⟩ A dispatch cleared by auth failure or credit exhaustion does not consume the per-issue attempt cap | Infrastructure failure is not an attempt |
 | ⟨r5⟩ N = 1 reproduces rev-4 behaviour exactly | The parameterisation is a generalisation, not a replacement |
 | ⟨r4⟩ Ledger total equals the sum of per-invocation `total_cost_usd` | Budget meter is exact, and independent of the metrics hook |
@@ -525,7 +603,7 @@ Two blocked states rather than one, because their resume semantics genuinely dif
 
 ## Open questions
 
-⟨r4⟩ Two validation rounds have now run (2026-08-23). Round 1 produced one blocker and one reversal-in-waiting; round 2 reversed it and retired the blocker.
+⟨r4⟩ Three validation rounds have now run. Round 1 (2026-08-23) produced one blocker and one reversal-in-waiting; round 2 (2026-08-23) reversed it and retired the blocker; ⟨r6⟩ round 3 (2026-08-24, rung 0 of the build ladder) measured the ⟨r5-doc⟩ `/goal` claims for real and closed open question 6a.
 
 **Resolved by validation**
 
@@ -534,26 +612,25 @@ Two blocked states rather than one, because their resume semantics genuinely dif
 3. ✅ **Is Lead→IC coordination push or pull? — SETTLED: both, with distinct jobs.** Pull (the next dispatch's prompt) is the control channel, because it is guaranteed-read and has no delivery dependency. Push is reserved for aborting a turn already in flight, because its latency is bounded by the IC's tool-call cadence and can never be relied on for assignment.
 4. ⚠️ **Checkpoint cadence — RE-OPENED BY REV 5, then closed by instruction.** Rev 4 got it free: the turn boundary *was* the process boundary. At N > 1 intra-dispatch turns are evaluator-driven, so the IC must be **explicitly instructed** to checkpoint every turn. Settled in substance — the IC checkpoints per turn — but it is now a prompt requirement rather than a structural guarantee, and can therefore be got wrong.
 5. ⚠️ **Transcript token ingestion is non-functioning** — zero `source='transcript'` rows in the live DB. ⟨r4⟩ **Demoted from prerequisite to hygiene.** Autopilot now meters spend from each invocation's result JSON and does not depend on the hook, even for reconciliation. Still worth its own issue, because the metrics surface is broken for every other consumer.
+6. ✅ ⟨r6⟩ **Does the result JSON distinguish "met" from "impossible"? — CLOSED, negative, with a working mitigation.** Measured 2026-08-24: the base result JSON does not — `terminal_reason`, `stop_reason`, `subtype`, and `is_error` were byte-identical between a satisfiable and a deliberately unsatisfiable condition in a controlled A/B. **Fix:** the turn-prompt template now requires `--json-schema` with an enum `verdict` field (`met`/`impossible`/`not_met`); tested, and both arms produced a correctly-distinguishing `structured_output.verdict`. This was the one unverified load-bearing fact in rev 5, and it did not hold without the fix — see *6a, closed* under *IC lifecycle*.
 
 **Still open, and worth deciding before implementation**
 
 > **Approved 2026-08-23 at rev 4.** These three were explicitly *not* resolved by the approval — the design is approved, the tuning below is not yet decided. Each changes the shape of an implementation plan, so settle them before `/iron-plan` rather than during it.
 
-6. **Per-dispatch wall-clock bound, and N itself.** ⟨r5⟩ Two numbers, not one. The dispatch needs a timeout after which it is considered wedged and killed — distinct from `--max-budget-usd` (spend) and `--max-turns` (hard iteration cap). And **N**, the turns per dispatch, trades supervision granularity against Lead spend; 5–8 is a starting suggestion, not a measured figure.
-
-6a. ⟨r5⟩ **Does the result JSON distinguish "met" from "impossible"?** Unverified, and load-bearing: an evaluator that judges a condition unsatisfiable clears the goal and ends the invocation, which from outside looks like a clean finish. If the Lead cannot tell them apart it will record abandonment as completion. First thing to measure in rung 0; cheap to test.
-7. **What the Lead actually puts in a turn prompt.** The primitive is settled; the prompt template is not. It must carry the issue, the gate results, the lineage of failed approaches, and any strategy redirect — cheaply enough that it does not defeat the cache economics.
-8. **Whether the Lead is a Claude session at all.** `claude agents --json` and per-invocation result JSON are both plain CLI surfaces, so a Rust supervisor could run the loop and reserve a Claude session for judgment calls only. This would make the Lead unwedgeable at the cost of splitting its reasoning. Not decided.
+7. **Per-dispatch wall-clock bound, and N itself.** ⟨r5⟩ Two numbers, not one. The dispatch needs a timeout after which it is considered wedged and killed — distinct from `--max-budget-usd` (spend) and `--max-turns` (hard iteration cap). And **N**, the turns per dispatch, trades supervision granularity against Lead spend; 5–8 is a starting suggestion, not a measured figure. ⚠️ ⟨r6⟩ **Partially addressed, not settled.** Rung 0's dispatches were lightweight (a file write, one real but fast gate command; 8–20s wall-clock, 1–5 turns) — nowhere near a real gate suite (`cargo test --workspace`, `xcodebuild`, a Python suite), so no responsible timeout constant can be derived from them; inventing one now would repeat the single-arm-probe mistake this spec's own method notes warn against. **Recommend:** make the wall-clock bound a **per-repo config value** (part of the same approved gate config the `/goal` condition is generated from), not a single global constant — repos' gate suites vary by an order of magnitude or more. N stays at the unchanged 5–8 suggestion; nothing rung 0 measured argues for a different number, because rung 0's tasks were too light to observe the thrash-timing tradeoff that actually determines it. Both need real-workload measurement, which is rung 4's job, not rung 0's.
+8. ✅ ⟨r6⟩ **What the Lead actually puts in a turn prompt. — ANSWERED.** See the *turn-prompt template* under *IC lifecycle*: issue + lineage + active strategy redirect + worktree/push constraints + explicit per-turn checkpoint instruction + the gate condition (generated from the repo's approved config, never authored separately) + the schema-validated verdict requirement. Built and run for real against this repo's own `cargo fmt` gate across two `--resume`-joined dispatches; see the cost figures there.
+9. ⚠️ ⟨r6⟩ **Whether the Lead is a Claude session at all. — NARROWED, not settled.** The strongest prior argument for a full Claude-session Lead was that distinguishing "met" from "impossible" looked like it needed semantic judgment over a transcript. Closing 6a removes that argument: with the schema fix, verdict-reading is an exact string match, not a judgment call. Re-surveying the Lead's actual responsibilities against that: dispatch-state bookkeeping, cost banking, `gh pr merge` on the deterministic PASS+low-risk+class-match rule, and drawer reconciliation via `claude agents --json` are all mechanical and Rust-native. What remains genuinely judgment-shaped is smaller than rev 5 assumed but not zero: **dispatch-time risk classification** (reading an issue's natural-language content to route it), **composing a strategy redirect** when an IC is thrashing, and **drafting a human escalation question**. **Recommend, pending rung 4/8 implementation experience:** a Rust-native mechanical supervisor loop, with those few judgment-shaped steps as short, individually-costed one-shot LLM calls rather than one long-lived Lead session holding everything in context — unwedgeable by construction, at the cost of splitting the reasoning across calls exactly as OQ8 originally flagged. Not a full close-out: cross-repo prioritization and thrash detection weren't exercised by rung 0 and could still tip this back toward a persistent session.
 
 **Tuning, deferred to implementation**
 
-9. **Name.** "Autopilot" is a working title.
-10. Concurrency cap — initial `N` for in-flight ICs.
-11. Daily token budget — the actual ceiling figure, and the per-turn `--max-budget-usd`.
-12. ⟨r2⟩ Within-dispatch retry bound, thrash-detection threshold, and cross-dispatch per-issue attempt cap — three distinct numbers.
-13. Retention policy specifics — when attempt records compact to a summary.
-14. ⟨r2⟩ Whether ICs (not just the reviewer) should route to Codex for some task classes.
-15. Whether the Lead reuses `evaluate-issue` (DIRECT/IRON/COLLAB/SPLIT scoring, and its mandatory split above 15 tasks) for decomposition, or classifies independently.
+10. **Name.** "Autopilot" is a working title.
+11. Concurrency cap — initial `N` for in-flight ICs.
+12. Daily token budget — the actual ceiling figure, and the per-turn `--max-budget-usd`.
+13. ⟨r2⟩ Within-dispatch retry bound, thrash-detection threshold, and cross-dispatch per-issue attempt cap — three distinct numbers.
+14. Retention policy specifics — when attempt records compact to a summary.
+15. ⟨r2⟩ Whether ICs (not just the reviewer) should route to Codex for some task classes.
+16. Whether the Lead reuses `evaluate-issue` (DIRECT/IRON/COLLAB/SPLIT scoring, and its mandatory split above 15 tasks) for decomposition, or classifies independently.
 
 ---
 
@@ -570,8 +647,14 @@ Two blocked states rather than one, because their resume semantics genuinely dif
 | 2 | 2026-08-23 | `claude agents --json` enumerates sessions without a TTY | ✅ |
 | 2 | 2026-08-23 | `-p` sessions expose busy/idle status | ❌ liveness only |
 | 2 | 2026-08-23 | `--bg` agents are drivable as ICs | ❌ not addressable peers |
-| — | 2026-08-24 | `/goal` mechanics (loop-to-completion under `-p`, transcript-only evaluator, met/not-met/impossible verdicts, anti-stall, goal-clearing errors, 4,000-char condition) | 📄 **documented, not measured** — from code.claude.com/docs/en/goal. Rung 0 measures them |
-| — | 2026-08-24 | Does result JSON distinguish "met" from "impossible"? | ❓ **unknown** — see open question 6a |
+| — | 2026-08-24 | `/goal` mechanics (loop-to-completion under `-p`, transcript-only evaluator, met/not-met/impossible verdicts, anti-stall, goal-clearing errors, 4,000-char condition) | 📄 documented pre-rung-0; loop-to-completion, met/impossible verdicts (via schema), and the condition-as-opening-directive behavior are now ✅ measured — see round 3 below. Anti-stall, goal-clearing-error, and 4,000-char-limit behavior were not separately probed this round |
+| 3 | 2026-08-24 | Does the base result JSON distinguish "met" from "impossible"? | ❌ **no** — `terminal_reason`, `stop_reason`, `subtype`, `is_error` identical across a controlled A/B (satisfiable vs. deliberately unsatisfiable condition). See OQ6a |
+| 3 | 2026-08-24 | Does `--json-schema` fix that? | ✅ forces a top-level `structured_output.verdict` (`met`/`impossible`/`not_met`), correct in both arms of the same A/B. Now required in the turn-prompt template |
+| 3 | 2026-08-24 | `--resume` carries the turn-prompt template's own content (not just a planted secret) across separate processes | ✅ dispatch 2 recalled the real gate command, its exit code, and the checkpoint summary verbatim without re-running the gate |
+| 3 | 2026-08-24 | Resume cost, reproduced against a real gate command | ✅ dispatch 1 (first invocation, 5 turns): $0.187. dispatch 2 (`--resume`, 1 turn): $0.036 — ~19% of dispatch 1 |
+| 3 | 2026-08-24 | Goal evaluator (Haiku) cost is a separate, small, billed line | ✅ appears as its own `modelUsage` entry in every probe, $0.002–$0.021 per dispatch regardless of turn count |
+| 3 | 2026-08-24 | Goal evaluator cache reuse across turns/dispatches | ❌ `cacheReadInputTokens` was 0 for the Haiku line in all six probes — each evaluation re-creates its cache; the "intra-dispatch iteration is cheap" claim holds in absolute terms ($0.02-ish) but not because of cache reuse |
+| 3 | 2026-08-24 | Total rung-0 probe spend | 6 invocations, $0.644 total |
 
 **Method note, worth keeping.** Both rev-3 errors share a root cause: a single-arm probe was treated as a conclusion. `success: true` was read as *delivered* when it meant *accepted*, and a negative result from a probe differing from production in one flag was written into the spec as a property of production. Round 2 was run as a controlled A/B for that reason.
 
