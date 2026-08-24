@@ -2,8 +2,12 @@
 
 **Date:** 2026-08-21
 **Scope:** A new, self-contained ironmem subsystem that works labeled GitHub backlog issues to a mergeable state across all write-access repos, without a human dispatching each one. Does not touch `collab`, `iron-build`, `iron-spec`, or the HumanLayer epic.
-**Status:** **Approved** — 2026-08-23, by Jeff Crum, at rev 4.
-**Revision:** rev 4 — rev 2 incorporated two review passes (marked ⟨r2⟩); rev 3 folded in the first validation round (⟨r3⟩); rev 4 folds in a second, controlled validation round on 2026-08-23 (marked ⟨r4⟩) that **reverses one rev-3 finding, retires one blocker, and settles the IC-primitive question**. See *Open questions*.
+**Status:** **Approved** — 2026-08-23, by Jeff Crum, at rev 4. Rev-5 amendment approved 2026-08-24.
+**Revision:** rev 5 — rev 2 incorporated two review passes (⟨r2⟩); rev 3 folded in the first validation round (⟨r3⟩); rev 4 folded in a controlled second round (⟨r4⟩) that reversed one rev-3 finding, retired one blocker, and settled the IC primitive; rev 5 (⟨r5⟩) **generalises that primitive by one parameter** and adds model routing. See *Open questions*.
+
+> ⟨r5⟩ **What changed from rev 4, in one line.** Rev 4 fixed the IC's supervision boundary at one process per *turn*. Rev 5 makes the number of turns per process a parameter, **N**, driven by a `/goal` condition inside the process. **Rev 4 is the N = 1 case and remains valid.** Nothing else about the architecture moves.
+
+> ⟨r5⟩ **Provenance note.** The ⟨r4⟩ findings were *measured* on this machine. The ⟨r5⟩ `/goal` mechanics are *documented* behaviour (code.claude.com/docs/en/goal), not yet measured here. They are marked ⟨r5-doc⟩ where load-bearing, and rung 0 of the build sequence exists partly to measure them.
 
 > ⟨r4⟩ **Read this first if you read rev 3.** Rev 3 recorded that push messaging to an unattended session fails. That was an artifact of the probe's own configuration, not a property of the system. Re-run as a controlled A/B, push messaging **works**. Rev 3's *Transport* section was wrong and is replaced. Separately, the transcript-ingestion breakage rev 3 called a prerequisite is no longer on the critical path.
 
@@ -62,7 +66,7 @@ This is not an ironmem-only problem. It applies across all repos — ironmem is 
 ```
         cron watchdog  ──(restarts if wedged)──►  Lead
                                                     │
-         control: re-invoke `-p --resume` per turn  │  (pull)
+     control: re-invoke `-p --resume` per dispatch  │  (pull)
                interrupt: SendMessage (abort only)  │  (push, best-effort)
                                                     │
                     ┌───────────────┬───────────────┴───────────────┐
@@ -96,7 +100,7 @@ The spawn path is largely already built. `launcher` validates the assistant bina
 
 Lead↔IC coordination is **pull for control, push for interrupts**. Explicitly *not* `collab_send`/`collab_recv`: that mailbox is a bespoke two-party (Claude↔Codex) protocol built for bounded human-gated turns, and bending it into an N-way supervision mesh would create a second messaging layer with none of the native one's addressing.
 
-**Control is pull.** The Lead directs an IC by writing the next turn's prompt, not by messaging a running one. Direction is therefore guaranteed to be read, arrives with no delivery dependency, and does not require the IC to be at a convenient point in its work. Status flows the other way through checkpoint and dispatch-state drawers the Lead polls.
+**Control is pull.** The Lead directs an IC by writing the next dispatch's prompt, not by messaging a running one. ⟨r5⟩ Direction is therefore guaranteed to be read, arrives with no delivery dependency, and does not require the IC to be at a convenient point in its work. Status flows the other way through checkpoint and dispatch-state drawers the Lead polls.
 
 **Push exists, and is reserved for interrupts.** Rev 3 recorded that push messaging to an unattended session fails. That was wrong — see the correction below. Push is used for exactly one job: aborting a turn already in flight (daily budget exhausted, human stop, issue closed upstream, duplicate PR merged). The alternative is `SIGKILL`, which discards that turn's spend and any uncheckpointed reasoning. Push is never used to assign work, because its latency is unbounded (below).
 
@@ -121,46 +125,96 @@ Lead↔IC coordination is **pull for control, push for interrupts**. Explicitly 
 
 **A coupling to keep in view:** push works *only* in bypass mode. Any future decision to run an IC without `--dangerously-skip-permissions` therefore also, and silently, removes the ability to abort it cleanly. The blast-radius decision and the interrupt channel are one decision, not two.
 
-### IC lifecycle — the session primitive ⟨r4⟩
+### IC lifecycle — the session primitive ⟨r4⟩⟨r5⟩
 
 Rev 3 left this as the highest-value open question: `claude -p` is one-shot, so what is a long-lived IC? The answer is that **an IC does not need a long-lived process, only a long-lived session.**
 
-**One turn = one process.** The Lead assigns a UUID at dispatch and invokes:
+⟨r5⟩ Rev 4 answered that with *one process per turn*. That was right about the session and wrong about the boundary: it assumed the Lead must own **every** turn boundary, when what the Lead actually needs is a boundary often enough to supervise. Those are different numbers.
+
+**One dispatch = one process = N turns.** The Lead assigns a UUID and invokes:
 
 ```
-claude -p "<turn prompt>" \
-  --session-id <uuid>              # first turn only; --resume <uuid> thereafter
+claude -p "/goal <the repo's approved gate condition> or stop after N turns" \
+  --session-id <uuid>              # first dispatch only; --resume <uuid> thereafter
   --output-format json \
   --name ic-<repo>-<issue> \
+  --model <per risk class> \
   --dangerously-skip-permissions \
-  --max-budget-usd <per-turn ceiling> \
-  --max-turns <bound>
+  --max-budget-usd <per-dispatch ceiling> \
+  --max-turns <hard bound>
 ```
 
-The process runs a full agentic loop, ends its turn, writes its checkpoint, and exits. The Lead reads the result JSON, decides, and invokes the next turn against the same session id.
+Inside the process, `/goal` runs the turn loop: after each turn a small fast model judges the condition against the transcript and either starts another turn or stops. The process exits, the Lead reads the result JSON, banks the cost, decides, and invokes the next dispatch against the same session id.
 
-**Validated 2026-08-23, same round as the transport A/B:**
+**N is the one new knob.** It trades supervision granularity against Lead cost:
+
+| N | Behaviour |
+|---|---|
+| `1` | Exactly rev 4. The Lead composes every turn. Maximum control, maximum Lead spend. |
+| `5–8` | Suggested starting range. The Lead supervises several times per issue; intra-dispatch iteration is priced at the evaluator's model, not the Lead's. |
+| unbounded | A pure goal loop. The Lead sees one result at the end and supervises nothing in between. Rejected — see *Alternatives*. |
+
+The reason N > 1 pays is that a Lead turn is not free. At N = 1 an Opus Lead spends one of its own turns per IC turn, plausibly exceeding the cost of the work being supervised. At N = 6 that supervision cost drops roughly six-fold while the Lead still gets six checkpoints per issue.
+
+**Measured 2026-08-23 ⟨r4⟩:**
 
 | Claim | Result |
 |---|---|
 | `--session-id` + `--resume` restores context across *separate processes* | ✅ a secret planted in turn 1 was recalled verbatim by a fresh process in turn 2 |
-| Resume is affordable | ✅ turn 1 created 53,763 cache tokens at $0.538; turn 2 read all 53,763 from cache at **$0.028 — ~5%**. Entries are `ephemeral_1h`, so turns less than an hour apart ride the cache |
+| Resume is affordable | ✅ turn 1 created 53,763 cache tokens at $0.538; turn 2 read all 53,763 from cache at **$0.028 — ~5%**. Entries are `ephemeral_1h`, so invocations less than an hour apart ride the cache |
 | `--output-format json` yields a usable meter | ✅ returns `total_cost_usd`, full `usage`, `num_turns`, `duration_ms`, `permission_denials`, `session_id`, `is_error` |
 | `claude agents --json` enumerates sessions without a TTY | ✅ lists interactive and background sessions — the Lead can enumerate ICs from plain Rust |
 | `-p` sessions report busy/idle | ❌ **no `status` field** (interactive sessions have one). The registry gives liveness only |
 | `--bg` background agents are drivable | ❌ they persist for weeks but do **not** appear in `ListAgents` as addressable peers |
 
-**Why this beats a persistent session**, given that push turned out to work:
+**Documented, not yet measured ⟨r5-doc⟩:**
 
-- **Restart-from-checkpoint stops being a special case.** It is simply the next turn. A wedged IC is a process that overran its wall-clock bound; killing it costs one turn, and the next `--resume` continues the same session.
-- **The budget ledger becomes exact rather than estimated.** The Lead sums `total_cost_usd` across invocations. No hook, no transcript parsing, no silent under-count — which is what retires the rev-3 prerequisite (see *Budget accounting*).
-- **`--max-budget-usd` becomes enforceable.** A runaway turn hits a ceiling the CLI enforces, instead of one the Lead notices afterwards.
-- **The checkpoint cadence stops being a tuning question.** The turn boundary *is* the checkpoint boundary: the IC writes lineage at end of turn because the process is about to die. Rev 3 listed cadence as an open sub-question; the primitive answers it.
-- **Redirecting strategy needs no delivery guarantee.** "You tried X and it failed for reason Y; do not retry it" is prompt content, not a message that must reach a process at the right moment.
+| Claim | Source |
+|---|---|
+| `claude -p "/goal …"` runs the whole multi-turn loop to completion in one invocation | docs |
+| The evaluator judges **only what is already in the transcript**; it runs no tools | docs |
+| Verdicts are met / not yet met / **impossible**; the last clears the goal and ends the loop | docs |
+| Several turns with no tool use halts the loop and returns control with the goal still set | docs |
+| Auth failure, exhausted credits, unrecoverable context overflow, and model-unavailable clear the goal; rate limits and overloads do **not** | docs |
+| The condition may be up to 4,000 characters and doubles as the opening directive | docs |
 
-**What it costs:** process startup and MCP registration per turn (seconds), and a cache read of the accumulated context. Both are negligible against turns measured in minutes — but the 1-hour cache TTL means an IC parked for longer than that pays a full context rebuild on its next turn. The Lead should either keep dispatch intervals inside the hour or accept the rebuild explicitly rather than by accident.
+**What the parameterisation buys:**
 
-**Two flags this design should use and rev 3 did not:** `--name` gives ICs deterministic addresses (`ic-ironmem-283`) for both `ListAgents` and the abort path, and `--json-schema` lets the Reviewer's verdict be schema-validated rather than parsed out of prose.
+- **Most of the turn runner disappears.** The inner loop is a flag rather than orchestration code the project owns and debugs.
+- **Intra-dispatch iteration is cheap.** The evaluator runs on the small fast model; see *Model routing*.
+- **No cache-TTL exposure inside a dispatch.** One continuous session has no gap between its turns. The 1-hour window now only applies *between* dispatches.
+- **Anti-stall and background check-in behaviour come free** rather than being reimplemented.
+
+**What it costs, honestly:**
+
+- **Checkpoint cadence stops being free.** Rev 4 got it as a consequence — the process was about to die, so the IC checkpointed. At N > 1 intra-dispatch turns are evaluator-driven, so **the IC must be explicitly instructed to checkpoint every turn**, and that instruction is now load-bearing rather than structural.
+- **Thrash detection slows by up to N turns.** strategy-health evaluates per dispatch; a doomed approach can burn N turns before the Lead sees it. This is the main argument for keeping N small.
+- **Budget granularity coarsens from turn to dispatch.** A killed process forfeits one dispatch's accounting rather than one turn's. Still bounded, still exact for everything already banked.
+- **Preemption granularity coarsens too.** Budget exhaustion, a closed issue, or a higher-priority arrival are acted on at dispatch boundaries — or, mid-dispatch, over the abort channel (see *Transport*).
+
+**Two requirements this introduces, neither of which existed in rev 4:**
+
+1. ⟨r5⟩ **One definition of "done."** The `/goal` condition and the repo's approved gate config must be the *same* expression, generated from the gate config rather than written separately. Two sources of truth produce an IC that returns "met" over red gates.
+2. ⟨r5⟩ **"Impossible" must be distinguishable from "met."** The evaluator can judge a condition unsatisfiable, which clears the goal and ends the invocation — a normal-looking exit. If the Lead cannot tell that from success it will treat abandonment as completion. Whether the result JSON distinguishes them is **unverified**; see *Open questions*.
+
+**Also unchanged from rev 4:** `--name` gives ICs deterministic addresses (`ic-ironmem-283`) for both `ListAgents` and the abort path, and `--json-schema` lets the Reviewer's verdict be schema-validated rather than parsed out of prose.
+
+### Model routing ⟨r5⟩
+
+Four distinct model slots, decided 2026-08-24:
+
+| Slot | Model | Why |
+|---|---|---|
+| Goal evaluator | **small fast model (Haiku default)** | Its errors are bounded on both sides: a false *met* is caught by the Lead's gate check and then the reviewer, costing one dispatch; a false *not met* is capped by the `stop after N turns` clause. It is a loop-continuation heuristic, never an authority. |
+| IC | **Sonnet**, escalating to Opus by risk class | Where capability converts into merged rather than abandoned issues. Ports `wiggum`'s existing model-tiering. |
+| Lead | **Opus** | Cross-repo prioritisation and judgement — and at N > 1 it runs far fewer turns. |
+| Reviewer | **Codex** | Cross-model on purpose. Unchanged from rev 2. |
+
+**Do not upgrade the evaluator to buy accuracy.** Two reasons.
+
+First, `ANTHROPIC_DEFAULT_HAIKU_MODEL` is read *everywhere* the small fast model is used — it also re-points the `haiku` alias and background work such as conversation summarisation — so the evaluator cannot be upgraded in isolation. If it is ever done, set it in the IC's spawn environment only, which `launcher` already controls, never in a settings file.
+
+Second and more important: the evaluator reads the IC's **own** transcript, so it is a same-family judge of an agent's self-report — the very blind spot this design refuses elsewhere ("No IC self-review"). A stronger evaluator makes that self-judgement more articulate, not more independent. The structural answer is the fresh-context cross-model reviewer already downstream. **An urge to upgrade the evaluator should be read as a signal that the gate condition is written too softly.**
 
 ### Repo onboarding (gate discovery)
 
@@ -206,6 +260,8 @@ An IC can be perfectly healthy and still completely stuck, so these are not redu
 
 ⟨r2⟩ strategy-health as described watches one IC inside one session. That is insufficient on its own — see *Cross-dispatch stagnation* below.
 
+⟨r5⟩ Both checks now run **per dispatch**, not per turn. process-health is unaffected in kind — the registry gave liveness only in any case. strategy-health is affected in degree: a doomed approach can burn up to N turns before the Lead sees it. N is therefore a supervision parameter as much as a cost one, and should start small.
+
 ### Cross-dispatch stagnation control ⟨r2⟩
 
 Without this the system livelocks on budget: an IC exhausts its retries today → the issue keeps `agent:ready` → the daily budget resets at midnight → the Lead picks the same issue tomorrow → lineage prevents repeating the *same* approach but not another doomed one → repeat indefinitely. AVO's supervisor watched the whole trajectory; rev 1 ported only the within-session half.
@@ -231,7 +287,7 @@ At dispatch the Lead writes a **dispatch-state drawer** (`logical_key` per in-fl
 | Alternative | Why rejected |
 |---|---|
 | Extend `collab` | Human-gated by design; its approval gates are invariants. Its mailbox is two-party. Unbounded autonomy is a different system, not a flag. |
-| Fork `wiggum` wholesale | Its git/logging/backoff plumbing is worth reusing, but its core — a **disconnected** `claude -p` per phase, starting blind with `fail_detail[-2000:]` pasted in — destroys lineage. ⟨r4⟩ Note the distinction from this design: one process per turn is the same *shape*, but `--resume` plus drawer lineage is exactly what `wiggum` lacked. Rewrite, don't patch. |
+| Fork `wiggum` wholesale | Its git/logging/backoff plumbing is worth reusing, but its core — a **disconnected** `claude -p` per phase, starting blind with `fail_detail[-2000:]` pasted in — destroys lineage. ⟨r4⟩ Note the distinction from this design: one process per unit of work is the same *shape*, but `--resume` plus drawer lineage is exactly what `wiggum` lacked. Rewrite, don't patch. |
 | Deterministic scheduler as top tier | Cannot itself wedge, but there is nothing to talk to, no cross-repo judgment, and supervision degrades to crude timeouts. The Lead is an interface, not just a dispatcher. |
 | Two peer Leads (Daisy's shape) | Correct at 8–10 concurrent projects; premature here. A cron one-liner buys the same resilience at v1 scale. |
 | Three tiers from the start | At v1 volume the middle tier mostly relays, while adding a process that can wedge, a message hop, and a place for context to go lossy. |
@@ -242,6 +298,8 @@ At dispatch the Lead writes a **dispatch-state drawer** (`logical_key` per in-fl
 | ⟨r4⟩ Persistent IC session (`--input-format stream-json`) | A genuinely long-lived process driven over stdin, and the obvious reading of "long-lived IC". Rejected: it makes crash recovery a special case instead of the normal path, hides spend until the session ends, cannot be bounded by `--max-budget-usd`, and buys nothing that `--resume` does not already provide at ~5% marginal cost. |
 | ⟨r4⟩ `--bg` background agents as ICs | They do persist for weeks — four were live on the test machine, the oldest from July. But they do not appear in `ListAgents` as addressable peers and there is no CLI to drive one, so the Lead could start them and never steer them. |
 | ⟨r4⟩ Push messaging as the control channel | Now that it demonstrably works, tempting. Rejected: delivery lands only between the IC's tool calls, so latency is unbounded in the case that matters (an IC deep in a long gate run), and it is silently contingent on the receiver's permission mode. Fine for "stop"; wrong for "here is your work". |
+| ⟨r5⟩ Pure goal loop (N unbounded) | Hand the whole issue to one `-p "/goal …"` invocation. Genuinely tempting: no turn runner at all, and evaluator-priced iteration. Rejected because the Lead then sees cost only at the end (violating Goal 6's "observable before the bill arrives"), cannot detect thrash — the evaluator asks "is the condition met?", never "is this failing the same way again?" — and cannot preempt on budget, priority, or an upstream close. |
+| ⟨r5⟩ Pure re-invocation (N = 1, rev 4) | Not rejected — it is the N = 1 case and stays available. Rejected only as a *default*, because it spends one Opus Lead turn per IC turn, which can exceed the cost of the work being supervised. |
 | ⟨r4⟩ Drawer-polling only, no push at all | Rev 3's fallback, and almost right. Rejected only because aborting an in-flight turn then degrades to `SIGKILL`, forfeiting that turn's spend and any uncheckpointed reasoning. Push earns its place on that one job. |
 
 ---
@@ -253,17 +311,20 @@ issue labeled `agent:ready`
    └─► Lead: pick by priority:* order; check budget, concurrency cap, per-issue attempt cap
         └─► Lead classifies risk (dispatch-time) → writes dispatch-state drawer
              └─► create git worktree for this issue
-                  └─► Lead assigns session uuid; launcher spawns IC TURN
-                       │   (`-p --session-id`, then `-p --resume` each turn)
+                  └─► Lead assigns session uuid; launcher spawns IC DISPATCH
+                       │   (`-p "/goal <gates> or stop after N turns"`,
+                       │    `--session-id` first time, `--resume` after)  ⟨r5⟩
                        ├─► IC reads knowledge base K: search / code_map / kg_query
                        ├─► IC reads lineage for THIS issue: prior attempts + verdicts
                        ├─► IC implements
                        ├─► IC runs approved gates for this repo
                        │     └─ fail ─► append attempt to lineage ─► bounded retry
                        │                 └─ retries exhausted ─► `agent:exhausted`
-                       ├─► turn ends: IC checkpoints, process EXITS
+                       ├─► each turn: goal evaluator judges the gate condition
+                       │     └─ not met ─► another turn, same process (up to N)
+                       ├─► dispatch ends: IC checkpoints, process EXITS
                        │     └─► Lead banks `total_cost_usd`, decides, re-invokes
-                       │          next turn on the same session uuid  ⟨r4⟩
+                       │          next dispatch on the same session uuid  ⟨r5⟩
                        └─► green
                             ├─► append SUCCESS attempt to lineage (with commit_sha)
                             ├─► push feature branch, open PR   [never pushes a default branch]
@@ -316,9 +377,10 @@ A likely contributing cause is visible in `~/.claude/settings.json`: the `Stop` 
 
 Restated:
 
-- **Authoritative meter:** the sum of `total_cost_usd` across IC and Reviewer invocations, written to the daily ledger drawer as each turn returns.
-- **Hard per-turn ceiling:** `--max-budget-usd`, enforced by the CLI rather than observed after the fact.
-- **Residual loss is now one turn, not one session.** A killed process forfeits only the in-flight turn's accounting, because every completed turn was already banked. Under a persistent-session design the entire session's spend went unrecorded.
+- **Authoritative meter:** the sum of `total_cost_usd` across IC and Reviewer invocations, written to the daily ledger drawer as each **dispatch** returns. ⟨r5⟩
+- **Hard per-dispatch ceiling:** `--max-budget-usd`, enforced by the CLI rather than observed after the fact. ⟨r5⟩ At N > 1 this becomes a per-issue-attempt ceiling, which is the economically meaningful unit anyway.
+- **Residual loss is one dispatch, not one session.** ⟨r5⟩ A killed process forfeits only the in-flight dispatch's accounting; everything already returned was banked. Coarser than rev 4's one-turn granularity, still bounded — and the bound is N turns of spend, which is exactly what N is choosing.
+- ⟨r5⟩ **Evaluator spend is a separate, small line.** It runs on the small fast model and is billed there; see *Model routing*.
 - **`token_usage` and transcript ingestion are demoted to hygiene.** Repairing them remains worth a separate issue — the metrics surface is broken for every other consumer too — but Autopilot no longer blocks on it, and no longer needs it even for reconciliation.
 
 ### Secret handling on the lineage write path ⟨r2⟩
@@ -337,7 +399,11 @@ The lineage store is shaped so the AVO loop is additive: add a `score` field to 
 
 | Condition | Behavior |
 |---|---|
-| ⟨r4⟩ IC process exits at end of turn | **Normal, not a fault.** The Lead banks the turn's cost and re-invokes on the same session uuid. |
+| ⟨r5⟩ IC process exits at end of dispatch | **Normal, not a fault.** The Lead banks the dispatch's cost and re-invokes on the same session uuid. |
+| ⟨r5⟩ Goal evaluator returns **impossible** | The goal clears and the invocation ends — a normal-looking exit. The Lead **must** distinguish this from success before recording an outcome; treat an indistinguishable case as failure, never as completion. |
+| ⟨r5⟩ Goal condition and approved gates disagree | Cannot occur by construction: the condition is generated from the gate config. A test guards it. |
+| ⟨r5⟩ Loop halts on the no-tool-use anti-stall | Returns control with the goal still set. To the Lead this is a short dispatch; it counts as an attempt and the next dispatch resumes normally. |
+| ⟨r5⟩ Auth failure, exhausted credits, unrecoverable context overflow, or model unavailable | Clears the goal mid-dispatch. Distinguish from a completed dispatch; these are infrastructure failures, never attempts, and must not consume the per-issue attempt cap. |
 | IC process dies mid-turn | process-health detects it; the next `--resume` continues the session from its last checkpoint. Lineage in drawers is unaffected; one turn's accounting is lost. |
 | ⟨r2⟩ IC alive but mid-long-turn (ping unanswered) | **Not** treated as dead. Death requires unanswered ping **and** no checkpoint advance in the longer window. ⟨r4⟩ Reinforced by measurement: `-p` sessions expose **no `status` field** in the session registry, so busy/idle is simply unavailable for an IC. Checkpoint advancement is the only progress signal there is. |
 | IC alive but repeats the same failure N times | strategy-health fires: redirect strategy, or stop and escalate. Never silent infinite retry. |
@@ -352,7 +418,7 @@ The lineage store is shaped so the AVO loop is additive: add a `score` field to 
 | ⟨r2⟩ Human answers a blocked issue | Lead polls `agent:blocked` issues for human comments newer than its own question, appends the answer to lineage, flips back to `agent:ready`, re-dispatches. Closes the one-way door rev 1 left open. |
 | Concurrency cap reached | Lead queues the issue; does not dispatch. |
 | Daily token budget exhausted | Lead stops dispatching and reports. In-flight ICs finish. |
-| ⟨r4⟩ Killed IC's tokens never recorded | Bounded to the **in-flight turn only** — every completed turn was banked from its result JSON as it returned. |
+| ⟨r5⟩ Killed IC's tokens never recorded | Bounded to the **in-flight dispatch only** — every completed dispatch was banked from its result JSON as it returned. |
 | ⟨r4⟩ Turn exceeds its spend ceiling | `--max-budget-usd` terminates it; the Lead treats it as a failed attempt and appends to lineage. |
 | ⟨r4⟩ Lead must abort a turn already in flight | Push a stop message (bypass mode makes it deliverable). It lands at the IC's next tool boundary, letting it checkpoint and exit cleanly. `SIGKILL` only if the push is not honoured within a bounded wait. |
 | ⟨r4⟩ IC parked longer than the 1h cache TTL | Next turn pays a full context rebuild. Expected and priced, not an error — but the Lead should not park ICs across the boundary casually. |
@@ -383,7 +449,11 @@ The lineage store is shaped so the AVO loop is additive: add a `score` field to 
 | `kg_query` on an issue returns all its attempts | Exact traversal works where semantic search can't |
 | Second attempt's prompt contains prior failure reasons | Goal 3 — dead ends actually consulted, not merely recorded |
 | Kill an IC mid-task → Lead restarts it, lineage intact | process-health |
-| ⟨r4⟩ Turn N+1 resumed by a fresh process sees turn N's context | The session primitive actually persists across processes |
+| ⟨r4⟩ Dispatch N+1 resumed by a fresh process sees dispatch N's context | The session primitive actually persists across processes |
+| ⟨r5⟩ The `/goal` condition is generated from the approved gate config, never authored separately | One definition of "done" |
+| ⟨r5⟩ An evaluator verdict of *impossible* is recorded as a failure, not a completion | The normal-looking-exit trap |
+| ⟨r5⟩ A dispatch cleared by auth failure or credit exhaustion does not consume the per-issue attempt cap | Infrastructure failure is not an attempt |
+| ⟨r5⟩ N = 1 reproduces rev-4 behaviour exactly | The parameterisation is a generalisation, not a replacement |
 | ⟨r4⟩ Ledger total equals the sum of per-invocation `total_cost_usd` | Budget meter is exact, and independent of the metrics hook |
 | ⟨r4⟩ Turn exceeding `--max-budget-usd` is terminated and recorded as a failed attempt | Hard spend ceiling is enforced, not merely observed |
 | ⟨r4⟩ Abort message to a bypass-mode IC is honoured at its next tool boundary | The interrupt channel works, and its latency assumption holds |
@@ -427,7 +497,8 @@ The lineage store is shaped so the AVO loop is additive: add a `score` field to 
 - The `agent:ready` label is manual: forget to apply it and nothing gets worked. Autonomy is capped by a human remembering to opt issues in.
 
 **Now committed to**
-- ⟨r4⟩ The IC session primitive: **one process per turn**, `claude -p --resume` against a Lead-assigned session uuid. Control is pull; push is interrupts only.
+- ⟨r5⟩ The IC session primitive: **one process per dispatch of N turns**, `claude -p "/goal …" --resume` against a Lead-assigned session uuid, with rev 4's one-turn form as the N = 1 case. Control is pull; push is interrupts only.
+- ⟨r5⟩ Model routing across four slots, and the rule that the goal evaluator is never upgraded to compensate for a soft condition.
 - ⟨r4⟩ Per-invocation result JSON as the authoritative budget meter, with `--max-budget-usd` as the per-turn ceiling.
 - The harness-native mesh for discovery and for the abort path.
 - ironmem drawers + kg as the lineage, dispatch-state, and budget substrate.
@@ -459,16 +530,18 @@ Two blocked states rather than one, because their resume semantics genuinely dif
 **Resolved by validation**
 
 1. ✅ **Headless addressability — WORKS.** Discovery works (`ListAgents`, and `claude agents --json` without a TTY). Delivery works **when the receiver runs in bypass-permissions mode**, which ICs do by design. ⟨r4⟩ Rev 3's "delivery refuted" was a probe artifact and has been corrected; see *Transport*.
-2. ✅ **What is the long-lived IC session primitive? — SETTLED.** A **supervised re-invocation loop**: one `claude -p --resume <uuid>` process per turn against a Lead-assigned session id. `--session-id`/`--resume` were measured to restore context across separate processes, and to do so at ~5% of first-turn cost while inside the 1-hour cache TTL. See *IC lifecycle*.
-3. ✅ **Is Lead→IC coordination push or pull? — SETTLED: both, with distinct jobs.** Pull (the next turn's prompt) is the control channel, because it is guaranteed-read and has no delivery dependency. Push is reserved for aborting a turn already in flight, because its latency is bounded by the IC's tool-call cadence and can never be relied on for assignment.
-4. ✅ **Checkpoint cadence — SETTLED as a consequence.** The turn boundary *is* the checkpoint boundary; the IC writes lineage at end of turn because its process is about to exit.
+2. ✅ **What is the long-lived IC session primitive? — SETTLED.** A **supervised re-invocation loop**: one `claude -p --resume <uuid>` process per **dispatch of N turns** against a Lead-assigned session id, with `/goal` driving the turns inside. `--session-id`/`--resume` were measured to restore context across separate processes at ~5% of first-turn cost inside the 1-hour cache TTL. ⟨r5⟩ Rev 4's one-turn form is the N = 1 case. See *IC lifecycle*.
+3. ✅ **Is Lead→IC coordination push or pull? — SETTLED: both, with distinct jobs.** Pull (the next dispatch's prompt) is the control channel, because it is guaranteed-read and has no delivery dependency. Push is reserved for aborting a turn already in flight, because its latency is bounded by the IC's tool-call cadence and can never be relied on for assignment.
+4. ⚠️ **Checkpoint cadence — RE-OPENED BY REV 5, then closed by instruction.** Rev 4 got it free: the turn boundary *was* the process boundary. At N > 1 intra-dispatch turns are evaluator-driven, so the IC must be **explicitly instructed** to checkpoint every turn. Settled in substance — the IC checkpoints per turn — but it is now a prompt requirement rather than a structural guarantee, and can therefore be got wrong.
 5. ⚠️ **Transcript token ingestion is non-functioning** — zero `source='transcript'` rows in the live DB. ⟨r4⟩ **Demoted from prerequisite to hygiene.** Autopilot now meters spend from each invocation's result JSON and does not depend on the hook, even for reconciliation. Still worth its own issue, because the metrics surface is broken for every other consumer.
 
 **Still open, and worth deciding before implementation**
 
 > **Approved 2026-08-23 at rev 4.** These three were explicitly *not* resolved by the approval — the design is approved, the tuning below is not yet decided. Each changes the shape of an implementation plan, so settle them before `/iron-plan` rather than during it.
 
-6. **Per-turn wall-clock bound.** The re-invocation loop needs a timeout after which a turn is considered wedged and killed. Distinct from `--max-budget-usd` (spend) and `--max-turns` (agentic iterations); nothing measured so far constrains it.
+6. **Per-dispatch wall-clock bound, and N itself.** ⟨r5⟩ Two numbers, not one. The dispatch needs a timeout after which it is considered wedged and killed — distinct from `--max-budget-usd` (spend) and `--max-turns` (hard iteration cap). And **N**, the turns per dispatch, trades supervision granularity against Lead spend; 5–8 is a starting suggestion, not a measured figure.
+
+6a. ⟨r5⟩ **Does the result JSON distinguish "met" from "impossible"?** Unverified, and load-bearing: an evaluator that judges a condition unsatisfiable clears the goal and ends the invocation, which from outside looks like a clean finish. If the Lead cannot tell them apart it will record abandonment as completion. First thing to measure in rung 0; cheap to test.
 7. **What the Lead actually puts in a turn prompt.** The primitive is settled; the prompt template is not. It must carry the issue, the gate results, the lineage of failed approaches, and any strategy redirect — cheaply enough that it does not defeat the cache economics.
 8. **Whether the Lead is a Claude session at all.** `claude agents --json` and per-invocation result JSON are both plain CLI surfaces, so a Rust supervisor could run the loop and reserve a Claude session for judgment calls only. This would make the Lead unwedgeable at the cost of splitting its reasoning. Not decided.
 
@@ -497,5 +570,9 @@ Two blocked states rather than one, because their resume semantics genuinely dif
 | 2 | 2026-08-23 | `claude agents --json` enumerates sessions without a TTY | ✅ |
 | 2 | 2026-08-23 | `-p` sessions expose busy/idle status | ❌ liveness only |
 | 2 | 2026-08-23 | `--bg` agents are drivable as ICs | ❌ not addressable peers |
+| — | 2026-08-24 | `/goal` mechanics (loop-to-completion under `-p`, transcript-only evaluator, met/not-met/impossible verdicts, anti-stall, goal-clearing errors, 4,000-char condition) | 📄 **documented, not measured** — from code.claude.com/docs/en/goal. Rung 0 measures them |
+| — | 2026-08-24 | Does result JSON distinguish "met" from "impossible"? | ❓ **unknown** — see open question 6a |
 
 **Method note, worth keeping.** Both rev-3 errors share a root cause: a single-arm probe was treated as a conclusion. `success: true` was read as *delivered* when it meant *accepted*, and a negative result from a probe differing from production in one flag was written into the spec as a property of production. Round 2 was run as a controlled A/B for that reason.
+
+⟨r5⟩ A second method note, from a different failure: rev 4 was written without reading the `/goal` documentation, and so committed to owning a turn loop that the harness already provides. Read the platform's own primitives before building one. Note also that everything marked ⟨r5-doc⟩ is documentation rather than measurement — a weaker class of evidence than ⟨r4⟩, and marked so it can be told apart.
