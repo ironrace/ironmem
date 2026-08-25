@@ -1,10 +1,13 @@
-//! Autopilot backlog runner — storage layer (build-ladder rung 1).
+//! Autopilot backlog runner (build-ladder rungs 1-2).
 //!
 //! See `docs/iron/specs/2026-08-21-autonomous-backlog-runner-design.md` for
-//! the full design. This module implements only the *storage* half of that
-//! design — the `backlog-lineage` drawer room and its knowledge-graph edges —
-//! not the dispatch runner, launcher integration, or `/goal` invocation
-//! logic. Those are later rungs.
+//! the full design. Rung 1 built the storage half — the `backlog-lineage`
+//! drawer room and its knowledge-graph edges. Rung 2 adds the [`dispatch`]
+//! primitive (build the IC's argv, run it, parse its result JSON) and the
+//! [`turn_prompt`] template that fills the `/goal` condition — together, the
+//! *IC lifecycle* CLI invocation the spec's rung-0/rung-2 validation rounds
+//! measured. Onboarding (gate inference), the Lead's orchestration loop, the
+//! Reviewer, and merge authority are later rungs.
 //!
 //! # The five drawer kinds, one room
 //!
@@ -48,10 +51,12 @@
 //! documented here so it's easy to revisit.
 
 pub mod budget;
+pub mod dispatch;
 pub mod dispatch_state;
 pub mod gate_config;
 pub mod lineage;
 pub mod scrub;
+pub mod turn_prompt;
 
 use crate::db::drawers::{generate_id, Drawer};
 use crate::db::schema::Database;
@@ -65,9 +70,11 @@ use crate::error::MemoryError;
 use crate::mcp::tools::{LOGICAL_KEY_ID_PREFIX, LOGICAL_KEY_SOURCE_PREFIX};
 
 pub use budget::BudgetLedgerEntry;
+pub use dispatch::{DispatchOutcome, DispatchSpec, SessionMode, Verdict};
 pub use dispatch_state::DispatchState;
 pub use gate_config::{GateConfig, GateConfigState};
 pub use lineage::{AttemptOutcome, AttemptRecord, IssueStatus, RecordedAttempt};
+pub use turn_prompt::{PriorAttempt, TurnPromptInputs};
 
 /// Drawer wing shared by every Autopilot backlog-lineage record. See the
 /// module doc's *Wing and room* section for why this is a single constant

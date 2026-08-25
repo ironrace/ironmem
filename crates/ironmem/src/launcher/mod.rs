@@ -12,6 +12,13 @@ use std::path::{Path, PathBuf};
 use crate::error::MemoryError;
 use crate::{config, ingest, mcp};
 
+/// Locate an assistant binary on `PATH`. Re-exported (rather than left
+/// module-private) so other spawn paths — the autopilot rung-2 dispatch
+/// runner, in particular — can reuse the same "validate the assistant
+/// binary" step the spec's *Reuse* section calls out, instead of
+/// re-implementing PATH scanning.
+pub(crate) use binary::find_on_path;
+
 /// The assistant a launcher targets.
 ///
 /// Each variant's behavior (`spec`/`binary`/`label`) is entirely
