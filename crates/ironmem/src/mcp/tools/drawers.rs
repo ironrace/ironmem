@@ -13,8 +13,13 @@ use super::shared::{
 use crate::mcp::app::App;
 use crate::mcp::readiness::ReadinessState;
 
-const LOGICAL_KEY_SOURCE_PREFIX: &str = "logical:";
-const LOGICAL_KEY_ID_PREFIX: &str = "logical-key:";
+/// Visible to the rest of the crate (see the `pub(crate) use` re-export in
+/// `mcp/tools/mod.rs`) so `crate::autopilot` can compute the exact same
+/// logical-key-derived drawer id/source-file this module does, instead of
+/// hardcoding its own copy of these literals that could silently drift out
+/// of sync.
+pub(crate) const LOGICAL_KEY_SOURCE_PREFIX: &str = "logical:";
+pub(crate) const LOGICAL_KEY_ID_PREFIX: &str = "logical-key:";
 
 /// `add_drawer`'s arguments after validation. Borrows `content` from the
 /// request (`sanitize_content` returns a borrowed slice).
