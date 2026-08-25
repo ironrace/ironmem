@@ -2,6 +2,10 @@
 //! memory backend with an MCP server, SQLite storage, semantic search, and
 //! knowledge-graph utilities.
 
+/// Autonomous backlog runner — storage layer for lineage, dispatch state,
+/// budget ledger, and gate config (build-ladder rung 1; see
+/// `docs/iron/specs/2026-08-21-autonomous-backlog-runner-design.md`).
+pub mod autopilot;
 /// Background startup orchestration and stale-lock recovery.
 pub mod bootstrap;
 /// Pure bounded planning protocol and SQLite-backed queue helpers.
