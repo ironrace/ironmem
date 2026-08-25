@@ -8,6 +8,7 @@
 //! logic itself is rung 7's (*supervision + crash safety*).
 
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 use crate::db::schema::Database;
 use crate::error::MemoryError;
@@ -102,9 +103,29 @@ pub fn get_dispatch_state(
 /// Clear an issue's dispatch-state drawer once it's no longer in flight
 /// (terminal success, exhaustion, or hand-off to a human). Returns `true` if
 /// a drawer was actually deleted.
+///
+/// Wrapped in a transaction with a `wal_log_tx` entry, like every other
+/// mutating call in this module ([`upsert_dispatch_state`] via
+/// [`write_current`], [`super::lineage::record_attempt`]): without it, a
+/// dispatch's crash-safe record could vanish with no audit trail explaining
+/// when or why, which is exactly the kind of gap rung 7's reconciliation
+/// logic would need to debug around.
 pub fn clear_dispatch_state(db: &Database, issue: &IssueRef) -> Result<bool, MemoryError> {
     let id = super::logical_drawer_id(&dispatch_state_key(issue));
-    db.delete_drawer(&id)
+    db.with_transaction(|tx| {
+        let deleted = Database::delete_drawer_tx(tx, &id)?;
+        Database::wal_log_tx(
+            tx,
+            "autopilot_clear_dispatch_state",
+            &json!({
+                "drawer_id": &id,
+                "issue": issue.canonical(),
+                "deleted": deleted,
+            }),
+            None,
+        )?;
+        Ok(deleted)
+    })
 }
 
 #[cfg(test)]
@@ -160,5 +181,44 @@ mod tests {
         assert_eq!(get_dispatch_state(&db, &issue).unwrap(), None);
         // Idempotent: clearing an already-cleared issue is not an error.
         assert!(!clear_dispatch_state(&db, &issue).unwrap());
+    }
+
+    // ── Regression: clearing must leave the same wal-log audit trail every
+    // other mutation in this module leaves. ─────────────────────────────────
+    #[test]
+    fn clear_dispatch_state_writes_a_wal_log_entry() {
+        let db = Database::open_in_memory().unwrap();
+        let issue = IssueRef::new("ironmem", 283);
+        upsert_dispatch_state(&db, &sample(&issue, 1)).unwrap();
+
+        assert!(clear_dispatch_state(&db, &issue).unwrap());
+
+        let count: i64 = db
+            .with_connection(|conn| {
+                Ok(conn.query_row(
+                    "SELECT COUNT(*) FROM wal_log WHERE operation = ?1",
+                    rusqlite::params!["autopilot_clear_dispatch_state"],
+                    |row| row.get(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "clearing a dispatch-state drawer must log exactly one wal entry"
+        );
+
+        // Clearing an already-cleared issue still logs (deleted: false), so
+        // the audit trail records the no-op attempt too.
+        assert!(!clear_dispatch_state(&db, &issue).unwrap());
+        let count_after_noop: i64 = db
+            .with_connection(|conn| {
+                Ok(conn.query_row(
+                    "SELECT COUNT(*) FROM wal_log WHERE operation = ?1",
+                    rusqlite::params!["autopilot_clear_dispatch_state"],
+                    |row| row.get(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(count_after_noop, 2);
     }
 }

@@ -24,6 +24,11 @@ mod test_support;
 /// scrub, rather than a module outside `mcp::tools` growing a second spelling
 /// of it. See the function's own doc for why an unscrubbed spawn is a defect.
 pub(crate) use collab_session::scrub_git_environment;
+/// Re-exported so `crate::autopilot`'s logical-key drawers land on the exact
+/// same id/source-file scheme `add_drawer{logical_key}` uses, rather than
+/// duplicating these literals and risking a silent drift between the two
+/// write paths.
+pub(crate) use drawers::{LOGICAL_KEY_ID_PREFIX, LOGICAL_KEY_SOURCE_PREFIX};
 
 use code_maps::{handle_code_map_load, handle_code_map_status, handle_code_map_write};
 use collab_caps::{handle_collab_get_caps, handle_collab_register_caps};

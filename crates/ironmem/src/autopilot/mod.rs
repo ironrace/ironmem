@@ -56,6 +56,13 @@ pub mod scrub;
 use crate::db::drawers::{generate_id, Drawer};
 use crate::db::schema::Database;
 use crate::error::MemoryError;
+// Imported (not duplicated) from `crate::mcp::tools`, which re-exports them
+// from the `drawers` tool module: a drawer written through
+// `mcp__ironmem__add_drawer{logical_key}` and one written through this
+// module for the same logical key must compute the same id/source-file, and
+// a hand-copied literal here could silently drift out of sync with the
+// original.
+use crate::mcp::tools::{LOGICAL_KEY_ID_PREFIX, LOGICAL_KEY_SOURCE_PREFIX};
 
 pub use budget::BudgetLedgerEntry;
 pub use dispatch_state::DispatchState;
@@ -74,22 +81,6 @@ pub const ROOM: &str = "backlog-lineage";
 /// `get_drawer`/`search` reader can tell Autopilot's own bookkeeping apart
 /// from human- or MCP-client-authored content in the same database.
 const ADDED_BY: &str = "autopilot";
-
-/// Mirrors `crate::mcp::tools::drawers::LOGICAL_KEY_ID_PREFIX`, which is
-/// private to that module and not reachable from here. Duplicated rather
-/// than exposed, to avoid widening the generic drawer core's surface for
-/// this one caller (see the module doc). **If that constant's value ever
-/// changes, this one must change with it** — otherwise a drawer written
-/// through `mcp__ironmem__add_drawer{logical_key}` and one written through
-/// this module for the same logical key would silently diverge onto two
-/// different ids.
-const LOGICAL_KEY_ID_PREFIX: &str = "logical-key:";
-
-/// Mirrors `crate::mcp::tools::drawers::LOGICAL_KEY_SOURCE_PREFIX` for the
-/// same reason and with the same caveat as [`LOGICAL_KEY_ID_PREFIX`]. Purely
-/// cosmetic (it only affects the `source_file` a reader sees), so a drift
-/// here is confusing rather than destructive.
-const LOGICAL_KEY_SOURCE_PREFIX: &str = "logical:";
 
 /// A GitHub issue, scoped to its repo. Autopilot spans "all write-access
 /// repos" (see the spec's Problem section), so an issue number alone is
@@ -276,6 +267,19 @@ mod tests {
         );
         let drawer = db.get_drawer(&id_second).unwrap().unwrap();
         assert_eq!(drawer.content, "v2");
+    }
+
+    #[test]
+    fn logical_key_prefixes_are_imported_from_the_shared_mcp_add_drawer_scheme() {
+        // `LOGICAL_KEY_ID_PREFIX`/`LOGICAL_KEY_SOURCE_PREFIX` are `use`d from
+        // `crate::mcp::tools` (see the import above), not duplicated as
+        // separate literals — so this pins today's actual values rather than
+        // asserting a local copy stayed in sync with itself. If
+        // `mcp/tools/drawers.rs` ever changes either value, this fails here
+        // instead of the two write paths silently diverging onto different
+        // drawer ids for the same logical key.
+        assert_eq!(LOGICAL_KEY_ID_PREFIX, "logical-key:");
+        assert_eq!(LOGICAL_KEY_SOURCE_PREFIX, "logical:");
     }
 
     #[test]

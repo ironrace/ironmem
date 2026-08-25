@@ -59,18 +59,42 @@ static JWT_RE: LazyLock<Regex> = LazyLock::new(|| {
 /// match. The key name is captured separately from the value so the
 /// replacement can keep it — "API_KEY=[REDACTED]" is a useful diagnostic
 /// line; blanking the whole thing is not.
+///
+/// The value alternates a double-quoted or single-quoted run before falling
+/// back to a bare `\S+`: without the quoted alternatives, `PASSWORD="hello
+/// world"` would only match up to the first space (`"hello`), leaving
+/// ` world"` — the rest of the secret — in the output untouched. Quoting is
+/// the only reliable signal this module has for "the value contains
+/// whitespace"; an unquoted multi-word value has no such marker and is out
+/// of scope here.
 static ASSIGNMENT_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r#"(?im)(?P<prefix>\b(?:export\s+)?[A-Za-z][A-Za-z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|PWD|CREDENTIAL)[A-Za-z0-9_]*\s*[:=]\s*)(?P<value>\S+)"#,
+        r#"(?im)(?P<prefix>\b(?:export\s+)?[A-Za-z][A-Za-z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|PWD|CREDENTIAL)[A-Za-z0-9_]*\s*[:=]\s*)(?P<value>"[^"\r\n]*"|'[^'\r\n]*'|\S+)"#,
     )
     .unwrap()
 });
 
 /// Candidate tokens for the generic high-entropy scan: 20+ characters drawn
-/// from the alphabet real secrets are usually encoded in (base64/base64url,
-/// plus `.`/`=` for JWT-ish and padded variants).
+/// from the alphabet real secrets are usually encoded in (base64/base64url).
+///
+/// `=` is deliberately excluded from this class entirely (earlier revisions
+/// of this pattern included it, for base64 padding). Including it let a
+/// `KEY=value` assignment whose key name doesn't match [`ASSIGNMENT_RE`]'s
+/// known-credential vocabulary merge into one candidate spanning both the key
+/// name and the value — including a trailing `=*` after the body class has
+/// the same failure mode, since it greedily swallows the assignment's own
+/// `=` delimiter as if it were padding, re-merging the two. Shannon entropy
+/// is an average over the whole candidate, so a long, low-diversity key name
+/// dilutes a genuinely high-entropy value below
+/// [`ENTROPY_THRESHOLD_BITS_PER_CHAR`] and the secret escapes redaction
+/// entirely. Excluding `=` unconditionally splits the two into separate
+/// candidates, each scored on its own; [`is_low_signal_token`] then exempts
+/// the key-name candidate via its identifier-shape check so a bare config key
+/// isn't itself flagged as a secret. The cost is cosmetic: trailing `==`
+/// base64 padding on an otherwise-redacted secret is left in the output
+/// rather than folded into `[REDACTED]`.
 static ENTROPY_CANDIDATE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"[A-Za-z0-9+/_.=-]{20,}").unwrap());
+    LazyLock::new(|| Regex::new(r"[A-Za-z0-9+/_.-]{20,}").unwrap());
 
 /// Shannon-entropy floor (bits/char) for the generic scan to redact a
 /// candidate token. Tuned so ordinary prose and identifiers stay under it
@@ -155,13 +179,51 @@ fn redact_high_entropy_tokens(input: &str) -> (String, bool) {
     (out.into_owned(), redacted)
 }
 
+/// A canonical UUID shape (`8-4-4-4-12` hex groups). A `session_uuid` or
+/// `record_id` mentioned in a `why_failed`/`approach` narrative (e.g. "the IC
+/// session `<uuid>` crashed mid-turn") would otherwise clear the entropy
+/// threshold — a plain UUID computes to roughly 4.06 bits/char, above
+/// [`ENTROPY_THRESHOLD_BITS_PER_CHAR`] — and be redacted as if it were a
+/// secret. That destroys exactly the session-correlation data
+/// `dispatch_state`/`lineage`'s crash-recovery design depends on, so this
+/// shape is exempted the same way hex and decimal runs are.
+static UUID_SHAPE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+        .unwrap()
+});
+
 /// Tokens common in benign gate output that would otherwise look
 /// "high-entropy" to a naive character-distribution check: plain hex (git
-/// SHAs, hashes) and plain decimal runs. Excluding them is what lets
-/// `commit_sha`-shaped text survive inside a `why_failed` narrative instead
+/// SHAs, hashes), plain decimal runs, UUIDs, and plain identifier/config-key
+/// names. Excluding them is what lets `commit_sha`-shaped text and
+/// `session_uuid`-shaped text survive inside a `why_failed` narrative instead
 /// of being redacted as if it were a secret.
 fn is_low_signal_token(token: &str) -> bool {
-    token.chars().all(|c| c.is_ascii_hexdigit()) || token.chars().all(|c| c.is_ascii_digit())
+    token.chars().all(|c| c.is_ascii_hexdigit())
+        || token.chars().all(|c| c.is_ascii_digit())
+        || UUID_SHAPE_RE.is_match(token)
+        || is_single_case_identifier(token)
+}
+
+/// A plain identifier/constant-name shape: only letters, digits, and
+/// underscores, with no *mixing* of upper- and lower-case letters.
+/// `SCREAMING_SNAKE_CASE` and `plain_snake_case` config-key names fit this
+/// shape; real base64/base64url secret material overwhelmingly does not (it
+/// mixes case, or uses `+`/`/`/`.` punctuation this check already excludes).
+///
+/// This exists because [`ENTROPY_CANDIDATE_RE`] no longer merges a
+/// `KEY=value` assignment into one candidate (see its doc): a long,
+/// ordinary-looking key name can now surface as its own candidate, and such
+/// names naturally run 3.9-4+ bits/char — above
+/// [`ENTROPY_THRESHOLD_BITS_PER_CHAR`] — purely from using a large,
+/// low-repetition alphabet (26 letters + `_`), not because they're secret.
+fn is_single_case_identifier(token: &str) -> bool {
+    if !token.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return false;
+    }
+    let has_upper = token.chars().any(|c| c.is_ascii_uppercase());
+    let has_lower = token.chars().any(|c| c.is_ascii_lowercase());
+    !(has_upper && has_lower)
 }
 
 fn shannon_entropy_bits_per_char(s: &str) -> f64 {
@@ -295,5 +357,81 @@ mod tests {
         let outcome = scrub_and_bound("short", 10);
         assert_eq!(outcome.text, "short");
         assert!(!outcome.truncated);
+    }
+
+    // ── Regression: quoted/multi-word assignment values must be fully
+    // redacted, not just their first whitespace-delimited word. ────────────
+    #[test]
+    fn redacts_a_quoted_multi_word_password_value_in_full() {
+        let (out, redacted) = scrub_secrets(r#"DB_PASSWORD="hello world secret""#);
+        assert!(redacted);
+        assert!(out.contains("DB_PASSWORD="));
+        assert!(out.contains(REDACTED));
+        assert!(!out.contains("hello"));
+        assert!(!out.contains("world"));
+        assert!(!out.contains("secret"));
+    }
+
+    #[test]
+    fn redacts_a_single_quoted_multi_word_token_value_in_full() {
+        let (out, redacted) = scrub_secrets("export AUTH_TOKEN='multi word token value'");
+        assert!(redacted);
+        assert!(out.contains("AUTH_TOKEN="));
+        assert!(!out.contains("multi"));
+        assert!(!out.contains("word"));
+        assert!(!out.contains("token value"));
+    }
+
+    // ── Regression: a real secret behind an unrecognized key name must not
+    // evade redaction just because a long, low-diversity prefix is merged
+    // into the same entropy candidate. ──────────────────────────────────────
+    #[test]
+    fn redacts_a_secret_behind_a_long_prefix_with_an_unrecognized_key_name() {
+        // "VALUE" isn't in ASSIGNMENT_RE's credential vocabulary, so this
+        // relies entirely on the fallback entropy scan.
+        let prefix = "SOME_VERY_LONG_APPLICATION_CONFIGURATION_ENDPOINT_URL_VALUE";
+        let secret = "H9jInyXgBylbrgihjsiyw"; // mixed-case, ~3.88 bits/char alone
+        let input = format!("{prefix}={secret}");
+        let (out, redacted) = scrub_secrets(&input);
+        assert!(
+            redacted,
+            "a real secret must still be caught even when a long prefix is merged ahead of it"
+        );
+        assert!(
+            !out.contains(secret),
+            "the secret value must not survive in the output"
+        );
+        assert!(
+            out.contains(prefix),
+            "the low-signal identifier prefix should be left intact for diagnostic context"
+        );
+    }
+
+    // ── Regression: a session UUID mentioned in narrative text must survive
+    // un-redacted — it's exactly the correlation data crash recovery needs. ─
+    #[test]
+    fn does_not_redact_a_session_uuid_in_prose() {
+        let uuid = "11111111-1111-1111-1111-111111111111";
+        let input = format!("the IC session {uuid} crashed mid-turn");
+        let (out, redacted) = scrub_secrets(&input);
+        assert!(
+            !redacted,
+            "a plain session UUID must not be treated as a secret"
+        );
+        assert!(out.contains(uuid));
+    }
+
+    // ── Regression: splitting the KEY=value entropy candidate (to fix the
+    // dilution-evasion bug above) must not turn ordinary identifiers into
+    // false-positive redactions. ─────────────────────────────────────────────
+    #[test]
+    fn does_not_redact_a_long_screaming_snake_case_identifier_on_its_own() {
+        let input = "the failing check referenced SOME_VERY_LONG_APPLICATION_CONFIGURATION_ENDPOINT_URL_VALUE in its output";
+        let (out, redacted) = scrub_secrets(input);
+        assert!(
+            !redacted,
+            "a plain constant/env-var name must not be treated as a secret"
+        );
+        assert_eq!(out, input);
     }
 }
