@@ -68,11 +68,20 @@ pub struct TurnPromptInputs<'a> {
 /// dispatch and every caller controls this value directly (it is never
 /// parsed from untrusted input), so a panic surfaces a caller bug immediately
 /// rather than silently emitting a nonsensical condition string.
+///
+/// Panics if `inputs.gate_commands` is empty, for the same reason: an empty
+/// gate would render a vacuous condition ("...never authored separately):
+/// .") that an IC could trivially call `met` against, silently defeating
+/// this module's "one definition of done" guarantee.
 pub fn render(inputs: &TurnPromptInputs) -> String {
     assert!(
         inputs.n_turns >= 1,
         "n_turns must be at least 1, got {}",
         inputs.n_turns
+    );
+    assert!(
+        !inputs.gate_commands.is_empty(),
+        "gate_commands must not be empty — a dispatch needs a real gate to satisfy"
     );
 
     let lineage_section = if inputs.prior_attempts.is_empty() {
@@ -125,18 +134,16 @@ fn format_prior_attempt(attempt: &PriorAttempt) -> String {
         AttemptOutcome::Success => "success",
         AttemptOutcome::Failed => "failed",
     };
-    match &attempt.why_failed {
-        Some(why) => format!(
-            "attempt {n}: {approach} — {verdict} ({why})",
-            n = attempt.attempt_n,
-            approach = attempt.approach,
-        ),
-        None => format!(
-            "attempt {n}: {approach} — {verdict}",
-            n = attempt.attempt_n,
-            approach = attempt.approach,
-        ),
-    }
+    let why = attempt
+        .why_failed
+        .as_deref()
+        .map(|w| format!(" ({w})"))
+        .unwrap_or_default();
+    format!(
+        "attempt {n}: {approach} — {verdict}{why}",
+        n = attempt.attempt_n,
+        approach = attempt.approach,
+    )
 }
 
 #[cfg(test)]
@@ -265,6 +272,23 @@ mod tests {
             strategy_redirect: None,
             gate_commands: &["cargo test".to_string()],
             n_turns: 0,
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "gate_commands must not be empty")]
+    fn empty_gate_commands_panics() {
+        // An empty gate would render a vacuous "/goal" condition an IC could
+        // trivially call `met` against — must fail as loudly as n_turns == 0.
+        let issue = base_issue();
+        render(&TurnPromptInputs {
+            issue: &issue,
+            issue_title: "T",
+            issue_body: "B",
+            prior_attempts: &[],
+            strategy_redirect: None,
+            gate_commands: &[],
+            n_turns: 1,
         });
     }
 

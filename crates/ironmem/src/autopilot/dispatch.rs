@@ -177,16 +177,28 @@ pub struct DispatchOutcome {
     /// `verdict` value outside the schema's enum — see [`Self::is_met`].
     pub verdict: Option<Verdict>,
     pub reason: Option<String>,
+    /// Whether the *process* itself exited zero. `true` when this outcome
+    /// came from [`parse_dispatch_output`] alone (no process context to
+    /// distinguish); [`run_dispatch`] overwrites it with the real exit
+    /// status. A process can flush a complete, schema-valid "met" result to
+    /// stdout and then die for an unrelated reason (killed, crashed during
+    /// cleanup) before exiting zero — [`Self::is_met`] refuses to trust that
+    /// verdict, but the rest of the outcome (cost, turns, session id) stays
+    /// available rather than being discarded, since the Lead still needs it
+    /// for budget accounting even on a failed dispatch.
+    pub process_success: bool,
 }
 
 impl DispatchOutcome {
     /// The 6a guard, in one place: a dispatch only counts as "met" when the
-    /// schema-forced verdict says so *and* the invocation did not itself
-    /// error. A dispatch with no verdict (schema not honored — e.g. an
-    /// infrastructure failure mid-turn) is never treated as met, no matter
-    /// what `is_error` says on its own.
+    /// schema-forced verdict says so, the invocation did not itself error,
+    /// *and* the process exited zero. A dispatch with no verdict (schema not
+    /// honored — e.g. an infrastructure failure mid-turn) or a non-zero exit
+    /// (the JSON's own claims are untrustworthy once the process itself
+    /// failed) is never treated as met, no matter what the JSON says on its
+    /// own.
     pub fn is_met(&self) -> bool {
-        !self.is_error && self.verdict == Some(Verdict::Met)
+        self.process_success && !self.is_error && self.verdict == Some(Verdict::Met)
     }
 
     /// The evaluator judged the goal condition unsatisfiable. Per the spec's
@@ -237,6 +249,7 @@ pub fn parse_dispatch_output(stdout: &str) -> Result<DispatchOutcome, MemoryErro
         session_id: raw.session_id,
         verdict,
         reason,
+        process_success: true,
     })
 }
 
@@ -252,6 +265,16 @@ pub fn resolve_claude_binary() -> Result<std::path::PathBuf, MemoryError> {
 /// interactive one; contrast `launcher::run_launcher`, which inherits stdio
 /// for a human-attended session). Blocks until the dispatch's process exits,
 /// per the spec's "one dispatch = one process" primitive.
+///
+/// A non-zero exit does **not** discard a successfully-parsed result — see
+/// [`DispatchOutcome::process_success`] — because that data (cost, turns,
+/// session id) is exactly what the Lead needs to bank spend and record a
+/// lineage attempt even for a dispatch that failed, per the spec's error
+/// table ("`--max-budget-usd` terminates it; the Lead treats it as a failed
+/// attempt"). What it *does* discard is trust in the verdict:
+/// [`DispatchOutcome::is_met`] refuses a "met" claim from a non-zero exit,
+/// since a process can flush a complete, schema-valid result to stdout and
+/// then die for an unrelated reason before exiting cleanly.
 pub fn run_dispatch(
     bin: &Path,
     repo: &Path,
@@ -263,14 +286,18 @@ pub fn run_dispatch(
         .current_dir(repo)
         .output()
         .map_err(|e| MemoryError::NotFound(format!("failed to launch IC dispatch: {e}")))?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    parse_dispatch_output(&stdout).map_err(|e| {
+    let describe_failure = |detail: String| {
         MemoryError::Validation(format!(
-            "{e} (exit status: {:?}, stderr: {})",
+            "{detail} (exit status: {:?}, stderr: {})",
             output.status.code(),
             String::from_utf8_lossy(&output.stderr).trim()
         ))
-    })
+    };
+    let stdout = std::str::from_utf8(&output.stdout)
+        .map_err(|e| describe_failure(format!("IC dispatch produced non-UTF-8 stdout: {e}")))?;
+    let mut outcome = parse_dispatch_output(stdout).map_err(|e| describe_failure(e.to_string()))?;
+    outcome.process_success = output.status.success();
+    Ok(outcome)
 }
 
 #[cfg(test)]
@@ -529,5 +556,52 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("no parseable result JSON"), "got: {msg}");
         assert!(msg.contains("not json"), "got: {msg}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_dispatch_rejects_a_met_verdict_from_a_failed_process_but_keeps_the_cost() {
+        // A crash or a killed-mid-cleanup process can still flush a complete,
+        // schema-valid "met" result to stdout before dying — exit status is
+        // the only signal that catches this, since the JSON itself parses
+        // fine and looks trustworthy. Mirrors launcher::run_launcher's
+        // status.success() check for trust, but — unlike a plain launcher
+        // failure — the parsed cost/turns/session data must still reach the
+        // caller: the Lead needs it to bank spend and record a failed
+        // attempt, per the spec's `--max-budget-usd` error-handling entry.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fake-claude-crashes-after-flushing.sh");
+        std::fs::write(
+            &path,
+            r#"#!/bin/sh
+cat <<'EOF'
+{"total_cost_usd":0.03,"num_turns":1,"duration_ms":900,
+ "is_error":false,"session_id":"s-fake",
+ "structured_output":{"verdict":"met","reason":"done"}}
+EOF
+exit 1
+"#,
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+
+        let spec = sample_spec(SessionMode::New {
+            session_uuid: "u".to_string(),
+        });
+        let outcome = run_dispatch(&path, dir.path(), &spec).unwrap();
+        assert!(
+            !outcome.is_met(),
+            "a non-zero exit must never be trusted as met, even with a schema-valid verdict"
+        );
+        assert!(!outcome.process_success);
+        assert_eq!(outcome.verdict, Some(Verdict::Met));
+        assert!(
+            (outcome.total_cost_usd - 0.03).abs() < 1e-9,
+            "cost must still be recoverable from a failed-process dispatch, not discarded"
+        );
+        assert_eq!(outcome.session_id, "s-fake");
     }
 }
