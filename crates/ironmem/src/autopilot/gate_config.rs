@@ -34,15 +34,30 @@ fn gate_config_key(repo: &str) -> String {
 }
 
 /// Write a fresh `pending` proposal for `repo`, as the Onboarder would after
-/// inspecting its CI config. Always writes `pending`, even if an `approved`
-/// config already exists — a re-run onboard is a new proposal a human must
-/// re-approve, not a silent no-op against an already-trusted config.
+/// inspecting its build manifests. Always writes `pending`, even if an
+/// `approved` config already exists — a re-run onboard is a new proposal a
+/// human must re-approve, not a silent no-op against an already-trusted
+/// config.
+///
+/// Rejects an empty `gate_commands`: this is the storage boundary every
+/// caller goes through — including a human bypassing [`super::onboard`]'s
+/// inference entirely to supply commands read out of CI config by hand (see
+/// that module's docs) — so it must not rely on [`super::onboard`] being the
+/// only caller that happens to already refuse an empty list. Without this
+/// check here, an empty-gate proposal would sail through `pending` →
+/// `approved` and only fail much later, as a panic inside
+/// `turn_prompt::render` at actual dispatch time.
 pub fn propose_gate_config(
     db: &Database,
     repo: &str,
     gate_commands: Vec<String>,
 ) -> Result<GateConfig, MemoryError> {
     validate_repo(repo)?;
+    if gate_commands.is_empty() {
+        return Err(MemoryError::Validation(
+            "gate_commands must not be empty — a dispatch needs a real gate to satisfy".into(),
+        ));
+    }
     let config = GateConfig {
         repo: repo.to_string(),
         state: GateConfigState::Pending,
@@ -100,6 +115,17 @@ pub fn is_gate_config_approved(db: &Database, repo: &str) -> Result<bool, Memory
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn propose_gate_config_rejects_an_empty_gate_commands_list() {
+        // The storage boundary must refuse this itself — not rely on
+        // callers (e.g. `onboard::infer_gate_commands`) to have already
+        // filtered it out — since the module's own docs invite a human to
+        // call this directly, bypassing that inference path entirely.
+        let db = Database::open_in_memory().unwrap();
+        assert!(propose_gate_config(&db, "ironmem", vec![]).is_err());
+        assert!(get_gate_config(&db, "ironmem").unwrap().is_none());
+    }
 
     #[test]
     fn work_is_refused_on_a_pending_unapproved_repo_config() {

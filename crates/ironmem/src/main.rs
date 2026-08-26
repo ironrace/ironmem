@@ -331,6 +331,19 @@ enum AutopilotCmd {
     },
 }
 
+/// Load config, open, and migrate the database — the sequence both
+/// `Autopilot` subcommand handlers need before touching storage. Several
+/// other command handlers in this file repeat the same three-line sequence
+/// inline rather than through a shared helper; that pre-existing duplication
+/// is out of scope here, but the two new `Autopilot` arms at least don't add
+/// to it.
+fn open_migrated_db(db: Option<String>) -> Result<ironmem::db::schema::Database, MemoryError> {
+    let cfg = config::Config::load(db)?;
+    let database = ironmem::db::schema::Database::open(&cfg.db_path)?;
+    database.migrate()?;
+    Ok(database)
+}
+
 /// Subcommands nested under `ironmem symbols`.
 #[derive(Subcommand)]
 enum SymbolsCmd {
@@ -848,9 +861,7 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                 path,
                 json,
             } => {
-                let cfg = config::Config::load(db)?;
-                let database = ironmem::db::schema::Database::open(&cfg.db_path)?;
-                database.migrate()?;
+                let database = open_migrated_db(db)?;
                 let config = ironmem::autopilot::onboard::onboard_repo(
                     &database,
                     &repo,
@@ -871,9 +882,7 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                 Ok(())
             }
             AutopilotCmd::Approve { db, repo, json } => {
-                let cfg = config::Config::load(db)?;
-                let database = ironmem::db::schema::Database::open(&cfg.db_path)?;
-                database.migrate()?;
+                let database = open_migrated_db(db)?;
                 let config =
                     ironmem::autopilot::gate_config::approve_gate_config(&database, &repo)?;
                 if json {

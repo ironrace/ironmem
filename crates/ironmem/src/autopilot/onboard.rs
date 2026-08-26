@@ -75,38 +75,41 @@ pub fn infer_gate_commands(repo_path: &Path) -> Result<Vec<String>, MemoryError>
     // A read/parse error on one manifest (e.g. invalid JSON in an unrelated
     // package.json) must not veto a *different* stack this function already
     // recognized — see the module doc's "every recognized stack ... contributes
-    // its command" contract. Such errors are collected and only surface if no
-    // stack was recognized at all, in place of the generic "nothing found"
-    // message below.
+    // its command" contract. Only the first such error is kept (there is
+    // never a reason to report more than one root-cause to a human fixing
+    // their repo one manifest at a time); it surfaces only if no stack was
+    // recognized at all, in place of the generic "nothing found" message
+    // below.
     let mut commands = Vec::new();
-    let mut manifest_errors = Vec::new();
+    let mut manifest_error: Option<MemoryError> = None;
 
-    match infer_rust(repo_path) {
-        Ok(Some(cmd)) => commands.push(cmd),
-        Ok(None) => {}
-        Err(err) => manifest_errors.push(err),
-    }
+    record(infer_rust(repo_path), &mut commands, &mut manifest_error);
     if let Some(cmd) = infer_python(repo_path) {
         commands.push(cmd);
     }
     if let Some(cmd) = infer_swift(repo_path) {
         commands.push(cmd);
     }
-    match infer_node(repo_path) {
-        Ok(Some(cmd)) => commands.push(cmd),
-        Ok(None) => {}
-        Err(err) => manifest_errors.push(err),
-    }
-    if commands.is_empty() {
-        match infer_makefile_fallback(repo_path) {
-            Ok(Some(cmd)) => commands.push(cmd),
-            Ok(None) => {}
-            Err(err) => manifest_errors.push(err),
-        }
+    record(infer_node(repo_path), &mut commands, &mut manifest_error);
+    // Only consult the Makefile fallback when *nothing at all* was
+    // recognized, per the module doc's fallback-only scope — critically,
+    // that means skipping it when a manifest error occurred too, even
+    // though `commands` is also empty in that case. Without the
+    // `manifest_error.is_none()` half of this guard, a Cargo.toml that
+    // exists but fails to read (permission error, symlink loop, ...)
+    // alongside an incidental Makefile `test:` target would silently
+    // substitute `make test` for the intended `cargo test` and discard the
+    // real read error below, instead of surfacing it.
+    if commands.is_empty() && manifest_error.is_none() {
+        record(
+            infer_makefile_fallback(repo_path),
+            &mut commands,
+            &mut manifest_error,
+        );
     }
 
     if commands.is_empty() {
-        if let Some(err) = manifest_errors.into_iter().next() {
+        if let Some(err) = manifest_error {
             return Err(err);
         }
         return Err(MemoryError::Validation(format!(
@@ -120,6 +123,26 @@ pub fn infer_gate_commands(repo_path: &Path) -> Result<Vec<String>, MemoryError>
     Ok(commands)
 }
 
+/// Fold one fallible stack detector's result into the shared `commands`/
+/// `manifest_error` accumulators — the identical 3-way handling
+/// [`infer_rust`], [`infer_node`], and [`infer_makefile_fallback`] each need
+/// in [`infer_gate_commands`], pulled out once rather than repeated at every
+/// call site. Only the first error is kept, matching the "one root cause at
+/// a time" contract described there.
+fn record(
+    result: Result<Option<String>, MemoryError>,
+    commands: &mut Vec<String>,
+    manifest_error: &mut Option<MemoryError>,
+) {
+    match result {
+        Ok(Some(cmd)) => commands.push(cmd),
+        Ok(None) => {}
+        Err(err) => {
+            manifest_error.get_or_insert(err);
+        }
+    }
+}
+
 /// `Cargo.toml` present → Rust. A root `[workspace]` table means member
 /// crates typically don't all build/test from the root package alone, so
 /// `--workspace` is required for the gate to actually cover them; a plain
@@ -129,19 +152,59 @@ fn infer_rust(repo_path: &Path) -> Result<Option<String>, MemoryError> {
     if !manifest.is_file() {
         return Ok(None);
     }
-    let content = std::fs::read_to_string(&manifest)?;
-    let is_workspace = content.lines().any(|line| {
-        let header = line.split('#').next().unwrap_or("").trim();
-        header
-            .strip_prefix('[')
-            .and_then(|rest| rest.strip_suffix(']'))
-            .is_some_and(|name| name.trim() == "workspace")
-    });
-    Ok(Some(if is_workspace {
+    let content = read_manifest(&manifest)?;
+    Ok(Some(if is_cargo_workspace(&content) {
         "cargo test --workspace".to_string()
     } else {
         "cargo test".to_string()
     }))
+}
+
+/// Whether a `Cargo.toml`'s content declares a `[workspace]` table — either
+/// directly, or via a `[workspace.*]` subtable header (TOML's implicit-
+/// parent-table rule means a manifest that only ever writes e.g.
+/// `[workspace.package]` still establishes the `workspace` table Cargo looks
+/// for; a real `Cargo.toml` combining `[workspace]` with `[workspace.package]`
+/// for shared metadata is common, and this repo's own root manifest is one).
+///
+/// This is a line-oriented heuristic, not a real TOML parser (this crate
+/// has no TOML-parsing dependency), so it tracks whether each line falls
+/// inside a `"""`-delimited multi-line string — otherwise a `description`
+/// field's free text merely *containing* the line `[workspace]` would be
+/// mistaken for a real header. It still cannot see a workspace declared
+/// purely through top-level dotted-key syntax with no header line at all
+/// (e.g. `workspace.members = [...]`) — closing that gap fully would need a
+/// real TOML parser, which is more machinery than this rung's fixture-repo
+/// testing bar (see the module doc) asks for.
+fn is_cargo_workspace(content: &str) -> bool {
+    let mut in_multiline_string = false;
+    for raw_line in content.lines() {
+        let has_odd_triple_quotes = raw_line.matches("\"\"\"").count() % 2 == 1;
+        if in_multiline_string {
+            if has_odd_triple_quotes {
+                in_multiline_string = false;
+            }
+            continue;
+        }
+        if has_odd_triple_quotes {
+            in_multiline_string = true;
+            continue;
+        }
+        let header = raw_line
+            .split('#')
+            .next()
+            .expect("str::split always yields at least one item")
+            .trim();
+        let is_workspace_header = header
+            .strip_prefix('[')
+            .and_then(|rest| rest.strip_suffix(']'))
+            .map(str::trim)
+            .is_some_and(|name| name == "workspace" || name.starts_with("workspace."));
+        if is_workspace_header {
+            return true;
+        }
+    }
+    false
 }
 
 /// The exact `npm init` default `scripts.test` placeholder — always fails,
@@ -183,16 +246,15 @@ fn infer_node(repo_path: &Path) -> Result<Option<String>, MemoryError> {
     if !manifest.is_file() {
         return Ok(None);
     }
-    let content = std::fs::read_to_string(&manifest)?;
+    let content = read_manifest(&manifest)?;
     let value: serde_json::Value = serde_json::from_str(&content)?;
     let test_script = value
         .get("scripts")
         .and_then(|scripts| scripts.get("test"))
-        .and_then(|script| script.as_str());
+        .and_then(|script| script.as_str())
+        .map(str::trim);
     Ok(match test_script {
-        Some(script)
-            if !script.trim().is_empty() && script.trim() != NPM_INIT_PLACEHOLDER_TEST_SCRIPT =>
-        {
+        Some(script) if !script.is_empty() && script != NPM_INIT_PLACEHOLDER_TEST_SCRIPT => {
             Some("npm test".to_string())
         }
         _ => None,
@@ -200,22 +262,58 @@ fn infer_node(repo_path: &Path) -> Result<Option<String>, MemoryError> {
 }
 
 /// Fallback consulted only when no other stack was recognized (see module
-/// docs): a makefile with a line starting `test:` → `make test`. Checked
-/// under each name GNU Make itself recognizes, in Make's own preference
-/// order (`GNUmakefile`, `makefile`, `Makefile`), so a lowercase `makefile`
-/// on a case-sensitive filesystem is not missed.
+/// docs): a makefile with a `test` target → `make test`. Checked under each
+/// name GNU Make itself recognizes, in Make's own preference order
+/// (`GNUmakefile`, `makefile`, `Makefile`) — but, matching real Make, only
+/// the *first name that exists* is ever read. Real `make` never falls back
+/// to a lower-preference file just because the file it actually loaded
+/// lacks the target being asked for; it fails outright. So once this loop
+/// finds the first existing name, that file's content is authoritative —
+/// whether or not it has a `test` target — and the search stops rather than
+/// continuing on to check the other two names' content.
 fn infer_makefile_fallback(repo_path: &Path) -> Result<Option<String>, MemoryError> {
     for name in ["GNUmakefile", "makefile", "Makefile"] {
         let makefile = repo_path.join(name);
         if !makefile.is_file() {
             continue;
         }
-        let content = std::fs::read_to_string(&makefile)?;
-        if content.lines().any(|line| line.starts_with("test:")) {
-            return Ok(Some("make test".to_string()));
-        }
+        let content = read_manifest(&makefile)?;
+        return Ok(has_test_target(&content).then(|| "make test".to_string()));
     }
     Ok(None)
+}
+
+/// Whether a Makefile's content declares a `test` target: a line whose
+/// non-recipe portion (a leading tab denotes a recipe/command line, not a
+/// target header — leading spaces before a target are otherwise harmless)
+/// starts with `test:` or the double-colon form `test::`, followed by
+/// prerequisites or nothing. This deliberately excludes a Make
+/// variable-assignment line that happens to share the same prefix — `test:=`
+/// (simple/immediate assignment) or `test::=` (POSIX/GNU immediate
+/// assignment) — which defines a *variable* named `test`, not a target, and
+/// would otherwise make `make test` fail with "No rule to make target
+/// `test'" despite this function reporting a gate.
+fn has_test_target(content: &str) -> bool {
+    content.lines().any(|line| {
+        if line.starts_with('\t') {
+            return false;
+        }
+        line.trim_start()
+            .strip_prefix("test:")
+            .is_some_and(|rest| !rest.starts_with('=') && !rest.starts_with(":="))
+    })
+}
+
+/// `std::fs::read_to_string`, but with the failing path folded into the
+/// error message. `MemoryError::Io`'s `#[from] std::io::Error` conversion
+/// alone loses the path — `std::io::Error`'s `Display` never includes it —
+/// which would otherwise leave a human debugging a bare "IO error:
+/// Permission denied (os error 13)" with no indication of which manifest
+/// (`Cargo.toml`, `package.json`, or a `Makefile` variant) caused it.
+fn read_manifest(path: &Path) -> Result<String, MemoryError> {
+    std::fs::read_to_string(path).map_err(|err| {
+        MemoryError::Validation(format!("failed to read '{}': {err}", path.display()))
+    })
 }
 
 /// End-to-end onboarding (spec steps 1-2): infer gate commands for the local
@@ -276,6 +374,39 @@ mod tests {
         assert_eq!(
             infer_gate_commands(dir.path()).unwrap(),
             vec!["cargo test --workspace".to_string()]
+        );
+    }
+
+    #[test]
+    fn infers_workspace_cargo_test_from_a_workspace_package_subtable_with_no_bare_header() {
+        // `[workspace.package]` alone (no standalone `[workspace]` line)
+        // still establishes the `workspace` table per TOML's implicit-
+        // parent-table rule, and Cargo genuinely treats this as a workspace
+        // root — this repo's own root Cargo.toml combines `[workspace]` with
+        // `[workspace.package]` for exactly this reason.
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "Cargo.toml",
+            "[workspace.package]\nrust-version = \"1.91\"\n",
+        );
+        assert_eq!(
+            infer_gate_commands(dir.path()).unwrap(),
+            vec!["cargo test --workspace".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_workspace_bracket_line_inside_a_multiline_string_is_not_a_real_header() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "Cargo.toml",
+            "[package]\nname = \"x\"\ndescription = \"\"\"\n[workspace]\n\"\"\"\n",
+        );
+        assert_eq!(
+            infer_gate_commands(dir.path()).unwrap(),
+            vec!["cargo test".to_string()]
         );
     }
 
@@ -425,6 +556,95 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "Makefile", "release:\n\t./ship.sh\n");
         assert!(infer_gate_commands(dir.path()).is_err());
+    }
+
+    #[test]
+    fn gnu_makefile_precedence_wins_even_without_a_test_target_there() {
+        // Real `make` loads only the first of GNUmakefile/makefile/Makefile
+        // that exists and never falls through to the others. A GNUmakefile
+        // with no `test:` target means `make test` really fails, even
+        // though a sibling Makefile happens to have one — this must not be
+        // detected as a working gate.
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "GNUmakefile", "build:\n\t./build.sh\n");
+        write(dir.path(), "Makefile", "test:\n\t./run_tests.sh\n");
+        assert!(infer_gate_commands(dir.path()).is_err());
+    }
+
+    #[test]
+    fn makefile_variable_assignment_is_not_mistaken_for_a_test_target() {
+        // `test:=...` (Make's simple/immediate-assignment operator) defines
+        // a variable named `test`, not a target — `make test` would fail
+        // with "No rule to make target `test'" against this file.
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "Makefile", "test:=$(wildcard tests/*.py)\n");
+        assert!(infer_gate_commands(dir.path()).is_err());
+    }
+
+    #[test]
+    fn makefile_test_target_with_leading_whitespace_is_recognized() {
+        // Only a leading TAB denotes a recipe line in Make; leading spaces
+        // before a target header are harmless and `make test` really works
+        // against this file.
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "Makefile", " test: build\n\t./run_tests.sh\n");
+        assert_eq!(
+            infer_gate_commands(dir.path()).unwrap(),
+            vec!["make test".to_string()]
+        );
+    }
+
+    #[test]
+    fn makefile_double_colon_test_target_is_still_recognized() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "Makefile", "test:: unit\n\t./run_unit.sh\n");
+        assert_eq!(
+            infer_gate_commands(dir.path()).unwrap(),
+            vec!["make test".to_string()]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_cargo_toml_is_not_masked_by_an_incidental_makefile_test_target() {
+        // Regression test for a conflation bug: the Makefile fallback must
+        // only fire when *nothing* was recognized, not merely when
+        // `commands` is empty — those are different when Cargo.toml exists
+        // but fails to read. Without this guard, the real Cargo.toml error
+        // was silently discarded in favor of `make test`.
+        //
+        // Uses a real unreadable file via Unix permission bits, so this is
+        // skipped in effect (though not compiled out) when the test runner
+        // executes as root, which ignores permission bits entirely.
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "Cargo.toml", "[package]\nname = \"x\"\n");
+        write(dir.path(), "Makefile", "test:\n\t./run_tests.sh\n");
+        let cargo_toml = dir.path().join("Cargo.toml");
+        std::fs::set_permissions(&cargo_toml, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let result = infer_gate_commands(dir.path());
+
+        // Restore read access so the tempdir can clean itself up.
+        std::fs::set_permissions(&cargo_toml, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        if test_runner_is_root() {
+            // Root ignores permission bits entirely, so the read above
+            // would have succeeded and this test can't exercise the fix —
+            // skip rather than fail for a reason unrelated to it.
+            return;
+        }
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("Cargo.toml"),
+            "expected the real Cargo.toml read error to surface, got: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    fn test_runner_is_root() -> bool {
+        std::env::var("USER").as_deref() == Ok("root") || std::env::var("USER").is_err()
     }
 
     #[test]
