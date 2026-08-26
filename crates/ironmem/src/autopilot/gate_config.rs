@@ -3,8 +3,8 @@
 //!
 //! This module implements only the storage/state-transition half of that
 //! section: writing a proposed config and flipping it to approved. Inferring
-//! the gate commands from a repo's CI config is rung 3's Onboarder; nothing
-//! here inspects a repo at all.
+//! the gate commands from a repo's build manifests is [`super::onboard`]
+//! (rung 3's Onboarder); nothing here inspects a repo at all.
 
 use serde::{Deserialize, Serialize};
 
