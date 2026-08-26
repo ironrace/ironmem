@@ -874,8 +874,14 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                         "Proposed gate config for '{}' (pending approval):",
                         config.repo
                     );
-                    for gate_command in &config.gate_commands {
+                    for gate_command in config.gate_commands() {
                         println!("  - {gate_command}");
+                    }
+                    if !config.manifest_warnings.is_empty() {
+                        println!("Warnings (review before approving):");
+                        for warning in &config.manifest_warnings {
+                            println!("  - {warning}");
+                        }
                     }
                     println!("Run `ironmem autopilot approve {}` to accept.", config.repo);
                 }

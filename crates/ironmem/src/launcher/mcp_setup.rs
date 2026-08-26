@@ -89,8 +89,8 @@ pub(crate) fn ensure_claude_registered(
     proxy_args: &[String],
 ) -> Result<RegisterOutcome, MemoryError> {
     let mut root: serde_json::Value = if config_path.exists() {
-        let raw = std::fs::read_to_string(config_path)
-            .map_err(|e| MemoryError::Config(format!("read {}: {e}", config_path.display())))?;
+        let raw =
+            crate::error::read_to_string_with_path(config_path).map_err(MemoryError::Config)?;
         serde_json::from_str(&raw)
             .map_err(|e| MemoryError::Config(format!("parse {}: {e}", config_path.display())))?
     } else {
@@ -176,8 +176,7 @@ pub(crate) fn ensure_codex_registered(
     proxy_args: &[String],
 ) -> Result<RegisterOutcome, MemoryError> {
     let existing = if config_path.exists() {
-        std::fs::read_to_string(config_path)
-            .map_err(|e| MemoryError::Config(format!("read {}: {e}", config_path.display())))?
+        crate::error::read_to_string_with_path(config_path).map_err(MemoryError::Config)?
     } else {
         String::new()
     };

@@ -55,6 +55,16 @@ const PYTHON_MARKERS: &[&str] = &[
     "Pipfile",
 ];
 
+/// The result of [`infer_gate_commands`]: every recognized stack's command,
+/// plus any non-fatal problems hit while inferring them.
+#[derive(Debug)]
+pub struct InferredGates {
+    pub commands: Vec<String>,
+    /// See [`GateConfig::manifest_warnings`] — [`onboard_repo`] carries these
+    /// straight through so a human approving the proposal can see them.
+    pub warnings: Vec<String>,
+}
+
 /// Infer gate commands for the repo checked out at `repo_path`, by
 /// deterministic root-level build-manifest detection (see module docs for
 /// scope). Returns every recognized stack's command, in a fixed order
@@ -64,7 +74,7 @@ const PYTHON_MARKERS: &[&str] = &[
 /// `turn_prompt::render` already panics on an empty `gate_commands`; failing
 /// here, with a message a human can act on, is strictly better than that
 /// panic firing downstream at dispatch time).
-pub fn infer_gate_commands(repo_path: &Path) -> Result<Vec<String>, MemoryError> {
+pub fn infer_gate_commands(repo_path: &Path) -> Result<InferredGates, MemoryError> {
     if !repo_path.is_dir() {
         return Err(MemoryError::Validation(format!(
             "'{}' is not a directory — cannot inspect it for build manifests",
@@ -77,9 +87,10 @@ pub fn infer_gate_commands(repo_path: &Path) -> Result<Vec<String>, MemoryError>
     // recognized — see the module doc's "every recognized stack ... contributes
     // its command" contract. Only the first such error is kept (there is
     // never a reason to report more than one root-cause to a human fixing
-    // their repo one manifest at a time); it surfaces only if no stack was
-    // recognized at all, in place of the generic "nothing found" message
-    // below.
+    // their repo one manifest at a time); it surfaces as a hard error only
+    // if no stack was recognized at all, in place of the generic "nothing
+    // found" message below — otherwise it becomes a warning (see below),
+    // never silently vanishing either way.
     let mut commands = Vec::new();
     let mut manifest_error: Option<MemoryError> = None;
 
@@ -120,7 +131,21 @@ pub fn infer_gate_commands(repo_path: &Path) -> Result<Vec<String>, MemoryError>
             PYTHON_MARKERS.join("/"),
         )));
     }
-    Ok(commands)
+
+    // At least one stack was recognized, so any manifest error here is the
+    // "different stack" case the module doc describes — not vetoed, but
+    // also not allowed to disappear with zero trace: a human approving what
+    // looks like a complete gate deserves to know a different manifest sat
+    // broken and was skipped rather than contributing its own command.
+    let warnings = manifest_error
+        .map(|err| {
+            vec![format!(
+                "a build manifest could not be inspected and was skipped: {err}"
+            )]
+        })
+        .unwrap_or_default();
+
+    Ok(InferredGates { commands, warnings })
 }
 
 /// Fold one fallible stack detector's result into the shared `commands`/
@@ -143,21 +168,61 @@ fn record(
     }
 }
 
+/// Whether `dir` contains an entry whose file name is *exactly* `name`,
+/// verified via a directory listing rather than `dir.join(name).is_file()`
+/// — the latter resolves through the OS's own path-lookup semantics, which
+/// on a case-insensitive-but-case-preserving filesystem (e.g. default macOS
+/// APFS) silently matches a differently-cased file that a case-sensitive one
+/// (Linux, where these gate commands actually run in CI) would not. Without
+/// this, the identical checkout content could infer a different gate for
+/// the same repo depending on which machine ran onboarding. Uses
+/// `DirEntry::metadata` (which follows symlinks, like `Path::is_file`) —
+/// not `DirEntry::file_type` (which reports the symlink itself without
+/// following it) — so a manifest symlinked in from elsewhere in a monorepo
+/// is still recognized, matching the prior `.is_file()` behavior for that
+/// case.
+fn exact_file_exists(dir: &Path, name: &str) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries.filter_map(Result::ok).any(|entry| {
+        entry.file_name() == std::ffi::OsStr::new(name)
+            && entry.metadata().map(|m| m.is_file()).unwrap_or(false)
+    })
+}
+
 /// `Cargo.toml` present → Rust. A root `[workspace]` table means member
 /// crates typically don't all build/test from the root package alone, so
 /// `--workspace` is required for the gate to actually cover them; a plain
 /// package gets the simpler `cargo test`.
 fn infer_rust(repo_path: &Path) -> Result<Option<String>, MemoryError> {
-    let manifest = repo_path.join("Cargo.toml");
-    if !manifest.is_file() {
+    if !exact_file_exists(repo_path, "Cargo.toml") {
         return Ok(None);
     }
-    let content = read_manifest(&manifest)?;
+    let content = read_manifest(&repo_path.join("Cargo.toml"))?;
     Ok(Some(if is_cargo_workspace(&content) {
         "cargo test --workspace".to_string()
     } else {
         "cargo test".to_string()
     }))
+}
+
+/// Strip one layer of matching `"`/`'` quoting from a TOML bare-or-quoted
+/// key segment, e.g. `"workspace"` or `'workspace'` → `workspace` — TOML
+/// allows a table header's key to be quoted (`["workspace"]` is exactly as
+/// valid as `[workspace]`), and [`is_cargo_workspace`]'s heuristic must
+/// recognize both forms the same way a real TOML parser would. Does not
+/// handle a *dotted* header with only some segments quoted (e.g.
+/// `["workspace".package]`) — closing that fully needs a real TOML parser,
+/// the same limitation already documented on `is_cargo_workspace` for the
+/// unquoted dotted-key-only form.
+fn strip_matching_quotes(s: &str) -> &str {
+    for quote in ['"', '\''] {
+        if s.len() >= 2 && s.starts_with(quote) && s.ends_with(quote) {
+            return &s[1..s.len() - 1];
+        }
+    }
+    s
 }
 
 /// Whether a `Cargo.toml`'s content declares a `[workspace]` table — either
@@ -169,25 +234,42 @@ fn infer_rust(repo_path: &Path) -> Result<Option<String>, MemoryError> {
 ///
 /// This is a line-oriented heuristic, not a real TOML parser (this crate
 /// has no TOML-parsing dependency), so it tracks whether each line falls
-/// inside a `"""`-delimited multi-line string — otherwise a `description`
-/// field's free text merely *containing* the line `[workspace]` would be
-/// mistaken for a real header. It still cannot see a workspace declared
-/// purely through top-level dotted-key syntax with no header line at all
-/// (e.g. `workspace.members = [...]`) — closing that gap fully would need a
-/// real TOML parser, which is more machinery than this rung's fixture-repo
-/// testing bar (see the module doc) asks for.
+/// inside a `"""`- or `'''`-delimited multi-line string (TOML's basic and
+/// literal multi-line string forms, respectively) — otherwise a
+/// `description` field's free text merely *containing* the line
+/// `[workspace]` would be mistaken for a real header. It still cannot see a
+/// workspace declared purely through top-level dotted-key syntax with no
+/// header line at all (e.g. `workspace.members = [...]`) — closing that gap
+/// fully would need a real TOML parser, which is more machinery than this
+/// rung's fixture-repo testing bar (see the module doc) asks for.
 fn is_cargo_workspace(content: &str) -> bool {
-    let mut in_multiline_string = false;
+    // Tracked independently, not folded into one flag: content inside a
+    // `"""` block can itself contain a stray `'''` substring (and vice
+    // versa) without that being a real delimiter, so a shared flag would
+    // let one string type's content spuriously close the other's block.
+    let mut in_basic_multiline = false;
+    let mut in_literal_multiline = false;
     for raw_line in content.lines() {
-        let has_odd_triple_quotes = raw_line.matches("\"\"\"").count() % 2 == 1;
-        if in_multiline_string {
-            if has_odd_triple_quotes {
-                in_multiline_string = false;
+        let has_odd_triple_double = raw_line.matches("\"\"\"").count() % 2 == 1;
+        let has_odd_triple_single = raw_line.matches("'''").count() % 2 == 1;
+        if in_basic_multiline {
+            if has_odd_triple_double {
+                in_basic_multiline = false;
             }
             continue;
         }
-        if has_odd_triple_quotes {
-            in_multiline_string = true;
+        if in_literal_multiline {
+            if has_odd_triple_single {
+                in_literal_multiline = false;
+            }
+            continue;
+        }
+        if has_odd_triple_double {
+            in_basic_multiline = true;
+            continue;
+        }
+        if has_odd_triple_single {
+            in_literal_multiline = true;
             continue;
         }
         let header = raw_line
@@ -199,6 +281,7 @@ fn is_cargo_workspace(content: &str) -> bool {
             .strip_prefix('[')
             .and_then(|rest| rest.strip_suffix(']'))
             .map(str::trim)
+            .map(strip_matching_quotes)
             .is_some_and(|name| name == "workspace" || name.starts_with("workspace."));
         if is_workspace_header {
             return true;
@@ -219,7 +302,7 @@ const NPM_INIT_PLACEHOLDER_TEST_SCRIPT: &str = "echo \"Error: no test specified\
 fn infer_python(repo_path: &Path) -> Option<String> {
     PYTHON_MARKERS
         .iter()
-        .any(|marker| repo_path.join(marker).is_file())
+        .any(|marker| exact_file_exists(repo_path, marker))
         .then(|| "pytest".to_string())
 }
 
@@ -229,10 +312,7 @@ fn infer_python(repo_path: &Path) -> Option<String> {
 /// has no reliable way to infer, and guessing wrong would silently propose a
 /// gate command that fails on every dispatch.
 fn infer_swift(repo_path: &Path) -> Option<String> {
-    repo_path
-        .join("Package.swift")
-        .is_file()
-        .then(|| "swift test".to_string())
+    exact_file_exists(repo_path, "Package.swift").then(|| "swift test".to_string())
 }
 
 /// `package.json` present with a real (non-placeholder) `scripts.test`
@@ -242,12 +322,18 @@ fn infer_swift(repo_path: &Path) -> Option<String> {
 /// it would make the gate config permanently unsatisfiable for a project
 /// that simply has no test script yet.
 fn infer_node(repo_path: &Path) -> Result<Option<String>, MemoryError> {
-    let manifest = repo_path.join("package.json");
-    if !manifest.is_file() {
+    if !exact_file_exists(repo_path, "package.json") {
         return Ok(None);
     }
+    let manifest = repo_path.join("package.json");
     let content = read_manifest(&manifest)?;
-    let value: serde_json::Value = serde_json::from_str(&content)?;
+    // Fold the path into the error the same way `read_manifest` does for a
+    // read failure — `serde_json::Error`'s `Display` names only a line/column,
+    // never the file, and `MemoryError::Json`'s `#[from]` conversion via `?`
+    // would otherwise leave a human with an unattributed "JSON error: ...".
+    let value: serde_json::Value = serde_json::from_str(&content).map_err(|err| {
+        MemoryError::Validation(format!("failed to parse '{}': {err}", manifest.display()))
+    })?;
     let test_script = value
         .get("scripts")
         .and_then(|scripts| scripts.get("test"))
@@ -273,47 +359,124 @@ fn infer_node(repo_path: &Path) -> Result<Option<String>, MemoryError> {
 /// continuing on to check the other two names' content.
 fn infer_makefile_fallback(repo_path: &Path) -> Result<Option<String>, MemoryError> {
     for name in ["GNUmakefile", "makefile", "Makefile"] {
-        let makefile = repo_path.join(name);
-        if !makefile.is_file() {
+        if !exact_file_exists(repo_path, name) {
             continue;
         }
-        let content = read_manifest(&makefile)?;
+        let content = read_manifest(&repo_path.join(name))?;
         return Ok(has_test_target(&content).then(|| "make test".to_string()));
     }
     Ok(None)
 }
 
-/// Whether a Makefile's content declares a `test` target: a line whose
-/// non-recipe portion (a leading tab denotes a recipe/command line, not a
-/// target header — leading spaces before a target are otherwise harmless)
-/// starts with `test:` or the double-colon form `test::`, followed by
-/// prerequisites or nothing. This deliberately excludes a Make
-/// variable-assignment line that happens to share the same prefix — `test:=`
-/// (simple/immediate assignment) or `test::=` (POSIX/GNU immediate
-/// assignment) — which defines a *variable* named `test`, not a target, and
-/// would otherwise make `make test` fail with "No rule to make target
-/// `test'" despite this function reporting a gate.
+/// Whether a Makefile's content declares a `test` target: a rule line
+/// (a leading tab denotes a recipe/command line, not a target header —
+/// leading spaces before a target are otherwise harmless) whose
+/// colon-separated *target list* names `test` as one of one-or-more
+/// whitespace-separated targets (real Make allows both `test : build` and
+/// multi-target headers like `test other-target:`, not only the single
+/// literal prefix `test:`), followed by a single or double colon that is
+/// *not* immediately followed by `=` — `test:=`/`test::=` (simple/immediate
+/// and POSIX/GNU immediate assignment) define a *variable* named `test`,
+/// not a target, and would otherwise make `make test` fail with "No rule to
+/// make target `test'" despite this function reporting a gate.
+///
+/// Also tracks `define`/`endef` blocks (Make's multi-line variable
+/// definition, most commonly used to build canned recipes or help text):
+/// their body is opaque text to Make, not rule headers, so a line inside one
+/// that merely *contains* `test:` — e.g. help text describing a `test`
+/// target — must not be mistaken for a real one, the same reasoning
+/// `is_cargo_workspace` already applies to a TOML multi-line string.
+///
+/// A `#` starts a real Make comment on any non-recipe line, stripped before
+/// scanning for a target header or a `define` directive — otherwise a doc
+/// comment merely *mentioning* `test:` (e.g. `# test: run the test suite`)
+/// would be mistaken for a real target, since a bare colon-scan has no other
+/// way to tell prose from a header.
 fn has_test_target(content: &str) -> bool {
+    let mut in_define_block = false;
     content.lines().any(|line| {
+        if in_define_block {
+            if line.trim_start().starts_with("endef") {
+                in_define_block = false;
+            }
+            return false;
+        }
+        // A tab-led recipe line is never a directive, even if its shell
+        // command happens to start with the word "define" — check this
+        // before the `define` check below, matching real Make's own
+        // precedence (recipe-ness is purely about the leading tab).
         if line.starts_with('\t') {
             return false;
         }
-        line.trim_start()
-            .strip_prefix("test:")
-            .is_some_and(|rest| !rest.starts_with('=') && !rest.starts_with(":="))
+        let trimmed = line.trim_start();
+        let trimmed = trimmed
+            .split('#')
+            .next()
+            .expect("str::split always yields at least one item")
+            .trim_end();
+        if trimmed.starts_with("define") {
+            in_define_block = true;
+            return false;
+        }
+        let Some(colon_pos) = trimmed.find(':') else {
+            return false;
+        };
+        let (targets, rest) = trimmed.split_at(colon_pos);
+        // Consume one or two colons (single- or double-colon rule form),
+        // then check the assignment-operator lookalikes: `test:=...` and
+        // `test::=...` both leave `=` immediately after the colon(s).
+        let after_colons = rest
+            .strip_prefix("::")
+            .or_else(|| rest.strip_prefix(':'))
+            .unwrap_or(rest);
+        if after_colons.starts_with('=') {
+            return false;
+        }
+        targets.split_whitespace().any(|target| target == "test")
     })
 }
 
+/// Generous cap on a build manifest's size. A real `Cargo.toml`/
+/// `package.json`/`Makefile` is at most a few KB; `read_to_string` has no
+/// size limit of its own, so a manifest that resolves — directly, or via a
+/// symlink a monorepo might legitimately use — to an unexpectedly large
+/// regular file would otherwise be loaded into memory in full with no
+/// bound. (A symlink to a device or other special file, e.g. `/dev/zero`,
+/// is already excluded upstream: both `exact_file_exists` and this
+/// function's own `fs::metadata` call follow symlinks and check the
+/// *destination's* type, and neither ever reports such a target as a
+/// regular file.)
+const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
+
 /// `std::fs::read_to_string`, but with the failing path folded into the
-/// error message. `MemoryError::Io`'s `#[from] std::io::Error` conversion
-/// alone loses the path — `std::io::Error`'s `Display` never includes it —
-/// which would otherwise leave a human debugging a bare "IO error:
-/// Permission denied (os error 13)" with no indication of which manifest
-/// (`Cargo.toml`, `package.json`, or a `Makefile` variant) caused it.
+/// error message (via [`crate::error::read_to_string_with_path`]) and a size
+/// cap enforced first (see [`MAX_MANIFEST_BYTES`]).
+///
+/// A leading UTF-8 BOM (U+FEFF), if present, is stripped before returning:
+/// it is not Unicode whitespace, so it would otherwise survive every
+/// caller's own trimming and hide the very first line's real content — a
+/// `[workspace]` header for [`is_cargo_workspace`], or the opening `{` for
+/// `infer_node`'s JSON parse (`serde_json` does not skip a BOM either).
+/// Stripped once here, at the shared read boundary, rather than patched
+/// into each format-specific parser separately.
 fn read_manifest(path: &Path) -> Result<String, MemoryError> {
-    std::fs::read_to_string(path).map_err(|err| {
-        MemoryError::Validation(format!("failed to read '{}': {err}", path.display()))
-    })
+    let size = std::fs::metadata(path)
+        .map_err(|err| {
+            MemoryError::Validation(format!("failed to read '{}': {err}", path.display()))
+        })?
+        .len();
+    if size > MAX_MANIFEST_BYTES {
+        return Err(MemoryError::Validation(format!(
+            "'{}' is {size} bytes, over the {MAX_MANIFEST_BYTES}-byte limit for a build \
+             manifest — refusing to read it",
+            path.display()
+        )));
+    }
+    let content = crate::error::read_to_string_with_path(path).map_err(MemoryError::Validation)?;
+    Ok(content
+        .strip_prefix('\u{FEFF}')
+        .map(str::to_string)
+        .unwrap_or(content))
 }
 
 /// End-to-end onboarding (spec steps 1-2): infer gate commands for the local
@@ -322,13 +485,22 @@ fn read_manifest(path: &Path) -> Result<String, MemoryError> {
 /// deliberately a separate parameter from `repo_path` (the physical checkout
 /// used only for inspection; the Lead's dispatches later resolve their own
 /// worktrees independently, per rung 2's `run_dispatch`).
+///
+/// Validates `repo` *before* inspecting `repo_path`: `propose_gate_config`
+/// re-validates it regardless (this call must not rely on being the only
+/// caller that already checked), but doing it here first means an invalid
+/// `repo` identity fails immediately rather than after this function has
+/// already walked and read the checkout's build manifests for nothing —
+/// and surfaces the actual root cause (a bad `repo` argument) instead of a
+/// filesystem-shaped error from a step that never needed to run.
 pub fn onboard_repo(
     db: &Database,
     repo: &str,
     repo_path: &Path,
 ) -> Result<GateConfig, MemoryError> {
-    let commands = infer_gate_commands(repo_path)?;
-    propose_gate_config(db, repo, commands)
+    super::validate_repo(repo)?;
+    let inferred = infer_gate_commands(repo_path)?;
+    propose_gate_config(db, repo, inferred.commands, inferred.warnings)
 }
 
 #[cfg(test)]
@@ -344,7 +516,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "Cargo.toml", "[package]\nname = \"x\"\n");
         assert_eq!(
-            infer_gate_commands(dir.path()).unwrap(),
+            infer_gate_commands(dir.path()).unwrap().commands,
             vec!["cargo test".to_string()]
         );
     }
@@ -358,7 +530,7 @@ mod tests {
             "[workspace]\nmembers = [\"crates/*\"]\n",
         );
         assert_eq!(
-            infer_gate_commands(dir.path()).unwrap(),
+            infer_gate_commands(dir.path()).unwrap().commands,
             vec!["cargo test --workspace".to_string()]
         );
     }
@@ -372,7 +544,7 @@ mod tests {
             "[ workspace ]  # members below\nmembers = [\"crates/*\"]\n",
         );
         assert_eq!(
-            infer_gate_commands(dir.path()).unwrap(),
+            infer_gate_commands(dir.path()).unwrap().commands,
             vec!["cargo test --workspace".to_string()]
         );
     }
@@ -391,7 +563,7 @@ mod tests {
             "[workspace.package]\nrust-version = \"1.91\"\n",
         );
         assert_eq!(
-            infer_gate_commands(dir.path()).unwrap(),
+            infer_gate_commands(dir.path()).unwrap().commands,
             vec!["cargo test --workspace".to_string()]
         );
     }
@@ -405,8 +577,87 @@ mod tests {
             "[package]\nname = \"x\"\ndescription = \"\"\"\n[workspace]\n\"\"\"\n",
         );
         assert_eq!(
-            infer_gate_commands(dir.path()).unwrap(),
+            infer_gate_commands(dir.path()).unwrap().commands,
             vec!["cargo test".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_workspace_bracket_line_inside_a_literal_multiline_string_is_not_a_real_header() {
+        // TOML's `'''`-delimited multi-line *literal* string is a distinct
+        // form from the `"""`-delimited basic one above, and must be
+        // tracked independently — not just the basic form.
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "Cargo.toml",
+            "[package]\nname = \"x\"\ndescription = '''\n[workspace]\n'''\n",
+        );
+        assert_eq!(
+            infer_gate_commands(dir.path()).unwrap().commands,
+            vec!["cargo test".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_quoted_workspace_bracket_header_is_recognized() {
+        // TOML allows a table header's key to be quoted: `["workspace"]` is
+        // exactly as valid as `[workspace]`.
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "Cargo.toml",
+            "[\"workspace\"]\nmembers = [\"crates/*\"]\n",
+        );
+        assert_eq!(
+            infer_gate_commands(dir.path()).unwrap().commands,
+            vec!["cargo test --workspace".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_single_quoted_workspace_bracket_header_is_recognized_too() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "Cargo.toml",
+            "['workspace']\nmembers = [\"crates/*\"]\n",
+        );
+        assert_eq!(
+            infer_gate_commands(dir.path()).unwrap().commands,
+            vec!["cargo test --workspace".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_leading_utf8_bom_does_not_hide_a_workspace_header_on_the_first_line() {
+        // A BOM (U+FEFF) is not Unicode whitespace, so `.trim()` alone would
+        // leave it attached to the first line and hide the `[` that starts
+        // a real header there.
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "Cargo.toml",
+            "\u{FEFF}[workspace]\nmembers = [\"crates/*\"]\n",
+        );
+        assert_eq!(
+            infer_gate_commands(dir.path()).unwrap().commands,
+            vec!["cargo test --workspace".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_manifest_over_the_size_cap_is_refused_instead_of_read_in_full() {
+        // `read_to_string` has no size limit of its own; the cap exists so
+        // an unexpectedly huge regular file (reached directly or via a
+        // symlink) is refused up front rather than loaded into memory whole.
+        let dir = tempfile::tempdir().unwrap();
+        let oversized = "a".repeat(MAX_MANIFEST_BYTES as usize + 1);
+        write(dir.path(), "Cargo.toml", &oversized);
+        let err = infer_gate_commands(dir.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("byte limit"),
+            "expected the size-cap error, got: {err}"
         );
     }
 
@@ -415,7 +666,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "pyproject.toml", "[project]\nname = \"x\"\n");
         assert_eq!(
-            infer_gate_commands(dir.path()).unwrap(),
+            infer_gate_commands(dir.path()).unwrap().commands,
             vec!["pytest".to_string()]
         );
     }
@@ -425,9 +676,23 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "requirements.txt", "flask==3.0\n");
         assert_eq!(
-            infer_gate_commands(dir.path()).unwrap(),
+            infer_gate_commands(dir.path()).unwrap().commands,
             vec!["pytest".to_string()]
         );
+    }
+
+    #[test]
+    fn python_marker_matching_is_case_sensitive_for_deterministic_cross_platform_behavior() {
+        // On a case-insensitive-but-case-preserving filesystem (default
+        // macOS APFS), `Path::join("requirements.txt").is_file()` would
+        // previously match a file actually named "Requirements.TXT",
+        // inferring Python there but not on a case-sensitive filesystem
+        // (Linux, where the gate command actually runs in CI) for the
+        // identical checkout content. Exact-name matching must refuse this
+        // consistently on every platform.
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "Requirements.TXT", "flask==3.0\n");
+        assert!(infer_gate_commands(dir.path()).is_err());
     }
 
     #[test]
@@ -439,7 +704,7 @@ mod tests {
             "// swift-tools-version:5.9\nimport PackageDescription\n",
         );
         assert_eq!(
-            infer_gate_commands(dir.path()).unwrap(),
+            infer_gate_commands(dir.path()).unwrap().commands,
             vec!["swift test".to_string()]
         );
     }
@@ -453,7 +718,7 @@ mod tests {
             r#"{"name":"x","scripts":{"test":"jest"}}"#,
         );
         assert_eq!(
-            infer_gate_commands(dir.path()).unwrap(),
+            infer_gate_commands(dir.path()).unwrap().commands,
             vec!["npm test".to_string()]
         );
     }
@@ -487,8 +752,23 @@ mod tests {
             r#"{"name":"x","scripts":{"test":"jest || echo \"Error: no test specified\" && exit 1"}}"#,
         );
         assert_eq!(
-            infer_gate_commands(dir.path()).unwrap(),
+            infer_gate_commands(dir.path()).unwrap().commands,
             vec!["npm test".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_malformed_package_json_error_names_the_file() {
+        // Unlike a Cargo.toml/Makefile read failure (which `read_manifest`
+        // already folds the path into), `serde_json::Error`'s own `Display`
+        // never names the file it was parsing — the wrapping in
+        // `infer_node` must supply that context itself.
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "package.json", "{ not valid json");
+        let err = infer_gate_commands(dir.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("package.json"),
+            "expected the malformed-JSON error to name package.json, got: {err}"
         );
     }
 
@@ -497,9 +777,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "Cargo.toml", "[package]\nname = \"x\"\n");
         write(dir.path(), "package.json", "{ not valid json");
-        assert_eq!(
-            infer_gate_commands(dir.path()).unwrap(),
-            vec!["cargo test".to_string()]
+        let inferred = infer_gate_commands(dir.path()).unwrap();
+        assert_eq!(inferred.commands, vec!["cargo test".to_string()]);
+        // The broken package.json must not vanish with zero trace just
+        // because Rust was still recognized — a human approving this
+        // proposal needs to know Node's real gate never ran.
+        assert_eq!(inferred.warnings.len(), 1);
+        assert!(
+            inferred.warnings[0].contains("package.json"),
+            "expected the warning to name package.json, got: {:?}",
+            inferred.warnings
         );
     }
 
@@ -509,7 +796,7 @@ mod tests {
         write(dir.path(), "Cargo.toml", "[package]\nname = \"x\"\n");
         write(dir.path(), "pyproject.toml", "[project]\nname = \"x\"\n");
         assert_eq!(
-            infer_gate_commands(dir.path()).unwrap(),
+            infer_gate_commands(dir.path()).unwrap().commands,
             vec!["cargo test".to_string(), "pytest".to_string()]
         );
     }
@@ -519,7 +806,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "Makefile", "test:\n\t./run_tests.sh\n");
         assert_eq!(
-            infer_gate_commands(dir.path()).unwrap(),
+            infer_gate_commands(dir.path()).unwrap().commands,
             vec!["make test".to_string()]
         );
     }
@@ -533,7 +820,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "makefile", "test:\n\t./run_tests.sh\n");
         assert_eq!(
-            infer_gate_commands(dir.path()).unwrap(),
+            infer_gate_commands(dir.path()).unwrap().commands,
             vec!["make test".to_string()]
         );
     }
@@ -546,7 +833,7 @@ mod tests {
         // Only the Rust command — the Makefile's target is not additionally
         // included per the module's documented fallback-only scope.
         assert_eq!(
-            infer_gate_commands(dir.path()).unwrap(),
+            infer_gate_commands(dir.path()).unwrap().commands,
             vec!["cargo test".to_string()]
         );
     }
@@ -589,7 +876,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "Makefile", " test: build\n\t./run_tests.sh\n");
         assert_eq!(
-            infer_gate_commands(dir.path()).unwrap(),
+            infer_gate_commands(dir.path()).unwrap().commands,
             vec!["make test".to_string()]
         );
     }
@@ -599,9 +886,82 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "Makefile", "test:: unit\n\t./run_unit.sh\n");
         assert_eq!(
-            infer_gate_commands(dir.path()).unwrap(),
+            infer_gate_commands(dir.path()).unwrap().commands,
             vec!["make test".to_string()]
         );
+    }
+
+    #[test]
+    fn makefile_test_target_with_whitespace_before_the_colon_is_recognized() {
+        // GNU Make allows (and this is common style) whitespace between a
+        // target name and its colon — `test : build` really works with
+        // `make test`, the same as `test: build`.
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "Makefile", "test : build\n\t./run_tests.sh\n");
+        assert_eq!(
+            infer_gate_commands(dir.path()).unwrap().commands,
+            vec!["make test".to_string()]
+        );
+    }
+
+    #[test]
+    fn makefile_multi_target_header_naming_test_is_recognized() {
+        // A single rule header can name several space-separated targets
+        // sharing one prerequisite list/recipe; `test` is a real target
+        // here even though it isn't the only, or the first-before-colon,
+        // name on the line.
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "Makefile",
+            "build test other-target:\n\t./run_tests.sh\n",
+        );
+        assert_eq!(
+            infer_gate_commands(dir.path()).unwrap().commands,
+            vec!["make test".to_string()]
+        );
+    }
+
+    #[test]
+    fn makefile_comment_mentioning_test_colon_is_not_a_real_target() {
+        // A doc comment describing a target in prose (`# test: ...`) must
+        // not be mistaken for a real header just because a bare colon-scan
+        // would otherwise see `test` before the first `:`.
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "Makefile",
+            "# test: run the test suite via ./run_tests.sh\nbuild:\n\t./build.sh\n",
+        );
+        assert!(infer_gate_commands(dir.path()).is_err());
+    }
+
+    #[test]
+    fn makefile_test_target_with_a_trailing_comment_is_still_recognized() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "Makefile",
+            "test: build  # runs the test suite\n\t./run_tests.sh\n",
+        );
+        assert_eq!(
+            infer_gate_commands(dir.path()).unwrap().commands,
+            vec!["make test".to_string()]
+        );
+    }
+
+    #[test]
+    fn makefile_test_colon_inside_a_define_block_is_not_a_real_target() {
+        // `define`/`endef` bodies are opaque help/canned-recipe text to
+        // Make, not rule headers — a `test:` line inside one describing a
+        // target in prose must not be mistaken for a real target.
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "Makefile",
+            "define HELP\ntest: run the test suite via ./run_tests.sh\nendef\nhelp:\n\t@echo \"$$HELP\"\n",
+        );
+        assert!(infer_gate_commands(dir.path()).is_err());
     }
 
     #[cfg(unix)]
@@ -670,9 +1030,10 @@ mod tests {
         let config = onboard_repo(&db, "ironrace/ironmem", dir.path()).unwrap();
 
         assert_eq!(
-            config.gate_commands,
+            config.gate_commands(),
             vec!["cargo test --workspace".to_string()]
         );
+        assert!(config.manifest_warnings.is_empty());
         assert_eq!(
             config.state,
             super::super::gate_config::GateConfigState::Pending
@@ -691,5 +1052,23 @@ mod tests {
         assert!(super::super::gate_config::get_gate_config(&db, "some/repo")
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn onboard_repo_rejects_an_invalid_repo_before_inspecting_repo_path() {
+        // An invalid `repo` identity must fail fast on the cheap, in-memory
+        // check rather than only after this function has already walked and
+        // read a (possibly large, possibly slow) checkout for nothing — and
+        // the resulting error must name the real problem (the `repo`
+        // argument), not `repo_path` not existing.
+        let db = Database::open_in_memory().unwrap();
+        let missing_path = std::path::Path::new("/does/not/exist");
+
+        let err = onboard_repo(&db, "", missing_path).unwrap_err();
+
+        assert!(
+            err.to_string().contains("repo"),
+            "expected the repo-identity validation error, got: {err}"
+        );
     }
 }

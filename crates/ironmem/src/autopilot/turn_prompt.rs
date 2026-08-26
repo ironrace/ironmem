@@ -81,7 +81,8 @@ pub fn render(inputs: &TurnPromptInputs) -> String {
     );
     assert!(
         !inputs.gate_commands.is_empty(),
-        "gate_commands must not be empty — a dispatch needs a real gate to satisfy"
+        "{}",
+        super::EMPTY_GATE_COMMANDS_MSG
     );
 
     let lineage_section = if inputs.prior_attempts.is_empty() {

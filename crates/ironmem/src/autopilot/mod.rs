@@ -77,7 +77,7 @@ pub use dispatch::{DispatchOutcome, DispatchSpec, SessionMode, Verdict};
 pub use dispatch_state::DispatchState;
 pub use gate_config::{GateConfig, GateConfigState};
 pub use lineage::{AttemptOutcome, AttemptRecord, IssueStatus, RecordedAttempt};
-pub use onboard::{infer_gate_commands, onboard_repo};
+pub use onboard::{infer_gate_commands, onboard_repo, InferredGates};
 pub use turn_prompt::{PriorAttempt, TurnPromptInputs};
 
 /// Drawer wing shared by every Autopilot backlog-lineage record. See the
@@ -173,6 +173,15 @@ pub(crate) fn validate_repo(repo: &str) -> Result<(), MemoryError> {
     }
     Ok(())
 }
+
+/// Shared between [`gate_config::propose_gate_config`]'s `Result`-returning
+/// storage-boundary check and [`turn_prompt::render`]'s `assert!` — both
+/// exist to catch the same "a dispatch needs a real gate to satisfy"
+/// invariant, at two different points a caller can violate it, so both
+/// quote this one string rather than two independently-maintained literals
+/// that could silently drift apart.
+pub(crate) const EMPTY_GATE_COMMANDS_MSG: &str =
+    "gate_commands must not be empty — a dispatch needs a real gate to satisfy";
 
 /// A zero vector of the bundled embedder's dimensionality. Every Autopilot
 /// drawer is written directly against [`Database`], not through the `App`
