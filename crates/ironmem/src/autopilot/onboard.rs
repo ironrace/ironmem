@@ -72,9 +72,19 @@ pub fn infer_gate_commands(repo_path: &Path) -> Result<Vec<String>, MemoryError>
         )));
     }
 
+    // A read/parse error on one manifest (e.g. invalid JSON in an unrelated
+    // package.json) must not veto a *different* stack this function already
+    // recognized — see the module doc's "every recognized stack ... contributes
+    // its command" contract. Such errors are collected and only surface if no
+    // stack was recognized at all, in place of the generic "nothing found"
+    // message below.
     let mut commands = Vec::new();
-    if let Some(cmd) = infer_rust(repo_path)? {
-        commands.push(cmd);
+    let mut manifest_errors = Vec::new();
+
+    match infer_rust(repo_path) {
+        Ok(Some(cmd)) => commands.push(cmd),
+        Ok(None) => {}
+        Err(err) => manifest_errors.push(err),
     }
     if let Some(cmd) = infer_python(repo_path) {
         commands.push(cmd);
@@ -82,16 +92,23 @@ pub fn infer_gate_commands(repo_path: &Path) -> Result<Vec<String>, MemoryError>
     if let Some(cmd) = infer_swift(repo_path) {
         commands.push(cmd);
     }
-    if let Some(cmd) = infer_node(repo_path)? {
-        commands.push(cmd);
+    match infer_node(repo_path) {
+        Ok(Some(cmd)) => commands.push(cmd),
+        Ok(None) => {}
+        Err(err) => manifest_errors.push(err),
     }
     if commands.is_empty() {
-        if let Some(cmd) = infer_makefile_fallback(repo_path)? {
-            commands.push(cmd);
+        match infer_makefile_fallback(repo_path) {
+            Ok(Some(cmd)) => commands.push(cmd),
+            Ok(None) => {}
+            Err(err) => manifest_errors.push(err),
         }
     }
 
     if commands.is_empty() {
+        if let Some(err) = manifest_errors.into_iter().next() {
+            return Err(err);
+        }
         return Err(MemoryError::Validation(format!(
             "could not infer any gate commands for '{}' — no recognized build manifest \
              (Cargo.toml, {}, Package.swift, package.json) or Makefile 'test:' target found; \
@@ -113,13 +130,26 @@ fn infer_rust(repo_path: &Path) -> Result<Option<String>, MemoryError> {
         return Ok(None);
     }
     let content = std::fs::read_to_string(&manifest)?;
-    let is_workspace = content.lines().any(|line| line.trim() == "[workspace]");
+    let is_workspace = content.lines().any(|line| {
+        let header = line.split('#').next().unwrap_or("").trim();
+        header
+            .strip_prefix('[')
+            .and_then(|rest| rest.strip_suffix(']'))
+            .is_some_and(|name| name.trim() == "workspace")
+    });
     Ok(Some(if is_workspace {
         "cargo test --workspace".to_string()
     } else {
         "cargo test".to_string()
     }))
 }
+
+/// The exact `npm init` default `scripts.test` placeholder — always fails,
+/// so it never counts as a real gate. An exact match (rather than a
+/// substring check) so a real script that merely mentions this text, e.g. a
+/// fallback branch like `"jest || echo \"Error: no test specified\" && exit
+/// 1"`, is still recognized as a real gate.
+const NPM_INIT_PLACEHOLDER_TEST_SCRIPT: &str = "echo \"Error: no test specified\" && exit 1";
 
 /// Any [`PYTHON_MARKERS`] file present at the root → Python, gated by
 /// `pytest`.
@@ -161,7 +191,7 @@ fn infer_node(repo_path: &Path) -> Result<Option<String>, MemoryError> {
         .and_then(|script| script.as_str());
     Ok(match test_script {
         Some(script)
-            if !script.trim().is_empty() && !script.contains("Error: no test specified") =>
+            if !script.trim().is_empty() && script.trim() != NPM_INIT_PLACEHOLDER_TEST_SCRIPT =>
         {
             Some("npm test".to_string())
         }
@@ -170,15 +200,22 @@ fn infer_node(repo_path: &Path) -> Result<Option<String>, MemoryError> {
 }
 
 /// Fallback consulted only when no other stack was recognized (see module
-/// docs): a `Makefile` with a line starting `test:` → `make test`.
+/// docs): a makefile with a line starting `test:` → `make test`. Checked
+/// under each name GNU Make itself recognizes, in Make's own preference
+/// order (`GNUmakefile`, `makefile`, `Makefile`), so a lowercase `makefile`
+/// on a case-sensitive filesystem is not missed.
 fn infer_makefile_fallback(repo_path: &Path) -> Result<Option<String>, MemoryError> {
-    let makefile = repo_path.join("Makefile");
-    if !makefile.is_file() {
-        return Ok(None);
+    for name in ["GNUmakefile", "makefile", "Makefile"] {
+        let makefile = repo_path.join(name);
+        if !makefile.is_file() {
+            continue;
+        }
+        let content = std::fs::read_to_string(&makefile)?;
+        if content.lines().any(|line| line.starts_with("test:")) {
+            return Ok(Some("make test".to_string()));
+        }
     }
-    let content = std::fs::read_to_string(&makefile)?;
-    let has_test_target = content.lines().any(|line| line.starts_with("test:"));
-    Ok(has_test_target.then(|| "make test".to_string()))
+    Ok(None)
 }
 
 /// End-to-end onboarding (spec steps 1-2): infer gate commands for the local
@@ -221,6 +258,20 @@ mod tests {
             dir.path(),
             "Cargo.toml",
             "[workspace]\nmembers = [\"crates/*\"]\n",
+        );
+        assert_eq!(
+            infer_gate_commands(dir.path()).unwrap(),
+            vec!["cargo test --workspace".to_string()]
+        );
+    }
+
+    #[test]
+    fn infers_workspace_cargo_test_when_the_header_has_a_trailing_comment_or_inner_spacing() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "Cargo.toml",
+            "[ workspace ]  # members below\nmembers = [\"crates/*\"]\n",
         );
         assert_eq!(
             infer_gate_commands(dir.path()).unwrap(),
@@ -297,6 +348,31 @@ mod tests {
     }
 
     #[test]
+    fn a_test_script_that_merely_mentions_the_npm_placeholder_text_is_still_a_real_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "package.json",
+            r#"{"name":"x","scripts":{"test":"jest || echo \"Error: no test specified\" && exit 1"}}"#,
+        );
+        assert_eq!(
+            infer_gate_commands(dir.path()).unwrap(),
+            vec!["npm test".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_malformed_package_json_does_not_discard_an_already_recognized_rust_stack() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "Cargo.toml", "[package]\nname = \"x\"\n");
+        write(dir.path(), "package.json", "{ not valid json");
+        assert_eq!(
+            infer_gate_commands(dir.path()).unwrap(),
+            vec!["cargo test".to_string()]
+        );
+    }
+
+    #[test]
     fn multi_stack_repo_unions_every_recognized_command_in_a_fixed_order() {
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "Cargo.toml", "[package]\nname = \"x\"\n");
@@ -311,6 +387,20 @@ mod tests {
     fn makefile_test_target_is_used_only_when_nothing_else_is_recognized() {
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "Makefile", "test:\n\t./run_tests.sh\n");
+        assert_eq!(
+            infer_gate_commands(dir.path()).unwrap(),
+            vec!["make test".to_string()]
+        );
+    }
+
+    #[test]
+    fn lowercase_makefile_test_target_is_recognized_too() {
+        // On a case-sensitive filesystem (as CI runs), a lowercase `makefile`
+        // is a distinct file from `Makefile` and must still be found — GNU
+        // Make itself honors both. (On a case-insensitive filesystem this
+        // still passes, just without exercising the case-sensitive path.)
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "makefile", "test:\n\t./run_tests.sh\n");
         assert_eq!(
             infer_gate_commands(dir.path()).unwrap(),
             vec!["make test".to_string()]
