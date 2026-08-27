@@ -996,11 +996,15 @@ async fn initialize_ping(stream: UnixStream) -> Result<bool, MemoryError> {
     let (read_half, mut write_half) = tokio::io::split(stream);
     let mut reader = BufReader::new(read_half);
 
-    let latest_version = super::protocol::SUPPORTED_PROTOCOL_VERSIONS
-        .last()
-        .expect("SUPPORTED_PROTOCOL_VERSIONS is never empty");
+    // Ask for the oldest supported version, not the newest: a running
+    // daemon process from an older binary is far more likely to still
+    // recognize the oldest widely-supported revision than to have already
+    // learned about whatever revision just became newest in a freshly-built
+    // binary. Using the newest would make the probe falsely report a
+    // healthy-but-older daemon as unreachable after a version-list rotation.
     let payload = format!(
-        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"protocolVersion\":\"{latest_version}\",\"clientInfo\":{{\"name\":\"ironmem-internal\",\"version\":\"1.0.0\"}}}}}}\n"
+        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"protocolVersion\":\"{}\",\"clientInfo\":{{\"name\":\"ironmem-internal\",\"version\":\"1.0.0\"}}}}}}\n",
+        super::protocol::DEFAULT_PROTOCOL_VERSION
     );
     write_half
         .write_all(payload.as_bytes())

@@ -158,15 +158,25 @@ pub fn negotiate_initialize(
 
 /// `server/discover` result body: supported protocol versions, capabilities,
 /// and server identity, answerable without a prior `initialize` handshake.
+///
+/// Shape matches the real `DiscoverResult` schema from the `2026-07-28`
+/// spec's `server/discover`: `resultType` is required (`"complete"` for a
+/// normal successful result), the version list is `supportedVersions` (not
+/// `protocolVersions`), and server identity lives under
+/// `_meta['io.modelcontextprotocol/serverInfo']`, not a top-level
+/// `serverInfo` field.
 pub fn discover_response() -> serde_json::Value {
     serde_json::json!({
-        "protocolVersions": SUPPORTED_PROTOCOL_VERSIONS,
+        "resultType": "complete",
+        "supportedVersions": SUPPORTED_PROTOCOL_VERSIONS,
         "capabilities": {
             "tools": {}
         },
-        "serverInfo": {
-            "name": "ironmem",
-            "version": env!("IRONMEM_VERSION")
+        "_meta": {
+            "io.modelcontextprotocol/serverInfo": {
+                "name": "ironmem",
+                "version": env!("IRONMEM_VERSION")
+            }
         }
     })
 }
@@ -219,20 +229,24 @@ mod tests {
     #[test]
     fn discover_response_lists_all_supported_versions() {
         let body = discover_response();
-        let versions: Vec<&str> = body["protocolVersions"]
+        assert_eq!(body["resultType"], serde_json::json!("complete"));
+        let versions: Vec<&str> = body["supportedVersions"]
             .as_array()
             .unwrap()
             .iter()
             .map(|v| v.as_str().unwrap())
             .collect();
         assert_eq!(versions, SUPPORTED_PROTOCOL_VERSIONS);
-        assert_eq!(body["serverInfo"]["name"], serde_json::json!("ironmem"));
+        assert_eq!(
+            body["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
+            serde_json::json!("ironmem")
+        );
         assert!(
-            body["serverInfo"]["version"]
+            body["_meta"]["io.modelcontextprotocol/serverInfo"]["version"]
                 .as_str()
                 .is_some_and(|v| !v.is_empty()),
             "serverInfo.version must be a non-empty string, got {:?}",
-            body["serverInfo"]["version"]
+            body["_meta"]["io.modelcontextprotocol/serverInfo"]["version"]
         );
         assert!(
             body["capabilities"]["tools"].is_object(),

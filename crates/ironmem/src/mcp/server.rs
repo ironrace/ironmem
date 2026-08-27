@@ -1415,10 +1415,17 @@ mod tests {
             "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"server/discover\",\"params\":{}}\n",
         )
         .await;
-        assert!(output.contains("\"protocolVersions\""), "got: {output}");
+        assert!(
+            output.contains("\"resultType\":\"complete\""),
+            "got: {output}"
+        );
+        assert!(output.contains("\"supportedVersions\""), "got: {output}");
         assert!(output.contains("\"2024-11-05\""), "got: {output}");
         assert!(output.contains("\"2026-07-28\""), "got: {output}");
-        assert!(output.contains("\"serverInfo\""), "got: {output}");
+        assert!(
+            output.contains("\"io.modelcontextprotocol/serverInfo\""),
+            "got: {output}"
+        );
     }
 
     /// `session_id_from_params` reads `_meta.sessionId` first (a prior task).
