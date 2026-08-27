@@ -1243,10 +1243,27 @@ fn dispatch_with_compact_delta(
         // across many (see `ConnectionContext` doc comment). `dispatch` stays
         // a pure request -> response function so its many direct test callers
         // (outside this module) are unaffected by this change.
-        "initialize" => Some((
-            JsonRpcResponse::success(id, protocol::capabilities_response()),
-            None,
-        )),
+        "initialize" => {
+            let requested_version = request
+                .params
+                .get("protocolVersion")
+                .and_then(|v| v.as_str());
+            Some(match protocol::negotiate_initialize(requested_version) {
+                Ok(body) => (JsonRpcResponse::success(id, body), None),
+                Err(unsupported) => (
+                    JsonRpcResponse::error_with_data(
+                        id,
+                        -32022,
+                        &unsupported.to_string(),
+                        serde_json::json!({
+                            "requested": unsupported.0,
+                            "supported": protocol::SUPPORTED_PROTOCOL_VERSIONS,
+                        }),
+                    ),
+                    None,
+                ),
+            })
+        }
 
         "tools/list" => {
             let tool_list = tools::tool_definitions(app);
@@ -1278,6 +1295,11 @@ fn dispatch_with_compact_delta(
                 )),
             }
         }
+
+        "server/discover" => Some((
+            JsonRpcResponse::success(id, protocol::discover_response()),
+            None,
+        )),
 
         "notifications/initialized" | "notifications/cancelled" => None, // No response
 
@@ -1344,6 +1366,91 @@ mod tests {
         let mut output = String::new();
         client_out.read_to_string(&mut output).await.unwrap();
         assert!(output.contains("\"protocolVersion\":\"2024-11-05\""));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn initialize_negotiates_each_supported_protocol_version_at_the_wire() {
+        for version in protocol::SUPPORTED_PROTOCOL_VERSIONS {
+            let input = format!(
+                "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"protocolVersion\":\"{version}\"}}}}\n"
+            );
+            let output = run_with_input(&input).await;
+            assert!(
+                output.contains(&format!("\"protocolVersion\":\"{version}\"")),
+                "expected negotiated version {version} in response: {output}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn initialize_rejects_unsupported_protocol_version() {
+        let output = run_with_input(
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"1999-01-01\"}}\n",
+        )
+        .await;
+        assert!(output.contains("\"code\":-32022"), "got: {output}");
+        assert!(
+            output.contains("\"requested\":\"1999-01-01\""),
+            "got: {output}"
+        );
+        assert!(
+            output.contains("\"2026-07-28\""),
+            "supported list must include the current (newest) revision: {output}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn server_discover_returns_supported_versions_without_a_handshake() {
+        let output = run_with_input(
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"server/discover\",\"params\":{}}\n",
+        )
+        .await;
+        assert!(output.contains("\"protocolVersions\""), "got: {output}");
+        assert!(output.contains("\"2024-11-05\""), "got: {output}");
+        assert!(output.contains("\"2026-07-28\""), "got: {output}");
+        assert!(output.contains("\"serverInfo\""), "got: {output}");
+    }
+
+    /// `session_id_from_params` reads `_meta.sessionId` first (a prior task).
+    /// This proves that path attributes MCP response metrics identically to
+    /// the legacy top-level `sessionId` path already covered by
+    /// `sequential_connections_on_shared_app_get_independent_attribution`.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn meta_session_id_attributes_metrics_like_top_level_session_id() {
+        let _g = METRICS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("IRONMEM_METRICS");
+        std::env::remove_var("IRONMEM_HARNESS");
+        #[allow(clippy::arc_with_non_send_sync)]
+        let app = Arc::new(App::open_for_test().unwrap());
+
+        let (mut client_in, server_in) = tokio::io::duplex(65536);
+        let (server_out, mut client_out) = tokio::io::duplex(65536);
+        client_in
+            .write_all(
+                b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"_meta\":{\"sessionId\":\"meta-attrib-session\"},\"clientInfo\":{\"name\":\"claude-code\",\"version\":\"1.0.0\"}}}\n\
+                  {\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"status\",\"arguments\":{}}}\n",
+            )
+            .await
+            .unwrap();
+        client_in.shutdown().await.unwrap();
+        run_server_io(Arc::clone(&app), BufReader::new(server_in), server_out)
+            .await
+            .unwrap();
+        let mut out = String::new();
+        client_out.read_to_string(&mut out).await.unwrap();
+
+        let rows = app
+            .db
+            .query_token_usage(&crate::db::metrics::TokenUsageQuery::default())
+            .unwrap();
+        let mcp: Vec<_> = rows.iter().filter(|r| r.source == "mcp_response").collect();
+        assert_eq!(mcp.len(), 2, "initialize + tools/call responses recorded");
+        assert!(
+            mcp.iter()
+                .all(|r| r.session_id.as_deref() == Some("meta-attrib-session")),
+            "both responses attributed to the _meta-supplied session id: {mcp:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

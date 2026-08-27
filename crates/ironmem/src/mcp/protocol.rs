@@ -93,20 +93,6 @@ impl JsonRpcResponse {
     }
 }
 
-/// MCP capabilities response for tools/list.
-pub fn capabilities_response() -> serde_json::Value {
-    serde_json::json!({
-        "protocolVersion": "2024-11-05",
-        "capabilities": {
-            "tools": {}
-        },
-        "serverInfo": {
-            "name": "ironmem",
-            "version": env!("IRONMEM_VERSION")
-        }
-    })
-}
-
 /// MCP protocol revisions this server understands, oldest first. Current as
 /// of issue #275 — the current revision plus the prior four.
 pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &[
