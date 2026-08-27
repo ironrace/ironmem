@@ -1244,25 +1244,26 @@ fn dispatch_with_compact_delta(
         // a pure request -> response function so its many direct test callers
         // (outside this module) are unaffected by this change.
         "initialize" => {
-            let requested_version = request
-                .params
-                .get("protocolVersion")
-                .and_then(|v| v.as_str());
-            Some(match protocol::negotiate_initialize(requested_version) {
-                Ok(body) => (JsonRpcResponse::success(id, body), None),
-                Err(unsupported) => (
-                    JsonRpcResponse::error_with_data(
-                        id,
-                        -32022,
-                        &unsupported.to_string(),
-                        serde_json::json!({
-                            "requested": unsupported.0,
-                            "supported": protocol::SUPPORTED_PROTOCOL_VERSIONS,
-                        }),
-                    ),
-                    None,
-                ),
-            })
+            let response = match request.params.get("protocolVersion") {
+                Some(v) if !v.is_string() => {
+                    JsonRpcResponse::error(id, -32602, "protocolVersion must be a string")
+                }
+                maybe_version => {
+                    match protocol::negotiate_initialize(maybe_version.and_then(|v| v.as_str())) {
+                        Ok(body) => JsonRpcResponse::success(id, body),
+                        Err(unsupported) => JsonRpcResponse::error_with_data(
+                            id,
+                            -32022,
+                            &unsupported.to_string(),
+                            serde_json::json!({
+                                "requested": unsupported.0,
+                                "supported": protocol::SUPPORTED_PROTOCOL_VERSIONS,
+                            }),
+                        ),
+                    }
+                }
+            };
+            Some((response, None))
         }
 
         "tools/list" => {
@@ -1400,6 +1401,15 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn initialize_rejects_non_string_protocol_version() {
+        let output = run_with_input(
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":20241105}}\n",
+        )
+        .await;
+        assert!(output.contains("\"code\":-32602"), "got: {output}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn server_discover_returns_supported_versions_without_a_handshake() {
         let output = run_with_input(
             "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"server/discover\",\"params\":{}}\n",
@@ -1439,6 +1449,7 @@ mod tests {
             .unwrap();
         let mut out = String::new();
         client_out.read_to_string(&mut out).await.unwrap();
+        assert!(out.contains("\"protocolVersion\""), "{out}");
 
         let rows = app
             .db

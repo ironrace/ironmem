@@ -110,12 +110,12 @@ pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &[
 /// any pre-negotiation client still in the wild) so they keep getting a
 /// successful handshake instead of a new hard failure.
 ///
-/// Set to the *oldest* supported version, matching `capabilities_response`'s
-/// prior unconditional behavior (it always answered `"2024-11-05"`,
-/// regardless of what — if anything — the client asked for). Defaulting to
-/// the oldest version exactly preserves that behavior for every existing
-/// caller that omits `protocolVersion`, rather than handing a
-/// pre-negotiation caller a revision it never asked for and may not expect.
+/// Set to the *oldest* supported version, matching the pre-#275 `initialize`
+/// response, which always answered `"2024-11-05"`, regardless of what — if
+/// anything — the client asked for. Defaulting to the oldest version exactly
+/// preserves that behavior for every existing caller that omits
+/// `protocolVersion`, rather than handing a pre-negotiation caller a
+/// revision it never asked for and may not expect.
 pub const DEFAULT_PROTOCOL_VERSION: &str = "2024-11-05";
 
 /// The `protocolVersion` a client requested that is not in
