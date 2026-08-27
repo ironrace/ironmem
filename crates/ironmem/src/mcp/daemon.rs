@@ -1002,9 +1002,11 @@ async fn initialize_ping(stream: UnixStream) -> Result<bool, MemoryError> {
     // learned about whatever revision just became newest in a freshly-built
     // binary. Using the newest would make the probe falsely report a
     // healthy-but-older daemon as unreachable after a version-list rotation.
+    let probe_version = super::protocol::SUPPORTED_PROTOCOL_VERSIONS
+        .first()
+        .expect("SUPPORTED_PROTOCOL_VERSIONS is never empty");
     let payload = format!(
-        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"protocolVersion\":\"{}\",\"clientInfo\":{{\"name\":\"ironmem-internal\",\"version\":\"1.0.0\"}}}}}}\n",
-        super::protocol::DEFAULT_PROTOCOL_VERSION
+        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"protocolVersion\":\"{probe_version}\",\"clientInfo\":{{\"name\":\"ironmem-internal\",\"version\":\"1.0.0\"}}}}}}\n"
     );
     write_half
         .write_all(payload.as_bytes())
