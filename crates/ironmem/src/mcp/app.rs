@@ -787,20 +787,26 @@ fn normalize_session_id(value: &str) -> Option<String> {
 /// vendor-namespaced `_meta` key first (the spec-sanctioned home for
 /// non-standard fields), then falls back to the legacy top-level
 /// `sessionId`/`session_id` so already-released clients keep attributing
-/// correctly. Returns `None` if absent or the value sanitizes to `"unknown"`.
+/// correctly. Each candidate is fully extracted and normalized before
+/// precedence is decided, so a candidate that is merely *present* but
+/// unusable (not a string, or sanitizes to `"unknown"`) falls through to the
+/// next one instead of defeating it. Returns `None` if no candidate yields a
+/// usable value.
 ///
 /// Pure and connection-agnostic: callers (e.g. `mcp::server::ConnectionContext`)
 /// own the "set once per connection" semantics — this function only extracts
 /// and normalizes, it never mutates any state.
 pub(crate) fn session_id_from_params(params: &serde_json::Value) -> Option<String> {
-    params
-        .get("_meta")
-        .and_then(|m| m.get("sessionId"))
-        .or_else(|| params.get("_meta").and_then(|m| m.get("session_id")))
-        .or_else(|| params.get("sessionId"))
-        .or_else(|| params.get("session_id"))
-        .and_then(|v| v.as_str())
-        .and_then(normalize_session_id)
+    let meta = params.get("_meta");
+    [
+        meta.and_then(|m| m.get("sessionId")),
+        meta.and_then(|m| m.get("session_id")),
+        params.get("sessionId"),
+        params.get("session_id"),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(|v| v.as_str().and_then(normalize_session_id))
 }
 
 /// Extract a metrics harness id from MCP `initialize.clientInfo` (or
@@ -1006,6 +1012,33 @@ mod tests {
         assert_eq!(
             session_id_from_params(&params).as_deref(),
             Some("meta-snake-session")
+        );
+    }
+
+    #[test]
+    fn session_id_from_params_falls_through_when_meta_sessionid_is_not_a_string() {
+        // A real client can send `_meta: { sessionId: cfg.sessionId ?? null }`.
+        // A present-but-unusable `_meta.sessionId` must not defeat a valid
+        // top-level id — it should fall through to the next candidate rather
+        // than committing to `_meta` on presence alone.
+        let params = serde_json::json!({
+            "sessionId": "legacy-session",
+            "_meta": { "sessionId": null }
+        });
+        assert_eq!(
+            session_id_from_params(&params).as_deref(),
+            Some("legacy-session")
+        );
+    }
+
+    #[test]
+    fn session_id_from_params_meta_camel_case_wins_over_meta_snake_case() {
+        let params = serde_json::json!({
+            "_meta": { "sessionId": "meta-camel", "session_id": "meta-snake" }
+        });
+        assert_eq!(
+            session_id_from_params(&params).as_deref(),
+            Some("meta-camel")
         );
     }
 }
