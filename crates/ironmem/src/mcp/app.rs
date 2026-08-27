@@ -783,20 +783,22 @@ fn normalize_session_id(value: &str) -> Option<String> {
     }
 }
 
-/// Extract a harness session id from MCP `initialize` params. Probes the
-/// common locations clients may use (top-level `sessionId`/`session_id`, or
-/// nested under `_meta`). Returns `None` if absent or the value sanitizes to
-/// `"unknown"`.
+/// Extract a harness session id from MCP `initialize` params. Checks the
+/// vendor-namespaced `_meta` key first (the spec-sanctioned home for
+/// non-standard fields), then falls back to the legacy top-level
+/// `sessionId`/`session_id` so already-released clients keep attributing
+/// correctly. Returns `None` if absent or the value sanitizes to `"unknown"`.
 ///
 /// Pure and connection-agnostic: callers (e.g. `mcp::server::ConnectionContext`)
 /// own the "set once per connection" semantics — this function only extracts
 /// and normalizes, it never mutates any state.
 pub(crate) fn session_id_from_params(params: &serde_json::Value) -> Option<String> {
     params
-        .get("sessionId")
-        .or_else(|| params.get("session_id"))
-        .or_else(|| params.get("_meta").and_then(|m| m.get("sessionId")))
+        .get("_meta")
+        .and_then(|m| m.get("sessionId"))
         .or_else(|| params.get("_meta").and_then(|m| m.get("session_id")))
+        .or_else(|| params.get("sessionId"))
+        .or_else(|| params.get("session_id"))
         .and_then(|v| v.as_str())
         .and_then(normalize_session_id)
 }
@@ -966,5 +968,44 @@ mod tests {
         ];
         let result = crate::harness::classify_client_info("gemini-cli", &reg);
         assert_eq!(result, Some("gemini"));
+    }
+
+    #[test]
+    fn session_id_from_params_prefers_meta_over_top_level() {
+        let params = serde_json::json!({
+            "sessionId": "legacy-session",
+            "_meta": { "sessionId": "meta-session" }
+        });
+        assert_eq!(
+            session_id_from_params(&params).as_deref(),
+            Some("meta-session")
+        );
+    }
+
+    #[test]
+    fn session_id_from_params_falls_back_to_top_level_sessionid_when_meta_absent() {
+        let params = serde_json::json!({ "sessionId": "legacy-session" });
+        assert_eq!(
+            session_id_from_params(&params).as_deref(),
+            Some("legacy-session")
+        );
+    }
+
+    #[test]
+    fn session_id_from_params_falls_back_to_top_level_session_id_snake_case() {
+        let params = serde_json::json!({ "session_id": "legacy-snake-session" });
+        assert_eq!(
+            session_id_from_params(&params).as_deref(),
+            Some("legacy-snake-session")
+        );
+    }
+
+    #[test]
+    fn session_id_from_params_reads_meta_session_id_snake_case() {
+        let params = serde_json::json!({ "_meta": { "session_id": "meta-snake-session" } });
+        assert_eq!(
+            session_id_from_params(&params).as_deref(),
+            Some("meta-snake-session")
+        );
     }
 }
