@@ -996,8 +996,14 @@ async fn initialize_ping(stream: UnixStream) -> Result<bool, MemoryError> {
     let (read_half, mut write_half) = tokio::io::split(stream);
     let mut reader = BufReader::new(read_half);
 
+    let latest_version = super::protocol::SUPPORTED_PROTOCOL_VERSIONS
+        .last()
+        .expect("SUPPORTED_PROTOCOL_VERSIONS is never empty");
+    let payload = format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"protocolVersion\":\"{latest_version}\",\"clientInfo\":{{\"name\":\"ironmem-internal\",\"version\":\"1.0.0\"}}}}}}\n"
+    );
     write_half
-        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2026-07-28\",\"clientInfo\":{\"name\":\"ironmem-internal\",\"version\":\"1.0.0\"}}}\n")
+        .write_all(payload.as_bytes())
         .await
         .map_err(MemoryError::Io)?;
     write_half.flush().await.map_err(MemoryError::Io)?;
