@@ -9,6 +9,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`initialize` now negotiates the MCP protocol version instead of always
+  answering with a hardcoded one (#275).** Every `initialize` call used to get
+  back `"2024-11-05"` no matter what the client requested — a silent,
+  incorrect success for any client actually running a newer or older
+  revision. The handshake now checks the requested `protocolVersion` against
+  the server's supported list (`"2024-11-05"` through the current
+  `"2026-07-28"`) and echoes it back when it's supported. A client that asks
+  for a version outside that list now gets a `-32022` JSON-RPC error instead
+  of a false success, with a structured `data` payload naming the `requested`
+  version and the full `supported` list so a client can react
+  programmatically rather than parse an error string. A `protocolVersion`
+  that isn't a JSON string (e.g. a bare number) is rejected separately, with
+  `-32602`. A client that omits `protocolVersion` entirely still negotiates
+  the old default, `"2024-11-05"`, so already-deployed callers that never
+  sent the field keep working exactly as before.
+
+- **New `server/discover` RPC lets a client learn what the server supports
+  before ever calling `initialize` (#275).** It returns the server's
+  supported protocol versions, capabilities, and identity, and requires no
+  prior handshake. The response shape follows the real MCP `2026-07-28`
+  `DiscoverResult` wire schema rather than an ad hoc guess: `resultType:
+  "complete"`, a `supportedVersions` array (not `protocolVersions`), server
+  identity nested under `_meta['io.modelcontextprotocol/serverInfo']` rather
+  than a top-level `serverInfo` field, and the spec-mandated caching hints —
+  `ttlMs` and `cacheScope` — since this response is identical for every
+  caller and is set to a one-hour TTL with `cacheScope: "public"`.
+
+- **Session-id resolution from `initialize` params now checks `_meta` before
+  the legacy top-level fields — the reverse of the previous order (#275).**
+  `_meta.sessionId` / `_meta.session_id` are now tried first, falling back to
+  the legacy top-level `sessionId` / `session_id` only if neither is present
+  and usable. This is a **behavior change** for any client that sends a
+  session id in both places with different values: the `_meta`-supplied value
+  now wins where the legacy top-level value used to. A candidate that is
+  merely present but unusable — not a string, or one that sanitizes to the
+  reserved `"unknown"` value — no longer short-circuits resolution; it falls
+  through to the next candidate instead, so a malformed `_meta.sessionId`
+  can't defeat a perfectly good legacy field.
+
 - **The duplicate-session refusal now recommends a remedy the server will
   actually accept (#297).** `collab_start` / `collab_start_code_review`
   previously told every caller to "call `collab_end` on it", which the server
