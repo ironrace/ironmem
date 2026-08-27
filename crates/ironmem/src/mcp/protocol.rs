@@ -132,9 +132,7 @@ pub const DEFAULT_PROTOCOL_VERSION: &str = "2026-07-28";
 ///
 /// Returns `Err(v)` when `v` is set but not supported; the caller turns that
 /// into a `-32022` JSON-RPC error carrying `v` and the supported list.
-pub fn negotiate_initialize(
-    requested_version: Option<&str>,
-) -> Result<serde_json::Value, String> {
+pub fn negotiate_initialize(requested_version: Option<&str>) -> Result<serde_json::Value, String> {
     let negotiated = match requested_version {
         None => DEFAULT_PROTOCOL_VERSION,
         Some(v) if SUPPORTED_PROTOCOL_VERSIONS.contains(&v) => v,
