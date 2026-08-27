@@ -1426,6 +1426,11 @@ mod tests {
             output.contains("\"io.modelcontextprotocol/serverInfo\""),
             "got: {output}"
         );
+        assert!(output.contains("\"ttlMs\":3600000"), "got: {output}");
+        assert!(
+            output.contains("\"cacheScope\":\"public\""),
+            "got: {output}"
+        );
     }
 
     /// `session_id_from_params` reads `_meta.sessionId` first (a prior task).

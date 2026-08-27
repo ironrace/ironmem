@@ -164,7 +164,13 @@ pub fn negotiate_initialize(
 /// normal successful result), the version list is `supportedVersions` (not
 /// `protocolVersions`), and server identity lives under
 /// `_meta['io.modelcontextprotocol/serverInfo']`, not a top-level
-/// `serverInfo` field.
+/// `serverInfo` field. The spec also mandates caching hints on any
+/// `resultType: "complete"` result from `server/discover`: `ttlMs` (>= 0)
+/// and `cacheScope`. This response never varies per caller (server
+/// identity, capabilities, and supported versions are the same for every
+/// client), so `cacheScope: "public"` applies, per the spec's own guidance
+/// for content that's identical for all users; `ttlMs` uses the spec's
+/// canonical example value of one hour.
 pub fn discover_response() -> serde_json::Value {
     serde_json::json!({
         "resultType": "complete",
@@ -172,6 +178,8 @@ pub fn discover_response() -> serde_json::Value {
         "capabilities": {
             "tools": {}
         },
+        "ttlMs": 3_600_000,
+        "cacheScope": "public",
         "_meta": {
             "io.modelcontextprotocol/serverInfo": {
                 "name": "ironmem",
@@ -237,6 +245,8 @@ mod tests {
             .map(|v| v.as_str().unwrap())
             .collect();
         assert_eq!(versions, SUPPORTED_PROTOCOL_VERSIONS);
+        assert_eq!(body["ttlMs"], serde_json::json!(3_600_000));
+        assert_eq!(body["cacheScope"], serde_json::json!("public"));
         assert_eq!(
             body["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
             serde_json::json!("ironmem")
