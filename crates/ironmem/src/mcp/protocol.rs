@@ -123,20 +123,43 @@ pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &[
 /// already-permissive callers (this crate's own test/health-probe code, and
 /// any pre-negotiation client still in the wild) so they keep getting a
 /// successful handshake instead of a new hard failure.
-pub const DEFAULT_PROTOCOL_VERSION: &str = "2026-07-28";
+///
+/// Set to the *oldest* supported version, matching `capabilities_response`'s
+/// prior unconditional behavior (it always answered `"2024-11-05"`,
+/// regardless of what — if anything — the client asked for). Defaulting to
+/// the oldest version exactly preserves that behavior for every existing
+/// caller that omits `protocolVersion`, rather than handing a
+/// pre-negotiation caller a revision it never asked for and may not expect.
+pub const DEFAULT_PROTOCOL_VERSION: &str = "2024-11-05";
+
+/// The `protocolVersion` a client requested that is not in
+/// `SUPPORTED_PROTOCOL_VERSIONS`. A newtype (not a raw `String`) so it can't
+/// be mistaken for an error *message* at a call site — it's the rejected
+/// *value*.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsupportedProtocolVersion(pub String);
+
+impl std::fmt::Display for UnsupportedProtocolVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
 
 /// Build the successful `initialize` result body, negotiating on
 /// `requested_version`:
 /// - `Some(v)` with `v` in [`SUPPORTED_PROTOCOL_VERSIONS`]: echoes `v` back.
 /// - `None`: negotiates [`DEFAULT_PROTOCOL_VERSION`].
 ///
-/// Returns `Err(v)` when `v` is set but not supported; the caller turns that
-/// into a `-32022` JSON-RPC error carrying `v` and the supported list.
-pub fn negotiate_initialize(requested_version: Option<&str>) -> Result<serde_json::Value, String> {
+/// Returns `Err(UnsupportedProtocolVersion(v))` when `v` is set but not
+/// supported; the caller turns that into a `-32022` JSON-RPC error carrying
+/// `v` and the supported list.
+pub fn negotiate_initialize(
+    requested_version: Option<&str>,
+) -> Result<serde_json::Value, UnsupportedProtocolVersion> {
     let negotiated = match requested_version {
         None => DEFAULT_PROTOCOL_VERSION,
         Some(v) if SUPPORTED_PROTOCOL_VERSIONS.contains(&v) => v,
-        Some(v) => return Err(v.to_string()),
+        Some(v) => return Err(UnsupportedProtocolVersion(v.to_string())),
     };
     Ok(serde_json::json!({
         "protocolVersion": negotiated,
@@ -174,6 +197,19 @@ mod tests {
         for version in SUPPORTED_PROTOCOL_VERSIONS {
             let body = negotiate_initialize(Some(version)).unwrap();
             assert_eq!(body["protocolVersion"], serde_json::json!(version));
+            assert_eq!(body["serverInfo"]["name"], serde_json::json!("ironmem"));
+            assert!(
+                body["serverInfo"]["version"]
+                    .as_str()
+                    .is_some_and(|v| !v.is_empty()),
+                "serverInfo.version must be a non-empty string, got {:?}",
+                body["serverInfo"]["version"]
+            );
+            assert!(
+                body["capabilities"]["tools"].is_object(),
+                "capabilities.tools must be an object, got {:?}",
+                body["capabilities"]["tools"]
+            );
         }
     }
 
@@ -189,7 +225,12 @@ mod tests {
     #[test]
     fn negotiate_initialize_rejects_unsupported_version() {
         let err = negotiate_initialize(Some("1999-01-01")).unwrap_err();
-        assert_eq!(err, "1999-01-01");
+        assert_eq!(err, UnsupportedProtocolVersion("1999-01-01".to_string()));
+    }
+
+    #[test]
+    fn default_protocol_version_is_supported() {
+        assert!(SUPPORTED_PROTOCOL_VERSIONS.contains(&DEFAULT_PROTOCOL_VERSION));
     }
 
     #[test]
@@ -202,6 +243,26 @@ mod tests {
             .map(|v| v.as_str().unwrap())
             .collect();
         assert_eq!(versions, SUPPORTED_PROTOCOL_VERSIONS);
+        assert_eq!(body["serverInfo"]["name"], serde_json::json!("ironmem"));
+        assert!(
+            body["serverInfo"]["version"]
+                .as_str()
+                .is_some_and(|v| !v.is_empty()),
+            "serverInfo.version must be a non-empty string, got {:?}",
+            body["serverInfo"]["version"]
+        );
+        assert!(
+            body["capabilities"]["tools"].is_object(),
+            "capabilities.tools must be an object, got {:?}",
+            body["capabilities"]["tools"]
+        );
+    }
+
+    #[test]
+    fn error_without_data_omits_data_key_from_wire_format() {
+        let response = JsonRpcResponse::error(Some(serde_json::json!(1)), -32602, "boom");
+        let wire = serde_json::to_string(&response).unwrap();
+        assert!(!wire.contains("\"data\""), "wire format: {wire}");
     }
 
     #[test]
