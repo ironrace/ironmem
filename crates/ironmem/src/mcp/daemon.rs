@@ -997,7 +997,7 @@ async fn initialize_ping(stream: UnixStream) -> Result<bool, MemoryError> {
     let mut reader = BufReader::new(read_half);
 
     write_half
-        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n")
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2026-07-28\",\"clientInfo\":{\"name\":\"ironmem-internal\",\"version\":\"1.0.0\"}}}\n")
         .await
         .map_err(MemoryError::Io)?;
     write_half.flush().await.map_err(MemoryError::Io)?;
@@ -1358,7 +1358,7 @@ mod daemon_tests {
 
         // initialize
         writer
-            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n")
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2026-07-28\",\"clientInfo\":{\"name\":\"ironmem-internal\",\"version\":\"1.0.0\"}}}\n")
             .unwrap();
         writer.flush().unwrap();
         let mut init_line = String::new();
@@ -1426,7 +1426,7 @@ mod daemon_tests {
         let mut writer = stream.try_clone().unwrap();
         let mut reader = StdBufReader::new(stream);
         writer
-            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n")
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2026-07-28\",\"clientInfo\":{\"name\":\"ironmem-internal\",\"version\":\"1.0.0\"}}}\n")
             .unwrap();
         writer.flush().unwrap();
         let mut line = String::new();
@@ -1514,7 +1514,7 @@ mod daemon_tests {
             let mut reader = StdBufReader::new(stream);
             writer
                 .write_all(
-                    b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n",
+                    b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2026-07-28\",\"clientInfo\":{\"name\":\"ironmem-internal\",\"version\":\"1.0.0\"}}}\n",
                 )
                 .unwrap();
             writer.flush().unwrap();
@@ -1532,7 +1532,7 @@ mod daemon_tests {
         let mut writer2 = stream2.try_clone().unwrap();
         let mut reader2 = StdBufReader::new(stream2);
         writer2
-            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"initialize\",\"params\":{}}\n")
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2026-07-28\",\"clientInfo\":{\"name\":\"ironmem-internal\",\"version\":\"1.0.0\"}}}\n")
             .unwrap();
         writer2.flush().unwrap();
         let mut line2 = String::new();
@@ -1560,7 +1560,7 @@ mod daemon_tests {
         );
         std::thread::sleep(past_original_deadline - now);
         writer2
-            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"initialize\",\"params\":{}}\n")
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2026-07-28\",\"clientInfo\":{\"name\":\"ironmem-internal\",\"version\":\"1.0.0\"}}}\n")
             .unwrap();
         writer2.flush().unwrap();
         let mut line3 = String::new();
@@ -1636,7 +1636,7 @@ mod daemon_tests {
         let mut writer = stream.try_clone().unwrap();
         let mut reader = StdBufReader::new(stream);
         writer
-            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n")
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2026-07-28\",\"clientInfo\":{\"name\":\"ironmem-internal\",\"version\":\"1.0.0\"}}}\n")
             .unwrap();
         writer.flush().unwrap();
         let mut line = String::new();
@@ -1649,7 +1649,7 @@ mod daemon_tests {
 
         // The SAME still-open connection must still be served afterward.
         writer
-            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"initialize\",\"params\":{}}\n")
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2026-07-28\",\"clientInfo\":{\"name\":\"ironmem-internal\",\"version\":\"1.0.0\"}}}\n")
             .unwrap();
         writer.flush().unwrap();
         let mut line2 = String::new();
@@ -1740,7 +1740,7 @@ mod daemon_tests {
         let mut writer = stream.try_clone().unwrap();
         let mut reader = StdBufReader::new(stream);
         writer
-            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n")
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2026-07-28\",\"clientInfo\":{\"name\":\"ironmem-internal\",\"version\":\"1.0.0\"}}}\n")
             .unwrap();
         writer.flush().unwrap();
         let mut line = String::new();
@@ -1778,7 +1778,7 @@ mod daemon_tests {
         //    than an anonymous `unwrap` panic.
         let mut line2 = String::new();
         let served = writer
-            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"initialize\",\"params\":{}}\n")
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2026-07-28\",\"clientInfo\":{\"name\":\"ironmem-internal\",\"version\":\"1.0.0\"}}}\n")
             .and_then(|()| writer.flush())
             .and_then(|()| reader.read_line(&mut line2));
         assert!(
@@ -2367,7 +2367,7 @@ mod daemon_tests {
         });
 
         test_write_in
-            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n")
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2026-07-28\",\"clientInfo\":{\"name\":\"ironmem-internal\",\"version\":\"1.0.0\"}}}\n")
             .await
             .unwrap();
         test_write_in.flush().await.unwrap();
@@ -2518,7 +2518,7 @@ mod daemon_tests {
         let (proxy_out, mut test_read_out) = tokio::io::duplex(4096);
 
         test_write_in
-            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n")
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2026-07-28\",\"clientInfo\":{\"name\":\"ironmem-internal\",\"version\":\"1.0.0\"}}}\n")
             .await
             .unwrap();
         // Immediate stdin EOF, before the stub's delayed reply arrives.
