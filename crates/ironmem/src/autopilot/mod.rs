@@ -1,4 +1,4 @@
-//! Autopilot backlog runner (build-ladder rungs 1-2).
+//! Autopilot backlog runner (build-ladder rungs 1-3).
 //!
 //! See `docs/iron/specs/2026-08-21-autonomous-backlog-runner-design.md` for
 //! the full design. Rung 1 built the storage half — the `backlog-lineage`
@@ -6,8 +6,10 @@
 //! primitive (build the IC's argv, run it, parse its result JSON) and the
 //! [`turn_prompt`] template that fills the `/goal` condition — together, the
 //! *IC lifecycle* CLI invocation the spec's rung-0/rung-2 validation rounds
-//! measured. Onboarding (gate inference), the Lead's orchestration loop, the
-//! Reviewer, and merge authority are later rungs.
+//! measured. Rung 3 adds [`onboard`], the Onboarder that infers gate
+//! commands from a repo's build manifests and proposes them via
+//! [`gate_config`]. The Lead's orchestration loop, the Reviewer, and merge
+//! authority are later rungs.
 //!
 //! # The five drawer kinds, one room
 //!
@@ -24,8 +26,8 @@
 //! 4. [`budget::BudgetLedgerEntry`] — `logical_key` per date: the daily spend
 //!    ledger, accumulated across invocations.
 //! 5. [`gate_config::GateConfig`] — `logical_key` per repo: the
-//!    `pending` → `approved` gate-config state machine (storage/transition
-//!    only; inference is rung 3's Onboarder).
+//!    `pending` → `approved` gate-config state machine (storage/transition;
+//!    [`onboard`] is the rung-3 Onboarder that infers the proposed content).
 //!
 //! # The `logical_key` hazard
 //!
@@ -55,6 +57,7 @@ pub mod dispatch;
 pub mod dispatch_state;
 pub mod gate_config;
 pub mod lineage;
+pub mod onboard;
 pub mod scrub;
 pub mod turn_prompt;
 
@@ -74,6 +77,7 @@ pub use dispatch::{DispatchOutcome, DispatchSpec, SessionMode, Verdict};
 pub use dispatch_state::DispatchState;
 pub use gate_config::{GateConfig, GateConfigState};
 pub use lineage::{AttemptOutcome, AttemptRecord, IssueStatus, RecordedAttempt};
+pub use onboard::{infer_gate_commands, onboard_repo, InferredGates};
 pub use turn_prompt::{PriorAttempt, TurnPromptInputs};
 
 /// Drawer wing shared by every Autopilot backlog-lineage record. See the
@@ -169,6 +173,15 @@ pub(crate) fn validate_repo(repo: &str) -> Result<(), MemoryError> {
     }
     Ok(())
 }
+
+/// Shared between [`gate_config::propose_gate_config`]'s `Result`-returning
+/// storage-boundary check and [`turn_prompt::render`]'s `assert!` — both
+/// exist to catch the same "a dispatch needs a real gate to satisfy"
+/// invariant, at two different points a caller can violate it, so both
+/// quote this one string rather than two independently-maintained literals
+/// that could silently drift apart.
+pub(crate) const EMPTY_GATE_COMMANDS_MSG: &str =
+    "gate_commands must not be empty — a dispatch needs a real gate to satisfy";
 
 /// A zero vector of the bundled embedder's dimensionality. Every Autopilot
 /// drawer is written directly against [`Database`], not through the `App`

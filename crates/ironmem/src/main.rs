@@ -197,6 +197,11 @@ enum Commands {
         #[command(subcommand)]
         cmd: MemoryCmd,
     },
+    /// Onboard or approve a repo's autopilot gate config (build-ladder rung 3)
+    Autopilot {
+        #[command(subcommand)]
+        cmd: AutopilotCmd,
+    },
     /// List registered harnesses (dev/CI helper for packaging scripts)
     Harnesses {
         /// Output format
@@ -292,6 +297,51 @@ enum MemoryCmd {
         #[arg(long)]
         json: bool,
     },
+}
+
+/// Subcommands nested under `ironmem autopilot` (spec's *Repo onboarding*
+/// section, steps 1 and 3 — step 2, gate inference, is
+/// `ironmem::autopilot::onboard::infer_gate_commands`).
+#[derive(Subcommand)]
+enum AutopilotCmd {
+    /// Infer gate commands for a repo checkout and write a pending proposal
+    Onboard {
+        /// Path to the database
+        #[arg(long)]
+        db: Option<String>,
+        /// Repo identity used as the storage key (e.g. "owner/repo")
+        repo: String,
+        /// Local checkout to inspect for build manifests
+        #[arg(long, default_value = ".")]
+        path: String,
+        /// Emit JSON instead of text
+        #[arg(long)]
+        json: bool,
+    },
+    /// Approve a repo's pending gate-config proposal
+    Approve {
+        /// Path to the database
+        #[arg(long)]
+        db: Option<String>,
+        /// Repo identity used as the storage key (e.g. "owner/repo")
+        repo: String,
+        /// Emit JSON instead of text
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// Load config, open, and migrate the database — the sequence both
+/// `Autopilot` subcommand handlers need before touching storage. Several
+/// other command handlers in this file repeat the same three-line sequence
+/// inline rather than through a shared helper; that pre-existing duplication
+/// is out of scope here, but the two new `Autopilot` arms at least don't add
+/// to it.
+fn open_migrated_db(db: Option<String>) -> Result<ironmem::db::schema::Database, MemoryError> {
+    let cfg = config::Config::load(db)?;
+    let database = ironmem::db::schema::Database::open(&cfg.db_path)?;
+    database.migrate()?;
+    Ok(database)
 }
 
 /// Subcommands nested under `ironmem symbols`.
@@ -804,6 +854,51 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                 Ok(())
             }
         },
+        Commands::Autopilot { cmd } => match cmd {
+            AutopilotCmd::Onboard {
+                db,
+                repo,
+                path,
+                json,
+            } => {
+                let database = open_migrated_db(db)?;
+                let config = ironmem::autopilot::onboard::onboard_repo(
+                    &database,
+                    &repo,
+                    std::path::Path::new(&path),
+                )?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&config)?);
+                } else {
+                    println!(
+                        "Proposed gate config for '{}' (pending approval):",
+                        config.repo
+                    );
+                    for gate_command in config.gate_commands() {
+                        println!("  - {gate_command}");
+                    }
+                    if !config.manifest_warnings.is_empty() {
+                        println!("Warnings (review before approving):");
+                        for warning in &config.manifest_warnings {
+                            println!("  - {warning}");
+                        }
+                    }
+                    println!("Run `ironmem autopilot approve {}` to accept.", config.repo);
+                }
+                Ok(())
+            }
+            AutopilotCmd::Approve { db, repo, json } => {
+                let database = open_migrated_db(db)?;
+                let config =
+                    ironmem::autopilot::gate_config::approve_gate_config(&database, &repo)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&config)?);
+                } else {
+                    println!("Approved gate config for '{}'.", config.repo);
+                }
+                Ok(())
+            }
+        },
         Commands::Harnesses { format } => {
             match format.as_str() {
                 "json" => println!(
@@ -933,5 +1028,71 @@ mod tests {
         assert_eq!(listen, None);
         assert_eq!(connect.as_deref(), Some("/tmp/d.sock"));
         assert!(no_autospawn);
+    }
+
+    #[test]
+    fn autopilot_onboard_defaults_path_to_current_directory() {
+        let cli = Cli::try_parse_from(["ironmem", "autopilot", "onboard", "owner/repo"])
+            .expect("expected argv to parse");
+        match cli.command {
+            Commands::Autopilot {
+                cmd:
+                    AutopilotCmd::Onboard {
+                        repo,
+                        path,
+                        db,
+                        json,
+                    },
+            } => {
+                assert_eq!(repo, "owner/repo");
+                assert_eq!(path, ".");
+                assert_eq!(db, None);
+                assert!(!json);
+            }
+            _ => panic!("expected Commands::Autopilot(Onboard), got a different variant"),
+        }
+    }
+
+    #[test]
+    fn autopilot_onboard_accepts_an_explicit_path() {
+        let cli = Cli::try_parse_from([
+            "ironmem",
+            "autopilot",
+            "onboard",
+            "owner/repo",
+            "--path",
+            "/tmp/some-checkout",
+        ])
+        .expect("expected argv to parse");
+        match cli.command {
+            Commands::Autopilot {
+                cmd: AutopilotCmd::Onboard { path, .. },
+            } => assert_eq!(path, "/tmp/some-checkout"),
+            _ => panic!("expected Commands::Autopilot(Onboard), got a different variant"),
+        }
+    }
+
+    #[test]
+    fn autopilot_approve_requires_a_repo_argument() {
+        let result = Cli::try_parse_from(["ironmem", "autopilot", "approve"]);
+        assert!(
+            result.is_err(),
+            "expected missing repo argument to fail parsing"
+        );
+    }
+
+    #[test]
+    fn autopilot_approve_parses_repo_and_json_flag() {
+        let cli = Cli::try_parse_from(["ironmem", "autopilot", "approve", "owner/repo", "--json"])
+            .expect("expected argv to parse");
+        match cli.command {
+            Commands::Autopilot {
+                cmd: AutopilotCmd::Approve { repo, json, .. },
+            } => {
+                assert_eq!(repo, "owner/repo");
+                assert!(json);
+            }
+            _ => panic!("expected Commands::Autopilot(Approve), got a different variant"),
+        }
     }
 }
