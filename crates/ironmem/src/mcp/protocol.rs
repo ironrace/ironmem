@@ -135,15 +135,12 @@ pub const DEFAULT_PROTOCOL_VERSION: &str = "2024-11-05";
 /// The `protocolVersion` a client requested that is not in
 /// `SUPPORTED_PROTOCOL_VERSIONS`. A newtype (not a raw `String`) so it can't
 /// be mistaken for an error *message* at a call site — it's the rejected
-/// *value*.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// *value*. `Display` (via `thiserror`) renders a message-shaped string, not
+/// the bare version, so `.to_string()` can't accidentally reintroduce the
+/// context-free-message footgun this newtype exists to close.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("unsupported protocol version: {0}")]
 pub struct UnsupportedProtocolVersion(pub String);
-
-impl std::fmt::Display for UnsupportedProtocolVersion {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
 
 /// Build the successful `initialize` result body, negotiating on
 /// `requested_version`:
