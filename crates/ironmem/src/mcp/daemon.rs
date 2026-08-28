@@ -964,8 +964,12 @@ pub async fn run_connect_mode(
 pub enum DaemonHealth {
     /// Connected and received a valid `initialize` response.
     Reachable,
+    /// Connected and got a well-formed JSON-RPC response, but it was an
+    /// error, not a successful `initialize` result (the daemon is alive but
+    /// is running incompatible/stale code).
+    RejectedHandshake,
     /// No live daemon: connect failed, timed out, or the reply was not a
-    /// recognizable `initialize` response.
+    /// recognizable JSON-RPC response.
     Unreachable,
 }
 
@@ -982,29 +986,73 @@ pub async fn probe_daemon_health(socket_path: &Path, timeout: std::time::Duratio
     };
 
     match tokio::time::timeout(timeout, initialize_ping(stream)).await {
-        Ok(Ok(true)) => DaemonHealth::Reachable,
-        _ => DaemonHealth::Unreachable,
+        Ok(Ok(health)) => health,
+        // Either the outer probe timeout elapsed, or `initialize_ping` hit an
+        // I/O error (write/flush/read failure) — both mean "couldn't complete
+        // a round trip", which is exactly what `Unreachable` means. A
+        // rejected handshake is never surfaced through this arm: it comes
+        // back as `Ok(Ok(DaemonHealth::RejectedHandshake))` above, because
+        // `initialize_ping` classifies a well-formed JSON-RPC error reply as
+        // a successful round trip that happened to be rejected.
+        Ok(Err(_)) | Err(_) => DaemonHealth::Unreachable,
     }
 }
 
-/// Send one `initialize` request over `stream` and report whether the reply
-/// looks like a genuine MCP `initialize` response.
+/// Send an `initialize` request asking for `protocol_version` over `stream`
+/// and classify the reply as reachable, rejected, or unreachable. Factored
+/// out of [`initialize_ping`] (which always asks for the oldest supported
+/// version) purely so tests can exercise the rejection path by asking for a
+/// version the daemon won't accept, without changing what the real probe
+/// ever sends on the wire.
 #[cfg(unix)]
-async fn initialize_ping(stream: UnixStream) -> Result<bool, MemoryError> {
+async fn initialize_ping_with_version(
+    stream: UnixStream,
+    protocol_version: &str,
+) -> Result<DaemonHealth, MemoryError> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     let (read_half, mut write_half) = tokio::io::split(stream);
     let mut reader = BufReader::new(read_half);
 
+    let payload = format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"protocolVersion\":\"{protocol_version}\",\"clientInfo\":{{\"name\":\"ironmem-internal\",\"version\":\"1.0.0\"}}}}}}\n"
+    );
     write_half
-        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n")
+        .write_all(payload.as_bytes())
         .await
         .map_err(MemoryError::Io)?;
     write_half.flush().await.map_err(MemoryError::Io)?;
 
     let mut line = String::new();
     reader.read_line(&mut line).await.map_err(MemoryError::Io)?;
-    Ok(line.contains("\"protocolVersion\""))
+    Ok(if line.contains("\"protocolVersion\"") {
+        // A successful `initialize` result echoes `protocolVersion` back.
+        DaemonHealth::Reachable
+    } else if line.contains("\"error\"") {
+        // A well-formed JSON-RPC error reply (e.g. -32022 for an
+        // unsupported version) — the daemon is alive and answered, it just
+        // rejected this handshake.
+        DaemonHealth::RejectedHandshake
+    } else {
+        // Empty line, garbage, or EOF: not a recognizable JSON-RPC reply.
+        DaemonHealth::Unreachable
+    })
+}
+
+/// Send one `initialize` request over `stream` and report whether the reply
+/// looks like a genuine MCP `initialize` response.
+#[cfg(unix)]
+async fn initialize_ping(stream: UnixStream) -> Result<DaemonHealth, MemoryError> {
+    // Ask for the oldest supported version, not the newest: a running
+    // daemon process from an older binary is far more likely to still
+    // recognize the oldest widely-supported revision than to have already
+    // learned about whatever revision just became newest in a freshly-built
+    // binary. Using the newest would make the probe falsely report a
+    // healthy-but-older daemon as unreachable after a version-list rotation.
+    let probe_version = super::protocol::SUPPORTED_PROTOCOL_VERSIONS
+        .first()
+        .expect("SUPPORTED_PROTOCOL_VERSIONS is never empty");
+    initialize_ping_with_version(stream, probe_version).await
 }
 
 // ---------------------------------------------------------------------------
@@ -1357,9 +1405,13 @@ mod daemon_tests {
         let mut reader = StdBufReader::new(stream);
 
         // initialize
-        writer
-            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n")
-            .unwrap();
+        let current_version = crate::mcp::protocol::SUPPORTED_PROTOCOL_VERSIONS
+            .last()
+            .expect("SUPPORTED_PROTOCOL_VERSIONS is never empty");
+        let init_payload = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"protocolVersion\":\"{current_version}\",\"clientInfo\":{{\"name\":\"ironmem-internal\",\"version\":\"1.0.0\"}}}}}}\n"
+        );
+        writer.write_all(init_payload.as_bytes()).unwrap();
         writer.flush().unwrap();
         let mut init_line = String::new();
         reader.read_line(&mut init_line).unwrap();
@@ -1425,9 +1477,13 @@ mod daemon_tests {
         let stream = connect_with_retry(&sock, "initial connect");
         let mut writer = stream.try_clone().unwrap();
         let mut reader = StdBufReader::new(stream);
-        writer
-            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n")
-            .unwrap();
+        let current_version = crate::mcp::protocol::SUPPORTED_PROTOCOL_VERSIONS
+            .last()
+            .expect("SUPPORTED_PROTOCOL_VERSIONS is never empty");
+        let init_payload = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"protocolVersion\":\"{current_version}\",\"clientInfo\":{{\"name\":\"ironmem-internal\",\"version\":\"1.0.0\"}}}}}}\n"
+        );
+        writer.write_all(init_payload.as_bytes()).unwrap();
         writer.flush().unwrap();
         let mut line = String::new();
         reader.read_line(&mut line).unwrap();
@@ -1505,6 +1561,10 @@ mod daemon_tests {
             });
         });
 
+        let current_version = crate::mcp::protocol::SUPPORTED_PROTOCOL_VERSIONS
+            .last()
+            .expect("SUPPORTED_PROTOCOL_VERSIONS is never empty");
+
         // Connection 1: connect + disconnect immediately, arming the timer.
         // `armed_at` anchors the original deadline at roughly
         // `armed_at + idle_timeout`; every later instant is measured from it.
@@ -1512,11 +1572,10 @@ mod daemon_tests {
             let stream = connect_with_retry(&sock, "first connect, arms the idle timer");
             let mut writer = stream.try_clone().unwrap();
             let mut reader = StdBufReader::new(stream);
-            writer
-                .write_all(
-                    b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n",
-                )
-                .unwrap();
+            let init_payload = format!(
+                "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"protocolVersion\":\"{current_version}\",\"clientInfo\":{{\"name\":\"ironmem-internal\",\"version\":\"1.0.0\"}}}}}}\n"
+            );
+            writer.write_all(init_payload.as_bytes()).unwrap();
             writer.flush().unwrap();
             let mut line = String::new();
             reader.read_line(&mut line).unwrap();
@@ -1531,9 +1590,10 @@ mod daemon_tests {
         let stream2 = connect_with_retry(&sock, "second connect, inside the idle window");
         let mut writer2 = stream2.try_clone().unwrap();
         let mut reader2 = StdBufReader::new(stream2);
-        writer2
-            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"initialize\",\"params\":{}}\n")
-            .unwrap();
+        let init_payload2 = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"initialize\",\"params\":{{\"protocolVersion\":\"{current_version}\",\"clientInfo\":{{\"name\":\"ironmem-internal\",\"version\":\"1.0.0\"}}}}}}\n"
+        );
+        writer2.write_all(init_payload2.as_bytes()).unwrap();
         writer2.flush().unwrap();
         let mut line2 = String::new();
         reader2
@@ -1559,9 +1619,10 @@ mod daemon_tests {
             idle_timeout,
         );
         std::thread::sleep(past_original_deadline - now);
-        writer2
-            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"initialize\",\"params\":{}}\n")
-            .unwrap();
+        let init_payload3 = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"initialize\",\"params\":{{\"protocolVersion\":\"{current_version}\",\"clientInfo\":{{\"name\":\"ironmem-internal\",\"version\":\"1.0.0\"}}}}}}\n"
+        );
+        writer2.write_all(init_payload3.as_bytes()).unwrap();
         writer2.flush().unwrap();
         let mut line3 = String::new();
         let read3 = reader2.read_line(&mut line3);
@@ -1630,14 +1691,19 @@ mod daemon_tests {
             });
         });
 
+        let current_version = crate::mcp::protocol::SUPPORTED_PROTOCOL_VERSIONS
+            .last()
+            .expect("SUPPORTED_PROTOCOL_VERSIONS is never empty");
+
         // Open ONE connection and keep it open (never drop writer/reader)
         // across more than the full idle window.
         let stream = connect_with_retry(&sock, "initial connect, held open across the idle window");
         let mut writer = stream.try_clone().unwrap();
         let mut reader = StdBufReader::new(stream);
-        writer
-            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n")
-            .unwrap();
+        let init_payload = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"protocolVersion\":\"{current_version}\",\"clientInfo\":{{\"name\":\"ironmem-internal\",\"version\":\"1.0.0\"}}}}}}\n"
+        );
+        writer.write_all(init_payload.as_bytes()).unwrap();
         writer.flush().unwrap();
         let mut line = String::new();
         reader.read_line(&mut line).unwrap();
@@ -1648,9 +1714,10 @@ mod daemon_tests {
         std::thread::sleep(idle_timeout * 3);
 
         // The SAME still-open connection must still be served afterward.
-        writer
-            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"initialize\",\"params\":{}}\n")
-            .unwrap();
+        let init_payload2 = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"initialize\",\"params\":{{\"protocolVersion\":\"{current_version}\",\"clientInfo\":{{\"name\":\"ironmem-internal\",\"version\":\"1.0.0\"}}}}}}\n"
+        );
+        writer.write_all(init_payload2.as_bytes()).unwrap();
         writer.flush().unwrap();
         let mut line2 = String::new();
         reader
@@ -1739,9 +1806,13 @@ mod daemon_tests {
         let stream = connect_with_retry(&sock, "attached client, held open across shutdown");
         let mut writer = stream.try_clone().unwrap();
         let mut reader = StdBufReader::new(stream);
-        writer
-            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n")
-            .unwrap();
+        let current_version = crate::mcp::protocol::SUPPORTED_PROTOCOL_VERSIONS
+            .last()
+            .expect("SUPPORTED_PROTOCOL_VERSIONS is never empty");
+        let init_payload = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"protocolVersion\":\"{current_version}\",\"clientInfo\":{{\"name\":\"ironmem-internal\",\"version\":\"1.0.0\"}}}}}}\n"
+        );
+        writer.write_all(init_payload.as_bytes()).unwrap();
         writer.flush().unwrap();
         let mut line = String::new();
         reader.read_line(&mut line).unwrap();
@@ -1777,8 +1848,11 @@ mod daemon_tests {
         //    the same regression, so both land on the same explanation rather
         //    than an anonymous `unwrap` panic.
         let mut line2 = String::new();
+        let init_payload2 = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"initialize\",\"params\":{{\"protocolVersion\":\"{current_version}\",\"clientInfo\":{{\"name\":\"ironmem-internal\",\"version\":\"1.0.0\"}}}}}}\n"
+        );
         let served = writer
-            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"initialize\",\"params\":{}}\n")
+            .write_all(init_payload2.as_bytes())
             .and_then(|()| writer.flush())
             .and_then(|()| reader.read_line(&mut line2));
         assert!(
@@ -2366,8 +2440,14 @@ mod daemon_tests {
             .await
         });
 
+        let current_version = crate::mcp::protocol::SUPPORTED_PROTOCOL_VERSIONS
+            .last()
+            .expect("SUPPORTED_PROTOCOL_VERSIONS is never empty");
+        let init_payload = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"protocolVersion\":\"{current_version}\",\"clientInfo\":{{\"name\":\"ironmem-internal\",\"version\":\"1.0.0\"}}}}}}\n"
+        );
         test_write_in
-            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n")
+            .write_all(init_payload.as_bytes())
             .await
             .unwrap();
         test_write_in.flush().await.unwrap();
@@ -2517,8 +2597,14 @@ mod daemon_tests {
         let (mut test_write_in, proxy_in) = tokio::io::duplex(4096);
         let (proxy_out, mut test_read_out) = tokio::io::duplex(4096);
 
+        let current_version = crate::mcp::protocol::SUPPORTED_PROTOCOL_VERSIONS
+            .last()
+            .expect("SUPPORTED_PROTOCOL_VERSIONS is never empty");
+        let init_payload = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"protocolVersion\":\"{current_version}\",\"clientInfo\":{{\"name\":\"ironmem-internal\",\"version\":\"1.0.0\"}}}}}}\n"
+        );
         test_write_in
-            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n")
+            .write_all(init_payload.as_bytes())
             .await
             .unwrap();
         // Immediate stdin EOF, before the stub's delayed reply arrives.
@@ -2773,6 +2859,54 @@ mod daemon_tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let health = rt.block_on(probe_daemon_health(&sock, Duration::from_millis(500)));
         assert_eq!(health, DaemonHealth::Reachable);
+
+        shutdown_tx.send(()).ok();
+        daemon.join().unwrap();
+    }
+
+    /// #321 review finding: a daemon that is alive and answers, but rejects
+    /// the handshake (e.g. because the probe asked for an unsupported
+    /// protocol version), must be distinguishable from no daemon at all.
+    /// `probe_daemon_health` itself always asks for
+    /// `SUPPORTED_PROTOCOL_VERSIONS.first()` — a version any compatible
+    /// daemon accepts — so it can never observe a rejection through its own
+    /// production call path. This exercises the rejection classification
+    /// directly, over a fresh connection to a REAL running daemon, via the
+    /// lower-level `initialize_ping_with_version` that `initialize_ping`
+    /// wraps: asking for a version no daemon will ever support proves the
+    /// daemon is alive and answering, and that a well-formed JSON-RPC error
+    /// reply is classified as `RejectedHandshake`, not `Unreachable`.
+    #[test]
+    fn probe_classifies_a_rejected_handshake_against_a_running_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("daemon.sock");
+        let sock_thread = sock.clone();
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let daemon = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                #[allow(clippy::arc_with_non_send_sync)]
+                let app = Arc::new(App::open_for_test().unwrap());
+                let listener = bind_daemon_listener(&sock_thread).await.unwrap();
+                serve_accept_loop(app, listener, Duration::from_secs(600), shutdown_rx)
+                    .await
+                    .unwrap();
+            });
+        });
+        connect_with_retry(&sock, "readiness probe"); // wait for the socket to accept
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let health = rt.block_on(async {
+            let stream = UnixStream::connect(&sock).await.unwrap();
+            initialize_ping_with_version(stream, "1999-01-01")
+                .await
+                .expect("a live daemon must answer, even with an error reply")
+        });
+        assert_eq!(health, DaemonHealth::RejectedHandshake);
 
         shutdown_tx.send(()).ok();
         daemon.join().unwrap();

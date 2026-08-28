@@ -26,6 +26,8 @@ pub struct JsonRpcResponse {
 pub struct JsonRpcError {
     pub code: i64,
     pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<serde_json::Value>,
 }
 
 /// Generic outgoing JSON-RPC 2.0 request envelope for internal clients.
@@ -63,15 +65,104 @@ impl JsonRpcResponse {
             error: Some(JsonRpcError {
                 code,
                 message: message.into(),
+                data: None,
+            }),
+        }
+    }
+
+    /// Same as [`Self::error`], with a structured `data` payload attached —
+    /// used by `-32022` to carry the requested and supported protocol
+    /// versions so a client can react programmatically instead of parsing
+    /// `message`.
+    pub fn error_with_data(
+        id: Option<serde_json::Value>,
+        code: i64,
+        message: &str,
+        data: serde_json::Value,
+    ) -> Self {
+        Self {
+            jsonrpc: "2.0".into(),
+            id,
+            result: None,
+            error: Some(JsonRpcError {
+                code,
+                message: message.into(),
+                data: Some(data),
             }),
         }
     }
 }
 
-/// MCP capabilities response for tools/list.
-pub fn capabilities_response() -> serde_json::Value {
-    serde_json::json!({
-        "protocolVersion": "2024-11-05",
+/// MCP protocol revisions this server understands, oldest first. Current as
+/// of issue #275 — the current revision plus the prior four.
+pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &[
+    "2024-11-05",
+    "2025-03-26",
+    "2025-06-18",
+    "2025-11-25",
+    "2026-07-28",
+];
+
+/// The version negotiated when a client's `initialize` omits
+/// `protocolVersion` entirely. Not part of the MCP spec's negotiation
+/// algorithm (a compliant client always sends one) — this only covers
+/// already-permissive callers (this crate's own test code, and any
+/// pre-negotiation client still in the wild) so they keep getting a
+/// successful handshake instead of a new hard failure.
+///
+/// Set to the *oldest* supported version, matching the pre-#275 `initialize`
+/// response, which always answered `"2024-11-05"`, regardless of what — if
+/// anything — the client asked for. Defaulting to the oldest version exactly
+/// preserves that behavior for every existing caller that omits
+/// `protocolVersion`, rather than handing a pre-negotiation caller a
+/// revision it never asked for and may not expect.
+pub const DEFAULT_PROTOCOL_VERSION: &str = "2024-11-05";
+
+/// The `protocolVersion` a client requested that is not in
+/// `SUPPORTED_PROTOCOL_VERSIONS`. A newtype (not a raw `String`) so it can't
+/// be mistaken for an error *message* at a call site — it's the rejected
+/// *value*. `Display` (via `thiserror`) renders a message-shaped string, not
+/// the bare version, so `.to_string()` can't accidentally reintroduce the
+/// context-free-message footgun this newtype exists to close.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("unsupported protocol version: {0}")]
+pub struct UnsupportedProtocolVersion(pub String);
+
+impl UnsupportedProtocolVersion {
+    /// Build the `-32022` JSON-RPC error response for this rejection. Owns
+    /// the `data: {requested, supported}` shape so it can't drift from the
+    /// call site — see issue #275's acceptance criteria.
+    pub fn into_response(self, id: Option<serde_json::Value>) -> JsonRpcResponse {
+        JsonRpcResponse::error_with_data(
+            id,
+            -32022,
+            &self.to_string(),
+            serde_json::json!({
+                "requested": self.0,
+                "supported": SUPPORTED_PROTOCOL_VERSIONS,
+            }),
+        )
+    }
+}
+
+/// Build the successful `initialize` result body, negotiating on
+/// `requested_version`:
+/// - `Some(v)` with `v` in [`SUPPORTED_PROTOCOL_VERSIONS`]: echoes `v` back.
+/// - `None`: negotiates [`DEFAULT_PROTOCOL_VERSION`].
+///
+/// Returns `Err(UnsupportedProtocolVersion(v))` when `v` is set but not
+/// supported; the caller turns that into a `-32022` JSON-RPC error carrying
+/// `v` and the supported list.
+pub fn negotiate_initialize(
+    requested_version: Option<&str>,
+) -> Result<serde_json::Value, UnsupportedProtocolVersion> {
+    let negotiated = match requested_version {
+        None => DEFAULT_PROTOCOL_VERSION,
+        Some(v) if SUPPORTED_PROTOCOL_VERSIONS.contains(&v) => v,
+        Some(v) => return Err(UnsupportedProtocolVersion(v.to_string())),
+    };
+    Ok(serde_json::json!({
+        "protocolVersion": negotiated,
         "capabilities": {
             "tools": {}
         },
@@ -79,5 +170,185 @@ pub fn capabilities_response() -> serde_json::Value {
             "name": "ironmem",
             "version": env!("IRONMEM_VERSION")
         }
+    }))
+}
+
+/// `server/discover` result body: supported protocol versions, capabilities,
+/// and server identity, answerable without a prior `initialize` handshake.
+///
+/// Shape matches the real `DiscoverResult` schema from the `2026-07-28`
+/// spec's `server/discover`: `resultType` is required (`"complete"` for a
+/// normal successful result), the version list is `supportedVersions` (not
+/// `protocolVersions`), and server identity lives under
+/// `_meta['io.modelcontextprotocol/serverInfo']`, not a top-level
+/// `serverInfo` field. The spec also mandates caching hints on any
+/// `resultType: "complete"` result from `server/discover`: `ttlMs` (>= 0)
+/// and `cacheScope`. This response never varies per caller (server
+/// identity, capabilities, and supported versions are the same for every
+/// client), so `cacheScope: "public"` applies, per the spec's own guidance
+/// for content that's identical for all users; `ttlMs` uses the spec's
+/// canonical example value of one hour.
+///
+/// Known, deliberate scope boundary (issue #275 Non-goals): `2026-07-28` is
+/// a modern-only MCP revision with no handshake concept in the real spec,
+/// yet this PR's legacy `initialize` handshake still negotiates it (see
+/// `negotiate_initialize`). A modern client that calls `server/discover`
+/// first — the spec's recommended flow — may therefore never call
+/// `initialize` at all, so `ConnectionContext::learn` (server.rs) never
+/// fires for that connection, losing session/harness attribution for it.
+/// Issue #275's Non-goals are explicit: "Do not implement the full
+/// `2026-07-28` per-request `_meta` version declaration model;
+/// initialize-time negotiation only." This is a known limitation, not a bug
+/// — do not "fix" by inventing per-request negotiation here.
+pub fn discover_response() -> serde_json::Value {
+    serde_json::json!({
+        "resultType": "complete",
+        "supportedVersions": SUPPORTED_PROTOCOL_VERSIONS,
+        "capabilities": {
+            "tools": {}
+        },
+        "ttlMs": 3_600_000,
+        "cacheScope": "public",
+        "_meta": {
+            "io.modelcontextprotocol/serverInfo": {
+                "name": "ironmem",
+                "version": env!("IRONMEM_VERSION")
+            }
+        }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn negotiate_initialize_echoes_each_supported_version() {
+        for version in SUPPORTED_PROTOCOL_VERSIONS {
+            let body = negotiate_initialize(Some(version)).unwrap();
+            assert_eq!(body["protocolVersion"], serde_json::json!(version));
+            assert_eq!(body["serverInfo"]["name"], serde_json::json!("ironmem"));
+            assert!(
+                body["serverInfo"]["version"]
+                    .as_str()
+                    .is_some_and(|v| !v.is_empty()),
+                "serverInfo.version must be a non-empty string, got {:?}",
+                body["serverInfo"]["version"]
+            );
+            assert!(
+                body["capabilities"]["tools"].is_object(),
+                "capabilities.tools must be an object, got {:?}",
+                body["capabilities"]["tools"]
+            );
+        }
+    }
+
+    #[test]
+    fn negotiate_initialize_defaults_when_version_omitted() {
+        let body = negotiate_initialize(None).unwrap();
+        assert_eq!(
+            body["protocolVersion"],
+            serde_json::json!(DEFAULT_PROTOCOL_VERSION)
+        );
+    }
+
+    #[test]
+    fn negotiate_initialize_rejects_unsupported_version() {
+        let err = negotiate_initialize(Some("1999-01-01")).unwrap_err();
+        assert_eq!(err, UnsupportedProtocolVersion("1999-01-01".to_string()));
+    }
+
+    #[test]
+    fn default_protocol_version_is_supported() {
+        assert!(SUPPORTED_PROTOCOL_VERSIONS.contains(&DEFAULT_PROTOCOL_VERSION));
+    }
+
+    #[test]
+    fn discover_response_lists_all_supported_versions() {
+        let body = discover_response();
+        assert_eq!(body["resultType"], serde_json::json!("complete"));
+        let versions: Vec<&str> = body["supportedVersions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(versions, SUPPORTED_PROTOCOL_VERSIONS);
+        assert_eq!(body["ttlMs"], serde_json::json!(3_600_000));
+        assert_eq!(body["cacheScope"], serde_json::json!("public"));
+        assert_eq!(
+            body["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
+            serde_json::json!("ironmem")
+        );
+        assert!(
+            body["_meta"]["io.modelcontextprotocol/serverInfo"]["version"]
+                .as_str()
+                .is_some_and(|v| !v.is_empty()),
+            "serverInfo.version must be a non-empty string, got {:?}",
+            body["_meta"]["io.modelcontextprotocol/serverInfo"]["version"]
+        );
+        assert!(
+            body["capabilities"]["tools"].is_object(),
+            "capabilities.tools must be an object, got {:?}",
+            body["capabilities"]["tools"]
+        );
+    }
+
+    #[test]
+    fn error_without_data_omits_data_key_from_wire_format() {
+        let response = JsonRpcResponse::error(Some(serde_json::json!(1)), -32602, "boom");
+        let wire = serde_json::to_string(&response).unwrap();
+        assert!(!wire.contains("\"data\""), "wire format: {wire}");
+    }
+
+    #[test]
+    fn unsupported_protocol_version_into_response_has_exact_shape() {
+        let err = UnsupportedProtocolVersion("1999-01-01".to_string());
+        let response = err.into_response(Some(serde_json::json!(7)));
+        assert_eq!(response.id, Some(serde_json::json!(7)));
+        let error = response
+            .error
+            .expect("into_response must build an error response");
+        assert_eq!(error.code, -32022);
+        assert_eq!(error.message, "unsupported protocol version: 1999-01-01");
+        let data = error.data.expect("into_response must set data");
+        assert_eq!(data["requested"], serde_json::json!("1999-01-01"));
+        assert_eq!(
+            data["supported"],
+            serde_json::json!(SUPPORTED_PROTOCOL_VERSIONS),
+            "data.supported must deep-equal the full SUPPORTED_PROTOCOL_VERSIONS array"
+        );
+    }
+
+    #[test]
+    fn supported_protocol_versions_starts_with_the_default() {
+        // `daemon.rs`'s health probe relies on `.first()` being the
+        // oldest/default version — pin that invariant with a real assertion
+        // instead of only a comment.
+        assert_eq!(
+            SUPPORTED_PROTOCOL_VERSIONS.first(),
+            Some(&DEFAULT_PROTOCOL_VERSION)
+        );
+    }
+
+    #[test]
+    fn supported_protocol_versions_is_sorted_oldest_first() {
+        assert!(SUPPORTED_PROTOCOL_VERSIONS.is_sorted());
+    }
+
+    #[test]
+    fn error_with_data_carries_structured_payload() {
+        let response = JsonRpcResponse::error_with_data(
+            Some(serde_json::json!(1)),
+            -32022,
+            "Unsupported protocol version",
+            serde_json::json!({"requested": "1999-01-01", "supported": SUPPORTED_PROTOCOL_VERSIONS}),
+        );
+        let error = response.error.expect("error_with_data must set error");
+        assert_eq!(error.code, -32022);
+        assert_eq!(
+            error.data.expect("data must be set")["requested"],
+            serde_json::json!("1999-01-01")
+        );
+    }
 }

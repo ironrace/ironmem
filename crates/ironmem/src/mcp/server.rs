@@ -1243,10 +1243,58 @@ fn dispatch_with_compact_delta(
         // across many (see `ConnectionContext` doc comment). `dispatch` stays
         // a pure request -> response function so its many direct test callers
         // (outside this module) are unaffected by this change.
-        "initialize" => Some((
-            JsonRpcResponse::success(id, protocol::capabilities_response()),
-            None,
-        )),
+        "initialize" => {
+            let response = match request.params.get("protocolVersion") {
+                // Deliberately a hard error here, unlike `_meta.sessionId`'s
+                // null-tolerant fallthrough (app.rs's `session_id_from_params`):
+                // session id has multiple fallback candidates by design, so a
+                // bad one can fall through to the next candidate. `protocolVersion`
+                // has no fallback candidate, and the spec requires it be a
+                // string whenever present — that includes an explicit JSON
+                // `null`, which is not a string and hits this arm too.
+                Some(v) if !v.is_string() => {
+                    tracing::warn!(
+                        request_id = ?id,
+                        received = ?v,
+                        "initialize rejected: protocolVersion must be a string"
+                    );
+                    JsonRpcResponse::error_with_data(
+                        id,
+                        -32602,
+                        "protocolVersion must be a string",
+                        serde_json::json!({
+                            "expected": "string",
+                            "received": v,
+                        }),
+                    )
+                }
+                maybe_version => {
+                    match protocol::negotiate_initialize(maybe_version.and_then(|v| v.as_str())) {
+                        Ok(body) => JsonRpcResponse::success(id, body),
+                        // Known, deliberate scope boundary (issue #275
+                        // Non-goals / Acceptance criteria): the legacy MCP
+                        // spec says an unsupported version on `initialize`
+                        // MUST get a downgrade offer, not a hard error.
+                        // `-32022` is unambiguously correct for the modern
+                        // per-request path but arguably wrong for this
+                        // legacy handshake — #275's acceptance criteria
+                        // explicitly require `-32022` with the supported
+                        // list here ("not a silent `2024-11-05`"), so this
+                        // is intentional, not a bug to "fix" toward a
+                        // downgrade offer.
+                        Err(unsupported) => {
+                            tracing::warn!(
+                                request_id = ?id,
+                                requested = %unsupported.0,
+                                "initialize rejected: unsupported protocol version"
+                            );
+                            unsupported.into_response(id)
+                        }
+                    }
+                }
+            };
+            Some((response, None))
+        }
 
         "tools/list" => {
             let tool_list = tools::tool_definitions(app);
@@ -1278,6 +1326,11 @@ fn dispatch_with_compact_delta(
                 )),
             }
         }
+
+        "server/discover" => Some((
+            JsonRpcResponse::success(id, protocol::discover_response()),
+            None,
+        )),
 
         "notifications/initialized" | "notifications/cancelled" => None, // No response
 
@@ -1344,6 +1397,262 @@ mod tests {
         let mut output = String::new();
         client_out.read_to_string(&mut output).await.unwrap();
         assert!(output.contains("\"protocolVersion\":\"2024-11-05\""));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn initialize_negotiates_each_supported_protocol_version_at_the_wire() {
+        for version in protocol::SUPPORTED_PROTOCOL_VERSIONS {
+            let input = format!(
+                "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"protocolVersion\":\"{version}\"}}}}\n"
+            );
+            let output = run_with_input(&input).await;
+            assert!(
+                output.contains(&format!("\"protocolVersion\":\"{version}\"")),
+                "expected negotiated version {version} in response: {output}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn initialize_rejects_unsupported_protocol_version() {
+        let output = run_with_input(
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"1999-01-01\"}}\n",
+        )
+        .await;
+        let response: serde_json::Value = serde_json::from_str(output.trim()).unwrap_or_else(|e| {
+            panic!("expected exactly one JSON-RPC response line, got {output:?}: {e}")
+        });
+        assert_eq!(response["error"]["code"], json!(-32022), "got: {response}");
+        assert_eq!(
+            response["error"]["message"],
+            json!("unsupported protocol version: 1999-01-01"),
+            "got: {response}"
+        );
+        assert_eq!(
+            response["error"]["data"]["requested"],
+            json!("1999-01-01"),
+            "got: {response}"
+        );
+        let supported = response["error"]["data"]["supported"]
+            .as_array()
+            .unwrap_or_else(|| panic!("expected data.supported to be an array, got: {response}"))
+            .iter()
+            .map(|v| v.as_str().expect("each supported version must be a string"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            supported,
+            protocol::SUPPORTED_PROTOCOL_VERSIONS,
+            "data.supported must deep-equal the full, ordered SUPPORTED_PROTOCOL_VERSIONS array"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn initialize_rejects_non_string_protocol_version() {
+        let output = run_with_input(
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":20241105}}\n",
+        )
+        .await;
+        assert!(output.contains("\"code\":-32602"), "got: {output}");
+    }
+
+    /// `request.params.get("protocolVersion")` returns `Some(&Value::Null)`
+    /// for an explicit JSON `null`, and `!v.is_string()` is `true` for
+    /// `Value::Null` — so this already correctly hits the `-32602` hard-error
+    /// arm. Not a bug; this pins that it stays covered.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn initialize_rejects_explicit_null_protocol_version() {
+        let output = run_with_input(
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":null}}\n",
+        )
+        .await;
+        assert!(output.contains("\"code\":-32602"), "got: {output}");
+        assert!(output.contains("\"expected\":\"string\""), "got: {output}");
+        assert!(output.contains("\"received\":null"), "got: {output}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn server_discover_returns_supported_versions_without_a_handshake() {
+        let output = run_with_input(
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"server/discover\",\"params\":{}}\n",
+        )
+        .await;
+        assert!(
+            output.contains("\"resultType\":\"complete\""),
+            "got: {output}"
+        );
+        assert!(output.contains("\"supportedVersions\""), "got: {output}");
+        assert!(output.contains("\"2024-11-05\""), "got: {output}");
+        assert!(output.contains("\"2026-07-28\""), "got: {output}");
+        assert!(
+            output.contains("\"io.modelcontextprotocol/serverInfo\""),
+            "got: {output}"
+        );
+        assert!(output.contains("\"ttlMs\":3600000"), "got: {output}");
+        assert!(
+            output.contains("\"cacheScope\":\"public\""),
+            "got: {output}"
+        );
+    }
+
+    /// `session_id_from_params` reads `_meta.sessionId` first (a prior task).
+    /// This proves that path attributes MCP response metrics identically to
+    /// the legacy top-level `sessionId` path already covered by
+    /// `sequential_connections_on_shared_app_get_independent_attribution`.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn meta_session_id_attributes_metrics_like_top_level_session_id() {
+        let _g = METRICS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("IRONMEM_METRICS");
+        std::env::remove_var("IRONMEM_HARNESS");
+        #[allow(clippy::arc_with_non_send_sync)]
+        let app = Arc::new(App::open_for_test().unwrap());
+
+        let (mut client_in, server_in) = tokio::io::duplex(65536);
+        let (server_out, mut client_out) = tokio::io::duplex(65536);
+        client_in
+            .write_all(
+                b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"_meta\":{\"sessionId\":\"meta-attrib-session\"},\"clientInfo\":{\"name\":\"claude-code\",\"version\":\"1.0.0\"}}}\n\
+                  {\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"status\",\"arguments\":{}}}\n",
+            )
+            .await
+            .unwrap();
+        client_in.shutdown().await.unwrap();
+        run_server_io(Arc::clone(&app), BufReader::new(server_in), server_out)
+            .await
+            .unwrap();
+        let mut out = String::new();
+        client_out.read_to_string(&mut out).await.unwrap();
+        assert!(out.contains("\"protocolVersion\""), "{out}");
+
+        let rows = app
+            .db
+            .query_token_usage(&crate::db::metrics::TokenUsageQuery::default())
+            .unwrap();
+        let mcp: Vec<_> = rows.iter().filter(|r| r.source == "mcp_response").collect();
+        assert_eq!(mcp.len(), 2, "initialize + tools/call responses recorded");
+        assert!(
+            mcp.iter()
+                .all(|r| r.session_id.as_deref() == Some("meta-attrib-session")),
+            "both responses attributed to the _meta-supplied session id: {mcp:?}"
+        );
+    }
+
+    /// `ConnectionContext::learn` (see its doc comment and the call site
+    /// comment above `if request.method == "initialize"` in
+    /// `run_framing_loop`) is set-once per connection and runs
+    /// unconditionally whenever `request.method == "initialize"` — BEFORE
+    /// dispatch decides whether protocol-version negotiation succeeds. So a
+    /// REJECTED `initialize` still locks in whatever session id it carried;
+    /// a client that retries with a corrected `initialize` carrying a
+    /// *different* session id has that id silently ignored for the rest of
+    /// the connection.
+    ///
+    /// This is a known, low-priority limitation (found in PR #321 review of
+    /// issue #275) — pinning current behavior here, not asserting it is
+    /// correct. Do NOT "fix" by gating `learn` on dispatch's async result:
+    /// that would break the synchronous, read-order-correct guarantee
+    /// `learn`'s call site depends on (see the comment there).
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rejected_initializes_session_id_is_locked_in_and_not_replaced_by_a_retry() {
+        let _g = METRICS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("IRONMEM_METRICS");
+        std::env::remove_var("IRONMEM_HARNESS");
+        #[allow(clippy::arc_with_non_send_sync)]
+        let app = Arc::new(App::open_for_test().unwrap());
+
+        let (mut client_in, server_in) = tokio::io::duplex(65536);
+        let (server_out, mut client_out) = tokio::io::duplex(65536);
+        client_in
+            .write_all(
+                b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"sessionId\":\"session-a-rejected\",\"protocolVersion\":\"1999-01-01\"}}\n\
+                  {\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"initialize\",\"params\":{\"sessionId\":\"session-b-corrected\",\"protocolVersion\":\"2026-07-28\"}}\n\
+                  {\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"status\",\"arguments\":{}}}\n",
+            )
+            .await
+            .unwrap();
+        client_in.shutdown().await.unwrap();
+        run_server_io(Arc::clone(&app), BufReader::new(server_in), server_out)
+            .await
+            .unwrap();
+        let mut out = String::new();
+        client_out.read_to_string(&mut out).await.unwrap();
+        assert!(
+            out.contains("\"code\":-32022"),
+            "the first initialize must be rejected: {out}"
+        );
+
+        let rows = app
+            .db
+            .query_token_usage(&crate::db::metrics::TokenUsageQuery::default())
+            .unwrap();
+        let status_row = rows
+            .iter()
+            .find(|r| r.source == "mcp_response" && r.tool_name.as_deref() == Some("status"))
+            .expect("status tools/call must record an mcp_response row");
+        assert_eq!(
+            status_row.session_id.as_deref(),
+            Some("session-a-rejected"),
+            "pinning current behavior: the REJECTED first initialize's session \
+             id wins because `learn` set-once locks it in before dispatch \
+             decides negotiation failed, so the retry's corrected session id \
+             on the second initialize is silently ignored: {status_row:?}"
+        );
+    }
+
+    /// Companion to
+    /// `rejected_initializes_session_id_is_locked_in_and_not_replaced_by_a_retry`:
+    /// documents the true answer to whether a REJECTED `initialize`'s
+    /// `_meta.sessionId` still attributes a later `tools/call`'s metrics.
+    /// Follows the exact pattern of
+    /// `meta_session_id_attributes_metrics_like_top_level_session_id` above,
+    /// except this `initialize` carries an UNSUPPORTED `protocolVersion` and
+    /// therefore gets `-32022` instead of succeeding.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rejected_initialize_still_attributes_metrics_from_learned_session_id() {
+        let _g = METRICS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("IRONMEM_METRICS");
+        std::env::remove_var("IRONMEM_HARNESS");
+        #[allow(clippy::arc_with_non_send_sync)]
+        let app = Arc::new(App::open_for_test().unwrap());
+
+        let (mut client_in, server_in) = tokio::io::duplex(65536);
+        let (server_out, mut client_out) = tokio::io::duplex(65536);
+        client_in
+            .write_all(
+                b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"_meta\":{\"sessionId\":\"rejected-meta-session\"},\"protocolVersion\":\"1999-01-01\",\"clientInfo\":{\"name\":\"claude-code\",\"version\":\"1.0.0\"}}}\n\
+                  {\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"status\",\"arguments\":{}}}\n",
+            )
+            .await
+            .unwrap();
+        client_in.shutdown().await.unwrap();
+        run_server_io(Arc::clone(&app), BufReader::new(server_in), server_out)
+            .await
+            .unwrap();
+        let mut out = String::new();
+        client_out.read_to_string(&mut out).await.unwrap();
+        assert!(
+            out.contains("\"code\":-32022"),
+            "the initialize must be rejected: {out}"
+        );
+
+        let rows = app
+            .db
+            .query_token_usage(&crate::db::metrics::TokenUsageQuery::default())
+            .unwrap();
+        let mcp: Vec<_> = rows.iter().filter(|r| r.source == "mcp_response").collect();
+        assert_eq!(
+            mcp.len(),
+            2,
+            "rejected initialize + tools/call responses both recorded: {mcp:?}"
+        );
+        assert!(
+            mcp.iter()
+                .all(|r| r.session_id.as_deref() == Some("rejected-meta-session")),
+            "both responses attributed to the _meta session id learned from \
+             the REJECTED initialize: {mcp:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
