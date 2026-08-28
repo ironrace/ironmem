@@ -1466,10 +1466,7 @@ mod tests {
         )
         .await;
         assert!(output.contains("\"code\":-32602"), "got: {output}");
-        assert!(
-            output.contains("\"expected\":\"string\""),
-            "got: {output}"
-        );
+        assert!(output.contains("\"expected\":\"string\""), "got: {output}");
         assert!(output.contains("\"received\":null"), "got: {output}");
     }
 

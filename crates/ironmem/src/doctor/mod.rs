@@ -1157,7 +1157,9 @@ mod tests {
         );
         assert_eq!(check.status, CheckStatus::Warn);
         assert!(
-            check.summary.contains("rejected the health-probe handshake"),
+            check
+                .summary
+                .contains("rejected the health-probe handshake"),
             "got: {check:?}"
         );
         let hint = check
