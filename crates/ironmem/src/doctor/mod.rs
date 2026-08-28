@@ -145,6 +145,15 @@ fn daemon_check(socket_path: &Path, health: crate::mcp::daemon::DaemonHealth) ->
             CheckStatus::Ok,
             format!("shared daemon reachable at {}", socket_path.display()),
         ),
+        crate::mcp::daemon::DaemonHealth::RejectedHandshake => Check::new(
+            "daemon",
+            CheckStatus::Warn,
+            format!(
+                "shared daemon at {} is running but rejected the health-probe handshake",
+                socket_path.display()
+            ),
+        )
+        .with_hint("it may be stale; consider restarting it"),
         crate::mcp::daemon::DaemonHealth::Unreachable => Check::new(
             "daemon",
             CheckStatus::Info,
@@ -1126,6 +1135,45 @@ mod tests {
         tokio::task::spawn_blocking(move || daemon.join().unwrap())
             .await
             .unwrap();
+    }
+
+    /// #321 review finding: a daemon that answered but rejected the
+    /// handshake (alive, running incompatible/stale code) must be reported
+    /// distinctly from both `Reachable` and `Unreachable` — a `Warn`, not an
+    /// `Info`, and without the auto-spawn hint (auto-spawn only helps when
+    /// nothing is listening; it does nothing for a stale running daemon).
+    /// `daemon_check` is a pure function of `DaemonHealth`, so this is
+    /// exercised directly rather than through a real daemon — the daemon-side
+    /// classification into `RejectedHandshake` is proven end-to-end by
+    /// `mcp::daemon::daemon_tests::probe_classifies_a_rejected_handshake_against_a_running_daemon`.
+    #[test]
+    fn daemon_check_reports_warn_for_a_rejected_handshake() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("daemon.sock");
+
+        let check = daemon_check(
+            &socket_path,
+            crate::mcp::daemon::DaemonHealth::RejectedHandshake,
+        );
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert!(
+            check.summary.contains("rejected the health-probe handshake"),
+            "got: {check:?}"
+        );
+        let hint = check
+            .hint
+            .as_ref()
+            .expect("a rejected handshake must carry a remediation hint");
+        assert!(
+            hint.contains("restarting"),
+            "hint should point at restarting the stale daemon, got: {hint}"
+        );
+        assert!(
+            !hint.contains("auto-spawn"),
+            "auto-spawn only helps when nothing is listening — it must not be \
+             suggested for a daemon that IS running but rejected the \
+             handshake, got: {hint}"
+        );
     }
 
     #[test]

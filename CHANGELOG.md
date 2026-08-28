@@ -25,17 +25,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the old default, `"2024-11-05"`, so already-deployed callers that never
   sent the field keep working exactly as before.
 
-- **New `server/discover` RPC lets a client learn what the server supports
-  before ever calling `initialize` (#275).** It returns the server's
-  supported protocol versions, capabilities, and identity, and requires no
-  prior handshake. The response shape follows the real MCP `2026-07-28`
-  `DiscoverResult` wire schema rather than an ad hoc guess: `resultType:
-  "complete"`, a `supportedVersions` array (not `protocolVersions`), server
-  identity nested under `_meta['io.modelcontextprotocol/serverInfo']` rather
-  than a top-level `serverInfo` field, and the spec-mandated caching hints —
-  `ttlMs` and `cacheScope` — since this response is identical for every
-  caller and is set to a one-hour TTL with `cacheScope: "public"`.
-
 - **Session-id resolution from `initialize` params now checks `_meta` before
   the legacy top-level fields — the reverse of the previous order (#275).**
   `_meta.sessionId` / `_meta.session_id` are now tried first, falling back to
@@ -109,6 +98,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   being invisible to its caller.
 
 ### Added
+
+- **New `server/discover` RPC lets a client learn what the server supports
+  before ever calling `initialize` (#275).** It returns the server's
+  supported protocol versions, capabilities, and identity, and requires no
+  prior handshake. The response shape follows the real MCP `2026-07-28`
+  `DiscoverResult` wire schema rather than an ad hoc guess: `resultType:
+  "complete"`, a `supportedVersions` array (not `protocolVersions`), server
+  identity nested under `_meta['io.modelcontextprotocol/serverInfo']` rather
+  than a top-level `serverInfo` field, and the spec-mandated caching hints —
+  `ttlMs` and `cacheScope` — since this response is identical for every
+  caller and is set to a one-hour TTL with `cacheScope: "public"`.
 
 - **`session_handoff` can recover a session whose generation holder died
   (#298).** New `force_reissue: true` mints a handoff token without holding

@@ -784,8 +784,9 @@ fn normalize_session_id(value: &str) -> Option<String> {
 }
 
 /// Extract a harness session id from MCP `initialize` params. Checks the
-/// vendor-namespaced `_meta` key first (the spec-sanctioned home for
-/// non-standard fields), then falls back to the legacy top-level
+/// spec-sanctioned `_meta` key first (an optionally vendor-prefixed field
+/// per spec; this reads the bare, unprefixed `sessionId`/`session_id`
+/// form), then falls back to the legacy top-level
 /// `sessionId`/`session_id` so already-released clients keep attributing
 /// correctly. Each candidate is fully extracted and normalized before
 /// precedence is decided, so a candidate that is merely *present* but
@@ -1028,6 +1029,37 @@ mod tests {
         assert_eq!(
             session_id_from_params(&params).as_deref(),
             Some("legacy-session")
+        );
+    }
+
+    #[test]
+    fn session_id_from_params_falls_through_when_meta_sessionid_is_empty_string() {
+        // A real client can send `_meta: { sessionId: "" }` before it has a
+        // session id populated. An empty string sanitizes to "unknown" via
+        // normalize_session_id, so it must fall through rather than committing
+        // to an unusable value and defeating a valid top-level id.
+        let params = serde_json::json!({
+            "sessionId": "legacy-session",
+            "_meta": { "sessionId": "" }
+        });
+        assert_eq!(
+            session_id_from_params(&params).as_deref(),
+            Some("legacy-session")
+        );
+    }
+
+    #[test]
+    fn session_id_from_params_falls_through_meta_camel_to_meta_snake_before_legacy() {
+        // Top-priority candidate (_meta.sessionId) present but unusable must
+        // check the SECOND-priority candidate (_meta.session_id) before
+        // falling all the way to the legacy top-level fields.
+        let params = serde_json::json!({
+            "sessionId": "legacy-session",
+            "_meta": { "sessionId": "", "session_id": "meta-snake-session" }
+        });
+        assert_eq!(
+            session_id_from_params(&params).as_deref(),
+            Some("meta-snake-session")
         );
     }
 

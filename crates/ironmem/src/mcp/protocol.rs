@@ -106,8 +106,8 @@ pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &[
 /// The version negotiated when a client's `initialize` omits
 /// `protocolVersion` entirely. Not part of the MCP spec's negotiation
 /// algorithm (a compliant client always sends one) — this only covers
-/// already-permissive callers (this crate's own test/health-probe code, and
-/// any pre-negotiation client still in the wild) so they keep getting a
+/// already-permissive callers (this crate's own test code, and any
+/// pre-negotiation client still in the wild) so they keep getting a
 /// successful handshake instead of a new hard failure.
 ///
 /// Set to the *oldest* supported version, matching the pre-#275 `initialize`
@@ -127,6 +127,23 @@ pub const DEFAULT_PROTOCOL_VERSION: &str = "2024-11-05";
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("unsupported protocol version: {0}")]
 pub struct UnsupportedProtocolVersion(pub String);
+
+impl UnsupportedProtocolVersion {
+    /// Build the `-32022` JSON-RPC error response for this rejection. Owns
+    /// the `data: {requested, supported}` shape so it can't drift from the
+    /// call site — see issue #275's acceptance criteria.
+    pub fn into_response(self, id: Option<serde_json::Value>) -> JsonRpcResponse {
+        JsonRpcResponse::error_with_data(
+            id,
+            -32022,
+            &self.to_string(),
+            serde_json::json!({
+                "requested": self.0,
+                "supported": SUPPORTED_PROTOCOL_VERSIONS,
+            }),
+        )
+    }
+}
 
 /// Build the successful `initialize` result body, negotiating on
 /// `requested_version`:
@@ -171,6 +188,18 @@ pub fn negotiate_initialize(
 /// client), so `cacheScope: "public"` applies, per the spec's own guidance
 /// for content that's identical for all users; `ttlMs` uses the spec's
 /// canonical example value of one hour.
+///
+/// Known, deliberate scope boundary (issue #275 Non-goals): `2026-07-28` is
+/// a modern-only MCP revision with no handshake concept in the real spec,
+/// yet this PR's legacy `initialize` handshake still negotiates it (see
+/// `negotiate_initialize`). A modern client that calls `server/discover`
+/// first — the spec's recommended flow — may therefore never call
+/// `initialize` at all, so `ConnectionContext::learn` (server.rs) never
+/// fires for that connection, losing session/harness attribution for it.
+/// Issue #275's Non-goals are explicit: "Do not implement the full
+/// `2026-07-28` per-request `_meta` version declaration model;
+/// initialize-time negotiation only." This is a known limitation, not a bug
+/// — do not "fix" by inventing per-request negotiation here.
 pub fn discover_response() -> serde_json::Value {
     serde_json::json!({
         "resultType": "complete",
@@ -270,6 +299,41 @@ mod tests {
         let response = JsonRpcResponse::error(Some(serde_json::json!(1)), -32602, "boom");
         let wire = serde_json::to_string(&response).unwrap();
         assert!(!wire.contains("\"data\""), "wire format: {wire}");
+    }
+
+    #[test]
+    fn unsupported_protocol_version_into_response_has_exact_shape() {
+        let err = UnsupportedProtocolVersion("1999-01-01".to_string());
+        let response = err.into_response(Some(serde_json::json!(7)));
+        assert_eq!(response.id, Some(serde_json::json!(7)));
+        let error = response
+            .error
+            .expect("into_response must build an error response");
+        assert_eq!(error.code, -32022);
+        assert_eq!(error.message, "unsupported protocol version: 1999-01-01");
+        let data = error.data.expect("into_response must set data");
+        assert_eq!(data["requested"], serde_json::json!("1999-01-01"));
+        assert_eq!(
+            data["supported"],
+            serde_json::json!(SUPPORTED_PROTOCOL_VERSIONS),
+            "data.supported must deep-equal the full SUPPORTED_PROTOCOL_VERSIONS array"
+        );
+    }
+
+    #[test]
+    fn supported_protocol_versions_starts_with_the_default() {
+        // `daemon.rs`'s health probe relies on `.first()` being the
+        // oldest/default version — pin that invariant with a real assertion
+        // instead of only a comment.
+        assert_eq!(
+            SUPPORTED_PROTOCOL_VERSIONS.first(),
+            Some(&DEFAULT_PROTOCOL_VERSION)
+        );
+    }
+
+    #[test]
+    fn supported_protocol_versions_is_sorted_oldest_first() {
+        assert!(SUPPORTED_PROTOCOL_VERSIONS.is_sorted());
     }
 
     #[test]
