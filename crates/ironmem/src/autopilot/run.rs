@@ -372,6 +372,17 @@ pub struct IssueRun {
 /// and dispatch-state writes, terminal classification — is testable against
 /// a real database without spawning `claude` and spending real money. The
 /// production implementation is [`ClaudeDispatcher`].
+///
+/// # Error contract
+///
+/// An implementation must report a failure to **start** the process as
+/// [`MemoryError::NotFound`], and anything else as a different variant.
+/// [`run_issue`] reads that distinction to decide whether the next
+/// invocation may still use `--session-id`: a process that never launched
+/// created no session, whereas one that ran and then produced no parseable
+/// result probably did, and re-supplying `--session-id` for a uuid that
+/// already exists fails. [`dispatch::run_dispatch`] follows this — it returns
+/// `NotFound` only from the `Command::output()` call itself.
 pub trait Dispatcher {
     fn dispatch(
         &mut self,
@@ -752,6 +763,14 @@ pub fn run_issue(
                 // there is no verdict to trust and no meter to read. It never
                 // consumes an attempt, so only the consecutive bound stops
                 // the loop here.
+                //
+                // The session, though, may well exist: anything but a
+                // launch failure means the process ran, and `--session-id`
+                // is rejected for a uuid that already exists. See the
+                // [`Dispatcher`] error contract.
+                if !matches!(err, MemoryError::NotFound(_)) {
+                    resuming = true;
+                }
                 consecutive_infrastructure_failures += 1;
                 dispatches.push(DispatchSummary {
                     attempt_n: None,
@@ -1458,6 +1477,50 @@ mod tests {
             run.terminal
         );
         assert_eq!(dispatcher.seen.len(), 4);
+    }
+
+    #[test]
+    fn a_dispatch_that_ran_but_failed_to_parse_leaves_the_session_claimed() {
+        // The process ran, so its session uuid may already exist — a retry
+        // must resume rather than re-claim it with `--session-id`.
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        let mut dispatcher = ScriptedDispatcher::new(vec![
+            Err(MemoryError::Validation(
+                "IC dispatch produced no parseable result JSON".into(),
+            )),
+            Ok(met()),
+        ]);
+
+        run_issue(&db, &issue(), &brief(), &wt, &config(), &mut dispatcher).unwrap();
+
+        assert!(
+            matches!(dispatcher.seen[1].session, SessionMode::Resume { .. }),
+            "a retry after a process that ran must resume, got {:?}",
+            dispatcher.seen[1].session
+        );
+    }
+
+    #[test]
+    fn a_dispatch_that_never_launched_leaves_the_session_unclaimed() {
+        // No process started, so no session exists — the retry must still
+        // open one with `--session-id`.
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        let mut dispatcher = ScriptedDispatcher::new(vec![
+            Err(MemoryError::NotFound(
+                "failed to launch IC dispatch: no such file".into(),
+            )),
+            Ok(met()),
+        ]);
+
+        run_issue(&db, &issue(), &brief(), &wt, &config(), &mut dispatcher).unwrap();
+
+        assert!(
+            matches!(dispatcher.seen[1].session, SessionMode::New { .. }),
+            "a retry after a failed launch must still open the session, got {:?}",
+            dispatcher.seen[1].session
+        );
     }
 
     #[test]
