@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Autopilot rung 4: `ironmem autopilot run` drives one issue end to end.**
+  Rungs 1–3 built the storage shapes, the dispatch primitive, and the
+  approved gate config; nothing yet *consumed* a dispatch's result. The new
+  `autopilot::run` module is that consumer. It loops dispatches against one
+  issue — opening a session with `--session-id` and resuming it with
+  `--resume` thereafter — and for each result banks `total_cost_usd` to the
+  daily ledger, records an append-only lineage attempt, advances the
+  cross-dispatch attempt counter in the issue-status drawer, and updates the
+  crash-safe dispatch-state drawer. `autopilot::worktree` provisions the
+  per-issue git worktree the loop dispatches into, on its own
+  `autopilot/<repo>-<issue>` branch, quarantining (never deleting) a dirty
+  checkout left behind by a dead IC.
+
+  Three behaviors are worth calling out because they are policy, not
+  plumbing:
+
+  - **Infrastructure failures never consume an attempt**, per the design's
+    error table — but they are now bounded separately by a consecutive-failure
+    cap, because exempting them from the attempt cap otherwise leaves nothing
+    to stop the loop from retrying a wedged configuration forever while
+    billing the ledger on every pass.
+  - **`--max-turns` must clear `--n-turns` by at least 4.** Rung 2 measured a
+    dispatch that completed its work correctly and still returned
+    `is_error: true` with no verdict at all, because the CLI's hard turn cap
+    fired before the goal loop's own evaluated stop. The two are coupled, and
+    the config now refuses a pairing that would reproduce that.
+  - **A dispatch is refused when its own `--max-budget-usd` ceiling could
+    carry the day past the daily cap**, rather than stopping once the cap has
+    already been passed — so the day's spend is bounded by the cap by
+    construction instead of overshooting it by up to one dispatch.
+
+  A repo whose gate config is missing or still `pending` is refused before a
+  worktree or branch is created for it, and an issue at its attempt cap never
+  self-resumes — only a human re-running it after re-labeling does.
+
 ### Changed
 
 - **`initialize` now negotiates the MCP protocol version instead of always
