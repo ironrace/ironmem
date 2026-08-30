@@ -157,7 +157,22 @@ pub fn is_dirty(worktree: &Path) -> Result<bool, MemoryError> {
 /// different spellings of the same directory and a restart's reconciliation
 /// would fail to match them.
 fn canonical_or_self(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    if let Ok(resolved) = std::fs::canonicalize(path) {
+        return resolved;
+    }
+    // `canonicalize` fails outright on a path that does not exist, which
+    // would leave exactly the two spellings this function exists to collapse.
+    // A worktree registered under `/var/folders/...` whose directory has
+    // since been deleted is listed by git as `/private/var/folders/...`, and
+    // comparing the un-resolved caller path against it would report the
+    // worktree as unregistered — so resolve the deepest ancestor that *does*
+    // exist and re-attach the rest.
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) if !parent.as_os_str().is_empty() => {
+            canonical_or_self(parent).join(name)
+        }
+        _ => path.to_path_buf(),
+    }
 }
 
 /// Whether `path` is currently registered as a worktree of `repo_root`.
@@ -242,15 +257,44 @@ pub fn ensure_worktree(
 
     let mut quarantined_from = None;
     if is_registered_worktree(&root, &path)? {
-        if !is_dirty(&path)? {
+        if !path.exists() {
+            // Registered but gone from disk — someone reclaimed the space
+            // with `rm -rf`, or a `git worktree remove` died partway. Every
+            // probe below (`git status`, `git worktree move`) would fail to
+            // even spawn with that directory as its cwd, so the whole issue
+            // would stay unrunnable behind a "failed to run git" message
+            // until a human pruned it by hand. Prune it here and fall
+            // through to creating a fresh checkout on the same branch.
+            //
+            // `--expire now` is required: a bare `git worktree prune` honors
+            // `gc.worktreePruneExpire` (three months by default) and would
+            // leave the stale registration in place, so `git worktree add`
+            // would still refuse the path as "missing but already
+            // registered".
+            git(&root, &["worktree", "prune", "--expire", "now"])?;
+        } else if !is_dirty(&path)? {
+            // Clean, but not necessarily still ours: a `git checkout` run
+            // inside the worktree (by a human, or by an IC comparing
+            // against another branch) leaves it clean on the wrong branch,
+            // and handing that back would report `branch` while the next
+            // dispatch actually commits onto whatever is checked out.
+            let head = git(&path, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+            if head != branch {
+                return Err(MemoryError::Validation(format!(
+                    "worktree {} is on '{head}', not the issue's branch '{branch}' — check the \
+                     branch back out or remove the worktree before dispatching",
+                    path.display()
+                )));
+            }
             return Ok(Worktree {
                 path: canonical_or_self(&path),
                 branch,
                 created: false,
                 quarantined_from: None,
             });
+        } else {
+            quarantined_from = Some(quarantine(&root, &path)?);
         }
-        quarantined_from = Some(quarantine(&root, &path)?);
     }
 
     // A directory can survive at `path` without being a registered worktree
@@ -425,6 +469,33 @@ mod tests {
         assert_eq!(
             quarantined_head, "HEAD",
             "the quarantined copy must be detached"
+        );
+    }
+
+    #[test]
+    fn ensure_worktree_recreates_a_registered_worktree_whose_directory_is_gone() {
+        let repo = fixture_repo();
+        let roots = tempfile::tempdir().unwrap();
+        let first = ensure_worktree(repo.path(), roots.path(), &issue(), "HEAD").unwrap();
+        std::fs::remove_dir_all(&first.path).unwrap();
+
+        let second = ensure_worktree(repo.path(), roots.path(), &issue(), "HEAD").unwrap();
+        assert!(second.created);
+        assert!(second.path.join("README.md").is_file());
+        assert!(second.quarantined_from.is_none());
+    }
+
+    #[test]
+    fn ensure_worktree_refuses_a_clean_checkout_left_on_another_branch() {
+        let repo = fixture_repo();
+        let roots = tempfile::tempdir().unwrap();
+        let first = ensure_worktree(repo.path(), roots.path(), &issue(), "HEAD").unwrap();
+        run(&first.path, &["checkout", "--detach"]);
+
+        let err = ensure_worktree(repo.path(), roots.path(), &issue(), "HEAD").unwrap_err();
+        assert!(
+            err.to_string().contains("not the issue's branch"),
+            "unexpected error: {err}"
         );
     }
 

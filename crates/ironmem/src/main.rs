@@ -393,12 +393,6 @@ enum AutopilotCmd {
     },
 }
 
-/// Load config, open, and migrate the database — the sequence both
-/// `Autopilot` subcommand handlers need before touching storage. Several
-/// other command handlers in this file repeat the same three-line sequence
-/// inline rather than through a shared helper; that pre-existing duplication
-/// is out of scope here, but the two new `Autopilot` arms at least don't add
-/// to it.
 /// Where per-issue worktrees live when `--worktree-root` is not given.
 ///
 /// Deliberately *outside* any target repo: a worktree nested inside its own
@@ -411,6 +405,12 @@ fn default_worktree_root() -> Result<std::path::PathBuf, MemoryError> {
     Ok(home.join(".ironrace-memory").join("autopilot-worktrees"))
 }
 
+/// Load config, open, and migrate the database — the sequence every
+/// `Autopilot` subcommand handler needs before touching storage. Several
+/// other command handlers in this file repeat the same three-line sequence
+/// inline rather than through a shared helper; that pre-existing duplication
+/// is out of scope here, but the new `Autopilot` arms at least don't add
+/// to it.
 fn open_migrated_db(db: Option<String>) -> Result<ironmem::db::schema::Database, MemoryError> {
     let cfg = config::Config::load(db)?;
     let database = ironmem::db::schema::Database::open(&cfg.db_path)?;

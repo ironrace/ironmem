@@ -550,6 +550,17 @@ fn record_and_advance(
     Ok(())
 }
 
+/// Opening words of the attempt-cap terminal record's `approach`. A const
+/// because it is written by [`record_terminal_summary`] and read back by
+/// [`is_terminal_summary`] to keep the record from being appended twice.
+const TERMINAL_SUMMARY_PREFIX: &str = "terminal: per-issue attempt cap";
+
+/// Whether a recorded attempt is an attempt-cap terminal marker rather than
+/// a real try.
+fn is_terminal_summary(attempt: &PriorAttempt) -> bool {
+    attempt.approach.starts_with(TERMINAL_SUMMARY_PREFIX)
+}
+
 /// The spec's *Cross-dispatch stagnation control* terminal record: on
 /// reaching the cap, "append a terminal lineage record, post a comment
 /// summarizing everything tried". This writes the lineage half; the GitHub
@@ -558,13 +569,25 @@ fn record_and_advance(
 /// It shares `attempt_n` with the final attempt rather than claiming a new
 /// one — it is a marker summarizing the run, not another try, and
 /// incrementing the cumulative counter past the cap would make the stored
-/// state contradict the cap it just reported hitting.
+/// state contradict the cap it just reported hitting. `attempt_cap` is
+/// carried separately only for the message, since a cap lowered between runs
+/// leaves `attempt_n` above it.
 fn record_terminal_summary(
     db: &Database,
     issue: &IssueRef,
+    attempt_n: u32,
     attempt_cap: u32,
     attempts: &[PriorAttempt],
 ) -> Result<(), MemoryError> {
+    // Written once, not once per invocation. An exhausted issue is a stable
+    // state that a polling Lead re-reads every pass, and each terminal
+    // record's summary quotes every attempt before it — including earlier
+    // terminal records — so appending a second one would nest the first
+    // one's whole text inside it and grow the lineage (and the prior-attempt
+    // prompt every later dispatch reads) on every single re-run.
+    if attempts.iter().any(is_terminal_summary) {
+        return Ok(());
+    }
     let summary = if attempts.is_empty() {
         "no attempts recorded".to_string()
     } else {
@@ -588,9 +611,9 @@ fn record_terminal_summary(
         db,
         &AttemptRecord {
             issue: issue.clone(),
-            attempt_n: attempt_cap,
+            attempt_n,
             approach: format!(
-                "terminal: per-issue attempt cap ({attempt_cap}) reached; this record summarizes \
+                "{TERMINAL_SUMMARY_PREFIX} ({attempt_cap}) reached; this record summarizes \
                  every attempt and is a marker, not a further attempt"
             ),
             verdict: AttemptOutcome::Failed,
@@ -675,7 +698,15 @@ pub fn run_issue(
         .as_ref()
         .map(|state| state.session_uuid.clone())
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let mut resuming = existing_state.is_some();
+    // A drawer existing is *not* proof the session exists: crash safety
+    // makes this record be written before the first launch, so a run that
+    // stopped before dispatching anything (daily budget, or repeated launch
+    // failures) leaves a uuid that no `claude` process has ever seen.
+    // Resuming that uuid fails on every subsequent pass, forever — so trust
+    // the recorded claim, not the drawer's mere presence.
+    let mut resuming = existing_state
+        .as_ref()
+        .is_some_and(|state| state.session_claimed);
     let started_at = existing_state
         .as_ref()
         .map(|state| state.started_at.clone())
@@ -687,25 +718,27 @@ pub fn run_issue(
     let ic_session_name = dispatch::ic_name(issue);
     let worktree_path = worktree.path.to_string_lossy().to_string();
 
-    let write_state = |db: &Database, attempt_n: u32, turn_n: u32, state: &str| {
-        dispatch_state::upsert_dispatch_state(
-            db,
-            &DispatchState {
-                issue: issue.clone(),
-                worktree_path: worktree_path.clone(),
-                ic_session_name: ic_session_name.clone(),
-                dispatch_class: config.dispatch_class.clone(),
-                attempt_n,
-                state: state.to_string(),
-                started_at: started_at.clone(),
-                session_uuid: session_uuid.clone(),
-                turn_n,
-            },
-        )
-        .map(|_| ())
-    };
+    let write_state =
+        |db: &Database, attempt_n: u32, turn_n: u32, state: &str, session_claimed: bool| {
+            dispatch_state::upsert_dispatch_state(
+                db,
+                &DispatchState {
+                    issue: issue.clone(),
+                    worktree_path: worktree_path.clone(),
+                    ic_session_name: ic_session_name.clone(),
+                    dispatch_class: config.dispatch_class.clone(),
+                    attempt_n,
+                    state: state.to_string(),
+                    started_at: started_at.clone(),
+                    session_uuid: session_uuid.clone(),
+                    turn_n,
+                    session_claimed,
+                },
+            )
+            .map(|_| ())
+        };
 
-    write_state(db, cumulative_attempt_n, turn_n, "dispatching")?;
+    write_state(db, cumulative_attempt_n, turn_n, "dispatching", resuming)?;
 
     let mut dispatches = Vec::new();
     let mut total_cost_usd = 0.0;
@@ -714,7 +747,13 @@ pub fn run_issue(
     let terminal = loop {
         if cumulative_attempt_n >= config.attempt_cap {
             let attempts = prior_attempts(db, issue)?;
-            record_terminal_summary(db, issue, config.attempt_cap, &attempts)?;
+            record_terminal_summary(
+                db,
+                issue,
+                cumulative_attempt_n,
+                config.attempt_cap,
+                &attempts,
+            )?;
             break TerminalReason::AttemptCapExhausted;
         }
 
@@ -780,7 +819,13 @@ pub fn run_issue(
                     verdict: None,
                     reason: Some(err.to_string()),
                 });
-                write_state(db, cumulative_attempt_n, turn_n, "infrastructure-failure")?;
+                write_state(
+                    db,
+                    cumulative_attempt_n,
+                    turn_n,
+                    "infrastructure-failure",
+                    resuming,
+                )?;
                 if consecutive_infrastructure_failures
                     >= config.max_consecutive_infrastructure_failures
                 {
@@ -870,10 +915,16 @@ pub fn run_issue(
                     status.as_ref(),
                 )?;
                 status = lineage::get_issue_status(db, issue)?;
-                write_state(db, cumulative_attempt_n, turn_n, "dispatching")?;
+                write_state(db, cumulative_attempt_n, turn_n, "dispatching", resuming)?;
             }
             DispatchClassification::InfrastructureFailure => {
-                write_state(db, cumulative_attempt_n, turn_n, "infrastructure-failure")?;
+                write_state(
+                    db,
+                    cumulative_attempt_n,
+                    turn_n,
+                    "infrastructure-failure",
+                    resuming,
+                )?;
                 if consecutive_infrastructure_failures
                     >= config.max_consecutive_infrastructure_failures
                 {
@@ -892,7 +943,7 @@ pub fn run_issue(
             TerminalReason::DailyBudgetExhausted { .. } => "paused-daily-budget",
             _ => "paused-infrastructure-failure",
         };
-        write_state(db, cumulative_attempt_n, turn_n, state_label)?;
+        write_state(db, cumulative_attempt_n, turn_n, state_label, resuming)?;
     }
 
     Ok(IssueRun {
@@ -1653,6 +1704,89 @@ mod tests {
             .unwrap();
         assert_eq!(state.worktree_path, wt.path.to_string_lossy());
         assert_eq!(state.turn_n, 3, "turns accumulate across dispatches");
+    }
+
+    #[test]
+    fn a_pause_before_any_dispatch_leaves_the_session_unclaimed() {
+        // The crash-safe drawer is written before the first launch, so a run
+        // that stops on the daily budget without dispatching anything has a
+        // session uuid no `claude` process has ever seen. Resuming it would
+        // fail on every later pass, wedging the issue permanently.
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        let mut broke = config();
+        broke.max_budget_usd = 2.5;
+        broke.daily_budget_usd = 2.6;
+        budget::accumulate_daily_spend(&db, &today_utc(), 1.0).unwrap();
+        let mut none = ScriptedDispatcher::new(vec![]);
+        let run = run_issue(&db, &issue(), &brief(), &wt, &broke, &mut none).unwrap();
+        assert!(matches!(
+            run.terminal,
+            TerminalReason::DailyBudgetExhausted { .. }
+        ));
+        assert!(none.seen.is_empty());
+        let state = dispatch_state::get_dispatch_state(&db, &issue())
+            .unwrap()
+            .expect("a budget pause keeps the state");
+        assert!(
+            !state.session_claimed,
+            "no process ran, so the session was never opened"
+        );
+
+        // Tomorrow's run must still *open* the session, not resume a uuid
+        // that does not exist.
+        let mut second = ScriptedDispatcher::new(vec![Ok(met())]);
+        run_issue(&db, &issue(), &brief(), &wt, &config(), &mut second).unwrap();
+        match &second.seen[0].session {
+            SessionMode::New { session_uuid } => {
+                assert_eq!(
+                    session_uuid, &state.session_uuid,
+                    "same uuid, freshly opened"
+                )
+            }
+            other => panic!("an unclaimed session must be opened, not resumed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_paused_run_that_did_dispatch_resumes_its_claimed_session() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        let mut paused = config();
+        paused.daily_budget_usd = 2.6;
+        paused.max_budget_usd = 2.5;
+        let mut first = ScriptedDispatcher::new(vec![Ok(not_met())]);
+        run_issue(&db, &issue(), &brief(), &wt, &paused, &mut first).unwrap();
+        let state = dispatch_state::get_dispatch_state(&db, &issue())
+            .unwrap()
+            .unwrap();
+        assert!(
+            state.session_claimed,
+            "a dispatch ran, so the session exists"
+        );
+    }
+
+    #[test]
+    fn re_running_an_exhausted_issue_does_not_append_another_terminal_record() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        let mut config = config();
+        config.attempt_cap = 1;
+        let mut first = ScriptedDispatcher::new(vec![Ok(not_met())]);
+        run_issue(&db, &issue(), &brief(), &wt, &config, &mut first).unwrap();
+        let after_first = lineage::attempts_for_issue(&db, &issue()).unwrap().len();
+
+        for _ in 0..3 {
+            let mut again = ScriptedDispatcher::new(vec![]);
+            let run = run_issue(&db, &issue(), &brief(), &wt, &config, &mut again).unwrap();
+            assert_eq!(run.terminal, TerminalReason::AttemptCapExhausted);
+        }
+
+        assert_eq!(
+            lineage::attempts_for_issue(&db, &issue()).unwrap().len(),
+            after_first,
+            "a polling Lead must not grow the lineage on every pass over a settled issue"
+        );
     }
 
     #[test]
