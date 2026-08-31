@@ -391,6 +391,58 @@ enum AutopilotCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Review an issue's open PR with a fresh-context Codex reviewer (rung 5)
+    Review {
+        /// Path to the database
+        #[arg(long)]
+        db: Option<String>,
+        /// Repo identity used as the storage key (e.g. "owner/repo")
+        repo: String,
+        /// GitHub issue number the PR closes
+        issue: u64,
+        /// Pull request number to review
+        #[arg(long)]
+        pr: u64,
+        /// The dispatch-time risk class the Lead assigned, compared against
+        /// the class the reviewer derives from the diff
+        #[arg(long = "class")]
+        dispatch_class: String,
+        /// Checkout the reviewer reads (read-only to it)
+        #[arg(long, default_value = ".")]
+        path: String,
+        /// Base branch the PR merges into
+        #[arg(long, default_value = "main")]
+        base: String,
+        /// Head branch the IC pushed. Defaults to this issue's autopilot branch.
+        #[arg(long)]
+        head: Option<String>,
+        /// Model for the reviewer; defaults to Codex's own configured model
+        #[arg(long)]
+        model: Option<String>,
+        /// Assert the repo's gate was green when the PR was opened.
+        ///
+        /// Off by default, and deliberately an *opt-in assertion* rather than
+        /// a `--gate-red` opt-out: auto-merge requires green **and** a
+        /// reviewer PASS, so a caller who forgets the flag gets a hold, not a
+        /// merge. The failure mode of the inverse spelling is shipping
+        /// unreviewed code on a red gate.
+        #[arg(long)]
+        gate_green: bool,
+        /// Daily ledger ceiling.
+        ///
+        /// Note this cannot bound a Codex reviewer on its own: Codex reports
+        /// no price, so a review never moves the ledger's dollar total. Use
+        /// --max-unpriced-reviews-per-day for that.
+        #[arg(long)]
+        daily_budget_usd: Option<f64>,
+        /// How many unpriced reviewer invocations may run today. The only
+        /// bound on reviewer spend that actually holds today.
+        #[arg(long)]
+        max_unpriced_reviews_per_day: Option<u32>,
+        /// Emit JSON instead of text
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Where per-issue worktrees live when `--worktree-root` is not given.
@@ -1081,6 +1133,83 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                 }
                 Ok(())
             }
+            AutopilotCmd::Review {
+                db,
+                repo,
+                issue,
+                pr,
+                dispatch_class,
+                path,
+                base,
+                head,
+                model,
+                gate_green,
+                daily_budget_usd,
+                max_unpriced_reviews_per_day,
+                json,
+            } => {
+                let issue_ref = ironmem::autopilot::IssueRef::new(repo, issue);
+                let head_branch =
+                    head.unwrap_or_else(|| ironmem::autopilot::worktree::branch_name(&issue_ref));
+
+                let database = open_migrated_db(db)?;
+                // Refuse an unapproved repo before spending anything: the
+                // reviewer's prompt is built from the *approved* gate
+                // commands, so there is nothing coherent to dispatch without
+                // them.
+                let gate_commands =
+                    ironmem::autopilot::run::approved_gate_commands(&database, &issue_ref.repo)?;
+
+                let mut runner = ironmem::autopilot::review::CodexReviewer::resolve(model)?;
+                let review = ironmem::autopilot::review::review_pr(
+                    &database,
+                    &mut runner,
+                    &ironmem::autopilot::review::ReviewRequest {
+                        issue: &issue_ref,
+                        pr_number: pr,
+                        base_branch: &base,
+                        head_branch: &head_branch,
+                        dispatch_class: &dispatch_class,
+                        gate_commands: &gate_commands,
+                        gate_green,
+                        repo_dir: std::path::Path::new(&path),
+                        daily_budget_usd: daily_budget_usd
+                            .unwrap_or(ironmem::autopilot::run::DEFAULT_DAILY_BUDGET_USD),
+                        max_unpriced_reviews_per_day: max_unpriced_reviews_per_day.unwrap_or(
+                            ironmem::autopilot::review::DEFAULT_MAX_UNPRICED_REVIEWS_PER_DAY,
+                        ),
+                    },
+                )?;
+
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&review)?);
+                } else {
+                    println!(
+                        "Issue {} PR #{}",
+                        review.issue.canonical(),
+                        review.pr_number
+                    );
+                    if let Some(refusal) = &review.refusal {
+                        println!("  reviewer: not dispatched ({refusal:?})");
+                    }
+                    println!("  verdict: {:?}", review.outcome.verdict);
+                    println!("  diff risk class: {:?}", review.outcome.risk_class);
+                    if let Some(reason) = &review.outcome.reason {
+                        println!("  reason: {reason}");
+                    }
+                    if let Some(usage) = &review.outcome.token_usage {
+                        println!(
+                            "  tokens: {} in ({} cached), {} out — no price reported by Codex",
+                            usage.input_tokens, usage.cached_input_tokens, usage.output_tokens
+                        );
+                    }
+                    println!("  decision: {:?}", review.decision);
+                    if let Some(id) = &review.record_drawer_id {
+                        println!("  recorded: {id}");
+                    }
+                }
+                Ok(())
+            }
         },
         Commands::Harnesses { format } => {
             match format.as_str() {
@@ -1290,6 +1419,100 @@ mod tests {
                 assert_eq!(dispatch_class, "unclassified");
             }
             _ => panic!("expected Commands::Autopilot(Run), got a different variant"),
+        }
+    }
+
+    #[test]
+    fn autopilot_review_parses_the_pr_and_class() {
+        let cli = Cli::try_parse_from([
+            "ironmem",
+            "autopilot",
+            "review",
+            "owner/repo",
+            "283",
+            "--pr",
+            "322",
+            "--class",
+            "documentation",
+        ])
+        .expect("review args should parse");
+        match cli.command {
+            Commands::Autopilot {
+                cmd:
+                    AutopilotCmd::Review {
+                        repo,
+                        issue,
+                        pr,
+                        dispatch_class,
+                        base,
+                        head,
+                        gate_green,
+                        ..
+                    },
+            } => {
+                assert_eq!(repo, "owner/repo");
+                assert_eq!(issue, 283);
+                assert_eq!(pr, 322);
+                assert_eq!(dispatch_class, "documentation");
+                assert_eq!(base, "main");
+                assert_eq!(head, None, "head defaults to the issue's autopilot branch");
+                assert!(
+                    !gate_green,
+                    "the gate must not be assumed green when the flag is absent"
+                );
+            }
+            _ => panic!("expected Commands::Autopilot(Review), got a different variant"),
+        }
+    }
+
+    #[test]
+    fn autopilot_review_requires_a_pr_and_a_dispatch_class() {
+        // Without `--pr` there is nothing to review; without `--class` the
+        // double-classification check has nothing to compare against, and
+        // defaulting it would make one half of the spec's fail-closed rule
+        // silently vacuous.
+        assert!(Cli::try_parse_from([
+            "ironmem",
+            "autopilot",
+            "review",
+            "owner/repo",
+            "283",
+            "--class",
+            "documentation",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "ironmem",
+            "autopilot",
+            "review",
+            "owner/repo",
+            "283",
+            "--pr",
+            "322",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn autopilot_review_gate_green_is_opt_in() {
+        let cli = Cli::try_parse_from([
+            "ironmem",
+            "autopilot",
+            "review",
+            "owner/repo",
+            "283",
+            "--pr",
+            "322",
+            "--class",
+            "test_only",
+            "--gate-green",
+        ])
+        .expect("review args should parse");
+        match cli.command {
+            Commands::Autopilot {
+                cmd: AutopilotCmd::Review { gate_green, .. },
+            } => assert!(gate_green),
+            _ => panic!("expected Commands::Autopilot(Review), got a different variant"),
         }
     }
 
