@@ -233,6 +233,17 @@ fn zero_embedding() -> Vec<f32> {
     vec![0.0; ironrace_embed::EMBED_DIM]
 }
 
+/// Today's date in UTC, in the `YYYY-MM-DD` spelling
+/// [`budget::budget_key`] expects.
+///
+/// Shared by every module that touches the daily ledger so the ledger key
+/// can only ever be spelled one way: an IC dispatch and a reviewer that
+/// disagreed about the date format would silently bank into two different
+/// drawers and neither ceiling would see the other's spend.
+pub(crate) fn today_utc() -> String {
+    chrono::Utc::now().format("%Y-%m-%d").to_string()
+}
+
 /// The deterministic drawer id for a given logical key, computed exactly the
 /// way `mcp__ironmem__add_drawer`/`get_drawer` do it — see
 /// [`LOGICAL_KEY_ID_PREFIX`]'s caveat.

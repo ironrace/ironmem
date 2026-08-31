@@ -279,9 +279,17 @@ pub fn build_argv(spec: &ReviewSpec, repo_dir: &Path) -> Vec<String> {
         args.push("-m".to_string());
         args.push(model.clone());
     }
-    // The prompt is the trailing positional. Pushed last so a prompt that
-    // happens to start with `-` is still read as the prompt rather than as a
-    // flag.
+    // The prompt is `codex exec`'s single trailing positional, so it is
+    // pushed after every flag and its value.
+    //
+    // Note what this does *not* buy: being last does not protect a prompt
+    // that begins with `-`, because clap dispatches on the leading dash, not
+    // on position — such a prompt would be rejected as an unknown flag, and a
+    // prompt of exactly `-` means "read the instructions from stdin". Neither
+    // is reachable today ([`super::review_prompt::render`] always opens with
+    // "You are a fresh-context..."), and both fail closed if it ever changes,
+    // so no `--` escape is spelled here; the guarantee just isn't the one the
+    // ordering suggests.
     args.push(spec.prompt.clone());
     args
 }
@@ -779,10 +787,19 @@ pub fn record_review(db: &Database, record: &ReviewRecord) -> Result<RecordedRev
     })
 }
 
-/// The most reviews [`reviews_for_issue`] will walk for one issue. Mirrors
-/// `lineage`'s own per-issue cap: a bound on a traversal that is otherwise
-/// unbounded by anything but retention.
-const MAX_REVIEWS_PER_ISSUE: usize = 200;
+/// The most triples [`reviews_for_issue`] will walk for one issue. Matches
+/// `lineage::MAX_ATTEMPTS_PER_ISSUE`: a bound on a traversal that is
+/// otherwise unbounded by anything but retention.
+///
+/// It has to be generous, because it is a `LIMIT` on **every** current edge
+/// hanging off the issue entity — `has_attempt` and `has_review` alike, plus
+/// whatever a later rung adds — not on reviews alone, and
+/// `query_entity_current` orders newest-first. A tight cap would therefore
+/// let a long-running issue's attempt edges crowd its reviews out of the
+/// result set entirely, and rung 6 asking "has this PR already been
+/// reviewed, and what did it say?" would read an empty history and
+/// re-review — or lose a `needs_changes`.
+const MAX_REVIEWS_PER_ISSUE: usize = 10_000;
 
 /// One recorded review, as read back from storage.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -990,8 +1007,17 @@ pub fn review_pr(
     request: &ReviewRequest,
 ) -> Result<PrReview, MemoryError> {
     validate_repo(&request.issue.repo)?;
+    // Same check `run::RunConfig::validate` applies, for the same reason: a
+    // NaN ceiling makes every `spent_today >= daily_budget_usd` comparison
+    // false, so the dollar bound silently disappears instead of failing
+    // closed. A caller must not be able to spell "no ceiling" by accident.
+    if !request.daily_budget_usd.is_finite() || request.daily_budget_usd <= 0.0 {
+        return Err(MemoryError::Config(
+            "daily_budget_usd must be a finite, positive number".into(),
+        ));
+    }
 
-    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let today = super::today_utc();
     let ledger = super::budget::get_daily_spend(db, &today)?;
     let spent_today = ledger.as_ref().map(|e| e.total_cost_usd).unwrap_or(0.0);
     let unpriced_today = ledger
@@ -1036,23 +1062,49 @@ pub fn review_pr(
     // is the spec's "treated as NOT reviewed", which must still be recorded
     // and held on rather than propagated as an `Err` a caller might retry
     // into an unbounded loop.
-    let outcome = match runner.review(request.repo_dir, &prompt) {
-        Ok(outcome) => outcome,
+    let (outcome, launched) = match runner.review(request.repo_dir, &prompt) {
+        Ok(outcome) => (outcome, true),
         Err(e) => {
             tracing::warn!(error = %e, "autopilot reviewer failed to run; treating as NOT reviewed");
-            ReviewOutcome::did_not_run()
+            (ReviewOutcome::did_not_run(), false)
         }
     };
 
     // Bank the invocation before deciding anything with it: a review that
     // ran cost money whatever its verdict, and rung 4 banks failed dispatches
     // for the same reason.
-    match outcome.total_cost_usd {
-        Some(cost) => {
-            super::budget::accumulate_daily_spend(db, &today, cost)?;
-        }
-        None => {
-            super::budget::record_unpriced_dispatch(db, &today)?;
+    //
+    // An `Err` from the runner is the one case that banks *nothing*. Per the
+    // [`ReviewRunner`] error contract every such failure happens before the
+    // process is spawned, so no tokens were spent — and the unpriced counter
+    // is the only bound on reviewer spend that actually holds, so charging a
+    // never-launched reviewer against it would let a broken `codex` exhaust
+    // the day's reviews for free. Rung 4 draws the same line for the same
+    // reason (`run::run_issue`'s dispatch-error arm banks no cost), and the
+    // `refusal` field's "retry tomorrow vs. something is broken" distinction
+    // only survives if a broken reviewer never turns into a budget refusal.
+    if launched {
+        match outcome.total_cost_usd {
+            // A price only counts as a price if it is one. A harness that
+            // reports a negative, NaN, or infinite figure has told us nothing
+            // usable, and `accumulate_daily_spend` rejects all three — which
+            // would turn a review that actually ran into an `Err` that
+            // discards its record *and* its merge decision. Routing it to the
+            // unpriced counter instead keeps this module's whole thesis
+            // intact: unknown is recorded as unknown, never as free.
+            Some(cost) if cost.is_finite() && cost >= 0.0 => {
+                super::budget::accumulate_daily_spend(db, &today, cost)?;
+            }
+            Some(cost) => {
+                tracing::warn!(
+                    cost,
+                    "autopilot reviewer reported an unusable price; banking it as unpriced"
+                );
+                super::budget::record_unpriced_dispatch(db, &today)?;
+            }
+            None => {
+                super::budget::record_unpriced_dispatch(db, &today)?;
+            }
         }
     }
 
@@ -1222,11 +1274,16 @@ mod tests {
 
     #[test]
     fn the_prompt_is_the_trailing_positional() {
-        // A prompt that begins with `-` must still be read as the prompt.
+        // The prompt lands after every flag *and every flag's value* — a
+        // prompt emitted between `-m` and the model name would be consumed as
+        // the model. Note this says nothing about a prompt that begins with
+        // `-`; see `build_argv`'s note on why that is not a guarantee here.
         let mut spec = sample_spec();
-        spec.prompt = "--not-a-flag".to_string();
+        spec.model = Some("gpt-5-codex".to_string());
+        spec.prompt = "review this".to_string();
         let args = build_argv(&spec, Path::new("/repo"));
-        assert_eq!(args.last().unwrap(), "--not-a-flag");
+        assert_eq!(args.last().unwrap(), "review this");
+        assert_eq!(value_after(&args, "-m"), "gpt-5-codex");
     }
 
     #[test]
@@ -1812,13 +1869,111 @@ not json at all
         )
         .unwrap();
 
-        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let today = super::super::today_utc();
         let ledger = super::super::budget::get_daily_spend(&db, &today)
             .unwrap()
             .expect("the review must appear on the day's ledger");
         assert_eq!(ledger.unpriced_dispatch_count, 1);
         assert_eq!(ledger.dispatch_count, 0);
         assert_eq!(ledger.total_cost_usd, 0.0);
+    }
+
+    #[test]
+    fn a_reviewer_that_never_launched_does_not_burn_an_unpriced_slot() {
+        // The unpriced counter is the *only* bound on reviewer spend that
+        // holds today, so charging it for an invocation that never spawned
+        // would let a broken `codex` exhaust the day's reviews for free —
+        // and would then report the breakage as `UnpricedReviewCapReached`,
+        // destroying the "retry tomorrow vs. something is broken" split that
+        // `PrReview::refusal` exists to preserve. Rung 4 draws the same line:
+        // a dispatch that errored banks no cost.
+        let db = Database::open_in_memory().unwrap();
+        let issue = IssueRef::new("ironrace/ironmem", 283);
+        let gates = vec!["cargo test".to_string()];
+        let mut runner = StubRunner::failing_to_launch("no codex on PATH");
+
+        for _ in 0..5 {
+            let review = review_pr(
+                &db,
+                &mut runner,
+                &sample_request(&issue, &gates, Path::new("/repo")),
+            )
+            .unwrap();
+            assert_eq!(review.refusal, None, "a launch failure is never a refusal");
+        }
+
+        let today = super::super::today_utc();
+        match super::super::budget::get_daily_spend(&db, &today).unwrap() {
+            None => {}
+            Some(ledger) => {
+                assert_eq!(
+                    ledger.unpriced_dispatch_count, 0,
+                    "a reviewer that never spawned spent nothing"
+                );
+                assert_eq!(ledger.dispatch_count, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn a_nonsensical_reported_price_does_not_discard_a_completed_review() {
+        // A harness reporting a negative, NaN, or infinite price must not
+        // turn a review that actually ran into an `Err` that throws away its
+        // record and its merge decision — and must not be believed either.
+        // It lands on the unpriced counter: unknown, never free.
+        let db = Database::open_in_memory().unwrap();
+        let issue = IssueRef::new("ironrace/ironmem", 283);
+        let gates = vec!["cargo test".to_string()];
+        let bogus_prices = [-1.0_f64, f64::NAN, f64::INFINITY];
+        for bogus in bogus_prices {
+            let mut outcome = passing_outcome(RiskClass::Documentation);
+            outcome.total_cost_usd = Some(bogus);
+            let mut runner = StubRunner::returning(outcome);
+            let review = review_pr(
+                &db,
+                &mut runner,
+                &sample_request(&issue, &gates, Path::new("/repo")),
+            )
+            .expect("a bogus price must not sink the review");
+            assert!(review.record_drawer_id.is_some());
+        }
+
+        let ledger = super::super::budget::get_daily_spend(&db, &super::super::today_utc())
+            .unwrap()
+            .unwrap();
+        assert_eq!(ledger.total_cost_usd, 0.0);
+        assert_eq!(ledger.dispatch_count, 0);
+        assert_eq!(
+            ledger.unpriced_dispatch_count,
+            bogus_prices.len() as u32,
+            "an unusable price is unknown spend, not zero spend"
+        );
+    }
+
+    #[test]
+    fn a_ceiling_that_cannot_bind_is_rejected_rather_than_silently_ignored() {
+        // `spent_today >= NaN` is always false, so a NaN ceiling would make
+        // the dollar bound vanish instead of failing closed. Same check
+        // `RunConfig::validate` applies to the IC path.
+        let db = Database::open_in_memory().unwrap();
+        let issue = IssueRef::new("ironrace/ironmem", 283);
+        let gates = vec!["cargo test".to_string()];
+        let mut runner = StubRunner::returning(passing_outcome(RiskClass::Documentation));
+
+        for bad in [f64::NAN, 0.0, -1.0, f64::INFINITY] {
+            let request = ReviewRequest {
+                daily_budget_usd: bad,
+                ..sample_request(&issue, &gates, Path::new("/repo"))
+            };
+            assert!(
+                review_pr(&db, &mut runner, &request).is_err(),
+                "daily_budget_usd {bad} must be rejected"
+            );
+        }
+        assert_eq!(
+            runner.calls, 0,
+            "no reviewer may run on an unusable ceiling"
+        );
     }
 
     #[test]
@@ -1839,7 +1994,7 @@ not json at all
         )
         .unwrap();
 
-        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let today = super::super::today_utc();
         let ledger = super::super::budget::get_daily_spend(&db, &today)
             .unwrap()
             .unwrap();
@@ -1853,7 +2008,7 @@ not json at all
         let db = Database::open_in_memory().unwrap();
         let issue = IssueRef::new("ironrace/ironmem", 283);
         let gates = vec!["cargo test".to_string()];
-        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let today = super::super::today_utc();
         super::super::budget::accumulate_daily_spend(&db, &today, 25.0).unwrap();
 
         let mut runner = StubRunner::returning(passing_outcome(RiskClass::Documentation));
@@ -1893,7 +2048,7 @@ not json at all
         let db = Database::open_in_memory().unwrap();
         let issue = IssueRef::new("ironrace/ironmem", 283);
         let gates = vec!["cargo test".to_string()];
-        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let today = super::super::today_utc();
 
         let mut runner = StubRunner::returning(passing_outcome(RiskClass::Documentation));
         for _ in 0..3 {
@@ -1941,7 +2096,7 @@ not json at all
         let db = Database::open_in_memory().unwrap();
         let issue = IssueRef::new("ironrace/ironmem", 283);
         let gates = vec!["cargo test".to_string()];
-        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let today = super::super::today_utc();
         super::super::budget::accumulate_daily_spend(&db, &today, 25.0).unwrap();
 
         let mut outcome = passing_outcome(RiskClass::Documentation);
@@ -1980,7 +2135,7 @@ not json at all
             review.decision,
             MergeDecision::HoldForHuman(HoldReason::NeedsChanges)
         );
-        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let today = super::super::today_utc();
         assert_eq!(
             super::super::budget::get_daily_spend(&db, &today)
                 .unwrap()
