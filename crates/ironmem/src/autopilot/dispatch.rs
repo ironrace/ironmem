@@ -118,8 +118,11 @@ pub fn build_argv(spec: &DispatchSpec) -> Vec<String> {
     args
 }
 
-/// The evaluator's verdict, as forced through `--json-schema`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The evaluator's verdict, as forced through `--json-schema`. Serialized in
+/// the schema's own lowercase spelling so a `--json` run report round-trips
+/// the exact strings the enum was parsed from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Verdict {
     Met,
     Impossible,

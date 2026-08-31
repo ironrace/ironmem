@@ -301,8 +301,18 @@ enum MemoryCmd {
 
 /// Subcommands nested under `ironmem autopilot` (spec's *Repo onboarding*
 /// section, steps 1 and 3 — step 2, gate inference, is
-/// `ironmem::autopilot::onboard::infer_gate_commands`).
+/// `ironmem::autopilot::onboard::infer_gate_commands`; `Run` is rung 4's
+/// end-to-end single-issue loop).
+///
+/// `large_enum_variant` is allowed rather than satisfied: `Run` carries the
+/// whole `RunConfig` surface as individual clap arguments, which makes it
+/// far larger than its two siblings. The lint's concern — an oversized enum
+/// copied around a hot path — does not apply to a command enum that is
+/// parsed exactly once at startup and immediately destructured, and clippy's
+/// suggested `Box<String>` fields would obscure the argument definitions
+/// without changing anything that runs.
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum AutopilotCmd {
     /// Infer gate commands for a repo checkout and write a pending proposal
     Onboard {
@@ -329,13 +339,77 @@ enum AutopilotCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Drive one issue end to end against its approved gate config (rung 4)
+    Run {
+        /// Path to the database
+        #[arg(long)]
+        db: Option<String>,
+        /// Repo identity used as the storage key (e.g. "owner/repo")
+        repo: String,
+        /// GitHub issue number
+        issue: u64,
+        /// Issue title, shown to the IC in its turn prompt
+        #[arg(long)]
+        title: String,
+        /// Issue body text. Mutually exclusive with --body-file.
+        #[arg(long, conflicts_with = "body_file")]
+        body: Option<String>,
+        /// Read the issue body from a file instead of the command line
+        #[arg(long)]
+        body_file: Option<String>,
+        /// Local checkout of `repo` that worktrees are cut from
+        #[arg(long, default_value = ".")]
+        path: String,
+        /// Directory that per-issue worktrees are created under
+        #[arg(long)]
+        worktree_root: Option<String>,
+        /// Committish new issue branches are cut from
+        #[arg(long, default_value = "HEAD")]
+        base: String,
+        /// Model for the IC dispatch
+        #[arg(long, default_value = "claude-sonnet-5")]
+        model: String,
+        /// Dispatch-time risk class, recorded for the Reviewer to compare against
+        #[arg(long = "class", default_value = "unclassified")]
+        dispatch_class: String,
+        /// Turns per dispatch (the N in "or stop after N turns")
+        #[arg(long)]
+        n_turns: Option<u32>,
+        /// Hard --max-turns ceiling; must clear --n-turns with headroom
+        #[arg(long)]
+        max_turns: Option<u32>,
+        /// Per-dispatch spend ceiling, passed through to --max-budget-usd
+        #[arg(long)]
+        max_budget_usd: Option<f64>,
+        /// Per-issue attempt cap, cumulative across runs
+        #[arg(long)]
+        attempt_cap: Option<u32>,
+        /// Daily ledger ceiling across all dispatches
+        #[arg(long)]
+        daily_budget_usd: Option<f64>,
+        /// Emit JSON instead of text
+        #[arg(long)]
+        json: bool,
+    },
 }
 
-/// Load config, open, and migrate the database — the sequence both
-/// `Autopilot` subcommand handlers need before touching storage. Several
+/// Where per-issue worktrees live when `--worktree-root` is not given.
+///
+/// Deliberately *outside* any target repo: a worktree nested inside its own
+/// repo shows up in that repo's `git status` and in every glob a build script
+/// runs, so Autopilot's checkouts sit beside the database instead, under the
+/// same `~/.ironrace-memory` base directory `Config` already owns.
+fn default_worktree_root() -> Result<std::path::PathBuf, MemoryError> {
+    let home = dirs::home_dir()
+        .ok_or_else(|| MemoryError::Config("Cannot determine home directory".into()))?;
+    Ok(home.join(".ironrace-memory").join("autopilot-worktrees"))
+}
+
+/// Load config, open, and migrate the database — the sequence every
+/// `Autopilot` subcommand handler needs before touching storage. Several
 /// other command handlers in this file repeat the same three-line sequence
 /// inline rather than through a shared helper; that pre-existing duplication
-/// is out of scope here, but the two new `Autopilot` arms at least don't add
+/// is out of scope here, but the new `Autopilot` arms at least don't add
 /// to it.
 fn open_migrated_db(db: Option<String>) -> Result<ironmem::db::schema::Database, MemoryError> {
     let cfg = config::Config::load(db)?;
@@ -898,6 +972,115 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                 }
                 Ok(())
             }
+            AutopilotCmd::Run {
+                db,
+                repo,
+                issue,
+                title,
+                body,
+                body_file,
+                path,
+                worktree_root,
+                base,
+                model,
+                dispatch_class,
+                n_turns,
+                max_turns,
+                max_budget_usd,
+                attempt_cap,
+                daily_budget_usd,
+                json,
+            } => {
+                use ironmem::autopilot::run::RunConfig;
+
+                let issue_ref = ironmem::autopilot::IssueRef::new(repo, issue);
+                let body = match (body, body_file) {
+                    (Some(text), _) => text,
+                    (None, Some(file)) => std::fs::read_to_string(&file).map_err(|e| {
+                        MemoryError::NotFound(format!("cannot read --body-file {file}: {e}"))
+                    })?,
+                    (None, None) => String::new(),
+                };
+
+                let mut config = RunConfig::new(model, dispatch_class);
+                if let Some(n) = n_turns {
+                    config.n_turns = n;
+                    // Keep the documented headroom when only N was supplied,
+                    // rather than silently failing validation against the
+                    // default `max_turns` that was derived from the default N.
+                    config.max_turns =
+                        n.saturating_add(ironmem::autopilot::run::DEFAULT_MAX_TURNS_HEADROOM);
+                }
+                if let Some(max) = max_turns {
+                    config.max_turns = max;
+                }
+                if let Some(budget) = max_budget_usd {
+                    config.max_budget_usd = budget;
+                }
+                if let Some(cap) = attempt_cap {
+                    config.attempt_cap = cap;
+                }
+                if let Some(daily) = daily_budget_usd {
+                    config.daily_budget_usd = daily;
+                }
+                // Validate before provisioning a worktree: a bad config
+                // should not leave a checkout behind.
+                config.validate()?;
+
+                let database = open_migrated_db(db)?;
+                // Refuse an unapproved repo *before* creating a worktree and
+                // branch for it — `run_issue` checks this too, but by then
+                // the checkout already exists on disk.
+                ironmem::autopilot::run::approved_gate_commands(&database, &issue_ref.repo)?;
+
+                let worktree_root = match worktree_root {
+                    Some(dir) => std::path::PathBuf::from(dir),
+                    None => default_worktree_root()?,
+                };
+                let worktree = ironmem::autopilot::worktree::ensure_worktree(
+                    std::path::Path::new(&path),
+                    &worktree_root,
+                    &issue_ref,
+                    &base,
+                )?;
+                let mut dispatcher = ironmem::autopilot::run::ClaudeDispatcher::resolve()?;
+                let run = ironmem::autopilot::run::run_issue(
+                    &database,
+                    &issue_ref,
+                    &ironmem::autopilot::run::IssueBrief { title, body },
+                    &worktree,
+                    &config,
+                    &mut dispatcher,
+                )?;
+
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&run)?);
+                } else {
+                    println!("Issue {}", run.issue.canonical());
+                    println!("  worktree: {}", worktree.path.display());
+                    if let Some(quarantined) = &worktree.quarantined_from {
+                        println!("  quarantined dirty worktree to: {}", quarantined.display());
+                    }
+                    println!("  dispatches: {}", run.dispatches.len());
+                    for (i, dispatch) in run.dispatches.iter().enumerate() {
+                        println!(
+                            "    {}. {:?} — {} turns, ${:.4}{}",
+                            i + 1,
+                            dispatch.classification,
+                            dispatch.num_turns,
+                            dispatch.total_cost_usd,
+                            dispatch
+                                .attempt_n
+                                .map(|n| format!(" (attempt {n})"))
+                                .unwrap_or_default()
+                        );
+                    }
+                    println!("  spend this run: ${:.4}", run.total_cost_usd);
+                    println!("  cumulative attempts: {}", run.cumulative_attempt_n);
+                    println!("  terminal: {:?}", run.terminal);
+                }
+                Ok(())
+            }
         },
         Commands::Harnesses { format } => {
             match format.as_str() {
@@ -1070,6 +1253,71 @@ mod tests {
             } => assert_eq!(path, "/tmp/some-checkout"),
             _ => panic!("expected Commands::Autopilot(Onboard), got a different variant"),
         }
+    }
+
+    #[test]
+    fn autopilot_run_parses_the_issue_and_brief() {
+        let cli = Cli::try_parse_from([
+            "ironmem",
+            "autopilot",
+            "run",
+            "owner/repo",
+            "283",
+            "--title",
+            "Make the gate pass",
+            "--body",
+            "The suite is red.",
+        ])
+        .expect("parse");
+        match cli.command {
+            Commands::Autopilot {
+                cmd:
+                    AutopilotCmd::Run {
+                        repo,
+                        issue,
+                        title,
+                        body,
+                        base,
+                        dispatch_class,
+                        ..
+                    },
+            } => {
+                assert_eq!(repo, "owner/repo");
+                assert_eq!(issue, 283);
+                assert_eq!(title, "Make the gate pass");
+                assert_eq!(body.as_deref(), Some("The suite is red."));
+                assert_eq!(base, "HEAD");
+                assert_eq!(dispatch_class, "unclassified");
+            }
+            _ => panic!("expected Commands::Autopilot(Run), got a different variant"),
+        }
+    }
+
+    #[test]
+    fn autopilot_run_requires_a_title() {
+        let result = Cli::try_parse_from(["ironmem", "autopilot", "run", "owner/repo", "283"]);
+        assert!(result.is_err(), "--title is required for the turn prompt");
+    }
+
+    #[test]
+    fn autopilot_run_rejects_both_body_and_body_file() {
+        let result = Cli::try_parse_from([
+            "ironmem",
+            "autopilot",
+            "run",
+            "owner/repo",
+            "283",
+            "--title",
+            "t",
+            "--body",
+            "inline",
+            "--body-file",
+            "issue.md",
+        ]);
+        assert!(
+            result.is_err(),
+            "--body and --body-file are mutually exclusive"
+        );
     }
 
     #[test]

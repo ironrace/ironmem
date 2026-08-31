@@ -19,7 +19,8 @@ use super::{read_current, validate_repo, write_current, IssueRef};
 /// (`issue`, `repo`, `worktree_path`, `ic_session_name`, `dispatch_class`,
 /// `attempt_n`, `state`, `started_at`) mirror the spec's storage table
 /// exactly; `session_uuid` and `turn_n` are the two additions the spec calls
-/// out by name (line 432) on top of that base shape.
+/// out by name (line 432) on top of that base shape, and `session_claimed`
+/// is a third the resume path needs — see its own doc.
 ///
 /// Unlike [`super::lineage::AttemptRecord`], the spec's shape here lists
 /// `issue` and `repo` as *separate* sibling fields — so `issue` in the
@@ -37,6 +38,21 @@ pub struct DispatchState {
     pub started_at: String,
     pub session_uuid: String,
     pub turn_n: u32,
+    /// Whether `session_uuid` has actually been handed to a `claude`
+    /// process yet. `--session-id` may only be used once and `--resume`
+    /// only works for a session that exists, so "a drawer exists" is *not*
+    /// the same question as "the session exists": a run can persist this
+    /// record (crash safety demands it be written before the first launch)
+    /// and then stop — on the daily budget, or on repeated launch
+    /// failures — without ever starting a process. Resuming such a uuid
+    /// would fail every time, forever.
+    ///
+    /// Defaulted on read so records written before this field existed
+    /// deserialize as "not claimed", which is the conservative answer: a
+    /// spurious `--session-id` on an existing session fails loudly on the
+    /// next dispatch, whereas a spurious `--resume` on a session that was
+    /// never opened wedges the issue.
+    pub session_claimed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,6 +67,8 @@ struct DispatchStateBody {
     started_at: String,
     session_uuid: String,
     turn_n: u32,
+    #[serde(default)]
+    session_claimed: bool,
 }
 
 fn dispatch_state_key(issue: &IssueRef) -> String {
@@ -72,6 +90,7 @@ pub fn upsert_dispatch_state(db: &Database, state: &DispatchState) -> Result<Str
         started_at: state.started_at.clone(),
         session_uuid: state.session_uuid.clone(),
         turn_n: state.turn_n,
+        session_claimed: state.session_claimed,
     };
     let content = serde_json::to_string(&body)?;
     write_current(db, &dispatch_state_key(&state.issue), &content)
@@ -97,6 +116,7 @@ pub fn get_dispatch_state(
         started_at: body.started_at,
         session_uuid: body.session_uuid,
         turn_n: body.turn_n,
+        session_claimed: body.session_claimed,
     }))
 }
 
@@ -143,6 +163,7 @@ mod tests {
             started_at: "2026-08-25T00:00:00Z".into(),
             session_uuid: "11111111-1111-1111-1111-111111111111".into(),
             turn_n,
+            session_claimed: true,
         }
     }
 

@@ -1,4 +1,4 @@
-//! Autopilot backlog runner (build-ladder rungs 1-3).
+//! Autopilot backlog runner (build-ladder rungs 1-4).
 //!
 //! See `docs/iron/specs/2026-08-21-autonomous-backlog-runner-design.md` for
 //! the full design. Rung 1 built the storage half — the `backlog-lineage`
@@ -8,8 +8,12 @@
 //! *IC lifecycle* CLI invocation the spec's rung-0/rung-2 validation rounds
 //! measured. Rung 3 adds [`onboard`], the Onboarder that infers gate
 //! commands from a repo's build manifests and proposes them via
-//! [`gate_config`]. The Lead's orchestration loop, the Reviewer, and merge
-//! authority are later rungs.
+//! [`gate_config`]. Rung 4 adds [`worktree`] (one checkout per issue) and
+//! [`run`], the end-to-end single-issue loop that finally *consumes* a
+//! [`dispatch::DispatchOutcome`] — banking its cost to the ledger, deciding
+//! whether it consumes an attempt, and writing the lineage and
+//! dispatch-state records the earlier rungs only defined shapes for. The
+//! Reviewer and merge authority are later rungs.
 //!
 //! # The five drawer kinds, one room
 //!
@@ -58,8 +62,10 @@ pub mod dispatch_state;
 pub mod gate_config;
 pub mod lineage;
 pub mod onboard;
+pub mod run;
 pub mod scrub;
 pub mod turn_prompt;
+pub mod worktree;
 
 use crate::db::drawers::{generate_id, Drawer};
 use crate::db::schema::Database;
@@ -78,7 +84,12 @@ pub use dispatch_state::DispatchState;
 pub use gate_config::{GateConfig, GateConfigState};
 pub use lineage::{AttemptOutcome, AttemptRecord, IssueStatus, RecordedAttempt};
 pub use onboard::{infer_gate_commands, onboard_repo, InferredGates};
+pub use run::{
+    approved_gate_commands, run_issue, ClaudeDispatcher, DispatchClassification, DispatchSummary,
+    Dispatcher, IssueBrief, IssueRun, RunConfig, TerminalReason,
+};
 pub use turn_prompt::{PriorAttempt, TurnPromptInputs};
+pub use worktree::{ensure_worktree, Worktree};
 
 /// Drawer wing shared by every Autopilot backlog-lineage record. See the
 /// module doc's *Wing and room* section for why this is a single constant
