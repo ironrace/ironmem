@@ -1055,6 +1055,65 @@ mod tests {
     }
 
     #[test]
+    fn this_repositorys_own_protection_body_parses_as_requiring_a_human() {
+        // Captured verbatim from `gh api repos/ironrace/ironmem/branches/
+        // main/protection` on 2026-08-31, trimmed of the `url` fields. A
+        // hand-written fixture proves the parser handles what its author
+        // imagined; this proves it handles what GitHub actually sends to the
+        // one repository this code has to be right about.
+        let p = parse_branch_protection(
+            r#"{"required_pull_request_reviews":{"dismiss_stale_reviews":true,
+                "require_code_owner_reviews":false,"require_last_push_approval":false,
+                "required_approving_review_count":1},
+                "required_signatures":{"enabled":false},
+                "enforce_admins":{"enabled":true},
+                "required_linear_history":{"enabled":false},
+                "allow_force_pushes":{"enabled":false},
+                "allow_deletions":{"enabled":false},
+                "block_creations":{"enabled":false},
+                "required_conversation_resolution":{"enabled":false},
+                "lock_branch":{"enabled":false},
+                "allow_fork_syncing":{"enabled":false}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            p,
+            BranchProtection::HumanApprovalRequired {
+                required_approving_review_count: 1,
+                require_code_owner_reviews: false,
+                enforce_admins: true,
+            }
+        );
+        assert!(!p.permits_autopilot_merge());
+    }
+
+    #[test]
+    fn this_repositorys_own_pr_view_body_parses_as_awaiting_a_review() {
+        // Captured verbatim from `gh pr view 324 --json …` on 2026-08-31,
+        // with gh 2.96.0. The state that defeated the old guard ordering:
+        // BLOCKED *because* the approval is missing, not because anything is
+        // wrong with the branch.
+        let snap = parse_pr_view(
+            r#"{"baseRefName":"main","mergeStateStatus":"BLOCKED",
+                "reviewDecision":"REVIEW_REQUIRED","state":"OPEN"}"#,
+        )
+        .unwrap();
+        assert_eq!(snap.merge_state_status, "BLOCKED");
+        assert!(!snap.human_approved(), "REVIEW_REQUIRED is not an approval");
+    }
+
+    #[test]
+    fn an_empty_ruleset_array_is_an_answer_not_a_failure() {
+        // What `gh api repos/ironrace/ironmem/rules/branches/main` returns
+        // today. Reached only when the classic endpoint 404s, but it must
+        // parse rather than error when it is.
+        assert_eq!(
+            parse_branch_rules("[]").unwrap(),
+            BranchProtection::NoHumanApprovalRequired
+        );
+    }
+
+    #[test]
     fn protection_without_a_review_requirement_permits_a_merge() {
         let p = parse_branch_protection(
             r#"{"required_status_checks":{"strict":true},"enforce_admins":{"enabled":false}}"#,

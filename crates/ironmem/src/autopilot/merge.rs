@@ -863,6 +863,18 @@ struct MergeBody {
 /// merge of the same PR are two facts, and keying them would destroy the
 /// first. This is the audit trail for the only irreversible thing Autopilot
 /// does.
+///
+/// # Append-only is about *transitions*, not about invocations
+///
+/// [`record_once`] declines to call this when the attempt is identical to
+/// the one already at the head of the PR's history, and that is not a
+/// weakening of the guarantee above. Every state this PR has been in is
+/// still recorded, in order, and none overwrites another. What is not
+/// recorded is the tenth consecutive poll finding the same unresolved hold —
+/// which adds no fact, and which this module already declined to *comment*
+/// on for exactly that reason. Extending the same judgment from the comment
+/// to the record makes the two consistent; treating a repeated invocation as
+/// a new fact was what let a poll loop grow the trail without end.
 pub fn record_merge(db: &Database, record: &MergeRecord) -> Result<String, MemoryError> {
     validate_repo(&record.issue.repo)?;
 
