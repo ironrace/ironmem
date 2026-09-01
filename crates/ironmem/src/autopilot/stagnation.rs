@@ -25,6 +25,7 @@
 //! performs Autopilot's only irreversible action.
 
 use serde::Serialize;
+use serde_json::json;
 
 use super::gh::{self, GhRunner};
 use super::labels::{self, AgentLabel};
@@ -68,6 +69,10 @@ pub enum ExhaustOutcome {
     Exhausted {
         label_plan: labels::LabelPlan,
         attempts_summarized: usize,
+        /// Whether *this* run posted the summary. False when a previous run
+        /// posted it and then failed to apply the label — see
+        /// [`exhaustion_notice_posted`].
+        commented: bool,
     },
 }
 
@@ -138,7 +143,20 @@ pub fn exhaust_issue(
     // the summary; if the order were reversed a failure would leave an issue
     // marked exhausted with no explanation of why, which is the worse half to
     // lose.
-    gh::comment_on_issue(gh_runner, issue, &body)?;
+    //
+    // But "the label write failed" is exactly the state that brings us back
+    // here: the label is the only thing the idempotency check above reads,
+    // so without a second record of the comment every retry re-posted an
+    // identical exhaustion summary. The notice is written *after* the
+    // comment succeeds and *before* the label is attempted, so a retry
+    // skips the comment and retries only the half that failed.
+    let commented = if exhaustion_notice_posted(db, issue)? {
+        false
+    } else {
+        gh::comment_on_issue(gh_runner, issue, &body)?;
+        record_exhaustion_notice(db, issue, attempts.len())?;
+        true
+    };
     // `current` was read at the top of this function; re-reading it inside
     // `set_exclusive_label` would spawn a second `gh issue view` for labels
     // we are already holding.
@@ -153,8 +171,45 @@ pub fn exhaust_issue(
         outcome: ExhaustOutcome::Exhausted {
             label_plan: plan,
             attempts_summarized: attempts.len().min(MAX_ATTEMPTS_IN_COMMENT),
+            commented,
         },
     })
+}
+
+/// The logical key of the "this issue's exhaustion summary has been posted"
+/// drawer.
+///
+/// Its own key rather than a field on [`lineage::IssueStatus`]: that drawer
+/// is rewritten wholesale by the dispatch path, which would clear a flag it
+/// knows nothing about.
+fn exhaustion_notice_key(issue: &IssueRef) -> String {
+    format!("exhaustion-notice:{}", issue.slug())
+}
+
+/// Whether the exhaustion summary has already been posted for this issue.
+///
+/// The second half of `exhaust_issue`'s idempotency, and the half that
+/// survives a failed label write. The label alone cannot answer this: the
+/// run that posts the comment and then fails to label is precisely the run
+/// whose work must not be repeated.
+fn exhaustion_notice_posted(db: &Database, issue: &IssueRef) -> Result<bool, MemoryError> {
+    Ok(super::read_current(db, &exhaustion_notice_key(issue))?.is_some())
+}
+
+fn record_exhaustion_notice(
+    db: &Database,
+    issue: &IssueRef,
+    attempts_summarized: usize,
+) -> Result<(), MemoryError> {
+    let content = serde_json::to_string(&json!({
+        "issue": issue.canonical(),
+        "repo": issue.repo,
+        "issue_number": issue.number,
+        "attempts_summarized": attempts_summarized,
+        "posted_at": chrono::Utc::now().to_rfc3339(),
+    }))?;
+    super::write_current(db, &exhaustion_notice_key(issue), &content)?;
+    Ok(())
 }
 
 /// Render the exhaustion summary comment.
@@ -311,11 +366,13 @@ are read once, not again inside the label write: {:?}",
         let ExhaustOutcome::Exhausted {
             label_plan,
             attempts_summarized,
+            commented,
         } = exec.outcome
         else {
             panic!("expected Exhausted, got {:?}", exec.outcome);
         };
         assert_eq!(attempts_summarized, 3);
+        assert!(commented, "the first pass posts the summary");
         assert_eq!(label_plan.add, vec!["agent:exhausted".to_string()]);
         assert_eq!(label_plan.remove, vec!["agent:ready".to_string()]);
         // The comment is posted before the label: losing the label leaves the
@@ -325,6 +382,78 @@ are read once, not again inside the label write: {:?}",
             gh_runner.seen[3].contains(&"edit".to_string()),
             "{:?}",
             gh_runner.seen[3]
+        );
+    }
+
+    #[test]
+    fn a_failed_label_write_does_not_make_the_next_run_repost_the_summary() {
+        // The label is the only thing the idempotency check reads, so the
+        // run that posts the comment and *then* fails to label is exactly
+        // the run whose work must not be repeated — every retry re-posted an
+        // identical exhaustion summary.
+        let database = db();
+        lineage::record_attempt(&database, &attempt(1, AttemptOutcome::Failed, Some("red")))
+            .unwrap();
+
+        let mut gh_runner = ScriptedGh::new(vec![
+            Ok(GhOutput::ok(r#"{"labels":[{"name":"agent:ready"}]}"#)),
+            Ok(GhOutput::ok("")),
+            Ok(GhOutput::failed("", "label already exists")),
+            Ok(GhOutput::failed("", "HTTP 403: Forbidden")),
+        ]);
+        let err = exhaust_issue(&mut gh_runner, &database, &issue(), false).unwrap_err();
+        assert!(err.to_string().contains("403"), "{err}");
+
+        let mut gh_runner = ScriptedGh::new(vec![
+            Ok(GhOutput::ok(r#"{"labels":[{"name":"agent:ready"}]}"#)),
+            Ok(GhOutput::failed("", "label already exists")),
+            Ok(GhOutput::ok("")),
+        ]);
+        let exec = exhaust_issue(&mut gh_runner, &database, &issue(), false).unwrap();
+
+        let ExhaustOutcome::Exhausted { commented, .. } = exec.outcome else {
+            panic!("expected Exhausted, got {:?}", exec.outcome);
+        };
+        assert!(!commented, "the summary was already posted");
+        assert!(
+            !gh_runner
+                .seen
+                .iter()
+                .any(|a| a.contains(&"comment".to_string())),
+            "no second summary may be posted: {:?}",
+            gh_runner.seen
+        );
+        assert!(
+            gh_runner
+                .seen
+                .iter()
+                .any(|a| a.contains(&"--add-label".to_string())),
+            "but the label that failed is retried: {:?}",
+            gh_runner.seen
+        );
+    }
+
+    #[test]
+    fn a_rehearsal_leaves_no_notice_that_would_suppress_the_real_summary() {
+        let database = db();
+        lineage::record_attempt(&database, &attempt(1, AttemptOutcome::Failed, Some("red")))
+            .unwrap();
+        let mut gh_runner = ScriptedGh::new(vec![Ok(GhOutput::ok(r#"{"labels":[]}"#))]);
+        exhaust_issue(&mut gh_runner, &database, &issue(), true).unwrap();
+
+        let mut gh_runner = ScriptedGh::new(vec![
+            Ok(GhOutput::ok(r#"{"labels":[]}"#)),
+            Ok(GhOutput::ok("")),
+            Ok(GhOutput::failed("", "label already exists")),
+            Ok(GhOutput::ok("")),
+        ]);
+        let exec = exhaust_issue(&mut gh_runner, &database, &issue(), false).unwrap();
+        let ExhaustOutcome::Exhausted { commented, .. } = exec.outcome else {
+            panic!("expected Exhausted, got {:?}", exec.outcome);
+        };
+        assert!(
+            commented,
+            "a dry run notifies nobody and must suppress nothing"
         );
     }
 

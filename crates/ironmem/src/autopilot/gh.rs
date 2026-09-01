@@ -416,12 +416,32 @@ fn encode_path_segment(segment: &str) -> String {
     out
 }
 
+/// `owner/name` with each half encoded as its own path segment.
+///
+/// `validate_repo` is deliberately permissive on character set — it rejects
+/// only empty, over-long and control-character strings — so `#`, `?` and `%`
+/// all reach these format strings. Encoding the branch and interpolating the
+/// repo raw would leave the same truncation hole open one segment to the
+/// left, and these builders are `pub`: their safety must not rest on which
+/// caller happens to have validated what first.
+fn encode_repo_path(repo: &str) -> String {
+    match repo.split_once('/') {
+        Some((owner, name)) => format!(
+            "{}/{}",
+            encode_path_segment(owner),
+            encode_path_segment(name)
+        ),
+        None => encode_path_segment(repo),
+    }
+}
+
 /// `gh api repos/{repo}/branches/{branch}/protection`.
 pub fn branch_protection_argv(repo: &str, branch: &str) -> Vec<String> {
     vec![
         "api".into(),
         format!(
-            "repos/{repo}/branches/{}/protection",
+            "repos/{}/branches/{}/protection",
+            encode_repo_path(repo),
             encode_path_segment(branch)
         ),
     ]
@@ -439,9 +459,26 @@ pub fn branch_rules_argv(repo: &str, branch: &str) -> Vec<String> {
     vec![
         "api".into(),
         format!(
-            "repos/{repo}/rules/branches/{}",
+            "repos/{}/rules/branches/{}",
+            encode_repo_path(repo),
             encode_path_segment(branch)
         ),
+        // **A list endpoint, and it pages at 30.** It returns one element
+        // per *rule*, not per ruleset, and a single ruleset routinely
+        // contributes a dozen (`creation`, `update`, `deletion`,
+        // `non_fast_forward`, `required_signatures`, …). Two rulesets on a
+        // branch clear 30 easily, and an unpaginated call would then return
+        // a truncated first page in which the `pull_request` rule simply is
+        // not present — indistinguishable, in shape, from a branch that
+        // requires no review. That reads as `NoHumanApprovalRequired` and
+        // merges into a protected branch: the exact failure this endpoint
+        // was added to prevent, reintroduced one layer down.
+        "--paginate".into(),
+        // Without `--slurp`, `--paginate` concatenates one JSON array per
+        // page back to back, which is not valid JSON. With it the pages
+        // arrive as an array *of* arrays — hence `parse_branch_rules`
+        // flattening rather than parsing a flat list.
+        "--slurp".into(),
     ]
 }
 
@@ -699,12 +736,16 @@ struct PullRequestRuleJson {
 /// not read — so it is reported `false`, which understates the constraint and
 /// never overstates Autopilot's authority.
 pub fn parse_branch_rules(stdout: &str) -> Result<BranchProtection, MemoryError> {
-    let rules: Vec<BranchRuleJson> = serde_json::from_str(stdout.trim()).map_err(|e| {
+    // `gh api --paginate --slurp` wraps each page in the outer array, so
+    // this is a list of *pages*, not a list of rules. Verified against a
+    // live ruleset-bearing repository: the unpaginated call returns `[…]`
+    // and this one returns `[[…]]`.
+    let pages: Vec<Vec<BranchRuleJson>> = serde_json::from_str(stdout.trim()).map_err(|e| {
         MemoryError::Validation(format!("could not parse branch rules response: {e}"))
     })?;
     let mut count = 0;
     let mut code_owners = false;
-    for rule in rules {
+    for rule in pages.into_iter().flatten() {
         if !rule.r#type.eq_ignore_ascii_case("pull_request") {
             continue;
         }
@@ -726,57 +767,127 @@ pub fn parse_branch_rules(stdout: &str) -> Result<BranchProtection, MemoryError>
     })
 }
 
-/// Read a base branch's protection rules.
+/// Read a base branch's review requirement, from both places GitHub keeps
+/// one.
 ///
-/// # Why a 404 is not an answer on its own
+/// # Why two endpoints, always
 ///
-/// GitHub returns `404 Not Found` from the *classic* protection endpoint for
-/// a branch with no classic protection — and also for a branch protected
-/// entirely by a **ruleset**, which is the modern mechanism and invisible to
-/// that endpoint. Reading the 404 as "unprotected", as this once did, is
-/// therefore wrong in exactly the repositories that adopted the newer
-/// feature: Autopilot would proceed to `gh pr merge` against a branch
-/// requiring a human approval.
+/// The classic `.../branches/{b}/protection` endpoint and the newer
+/// `.../rules/branches/{b}` endpoint describe *different* mechanisms, and a
+/// branch can be governed by either or both. Neither is a superset:
 ///
-/// So a 404 asks the second question rather than concluding. The rules
-/// endpoint reports every rule in force, from repository and organization
-/// rulesets alike, and needs only read access where the classic endpoint
-/// needs admin — so it is both the more accurate answer and the one more
-/// tokens can obtain.
+/// - Classic protection is invisible to the rules endpoint.
+/// - Rulesets — repository- and organization-level — are invisible to the
+///   classic endpoint, which answers `404` as though nothing protected the
+///   branch.
 ///
-/// Everything else holds. A `403` from a token without admin scope, a
-/// network failure, an unparseable body, or a rules lookup that itself fails
-/// all become [`BranchProtection::Unknown`]. No failed `gh` call means
-/// "proceed" any more: the only route to
-/// [`BranchProtection::NoHumanApprovalRequired`] is an endpoint that
-/// answered.
+/// So asking only the classic one reads a ruleset-protected branch as open,
+/// and asking it *first and stopping when it answers* reads a branch with
+/// status-check-only classic protection plus an approval-requiring ruleset
+/// as open too. Both are the same bug. The only correct question is the
+/// conjunction, and the strictest answer wins — which is how GitHub itself
+/// composes them.
+///
+/// The classic endpoint additionally requires **admin** rights, while the
+/// rules endpoint needs only read. A token without admin gets `403` from the
+/// first and a perfectly good answer from the second, so a `403` must not
+/// end the enquiry either: doing so stalled every PR on every poll, forever,
+/// for the commonest credential configuration there is.
+///
+/// # What still holds
+///
+/// [`BranchProtection::Unknown`] whenever a requirement *might* exist and
+/// could not be read: the classic endpoint failed for any reason other than
+/// "no classic protection", and the rules endpoint did not independently
+/// find a requirement. An unreadable answer is never "proceed".
 pub fn branch_protection(
     gh: &mut dyn GhRunner,
     repo: &str,
     branch: &str,
 ) -> Result<BranchProtection, MemoryError> {
+    let classic = classic_protection(gh, repo, branch)?;
+
+    // A classic requirement is already the strictest answer available: the
+    // rules endpoint can only agree, and asking it would buy nothing but an
+    // API call.
+    if matches!(
+        classic,
+        ClassicProtection::Answered(BranchProtection::HumanApprovalRequired { .. })
+    ) {
+        let ClassicProtection::Answered(p) = classic else {
+            unreachable!("just matched Answered")
+        };
+        return Ok(p);
+    }
+
+    let rules = branch_rules(gh, repo, branch)?;
+    if matches!(rules, BranchProtection::HumanApprovalRequired { .. }) {
+        return Ok(rules);
+    }
+
+    Ok(match (classic, rules) {
+        // Both endpoints answered, neither requires a review.
+        (
+            ClassicProtection::Answered(_) | ClassicProtection::Absent,
+            BranchProtection::NoHumanApprovalRequired,
+        ) => BranchProtection::NoHumanApprovalRequired,
+        // The rules endpoint could not answer either.
+        (_, unknown @ BranchProtection::Unknown { .. }) => unknown,
+        // The rules endpoint found nothing, but the classic one was never
+        // readable — so a classic requirement may exist and be invisible to
+        // us. Not "unprotected".
+        (ClassicProtection::Unreadable(detail), _) => BranchProtection::Unknown { detail },
+        (_, other) => other,
+    })
+}
+
+/// What the classic protection endpoint said.
+///
+/// Three states, not two: "no classic protection exists" (`404`) and "I
+/// could not read whether classic protection exists" (`403`, a network
+/// failure, an unreadable body) are the same *failure* to `gh` and opposite
+/// *facts* to this module.
+enum ClassicProtection {
+    Answered(BranchProtection),
+    /// `404` — the branch has no classic protection. A real answer.
+    Absent,
+    Unreadable(String),
+}
+
+fn classic_protection(
+    gh: &mut dyn GhRunner,
+    repo: &str,
+    branch: &str,
+) -> Result<ClassicProtection, MemoryError> {
     let out = gh.run(&branch_protection_argv(repo, branch))?;
     if out.success {
-        return parse_branch_protection(&out.stdout);
+        // Unparseable is `Unknown`, not `Err`, and the difference is the
+        // whole notification path: `Unknown` becomes a hold, which comments
+        // on the issue and labels it, whereas an `Err` propagates out of
+        // `execute_merge` and leaves the issue with no trace that anything
+        // was attempted. A human learns about every refusal from the issue
+        // itself, or the refusal may as well not have happened.
+        return Ok(match parse_branch_protection(&out.stdout) {
+            Ok(p) => ClassicProtection::Answered(p),
+            Err(e) => ClassicProtection::Unreadable(format!(
+                "{repo}@{branch} protection response was unreadable: {e}"
+            )),
+        });
     }
     if out.mentions_any(&BRANCH_UNPROTECTED_MARKERS) {
-        return branch_rules(gh, repo, branch);
+        return Ok(ClassicProtection::Absent);
     }
-    Ok(BranchProtection::Unknown {
-        detail: format!(
-            "gh api branch protection for {repo}@{branch} exited {:?}: {}",
-            out.code,
-            out.stderr.trim()
-        ),
-    })
+    Ok(ClassicProtection::Unreadable(format!(
+        "gh api branch protection for {repo}@{branch} exited {:?}: {}",
+        out.code,
+        out.stderr.trim()
+    )))
 }
 
 /// Read the rulesets in force on a branch.
 ///
-/// Reached only when the classic endpoint reported no classic protection.
-/// A failure here is [`BranchProtection::Unknown`] and holds the PR: the
-/// classic 404 has already told us nothing, so an unanswered rules lookup
-/// leaves the question genuinely open.
+/// A failure here is [`BranchProtection::Unknown`]: a ruleset that cannot be
+/// read may require anything.
 fn branch_rules(
     gh: &mut dyn GhRunner,
     repo: &str,
@@ -784,12 +895,15 @@ fn branch_rules(
 ) -> Result<BranchProtection, MemoryError> {
     let out = gh.run(&branch_rules_argv(repo, branch))?;
     if out.success {
-        return parse_branch_rules(&out.stdout);
+        return Ok(
+            parse_branch_rules(&out.stdout).unwrap_or_else(|e| BranchProtection::Unknown {
+                detail: format!("{repo}@{branch} ruleset response was unreadable: {e}"),
+            }),
+        );
     }
     Ok(BranchProtection::Unknown {
         detail: format!(
-            "{repo}@{branch} has no classic branch protection, and the ruleset lookup \
-exited {:?}: {}",
+            "the ruleset lookup for {repo}@{branch} exited {:?}: {}",
             out.code,
             out.stderr.trim()
         ),
@@ -1108,7 +1222,7 @@ mod tests {
         // today. Reached only when the classic endpoint 404s, but it must
         // parse rather than error when it is.
         assert_eq!(
-            parse_branch_rules("[]").unwrap(),
+            parse_branch_rules("[[]]").unwrap(),
             BranchProtection::NoHumanApprovalRequired
         );
     }
@@ -1161,7 +1275,7 @@ mod tests {
         // tells them apart.
         let mut gh = ScriptedGh::new(vec![
             Ok(GhOutput::failed("", "gh: Branch not protected (HTTP 404)")),
-            Ok(GhOutput::ok("[]")),
+            Ok(GhOutput::ok("[[]]")),
         ]);
         let p = branch_protection(&mut gh, "owner/repo", "main").unwrap();
         assert_eq!(p, BranchProtection::NoHumanApprovalRequired);
@@ -1170,6 +1284,7 @@ mod tests {
             branch_rules_argv("owner/repo", "main"),
             "the 404 must be followed by the ruleset lookup"
         );
+        assert_eq!(gh.seen.len(), 2);
     }
 
     #[test]
@@ -1180,10 +1295,10 @@ mod tests {
         let mut gh = ScriptedGh::new(vec![
             Ok(GhOutput::failed("", "gh: Branch not protected (HTTP 404)")),
             Ok(GhOutput::ok(
-                r#"[{"type":"creation"},
-                    {"type":"pull_request","parameters":{
-                        "required_approving_review_count":1,
-                        "require_code_owner_review":false}}]"#,
+                r#"[[{"type":"creation"},
+                     {"type":"pull_request","parameters":{
+                         "required_approving_review_count":1,
+                         "require_code_owner_review":false}}]]"#,
             )),
         ]);
         let p = branch_protection(&mut gh, "owner/repo", "main").unwrap();
@@ -1206,9 +1321,9 @@ mod tests {
         // classic one spells it `..._reviews`. Reusing the classic parser
         // here would read a required code-owner review as `false`.
         let p = parse_branch_rules(
-            r#"[{"type":"pull_request","parameters":{
-                "required_approving_review_count":0,
-                "require_code_owner_review":true}}]"#,
+            r#"[[{"type":"pull_request","parameters":{
+                 "required_approving_review_count":0,
+                 "require_code_owner_review":true}}]]"#,
         )
         .unwrap();
         assert_eq!(
@@ -1222,14 +1337,14 @@ mod tests {
     }
 
     #[test]
-    fn several_rulesets_compose_to_the_strictest_of_them() {
+    fn rules_split_across_pages_compose_to_the_strictest_of_them() {
         let p = parse_branch_rules(
-            r#"[{"type":"pull_request","parameters":{
-                    "required_approving_review_count":1,
-                    "require_code_owner_review":false}},
-                {"type":"pull_request","parameters":{
-                    "required_approving_review_count":2,
-                    "require_code_owner_review":true}}]"#,
+            r#"[[{"type":"pull_request","parameters":{
+                     "required_approving_review_count":1,
+                     "require_code_owner_review":false}}],
+                 [{"type":"pull_request","parameters":{
+                     "required_approving_review_count":2,
+                     "require_code_owner_review":true}}]]"#,
         )
         .unwrap();
         assert_eq!(
@@ -1240,6 +1355,57 @@ mod tests {
                 enforce_admins: false,
             }
         );
+    }
+
+    #[test]
+    fn the_rules_lookup_asks_for_every_page() {
+        // The endpoint returns one element per *rule*, not per ruleset, and
+        // pages at 30. A truncated first page missing the `pull_request`
+        // rule is shape-identical to a branch that requires no review, so an
+        // unpaginated call would read a protected branch as open — the very
+        // failure the ruleset lookup was added to prevent.
+        let argv = branch_rules_argv("owner/repo", "main");
+        assert!(argv.contains(&"--paginate".to_string()), "{argv:?}");
+        assert!(
+            argv.contains(&"--slurp".to_string()),
+            "without --slurp the pages are concatenated into invalid JSON: {argv:?}"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_protection_body_holds_instead_of_erroring_out() {
+        // An `Err` propagates out of `execute_merge` and leaves the issue
+        // with no comment, no label and no record — from the issue's point
+        // of view nothing happened. `Unknown` becomes a hold, which tells
+        // the human.
+        let mut gh = ScriptedGh::new(vec![
+            Ok(GhOutput::ok("not json at all")),
+            Ok(GhOutput::ok("[[]]")),
+        ]);
+        let p = branch_protection(&mut gh, "owner/repo", "main").unwrap();
+        assert!(matches!(p, BranchProtection::Unknown { .. }), "{p:?}");
+        assert!(!p.permits_autopilot_merge());
+    }
+
+    #[test]
+    fn an_unreadable_ruleset_body_holds_too() {
+        let mut gh = ScriptedGh::new(vec![
+            Ok(GhOutput::failed("", "gh: Branch not protected (HTTP 404)")),
+            Ok(GhOutput::ok("{}")),
+        ]);
+        let p = branch_protection(&mut gh, "owner/repo", "main").unwrap();
+        assert!(matches!(p, BranchProtection::Unknown { .. }), "{p:?}");
+    }
+
+    #[test]
+    fn the_repo_is_encoded_into_the_path_just_as_the_branch_is() {
+        // `validate_repo` is permissive on character set, so a `?` here
+        // would truncate the path to `repos/owner/repo` — a plain repository
+        // object, which every field of `ProtectionJson` being optional would
+        // parse cleanly as "no approval required".
+        let argv = branch_protection_argv("own?er/re#po", "main");
+        assert_eq!(argv[1], "repos/own%3Fer/re%23po/branches/main/protection");
+        assert!(!argv[1].contains('?') && !argv[1].contains('#'));
     }
 
     #[test]
@@ -1268,11 +1434,8 @@ mod tests {
             ]
         );
         assert_eq!(
-            branch_rules_argv("owner/repo", "release/1.0"),
-            vec![
-                "api".to_string(),
-                "repos/owner/repo/rules/branches/release%2F1.0".to_string()
-            ]
+            branch_rules_argv("owner/repo", "release/1.0")[1],
+            "repos/owner/repo/rules/branches/release%2F1.0"
         );
     }
 
@@ -1298,11 +1461,8 @@ mod tests {
     #[test]
     fn the_rules_argv_is_the_rest_path_for_the_branch() {
         assert_eq!(
-            branch_rules_argv("owner/repo", "main"),
-            vec![
-                "api".to_string(),
-                "repos/owner/repo/rules/branches/main".to_string()
-            ]
+            branch_rules_argv("owner/repo", "main")[1],
+            "repos/owner/repo/rules/branches/main"
         );
     }
 
@@ -1311,10 +1471,16 @@ mod tests {
         // The one place a failed `gh` call means "proceed", so the match is
         // anchored to the status phrase: a request id, a docs URL or a
         // rate-limit body that merely contains the digits must still hold.
-        let mut gh = ScriptedGh::new(vec![Ok(GhOutput::failed(
-            "",
-            "HTTP 500: server error (request id 404abc, see https://docs.github.com/rest/404)",
-        ))]);
+        let mut gh = ScriptedGh::new(vec![
+            Ok(GhOutput::failed(
+                "",
+                "HTTP 500: server error (request id 404abc, see https://docs.github.com/rest/404)",
+            )),
+            // the rules endpoint is still consulted — it needs no admin —
+            // but finding no ruleset cannot vouch for the classic
+            // protection we were unable to read
+            Ok(GhOutput::ok("[[]]")),
+        ]);
         let p = branch_protection(&mut gh, "owner/repo", "main").unwrap();
         assert!(matches!(p, BranchProtection::Unknown { .. }), "{p:?}");
         assert!(!p.permits_autopilot_merge());
@@ -1325,10 +1491,80 @@ mod tests {
         // The inversion that would merge into a protected branch: a token
         // without admin scope cannot read protection, and "cannot read" is
         // not "not protected".
-        let mut gh = ScriptedGh::new(vec![Ok(GhOutput::failed("", "HTTP 403: Forbidden"))]);
+        let mut gh = ScriptedGh::new(vec![
+            Ok(GhOutput::failed("", "HTTP 403: Forbidden")),
+            Ok(GhOutput::ok("[[]]")),
+        ]);
         let p = branch_protection(&mut gh, "owner/repo", "main").unwrap();
         assert!(matches!(p, BranchProtection::Unknown { .. }));
         assert!(!p.permits_autopilot_merge());
+    }
+
+    #[test]
+    fn a_403_still_consults_the_rules_endpoint_which_needs_no_admin() {
+        // The classic endpoint requires admin rights. A token without them
+        // gets 403 on every poll forever — so ending the enquiry there
+        // stalled every PR permanently for the commonest credential setup
+        // there is. The rules endpoint needs only read access and can still
+        // find a requirement.
+        let mut gh = ScriptedGh::new(vec![
+            Ok(GhOutput::failed("", "HTTP 403: Must have admin rights")),
+            Ok(GhOutput::ok(
+                r#"[[{"type":"pull_request","parameters":{
+                     "required_approving_review_count":1,
+                     "require_code_owner_review":false}}]]"#,
+            )),
+        ]);
+        let p = branch_protection(&mut gh, "owner/repo", "main").unwrap();
+        assert_eq!(
+            p,
+            BranchProtection::HumanApprovalRequired {
+                required_approving_review_count: 1,
+                require_code_owner_reviews: false,
+                enforce_admins: false,
+            },
+            "an unreadable classic endpoint must not hide a ruleset requirement"
+        );
+    }
+
+    #[test]
+    fn classic_protection_without_a_review_requirement_still_asks_about_rulesets() {
+        // A branch can carry classic protection for status checks only *and*
+        // an organization ruleset requiring an approval. Stopping as soon as
+        // the classic endpoint answered read that branch as open.
+        let mut gh = ScriptedGh::new(vec![
+            Ok(GhOutput::ok(
+                r#"{"required_status_checks":{"strict":true},"enforce_admins":{"enabled":false}}"#,
+            )),
+            Ok(GhOutput::ok(
+                r#"[[{"type":"pull_request","parameters":{
+                     "required_approving_review_count":2,
+                     "require_code_owner_review":false}}]]"#,
+            )),
+        ]);
+        let p = branch_protection(&mut gh, "owner/repo", "main").unwrap();
+        assert_eq!(
+            p,
+            BranchProtection::HumanApprovalRequired {
+                required_approving_review_count: 2,
+                require_code_owner_reviews: false,
+                enforce_admins: false,
+            }
+        );
+        assert!(!p.permits_autopilot_merge());
+    }
+
+    #[test]
+    fn a_classic_requirement_is_the_strictest_answer_and_costs_no_second_call() {
+        // The rules endpoint can only agree with a classic requirement, so
+        // asking it would buy nothing but an API call.
+        let mut gh = ScriptedGh::new(vec![Ok(GhOutput::ok(
+            r#"{"required_pull_request_reviews":{"required_approving_review_count":1},
+                "enforce_admins":{"enabled":true}}"#,
+        ))]);
+        let p = branch_protection(&mut gh, "owner/repo", "main").unwrap();
+        assert!(matches!(p, BranchProtection::HumanApprovalRequired { .. }));
+        assert_eq!(gh.seen.len(), 1, "{:?}", gh.seen);
     }
 
     #[test]

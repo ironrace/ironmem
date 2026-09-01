@@ -160,8 +160,25 @@ pub enum MergeHold {
     },
     /// The base branch's protection rules could not be read.
     ProtectionUnknown { detail: String },
-    /// `gh pr merge` itself refused.
+    /// `gh pr merge` itself refused, and a re-read confirmed the PR is still
+    /// open — so the merge definitely did not land.
     MergeCommandFailed { detail: String },
+    /// `gh pr merge` failed *and* the PR's state could not be re-read, so
+    /// whether the merge landed is genuinely unknown.
+    ///
+    /// Its own variant because the honest thing to say is the whole point.
+    /// `gh pr merge` deletes the head branch *after* performing the merge,
+    /// so a failure there can sit on top of a completed merge; the re-read
+    /// exists to tell those apart, and when the re-read itself fails —
+    /// a rate limit, a dropped socket, a `gh` that is suddenly gone — the
+    /// module knows nothing. Reporting `MergeCommandFailed` there told a
+    /// human "PR #N was not merged" about a PR that may well be merged,
+    /// which is the fail-closed rule inverted: an unanswered question became
+    /// a definite negative claim.
+    MergeResultUnknown {
+        detail: String,
+        read_failure: String,
+    },
 }
 
 impl MergeHold {
@@ -240,7 +257,39 @@ so it cannot be tied to this PR's head"
                 format!("the base branch's protection rules could not be read: {detail}")
             }
             MergeHold::MergeCommandFailed { detail } => format!("`gh pr merge` failed: {detail}"),
+            MergeHold::MergeResultUnknown {
+                detail,
+                read_failure,
+            } => format!(
+                "`gh pr merge` failed ({detail}) and the pull request's state could not be \
+re-read afterwards ({read_failure}), so whether the merge landed is unknown — check the \
+pull request before doing anything else"
+            ),
         }
+    }
+
+    /// The comment's opening line.
+    ///
+    /// Varies by hold because one of them must not assert a negative: for
+    /// [`MergeHold::MergeResultUnknown`] the module does not know whether
+    /// the merge happened, and "PR #7 was not merged" would be a claim it
+    /// cannot support.
+    fn headline(&self, pr_number: u64) -> String {
+        match self {
+            MergeHold::MergeResultUnknown { .. } => {
+                format!("**Autopilot: PR #{pr_number} may or may not have been merged.**")
+            }
+            _ => format!("**Autopilot: PR #{pr_number} was not merged.**"),
+        }
+    }
+
+    /// Whether this hold leaves the pull request open.
+    ///
+    /// False only for [`MergeHold::MergeResultUnknown`], where saying "the
+    /// pull request stays open" would be the same unsupported claim as the
+    /// headline.
+    fn pr_definitely_still_open(&self) -> bool {
+        !matches!(self, MergeHold::MergeResultUnknown { .. })
     }
 }
 
@@ -327,6 +376,14 @@ pub struct MergeExecution {
     /// label was touched — a dry run, or a hold on an already-exhausted
     /// issue.
     pub label_plan: Option<labels::LabelPlan>,
+    /// Why the label transition did not happen, when the outcome was a
+    /// merge and the label write failed.
+    ///
+    /// A merge cannot be undone, so its report must survive a later failure
+    /// rather than being replaced by one. `None` on every other outcome,
+    /// where a label failure is still an `Err`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label_error: Option<String>,
     /// Whether a notification comment was posted.
     pub commented: bool,
     /// Whether a *new* merge record was appended, as against this attempt
@@ -398,13 +455,35 @@ fn evaluate(
     gh_runner: &mut dyn GhRunner,
     request: &MergeRequest,
 ) -> Result<(MergeOutcome, Option<PrSnapshot>), MemoryError> {
-    // 1. The review. Reading storage before touching GitHub means a PR with
-    //    no review is refused without a single API call.
+    // 1. The PR as GitHub sees it now — before any storage guard, and that
+    //    ordering is load-bearing.
+    //
+    //    This read used to come third, after the review lookup and rung 5's
+    //    gate, so that a PR with no recorded review could be refused without
+    //    a single API call. That saving bought a wrong answer: an
+    //    already-merged PR whose review was missing, or whose gate had since
+    //    gone red, or whose reviewer said `needs_changes` before a human
+    //    merged it anyway, never reached the merged check at all. It was
+    //    told "PR #N was not merged … the pull request stays open" and
+    //    parked in `agent:blocked`, which auto-resumes. Three reachable
+    //    paths, all of them saying something false about a PR that had
+    //    landed.
+    //
+    //    One `gh pr view` is a cheap price for never asserting the state of
+    //    a pull request without having looked at it.
+    let snapshot = gh::pr_snapshot(gh_runner, &request.issue.repo, request.pr_number)?;
+
+    if snapshot.state.eq_ignore_ascii_case("merged") {
+        let head_sha = snapshot.head_ref_oid.clone();
+        return Ok((MergeOutcome::AlreadyMerged { head_sha }, Some(snapshot)));
+    }
+
+    // 2. The review.
     let Some(review) = latest_review_for_pr(db, request.issue, request.pr_number)? else {
-        return Ok((MergeOutcome::Held(MergeHold::NotReviewed), None));
+        return Ok((MergeOutcome::Held(MergeHold::NotReviewed), Some(snapshot)));
     };
 
-    // 2. Rung 5's gate, re-derived against the *present* gate state.
+    // 3. Rung 5's gate, re-derived against the *present* gate state.
     //
     //    Built directly, with no fabricated fields: `decide_merge` takes
     //    exactly the three facts it decides on, so this layer supplies
@@ -420,16 +499,13 @@ fn evaluate(
         },
     );
     if let MergeDecision::HoldForHuman(reason) = decision {
-        return Ok((MergeOutcome::Held(MergeHold::Review(reason)), None));
+        return Ok((
+            MergeOutcome::Held(MergeHold::Review(reason)),
+            Some(snapshot),
+        ));
     }
 
-    // 3. The PR as GitHub sees it now.
-    let snapshot = gh::pr_snapshot(gh_runner, &request.issue.repo, request.pr_number)?;
-
-    if snapshot.state.eq_ignore_ascii_case("merged") {
-        let head_sha = snapshot.head_ref_oid.clone();
-        return Ok((MergeOutcome::AlreadyMerged { head_sha }, Some(snapshot)));
-    }
+    // 4. Is it open?
     if !snapshot.state.eq_ignore_ascii_case("open") {
         let state = snapshot.state.clone();
         return Ok((
@@ -441,7 +517,7 @@ fn evaluate(
         return Ok((MergeOutcome::Held(MergeHold::PrIsDraft), Some(snapshot)));
     }
 
-    // 4. Did the reviewer read *this* commit?
+    // 5. Did the reviewer read *this* commit?
     let Some(reviewed_head) = review.head_sha.clone() else {
         return Ok((
             MergeOutcome::Held(MergeHold::ReviewHeadUnknown {
@@ -461,7 +537,7 @@ fn evaluate(
         ));
     }
 
-    // 5. Is it still the same merge? A retargeted PR was reviewed against a
+    // 6. Is it still the same merge? A retargeted PR was reviewed against a
     //    diff that no longer exists. `None` means the review predates the
     //    field — unknown, so the comparison is skipped rather than reported
     //    as a mismatch; the head-SHA guard above still protects the diff.
@@ -474,7 +550,7 @@ fn evaluate(
         return Ok((MergeOutcome::Held(hold), Some(snapshot)));
     }
 
-    // 6. Branch protection — the ladder's open question.
+    // 7. Branch protection — the ladder's open question.
     //
     //    **Before** the mergeability guard, and that ordering is the whole
     //    point. GitHub reports `mergeStateStatus: BLOCKED` for a PR that is
@@ -511,7 +587,7 @@ fn evaluate(
         return Ok((MergeOutcome::Held(hold), Some(snapshot)));
     }
 
-    // 7. Would GitHub take the merge at all? Last of the read-only guards,
+    // 8. Would GitHub take the merge at all? Last of the read-only guards,
     //    because it is the least specific: everything above names a cause,
     //    this names only the symptom GitHub reports.
     if !snapshot.mergeable.eq_ignore_ascii_case("mergeable")
@@ -524,7 +600,7 @@ fn evaluate(
         return Ok((MergeOutcome::Held(hold), Some(snapshot)));
     }
 
-    // 8. Every guard passed.
+    // 9. Every guard passed.
     let head_sha = snapshot.head_ref_oid.clone();
     if request.dry_run {
         return Ok((
@@ -558,27 +634,47 @@ fn evaluate(
         // and outranks the exit code. A re-read that fails answers nothing,
         // and is discarded rather than propagated — the merge command's own
         // failure is the more useful thing to report.
-        let after = gh::pr_snapshot(gh_runner, &request.issue.repo, request.pr_number).ok();
-        if after
-            .as_ref()
-            .is_some_and(|s| s.state.eq_ignore_ascii_case("merged"))
-        {
-            return Ok((
-                MergeOutcome::Merged {
-                    strategy: request.strategy,
-                    head_sha,
-                },
-                after,
-            ));
-        }
-        let hold = MergeHold::MergeCommandFailed {
-            detail: format!(
-                "exit {:?}: {}",
-                out.code,
-                scrub_and_bound(out.stderr.trim(), MAX_LINEAGE_FIELD_CHARS).text
-            ),
+        let detail = format!(
+            "exit {:?}: {}",
+            out.code,
+            scrub_and_bound(out.stderr.trim(), MAX_LINEAGE_FIELD_CHARS).text
+        );
+        let after = gh::pr_snapshot(gh_runner, &request.issue.repo, request.pr_number);
+        let hold = match after {
+            // Merged — but by whom? `--match-head-commit` makes GitHub
+            // refuse if the head moved, so a 409 *plus* a merged PR whose
+            // head is not the commit we named means somebody else merged a
+            // newer commit while we were asking. Reporting that as
+            // `Merged` would write "Autopilot merged this" into the audit
+            // trail for an action Autopilot did not take, and would pair a
+            // `head_sha` we tried to merge with a record naming the one
+            // that actually landed.
+            Ok(ref s) if s.state.eq_ignore_ascii_case("merged") => {
+                let landed = s.head_ref_oid.clone();
+                let outcome = if landed.eq_ignore_ascii_case(&head_sha) {
+                    MergeOutcome::Merged {
+                        strategy: request.strategy,
+                        head_sha,
+                    }
+                } else {
+                    MergeOutcome::AlreadyMerged { head_sha: landed }
+                };
+                return Ok((outcome, after.ok()));
+            }
+            // The re-read answered, and said the PR is still open. The exit
+            // code is then the whole story and may be reported as one.
+            Ok(_) => MergeHold::MergeCommandFailed { detail },
+            // The re-read did not answer. Discarding this error and
+            // reporting `MergeCommandFailed` would turn "we could not ask"
+            // into "the merge did not happen" — the one inversion this
+            // module exists to prevent. The error is carried into the hold
+            // so the human sees *both* failures, not just the first.
+            Err(ref e) => MergeHold::MergeResultUnknown {
+                detail,
+                read_failure: scrub_and_bound(&e.to_string(), MAX_LINEAGE_FIELD_CHARS).text,
+            },
         };
-        return Ok((MergeOutcome::Held(hold), after.or(Some(snapshot))));
+        return Ok((MergeOutcome::Held(hold), after.ok().or(Some(snapshot))));
     }
 
     Ok((
@@ -591,6 +687,18 @@ fn evaluate(
 }
 
 /// Whether GitHub's `mergeStateStatus` permits a merge.
+///
+/// # A known limitation, stated rather than hidden
+///
+/// `UNKNOWN` — and [`MergeHold::ProtectionUnknown`] with it — is often
+/// *transient*: GitHub has not finished computing the answer and would give
+/// a real one seconds later. Rung 6 nonetheless escalates it like any other
+/// hold, with a comment and `agent:blocked`, because it has no retry or
+/// backoff of its own and the alternative is worse: silently declining to
+/// notify anybody would leave a genuinely stuck PR spinning with no human
+/// ever told. Escalating a self-resolving condition costs one comment, which
+/// the dedup bounds to exactly one, and a label a human can clear. That is
+/// the right side to err on until a rung adds bounded retries.
 ///
 /// Only `CLEAN` and `UNSTABLE` do. `UNSTABLE` means non-required checks are
 /// failing or pending while every *required* one has passed — GitHub will
@@ -647,6 +755,7 @@ fn finish(
 
     let mut commented = false;
     let mut label_plan = None;
+    let mut label_error = None;
     let record_drawer_id;
 
     match (&outcome, request.dry_run) {
@@ -668,7 +777,18 @@ fn finish(
             // `agent:ready` is re-picked by the next poll forever — the
             // same budget livelock the spec's stagnation control exists
             // to prevent, arrived at from the opposite direction.
-            label_plan = Some(labels::set_exclusive_label(gh_runner, request.issue, None)?);
+            //
+            // A failure here is reported, not propagated. `?` here threw
+            // away a fully-populated `MergeExecution` carrying
+            // `MergeOutcome::Merged` and the record id, so a merge that
+            // *succeeded* and then hit a 403 on `gh issue edit` was
+            // indistinguishable, to every caller, from one that never
+            // happened. The merge is the irreversible part and the caller
+            // has to be told about it; the label is retried on the next
+            // pass, which now recognises the PR as `AlreadyMerged` and
+            // clears the labels then.
+            (label_plan, label_error) =
+                split_label_result(labels::set_exclusive_label(gh_runner, request.issue, None));
         }
         // Same terminal state as a merge Autopilot performed itself: the
         // work has landed, so no `agent:*` label should keep the issue in
@@ -684,7 +804,10 @@ fn finish(
                 commented = true;
             }
             record_drawer_id = record_once(db, &record, repeat.as_ref())?;
-            label_plan = Some(labels::set_exclusive_label(gh_runner, request.issue, None)?);
+            // Same reasoning as the `Merged` arm: the PR has landed, and a
+            // label write that fails must not erase that from the report.
+            (label_plan, label_error) =
+                split_label_result(labels::set_exclusive_label(gh_runner, request.issue, None));
         }
         // Recorded *after* the comment, and the opposite of the merge case
         // for the opposite reason: nothing irreversible has happened, and
@@ -694,6 +817,15 @@ fn finish(
         // told about that hold — on any later run — because the reason had
         // not changed.
         (MergeOutcome::Held(hold), _) => {
+            // The labels are read *first*, before the comment is written,
+            // because the comment names the label the issue will carry —
+            // and on an exhausted issue that is not `agent:blocked`. Writing
+            // a fixed string first told the human "labeled `agent:blocked`"
+            // on every hold against an exhausted issue, which was both false
+            // and, thanks to the dedup below, never corrected.
+            let current = gh::issue_labels(gh_runner, request.issue)?;
+            let stop = hold_stop_label(&current);
+
             // Not re-posted when the previous attempt on this PR held for
             // the *same* reason: `HumanApprovalRequired` on a protected
             // branch never resolves on its own, so a poll loop would
@@ -704,12 +836,22 @@ fn finish(
                 gh::comment_on_issue(
                     gh_runner,
                     request.issue,
-                    &render_hold_comment(request, hold),
+                    &render_hold_comment(request, hold, stop),
                 )?;
                 commented = true;
             }
             record_drawer_id = record_once(db, &record, repeat.as_ref())?;
-            label_plan = hold_label_plan(gh_runner, request.issue)?;
+            label_plan = match stop {
+                // Already carrying the permanent stop sign: nothing to do,
+                // and `plan_exclusive` toward `agent:blocked` would take it
+                // down. See [`hold_stop_label`].
+                AgentLabel::Exhausted => None,
+                target => Some(labels::apply_plan(
+                    gh_runner,
+                    request.issue,
+                    labels::plan_exclusive(&current, Some(target)),
+                )?),
+            };
         }
     }
 
@@ -719,10 +861,26 @@ fn finish(
         outcome,
         snapshot,
         label_plan,
+        label_error,
         commented,
         record_appended: repeat.is_none(),
         record_drawer_id,
     })
+}
+
+/// Split a label write's result into "what was applied" and "what went
+/// wrong", so a caller can report both rather than choosing one.
+///
+/// Used only on the two outcomes where the pull request has already landed.
+/// Everywhere else a label failure is still an `Err`: nothing irreversible
+/// has happened, so stopping and retrying loses nothing.
+fn split_label_result(
+    result: Result<labels::LabelPlan, MemoryError>,
+) -> (Option<labels::LabelPlan>, Option<String>) {
+    match result {
+        Ok(plan) => (Some(plan), None),
+        Err(e) => (None, Some(e.to_string())),
+    }
 }
 
 /// Append `record`, unless an identical one is already at the head of this
@@ -744,8 +902,7 @@ fn record_once(
     }
 }
 
-/// The label transition a hold applies: `agent:blocked`, unless the issue
-/// already carries `agent:exhausted`.
+/// Which `agent:*` label an issue should carry after a hold.
 ///
 /// `agent:blocked` is the right label for a held PR — "awaiting a human" is
 /// exactly what it means, and its auto-resume-on-a-newer-human-comment
@@ -756,22 +913,21 @@ fn record_once(
 ///
 /// But `set_exclusive_label` removes every *other* `agent:*` label, so
 /// applying it unconditionally took an exhausted issue — one the spec says
-/// **never self-resumes** — and moved it to the one label that does. A hold
-/// on an exhausted issue therefore changes no labels at all: the stop sign
-/// stays up, and the comment still explains why this attempt stopped.
-fn hold_label_plan(
-    gh_runner: &mut dyn GhRunner,
-    issue: &IssueRef,
-) -> Result<Option<labels::LabelPlan>, MemoryError> {
-    let current = gh::issue_labels(gh_runner, issue)?;
+/// **never self-resumes** — and moved it to the one label that does. An
+/// exhausted issue therefore keeps `agent:exhausted`: the stop sign stays
+/// up, and the comment still explains why this attempt stopped.
+///
+/// Pure, so the comment and the label write cannot disagree about the
+/// answer: both are derived from one call on one reading of the labels.
+fn hold_stop_label(current: &[String]) -> AgentLabel {
     if current
         .iter()
         .any(|l| AgentLabel::from_label_str(l) == Some(AgentLabel::Exhausted))
     {
-        return Ok(None);
+        AgentLabel::Exhausted
+    } else {
+        AgentLabel::Blocked
     }
-    let plan = labels::plan_exclusive(&current, Some(AgentLabel::Blocked));
-    Ok(Some(labels::apply_plan(gh_runner, issue, plan)?))
 }
 
 /// The comment posted when Autopilot finds the PR already merged.
@@ -783,9 +939,9 @@ fn hold_label_plan(
 pub fn render_already_merged_comment(request: &MergeRequest) -> String {
     let body = format!(
         "**Autopilot: PR #{pr} is already merged.**\n\n\
-Autopilot did not merge it and made no change to the pull request. Every \
-`agent:*` label has been cleared from this issue so it is not picked up \
-again; re-label it `{ready}` if there is more to do.\n\n\
+No further action was taken on the pull request. Every `agent:*` label has \
+been cleared from this issue so it is not picked up again; re-label it \
+`{ready}` if there is more to do.\n\n\
 <sub>Autopilot rung 6.</sub>",
         pr = request.pr_number,
         ready = AgentLabel::Ready.as_str(),
@@ -798,18 +954,35 @@ again; re-label it `{ready}` if there is more to do.\n\n\
 /// Pure, so the exact text a human sees is asserted in tests rather than
 /// discovered in production. Scrubbed and bounded because a hold reason can
 /// quote `gh`'s stderr and a review's reason, both of which quote the diff.
-pub fn render_hold_comment(request: &MergeRequest, hold: &MergeHold) -> String {
+///
+/// `stop` is the label the issue will actually carry, passed in rather than
+/// assumed: the sentence naming it was once a fixed string, and on an
+/// exhausted issue it named a label that was deliberately not applied.
+pub fn render_hold_comment(request: &MergeRequest, hold: &MergeHold, stop: AgentLabel) -> String {
+    let disposition = match stop {
+        AgentLabel::Exhausted => format!(
+            "The issue keeps `{}` and Autopilot will not retry it; a human must re-label it \
+`{}` to put it back in the queue.",
+            AgentLabel::Exhausted.as_str(),
+            AgentLabel::Ready.as_str()
+        ),
+        target => format!(
+            "{}It is labeled `{}` for a human. Autopilot will not merge it on its own; \
+re-labeling the issue `{}` after resolving the above puts it back in the queue.",
+            if hold.pr_definitely_still_open() {
+                "The pull request stays open. "
+            } else {
+                ""
+            },
+            target.as_str(),
+            AgentLabel::Ready.as_str()
+        ),
+    };
     let body = format!(
-        "**Autopilot: PR #{pr} was not merged.**\n\n\
-{summary}.\n\n\
-The pull request stays open and is labeled `{label}` for a human. Autopilot \
-will not merge it on its own; re-labeling the issue `{ready}` after resolving \
-the above puts it back in the queue.\n\n\
+        "{headline}\n\n{summary}.\n\n{disposition}\n\n\
 <sub>Gate reported {gate} at merge time. Autopilot rung 6.</sub>",
-        pr = request.pr_number,
+        headline = hold.headline(request.pr_number),
         summary = hold.summary(),
-        label = AgentLabel::Blocked.as_str(),
-        ready = AgentLabel::Ready.as_str(),
         gate = if request.gate_green {
             "green"
         } else {
@@ -936,6 +1109,9 @@ pub struct RecordedMergeSummary {
     /// append a duplicate can still name the record that says the same
     /// thing.
     pub drawer_id: String,
+    /// The issue this record hangs off, in canonical `repo#number` form.
+    /// Read back rather than assumed — see [`Self::says_the_same_as`].
+    pub issue: String,
     pub pr_number: u64,
     pub gate_green: bool,
     pub dry_run: bool,
@@ -953,7 +1129,16 @@ impl RecordedMergeSummary {
     /// differ on every pass by construction, so including them would make
     /// nothing ever a repeat.
     fn says_the_same_as(&self, candidate: &MergeRecord) -> bool {
-        self.pr_number == candidate.pr_number
+        // `issue` is compared even though `last_record_for_pr` reads only
+        // this issue's own lineage. That lineage is keyed by
+        // `IssueRef::entity_name()`, whose `repo_slug` maps every character
+        // outside `[A-Za-z0-9_.-]` to `-` — so `owner/repo#42` and
+        // `owner-repo#42` share one entity and one history. Without this
+        // line a hold on the second would be suppressed as a repeat of the
+        // first: no comment, no record, and a human never told. Asserting an
+        // invariant is cheaper than trusting it.
+        self.issue == candidate.issue.canonical()
+            && self.pr_number == candidate.pr_number
             && self.gate_green == candidate.gate_green
             && self.dry_run == candidate.dry_run
             && self.outcome == candidate.outcome
@@ -987,6 +1172,7 @@ pub fn merges_for_issue(
         let body: MergeBody = serde_json::from_str(&drawer.content)?;
         records.push(RecordedMergeSummary {
             drawer_id: object_entity.name.clone(),
+            issue: body.issue,
             pr_number: body.pr_number,
             gate_green: body.gate_green,
             dry_run: body.dry_run,
@@ -996,7 +1182,18 @@ pub fn merges_for_issue(
             recorded_at: body.recorded_at,
         });
     }
-    records.sort_by(|a, b| a.recorded_at.cmp(&b.recorded_at));
+    // The secondary key keeps the order total. `recorded_at` is an RFC 3339
+    // string and sorts correctly, but two records written inside the same
+    // nanosecond would tie — and a *stable* sort over a vec the SQL handed
+    // back newest-first would then leave the oldest of the tie group last,
+    // so `rfind` would take the oldest as "most recent". The drawer id is
+    // content-derived and unique, which is enough to make the answer
+    // deterministic rather than dependent on the query's arrival order.
+    records.sort_by(|a, b| {
+        a.recorded_at
+            .cmp(&b.recorded_at)
+            .then_with(|| a.drawer_id.cmp(&b.drawer_id))
+    });
     Ok(records)
 }
 
@@ -1120,7 +1317,7 @@ mod tests {
 
     /// The rulesets endpoint reporting no rules in force.
     fn no_rules() -> GhOutput {
-        GhOutput::ok("[]")
+        GhOutput::ok("[[]]")
     }
 
     /// `gh label create` for a label the repo does not have yet. Every plan
@@ -1229,12 +1426,18 @@ mod tests {
     // ── review guards ───────────────────────────────────────────────────
 
     #[test]
-    fn an_unreviewed_pr_is_never_merged_and_costs_no_api_calls() {
+    fn an_unreviewed_pr_is_never_merged_but_github_is_still_asked_first() {
+        // This used to assert that an unreviewed PR cost *no* API calls,
+        // because the review lookup came first. That saving bought a wrong
+        // answer: a PR a human had already merged, whose review was never
+        // recorded, was told "PR #7 was not merged … the pull request stays
+        // open" and parked in `agent:blocked`. One `gh pr view` is the price
+        // of never asserting a pull request's state without looking at it.
         let database = db();
         let mut gh_runner = ScriptedGh::new(vec![
-            // the hold's comment, then the label read + edit
-            Ok(GhOutput::ok("")),
+            Ok(pr_view_ok("OPEN", HEAD)),
             Ok(GhOutput::ok(r#"{"labels":[]}"#)),
+            Ok(GhOutput::ok("")),
             Ok(label_created()),
             Ok(GhOutput::ok("")),
         ]);
@@ -1250,9 +1453,58 @@ mod tests {
             "nothing may be merged"
         );
         assert!(
-            exec.snapshot.is_none(),
-            "GitHub was never asked about the PR"
+            !gh_runner
+                .seen
+                .iter()
+                .any(|a| a.iter().any(|s| s.contains("protection"))),
+            "and nothing beyond the PR read is asked: {:?}",
+            gh_runner.seen
         );
+    }
+
+    #[test]
+    fn a_merged_pr_is_recognised_even_when_no_review_was_ever_recorded() {
+        // The path the storage-first ordering hid: a human opens, reviews
+        // and merges the PR before Autopilot's reviewer ever runs.
+        let database = db();
+        let mut gh_runner = ScriptedGh::new(vec![
+            Ok(pr_view_ok("MERGED", HEAD)),
+            Ok(GhOutput::ok("")),
+            Ok(GhOutput::ok(r#"{"labels":[{"name":"agent:ready"}]}"#)),
+            Ok(GhOutput::ok("")),
+        ]);
+
+        let exec = execute_merge(&database, &mut gh_runner, &request(false)).unwrap();
+
+        assert!(exec.outcome.landed(), "{:?}", exec.outcome);
+        assert!(exec.outcome.hold().is_none(), "a landed PR is not a hold");
+    }
+
+    #[test]
+    fn a_merged_pr_is_recognised_even_when_the_gate_has_since_gone_red() {
+        // And the second hidden path: the review passed, the PR was merged,
+        // and the gate then went red on an unrelated commit. `decide_merge`
+        // held before anyone asked GitHub anything.
+        let database = db();
+        store_review(&database, 7, Some(HEAD), pass_outcome());
+        let mut gh_runner = ScriptedGh::new(vec![
+            Ok(pr_view_ok("MERGED", HEAD)),
+            Ok(GhOutput::ok("")),
+            Ok(GhOutput::ok(r#"{"labels":[{"name":"agent:ready"}]}"#)),
+            Ok(GhOutput::ok("")),
+        ]);
+
+        let exec = execute_merge(
+            &database,
+            &mut gh_runner,
+            &MergeRequest {
+                gate_green: false,
+                ..request(false)
+            },
+        )
+        .unwrap();
+
+        assert!(exec.outcome.landed(), "{:?}", exec.outcome);
     }
 
     #[test]
@@ -1261,8 +1513,9 @@ mod tests {
         let database = db();
         store_review(&database, 99, Some(HEAD), pass_outcome());
         let mut gh_runner = ScriptedGh::new(vec![
-            Ok(GhOutput::ok("")),
+            Ok(pr_view_ok("OPEN", HEAD)),
             Ok(GhOutput::ok(r#"{"labels":[]}"#)),
+            Ok(GhOutput::ok("")),
             Ok(label_created()),
             Ok(GhOutput::ok("")),
         ]);
@@ -1293,8 +1546,9 @@ mod tests {
             },
         );
         let mut gh_runner = ScriptedGh::new(vec![
-            Ok(GhOutput::ok("")),
+            Ok(pr_view_ok("OPEN", HEAD)),
             Ok(GhOutput::ok(r#"{"labels":[]}"#)),
+            Ok(GhOutput::ok("")),
             Ok(label_created()),
             Ok(GhOutput::ok("")),
         ]);
@@ -1314,8 +1568,9 @@ mod tests {
         let database = db();
         store_review(&database, 7, Some(HEAD), pass_outcome());
         let mut gh_runner = ScriptedGh::new(vec![
-            Ok(GhOutput::ok("")),
+            Ok(pr_view_ok("OPEN", HEAD)),
             Ok(GhOutput::ok(r#"{"labels":[]}"#)),
+            Ok(GhOutput::ok("")),
             Ok(label_created()),
             Ok(GhOutput::ok("")),
         ]);
@@ -1356,8 +1611,9 @@ mod tests {
         )
         .unwrap();
         let mut gh_runner = ScriptedGh::new(vec![
-            Ok(GhOutput::ok("")),
+            Ok(pr_view_ok("OPEN", HEAD)),
             Ok(GhOutput::ok(r#"{"labels":[]}"#)),
+            Ok(GhOutput::ok("")),
             Ok(label_created()),
             Ok(GhOutput::ok("")),
         ]);
@@ -1382,8 +1638,8 @@ mod tests {
         store_review(&database, 7, Some(HEAD), pass_outcome());
         let mut gh_runner = ScriptedGh::new(vec![
             Ok(pr_view_ok("OPEN", OTHER_HEAD)),
-            Ok(GhOutput::ok("")),
             Ok(GhOutput::ok(r#"{"labels":[]}"#)),
+            Ok(GhOutput::ok("")),
             Ok(label_created()),
             Ok(GhOutput::ok("")),
         ]);
@@ -1407,8 +1663,8 @@ mod tests {
         store_review(&database, 7, None, pass_outcome());
         let mut gh_runner = ScriptedGh::new(vec![
             Ok(pr_view_ok("OPEN", HEAD)),
-            Ok(GhOutput::ok("")),
             Ok(GhOutput::ok(r#"{"labels":[]}"#)),
+            Ok(GhOutput::ok("")),
             Ok(label_created()),
             Ok(GhOutput::ok("")),
         ]);
@@ -1433,8 +1689,8 @@ mod tests {
         store_review_against(&database, 7, Some(HEAD), Some("develop"), pass_outcome());
         let mut gh_runner = ScriptedGh::new(vec![
             Ok(pr_view_ok("OPEN", HEAD)), // baseRefName is "main"
-            Ok(GhOutput::ok("")),
             Ok(GhOutput::ok(r#"{"labels":[]}"#)),
+            Ok(GhOutput::ok("")),
             Ok(label_created()),
             Ok(GhOutput::ok("")),
         ]);
@@ -1541,8 +1797,8 @@ mod tests {
         store_review(&database, 7, Some(HEAD), pass_outcome());
         let mut gh_runner = ScriptedGh::new(vec![
             Ok(pr_view_ok("CLOSED", HEAD)),
-            Ok(GhOutput::ok("")),
             Ok(GhOutput::ok(r#"{"labels":[]}"#)),
+            Ok(GhOutput::ok("")),
             Ok(label_created()),
             Ok(GhOutput::ok("")),
         ]);
@@ -1569,8 +1825,8 @@ mod tests {
                     "mergeStateStatus":"CLEAN","baseRefName":"main",
                     "headRefName":"h","headRefOid":"{HEAD}","url":"u"}}"#
             ))),
-            Ok(GhOutput::ok("")),
             Ok(GhOutput::ok(r#"{"labels":[]}"#)),
+            Ok(GhOutput::ok("")),
             Ok(label_created()),
             Ok(GhOutput::ok("")),
         ]);
@@ -1593,8 +1849,8 @@ mod tests {
             // the protection lookups now precede the mergeability guard
             Ok(unprotected()),
             Ok(no_rules()),
-            Ok(GhOutput::ok("")),
             Ok(GhOutput::ok(r#"{"labels":[]}"#)),
+            Ok(GhOutput::ok("")),
             Ok(label_created()),
             Ok(GhOutput::ok("")),
         ]);
@@ -1620,8 +1876,8 @@ mod tests {
             ))),
             Ok(unprotected()),
             Ok(no_rules()),
-            Ok(GhOutput::ok("")),
             Ok(GhOutput::ok(r#"{"labels":[]}"#)),
+            Ok(GhOutput::ok("")),
             Ok(label_created()),
             Ok(GhOutput::ok("")),
         ]);
@@ -1670,8 +1926,8 @@ mod tests {
         let mut gh_runner = ScriptedGh::new(vec![
             Ok(pr_view_reviewed("OPEN", HEAD, "REVIEW_REQUIRED")),
             Ok(protected_requiring_one_approval()),
-            Ok(GhOutput::ok("")),
             Ok(GhOutput::ok(r#"{"labels":[{"name":"agent:ready"}]}"#)),
+            Ok(GhOutput::ok("")),
             Ok(label_created()),
             Ok(GhOutput::ok("")),
         ]);
@@ -1738,8 +1994,8 @@ mod tests {
                     "reviewDecision":"REVIEW_REQUIRED","url":"u"}}"#
             ))),
             Ok(protected_requiring_one_approval()),
-            Ok(GhOutput::ok("")),
             Ok(GhOutput::ok(r#"{"labels":[]}"#)),
+            Ok(GhOutput::ok("")),
             Ok(label_created()),
             Ok(GhOutput::ok("")),
         ]);
@@ -1779,8 +2035,8 @@ mod tests {
                     "reviewDecision":"APPROVED","url":"u"}}"#
             ))),
             Ok(protected_requiring_one_approval()),
-            Ok(GhOutput::ok("")),
             Ok(GhOutput::ok(r#"{"labels":[]}"#)),
+            Ok(GhOutput::ok("")),
             Ok(label_created()),
             Ok(GhOutput::ok("")),
         ]);
@@ -1801,8 +2057,12 @@ mod tests {
         let mut gh_runner = ScriptedGh::new(vec![
             Ok(pr_view_ok("OPEN", HEAD)),
             Ok(GhOutput::failed("", "HTTP 403: Forbidden")),
-            Ok(GhOutput::ok("")),
+            // the rules endpoint needs no admin and is still consulted, but
+            // finding no ruleset cannot vouch for classic protection we were
+            // not allowed to read
+            Ok(no_rules()),
             Ok(GhOutput::ok(r#"{"labels":[]}"#)),
+            Ok(GhOutput::ok("")),
             Ok(label_created()),
             Ok(GhOutput::ok("")),
         ]);
@@ -1833,8 +2093,8 @@ mod tests {
             // the re-read that decides whether the failure was pre- or
             // post-mutation: still OPEN, so it was pre-mutation
             Ok(pr_view_ok("OPEN", HEAD)),
-            Ok(GhOutput::ok("")),
             Ok(GhOutput::ok(r#"{"labels":[]}"#)),
+            Ok(GhOutput::ok("")),
             Ok(label_created()),
             Ok(GhOutput::ok("")),
         ]);
@@ -1896,8 +2156,8 @@ mod tests {
             Ok(no_rules()),
             Ok(GhOutput::failed("", "HTTP 502")),
             Ok(GhOutput::failed("", "HTTP 502")),
-            Ok(GhOutput::ok("")),
             Ok(GhOutput::ok(r#"{"labels":[]}"#)),
+            Ok(GhOutput::ok("")),
             Ok(label_created()),
             Ok(GhOutput::ok("")),
         ]);
@@ -1907,11 +2167,13 @@ mod tests {
         assert!(
             matches!(
                 exec.outcome.hold(),
-                Some(MergeHold::MergeCommandFailed { .. })
+                Some(MergeHold::MergeResultUnknown { .. })
             ),
-            "{:?}",
+            "an unanswered re-read is not a definite 'not merged': {:?}",
             exec.outcome
         );
+        let summary = exec.outcome.hold().unwrap().summary();
+        assert!(summary.contains("unknown"), "{summary}");
         assert!(exec.commented);
     }
 
@@ -1932,8 +2194,8 @@ mod tests {
             let mut gh_runner = ScriptedGh::new(vec![
                 Ok(pr_view_reviewed("OPEN", HEAD, "REVIEW_REQUIRED")),
                 Ok(protected_requiring_one_approval()),
-                Ok(GhOutput::ok("")),
                 Ok(GhOutput::ok(r#"{"labels":[]}"#)),
+                Ok(GhOutput::ok("")),
                 Ok(label_created()),
                 Ok(GhOutput::ok("")),
             ]);
@@ -1963,8 +2225,8 @@ mod tests {
         let mut gh_runner = ScriptedGh::new(vec![
             Ok(pr_view_reviewed("OPEN", HEAD, "REVIEW_REQUIRED")),
             Ok(protected_requiring_one_approval()),
-            Ok(GhOutput::ok("")),
             Ok(GhOutput::ok(r#"{"labels":[]}"#)),
+            Ok(GhOutput::ok("")),
             Ok(label_created()),
             Ok(GhOutput::ok("")),
         ]);
@@ -1972,8 +2234,8 @@ mod tests {
 
         let mut gh_runner = ScriptedGh::new(vec![
             Ok(pr_view_ok("OPEN", OTHER_HEAD)),
-            Ok(GhOutput::ok("")),
             Ok(GhOutput::ok(r#"{"labels":[]}"#)),
+            Ok(GhOutput::ok("")),
             Ok(label_created()),
             Ok(GhOutput::ok("")),
         ]);
@@ -2025,8 +2287,8 @@ mod tests {
             let mut gh_runner = ScriptedGh::new(vec![
                 Ok(pr_view_reviewed("OPEN", HEAD, "REVIEW_REQUIRED")),
                 Ok(protected_requiring_one_approval()),
-                Ok(GhOutput::ok("")),
                 Ok(GhOutput::ok(r#"{"labels":[]}"#)),
+                Ok(GhOutput::ok("")),
                 Ok(label_created()),
                 Ok(GhOutput::ok("")),
             ]);
@@ -2079,8 +2341,8 @@ mod tests {
         let mut gh_runner = ScriptedGh::new(vec![
             Ok(pr_view_reviewed("OPEN", HEAD, "REVIEW_REQUIRED")),
             Ok(protected_requiring_one_approval()),
-            Ok(GhOutput::ok("")),
             Ok(GhOutput::ok(r#"{"labels":[]}"#)),
+            Ok(GhOutput::ok("")),
             Ok(label_created()),
             Ok(GhOutput::ok("")),
         ]);
@@ -2101,8 +2363,8 @@ mod tests {
         let mut gh_runner = ScriptedGh::new(vec![
             Ok(pr_view_reviewed("OPEN", HEAD, "REVIEW_REQUIRED")),
             Ok(protected_requiring_one_approval()),
-            Ok(GhOutput::ok("")),
             Ok(GhOutput::ok(r#"{"labels":[{"name":"agent:exhausted"}]}"#)),
+            Ok(GhOutput::ok("")),
         ]);
 
         let exec = execute_merge(&database, &mut gh_runner, &request(false)).unwrap();
@@ -2131,8 +2393,8 @@ mod tests {
         store_review(&database, 7, Some(HEAD), pass_outcome());
         let mut gh_runner = ScriptedGh::new(vec![
             Ok(pr_view_ok("MERGED", HEAD)),
-            Ok(GhOutput::ok("")),
             Ok(GhOutput::ok(r#"{"labels":[]}"#)),
+            Ok(GhOutput::ok("")),
             Ok(label_created()),
             Ok(GhOutput::ok("")),
         ]);
@@ -2140,8 +2402,8 @@ mod tests {
 
         let mut gh_runner = ScriptedGh::new(vec![
             Ok(pr_view_ok("OPEN", OTHER_HEAD)),
-            Ok(GhOutput::ok("")),
             Ok(GhOutput::ok(r#"{"labels":[]}"#)),
+            Ok(GhOutput::ok("")),
             Ok(label_created()),
             Ok(GhOutput::ok("")),
         ]);
@@ -2168,8 +2430,16 @@ mod tests {
             Ok(GhOutput::failed("", "HTTP 403: Forbidden")),
         ]);
 
-        let err = execute_merge(&database, &mut gh_runner, &request(false)).unwrap_err();
-        assert!(err.to_string().contains("403"), "{err}");
+        let exec = execute_merge(&database, &mut gh_runner, &request(false)).unwrap();
+
+        assert!(
+            exec.outcome.merged(),
+            "a merge that happened must be reported as one: {:?}",
+            exec.outcome
+        );
+        let label_error = exec.label_error.expect("the label failure is reported");
+        assert!(label_error.contains("403"), "{label_error}");
+        assert!(exec.label_plan.is_none());
 
         let records = merges_for_issue(&database, &issue()).unwrap();
         assert_eq!(records.len(), 1, "the merge must still be on the record");
@@ -2237,6 +2507,7 @@ mod tests {
                 enforce_admins: true,
                 review_decision: "REVIEW_REQUIRED".into(),
             },
+            AgentLabel::Blocked,
         );
         assert!(body.contains("was not merged"));
         assert!(body.contains("main requires 1 approving review"));
@@ -2250,6 +2521,7 @@ mod tests {
                     enforce_admins: true,
                     review_decision: "REVIEW_REQUIRED".into(),
                 },
+                AgentLabel::Blocked,
             )
             .contains("0 approving review"),
             "a code-owner requirement must not read to a human as \"requires 0\""

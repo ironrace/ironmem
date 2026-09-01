@@ -1403,9 +1403,16 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                         ExhaustOutcome::Exhausted {
                             label_plan,
                             attempts_summarized,
+                            commented,
                         } => println!(
-                            "  exhausted: commented on {attempts_summarized} attempt(s), labels +{:?} -{:?}",
-                            label_plan.add, label_plan.remove
+                            "  exhausted: {} {attempts_summarized} attempt(s), labels +{:?} -{:?}",
+                            if *commented {
+                                "commented on"
+                            } else {
+                                "summary already posted for"
+                            },
+                            label_plan.add,
+                            label_plan.remove
                         ),
                         ExhaustOutcome::WouldExhaust {
                             label_plan,

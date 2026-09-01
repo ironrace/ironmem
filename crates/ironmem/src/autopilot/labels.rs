@@ -287,7 +287,12 @@ pub(crate) fn ensure_label(
         &format!("gh label create {} on {repo}", label.as_str()),
         GhFailure::Refused,
     )?;
-    Ok(EnsuredLabel::AlreadyPresent)
+    // `require_success` returns `Ok` only when `out.success`, which returned
+    // above. Stating the invariant rather than returning a value that would
+    // be a lie if the guard above were ever reordered — the compiler will
+    // not warn about that, and `AlreadyPresent` on a label that was never
+    // created would send `--add-label` at a label the repo does not have.
+    unreachable!("require_success returns Err when the command did not succeed")
 }
 
 /// Read an issue's current labels, then move it to exactly one `agent:*`
