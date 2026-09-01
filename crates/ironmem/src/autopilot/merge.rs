@@ -1194,7 +1194,8 @@ impl RecordedMergeSummary {
         // line a hold on the second would be suppressed as a repeat of the
         // first: no comment, no record, and a human never told. Asserting an
         // invariant is cheaper than trusting it.
-        self.issue == candidate.issue.canonical()
+        self.issue
+            .eq_ignore_ascii_case(&candidate.issue.canonical())
             && self.pr_number == candidate.pr_number
             && self.gate_green == candidate.gate_green
             && self.dry_run == candidate.dry_run
@@ -1276,10 +1277,14 @@ fn last_record_for_pr(
     // never match each other's records — `repeat` is always `None` — and the
     // dedup inverts from losing a notification into an unbounded stream of
     // comments and records.
+    // Case-insensitive for the reason `latest_review_for_pr` documents: the
+    // entity these records hang off is keyed on a lowercased name, so an
+    // exact match would miss this issue's own records whenever the caller
+    // spelled the repo differently.
     let canonical = issue.canonical();
-    Ok(records
-        .into_iter()
-        .rfind(|r| r.issue == canonical && r.pr_number == pr_number && r.dry_run == dry_run))
+    Ok(records.into_iter().rfind(|r| {
+        r.issue.eq_ignore_ascii_case(&canonical) && r.pr_number == pr_number && r.dry_run == dry_run
+    }))
 }
 
 /// The most recent review recorded for this issue **and this PR**.
@@ -1303,10 +1308,22 @@ fn latest_review_for_pr(
     // repo's `PASS` as a candidate review for the other's PR of the same
     // number. The head-SHA guard blocks that only while the two heads
     // differ, which for a fork pair is not something to rely on.
+    //
+    // Compared case-*insensitively*, and that is not a nicety. `canonical()`
+    // preserves whatever case the caller spelled the repo in, while the
+    // knowledge-graph entity these records hang off is keyed on a lowercased
+    // name — so `--repo ironrace/ironmem` and `--repo ironrace/IronMem`
+    // resolve to the same entity and return each other's records, but their
+    // canonical strings differ. An exact comparison would then reject a
+    // review that genuinely belongs to this issue and report `NotReviewed`,
+    // and the PR would never merge. GitHub repo names are ASCII, so
+    // `eq_ignore_ascii_case` is the same equivalence the entity id uses; the
+    // slug collision this filter exists for differs by `/` versus `-`, not
+    // by case, so it is still caught.
     let canonical = issue.canonical();
     Ok(reviews
         .into_iter()
-        .rfind(|r| r.issue == canonical && r.pr_number == pr_number))
+        .rfind(|r| r.issue.eq_ignore_ascii_case(&canonical) && r.pr_number == pr_number))
 }
 
 #[cfg(test)]
@@ -1579,6 +1596,61 @@ mod tests {
         .unwrap();
 
         assert!(exec.outcome.landed(), "{:?}", exec.outcome);
+    }
+
+    #[test]
+    fn a_review_recorded_under_a_differently_cased_repo_still_authorizes_the_merge() {
+        // `canonical()` keeps the caller's spelling; the knowledge-graph
+        // entity is keyed on a lowercased name. So these two resolve to one
+        // entity and see each other's records, and an exact string filter
+        // would report a reviewed PR as `NotReviewed` — blocking the merge
+        // forever on nothing but a capital letter.
+        let database = db();
+        let recorded_as = IssueRef::new("Owner/Repo", 42);
+        let merged_as = IssueRef::new("owner/repo", 42);
+
+        let outcome = pass_outcome();
+        let decision = decide_merge(true, "documentation", outcome.judgment());
+        record_review(
+            &database,
+            &ReviewRecord {
+                issue: recorded_as,
+                pr_number: 7,
+                dispatch_class: "documentation".into(),
+                head_sha: Some(HEAD.into()),
+                base_branch: Some("main".into()),
+                outcome,
+                decision,
+            },
+        )
+        .unwrap();
+
+        let mut gh_runner = ScriptedGh::new(vec![
+            Ok(pr_view_ok("OPEN", HEAD)),
+            Ok(unprotected()),
+            Ok(no_rules()),
+            Ok(GhOutput::ok("merged")),
+            Ok(GhOutput::ok(r#"{"labels":[]}"#)),
+        ]);
+        let exec = execute_merge(
+            &database,
+            &mut gh_runner,
+            &MergeRequest {
+                issue: &merged_as,
+                pr_number: 7,
+                gate_green: true,
+                strategy: MergeStrategy::Squash,
+                delete_branch: true,
+                dry_run: false,
+            },
+        )
+        .unwrap();
+
+        assert!(
+            exec.outcome.merged(),
+            "a capital letter must not withhold a recorded review: {:?}",
+            exec.outcome
+        );
     }
 
     #[test]

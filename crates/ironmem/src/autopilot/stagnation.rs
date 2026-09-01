@@ -250,7 +250,13 @@ fn exhaustion_notice_posted(db: &Database, issue: &IssueRef) -> Result<bool, Mem
     let Ok(body) = serde_json::from_str::<serde_json::Value>(&drawer.content) else {
         return Ok(false);
     };
-    Ok(body["issue"].as_str() == Some(issue.canonical().as_str()))
+    // Case-insensitive, matching how the rest of this module compares
+    // canonical issue names: the repo's spelling comes from the caller and
+    // GitHub treats it case-insensitively, so an exact match would fail to
+    // recognise this issue's own notice and re-post its summary.
+    Ok(body["issue"]
+        .as_str()
+        .is_some_and(|stored| stored.eq_ignore_ascii_case(&issue.canonical())))
 }
 
 /// Delete the notice once the label it was covering for has landed.
