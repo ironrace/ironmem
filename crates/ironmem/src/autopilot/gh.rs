@@ -48,6 +48,16 @@ use crate::error::MemoryError;
 pub(crate) const LABEL_ALREADY_EXISTS_MARKERS: [&str; 3] =
     ["already exists", "already been taken", "http 422"];
 
+/// Lowercased substrings that identify `gh api .../protection`'s "this branch
+/// has no protection rules" answer, as opposed to a real failure.
+///
+/// Anchored to the status phrase (`http 404`) rather than to a bare `404`:
+/// this is the single place in the module where a *failed* `gh` call is
+/// allowed to mean "proceed with the merge", so a `404` appearing anywhere in
+/// an unrelated error — a docs URL, a request id, a rate-limit body — must not
+/// be enough to unlock it.
+const BRANCH_UNPROTECTED_MARKERS: [&str; 2] = ["http 404", "branch not protected"];
+
 /// One `gh` invocation's result.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GhOutput {
@@ -577,7 +587,10 @@ pub fn branch_protection(
         return parse_branch_protection(&out.stdout);
     }
     let haystack = format!("{} {}", out.stdout, out.stderr).to_lowercase();
-    if haystack.contains("404") || haystack.contains("branch not protected") {
+    if BRANCH_UNPROTECTED_MARKERS
+        .iter()
+        .any(|marker| haystack.contains(marker))
+    {
         return Ok(BranchProtection::NoHumanApprovalRequired);
     }
     Ok(BranchProtection::Unknown {
@@ -847,6 +860,20 @@ mod tests {
     }
 
     #[test]
+    fn a_stray_404_in_an_unrelated_failure_does_not_unlock_a_merge() {
+        // The one place a failed `gh` call means "proceed", so the match is
+        // anchored to the status phrase: a request id, a docs URL or a
+        // rate-limit body that merely contains the digits must still hold.
+        let mut gh = ScriptedGh::new(vec![Ok(GhOutput::failed(
+            "",
+            "HTTP 500: server error (request id 404abc, see https://docs.github.com/rest/404)",
+        ))]);
+        let p = branch_protection(&mut gh, "owner/repo", "main").unwrap();
+        assert!(matches!(p, BranchProtection::Unknown { .. }), "{p:?}");
+        assert!(!p.permits_autopilot_merge());
+    }
+
+    #[test]
     fn a_403_is_unknown_and_therefore_blocks() {
         // The inversion that would merge into a protected branch: a token
         // without admin scope cannot read protection, and "cannot read" is
@@ -879,9 +906,12 @@ mod tests {
 
     #[test]
     fn the_already_exists_markers_are_matched_lowercased() {
-        for marker in LABEL_ALREADY_EXISTS_MARKERS {
+        for marker in LABEL_ALREADY_EXISTS_MARKERS
+            .iter()
+            .chain(BRANCH_UNPROTECTED_MARKERS.iter())
+        {
             assert_eq!(
-                marker,
+                *marker,
                 marker.to_lowercase(),
                 "markers are compared against a lowercased haystack"
             );

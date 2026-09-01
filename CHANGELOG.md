@@ -50,9 +50,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   allowed to know", and treating the second as the first is exactly the
   inversion that merges into a protected branch.
 
-  Reviews now record the commit SHA they read (`#[serde(default)]`, so every
-  review written before this rung reads back as `None` — which holds, rather
-  than reading as "nothing changed"). Merge attempts are persisted as a
+  Reviews now record the commit SHA they read and the base branch they read
+  it against (`#[serde(default)]`, so every review written before this rung
+  reads back as `None` — which holds, rather than reading as "nothing
+  changed"), which is what lets a PR retargeted after its review be caught
+  rather than merged against a diff nobody read. A hold is commented on once
+  per *distinct* reason, so a poll loop cannot bury an issue that is waiting
+  on a human in identical notifications. Merge attempts are persisted as a
   seventh append-only drawer kind with a `has_merge` edge, so a hold and a
   later merge of the same PR are two facts: the audit trail for the only
   irreversible thing Autopilot does. Both `merge` and `exhaust` take

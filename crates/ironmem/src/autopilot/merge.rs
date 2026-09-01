@@ -506,6 +506,17 @@ fn mergeable_state_permits(status: &str) -> bool {
 /// outcome can be returned without the label and notification the spec
 /// attaches to it ("PR stays open, **labeled, human notified**"), and so that
 /// the record is written exactly once.
+///
+/// # Why the record is written before the GitHub writes
+///
+/// By the time `finish` sees a [`MergeOutcome::Merged`] the merge has already
+/// happened and cannot be undone. If the record were appended after the label
+/// write, a `gh issue edit` that failed — a 403, a rate limit, a dropped
+/// connection — would propagate out of `finish` and take the record with it,
+/// leaving the one irreversible action Autopilot performs with no entry in the
+/// audit trail that exists precisely for it. Recording first costs a
+/// never-executed record only when *storage* fails, which is before anything
+/// has been written to GitHub at all.
 fn finish(
     db: &Database,
     gh_runner: &mut dyn GhRunner,
@@ -513,6 +524,27 @@ fn finish(
     outcome: MergeOutcome,
     snapshot: Option<PrSnapshot>,
 ) -> Result<MergeExecution, MemoryError> {
+    // Read before the new record is appended, or it would always find itself.
+    let hold_already_reported = match (&outcome, request.dry_run) {
+        (MergeOutcome::Held(hold), false) => {
+            last_reported_hold(db, request.issue, request.pr_number)?.as_ref() == Some(hold)
+        }
+        _ => false,
+    };
+
+    let record_drawer_id = Some(record_merge(
+        db,
+        &MergeRecord {
+            issue: request.issue.clone(),
+            pr_number: request.pr_number,
+            gate_green: request.gate_green,
+            dry_run: request.dry_run,
+            outcome: outcome.clone(),
+            base_branch: snapshot.as_ref().map(|s| s.base_ref_name.clone()),
+            head_sha: snapshot.as_ref().map(|s| s.head_ref_oid.clone()),
+        },
+    )?);
+
     let mut commented = false;
     let mut label_plan = None;
 
@@ -526,12 +558,20 @@ fn finish(
                 label_plan = Some(labels::set_exclusive_label(gh_runner, request.issue, None)?);
             }
             MergeOutcome::Held(hold) => {
-                gh::comment_on_issue(
-                    gh_runner,
-                    request.issue,
-                    &render_hold_comment(request, hold),
-                )?;
-                commented = true;
+                // Not re-posted when the previous attempt on this PR held for
+                // the *same* reason: `HumanApprovalRequired` on a protected
+                // branch never resolves on its own, so a poll loop would
+                // otherwise bury the issue in identical comments — the shape
+                // `exhaust_issue` already refuses. A hold that has *changed*
+                // is new information and is still commented on.
+                if !hold_already_reported {
+                    gh::comment_on_issue(
+                        gh_runner,
+                        request.issue,
+                        &render_hold_comment(request, hold),
+                    )?;
+                    commented = true;
+                }
                 // `agent:blocked` and not a fourth label: a held PR is
                 // "awaiting a human", which is exactly what the label means,
                 // and its auto-resume-on-a-newer-human-comment semantics are
@@ -548,19 +588,6 @@ fn finish(
             MergeOutcome::WouldMerge { .. } => {}
         }
     }
-
-    let record_drawer_id = Some(record_merge(
-        db,
-        &MergeRecord {
-            issue: request.issue.clone(),
-            pr_number: request.pr_number,
-            gate_green: request.gate_green,
-            dry_run: request.dry_run,
-            outcome: outcome.clone(),
-            base_branch: snapshot.as_ref().map(|s| s.base_ref_name.clone()),
-            head_sha: snapshot.as_ref().map(|s| s.head_ref_oid.clone()),
-        },
-    )?);
 
     Ok(MergeExecution {
         issue: request.issue.clone(),
@@ -642,7 +669,6 @@ pub fn exhaust_issue(
         .iter()
         .any(|l| AgentLabel::from_label_str(l) == Some(AgentLabel::Exhausted));
 
-    let attempts = lineage::attempts_for_issue(db, issue)?;
     if already {
         return Ok(ExhaustExecution {
             issue: issue.clone(),
@@ -652,6 +678,9 @@ pub fn exhaust_issue(
         });
     }
 
+    // Read only once the issue is known to need a summary — an already-
+    // exhausted issue walks none of its lineage.
+    let attempts = lineage::attempts_for_issue(db, issue)?;
     let body = render_exhaustion_comment(issue, &attempts);
     if dry_run {
         return Ok(ExhaustExecution {
@@ -917,12 +946,38 @@ pub fn merges_for_issue(
     Ok(records)
 }
 
-/// A recorded review, plus the base branch it was taken against.
+/// The hold the most recent *executed* attempt on this PR reported, if that
+/// attempt was a hold at all.
 ///
-/// [`super::review::RecordedReviewSummary`] does not carry the base branch,
-/// so [`latest_review_for_pr`] pairs it with the one the PR reports. Kept as
-/// a distinct type rather than widening rung 5's so the review record stays
-/// exactly what rung 5 wrote.
+/// Dry runs are skipped because a rehearsal notifies nobody: suppressing a
+/// real comment on the strength of one would lose the notification entirely.
+/// A later [`MergeOutcome::Merged`] or a *different* hold resets this to
+/// `None`/a different value, so the next hold is commented on again.
+fn last_reported_hold(
+    db: &Database,
+    issue: &IssueRef,
+    pr_number: u64,
+) -> Result<Option<MergeHold>, MemoryError> {
+    let records = merges_for_issue(db, issue)?;
+    let Some(latest) = records
+        .into_iter()
+        .rfind(|r| r.pr_number == pr_number && !r.dry_run)
+    else {
+        return Ok(None);
+    };
+    match latest.outcome {
+        MergeOutcome::Held(hold) => Ok(Some(hold)),
+        _ => Ok(None),
+    }
+}
+
+/// A recorded review, in the shape [`execute_merge`]'s guards need it.
+///
+/// Kept as a distinct type rather than reusing
+/// [`super::review::RecordedReviewSummary`] so this module states exactly
+/// which fields the merge guards depend on, and so `base_branch`'s "unknown"
+/// case collapses to one representation (the empty string) at the boundary
+/// rather than being re-checked at every use.
 struct ReviewForMerge {
     dispatch_class: String,
     head_sha: Option<String>,
@@ -959,11 +1014,10 @@ fn latest_review_for_pr(
         reason: latest.reason,
         process_success: latest.process_success,
         recorded_at: latest.recorded_at,
-        // Rung 5 does not record the base branch, so there is nothing to
-        // compare against for a review it wrote. Empty means "unknown", and
-        // `execute_merge` skips the comparison rather than inventing a
-        // mismatch — the head-SHA guard is what actually protects the diff.
-        base_branch: String::new(),
+        // Empty means "unknown" — a review recorded before the field existed
+        // — and `execute_merge` skips the comparison rather than inventing a
+        // mismatch. The head-SHA guard still protects the diff in that case.
+        base_branch: latest.base_branch.unwrap_or_default(),
     }))
 }
 
@@ -1000,6 +1054,16 @@ mod tests {
     }
 
     fn store_review(database: &Database, pr: u64, head: Option<&str>, outcome: ReviewOutcome) {
+        store_review_against(database, pr, head, Some("main"), outcome);
+    }
+
+    fn store_review_against(
+        database: &Database,
+        pr: u64,
+        head: Option<&str>,
+        base: Option<&str>,
+        outcome: ReviewOutcome,
+    ) {
         let decision = decide_merge(true, "documentation", &outcome);
         record_review(
             database,
@@ -1008,6 +1072,7 @@ mod tests {
                 pr_number: pr,
                 dispatch_class: "documentation".into(),
                 head_sha: head.map(|h| h.to_string()),
+                base_branch: base.map(|b| b.to_string()),
                 outcome,
                 decision,
             },
@@ -1225,6 +1290,7 @@ mod tests {
                 pr_number: 7,
                 dispatch_class: "security".into(),
                 head_sha: Some(HEAD.into()),
+                base_branch: Some("main".into()),
                 outcome,
                 decision,
             },
@@ -1295,6 +1361,49 @@ mod tests {
             "{:?}",
             exec.outcome
         );
+    }
+
+    #[test]
+    fn a_retargeted_pr_holds_because_the_reviewed_diff_is_not_the_one_landing() {
+        // The review read `develop..head`; the PR now targets `main`, so the
+        // diff that would land is one no reviewer has seen.
+        let database = db();
+        store_review_against(&database, 7, Some(HEAD), Some("develop"), pass_outcome());
+        let mut gh_runner = ScriptedGh::new(vec![
+            Ok(pr_view_ok("OPEN", HEAD)), // baseRefName is "main"
+            Ok(GhOutput::ok("")),
+            Ok(GhOutput::ok(r#"{"labels":[]}"#)),
+            Ok(GhOutput::ok("")),
+        ]);
+
+        let exec = execute_merge(&database, &mut gh_runner, &request(false)).unwrap();
+
+        assert_eq!(
+            exec.outcome.hold(),
+            Some(&MergeHold::BaseBranchMismatch {
+                reviewed_base: "develop".into(),
+                current_base: "main".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_review_with_no_recorded_base_skips_the_comparison_rather_than_inventing_one() {
+        // Every review recorded before the field existed: unknown is not a
+        // mismatch, and the head-SHA guard still protects the diff.
+        let database = db();
+        store_review_against(&database, 7, Some(HEAD), None, pass_outcome());
+        let mut gh_runner = ScriptedGh::new(vec![
+            Ok(pr_view_ok("OPEN", HEAD)),
+            Ok(unprotected()),
+            Ok(GhOutput::ok("merged")),
+            Ok(GhOutput::ok(r#"{"labels":[]}"#)),
+            Ok(GhOutput::ok("")),
+        ]);
+
+        let exec = execute_merge(&database, &mut gh_runner, &request(false)).unwrap();
+
+        assert!(exec.outcome.merged(), "{:?}", exec.outcome);
     }
 
     #[test]
@@ -1527,13 +1636,21 @@ mod tests {
     fn every_outcome_is_recorded_and_holds_do_not_overwrite_each_other() {
         let database = db();
         store_review(&database, 7, Some(HEAD), pass_outcome());
-        for _ in 0..2 {
-            let mut gh_runner = ScriptedGh::new(vec![
+        // First pass comments; the second repeats the same hold and does not.
+        for responses in [
+            vec![
                 Ok(pr_view_ok("MERGED", HEAD)),
                 Ok(GhOutput::ok("")),
                 Ok(GhOutput::ok(r#"{"labels":[]}"#)),
                 Ok(GhOutput::ok("")),
-            ]);
+            ],
+            vec![
+                Ok(pr_view_ok("MERGED", HEAD)),
+                Ok(GhOutput::ok(r#"{"labels":[]}"#)),
+                Ok(GhOutput::ok("")),
+            ],
+        ] {
+            let mut gh_runner = ScriptedGh::new(responses);
             execute_merge(&database, &mut gh_runner, &request(false)).unwrap();
         }
 
@@ -1544,6 +1661,94 @@ mod tests {
             "append-only: two identical holds are two facts"
         );
         assert!(records.iter().all(|r| !r.outcome.merged()));
+    }
+
+    #[test]
+    fn the_same_hold_is_not_commented_on_twice() {
+        // `HumanApprovalRequired` on a protected branch never resolves on its
+        // own, so a poll loop would bury the issue in identical comments —
+        // the shape `exhaust_issue` already refuses.
+        let database = db();
+        store_review(&database, 7, Some(HEAD), pass_outcome());
+        let first = {
+            let mut gh_runner = ScriptedGh::new(vec![
+                Ok(pr_view_ok("MERGED", HEAD)),
+                Ok(GhOutput::ok("")),
+                Ok(GhOutput::ok(r#"{"labels":[]}"#)),
+                Ok(GhOutput::ok("")),
+            ]);
+            execute_merge(&database, &mut gh_runner, &request(false)).unwrap()
+        };
+        assert!(first.commented, "the first hold must notify the human");
+
+        let mut gh_runner = ScriptedGh::new(vec![
+            Ok(pr_view_ok("MERGED", HEAD)),
+            Ok(GhOutput::ok(r#"{"labels":[{"name":"agent:blocked"}]}"#)),
+        ]);
+        let second = execute_merge(&database, &mut gh_runner, &request(false)).unwrap();
+
+        assert!(!second.commented, "the same hold says nothing new");
+        assert!(
+            !gh_runner
+                .seen
+                .iter()
+                .any(|a| a.contains(&"comment".to_string())),
+            "no comment may be posted: {:?}",
+            gh_runner.seen
+        );
+        assert!(
+            second.record_drawer_id.is_some(),
+            "the repeat is still recorded"
+        );
+    }
+
+    #[test]
+    fn a_hold_that_changed_is_commented_on_again() {
+        // Suppressing a *different* reason would hide new information.
+        let database = db();
+        store_review(&database, 7, Some(HEAD), pass_outcome());
+        let mut gh_runner = ScriptedGh::new(vec![
+            Ok(pr_view_ok("MERGED", HEAD)),
+            Ok(GhOutput::ok("")),
+            Ok(GhOutput::ok(r#"{"labels":[]}"#)),
+            Ok(GhOutput::ok("")),
+        ]);
+        execute_merge(&database, &mut gh_runner, &request(false)).unwrap();
+
+        let mut gh_runner = ScriptedGh::new(vec![
+            Ok(pr_view_ok("OPEN", OTHER_HEAD)),
+            Ok(GhOutput::ok("")),
+            Ok(GhOutput::ok(r#"{"labels":[]}"#)),
+            Ok(GhOutput::ok("")),
+        ]);
+        let second = execute_merge(&database, &mut gh_runner, &request(false)).unwrap();
+
+        assert!(matches!(
+            second.outcome.hold(),
+            Some(MergeHold::ReviewIsStale { .. })
+        ));
+        assert!(second.commented, "a new reason is new information");
+    }
+
+    #[test]
+    fn a_merge_is_recorded_even_when_the_label_write_fails() {
+        // The merge already happened and cannot be undone; losing the audit
+        // record of the only irreversible action would be the worse half.
+        let database = db();
+        store_review(&database, 7, Some(HEAD), pass_outcome());
+        let mut gh_runner = ScriptedGh::new(vec![
+            Ok(pr_view_ok("OPEN", HEAD)),
+            Ok(unprotected()),
+            Ok(GhOutput::ok("merged")),
+            Ok(GhOutput::failed("", "HTTP 403: Forbidden")),
+        ]);
+
+        let err = execute_merge(&database, &mut gh_runner, &request(false)).unwrap_err();
+        assert!(err.to_string().contains("403"), "{err}");
+
+        let records = merges_for_issue(&database, &issue()).unwrap();
+        assert_eq!(records.len(), 1, "the merge must still be on the record");
+        assert!(records[0].outcome.merged());
     }
 
     #[test]

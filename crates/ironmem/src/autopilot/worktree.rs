@@ -47,7 +47,8 @@ const QUARANTINE_INFIX: &str = "quarantine";
 
 /// Resolve `rev` to a full commit SHA inside `repo_dir`.
 ///
-/// Returns `Ok(None)` — never an `Err` — when the revision does not exist,
+/// Returns `None` rather than an error — the signature has no error channel
+/// at all — when the revision does not exist,
 /// because every caller of this is answering "which commit did we review?"
 /// and the answer "we could not tell" is a legitimate one that rung 6 fails
 /// closed on ([`super::review::RecordedReviewSummary::head_sha`]). A hard

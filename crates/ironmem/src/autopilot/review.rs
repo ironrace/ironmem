@@ -676,6 +676,11 @@ pub struct ReviewRecord {
     /// SHA, so a record without one cannot authorize a merge at all — see
     /// [`RecordedReviewSummary::head_sha`].
     pub head_sha: Option<String>,
+    /// The base branch the review was taken against, if the caller knows it.
+    /// Rung 6 refuses to merge a PR that has since been retargeted, because
+    /// the reviewed diff is not then the diff that would land — see
+    /// [`RecordedReviewSummary::base_branch`].
+    pub base_branch: Option<String>,
     pub outcome: ReviewOutcome,
     pub decision: MergeDecision,
 }
@@ -693,6 +698,12 @@ struct ReviewBody {
     /// unknown" and holds on, rather than as "the head has not moved".
     #[serde(default)]
     head_sha: Option<String>,
+    /// `#[serde(default)]` for the same reason `head_sha` is: a review
+    /// recorded before the field existed reads back as `None`, which rung 6
+    /// treats as "the reviewed base is unknown" and skips the comparison on,
+    /// rather than as a mismatch.
+    #[serde(default)]
+    base_branch: Option<String>,
     verdict: Option<ReviewVerdict>,
     risk_class: Option<RiskClass>,
     reason: Option<String>,
@@ -742,6 +753,7 @@ pub fn record_review(db: &Database, record: &ReviewRecord) -> Result<RecordedRev
         pr_number: record.pr_number,
         dispatch_class: record.dispatch_class.clone(),
         head_sha: record.head_sha.clone(),
+        base_branch: record.base_branch.clone(),
         verdict: record.outcome.verdict,
         risk_class: record.outcome.risk_class,
         reason: reason_scrub.as_ref().map(|o| o.text.clone()),
@@ -825,6 +837,13 @@ pub struct RecordedReviewSummary {
     /// merged.
     #[serde(default)]
     pub head_sha: Option<String>,
+    /// The base branch this review was taken against. `None` for a review
+    /// recorded before the field existed. Rung 6's
+    /// [`super::merge::execute_merge`] holds when it disagrees with the PR's
+    /// current base: a retargeted PR was reviewed against a diff that no
+    /// longer exists.
+    #[serde(default)]
+    pub base_branch: Option<String>,
     pub verdict: Option<ReviewVerdict>,
     pub risk_class: Option<RiskClass>,
     pub reason: Option<String>,
@@ -874,6 +893,7 @@ pub fn reviews_for_issue(
             pr_number: body.pr_number,
             dispatch_class: body.dispatch_class,
             head_sha: body.head_sha,
+            base_branch: body.base_branch,
             verdict: body.verdict,
             risk_class: body.risk_class,
             reason: body.reason,
@@ -1140,6 +1160,7 @@ pub fn review_pr(
             pr_number: request.pr_number,
             dispatch_class: request.dispatch_class.to_string(),
             head_sha: request.head_sha.clone(),
+            base_branch: Some(request.base_branch.to_string()),
             outcome: outcome.clone(),
             decision: decision.clone(),
         },
@@ -1604,6 +1625,7 @@ not json at all
             pr_number: 322,
             dispatch_class: "documentation".to_string(),
             head_sha: Some("0".repeat(40)),
+            base_branch: Some("main".to_string()),
             outcome,
             decision,
         }

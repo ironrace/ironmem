@@ -76,8 +76,15 @@ impl AgentLabel {
     /// Parse a GitHub label name back into a variant. Returns `None` for any
     /// label outside this module's vocabulary — including other `agent:*`
     /// names, which are somebody else's and must be left alone.
+    ///
+    /// Compared case-insensitively because GitHub's label names are: a repo
+    /// where a human created `Agent:Exhausted` by hand has *that* name
+    /// returned by `gh issue view --json labels`, and reading it as a foreign
+    /// label would make the stop sign invisible — the issue would come back as
+    /// [`DispatchEligibility::NotOptedIn`] and `plan_exclusive` would add a
+    /// second, differently-cased copy beside it rather than recognizing it.
     pub fn from_label_str(s: &str) -> Option<Self> {
-        match s.trim() {
+        match s.trim().to_ascii_lowercase().as_str() {
             "agent:ready" => Some(AgentLabel::Ready),
             "agent:blocked" => Some(AgentLabel::Blocked),
             "agent:exhausted" => Some(AgentLabel::Exhausted),
@@ -200,7 +207,7 @@ impl LabelPlan {
 /// they are: this module's authority is its own three labels, and silently
 /// stripping a human's or another tool's label would exceed it.
 pub fn plan_exclusive(current: &[String], target: Option<AgentLabel>) -> LabelPlan {
-    let mut remove = Vec::new();
+    let mut remove: Vec<String> = Vec::new();
     let mut target_present = false;
     for label in current {
         let Some(known) = AgentLabel::from_label_str(label) else {
@@ -208,10 +215,20 @@ pub fn plan_exclusive(current: &[String], target: Option<AgentLabel>) -> LabelPl
         };
         if Some(known) == target {
             target_present = true;
-        } else if !remove.iter().any(|r| r == known.as_str()) {
+        } else if !remove.iter().any(|r| r == label) {
+            // Removed **as spelled on the issue**, not in canonical form.
+            // `from_label_str` matches case-insensitively, so a hand-created
+            // `Agent:Ready` is recognized here — but whether GitHub would
+            // then honour `--remove-label agent:ready` against it depends on
+            // the API matching label names case-insensitively, which nothing
+            // in this codebase has verified. Sending back the exact string
+            // GitHub just gave us needs no such assumption. A label that
+            // appears twice in different cases is therefore removed twice,
+            // which is correct: they are two distinct strings to remove.
+            //
             // De-duplicated because GitHub's API tolerates a repeated label
             // in the list but `gh` would send it twice.
-            remove.push(known.as_str().to_string());
+            remove.push(label.clone());
         }
     }
     let add = match target {
@@ -338,6 +355,33 @@ mod tests {
     }
 
     #[test]
+    fn a_differently_cased_label_is_still_ours() {
+        // GitHub label names are case-insensitive for uniqueness, so a
+        // hand-created `Agent:Exhausted` is the same stop sign as
+        // `agent:exhausted` and must not read as a foreign label.
+        assert_eq!(
+            AgentLabel::from_label_str("Agent:Exhausted"),
+            Some(AgentLabel::Exhausted)
+        );
+        assert_eq!(
+            eligibility(&labels(&["AGENT:READY"])),
+            DispatchEligibility::Eligible
+        );
+        let plan = plan_exclusive(&labels(&["Agent:Ready"]), Some(AgentLabel::Exhausted));
+        assert_eq!(
+            plan.remove,
+            labels(&["Agent:Ready"]),
+            "removed as spelled on the issue, so removal needs no assumption \
+about GitHub matching label names case-insensitively"
+        );
+        assert_eq!(
+            plan.add,
+            labels(&["agent:exhausted"]),
+            "but the label we create is always the canonical spelling"
+        );
+    }
+
+    #[test]
     fn only_exhausted_refuses_to_self_resume() {
         // The spec's whole reason for having two blocked states.
         assert!(!AgentLabel::Exhausted.self_resumes());
@@ -444,6 +488,16 @@ mod tests {
             labels(&["agent:ready"]),
             "only this module's own vocabulary is in scope"
         );
+    }
+
+    #[test]
+    fn two_spellings_of_one_label_are_both_removed() {
+        // They are two distinct strings on the issue, so both must be sent.
+        let plan = plan_exclusive(
+            &labels(&["agent:ready", "Agent:Ready"]),
+            Some(AgentLabel::Exhausted),
+        );
+        assert_eq!(plan.remove, labels(&["agent:ready", "Agent:Ready"]));
     }
 
     #[test]
