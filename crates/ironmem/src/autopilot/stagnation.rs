@@ -1,0 +1,787 @@
+//! Cross-dispatch stagnation control — build-ladder rung 6.
+//!
+//! The spec's *Cross-dispatch stagnation control* exists to stop one specific
+//! livelock: an IC exhausts its retries today, the issue keeps `agent:ready`,
+//! the daily budget resets at midnight, the Lead picks the same issue
+//! tomorrow, and lineage prevents repeating the *same* approach but not
+//! another doomed one — forever.
+//!
+//! The countermeasure has three parts. Rung 4 built the first (a per-issue
+//! attempt counter that persists across dispatches, and a terminal lineage
+//! record when it is reached — see [`super::run`]). This module is the other
+//! two: **post a comment summarizing everything tried, and flip the label to
+//! `agent:exhausted`**, which never self-resumes.
+//!
+//! # Why this is not in [`super::merge`]
+//!
+//! It was, and it did not belong there. Nothing here touches a
+//! `MergeDecision`, a `PrSnapshot`, or a pull request at all — an issue can
+//! exhaust its attempts without ever opening one. What it shares with the
+//! merge path is a *notification primitive* (post a bounded, scrubbed
+//! comment, then set the exclusive `agent:*` label), not a subject. Leaving
+//! it there would have meant rung 7's loop depending on the merge-authority
+//! module in order to close out an issue that has no PR, and every change to
+//! stagnation policy re-entering the review surface of the one module that
+//! performs Autopilot's only irreversible action.
+
+use serde::Serialize;
+use serde_json::json;
+
+use super::gh::{self, GhRunner};
+use super::labels::{self, AgentLabel};
+use super::lineage;
+use super::merge::{serialize_issue, short_sha, MAX_COMMENT_CHARS};
+use super::scrub::scrub_and_bound;
+use super::{validate_repo, IssueRef};
+use crate::db::schema::Database;
+use crate::error::MemoryError;
+
+/// How many attempts an exhaustion comment quotes, newest first.
+///
+/// Bounded separately from [`MAX_COMMENT_CHARS`] so the comment degrades by
+/// dropping *whole oldest attempts* rather than by truncating mid-sentence in
+/// the middle of the most recent one, which is the part a human reads first.
+pub const MAX_ATTEMPTS_IN_COMMENT: usize = 10;
+
+// ── stagnation ──────────────────────────────────────────────────────────
+
+/// What [`exhaust_issue`] did.
+///
+/// An enum rather than a `commented: bool` beside a
+/// `label_plan: Option<_>`: those two fields could spell four states for a
+/// process that has three, and the impossible fourth ("commented, but no
+/// label plan") had to be papered over with a catch-all arm at the one place
+/// that reads them. This makes the CLI's match total.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum ExhaustOutcome {
+    /// The issue already carried `agent:exhausted`. Nothing was read, posted
+    /// or changed.
+    AlreadyExhausted,
+    /// A dry run: the summary was rendered and the plan computed, but
+    /// nothing was written to GitHub.
+    WouldExhaust {
+        label_plan: labels::LabelPlan,
+        /// How many attempts the summary drew on.
+        attempts_summarized: usize,
+    },
+    /// The summary was posted and the label applied.
+    Exhausted {
+        label_plan: labels::LabelPlan,
+        attempts_summarized: usize,
+        /// Whether *this* run posted the summary. False when a previous run
+        /// posted it and then failed to apply the label — see
+        /// [`exhaustion_notice_posted`].
+        commented: bool,
+    },
+}
+
+/// The result of one exhaustion attempt.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ExhaustExecution {
+    #[serde(serialize_with = "serialize_issue")]
+    pub issue: IssueRef,
+    /// Flattened: [`ExhaustOutcome`] is already internally tagged on
+    /// `"outcome"`, so nesting it under a field of the same name would emit
+    /// `{"outcome":{"outcome":"exhausted",…}}` — a doubly-nested key nothing
+    /// asked for. Flattening puts the tag and its payload at the top level,
+    /// which is the shape the tag name was chosen for.
+    #[serde(flatten)]
+    pub outcome: ExhaustOutcome,
+}
+
+/// Close out an issue that hit its per-issue attempt cap: post a comment
+/// summarizing everything tried, then flip the label to `agent:exhausted`.
+///
+/// Rung 4 already appends the terminal lineage record when the cap is
+/// reached; this is the other two thirds of the spec's bullet — *"append a
+/// terminal lineage record, post a comment summarizing everything tried, and
+/// flip the label to `agent:exhausted`"*.
+///
+/// # Idempotent on purpose
+///
+/// An issue already carrying `agent:exhausted` is left completely alone —
+/// no second comment, no label churn. Rung 4's review found the same shape as
+/// a real defect (every re-run of an exhausted issue appended another
+/// terminal record, each quoting all the prior ones); a poll loop calling
+/// this on every pass would otherwise bury the issue in identical comments.
+pub fn exhaust_issue(
+    gh_runner: &mut dyn GhRunner,
+    db: &Database,
+    issue: &IssueRef,
+    dry_run: bool,
+) -> Result<ExhaustExecution, MemoryError> {
+    validate_repo(&issue.repo)?;
+
+    let current = gh::issue_labels(gh_runner, issue)?;
+    let already = current
+        .iter()
+        .any(|l| AgentLabel::from_label_str(l) == Some(AgentLabel::Exhausted));
+
+    if already {
+        // The label is on, so the notice has nothing left to bridge. Cleaned
+        // up *here* as well as after the label write, because a delete that
+        // failed there — `SQLITE_BUSY` from a concurrent writer, or a process
+        // killed between two statements — would otherwise leave the notice
+        // immortal: every later round returns from this branch without ever
+        // consulting it, and the one round that *does* consult it is the one
+        // where a human has removed the label to ask for another pass. That
+        // round would then re-apply the stop sign with no explanation, which
+        // is the exact failure the notice was introduced to prevent.
+        //
+        // Gated on the ownership check, because `clear_exhaustion_notice`
+        // deletes by key and the key collides across slug-equal repos —
+        // `own/er-repo#7` and `own-er/repo#7` share one drawer id. Deleting
+        // unconditionally here would let a *polled, already-exhausted* issue
+        // destroy its neighbour's outstanding bridge notice, and the
+        // neighbour would then re-post its exhaustion summary: the very bug
+        // the notice exists to prevent, re-opened through the cheapest path
+        // there is.
+        //
+        // Ignored on failure for the same reason it is safe to repeat: this
+        // path runs on every poll of an exhausted issue, so the next one
+        // tries again.
+        if exhaustion_notice_posted(db, issue).unwrap_or(false) {
+            let _ = clear_exhaustion_notice(db, issue);
+        }
+        return Ok(ExhaustExecution {
+            issue: issue.clone(),
+            outcome: ExhaustOutcome::AlreadyExhausted,
+        });
+    }
+
+    // Read only once the issue is known to need a summary — an already-
+    // exhausted issue walks none of its lineage.
+    let attempts = lineage::attempts_for_issue(db, issue)?;
+    let body = render_exhaustion_comment(issue, &attempts);
+    if dry_run {
+        return Ok(ExhaustExecution {
+            issue: issue.clone(),
+            outcome: ExhaustOutcome::WouldExhaust {
+                label_plan: labels::plan_exclusive(&current, Some(AgentLabel::Exhausted)),
+                attempts_summarized: attempts.len().min(MAX_ATTEMPTS_IN_COMMENT),
+            },
+        });
+    }
+
+    // Comment first, then label. If the label write fails the human still has
+    // the summary; if the order were reversed a failure would leave an issue
+    // marked exhausted with no explanation of why, which is the worse half to
+    // lose.
+    //
+    // But "the label write failed" is exactly the state that brings us back
+    // here: the label is the only thing the idempotency check above reads,
+    // so without a second record of the comment every retry re-posted an
+    // identical exhaustion summary. The notice is written *after* the
+    // comment succeeds and *before* the label is attempted, so a retry
+    // skips the comment and retries only the half that failed.
+    let commented = if exhaustion_notice_posted(db, issue)? {
+        false
+    } else {
+        gh::comment_on_issue(gh_runner, issue, &body)?;
+        record_exhaustion_notice(db, issue, attempts.len())?;
+        true
+    };
+    // `current` was read at the top of this function; re-reading it inside
+    // `set_exclusive_label` would spawn a second `gh issue view` for labels
+    // we are already holding.
+    let plan = labels::apply_plan(
+        gh_runner,
+        issue,
+        labels::plan_exclusive(&current, Some(AgentLabel::Exhausted)),
+    )?;
+
+    // The notice exists only to bridge "the comment posted, the label write
+    // then failed". Once the label is on, the label *is* the idempotency
+    // guard — the check at the top of this function returns
+    // `AlreadyExhausted` before anything else runs — so the notice has done
+    // its job and must not outlive it.
+    //
+    // Leaving it behind was worse than the bug it fixed. A human who reads
+    // the summary and does what it asks — re-label `agent:ready` for another
+    // pass — hits the cumulative attempt cap again, arrives back here with
+    // no `agent:exhausted` label, and finds a notice that suppresses the
+    // comment. Autopilot would then re-apply the stop label with *no*
+    // explanation on the issue, silently reverting the one intervention the
+    // summary had just invited.
+    //
+    // Not propagated. The comment is posted and the label is applied — the
+    // work of this function is done and cannot be undone, so a failed local
+    // delete must not report it as a failed run. (Same rule as
+    // `merge::split_label_result`: a later failure never erases the report of
+    // an action that already happened.) The leak it leaves is bounded: the
+    // `AlreadyExhausted` branch above retries this delete on every
+    // subsequent poll.
+    let _ = clear_exhaustion_notice(db, issue);
+
+    Ok(ExhaustExecution {
+        issue: issue.clone(),
+        outcome: ExhaustOutcome::Exhausted {
+            label_plan: plan,
+            attempts_summarized: attempts.len().min(MAX_ATTEMPTS_IN_COMMENT),
+            commented,
+        },
+    })
+}
+
+/// The logical key of the "this issue's exhaustion summary has been posted"
+/// drawer.
+///
+/// Its own key rather than a field on [`lineage::IssueStatus`]: that drawer
+/// is rewritten wholesale by the dispatch path, which would clear a flag it
+/// knows nothing about.
+fn exhaustion_notice_key(issue: &IssueRef) -> String {
+    format!("exhaustion-notice:{}", issue.slug())
+}
+
+/// Whether the exhaustion summary has already been posted for this issue.
+///
+/// The second half of `exhaust_issue`'s idempotency, and the half that
+/// survives a failed label write. The label alone cannot answer this: the
+/// run that posts the comment and then fails to label is precisely the run
+/// whose work must not be repeated.
+fn exhaustion_notice_posted(db: &Database, issue: &IssueRef) -> Result<bool, MemoryError> {
+    let Some(drawer) = super::read_current(db, &exhaustion_notice_key(issue))? else {
+        return Ok(false);
+    };
+    // The key goes through `repo_slug`, which maps `/` and every other
+    // unsafe character to `-` — so `own/er-repo#42` and `own-er/repo#42`
+    // share one key. A notice belonging to the *other* issue must not
+    // suppress this one's summary, so the stored canonical name is checked
+    // rather than trusted. Same hazard `RecordedMergeSummary::says_the_same_as`
+    // guards against, and the same answer: assert the invariant, do not
+    // assume it.
+    // A drawer that will not parse reads as "no notice", never as an error.
+    // Propagating here aborted `exhaust_issue` outright, so the issue was
+    // never labeled `agent:exhausted` and the budget livelock this module
+    // exists to stop just kept running — with nobody told. The worst case of
+    // treating it as absent is one duplicate comment. The logical-key space
+    // is shared with `add_drawer`, so a foreign writer landing on this id is
+    // reachable, not theoretical.
+    let Ok(body) = serde_json::from_str::<serde_json::Value>(&drawer.content) else {
+        return Ok(false);
+    };
+    // Compared case-insensitively for consistency with this module's other
+    // canonical comparisons, though unlike those it is not load-bearing:
+    // the notice key runs through `repo_slug`, which *preserves* case, so
+    // two spellings that differ only in case already land on different
+    // drawer ids and never reach this line. The keys that do collide differ
+    // by `/` versus `-`, which no case folding can conflate — so this
+    // comparison can only ever be more permissive than the key, never less.
+    Ok(body["issue"]
+        .as_str()
+        .is_some_and(|stored| stored.eq_ignore_ascii_case(&issue.canonical())))
+}
+
+/// Delete the notice once the label it was covering for has landed.
+fn clear_exhaustion_notice(db: &Database, issue: &IssueRef) -> Result<bool, MemoryError> {
+    let id = super::logical_drawer_id(&exhaustion_notice_key(issue));
+    db.with_transaction(|tx| {
+        let deleted = Database::delete_drawer_tx(tx, &id)?;
+        Database::wal_log_tx(
+            tx,
+            "autopilot_clear_exhaustion_notice",
+            &json!({
+                "drawer_id": &id,
+                "issue": issue.canonical(),
+                "deleted": deleted,
+            }),
+            None,
+        )?;
+        Ok(deleted)
+    })
+}
+
+fn record_exhaustion_notice(
+    db: &Database,
+    issue: &IssueRef,
+    attempts_summarized: usize,
+) -> Result<(), MemoryError> {
+    let content = serde_json::to_string(&json!({
+        "issue": issue.canonical(),
+        "repo": issue.repo,
+        "issue_number": issue.number,
+        "attempts_summarized": attempts_summarized,
+        "posted_at": chrono::Utc::now().to_rfc3339(),
+    }))?;
+    super::write_current(db, &exhaustion_notice_key(issue), &content)?;
+    Ok(())
+}
+
+/// Render the exhaustion summary comment.
+///
+/// Newest attempts first, because that is what a human triaging the issue
+/// reads: the last thing tried is the best evidence about why this is stuck.
+/// Every quoted field is already scrubbed and bounded on the way *into*
+/// lineage; the whole body is scrubbed again on the way out, because the
+/// composition is a new string and this is the point where it leaves the
+/// machine.
+pub fn render_exhaustion_comment(issue: &IssueRef, attempts: &[lineage::AttemptRecord]) -> String {
+    let mut body = format!(
+        "**Autopilot stopped working {issue}.**\n\n\
+The per-issue attempt cap was reached, so this issue is now labeled `{label}`. \
+It **will not be retried automatically** — that is the point of the label. A \
+human who wants another pass should re-label it `{ready}`.\n\n",
+        issue = issue.canonical(),
+        label = AgentLabel::Exhausted.as_str(),
+        ready = AgentLabel::Ready.as_str(),
+    );
+
+    if attempts.is_empty() {
+        body.push_str("No attempt records were found for this issue.\n");
+    } else {
+        let shown: Vec<&lineage::AttemptRecord> = attempts
+            .iter()
+            .rev()
+            .take(MAX_ATTEMPTS_IN_COMMENT)
+            .collect();
+        body.push_str(&format!(
+            "### What was tried ({} attempt{}, most recent first)\n\n",
+            attempts.len(),
+            if attempts.len() == 1 { "" } else { "s" }
+        ));
+        for attempt in shown {
+            body.push_str(&format!(
+                "- **Attempt {n}** — {verdict:?}\n  - approach: {approach}\n",
+                n = attempt.attempt_n,
+                verdict = attempt.verdict,
+                approach = one_line(&attempt.approach),
+            ));
+            if let Some(why) = &attempt.why_failed {
+                body.push_str(&format!("  - why it failed: {}\n", one_line(why)));
+            }
+            if let Some(sha) = &attempt.commit_sha {
+                body.push_str(&format!("  - commit: `{}`\n", short_sha(sha)));
+            }
+        }
+        if attempts.len() > MAX_ATTEMPTS_IN_COMMENT {
+            body.push_str(&format!(
+                "\n<sub>{} older attempt(s) omitted; the full lineage is in Autopilot's \
+knowledge base.</sub>\n",
+                attempts.len() - MAX_ATTEMPTS_IN_COMMENT
+            ));
+        }
+    }
+
+    body.push_str("\n<sub>Autopilot rung 6.</sub>");
+    scrub_and_bound(&body, MAX_COMMENT_CHARS).text
+}
+
+/// Flatten a multi-line field into one Markdown list line.
+///
+/// Newlines in an attempt's `approach` or `why_failed` would otherwise break
+/// out of the bullet they belong to and reflow the rest of the comment; a
+/// leading `#` or `-` on a wrapped line would even render as a new heading or
+/// list item. Bounded here as well as at the whole-comment level so one
+/// enormous field cannot crowd out every other attempt.
+///
+/// The collapse itself is [`crate::sanitize::collapse_whitespace_and_control`],
+/// the crate's shared "neutralize text before it reaches a human-visible
+/// line" helper, whose doc describes exactly this layering (each caller adds
+/// its own truncation on top). Hand-rolling it here mapped `\n` and `\r` only
+/// and passed every other control character — `ESC`, `NUL`, `\x0b` — straight
+/// through into a GitHub comment body.
+///
+/// `strip_invisible: true` because this string is rendered to a human on a
+/// public issue and is composed from model-authored `approach` / `why_failed`
+/// text that quotes the diff. `char::is_control` covers only category `Cc`,
+/// so a bidi override or zero-width joiner (`Cf`) would otherwise survive and
+/// visually reorder or hide the rest of the summary — Trojan-Source-style
+/// spoofing in the one artifact a human reads to decide what to do next.
+/// [`scrub_and_bound`] does not help here: it redacts secrets, not
+/// [`crate::sanitize::is_forgeable_invisible`] characters.
+fn one_line(text: &str) -> String {
+    const MAX_FIELD_IN_COMMENT: usize = 500;
+    // `trim`, not just the collapse: `collapse_whitespace_and_control`'s
+    // internal `value.trim()` only strips `White_Space`, so a field starting
+    // with a control or `Cf` character collapses to a *leading space* that
+    // would be rendered inside the bullet. The hand-rolled version this
+    // replaced could not produce one.
+    let collapsed = crate::sanitize::collapse_whitespace_and_control(text, true)
+        .trim()
+        .to_string();
+    if collapsed.chars().count() > MAX_FIELD_IN_COMMENT {
+        let head: String = collapsed.chars().take(MAX_FIELD_IN_COMMENT).collect();
+        format!("{head}…")
+    } else {
+        collapsed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::autopilot::gh::testing::ScriptedGh;
+    use crate::autopilot::gh::GhOutput;
+    use crate::autopilot::lineage::{AttemptOutcome, AttemptRecord};
+
+    fn issue() -> IssueRef {
+        IssueRef::new("owner/repo", 42)
+    }
+
+    fn db() -> Database {
+        Database::open_in_memory().expect("in-memory db")
+    }
+
+    fn attempt(n: u32, verdict: AttemptOutcome, why: Option<&str>) -> AttemptRecord {
+        AttemptRecord {
+            issue: issue(),
+            attempt_n: n,
+            approach: format!("approach number {n}"),
+            verdict,
+            why_failed: why.map(|w| w.to_string()),
+            commit_sha: None,
+        }
+    }
+
+    #[test]
+    fn exhausting_an_issue_comments_then_labels() {
+        let database = db();
+        for n in 1..=3 {
+            lineage::record_attempt(&database, &attempt(n, AttemptOutcome::Failed, Some("red")))
+                .unwrap();
+        }
+        let mut gh_runner = ScriptedGh::new(vec![
+            Ok(GhOutput::ok(r#"{"labels":[{"name":"agent:ready"}]}"#)),
+            Ok(GhOutput::ok("")),
+            // `agent:exhausted` is provisioned before it is applied
+            Ok(GhOutput::failed("", "label already exists")),
+            Ok(GhOutput::ok("")),
+        ]);
+
+        let exec = exhaust_issue(&mut gh_runner, &database, &issue(), false).unwrap();
+
+        assert_eq!(
+            gh_runner.seen.len(),
+            4,
+            "one label read, one comment, one create, one edit — the labels \
+are read once, not again inside the label write: {:?}",
+            gh_runner.seen
+        );
+
+        let ExhaustOutcome::Exhausted {
+            label_plan,
+            attempts_summarized,
+            commented,
+        } = exec.outcome
+        else {
+            panic!("expected Exhausted, got {:?}", exec.outcome);
+        };
+        assert_eq!(attempts_summarized, 3);
+        assert!(commented, "the first pass posts the summary");
+        assert_eq!(label_plan.add, vec!["agent:exhausted".to_string()]);
+        assert_eq!(label_plan.remove, vec!["agent:ready".to_string()]);
+        // The comment is posted before the label: losing the label leaves the
+        // human an explanation; losing the comment leaves a bare stop sign.
+        assert!(gh_runner.seen[1].contains(&"comment".to_string()));
+        assert!(
+            gh_runner.seen[3].contains(&"edit".to_string()),
+            "{:?}",
+            gh_runner.seen[3]
+        );
+    }
+
+    #[test]
+    fn a_failed_label_write_does_not_make_the_next_run_repost_the_summary() {
+        // The label is the only thing the idempotency check reads, so the
+        // run that posts the comment and *then* fails to label is exactly
+        // the run whose work must not be repeated — every retry re-posted an
+        // identical exhaustion summary.
+        let database = db();
+        lineage::record_attempt(&database, &attempt(1, AttemptOutcome::Failed, Some("red")))
+            .unwrap();
+
+        let mut gh_runner = ScriptedGh::new(vec![
+            Ok(GhOutput::ok(r#"{"labels":[{"name":"agent:ready"}]}"#)),
+            Ok(GhOutput::ok("")),
+            Ok(GhOutput::failed("", "label already exists")),
+            Ok(GhOutput::failed("", "HTTP 403: Forbidden")),
+        ]);
+        let err = exhaust_issue(&mut gh_runner, &database, &issue(), false).unwrap_err();
+        assert!(err.to_string().contains("403"), "{err}");
+
+        let mut gh_runner = ScriptedGh::new(vec![
+            Ok(GhOutput::ok(r#"{"labels":[{"name":"agent:ready"}]}"#)),
+            Ok(GhOutput::failed("", "label already exists")),
+            Ok(GhOutput::ok("")),
+        ]);
+        let exec = exhaust_issue(&mut gh_runner, &database, &issue(), false).unwrap();
+
+        let ExhaustOutcome::Exhausted { commented, .. } = exec.outcome else {
+            panic!("expected Exhausted, got {:?}", exec.outcome);
+        };
+        assert!(!commented, "the summary was already posted");
+        assert!(
+            !gh_runner
+                .seen
+                .iter()
+                .any(|a| a.contains(&"comment".to_string())),
+            "no second summary may be posted: {:?}",
+            gh_runner.seen
+        );
+        assert!(
+            gh_runner
+                .seen
+                .iter()
+                .any(|a| a.contains(&"--add-label".to_string())),
+            "but the label that failed is retried: {:?}",
+            gh_runner.seen
+        );
+    }
+
+    #[test]
+    fn a_second_exhaustion_after_a_human_resume_still_explains_itself() {
+        // The summary tells the human to re-label `agent:ready` for another
+        // pass. Doing so hits the cumulative cap again and arrives back here
+        // with no `agent:exhausted` label — so a notice that outlived its
+        // label write would suppress the comment and Autopilot would
+        // re-apply the stop label with *no* explanation, silently reverting
+        // the one intervention the summary had just invited.
+        let database = db();
+        lineage::record_attempt(&database, &attempt(1, AttemptOutcome::Failed, Some("red")))
+            .unwrap();
+
+        let mut gh_runner = ScriptedGh::new(vec![
+            Ok(GhOutput::ok(r#"{"labels":[{"name":"agent:ready"}]}"#)),
+            Ok(GhOutput::ok("")),
+            Ok(GhOutput::failed("", "label already exists")),
+            Ok(GhOutput::ok("")),
+        ]);
+        let first = exhaust_issue(&mut gh_runner, &database, &issue(), false).unwrap();
+        let ExhaustOutcome::Exhausted { commented, .. } = first.outcome else {
+            panic!("expected Exhausted, got {:?}", first.outcome);
+        };
+        assert!(commented);
+
+        // The human re-labels `agent:ready`; the cap is still exceeded.
+        let mut gh_runner = ScriptedGh::new(vec![
+            Ok(GhOutput::ok(r#"{"labels":[{"name":"agent:ready"}]}"#)),
+            Ok(GhOutput::ok("")),
+            Ok(GhOutput::failed("", "label already exists")),
+            Ok(GhOutput::ok("")),
+        ]);
+        let second = exhaust_issue(&mut gh_runner, &database, &issue(), false).unwrap();
+        let ExhaustOutcome::Exhausted { commented, .. } = second.outcome else {
+            panic!("expected Exhausted, got {:?}", second.outcome);
+        };
+        assert!(
+            commented,
+            "a stop sign re-applied over a human's resume must say why"
+        );
+        assert!(
+            gh_runner
+                .seen
+                .iter()
+                .any(|a| a.contains(&"comment".to_string())),
+            "{:?}",
+            gh_runner.seen
+        );
+    }
+
+    #[test]
+    fn a_notice_from_a_slug_colliding_issue_does_not_silence_this_one() {
+        // `repo_slug` maps `/` to `-`, so `own/er-repo#7` and `own-er/repo#7`
+        // share a notice key. The first to exhaust must not suppress the
+        // second's summary.
+        let database = db();
+        let a = IssueRef::new("own/er-repo", 7);
+        let b = IssueRef::new("own-er/repo", 7);
+        assert_eq!(a.slug(), b.slug(), "the collision this test is about");
+
+        for issue in [&a, &b] {
+            lineage::record_attempt(
+                &database,
+                &lineage::AttemptRecord {
+                    issue: (*issue).clone(),
+                    ..attempt(1, AttemptOutcome::Failed, Some("red"))
+                },
+            )
+            .unwrap();
+        }
+
+        // `a` exhausts but its label write *fails*, so `a`'s notice survives
+        // in the shared key. Without that the notice would be cleaned up and
+        // this test would pass against a plain `.is_some()` check, proving
+        // nothing.
+        let mut gh_runner = ScriptedGh::new(vec![
+            Ok(GhOutput::ok(r#"{"labels":[]}"#)),
+            Ok(GhOutput::ok("")),
+            Ok(GhOutput::failed("", "label already exists")),
+            Ok(GhOutput::failed("", "HTTP 403: Forbidden")),
+        ]);
+        exhaust_issue(&mut gh_runner, &database, &a, false).unwrap_err();
+        assert!(
+            crate::autopilot::read_current(&database, &exhaustion_notice_key(&b))
+                .unwrap()
+                .is_some(),
+            "the collision requires a's notice to be readable under b's key"
+        );
+
+        // `b` must still get its own summary, which only the canonical check
+        // inside `exhaustion_notice_posted` can deliver.
+        let mut gh_runner = ScriptedGh::new(vec![
+            Ok(GhOutput::ok(r#"{"labels":[]}"#)),
+            Ok(GhOutput::ok("")),
+            Ok(GhOutput::failed("", "label already exists")),
+            Ok(GhOutput::ok("")),
+        ]);
+        let exec = exhaust_issue(&mut gh_runner, &database, &b, false).unwrap();
+        let ExhaustOutcome::Exhausted { commented, .. } = exec.outcome else {
+            panic!("expected Exhausted for {}", b.canonical());
+        };
+        assert!(commented, "{} must get its own summary", b.canonical());
+    }
+
+    #[test]
+    fn a_rehearsal_leaves_no_notice_that_would_suppress_the_real_summary() {
+        let database = db();
+        lineage::record_attempt(&database, &attempt(1, AttemptOutcome::Failed, Some("red")))
+            .unwrap();
+        let mut gh_runner = ScriptedGh::new(vec![Ok(GhOutput::ok(r#"{"labels":[]}"#))]);
+        exhaust_issue(&mut gh_runner, &database, &issue(), true).unwrap();
+
+        let mut gh_runner = ScriptedGh::new(vec![
+            Ok(GhOutput::ok(r#"{"labels":[]}"#)),
+            Ok(GhOutput::ok("")),
+            Ok(GhOutput::failed("", "label already exists")),
+            Ok(GhOutput::ok("")),
+        ]);
+        let exec = exhaust_issue(&mut gh_runner, &database, &issue(), false).unwrap();
+        let ExhaustOutcome::Exhausted { commented, .. } = exec.outcome else {
+            panic!("expected Exhausted, got {:?}", exec.outcome);
+        };
+        assert!(
+            commented,
+            "a dry run notifies nobody and must suppress nothing"
+        );
+    }
+
+    #[test]
+    fn an_already_exhausted_issue_is_left_completely_alone() {
+        // A poll loop calling this every pass would otherwise bury the issue
+        // in identical comments — rung 4 found the same shape as a real bug.
+        let database = db();
+        let mut gh_runner = ScriptedGh::new(vec![Ok(GhOutput::ok(
+            r#"{"labels":[{"name":"agent:exhausted"}]}"#,
+        ))]);
+
+        let exec = exhaust_issue(&mut gh_runner, &database, &issue(), false).unwrap();
+
+        assert_eq!(exec.outcome, ExhaustOutcome::AlreadyExhausted);
+        assert_eq!(gh_runner.seen.len(), 1, "only the label read happened");
+    }
+
+    #[test]
+    fn an_exhaustion_dry_run_writes_nothing() {
+        let database = db();
+        let mut gh_runner = ScriptedGh::new(vec![Ok(GhOutput::ok(
+            r#"{"labels":[{"name":"agent:ready"}]}"#,
+        ))]);
+
+        let exec = exhaust_issue(&mut gh_runner, &database, &issue(), true).unwrap();
+
+        assert_eq!(gh_runner.seen.len(), 1, "nothing was written");
+        let ExhaustOutcome::WouldExhaust { label_plan, .. } = exec.outcome else {
+            panic!("expected WouldExhaust, got {:?}", exec.outcome);
+        };
+        assert_eq!(label_plan.add, vec!["agent:exhausted".to_string()]);
+    }
+
+    #[test]
+    fn the_exhaustion_comment_states_that_it_never_self_resumes() {
+        let attempts = vec![attempt(1, AttemptOutcome::Failed, Some("tests red"))];
+        let body = render_exhaustion_comment(&issue(), &attempts);
+        assert!(body.contains("agent:exhausted"));
+        assert!(body.contains("will not be retried automatically"));
+        assert!(body.contains("agent:ready"), "the way back must be stated");
+        assert!(body.contains("tests red"));
+    }
+
+    #[test]
+    fn the_exhaustion_comment_lists_newest_attempts_first() {
+        let attempts: Vec<AttemptRecord> = (1..=3)
+            .map(|n| attempt(n, AttemptOutcome::Failed, None))
+            .collect();
+        let body = render_exhaustion_comment(&issue(), &attempts);
+        let third = body
+            .find("approach number 3")
+            .expect("newest attempt shown");
+        let first = body
+            .find("approach number 1")
+            .expect("oldest attempt shown");
+        assert!(third < first, "most recent first: {body}");
+    }
+
+    #[test]
+    fn the_exhaustion_comment_bounds_how_many_attempts_it_quotes() {
+        let attempts: Vec<AttemptRecord> = (1..=25)
+            .map(|n| attempt(n, AttemptOutcome::Failed, None))
+            .collect();
+        let body = render_exhaustion_comment(&issue(), &attempts);
+        assert!(body.contains("25 attempts"), "the real count is stated");
+        assert!(body.contains("older attempt(s) omitted"));
+        assert!(
+            !body.contains("approach number 1\n"),
+            "the oldest attempts are dropped whole, not truncated"
+        );
+        assert!(body.chars().count() <= MAX_COMMENT_CHARS);
+    }
+
+    #[test]
+    fn a_multiline_attempt_field_cannot_break_the_comment_layout() {
+        // A wrapped line beginning `#` or `-` would render as a new heading
+        // or list item and reflow everything after it.
+        let attempts = vec![attempt(
+            1,
+            AttemptOutcome::Failed,
+            Some("line one\n# not a heading\n- not a bullet"),
+        )];
+        let body = render_exhaustion_comment(&issue(), &attempts);
+        let why_line = body
+            .lines()
+            .find(|l| l.contains("why it failed"))
+            .expect("the field is rendered");
+        assert!(why_line.contains("# not a heading"));
+        assert!(
+            !body.contains("\n# not a heading"),
+            "the newline must not survive: {body}"
+        );
+    }
+
+    #[test]
+    fn an_invisible_control_character_cannot_reorder_the_comment() {
+        // Category `Cf` — a bidi override — is not `char::is_control`, so it
+        // survives the collapse unless `strip_invisible` is set, and would
+        // visually reverse everything after it on the line a human reads.
+        let attempts = vec![attempt(
+            1,
+            AttemptOutcome::Failed,
+            Some("\u{202E}gnitset\u{200B} deliaf"),
+        )];
+        let body = render_exhaustion_comment(&issue(), &attempts);
+        assert!(
+            !body.contains('\u{202E}') && !body.contains('\u{200B}'),
+            "no forgeable invisible may reach the comment: {body:?}"
+        );
+    }
+
+    #[test]
+    fn the_json_shape_puts_the_outcome_tag_at_the_top_level() {
+        // A doubly-nested `"outcome":{"outcome":…}` is what an un-flattened
+        // internally-tagged enum under a same-named field produces.
+        let exec = ExhaustExecution {
+            issue: issue(),
+            outcome: ExhaustOutcome::AlreadyExhausted,
+        };
+        let json: serde_json::Value = serde_json::to_value(&exec).unwrap();
+        assert_eq!(json["outcome"], serde_json::json!("already_exhausted"));
+        assert_eq!(json["issue"], serde_json::json!("owner/repo#42"));
+    }
+
+    #[test]
+    fn an_issue_with_no_attempts_still_produces_a_usable_comment() {
+        let body = render_exhaustion_comment(&issue(), &[]);
+        assert!(body.contains("No attempt records"));
+        assert!(body.contains("agent:exhausted"));
+    }
+}

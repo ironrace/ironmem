@@ -443,6 +443,73 @@ enum AutopilotCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Execute the merge decision for a reviewed PR (build-ladder rung 6)
+    Merge {
+        /// Path to the database
+        #[arg(long)]
+        db: Option<String>,
+        /// Repo identity used as the storage key (e.g. "owner/repo")
+        repo: String,
+        /// GitHub issue number the PR closes
+        issue: u64,
+        /// Pull request number to merge
+        #[arg(long)]
+        pr: u64,
+        /// Directory `gh` runs in. Only affects `gh`'s own configuration
+        /// resolution — every command names --repo explicitly.
+        #[arg(long, default_value = ".")]
+        path: String,
+        /// Assert the repo's gate is green **right now**.
+        ///
+        /// Opt-in for the same reason `review --gate-green` is: a caller who
+        /// forgets the flag gets a hold, never a merge.
+        #[arg(long)]
+        gate_green: bool,
+        /// Merge strategy: squash (default), merge, or rebase
+        #[arg(long, default_value = "squash")]
+        strategy: String,
+        /// Delete the head branch after a successful merge
+        #[arg(long)]
+        delete_branch: bool,
+        /// Run every check and every read, but write nothing to GitHub
+        #[arg(long)]
+        dry_run: bool,
+        /// Emit JSON instead of text
+        #[arg(long)]
+        json: bool,
+    },
+    /// Close out an issue that hit its attempt cap: summary comment plus
+    /// `agent:exhausted` (build-ladder rung 6)
+    Exhaust {
+        /// Path to the database
+        #[arg(long)]
+        db: Option<String>,
+        /// Repo identity used as the storage key (e.g. "owner/repo")
+        repo: String,
+        /// GitHub issue number to exhaust
+        issue: u64,
+        /// Directory `gh` runs in
+        #[arg(long, default_value = ".")]
+        path: String,
+        /// Render the comment and the label plan, but write nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// Emit JSON instead of text
+        #[arg(long)]
+        json: bool,
+    },
+    /// Create the three `agent:*` labels in a repo if they are missing
+    /// (build-ladder rung 6)
+    Labels {
+        /// Repo identity (e.g. "owner/repo")
+        repo: String,
+        /// Directory `gh` runs in
+        #[arg(long, default_value = ".")]
+        path: String,
+        /// Emit JSON instead of text
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Where per-issue worktrees live when `--worktree-root` is not given.
@@ -1169,6 +1236,10 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                         pr_number: pr,
                         base_branch: &base,
                         head_branch: &head_branch,
+                        // `review_pr` resolves this from `repo_dir` and
+                        // `head_branch`; the field is an override, and the
+                        // CLI has nothing to override it with.
+                        head_sha: None,
                         dispatch_class: &dispatch_class,
                         gate_commands: &gate_commands,
                         gate_green,
@@ -1223,6 +1294,159 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                     println!("  decision: {:?}", review.decision);
                     if let Some(id) = &review.record_drawer_id {
                         println!("  recorded: {id}");
+                    }
+                }
+                Ok(())
+            }
+            AutopilotCmd::Merge {
+                db,
+                repo,
+                issue,
+                pr,
+                path,
+                gate_green,
+                strategy,
+                delete_branch,
+                dry_run,
+                json,
+            } => {
+                let strategy =
+                    ironmem::autopilot::gh::MergeStrategy::parse(&strategy).ok_or_else(|| {
+                        ironmem::error::MemoryError::Config(format!(
+                            "unknown merge strategy {strategy:?} — expected squash, merge or rebase"
+                        ))
+                    })?;
+                let issue_ref = ironmem::autopilot::IssueRef::new(repo, issue);
+                let database = open_migrated_db(db)?;
+                let mut gh = ironmem::autopilot::gh::GhCli::resolve(&path)?;
+                let exec = ironmem::autopilot::merge::execute_merge(
+                    &database,
+                    &mut gh,
+                    &ironmem::autopilot::merge::MergeRequest {
+                        issue: &issue_ref,
+                        pr_number: pr,
+                        gate_green,
+                        strategy,
+                        delete_branch,
+                        dry_run,
+                    },
+                )?;
+
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&exec)?);
+                } else {
+                    println!("Issue {} PR #{}", exec.issue.canonical(), exec.pr_number);
+                    match &exec.outcome {
+                        ironmem::autopilot::merge::MergeOutcome::Merged { strategy, head_sha } => {
+                            println!("  MERGED ({} of {head_sha})", strategy.as_str());
+                        }
+                        ironmem::autopilot::merge::MergeOutcome::WouldMerge {
+                            strategy,
+                            head_sha,
+                        } => {
+                            println!(
+                                "  would merge ({} of {head_sha}) — dry run, nothing written",
+                                strategy.as_str()
+                            );
+                        }
+                        ironmem::autopilot::merge::MergeOutcome::AlreadyMerged { head_sha } => {
+                            println!("  already merged ({head_sha}) — Autopilot did not merge it");
+                        }
+                        ironmem::autopilot::merge::MergeOutcome::Held(hold) => {
+                            println!("  HELD: {}", hold.summary());
+                        }
+                    }
+                    if let Some(plan) = &exec.label_plan {
+                        if !plan.is_noop() {
+                            println!("  labels: +{:?} -{:?}", plan.add, plan.remove);
+                        }
+                    }
+                    if let Some(err) = &exec.label_error {
+                        // The merge landed and the label write did not. Silent
+                        // here, this was indistinguishable from a clean run —
+                        // which defeats the point of reporting it rather than
+                        // erroring.
+                        println!("  WARNING: labels were NOT updated: {err}");
+                        println!("  the next run clears them once it sees the PR as merged");
+                    }
+                    if exec.commented {
+                        println!("  commented on the issue");
+                    }
+                    println!(
+                        "  {}: {}",
+                        if exec.record_appended {
+                            "recorded"
+                        } else {
+                            "unchanged since"
+                        },
+                        exec.record_drawer_id
+                    );
+                }
+                Ok(())
+            }
+            AutopilotCmd::Exhaust {
+                db,
+                repo,
+                issue,
+                path,
+                dry_run,
+                json,
+            } => {
+                let issue_ref = ironmem::autopilot::IssueRef::new(repo, issue);
+                let database = open_migrated_db(db)?;
+                let mut gh = ironmem::autopilot::gh::GhCli::resolve(&path)?;
+                let exec = ironmem::autopilot::stagnation::exhaust_issue(
+                    &mut gh, &database, &issue_ref, dry_run,
+                )?;
+
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&exec)?);
+                } else {
+                    println!("Issue {}", exec.issue.canonical());
+                    use ironmem::autopilot::stagnation::ExhaustOutcome;
+                    match &exec.outcome {
+                        ExhaustOutcome::AlreadyExhausted => {
+                            println!("  already agent:exhausted — nothing to do")
+                        }
+                        ExhaustOutcome::Exhausted {
+                            label_plan,
+                            attempts_summarized,
+                            commented,
+                        } => println!(
+                            "  exhausted: {} {attempts_summarized} attempt(s), labels +{:?} -{:?}",
+                            if *commented {
+                                "commented on"
+                            } else {
+                                "summary already posted for"
+                            },
+                            label_plan.add,
+                            label_plan.remove
+                        ),
+                        ExhaustOutcome::WouldExhaust {
+                            label_plan,
+                            attempts_summarized,
+                        } => println!(
+                            "  would exhaust: {attempts_summarized} attempt(s) summarized, labels +{:?} -{:?} — dry run, nothing written",
+                            label_plan.add, label_plan.remove
+                        ),
+                    }
+                }
+                Ok(())
+            }
+            AutopilotCmd::Labels { repo, path, json } => {
+                let mut gh = ironmem::autopilot::gh::GhCli::resolve(&path)?;
+                let results = ironmem::autopilot::labels::ensure_labels(&mut gh, &repo)?;
+                if json {
+                    let rows: Vec<serde_json::Value> = results
+                        .iter()
+                        .map(|(label, state)| {
+                            serde_json::json!({ "label": label.as_str(), "state": state })
+                        })
+                        .collect();
+                    println!("{}", serde_json::to_string_pretty(&rows)?);
+                } else {
+                    for (label, state) in results {
+                        println!("  {} — {state:?}", label.as_str());
                     }
                 }
                 Ok(())
@@ -1357,6 +1581,131 @@ mod tests {
         assert_eq!(listen, None);
         assert_eq!(connect.as_deref(), Some("/tmp/d.sock"));
         assert!(no_autospawn);
+    }
+
+    #[test]
+    fn autopilot_merge_defaults_are_the_conservative_ones() {
+        // Every default here is the one that cannot merge by accident:
+        // gate_green off, dry_run off but delete_branch off too, and squash.
+        let cli = Cli::try_parse_from([
+            "ironmem",
+            "autopilot",
+            "merge",
+            "owner/repo",
+            "42",
+            "--pr",
+            "7",
+        ])
+        .expect("expected argv to parse");
+        match cli.command {
+            Commands::Autopilot {
+                cmd:
+                    AutopilotCmd::Merge {
+                        repo,
+                        issue,
+                        pr,
+                        path,
+                        gate_green,
+                        strategy,
+                        delete_branch,
+                        dry_run,
+                        ..
+                    },
+            } => {
+                assert_eq!(repo, "owner/repo");
+                assert_eq!(issue, 42);
+                assert_eq!(pr, 7);
+                assert_eq!(path, ".");
+                assert!(
+                    !gate_green,
+                    "gate_green must be opt-in: forgetting it must hold, never merge"
+                );
+                assert_eq!(strategy, "squash");
+                assert!(!delete_branch);
+                assert!(!dry_run);
+            }
+            _ => panic!("expected Commands::Autopilot(Merge), got a different variant"),
+        }
+    }
+
+    #[test]
+    fn autopilot_merge_requires_a_pr_number() {
+        assert!(
+            Cli::try_parse_from(["ironmem", "autopilot", "merge", "owner/repo", "42"]).is_err(),
+            "a merge with no PR to merge must not parse"
+        );
+    }
+
+    #[test]
+    fn autopilot_merge_accepts_a_dry_run_and_a_strategy() {
+        let cli = Cli::try_parse_from([
+            "ironmem",
+            "autopilot",
+            "merge",
+            "owner/repo",
+            "42",
+            "--pr",
+            "7",
+            "--gate-green",
+            "--strategy",
+            "rebase",
+            "--dry-run",
+        ])
+        .expect("expected argv to parse");
+        match cli.command {
+            Commands::Autopilot {
+                cmd:
+                    AutopilotCmd::Merge {
+                        gate_green,
+                        strategy,
+                        dry_run,
+                        ..
+                    },
+            } => {
+                assert!(gate_green);
+                assert_eq!(strategy, "rebase");
+                assert!(dry_run);
+            }
+            _ => panic!("expected Commands::Autopilot(Merge), got a different variant"),
+        }
+    }
+
+    #[test]
+    fn autopilot_exhaust_parses_the_issue() {
+        let cli = Cli::try_parse_from(["ironmem", "autopilot", "exhaust", "owner/repo", "42"])
+            .expect("expected argv to parse");
+        match cli.command {
+            Commands::Autopilot {
+                cmd:
+                    AutopilotCmd::Exhaust {
+                        repo,
+                        issue,
+                        dry_run,
+                        ..
+                    },
+            } => {
+                assert_eq!(repo, "owner/repo");
+                assert_eq!(issue, 42);
+                assert!(!dry_run);
+            }
+            _ => panic!("expected Commands::Autopilot(Exhaust), got a different variant"),
+        }
+    }
+
+    #[test]
+    fn autopilot_labels_takes_only_a_repo() {
+        let cli = Cli::try_parse_from(["ironmem", "autopilot", "labels", "owner/repo"])
+            .expect("expected argv to parse");
+        match cli.command {
+            Commands::Autopilot {
+                cmd: AutopilotCmd::Labels { repo, path, json },
+            } => {
+                assert_eq!(repo, "owner/repo");
+                assert_eq!(path, ".");
+                assert!(!json);
+            }
+            _ => panic!("expected Commands::Autopilot(Labels), got a different variant"),
+        }
     }
 
     #[test]

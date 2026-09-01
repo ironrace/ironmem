@@ -1,4 +1,4 @@
-//! Autopilot backlog runner (build-ladder rungs 1-4).
+//! Autopilot backlog runner (build-ladder rungs 1-6).
 //!
 //! See `docs/iron/specs/2026-08-21-autonomous-backlog-runner-design.md` for
 //! the full design. Rung 1 built the storage half — the `backlog-lineage`
@@ -16,9 +16,12 @@
 //! adds [`review`] and [`review_prompt`], the fresh-context, read-only,
 //! cross-model (Codex) Reviewer that re-classifies the diff's risk and
 //! reviews it — and, in [`review::decide_merge`], the single fail-closed
-//! answer to "may this merge?". Executing that answer (`gh pr merge`,
-//! labels, the human notification) is rung 6's: merge authority is the
-//! Lead's alone.
+//! answer to "may this merge?". Rung 6 adds [`gh`] (the one place every
+//! GitHub write goes through), [`labels`] (the three `agent:*` labels and
+//! their differing resume semantics), and [`merge`] — the sole consumer of
+//! rung 5's [`review::MergeDecision`], which executes it: `gh pr merge` on
+//! the fall-through, and otherwise a labeled PR and a notified human. Merge
+//! authority is the Lead's alone, and [`merge`] is where it lives.
 //!
 //! # The drawer kinds, one room
 //!
@@ -37,6 +40,13 @@
 //! 5. [`gate_config::GateConfig`] — `logical_key` per repo: the
 //!    `pending` → `approved` gate-config state machine (storage/transition;
 //!    [`onboard`] is the rung-3 Onboarder that infers the proposed content).
+//!
+//! Rung 6 adds a seventh, also of kind 1's shape:
+//! [`merge::MergeRecord`] — one drawer per merge *attempt*, `has_merge`
+//! edge, no `logical_key`. A hold and a later merge of the same PR are two
+//! facts for the same reason a `needs_changes` and a later `pass` are, and
+//! this is the audit trail for the only irreversible action in the whole
+//! subsystem.
 //!
 //! Rung 5 adds a sixth, of kind 1's shape: [`review::ReviewRecord`] — plain
 //! `add_drawer` calls, **no `logical_key`**, one drawer per review. The spec
@@ -75,12 +85,16 @@ pub mod budget;
 pub mod dispatch;
 pub mod dispatch_state;
 pub mod gate_config;
+pub mod gh;
+pub mod labels;
 pub mod lineage;
+pub mod merge;
 pub mod onboard;
 pub mod review;
 pub mod review_prompt;
 pub mod run;
 pub mod scrub;
+pub mod stagnation;
 pub mod turn_prompt;
 pub mod worktree;
 
@@ -232,6 +246,38 @@ pub(crate) const EMPTY_GATE_COMMANDS_MSG: &str =
 fn zero_embedding() -> Vec<f32> {
     vec![0.0; ironrace_embed::EMBED_DIM]
 }
+
+/// The knowledge-graph entity type every per-issue record hangs off.
+///
+/// One declaration rather than one per record kind: [`lineage`], [`review`]
+/// and [`merge`] all resolve the *same* entity, and a module spelling it
+/// differently would silently read an empty history.
+pub(crate) const ISSUE_ENTITY_TYPE: &str = "issue";
+
+/// The `LIMIT` every issue→record traversal passes to
+/// `KnowledgeGraph::query_entity_current_with_predicate`.
+///
+/// **One number, applied once per record kind.** `has_attempt`, `has_review`
+/// and `has_merge` each get their own budget of this size, because the
+/// traversals ask SQLite for one predicate at a time.
+///
+/// That split is load-bearing, not tidiness. The unrestricted
+/// `query_entity_current` applies its `LIMIT` across *all* of an entity's
+/// edges, newest-first, before any caller can filter — so a PR polled on a
+/// hold that never resolves would append `has_merge` edges until every
+/// `has_review` edge fell outside the window, and `merge` would then read
+/// "this PR was never reviewed" and hold forever. Not an error, a wrong
+/// answer. Per-predicate budgets make that failure inexpressible.
+///
+/// It lived as three separate private constants (`MAX_ATTEMPTS_PER_ISSUE`,
+/// `MAX_REVIEWS_PER_ISSUE`, `MAX_MERGES_PER_ISSUE`) that had to be equal by
+/// construction and were kept so only by three doc comments pointing at each
+/// other. That is a comment, not an invariant; this is the invariant.
+///
+/// Generous but bounded — see `KnowledgeGraph::query_entity_current`'s own
+/// doc on why a cap exists at all (a well-connected hub entity could
+/// otherwise dump unbounded rows).
+pub(crate) const MAX_ISSUE_EDGES: usize = 10_000;
 
 /// Today's date in UTC, in the `YYYY-MM-DD` spelling
 /// [`budget::budget_key`] expects.
