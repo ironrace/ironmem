@@ -886,6 +886,12 @@ pub struct RecordedReviewSummary {
     /// Surfaced so callers can filter on it: `repo_slug` collapses
     /// `owner/repo` and `owner-repo` onto one lineage entity, so an issue's
     /// reviews are not by themselves guaranteed to be *its* reviews.
+    ///
+    /// Defaulted for the reason `PrSnapshot`'s fields are: a payload written
+    /// before this field existed reads back as empty, which matches no
+    /// issue's canonical name and so yields "not reviewed" — a hold — rather
+    /// than a deserialization error or, worse, a merge.
+    #[serde(default)]
     pub issue: String,
     pub pr_number: u64,
     pub dispatch_class: String,
