@@ -568,7 +568,7 @@ pub fn run_review(
 }
 
 /// Why a PR is being held for a human instead of auto-merged.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "reason", rename_all = "snake_case")]
 pub enum HoldReason {
     /// The gate was not green. A reviewer PASS never substitutes for it: the
@@ -671,6 +671,11 @@ pub struct ReviewRecord {
     pub issue: IssueRef,
     pub pr_number: u64,
     pub dispatch_class: String,
+    /// The commit the reviewer actually read, if the caller could resolve
+    /// it. Rung 6 refuses to merge a PR whose head has moved since this
+    /// SHA, so a record without one cannot authorize a merge at all — see
+    /// [`RecordedReviewSummary::head_sha`].
+    pub head_sha: Option<String>,
     pub outcome: ReviewOutcome,
     pub decision: MergeDecision,
 }
@@ -683,6 +688,11 @@ struct ReviewBody {
     issue_number: u64,
     pr_number: u64,
     dispatch_class: String,
+    /// `#[serde(default)]` so every review recorded before rung 6 existed
+    /// reads back as `None` — which rung 6 treats as "the reviewed commit is
+    /// unknown" and holds on, rather than as "the head has not moved".
+    #[serde(default)]
+    head_sha: Option<String>,
     verdict: Option<ReviewVerdict>,
     risk_class: Option<RiskClass>,
     reason: Option<String>,
@@ -731,6 +741,7 @@ pub fn record_review(db: &Database, record: &ReviewRecord) -> Result<RecordedRev
         issue_number: record.issue.number,
         pr_number: record.pr_number,
         dispatch_class: record.dispatch_class.clone(),
+        head_sha: record.head_sha.clone(),
         verdict: record.outcome.verdict,
         risk_class: record.outcome.risk_class,
         reason: reason_scrub.as_ref().map(|o| o.text.clone()),
@@ -806,6 +817,14 @@ const MAX_REVIEWS_PER_ISSUE: usize = 10_000;
 pub struct RecordedReviewSummary {
     pub pr_number: u64,
     pub dispatch_class: String,
+    /// The commit this review read. `None` for a review recorded before the
+    /// field existed, and for one whose caller could not resolve the head
+    /// branch. Both are "unknown", and rung 6's
+    /// [`super::merge::execute_merge`] holds on unknown: a PASS that cannot
+    /// be tied to a specific commit is not evidence about the commit being
+    /// merged.
+    #[serde(default)]
+    pub head_sha: Option<String>,
     pub verdict: Option<ReviewVerdict>,
     pub risk_class: Option<RiskClass>,
     pub reason: Option<String>,
@@ -854,6 +873,7 @@ pub fn reviews_for_issue(
         records.push(RecordedReviewSummary {
             pr_number: body.pr_number,
             dispatch_class: body.dispatch_class,
+            head_sha: body.head_sha,
             verdict: body.verdict,
             risk_class: body.risk_class,
             reason: body.reason,
@@ -911,6 +931,10 @@ pub struct ReviewRequest<'a> {
     pub pr_number: u64,
     pub base_branch: &'a str,
     pub head_branch: &'a str,
+    /// The commit `head_branch` resolves to in `repo_dir` right now, if the
+    /// caller could resolve it. Recorded verbatim so rung 6 can tell whether
+    /// the PR it is about to merge is still the change this review read.
+    pub head_sha: Option<String>,
     /// The Lead's dispatch-time class, compared against the reviewer's.
     pub dispatch_class: &'a str,
     /// The repo's approved gate commands.
@@ -1115,6 +1139,7 @@ pub fn review_pr(
             issue: request.issue.clone(),
             pr_number: request.pr_number,
             dispatch_class: request.dispatch_class.to_string(),
+            head_sha: request.head_sha.clone(),
             outcome: outcome.clone(),
             decision: decision.clone(),
         },
@@ -1578,6 +1603,7 @@ not json at all
             issue: issue.clone(),
             pr_number: 322,
             dispatch_class: "documentation".to_string(),
+            head_sha: Some("0".repeat(40)),
             outcome,
             decision,
         }
@@ -1794,6 +1820,7 @@ not json at all
             pr_number: 322,
             base_branch: "main",
             head_branch: "autopilot/ironrace-ironmem-283",
+            head_sha: Some("0".repeat(40)),
             dispatch_class: "documentation",
             gate_commands: gates,
             gate_green: true,

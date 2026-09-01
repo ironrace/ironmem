@@ -9,6 +9,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Autopilot rung 6: `ironmem autopilot merge` executes the merge decision,
+  and `autopilot exhaust` closes out an issue that cannot converge.** Rung 5
+  answered *"may this merge?"* and deliberately stopped there. Rung 6 is that
+  answer's only consumer, and it does the three things the design's data flow
+  puts after the review: merge the PR via `gh pr merge` on a clean pass;
+  otherwise leave it open, labeled and with a human notified; and, on hitting
+  the per-issue attempt cap, post a summary of everything tried and flip the
+  issue to `agent:exhausted`.
+
+  Three new modules. `autopilot::gh` is the one place every GitHub write goes
+  through — argv construction and response parsing, both pure, behind a
+  `GhRunner` trait so the whole policy layer is tested without performing an
+  irreversible GitHub action. `autopilot::labels` implements the design's
+  three `agent:*` labels and the thing that makes them worth having: their
+  resume semantics differ, `agent:exhausted` never self-resumes, and the two
+  stop states outrank `agent:ready` so a stale label can never restart work a
+  human meant to stop. `autopilot::merge` holds the merge authority itself.
+
+  `execute_merge` **re-derives** rung 5's decision rather than replaying the
+  stored one, so there is exactly one implementation of the merge guard in
+  the codebase and so `gate_green` is read as the present-tense fact it is —
+  a pass recorded when the gate was green says nothing about a gate that has
+  since gone red. On top of rung 5's five guards it adds five more, all about
+  the world between the review and the merge: the review must be for *this*
+  PR (a pass on PR #10 is not a pass on PR #12), it must name the commit it
+  read and that commit must still be the PR's head, the PR must be open and
+  mergeable and not a draft, and the base branch must permit the merge. The
+  merge itself passes `--match-head-commit`, so GitHub refuses too if the
+  head moves in the window between the check and the call.
+
+  That last guard settles a question the ladder had left open: the design
+  names the Lead as sole merge authority, but a repository whose default
+  branch requires an approving review — this one, with `enforce_admins` on
+  and therefore no admin bypass — makes that claim false. Rung 6 resolves it
+  by asking rather than assuming: `execute_merge` reads the base branch's
+  protection rules first and holds with `HumanApprovalRequired` when a human
+  review is required. Protection that cannot be *read* holds as well, because
+  a token without admin scope cannot distinguish "unprotected" from "I am not
+  allowed to know", and treating the second as the first is exactly the
+  inversion that merges into a protected branch.
+
+  Reviews now record the commit SHA they read (`#[serde(default)]`, so every
+  review written before this rung reads back as `None` — which holds, rather
+  than reading as "nothing changed"). Merge attempts are persisted as a
+  seventh append-only drawer kind with a `has_merge` edge, so a hold and a
+  later merge of the same PR are two facts: the audit trail for the only
+  irreversible thing Autopilot does. Both `merge` and `exhaust` take
+  `--dry-run`, which runs every check and every read and writes nothing.
+
 - **Autopilot rung 5: `ironmem autopilot review` decides whether a PR may
   auto-merge.** Rung 4 could carry an issue to a green branch and an open PR,
   but nothing read the diff — and the design is explicit that "no change

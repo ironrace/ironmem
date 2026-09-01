@@ -1,0 +1,890 @@
+//! The GitHub CLI surface — build-ladder rung 6.
+//!
+//! Every GitHub write Autopilot performs goes through `gh`, and every one of
+//! them goes through this module. It is deliberately thin: argv construction
+//! and response parsing, both pure and both unit-tested, behind one
+//! [`GhRunner`] trait so [`super::merge`] and [`super::labels`] can be tested
+//! end-to-end against a real database without touching GitHub.
+//!
+//! # Why `gh` and not the REST API directly
+//!
+//! The spec settles this: "**Auto-merge is the Lead merging that PR** via `gh
+//! pr merge` after reviewer PASS + matching low-risk classification. A GitHub
+//! API merge, not a local push, so the deny-list stays absolute." The deny-list
+//! forbids every IC from pushing a default branch without exception; routing
+//! the merge through GitHub's API rather than a local `git push` is what keeps
+//! that absolute rather than "absolute except for the Lead". `gh` also carries
+//! the human's existing authentication, so Autopilot never handles a token.
+//!
+//! # The error contract
+//!
+//! Mirrors [`super::run::Dispatcher`]'s and [`super::review::ReviewRunner`]'s,
+//! for the same reason: a failure to **start** `gh` is
+//! [`MemoryError::NotFound`], and a `gh` that ran and exited non-zero is
+//! **not** an `Err` at all — it is a [`GhOutput`] with `success: false`. That
+//! split is load-bearing here. "The label already exists" and "HTTP 403" both
+//! arrive as a non-zero exit, and only the caller knows which of them is
+//! benign; collapsing them into `Err` would make [`super::labels::ensure_labels`]
+//! usable exactly once per repo.
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use serde::Deserialize;
+
+use super::labels::AgentLabel;
+use super::IssueRef;
+use crate::error::MemoryError;
+
+/// Lowercased substrings that identify `gh label create`'s "this label is
+/// already here" refusal, as opposed to a real failure.
+///
+/// Matched against the *lowercased* concatenation of stdout and stderr, and
+/// deliberately more than one phrasing: `gh` has surfaced this as both its
+/// own message and a passed-through `HTTP 422` from the API, and a future
+/// version could reword either. Missing a phrasing degrades safely — the
+/// label is reported as an error rather than as already-present, which is
+/// noisy but never wrong in the dangerous direction.
+pub(crate) const LABEL_ALREADY_EXISTS_MARKERS: [&str; 3] =
+    ["already exists", "already been taken", "http 422"];
+
+/// One `gh` invocation's result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GhOutput {
+    pub stdout: String,
+    pub stderr: String,
+    pub success: bool,
+    pub code: Option<i32>,
+}
+
+impl GhOutput {
+    #[cfg(test)]
+    pub(crate) fn ok(stdout: &str) -> Self {
+        Self {
+            stdout: stdout.to_string(),
+            stderr: String::new(),
+            success: true,
+            code: Some(0),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn failed(stdout: &str, stderr: &str) -> Self {
+        Self {
+            stdout: stdout.to_string(),
+            stderr: stderr.to_string(),
+            success: false,
+            code: Some(1),
+        }
+    }
+}
+
+/// How the merge and label paths reach GitHub.
+///
+/// A trait for the same reason [`super::run::Dispatcher`] and
+/// [`super::review::ReviewRunner`] are: it makes the policy layer — the merge
+/// guards, the label transitions, the exhaustion summary — testable against a
+/// real database without performing an irreversible GitHub write. Rung 6's
+/// actions are the first in the whole ladder that a test cannot undo, so this
+/// is the rung where that pattern stops being a convenience.
+pub trait GhRunner {
+    /// Run `gh` with `args`. A failure to **spawn** is
+    /// [`MemoryError::NotFound`]; a non-zero exit is a successful call
+    /// returning `success: false`.
+    fn run(&mut self, args: &[String]) -> Result<GhOutput, MemoryError>;
+}
+
+/// Locate the `gh` binary on `PATH`, reusing `launcher`'s own binary
+/// validation exactly as [`super::review::resolve_codex_binary`] does.
+pub fn resolve_gh_binary() -> Result<PathBuf, MemoryError> {
+    crate::launcher::find_on_path("gh")
+}
+
+/// The real `gh`, run in a working directory.
+pub struct GhCli {
+    bin: PathBuf,
+    cwd: PathBuf,
+}
+
+impl GhCli {
+    /// Resolve `gh` on PATH and pin the directory it runs in.
+    ///
+    /// The cwd matters even though every argv passes `--repo` explicitly:
+    /// `gh` reads its configuration and host resolution relative to where it
+    /// runs. `--repo` is still passed everywhere so the target can never be
+    /// inferred from whatever happens to be checked out — Autopilot works
+    /// several repos, and a cwd-inferred target would be the one mistake in
+    /// this module that merges the wrong thing.
+    pub fn resolve(cwd: impl Into<PathBuf>) -> Result<Self, MemoryError> {
+        Ok(Self {
+            bin: resolve_gh_binary()?,
+            cwd: cwd.into(),
+        })
+    }
+
+    pub fn binary(&self) -> &Path {
+        &self.bin
+    }
+}
+
+impl GhRunner for GhCli {
+    fn run(&mut self, args: &[String]) -> Result<GhOutput, MemoryError> {
+        let output = Command::new(&self.bin)
+            .args(args)
+            .current_dir(&self.cwd)
+            .output()
+            .map_err(|e| {
+                MemoryError::NotFound(format!(
+                    "failed to start {} {}: {e}",
+                    self.bin.display(),
+                    args.join(" ")
+                ))
+            })?;
+        Ok(GhOutput {
+            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+            success: output.status.success(),
+            code: output.status.code(),
+        })
+    }
+}
+
+// ── argv builders ───────────────────────────────────────────────────────
+//
+// All pure, all returning owned `Vec<String>` so a test can assert on the
+// exact command line without running it. Every one passes `--repo` rather
+// than relying on the working directory; see `GhCli::resolve`.
+
+/// `gh label create <name> --repo R --color C --description D`.
+pub fn label_create_argv(repo: &str, label: AgentLabel) -> Vec<String> {
+    vec![
+        "label".into(),
+        "create".into(),
+        label.as_str().into(),
+        "--repo".into(),
+        repo.into(),
+        "--color".into(),
+        label.color().into(),
+        "--description".into(),
+        label.description().into(),
+    ]
+}
+
+/// `gh issue view N --repo R --json labels`.
+pub fn issue_view_labels_argv(issue: &IssueRef) -> Vec<String> {
+    vec![
+        "issue".into(),
+        "view".into(),
+        issue.number.to_string(),
+        "--repo".into(),
+        issue.repo.clone(),
+        "--json".into(),
+        "labels".into(),
+    ]
+}
+
+/// `gh issue edit N --repo R [--add-label L]... [--remove-label L]...`.
+pub fn issue_edit_labels_argv(issue: &IssueRef, add: &[String], remove: &[String]) -> Vec<String> {
+    let mut argv = vec![
+        "issue".into(),
+        "edit".into(),
+        issue.number.to_string(),
+        "--repo".into(),
+        issue.repo.clone(),
+    ];
+    for label in add {
+        argv.push("--add-label".into());
+        argv.push(label.clone());
+    }
+    for label in remove {
+        argv.push("--remove-label".into());
+        argv.push(label.clone());
+    }
+    argv
+}
+
+/// `gh issue comment N --repo R --body <body>`.
+///
+/// The body is a single argv element rather than a here-doc on stdin because
+/// [`GhRunner`] deliberately has no stdin channel — one input surface is one
+/// thing to get wrong. Every body this module sends is rendered by
+/// [`super::merge`] with a fixed literal prefix and bounded length, so it is
+/// neither large enough to approach an argv limit nor able to begin with a
+/// `-`. That is a property of the callers, not a guarantee of `--body`.
+pub fn issue_comment_argv(issue: &IssueRef, body: &str) -> Vec<String> {
+    vec![
+        "issue".into(),
+        "comment".into(),
+        issue.number.to_string(),
+        "--repo".into(),
+        issue.repo.clone(),
+        "--body".into(),
+        body.into(),
+    ]
+}
+
+/// The `--json` field list [`parse_pr_view`] expects, as one comma-separated
+/// value. Named so the builder and the parser cannot drift apart.
+pub const PR_VIEW_FIELDS: &str =
+    "state,isDraft,mergeable,mergeStateStatus,baseRefName,headRefName,headRefOid,url";
+
+/// `gh pr view N --repo R --json <PR_VIEW_FIELDS>`.
+pub fn pr_view_argv(repo: &str, pr_number: u64) -> Vec<String> {
+    vec![
+        "pr".into(),
+        "view".into(),
+        pr_number.to_string(),
+        "--repo".into(),
+        repo.into(),
+        "--json".into(),
+        PR_VIEW_FIELDS.into(),
+    ]
+}
+
+/// How a merge is performed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MergeStrategy {
+    Squash,
+    Merge,
+    Rebase,
+}
+
+impl MergeStrategy {
+    /// The `gh pr merge` flag selecting this strategy. `gh` requires exactly
+    /// one of them and errors if none is given, so this is never optional.
+    pub fn as_flag(self) -> &'static str {
+        match self {
+            MergeStrategy::Squash => "--squash",
+            MergeStrategy::Merge => "--merge",
+            MergeStrategy::Rebase => "--rebase",
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MergeStrategy::Squash => "squash",
+            MergeStrategy::Merge => "merge",
+            MergeStrategy::Rebase => "rebase",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "squash" => Some(MergeStrategy::Squash),
+            "merge" => Some(MergeStrategy::Merge),
+            "rebase" => Some(MergeStrategy::Rebase),
+            _ => None,
+        }
+    }
+}
+
+impl Default for MergeStrategy {
+    /// Squash, because an Autopilot PR's intermediate commits are one IC's
+    /// dispatch-by-dispatch working history — lineage already records that
+    /// history in a form built for reading, and replaying it onto the default
+    /// branch would be the second copy.
+    fn default() -> Self {
+        MergeStrategy::Squash
+    }
+}
+
+/// `gh pr merge N --repo R <strategy> [--delete-branch]`.
+///
+/// `--match-head-commit` is passed by [`super::merge`] separately, not here,
+/// because it needs the SHA the reviewer actually read; see
+/// [`pr_merge_argv_at`].
+pub fn pr_merge_argv(
+    repo: &str,
+    pr_number: u64,
+    strategy: MergeStrategy,
+    delete_branch: bool,
+) -> Vec<String> {
+    let mut argv = vec![
+        "pr".into(),
+        "merge".into(),
+        pr_number.to_string(),
+        "--repo".into(),
+        repo.into(),
+        strategy.as_flag().into(),
+    ];
+    if delete_branch {
+        argv.push("--delete-branch".into());
+    }
+    argv
+}
+
+/// [`pr_merge_argv`] plus `--match-head-commit <sha>`.
+///
+/// This is the merge argv Autopilot actually uses. The flag makes GitHub
+/// itself refuse the merge if the PR's head has moved since `sha`, which
+/// closes the window between [`super::merge`]'s own head check and the merge
+/// call: a push landing in that window would otherwise merge a commit no
+/// reviewer ever read, which is the one thing the spec's goal 5 forbids
+/// outright. Our own check is still performed first, because it produces a
+/// hold reason a human can act on rather than a `gh` error string.
+pub fn pr_merge_argv_at(
+    repo: &str,
+    pr_number: u64,
+    strategy: MergeStrategy,
+    delete_branch: bool,
+    head_sha: &str,
+) -> Vec<String> {
+    let mut argv = pr_merge_argv(repo, pr_number, strategy, delete_branch);
+    argv.push("--match-head-commit".into());
+    argv.push(head_sha.into());
+    argv
+}
+
+/// `gh api repos/{repo}/branches/{branch}/protection`.
+pub fn branch_protection_argv(repo: &str, branch: &str) -> Vec<String> {
+    vec![
+        "api".into(),
+        format!("repos/{repo}/branches/{branch}/protection"),
+    ]
+}
+
+// ── responses ───────────────────────────────────────────────────────────
+
+/// A pull request as GitHub currently sees it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PrSnapshot {
+    /// `OPEN`, `CLOSED` or `MERGED`, verbatim.
+    pub state: String,
+    pub is_draft: bool,
+    /// `MERGEABLE`, `CONFLICTING` or `UNKNOWN`, verbatim.
+    pub mergeable: String,
+    /// `CLEAN`, `BLOCKED`, `BEHIND`, `DIRTY`, `UNSTABLE`, `HAS_HOOKS`,
+    /// `DRAFT` or `UNKNOWN`, verbatim.
+    pub merge_state_status: String,
+    pub base_ref_name: String,
+    pub head_ref_name: String,
+    /// The commit at the head of the PR right now. The single most important
+    /// field in this struct: it is what a recorded review's head SHA is
+    /// compared against.
+    pub head_ref_oid: String,
+    pub url: String,
+}
+
+#[derive(Deserialize)]
+struct PrViewJson {
+    state: String,
+    #[serde(rename = "isDraft", default)]
+    is_draft: bool,
+    #[serde(default)]
+    mergeable: String,
+    #[serde(rename = "mergeStateStatus", default)]
+    merge_state_status: String,
+    #[serde(rename = "baseRefName", default)]
+    base_ref_name: String,
+    #[serde(rename = "headRefName", default)]
+    head_ref_name: String,
+    #[serde(rename = "headRefOid", default)]
+    head_ref_oid: String,
+    #[serde(default)]
+    url: String,
+}
+
+/// Parse `gh pr view --json <PR_VIEW_FIELDS>` output.
+///
+/// `state` is the only required field: every other one has a `#[serde(default)]`
+/// so a `gh` that drops or renames a field yields an empty string rather than
+/// an error. Empty is the safe value throughout — an empty `head_ref_oid`
+/// matches no recorded review, and an empty `merge_state_status` is not
+/// `CLEAN` — so a schema drift degrades to "hold for a human", never to a
+/// merge.
+pub fn parse_pr_view(stdout: &str) -> Result<PrSnapshot, MemoryError> {
+    let raw: PrViewJson = serde_json::from_str(stdout.trim()).map_err(|e| {
+        MemoryError::Validation(format!("could not parse `gh pr view --json` output: {e}"))
+    })?;
+    Ok(PrSnapshot {
+        state: raw.state,
+        is_draft: raw.is_draft,
+        mergeable: raw.mergeable,
+        merge_state_status: raw.merge_state_status,
+        base_ref_name: raw.base_ref_name,
+        head_ref_name: raw.head_ref_name,
+        head_ref_oid: raw.head_ref_oid,
+        url: raw.url,
+    })
+}
+
+/// Fetch a PR's current state.
+pub fn pr_snapshot(
+    gh: &mut dyn GhRunner,
+    repo: &str,
+    pr_number: u64,
+) -> Result<PrSnapshot, MemoryError> {
+    let out = gh.run(&pr_view_argv(repo, pr_number))?;
+    if !out.success {
+        return Err(MemoryError::NotFound(format!(
+            "gh pr view {pr_number} failed on {repo} (exit {:?}): {}",
+            out.code,
+            out.stderr.trim()
+        )));
+    }
+    parse_pr_view(&out.stdout)
+}
+
+#[derive(Deserialize)]
+struct IssueLabelsJson {
+    #[serde(default)]
+    labels: Vec<LabelJson>,
+}
+
+#[derive(Deserialize)]
+struct LabelJson {
+    #[serde(default)]
+    name: String,
+}
+
+/// Parse `gh issue view --json labels` output into bare label names.
+pub fn parse_issue_labels(stdout: &str) -> Result<Vec<String>, MemoryError> {
+    let raw: IssueLabelsJson = serde_json::from_str(stdout.trim()).map_err(|e| {
+        MemoryError::Validation(format!(
+            "could not parse `gh issue view --json labels`: {e}"
+        ))
+    })?;
+    Ok(raw
+        .labels
+        .into_iter()
+        .map(|l| l.name)
+        .filter(|n| !n.is_empty())
+        .collect())
+}
+
+/// Read an issue's current label names.
+pub fn issue_labels(gh: &mut dyn GhRunner, issue: &IssueRef) -> Result<Vec<String>, MemoryError> {
+    let out = gh.run(&issue_view_labels_argv(issue))?;
+    if !out.success {
+        return Err(MemoryError::NotFound(format!(
+            "gh issue view {} failed (exit {:?}): {}",
+            issue.canonical(),
+            out.code,
+            out.stderr.trim()
+        )));
+    }
+    parse_issue_labels(&out.stdout)
+}
+
+/// Post a comment on an issue.
+pub fn comment_on_issue(
+    gh: &mut dyn GhRunner,
+    issue: &IssueRef,
+    body: &str,
+) -> Result<(), MemoryError> {
+    let out = gh.run(&issue_comment_argv(issue, body))?;
+    if !out.success {
+        return Err(MemoryError::Validation(format!(
+            "gh issue comment failed for {} (exit {:?}): {}",
+            issue.canonical(),
+            out.code,
+            out.stderr.trim()
+        )));
+    }
+    Ok(())
+}
+
+/// What a base branch's protection rules say about human approval.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "protection", rename_all = "snake_case")]
+pub enum BranchProtection {
+    /// The branch has no protection rules, or none that require an approving
+    /// review. A merge may proceed on Autopilot's own authority.
+    NoHumanApprovalRequired,
+    /// The branch requires at least one approving review. Autopilot cannot
+    /// supply one — a review it wrote would not be independent even if the
+    /// API allowed it — so the PR waits.
+    HumanApprovalRequired {
+        required_approving_review_count: u64,
+        /// Whether the rule also applies to administrators. When true there
+        /// is no bypass at all, which is the case for this very repository.
+        enforce_admins: bool,
+    },
+    /// The protection rules could not be read. **Not** the same as "no
+    /// protection": the commonest cause is a token without admin scope on the
+    /// repo, and treating an unreadable rule as an absent one is exactly the
+    /// inversion that would merge into a protected branch.
+    Unknown { detail: String },
+}
+
+impl BranchProtection {
+    /// Whether a merge may proceed. `Unknown` answers `false` — the whole
+    /// point of the variant.
+    pub fn permits_autopilot_merge(&self) -> bool {
+        matches!(self, BranchProtection::NoHumanApprovalRequired)
+    }
+}
+
+#[derive(Deserialize)]
+struct ProtectionJson {
+    #[serde(default)]
+    required_pull_request_reviews: Option<RequiredReviewsJson>,
+    #[serde(default)]
+    enforce_admins: Option<EnabledJson>,
+}
+
+#[derive(Deserialize)]
+struct RequiredReviewsJson {
+    #[serde(default)]
+    required_approving_review_count: u64,
+}
+
+#[derive(Deserialize)]
+struct EnabledJson {
+    #[serde(default)]
+    enabled: bool,
+}
+
+/// Parse a successful `gh api .../protection` response.
+pub fn parse_branch_protection(stdout: &str) -> Result<BranchProtection, MemoryError> {
+    let raw: ProtectionJson = serde_json::from_str(stdout.trim()).map_err(|e| {
+        MemoryError::Validation(format!("could not parse branch protection response: {e}"))
+    })?;
+    let count = raw
+        .required_pull_request_reviews
+        .map(|r| r.required_approving_review_count)
+        .unwrap_or(0);
+    if count == 0 {
+        return Ok(BranchProtection::NoHumanApprovalRequired);
+    }
+    Ok(BranchProtection::HumanApprovalRequired {
+        required_approving_review_count: count,
+        enforce_admins: raw.enforce_admins.map(|e| e.enabled).unwrap_or(false),
+    })
+}
+
+/// Read a base branch's protection rules.
+///
+/// # Why a 404 is a success and everything else is not
+///
+/// GitHub returns `404 Not Found` for a branch with no protection at all, so
+/// that specific failure is the *good* answer and is mapped to
+/// [`BranchProtection::NoHumanApprovalRequired`]. Every other non-zero exit —
+/// `403` from a token without admin scope, a network failure, an unparseable
+/// body — becomes [`BranchProtection::Unknown`], which holds the PR. The
+/// asymmetry is deliberate and is the single place in this module where a
+/// failed `gh` call is allowed to mean "proceed": 404 is unambiguous, and
+/// treating it as unknown would make Autopilot unable to merge in any
+/// unprotected repo, which is most of them.
+pub fn branch_protection(
+    gh: &mut dyn GhRunner,
+    repo: &str,
+    branch: &str,
+) -> Result<BranchProtection, MemoryError> {
+    let out = gh.run(&branch_protection_argv(repo, branch))?;
+    if out.success {
+        return parse_branch_protection(&out.stdout);
+    }
+    let haystack = format!("{} {}", out.stdout, out.stderr).to_lowercase();
+    if haystack.contains("404") || haystack.contains("branch not protected") {
+        return Ok(BranchProtection::NoHumanApprovalRequired);
+    }
+    Ok(BranchProtection::Unknown {
+        detail: format!(
+            "gh api branch protection for {repo}@{branch} exited {:?}: {}",
+            out.code,
+            out.stderr.trim()
+        ),
+    })
+}
+
+#[cfg(test)]
+pub(crate) mod testing {
+    use super::*;
+
+    /// A [`GhRunner`] that replays a fixed script and records what it was
+    /// asked to run. The whole reason [`GhRunner`] is a trait.
+    pub(crate) struct ScriptedGh {
+        pub(crate) seen: Vec<Vec<String>>,
+        responses: std::collections::VecDeque<Result<GhOutput, MemoryError>>,
+    }
+
+    impl ScriptedGh {
+        pub(crate) fn new(responses: Vec<Result<GhOutput, MemoryError>>) -> Self {
+            Self {
+                seen: Vec::new(),
+                responses: responses.into(),
+            }
+        }
+    }
+
+    impl GhRunner for ScriptedGh {
+        fn run(&mut self, args: &[String]) -> Result<GhOutput, MemoryError> {
+            self.seen.push(args.to_vec());
+            self.responses.pop_front().unwrap_or_else(|| {
+                panic!(
+                    "ScriptedGh ran out of responses on call {}: {}",
+                    self.seen.len(),
+                    args.join(" ")
+                )
+            })
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::testing::ScriptedGh;
+    use super::*;
+
+    fn issue() -> IssueRef {
+        IssueRef::new("owner/repo", 42)
+    }
+
+    // ── argv ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn every_argv_targets_the_repo_explicitly() {
+        // A cwd-inferred target is the one mistake in this module that merges
+        // the wrong thing.
+        let argvs = vec![
+            label_create_argv("owner/repo", AgentLabel::Ready),
+            issue_view_labels_argv(&issue()),
+            issue_edit_labels_argv(&issue(), &["agent:ready".into()], &[]),
+            issue_comment_argv(&issue(), "hello"),
+            pr_view_argv("owner/repo", 7),
+            pr_merge_argv("owner/repo", 7, MergeStrategy::Squash, true),
+        ];
+        for argv in argvs {
+            assert!(
+                argv.contains(&"--repo".to_string()),
+                "argv must name the repo: {argv:?}"
+            );
+            assert!(
+                argv.contains(&"owner/repo".to_string()),
+                "argv must name the repo: {argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_pr_view_field_list_covers_every_field_the_parser_reads() {
+        // The builder and the parser drift apart silently otherwise: a field
+        // dropped from the request parses as `default` rather than erroring.
+        for field in [
+            "state",
+            "isDraft",
+            "mergeable",
+            "mergeStateStatus",
+            "baseRefName",
+            "headRefName",
+            "headRefOid",
+            "url",
+        ] {
+            assert!(
+                PR_VIEW_FIELDS.split(',').any(|f| f == field),
+                "{field} must be requested"
+            );
+        }
+    }
+
+    #[test]
+    fn a_merge_argv_always_names_exactly_one_strategy() {
+        for strategy in [
+            MergeStrategy::Squash,
+            MergeStrategy::Merge,
+            MergeStrategy::Rebase,
+        ] {
+            let argv = pr_merge_argv("owner/repo", 7, strategy, false);
+            let flags = argv
+                .iter()
+                .filter(|a| ["--squash", "--merge", "--rebase"].contains(&a.as_str()))
+                .count();
+            assert_eq!(flags, 1, "gh requires exactly one: {argv:?}");
+            assert!(!argv.contains(&"--delete-branch".to_string()));
+        }
+    }
+
+    #[test]
+    fn the_merge_argv_pins_the_head_commit() {
+        // Closes the window between our head check and the merge call: a push
+        // landing in it would merge a commit no reviewer read.
+        let argv = pr_merge_argv_at("owner/repo", 7, MergeStrategy::Squash, true, "abc123");
+        let idx = argv
+            .iter()
+            .position(|a| a == "--match-head-commit")
+            .expect("the head commit must be pinned");
+        assert_eq!(argv[idx + 1], "abc123");
+        assert!(argv.contains(&"--delete-branch".to_string()));
+    }
+
+    #[test]
+    fn merge_strategy_parses_case_insensitively_and_rejects_junk() {
+        assert_eq!(MergeStrategy::parse("SQUASH"), Some(MergeStrategy::Squash));
+        assert_eq!(
+            MergeStrategy::parse(" rebase "),
+            Some(MergeStrategy::Rebase)
+        );
+        assert_eq!(MergeStrategy::parse("fast-forward"), None);
+        assert_eq!(MergeStrategy::default(), MergeStrategy::Squash);
+    }
+
+    #[test]
+    fn label_edit_argv_emits_one_flag_per_label() {
+        let argv = issue_edit_labels_argv(
+            &issue(),
+            &["agent:exhausted".into()],
+            &["agent:ready".into(), "agent:blocked".into()],
+        );
+        assert_eq!(
+            argv.iter().filter(|a| *a == "--add-label").count(),
+            1,
+            "{argv:?}"
+        );
+        assert_eq!(
+            argv.iter().filter(|a| *a == "--remove-label").count(),
+            2,
+            "{argv:?}"
+        );
+    }
+
+    #[test]
+    fn the_protection_argv_is_the_rest_path_for_the_base_branch() {
+        assert_eq!(
+            branch_protection_argv("owner/repo", "main"),
+            vec![
+                "api".to_string(),
+                "repos/owner/repo/branches/main/protection".to_string()
+            ]
+        );
+    }
+
+    // ── parsing ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn a_pr_view_response_parses_every_field() {
+        let snap = parse_pr_view(
+            r#"{"state":"OPEN","isDraft":false,"mergeable":"MERGEABLE",
+                "mergeStateStatus":"CLEAN","baseRefName":"main",
+                "headRefName":"autopilot/owner-repo-42","headRefOid":"deadbeef",
+                "url":"https://github.com/owner/repo/pull/7"}"#,
+        )
+        .unwrap();
+        assert_eq!(snap.state, "OPEN");
+        assert!(!snap.is_draft);
+        assert_eq!(snap.head_ref_oid, "deadbeef");
+        assert_eq!(snap.base_ref_name, "main");
+    }
+
+    #[test]
+    fn a_missing_field_degrades_to_empty_not_to_an_error() {
+        // Schema drift in `gh` must fail toward "hold", not toward a merge:
+        // an empty head oid matches no recorded review and an empty merge
+        // state is not CLEAN.
+        let snap = parse_pr_view(r#"{"state":"OPEN"}"#).unwrap();
+        assert_eq!(snap.head_ref_oid, "");
+        assert_eq!(snap.merge_state_status, "");
+        assert_eq!(snap.mergeable, "");
+    }
+
+    #[test]
+    fn unparseable_pr_view_output_is_an_error() {
+        assert!(parse_pr_view("not json").is_err());
+    }
+
+    #[test]
+    fn issue_labels_parse_to_bare_names() {
+        let names = parse_issue_labels(
+            r#"{"labels":[{"name":"agent:ready","color":"0e8a16"},{"name":"bug"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(names, vec!["agent:ready".to_string(), "bug".to_string()]);
+    }
+
+    #[test]
+    fn an_issue_with_no_labels_parses_to_an_empty_list() {
+        assert!(parse_issue_labels(r#"{"labels":[]}"#).unwrap().is_empty());
+        assert!(parse_issue_labels(r#"{}"#).unwrap().is_empty());
+    }
+
+    // ── branch protection ───────────────────────────────────────────────
+
+    #[test]
+    fn a_branch_requiring_an_approval_blocks_autopilot() {
+        let p = parse_branch_protection(
+            r#"{"required_pull_request_reviews":{"required_approving_review_count":1},
+                "enforce_admins":{"enabled":true}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            p,
+            BranchProtection::HumanApprovalRequired {
+                required_approving_review_count: 1,
+                enforce_admins: true,
+            }
+        );
+        assert!(!p.permits_autopilot_merge());
+    }
+
+    #[test]
+    fn protection_without_a_review_requirement_permits_a_merge() {
+        let p = parse_branch_protection(
+            r#"{"required_status_checks":{"strict":true},"enforce_admins":{"enabled":false}}"#,
+        )
+        .unwrap();
+        assert_eq!(p, BranchProtection::NoHumanApprovalRequired);
+        assert!(p.permits_autopilot_merge());
+    }
+
+    #[test]
+    fn a_zero_approval_requirement_is_not_a_requirement() {
+        let p = parse_branch_protection(
+            r#"{"required_pull_request_reviews":{"required_approving_review_count":0}}"#,
+        )
+        .unwrap();
+        assert_eq!(p, BranchProtection::NoHumanApprovalRequired);
+    }
+
+    #[test]
+    fn a_404_means_the_branch_is_simply_unprotected() {
+        let mut gh = ScriptedGh::new(vec![Ok(GhOutput::failed(
+            "",
+            "gh: Branch not protected (HTTP 404)",
+        ))]);
+        let p = branch_protection(&mut gh, "owner/repo", "main").unwrap();
+        assert_eq!(p, BranchProtection::NoHumanApprovalRequired);
+    }
+
+    #[test]
+    fn a_403_is_unknown_and_therefore_blocks() {
+        // The inversion that would merge into a protected branch: a token
+        // without admin scope cannot read protection, and "cannot read" is
+        // not "not protected".
+        let mut gh = ScriptedGh::new(vec![Ok(GhOutput::failed("", "HTTP 403: Forbidden"))]);
+        let p = branch_protection(&mut gh, "owner/repo", "main").unwrap();
+        assert!(matches!(p, BranchProtection::Unknown { .. }));
+        assert!(!p.permits_autopilot_merge());
+    }
+
+    #[test]
+    fn a_spawn_failure_propagates_rather_than_reading_as_unprotected() {
+        let mut gh = ScriptedGh::new(vec![Err(MemoryError::NotFound("no gh".into()))]);
+        assert!(branch_protection(&mut gh, "owner/repo", "main").is_err());
+    }
+
+    // ── runner plumbing ─────────────────────────────────────────────────
+
+    #[test]
+    fn a_failed_pr_view_is_an_error_not_an_empty_snapshot() {
+        let mut gh = ScriptedGh::new(vec![Ok(GhOutput::failed("", "no such PR"))]);
+        assert!(pr_snapshot(&mut gh, "owner/repo", 7).is_err());
+    }
+
+    #[test]
+    fn a_failed_comment_is_an_error() {
+        let mut gh = ScriptedGh::new(vec![Ok(GhOutput::failed("", "HTTP 403"))]);
+        assert!(comment_on_issue(&mut gh, &issue(), "body").is_err());
+    }
+
+    #[test]
+    fn the_already_exists_markers_are_matched_lowercased() {
+        for marker in LABEL_ALREADY_EXISTS_MARKERS {
+            assert_eq!(
+                marker,
+                marker.to_lowercase(),
+                "markers are compared against a lowercased haystack"
+            );
+        }
+    }
+}

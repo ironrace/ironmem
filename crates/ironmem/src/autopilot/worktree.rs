@@ -45,6 +45,31 @@ pub const BRANCH_PREFIX: &str = "autopilot";
 /// timestamp so quarantining twice never collides.
 const QUARANTINE_INFIX: &str = "quarantine";
 
+/// Resolve `rev` to a full commit SHA inside `repo_dir`.
+///
+/// Returns `Ok(None)` — never an `Err` — when the revision does not exist,
+/// because every caller of this is answering "which commit did we review?"
+/// and the answer "we could not tell" is a legitimate one that rung 6 fails
+/// closed on ([`super::review::RecordedReviewSummary::head_sha`]). A hard
+/// error here would instead abort a review that was otherwise about to
+/// produce a usable verdict.
+pub fn resolve_commit(repo_dir: &Path, rev: &str) -> Option<String> {
+    let sha = git(
+        repo_dir,
+        &["rev-parse", "--verify", &format!("{rev}^{{commit}}")],
+    )
+    .ok()?;
+    let sha = sha.trim();
+    // `rev-parse --verify` prints exactly one 40-char object name on success.
+    // Anything else means we are not looking at what we think we are, and a
+    // half-parsed SHA compared against a PR head would silently never match.
+    if sha.len() == 40 && sha.chars().all(|c| c.is_ascii_hexdigit()) {
+        Some(sha.to_string())
+    } else {
+        None
+    }
+}
+
 /// The branch an issue's worktree checks out: `autopilot/<repo-slug>-<n>`.
 ///
 /// Uses [`IssueRef::slug`] (the full `owner-repo-number` form) rather than a
