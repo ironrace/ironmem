@@ -881,6 +881,12 @@ pub fn record_review(db: &Database, record: &ReviewRecord) -> Result<RecordedRev
 /// One recorded review, as read back from storage.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RecordedReviewSummary {
+    /// The issue this review hangs off, in canonical `repo#number` form.
+    ///
+    /// Surfaced so callers can filter on it: `repo_slug` collapses
+    /// `owner/repo` and `owner-repo` onto one lineage entity, so an issue's
+    /// reviews are not by themselves guaranteed to be *its* reviews.
+    pub issue: String,
     pub pr_number: u64,
     pub dispatch_class: String,
     /// The commit this review read. `None` for a review recorded before the
@@ -942,6 +948,7 @@ pub fn reviews_for_issue(
         };
         let body: ReviewBody = serde_json::from_str(&drawer.content)?;
         records.push(RecordedReviewSummary {
+            issue: body.issue,
             pr_number: body.pr_number,
             dispatch_class: body.dispatch_class,
             head_sha: body.head_sha,

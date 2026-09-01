@@ -119,6 +119,20 @@ pub fn exhaust_issue(
         .any(|l| AgentLabel::from_label_str(l) == Some(AgentLabel::Exhausted));
 
     if already {
+        // The label is on, so the notice has nothing left to bridge. Cleaned
+        // up *here* as well as after the label write, because a delete that
+        // failed there — `SQLITE_BUSY` from a concurrent writer, or a process
+        // killed between two statements — would otherwise leave the notice
+        // immortal: every later round returns from this branch without ever
+        // consulting it, and the one round that *does* consult it is the one
+        // where a human has removed the label to ask for another pass. That
+        // round would then re-apply the stop sign with no explanation, which
+        // is the exact failure the notice was introduced to prevent.
+        //
+        // Ignored on failure for the same reason it is safe to repeat: this
+        // path runs on every poll of an exhausted issue, so the next one
+        // tries again.
+        let _ = clear_exhaustion_notice(db, issue);
         return Ok(ExhaustExecution {
             issue: issue.clone(),
             outcome: ExhaustOutcome::AlreadyExhausted,
@@ -180,9 +194,14 @@ pub fn exhaust_issue(
     // explanation on the issue, silently reverting the one intervention the
     // summary had just invited.
     //
-    // A failed delete is harmless: the next round sees `agent:exhausted` and
-    // stops at the check above without consulting the notice at all.
-    clear_exhaustion_notice(db, issue)?;
+    // Not propagated. The comment is posted and the label is applied — the
+    // work of this function is done and cannot be undone, so a failed local
+    // delete must not report it as a failed run. (Same rule as
+    // `merge::split_label_result`: a later failure never erases the report of
+    // an action that already happened.) The leak it leaves is bounded: the
+    // `AlreadyExhausted` branch above retries this delete on every
+    // subsequent poll.
+    let _ = clear_exhaustion_notice(db, issue);
 
     Ok(ExhaustExecution {
         issue: issue.clone(),
@@ -221,7 +240,16 @@ fn exhaustion_notice_posted(db: &Database, issue: &IssueRef) -> Result<bool, Mem
     // rather than trusted. Same hazard `RecordedMergeSummary::says_the_same_as`
     // guards against, and the same answer: assert the invariant, do not
     // assume it.
-    let body: serde_json::Value = serde_json::from_str(&drawer.content)?;
+    // A drawer that will not parse reads as "no notice", never as an error.
+    // Propagating here aborted `exhaust_issue` outright, so the issue was
+    // never labeled `agent:exhausted` and the budget livelock this module
+    // exists to stop just kept running — with nobody told. The worst case of
+    // treating it as absent is one duplicate comment. The logical-key space
+    // is shared with `add_drawer`, so a foreign writer landing on this id is
+    // reachable, not theoretical.
+    let Ok(body) = serde_json::from_str::<serde_json::Value>(&drawer.content) else {
+        return Ok(false);
+    };
     Ok(body["issue"].as_str() == Some(issue.canonical().as_str()))
 }
 
@@ -549,18 +577,39 @@ are read once, not again inside the label write: {:?}",
                 },
             )
             .unwrap();
-            let mut gh_runner = ScriptedGh::new(vec![
-                Ok(GhOutput::ok(r#"{"labels":[]}"#)),
-                Ok(GhOutput::ok("")),
-                Ok(GhOutput::failed("", "label already exists")),
-                Ok(GhOutput::ok("")),
-            ]);
-            let exec = exhaust_issue(&mut gh_runner, &database, issue, false).unwrap();
-            let ExhaustOutcome::Exhausted { commented, .. } = exec.outcome else {
-                panic!("expected Exhausted for {}", issue.canonical());
-            };
-            assert!(commented, "{} must get its own summary", issue.canonical());
         }
+
+        // `a` exhausts but its label write *fails*, so `a`'s notice survives
+        // in the shared key. Without that the notice would be cleaned up and
+        // this test would pass against a plain `.is_some()` check, proving
+        // nothing.
+        let mut gh_runner = ScriptedGh::new(vec![
+            Ok(GhOutput::ok(r#"{"labels":[]}"#)),
+            Ok(GhOutput::ok("")),
+            Ok(GhOutput::failed("", "label already exists")),
+            Ok(GhOutput::failed("", "HTTP 403: Forbidden")),
+        ]);
+        exhaust_issue(&mut gh_runner, &database, &a, false).unwrap_err();
+        assert!(
+            crate::autopilot::read_current(&database, &exhaustion_notice_key(&b))
+                .unwrap()
+                .is_some(),
+            "the collision requires a's notice to be readable under b's key"
+        );
+
+        // `b` must still get its own summary, which only the canonical check
+        // inside `exhaustion_notice_posted` can deliver.
+        let mut gh_runner = ScriptedGh::new(vec![
+            Ok(GhOutput::ok(r#"{"labels":[]}"#)),
+            Ok(GhOutput::ok("")),
+            Ok(GhOutput::failed("", "label already exists")),
+            Ok(GhOutput::ok("")),
+        ]);
+        let exec = exhaust_issue(&mut gh_runner, &database, &b, false).unwrap();
+        let ExhaustOutcome::Exhausted { commented, .. } = exec.outcome else {
+            panic!("expected Exhausted for {}", b.canonical());
+        };
+        assert!(commented, "{} must get its own summary", b.canonical());
     }
 
     #[test]

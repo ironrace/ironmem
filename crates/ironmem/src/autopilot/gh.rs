@@ -827,11 +827,16 @@ pub fn branch_protection(
 
     Ok(match (classic, rules) {
         // Both endpoints answered, neither requires a review.
-        // Spelled out rather than `Answered(_)`: the wildcard would map a
-        // hypothetical `Answered(Unknown)` to "proceed". That is unreachable
-        // only because `parse_branch_protection` never returns `Unknown` —
-        // a property of a `pub` function that nothing here enforces. Naming
-        // the variant makes the compiler keep the promise.
+        // An unreadable classic answer holds, wherever it came from. This
+        // arm is unreachable today — `parse_branch_protection` never returns
+        // `Unknown` — but it is what actually stops the catch-all below from
+        // handing back `NoHumanApprovalRequired` if that ever changes.
+        // Spelling the *permitting* arm precisely is not enough on its own,
+        // because the catch-all returns `other`, and `other` can be
+        // `NoHumanApprovalRequired`.
+        (ClassicProtection::Answered(unknown @ BranchProtection::Unknown { .. }), _) => unknown,
+        // Spelled out rather than `Answered(_)`, so the one classic answer
+        // that permits a merge has to be named to get one.
         (
             ClassicProtection::Answered(BranchProtection::NoHumanApprovalRequired)
             | ClassicProtection::Absent,

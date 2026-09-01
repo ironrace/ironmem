@@ -829,19 +829,28 @@ fn finish(
         // any queue. Commented once — `repeat` suppresses the second — so
         // the issue records that Autopilot saw it and stood down.
         (MergeOutcome::AlreadyMerged { .. }, _) => {
+            // The labels are cleared *before* the comment is written, for
+            // the reason the hold arm reads them first: the comment says
+            // what happened to them. Commenting first asserted "every
+            // `agent:*` label has been cleared from this issue" and only
+            // then attempted the clear — so a 403 left that sentence
+            // standing and false, with the dedup below guaranteeing no
+            // later run would ever correct it.
+            //
+            // A label write that fails must not erase the fact that the PR
+            // has landed, so it is reported rather than propagated — the
+            // same rule as the `Merged` arm.
+            (label_plan, label_error) =
+                split_label_result(labels::set_exclusive_label(gh_runner, request.issue, None));
             if repeat.is_none() {
                 gh::comment_on_issue(
                     gh_runner,
                     request.issue,
-                    &render_already_merged_comment(request),
+                    &render_already_merged_comment(request, label_error.is_none()),
                 )?;
                 commented = true;
             }
             record_drawer_id = record_once(db, &record, repeat.as_ref())?;
-            // Same reasoning as the `Merged` arm: the PR has landed, and a
-            // label write that fails must not erase that from the report.
-            (label_plan, label_error) =
-                split_label_result(labels::set_exclusive_label(gh_runner, request.issue, None));
         }
         // Recorded *after* the comment, and the opposite of the merge case
         // for the opposite reason: nothing irreversible has happened, and
@@ -970,15 +979,29 @@ fn hold_stop_label(current: &[String]) -> AgentLabel {
 /// reason: every sentence in that one — "was not merged", "stays open",
 /// "labeled for a human", "re-labeling puts it back in the queue" — is false
 /// of a PR that has landed.
-pub fn render_already_merged_comment(request: &MergeRequest) -> String {
+/// `labels_cleared` is passed in rather than assumed: this comment used to
+/// state the clearing as accomplished fact while being written *before* the
+/// attempt, so a refused `gh issue edit` left a false sentence on the issue
+/// that no later run would correct.
+pub fn render_already_merged_comment(request: &MergeRequest, labels_cleared: bool) -> String {
+    let labels = if labels_cleared {
+        format!(
+            "Every `agent:*` label has been cleared from this issue so it is not picked up \
+again; re-label it `{}` if there is more to do.",
+            AgentLabel::Ready.as_str()
+        )
+    } else {
+        format!(
+            "The `agent:*` labels could **not** be cleared from this issue, so it may be \
+picked up again — remove them by hand, or leave `{}` on it if there is more to do.",
+            AgentLabel::Ready.as_str()
+        )
+    };
     let body = format!(
         "**Autopilot: PR #{pr} is already merged.**\n\n\
-Autopilot did not merge it on this run. Every `agent:*` label has \
-been cleared from this issue so it is not picked up again; re-label it \
-`{ready}` if there is more to do.\n\n\
+Autopilot did not merge it on this run. {labels}\n\n\
 <sub>Autopilot rung 6.</sub>",
         pr = request.pr_number,
-        ready = AgentLabel::Ready.as_str(),
     );
     scrub_and_bound(&body, MAX_COMMENT_CHARS).text
 }
@@ -1273,7 +1296,17 @@ fn latest_review_for_pr(
     pr_number: u64,
 ) -> Result<Option<RecordedReviewSummary>, MemoryError> {
     let reviews: Vec<RecordedReviewSummary> = super::review::reviews_for_issue(db, issue)?;
-    Ok(reviews.into_iter().rfind(|r| r.pr_number == pr_number))
+    // Filtered on the issue as well as the PR, the third place in this
+    // module that must not trust `repo_slug`. It collapses `owner/repo` and
+    // `owner-repo` onto one lineage entity, and a fork pair — plausibly
+    // slug-colliding, plausibly sharing commits — could therefore offer one
+    // repo's `PASS` as a candidate review for the other's PR of the same
+    // number. The head-SHA guard blocks that only while the two heads
+    // differ, which for a fork pair is not something to rely on.
+    let canonical = issue.canonical();
+    Ok(reviews
+        .into_iter()
+        .rfind(|r| r.issue == canonical && r.pr_number == pr_number))
 }
 
 #[cfg(test)]
@@ -1510,8 +1543,8 @@ mod tests {
         let database = db();
         let mut gh_runner = ScriptedGh::new(vec![
             Ok(pr_view_ok("MERGED", HEAD)),
-            Ok(GhOutput::ok("")),
             Ok(GhOutput::ok(r#"{"labels":[{"name":"agent:ready"}]}"#)),
+            Ok(GhOutput::ok("")),
             Ok(GhOutput::ok("")),
         ]);
 
@@ -1530,8 +1563,8 @@ mod tests {
         store_review(&database, 7, Some(HEAD), pass_outcome());
         let mut gh_runner = ScriptedGh::new(vec![
             Ok(pr_view_ok("MERGED", HEAD)),
-            Ok(GhOutput::ok("")),
             Ok(GhOutput::ok(r#"{"labels":[{"name":"agent:ready"}]}"#)),
+            Ok(GhOutput::ok("")),
             Ok(GhOutput::ok("")),
         ]);
 
@@ -1546,6 +1579,62 @@ mod tests {
         .unwrap();
 
         assert!(exec.outcome.landed(), "{:?}", exec.outcome);
+    }
+
+    #[test]
+    fn a_pass_on_a_slug_colliding_issue_does_not_authorize_this_one() {
+        // `repo_slug` maps `/` to `-`, so `own/er-repo#7` and `own-er/repo#7`
+        // share one lineage entity — a fork pair, plausibly sharing commits.
+        // One repo's `PASS` must not authorize the other's PR of the same
+        // number, and the head-SHA guard cannot be relied on to catch it.
+        let database = db();
+        let other = IssueRef::new("own/er-repo", 42);
+        let mine = IssueRef::new("own-er/repo", 42);
+        assert_eq!(other.slug(), mine.slug(), "the collision under test");
+
+        let outcome = pass_outcome();
+        let decision = decide_merge(true, "documentation", outcome.judgment());
+        record_review(
+            &database,
+            &ReviewRecord {
+                issue: other.clone(),
+                pr_number: 7,
+                dispatch_class: "documentation".into(),
+                head_sha: Some(HEAD.into()),
+                base_branch: Some("main".into()),
+                outcome,
+                decision,
+            },
+        )
+        .unwrap();
+
+        let mut gh_runner = ScriptedGh::new(vec![
+            Ok(pr_view_ok("OPEN", HEAD)),
+            Ok(GhOutput::ok(r#"{"labels":[]}"#)),
+            Ok(GhOutput::ok("")),
+            Ok(label_created()),
+            Ok(GhOutput::ok("")),
+        ]);
+        let exec = execute_merge(
+            &database,
+            &mut gh_runner,
+            &MergeRequest {
+                issue: &mine,
+                pr_number: 7,
+                gate_green: true,
+                strategy: MergeStrategy::Squash,
+                delete_branch: true,
+                dry_run: false,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            exec.outcome.hold(),
+            Some(&MergeHold::NotReviewed),
+            "another issue's review is not this one's: {:?}",
+            exec.outcome
+        );
     }
 
     #[test]
@@ -1798,8 +1887,8 @@ mod tests {
         store_review(&database, 7, Some(HEAD), pass_outcome());
         let mut gh_runner = ScriptedGh::new(vec![
             Ok(pr_view_ok("MERGED", HEAD)),
-            Ok(GhOutput::ok("")),
             Ok(GhOutput::ok(r#"{"labels":[{"name":"agent:ready"}]}"#)),
+            Ok(GhOutput::ok("")),
             Ok(GhOutput::ok("")),
         ]);
 
@@ -1823,11 +1912,62 @@ mod tests {
 
     #[test]
     fn the_already_merged_comment_does_not_claim_the_pr_is_open() {
-        let body = render_already_merged_comment(&request(false));
+        let body = render_already_merged_comment(&request(false), true);
         assert!(body.contains("already merged"));
         assert!(!body.contains("was not merged"));
         assert!(!body.contains("stays open"));
         assert!(!body.contains("agent:blocked"));
+    }
+
+    #[test]
+    fn the_already_merged_comment_does_not_claim_a_label_clear_that_failed() {
+        // Written before the clear was attempted, this sentence stood as a
+        // falsehood on the issue whenever `gh issue edit` refused — and the
+        // record dedup guaranteed no later run would correct it.
+        let cleared = render_already_merged_comment(&request(false), true);
+        assert!(cleared.contains("has been cleared"), "{cleared}");
+
+        let failed = render_already_merged_comment(&request(false), false);
+        assert!(
+            !failed.contains("has been cleared"),
+            "must not claim a clear that did not happen: {failed}"
+        );
+        assert!(failed.contains("could **not** be cleared"), "{failed}");
+        assert!(
+            failed.contains("picked up again"),
+            "and must say what that means for the human: {failed}"
+        );
+    }
+
+    #[test]
+    fn an_already_merged_pr_clears_its_labels_before_it_says_it_did() {
+        let database = db();
+        store_review(&database, 7, Some(HEAD), pass_outcome());
+        let mut gh_runner = ScriptedGh::new(vec![
+            Ok(pr_view_ok("MERGED", HEAD)),
+            Ok(GhOutput::ok(r#"{"labels":[{"name":"agent:ready"}]}"#)),
+            Ok(GhOutput::ok("")),
+            Ok(GhOutput::ok("")),
+        ]);
+
+        let exec = execute_merge(&database, &mut gh_runner, &request(false)).unwrap();
+
+        assert!(exec.commented);
+        let label_call = gh_runner
+            .seen
+            .iter()
+            .position(|a| a.contains(&"edit".to_string()))
+            .expect("the labels must be edited");
+        let comment_call = gh_runner
+            .seen
+            .iter()
+            .position(|a| a.contains(&"comment".to_string()))
+            .expect("the issue must be commented on");
+        assert!(
+            label_call < comment_call,
+            "the clear must precede the sentence describing it: {:?}",
+            gh_runner.seen
+        );
     }
 
     #[test]
