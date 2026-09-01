@@ -1349,6 +1349,9 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                                 strategy.as_str()
                             );
                         }
+                        ironmem::autopilot::merge::MergeOutcome::AlreadyMerged { head_sha } => {
+                            println!("  already merged ({head_sha}) — Autopilot did not merge it");
+                        }
                         ironmem::autopilot::merge::MergeOutcome::Held(hold) => {
                             println!("  HELD: {}", hold.summary());
                         }
@@ -1361,7 +1364,15 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                     if exec.commented {
                         println!("  commented on the issue");
                     }
-                    println!("  recorded: {}", exec.record_drawer_id);
+                    println!(
+                        "  {}: {}",
+                        if exec.record_appended {
+                            "recorded"
+                        } else {
+                            "unchanged since"
+                        },
+                        exec.record_drawer_id
+                    );
                 }
                 Ok(())
             }

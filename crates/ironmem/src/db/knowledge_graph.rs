@@ -127,6 +127,39 @@ impl<'a> KnowledgeGraph<'a> {
         Ok(result)
     }
 
+    /// [`Self::query_entity_current`], restricted to a single predicate.
+    ///
+    /// The `limit` in the unrestricted version is applied *before* the caller
+    /// can filter, so an entity whose edges are of several kinds spends one
+    /// budget across all of them: enough `has_merge` edges push every
+    /// `has_review` edge out of the window, and the caller reads "never
+    /// reviewed" rather than erroring. Pushing the predicate into the SQL
+    /// gives each kind its own budget, which is the only way the truncation
+    /// of one kind cannot silently erase another.
+    pub fn query_entity_current_with_predicate(
+        &self,
+        entity_id: &str,
+        predicate: &str,
+        limit: usize,
+    ) -> Result<Vec<Triple>, MemoryError> {
+        let mut stmt = self.db.conn.prepare(
+            "SELECT id, subject, predicate, object, valid_from, valid_to, confidence, source_closet, extracted_at
+             FROM triples
+             WHERE (subject = ?1 OR object = ?1) AND predicate = ?2 AND valid_to IS NULL
+             ORDER BY extracted_at DESC, id ASC
+             LIMIT ?3",
+        )?;
+
+        // Clamped for the same reason as in `query_entity_current`.
+        let bounded = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = stmt.query_map(params![entity_id, predicate, bounded], Self::row_to_triple)?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
     /// Get entity timeline — all triples (including invalidated) sorted by valid_from.
     pub fn timeline_for_entity_id(&self, entity_id: &str) -> Result<Vec<Triple>, MemoryError> {
         let mut stmt = self.db.conn.prepare(
@@ -537,6 +570,68 @@ mod tests {
         // The truncated set is a prefix of the larger set (consistent order).
         let smaller_ids: Vec<&str> = smaller.iter().map(|t| t.id.as_str()).collect();
         assert_eq!(smaller_ids, ids_a[..10]);
+    }
+
+    #[test]
+    fn a_predicate_scoped_query_cannot_be_starved_by_a_busier_predicate() {
+        // The failure this method exists to make unreachable: one entity's
+        // edges are of several kinds, the unrestricted query spends a single
+        // budget across all of them newest-first, and enough edges of the
+        // busy kind push every edge of the quiet kind out of the window. The
+        // caller then reads an empty result and concludes the quiet fact
+        // never happened — a wrong answer, not an error.
+        let db = Database::open_in_memory().unwrap();
+        let kg = KnowledgeGraph::new(&db);
+
+        // The quiet kind first, so it is the *oldest* and therefore the
+        // first to be truncated away.
+        kg.add_triple(
+            "Hub",
+            "issue",
+            "has_review",
+            "R1",
+            "review",
+            None,
+            1.0,
+            None,
+        )
+        .unwrap();
+        for i in 0..20 {
+            kg.add_triple(
+                "Hub",
+                "issue",
+                "has_merge",
+                &format!("M{i:02}"),
+                "merge",
+                None,
+                1.0,
+                None,
+            )
+            .unwrap();
+        }
+        let hub_id = entity_id("hub", "issue");
+
+        // The unrestricted query, with a budget smaller than the busy kind:
+        // the review is gone.
+        let mixed = kg.query_entity_current(&hub_id, 10).unwrap();
+        assert!(
+            !mixed.iter().any(|t| t.predicate == "has_review"),
+            "the starvation this test is about must actually happen"
+        );
+
+        // The scoped query, at the same budget: the review is still there.
+        let reviews = kg
+            .query_entity_current_with_predicate(&hub_id, "has_review", 10)
+            .unwrap();
+        assert_eq!(reviews.len(), 1);
+        assert!(reviews.iter().all(|t| t.predicate == "has_review"));
+
+        // And the busy kind still gets its own full budget.
+        let merges = kg
+            .query_entity_current_with_predicate(&hub_id, "has_merge", 10)
+            .unwrap();
+        assert_eq!(merges.len(), 10);
+        assert!(merges.iter().all(|t| t.predicate == "has_merge"));
     }
 
     #[test]

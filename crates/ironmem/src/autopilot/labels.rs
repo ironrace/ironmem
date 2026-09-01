@@ -258,22 +258,36 @@ pub fn ensure_labels(
     validate_repo(repo)?;
     let mut results = Vec::with_capacity(AgentLabel::ALL.len());
     for label in AgentLabel::ALL {
-        let argv = super::gh::label_create_argv(repo, label);
-        let out = gh.run(&argv)?;
-        if out.success {
-            results.push((label, EnsuredLabel::Created));
-            continue;
-        }
-        if out.mentions_any(&LABEL_ALREADY_EXISTS_MARKERS) {
-            results.push((label, EnsuredLabel::AlreadyPresent));
-            continue;
-        }
-        out.require_success(
-            &format!("gh label create {} on {repo}", label.as_str()),
-            GhFailure::Refused,
-        )?;
+        results.push((label, ensure_label(gh, repo, label)?));
     }
     Ok(results)
+}
+
+/// Create one of the three `agent:*` labels if the repo does not have it.
+///
+/// The unit [`ensure_labels`] is built from, and the unit [`apply_plan`]
+/// needs: a label cannot be added to an issue in a repo that has never
+/// heard of it. `ensure_labels` had exactly one caller — a standalone CLI
+/// subcommand nothing else invokes — so a repo where an operator had not
+/// separately run it turned the merge path's `--add-label agent:blocked`
+/// into an error, and did so *after* the merge had landed.
+pub(crate) fn ensure_label(
+    gh: &mut dyn GhRunner,
+    repo: &str,
+    label: AgentLabel,
+) -> Result<EnsuredLabel, MemoryError> {
+    let out = gh.run(&super::gh::label_create_argv(repo, label))?;
+    if out.success {
+        return Ok(EnsuredLabel::Created);
+    }
+    if out.mentions_any(&LABEL_ALREADY_EXISTS_MARKERS) {
+        return Ok(EnsuredLabel::AlreadyPresent);
+    }
+    out.require_success(
+        &format!("gh label create {} on {repo}", label.as_str()),
+        GhFailure::Refused,
+    )?;
+    Ok(EnsuredLabel::AlreadyPresent)
 }
 
 /// Read an issue's current labels, then move it to exactly one `agent:*`
@@ -311,6 +325,18 @@ pub(crate) fn apply_plan(
     validate_repo(&issue.repo)?;
     if plan.is_noop() {
         return Ok(plan);
+    }
+    // A label the repo does not have cannot be added to one of its issues.
+    // Created here rather than left to a separate `autopilot labels` run
+    // nobody chains, and only for labels this module owns — `plan_exclusive`
+    // is the only thing that puts a name in `add`, so this creates nothing a
+    // human did not already agree to by opting the repo in. Idempotent, and
+    // skipped entirely by the no-op return above, so a poll loop on an
+    // unchanging state pays nothing.
+    for name in &plan.add {
+        if let Some(label) = AgentLabel::from_label_str(name) {
+            ensure_label(gh, &issue.repo, label)?;
+        }
     }
     let argv = super::gh::issue_edit_labels_argv(issue, &plan.add, &plan.remove);
     gh.run(&argv)?.require_success(
@@ -570,6 +596,8 @@ about GitHub matching label names case-insensitively"
     fn setting_a_label_reads_current_state_then_edits() {
         let mut gh = ScriptedGh::new(vec![
             Ok(GhOutput::ok(r#"{"labels":[{"name":"agent:ready"}]}"#)),
+            // the target label is provisioned before it is added
+            Ok(GhOutput::failed("", "label already exists")),
             Ok(GhOutput::ok("")),
         ]);
         let plan = set_exclusive_label(
@@ -580,10 +608,46 @@ about GitHub matching label names case-insensitively"
         .unwrap();
         assert_eq!(plan.add, labels(&["agent:exhausted"]));
         assert_eq!(plan.remove, labels(&["agent:ready"]));
-        assert_eq!(gh.seen.len(), 2, "one read, one write");
-        let edit = &gh.seen[1];
+        assert_eq!(gh.seen.len(), 3, "one read, one create, one write");
+        let edit = &gh.seen[2];
         assert!(edit.contains(&"--add-label".to_string()));
         assert!(edit.contains(&"--remove-label".to_string()));
+    }
+
+    #[test]
+    fn a_label_the_repo_does_not_have_is_created_before_it_is_added() {
+        // `ensure_labels` had one caller — a standalone CLI subcommand
+        // nothing else invokes — so a repo where nobody had run it turned
+        // the merge path's `--add-label agent:blocked` into an error, and
+        // did so *after* the merge had landed.
+        let mut gh = ScriptedGh::new(vec![
+            Ok(GhOutput::ok(r#"{"labels":[]}"#)),
+            Ok(GhOutput::ok("")),
+            Ok(GhOutput::ok("")),
+        ]);
+        set_exclusive_label(
+            &mut gh,
+            &IssueRef::new("owner/repo", 7),
+            Some(AgentLabel::Blocked),
+        )
+        .unwrap();
+        assert!(
+            gh.seen[1].contains(&"label".to_string()) && gh.seen[1].contains(&"create".to_string()),
+            "{:?}",
+            gh.seen[1]
+        );
+    }
+
+    #[test]
+    fn clearing_labels_provisions_nothing() {
+        // Nothing is added, so nothing needs to exist. A poll loop that only
+        // ever clears must not pay for a create on every pass.
+        let mut gh = ScriptedGh::new(vec![
+            Ok(GhOutput::ok(r#"{"labels":[{"name":"agent:ready"}]}"#)),
+            Ok(GhOutput::ok("")),
+        ]);
+        set_exclusive_label(&mut gh, &IssueRef::new("owner/repo", 7), None).unwrap();
+        assert_eq!(gh.seen.len(), 2, "one read, one write: {:?}", gh.seen);
     }
 
     #[test]

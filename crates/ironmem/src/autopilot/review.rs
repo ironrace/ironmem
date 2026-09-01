@@ -927,12 +927,10 @@ pub fn reviews_for_issue(
         Err(other) => return Err(other),
     };
 
-    let triples = kg.query_entity_current(&entity.id, MAX_ISSUE_EDGES)?;
+    let triples =
+        kg.query_entity_current_with_predicate(&entity.id, HAS_REVIEW_PREDICATE, MAX_ISSUE_EDGES)?;
     let mut records = Vec::new();
     for triple in triples {
-        if triple.predicate != HAS_REVIEW_PREDICATE {
-            continue;
-        }
         // `triple.object` is the *entity* id, not the drawer id stored as
         // that entity's `name` — the same indirection
         // `lineage::attempts_for_issue` documents.

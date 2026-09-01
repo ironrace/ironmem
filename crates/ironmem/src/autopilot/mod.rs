@@ -255,15 +255,19 @@ fn zero_embedding() -> Vec<f32> {
 pub(crate) const ISSUE_ENTITY_TYPE: &str = "issue";
 
 /// The `LIMIT` every issue→record traversal passes to
-/// `KnowledgeGraph::query_entity_current`.
+/// `KnowledgeGraph::query_entity_current_with_predicate`.
 ///
-/// **One number, because it bounds one thing.** It is a cap on *every*
-/// current edge on the issue entity — `has_attempt`, `has_review` and
-/// `has_merge` alike, plus whatever a later rung adds — not on any single
-/// predicate, and `query_entity_current` orders newest-first across all of
-/// them. So a module that tightened "its own" cap would truncate a
-/// *different* module's history, and do it invisibly: the starved caller
-/// reads an empty result and reports "never reviewed" rather than erroring.
+/// **One number, applied once per record kind.** `has_attempt`, `has_review`
+/// and `has_merge` each get their own budget of this size, because the
+/// traversals ask SQLite for one predicate at a time.
+///
+/// That split is load-bearing, not tidiness. The unrestricted
+/// `query_entity_current` applies its `LIMIT` across *all* of an entity's
+/// edges, newest-first, before any caller can filter — so a PR polled on a
+/// hold that never resolves would append `has_merge` edges until every
+/// `has_review` edge fell outside the window, and `merge` would then read
+/// "this PR was never reviewed" and hold forever. Not an error, a wrong
+/// answer. Per-predicate budgets make that failure inexpressible.
 ///
 /// It lived as three separate private constants (`MAX_ATTEMPTS_PER_ISSUE`,
 /// `MAX_REVIEWS_PER_ISSUE`, `MAX_MERGES_PER_ISSUE`) that had to be equal by

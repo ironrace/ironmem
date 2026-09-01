@@ -293,6 +293,8 @@ mod tests {
         let mut gh_runner = ScriptedGh::new(vec![
             Ok(GhOutput::ok(r#"{"labels":[{"name":"agent:ready"}]}"#)),
             Ok(GhOutput::ok("")),
+            // `agent:exhausted` is provisioned before it is applied
+            Ok(GhOutput::failed("", "label already exists")),
             Ok(GhOutput::ok("")),
         ]);
 
@@ -300,9 +302,9 @@ mod tests {
 
         assert_eq!(
             gh_runner.seen.len(),
-            3,
-            "one label read, one comment, one edit — the labels are read once, \
-not again inside the label write: {:?}",
+            4,
+            "one label read, one comment, one create, one edit — the labels \
+are read once, not again inside the label write: {:?}",
             gh_runner.seen
         );
 
@@ -319,6 +321,11 @@ not again inside the label write: {:?}",
         // The comment is posted before the label: losing the label leaves the
         // human an explanation; losing the comment leaves a bare stop sign.
         assert!(gh_runner.seen[1].contains(&"comment".to_string()));
+        assert!(
+            gh_runner.seen[3].contains(&"edit".to_string()),
+            "{:?}",
+            gh_runner.seen[3]
+        );
     }
 
     #[test]
