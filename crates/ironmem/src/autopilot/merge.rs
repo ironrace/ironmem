@@ -285,11 +285,26 @@ pull request before doing anything else"
 
     /// Whether this hold leaves the pull request open.
     ///
-    /// False only for [`MergeHold::MergeResultUnknown`], where saying "the
-    /// pull request stays open" would be the same unsupported claim as the
-    /// headline.
+    /// A positive list, not an exclusion list. Written as "everything except
+    /// `MergeResultUnknown`" it told a human "**The pull request stays
+    /// open**" three lines under "the PR is CLOSED, not open" — a hold whose
+    /// entire content is that the PR is *not* open. Enumerating the holds
+    /// that genuinely leave it open means a variant added later has to opt
+    /// in rather than inherit a claim that may not be true of it.
     fn pr_definitely_still_open(&self) -> bool {
-        !matches!(self, MergeHold::MergeResultUnknown { .. })
+        matches!(
+            self,
+            MergeHold::Review(_)
+                | MergeHold::NotReviewed
+                | MergeHold::ReviewHeadUnknown { .. }
+                | MergeHold::ReviewIsStale { .. }
+                | MergeHold::PrIsDraft
+                | MergeHold::PrNotMergeable { .. }
+                | MergeHold::BaseBranchMismatch { .. }
+                | MergeHold::HumanApprovalRequired { .. }
+                | MergeHold::ProtectionUnknown { .. }
+                | MergeHold::MergeCommandFailed { .. }
+        )
     }
 }
 
@@ -661,9 +676,19 @@ fn evaluate(
                 };
                 return Ok((outcome, after.ok()));
             }
-            // The re-read answered, and said the PR is still open. The exit
+            // The re-read answered and said the PR is still open. The exit
             // code is then the whole story and may be reported as one.
-            Ok(_) => MergeHold::MergeCommandFailed { detail },
+            Ok(ref s) if s.state.eq_ignore_ascii_case("open") => {
+                MergeHold::MergeCommandFailed { detail }
+            }
+            // It answered something else — `CLOSED`, most likely a human
+            // closing the PR while the merge was being attempted. Reporting
+            // `MergeCommandFailed` there produced a comment claiming "the
+            // pull request stays open" about a closed PR, and a record
+            // asserting a state nothing had confirmed.
+            Ok(ref s) => MergeHold::PrNotOpen {
+                state: s.state.clone(),
+            },
             // The re-read did not answer. Discarding this error and
             // reporting `MergeCommandFailed` would turn "we could not ask"
             // into "the merge did not happen" — the one inversion this
@@ -939,7 +964,7 @@ fn hold_stop_label(current: &[String]) -> AgentLabel {
 pub fn render_already_merged_comment(request: &MergeRequest) -> String {
     let body = format!(
         "**Autopilot: PR #{pr} is already merged.**\n\n\
-No further action was taken on the pull request. Every `agent:*` label has \
+Autopilot did not merge it on this run. Every `agent:*` label has \
 been cleared from this issue so it is not picked up again; re-label it \
 `{ready}` if there is more to do.\n\n\
 <sub>Autopilot rung 6.</sub>",
@@ -1213,9 +1238,16 @@ fn last_record_for_pr(
     dry_run: bool,
 ) -> Result<Option<RecordedMergeSummary>, MemoryError> {
     let records = merges_for_issue(db, issue)?;
+    // Filtered on the issue for the reason `says_the_same_as` compares it:
+    // `repo_slug` collapses `owner/repo` and `owner-repo` onto one lineage
+    // entity. Without this, two colliding issues polling the same PR number
+    // never match each other's records — `repeat` is always `None` — and the
+    // dedup inverts from losing a notification into an unbounded stream of
+    // comments and records.
+    let canonical = issue.canonical();
     Ok(records
         .into_iter()
-        .rfind(|r| r.pr_number == pr_number && r.dry_run == dry_run))
+        .rfind(|r| r.issue == canonical && r.pr_number == pr_number && r.dry_run == dry_run))
 }
 
 /// The most recent review recorded for this issue **and this PR**.
@@ -2494,6 +2526,59 @@ mod tests {
     fn an_issue_with_no_merges_reads_back_empty() {
         let database = db();
         assert!(merges_for_issue(&database, &issue()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn no_hold_comment_claims_the_pr_is_open_while_saying_it_is_closed() {
+        // The exclusion-list version of `pr_definitely_still_open` printed
+        // "The pull request stays open" three lines under "the PR is CLOSED,
+        // not open".
+        for hold in [
+            MergeHold::PrNotOpen {
+                state: "CLOSED".into(),
+            },
+            MergeHold::MergeResultUnknown {
+                detail: "exit 1".into(),
+                read_failure: "HTTP 502".into(),
+            },
+        ] {
+            let body = render_hold_comment(&request(false), &hold, AgentLabel::Blocked);
+            assert!(
+                !body.contains("stays open"),
+                "{hold:?} must not claim the PR is open:\n{body}"
+            );
+        }
+        // …while a hold that genuinely leaves it open still says so.
+        let body = render_hold_comment(&request(false), &MergeHold::PrIsDraft, AgentLabel::Blocked);
+        assert!(body.contains("stays open"), "{body}");
+    }
+
+    #[test]
+    fn a_merge_command_failure_on_a_concurrently_closed_pr_reports_it_closed() {
+        let database = db();
+        store_review(&database, 7, Some(HEAD), pass_outcome());
+        let mut gh_runner = ScriptedGh::new(vec![
+            Ok(pr_view_ok("OPEN", HEAD)),
+            Ok(unprotected()),
+            Ok(no_rules()),
+            Ok(GhOutput::failed("", "Pull request is not mergeable")),
+            // a human closed it while the merge was being attempted
+            Ok(pr_view_ok("CLOSED", HEAD)),
+            Ok(GhOutput::ok(r#"{"labels":[]}"#)),
+            Ok(GhOutput::ok("")),
+            Ok(label_created()),
+            Ok(GhOutput::ok("")),
+        ]);
+
+        let exec = execute_merge(&database, &mut gh_runner, &request(false)).unwrap();
+
+        assert_eq!(
+            exec.outcome.hold(),
+            Some(&MergeHold::PrNotOpen {
+                state: "CLOSED".into()
+            }),
+            "a re-read that says CLOSED is not 'the merge simply failed'"
+        );
     }
 
     #[test]

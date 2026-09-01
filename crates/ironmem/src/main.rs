@@ -1361,6 +1361,14 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                             println!("  labels: +{:?} -{:?}", plan.add, plan.remove);
                         }
                     }
+                    if let Some(err) = &exec.label_error {
+                        // The merge landed and the label write did not. Silent
+                        // here, this was indistinguishable from a clean run —
+                        // which defeats the point of reporting it rather than
+                        // erroring.
+                        println!("  WARNING: labels were NOT updated: {err}");
+                        println!("  the next run clears them once it sees the PR as merged");
+                    }
                     if exec.commented {
                         println!("  commented on the issue");
                     }

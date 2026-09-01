@@ -827,8 +827,14 @@ pub fn branch_protection(
 
     Ok(match (classic, rules) {
         // Both endpoints answered, neither requires a review.
+        // Spelled out rather than `Answered(_)`: the wildcard would map a
+        // hypothetical `Answered(Unknown)` to "proceed". That is unreachable
+        // only because `parse_branch_protection` never returns `Unknown` —
+        // a property of a `pub` function that nothing here enforces. Naming
+        // the variant makes the compiler keep the promise.
         (
-            ClassicProtection::Answered(_) | ClassicProtection::Absent,
+            ClassicProtection::Answered(BranchProtection::NoHumanApprovalRequired)
+            | ClassicProtection::Absent,
             BranchProtection::NoHumanApprovalRequired,
         ) => BranchProtection::NoHumanApprovalRequired,
         // The rules endpoint could not answer either.

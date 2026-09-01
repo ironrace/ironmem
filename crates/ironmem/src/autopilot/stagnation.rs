@@ -166,6 +166,24 @@ pub fn exhaust_issue(
         labels::plan_exclusive(&current, Some(AgentLabel::Exhausted)),
     )?;
 
+    // The notice exists only to bridge "the comment posted, the label write
+    // then failed". Once the label is on, the label *is* the idempotency
+    // guard — the check at the top of this function returns
+    // `AlreadyExhausted` before anything else runs — so the notice has done
+    // its job and must not outlive it.
+    //
+    // Leaving it behind was worse than the bug it fixed. A human who reads
+    // the summary and does what it asks — re-label `agent:ready` for another
+    // pass — hits the cumulative attempt cap again, arrives back here with
+    // no `agent:exhausted` label, and finds a notice that suppresses the
+    // comment. Autopilot would then re-apply the stop label with *no*
+    // explanation on the issue, silently reverting the one intervention the
+    // summary had just invited.
+    //
+    // A failed delete is harmless: the next round sees `agent:exhausted` and
+    // stops at the check above without consulting the notice at all.
+    clear_exhaustion_notice(db, issue)?;
+
     Ok(ExhaustExecution {
         issue: issue.clone(),
         outcome: ExhaustOutcome::Exhausted {
@@ -193,7 +211,37 @@ fn exhaustion_notice_key(issue: &IssueRef) -> String {
 /// run that posts the comment and then fails to label is precisely the run
 /// whose work must not be repeated.
 fn exhaustion_notice_posted(db: &Database, issue: &IssueRef) -> Result<bool, MemoryError> {
-    Ok(super::read_current(db, &exhaustion_notice_key(issue))?.is_some())
+    let Some(drawer) = super::read_current(db, &exhaustion_notice_key(issue))? else {
+        return Ok(false);
+    };
+    // The key goes through `repo_slug`, which maps `/` and every other
+    // unsafe character to `-` — so `own/er-repo#42` and `own-er/repo#42`
+    // share one key. A notice belonging to the *other* issue must not
+    // suppress this one's summary, so the stored canonical name is checked
+    // rather than trusted. Same hazard `RecordedMergeSummary::says_the_same_as`
+    // guards against, and the same answer: assert the invariant, do not
+    // assume it.
+    let body: serde_json::Value = serde_json::from_str(&drawer.content)?;
+    Ok(body["issue"].as_str() == Some(issue.canonical().as_str()))
+}
+
+/// Delete the notice once the label it was covering for has landed.
+fn clear_exhaustion_notice(db: &Database, issue: &IssueRef) -> Result<bool, MemoryError> {
+    let id = super::logical_drawer_id(&exhaustion_notice_key(issue));
+    db.with_transaction(|tx| {
+        let deleted = Database::delete_drawer_tx(tx, &id)?;
+        Database::wal_log_tx(
+            tx,
+            "autopilot_clear_exhaustion_notice",
+            &json!({
+                "drawer_id": &id,
+                "issue": issue.canonical(),
+                "deleted": deleted,
+            }),
+            None,
+        )?;
+        Ok(deleted)
+    })
 }
 
 fn record_exhaustion_notice(
@@ -431,6 +479,88 @@ are read once, not again inside the label write: {:?}",
             "but the label that failed is retried: {:?}",
             gh_runner.seen
         );
+    }
+
+    #[test]
+    fn a_second_exhaustion_after_a_human_resume_still_explains_itself() {
+        // The summary tells the human to re-label `agent:ready` for another
+        // pass. Doing so hits the cumulative cap again and arrives back here
+        // with no `agent:exhausted` label — so a notice that outlived its
+        // label write would suppress the comment and Autopilot would
+        // re-apply the stop label with *no* explanation, silently reverting
+        // the one intervention the summary had just invited.
+        let database = db();
+        lineage::record_attempt(&database, &attempt(1, AttemptOutcome::Failed, Some("red")))
+            .unwrap();
+
+        let mut gh_runner = ScriptedGh::new(vec![
+            Ok(GhOutput::ok(r#"{"labels":[{"name":"agent:ready"}]}"#)),
+            Ok(GhOutput::ok("")),
+            Ok(GhOutput::failed("", "label already exists")),
+            Ok(GhOutput::ok("")),
+        ]);
+        let first = exhaust_issue(&mut gh_runner, &database, &issue(), false).unwrap();
+        let ExhaustOutcome::Exhausted { commented, .. } = first.outcome else {
+            panic!("expected Exhausted, got {:?}", first.outcome);
+        };
+        assert!(commented);
+
+        // The human re-labels `agent:ready`; the cap is still exceeded.
+        let mut gh_runner = ScriptedGh::new(vec![
+            Ok(GhOutput::ok(r#"{"labels":[{"name":"agent:ready"}]}"#)),
+            Ok(GhOutput::ok("")),
+            Ok(GhOutput::failed("", "label already exists")),
+            Ok(GhOutput::ok("")),
+        ]);
+        let second = exhaust_issue(&mut gh_runner, &database, &issue(), false).unwrap();
+        let ExhaustOutcome::Exhausted { commented, .. } = second.outcome else {
+            panic!("expected Exhausted, got {:?}", second.outcome);
+        };
+        assert!(
+            commented,
+            "a stop sign re-applied over a human's resume must say why"
+        );
+        assert!(
+            gh_runner
+                .seen
+                .iter()
+                .any(|a| a.contains(&"comment".to_string())),
+            "{:?}",
+            gh_runner.seen
+        );
+    }
+
+    #[test]
+    fn a_notice_from_a_slug_colliding_issue_does_not_silence_this_one() {
+        // `repo_slug` maps `/` to `-`, so `own/er-repo#7` and `own-er/repo#7`
+        // share a notice key. The first to exhaust must not suppress the
+        // second's summary.
+        let database = db();
+        let a = IssueRef::new("own/er-repo", 7);
+        let b = IssueRef::new("own-er/repo", 7);
+        assert_eq!(a.slug(), b.slug(), "the collision this test is about");
+
+        for issue in [&a, &b] {
+            lineage::record_attempt(
+                &database,
+                &lineage::AttemptRecord {
+                    issue: (*issue).clone(),
+                    ..attempt(1, AttemptOutcome::Failed, Some("red"))
+                },
+            )
+            .unwrap();
+            let mut gh_runner = ScriptedGh::new(vec![
+                Ok(GhOutput::ok(r#"{"labels":[]}"#)),
+                Ok(GhOutput::ok("")),
+                Ok(GhOutput::failed("", "label already exists")),
+                Ok(GhOutput::ok("")),
+            ]);
+            let exec = exhaust_issue(&mut gh_runner, &database, issue, false).unwrap();
+            let ExhaustOutcome::Exhausted { commented, .. } = exec.outcome else {
+                panic!("expected Exhausted for {}", issue.canonical());
+            };
+            assert!(commented, "{} must get its own summary", issue.canonical());
+        }
     }
 
     #[test]
