@@ -27,7 +27,7 @@
 //! benign; collapsing them into `Err` would make [`super::labels::ensure_labels`]
 //! usable exactly once per repo.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 
 use serde::Deserialize;
@@ -58,6 +58,15 @@ pub(crate) const LABEL_ALREADY_EXISTS_MARKERS: [&str; 3] =
 /// be enough to unlock it.
 const BRANCH_UNPROTECTED_MARKERS: [&str; 2] = ["http 404", "branch not protected"];
 
+/// Which `MemoryError` a refused `gh` call becomes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GhFailure {
+    /// A read whose subject could not be found.
+    NotFound,
+    /// A write GitHub declined.
+    Refused,
+}
+
 /// One `gh` invocation's result.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GhOutput {
@@ -68,6 +77,42 @@ pub struct GhOutput {
 }
 
 impl GhOutput {
+    /// The stdout of a successful call, or a `MemoryError` naming what failed.
+    ///
+    /// One wording for one failure shape. Four call sites across this module
+    /// and [`super::labels`] each hand-rolled the same
+    /// `"gh X failed (exit {:?}): {}"` string, which is four places for the
+    /// exit code or the stderr trim to be forgotten.
+    ///
+    /// `kind` picks the variant because the distinction is real: a read that
+    /// cannot find its subject is [`MemoryError::NotFound`], while a refused
+    /// *write* is [`MemoryError::Validation`].
+    pub(crate) fn require_success(&self, what: &str, kind: GhFailure) -> Result<&str, MemoryError> {
+        if self.success {
+            return Ok(&self.stdout);
+        }
+        let msg = format!(
+            "{what} failed (exit {:?}): {}",
+            self.code,
+            self.stderr.trim()
+        );
+        Err(match kind {
+            GhFailure::NotFound => MemoryError::NotFound(msg),
+            GhFailure::Refused => MemoryError::Validation(msg),
+        })
+    }
+
+    /// Whether stdout or stderr mentions any of `markers`.
+    ///
+    /// `markers` must already be lowercase — the haystack is lowercased here,
+    /// and a mixed-case marker would silently never match. The two constants
+    /// that feed this ([`LABEL_ALREADY_EXISTS_MARKERS`] and
+    /// [`BRANCH_UNPROTECTED_MARKERS`]) are both asserted lowercase by test.
+    pub(crate) fn mentions_any(&self, markers: &[&str]) -> bool {
+        let haystack = format!("{} {}", self.stdout, self.stderr).to_lowercase();
+        markers.iter().any(|marker| haystack.contains(marker))
+    }
+
     #[cfg(test)]
     pub(crate) fn ok(stdout: &str) -> Self {
         Self {
@@ -130,10 +175,6 @@ impl GhCli {
             bin: resolve_gh_binary()?,
             cwd: cwd.into(),
         })
-    }
-
-    pub fn binary(&self) -> &Path {
-        &self.bin
     }
 }
 
@@ -357,42 +398,38 @@ pub fn branch_protection_argv(repo: &str, branch: &str) -> Vec<String> {
 // ── responses ───────────────────────────────────────────────────────────
 
 /// A pull request as GitHub currently sees it.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+///
+/// Deserialized straight from `gh pr view --json`'s camelCase, and serialized
+/// back out in snake_case for this crate's own `--json` output — hence the
+/// direction-scoped `rename_all`. It previously had a field-for-field shadow
+/// struct doing the rename by hand, which was a second place to forget a
+/// field when the schema grows.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Deserialize)]
+#[serde(rename_all(deserialize = "camelCase"))]
 pub struct PrSnapshot {
-    /// `OPEN`, `CLOSED` or `MERGED`, verbatim.
+    /// `OPEN`, `CLOSED` or `MERGED`, verbatim. The one required field: a
+    /// response without it is not a PR view at all.
     pub state: String,
+    #[serde(default)]
     pub is_draft: bool,
     /// `MERGEABLE`, `CONFLICTING` or `UNKNOWN`, verbatim.
+    #[serde(default)]
     pub mergeable: String,
     /// `CLEAN`, `BLOCKED`, `BEHIND`, `DIRTY`, `UNSTABLE`, `HAS_HOOKS`,
     /// `DRAFT` or `UNKNOWN`, verbatim.
+    #[serde(default)]
     pub merge_state_status: String,
+    #[serde(default)]
     pub base_ref_name: String,
+    #[serde(default)]
     pub head_ref_name: String,
     /// The commit at the head of the PR right now. The single most important
     /// field in this struct: it is what a recorded review's head SHA is
     /// compared against.
+    #[serde(default)]
     pub head_ref_oid: String,
+    #[serde(default)]
     pub url: String,
-}
-
-#[derive(Deserialize)]
-struct PrViewJson {
-    state: String,
-    #[serde(rename = "isDraft", default)]
-    is_draft: bool,
-    #[serde(default)]
-    mergeable: String,
-    #[serde(rename = "mergeStateStatus", default)]
-    merge_state_status: String,
-    #[serde(rename = "baseRefName", default)]
-    base_ref_name: String,
-    #[serde(rename = "headRefName", default)]
-    head_ref_name: String,
-    #[serde(rename = "headRefOid", default)]
-    head_ref_oid: String,
-    #[serde(default)]
-    url: String,
 }
 
 /// Parse `gh pr view --json <PR_VIEW_FIELDS>` output.
@@ -404,18 +441,8 @@ struct PrViewJson {
 /// `CLEAN` — so a schema drift degrades to "hold for a human", never to a
 /// merge.
 pub fn parse_pr_view(stdout: &str) -> Result<PrSnapshot, MemoryError> {
-    let raw: PrViewJson = serde_json::from_str(stdout.trim()).map_err(|e| {
+    serde_json::from_str(stdout.trim()).map_err(|e| {
         MemoryError::Validation(format!("could not parse `gh pr view --json` output: {e}"))
-    })?;
-    Ok(PrSnapshot {
-        state: raw.state,
-        is_draft: raw.is_draft,
-        mergeable: raw.mergeable,
-        merge_state_status: raw.merge_state_status,
-        base_ref_name: raw.base_ref_name,
-        head_ref_name: raw.head_ref_name,
-        head_ref_oid: raw.head_ref_oid,
-        url: raw.url,
     })
 }
 
@@ -426,14 +453,10 @@ pub fn pr_snapshot(
     pr_number: u64,
 ) -> Result<PrSnapshot, MemoryError> {
     let out = gh.run(&pr_view_argv(repo, pr_number))?;
-    if !out.success {
-        return Err(MemoryError::NotFound(format!(
-            "gh pr view {pr_number} failed on {repo} (exit {:?}): {}",
-            out.code,
-            out.stderr.trim()
-        )));
-    }
-    parse_pr_view(&out.stdout)
+    parse_pr_view(out.require_success(
+        &format!("gh pr view {pr_number} on {repo}"),
+        GhFailure::NotFound,
+    )?)
 }
 
 #[derive(Deserialize)]
@@ -466,15 +489,10 @@ pub fn parse_issue_labels(stdout: &str) -> Result<Vec<String>, MemoryError> {
 /// Read an issue's current label names.
 pub fn issue_labels(gh: &mut dyn GhRunner, issue: &IssueRef) -> Result<Vec<String>, MemoryError> {
     let out = gh.run(&issue_view_labels_argv(issue))?;
-    if !out.success {
-        return Err(MemoryError::NotFound(format!(
-            "gh issue view {} failed (exit {:?}): {}",
-            issue.canonical(),
-            out.code,
-            out.stderr.trim()
-        )));
-    }
-    parse_issue_labels(&out.stdout)
+    parse_issue_labels(out.require_success(
+        &format!("gh issue view {}", issue.canonical()),
+        GhFailure::NotFound,
+    )?)
 }
 
 /// Post a comment on an issue.
@@ -484,14 +502,10 @@ pub fn comment_on_issue(
     body: &str,
 ) -> Result<(), MemoryError> {
     let out = gh.run(&issue_comment_argv(issue, body))?;
-    if !out.success {
-        return Err(MemoryError::Validation(format!(
-            "gh issue comment failed for {} (exit {:?}): {}",
-            issue.canonical(),
-            out.code,
-            out.stderr.trim()
-        )));
-    }
+    out.require_success(
+        &format!("gh issue comment on {}", issue.canonical()),
+        GhFailure::Refused,
+    )?;
     Ok(())
 }
 
@@ -604,11 +618,7 @@ pub fn branch_protection(
     if out.success {
         return parse_branch_protection(&out.stdout);
     }
-    let haystack = format!("{} {}", out.stdout, out.stderr).to_lowercase();
-    if BRANCH_UNPROTECTED_MARKERS
-        .iter()
-        .any(|marker| haystack.contains(marker))
-    {
+    if out.mentions_any(&BRANCH_UNPROTECTED_MARKERS) {
         return Ok(BranchProtection::NoHumanApprovalRequired);
     }
     Ok(BranchProtection::Unknown {

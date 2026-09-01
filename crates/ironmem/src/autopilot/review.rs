@@ -97,7 +97,10 @@ use crate::error::MemoryError;
 
 use super::lineage::MAX_LINEAGE_FIELD_CHARS;
 use super::scrub::scrub_and_bound;
-use super::{validate_repo, zero_embedding, IssueRef, ADDED_BY, ROOM, WING};
+use super::{
+    validate_repo, zero_embedding, IssueRef, ADDED_BY, ISSUE_ENTITY_TYPE, MAX_ISSUE_EDGES, ROOM,
+    WING,
+};
 
 /// The schema forced onto every Reviewer invocation via `--output-schema`.
 ///
@@ -592,6 +595,44 @@ pub enum HoldReason {
     },
 }
 
+impl HoldReason {
+    /// One human-readable line, for the GitHub comment a held PR posts.
+    ///
+    /// Lives here rather than in [`super::merge`] because this module owns
+    /// the vocabulary: only the layer that knows what `ClassMismatch` *means*
+    /// can say it in prose, and a later rung adding a variant gets a compile
+    /// error here rather than silently changing public comment text.
+    pub fn summary(&self) -> String {
+        match self {
+            HoldReason::GateNotGreen => {
+                "the repo's approved gate was not green, and a reviewer PASS never \
+substitutes for it"
+                    .to_string()
+            }
+            HoldReason::ReviewerDidNotRun => {
+                "the reviewer did not run, and an infrastructure failure never becomes \
+implicit approval"
+                    .to_string()
+            }
+            HoldReason::NoVerdict => "the reviewer ran but returned no usable verdict".to_string(),
+            HoldReason::NeedsChanges => "the reviewer asked for changes".to_string(),
+            HoldReason::HighRiskClass { class } => format!(
+                "the diff is classed `{}`, which always waits for a human",
+                class.as_str()
+            ),
+            HoldReason::ClassMismatch {
+                dispatch_class,
+                diff_class,
+            } => format!(
+                "the diff classifies as `{}` but was dispatched as `{}`, and a mismatch \
+between the two always fails closed",
+                diff_class.as_str(),
+                dispatch_class.trim()
+            ),
+        }
+    }
+}
+
 /// Whether this PR may be auto-merged, and if not, why not.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "decision", rename_all = "snake_case")]
@@ -607,6 +648,34 @@ pub enum MergeDecision {
 impl MergeDecision {
     pub fn is_eligible(&self) -> bool {
         matches!(self, MergeDecision::EligibleForMerge { .. })
+    }
+}
+
+/// Exactly the facts [`decide_merge`] decides on.
+///
+/// [`ReviewOutcome`] carries three more fields (`reason`, `total_cost_usd`,
+/// `token_usage`) that the decision never reads. Taking the wider type meant
+/// rung 6 — which re-derives the decision from a *stored* review and has no
+/// cost or token data at all — had to fabricate `None`s to call it. That is
+/// inert today and silently wrong the moment `decide_merge` consults either
+/// field: the merge path would then get a different answer from the review
+/// path, which is precisely the drift re-deriving exists to prevent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReviewJudgment {
+    /// The reviewer process ran and exited zero.
+    pub process_success: bool,
+    pub verdict: Option<ReviewVerdict>,
+    pub risk_class: Option<RiskClass>,
+}
+
+impl ReviewOutcome {
+    /// The subset of this outcome that authorizes (or refuses) a merge.
+    pub fn judgment(&self) -> ReviewJudgment {
+        ReviewJudgment {
+            process_success: self.process_success,
+            verdict: self.verdict,
+            risk_class: self.risk_class,
+        }
     }
 }
 
@@ -633,15 +702,15 @@ impl MergeDecision {
 pub fn decide_merge(
     gate_green: bool,
     dispatch_class: &str,
-    outcome: &ReviewOutcome,
+    judgment: ReviewJudgment,
 ) -> MergeDecision {
     if !gate_green {
         return MergeDecision::HoldForHuman(HoldReason::GateNotGreen);
     }
-    if !outcome.process_success {
+    if !judgment.process_success {
         return MergeDecision::HoldForHuman(HoldReason::ReviewerDidNotRun);
     }
-    let (Some(verdict), Some(diff_class)) = (outcome.verdict, outcome.risk_class) else {
+    let (Some(verdict), Some(diff_class)) = (judgment.verdict, judgment.risk_class) else {
         return MergeDecision::HoldForHuman(HoldReason::NoVerdict);
     };
     if verdict == ReviewVerdict::NeedsChanges {
@@ -661,7 +730,6 @@ pub fn decide_merge(
 
 const REVIEW_ENTITY_TYPE: &str = "review";
 const HAS_REVIEW_PREDICATE: &str = "has_review";
-const ISSUE_ENTITY_TYPE: &str = "issue";
 
 /// One review, as the caller supplies it. `reason` is scrubbed and
 /// length-bounded by [`record_review`] before it is persisted — a review
@@ -810,20 +878,6 @@ pub fn record_review(db: &Database, record: &ReviewRecord) -> Result<RecordedRev
     })
 }
 
-/// The most triples [`reviews_for_issue`] will walk for one issue. Matches
-/// `lineage::MAX_ATTEMPTS_PER_ISSUE`: a bound on a traversal that is
-/// otherwise unbounded by anything but retention.
-///
-/// It has to be generous, because it is a `LIMIT` on **every** current edge
-/// hanging off the issue entity — `has_attempt` and `has_review` alike, plus
-/// whatever a later rung adds — not on reviews alone, and
-/// `query_entity_current` orders newest-first. A tight cap would therefore
-/// let a long-running issue's attempt edges crowd its reviews out of the
-/// result set entirely, and rung 6 asking "has this PR already been
-/// reviewed, and what did it say?" would read an empty history and
-/// re-review — or lose a `needs_changes`.
-const MAX_REVIEWS_PER_ISSUE: usize = 10_000;
-
 /// One recorded review, as read back from storage.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RecordedReviewSummary {
@@ -873,7 +927,7 @@ pub fn reviews_for_issue(
         Err(other) => return Err(other),
     };
 
-    let triples = kg.query_entity_current(&entity.id, MAX_REVIEWS_PER_ISSUE)?;
+    let triples = kg.query_entity_current(&entity.id, MAX_ISSUE_EDGES)?;
     let mut records = Vec::new();
     for triple in triples {
         if triple.predicate != HAS_REVIEW_PREDICATE {
@@ -951,9 +1005,16 @@ pub struct ReviewRequest<'a> {
     pub pr_number: u64,
     pub base_branch: &'a str,
     pub head_branch: &'a str,
-    /// The commit `head_branch` resolves to in `repo_dir` right now, if the
-    /// caller could resolve it. Recorded verbatim so rung 6 can tell whether
-    /// the PR it is about to merge is still the change this review read.
+    /// Override for the commit this review reads. **Normally `None`** —
+    /// [`review_pr`] resolves it from `repo_dir` and `head_branch`, which is
+    /// everything the computation needs. Set it only when the caller already
+    /// knows the SHA and wants to pin it.
+    ///
+    /// It is recorded verbatim so rung 6 can tell whether the PR it is about
+    /// to merge is still the change this review read, and a review with no
+    /// SHA cannot authorize a merge at all — so leaving the resolution to
+    /// each caller meant a caller that forgot produced reviews that were
+    /// permanently unmergeable, silently and while looking healthy.
     pub head_sha: Option<String>,
     /// The Lead's dispatch-time class, compared against the reviewer's.
     pub dispatch_class: &'a str,
@@ -1082,7 +1143,11 @@ pub fn review_pr(
     };
     if let Some(refusal) = refusal {
         let outcome = ReviewOutcome::did_not_run();
-        let decision = decide_merge(request.gate_green, request.dispatch_class, &outcome);
+        let decision = decide_merge(
+            request.gate_green,
+            request.dispatch_class,
+            outcome.judgment(),
+        );
         return Ok(PrReview {
             issue: request.issue.clone(),
             pr_number: request.pr_number,
@@ -1092,6 +1157,14 @@ pub fn review_pr(
             refusal: Some(refusal),
         });
     }
+
+    // Resolved here, not by the caller: every input is already in `request`,
+    // so a caller cannot get it wrong by omission. `None` survives as
+    // "unknown", which rung 6 holds on.
+    let head_sha = request
+        .head_sha
+        .clone()
+        .or_else(|| super::worktree::resolve_commit(request.repo_dir, request.head_branch));
 
     let prompt = super::review_prompt::render(&super::review_prompt::ReviewPromptInputs {
         issue: request.issue,
@@ -1152,14 +1225,18 @@ pub fn review_pr(
         }
     }
 
-    let decision = decide_merge(request.gate_green, request.dispatch_class, &outcome);
+    let decision = decide_merge(
+        request.gate_green,
+        request.dispatch_class,
+        outcome.judgment(),
+    );
     let recorded = record_review(
         db,
         &ReviewRecord {
             issue: request.issue.clone(),
             pr_number: request.pr_number,
             dispatch_class: request.dispatch_class.to_string(),
-            head_sha: request.head_sha.clone(),
+            head_sha,
             base_branch: Some(request.base_branch.to_string()),
             outcome: outcome.clone(),
             decision: decision.clone(),
@@ -1442,7 +1519,7 @@ not json at all
         let decision = decide_merge(
             true,
             "documentation",
-            &passing_outcome(RiskClass::Documentation),
+            passing_outcome(RiskClass::Documentation).judgment(),
         );
         assert_eq!(
             decision,
@@ -1460,7 +1537,7 @@ not json at all
         let mut outcome = passing_outcome(RiskClass::Documentation);
         outcome.verdict = Some(ReviewVerdict::NeedsChanges);
         assert_eq!(
-            decide_merge(true, "documentation", &outcome),
+            decide_merge(true, "documentation", outcome.judgment()),
             MergeDecision::HoldForHuman(HoldReason::NeedsChanges)
         );
     }
@@ -1470,7 +1547,11 @@ not json at all
         // Spec Testing table: "Reviewer process fails to start → no merge
         // occurs. Infrastructure failure ≠ approval."
         assert_eq!(
-            decide_merge(true, "documentation", &ReviewOutcome::did_not_run()),
+            decide_merge(
+                true,
+                "documentation",
+                ReviewOutcome::did_not_run().judgment()
+            ),
             MergeDecision::HoldForHuman(HoldReason::ReviewerDidNotRun)
         );
     }
@@ -1482,7 +1563,7 @@ not json at all
         let mut outcome = passing_outcome(RiskClass::Documentation);
         outcome.process_success = false;
         assert_eq!(
-            decide_merge(true, "documentation", &outcome),
+            decide_merge(true, "documentation", outcome.judgment()),
             MergeDecision::HoldForHuman(HoldReason::ReviewerDidNotRun)
         );
     }
@@ -1492,7 +1573,7 @@ not json at all
         let mut outcome = passing_outcome(RiskClass::Documentation);
         outcome.verdict = None;
         assert_eq!(
-            decide_merge(true, "documentation", &outcome),
+            decide_merge(true, "documentation", outcome.judgment()),
             MergeDecision::HoldForHuman(HoldReason::NoVerdict)
         );
 
@@ -1501,7 +1582,7 @@ not json at all
         let mut outcome = passing_outcome(RiskClass::Documentation);
         outcome.risk_class = None;
         assert_eq!(
-            decide_merge(true, "documentation", &outcome),
+            decide_merge(true, "documentation", outcome.judgment()),
             MergeDecision::HoldForHuman(HoldReason::NoVerdict)
         );
     }
@@ -1519,7 +1600,7 @@ not json at all
             RiskClass::PublicApi,
         ] {
             assert_eq!(
-                decide_merge(true, class.as_str(), &passing_outcome(class)),
+                decide_merge(true, class.as_str(), passing_outcome(class).judgment()),
                 MergeDecision::HoldForHuman(HoldReason::HighRiskClass { class }),
                 "{} must never auto-merge",
                 class.as_str()
@@ -1531,7 +1612,11 @@ not json at all
     fn a_docs_dispatch_whose_diff_touches_logic_opens_a_pr_instead_of_merging() {
         // Spec Testing table, verbatim: "Dispatch class `docs`, diff touches
         // logic → PR, not merge. Double classification fails closed."
-        let decision = decide_merge(true, "documentation", &passing_outcome(RiskClass::Logic));
+        let decision = decide_merge(
+            true,
+            "documentation",
+            passing_outcome(RiskClass::Logic).judgment(),
+        );
         assert_eq!(
             decision,
             MergeDecision::HoldForHuman(HoldReason::HighRiskClass {
@@ -1548,7 +1633,11 @@ not json at all
         // the two ... fails closed to a human PR. Never merge on the stale
         // class."
         assert_eq!(
-            decide_merge(true, "documentation", &passing_outcome(RiskClass::TestOnly)),
+            decide_merge(
+                true,
+                "documentation",
+                passing_outcome(RiskClass::TestOnly).judgment()
+            ),
             MergeDecision::HoldForHuman(HoldReason::ClassMismatch {
                 dispatch_class: "documentation".to_string(),
                 diff_class: RiskClass::TestOnly,
@@ -1566,17 +1655,25 @@ not json at all
             decide_merge(
                 true,
                 "unclassified",
-                &passing_outcome(RiskClass::Documentation)
+                passing_outcome(RiskClass::Documentation).judgment()
             ),
             MergeDecision::HoldForHuman(HoldReason::ClassMismatch {
                 dispatch_class: "unclassified".to_string(),
                 diff_class: RiskClass::Documentation,
             })
         );
-        assert!(!decide_merge(true, "", &passing_outcome(RiskClass::Documentation)).is_eligible());
-        assert!(
-            !decide_merge(true, "docs", &passing_outcome(RiskClass::Documentation)).is_eligible()
-        );
+        assert!(!decide_merge(
+            true,
+            "",
+            passing_outcome(RiskClass::Documentation).judgment()
+        )
+        .is_eligible());
+        assert!(!decide_merge(
+            true,
+            "docs",
+            passing_outcome(RiskClass::Documentation).judgment()
+        )
+        .is_eligible());
     }
 
     #[test]
@@ -1586,7 +1683,7 @@ not json at all
         assert!(decide_merge(
             true,
             "  documentation  ",
-            &passing_outcome(RiskClass::Documentation)
+            passing_outcome(RiskClass::Documentation).judgment()
         )
         .is_eligible());
     }
@@ -1598,7 +1695,7 @@ not json at all
             decide_merge(
                 false,
                 "documentation",
-                &passing_outcome(RiskClass::Documentation)
+                passing_outcome(RiskClass::Documentation).judgment()
             ),
             MergeDecision::HoldForHuman(HoldReason::GateNotGreen)
         );
@@ -1619,7 +1716,7 @@ not json at all
             }),
             process_success: true,
         };
-        let decision = decide_merge(true, "documentation", &outcome);
+        let decision = decide_merge(true, "documentation", outcome.judgment());
         ReviewRecord {
             issue: issue.clone(),
             pr_number: 322,

@@ -58,12 +58,13 @@ use serde_json::json;
 
 use super::gh::{self, BranchProtection, GhRunner, MergeStrategy, PrSnapshot};
 use super::labels::{self, AgentLabel};
-use super::lineage::{self, MAX_LINEAGE_FIELD_CHARS};
-use super::review::{
-    decide_merge, MergeDecision, RecordedReviewSummary, ReviewOutcome, ReviewVerdict,
-};
+use super::lineage::MAX_LINEAGE_FIELD_CHARS;
+use super::review::{decide_merge, MergeDecision, RecordedReviewSummary, ReviewJudgment};
 use super::scrub::scrub_and_bound;
-use super::{validate_repo, zero_embedding, IssueRef, ADDED_BY, ROOM, WING};
+use super::{
+    validate_repo, zero_embedding, IssueRef, ADDED_BY, ISSUE_ENTITY_TYPE, MAX_ISSUE_EDGES, ROOM,
+    WING,
+};
 use crate::db::knowledge_graph::KnowledgeGraph;
 use crate::db::schema::Database;
 use crate::error::MemoryError;
@@ -76,13 +77,6 @@ use crate::error::MemoryError;
 /// needs more than this has more attempts than a human will read anyway, and
 /// the full record is in lineage.
 pub const MAX_COMMENT_CHARS: usize = 20_000;
-
-/// How many attempts an exhaustion comment quotes, newest first.
-///
-/// Bounded separately from [`MAX_COMMENT_CHARS`] so the comment degrades by
-/// dropping *whole oldest attempts* rather than by truncating mid-sentence in
-/// the middle of the most recent one, which is the part a human reads first.
-pub const MAX_ATTEMPTS_IN_COMMENT: usize = 10;
 
 // ── holds ───────────────────────────────────────────────────────────────
 
@@ -147,9 +141,11 @@ impl MergeHold {
     /// One line, for a comment and for the CLI's text output.
     pub fn summary(&self) -> String {
         match self {
-            MergeHold::Review(reason) => {
-                format!("the review did not authorize a merge ({reason:?})")
-            }
+            // Delegated, not `{:?}`: two of `HoldReason`'s variants carry
+            // payloads, and Debug-formatting them put
+            // `ClassMismatch { dispatch_class: "documentation", .. }` into a
+            // comment written for a human.
+            MergeHold::Review(reason) => reason.summary(),
             MergeHold::NotReviewed => {
                 "no review has been recorded for this PR, and gates alone never authorize a merge"
                     .to_string()
@@ -216,7 +212,7 @@ so it cannot be tied to this PR's head"
 }
 
 /// First 8 characters of a SHA, or the whole string if it is shorter.
-fn short_sha(sha: &str) -> String {
+pub(crate) fn short_sha(sha: &str) -> String {
     sha.chars().take(8).collect()
 }
 
@@ -269,11 +265,16 @@ pub struct MergeExecution {
     pub label_plan: Option<labels::LabelPlan>,
     /// Whether a notification comment was posted.
     pub commented: bool,
-    /// The drawer id of the appended merge record.
-    pub record_drawer_id: Option<String>,
+    /// The drawer id of the appended merge record. Always present: `finish`
+    /// records before it does anything else, and a storage failure is an
+    /// `Err` rather than a missing id.
+    pub record_drawer_id: String,
 }
 
-fn serialize_issue<S: serde::Serializer>(issue: &IssueRef, s: S) -> Result<S::Ok, S::Error> {
+pub(crate) fn serialize_issue<S: serde::Serializer>(
+    issue: &IssueRef,
+    s: S,
+) -> Result<S::Ok, S::Error> {
     s.serialize_str(&issue.canonical())
 }
 
@@ -308,166 +309,138 @@ pub fn execute_merge(
     request: &MergeRequest,
 ) -> Result<MergeExecution, MemoryError> {
     validate_repo(&request.issue.repo)?;
+    let (outcome, snapshot) = evaluate(db, gh_runner, request)?;
+    finish(db, gh_runner, request, outcome, snapshot)
+}
 
+/// Run every guard and report what the merge *is*, performing the merge
+/// itself but none of the bookkeeping around it.
+///
+/// Split from [`finish`] so each guard reads as its own answer —
+/// `return Ok((MergeOutcome::Held(MergeHold::PrIsDraft), Some(snapshot)))` —
+/// rather than burying the reason three arguments into a five-line call.
+/// [`execute_merge`] is then the whole shape in two lines: decide, then
+/// record and notify exactly once.
+///
+/// The `gh pr merge` call is reachable only by falling through every guard
+/// below, the same construction [`super::review::decide_merge`] uses.
+fn evaluate(
+    db: &Database,
+    gh_runner: &mut dyn GhRunner,
+    request: &MergeRequest,
+) -> Result<(MergeOutcome, Option<PrSnapshot>), MemoryError> {
     // 1. The review. Reading storage before touching GitHub means a PR with
-    //    no review costs one database query and no API calls.
-    let review = latest_review_for_pr(db, request.issue, request.pr_number)?;
-    let Some(review) = review else {
-        return finish(
-            db,
-            gh_runner,
-            request,
-            MergeOutcome::Held(MergeHold::NotReviewed),
-            None,
-        );
+    //    no review is refused without a single API call.
+    let Some(review) = latest_review_for_pr(db, request.issue, request.pr_number)? else {
+        return Ok((MergeOutcome::Held(MergeHold::NotReviewed), None));
     };
 
     // 2. Rung 5's gate, re-derived against the *present* gate state.
-    let outcome = ReviewOutcome {
-        verdict: review.verdict,
-        risk_class: review.risk_class,
-        reason: review.reason.clone(),
-        total_cost_usd: None,
-        token_usage: None,
-        process_success: review.process_success,
-    };
-    let decision = decide_merge(request.gate_green, &review.dispatch_class, &outcome);
+    //
+    //    Built directly, with no fabricated fields: `decide_merge` takes
+    //    exactly the three facts it decides on, so this layer supplies
+    //    everything the decision needs rather than padding a wider struct
+    //    with `None`s it has no way to know.
+    let decision = decide_merge(
+        request.gate_green,
+        &review.dispatch_class,
+        ReviewJudgment {
+            process_success: review.process_success,
+            verdict: review.verdict,
+            risk_class: review.risk_class,
+        },
+    );
     if let MergeDecision::HoldForHuman(reason) = decision {
-        return finish(
-            db,
-            gh_runner,
-            request,
-            MergeOutcome::Held(MergeHold::Review(reason)),
-            None,
-        );
+        return Ok((MergeOutcome::Held(MergeHold::Review(reason)), None));
     }
 
     // 3. The PR as GitHub sees it now.
     let snapshot = gh::pr_snapshot(gh_runner, &request.issue.repo, request.pr_number)?;
 
     if !snapshot.state.eq_ignore_ascii_case("open") {
-        return finish(
-            db,
-            gh_runner,
-            request,
-            MergeOutcome::Held(MergeHold::PrNotOpen {
-                state: snapshot.state.clone(),
-            }),
+        let state = snapshot.state.clone();
+        return Ok((
+            MergeOutcome::Held(MergeHold::PrNotOpen { state }),
             Some(snapshot),
-        );
+        ));
     }
     if snapshot.is_draft {
-        return finish(
-            db,
-            gh_runner,
-            request,
-            MergeOutcome::Held(MergeHold::PrIsDraft),
-            Some(snapshot),
-        );
+        return Ok((MergeOutcome::Held(MergeHold::PrIsDraft), Some(snapshot)));
     }
 
     // 4. Did the reviewer read *this* commit?
     let Some(reviewed_head) = review.head_sha.clone() else {
-        return finish(
-            db,
-            gh_runner,
-            request,
+        return Ok((
             MergeOutcome::Held(MergeHold::ReviewHeadUnknown {
                 reviewed_at: review.recorded_at.clone(),
             }),
             Some(snapshot),
-        );
+        ));
     };
     if !reviewed_head.eq_ignore_ascii_case(&snapshot.head_ref_oid) {
-        return finish(
-            db,
-            gh_runner,
-            request,
+        let current_head = snapshot.head_ref_oid.clone();
+        return Ok((
             MergeOutcome::Held(MergeHold::ReviewIsStale {
                 reviewed_head,
-                current_head: snapshot.head_ref_oid.clone(),
+                current_head,
             }),
             Some(snapshot),
-        );
+        ));
     }
 
     // 5. Is it still the same merge? A retargeted PR was reviewed against a
-    //    diff that no longer exists.
-    if !review.base_branch.is_empty() && review.base_branch != snapshot.base_ref_name {
-        return finish(
-            db,
-            gh_runner,
-            request,
-            MergeOutcome::Held(MergeHold::BaseBranchMismatch {
-                reviewed_base: review.base_branch.clone(),
-                current_base: snapshot.base_ref_name.clone(),
-            }),
-            Some(snapshot),
-        );
+    //    diff that no longer exists. `None` means the review predates the
+    //    field — unknown, so the comparison is skipped rather than reported
+    //    as a mismatch; the head-SHA guard above still protects the diff.
+    let reviewed_base = review.base_branch.as_deref().unwrap_or_default();
+    if !reviewed_base.is_empty() && reviewed_base != snapshot.base_ref_name {
+        let hold = MergeHold::BaseBranchMismatch {
+            reviewed_base: reviewed_base.to_string(),
+            current_base: snapshot.base_ref_name.clone(),
+        };
+        return Ok((MergeOutcome::Held(hold), Some(snapshot)));
     }
 
     if !snapshot.mergeable.eq_ignore_ascii_case("mergeable")
         || !mergeable_state_permits(&snapshot.merge_state_status)
     {
-        return finish(
-            db,
-            gh_runner,
-            request,
-            MergeOutcome::Held(MergeHold::PrNotMergeable {
-                mergeable: snapshot.mergeable.clone(),
-                merge_state_status: snapshot.merge_state_status.clone(),
-            }),
-            Some(snapshot),
-        );
+        let hold = MergeHold::PrNotMergeable {
+            mergeable: snapshot.mergeable.clone(),
+            merge_state_status: snapshot.merge_state_status.clone(),
+        };
+        return Ok((MergeOutcome::Held(hold), Some(snapshot)));
     }
 
     // 6. Branch protection — the ladder's open question.
-    let protection =
-        gh::branch_protection(gh_runner, &request.issue.repo, &snapshot.base_ref_name)?;
-    match protection {
-        BranchProtection::NoHumanApprovalRequired => {}
+    let hold = match gh::branch_protection(gh_runner, &request.issue.repo, &snapshot.base_ref_name)?
+    {
+        BranchProtection::NoHumanApprovalRequired => None,
         BranchProtection::HumanApprovalRequired {
             required_approving_review_count,
             require_code_owner_reviews,
             enforce_admins,
-        } => {
-            return finish(
-                db,
-                gh_runner,
-                request,
-                MergeOutcome::Held(MergeHold::HumanApprovalRequired {
-                    base: snapshot.base_ref_name.clone(),
-                    required_approving_review_count,
-                    require_code_owner_reviews,
-                    enforce_admins,
-                }),
-                Some(snapshot),
-            );
-        }
-        BranchProtection::Unknown { detail } => {
-            return finish(
-                db,
-                gh_runner,
-                request,
-                MergeOutcome::Held(MergeHold::ProtectionUnknown { detail }),
-                Some(snapshot),
-            );
-        }
+        } => Some(MergeHold::HumanApprovalRequired {
+            base: snapshot.base_ref_name.clone(),
+            required_approving_review_count,
+            require_code_owner_reviews,
+            enforce_admins,
+        }),
+        BranchProtection::Unknown { detail } => Some(MergeHold::ProtectionUnknown { detail }),
+    };
+    if let Some(hold) = hold {
+        return Ok((MergeOutcome::Held(hold), Some(snapshot)));
     }
 
     // 7. Every guard passed.
     let head_sha = snapshot.head_ref_oid.clone();
     if request.dry_run {
-        return finish(
-            db,
-            gh_runner,
-            request,
+        return Ok((
             MergeOutcome::WouldMerge {
                 strategy: request.strategy,
                 head_sha,
             },
             Some(snapshot),
-        );
+        ));
     }
 
     let argv = gh::pr_merge_argv_at(
@@ -479,31 +452,23 @@ pub fn execute_merge(
     );
     let out = gh_runner.run(&argv)?;
     if !out.success {
-        return finish(
-            db,
-            gh_runner,
-            request,
-            MergeOutcome::Held(MergeHold::MergeCommandFailed {
-                detail: format!(
-                    "exit {:?}: {}",
-                    out.code,
-                    scrub_and_bound(out.stderr.trim(), MAX_LINEAGE_FIELD_CHARS).text
-                ),
-            }),
-            Some(snapshot),
-        );
+        let hold = MergeHold::MergeCommandFailed {
+            detail: format!(
+                "exit {:?}: {}",
+                out.code,
+                scrub_and_bound(out.stderr.trim(), MAX_LINEAGE_FIELD_CHARS).text
+            ),
+        };
+        return Ok((MergeOutcome::Held(hold), Some(snapshot)));
     }
 
-    finish(
-        db,
-        gh_runner,
-        request,
+    Ok((
         MergeOutcome::Merged {
             strategy: request.strategy,
             head_sha,
         },
         Some(snapshot),
-    )
+    ))
 }
 
 /// Whether GitHub's `mergeStateStatus` permits a merge.
@@ -550,7 +515,7 @@ fn finish(
         _ => false,
     };
 
-    let record_drawer_id = Some(record_merge(
+    let record_drawer_id = record_merge(
         db,
         &MergeRecord {
             issue: request.issue.clone(),
@@ -561,7 +526,7 @@ fn finish(
             base_branch: snapshot.as_ref().map(|s| s.base_ref_name.clone()),
             head_sha: snapshot.as_ref().map(|s| s.head_ref_oid.clone()),
         },
-    )?);
+    )?;
 
     let mut commented = false;
     let mut label_plan = None;
@@ -644,183 +609,10 @@ the above puts it back in the queue.\n\n\
     scrub_and_bound(&body, MAX_COMMENT_CHARS).text
 }
 
-// ── stagnation ──────────────────────────────────────────────────────────
-
-/// What [`exhaust_issue`] did.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct ExhaustExecution {
-    #[serde(serialize_with = "serialize_issue")]
-    pub issue: IssueRef,
-    /// False when the issue was already labeled `agent:exhausted`, in which
-    /// case nothing was posted.
-    pub commented: bool,
-    pub label_plan: Option<labels::LabelPlan>,
-    /// How many attempts the summary drew on.
-    pub attempts_summarized: usize,
-}
-
-/// Close out an issue that hit its per-issue attempt cap: post a comment
-/// summarizing everything tried, then flip the label to `agent:exhausted`.
-///
-/// Rung 4 already appends the terminal lineage record when the cap is
-/// reached; this is the other two thirds of the spec's bullet — *"append a
-/// terminal lineage record, post a comment summarizing everything tried, and
-/// flip the label to `agent:exhausted`"*.
-///
-/// # Idempotent on purpose
-///
-/// An issue already carrying `agent:exhausted` is left completely alone —
-/// no second comment, no label churn. Rung 4's review found the same shape as
-/// a real defect (every re-run of an exhausted issue appended another
-/// terminal record, each quoting all the prior ones); a poll loop calling
-/// this on every pass would otherwise bury the issue in identical comments.
-pub fn exhaust_issue(
-    gh_runner: &mut dyn GhRunner,
-    db: &Database,
-    issue: &IssueRef,
-    dry_run: bool,
-) -> Result<ExhaustExecution, MemoryError> {
-    validate_repo(&issue.repo)?;
-
-    let current = gh::issue_labels(gh_runner, issue)?;
-    let already = current
-        .iter()
-        .any(|l| AgentLabel::from_label_str(l) == Some(AgentLabel::Exhausted));
-
-    if already {
-        return Ok(ExhaustExecution {
-            issue: issue.clone(),
-            commented: false,
-            label_plan: None,
-            attempts_summarized: 0,
-        });
-    }
-
-    // Read only once the issue is known to need a summary — an already-
-    // exhausted issue walks none of its lineage.
-    let attempts = lineage::attempts_for_issue(db, issue)?;
-    let body = render_exhaustion_comment(issue, &attempts);
-    if dry_run {
-        return Ok(ExhaustExecution {
-            issue: issue.clone(),
-            commented: false,
-            label_plan: Some(labels::plan_exclusive(
-                &current,
-                Some(AgentLabel::Exhausted),
-            )),
-            attempts_summarized: attempts.len().min(MAX_ATTEMPTS_IN_COMMENT),
-        });
-    }
-
-    // Comment first, then label. If the label write fails the human still has
-    // the summary; if the order were reversed a failure would leave an issue
-    // marked exhausted with no explanation of why, which is the worse half to
-    // lose.
-    gh::comment_on_issue(gh_runner, issue, &body)?;
-    let plan = labels::set_exclusive_label(gh_runner, issue, Some(AgentLabel::Exhausted))?;
-
-    Ok(ExhaustExecution {
-        issue: issue.clone(),
-        commented: true,
-        label_plan: Some(plan),
-        attempts_summarized: attempts.len().min(MAX_ATTEMPTS_IN_COMMENT),
-    })
-}
-
-/// Render the exhaustion summary comment.
-///
-/// Newest attempts first, because that is what a human triaging the issue
-/// reads: the last thing tried is the best evidence about why this is stuck.
-/// Every quoted field is already scrubbed and bounded on the way *into*
-/// lineage; the whole body is scrubbed again on the way out, because the
-/// composition is a new string and this is the point where it leaves the
-/// machine.
-pub fn render_exhaustion_comment(issue: &IssueRef, attempts: &[lineage::AttemptRecord]) -> String {
-    let mut body = format!(
-        "**Autopilot stopped working {issue}.**\n\n\
-The per-issue attempt cap was reached, so this issue is now labeled `{label}`. \
-It **will not be retried automatically** — that is the point of the label. A \
-human who wants another pass should re-label it `{ready}`.\n\n",
-        issue = issue.canonical(),
-        label = AgentLabel::Exhausted.as_str(),
-        ready = AgentLabel::Ready.as_str(),
-    );
-
-    if attempts.is_empty() {
-        body.push_str("No attempt records were found for this issue.\n");
-    } else {
-        let shown: Vec<&lineage::AttemptRecord> = attempts
-            .iter()
-            .rev()
-            .take(MAX_ATTEMPTS_IN_COMMENT)
-            .collect();
-        body.push_str(&format!(
-            "### What was tried ({} attempt{}, most recent first)\n\n",
-            attempts.len(),
-            if attempts.len() == 1 { "" } else { "s" }
-        ));
-        for attempt in shown {
-            body.push_str(&format!(
-                "- **Attempt {n}** — {verdict:?}\n  - approach: {approach}\n",
-                n = attempt.attempt_n,
-                verdict = attempt.verdict,
-                approach = one_line(&attempt.approach),
-            ));
-            if let Some(why) = &attempt.why_failed {
-                body.push_str(&format!("  - why it failed: {}\n", one_line(why)));
-            }
-            if let Some(sha) = &attempt.commit_sha {
-                body.push_str(&format!("  - commit: `{}`\n", short_sha(sha)));
-            }
-        }
-        if attempts.len() > MAX_ATTEMPTS_IN_COMMENT {
-            body.push_str(&format!(
-                "\n<sub>{} older attempt(s) omitted; the full lineage is in Autopilot's \
-knowledge base.</sub>\n",
-                attempts.len() - MAX_ATTEMPTS_IN_COMMENT
-            ));
-        }
-    }
-
-    body.push_str("\n<sub>Autopilot rung 6.</sub>");
-    scrub_and_bound(&body, MAX_COMMENT_CHARS).text
-}
-
-/// Flatten a multi-line field into one Markdown list line.
-///
-/// Newlines in an attempt's `approach` or `why_failed` would otherwise break
-/// out of the bullet they belong to and reflow the rest of the comment; a
-/// leading `#` or `-` on a wrapped line would even render as a new heading or
-/// list item. Bounded here as well as at the whole-comment level so one
-/// enormous field cannot crowd out every other attempt.
-fn one_line(text: &str) -> String {
-    const MAX_FIELD_IN_COMMENT: usize = 500;
-    let flattened: String = text
-        .chars()
-        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
-        .collect();
-    let trimmed = flattened.split_whitespace().collect::<Vec<_>>().join(" ");
-    if trimmed.chars().count() > MAX_FIELD_IN_COMMENT {
-        let head: String = trimmed.chars().take(MAX_FIELD_IN_COMMENT).collect();
-        format!("{head}…")
-    } else {
-        trimmed
-    }
-}
-
 // ── storage ─────────────────────────────────────────────────────────────
 
 const MERGE_ENTITY_TYPE: &str = "merge";
 const HAS_MERGE_PREDICATE: &str = "has_merge";
-const ISSUE_ENTITY_TYPE: &str = "issue";
-
-/// The most triples [`merges_for_issue`] walks. Matches
-/// `review::MAX_REVIEWS_PER_ISSUE` and `lineage::MAX_ATTEMPTS_PER_ISSUE`
-/// deliberately: it is a `LIMIT` on **every** current edge on the issue
-/// entity — attempts, reviews and merges alike — not on merges alone, so a
-/// tight cap would let an issue's attempt edges crowd its merges out of the
-/// result set entirely.
-const MAX_MERGES_PER_ISSUE: usize = 10_000;
 
 /// One merge attempt, as the caller supplies it.
 #[derive(Debug, Clone, PartialEq)]
@@ -938,7 +730,7 @@ pub fn merges_for_issue(
         Err(other) => return Err(other),
     };
 
-    let triples = kg.query_entity_current(&entity.id, MAX_MERGES_PER_ISSUE)?;
+    let triples = kg.query_entity_current(&entity.id, MAX_ISSUE_EDGES)?;
     let mut records = Vec::new();
     for triple in triples {
         if triple.predicate != HAS_MERGE_PREDICATE {
@@ -989,24 +781,6 @@ fn last_reported_hold(
     }
 }
 
-/// A recorded review, in the shape [`execute_merge`]'s guards need it.
-///
-/// Kept as a distinct type rather than reusing
-/// [`super::review::RecordedReviewSummary`] so this module states exactly
-/// which fields the merge guards depend on, and so `base_branch`'s "unknown"
-/// case collapses to one representation (the empty string) at the boundary
-/// rather than being re-checked at every use.
-struct ReviewForMerge {
-    dispatch_class: String,
-    head_sha: Option<String>,
-    verdict: Option<ReviewVerdict>,
-    risk_class: Option<super::review::RiskClass>,
-    reason: Option<String>,
-    process_success: bool,
-    recorded_at: String,
-    base_branch: String,
-}
-
 /// The most recent review recorded for this issue **and this PR**.
 ///
 /// Filtering by PR number is not a nicety: an issue's reviews accumulate
@@ -1019,24 +793,9 @@ fn latest_review_for_pr(
     db: &Database,
     issue: &IssueRef,
     pr_number: u64,
-) -> Result<Option<ReviewForMerge>, MemoryError> {
+) -> Result<Option<RecordedReviewSummary>, MemoryError> {
     let reviews: Vec<RecordedReviewSummary> = super::review::reviews_for_issue(db, issue)?;
-    let Some(latest) = reviews.into_iter().rfind(|r| r.pr_number == pr_number) else {
-        return Ok(None);
-    };
-    Ok(Some(ReviewForMerge {
-        dispatch_class: latest.dispatch_class,
-        head_sha: latest.head_sha,
-        verdict: latest.verdict,
-        risk_class: latest.risk_class,
-        reason: latest.reason,
-        process_success: latest.process_success,
-        recorded_at: latest.recorded_at,
-        // Empty means "unknown" — a review recorded before the field existed
-        // — and `execute_merge` skips the comparison rather than inventing a
-        // mismatch. The head-SHA guard still protects the diff in that case.
-        base_branch: latest.base_branch.unwrap_or_default(),
-    }))
+    Ok(reviews.into_iter().rfind(|r| r.pr_number == pr_number))
 }
 
 #[cfg(test)]
@@ -1044,9 +803,8 @@ mod tests {
     use super::*;
     use crate::autopilot::gh::testing::ScriptedGh;
     use crate::autopilot::gh::GhOutput;
-    use crate::autopilot::lineage::{AttemptOutcome, AttemptRecord};
     use crate::autopilot::review::{
-        record_review, HoldReason, ReviewOutcome, ReviewRecord, RiskClass,
+        record_review, HoldReason, ReviewOutcome, ReviewRecord, ReviewVerdict, RiskClass,
     };
 
     fn issue() -> IssueRef {
@@ -1082,7 +840,7 @@ mod tests {
         base: Option<&str>,
         outcome: ReviewOutcome,
     ) {
-        let decision = decide_merge(true, "documentation", &outcome);
+        let decision = decide_merge(true, "documentation", outcome.judgment());
         record_review(
             database,
             &ReviewRecord {
@@ -1300,7 +1058,7 @@ mod tests {
         };
         // Recorded with a matching dispatch class so the *only* thing holding
         // it is the class being high-risk.
-        let decision = decide_merge(true, "security", &outcome);
+        let decision = decide_merge(true, "security", outcome.judgment());
         record_review(
             &database,
             &ReviewRecord {
@@ -1716,7 +1474,7 @@ mod tests {
             gh_runner.seen
         );
         assert!(
-            second.record_drawer_id.is_some(),
+            !second.record_drawer_id.is_empty(),
             "the repeat is still recorded"
         );
     }
@@ -1789,148 +1547,6 @@ mod tests {
         assert!(merges_for_issue(&database, &issue()).unwrap().is_empty());
     }
 
-    // ── stagnation ──────────────────────────────────────────────────────
-
-    fn attempt(n: u32, verdict: AttemptOutcome, why: Option<&str>) -> AttemptRecord {
-        AttemptRecord {
-            issue: issue(),
-            attempt_n: n,
-            approach: format!("approach number {n}"),
-            verdict,
-            why_failed: why.map(|w| w.to_string()),
-            commit_sha: None,
-        }
-    }
-
-    #[test]
-    fn exhausting_an_issue_comments_then_labels() {
-        let database = db();
-        for n in 1..=3 {
-            lineage::record_attempt(&database, &attempt(n, AttemptOutcome::Failed, Some("red")))
-                .unwrap();
-        }
-        let mut gh_runner = ScriptedGh::new(vec![
-            Ok(GhOutput::ok(r#"{"labels":[{"name":"agent:ready"}]}"#)),
-            Ok(GhOutput::ok("")),
-            Ok(GhOutput::ok(r#"{"labels":[{"name":"agent:ready"}]}"#)),
-            Ok(GhOutput::ok("")),
-        ]);
-
-        let exec = exhaust_issue(&mut gh_runner, &database, &issue(), false).unwrap();
-
-        assert!(exec.commented);
-        assert_eq!(exec.attempts_summarized, 3);
-        let plan = exec.label_plan.unwrap();
-        assert_eq!(plan.add, vec!["agent:exhausted".to_string()]);
-        assert_eq!(plan.remove, vec!["agent:ready".to_string()]);
-        // The comment is posted before the label: losing the label leaves the
-        // human an explanation; losing the comment leaves a bare stop sign.
-        assert!(gh_runner.seen[1].contains(&"comment".to_string()));
-    }
-
-    #[test]
-    fn an_already_exhausted_issue_is_left_completely_alone() {
-        // A poll loop calling this every pass would otherwise bury the issue
-        // in identical comments — rung 4 found the same shape as a real bug.
-        let database = db();
-        let mut gh_runner = ScriptedGh::new(vec![Ok(GhOutput::ok(
-            r#"{"labels":[{"name":"agent:exhausted"}]}"#,
-        ))]);
-
-        let exec = exhaust_issue(&mut gh_runner, &database, &issue(), false).unwrap();
-
-        assert!(!exec.commented);
-        assert!(exec.label_plan.is_none());
-        assert_eq!(gh_runner.seen.len(), 1, "only the label read happened");
-    }
-
-    #[test]
-    fn an_exhaustion_dry_run_writes_nothing() {
-        let database = db();
-        let mut gh_runner = ScriptedGh::new(vec![Ok(GhOutput::ok(
-            r#"{"labels":[{"name":"agent:ready"}]}"#,
-        ))]);
-
-        let exec = exhaust_issue(&mut gh_runner, &database, &issue(), true).unwrap();
-
-        assert!(!exec.commented);
-        assert_eq!(gh_runner.seen.len(), 1);
-        assert_eq!(
-            exec.label_plan.unwrap().add,
-            vec!["agent:exhausted".to_string()]
-        );
-    }
-
-    // ── comment rendering ───────────────────────────────────────────────
-
-    #[test]
-    fn the_exhaustion_comment_states_that_it_never_self_resumes() {
-        let attempts = vec![attempt(1, AttemptOutcome::Failed, Some("tests red"))];
-        let body = render_exhaustion_comment(&issue(), &attempts);
-        assert!(body.contains("agent:exhausted"));
-        assert!(body.contains("will not be retried automatically"));
-        assert!(body.contains("agent:ready"), "the way back must be stated");
-        assert!(body.contains("tests red"));
-    }
-
-    #[test]
-    fn the_exhaustion_comment_lists_newest_attempts_first() {
-        let attempts: Vec<AttemptRecord> = (1..=3)
-            .map(|n| attempt(n, AttemptOutcome::Failed, None))
-            .collect();
-        let body = render_exhaustion_comment(&issue(), &attempts);
-        let third = body
-            .find("approach number 3")
-            .expect("newest attempt shown");
-        let first = body
-            .find("approach number 1")
-            .expect("oldest attempt shown");
-        assert!(third < first, "most recent first: {body}");
-    }
-
-    #[test]
-    fn the_exhaustion_comment_bounds_how_many_attempts_it_quotes() {
-        let attempts: Vec<AttemptRecord> = (1..=25)
-            .map(|n| attempt(n, AttemptOutcome::Failed, None))
-            .collect();
-        let body = render_exhaustion_comment(&issue(), &attempts);
-        assert!(body.contains("25 attempts"), "the real count is stated");
-        assert!(body.contains("older attempt(s) omitted"));
-        assert!(
-            !body.contains("approach number 1\n"),
-            "the oldest attempts are dropped whole, not truncated"
-        );
-        assert!(body.chars().count() <= MAX_COMMENT_CHARS);
-    }
-
-    #[test]
-    fn a_multiline_attempt_field_cannot_break_the_comment_layout() {
-        // A wrapped line beginning `#` or `-` would render as a new heading
-        // or list item and reflow everything after it.
-        let attempts = vec![attempt(
-            1,
-            AttemptOutcome::Failed,
-            Some("line one\n# not a heading\n- not a bullet"),
-        )];
-        let body = render_exhaustion_comment(&issue(), &attempts);
-        let why_line = body
-            .lines()
-            .find(|l| l.contains("why it failed"))
-            .expect("the field is rendered");
-        assert!(why_line.contains("# not a heading"));
-        assert!(
-            !body.contains("\n# not a heading"),
-            "the newline must not survive: {body}"
-        );
-    }
-
-    #[test]
-    fn an_issue_with_no_attempts_still_produces_a_usable_comment() {
-        let body = render_exhaustion_comment(&issue(), &[]);
-        assert!(body.contains("No attempt records"));
-        assert!(body.contains("agent:exhausted"));
-    }
-
     #[test]
     fn the_hold_comment_names_the_reason_and_the_way_back() {
         let body = render_hold_comment(
@@ -1967,6 +1583,20 @@ mod tests {
         // A hold a human cannot read is a hold that gets ignored.
         let holds = vec![
             MergeHold::Review(HoldReason::NeedsChanges),
+            // The payload-carrying `HoldReason`s specifically: these are what
+            // rendered as Rust debug output before `HoldReason::summary`
+            // existed, and the `{` assertion below only catches them if they
+            // are actually exercised.
+            MergeHold::Review(HoldReason::HighRiskClass {
+                class: RiskClass::Logic,
+            }),
+            MergeHold::Review(HoldReason::ClassMismatch {
+                dispatch_class: "documentation".into(),
+                diff_class: RiskClass::Logic,
+            }),
+            MergeHold::Review(HoldReason::GateNotGreen),
+            MergeHold::Review(HoldReason::ReviewerDidNotRun),
+            MergeHold::Review(HoldReason::NoVerdict),
             MergeHold::NotReviewed,
             MergeHold::ReviewHeadUnknown {
                 reviewed_at: "2026-08-31T00:00:00Z".into(),

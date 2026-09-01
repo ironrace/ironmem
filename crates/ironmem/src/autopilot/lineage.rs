@@ -30,14 +30,10 @@ use super::{validate_repo, write_current, zero_embedding, IssueRef, ADDED_BY, RO
 /// record from ballooning to the size of a raw CI log.
 pub const MAX_LINEAGE_FIELD_CHARS: usize = 4_000;
 
-const ISSUE_ENTITY_TYPE: &str = "issue";
+use super::{ISSUE_ENTITY_TYPE, MAX_ISSUE_EDGES};
+
 const ATTEMPT_ENTITY_TYPE: &str = "attempt";
 const HAS_ATTEMPT_PREDICATE: &str = "has_attempt";
-
-/// Generous but bounded — this is a `LIMIT`, not an expectation; see
-/// `KnowledgeGraph::query_entity_current`'s own doc on why a cap exists at
-/// all (a well-connected hub entity could otherwise dump unbounded rows).
-const MAX_ATTEMPTS_PER_ISSUE: usize = 10_000;
 
 /// Outcome of one dispatch's work on an issue. Distinct from the goal
 /// evaluator's `met`/`not_met`/`impossible` verdict (that's a rung-2
@@ -207,7 +203,7 @@ pub fn attempts_for_issue(
         Err(other) => return Err(other),
     };
 
-    let triples = kg.query_entity_current(&entity.id, MAX_ATTEMPTS_PER_ISSUE)?;
+    let triples = kg.query_entity_current(&entity.id, MAX_ISSUE_EDGES)?;
     let mut records = Vec::new();
     for triple in triples {
         if triple.predicate != HAS_ATTEMPT_PREDICATE {

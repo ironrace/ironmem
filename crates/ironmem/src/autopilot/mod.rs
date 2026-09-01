@@ -94,6 +94,7 @@ pub mod review;
 pub mod review_prompt;
 pub mod run;
 pub mod scrub;
+pub mod stagnation;
 pub mod turn_prompt;
 pub mod worktree;
 
@@ -245,6 +246,34 @@ pub(crate) const EMPTY_GATE_COMMANDS_MSG: &str =
 fn zero_embedding() -> Vec<f32> {
     vec![0.0; ironrace_embed::EMBED_DIM]
 }
+
+/// The knowledge-graph entity type every per-issue record hangs off.
+///
+/// One declaration rather than one per record kind: [`lineage`], [`review`]
+/// and [`merge`] all resolve the *same* entity, and a module spelling it
+/// differently would silently read an empty history.
+pub(crate) const ISSUE_ENTITY_TYPE: &str = "issue";
+
+/// The `LIMIT` every issue→record traversal passes to
+/// `KnowledgeGraph::query_entity_current`.
+///
+/// **One number, because it bounds one thing.** It is a cap on *every*
+/// current edge on the issue entity — `has_attempt`, `has_review` and
+/// `has_merge` alike, plus whatever a later rung adds — not on any single
+/// predicate, and `query_entity_current` orders newest-first across all of
+/// them. So a module that tightened "its own" cap would truncate a
+/// *different* module's history, and do it invisibly: the starved caller
+/// reads an empty result and reports "never reviewed" rather than erroring.
+///
+/// It lived as three separate private constants (`MAX_ATTEMPTS_PER_ISSUE`,
+/// `MAX_REVIEWS_PER_ISSUE`, `MAX_MERGES_PER_ISSUE`) that had to be equal by
+/// construction and were kept so only by three doc comments pointing at each
+/// other. That is a comment, not an invariant; this is the invariant.
+///
+/// Generous but bounded — see `KnowledgeGraph::query_entity_current`'s own
+/// doc on why a cap exists at all (a well-connected hub entity could
+/// otherwise dump unbounded rows).
+pub(crate) const MAX_ISSUE_EDGES: usize = 10_000;
 
 /// Today's date in UTC, in the `YYYY-MM-DD` spelling
 /// [`budget::budget_key`] expects.

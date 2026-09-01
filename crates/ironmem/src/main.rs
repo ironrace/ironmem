@@ -1227,16 +1227,6 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                 let gate_commands =
                     ironmem::autopilot::run::approved_gate_commands(&database, &issue_ref.repo)?;
 
-                // The commit the reviewer is about to read. Recorded with
-                // the review so rung 6's `merge` can tell whether the PR it
-                // is asked to merge is still the change that was reviewed.
-                // `None` when it cannot be resolved — the reviewer still
-                // runs, but its verdict will not authorize a merge.
-                let head_sha = ironmem::autopilot::worktree::resolve_commit(
-                    std::path::Path::new(&path),
-                    &head_branch,
-                );
-
                 let mut runner = ironmem::autopilot::review::CodexReviewer::resolve(model)?;
                 let mut review = ironmem::autopilot::review::review_pr(
                     &database,
@@ -1246,7 +1236,10 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                         pr_number: pr,
                         base_branch: &base,
                         head_branch: &head_branch,
-                        head_sha,
+                        // `review_pr` resolves this from `repo_dir` and
+                        // `head_branch`; the field is an override, and the
+                        // CLI has nothing to override it with.
+                        head_sha: None,
                         dispatch_class: &dispatch_class,
                         gate_commands: &gate_commands,
                         gate_green,
@@ -1368,9 +1361,7 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                     if exec.commented {
                         println!("  commented on the issue");
                     }
-                    if let Some(id) = &exec.record_drawer_id {
-                        println!("  recorded: {id}");
-                    }
+                    println!("  recorded: {}", exec.record_drawer_id);
                 }
                 Ok(())
             }
@@ -1385,7 +1376,7 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                 let issue_ref = ironmem::autopilot::IssueRef::new(repo, issue);
                 let database = open_migrated_db(db)?;
                 let mut gh = ironmem::autopilot::gh::GhCli::resolve(&path)?;
-                let exec = ironmem::autopilot::merge::exhaust_issue(
+                let exec = ironmem::autopilot::stagnation::exhaust_issue(
                     &mut gh, &database, &issue_ref, dry_run,
                 )?;
 
@@ -1393,15 +1384,24 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                     println!("{}", serde_json::to_string_pretty(&exec)?);
                 } else {
                     println!("Issue {}", exec.issue.canonical());
-                    match (&exec.label_plan, exec.commented) {
-                        (None, _) => println!("  already agent:exhausted — nothing to do"),
-                        (Some(plan), true) => println!(
-                            "  exhausted: commented on {} attempt(s), labels +{:?} -{:?}",
-                            exec.attempts_summarized, plan.add, plan.remove
+                    use ironmem::autopilot::stagnation::ExhaustOutcome;
+                    match &exec.outcome {
+                        ExhaustOutcome::AlreadyExhausted => {
+                            println!("  already agent:exhausted — nothing to do")
+                        }
+                        ExhaustOutcome::Exhausted {
+                            label_plan,
+                            attempts_summarized,
+                        } => println!(
+                            "  exhausted: commented on {attempts_summarized} attempt(s), labels +{:?} -{:?}",
+                            label_plan.add, label_plan.remove
                         ),
-                        (Some(plan), false) => println!(
-                            "  would exhaust: {} attempt(s) summarized, labels +{:?} -{:?} — dry run, nothing written",
-                            exec.attempts_summarized, plan.add, plan.remove
+                        ExhaustOutcome::WouldExhaust {
+                            label_plan,
+                            attempts_summarized,
+                        } => println!(
+                            "  would exhaust: {attempts_summarized} attempt(s) summarized, labels +{:?} -{:?} — dry run, nothing written",
+                            label_plan.add, label_plan.remove
                         ),
                     }
                 }

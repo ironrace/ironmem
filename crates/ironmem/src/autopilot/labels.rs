@@ -13,7 +13,7 @@
 //! answered should flow again on its own, whereas work the system already
 //! proved it cannot finish must not silently retry".
 //!
-//! # Why the label is the eligibility gate, not a drawer
+//! # Why the eligibility gate reads labels, not a drawer
 //!
 //! [`eligibility`] reads the *labels* rather than lineage state because the
 //! spec makes the label the human's control surface: `agent:exhausted`
@@ -21,6 +21,14 @@
 //! gate would be un-overridable from GitHub, which is the one place the
 //! human is guaranteed to be looking. Lineage still bounds the work (rung
 //! 4's cumulative attempt cap); the label is what a human can *undo*.
+//!
+//! ⚠️ **Nothing calls [`eligibility`] yet.** Rung 6 *writes* the labels — it
+//! sets `agent:exhausted` on the attempt cap and `agent:blocked` on a held
+//! PR — but the issue *picking* that would consult them is the Lead's, and
+//! the Lead loop is rung 7. This function is the rule stated once, in the
+//! module that owns the vocabulary, for that loop to call; it is not a gate
+//! rung 6 enforces. Do not read the paragraph above as a description of
+//! current behavior.
 //!
 //! # Why the transitions are exclusive
 //!
@@ -37,13 +45,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::gh::{GhRunner, LABEL_ALREADY_EXISTS_MARKERS};
+use super::gh::{GhFailure, GhRunner, LABEL_ALREADY_EXISTS_MARKERS};
 use super::{validate_repo, IssueRef};
 use crate::error::MemoryError;
-
-/// The namespace every Autopilot label lives in. Anything outside it is
-/// another system's label and is never added or removed by this module.
-pub const LABEL_PREFIX: &str = "agent:";
 
 /// One of the spec's three `agent:*` labels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,17 +116,6 @@ impl AgentLabel {
             AgentLabel::Ready => "0e8a16",
             AgentLabel::Blocked => "fbca04",
             AgentLabel::Exhausted => "b60205",
-        }
-    }
-
-    /// Whether an issue in this state can start flowing again without a
-    /// human re-labeling it. The spec's central distinction between the two
-    /// blocked states, encoded once so no caller has to remember it.
-    pub fn self_resumes(self) -> bool {
-        match self {
-            AgentLabel::Ready => true,
-            AgentLabel::Blocked => true,
-            AgentLabel::Exhausted => false,
         }
     }
 }
@@ -271,20 +264,14 @@ pub fn ensure_labels(
             results.push((label, EnsuredLabel::Created));
             continue;
         }
-        let haystack = format!("{} {}", out.stdout, out.stderr).to_lowercase();
-        if LABEL_ALREADY_EXISTS_MARKERS
-            .iter()
-            .any(|marker| haystack.contains(marker))
-        {
+        if out.mentions_any(&LABEL_ALREADY_EXISTS_MARKERS) {
             results.push((label, EnsuredLabel::AlreadyPresent));
             continue;
         }
-        return Err(MemoryError::Validation(format!(
-            "gh label create {} failed on {repo} (exit {:?}): {}",
-            label.as_str(),
-            out.code,
-            out.stderr.trim()
-        )));
+        out.require_success(
+            &format!("gh label create {} on {repo}", label.as_str()),
+            GhFailure::Refused,
+        )?;
     }
     Ok(results)
 }
@@ -299,20 +286,28 @@ pub fn set_exclusive_label(
 ) -> Result<LabelPlan, MemoryError> {
     validate_repo(&issue.repo)?;
     let current = super::gh::issue_labels(gh, issue)?;
-    let plan = plan_exclusive(&current, target);
+    apply_plan(gh, issue, plan_exclusive(&current, target))
+}
+
+/// Apply an already-computed [`LabelPlan`].
+///
+/// Split out from [`set_exclusive_label`] so a caller that has *just* read
+/// the issue's labels does not pay for a second `gh issue view` — a process
+/// spawn and a GitHub round trip — to be told the same thing.
+pub fn apply_plan(
+    gh: &mut dyn GhRunner,
+    issue: &IssueRef,
+    plan: LabelPlan,
+) -> Result<LabelPlan, MemoryError> {
+    validate_repo(&issue.repo)?;
     if plan.is_noop() {
         return Ok(plan);
     }
     let argv = super::gh::issue_edit_labels_argv(issue, &plan.add, &plan.remove);
-    let out = gh.run(&argv)?;
-    if !out.success {
-        return Err(MemoryError::Validation(format!(
-            "gh issue edit failed for {} (exit {:?}): {}",
-            issue.canonical(),
-            out.code,
-            out.stderr.trim()
-        )));
-    }
+    gh.run(&argv)?.require_success(
+        &format!("gh issue edit on {}", issue.canonical()),
+        GhFailure::Refused,
+    )?;
     Ok(plan)
 }
 
@@ -338,7 +333,7 @@ mod tests {
                 label.as_str()
             );
             assert!(
-                label.as_str().starts_with(LABEL_PREFIX),
+                label.as_str().starts_with("agent:"),
                 "{} must live in the agent: namespace",
                 label.as_str()
             );
@@ -379,14 +374,6 @@ about GitHub matching label names case-insensitively"
             labels(&["agent:exhausted"]),
             "but the label we create is always the canonical spelling"
         );
-    }
-
-    #[test]
-    fn only_exhausted_refuses_to_self_resume() {
-        // The spec's whole reason for having two blocked states.
-        assert!(!AgentLabel::Exhausted.self_resumes());
-        assert!(AgentLabel::Blocked.self_resumes());
-        assert!(AgentLabel::Ready.self_resumes());
     }
 
     // ── eligibility ─────────────────────────────────────────────────────
