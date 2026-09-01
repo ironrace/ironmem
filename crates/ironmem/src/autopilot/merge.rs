@@ -493,12 +493,29 @@ fn evaluate(
         return Ok((MergeOutcome::AlreadyMerged { head_sha }, Some(snapshot)));
     }
 
-    // 2. The review.
+    // 2. Is it open? Directly after the merged check and *before* the
+    //    storage guards, for the same reason the snapshot itself moved to
+    //    the front: every hold below this line describes a pull request that
+    //    is still open — "the review is stale", "the base moved", "nobody
+    //    reviewed it" — and the comment those holds render says so in as
+    //    many words. Reached on a closed PR, they told a human "**The pull
+    //    request stays open**" about a PR somebody had closed. Whether it is
+    //    open is knowable here, from a snapshot already in hand, so no hold
+    //    that assumes it should be reachable before it is checked.
+    if !snapshot.state.eq_ignore_ascii_case("open") {
+        let state = snapshot.state.clone();
+        return Ok((
+            MergeOutcome::Held(MergeHold::PrNotOpen { state }),
+            Some(snapshot),
+        ));
+    }
+
+    // 3. The review.
     let Some(review) = latest_review_for_pr(db, request.issue, request.pr_number)? else {
         return Ok((MergeOutcome::Held(MergeHold::NotReviewed), Some(snapshot)));
     };
 
-    // 3. Rung 5's gate, re-derived against the *present* gate state.
+    // 4. Rung 5's gate, re-derived against the *present* gate state.
     //
     //    Built directly, with no fabricated fields: `decide_merge` takes
     //    exactly the three facts it decides on, so this layer supplies
@@ -520,14 +537,6 @@ fn evaluate(
         ));
     }
 
-    // 4. Is it open?
-    if !snapshot.state.eq_ignore_ascii_case("open") {
-        let state = snapshot.state.clone();
-        return Ok((
-            MergeOutcome::Held(MergeHold::PrNotOpen { state }),
-            Some(snapshot),
-        ));
-    }
     if snapshot.is_draft {
         return Ok((MergeOutcome::Held(MergeHold::PrIsDraft), Some(snapshot)));
     }
@@ -2526,6 +2535,89 @@ mod tests {
     fn an_issue_with_no_merges_reads_back_empty() {
         let database = db();
         assert!(merges_for_issue(&database, &issue()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_closed_pr_is_reported_closed_even_when_nothing_was_ever_reviewed() {
+        // The open check sits above the storage guards precisely so that
+        // `NotReviewed` — whose comment says "the pull request stays open" —
+        // cannot be reached on a PR somebody closed.
+        let database = db();
+        let mut gh_runner = ScriptedGh::new(vec![
+            Ok(pr_view_ok("CLOSED", HEAD)),
+            Ok(GhOutput::ok(r#"{"labels":[]}"#)),
+            Ok(GhOutput::ok("")),
+            Ok(label_created()),
+            Ok(GhOutput::ok("")),
+        ]);
+
+        let exec = execute_merge(&database, &mut gh_runner, &request(false)).unwrap();
+
+        assert_eq!(
+            exec.outcome.hold(),
+            Some(&MergeHold::PrNotOpen {
+                state: "CLOSED".into()
+            }),
+            "a closed PR's state outranks the missing review: {:?}",
+            exec.outcome
+        );
+    }
+
+    #[test]
+    fn a_closed_pr_is_reported_closed_even_when_the_gate_is_red() {
+        let database = db();
+        store_review(&database, 7, Some(HEAD), pass_outcome());
+        let mut gh_runner = ScriptedGh::new(vec![
+            Ok(pr_view_ok("CLOSED", HEAD)),
+            Ok(GhOutput::ok(r#"{"labels":[]}"#)),
+            Ok(GhOutput::ok("")),
+            Ok(label_created()),
+            Ok(GhOutput::ok("")),
+        ]);
+
+        let exec = execute_merge(
+            &database,
+            &mut gh_runner,
+            &MergeRequest {
+                gate_green: false,
+                ..request(false)
+            },
+        )
+        .unwrap();
+
+        assert!(
+            matches!(exec.outcome.hold(), Some(MergeHold::PrNotOpen { .. })),
+            "{:?}",
+            exec.outcome
+        );
+    }
+
+    #[test]
+    fn every_hold_that_claims_the_pr_is_open_is_only_reachable_on_an_open_pr() {
+        // The positive list in `pr_definitely_still_open` is only sound if
+        // `evaluate` cannot produce those holds for a non-open PR. The open
+        // guard's position is what makes that true, so pin the pairing.
+        for hold in [
+            MergeHold::NotReviewed,
+            MergeHold::Review(HoldReason::GateNotGreen),
+            MergeHold::PrIsDraft,
+        ] {
+            assert!(
+                hold.pr_definitely_still_open(),
+                "{hold:?} claims the PR is open"
+            );
+        }
+        for hold in [
+            MergeHold::PrNotOpen {
+                state: "CLOSED".into(),
+            },
+            MergeHold::MergeResultUnknown {
+                detail: String::new(),
+                read_failure: String::new(),
+            },
+        ] {
+            assert!(!hold.pr_definitely_still_open(), "{hold:?}");
+        }
     }
 
     #[test]
