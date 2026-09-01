@@ -133,6 +133,8 @@ pub enum MergeHold {
     HumanApprovalRequired {
         base: String,
         required_approving_review_count: u64,
+        /// A CODEOWNERS approval is required, independent of the count.
+        require_code_owner_reviews: bool,
         enforce_admins: bool,
     },
     /// The base branch's protection rules could not be read.
@@ -181,16 +183,30 @@ so it cannot be tied to this PR's head"
             MergeHold::HumanApprovalRequired {
                 base,
                 required_approving_review_count,
+                require_code_owner_reviews,
                 enforce_admins,
-            } => format!(
-                "{base} requires {required_approving_review_count} approving review(s){}, \
-which Autopilot cannot supply",
-                if *enforce_admins {
-                    " and enforces the rule on administrators too"
-                } else {
-                    ""
-                }
-            ),
+            } => {
+                // Rendered from whichever requirement actually applies. A
+                // count of zero with code owners required is a real
+                // configuration, and "requires 0 approving review(s)" would
+                // read to a human as though nothing were wrong.
+                let requirement = match (
+                    *required_approving_review_count,
+                    *require_code_owner_reviews,
+                ) {
+                    (0, _) => "an approving review from a code owner".to_string(),
+                    (n, false) => format!("{n} approving review(s)"),
+                    (n, true) => format!("{n} approving review(s), including a code owner's"),
+                };
+                format!(
+                    "{base} requires {requirement}{}, which Autopilot cannot supply",
+                    if *enforce_admins {
+                        " and enforces the rule on administrators too"
+                    } else {
+                        ""
+                    }
+                )
+            }
             MergeHold::ProtectionUnknown { detail } => {
                 format!("the base branch's protection rules could not be read: {detail}")
             }
@@ -412,6 +428,7 @@ pub fn execute_merge(
         BranchProtection::NoHumanApprovalRequired => {}
         BranchProtection::HumanApprovalRequired {
             required_approving_review_count,
+            require_code_owner_reviews,
             enforce_admins,
         } => {
             return finish(
@@ -421,6 +438,7 @@ pub fn execute_merge(
                 MergeOutcome::Held(MergeHold::HumanApprovalRequired {
                     base: snapshot.base_ref_name.clone(),
                     required_approving_review_count,
+                    require_code_owner_reviews,
                     enforce_admins,
                 }),
                 Some(snapshot),
@@ -1563,6 +1581,7 @@ mod tests {
             Some(&MergeHold::HumanApprovalRequired {
                 base: "main".into(),
                 required_approving_review_count: 1,
+                require_code_owner_reviews: false,
                 enforce_admins: true,
             })
         );
@@ -1919,11 +1938,25 @@ mod tests {
             &MergeHold::HumanApprovalRequired {
                 base: "main".into(),
                 required_approving_review_count: 1,
+                require_code_owner_reviews: false,
                 enforce_admins: true,
             },
         );
         assert!(body.contains("was not merged"));
         assert!(body.contains("main requires 1 approving review"));
+        assert!(
+            !render_hold_comment(
+                &request(false),
+                &MergeHold::HumanApprovalRequired {
+                    base: "main".into(),
+                    required_approving_review_count: 0,
+                    require_code_owner_reviews: true,
+                    enforce_admins: true,
+                },
+            )
+            .contains("0 approving review"),
+            "a code-owner requirement must not read to a human as \"requires 0\""
+        );
         assert!(body.contains("administrators"));
         assert!(body.contains("agent:blocked"));
         assert!(body.contains("agent:ready"));
@@ -1957,7 +1990,14 @@ mod tests {
             MergeHold::HumanApprovalRequired {
                 base: "main".into(),
                 required_approving_review_count: 2,
+                require_code_owner_reviews: false,
                 enforce_admins: false,
+            },
+            MergeHold::HumanApprovalRequired {
+                base: "main".into(),
+                required_approving_review_count: 0,
+                require_code_owner_reviews: true,
+                enforce_admins: true,
             },
             MergeHold::ProtectionUnknown {
                 detail: "403".into(),

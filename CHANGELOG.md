@@ -48,7 +48,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   review is required. Protection that cannot be *read* holds as well, because
   a token without admin scope cannot distinguish "unprotected" from "I am not
   allowed to know", and treating the second as the first is exactly the
-  inversion that merges into a protected branch.
+  inversion that merges into a protected branch. A required CODEOWNERS
+  approval counts as a required human review even when the approving-review
+  *count* is zero — the two are independent fields, and reading only the
+  count would turn an accurate `HumanApprovalRequired` into a bare
+  `MergeCommandFailed` after a merge GitHub was always going to refuse.
 
   Reviews now record the commit SHA they read and the base branch they read
   it against (`#[serde(default)]`, so every review written before this rung

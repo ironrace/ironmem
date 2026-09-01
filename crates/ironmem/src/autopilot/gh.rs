@@ -502,11 +502,16 @@ pub enum BranchProtection {
     /// The branch has no protection rules, or none that require an approving
     /// review. A merge may proceed on Autopilot's own authority.
     NoHumanApprovalRequired,
-    /// The branch requires at least one approving review. Autopilot cannot
-    /// supply one — a review it wrote would not be independent even if the
-    /// API allowed it — so the PR waits.
+    /// The branch requires an approving review — either a count of them, or
+    /// a code-owner's, or both. Autopilot cannot supply one — a review it
+    /// wrote would not be independent even if the API allowed it — so the PR
+    /// waits.
     HumanApprovalRequired {
         required_approving_review_count: u64,
+        /// A CODEOWNERS approval is required. Independent of the count: a
+        /// branch can require a code owner's review with a count of zero,
+        /// and keying only on the count would read that as unprotected.
+        require_code_owner_reviews: bool,
         /// Whether the rule also applies to administrators. When true there
         /// is no bypass at all, which is the case for this very repository.
         enforce_admins: bool,
@@ -538,6 +543,8 @@ struct ProtectionJson {
 struct RequiredReviewsJson {
     #[serde(default)]
     required_approving_review_count: u64,
+    #[serde(default)]
+    require_code_owner_reviews: bool,
 }
 
 #[derive(Deserialize)]
@@ -551,15 +558,26 @@ pub fn parse_branch_protection(stdout: &str) -> Result<BranchProtection, MemoryE
     let raw: ProtectionJson = serde_json::from_str(stdout.trim()).map_err(|e| {
         MemoryError::Validation(format!("could not parse branch protection response: {e}"))
     })?;
-    let count = raw
-        .required_pull_request_reviews
+    let reviews = raw.required_pull_request_reviews;
+    let count = reviews
+        .as_ref()
         .map(|r| r.required_approving_review_count)
         .unwrap_or(0);
-    if count == 0 {
+    let code_owners = reviews
+        .as_ref()
+        .map(|r| r.require_code_owner_reviews)
+        .unwrap_or(false);
+    // Either condition alone requires a human. They are independent in the
+    // API: a branch may require a code owner's approval with a count of
+    // zero, and keying only on the count would read that as unprotected —
+    // Autopilot would then attempt a merge GitHub refuses, and report the
+    // accurate `HumanApprovalRequired` as a bare `MergeCommandFailed`.
+    if count == 0 && !code_owners {
         return Ok(BranchProtection::NoHumanApprovalRequired);
     }
     Ok(BranchProtection::HumanApprovalRequired {
         required_approving_review_count: count,
+        require_code_owner_reviews: code_owners,
         enforce_admins: raw.enforce_admins.map(|e| e.enabled).unwrap_or(false),
     })
 }
@@ -824,6 +842,7 @@ mod tests {
             p,
             BranchProtection::HumanApprovalRequired {
                 required_approving_review_count: 1,
+                require_code_owner_reviews: false,
                 enforce_admins: true,
             }
         );
@@ -841,9 +860,31 @@ mod tests {
     }
 
     #[test]
+    fn a_code_owner_requirement_counts_even_with_a_zero_review_count() {
+        // Independent fields in the API. Keying only on the count would read
+        // this branch as unprotected and turn an accurate
+        // `HumanApprovalRequired` into a bare `MergeCommandFailed`.
+        let p = parse_branch_protection(
+            r#"{"required_pull_request_reviews":{"required_approving_review_count":0,
+                "require_code_owner_reviews":true}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            p,
+            BranchProtection::HumanApprovalRequired {
+                required_approving_review_count: 0,
+                require_code_owner_reviews: true,
+                enforce_admins: false,
+            }
+        );
+        assert!(!p.permits_autopilot_merge());
+    }
+
+    #[test]
     fn a_zero_approval_requirement_is_not_a_requirement() {
         let p = parse_branch_protection(
-            r#"{"required_pull_request_reviews":{"required_approving_review_count":0}}"#,
+            r#"{"required_pull_request_reviews":{"required_approving_review_count":0,
+                "require_code_owner_reviews":false}}"#,
         )
         .unwrap();
         assert_eq!(p, BranchProtection::NoHumanApprovalRequired);
