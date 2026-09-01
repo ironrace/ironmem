@@ -129,10 +129,21 @@ pub fn exhaust_issue(
         // round would then re-apply the stop sign with no explanation, which
         // is the exact failure the notice was introduced to prevent.
         //
+        // Gated on the ownership check, because `clear_exhaustion_notice`
+        // deletes by key and the key collides across slug-equal repos —
+        // `own/er-repo#7` and `own-er/repo#7` share one drawer id. Deleting
+        // unconditionally here would let a *polled, already-exhausted* issue
+        // destroy its neighbour's outstanding bridge notice, and the
+        // neighbour would then re-post its exhaustion summary: the very bug
+        // the notice exists to prevent, re-opened through the cheapest path
+        // there is.
+        //
         // Ignored on failure for the same reason it is safe to repeat: this
         // path runs on every poll of an exhausted issue, so the next one
         // tries again.
-        let _ = clear_exhaustion_notice(db, issue);
+        if exhaustion_notice_posted(db, issue).unwrap_or(false) {
+            let _ = clear_exhaustion_notice(db, issue);
+        }
         return Ok(ExhaustExecution {
             issue: issue.clone(),
             outcome: ExhaustOutcome::AlreadyExhausted,
@@ -250,10 +261,13 @@ fn exhaustion_notice_posted(db: &Database, issue: &IssueRef) -> Result<bool, Mem
     let Ok(body) = serde_json::from_str::<serde_json::Value>(&drawer.content) else {
         return Ok(false);
     };
-    // Case-insensitive, matching how the rest of this module compares
-    // canonical issue names: the repo's spelling comes from the caller and
-    // GitHub treats it case-insensitively, so an exact match would fail to
-    // recognise this issue's own notice and re-post its summary.
+    // Compared case-insensitively for consistency with this module's other
+    // canonical comparisons, though unlike those it is not load-bearing:
+    // the notice key runs through `repo_slug`, which *preserves* case, so
+    // two spellings that differ only in case already land on different
+    // drawer ids and never reach this line. The keys that do collide differ
+    // by `/` versus `-`, which no case folding can conflate — so this
+    // comparison can only ever be more permissive than the key, never less.
     Ok(body["issue"]
         .as_str()
         .is_some_and(|stored| stored.eq_ignore_ascii_case(&issue.canonical())))

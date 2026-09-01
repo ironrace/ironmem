@@ -887,10 +887,12 @@ pub struct RecordedReviewSummary {
     /// `owner/repo` and `owner-repo` onto one lineage entity, so an issue's
     /// reviews are not by themselves guaranteed to be *its* reviews.
     ///
-    /// Defaulted for the reason `PrSnapshot`'s fields are: a payload written
-    /// before this field existed reads back as empty, which matches no
-    /// issue's canonical name and so yields "not reviewed" — a hold — rather
-    /// than a deserialization error or, worse, a merge.
+    /// Defaulted defensively rather than out of need: nothing deserializes
+    /// *this* struct from storage — the stored type is `ReviewBody`, whose
+    /// `issue` is required and has been present since rung 5 — so no
+    /// existing payload can lack it. The attribute costs nothing and masks
+    /// nothing: a `ReviewBody` missing `issue` still errors out of
+    /// `reviews_for_issue`, which holds the merge.
     #[serde(default)]
     pub issue: String,
     pub pr_number: u64,

@@ -14,6 +14,20 @@ fn bin() -> &'static str {
 
 const PROMPT_HOOK_BUDGET_MS: u64 = 150;
 
+/// The hybrid budget the *fusion* test gives the daemon round trip.
+///
+/// Larger than the 40-80 ms the fallback tests use, and deliberately still
+/// inside [`PROMPT_HOOK_BUDGET_MS`]. That test asserts warm vector IDs reach
+/// the local rendering; it is not a test of the budget. At 80 ms a loaded CI
+/// runner blew the *hybrid* deadline while staying inside the overall one —
+/// so the hook fell back, `on.raw == off.raw`, and the test failed for a
+/// reason with nothing to do with fusion.
+///
+/// This is a timeout, not a sleep: the happy path is unaffected, and the
+/// 150 ms elapsed assertion still guards latency. A runner slow enough to
+/// exceed *that* is a real finding and still fails the test.
+const HYBRID_FUSION_BUDGET_MS: u64 = 120;
+
 fn seed_db_file_bulk(path: &Path, n: usize) {
     let db = Database::open(path).unwrap();
     db.migrate().unwrap();
@@ -805,7 +819,7 @@ fn prompt_hook_warm_noop_daemon_fuses_compact_remote_ids_into_local_rendering() 
             socket_path: Some(hook_socket.clone()),
             hybrid: false,
             hook_budget_ms: PROMPT_HOOK_BUDGET_MS,
-            hybrid_budget_ms: 80,
+            hybrid_budget_ms: HYBRID_FUSION_BUDGET_MS,
             hybrid_limit: 10,
             max_hits: Some(2),
             summary_max_bytes: Some(48),
@@ -821,7 +835,7 @@ fn prompt_hook_warm_noop_daemon_fuses_compact_remote_ids_into_local_rendering() 
             socket_path: Some(hook_socket.clone()),
             hybrid: true,
             hook_budget_ms: PROMPT_HOOK_BUDGET_MS,
-            hybrid_budget_ms: 80,
+            hybrid_budget_ms: HYBRID_FUSION_BUDGET_MS,
             hybrid_limit: 10,
             max_hits: Some(2),
             summary_max_bytes: Some(48),

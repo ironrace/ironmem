@@ -826,7 +826,6 @@ pub fn branch_protection(
     }
 
     Ok(match (classic, rules) {
-        // Both endpoints answered, neither requires a review.
         // An unreadable classic answer holds, wherever it came from. This
         // arm is unreachable today — `parse_branch_protection` never returns
         // `Unknown` — but it is what actually stops the catch-all below from

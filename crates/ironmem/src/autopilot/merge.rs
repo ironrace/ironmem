@@ -1992,6 +1992,41 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_clear_reaches_the_comment_that_describes_it() {
+        // The renderer is tested with both booleans and the ordering is
+        // tested with a *successful* clear — so a regression that hard-coded
+        // `true` at the call site would pass both and restore exactly the
+        // falsehood this exists to remove. This pins the wiring.
+        let database = db();
+        store_review(&database, 7, Some(HEAD), pass_outcome());
+        let mut gh_runner = ScriptedGh::new(vec![
+            Ok(pr_view_ok("MERGED", HEAD)),
+            Ok(GhOutput::ok(r#"{"labels":[{"name":"agent:ready"}]}"#)),
+            Ok(GhOutput::failed("", "HTTP 403: Forbidden")),
+            Ok(GhOutput::ok("")),
+        ]);
+
+        let exec = execute_merge(&database, &mut gh_runner, &request(false)).unwrap();
+
+        assert!(exec.label_error.is_some(), "the clear failed");
+        assert!(exec.commented);
+        let comment = gh_runner
+            .seen
+            .iter()
+            .find(|a| a.contains(&"comment".to_string()))
+            .expect("the issue must be commented on");
+        let body = comment.join(" ");
+        assert!(
+            body.contains("could **not** be cleared"),
+            "the comment must carry the failure through: {body}"
+        );
+        assert!(
+            !body.contains("has been cleared"),
+            "and must not also claim success: {body}"
+        );
+    }
+
+    #[test]
     fn the_already_merged_comment_does_not_claim_a_label_clear_that_failed() {
         // Written before the clear was attempted, this sentence stood as a
         // falsehood on the issue whenever `gh issue edit` refused — and the
