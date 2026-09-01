@@ -89,7 +89,7 @@ use crate::error::MemoryError;
 
 use super::dispatch::{self, DispatchOutcome, DispatchSpec, SessionMode, Verdict};
 use super::worktree::Worktree;
-use super::{budget, dispatch_state, gate_config, lineage, turn_prompt, IssueRef};
+use super::{budget, dispatch_state, gate_config, lineage, today_utc, turn_prompt, IssueRef};
 use super::{AttemptOutcome, AttemptRecord, DispatchState, IssueStatus, PriorAttempt};
 
 /// Turns per dispatch (the `N` in the spec's `/goal <gates> or stop after N
@@ -432,10 +432,6 @@ fn serialize_issue<S: serde::Serializer>(
     state.serialize_field("number", &issue.number)?;
     state.serialize_field("canonical", &issue.canonical())?;
     state.end()
-}
-
-fn today_utc() -> String {
-    chrono::Utc::now().format("%Y-%m-%d").to_string()
 }
 
 /// The commit the worktree's branch currently points at, for the lineage

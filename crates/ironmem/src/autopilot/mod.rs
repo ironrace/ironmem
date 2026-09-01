@@ -12,10 +12,15 @@
 //! [`run`], the end-to-end single-issue loop that finally *consumes* a
 //! [`dispatch::DispatchOutcome`] — banking its cost to the ledger, deciding
 //! whether it consumes an attempt, and writing the lineage and
-//! dispatch-state records the earlier rungs only defined shapes for. The
-//! Reviewer and merge authority are later rungs.
+//! dispatch-state records the earlier rungs only defined shapes for. Rung 5
+//! adds [`review`] and [`review_prompt`], the fresh-context, read-only,
+//! cross-model (Codex) Reviewer that re-classifies the diff's risk and
+//! reviews it — and, in [`review::decide_merge`], the single fail-closed
+//! answer to "may this merge?". Executing that answer (`gh pr merge`,
+//! labels, the human notification) is rung 6's: merge authority is the
+//! Lead's alone.
 //!
-//! # The five drawer kinds, one room
+//! # The drawer kinds, one room
 //!
 //! The spec's *Storage* section defines five distinct drawer kinds, all
 //! living in the same room (`ROOM`, `"backlog-lineage"`) but distinguished by
@@ -33,6 +38,14 @@
 //!    `pending` → `approved` gate-config state machine (storage/transition;
 //!    [`onboard`] is the rung-3 Onboarder that infers the proposed content).
 //!
+//! Rung 5 adds a sixth, of kind 1's shape: [`review::ReviewRecord`] — plain
+//! `add_drawer` calls, **no `logical_key`**, one drawer per review. The spec
+//! does not name it separately because it never enumerated the Reviewer's
+//! own output as storage, but it belongs to the append-only group for the
+//! same reason attempts do: the spec re-dispatches the IC on NEEDS CHANGES
+//! and reviews again, so a NEEDS CHANGES and a later PASS on the same PR are
+//! two facts, not one overwritten one.
+//!
 //! # The `logical_key` hazard
 //!
 //! `add_drawer`'s `logical_key` *rewrites* the drawer in that wing/room —
@@ -43,9 +56,11 @@
 //! takes a `logical_key`; [`lineage::record_attempt`] deliberately never
 //! calls it — its drawer id is derived straight from content via
 //! `crate::db::drawers::generate_id`, so there is no `logical_key` argument
-//! in that code path to mis-supply in the first place. See
-//! `lineage::tests::n_failed_attempts_produce_n_distinct_drawers` for the
-//! regression guard.
+//! in that code path to mis-supply in the first place. The same is true of
+//! [`review::record_review`]. See
+//! `lineage::tests::n_failed_attempts_produce_n_distinct_drawers` and
+//! `review::tests::two_reviews_of_the_same_pr_produce_two_drawers` for the
+//! regression guards.
 //!
 //! # Wing and room
 //!
@@ -62,6 +77,8 @@ pub mod dispatch_state;
 pub mod gate_config;
 pub mod lineage;
 pub mod onboard;
+pub mod review;
+pub mod review_prompt;
 pub mod run;
 pub mod scrub;
 pub mod turn_prompt;
@@ -84,6 +101,14 @@ pub use dispatch_state::DispatchState;
 pub use gate_config::{GateConfig, GateConfigState};
 pub use lineage::{AttemptOutcome, AttemptRecord, IssueStatus, RecordedAttempt};
 pub use onboard::{infer_gate_commands, onboard_repo, InferredGates};
+pub use review::reviews_for_issue;
+pub use review::{
+    decide_merge, record_review, review_pr, run_review, CodexReviewer, HoldReason, MergeDecision,
+    PrReview, RecordedReview, RecordedReviewSummary, ReviewOutcome, ReviewRecord, ReviewRefusal,
+    ReviewRequest, ReviewRunner, ReviewSpec, ReviewTokenUsage, ReviewVerdict, RiskClass,
+    DEFAULT_MAX_UNPRICED_REVIEWS_PER_DAY,
+};
+pub use review_prompt::ReviewPromptInputs;
 pub use run::{
     approved_gate_commands, run_issue, ClaudeDispatcher, DispatchClassification, DispatchSummary,
     Dispatcher, IssueBrief, IssueRun, RunConfig, TerminalReason,
@@ -206,6 +231,17 @@ pub(crate) const EMPTY_GATE_COMMANDS_MSG: &str =
 /// decide now.
 fn zero_embedding() -> Vec<f32> {
     vec![0.0; ironrace_embed::EMBED_DIM]
+}
+
+/// Today's date in UTC, in the `YYYY-MM-DD` spelling
+/// [`budget::budget_key`] expects.
+///
+/// Shared by every module that touches the daily ledger so the ledger key
+/// can only ever be spelled one way: an IC dispatch and a reviewer that
+/// disagreed about the date format would silently bank into two different
+/// drawers and neither ceiling would see the other's spend.
+pub(crate) fn today_utc() -> String {
+    chrono::Utc::now().format("%Y-%m-%d").to_string()
 }
 
 /// The deterministic drawer id for a given logical key, computed exactly the

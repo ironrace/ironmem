@@ -9,6 +9,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Autopilot rung 5: `ironmem autopilot review` decides whether a PR may
+  auto-merge.** Rung 4 could carry an issue to a green branch and an open PR,
+  but nothing read the diff — and the design is explicit that "no change
+  reaches the default branch without either a human or an independent
+  fresh-context reviewer having read the diff." The new `autopilot::review`
+  module dispatches that reviewer: a short-lived, sandboxed-read-only,
+  cross-model **Codex** invocation (`codex exec -s read-only --ephemeral`)
+  that does the two merge-time jobs the design assigns it — re-classify the
+  diff's risk, and review it — and returns a schema-forced
+  `pass`/`needs_changes` verdict alongside the class it derived.
+
+  The result is a single `decide_merge` function, which is the only way to
+  reach "may merge". Four separate rows of the design's error table end at
+  "no merge", and all four are guards there: the reviewer failed to run
+  (infrastructure failure never becomes implicit approval), it produced no
+  schema-valid verdict, it returned `needs_changes`, or the diff's own class
+  is one that always waits for a human. A fifth guard is the double
+  classification: if the class derived from the diff disagrees with the
+  Lead's dispatch-time class — *including* when the dispatch-time class was
+  never a recognized class at all, which is what `--class`'s default
+  `unclassified` produces — the PR is held. `--gate-green` is likewise an
+  opt-in assertion rather than a `--gate-red` opt-out, so a caller who
+  forgets it gets a hold rather than a merge.
+
+  Rung 5 only *decides*. Executing the decision — `gh pr merge`, the label
+  flips, the human notification — is rung 6's, because merge authority is
+  the Lead's alone.
+
+  Two things about the Codex harness are worth naming, because both are the
+  opposite of what the IC dispatch path does:
+
+  - **The verdict schema is passed as a file path, not inline.** Rung 0
+    measured `claude --json-schema <path>` failing with "not valid JSON";
+    `codex exec --output-schema` documents the exact opposite. Same
+    guarantee, two opposite spellings.
+  - **Codex reports token counts and no dollar figure**, and `codex exec` has
+    no `--max-budget-usd` equivalent. Banking `0.0` for a reviewer would make
+    the daily ledger quietly wrong in the one direction that matters, so the
+    ledger gained a distinct `unpriced_dispatch_count`: a non-zero value
+    means `total_cost_usd` is a floor, not a total. The reviewer's token
+    usage is persisted with its review record so a later rung can price it
+    retroactively. The consequence, stated rather than hidden: the day can
+    overshoot the budget by at most one reviewer invocation, which is the
+    precise property rung 4 eliminated for ICs and which the harness choice
+    reintroduces here.
+
+  Review records are append-only, one drawer per review with a `has_review`
+  knowledge-graph edge and a `reviews_for_issue` traversal to read them
+  back — the same shape (and the same `logical_key` hazard) as attempt
+  lineage, because reviews repeat: a `needs_changes` and a later `pass` on
+  the same PR are two facts, not one overwritten one. Review reasons quote
+  the diff, so they are scrubbed and length-bounded on the write path.
+
 - **Autopilot rung 4: `ironmem autopilot run` drives one issue end to end.**
   Rungs 1–3 built the storage shapes, the dispatch primitive, and the
   approved gate config; nothing yet *consumed* a dispatch's result. The new

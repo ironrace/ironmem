@@ -25,6 +25,24 @@ pub struct BudgetLedgerEntry {
     /// Number of invocations (IC + Reviewer dispatches) folded into
     /// `total_cost_usd` so far today.
     pub dispatch_count: u32,
+    /// Invocations that happened today but reported **no price**, so their
+    /// spend is missing from `total_cost_usd`.
+    ///
+    /// Non-zero means `total_cost_usd` is a **floor, not a total**. The
+    /// Codex reviewer (rung 5) lands here: `codex exec --json` reports token
+    /// counts and no dollar figure, and the spec's authoritative meter is
+    /// "the sum of `total_cost_usd` across IC **and Reviewer**
+    /// invocations". Banking `0.0` for those would satisfy the type and
+    /// quietly under-report the day — the exact failure mode the spec's
+    /// *Budget accounting* section rejects transcript ingestion for. So an
+    /// unpriced invocation increments this instead, and a reader can see
+    /// the ledger is incomplete rather than trusting a wrong total.
+    ///
+    /// `#[serde(default)]` so ledger drawers written before rung 5 read
+    /// back as "nothing unpriced", which is true of them: every writer that
+    /// existed then reported a price.
+    #[serde(default)]
+    pub unpriced_dispatch_count: u32,
 }
 
 fn budget_key(date: &str) -> String {
@@ -59,7 +77,37 @@ pub fn accumulate_daily_spend(
             "delta_usd must be a finite, non-negative number".into(),
         ));
     }
+    update_ledger(db, date, |entry| {
+        entry.total_cost_usd += delta_usd;
+        entry.dispatch_count += 1;
+    })
+}
 
+/// Record that an invocation happened today whose cost could not be
+/// determined, without moving `total_cost_usd`.
+///
+/// Deliberately **not** `accumulate_daily_spend(db, date, 0.0)`: that would
+/// count the invocation as costing nothing, which is a claim, whereas this
+/// records the truth — an invocation whose price is unknown. See
+/// [`BudgetLedgerEntry::unpriced_dispatch_count`].
+///
+/// Shares [`accumulate_daily_spend`]'s non-atomicity caveat.
+pub fn record_unpriced_dispatch(
+    db: &Database,
+    date: &str,
+) -> Result<BudgetLedgerEntry, MemoryError> {
+    validate_date(date)?;
+    update_ledger(db, date, |entry| {
+        entry.unpriced_dispatch_count += 1;
+    })
+}
+
+/// Read the day's ledger, apply `mutate`, write it back.
+fn update_ledger(
+    db: &Database,
+    date: &str,
+    mutate: impl FnOnce(&mut BudgetLedgerEntry),
+) -> Result<BudgetLedgerEntry, MemoryError> {
     let key = budget_key(date);
     let mut entry = match read_current(db, &key)? {
         Some(drawer) => serde_json::from_str::<BudgetLedgerEntry>(&drawer.content)?,
@@ -67,10 +115,10 @@ pub fn accumulate_daily_spend(
             date: date.to_string(),
             total_cost_usd: 0.0,
             dispatch_count: 0,
+            unpriced_dispatch_count: 0,
         },
     };
-    entry.total_cost_usd += delta_usd;
-    entry.dispatch_count += 1;
+    mutate(&mut entry);
 
     let content = serde_json::to_string(&entry)?;
     write_current(db, &key, &content)?;
@@ -143,9 +191,58 @@ mod tests {
     }
 
     #[test]
+    fn an_unpriced_dispatch_does_not_move_the_total() {
+        let db = Database::open_in_memory().unwrap();
+        accumulate_daily_spend(&db, "2026-08-31", 1.25).unwrap();
+        let entry = record_unpriced_dispatch(&db, "2026-08-31").unwrap();
+
+        // The whole point: the invocation is visible, but it did not get
+        // counted as costing $0.
+        assert_eq!(entry.total_cost_usd, 1.25);
+        assert_eq!(entry.dispatch_count, 1);
+        assert_eq!(entry.unpriced_dispatch_count, 1);
+    }
+
+    #[test]
+    fn unpriced_dispatches_accumulate_on_their_own_counter() {
+        let db = Database::open_in_memory().unwrap();
+        record_unpriced_dispatch(&db, "2026-08-31").unwrap();
+        let entry = record_unpriced_dispatch(&db, "2026-08-31").unwrap();
+        assert_eq!(entry.unpriced_dispatch_count, 2);
+        assert_eq!(entry.dispatch_count, 0);
+        assert_eq!(entry.total_cost_usd, 0.0);
+    }
+
+    #[test]
+    fn a_pre_rung_5_ledger_drawer_still_deserializes() {
+        // Ledger drawers written before `unpriced_dispatch_count` existed
+        // carry no such field. They must read back as "nothing unpriced"
+        // rather than failing the whole ledger read — which would make the
+        // budget check error out and stop every dispatch.
+        let db = Database::open_in_memory().unwrap();
+        write_current(
+            &db,
+            &budget_key("2026-08-25"),
+            r#"{"date":"2026-08-25","total_cost_usd":0.22,"dispatch_count":2}"#,
+        )
+        .unwrap();
+
+        let entry = get_daily_spend(&db, "2026-08-25").unwrap().unwrap();
+        assert_eq!(entry.unpriced_dispatch_count, 0);
+        assert_eq!(entry.dispatch_count, 2);
+
+        // And a later write from the new code path preserves the old fields.
+        let entry = record_unpriced_dispatch(&db, "2026-08-25").unwrap();
+        assert!((entry.total_cost_usd - 0.22).abs() < 1e-9);
+        assert_eq!(entry.dispatch_count, 2);
+        assert_eq!(entry.unpriced_dispatch_count, 1);
+    }
+
+    #[test]
     fn rejects_malformed_date_and_negative_delta() {
         let db = Database::open_in_memory().unwrap();
         assert!(accumulate_daily_spend(&db, "not-a-date", 1.0).is_err());
+        assert!(record_unpriced_dispatch(&db, "not-a-date").is_err());
         assert!(accumulate_daily_spend(&db, "2026-08-25", -1.0).is_err());
         assert!(accumulate_daily_spend(&db, "2026-08-25", f64::NAN).is_err());
     }
