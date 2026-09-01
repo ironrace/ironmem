@@ -418,9 +418,18 @@ fn spawn_forwarding_proxy(listen_path: &Path, upstream_path: &Path) -> Forwardin
         BufReader::new(upstream_reader)
             .read_line(&mut response_line)
             .unwrap();
+        // Deliberately *not* unwrapped. The hook abandons its daemon call
+        // when it runs out of budget and closes this socket, so a write here
+        // legitimately fails with `BrokenPipe` — that is the hook behaving
+        // as designed, not the proxy failing. Unwrapping panicked the helper
+        // thread, and `take_request`'s `join().unwrap()` then re-panicked
+        // with a bare `Any { .. }` *before* the elapsed-budget assertion
+        // below ever ran — so a slow run reported a broken pipe instead of
+        // the number that actually mattered. Letting the write fail quietly
+        // lets the real assertion speak.
         let mut downstream = downstream;
-        downstream.write_all(response_line.as_bytes()).unwrap();
-        downstream.flush().unwrap();
+        let _ = downstream.write_all(response_line.as_bytes());
+        let _ = downstream.flush();
     });
     ForwardingProxy {
         socket_path: listen_path.to_path_buf(),

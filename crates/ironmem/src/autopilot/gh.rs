@@ -478,6 +478,10 @@ pub fn branch_rules_argv(repo: &str, branch: &str) -> Vec<String> {
         // page back to back, which is not valid JSON. With it the pages
         // arrive as an array *of* arrays — hence `parse_branch_rules`
         // flattening rather than parsing a flat list.
+        //
+        // `--slurp` needs gh ≥ 2.55. An older gh rejects the flag, the call
+        // fails, and `branch_rules` answers `Unknown`, which holds the PR —
+        // the safe direction, and loudly enough to diagnose.
         "--slurp".into(),
     ]
 }
@@ -810,14 +814,10 @@ pub fn branch_protection(
     // A classic requirement is already the strictest answer available: the
     // rules endpoint can only agree, and asking it would buy nothing but an
     // API call.
-    if matches!(
-        classic,
-        ClassicProtection::Answered(BranchProtection::HumanApprovalRequired { .. })
-    ) {
-        let ClassicProtection::Answered(p) = classic else {
-            unreachable!("just matched Answered")
-        };
-        return Ok(p);
+    if let ClassicProtection::Answered(p @ BranchProtection::HumanApprovalRequired { .. }) =
+        &classic
+    {
+        return Ok(p.clone());
     }
 
     let rules = branch_rules(gh, repo, branch)?;
@@ -1498,6 +1498,50 @@ mod tests {
         let p = branch_protection(&mut gh, "owner/repo", "main").unwrap();
         assert!(matches!(p, BranchProtection::Unknown { .. }));
         assert!(!p.permits_autopilot_merge());
+    }
+
+    #[test]
+    fn no_combination_of_the_two_endpoints_reads_as_open_unless_both_said_so() {
+        // The safety property the whole lattice exists for, checked
+        // exhaustively rather than by reading the match arms. `classic ×
+        // rules`, every combination, with the one permitted route to
+        // `NoHumanApprovalRequired` named explicitly.
+        let requires = r#"{"required_pull_request_reviews":
+            {"required_approving_review_count":1}}"#;
+        let permits = r#"{"required_status_checks":{"strict":true}}"#;
+        let rules_require = r#"[[{"type":"pull_request","parameters":{
+            "required_approving_review_count":1,
+            "require_code_owner_review":false}}]]"#;
+
+        let classics = [
+            ("answered: requires", GhOutput::ok(requires)),
+            ("answered: permits", GhOutput::ok(permits)),
+            ("absent (404)", GhOutput::failed("", "HTTP 404")),
+            ("unreadable (403)", GhOutput::failed("", "HTTP 403")),
+            ("unreadable (bad body)", GhOutput::ok("{{{")),
+        ];
+        let rules = [
+            ("requires", GhOutput::ok(rules_require)),
+            ("none", GhOutput::ok("[[]]")),
+            ("unreadable", GhOutput::failed("", "HTTP 500")),
+            ("bad body", GhOutput::ok("not json")),
+        ];
+
+        for (cname, c) in &classics {
+            for (rname, r) in &rules {
+                let mut gh = ScriptedGh::new(vec![Ok(c.clone()), Ok(r.clone())]);
+                let p = branch_protection(&mut gh, "owner/repo", "main").unwrap();
+                let classic_permits = *cname == "answered: permits";
+                let classic_absent = *cname == "absent (404)";
+                let rules_none = *rname == "none";
+                let may_merge = (classic_permits || classic_absent) && rules_none;
+                assert_eq!(
+                    p.permits_autopilot_merge(),
+                    may_merge,
+                    "classic={cname}, rules={rname} gave {p:?}"
+                );
+            }
+        }
     }
 
     #[test]
