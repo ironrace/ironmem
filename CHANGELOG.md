@@ -25,7 +25,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   three `agent:*` labels and the thing that makes them worth having: their
   resume semantics differ, `agent:exhausted` never self-resumes, and the two
   stop states outrank `agent:ready` so a stale label can never restart work a
-  human meant to stop. `autopilot::merge` holds the merge authority itself.
+  human meant to stop. That guarantee is enforced where it is easiest to
+  break: a held merge labels the issue `agent:blocked`, which *does* resume on
+  a human comment — so an issue already carrying `agent:exhausted` is left
+  untouched rather than moved to the resuming label, and the comment says so
+  rather than naming a label it did not apply. `autopilot::merge` holds the
+  merge authority itself.
 
   `execute_merge` **re-derives** rung 5's decision rather than replaying the
   stored one, so there is exactly one implementation of the merge guard in
@@ -43,16 +48,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   names the Lead as sole merge authority, but a repository whose default
   branch requires an approving review — this one, with `enforce_admins` on
   and therefore no admin bypass — makes that claim false. Rung 6 resolves it
-  by asking rather than assuming: `execute_merge` reads the base branch's
-  protection rules first and holds with `HumanApprovalRequired` when a human
-  review is required. Protection that cannot be *read* holds as well, because
-  a token without admin scope cannot distinguish "unprotected" from "I am not
-  allowed to know", and treating the second as the first is exactly the
-  inversion that merges into a protected branch. A required CODEOWNERS
-  approval counts as a required human review even when the approving-review
-  *count* is zero — the two are independent fields, and reading only the
-  count would turn an accurate `HumanApprovalRequired` into a bare
-  `MergeCommandFailed` after a merge GitHub was always going to refuse.
+  by asking rather than assuming, in two halves that have to be asked
+  together. **Does the branch require an approval?** — read from the classic
+  protection rules *and* from the rulesets in force, since rulesets are
+  invisible to the classic endpoint (which answers `404`, indistinguishable
+  from "unprotected") and classic protection is invisible to the rules
+  endpoint. Both are always consulted and the strictest answer wins.
+  **Does this PR have one?** — read from GitHub's own `reviewDecision`.
+  Protection describes the *branch*: it still says an approval is required
+  after one has been given, so answering only the first question refuses an
+  approved PR forever. The guard runs before the mergeability check, because
+  GitHub reports `mergeStateStatus: BLOCKED` for a PR whose only problem is
+  the missing approval.
+
+  Protection that cannot be *read* holds, because a token without admin scope
+  cannot distinguish "unprotected" from "I am not allowed to know", and
+  treating the second as the first is exactly the inversion that merges into a
+  protected branch. That token is also why the rules endpoint is tried even
+  when the classic one refuses: it needs only read access, so a `403` no
+  longer stalls every PR forever. A required CODEOWNERS approval counts as a
+  required human review even when the approving-review *count* is zero — the
+  two are independent fields, and reading only the count would turn an
+  accurate `HumanApprovalRequired` into a bare `MergeCommandFailed` after a
+  merge GitHub was always going to refuse.
 
   Reviews now record the commit SHA they read and the base branch they read
   it against (`#[serde(default)]`, so every review written before this rung
