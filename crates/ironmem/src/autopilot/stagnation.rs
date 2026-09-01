@@ -76,6 +76,12 @@ pub enum ExhaustOutcome {
 pub struct ExhaustExecution {
     #[serde(serialize_with = "serialize_issue")]
     pub issue: IssueRef,
+    /// Flattened: [`ExhaustOutcome`] is already internally tagged on
+    /// `"outcome"`, so nesting it under a field of the same name would emit
+    /// `{"outcome":{"outcome":"exhausted",…}}` — a doubly-nested key nothing
+    /// asked for. Flattening puts the tag and its payload at the top level,
+    /// which is the shape the tag name was chosen for.
+    #[serde(flatten)]
     pub outcome: ExhaustOutcome,
 }
 
@@ -224,9 +230,25 @@ knowledge base.</sub>\n",
 /// its own truncation on top). Hand-rolling it here mapped `\n` and `\r` only
 /// and passed every other control character — `ESC`, `NUL`, `\x0b` — straight
 /// through into a GitHub comment body.
+///
+/// `strip_invisible: true` because this string is rendered to a human on a
+/// public issue and is composed from model-authored `approach` / `why_failed`
+/// text that quotes the diff. `char::is_control` covers only category `Cc`,
+/// so a bidi override or zero-width joiner (`Cf`) would otherwise survive and
+/// visually reorder or hide the rest of the summary — Trojan-Source-style
+/// spoofing in the one artifact a human reads to decide what to do next.
+/// [`scrub_and_bound`] does not help here: it redacts secrets, not
+/// [`crate::sanitize::is_forgeable_invisible`] characters.
 fn one_line(text: &str) -> String {
     const MAX_FIELD_IN_COMMENT: usize = 500;
-    let collapsed = crate::sanitize::collapse_whitespace_and_control(text, false);
+    // `trim`, not just the collapse: `collapse_whitespace_and_control`'s
+    // internal `value.trim()` only strips `White_Space`, so a field starting
+    // with a control or `Cf` character collapses to a *leading space* that
+    // would be rendered inside the bullet. The hand-rolled version this
+    // replaced could not produce one.
+    let collapsed = crate::sanitize::collapse_whitespace_and_control(text, true)
+        .trim()
+        .to_string();
     if collapsed.chars().count() > MAX_FIELD_IN_COMMENT {
         let head: String = collapsed.chars().take(MAX_FIELD_IN_COMMENT).collect();
         format!("{head}…")
@@ -389,6 +411,36 @@ not again inside the label write: {:?}",
             !body.contains("\n# not a heading"),
             "the newline must not survive: {body}"
         );
+    }
+
+    #[test]
+    fn an_invisible_control_character_cannot_reorder_the_comment() {
+        // Category `Cf` — a bidi override — is not `char::is_control`, so it
+        // survives the collapse unless `strip_invisible` is set, and would
+        // visually reverse everything after it on the line a human reads.
+        let attempts = vec![attempt(
+            1,
+            AttemptOutcome::Failed,
+            Some("\u{202E}gnitset\u{200B} deliaf"),
+        )];
+        let body = render_exhaustion_comment(&issue(), &attempts);
+        assert!(
+            !body.contains('\u{202E}') && !body.contains('\u{200B}'),
+            "no forgeable invisible may reach the comment: {body:?}"
+        );
+    }
+
+    #[test]
+    fn the_json_shape_puts_the_outcome_tag_at_the_top_level() {
+        // A doubly-nested `"outcome":{"outcome":…}` is what an un-flattened
+        // internally-tagged enum under a same-named field produces.
+        let exec = ExhaustExecution {
+            issue: issue(),
+            outcome: ExhaustOutcome::AlreadyExhausted,
+        };
+        let json: serde_json::Value = serde_json::to_value(&exec).unwrap();
+        assert_eq!(json["outcome"], serde_json::json!("already_exhausted"));
+        assert_eq!(json["issue"], serde_json::json!("owner/repo#42"));
     }
 
     #[test]

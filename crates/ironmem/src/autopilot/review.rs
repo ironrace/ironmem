@@ -1949,6 +1949,121 @@ not json at all
         }
     }
 
+    /// A real single-commit git repo on a real branch, so the head-SHA
+    /// resolution is exercised against actual `git` rather than a mock. The
+    /// resolution is the whole reason a review can authorize a merge, so a
+    /// mock asserting we call the command we already decided to call would
+    /// prove nothing.
+    fn fixture_repo(branch: &str) -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .output()
+                .expect("git should be runnable in tests");
+            assert!(
+                out.status.success(),
+                "git {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run(&["init", "-q", "-b", branch]);
+        std::fs::write(dir.path().join("README.md"), "hello").unwrap();
+        run(&["add", "-A"]);
+        run(&[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-qm",
+            "init",
+        ]);
+        let out = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (dir, sha)
+    }
+
+    #[test]
+    fn review_pr_resolves_the_head_sha_itself_when_the_caller_supplies_none() {
+        // The point of resolving here rather than in the caller is that a
+        // caller *cannot* get it wrong by omission. Nothing tested that until
+        // now: every other test either supplies an explicit `head_sha` or
+        // runs in a non-git tmpdir where resolution yields `None`, so a
+        // regression to `None` would leave reviews that look perfectly
+        // healthy and can never authorize a merge — rung 6 holds them all
+        // with `ReviewHeadUnknown`.
+        let branch = "autopilot/ironrace-ironmem-283";
+        let (repo, expected_sha) = fixture_repo(branch);
+        let db = Database::open_in_memory().unwrap();
+        let issue = IssueRef::new("ironrace/ironmem", 283);
+        let gates = vec!["cargo test --workspace".to_string()];
+        let mut runner = StubRunner::returning(passing_outcome(RiskClass::Documentation));
+
+        let request = ReviewRequest {
+            head_sha: None,
+            ..sample_request(&issue, &gates, repo.path())
+        };
+        review_pr(&db, &mut runner, &request).unwrap();
+
+        let recorded = reviews_for_issue(&db, &issue).unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(
+            recorded[0].head_sha.as_deref(),
+            Some(expected_sha.as_str()),
+            "the review must record the commit it actually read"
+        );
+    }
+
+    #[test]
+    fn an_explicit_head_sha_overrides_the_resolution() {
+        // The field is an override, not a duplicate source of truth.
+        let branch = "autopilot/ironrace-ironmem-283";
+        let (repo, resolved_sha) = fixture_repo(branch);
+        let db = Database::open_in_memory().unwrap();
+        let issue = IssueRef::new("ironrace/ironmem", 283);
+        let gates = vec!["cargo test --workspace".to_string()];
+        let mut runner = StubRunner::returning(passing_outcome(RiskClass::Documentation));
+
+        let pinned = "a".repeat(40);
+        let request = ReviewRequest {
+            head_sha: Some(pinned.clone()),
+            ..sample_request(&issue, &gates, repo.path())
+        };
+        review_pr(&db, &mut runner, &request).unwrap();
+
+        let recorded = reviews_for_issue(&db, &issue).unwrap();
+        assert_eq!(recorded[0].head_sha.as_deref(), Some(pinned.as_str()));
+        assert_ne!(recorded[0].head_sha.as_deref(), Some(resolved_sha.as_str()));
+    }
+
+    #[test]
+    fn an_unresolvable_head_yields_none_rather_than_a_wrong_sha() {
+        // "We could not tell" must stay unknown: rung 6 fails closed on it,
+        // and any fabricated value would be a merge authorization for a
+        // commit nobody read.
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_in_memory().unwrap();
+        let issue = IssueRef::new("ironrace/ironmem", 283);
+        let gates = vec!["cargo test --workspace".to_string()];
+        let mut runner = StubRunner::returning(passing_outcome(RiskClass::Documentation));
+
+        let request = ReviewRequest {
+            head_sha: None,
+            ..sample_request(&issue, &gates, dir.path())
+        };
+        review_pr(&db, &mut runner, &request).unwrap();
+
+        let recorded = reviews_for_issue(&db, &issue).unwrap();
+        assert_eq!(recorded[0].head_sha, None);
+    }
+
     #[test]
     fn a_clean_low_risk_review_is_recorded_and_eligible() {
         let db = Database::open_in_memory().unwrap();

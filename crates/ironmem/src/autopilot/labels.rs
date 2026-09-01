@@ -39,9 +39,9 @@
 //! the case where the target is `None` (a merged issue carries none, so the
 //! Lead cannot re-pick work that is already done).
 //!
-//! Everything in this module except [`ensure_labels`] and
-//! [`set_exclusive_label`] is pure, so the transition rules are tested
-//! without a GitHub round-trip.
+//! Everything in this module except [`ensure_labels`],
+//! [`set_exclusive_label`] and [`apply_plan`] is pure, so the transition
+//! rules are tested without a GitHub round-trip.
 
 use serde::{Deserialize, Serialize};
 
@@ -294,7 +294,16 @@ pub fn set_exclusive_label(
 /// Split out from [`set_exclusive_label`] so a caller that has *just* read
 /// the issue's labels does not pay for a second `gh issue view` — a process
 /// spawn and a GitHub round trip — to be told the same thing.
-pub fn apply_plan(
+///
+/// `pub(crate)`, not `pub`, and deliberately so. [`LabelPlan`]'s fields are
+/// public, so a plan can name *any* label — this function is the one place
+/// where the module's "only ever touches its own three `agent:*` labels"
+/// authority stops being enforced by construction and starts depending on
+/// the caller having built the plan with [`plan_exclusive`]. Keeping it
+/// in-crate means that assumption is checkable by reading this crate; a
+/// `pub` version would hand every downstream caller a way to strip a
+/// human's or another tool's labels through this module.
+pub(crate) fn apply_plan(
     gh: &mut dyn GhRunner,
     issue: &IssueRef,
     plan: LabelPlan,
