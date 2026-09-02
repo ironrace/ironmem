@@ -920,6 +920,165 @@ fn branch_rules(
     })
 }
 
+// ── rung 8: the two reads the Lead's queue is built from ────────────────
+
+/// The `--json` field list [`parse_issue_list`] expects. Named for the same
+/// reason [`PR_VIEW_FIELDS`] is: the builder and the parser cannot drift.
+///
+/// `body` is fetched here rather than with a second per-issue `gh issue view`
+/// because [`super::run::IssueBrief`] needs it for the turn prompt, and one
+/// list call per repo is the difference between a Lead tick costing one API
+/// round trip per repo and one per *issue*.
+pub const ISSUE_LIST_FIELDS: &str = "number,title,body,labels,updatedAt";
+
+/// `gh issue list --repo R --label L --state open --json <ISSUE_LIST_FIELDS> --limit N`.
+///
+/// `--state open` is explicit rather than relying on `gh`'s default: a closed
+/// issue that still carries `agent:ready` is not work, and depending on a CLI
+/// default to exclude it puts a correctness property in someone else's
+/// changelog.
+pub fn issue_list_argv(repo: &str, label: &str, limit: u32) -> Vec<String> {
+    vec![
+        "issue".into(),
+        "list".into(),
+        "--repo".into(),
+        repo.into(),
+        "--label".into(),
+        label.into(),
+        "--state".into(),
+        "open".into(),
+        "--json".into(),
+        ISSUE_LIST_FIELDS.into(),
+        "--limit".into(),
+        limit.to_string(),
+    ]
+}
+
+/// One issue as `gh issue list` reports it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct IssueListing {
+    pub number: u64,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub body: String,
+    #[serde(default, deserialize_with = "label_names")]
+    pub labels: Vec<String>,
+    #[serde(default, rename = "updatedAt")]
+    pub updated_at: String,
+}
+
+fn label_names<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw: Vec<LabelJson> = Vec::deserialize(deserializer)?;
+    Ok(raw
+        .into_iter()
+        .map(|l| l.name)
+        .filter(|n| !n.is_empty())
+        .collect())
+}
+
+/// Parse `gh issue list --json` output.
+///
+/// An issue numbered 0 is dropped rather than carried: GitHub never issues
+/// one, so its only source is a malformed or truncated response, and a
+/// `repo#0` reaching the queue would key a dispatch-state drawer that no
+/// human command can name.
+pub fn parse_issue_list(stdout: &str) -> Result<Vec<IssueListing>, MemoryError> {
+    let listings: Vec<IssueListing> = serde_json::from_str(stdout.trim()).map_err(|e| {
+        MemoryError::Validation(format!("could not parse `gh issue list --json`: {e}"))
+    })?;
+    Ok(listings.into_iter().filter(|i| i.number != 0).collect())
+}
+
+/// List one repo's issues carrying `label`.
+///
+/// A failure is an `Err`, never an empty list. Rung 7's lesson: an unreadable
+/// collection must not degrade to an empty one — an empty backlog is a
+/// confident claim that a repo has no work, and the Lead would act on it by
+/// giving that repo's slots to another repo.
+pub fn list_labeled_issues(
+    gh: &mut dyn GhRunner,
+    repo: &str,
+    label: &str,
+    limit: u32,
+) -> Result<Vec<IssueListing>, MemoryError> {
+    let out = gh.run(&issue_list_argv(repo, label, limit))?;
+    parse_issue_list(out.require_success(
+        &format!("gh issue list --label {label} on {repo}"),
+        GhFailure::NotFound,
+    )?)
+}
+
+/// `gh issue view N --repo R --json comments`.
+pub fn issue_comments_argv(issue: &IssueRef) -> Vec<String> {
+    vec![
+        "issue".into(),
+        "view".into(),
+        issue.number.to_string(),
+        "--repo".into(),
+        issue.repo.clone(),
+        "--json".into(),
+        "comments".into(),
+    ]
+}
+
+/// One comment on an issue.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct IssueComment {
+    #[serde(default)]
+    pub body: String,
+    #[serde(default, rename = "createdAt")]
+    pub created_at: String,
+    #[serde(default, deserialize_with = "author_login")]
+    pub author: String,
+}
+
+fn author_login<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    struct Author {
+        #[serde(default)]
+        login: String,
+    }
+    // `author` is null on a comment from a deleted account. That is a
+    // rendering detail, not a reason to fail the whole poll.
+    let raw: Option<Author> = Option::deserialize(deserializer)?;
+    Ok(raw.map(|a| a.login).unwrap_or_default())
+}
+
+#[derive(Deserialize)]
+struct IssueCommentsJson {
+    #[serde(default)]
+    comments: Vec<IssueComment>,
+}
+
+/// Parse `gh issue view --json comments` output.
+pub fn parse_issue_comments(stdout: &str) -> Result<Vec<IssueComment>, MemoryError> {
+    let raw: IssueCommentsJson = serde_json::from_str(stdout.trim()).map_err(|e| {
+        MemoryError::Validation(format!(
+            "could not parse `gh issue view --json comments`: {e}"
+        ))
+    })?;
+    Ok(raw.comments)
+}
+
+/// Read an issue's comment thread, oldest first (the order `gh` returns).
+pub fn issue_comments(
+    gh: &mut dyn GhRunner,
+    issue: &IssueRef,
+) -> Result<Vec<IssueComment>, MemoryError> {
+    let out = gh.run(&issue_comments_argv(issue))?;
+    parse_issue_comments(out.require_success(
+        &format!("gh issue view {} --json comments", issue.canonical()),
+        GhFailure::NotFound,
+    )?)
+}
+
 #[cfg(test)]
 pub(crate) mod testing {
     use super::*;
@@ -958,6 +1117,118 @@ pub(crate) mod testing {
 mod tests {
     use super::testing::ScriptedGh;
     use super::*;
+
+    // ── rung 8: the queue's two reads ───────────────────────────────────
+
+    #[test]
+    fn the_issue_list_argv_names_the_repo_the_label_and_the_open_state() {
+        let argv = issue_list_argv("owner/repo", "agent:ready", 50);
+        assert_eq!(argv[0], "issue");
+        assert_eq!(argv[1], "list");
+        assert!(argv.windows(2).any(|w| w == ["--repo", "owner/repo"]));
+        assert!(argv.windows(2).any(|w| w == ["--label", "agent:ready"]));
+        // Explicit, not inherited from a CLI default: a closed issue that
+        // still carries `agent:ready` is not work.
+        assert!(argv.windows(2).any(|w| w == ["--state", "open"]));
+        assert!(argv.windows(2).any(|w| w == ["--limit", "50"]));
+        assert!(argv.windows(2).any(|w| w == ["--json", ISSUE_LIST_FIELDS]));
+    }
+
+    #[test]
+    fn the_issue_list_field_list_covers_everything_the_parser_reads() {
+        for field in ["number", "title", "body", "labels", "updatedAt"] {
+            assert!(
+                ISSUE_LIST_FIELDS.split(',').any(|f| f == field),
+                "{field} is read by IssueListing but not requested"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_issue_list_reads_numbers_titles_bodies_and_label_names() {
+        let listings = parse_issue_list(
+            r#"[{"number":7,"title":"T","body":"B",
+                 "labels":[{"name":"agent:ready"},{"name":"priority:high"}],
+                 "updatedAt":"2026-09-02T00:00:00Z"}]"#,
+        )
+        .unwrap();
+        assert_eq!(listings.len(), 1);
+        assert_eq!(listings[0].number, 7);
+        assert_eq!(listings[0].title, "T");
+        assert_eq!(listings[0].body, "B");
+        assert_eq!(listings[0].labels, vec!["agent:ready", "priority:high"]);
+    }
+
+    #[test]
+    fn parse_issue_list_accepts_an_empty_backlog() {
+        assert!(parse_issue_list("[]").unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_issue_list_tolerates_missing_optional_fields() {
+        // Degrades to empty strings, never to an error: a missing body is a
+        // thin turn prompt, not a reason to skip a repo.
+        let listings = parse_issue_list(r#"[{"number":7}]"#).unwrap();
+        assert_eq!(listings[0].number, 7);
+        assert!(listings[0].body.is_empty());
+        assert!(listings[0].labels.is_empty());
+    }
+
+    #[test]
+    fn parse_issue_list_drops_an_issue_numbered_zero() {
+        // GitHub never issues one, so its only source is a malformed
+        // response — and `repo#0` would key a drawer no command can name.
+        let listings = parse_issue_list(r#"[{"number":0,"title":"junk"},{"number":5}]"#).unwrap();
+        assert_eq!(listings.len(), 1);
+        assert_eq!(listings[0].number, 5);
+    }
+
+    #[test]
+    fn an_unparseable_listing_is_an_error_never_an_empty_backlog() {
+        // Rung 7's lesson 21: an empty backlog is a confident claim that a
+        // repo has no work, and the Lead acts on it by giving the repo's
+        // slots away.
+        assert!(parse_issue_list("not json").is_err());
+        assert!(parse_issue_list("{}").is_err());
+    }
+
+    #[test]
+    fn a_failed_listing_call_is_an_error_never_an_empty_backlog() {
+        let mut gh = ScriptedGh::new(vec![Ok(GhOutput::failed("", "HTTP 403"))]);
+        assert!(list_labeled_issues(&mut gh, "owner/repo", "agent:ready", 10).is_err());
+    }
+
+    #[test]
+    fn parse_issue_comments_reads_body_author_and_creation_time_in_order() {
+        let comments = parse_issue_comments(
+            r#"{"comments":[
+                {"author":{"login":"a"},"body":"first","createdAt":"2026-09-01T00:00:00Z"},
+                {"author":{"login":"b"},"body":"second","createdAt":"2026-09-02T00:00:00Z"}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(comments.len(), 2);
+        assert_eq!(comments[0].body, "first");
+        assert_eq!(comments[0].author, "a");
+        assert_eq!(comments[1].created_at, "2026-09-02T00:00:00Z");
+    }
+
+    #[test]
+    fn a_comment_from_a_deleted_account_does_not_fail_the_whole_poll() {
+        let comments =
+            parse_issue_comments(r#"{"comments":[{"author":null,"body":"x","createdAt":"t"}]}"#)
+                .unwrap();
+        assert_eq!(comments.len(), 1);
+        assert!(comments[0].author.is_empty());
+    }
+
+    #[test]
+    fn an_issue_with_no_comments_parses_as_an_empty_thread() {
+        assert!(parse_issue_comments(r#"{"comments":[]}"#)
+            .unwrap()
+            .is_empty());
+        assert!(parse_issue_comments("{}").unwrap().is_empty());
+    }
 
     fn issue() -> IssueRef {
         IssueRef::new("owner/repo", 42)

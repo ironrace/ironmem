@@ -51,6 +51,16 @@ pub struct TurnPromptInputs<'a> {
     /// A strategy redirect in force for this dispatch, if the Lead's
     /// strategy-health check fired one. `None` for a normal dispatch.
     pub strategy_redirect: Option<&'a str>,
+    /// Questions Autopilot posted on the issue that a human has since
+    /// answered, oldest first — rung 8's
+    /// [`super::blocked::active_answers`].
+    ///
+    /// This is the delivery half of the spec's *"appends the answer to
+    /// lineage, flips back to `agent:ready`, re-dispatches"*. Without it the
+    /// re-dispatch would resume a session that asked a question and was never
+    /// told the answer, and the IC's only rational move would be to ask it
+    /// again — a loop between two halves of the same mechanism.
+    pub human_answers: &'a [(String, String)],
     /// The repo's approved gate commands, verbatim from
     /// [`super::gate_config::GateConfig::gate_commands`] — never authored
     /// separately from the approved config.
@@ -101,13 +111,32 @@ pub fn render(inputs: &TurnPromptInputs) -> String {
         .map(|r| format!("\n{r}"))
         .unwrap_or_default();
 
+    // Rendered before the constraints rather than appended to the lineage
+    // block: an answer is a human *instruction* for this dispatch, not a
+    // record of a past attempt, and burying it inside a list of failures is
+    // how it gets skimmed past.
+    let answers_section = if inputs.human_answers.is_empty() {
+        String::new()
+    } else {
+        let mut section = String::from(
+            "\n\nA human answered the question(s) you asked on this issue. \
+These answers are decisions, not suggestions — follow them:\n",
+        );
+        for (question, answer) in inputs.human_answers {
+            section.push_str(&format!(
+                "- you asked: {question}\n  the answer: {answer}\n"
+            ));
+        }
+        section
+    };
+
     let gate_line = inputs.gate_commands.join(" && ");
 
     format!(
         "You are an IC dispatch for issue {issue}: \"{title}\".\n\n\
 {body}\n\n\
 Prior attempts on this issue (read before doing anything else):\n\
-{lineage}{redirect}\n\n\
+{lineage}{redirect}{answers}\n\n\
 Constraints: feature-branch push only, never push to the default branch. Stay \
 inside your worktree. Never touch credential or secret files.\n\n\
 Checkpoint your progress (what you tried, current state, next step) after \
@@ -125,6 +154,7 @@ or stop after {n} turns",
         body = inputs.issue_body,
         lineage = lineage_section,
         redirect = redirect_line,
+        answers = answers_section,
         gate = gate_line,
         n = inputs.n_turns,
     )
@@ -164,6 +194,7 @@ mod tests {
             issue_body: "Body text.",
             prior_attempts: &[],
             strategy_redirect: None,
+            human_answers: &[],
             gate_commands: &["cargo test --workspace".to_string()],
             n_turns: 6,
         });
@@ -194,12 +225,82 @@ mod tests {
             issue_body: "B",
             prior_attempts: &prior,
             strategy_redirect: None,
+            human_answers: &[],
             gate_commands: &["cargo test".to_string()],
             n_turns: 1,
         });
         assert!(text.contains("attempt 1: tried approach A — failed (test X failed)"));
         assert!(text.contains("attempt 2: tried approach B — success"));
         assert!(!text.contains("none yet"));
+    }
+
+    #[test]
+    fn an_answered_question_reaches_the_next_dispatchs_condition() {
+        // Rung 8's blocked round trip is only closed if the answer is
+        // *delivered*. Without this the re-dispatched IC resumes a session
+        // that asked a question and was never told the answer, and its only
+        // rational move is to ask it again.
+        let issue = base_issue();
+        let text = render(&TurnPromptInputs {
+            issue: &issue,
+            issue_title: "T",
+            issue_body: "B",
+            prior_attempts: &[],
+            strategy_redirect: None,
+            human_answers: &[(
+                "Which schema should this use?".to_string(),
+                "SQLite, with migration 009.".to_string(),
+            )],
+            gate_commands: &["cargo test".to_string()],
+            n_turns: 3,
+        });
+        assert!(text.contains("Which schema should this use?"));
+        assert!(text.contains("SQLite, with migration 009."));
+        assert!(
+            text.contains("decisions, not suggestions"),
+            "an answer is an instruction, not a hint"
+        );
+    }
+
+    #[test]
+    fn an_answer_is_not_rendered_inside_the_prior_attempts_list() {
+        // A human decision buried in a list of past failures gets skimmed.
+        let issue = base_issue();
+        let text = render(&TurnPromptInputs {
+            issue: &issue,
+            issue_title: "T",
+            issue_body: "B",
+            prior_attempts: &[PriorAttempt {
+                attempt_n: 1,
+                approach: "tried A".to_string(),
+                verdict: AttemptOutcome::Failed,
+                why_failed: Some("A did not work".to_string()),
+            }],
+            strategy_redirect: None,
+            human_answers: &[("Q?".to_string(), "A!".to_string())],
+            gate_commands: &["cargo test".to_string()],
+            n_turns: 3,
+        });
+        let attempts_at = text.find("tried A").unwrap();
+        let answer_at = text.find("A!").unwrap();
+        let constraints_at = text.find("Constraints:").unwrap();
+        assert!(attempts_at < answer_at && answer_at < constraints_at);
+    }
+
+    #[test]
+    fn no_answers_adds_no_section_at_all() {
+        let issue = base_issue();
+        let text = render(&TurnPromptInputs {
+            issue: &issue,
+            issue_title: "T",
+            issue_body: "B",
+            prior_attempts: &[],
+            strategy_redirect: None,
+            human_answers: &[],
+            gate_commands: &["cargo test".to_string()],
+            n_turns: 3,
+        });
+        assert!(!text.contains("A human answered"));
     }
 
     #[test]
@@ -213,6 +314,7 @@ mod tests {
             strategy_redirect: Some(
                 "Do not retry approach A; it failed for reason Y. Try approach C instead.",
             ),
+            human_answers: &[],
             gate_commands: &["cargo test".to_string()],
             n_turns: 3,
         });
@@ -237,6 +339,7 @@ mod tests {
             issue_body: "B",
             prior_attempts: &[],
             strategy_redirect: None,
+            human_answers: &[],
             gate_commands: &commands,
             n_turns: 1,
         });
@@ -255,6 +358,7 @@ mod tests {
             issue_body: "B",
             prior_attempts: &[],
             strategy_redirect: None,
+            human_answers: &[],
             gate_commands: &["cargo test".to_string()],
             n_turns: 1,
         });
@@ -271,6 +375,7 @@ mod tests {
             issue_body: "B",
             prior_attempts: &[],
             strategy_redirect: None,
+            human_answers: &[],
             gate_commands: &["cargo test".to_string()],
             n_turns: 0,
         });
@@ -288,6 +393,7 @@ mod tests {
             issue_body: "B",
             prior_attempts: &[],
             strategy_redirect: None,
+            human_answers: &[],
             gate_commands: &[],
             n_turns: 1,
         });
@@ -314,6 +420,7 @@ mod tests {
             issue_body: "A realistic issue body of a few sentences describing the work.",
             prior_attempts: &prior,
             strategy_redirect: None,
+            human_answers: &[],
             gate_commands: &["cargo test --workspace".to_string()],
             n_turns: 6,
         });

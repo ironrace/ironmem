@@ -551,6 +551,110 @@ enum AutopilotCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Run one Lead tick: reconcile, unblock, supervise, choose, dispatch
+    /// (build-ladder rung 8)
+    Lead {
+        /// Path to the database
+        #[arg(long)]
+        db: Option<String>,
+        /// A repo and its local checkout, as `owner/repo=/path/to/checkout`.
+        /// Repeat for each repo this Lead works.
+        #[arg(long = "repo", value_name = "OWNER/REPO=PATH", required = true)]
+        repos: Vec<String>,
+        /// Committish new issue branches are cut from, for every repo
+        #[arg(long, default_value = "HEAD")]
+        base: String,
+        /// Directory that per-issue worktrees are created under
+        #[arg(long)]
+        worktree_root: Option<String>,
+        /// Model for IC dispatches
+        #[arg(long, default_value = "claude-sonnet-5")]
+        model: String,
+        /// Risk class for issues carrying no `risk:*` label.
+        ///
+        /// Defaults to `unclassified`, which **fails closed**: rung 5's
+        /// merge decision cannot parse it, so such a PR holds for a human
+        /// rather than auto-merging. Overriding this is a decision to let
+        /// unjudged issues route as something specific.
+        #[arg(long = "fallback-class", default_value = "unclassified")]
+        fallback_class: String,
+        /// How many issues one tick may dispatch
+        #[arg(long)]
+        max_dispatches: Option<usize>,
+        /// Ceiling on concurrently in-flight ICs across every repo
+        #[arg(long)]
+        concurrency_cap: Option<usize>,
+        /// Turns per dispatch (the N in "or stop after N turns")
+        #[arg(long)]
+        n_turns: Option<u32>,
+        /// Per-dispatch spend ceiling
+        #[arg(long)]
+        max_budget_usd: Option<f64>,
+        /// Per-issue attempt cap, cumulative across runs
+        #[arg(long)]
+        attempt_cap: Option<u32>,
+        /// Daily ledger ceiling across all dispatches
+        #[arg(long)]
+        daily_budget_usd: Option<f64>,
+        /// Read everything, plan everything, write nothing and spend nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// Emit JSON instead of text
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show what the Lead would work on next, without touching anything
+    /// (build-ladder rung 8)
+    Queue {
+        /// Path to the database
+        #[arg(long)]
+        db: Option<String>,
+        /// Repo to include. Repeat for each one.
+        #[arg(long = "repo", value_name = "OWNER/REPO", required = true)]
+        repos: Vec<String>,
+        /// Directory `gh` runs in
+        #[arg(long, default_value = ".")]
+        path: String,
+        /// Ceiling on concurrently in-flight ICs across every repo
+        #[arg(long)]
+        concurrency_cap: Option<usize>,
+        /// Per-issue attempt cap, cumulative across runs
+        #[arg(long)]
+        attempt_cap: Option<u32>,
+        /// Per-dispatch spend ceiling, used for the same pre-authorization
+        /// check `autopilot run` applies
+        #[arg(long)]
+        max_budget_usd: Option<f64>,
+        /// Daily ledger ceiling across all dispatches
+        #[arg(long)]
+        daily_budget_usd: Option<f64>,
+        /// Emit JSON instead of text
+        #[arg(long)]
+        json: bool,
+    },
+    /// Post a question on an issue and flip it to `agent:blocked`
+    /// (build-ladder rung 8)
+    Ask {
+        /// Path to the database
+        #[arg(long)]
+        db: Option<String>,
+        /// Repo identity (e.g. "owner/repo")
+        repo: String,
+        /// Issue number
+        issue: u64,
+        /// The question. A human's reply after it becomes the answer.
+        #[arg(long)]
+        question: String,
+        /// Directory `gh` runs in
+        #[arg(long, default_value = ".")]
+        path: String,
+        /// Render the comment and the label plan, but write nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// Emit JSON instead of text
+        #[arg(long)]
+        json: bool,
+    },
     /// Set or clear a repo's per-dispatch wall-clock bound (rung 7)
     Timeout {
         /// Path to the database
@@ -568,6 +672,115 @@ enum AutopilotCmd {
         #[arg(long)]
         json: bool,
     },
+}
+
+/// Parse one `--repo owner/repo=/path/to/checkout` argument.
+///
+/// Split on the **first** `=`: a checkout path may legitimately contain one,
+/// a repo identifier may not. Splitting on the last would turn
+/// `owner/repo=/srv/a=b` into a repo named `owner/repo=/srv/a`.
+fn parse_repo_target(
+    spec: &str,
+    base: &str,
+) -> Result<ironmem::autopilot::lead::RepoTarget, MemoryError> {
+    let (repo, path) = spec.split_once('=').ok_or_else(|| {
+        MemoryError::Validation(format!(
+            "--repo must be `owner/repo=/path/to/checkout`, got '{spec}' — the Lead cuts \
+             worktrees from a local checkout and has no way to guess where one is"
+        ))
+    })?;
+    let repo = repo.trim();
+    let path = path.trim();
+    if repo.is_empty() || path.is_empty() {
+        return Err(MemoryError::Validation(format!(
+            "--repo '{spec}' has an empty repo or path"
+        )));
+    }
+    Ok(ironmem::autopilot::lead::RepoTarget {
+        repo: repo.to_string(),
+        path: std::path::PathBuf::from(path),
+        base: base.to_string(),
+    })
+}
+
+/// Human-readable rendering of one queue plan.
+fn print_queue_plan(plan: &ironmem::autopilot::queue::QueuePlan) {
+    println!(
+        // `occupied_slots` counts in-flight work this pass did *not* pick, so
+        // it is not the number of slots in use — the selected resumes hold
+        // slots too. Both are named rather than one being printed under the
+        // other's label.
+        "Queue — {} to dispatch, {} deferred, {}/{} slots in use after this pass \
+         ({} held by work not picked), ${:.4} of ${:.2} spent today",
+        plan.dispatch.len(),
+        plan.deferred.len(),
+        plan.occupied_slots + plan.dispatch.len(),
+        plan.concurrency_cap,
+        plan.occupied_slots,
+        plan.spent_today_usd,
+        plan.daily_budget_usd,
+    );
+    for (i, queued) in plan.dispatch.iter().enumerate() {
+        println!(
+            "  {}. {} [{:?}]{}{} — {}",
+            i + 1,
+            queued.issue.canonical(),
+            queued.priority,
+            if queued.resuming { " (resume)" } else { "" },
+            queued
+                .risk_label
+                .as_ref()
+                .map(|c| format!(" risk:{c}"))
+                .unwrap_or_default(),
+            queued.title,
+        );
+    }
+    for deferred in &plan.deferred {
+        println!(
+            "  — {} deferred: {:?}",
+            deferred.issue.canonical(),
+            deferred.reason
+        );
+    }
+}
+
+/// Human-readable rendering of one Lead tick.
+fn print_lead_report(report: &ironmem::autopilot::lead::LeadReport) {
+    if report.dry_run {
+        println!("DRY RUN — nothing was written and nothing was spent");
+    }
+    if !report.registry_available {
+        println!("  registry: UNREADABLE — issues with a live session are held this tick");
+    }
+    for row in &report.reconciliation {
+        println!(
+            "  reconcile {}: {:?}",
+            row.issue
+                .as_ref()
+                .map(|i| i.canonical())
+                .unwrap_or_else(|| row.session_name.clone()),
+            row.verdict
+        );
+    }
+    for row in &report.blocked {
+        println!("  blocked {}: {:?}", row.issue.canonical(), row.poll);
+    }
+    for row in &report.supervision {
+        println!("  supervise {}: {:?}", row.issue.canonical(), row.action);
+    }
+    print_queue_plan(&report.plan);
+    for run in &report.runs {
+        println!(
+            "  ran {} — {} dispatch(es), ${:.4}, terminal {:?}",
+            run.issue.canonical(),
+            run.dispatches.len(),
+            run.total_cost_usd,
+            run.terminal,
+        );
+    }
+    for problem in &report.problems {
+        println!("  PROBLEM {}: {}", problem.what, problem.detail);
+    }
 }
 
 /// Where per-issue worktrees live when `--worktree-root` is not given.
@@ -1660,6 +1873,208 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                             ReconcileVerdict::Hold { reason } => {
                                 println!("  {who} [{}] — hold: {reason}", row.session_name)
                             }
+                        }
+                    }
+                }
+                Ok(())
+            }
+            AutopilotCmd::Lead {
+                db,
+                repos,
+                base,
+                worktree_root,
+                model,
+                fallback_class,
+                max_dispatches,
+                concurrency_cap,
+                n_turns,
+                max_budget_usd,
+                attempt_cap,
+                daily_budget_usd,
+                dry_run,
+                json,
+            } => {
+                use ironmem::autopilot::lead::LeadConfig;
+                use ironmem::autopilot::queue::QueueConfig;
+                use ironmem::autopilot::run::RunConfig;
+
+                let worktree_root = match worktree_root {
+                    Some(dir) => std::path::PathBuf::from(dir),
+                    None => default_worktree_root()?,
+                };
+
+                let mut targets = Vec::new();
+                for spec in &repos {
+                    targets.push(parse_repo_target(spec, &base)?);
+                }
+
+                let mut run = RunConfig::new(model, fallback_class);
+                if let Some(n) = n_turns {
+                    run.n_turns = n;
+                    run.max_turns =
+                        n.saturating_add(ironmem::autopilot::run::DEFAULT_MAX_TURNS_HEADROOM);
+                }
+                if let Some(budget) = max_budget_usd {
+                    run.max_budget_usd = budget;
+                }
+                if let Some(cap) = attempt_cap {
+                    run.attempt_cap = cap;
+                }
+                if let Some(daily) = daily_budget_usd {
+                    run.daily_budget_usd = daily;
+                }
+
+                let mut queue = QueueConfig::default();
+                if let Some(cap) = concurrency_cap {
+                    queue.concurrency_cap = cap;
+                }
+                if let Some(cap) = attempt_cap {
+                    queue.attempt_cap = cap;
+                }
+                // Kept in step with the run config on purpose: the queue's
+                // budget guard exists to apply the *same* predicate
+                // `run_issue` will, so two different numbers here would make
+                // the queue admit work the runner then refuses.
+                queue.max_budget_usd = run.max_budget_usd;
+                queue.daily_budget_usd = run.daily_budget_usd;
+
+                let config = LeadConfig {
+                    targets,
+                    queue,
+                    run,
+                    supervision: ironmem::autopilot::supervise::SupervisionConfig::default(),
+                    max_dispatches_per_tick: max_dispatches
+                        .unwrap_or(ironmem::autopilot::lead::DEFAULT_MAX_DISPATCHES_PER_TICK),
+                    worktree_root,
+                    dry_run,
+                };
+                // Validate before resolving binaries: a bad config should
+                // fail on the config, not on a missing `gh`.
+                config.validate()?;
+
+                let database = open_migrated_db(db)?;
+                let mut gh_runner = ironmem::autopilot::gh::GhCli::resolve(
+                    config
+                        .targets
+                        .first()
+                        .map(|t| t.path.clone())
+                        .unwrap_or_else(|| std::path::PathBuf::from(".")),
+                )?;
+                let mut registry = ironmem::autopilot::registry::ClaudeAgentRegistry::resolve()?;
+                let mut dispatcher = ironmem::autopilot::run::ClaudeDispatcher::resolve()?;
+
+                let report = ironmem::autopilot::lead::lead_tick(
+                    &database,
+                    &mut gh_runner,
+                    &mut registry,
+                    &mut dispatcher,
+                    &config,
+                )?;
+
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    print_lead_report(&report);
+                }
+                Ok(())
+            }
+            AutopilotCmd::Queue {
+                db,
+                repos,
+                path,
+                concurrency_cap,
+                attempt_cap,
+                max_budget_usd,
+                daily_budget_usd,
+                json,
+            } => {
+                use ironmem::autopilot::queue::{plan_queue, QueueConfig, RepoBacklog};
+
+                let mut config = QueueConfig::default();
+                if let Some(cap) = concurrency_cap {
+                    config.concurrency_cap = cap;
+                }
+                if let Some(cap) = attempt_cap {
+                    config.attempt_cap = cap;
+                }
+                if let Some(budget) = max_budget_usd {
+                    config.max_budget_usd = budget;
+                }
+                if let Some(daily) = daily_budget_usd {
+                    config.daily_budget_usd = daily;
+                }
+                config.validate()?;
+
+                let database = open_migrated_db(db)?;
+                let mut gh_runner =
+                    ironmem::autopilot::gh::GhCli::resolve(std::path::PathBuf::from(&path))?;
+                let mut registry = ironmem::autopilot::registry::ClaudeAgentRegistry::resolve()?;
+                let snapshot = ironmem::autopilot::registry::snapshot(&mut registry);
+
+                let mut backlogs = Vec::new();
+                for repo in &repos {
+                    let issues = ironmem::autopilot::gh::list_labeled_issues(
+                        &mut gh_runner,
+                        repo,
+                        ironmem::autopilot::labels::AgentLabel::Ready.as_str(),
+                        config.max_issues_per_repo,
+                    )?;
+                    backlogs.push(RepoBacklog {
+                        repo: repo.clone(),
+                        issues,
+                    });
+                }
+
+                let plan = plan_queue(&database, &backlogs, &snapshot, &config)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&plan)?);
+                } else {
+                    print_queue_plan(&plan);
+                }
+                Ok(())
+            }
+            AutopilotCmd::Ask {
+                db,
+                repo,
+                issue,
+                question,
+                path,
+                dry_run,
+                json,
+            } => {
+                let issue_ref = ironmem::autopilot::IssueRef::new(repo, issue);
+                let database = open_migrated_db(db)?;
+                let mut gh_runner =
+                    ironmem::autopilot::gh::GhCli::resolve(std::path::PathBuf::from(&path))?;
+                let outcome = ironmem::autopilot::blocked::ask_human(
+                    &database,
+                    &mut gh_runner,
+                    &issue_ref,
+                    &question,
+                    dry_run,
+                )?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&outcome)?);
+                } else {
+                    match &outcome {
+                        ironmem::autopilot::blocked::AskOutcome::Asked { question } => {
+                            println!("Asked on {}: {question}", issue_ref.canonical());
+                            println!(
+                                "  labeled agent:blocked; a reply after this comment resumes it"
+                            );
+                        }
+                        ironmem::autopilot::blocked::AskOutcome::AlreadyWaiting { question } => {
+                            println!(
+                                "{} is already waiting on a human: {question}",
+                                issue_ref.canonical()
+                            );
+                            println!("  nothing posted, no label touched");
+                        }
+                        ironmem::autopilot::blocked::AskOutcome::DryRun { question } => {
+                            println!(
+                                "DRY RUN — would ask on {}: {question}",
+                                issue_ref.canonical()
+                            );
                         }
                     }
                 }
