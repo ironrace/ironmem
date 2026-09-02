@@ -43,9 +43,15 @@
 //!
 //! | Judgment-shaped step | Where it is today | Why it is not mechanical |
 //! |---|---|---|
-//! | Dispatch-time risk classification | [`class_for`] reads a `risk:*` label, else falls back and **fails closed** | Reading an issue's prose to route it |
-//! | Composing a strategy redirect | Rung 7 generates it mechanically | It can forbid repeating a failure; it cannot propose a better approach |
-//! | Drafting a human escalation question | [`ask_human`](super::blocked::ask_human) takes the text from its caller | Same: naming *what* is unclear is the judgment |
+//! | Dispatch-time risk classification | [`class_for`] reads a `risk:*` label; [`resolve_class`] asks rung 9's advisor when there is none, and falls back **closed** when it has no answer | Reading an issue's prose to route it |
+//! | Composing a strategy redirect | Rung 7 generates the binding text; rung 9 may append a proposed alternative | It can forbid repeating a failure; it cannot propose a better approach |
+//! | Drafting a human escalation question | [`notify_escalation`] posts the mechanical notice, with rung 9's drafted question added when there is one | Same: naming *what* is unclear is the judgment |
+//!
+//! ⟨rung 9⟩ All three are now **built**, in [`super::advise`], and all three
+//! are **off unless an operator turns them on**. Nothing above changes when
+//! they are off, and — the property the close-out actually rests on —
+//! nothing above changes when they are on and *fail*. See
+//! `a_failing_advisor_changes_nothing_about_the_tick`.
 //!
 //! None of the three is on the tick's critical path. A Lead that never makes
 //! any of these calls still runs: it dispatches every issue as
@@ -69,6 +75,7 @@ use std::path::PathBuf;
 
 use serde::Serialize;
 
+use super::advise::{self, Advice, AdviceConfig, Advisor};
 use super::blocked::{self, BlockedPoll};
 use super::gh::{self, GhRunner};
 use super::labels::AgentLabel;
@@ -76,7 +83,8 @@ use super::merge::serialize_issue;
 use super::queue::{self, QueueConfig, QueuePlan, RepoBacklog, IN_FLIGHT_SCAN_LIMIT};
 use super::registry::{self, AgentRegistry, RegistrySnapshot};
 use super::run::{self, Dispatcher, IssueBrief, IssueRun, RunConfig};
-use super::supervise::{self, SupervisionConfig, SupervisionReport};
+use super::scrub::scrub_and_bound;
+use super::supervise::{self, SupervisionAction, SupervisionConfig, SupervisionReport};
 use super::worktree;
 use super::{validate_repo, IssueRef};
 use crate::db::schema::Database;
@@ -100,6 +108,19 @@ pub const DEFAULT_MAX_DISPATCHES_PER_TICK: usize = 1;
 /// would be the worst of both: it would look like classification and route on
 /// nothing.
 pub const RISK_LABEL_PREFIX: &str = "risk:";
+
+/// Bound on the whole escalation notice.
+pub const MAX_NOTICE_CHARS: usize = 20_000;
+
+/// Bound on any one quoted field inside it. Issue and lineage text is
+/// scrubbed and bounded on the way to GitHub, like every other comment this
+/// subsystem posts.
+pub const MAX_NOTICE_FIELD_CHARS: usize = 1_000;
+
+/// How many prior approaches the notice lists, newest first. Bounded to
+/// whole approaches rather than truncated mid-sentence — rung 6's
+/// exhaustion comment made the same choice for the same reason.
+pub const MAX_NOTICE_APPROACHES: usize = 10;
 
 /// One repo the Lead works, and the local checkout its worktrees come from.
 ///
@@ -126,6 +147,9 @@ pub struct LeadConfig {
     /// issue carrying no `risk:*` label. See [`class_for`].
     pub run: RunConfig,
     pub supervision: SupervisionConfig,
+    /// Rung 9's three one-shot judgment calls. Disabled by default; a tick
+    /// with them disabled is byte-for-byte rung 8's tick.
+    pub advice: AdviceConfig,
     pub max_dispatches_per_tick: usize,
     pub worktree_root: PathBuf,
     /// Read everything, decide everything, write nothing and spend nothing.
@@ -169,6 +193,7 @@ impl LeadConfig {
         self.queue.validate()?;
         self.run.validate()?;
         self.supervision.validate()?;
+        self.advice.validate()?;
         Ok(())
     }
 }
@@ -224,7 +249,24 @@ pub struct LeadReport {
     pub supervision: Vec<SupervisionReport>,
     pub plan: QueuePlan,
     pub runs: Vec<IssueRun>,
+    /// Every rung-9 advisor call this tick made, in the order it made them.
+    /// Empty when the advisor is disabled, which is the default.
+    pub advice: Vec<Advice>,
+    /// Escalated issues a human was told about on the issue itself this
+    /// tick. Independent of the advisor: the notice is mechanical, and the
+    /// advisor only adds a drafted question to it when it has one.
+    pub escalation_notices: Vec<EscalationNotice>,
     pub problems: Vec<TickProblem>,
+}
+
+/// One escalated issue a human was notified about.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct EscalationNotice {
+    #[serde(serialize_with = "serialize_issue")]
+    pub issue: IssueRef,
+    pub signature: String,
+    /// Whether rung 9's advisor supplied a drafted question for the notice.
+    pub drafted_question: bool,
 }
 
 /// Run one Lead tick.
@@ -239,11 +281,13 @@ pub fn lead_tick(
     gh_runner: &mut dyn GhRunner,
     agent_registry: &mut dyn AgentRegistry,
     dispatcher: &mut dyn Dispatcher,
+    advisor: &mut dyn Advisor,
     config: &LeadConfig,
 ) -> Result<LeadReport, MemoryError> {
     config.validate()?;
 
     let mut problems: Vec<TickProblem> = Vec::new();
+    let mut advice: Vec<Advice> = Vec::new();
 
     // ── 1. one registry read, shared by every step ──────────────────────
     //
@@ -259,6 +303,24 @@ pub fn lead_tick(
     // ── 3. supervise what is already in flight ──────────────────────────
     let supervision = supervise_in_flight(db, &snapshot, config, &mut problems)?;
 
+    // ── 3b. act on what supervision decided ⟨rung 9⟩ ────────────────────
+    //
+    // Two of the three judgment calls live here, and both are *additive*:
+    // the redirect already in force is unchanged if no proposal comes back,
+    // and the escalation notice is posted whether or not a question was
+    // drafted. Ordered after supervision and before the backlog read so a
+    // proposal armed this tick reaches this tick's dispatch — the same
+    // reason blocked issues are polled first.
+    let escalation_notices = act_on_supervision(
+        db,
+        gh_runner,
+        advisor,
+        &supervision,
+        config,
+        &mut advice,
+        &mut problems,
+    );
+
     // ── 4. read every backlog and choose ────────────────────────────────
     let backlogs = fetch_backlogs(gh_runner, config, &mut problems);
     let plan = queue::plan_queue(db, &backlogs, &snapshot, &config.queue)?;
@@ -267,7 +329,7 @@ pub fn lead_tick(
     let mut runs = Vec::new();
     if !config.dry_run {
         for queued in plan.dispatch.iter().take(config.max_dispatches_per_tick) {
-            match dispatch_one(db, queued, config, dispatcher) {
+            match dispatch_one(db, queued, config, dispatcher, advisor, &mut advice) {
                 Ok(run) => runs.push(run),
                 Err(e) => problems.push(TickProblem {
                     what: format!("dispatch {}", queued.issue.canonical()),
@@ -285,6 +347,8 @@ pub fn lead_tick(
         supervision,
         plan,
         runs,
+        advice,
+        escalation_notices,
         problems,
     })
 }
@@ -363,6 +427,241 @@ fn supervise_in_flight(
     Ok(reports)
 }
 
+/// Act on what supervision decided ⟨rung 9⟩.
+///
+/// Two things, both **additive to rung 8's behaviour** and both safe to
+/// omit:
+///
+/// 1. A newly-armed strategy redirect may get a model-proposed alternative
+///    appended ([`super::advise::advise_strategy_redirect`]). If the advisor
+///    is off, refuses, or fails, the redirect rung 7 generated stands
+///    unchanged — it is the floor, never the thing being replaced.
+/// 2. An escalated issue gets a comment telling a human, **once per
+///    signature**. This is not conditional on the advisor: before rung 9 an
+///    escalation stopped the work and said so only in a drawer, which is the
+///    "reports but does not bind" shape this ladder has now hit four times.
+///    The advisor only supplies the drafted question inside the notice.
+///
+/// Failures are collected, never propagated: a repo whose `gh` call fails
+/// must not stop the tick, and neither must an advisor.
+///
+/// A restart that *also* armed a redirect gets no proposal this tick — only
+/// [`SupervisionAction::Redirect`] is matched. Deliberate, and the cheap
+/// direction: [`supervise::plan_supervision`] reports a restart when the
+/// process is dead, a dead process cannot read a proposal anyway, and the
+/// next tick reports `Redirect` and buys one if the issue is still
+/// thrashing. The proposal is not lost, only deferred by one tick.
+fn act_on_supervision(
+    db: &Database,
+    gh_runner: &mut dyn GhRunner,
+    advisor: &mut dyn Advisor,
+    supervision: &[SupervisionReport],
+    config: &LeadConfig,
+    advice: &mut Vec<Advice>,
+    problems: &mut Vec<TickProblem>,
+) -> Vec<EscalationNotice> {
+    let mut notices = Vec::new();
+    for report in supervision {
+        match &report.action {
+            SupervisionAction::Redirect { signature, .. } => {
+                if !config.advice.enabled {
+                    continue;
+                }
+                match propose_alternative(db, advisor, report, signature, config) {
+                    Ok(Some(a)) => advice.push(a),
+                    Ok(None) => {}
+                    Err(e) => problems.push(TickProblem {
+                        what: format!("propose a redirect for {}", report.issue.canonical()),
+                        detail: e.to_string(),
+                    }),
+                }
+            }
+            SupervisionAction::Escalate { signature, .. } => {
+                match notify_escalation(db, gh_runner, advisor, report, signature, config, advice) {
+                    Ok(Some(notice)) => notices.push(notice),
+                    Ok(None) => {}
+                    Err(e) => problems.push(TickProblem {
+                        what: format!("notify escalation on {}", report.issue.canonical()),
+                        detail: e.to_string(),
+                    }),
+                }
+            }
+            _ => {}
+        }
+    }
+    notices
+}
+
+/// Buy one model-proposed alternative for a redirect already in force.
+///
+/// Returns the [`Advice`] if a call was made at all. The write is
+/// [`supervise::set_redirect_proposal`], which refuses a stale or duplicate
+/// proposal — so this is idempotent per signature and is *paid for* once,
+/// not once per tick.
+fn propose_alternative(
+    db: &Database,
+    advisor: &mut dyn Advisor,
+    report: &SupervisionReport,
+    signature: &str,
+    config: &LeadConfig,
+) -> Result<Option<Advice>, MemoryError> {
+    // Nothing to add to, or something already added. Checked before the call
+    // so a poll loop cannot pay for an answer it would then discard.
+    let Some(record) = supervise::get_supervision(db, &report.issue)? else {
+        return Ok(None);
+    };
+    if record.redirect_signature.as_deref() != Some(signature) || record.redirect_proposal.is_some()
+    {
+        return Ok(None);
+    }
+
+    let target = match config.targets.iter().find(|t| t.repo == report.issue.repo) {
+        Some(target) => target,
+        None => return Ok(None),
+    };
+    let approaches = attempt_approaches(db, &report.issue)?;
+    let advice = advise::advise_strategy_redirect(
+        db,
+        advisor,
+        &target.path,
+        &report.issue,
+        signature,
+        &approaches,
+        &config.advice,
+    )?;
+    if let Some(proposal) = advice.answered() {
+        supervise::set_redirect_proposal(db, &report.issue, signature, proposal)?;
+    }
+    Ok(Some(advice))
+}
+
+/// Tell a human, on the issue, that Autopilot has stopped working on it.
+///
+/// Once per signature: [`supervise::escalation_notified_signature`] gates the
+/// comment and [`supervise::mark_escalation_notified`] records it **after**
+/// the comment lands. The ordering is rung 6's lesson 15 in the direction
+/// that matters here — a mark written first would swallow the one
+/// notification the escalation exists to send, and an escalation never
+/// self-resolves, so nothing would ever send it again.
+#[allow(clippy::too_many_arguments)]
+fn notify_escalation(
+    db: &Database,
+    gh_runner: &mut dyn GhRunner,
+    advisor: &mut dyn Advisor,
+    report: &SupervisionReport,
+    signature: &str,
+    config: &LeadConfig,
+    advice: &mut Vec<Advice>,
+) -> Result<Option<EscalationNotice>, MemoryError> {
+    if supervise::escalation_notified_signature(db, &report.issue)?.as_deref() == Some(signature) {
+        return Ok(None);
+    }
+
+    let approaches = attempt_approaches(db, &report.issue)?;
+    let mut question = None;
+    if config.advice.enabled {
+        if let Some(target) = config.targets.iter().find(|t| t.repo == report.issue.repo) {
+            // The brief is read only here, and only once per signature —
+            // an in-flight issue is not in any backlog listing, so its text
+            // is not already in hand. A failure degrades the prompt rather
+            // than skipping the notice.
+            let brief = gh::issue_brief(gh_runner, &report.issue).unwrap_or_default();
+            let drafted = advise::advise_human_question(
+                db,
+                advisor,
+                &target.path,
+                &report.issue,
+                &brief.title,
+                &brief.body,
+                signature,
+                &approaches,
+                &config.advice,
+            )?;
+            question = drafted.answered().map(str::to_string);
+            advice.push(drafted);
+        }
+    }
+
+    gh::comment_on_issue(
+        gh_runner,
+        &report.issue,
+        &render_escalation_comment(&report.issue, signature, &approaches, question.as_deref()),
+    )?;
+    supervise::mark_escalation_notified(db, &report.issue, signature)?;
+
+    Ok(Some(EscalationNotice {
+        issue: report.issue.clone(),
+        signature: signature.to_string(),
+        drafted_question: question.is_some(),
+    }))
+}
+
+/// The escalation notice posted on the issue.
+///
+/// Carries [`blocked::AUTOPILOT_COMMENT_MARKER`] like every other comment
+/// Autopilot writes. Rung 8's lesson 30: when identity cannot come from
+/// authorship, every writer has to stamp, and a fifth renderer that forgot
+/// would make this comment look like a human's answer to an open question.
+///
+/// It does **not** carry `QUESTION_MARKER` even when it contains a drafted
+/// question, and it does not flip any label. An escalation is not the
+/// `agent:blocked` question round trip: that one resumes on an answer, and
+/// this one must not, because the thing being escalated is an approach the
+/// supervisor has already proved does not converge. The comment names the
+/// command that resumes it instead.
+pub fn render_escalation_comment(
+    issue: &IssueRef,
+    signature: &str,
+    approaches: &[String],
+    question: Option<&str>,
+) -> String {
+    let mut body = String::from(blocked::AUTOPILOT_COMMENT_MARKER);
+    body.push_str(&format!(
+        "\n**Autopilot has stopped working on {issue}.**\n\n\
+         Its attempts kept failing the same way, a redirected approach failed the same way \
+         too, and it will not start another attempt on this issue without a human.\n\n\
+         **The repeated failure:** {signature}\n",
+        issue = issue.canonical(),
+        signature = scrub_and_bound(signature, MAX_NOTICE_FIELD_CHARS).text,
+    ));
+
+    if !approaches.is_empty() {
+        body.push_str("\n**Approaches already tried (newest first):**\n");
+        for approach in approaches.iter().rev().take(MAX_NOTICE_APPROACHES) {
+            body.push_str(&format!(
+                "- {}\n",
+                scrub_and_bound(approach, MAX_NOTICE_FIELD_CHARS).text
+            ));
+        }
+    }
+
+    if let Some(question) = question {
+        body.push_str(&format!(
+            "\n**A question that would unblock it:** {}\n\n\
+             _Drafted by a model reading the failure history, not by a human._\n",
+            scrub_and_bound(question, MAX_NOTICE_FIELD_CHARS).text
+        ));
+    }
+
+    body.push_str(&format!(
+        "\nTo resume it once the cause is understood:\n\n\
+         ```\nironmem autopilot supervise {repo} {number} --clear-escalation\n```\n",
+        repo = issue.repo,
+        number = issue.number,
+    ));
+
+    scrub_and_bound(&body, MAX_NOTICE_CHARS).text
+}
+
+/// The approaches an issue has already tried, oldest first.
+fn attempt_approaches(db: &Database, issue: &IssueRef) -> Result<Vec<String>, MemoryError> {
+    Ok(super::lineage::attempts_for_issue(db, issue)?
+        .into_iter()
+        .filter(|a| !run::is_terminal_summary(&a.approach))
+        .map(|a| a.approach)
+        .collect())
+}
+
 /// Read every target repo's `agent:ready` backlog.
 ///
 /// A repo whose listing fails is **omitted**, and the failure is recorded. It
@@ -395,12 +694,61 @@ fn fetch_backlogs(
     backlogs
 }
 
+/// The dispatch class for one queued issue, asking rung 9's advisor when
+/// the repo has not already answered.
+///
+/// **The label always wins, and when there is a label no call is made.**
+/// Paying a model to re-derive a fact the repo states outright is the
+/// anti-pattern this ladder has avoided by construction; it is also the
+/// difference between an advisor that supplements human judgment and one
+/// that second-guesses it.
+///
+/// Every other path returns `config.run.dispatch_class` — the fallback,
+/// normally `unclassified`, which **fails closed** at rung 5's
+/// `ClassMismatch`. That includes an advisor that is off, refused,
+/// unavailable, or that answered `unclear`. An advisor's answer is only ever
+/// *better than nothing*, never load-bearing.
+pub fn resolve_class(
+    db: &Database,
+    advisor: &mut dyn Advisor,
+    queued: &queue::QueuedIssue,
+    repo_path: &std::path::Path,
+    config: &LeadConfig,
+) -> Result<(String, Option<Advice>), MemoryError> {
+    if let Some(label) = queued.risk_label.as_deref() {
+        return Ok((class_for(Some(label), &config.run.dispatch_class), None));
+    }
+    if !config.advice.enabled {
+        return Ok((class_for(None, &config.run.dispatch_class), None));
+    }
+
+    let advice = advise::advise_risk_class(
+        db,
+        advisor,
+        repo_path,
+        &queued.issue,
+        &queued.title,
+        &queued.body,
+        &config.advice,
+    )?;
+    // `risk_class()` re-parses the answer rather than trusting the output
+    // schema, so an answer outside the enum lands on the fallback exactly as
+    // a refusal does.
+    let class = match advice.risk_class() {
+        Some(class) => class.as_str().to_string(),
+        None => class_for(None, &config.run.dispatch_class),
+    };
+    Ok((class, Some(advice)))
+}
+
 /// Provision a worktree and drive one issue.
 fn dispatch_one(
     db: &Database,
     queued: &queue::QueuedIssue,
     config: &LeadConfig,
     dispatcher: &mut dyn Dispatcher,
+    advisor: &mut dyn Advisor,
+    advice: &mut Vec<Advice>,
 ) -> Result<IssueRun, MemoryError> {
     let target = config
         .targets
@@ -415,7 +763,11 @@ fn dispatch_one(
         })?;
 
     let mut run_config = config.run.clone();
-    run_config.dispatch_class = class_for(queued.risk_label.as_deref(), &config.run.dispatch_class);
+    let (class, classification) = resolve_class(db, advisor, queued, &target.path, config)?;
+    if let Some(classification) = classification {
+        advice.push(classification);
+    }
+    run_config.dispatch_class = class;
     // Validate the per-issue config *before* provisioning, so a class or
     // model that cannot dispatch does not leave a checkout and a branch
     // behind — rung 4's own review finding, in the one place rung 8 repeats
@@ -445,6 +797,8 @@ fn dispatch_one(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::autopilot::advise::testing::{envelope_json, ScriptedAdvisor};
+    use crate::autopilot::advise::{AdviceOutput, AdviceStatus};
     use crate::autopilot::dispatch::{DispatchOutcome, DispatchSpec, Verdict};
     use crate::autopilot::gh::testing::ScriptedGh;
     use crate::autopilot::gh::GhOutput;
@@ -464,6 +818,15 @@ mod tests {
                 Err(e) => Err(MemoryError::NotFound(e.to_string())),
             }
         }
+    }
+
+    /// An advisor that fails to launch on every call.
+    ///
+    /// The default for every test that is not about rung 9, and deliberately
+    /// not a no-op stub: if any of them ever starts making an advisor call,
+    /// this makes that call fail, and the test must still pass.
+    fn no_advisor() -> ScriptedAdvisor {
+        ScriptedAdvisor::broken()
     }
 
     fn empty_registry() -> FakeRegistry {
@@ -635,6 +998,9 @@ mod tests {
             queue: QueueConfig::default(),
             run: RunConfig::new("claude-sonnet-5", "unclassified"),
             supervision: SupervisionConfig::default(),
+            // Off, as it ships. Every test below therefore exercises rung
+            // 8's tick, and the rung-9 tests turn it on explicitly.
+            advice: AdviceConfig::default(),
             max_dispatches_per_tick: DEFAULT_MAX_DISPATCHES_PER_TICK,
             worktree_root: fixture.worktree_root.clone(),
             dry_run: false,
@@ -702,6 +1068,7 @@ mod tests {
             &mut gh_runner,
             &mut empty_registry(),
             &mut RefusingDispatcher,
+            &mut no_advisor(),
             &config(&f),
         )
         .unwrap();
@@ -729,6 +1096,7 @@ mod tests {
             &mut gh_runner,
             &mut empty_registry(),
             &mut dispatcher,
+            &mut no_advisor(),
             &config(&f),
         )
         .unwrap();
@@ -766,6 +1134,7 @@ mod tests {
             &mut gh_runner,
             &mut empty_registry(),
             &mut dispatcher,
+            &mut no_advisor(),
             &cfg,
         )
         .unwrap();
@@ -792,6 +1161,7 @@ mod tests {
             &mut gh_runner,
             &mut empty_registry(),
             &mut dispatcher,
+            &mut no_advisor(),
             &cfg,
         )
         .unwrap();
@@ -817,6 +1187,7 @@ mod tests {
             &mut gh_runner,
             &mut empty_registry(),
             &mut RefusingDispatcher,
+            &mut no_advisor(),
             &cfg,
         )
         .unwrap();
@@ -847,6 +1218,7 @@ mod tests {
             &mut gh_runner,
             &mut empty_registry(),
             &mut RefusingDispatcher,
+            &mut no_advisor(),
             &config(&f),
         )
         .unwrap();
@@ -892,6 +1264,7 @@ mod tests {
             &mut gh_runner,
             &mut empty_registry(),
             &mut dispatcher,
+            &mut no_advisor(),
             &cfg,
         )
         .unwrap();
@@ -916,6 +1289,7 @@ mod tests {
             &mut gh_runner,
             &mut registry,
             &mut dispatcher,
+            &mut no_advisor(),
             &config(&f),
         )
         .unwrap();
@@ -957,6 +1331,7 @@ mod tests {
             &mut gh_runner,
             &mut empty_registry(),
             &mut RefusingDispatcher,
+            &mut no_advisor(),
             &config(&f),
         )
         .unwrap();
@@ -993,6 +1368,7 @@ mod tests {
             &mut gh_runner,
             &mut empty_registry(),
             &mut RefusingDispatcher,
+            &mut no_advisor(),
             &config(&f),
         )
         .unwrap();
@@ -1006,5 +1382,566 @@ mod tests {
         let answers =
             crate::autopilot::blocked::active_answers(&db, &IssueRef::new(REPO, 4)).unwrap();
         assert_eq!(answers.len(), 1);
+    }
+
+    // ── rung 9: the three judgment calls ────────────────────────────────
+
+    fn advising(structured: &str) -> ScriptedAdvisor {
+        ScriptedAdvisor::new(vec![Ok(AdviceOutput {
+            stdout: envelope_json(structured, 0.02),
+            stderr: String::new(),
+            success: true,
+        })])
+    }
+
+    fn with_advisor(f: &Fixture) -> LeadConfig {
+        let mut cfg = config(f);
+        cfg.advice.enabled = true;
+        cfg
+    }
+
+    /// One `agent:ready` issue, no `risk:*` label.
+    fn one_unlabeled_issue() -> ScriptedGh {
+        ScriptedGh::new(vec![
+            Ok(GhOutput::ok("[]")),
+            Ok(GhOutput::ok(&issue_list_json(&[(3, &["agent:ready"])]))),
+        ])
+    }
+
+    #[test]
+    fn a_failing_advisor_changes_nothing_about_the_tick() {
+        // **The rung's central claim.** OQ9's close-out does not rest on the
+        // three calls being good; it rests on the loop not depending on them
+        // being available. So a tick with the advisor on and broken must
+        // dispatch the same issue, with the same class, and report no
+        // problem — identically to a tick with the advisor off.
+        let run_tick = |enabled: bool| {
+            let db = approved_db();
+            let f = fixture();
+            let mut cfg = config(&f);
+            cfg.advice.enabled = enabled;
+            cfg.run.max_consecutive_infrastructure_failures = 1;
+            let mut dispatcher = FailingDispatcher::new();
+            let report = lead_tick(
+                &db,
+                &mut one_unlabeled_issue(),
+                &mut empty_registry(),
+                &mut dispatcher,
+                &mut ScriptedAdvisor::broken(),
+                &cfg,
+            )
+            .unwrap();
+            let state = dispatch_state::get_dispatch_state(&db, &IssueRef::new(REPO, 3))
+                .unwrap()
+                .expect("the issue was dispatched");
+            (report, state.dispatch_class)
+        };
+
+        let (off, class_off) = run_tick(false);
+        let (on, class_on) = run_tick(true);
+
+        assert_eq!(class_off, "unclassified");
+        assert_eq!(class_on, class_off, "a broken advisor changes no class");
+        assert_eq!(on.runs.len(), off.runs.len(), "the same work happened");
+        assert!(
+            on.problems.is_empty() && off.problems.is_empty(),
+            "an advisor that cannot launch is not a problem with the tick"
+        );
+        // It is reported, though — the operator can see it failed.
+        assert_eq!(off.advice.len(), 0, "disabled means no call at all");
+        assert_eq!(on.advice.len(), 1);
+        assert!(matches!(
+            on.advice[0].status,
+            AdviceStatus::Unavailable { .. }
+        ));
+    }
+
+    #[test]
+    fn an_issue_with_a_risk_label_never_costs_an_advisor_call() {
+        // The label is the answer. Paying a model to re-derive a fact the
+        // repo states outright is the anti-pattern, and it is also the line
+        // between supplementing human judgment and second-guessing it.
+        let db = approved_db();
+        let f = fixture();
+        let mut cfg = with_advisor(&f);
+        cfg.run.max_consecutive_infrastructure_failures = 1;
+        let mut gh_runner = ScriptedGh::new(vec![
+            Ok(GhOutput::ok("[]")),
+            Ok(GhOutput::ok(&issue_list_json(&[(
+                3,
+                &["agent:ready", "risk:logic"],
+            )]))),
+        ]);
+        let mut advisor = ScriptedAdvisor::broken();
+        let report = lead_tick(
+            &db,
+            &mut gh_runner,
+            &mut empty_registry(),
+            &mut FailingDispatcher::new(),
+            &mut advisor,
+            &cfg,
+        )
+        .unwrap();
+
+        assert!(advisor.seen.is_empty(), "nothing was asked");
+        assert!(report.advice.is_empty());
+        assert_eq!(
+            dispatch_state::get_dispatch_state(&db, &IssueRef::new(REPO, 3))
+                .unwrap()
+                .unwrap()
+                .dispatch_class,
+            "logic"
+        );
+    }
+
+    #[test]
+    fn an_advised_class_reaches_the_dispatch_state_drawer() {
+        // Asserted against the value the Reviewer later compares its own
+        // classification with, not against the fact that a call was made.
+        let db = approved_db();
+        let f = fixture();
+        let mut cfg = with_advisor(&f);
+        cfg.run.max_consecutive_infrastructure_failures = 1;
+        let mut advisor = advising(r#"{"risk_class":"documentation","reason":"README only"}"#);
+        let report = lead_tick(
+            &db,
+            &mut one_unlabeled_issue(),
+            &mut empty_registry(),
+            &mut FailingDispatcher::new(),
+            &mut advisor,
+            &cfg,
+        )
+        .unwrap();
+
+        assert_eq!(report.advice.len(), 1);
+        assert_eq!(report.advice[0].status, AdviceStatus::Answered);
+        assert_eq!(
+            dispatch_state::get_dispatch_state(&db, &IssueRef::new(REPO, 3))
+                .unwrap()
+                .unwrap()
+                .dispatch_class,
+            "documentation"
+        );
+    }
+
+    #[test]
+    fn an_unclear_class_falls_back_to_the_class_that_cannot_auto_merge() {
+        let db = approved_db();
+        let f = fixture();
+        let mut cfg = with_advisor(&f);
+        cfg.run.max_consecutive_infrastructure_failures = 1;
+        let mut advisor = advising(r#"{"risk_class":"unclear","reason":"two sentences"}"#);
+        lead_tick(
+            &db,
+            &mut one_unlabeled_issue(),
+            &mut empty_registry(),
+            &mut FailingDispatcher::new(),
+            &mut advisor,
+            &cfg,
+        )
+        .unwrap();
+
+        assert_eq!(
+            dispatch_state::get_dispatch_state(&db, &IssueRef::new(REPO, 3))
+                .unwrap()
+                .unwrap()
+                .dispatch_class,
+            "unclassified"
+        );
+    }
+
+    #[test]
+    fn a_dry_run_asks_the_advisor_nothing() {
+        // A rehearsal must not spend. Classification happens at dispatch and
+        // supervision is skipped outright, so a dry run makes no call at
+        // all — which also means it cannot show the class it would choose.
+        let db = approved_db();
+        let f = fixture();
+        let mut cfg = with_advisor(&f);
+        cfg.dry_run = true;
+        let mut advisor = ScriptedAdvisor::broken();
+        let report = lead_tick(
+            &db,
+            &mut one_unlabeled_issue(),
+            &mut empty_registry(),
+            &mut RefusingDispatcher,
+            &mut advisor,
+            &cfg,
+        )
+        .unwrap();
+
+        assert!(advisor.seen.is_empty());
+        assert!(report.advice.is_empty());
+        assert!(report.escalation_notices.is_empty());
+    }
+
+    // ── the escalation notice ───────────────────────────────────────────
+
+    /// An in-flight issue that has thrashed one signature past a redirect
+    /// that was actually delivered, so supervision escalates it.
+    fn escalated_issue(db: &Database, f: &Fixture) -> IssueRef {
+        use crate::autopilot::lineage::{self, AttemptOutcome, AttemptRecord};
+
+        let issue = IssueRef::new(REPO, 3);
+        dispatch_state::upsert_dispatch_state(
+            db,
+            &DispatchState {
+                issue: issue.clone(),
+                worktree_path: f.repo_path.display().to_string(),
+                ic_session_name: crate::autopilot::dispatch::ic_name(&issue),
+                dispatch_class: "unclassified".to_string(),
+                attempt_n: 4,
+                state: "dispatching".to_string(),
+                started_at: chrono::Utc::now().to_rfc3339(),
+                session_claimed: true,
+                session_uuid: "11111111-2222-3333-4444-555555555555".to_string(),
+                turn_n: 0,
+            },
+        )
+        .unwrap();
+        for n in 1..=4u32 {
+            lineage::record_attempt(
+                db,
+                &AttemptRecord {
+                    issue: issue.clone(),
+                    attempt_n: n,
+                    approach: format!("attempt {n}: rewrote the parser"),
+                    verdict: AttemptOutcome::Failed,
+                    why_failed: Some("assertion failed: left == right".to_string()),
+                    commit_sha: None,
+                },
+            )
+            .unwrap();
+        }
+        // A redirect already issued and already delivered: escalation
+        // requires proof the IC actually ran with it.
+        supervise::upsert_supervision(
+            db,
+            &supervise::SupervisionRecord {
+                issue: issue.clone(),
+                fingerprint: String::new(),
+                progress_observed_at: chrono::Utc::now().to_rfc3339(),
+                first_absent_at: None,
+                last_checked_at: chrono::Utc::now().to_rfc3339(),
+                active_redirect: Some("do not repeat it".to_string()),
+                redirect_signature: Some("assertion failed: left == right".to_string()),
+                redirect_issued_after_attempts: Some(2),
+                escalated_signature: None,
+                redirect_proposal: None,
+                escalation_notified_signature: None,
+            },
+        )
+        .unwrap();
+        issue
+    }
+
+    #[test]
+    fn an_escalation_is_reported_to_a_human_even_with_no_advisor() {
+        // Before rung 9 an escalation stopped the work and said so only in a
+        // drawer — the "reports but does not bind" shape this ladder keeps
+        // hitting. The notice is mechanical, so it does not depend on the
+        // advisor at all.
+        let db = approved_db();
+        let f = fixture();
+        let issue = escalated_issue(&db, &f);
+        let mut gh_runner = ScriptedGh::new(vec![
+            Ok(GhOutput::ok("[]")), // blocked listing
+            Ok(GhOutput::ok("")),   // the escalation comment
+            Ok(GhOutput::ok("[]")), // ready listing
+        ]);
+        let report = lead_tick(
+            &db,
+            &mut gh_runner,
+            &mut empty_registry(),
+            &mut RefusingDispatcher,
+            &mut no_advisor(),
+            &config(&f),
+        )
+        .unwrap();
+
+        assert_eq!(report.escalation_notices.len(), 1);
+        assert!(!report.escalation_notices[0].drafted_question);
+        assert!(report.problems.is_empty());
+
+        let comment = gh_runner
+            .seen
+            .iter()
+            .find(|argv| argv.contains(&"comment".to_string()))
+            .expect("a comment was posted");
+        let body = comment.last().unwrap();
+        assert!(body.contains("--clear-escalation"), "it names the way out");
+        assert!(body.contains("assertion failed"));
+        assert_eq!(
+            supervise::escalation_notified_signature(&db, &issue)
+                .unwrap()
+                .as_deref(),
+            Some("assertion failed: left == right")
+        );
+    }
+
+    #[test]
+    fn a_human_is_told_once_per_signature_not_once_per_tick() {
+        // An escalation never self-resolves, so the naive "notify the human"
+        // is "bury the human" — rung 6's lesson 19, in the one place rung 9
+        // adds a new comment writer.
+        let db = approved_db();
+        let f = fixture();
+        escalated_issue(&db, &f);
+        for tick in 0..2 {
+            let mut gh_runner = ScriptedGh::new(if tick == 0 {
+                vec![
+                    Ok(GhOutput::ok("[]")),
+                    Ok(GhOutput::ok("")),
+                    Ok(GhOutput::ok("[]")),
+                ]
+            } else {
+                // No comment call is scripted: a second one would run the
+                // script dry and fail the tick.
+                vec![Ok(GhOutput::ok("[]")), Ok(GhOutput::ok("[]"))]
+            });
+            let report = lead_tick(
+                &db,
+                &mut gh_runner,
+                &mut empty_registry(),
+                &mut RefusingDispatcher,
+                &mut no_advisor(),
+                &config(&f),
+            )
+            .unwrap();
+            assert!(
+                report.problems.is_empty(),
+                "tick {tick}: {:?}",
+                report.problems
+            );
+            assert_eq!(
+                report.escalation_notices.len(),
+                if tick == 0 { 1 } else { 0 }
+            );
+        }
+    }
+
+    #[test]
+    fn a_drafted_question_is_added_to_the_notice_when_the_advisor_has_one() {
+        let db = approved_db();
+        let f = fixture();
+        escalated_issue(&db, &f);
+        let mut gh_runner = ScriptedGh::new(vec![
+            Ok(GhOutput::ok("[]")), // blocked listing
+            Ok(GhOutput::ok(
+                r#"{"title":"Migrate the table","body":"Move the rows"}"#,
+            )), // issue brief
+            Ok(GhOutput::ok("")),   // the escalation comment
+            Ok(GhOutput::ok("[]")), // ready listing
+        ]);
+        let mut advisor = advising(
+            r#"{"verdict":"question","question":"Should soft-deleted rows be migrated?","reason":"unstated"}"#,
+        );
+        let report = lead_tick(
+            &db,
+            &mut gh_runner,
+            &mut empty_registry(),
+            &mut RefusingDispatcher,
+            &mut advisor,
+            &with_advisor(&f),
+        )
+        .unwrap();
+
+        assert_eq!(report.escalation_notices.len(), 1);
+        assert!(report.escalation_notices[0].drafted_question);
+        let body = gh_runner
+            .seen
+            .iter()
+            .find(|argv| argv.contains(&"comment".to_string()))
+            .unwrap()
+            .last()
+            .unwrap();
+        assert!(body.contains("Should soft-deleted rows be migrated?"));
+        assert!(
+            body.contains("not by a human"),
+            "a drafted question must not read as a human's"
+        );
+    }
+
+    #[test]
+    fn an_escalation_notice_is_posted_even_when_the_drafting_call_fails() {
+        // The notice is the thing a human needs. Losing it because an
+        // optional call failed would make rung 9 a regression.
+        let db = approved_db();
+        let f = fixture();
+        escalated_issue(&db, &f);
+        let mut gh_runner = ScriptedGh::new(vec![
+            Ok(GhOutput::ok("[]")),
+            Ok(GhOutput::failed("", "HTTP 500")), // the brief read fails too
+            Ok(GhOutput::ok("")),
+            Ok(GhOutput::ok("[]")),
+        ]);
+        let report = lead_tick(
+            &db,
+            &mut gh_runner,
+            &mut empty_registry(),
+            &mut RefusingDispatcher,
+            &mut ScriptedAdvisor::broken(),
+            &with_advisor(&f),
+        )
+        .unwrap();
+
+        assert_eq!(report.escalation_notices.len(), 1);
+        assert!(!report.escalation_notices[0].drafted_question);
+    }
+
+    // ── the redirect proposal ───────────────────────────────────────────
+
+    #[test]
+    fn a_proposal_is_attached_to_a_redirect_the_tick_just_armed() {
+        let db = approved_db();
+        let f = fixture();
+        let issue = IssueRef::new(REPO, 3);
+        {
+            use crate::autopilot::lineage::{self, AttemptOutcome, AttemptRecord};
+            dispatch_state::upsert_dispatch_state(
+                &db,
+                &DispatchState {
+                    issue: issue.clone(),
+                    worktree_path: f.repo_path.display().to_string(),
+                    ic_session_name: crate::autopilot::dispatch::ic_name(&issue),
+                    dispatch_class: "unclassified".to_string(),
+                    attempt_n: 3,
+                    state: "dispatching".to_string(),
+                    started_at: chrono::Utc::now().to_rfc3339(),
+                    session_claimed: true,
+                    session_uuid: "11111111-2222-3333-4444-555555555555".to_string(),
+                    turn_n: 0,
+                },
+            )
+            .unwrap();
+            for n in 1..=3u32 {
+                lineage::record_attempt(
+                    &db,
+                    &AttemptRecord {
+                        issue: issue.clone(),
+                        attempt_n: n,
+                        approach: format!("attempt {n}"),
+                        verdict: AttemptOutcome::Failed,
+                        why_failed: Some("the same failure".to_string()),
+                        commit_sha: None,
+                    },
+                )
+                .unwrap();
+            }
+        }
+        let mut advisor = advising(
+            r#"{"verdict":"proposal","proposal":"The fixture is wrong, not the code.","reason":"three identical failures"}"#,
+        );
+        let report = lead_tick(
+            &db,
+            &mut ScriptedGh::new(vec![Ok(GhOutput::ok("[]")), Ok(GhOutput::ok("[]"))]),
+            &mut empty_registry(),
+            &mut RefusingDispatcher,
+            &mut advisor,
+            &with_advisor(&f),
+        )
+        .unwrap();
+
+        assert_eq!(report.advice.len(), 1);
+        assert_eq!(report.advice[0].status, AdviceStatus::Answered);
+
+        let redirect = supervise::active_redirect(&db, &issue).unwrap().unwrap();
+        assert!(
+            redirect.contains("Do NOT repeat it"),
+            "the mechanical floor survives"
+        );
+        assert!(redirect.contains("The fixture is wrong"));
+    }
+
+    #[test]
+    fn a_failing_proposal_leaves_the_mechanical_redirect_exactly_as_rung_7_wrote_it() {
+        let db = approved_db();
+        let f = fixture();
+        let issue = IssueRef::new(REPO, 3);
+        {
+            use crate::autopilot::lineage::{self, AttemptOutcome, AttemptRecord};
+            dispatch_state::upsert_dispatch_state(
+                &db,
+                &DispatchState {
+                    issue: issue.clone(),
+                    worktree_path: f.repo_path.display().to_string(),
+                    ic_session_name: crate::autopilot::dispatch::ic_name(&issue),
+                    dispatch_class: "unclassified".to_string(),
+                    attempt_n: 3,
+                    state: "dispatching".to_string(),
+                    started_at: chrono::Utc::now().to_rfc3339(),
+                    session_claimed: true,
+                    session_uuid: "11111111-2222-3333-4444-555555555555".to_string(),
+                    turn_n: 0,
+                },
+            )
+            .unwrap();
+            for n in 1..=3u32 {
+                lineage::record_attempt(
+                    &db,
+                    &AttemptRecord {
+                        issue: issue.clone(),
+                        attempt_n: n,
+                        approach: format!("attempt {n}"),
+                        verdict: AttemptOutcome::Failed,
+                        why_failed: Some("the same failure".to_string()),
+                        commit_sha: None,
+                    },
+                )
+                .unwrap();
+            }
+        }
+        let report = lead_tick(
+            &db,
+            &mut ScriptedGh::new(vec![Ok(GhOutput::ok("[]")), Ok(GhOutput::ok("[]"))]),
+            &mut empty_registry(),
+            &mut RefusingDispatcher,
+            &mut ScriptedAdvisor::broken(),
+            &with_advisor(&f),
+        )
+        .unwrap();
+
+        assert!(report.problems.is_empty());
+        let redirect = supervise::active_redirect(&db, &issue).unwrap().unwrap();
+        assert_eq!(
+            redirect,
+            supervise::redirect_text("the same failure", 3),
+            "unchanged, byte for byte"
+        );
+    }
+
+    // ── the notice itself ───────────────────────────────────────────────
+
+    #[test]
+    fn the_escalation_comment_is_stamped_like_every_other_autopilot_comment() {
+        // Rung 8's lesson 30: half a marker scheme is worse than none. An
+        // unstamped fifth renderer would make this comment readable as a
+        // human's answer to an open question.
+        let body = render_escalation_comment(
+            &IssueRef::new(REPO, 3),
+            "assertion failed",
+            &["rewrote the parser".to_string()],
+            Some("Which fixture is authoritative?"),
+        );
+        assert!(body.starts_with(blocked::AUTOPILOT_COMMENT_MARKER));
+        assert!(
+            !body.contains(blocked::QUESTION_MARKER),
+            "an escalation is not the agent:blocked question round trip — an \
+             answer must not resume an approach already proved not to converge"
+        );
+        assert!(body.contains("ironmem autopilot supervise"));
+    }
+
+    #[test]
+    fn the_escalation_comment_is_scrubbed_and_bounded() {
+        let secret = "token sk-ant-api03-AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHHIIIIJJJJKKKK";
+        let body = render_escalation_comment(
+            &IssueRef::new(REPO, 3),
+            secret,
+            &[format!("x{}", "y".repeat(50_000))],
+            None,
+        );
+        assert!(!body.contains("sk-ant-api03-AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHHIIIIJJJJKKKK"));
+        assert!(body.chars().count() <= MAX_NOTICE_CHARS);
     }
 }

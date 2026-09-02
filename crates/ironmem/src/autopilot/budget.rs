@@ -43,6 +43,29 @@ pub struct BudgetLedgerEntry {
     /// existed then reported a price.
     #[serde(default)]
     pub unpriced_dispatch_count: u32,
+    /// Advisor one-shot calls (rung 9) billed to this date, priced or not.
+    ///
+    /// Counted separately from `dispatch_count` because it is the quantity
+    /// [`super::advise::AdviceConfig::max_calls_per_day`] bounds, and an
+    /// advisor call is a different *kind* of thing from an IC dispatch: one
+    /// bounded turn with no tools, capped at cents, potentially made several
+    /// times per Lead tick.
+    #[serde(default)]
+    pub advice_call_count: u32,
+    /// Advisor calls whose price could not be read, so their spend is missing
+    /// from `total_cost_usd`.
+    ///
+    /// **Deliberately not `unpriced_dispatch_count`.** Rung 7 already shares
+    /// that counter between IC dispatches and Codex reviews, and
+    /// [`super::run::RunConfig::max_unpriced_dispatches_per_day`] bounds it
+    /// at a value sized for `$2.50` dispatches. Folding a third writer into
+    /// it — one whose calls are cheap but frequent — would let a flaky
+    /// advisor stop every IC dispatch on any repo with a wall-clock bound.
+    /// That is rung 7's lesson 26 read correctly: inherit the earlier
+    /// mechanism's *fix* (bound unpriced spend by count) rather than its
+    /// *shape* (the same counter).
+    #[serde(default)]
+    pub unpriced_advice_count: u32,
 }
 
 fn budget_key(date: &str) -> String {
@@ -102,6 +125,40 @@ pub fn record_unpriced_dispatch(
     })
 }
 
+/// Bill one advisor one-shot call (rung 9) to `date`.
+///
+/// One ledger write, not two: the call's price and the fact that a call
+/// happened at all are two fields of the same fact, and
+/// [`accumulate_daily_spend`]'s read-modify-write is not atomic, so
+/// recording them separately would give a concurrent writer a window to lose
+/// one of them.
+///
+/// `cost_usd` is `None` when the call's price could not be read — the same
+/// distinction [`record_unpriced_dispatch`] draws, and for the same reason:
+/// `Some(0.0)` is a claim that it was free, which is never known to be true
+/// of a process that ran.
+pub fn record_advice_call(
+    db: &Database,
+    date: &str,
+    cost_usd: Option<f64>,
+) -> Result<BudgetLedgerEntry, MemoryError> {
+    validate_date(date)?;
+    // A non-finite or negative price is not a price. Routed to the unpriced
+    // counter rather than rejected, because rejecting here would discard the
+    // record of a call that really happened — rung 5's review finding #2.
+    let cost_usd = cost_usd.filter(|c| c.is_finite() && *c >= 0.0);
+    update_ledger(db, date, |entry| {
+        entry.advice_call_count += 1;
+        match cost_usd {
+            Some(cost) => {
+                entry.total_cost_usd += cost;
+                entry.dispatch_count += 1;
+            }
+            None => entry.unpriced_advice_count += 1,
+        }
+    })
+}
+
 /// Read the day's ledger, apply `mutate`, write it back.
 fn update_ledger(
     db: &Database,
@@ -116,6 +173,8 @@ fn update_ledger(
             total_cost_usd: 0.0,
             dispatch_count: 0,
             unpriced_dispatch_count: 0,
+            advice_call_count: 0,
+            unpriced_advice_count: 0,
         },
     };
     mutate(&mut entry);
@@ -245,5 +304,53 @@ mod tests {
         assert!(record_unpriced_dispatch(&db, "not-a-date").is_err());
         assert!(accumulate_daily_spend(&db, "2026-08-25", -1.0).is_err());
         assert!(accumulate_daily_spend(&db, "2026-08-25", f64::NAN).is_err());
+        assert!(record_advice_call(&db, "not-a-date", Some(0.01)).is_err());
+    }
+
+    #[test]
+    fn a_priced_advice_call_moves_the_dollar_total_and_both_counts() {
+        let db = Database::open_in_memory().unwrap();
+        let entry = record_advice_call(&db, "2026-09-02", Some(0.02)).unwrap();
+
+        assert!((entry.total_cost_usd - 0.02).abs() < 1e-9);
+        assert_eq!(entry.dispatch_count, 1, "it is billed spend like any other");
+        assert_eq!(entry.advice_call_count, 1);
+        assert_eq!(entry.unpriced_advice_count, 0);
+    }
+
+    #[test]
+    fn an_unpriced_advice_call_never_reports_as_free_and_never_touches_the_dispatch_counter() {
+        // The load-bearing half: `unpriced_dispatch_count` gates IC
+        // dispatches through `max_unpriced_dispatches_per_day`, so a flaky
+        // advisor must not be able to stop real work.
+        let db = Database::open_in_memory().unwrap();
+        record_advice_call(&db, "2026-09-02", None).unwrap();
+        let entry = record_advice_call(&db, "2026-09-02", Some(f64::NAN)).unwrap();
+
+        assert_eq!(entry.total_cost_usd, 0.0);
+        assert_eq!(entry.dispatch_count, 0);
+        assert_eq!(entry.advice_call_count, 2);
+        assert_eq!(entry.unpriced_advice_count, 2, "NaN is not a price");
+        assert_eq!(entry.unpriced_dispatch_count, 0);
+    }
+
+    #[test]
+    fn a_pre_rung_9_ledger_drawer_still_deserializes() {
+        let db = Database::open_in_memory().unwrap();
+        write_current(
+            &db,
+            &budget_key("2026-09-01"),
+            r#"{"date":"2026-09-01","total_cost_usd":1.5,"dispatch_count":3,
+                "unpriced_dispatch_count":1}"#,
+        )
+        .unwrap();
+
+        let entry = get_daily_spend(&db, "2026-09-01").unwrap().unwrap();
+        assert_eq!(entry.advice_call_count, 0);
+        assert_eq!(entry.unpriced_advice_count, 0);
+
+        let entry = record_advice_call(&db, "2026-09-01", Some(0.5)).unwrap();
+        assert!((entry.total_cost_usd - 2.0).abs() < 1e-9);
+        assert_eq!(entry.unpriced_dispatch_count, 1, "old fields preserved");
     }
 }

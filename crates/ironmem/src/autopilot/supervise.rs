@@ -138,6 +138,15 @@ pub const MAX_SIGNATURE_CHARS: usize = 500;
 /// in total, shared with the issue body and the whole lineage section.
 pub const MAX_REDIRECT_CHARS: usize = 800;
 
+/// Bound on rung 9's model-proposed alternative, appended to the mechanical
+/// redirect by [`compose_redirect`].
+///
+/// Its own bound rather than a share of [`MAX_REDIRECT_CHARS`], so a long
+/// proposal can never crowd out the mechanical instruction it is attached
+/// to — the composed text is bounded by the sum, and the binding half is
+/// written first.
+pub const MAX_REDIRECT_PROPOSAL_CHARS: usize = 600;
+
 /// Upper bound on in-flight dispatch-state drawers [`reconcile`] will read.
 ///
 /// Applied to the dispatch-state rows *specifically* (see
@@ -246,6 +255,25 @@ pub struct SupervisionRecord {
     pub redirect_issued_after_attempts: Option<u32>,
     /// The signature already escalated on, so a poll loop escalates once.
     pub escalated_signature: Option<String>,
+    /// A model-proposed alternative approach for `redirect_signature`, added
+    /// by rung 9's [`super::advise::advise_strategy_redirect`].
+    ///
+    /// Stored beside [`Self::active_redirect`] rather than folded into it, so
+    /// the mechanical text stays the floor: [`active_redirect`] composes the
+    /// two on read, and a proposal can never overwrite the binding
+    /// instruction rung 7 generates. Also what makes the addition idempotent
+    /// — a proposal is bought once per signature, not once per poll.
+    ///
+    /// `#[serde(default)]` → pre-rung-9 records read back as "no proposal",
+    /// which is exactly what they are.
+    pub redirect_proposal: Option<String>,
+    /// The signature a human has already been told about on the issue
+    /// itself, so a poll loop comments once. Cleared with the escalation.
+    ///
+    /// `#[serde(default)]` → a pre-rung-9 record reads back as "not yet
+    /// notified", so an already-escalated issue gets its first notice on the
+    /// next tick rather than never.
+    pub escalation_notified_signature: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -261,6 +289,10 @@ struct SupervisionBody {
     #[serde(default)]
     redirect_issued_after_attempts: Option<u32>,
     escalated_signature: Option<String>,
+    #[serde(default)]
+    redirect_proposal: Option<String>,
+    #[serde(default)]
+    escalation_notified_signature: Option<String>,
 }
 
 fn supervision_key(issue: &IssueRef) -> String {
@@ -284,6 +316,8 @@ pub fn upsert_supervision(
         redirect_signature: record.redirect_signature.clone(),
         redirect_issued_after_attempts: record.redirect_issued_after_attempts,
         escalated_signature: record.escalated_signature.clone(),
+        redirect_proposal: record.redirect_proposal.clone(),
+        escalation_notified_signature: record.escalation_notified_signature.clone(),
     };
     let content = serde_json::to_string(&body)?;
     write_current(db, &supervision_key(&record.issue), &content)
@@ -308,6 +342,8 @@ pub fn get_supervision(
         redirect_signature: body.redirect_signature,
         redirect_issued_after_attempts: body.redirect_issued_after_attempts,
         escalated_signature: body.escalated_signature,
+        redirect_proposal: body.redirect_proposal,
+        escalation_notified_signature: body.escalation_notified_signature,
     }))
 }
 
@@ -317,7 +353,99 @@ pub fn get_supervision(
 /// [`super::turn_prompt::TurnPromptInputs::strategy_redirect`] slot, which
 /// was provisioned for this and hardcoded to `None` until now.
 pub fn active_redirect(db: &Database, issue: &IssueRef) -> Result<Option<String>, MemoryError> {
-    Ok(get_supervision(db, issue)?.and_then(|record| record.active_redirect))
+    Ok(get_supervision(db, issue)?.and_then(|record| compose_redirect(&record)))
+}
+
+/// The mechanical redirect, with rung 9's proposed alternative appended if
+/// one was bought for this signature.
+///
+/// Composed on read rather than stored joined, so the mechanical text is
+/// always the floor and cannot be lost, half-written, or overwritten by a
+/// proposal. A proposal with no mechanical redirect to attach to is
+/// unreachable ([`set_redirect_proposal`] refuses it) and is ignored here
+/// too, since the binding half is the half that must survive.
+pub fn compose_redirect(record: &SupervisionRecord) -> Option<String> {
+    let mechanical = record.active_redirect.as_deref()?;
+    let Some(proposal) = record
+        .redirect_proposal
+        .as_deref()
+        .filter(|p| !p.is_empty())
+    else {
+        return Some(mechanical.to_string());
+    };
+    let composed = format!(
+        "{mechanical}\n\nA SUGGESTED ALTERNATIVE (proposed by a separate model that read \
+         your failure history; it has not run your gate and may be wrong — judge it, do not \
+         obey it): {proposal}"
+    );
+    Some(scrub_and_bound(&composed, MAX_REDIRECT_CHARS + MAX_REDIRECT_PROPOSAL_CHARS).text)
+}
+
+/// Attach a model-proposed alternative to the redirect already in force for
+/// `signature`.
+///
+/// Returns whether anything was written. **Refuses**, rather than
+/// overwriting, in three cases, and each refusal is the safe direction:
+///
+/// - no redirect is in force, so there is nothing to add to;
+/// - the redirect in force was issued for a *different* signature, so the
+///   proposal answers a failure the IC has stopped having;
+/// - a proposal is already attached for this signature — the idempotence
+///   every poll-loop action in this subsystem needs, and here it also means
+///   the proposal is *paid for* once rather than once per tick.
+pub fn set_redirect_proposal(
+    db: &Database,
+    issue: &IssueRef,
+    signature: &str,
+    proposal: &str,
+) -> Result<bool, MemoryError> {
+    let proposal = scrub_and_bound(proposal.trim(), MAX_REDIRECT_PROPOSAL_CHARS).text;
+    if proposal.is_empty() {
+        return Ok(false);
+    }
+    let Some(mut record) = get_supervision(db, issue)? else {
+        return Ok(false);
+    };
+    if record.active_redirect.is_none()
+        || record.redirect_signature.as_deref() != Some(signature)
+        || record.redirect_proposal.is_some()
+    {
+        return Ok(false);
+    }
+    record.redirect_proposal = Some(proposal);
+    upsert_supervision(db, &record)?;
+    Ok(true)
+}
+
+/// The signature a human has already been told about on the issue itself.
+pub fn escalation_notified_signature(
+    db: &Database,
+    issue: &IssueRef,
+) -> Result<Option<String>, MemoryError> {
+    Ok(get_supervision(db, issue)?.and_then(|record| record.escalation_notified_signature))
+}
+
+/// Record that a human has been told about `signature`'s escalation.
+///
+/// Returns whether anything was written; a second call for the same
+/// signature writes nothing. Written **after** the comment lands, never
+/// before: rung 6's lesson 15 in the direction that matters here, since a
+/// mark written first would silently swallow the one notification the
+/// escalation exists to send.
+pub fn mark_escalation_notified(
+    db: &Database,
+    issue: &IssueRef,
+    signature: &str,
+) -> Result<bool, MemoryError> {
+    let Some(mut record) = get_supervision(db, issue)? else {
+        return Ok(false);
+    };
+    if record.escalation_notified_signature.as_deref() == Some(signature) {
+        return Ok(false);
+    }
+    record.escalation_notified_signature = Some(signature.to_string());
+    upsert_supervision(db, &record)?;
+    Ok(true)
 }
 
 /// The failure signature an issue has been escalated on, if any.
@@ -348,6 +476,10 @@ pub fn clear_escalation(db: &Database, issue: &IssueRef) -> Result<bool, MemoryE
     record.active_redirect = None;
     record.redirect_signature = None;
     record.redirect_issued_after_attempts = None;
+    record.redirect_proposal = None;
+    // So a *later* escalation of the same signature notifies again. A human
+    // who cleared one and saw it come back needs telling twice.
+    record.escalation_notified_signature = None;
     upsert_supervision(db, &record)?;
     Ok(true)
 }
@@ -368,6 +500,7 @@ pub fn clear_redirect(db: &Database, issue: &IssueRef) -> Result<bool, MemoryErr
     record.active_redirect = None;
     record.redirect_signature = None;
     record.redirect_issued_after_attempts = None;
+    record.redirect_proposal = None;
     upsert_supervision(db, &record)?;
     Ok(true)
 }
@@ -912,6 +1045,7 @@ pub fn supervise_issue(
     // every minute issues each exactly once.
     let mut active_redirect = prior.as_ref().and_then(|r| r.active_redirect.clone());
     let mut redirect_signature = prior.as_ref().and_then(|r| r.redirect_signature.clone());
+    let mut redirect_proposal = prior.as_ref().and_then(|r| r.redirect_proposal.clone());
     let mut redirect_issued_after_attempts = prior
         .as_ref()
         .and_then(|r| r.redirect_issued_after_attempts);
@@ -930,6 +1064,10 @@ pub fn supervise_issue(
             active_redirect = Some(redirect_text(signature, *consecutive));
             redirect_signature = Some(signature.clone());
             redirect_issued_after_attempts = Some(real_attempt_count);
+            // A proposal bought for the previous signature answers a failure
+            // the IC has stopped having. Dropped with the redirect it
+            // belonged to, so rung 9 may buy a fresh one for this signature.
+            redirect_proposal = None;
         }
         _ => {}
     }
@@ -949,6 +1087,7 @@ pub fn supervise_issue(
                 active_redirect = None;
                 redirect_signature = None;
                 redirect_issued_after_attempts = None;
+                redirect_proposal = None;
             }
         }
     }
@@ -963,6 +1102,13 @@ pub fn supervise_issue(
         redirect_signature,
         redirect_issued_after_attempts,
         escalated_signature,
+        redirect_proposal,
+        // Never set here: supervision writes no comments. The notice is the
+        // Lead's to send (rung 9's `notify_escalation`), and this records
+        // that it landed — so it is written by the code that watched it land.
+        escalation_notified_signature: prior
+            .as_ref()
+            .and_then(|r| r.escalation_notified_signature.clone()),
     };
     upsert_supervision(db, &record)?;
 
@@ -1512,6 +1658,8 @@ mod tests {
             redirect_signature: Some(signature.into()),
             redirect_issued_after_attempts: issued_after,
             escalated_signature: None,
+            redirect_proposal: None,
+            escalation_notified_signature: None,
         }
     }
 
@@ -1585,6 +1733,8 @@ mod tests {
             redirect_signature: None,
             redirect_issued_after_attempts: None,
             escalated_signature: Some("old failure".into()),
+            redirect_proposal: None,
+            escalation_notified_signature: None,
         };
         let action = plan_supervision(
             &ProcessHealth::Healthy,
@@ -1630,6 +1780,8 @@ mod tests {
             redirect_signature: Some("same".into()),
             redirect_issued_after_attempts: Some(3),
             escalated_signature: None,
+            redirect_proposal: None,
+            escalation_notified_signature: None,
         };
         assert!(matches!(
             plan_supervision(
@@ -1945,6 +2097,8 @@ mod tests {
                 redirect_signature: Some("sig".into()),
                 redirect_issued_after_attempts: None,
                 escalated_signature: Some("sig".into()),
+                redirect_proposal: None,
+                escalation_notified_signature: None,
             },
         )
         .unwrap();
@@ -1970,6 +2124,8 @@ mod tests {
             redirect_signature: Some("s".into()),
             redirect_issued_after_attempts: None,
             escalated_signature: None,
+            redirect_proposal: None,
+            escalation_notified_signature: None,
         };
         upsert_supervision(&db, &record).unwrap();
         assert_eq!(get_supervision(&db, &issue).unwrap().unwrap(), record);
@@ -2087,5 +2243,204 @@ mod tests {
         let rows = reconcile(&db, &alive_snapshot(&issue)).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].verdict, ReconcileVerdict::Adopt);
+    }
+
+    // ── rung 9: the proposal attached to a redirect ─────────────────────
+
+    /// A record with a mechanical redirect in force for `signature`.
+    fn armed(db: &Database, signature: &str) -> IssueRef {
+        let issue = issue();
+        let mut record = prior_with_redirect(signature, Some(3));
+        record.active_redirect = Some(redirect_text(signature, 3));
+        upsert_supervision(db, &record).unwrap();
+        issue
+    }
+
+    #[test]
+    fn a_proposal_is_appended_to_the_mechanical_redirect_never_substituted() {
+        // The mechanical text carries the binding instruction. A proposal
+        // that replaced it would trade a guaranteed floor for an
+        // unguaranteed improvement.
+        let db = Database::open_in_memory().unwrap();
+        let issue = armed(&db, "assertion failed");
+        let mechanical = active_redirect(&db, &issue).unwrap().unwrap();
+
+        assert!(
+            set_redirect_proposal(&db, &issue, "assertion failed", "Read the fixture.").unwrap()
+        );
+
+        let composed = active_redirect(&db, &issue).unwrap().unwrap();
+        assert!(composed.starts_with(&mechanical), "the floor comes first");
+        assert!(composed.contains("Read the fixture."));
+        assert!(
+            composed.contains("may be wrong"),
+            "the IC is told the proposal is not authoritative"
+        );
+    }
+
+    #[test]
+    fn a_proposal_is_bought_once_per_signature() {
+        // Idempotence, and here it is also money: a poll loop that could
+        // re-attach would pay for the same answer every tick.
+        let db = Database::open_in_memory().unwrap();
+        let issue = armed(&db, "same failure");
+        assert!(set_redirect_proposal(&db, &issue, "same failure", "first").unwrap());
+        assert!(
+            !set_redirect_proposal(&db, &issue, "same failure", "second").unwrap(),
+            "a second proposal for the same signature is refused"
+        );
+        assert!(active_redirect(&db, &issue)
+            .unwrap()
+            .unwrap()
+            .contains("first"));
+    }
+
+    #[test]
+    fn a_proposal_for_a_stale_signature_is_refused() {
+        // It answers a failure the IC has stopped having.
+        let db = Database::open_in_memory().unwrap();
+        let issue = armed(&db, "current failure");
+        assert!(!set_redirect_proposal(&db, &issue, "old failure", "irrelevant").unwrap());
+        assert!(!active_redirect(&db, &issue)
+            .unwrap()
+            .unwrap()
+            .contains("irrelevant"));
+    }
+
+    #[test]
+    fn a_proposal_with_no_redirect_in_force_has_nothing_to_attach_to() {
+        let db = Database::open_in_memory().unwrap();
+        let issue = issue();
+        assert!(!set_redirect_proposal(&db, &issue, "sig", "text").unwrap());
+
+        // And an empty one is refused even when there is: an empty
+        // instruction reads as an instruction with no content.
+        let issue = armed(&db, "sig");
+        assert!(!set_redirect_proposal(&db, &issue, "sig", "   ").unwrap());
+    }
+
+    #[test]
+    fn clearing_an_escalation_drops_the_proposal_and_the_notice() {
+        // Both belong to the redirect being cleared. A proposal that
+        // survived would attach to whatever redirect comes next, and a
+        // notice that survived would silence the next escalation.
+        let db = Database::open_in_memory().unwrap();
+        let issue = armed(&db, "sig");
+        set_redirect_proposal(&db, &issue, "sig", "an idea").unwrap();
+        mark_escalation_notified(&db, &issue, "sig").unwrap();
+        let mut record = get_supervision(&db, &issue).unwrap().unwrap();
+        record.escalated_signature = Some("sig".to_string());
+        upsert_supervision(&db, &record).unwrap();
+
+        assert!(clear_escalation(&db, &issue).unwrap());
+
+        let record = get_supervision(&db, &issue).unwrap().unwrap();
+        assert!(record.redirect_proposal.is_none());
+        assert!(record.escalation_notified_signature.is_none());
+        assert!(record.active_redirect.is_none());
+    }
+
+    #[test]
+    fn a_new_signature_drops_the_previous_proposal() {
+        // `supervise_issue` arms a fresh redirect for a new signature; the
+        // old proposal answered the old failure.
+        let db = Database::open_in_memory().unwrap();
+        let issue = issue();
+        for n in 1..=4u32 {
+            lineage::record_attempt(&db, &attempt(n, AttemptOutcome::Failed, Some("first kind")))
+                .unwrap();
+        }
+        supervise_issue(
+            &db,
+            &issue,
+            &RegistrySnapshot::Available(Vec::new()),
+            &SupervisionConfig::default(),
+        )
+        .unwrap();
+        let signature = get_supervision(&db, &issue)
+            .unwrap()
+            .unwrap()
+            .redirect_signature
+            .unwrap();
+        assert!(set_redirect_proposal(&db, &issue, &signature, "an idea").unwrap());
+
+        for n in 5..=8u32 {
+            lineage::record_attempt(
+                &db,
+                &attempt(n, AttemptOutcome::Failed, Some("second kind")),
+            )
+            .unwrap();
+        }
+        supervise_issue(
+            &db,
+            &issue,
+            &RegistrySnapshot::Available(Vec::new()),
+            &SupervisionConfig::default(),
+        )
+        .unwrap();
+
+        let record = get_supervision(&db, &issue).unwrap().unwrap();
+        assert_ne!(
+            record.redirect_signature.as_deref(),
+            Some(signature.as_str())
+        );
+        assert!(
+            record.redirect_proposal.is_none(),
+            "the old proposal answered the old failure"
+        );
+    }
+
+    // ── rung 9: the escalation notice ───────────────────────────────────
+
+    #[test]
+    fn a_human_is_marked_notified_once_per_signature() {
+        let db = Database::open_in_memory().unwrap();
+        let issue = armed(&db, "sig");
+        assert!(mark_escalation_notified(&db, &issue, "sig").unwrap());
+        assert!(
+            !mark_escalation_notified(&db, &issue, "sig").unwrap(),
+            "a poll loop comments once"
+        );
+        assert_eq!(
+            escalation_notified_signature(&db, &issue)
+                .unwrap()
+                .as_deref(),
+            Some("sig")
+        );
+        assert!(
+            mark_escalation_notified(&db, &issue, "a different failure").unwrap(),
+            "a different escalation is worth telling a human about"
+        );
+    }
+
+    #[test]
+    fn a_pre_rung_9_supervision_record_reads_back_with_neither_field() {
+        // It must read as "no proposal, not yet notified" rather than
+        // failing the whole record read, which would hold every in-flight
+        // issue on a shape change.
+        let db = Database::open_in_memory().unwrap();
+        let issue = issue();
+        write_current(
+            &db,
+            &supervision_key(&issue),
+            &format!(
+                r#"{{"issue":{},"repo":"{}","fingerprint":"f","progress_observed_at":"{}",
+                    "first_absent_at":null,"last_checked_at":"{}","active_redirect":"old",
+                    "redirect_signature":"sig","escalated_signature":null}}"#,
+                issue.number,
+                issue.repo,
+                ago(10),
+                ago(10)
+            ),
+        )
+        .unwrap();
+
+        let record = get_supervision(&db, &issue).unwrap().unwrap();
+        assert!(record.redirect_proposal.is_none());
+        assert!(record.escalation_notified_signature.is_none());
+        assert_eq!(
+            active_redirect(&db, &issue).unwrap().as_deref(),
+            Some("old")
+        );
     }
 }
