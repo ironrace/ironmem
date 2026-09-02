@@ -706,11 +706,17 @@ fn parse_repo_target(
 /// Human-readable rendering of one queue plan.
 fn print_queue_plan(plan: &ironmem::autopilot::queue::QueuePlan) {
     println!(
-        "Queue — {} to dispatch, {} deferred, {}/{} slots in use, ${:.4} of ${:.2} spent today",
+        // `occupied_slots` counts in-flight work this pass did *not* pick, so
+        // it is not the number of slots in use — the selected resumes hold
+        // slots too. Both are named rather than one being printed under the
+        // other's label.
+        "Queue — {} to dispatch, {} deferred, {}/{} slots in use after this pass \
+         ({} held by work not picked), ${:.4} of ${:.2} spent today",
         plan.dispatch.len(),
         plan.deferred.len(),
-        plan.occupied_slots,
+        plan.occupied_slots + plan.dispatch.len(),
         plan.concurrency_cap,
+        plan.occupied_slots,
         plan.spent_today_usd,
         plan.daily_budget_usd,
     );

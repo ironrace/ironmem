@@ -541,14 +541,39 @@ fn sort_candidates(candidates: &mut [QueuedIssue]) {
 /// place decides what a class means, and it is
 /// [`super::review::decide_merge`], where an unrecognized class holds the PR
 /// for a human instead of merging it.
+///
+/// # Conflicting labels resolve the opposite way to [`Priority::of`]
+///
+/// Priority can afford "highest wins" because ordering is not a safety
+/// boundary (see the module doc). The risk class *is* one: it is the value
+/// rung 5's `decide_merge` compares the Reviewer's classification against,
+/// and it is what lets a PR auto-merge without a human. An issue carrying
+/// both `risk:documentation` and `risk:logic` has not been judged to be
+/// either, and picking whichever GitHub happened to list first would let a
+/// logic change ride in on the documentation rule.
+///
+/// So distinct values are joined instead: `documentation+logic` is not a
+/// [`super::review::RiskClass`], so it lands at the same `ClassMismatch`
+/// hold an unrecognized class does — fail-closed, and self-explaining in the
+/// dispatch-state drawer. Sorted so the value does not depend on label order.
 fn risk_label(labels: &[String]) -> Option<String> {
-    labels.iter().find_map(|label| {
+    let mut found: Vec<String> = Vec::new();
+    for label in labels {
         let normalized = label.trim().to_ascii_lowercase();
-        normalized
-            .strip_prefix(super::lead::RISK_LABEL_PREFIX)
-            .filter(|rest| !rest.is_empty())
-            .map(str::to_string)
-    })
+        let Some(rest) = normalized.strip_prefix(super::lead::RISK_LABEL_PREFIX) else {
+            continue;
+        };
+        if rest.is_empty() || found.iter().any(|f| f == rest) {
+            continue;
+        }
+        found.push(rest.to_string());
+    }
+    found.sort();
+    match found.len() {
+        0 => None,
+        1 => found.pop(),
+        _ => Some(found.join("+")),
+    }
 }
 
 /// How many dispatch-state drawers one queue pass will read.
@@ -713,6 +738,29 @@ mod tests {
         );
         assert_eq!(risk_label(&["risk:".into()]), None);
         assert_eq!(risk_label(&["bug".into()]), None);
+    }
+
+    #[test]
+    fn conflicting_risk_labels_fail_closed_rather_than_picking_one() {
+        // Unlike `priority:*`, the risk class is a safety boundary: it is
+        // what `decide_merge` compares the Reviewer against, and picking
+        // whichever GitHub listed first would let a logic change ride in on
+        // the documentation rule. The joined value parses as no `RiskClass`,
+        // so it holds at `ClassMismatch`.
+        let combined = risk_label(&["risk:logic".into(), "risk:documentation".into()]).unwrap();
+        assert_eq!(combined, "documentation+logic");
+        assert!(super::super::review::RiskClass::from_schema_str(&combined).is_none());
+        // Order-independent: the same two labels always produce the same
+        // value, so two passes over one issue cannot disagree.
+        assert_eq!(
+            risk_label(&["risk:documentation".into(), "risk:logic".into()]),
+            Some(combined)
+        );
+        // The same label twice is not a conflict.
+        assert_eq!(
+            risk_label(&["risk:logic".into(), "Risk:Logic".into()]),
+            Some("logic".to_string())
+        );
     }
 
     // ── ordering ────────────────────────────────────────────────────────

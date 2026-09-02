@@ -364,6 +364,9 @@ knowledge base.</sub>\n",
     }
 
     body.push_str("\n<sub>Autopilot rung 6.</sub>");
+    // Rung 8: marks this as Autopilot's own writing, so `blocked::poll_answer`
+    // cannot mistake it for a human's answer to a pending question.
+    body.push_str(super::blocked::AUTOPILOT_COMMENT_MARKER);
     scrub_and_bound(&body, MAX_COMMENT_CHARS).text
 }
 

@@ -1000,8 +1000,9 @@ picked up again — remove them by hand, or leave `{}` on it if there is more to
     let body = format!(
         "**Autopilot: PR #{pr} is already merged.**\n\n\
 Autopilot did not merge it on this run. {labels}\n\n\
-<sub>Autopilot rung 6.</sub>",
+<sub>Autopilot rung 6.</sub>{marker}",
         pr = request.pr_number,
+        marker = super::blocked::AUTOPILOT_COMMENT_MARKER,
     );
     scrub_and_bound(&body, MAX_COMMENT_CHARS).text
 }
@@ -1037,7 +1038,7 @@ re-labeling the issue `{}` after resolving the above puts it back in the queue."
     };
     let body = format!(
         "{headline}\n\n{summary}.\n\n{disposition}\n\n\
-<sub>Gate reported {gate} at merge time. Autopilot rung 6.</sub>",
+<sub>Gate reported {gate} at merge time. Autopilot rung 6.</sub>{marker}",
         headline = hold.headline(request.pr_number),
         summary = hold.summary(),
         gate = if request.gate_green {
@@ -1045,6 +1046,7 @@ re-labeling the issue `{}` after resolving the above puts it back in the queue."
         } else {
             "not green"
         },
+        marker = super::blocked::AUTOPILOT_COMMENT_MARKER,
     );
     scrub_and_bound(&body, MAX_COMMENT_CHARS).text
 }
