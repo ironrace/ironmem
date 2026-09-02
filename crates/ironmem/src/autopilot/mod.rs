@@ -1,4 +1,4 @@
-//! Autopilot backlog runner (build-ladder rungs 1-6).
+//! Autopilot backlog runner (build-ladder rungs 1-7).
 //!
 //! See `docs/iron/specs/2026-08-21-autonomous-backlog-runner-design.md` for
 //! the full design. Rung 1 built the storage half — the `backlog-lineage`
@@ -21,7 +21,13 @@
 //! their differing resume semantics), and [`merge`] — the sole consumer of
 //! rung 5's [`review::MergeDecision`], which executes it: `gh pr merge` on
 //! the fall-through, and otherwise a labeled PR and a notified human. Merge
-//! authority is the Lead's alone, and [`merge`] is where it lives.
+//! authority is the Lead's alone, and [`merge`] is where it lives. Rung 7
+//! adds [`registry`] (the `claude agents --json` liveness read) and
+//! [`supervise`] — the spec's two required supervision checks and the
+//! dispatch-state reconciliation a restarted Lead rebuilds its picture of the
+//! world from. It is also where the wall-clock bound three earlier rungs
+//! deferred finally lands, as a **per-repo** value on [`gate_config`] rather
+//! than a global constant.
 //!
 //! # The drawer kinds, one room
 //!
@@ -47,6 +53,13 @@
 //! facts for the same reason a `needs_changes` and a later `pass` are, and
 //! this is the audit trail for the only irreversible action in the whole
 //! subsystem.
+//!
+//! Rung 7 adds an eighth, of kind 2's shape:
+//! [`supervise::SupervisionRecord`] — `logical_key` per issue, holding the
+//! origins of the two clocks process-health measures against and which
+//! strategy interventions have already been made. It exists because both of
+//! the spec's death conditions are *elapsed times since a transition*, and a
+//! transition is not observable in a point-in-time read.
 //!
 //! Rung 5 adds a sixth, of kind 1's shape: [`review::ReviewRecord`] — plain
 //! `add_drawer` calls, **no `logical_key`**, one drawer per review. The spec
@@ -90,11 +103,13 @@ pub mod labels;
 pub mod lineage;
 pub mod merge;
 pub mod onboard;
+pub mod registry;
 pub mod review;
 pub mod review_prompt;
 pub mod run;
 pub mod scrub;
 pub mod stagnation;
+pub mod supervise;
 pub mod turn_prompt;
 pub mod worktree;
 
@@ -115,6 +130,7 @@ pub use dispatch_state::DispatchState;
 pub use gate_config::{GateConfig, GateConfigState};
 pub use lineage::{AttemptOutcome, AttemptRecord, IssueStatus, RecordedAttempt};
 pub use onboard::{infer_gate_commands, onboard_repo, InferredGates};
+pub use registry::{AgentRegistry, ClaudeAgentRegistry, Liveness, RegistrySnapshot};
 pub use review::reviews_for_issue;
 pub use review::{
     decide_merge, record_review, review_pr, run_review, CodexReviewer, HoldReason, MergeDecision,
@@ -126,6 +142,11 @@ pub use review_prompt::ReviewPromptInputs;
 pub use run::{
     approved_gate_commands, run_issue, ClaudeDispatcher, DispatchClassification, DispatchSummary,
     Dispatcher, IssueBrief, IssueRun, RunConfig, TerminalReason,
+};
+pub use supervise::{
+    active_redirect, assess_process_health, assess_strategy_health, reconcile, supervise_issue,
+    ProcessHealth, ReconcileVerdict, Reconciliation, StrategyHealth, SupervisionAction,
+    SupervisionConfig, SupervisionRecord, SupervisionReport,
 };
 pub use turn_prompt::{PriorAttempt, TurnPromptInputs};
 pub use worktree::{ensure_worktree, Worktree};

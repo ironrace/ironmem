@@ -77,6 +77,17 @@ pub struct DispatchSpec {
     /// The rendered `/goal` condition body from [`super::turn_prompt::render`]
     /// — everything after `/goal ` in the CLI invocation.
     pub condition: String,
+    /// The repo's per-dispatch wall-clock bound (rung 7), or `None` for
+    /// unbounded.
+    ///
+    /// The third bound alongside `max_budget_usd` (spend) and `max_turns`
+    /// (iterations), and the only one of the three with **no CLI flag** —
+    /// `claude` exposes no wall-clock ceiling, so this one is enforced by the
+    /// supervisor around the process rather than by the process itself. It is
+    /// deliberately part of the spec a caller builds, not a parameter of the
+    /// runner, so the three bounds travel together and cannot be supplied
+    /// from three different places.
+    pub wall_clock_timeout: Option<std::time::Duration>,
 }
 
 /// `ic-<repo-slug>-<issue-number>`. The spec's own example (`ic-ironmem-283`)
@@ -190,6 +201,15 @@ pub struct DispatchOutcome {
     /// available rather than being discarded, since the Lead still needs it
     /// for budget accounting even on a failed dispatch.
     pub process_success: bool,
+    /// Whether this dispatch was killed for exceeding its repo's wall-clock
+    /// bound (rung 7). A timed-out dispatch has **no result JSON at all** —
+    /// the process never got to write one — so every other field here is a
+    /// synthesized placeholder rather than a measurement, and
+    /// `total_cost_usd` in particular is a `0.0` that means *unknown*, not
+    /// *free*. [`run_dispatch`]'s caller is responsible for banking it to
+    /// the ledger's unpriced counter rather than its total; see
+    /// [`super::run::run_issue`].
+    pub timed_out: bool,
 }
 
 impl DispatchOutcome {
@@ -253,6 +273,7 @@ pub fn parse_dispatch_output(stdout: &str) -> Result<DispatchOutcome, MemoryErro
         verdict,
         reason,
         process_success: true,
+        timed_out: false,
     })
 }
 
@@ -283,12 +304,192 @@ pub fn run_dispatch(
     repo: &Path,
     spec: &DispatchSpec,
 ) -> Result<DispatchOutcome, MemoryError> {
+    run_dispatch_bounded(bin, repo, spec, spec.wall_clock_timeout)
+}
+
+/// How often [`run_dispatch_bounded`] checks whether a bounded dispatch has
+/// exited. A dispatch runs for minutes at least, so a one-second granularity
+/// is far finer than any bound worth setting and costs one `waitpid` per
+/// second of an otherwise-idle wait.
+const TIMEOUT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// [`run_dispatch`], with the spec's open-question-7 wall-clock bound.
+///
+/// `timeout` is passed explicitly rather than read off the spec so this
+/// function stays testable with a short bound against a stub binary;
+/// [`run_dispatch`] supplies [`DispatchSpec::wall_clock_timeout`], which
+/// comes from the repo's approved gate config
+/// ([`super::gate_config::wall_clock_timeout`]) — per-repo, because gate
+/// suites differ by orders of magnitude. `None` means unbounded, which is
+/// what every rung before this one did unconditionally.
+///
+/// # What a timeout costs, stated rather than hidden
+///
+/// Killing the process forfeits its result JSON, and that JSON was the only
+/// meter there is: the spec's own error table says a killed IC's tokens are
+/// never recorded. So a timed-out dispatch really did spend money that
+/// nothing can report. The outcome it synthesizes therefore carries
+/// `timed_out: true` and a `total_cost_usd` of `0.0` that means **unknown**,
+/// and [`super::run::run_issue`] banks it to the ledger's *unpriced* counter
+/// — rung 5's `unpriced_dispatch_count`, which exists to mark a total as a
+/// floor rather than a total. Recording `$0.00` as spend would make the
+/// ledger quietly wrong in the one direction that matters.
+///
+/// The session is unaffected: `--resume` continues it from its last
+/// checkpoint on the next dispatch, which is the spec's "IC process dies
+/// mid-turn" row.
+pub fn run_dispatch_bounded(
+    bin: &Path,
+    repo: &Path,
+    spec: &DispatchSpec,
+    timeout: Option<std::time::Duration>,
+) -> Result<DispatchOutcome, MemoryError> {
     let args = build_argv(spec);
-    let output = std::process::Command::new(bin)
+    let Some(timeout) = timeout else {
+        let output = std::process::Command::new(bin)
+            .args(&args)
+            .current_dir(repo)
+            .output()
+            .map_err(|e| MemoryError::NotFound(format!("failed to launch IC dispatch: {e}")))?;
+        return finish_dispatch(output);
+    };
+
+    let mut command = std::process::Command::new(bin);
+    command
         .args(&args)
         .current_dir(repo)
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    // Put the dispatch in its own process group so the bound can reap what it
+    // *started*, not just the `claude` process itself. An IC's whole job is
+    // running the repo's gate — `cargo test --workspace`, `xcodebuild`, a
+    // pytest suite — as child processes. `Child::kill` sends SIGKILL to the
+    // direct child only, so those survive, keep running in the worktree, and
+    // collide with the next dispatch that resumes there: the wedged-repo case
+    // the bound exists to contain, made worse by the containment.
+    //
+    // Only on the bounded path. An unbounded dispatch is never killed, so it
+    // has nothing to reap, and leaving its process-group behavior exactly as
+    // rungs 2-6 shipped it keeps this change to the path that needs it.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command
+        .spawn()
         .map_err(|e| MemoryError::NotFound(format!("failed to launch IC dispatch: {e}")))?;
+
+    // Drain both pipes for the whole life of the process, on their own
+    // threads. Reading them only *after* it exits — what `wait_with_output`
+    // does — deadlocks any dispatch whose output exceeds the OS pipe buffer
+    // (~64 KiB): the child blocks writing, the poll loop below never sees it
+    // exit, and the bound then kills a perfectly healthy dispatch and reports
+    // it as timed out, forfeiting its work and its unrecorded spend. The
+    // unbounded path's `Command::output` drains concurrently for exactly this
+    // reason, and the two paths are supposed to differ only in how they wait.
+    fn drain<R: std::io::Read + Send + 'static>(pipe: Option<R>) -> DrainHandle {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut buf);
+            }
+            buf
+        })
+    }
+    let stdout_drain = drain(child.stdout.take());
+    let stderr_drain = drain(child.stderr.take());
+
+    let started = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {}
+            Err(e) => {
+                // We cannot tell whether it is running. Killing on that would
+                // destroy a healthy dispatch, so leave it and report.
+                return Err(MemoryError::Validation(format!(
+                    "could not check on the IC dispatch process: {e}"
+                )));
+            }
+        }
+        if started.elapsed() >= timeout {
+            // Best-effort kill, then reap. A `kill` that fails (the process
+            // exited in the window between the check and the call) is not an
+            // error — `wait` below settles what actually happened.
+            // The drain threads are deliberately *not* joined here: a
+            // descendant the killed process left behind can hold the write
+            // end of a pipe open indefinitely, and joining would hang the
+            // supervisor on the one path whose whole point is not to hang.
+            // They exit on their own when the pipes finally close.
+            kill_process_group(&mut child);
+            let _ = child.wait();
+            return Ok(DispatchOutcome {
+                total_cost_usd: 0.0,
+                num_turns: 0,
+                duration_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                is_error: true,
+                session_id: spec.session.session_uuid().to_string(),
+                verdict: None,
+                reason: Some(format!(
+                    "dispatch exceeded this repo's wall-clock bound of {}s and was killed; \
+                     its spend is unrecorded and the session resumes from its last checkpoint",
+                    timeout.as_secs()
+                )),
+                process_success: false,
+                timed_out: true,
+            });
+        }
+        std::thread::sleep(TIMEOUT_POLL_INTERVAL);
+    }
+
+    let status = child
+        .wait()
+        .map_err(|e| MemoryError::Validation(format!("IC dispatch output was lost: {e}")))?;
+    let output = std::process::Output {
+        status,
+        stdout: stdout_drain.join().unwrap_or_default(),
+        stderr: stderr_drain.join().unwrap_or_default(),
+    };
+    finish_dispatch(output)
+}
+
+/// A background reader collecting one of a bounded dispatch's pipes.
+type DrainHandle = std::thread::JoinHandle<Vec<u8>>;
+
+/// SIGKILL the whole process group a bounded dispatch was spawned into, then
+/// the child itself as a backstop.
+///
+/// The group call is what actually reaps the gate suite; `child.kill()` alone
+/// leaves it running. Both are best-effort: a group that has already exited
+/// returns `ESRCH`, which is the success case arriving as an error code.
+///
+/// On a non-unix target there are no process groups here, so this degrades to
+/// exactly the previous behavior — the direct child only. Stated rather than
+/// silently platform-dependent.
+fn kill_process_group(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        // Negated pid addresses the group, which `process_group(0)` made
+        // equal to the child's own pid at spawn.
+        let pid = child.id() as i32;
+        if pid > 0 {
+            // SAFETY: `killpg` on a pid we spawned ourselves, with a signal
+            // constant. It cannot address a group we did not create: the
+            // child was spawned into its own new group, and its pid is still
+            // reserved because we have not reaped it yet.
+            unsafe {
+                libc::killpg(pid, libc::SIGKILL);
+            }
+        }
+    }
+    let _ = child.kill();
+}
+
+/// Turn a completed process's output into an outcome. Shared by the bounded
+/// and unbounded paths so they cannot drift apart on how a non-zero exit or
+/// a non-UTF-8 stdout is treated.
+fn finish_dispatch(output: std::process::Output) -> Result<DispatchOutcome, MemoryError> {
     let describe_failure = |detail: String| {
         MemoryError::Validation(format!(
             "{detail} (exit status: {:?}, stderr: {})",
@@ -315,10 +516,237 @@ mod tests {
             max_budget_usd: 2.5,
             max_turns: 12,
             condition: "make cargo test pass or stop after 6 turns".to_string(),
+            wall_clock_timeout: None,
         }
     }
 
     // ── argv construction ───────────────────────────────────────────────
+
+    /// Write an executable stub script and return its path. Used to exercise
+    /// the real spawn/kill path without spawning `claude` — which costs money
+    /// and, at the wall-clock bound, would have to be killed mid-work.
+    #[cfg(unix)]
+    fn stub_binary(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    // ── rung 7: the wall-clock bound ────────────────────────────────────
+
+    #[test]
+    fn the_wall_clock_bound_is_not_a_cli_flag() {
+        // `claude` exposes no wall-clock ceiling, which is why the supervisor
+        // enforces it around the process. If a flag ever appeared in argv it
+        // would be an invented one, and the CLI would reject the dispatch.
+        let mut spec = sample_spec(SessionMode::New {
+            session_uuid: "u".to_string(),
+        });
+        spec.wall_clock_timeout = Some(std::time::Duration::from_secs(900));
+        let args = build_argv(&spec);
+        assert!(!args.iter().any(|a| a.contains("wall")));
+        assert!(!args.iter().any(|a| a.contains("timeout")));
+        assert!(!args.contains(&"900".to_string()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dispatch_that_overruns_its_bound_is_killed_and_reported_as_timed_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = stub_binary(dir.path(), "slow", "sleep 30");
+        let spec = sample_spec(SessionMode::New {
+            session_uuid: "abc".to_string(),
+        });
+
+        let started = std::time::Instant::now();
+        let outcome = run_dispatch_bounded(
+            &bin,
+            dir.path(),
+            &spec,
+            Some(std::time::Duration::from_secs(1)),
+        )
+        .unwrap();
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "the bound must actually kill the process, not wait it out"
+        );
+        assert!(outcome.timed_out);
+        assert!(!outcome.process_success);
+        assert!(outcome.is_error);
+        assert_eq!(outcome.verdict, None);
+        assert_eq!(
+            outcome.total_cost_usd, 0.0,
+            "a killed dispatch has no meter; this 0.0 means unknown and the caller banks it \
+             as unpriced"
+        );
+        assert_eq!(
+            outcome.session_id, "abc",
+            "the session id must survive so the next dispatch can --resume it"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dispatch_that_finishes_inside_its_bound_is_parsed_normally() {
+        let dir = tempfile::tempdir().unwrap();
+        let json = r#"{"total_cost_usd":0.25,"num_turns":4,"duration_ms":900,"is_error":false,"session_id":"abc","structured_output":{"verdict":"met","reason":"gate green"}}"#;
+        let bin = stub_binary(dir.path(), "fast", &format!("cat <<'EOF'\n{json}\nEOF"));
+        let spec = sample_spec(SessionMode::New {
+            session_uuid: "abc".to_string(),
+        });
+
+        let outcome = run_dispatch_bounded(
+            &bin,
+            dir.path(),
+            &spec,
+            Some(std::time::Duration::from_secs(30)),
+        )
+        .unwrap();
+
+        assert!(!outcome.timed_out);
+        assert!(outcome.is_met());
+        assert_eq!(outcome.num_turns, 4);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dispatch_that_outruns_the_pipe_buffer_is_not_killed_as_a_timeout() {
+        // 256 KiB of stderr, four times the usual 64 KiB pipe buffer. A
+        // bounded dispatch that reads its pipes only after the process exits
+        // deadlocks here: the child blocks writing, never exits, and the
+        // bound kills a healthy dispatch and reports it as timed out.
+        let dir = tempfile::tempdir().unwrap();
+        let json = r#"{"total_cost_usd":0.3,"num_turns":1,"duration_ms":7,"is_error":false,"session_id":"s","structured_output":{"verdict":"met"}}"#;
+        let bin = stub_binary(
+            dir.path(),
+            "chatty",
+            &format!("yes x | head -c 262144 >&2\ncat <<'EOF'\n{json}\nEOF"),
+        );
+        let spec = sample_spec(SessionMode::New {
+            session_uuid: "s".to_string(),
+        });
+
+        let outcome = run_dispatch_bounded(
+            &bin,
+            dir.path(),
+            &spec,
+            Some(std::time::Duration::from_secs(10)),
+        )
+        .unwrap();
+
+        assert!(
+            !outcome.timed_out,
+            "a chatty dispatch must not be mistaken for a wedged one"
+        );
+        assert!(outcome.is_met());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_timeout_reaps_the_gate_suite_the_dispatch_started() {
+        // An IC's whole job is running the repo's gate as child processes. A
+        // kill that reaps only `claude` leaves them running in the worktree,
+        // where they collide with the next dispatch that resumes there — the
+        // wedged-repo case the bound exists to contain.
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("grandchild.pid");
+        // The stub spawns a long-lived "gate suite", records its pid, and
+        // then hangs — exactly the shape the bound has to clean up after.
+        let bin = stub_binary(
+            dir.path(),
+            "spawns",
+            &format!("sleep 120 &\necho $! > {}\nsleep 120", marker.display()),
+        );
+        let spec = sample_spec(SessionMode::New {
+            session_uuid: "s".to_string(),
+        });
+
+        let outcome = run_dispatch_bounded(
+            &bin,
+            dir.path(),
+            &spec,
+            Some(std::time::Duration::from_secs(2)),
+        )
+        .unwrap();
+        assert!(outcome.timed_out);
+
+        let pid: i32 = std::fs::read_to_string(&marker)
+            .expect("the stub must have recorded its gate-suite pid")
+            .trim()
+            .parse()
+            .unwrap();
+
+        // Signal 0 probes for existence without delivering anything. Give
+        // the kernel a moment to finish tearing the group down first.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        // SAFETY: `kill` with signal 0 performs an existence/permission check
+        // and delivers no signal.
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        if alive {
+            // Do not leave a stray `sleep 120` behind if the assertion fails.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+        assert!(
+            !alive,
+            "the gate suite (pid {pid}) survived the wall-clock kill"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_bounded_and_unbounded_paths_parse_identically() {
+        // The two paths differ only in how they wait. A result that parses
+        // one way and not the other would mean the bound silently changed
+        // what a dispatch reports.
+        let dir = tempfile::tempdir().unwrap();
+        let json = r#"{"total_cost_usd":0.11,"num_turns":2,"duration_ms":5,"is_error":false,"session_id":"s","structured_output":{"verdict":"not_met"}}"#;
+        let bin = stub_binary(dir.path(), "same", &format!("cat <<'EOF'\n{json}\nEOF"));
+        let spec = sample_spec(SessionMode::New {
+            session_uuid: "s".to_string(),
+        });
+
+        let unbounded = run_dispatch_bounded(&bin, dir.path(), &spec, None).unwrap();
+        let bounded = run_dispatch_bounded(
+            &bin,
+            dir.path(),
+            &spec,
+            Some(std::time::Duration::from_secs(30)),
+        )
+        .unwrap();
+        assert_eq!(unbounded, bounded);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_zero_exit_inside_the_bound_still_keeps_its_parsed_meter() {
+        // Rung 2's rule, re-checked on the bounded path: a non-zero exit
+        // discards trust in the verdict, never the accounting.
+        let dir = tempfile::tempdir().unwrap();
+        let json = r#"{"total_cost_usd":0.42,"num_turns":6,"duration_ms":80,"is_error":false,"session_id":"s","structured_output":{"verdict":"met"}}"#;
+        let bin = stub_binary(
+            dir.path(),
+            "dies",
+            &format!("cat <<'EOF'\n{json}\nEOF\nexit 3"),
+        );
+        let spec = sample_spec(SessionMode::New {
+            session_uuid: "s".to_string(),
+        });
+
+        let outcome = run_dispatch_bounded(
+            &bin,
+            dir.path(),
+            &spec,
+            Some(std::time::Duration::from_secs(30)),
+        )
+        .unwrap();
+        assert!(!outcome.timed_out);
+        assert!(!outcome.process_success);
+        assert!(!outcome.is_met(), "a non-zero exit's 'met' is not believed");
+        assert!((outcome.total_cost_usd - 0.42).abs() < 1e-9);
+    }
 
     #[test]
     fn first_dispatch_uses_session_id_not_resume() {

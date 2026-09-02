@@ -510,6 +510,64 @@ enum AutopilotCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Run both supervision checks against one in-flight issue (rung 7)
+    Supervise {
+        /// Path to the database
+        #[arg(long)]
+        db: Option<String>,
+        /// Repo identity (e.g. "owner/repo")
+        repo: String,
+        /// Issue number
+        issue: u64,
+        /// Seconds a session must be missing from the registry before its
+        /// absence counts toward death (the spec's "short timeout")
+        #[arg(long)]
+        liveness_grace_secs: Option<u64>,
+        /// Seconds the observable lineage/dispatch state must sit unchanged
+        /// before staleness counts toward death (the "longer window")
+        #[arg(long)]
+        progress_window_secs: Option<u64>,
+        /// Consecutive identical failures that count as thrashing
+        #[arg(long)]
+        thrash_threshold: Option<u32>,
+        /// Clear a strategy escalation so the issue can be dispatched again.
+        ///
+        /// An escalation never self-resumes, exactly as `agent:exhausted`
+        /// does not — this is the human re-label. Clears the redirect with
+        /// it, since resuming while still carrying the redirect would
+        /// re-escalate on the very next attempt.
+        #[arg(long)]
+        clear_escalation: bool,
+        /// Emit JSON instead of text
+        #[arg(long)]
+        json: bool,
+    },
+    /// Rebuild the Lead's picture of in-flight work after a restart (rung 7)
+    Reconcile {
+        /// Path to the database
+        #[arg(long)]
+        db: Option<String>,
+        /// Emit JSON instead of text
+        #[arg(long)]
+        json: bool,
+    },
+    /// Set or clear a repo's per-dispatch wall-clock bound (rung 7)
+    Timeout {
+        /// Path to the database
+        #[arg(long)]
+        db: Option<String>,
+        /// Repo identity (e.g. "owner/repo")
+        repo: String,
+        /// Seconds one dispatch may run before it is killed. Omit to read the
+        /// current value; pass --clear to remove the bound entirely.
+        secs: Option<u64>,
+        /// Remove the bound, leaving dispatches into this repo unbounded
+        #[arg(long, conflicts_with = "secs")]
+        clear: bool,
+        /// Emit JSON instead of text
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Where per-issue worktrees live when `--worktree-root` is not given.
@@ -1447,6 +1505,215 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                 } else {
                     for (label, state) in results {
                         println!("  {} — {state:?}", label.as_str());
+                    }
+                }
+                Ok(())
+            }
+            AutopilotCmd::Supervise {
+                db,
+                repo,
+                issue,
+                liveness_grace_secs,
+                progress_window_secs,
+                thrash_threshold,
+                clear_escalation,
+                json,
+            } => {
+                use ironmem::autopilot::supervise::{
+                    ProcessHealth, StrategyHealth, SupervisionAction, SupervisionConfig,
+                };
+                let database = open_migrated_db(db)?;
+                let issue_ref = ironmem::autopilot::IssueRef::new(repo, issue);
+                let defaults = SupervisionConfig::default();
+                let config = SupervisionConfig {
+                    liveness_grace_secs: liveness_grace_secs
+                        .unwrap_or(defaults.liveness_grace_secs),
+                    progress_window_secs: progress_window_secs
+                        .unwrap_or(defaults.progress_window_secs),
+                    thrash_threshold: thrash_threshold.unwrap_or(defaults.thrash_threshold),
+                };
+                config.validate()?;
+
+                if clear_escalation {
+                    let cleared =
+                        ironmem::autopilot::supervise::clear_escalation(&database, &issue_ref)?;
+                    if cleared {
+                        println!(
+                            "cleared the strategy escalation on {} — it can be dispatched again",
+                            issue_ref.canonical()
+                        );
+                    } else {
+                        println!(
+                            "{} was not escalated; nothing to clear",
+                            issue_ref.canonical()
+                        );
+                    }
+                    return Ok(());
+                }
+
+                let mut registry = ironmem::autopilot::registry::ClaudeAgentRegistry::resolve()?;
+                let snapshot = ironmem::autopilot::registry::snapshot(&mut registry);
+                let report = ironmem::autopilot::supervise::supervise_issue(
+                    &database, &issue_ref, &snapshot, &config,
+                )?;
+
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    println!("{}", issue_ref.canonical());
+                    if !report.in_flight {
+                        println!("  not in flight — no dispatch state; process-health is vacuous");
+                    }
+                    match &report.process {
+                        ProcessHealth::Healthy => {
+                            println!("  process: alive and making progress")
+                        }
+                        ProcessHealth::AliveButStalled { stalled_for_secs } => println!(
+                            "  process: listed, but nothing observable has changed in \
+                             {stalled_for_secs}s — not a death, and not restartable"
+                        ),
+                        ProcessHealth::SilentNotDead {
+                            absent_for_secs,
+                            stalled_for_secs,
+                            reason,
+                        } => println!(
+                            "  process: silent but NOT dead ({reason:?}) — absent {absent_for_secs}s, \
+                             stalled {stalled_for_secs}s"
+                        ),
+                        ProcessHealth::Dead {
+                            absent_for_secs,
+                            stalled_for_secs,
+                        } => println!(
+                            "  process: DEAD — absent {absent_for_secs}s and stalled \
+                             {stalled_for_secs}s"
+                        ),
+                        ProcessHealth::Unknown { reason } => {
+                            println!("  process: unknown — {reason}")
+                        }
+                    }
+                    match &report.strategy {
+                        StrategyHealth::Ok => println!("  strategy: no repeated-failure pattern"),
+                        StrategyHealth::Thrashing {
+                            signature,
+                            consecutive,
+                        } => println!(
+                            "  strategy: THRASHING — {consecutive} identical failures: {signature}"
+                        ),
+                    }
+                    match &report.action {
+                        SupervisionAction::None => println!("  action: none"),
+                        SupervisionAction::Hold { reason } => {
+                            println!("  action: hold — {reason}")
+                        }
+                        SupervisionAction::RestartFromCheckpoint { .. } => println!(
+                            "  action: restart from checkpoint — run `ironmem autopilot run {} {}`",
+                            issue_ref.repo, issue_ref.number
+                        ),
+                        SupervisionAction::Redirect { .. } => println!(
+                            "  action: strategy redirect issued — it is in force for the next \
+                             dispatch"
+                        ),
+                        SupervisionAction::Escalate { reason, .. } => {
+                            println!("  action: ESCALATE to a human — {reason}")
+                        }
+                    }
+                }
+                Ok(())
+            }
+            AutopilotCmd::Reconcile { db, json } => {
+                use ironmem::autopilot::supervise::ReconcileVerdict;
+                let database = open_migrated_db(db)?;
+                let mut registry = ironmem::autopilot::registry::ClaudeAgentRegistry::resolve()?;
+                let snapshot = ironmem::autopilot::registry::snapshot(&mut registry);
+                let rows = ironmem::autopilot::supervise::reconcile(&database, &snapshot)?;
+
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&rows)?);
+                } else if rows.is_empty() {
+                    println!("nothing in flight, and no unrecognized IC sessions");
+                } else {
+                    for row in &rows {
+                        let who = match &row.issue {
+                            Some(issue) => issue.canonical(),
+                            None => "(no dispatch state)".to_string(),
+                        };
+                        match &row.verdict {
+                            ReconcileVerdict::Adopt => {
+                                println!(
+                                    "  {who} [{}] — adopt, resume supervision",
+                                    row.session_name
+                                )
+                            }
+                            ReconcileVerdict::RestartFromCheckpoint { session_claimed } => {
+                                let how = if *session_claimed {
+                                    "resume its session from the last checkpoint"
+                                } else {
+                                    "no session was ever opened — the next run starts a fresh one"
+                                };
+                                println!("  {who} [{}] — restart: {how}", row.session_name);
+                            }
+                            ReconcileVerdict::Orphan => println!(
+                                "  ORPHAN [{}] — a live IC session with no dispatch state. \
+                                 Flagged for a human; never adopted.",
+                                row.session_name
+                            ),
+                            ReconcileVerdict::Hold { reason } => {
+                                println!("  {who} [{}] — hold: {reason}", row.session_name)
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            }
+            AutopilotCmd::Timeout {
+                db,
+                repo,
+                secs,
+                clear,
+                json,
+            } => {
+                let database = open_migrated_db(db)?;
+                let current = if clear {
+                    ironmem::autopilot::gate_config::set_wall_clock_timeout(&database, &repo, None)?
+                        .wall_clock_timeout_secs
+                } else if let Some(secs) = secs {
+                    ironmem::autopilot::gate_config::set_wall_clock_timeout(
+                        &database,
+                        &repo,
+                        Some(secs),
+                    )?
+                    .wall_clock_timeout_secs
+                } else {
+                    // Read-only: distinguish "onboarded, no bound" from "never
+                    // onboarded". Both used to print UNBOUNDED and point the
+                    // operator at a `timeout <repo> <secs>` that then failed
+                    // with "no gate config has been proposed".
+                    match ironmem::autopilot::gate_config::get_gate_config(&database, &repo)? {
+                        Some(config) => config.wall_clock_timeout_secs,
+                        None => {
+                            return Err(MemoryError::NotFound(format!(
+                                "no gate config for '{repo}' — run `ironmem autopilot onboard \
+                                 {repo}` first; a wall-clock bound lives on the gate config"
+                            )))
+                        }
+                    }
+                };
+
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "repo": repo,
+                            "wall_clock_timeout_secs": current,
+                        }))?
+                    );
+                } else {
+                    match current {
+                        Some(secs) => println!("{repo}: dispatches are bounded at {secs}s"),
+                        None => println!(
+                            "{repo}: dispatches are UNBOUNDED — a wedged dispatch here runs \
+                             forever. Set one with `ironmem autopilot timeout {repo} <secs>`."
+                        ),
                     }
                 }
                 Ok(())
