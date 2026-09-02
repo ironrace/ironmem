@@ -1,4 +1,4 @@
-//! Autopilot backlog runner (build-ladder rungs 1-7).
+//! Autopilot backlog runner (build-ladder rungs 1-8 — the whole ladder).
 //!
 //! See `docs/iron/specs/2026-08-21-autonomous-backlog-runner-design.md` for
 //! the full design. Rung 1 built the storage half — the `backlog-lineage`
@@ -27,7 +27,14 @@
 //! dispatch-state reconciliation a restarted Lead rebuilds its picture of the
 //! world from. It is also where the wall-clock bound three earlier rungs
 //! deferred finally lands, as a **per-repo** value on [`gate_config`] rather
-//! than a global constant.
+//! than a global constant. Rung 8 closes the ladder with the Lead itself:
+//! [`queue`] (the cross-repo `agent:ready` backlog, ordered by `priority:*`
+//! and bounded by the concurrency cap, the attempt cap and the day's
+//! ledger), [`blocked`] (the human-question round trip, whose *resume* half
+//! the spec calls "the one-way door rev 1 left open"), and [`lead`] — one
+//! bounded tick that reconciles, unblocks, supervises, chooses and
+//! dispatches. [`lead`]'s module doc carries the ladder's answer to the
+//! spec's open question 9.
 //!
 //! # The drawer kinds, one room
 //!
@@ -53,6 +60,14 @@
 //! facts for the same reason a `needs_changes` and a later `pass` are, and
 //! this is the audit trail for the only irreversible action in the whole
 //! subsystem.
+//!
+//! Rung 8 adds a ninth, also of kind 2's shape:
+//! [`blocked::BlockedRecord`] — `logical_key` per issue, holding the bounded
+//! question/answer history. It exists so a human's answer is **delivered**
+//! rather than merely observed: [`blocked::active_answers`] fills
+//! [`turn_prompt::TurnPromptInputs::human_answers`], without which a
+//! re-dispatched IC would resume a session that asked a question and was
+//! never told the answer.
 //!
 //! Rung 7 adds an eighth, of kind 2's shape:
 //! [`supervise::SupervisionRecord`] — `logical_key` per issue, holding the
@@ -94,15 +109,18 @@
 //! repo inside the logical key or record body instead — a judgment call,
 //! documented here so it's easy to revisit.
 
+pub mod blocked;
 pub mod budget;
 pub mod dispatch;
 pub mod dispatch_state;
 pub mod gate_config;
 pub mod gh;
 pub mod labels;
+pub mod lead;
 pub mod lineage;
 pub mod merge;
 pub mod onboard;
+pub mod queue;
 pub mod registry;
 pub mod review;
 pub mod review_prompt;
@@ -124,12 +142,17 @@ use crate::error::MemoryError;
 // original.
 use crate::mcp::tools::{LOGICAL_KEY_ID_PREFIX, LOGICAL_KEY_SOURCE_PREFIX};
 
+pub use blocked::{ask_human, poll_answer, AskOutcome, BlockedPoll, BlockedRecord, QaPair};
 pub use budget::BudgetLedgerEntry;
 pub use dispatch::{DispatchOutcome, DispatchSpec, SessionMode, Verdict};
 pub use dispatch_state::DispatchState;
 pub use gate_config::{GateConfig, GateConfigState};
+pub use lead::{lead_tick, LeadConfig, LeadReport, RepoTarget};
 pub use lineage::{AttemptOutcome, AttemptRecord, IssueStatus, RecordedAttempt};
 pub use onboard::{infer_gate_commands, onboard_repo, InferredGates};
+pub use queue::{
+    plan_queue, DeferReason, Deferred, Priority, QueueConfig, QueuePlan, QueuedIssue, RepoBacklog,
+};
 pub use registry::{AgentRegistry, ClaudeAgentRegistry, Liveness, RegistrySnapshot};
 pub use review::reviews_for_issue;
 pub use review::{

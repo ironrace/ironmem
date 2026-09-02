@@ -90,7 +90,8 @@ use crate::error::MemoryError;
 use super::dispatch::{self, DispatchOutcome, DispatchSpec, SessionMode, Verdict};
 use super::worktree::Worktree;
 use super::{
-    budget, dispatch_state, gate_config, lineage, supervise, today_utc, turn_prompt, IssueRef,
+    blocked, budget, dispatch_state, gate_config, lineage, supervise, today_utc, turn_prompt,
+    IssueRef,
 };
 use super::{AttemptOutcome, AttemptRecord, DispatchState, IssueStatus, PriorAttempt};
 
@@ -883,12 +884,21 @@ pub fn run_issue(
         // dispatches (the spec's per-dispatch cadence) reaches the very next
         // one.
         let strategy_redirect = supervise::active_redirect(db, issue)?;
+        // Rung 8's other half of the blocked round trip. Read fresh on every
+        // pass for the same reason the redirect is: an answer that arrives
+        // between two dispatches must reach the very next one, and the
+        // resuming session is the one that asked the question.
+        let human_answers: Vec<(String, String)> = blocked::active_answers(db, issue)?
+            .into_iter()
+            .filter_map(|pair| pair.answer.map(|answer| (pair.question, answer)))
+            .collect();
         let condition = turn_prompt::render(&turn_prompt::TurnPromptInputs {
             issue,
             issue_title: &brief.title,
             issue_body: &brief.body,
             prior_attempts: &attempts,
             strategy_redirect: strategy_redirect.as_deref(),
+            human_answers: &human_answers,
             gate_commands: &gate_commands,
             n_turns: config.n_turns,
         });
