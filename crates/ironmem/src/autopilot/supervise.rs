@@ -227,6 +227,23 @@ pub struct SupervisionRecord {
     /// signature thrashing later is new information and earns its own
     /// redirect; the same one thrashing again means the redirect failed.
     pub redirect_signature: Option<String>,
+    /// How many real attempts this issue had when `active_redirect` was
+    /// issued.
+    ///
+    /// Without it, escalation is triggered by *being polled twice* rather
+    /// than by the redirect failing. A supervisor on a cron would arm the
+    /// redirect on one pass and escalate it on the next, over byte-identical
+    /// lineage, before any dispatch ever read it — which is not what
+    /// "the redirect did not work" means, and hands the IC's one steer back
+    /// unused. Escalation now additionally requires that the attempt count
+    /// has *moved* since, i.e. a dispatch actually consumed the redirect and
+    /// still failed the same way.
+    ///
+    /// `#[serde(default)]` → records written before this field existed read
+    /// back as `None`, which suppresses escalation until the next redirect
+    /// is issued. That is the conservative direction: it delays a human
+    /// notification rather than firing one on no evidence.
+    pub redirect_issued_after_attempts: Option<u32>,
     /// The signature already escalated on, so a poll loop escalates once.
     pub escalated_signature: Option<String>,
 }
@@ -241,6 +258,8 @@ struct SupervisionBody {
     last_checked_at: String,
     active_redirect: Option<String>,
     redirect_signature: Option<String>,
+    #[serde(default)]
+    redirect_issued_after_attempts: Option<u32>,
     escalated_signature: Option<String>,
 }
 
@@ -263,6 +282,7 @@ pub fn upsert_supervision(
         last_checked_at: record.last_checked_at.clone(),
         active_redirect: record.active_redirect.clone(),
         redirect_signature: record.redirect_signature.clone(),
+        redirect_issued_after_attempts: record.redirect_issued_after_attempts,
         escalated_signature: record.escalated_signature.clone(),
     };
     let content = serde_json::to_string(&body)?;
@@ -286,6 +306,7 @@ pub fn get_supervision(
         last_checked_at: body.last_checked_at,
         active_redirect: body.active_redirect,
         redirect_signature: body.redirect_signature,
+        redirect_issued_after_attempts: body.redirect_issued_after_attempts,
         escalated_signature: body.escalated_signature,
     }))
 }
@@ -297,6 +318,38 @@ pub fn get_supervision(
 /// was provisioned for this and hardcoded to `None` until now.
 pub fn active_redirect(db: &Database, issue: &IssueRef) -> Result<Option<String>, MemoryError> {
     Ok(get_supervision(db, issue)?.and_then(|record| record.active_redirect))
+}
+
+/// The failure signature an issue has been escalated on, if any.
+///
+/// [`super::run::run_issue`] calls this *before* dispatching. Without it the
+/// escalation would be a report nobody acts on, and the issue would keep
+/// spending its remaining attempts on the approach supervision already
+/// judged doomed — the spec's "never silent infinite retry", silently
+/// retried.
+pub fn escalated_signature(db: &Database, issue: &IssueRef) -> Result<Option<String>, MemoryError> {
+    Ok(get_supervision(db, issue)?.and_then(|record| record.escalated_signature))
+}
+
+/// Clear an issue's escalation so work can resume, as a human re-labeling an
+/// `agent:exhausted` issue does.
+///
+/// Clears the redirect alongside it: resuming an issue while still telling
+/// the IC not to repeat a failure it is about to be re-escalated on would
+/// re-escalate on the very next attempt.
+pub fn clear_escalation(db: &Database, issue: &IssueRef) -> Result<bool, MemoryError> {
+    let Some(mut record) = get_supervision(db, issue)? else {
+        return Ok(false);
+    };
+    if record.escalated_signature.is_none() {
+        return Ok(false);
+    }
+    record.escalated_signature = None;
+    record.active_redirect = None;
+    record.redirect_signature = None;
+    record.redirect_issued_after_attempts = None;
+    upsert_supervision(db, &record)?;
+    Ok(true)
 }
 
 /// Clear an issue's active redirect once it is no longer relevant — the
@@ -314,6 +367,7 @@ pub fn clear_redirect(db: &Database, issue: &IssueRef) -> Result<bool, MemoryErr
     }
     record.active_redirect = None;
     record.redirect_signature = None;
+    record.redirect_issued_after_attempts = None;
     upsert_supervision(db, &record)?;
     Ok(true)
 }
@@ -531,6 +585,24 @@ pub enum StrategyHealth {
     Thrashing { signature: String, consecutive: u32 },
 }
 
+/// The attempts that are actual tries, excluding attempt-cap terminal
+/// markers.
+///
+/// One definition, used by both the thrash window and the redirect-delivery
+/// check, so the two cannot disagree about what counts as an attempt — which
+/// would make escalation fire a try early or a try late.
+fn real_attempts_of(attempts: &[AttemptRecord]) -> Vec<&AttemptRecord> {
+    attempts
+        .iter()
+        .filter(|a| !super::run::is_terminal_summary(&a.approach))
+        .collect()
+}
+
+/// How many of `attempts` are actual tries. See [`real_attempts_of`].
+pub fn real_attempts(attempts: &[AttemptRecord]) -> usize {
+    real_attempts_of(attempts).len()
+}
+
 /// Normalize one attempt's `why_failed` into a comparable signature.
 ///
 /// Case-folded and whitespace-collapsed, and nothing more. The temptation is
@@ -561,10 +633,7 @@ pub fn assess_strategy_health(
     attempts: &[AttemptRecord],
     config: &SupervisionConfig,
 ) -> StrategyHealth {
-    let real: Vec<&AttemptRecord> = attempts
-        .iter()
-        .filter(|a| !super::run::is_terminal_summary(&a.approach))
-        .collect();
+    let real = real_attempts_of(attempts);
 
     let mut trailing: Vec<String> = Vec::new();
     for attempt in real.iter().rev() {
@@ -632,8 +701,15 @@ pub enum SupervisionAction {
     },
     /// A redirect was newly issued and is now in force for the next dispatch.
     Redirect { signature: String },
-    /// The same failure signature thrashed again after a redirect was already
-    /// in force. Stop and tell a human.
+    /// The same failure signature failed again *after* a dispatch ran with a
+    /// redirect in force. Stop and tell a human.
+    ///
+    /// "Stop" is literal, not advisory: [`escalated_signature`] refuses to
+    /// dispatch the issue again, and [`super::run::run_issue`] terminates
+    /// with [`super::run::TerminalReason::StrategyEscalated`] rather than
+    /// burning the remaining attempts on an approach supervision has already
+    /// judged doomed. Like `agent:exhausted`, it never self-resumes — a human
+    /// clears it with `ironmem autopilot supervise --clear-escalation`.
     Escalate { signature: String, reason: String },
 }
 
@@ -679,29 +755,42 @@ where
 ///    redirect is still *persisted* (see [`supervise_issue`]) and the
 ///    restarted dispatch picks it up from the drawer, so nothing is lost by
 ///    reporting the more urgent action.
+///
+/// `real_attempt_count` is the number of non-marker attempts on the issue
+/// *now*. It is what distinguishes "the redirect failed" from "we were polled
+/// again": escalation requires the count to have moved past
+/// [`SupervisionRecord::redirect_issued_after_attempts`], so a supervisor run
+/// on a cron cannot escalate a redirect no dispatch has yet read.
 pub fn plan_supervision(
     process: &ProcessHealth,
     strategy: &StrategyHealth,
     prior: Option<&SupervisionRecord>,
+    real_attempt_count: u32,
 ) -> SupervisionAction {
     if let StrategyHealth::Thrashing {
         signature,
         consecutive,
     } = strategy
     {
-        let already_redirected = prior
-            .and_then(|r| r.redirect_signature.as_deref())
-            .is_some_and(|s| s == signature);
+        // An escalation already recorded for this signature stands: it is a
+        // stable state a poll loop re-reads, not a new event each pass.
         let already_escalated = prior
             .and_then(|r| r.escalated_signature.as_deref())
             .is_some_and(|s| s == signature);
-        if already_redirected || already_escalated {
+        // A redirect counts as *tried* only once a dispatch has appended a
+        // new attempt since it was issued.
+        let redirect_was_tried = prior.is_some_and(|r| {
+            r.redirect_signature.as_deref() == Some(signature.as_str())
+                && r.redirect_issued_after_attempts
+                    .is_some_and(|at| real_attempt_count > at)
+        });
+        if already_escalated || redirect_was_tried {
             return SupervisionAction::Escalate {
                 signature: signature.clone(),
                 reason: format!(
-                    "{consecutive} consecutive attempts failed identically after a strategy \
-                     redirect was already in force for this failure — the redirect did not \
-                     change the outcome"
+                    "{consecutive} consecutive attempts failed identically, and at least one of \
+                     them ran with a strategy redirect already in force for this exact failure — \
+                     the redirect did not change the outcome"
                 ),
             };
         }
@@ -813,7 +902,8 @@ pub fn supervise_issue(
         ProcessHealth::Healthy
     };
     let strategy = assess_strategy_health(&attempts, config);
-    let action = plan_supervision(&process, &strategy, prior.as_ref());
+    let real_attempt_count = real_attempts(&attempts) as u32;
+    let action = plan_supervision(&process, &strategy, prior.as_ref(), real_attempt_count);
 
     // Persist the interventions. A redirect is armed whenever one is called
     // for, independently of which action was *reported* — see
@@ -822,6 +912,9 @@ pub fn supervise_issue(
     // every minute issues each exactly once.
     let mut active_redirect = prior.as_ref().and_then(|r| r.active_redirect.clone());
     let mut redirect_signature = prior.as_ref().and_then(|r| r.redirect_signature.clone());
+    let mut redirect_issued_after_attempts = prior
+        .as_ref()
+        .and_then(|r| r.redirect_issued_after_attempts);
     let mut escalated_signature = prior.as_ref().and_then(|r| r.escalated_signature.clone());
     match (&action, &strategy) {
         (SupervisionAction::Escalate { signature, .. }, _) => {
@@ -836,6 +929,7 @@ pub fn supervise_issue(
         ) if redirect_signature.as_deref() != Some(signature.as_str()) => {
             active_redirect = Some(redirect_text(signature, *consecutive));
             redirect_signature = Some(signature.clone());
+            redirect_issued_after_attempts = Some(real_attempt_count);
         }
         _ => {}
     }
@@ -854,6 +948,7 @@ pub fn supervise_issue(
             if !still_relevant {
                 active_redirect = None;
                 redirect_signature = None;
+                redirect_issued_after_attempts = None;
             }
         }
     }
@@ -866,6 +961,7 @@ pub fn supervise_issue(
         last_checked_at: now_str,
         active_redirect,
         redirect_signature,
+        redirect_issued_after_attempts,
         escalated_signature,
     };
     upsert_supervision(db, &record)?;
@@ -1148,6 +1244,7 @@ mod tests {
             },
             &StrategyHealth::Ok,
             None,
+            0,
         );
         assert!(
             matches!(action, SupervisionAction::Hold { .. }),
@@ -1169,6 +1266,7 @@ mod tests {
                 consecutive: 3,
             },
             None,
+            3,
         );
         assert!(
             matches!(action, SupervisionAction::Redirect { .. }),
@@ -1401,27 +1499,78 @@ mod tests {
 
     // ── plan precedence ─────────────────────────────────────────────────
 
-    #[test]
-    fn thrashing_after_a_redirect_escalates_rather_than_redirecting_again() {
-        let prior = SupervisionRecord {
+    /// A record with a redirect in force for `signature`, issued when the
+    /// issue had `issued_after` real attempts.
+    fn prior_with_redirect(signature: &str, issued_after: Option<u32>) -> SupervisionRecord {
+        SupervisionRecord {
             issue: issue(),
             fingerprint: String::new(),
             progress_observed_at: ago(10),
             first_absent_at: None,
             last_checked_at: ago(10),
             active_redirect: Some("redirect".into()),
-            redirect_signature: Some("same".into()),
+            redirect_signature: Some(signature.into()),
+            redirect_issued_after_attempts: issued_after,
             escalated_signature: None,
-        };
+        }
+    }
+
+    fn thrashing(signature: &str) -> StrategyHealth {
+        StrategyHealth::Thrashing {
+            signature: signature.into(),
+            consecutive: 3,
+        }
+    }
+
+    #[test]
+    fn thrashing_again_after_a_redirect_was_actually_tried_escalates() {
+        // Issued at 3 attempts, now at 4: a dispatch ran with the redirect
+        // in force and failed the same way regardless.
+        let prior = prior_with_redirect("same", Some(3));
+        let action = plan_supervision(&ProcessHealth::Healthy, &thrashing("same"), Some(&prior), 4);
+        assert!(matches!(action, SupervisionAction::Escalate { .. }));
+    }
+
+    #[test]
+    fn being_polled_twice_is_not_the_redirect_failing() {
+        // The bug this field exists to prevent: a supervisor on a cron arms
+        // a redirect on one pass and, over byte-identical lineage, escalates
+        // it on the next — before any dispatch has read it. The IC's one
+        // steer would be spent without ever being delivered.
+        let prior = prior_with_redirect("same", Some(3));
+        for poll in 0..5 {
+            let action =
+                plan_supervision(&ProcessHealth::Healthy, &thrashing("same"), Some(&prior), 3);
+            assert!(
+                !matches!(action, SupervisionAction::Escalate { .. }),
+                "poll {poll} escalated a redirect no dispatch has consumed"
+            );
+        }
+    }
+
+    #[test]
+    fn a_redirect_from_before_this_field_existed_does_not_escalate_on_sight() {
+        // `#[serde(default)]` → `None`. Delaying a human notification is the
+        // conservative direction; firing one on no evidence is not.
+        let prior = prior_with_redirect("same", None);
         let action = plan_supervision(
             &ProcessHealth::Healthy,
-            &StrategyHealth::Thrashing {
-                signature: "same".into(),
-                consecutive: 3,
-            },
+            &thrashing("same"),
             Some(&prior),
+            99,
         );
-        assert!(matches!(action, SupervisionAction::Escalate { .. }));
+        assert!(!matches!(action, SupervisionAction::Escalate { .. }));
+    }
+
+    #[test]
+    fn a_recorded_escalation_is_stable_across_polls() {
+        let mut prior = prior_with_redirect("same", Some(3));
+        prior.escalated_signature = Some("same".into());
+        for _ in 0..3 {
+            let action =
+                plan_supervision(&ProcessHealth::Healthy, &thrashing("same"), Some(&prior), 3);
+            assert!(matches!(action, SupervisionAction::Escalate { .. }));
+        }
     }
 
     #[test]
@@ -1434,6 +1583,7 @@ mod tests {
             last_checked_at: ago(10),
             active_redirect: None,
             redirect_signature: None,
+            redirect_issued_after_attempts: None,
             escalated_signature: Some("old failure".into()),
         };
         let action = plan_supervision(
@@ -1443,6 +1593,7 @@ mod tests {
                 consecutive: 3,
             },
             Some(&prior),
+            4,
         );
         assert!(matches!(action, SupervisionAction::Redirect { .. }));
     }
@@ -1453,7 +1604,7 @@ mod tests {
             reason: "registry".into(),
         };
         assert!(matches!(
-            plan_supervision(&unknown, &StrategyHealth::Ok, None),
+            plan_supervision(&unknown, &StrategyHealth::Ok, None, 0),
             SupervisionAction::Hold { .. }
         ));
 
@@ -1462,7 +1613,7 @@ mod tests {
             stalled_for_secs: 999,
         };
         assert!(matches!(
-            plan_supervision(&dead, &StrategyHealth::Ok, None),
+            plan_supervision(&dead, &StrategyHealth::Ok, None, 0),
             SupervisionAction::RestartFromCheckpoint { .. }
         ));
 
@@ -1477,6 +1628,7 @@ mod tests {
             last_checked_at: ago(10),
             active_redirect: Some("r".into()),
             redirect_signature: Some("same".into()),
+            redirect_issued_after_attempts: Some(3),
             escalated_signature: None,
         };
         assert!(matches!(
@@ -1486,7 +1638,8 @@ mod tests {
                     signature: "same".into(),
                     consecutive: 4
                 },
-                Some(&prior)
+                Some(&prior),
+                4,
             ),
             SupervisionAction::Escalate { .. }
         ));
@@ -1634,24 +1787,119 @@ mod tests {
         let redirect = active_redirect(&db, &issue).unwrap().unwrap();
         assert!(redirect.contains("STRATEGY REDIRECT"));
         assert!(redirect.contains("same failure"));
-
-        // A second pass over unchanged lineage escalates rather than
-        // re-issuing — the poll-loop idempotence rung 6's lesson 19 demands.
-        let second = supervise_issue(&db, &issue, &snapshot, &config).unwrap();
-        assert!(matches!(second.action, SupervisionAction::Escalate { .. }));
-        let third = supervise_issue(&db, &issue, &snapshot, &config).unwrap();
-        assert!(
-            matches!(third.action, SupervisionAction::Escalate { .. }),
-            "escalation is stable, not a new event each poll"
-        );
         assert_eq!(
             get_supervision(&db, &issue)
                 .unwrap()
                 .unwrap()
-                .escalated_signature
-                .as_deref(),
+                .redirect_issued_after_attempts,
+            Some(3),
+            "the redirect must record how much lineage existed when it was issued"
+        );
+    }
+
+    #[test]
+    fn polling_again_over_unchanged_lineage_does_not_burn_the_redirect() {
+        // A supervisor on a cron polls far more often than dispatches
+        // happen. Escalating on the second poll would spend the IC's one
+        // steer without ever delivering it.
+        let db = Database::open_in_memory().unwrap();
+        let issue = issue();
+        for n in 1..=3u32 {
+            lineage::record_attempt(
+                &db,
+                &attempt(n, AttemptOutcome::Failed, Some("same failure")),
+            )
+            .unwrap();
+        }
+        let snapshot = alive_snapshot(&issue);
+        let config = SupervisionConfig::default();
+
+        supervise_issue(&db, &issue, &snapshot, &config).unwrap();
+        for poll in 0..4 {
+            let report = supervise_issue(&db, &issue, &snapshot, &config).unwrap();
+            assert!(
+                !matches!(report.action, SupervisionAction::Escalate { .. }),
+                "poll {poll} escalated before any dispatch read the redirect"
+            );
+            assert!(
+                active_redirect(&db, &issue).unwrap().is_some(),
+                "the redirect must stay in force until it is actually tried"
+            );
+        }
+    }
+
+    #[test]
+    fn a_further_identical_failure_after_the_redirect_escalates_and_stays_escalated() {
+        let db = Database::open_in_memory().unwrap();
+        let issue = issue();
+        for n in 1..=3u32 {
+            lineage::record_attempt(
+                &db,
+                &attempt(n, AttemptOutcome::Failed, Some("same failure")),
+            )
+            .unwrap();
+        }
+        let snapshot = alive_snapshot(&issue);
+        let config = SupervisionConfig::default();
+        supervise_issue(&db, &issue, &snapshot, &config).unwrap();
+
+        // A dispatch runs with the redirect in force and fails the same way.
+        lineage::record_attempt(
+            &db,
+            &attempt(4, AttemptOutcome::Failed, Some("same failure")),
+        )
+        .unwrap();
+
+        let report = supervise_issue(&db, &issue, &snapshot, &config).unwrap();
+        assert!(
+            matches!(report.action, SupervisionAction::Escalate { .. }),
+            "got {:?}",
+            report.action
+        );
+        assert_eq!(
+            escalated_signature(&db, &issue).unwrap().as_deref(),
             Some("same failure")
         );
+
+        // Stable across further polls — a state a loop re-reads, not a new
+        // event each pass.
+        for _ in 0..3 {
+            let again = supervise_issue(&db, &issue, &snapshot, &config).unwrap();
+            assert!(matches!(again.action, SupervisionAction::Escalate { .. }));
+        }
+    }
+
+    #[test]
+    fn clear_escalation_lets_work_resume_and_takes_the_redirect_with_it() {
+        let db = Database::open_in_memory().unwrap();
+        let issue = issue();
+        for n in 1..=4u32 {
+            lineage::record_attempt(
+                &db,
+                &attempt(n, AttemptOutcome::Failed, Some("same failure")),
+            )
+            .unwrap();
+        }
+        let snapshot = alive_snapshot(&issue);
+        let config = SupervisionConfig::default();
+        supervise_issue(&db, &issue, &snapshot, &config).unwrap();
+        lineage::record_attempt(
+            &db,
+            &attempt(5, AttemptOutcome::Failed, Some("same failure")),
+        )
+        .unwrap();
+        supervise_issue(&db, &issue, &snapshot, &config).unwrap();
+        assert!(escalated_signature(&db, &issue).unwrap().is_some());
+
+        assert!(clear_escalation(&db, &issue).unwrap());
+        assert_eq!(escalated_signature(&db, &issue).unwrap(), None);
+        assert_eq!(
+            active_redirect(&db, &issue).unwrap(),
+            None,
+            "resuming while still carrying the redirect would re-escalate on the next attempt"
+        );
+        // Idempotent.
+        assert!(!clear_escalation(&db, &issue).unwrap());
     }
 
     #[test]
@@ -1695,6 +1943,7 @@ mod tests {
                 last_checked_at: ago(10),
                 active_redirect: Some("r".into()),
                 redirect_signature: Some("sig".into()),
+                redirect_issued_after_attempts: None,
                 escalated_signature: Some("sig".into()),
             },
         )
@@ -1719,6 +1968,7 @@ mod tests {
             last_checked_at: ago(10),
             active_redirect: Some("r".into()),
             redirect_signature: Some("s".into()),
+            redirect_issued_after_attempts: None,
             escalated_signature: None,
         };
         upsert_supervision(&db, &record).unwrap();

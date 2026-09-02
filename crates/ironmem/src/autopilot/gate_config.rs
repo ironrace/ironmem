@@ -148,7 +148,8 @@ impl TryFrom<GateConfigShadow> for GateConfig {
 fn validate_wall_clock_timeout(secs: Option<u64>) -> Result<(), String> {
     if secs == Some(0) {
         return Err(
-            "wall_clock_timeout_secs must be at least 1 second — omit it entirely for no bound,              since 0 would kill every dispatch immediately"
+            "wall_clock_timeout_secs must be at least 1 second — omit it entirely for no bound, \
+             since 0 would kill every dispatch immediately"
                 .to_string(),
         );
     }

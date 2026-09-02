@@ -530,6 +530,14 @@ enum AutopilotCmd {
         /// Consecutive identical failures that count as thrashing
         #[arg(long)]
         thrash_threshold: Option<u32>,
+        /// Clear a strategy escalation so the issue can be dispatched again.
+        ///
+        /// An escalation never self-resumes, exactly as `agent:exhausted`
+        /// does not — this is the human re-label. Clears the redirect with
+        /// it, since resuming while still carrying the redirect would
+        /// re-escalate on the very next attempt.
+        #[arg(long)]
+        clear_escalation: bool,
         /// Emit JSON instead of text
         #[arg(long)]
         json: bool,
@@ -1508,6 +1516,7 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                 liveness_grace_secs,
                 progress_window_secs,
                 thrash_threshold,
+                clear_escalation,
                 json,
             } => {
                 use ironmem::autopilot::supervise::{
@@ -1524,6 +1533,23 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                     thrash_threshold: thrash_threshold.unwrap_or(defaults.thrash_threshold),
                 };
                 config.validate()?;
+
+                if clear_escalation {
+                    let cleared =
+                        ironmem::autopilot::supervise::clear_escalation(&database, &issue_ref)?;
+                    if cleared {
+                        println!(
+                            "cleared the strategy escalation on {} — it can be dispatched again",
+                            issue_ref.canonical()
+                        );
+                    } else {
+                        println!(
+                            "{} was not escalated; nothing to clear",
+                            issue_ref.canonical()
+                        );
+                    }
+                    return Ok(());
+                }
 
                 let mut registry = ironmem::autopilot::registry::ClaudeAgentRegistry::resolve()?;
                 let snapshot = ironmem::autopilot::registry::snapshot(&mut registry);
@@ -1658,7 +1684,19 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                     )?
                     .wall_clock_timeout_secs
                 } else {
-                    ironmem::autopilot::gate_config::wall_clock_timeout(&database, &repo)?
+                    // Read-only: distinguish "onboarded, no bound" from "never
+                    // onboarded". Both used to print UNBOUNDED and point the
+                    // operator at a `timeout <repo> <secs>` that then failed
+                    // with "no gate config has been proposed".
+                    match ironmem::autopilot::gate_config::get_gate_config(&database, &repo)? {
+                        Some(config) => config.wall_clock_timeout_secs,
+                        None => {
+                            return Err(MemoryError::NotFound(format!(
+                                "no gate config for '{repo}' — run `ironmem autopilot onboard \
+                                 {repo}` first; a wall-clock bound lives on the gate config"
+                            )))
+                        }
+                    }
                 };
 
                 if json {

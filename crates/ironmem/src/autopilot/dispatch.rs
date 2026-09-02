@@ -354,13 +354,51 @@ pub fn run_dispatch_bounded(
         return finish_dispatch(output);
     };
 
-    let mut child = std::process::Command::new(bin)
+    let mut command = std::process::Command::new(bin);
+    command
         .args(&args)
         .current_dir(repo)
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    // Put the dispatch in its own process group so the bound can reap what it
+    // *started*, not just the `claude` process itself. An IC's whole job is
+    // running the repo's gate — `cargo test --workspace`, `xcodebuild`, a
+    // pytest suite — as child processes. `Child::kill` sends SIGKILL to the
+    // direct child only, so those survive, keep running in the worktree, and
+    // collide with the next dispatch that resumes there: the wedged-repo case
+    // the bound exists to contain, made worse by the containment.
+    //
+    // Only on the bounded path. An unbounded dispatch is never killed, so it
+    // has nothing to reap, and leaving its process-group behavior exactly as
+    // rungs 2-6 shipped it keeps this change to the path that needs it.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command
         .spawn()
         .map_err(|e| MemoryError::NotFound(format!("failed to launch IC dispatch: {e}")))?;
+
+    // Drain both pipes for the whole life of the process, on their own
+    // threads. Reading them only *after* it exits — what `wait_with_output`
+    // does — deadlocks any dispatch whose output exceeds the OS pipe buffer
+    // (~64 KiB): the child blocks writing, the poll loop below never sees it
+    // exit, and the bound then kills a perfectly healthy dispatch and reports
+    // it as timed out, forfeiting its work and its unrecorded spend. The
+    // unbounded path's `Command::output` drains concurrently for exactly this
+    // reason, and the two paths are supposed to differ only in how they wait.
+    fn drain<R: std::io::Read + Send + 'static>(pipe: Option<R>) -> DrainHandle {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut buf);
+            }
+            buf
+        })
+    }
+    let stdout_drain = drain(child.stdout.take());
+    let stderr_drain = drain(child.stderr.take());
 
     let started = std::time::Instant::now();
     loop {
@@ -379,7 +417,12 @@ pub fn run_dispatch_bounded(
             // Best-effort kill, then reap. A `kill` that fails (the process
             // exited in the window between the check and the call) is not an
             // error — `wait` below settles what actually happened.
-            let _ = child.kill();
+            // The drain threads are deliberately *not* joined here: a
+            // descendant the killed process left behind can hold the write
+            // end of a pipe open indefinitely, and joining would hang the
+            // supervisor on the one path whose whole point is not to hang.
+            // They exit on their own when the pipes finally close.
+            kill_process_group(&mut child);
             let _ = child.wait();
             return Ok(DispatchOutcome {
                 total_cost_usd: 0.0,
@@ -389,7 +432,8 @@ pub fn run_dispatch_bounded(
                 session_id: spec.session.session_uuid().to_string(),
                 verdict: None,
                 reason: Some(format!(
-                    "dispatch exceeded this repo's wall-clock bound of {}s and was killed; its                      spend is unrecorded and the session resumes from its last checkpoint",
+                    "dispatch exceeded this repo's wall-clock bound of {}s and was killed; \
+                     its spend is unrecorded and the session resumes from its last checkpoint",
                     timeout.as_secs()
                 )),
                 process_success: false,
@@ -399,10 +443,47 @@ pub fn run_dispatch_bounded(
         std::thread::sleep(TIMEOUT_POLL_INTERVAL);
     }
 
-    let output = child
-        .wait_with_output()
+    let status = child
+        .wait()
         .map_err(|e| MemoryError::Validation(format!("IC dispatch output was lost: {e}")))?;
+    let output = std::process::Output {
+        status,
+        stdout: stdout_drain.join().unwrap_or_default(),
+        stderr: stderr_drain.join().unwrap_or_default(),
+    };
     finish_dispatch(output)
+}
+
+/// A background reader collecting one of a bounded dispatch's pipes.
+type DrainHandle = std::thread::JoinHandle<Vec<u8>>;
+
+/// SIGKILL the whole process group a bounded dispatch was spawned into, then
+/// the child itself as a backstop.
+///
+/// The group call is what actually reaps the gate suite; `child.kill()` alone
+/// leaves it running. Both are best-effort: a group that has already exited
+/// returns `ESRCH`, which is the success case arriving as an error code.
+///
+/// On a non-unix target there are no process groups here, so this degrades to
+/// exactly the previous behavior — the direct child only. Stated rather than
+/// silently platform-dependent.
+fn kill_process_group(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        // Negated pid addresses the group, which `process_group(0)` made
+        // equal to the child's own pid at spawn.
+        let pid = child.id() as i32;
+        if pid > 0 {
+            // SAFETY: `killpg` on a pid we spawned ourselves, with a signal
+            // constant. It cannot address a group we did not create: the
+            // child was spawned into its own new group, and its pid is still
+            // reserved because we have not reaped it yet.
+            unsafe {
+                libc::killpg(pid, libc::SIGKILL);
+            }
+        }
+    }
+    let _ = child.kill();
 }
 
 /// Turn a completed process's output into an outcome. Shared by the bounded
@@ -528,6 +609,90 @@ mod tests {
         assert!(!outcome.timed_out);
         assert!(outcome.is_met());
         assert_eq!(outcome.num_turns, 4);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dispatch_that_outruns_the_pipe_buffer_is_not_killed_as_a_timeout() {
+        // 256 KiB of stderr, four times the usual 64 KiB pipe buffer. A
+        // bounded dispatch that reads its pipes only after the process exits
+        // deadlocks here: the child blocks writing, never exits, and the
+        // bound kills a healthy dispatch and reports it as timed out.
+        let dir = tempfile::tempdir().unwrap();
+        let json = r#"{"total_cost_usd":0.3,"num_turns":1,"duration_ms":7,"is_error":false,"session_id":"s","structured_output":{"verdict":"met"}}"#;
+        let bin = stub_binary(
+            dir.path(),
+            "chatty",
+            &format!("yes x | head -c 262144 >&2\ncat <<'EOF'\n{json}\nEOF"),
+        );
+        let spec = sample_spec(SessionMode::New {
+            session_uuid: "s".to_string(),
+        });
+
+        let outcome = run_dispatch_bounded(
+            &bin,
+            dir.path(),
+            &spec,
+            Some(std::time::Duration::from_secs(10)),
+        )
+        .unwrap();
+
+        assert!(
+            !outcome.timed_out,
+            "a chatty dispatch must not be mistaken for a wedged one"
+        );
+        assert!(outcome.is_met());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_timeout_reaps_the_gate_suite_the_dispatch_started() {
+        // An IC's whole job is running the repo's gate as child processes. A
+        // kill that reaps only `claude` leaves them running in the worktree,
+        // where they collide with the next dispatch that resumes there — the
+        // wedged-repo case the bound exists to contain.
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("grandchild.pid");
+        // The stub spawns a long-lived "gate suite", records its pid, and
+        // then hangs — exactly the shape the bound has to clean up after.
+        let bin = stub_binary(
+            dir.path(),
+            "spawns",
+            &format!("sleep 120 &\necho $! > {}\nsleep 120", marker.display()),
+        );
+        let spec = sample_spec(SessionMode::New {
+            session_uuid: "s".to_string(),
+        });
+
+        let outcome = run_dispatch_bounded(
+            &bin,
+            dir.path(),
+            &spec,
+            Some(std::time::Duration::from_secs(2)),
+        )
+        .unwrap();
+        assert!(outcome.timed_out);
+
+        let pid: i32 = std::fs::read_to_string(&marker)
+            .expect("the stub must have recorded its gate-suite pid")
+            .trim()
+            .parse()
+            .unwrap();
+
+        // Signal 0 probes for existence without delivering anything. Give
+        // the kernel a moment to finish tearing the group down first.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        // SAFETY: `kill` with signal 0 performs an existence/permission check
+        // and delivers no signal.
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        if alive {
+            // Do not leave a stray `sleep 120` behind if the assertion fails.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+        assert!(
+            !alive,
+            "the gate suite (pid {pid}) survived the wall-clock kill"
+        );
     }
 
     #[cfg(unix)]
