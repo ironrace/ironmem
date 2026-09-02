@@ -461,6 +461,48 @@ impl Database {
         Ok(result)
     }
 
+    /// Get drawers in a wing/room whose `source_file` starts with `prefix`.
+    ///
+    /// The distinction from [`Self::get_drawers`] is where the `LIMIT` lands.
+    /// `get_drawers` applies it across every drawer in the room, newest
+    /// first, and only then can a caller filter — so in a room that mixes a
+    /// small set of current-state drawers with an unbounded append-only
+    /// history (which is exactly the shape `autopilot`'s `backlog-lineage`
+    /// room has), ordinary history traffic silently pushes the current-state
+    /// rows out of the window and the caller reads back "there are none".
+    /// Filtering in SQL makes the limit apply to the population the caller
+    /// actually asked about.
+    ///
+    /// `prefix` is bound as a parameter with `LIKE`'s metacharacters escaped,
+    /// so a `%` or `_` in a caller's prefix matches literally.
+    pub fn get_drawers_by_source_prefix(
+        &self,
+        wing: &str,
+        room: &str,
+        prefix: &str,
+        limit: usize,
+    ) -> Result<Vec<Drawer>, MemoryError> {
+        let columns = Self::drawer_projection(&self.conn)?;
+        let escaped = prefix
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let pattern = format!("{escaped}%");
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {columns} FROM drawers WHERE wing = ?1 AND room = ?2 \
+             AND source_file LIKE ?3 ESCAPE '\\' ORDER BY filed_at DESC, id ASC LIMIT ?4"
+        ))?;
+        let rows = stmt.query_map(
+            params![wing, room, pattern, limit as i64],
+            Self::row_to_drawer,
+        )?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
     /// Count drawers, optionally filtered by wing.
     pub fn count_drawers(&self, wing: Option<&str>) -> Result<usize, MemoryError> {
         let count: i64 = match wing {
@@ -1161,6 +1203,78 @@ mod tests {
 
         let limited = db.get_drawers(None, None, 2).unwrap();
         assert_eq!(limited.len(), 2);
+    }
+
+    #[test]
+    fn get_drawers_by_source_prefix_limits_the_matching_population_not_the_room() {
+        let db = Database::open_in_memory().unwrap();
+        let emb = dummy_embedding();
+
+        // One current-state drawer, then a pile of history in the same room.
+        db.insert_drawer(
+            &format!("{:032x}", 0),
+            "state",
+            &emb,
+            "w",
+            "r",
+            "logical:state:one",
+            "test",
+        )
+        .unwrap();
+        for i in 1..50 {
+            db.insert_drawer(
+                &format!("{:032x}", i),
+                "history",
+                &emb,
+                "w",
+                "r",
+                "",
+                "test",
+            )
+            .unwrap();
+        }
+
+        // A room-wide read with a small limit can miss the state drawer
+        // entirely; a source-scoped one cannot.
+        let scoped = db
+            .get_drawers_by_source_prefix("w", "r", "logical:state:", 10)
+            .unwrap();
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].content, "state");
+    }
+
+    #[test]
+    fn get_drawers_by_source_prefix_treats_like_metacharacters_literally() {
+        let db = Database::open_in_memory().unwrap();
+        let emb = dummy_embedding();
+        db.insert_drawer(
+            &format!("{:032x}", 0),
+            "wanted",
+            &emb,
+            "w",
+            "r",
+            "logical:a_b:1",
+            "test",
+        )
+        .unwrap();
+        db.insert_drawer(
+            &format!("{:032x}", 1),
+            "not wanted",
+            &emb,
+            "w",
+            "r",
+            "logical:axb:1",
+            "test",
+        )
+        .unwrap();
+
+        // `_` is LIKE's single-character wildcard; unescaped, this prefix
+        // would also match `logical:axb:`.
+        let found = db
+            .get_drawers_by_source_prefix("w", "r", "logical:a_b:", 10)
+            .unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].content, "wanted");
     }
 
     #[test]

@@ -71,8 +71,15 @@ struct DispatchStateBody {
     session_claimed: bool,
 }
 
+/// Logical-key prefix shared by every dispatch-state drawer. One constant
+/// because [`all_dispatch_states`] enumerates by it: a prefix spelled
+/// differently in the two places would silently enumerate nothing, and
+/// "nothing is in flight" is a plausible-looking wrong answer rather than a
+/// visible failure.
+pub(crate) const DISPATCH_STATE_KEY_PREFIX: &str = "dispatch-state:";
+
 fn dispatch_state_key(issue: &IssueRef) -> String {
-    format!("dispatch-state:{}", issue.slug())
+    format!("{DISPATCH_STATE_KEY_PREFIX}{}", issue.slug())
 }
 
 /// Write (overwrite) the dispatch-state drawer for `state.issue`. Called at
@@ -118,6 +125,51 @@ pub fn get_dispatch_state(
         turn_n: body.turn_n,
         session_claimed: body.session_claimed,
     }))
+}
+
+/// Every in-flight issue's dispatch-state drawer.
+///
+/// This is the left-hand column of the spec's *Lead crash-safe state* restart
+/// table — "what the Lead knew" — which [`super::supervise::reconcile`] joins
+/// against the session registry's "who is alive".
+///
+/// Scoped by `source_file` prefix rather than read out of the room and
+/// filtered afterwards: this room also holds every append-only attempt,
+/// review and merge record, and a limit applied across all of them
+/// newest-first would let ordinary lineage traffic push the in-flight
+/// dispatch states out of the window. A reconciliation that cannot see a
+/// dispatch state reports its live IC as an orphan — a wrong answer, not an
+/// error. See `Database::get_drawers_by_source_prefix`.
+///
+/// A drawer whose body no longer deserializes is skipped rather than failing
+/// the whole reconciliation: one unreadable record must not take every other
+/// in-flight issue's supervision offline with it.
+pub fn all_dispatch_states(db: &Database, limit: usize) -> Result<Vec<DispatchState>, MemoryError> {
+    let prefix = format!(
+        "{}{}",
+        crate::mcp::tools::LOGICAL_KEY_SOURCE_PREFIX,
+        DISPATCH_STATE_KEY_PREFIX
+    );
+    let drawers = db.get_drawers_by_source_prefix(super::WING, super::ROOM, &prefix, limit)?;
+    let mut states = Vec::new();
+    for drawer in drawers {
+        let Ok(body) = serde_json::from_str::<DispatchStateBody>(&drawer.content) else {
+            continue;
+        };
+        states.push(DispatchState {
+            issue: IssueRef::new(body.repo, body.issue),
+            worktree_path: body.worktree_path,
+            ic_session_name: body.ic_session_name,
+            dispatch_class: body.dispatch_class,
+            attempt_n: body.attempt_n,
+            state: body.state,
+            started_at: body.started_at,
+            session_uuid: body.session_uuid,
+            turn_n: body.turn_n,
+            session_claimed: body.session_claimed,
+        });
+    }
+    Ok(states)
 }
 
 /// Clear an issue's dispatch-state drawer once it's no longer in flight
@@ -202,6 +254,60 @@ mod tests {
         assert_eq!(get_dispatch_state(&db, &issue).unwrap(), None);
         // Idempotent: clearing an already-cleared issue is not an error.
         assert!(!clear_dispatch_state(&db, &issue).unwrap());
+    }
+
+    #[test]
+    fn all_dispatch_states_returns_every_in_flight_issue() {
+        let db = Database::open_in_memory().unwrap();
+        let a = IssueRef::new("ironrace/ironmem", 283);
+        let b = IssueRef::new("ironrace/other", 7);
+        upsert_dispatch_state(&db, &sample(&a, 1)).unwrap();
+        upsert_dispatch_state(&db, &sample(&b, 1)).unwrap();
+
+        let states = all_dispatch_states(&db, 100).unwrap();
+        assert_eq!(states.len(), 2);
+        assert!(states.iter().any(|s| s.issue == a));
+        assert!(states.iter().any(|s| s.issue == b));
+
+        // Cleared issues drop out.
+        clear_dispatch_state(&db, &a).unwrap();
+        let states = all_dispatch_states(&db, 100).unwrap();
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].issue, b);
+    }
+
+    #[test]
+    fn all_dispatch_states_ignores_other_kinds_in_the_same_room() {
+        // The room also holds issue-status, gate-config, budget and every
+        // append-only lineage record. Only dispatch states are in flight.
+        let db = Database::open_in_memory().unwrap();
+        let issue = IssueRef::new("ironrace/ironmem", 283);
+        upsert_dispatch_state(&db, &sample(&issue, 1)).unwrap();
+        super::super::write_current(&db, "issue-status:ironrace-ironmem-283", "{}").unwrap();
+        super::super::write_current(&db, "budget:2026-09-01", "{}").unwrap();
+
+        let states = all_dispatch_states(&db, 100).unwrap();
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].issue, issue);
+    }
+
+    #[test]
+    fn an_undeserializable_dispatch_state_is_skipped_not_fatal() {
+        // One corrupt record must not take every other in-flight issue's
+        // supervision offline with it.
+        let db = Database::open_in_memory().unwrap();
+        let good = IssueRef::new("ironrace/ironmem", 283);
+        upsert_dispatch_state(&db, &sample(&good, 1)).unwrap();
+        super::super::write_current(
+            &db,
+            &format!("{DISPATCH_STATE_KEY_PREFIX}corrupt-1"),
+            "not json",
+        )
+        .unwrap();
+
+        let states = all_dispatch_states(&db, 100).unwrap();
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].issue, good);
     }
 
     // ── Regression: clearing must leave the same wal-log audit trail every

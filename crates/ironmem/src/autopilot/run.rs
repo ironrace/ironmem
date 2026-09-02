@@ -89,7 +89,9 @@ use crate::error::MemoryError;
 
 use super::dispatch::{self, DispatchOutcome, DispatchSpec, SessionMode, Verdict};
 use super::worktree::Worktree;
-use super::{budget, dispatch_state, gate_config, lineage, today_utc, turn_prompt, IssueRef};
+use super::{
+    budget, dispatch_state, gate_config, lineage, supervise, today_utc, turn_prompt, IssueRef,
+};
 use super::{AttemptOutcome, AttemptRecord, DispatchState, IssueStatus, PriorAttempt};
 
 /// Turns per dispatch (the `N` in the spec's `/goal <gates> or stop after N
@@ -286,6 +288,24 @@ pub fn classify(outcome: &DispatchOutcome) -> DispatchClassification {
     if outcome.is_met() {
         return DispatchClassification::Met;
     }
+    // A wall-clock kill, stated explicitly rather than left to fall through
+    // the `!process_success` arm below it would already hit. Two reasons to
+    // spell it out: it documents the decision, and it stops a later change to
+    // how `process_success` is set from silently reclassifying it.
+    //
+    // Infrastructure, not a failed attempt — despite the spec calling a
+    // `--max-budget-usd` termination a failed attempt, which looks like the
+    // same thing. It is not: a spend-terminated dispatch still returns its
+    // result JSON, so there is a real diagnostic to record as `why_failed`
+    // and a real meter to bank. A killed one returns nothing at all, and an
+    // attempt record whose only content is "we killed it" would consume one
+    // of the issue's five attempts while adding nothing the next dispatch can
+    // learn from. Whose problem it is settles it too: repeated timeouts mean
+    // the bound is wrong or the repo is wedged — an operator's fix, which is
+    // exactly what the consecutive-infrastructure-failure bound escalates to.
+    if outcome.timed_out {
+        return DispatchClassification::InfrastructureFailure;
+    }
     if !outcome.process_success || (outcome.is_error && outcome.verdict.is_none()) {
         return DispatchClassification::InfrastructureFailure;
     }
@@ -363,6 +383,13 @@ pub struct IssueRun {
     pub total_cost_usd: f64,
     /// The issue's cumulative attempt count after the run.
     pub cumulative_attempt_n: u32,
+    /// The repo's per-dispatch wall-clock bound, or `None` if it has none.
+    ///
+    /// Reported rather than merely applied: an unbounded repo is a real
+    /// operational fact (a wedged dispatch there runs forever), and a caller
+    /// that never sees the `None` cannot tell an unbounded repo from a
+    /// bounded one that simply never timed out.
+    pub wall_clock_timeout_secs: Option<u64>,
 }
 
 /// How [`run_issue`] executes a dispatch.
@@ -551,10 +578,16 @@ fn record_and_advance(
 /// [`is_terminal_summary`] to keep the record from being appended twice.
 const TERMINAL_SUMMARY_PREFIX: &str = "terminal: per-issue attempt cap";
 
-/// Whether a recorded attempt is an attempt-cap terminal marker rather than
-/// a real try.
-fn is_terminal_summary(attempt: &PriorAttempt) -> bool {
-    attempt.approach.starts_with(TERMINAL_SUMMARY_PREFIX)
+/// Whether a recorded attempt's `approach` marks it as an attempt-cap
+/// terminal record rather than a real try.
+///
+/// Takes the `approach` string rather than a record type because both
+/// [`PriorAttempt`] and [`AttemptRecord`] readers need the same answer —
+/// [`super::supervise::assess_strategy_health`] must exclude these markers
+/// from its thrash window, since a marker's `why_failed` quotes every attempt
+/// before it and would otherwise look like a repetition of them.
+pub(super) fn is_terminal_summary(approach: &str) -> bool {
+    approach.starts_with(TERMINAL_SUMMARY_PREFIX)
 }
 
 /// The spec's *Cross-dispatch stagnation control* terminal record: on
@@ -568,7 +601,7 @@ fn is_terminal_summary(attempt: &PriorAttempt) -> bool {
 /// state contradict the cap it just reported hitting. `attempt_cap` is
 /// carried separately only for the message, since a cap lowered between runs
 /// leaves `attempt_n` above it.
-fn record_terminal_summary(
+pub(super) fn record_terminal_summary(
     db: &Database,
     issue: &IssueRef,
     attempt_n: u32,
@@ -581,7 +614,7 @@ fn record_terminal_summary(
     // terminal records — so appending a second one would nest the first
     // one's whole text inside it and grow the lineage (and the prior-attempt
     // prompt every later dispatch reads) on every single re-run.
-    if attempts.iter().any(is_terminal_summary) {
+    if attempts.iter().any(|a| is_terminal_summary(&a.approach)) {
         return Ok(());
     }
     let summary = if attempts.is_empty() {
@@ -668,6 +701,13 @@ pub fn run_issue(
     config.validate()?;
 
     let gate_commands = approved_gate_commands(db, &issue.repo)?;
+    // Read *after* the approval check above, which is the gate that refuses
+    // an unapproved repo outright. `None` here means this repo has no
+    // wall-clock bound — legal, and the pre-rung-7 behavior, but it is
+    // surfaced on `IssueRun` rather than passing silently, because "no
+    // timeout" and "a timeout nobody set" look identical from the outside.
+    let wall_clock_timeout_secs = gate_config::wall_clock_timeout(db, &issue.repo)?;
+    let wall_clock_timeout = wall_clock_timeout_secs.map(std::time::Duration::from_secs);
 
     let mut status = lineage::get_issue_status(db, issue)?;
     if let Some(existing) = &status {
@@ -680,6 +720,7 @@ pub fn run_issue(
                 dispatches: Vec::new(),
                 total_cost_usd: 0.0,
                 cumulative_attempt_n: existing.cumulative_attempt_n,
+                wall_clock_timeout_secs,
             });
         }
     }
@@ -763,12 +804,18 @@ pub fn run_issue(
         }
 
         let attempts = prior_attempts(db, issue)?;
+        // Rung 2 provisioned this slot and hardcoded it to `None`; rung 7's
+        // strategy-health check is what finally fills it. Read fresh on every
+        // pass so a redirect issued by a supervisor running *between*
+        // dispatches (the spec's per-dispatch cadence) reaches the very next
+        // one.
+        let strategy_redirect = supervise::active_redirect(db, issue)?;
         let condition = turn_prompt::render(&turn_prompt::TurnPromptInputs {
             issue,
             issue_title: &brief.title,
             issue_body: &brief.body,
             prior_attempts: &attempts,
-            strategy_redirect: None,
+            strategy_redirect: strategy_redirect.as_deref(),
             gate_commands: &gate_commands,
             n_turns: config.n_turns,
         });
@@ -788,6 +835,7 @@ pub fn run_issue(
             max_budget_usd: config.max_budget_usd,
             max_turns: config.max_turns,
             condition,
+            wall_clock_timeout,
         };
 
         let outcome = match dispatcher.dispatch(&worktree.path, &spec) {
@@ -841,8 +889,19 @@ pub fn run_issue(
 
         // Bank spend before deciding anything else. Every dispatch that
         // returned a result is billed, met or not.
-        budget::accumulate_daily_spend(db, &today_utc(), outcome.total_cost_usd.max(0.0))?;
-        total_cost_usd += outcome.total_cost_usd.max(0.0);
+        //
+        // A dispatch killed on the wall-clock bound is the exception, and
+        // the reason rung 5's unpriced counter exists: it really did spend
+        // money, and its result JSON — the only meter there is — died with
+        // it. Banking its synthesized `0.0` as *spend* would record a
+        // measurement that was never taken; banking it as *unpriced* marks
+        // the day's total as a floor, which is the true statement.
+        if outcome.timed_out {
+            budget::record_unpriced_dispatch(db, &today_utc())?;
+        } else {
+            budget::accumulate_daily_spend(db, &today_utc(), outcome.total_cost_usd.max(0.0))?;
+            total_cost_usd += outcome.total_cost_usd.max(0.0);
+        }
 
         let classification = classify(&outcome);
         let attempt_n = if classification.consumes_attempt() {
@@ -948,6 +1007,7 @@ pub fn run_issue(
         dispatches,
         total_cost_usd,
         cumulative_attempt_n,
+        wall_clock_timeout_secs,
     })
 }
 
@@ -1006,6 +1066,7 @@ mod tests {
             verdict,
             reason: verdict.map(|v| format!("scripted {v:?}")),
             process_success,
+            timed_out: false,
         }
     }
 
@@ -1053,6 +1114,207 @@ mod tests {
         .unwrap();
         gate_config::approve_gate_config(&db, &issue().repo).unwrap();
         db
+    }
+
+    /// Rung 7: a dispatch killed on the repo's wall-clock bound. No result
+    /// JSON survives such a process, so every field but `timed_out` is a
+    /// placeholder — `total_cost_usd: 0.0` means *unknown*, not *free*.
+    fn timed_out() -> DispatchOutcome {
+        DispatchOutcome {
+            total_cost_usd: 0.0,
+            num_turns: 0,
+            duration_ms: 600_000,
+            is_error: true,
+            session_id: "11111111-2222-3333-4444-555555555555".to_string(),
+            verdict: None,
+            reason: Some("dispatch exceeded this repo's wall-clock bound".to_string()),
+            process_success: false,
+            timed_out: true,
+        }
+    }
+
+    // ── rung 7: the wall-clock bound and the strategy redirect ──────────
+
+    #[test]
+    fn a_repo_with_no_wall_clock_bound_dispatches_unbounded_and_says_so() {
+        let db = approved_db();
+        let (_dir, worktree) = fixture_worktree();
+        let mut dispatcher = ScriptedDispatcher::new(vec![Ok(met())]);
+        let run = run_issue(
+            &db,
+            &issue(),
+            &brief(),
+            &worktree,
+            &config(),
+            &mut dispatcher,
+        )
+        .unwrap();
+
+        assert_eq!(run.wall_clock_timeout_secs, None);
+        assert_eq!(dispatcher.seen[0].wall_clock_timeout, None);
+    }
+
+    #[test]
+    fn an_approved_repos_wall_clock_bound_reaches_the_dispatch_spec() {
+        let db = approved_db();
+        gate_config::set_wall_clock_timeout(&db, &issue().repo, Some(1_800)).unwrap();
+        let (_dir, worktree) = fixture_worktree();
+        let mut dispatcher = ScriptedDispatcher::new(vec![Ok(met())]);
+        let run = run_issue(
+            &db,
+            &issue(),
+            &brief(),
+            &worktree,
+            &config(),
+            &mut dispatcher,
+        )
+        .unwrap();
+
+        assert_eq!(run.wall_clock_timeout_secs, Some(1_800));
+        assert_eq!(
+            dispatcher.seen[0].wall_clock_timeout,
+            Some(std::time::Duration::from_secs(1_800))
+        );
+    }
+
+    #[test]
+    fn a_timed_out_dispatch_banks_unpriced_spend_never_zero_dollars() {
+        // The rung-5 lesson, applied to the one dispatch outcome that has no
+        // meter at all: `$0.00` would make the ledger read as a total when
+        // it is only a floor.
+        let db = approved_db();
+        let (_dir, worktree) = fixture_worktree();
+        let mut dispatcher = ScriptedDispatcher::new(vec![Ok(timed_out()), Ok(met())]);
+        let run = run_issue(
+            &db,
+            &issue(),
+            &brief(),
+            &worktree,
+            &config(),
+            &mut dispatcher,
+        )
+        .unwrap();
+
+        let ledger = budget::get_daily_spend(&db, &today_utc()).unwrap().unwrap();
+        assert_eq!(
+            ledger.unpriced_dispatch_count, 1,
+            "the killed dispatch must be marked unpriced"
+        );
+        // Only the successful dispatch's real cost is in the total.
+        assert!((ledger.total_cost_usd - 0.20).abs() < 1e-9);
+        assert!((run.total_cost_usd - 0.20).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_timed_out_dispatch_does_not_consume_an_attempt() {
+        let db = approved_db();
+        let (_dir, worktree) = fixture_worktree();
+        let mut dispatcher = ScriptedDispatcher::new(vec![Ok(timed_out()), Ok(met())]);
+        let run = run_issue(
+            &db,
+            &issue(),
+            &brief(),
+            &worktree,
+            &config(),
+            &mut dispatcher,
+        )
+        .unwrap();
+
+        assert_eq!(
+            run.dispatches[0].classification,
+            DispatchClassification::InfrastructureFailure
+        );
+        assert_eq!(run.dispatches[0].attempt_n, None);
+        assert_eq!(
+            run.cumulative_attempt_n, 1,
+            "only the real attempt counts against the cap"
+        );
+    }
+
+    #[test]
+    fn repeated_timeouts_stop_the_run_rather_than_looping_forever() {
+        let db = approved_db();
+        let (_dir, worktree) = fixture_worktree();
+        let mut dispatcher =
+            ScriptedDispatcher::new(vec![Ok(timed_out()), Ok(timed_out()), Ok(timed_out())]);
+        let run = run_issue(
+            &db,
+            &issue(),
+            &brief(),
+            &worktree,
+            &config(),
+            &mut dispatcher,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            run.terminal,
+            TerminalReason::InfrastructureFailure { consecutive: 3 }
+        ));
+        // "Paused, not finished": the session is kept so a human who raises
+        // the bound can resume it rather than starting over.
+        assert!(dispatch_state::get_dispatch_state(&db, &issue())
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn an_active_strategy_redirect_reaches_the_next_dispatchs_condition() {
+        // Rung 2 provisioned the turn prompt's `strategy_redirect` slot and
+        // left it hardcoded to `None`. This is the wire finally being
+        // connected.
+        let db = approved_db();
+        let (_dir, worktree) = fixture_worktree();
+        supervise::upsert_supervision(
+            &db,
+            &supervise::SupervisionRecord {
+                issue: issue(),
+                fingerprint: "f".to_string(),
+                progress_observed_at: chrono::Utc::now().to_rfc3339(),
+                first_absent_at: None,
+                last_checked_at: chrono::Utc::now().to_rfc3339(),
+                active_redirect: Some("STRATEGY REDIRECT: stop doing that".to_string()),
+                redirect_signature: Some("sig".to_string()),
+                escalated_signature: None,
+            },
+        )
+        .unwrap();
+
+        let mut dispatcher = ScriptedDispatcher::new(vec![Ok(met())]);
+        run_issue(
+            &db,
+            &issue(),
+            &brief(),
+            &worktree,
+            &config(),
+            &mut dispatcher,
+        )
+        .unwrap();
+
+        assert!(
+            dispatcher.seen[0]
+                .condition
+                .contains("STRATEGY REDIRECT: stop doing that"),
+            "the redirect must be in the rendered /goal condition, got: {}",
+            dispatcher.seen[0].condition
+        );
+    }
+
+    #[test]
+    fn no_redirect_renders_exactly_as_before() {
+        let db = approved_db();
+        let (_dir, worktree) = fixture_worktree();
+        let mut dispatcher = ScriptedDispatcher::new(vec![Ok(met())]);
+        run_issue(
+            &db,
+            &issue(),
+            &brief(),
+            &worktree,
+            &config(),
+            &mut dispatcher,
+        )
+        .unwrap();
+        assert!(!dispatcher.seen[0].condition.contains("STRATEGY REDIRECT"));
     }
 
     /// A worktree value pointing at a real single-commit repo, so
