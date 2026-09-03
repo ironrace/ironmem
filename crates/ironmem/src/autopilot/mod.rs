@@ -129,6 +129,7 @@
 //! repo inside the logical key or record body instead — a judgment call,
 //! documented here so it's easy to revisit.
 
+pub mod advance;
 pub mod advise;
 pub mod blocked;
 pub mod budget;

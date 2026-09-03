@@ -198,6 +198,18 @@ impl LeadConfig {
     }
 }
 
+/// The dispatch class an issue has when nothing has classified it.
+///
+/// **Fails closed by construction:** it is not a
+/// [`super::review::RiskClass`], so `decide_merge` holds at `ClassMismatch`
+/// and the PR waits for a human rather than auto-merging.
+///
+/// One constant because four call sites spelled the literal — two CLI
+/// defaults, the fallback rung 9 passes, and rung 10's advance class — and a
+/// fifth spelling it differently would silently produce a class that merges
+/// under nobody's rule.
+pub const UNCLASSIFIED: &str = "unclassified";
+
 /// The dispatch-time risk class for an issue.
 ///
 /// Takes the `risk:<class>` label [`super::queue::QueuedIssue::risk_label`]

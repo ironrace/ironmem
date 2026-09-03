@@ -556,7 +556,7 @@ fn sort_candidates(candidates: &mut [QueuedIssue]) {
 /// [`super::review::RiskClass`], so it lands at the same `ClassMismatch`
 /// hold an unrecognized class does — fail-closed, and self-explaining in the
 /// dispatch-state drawer. Sorted so the value does not depend on label order.
-fn risk_label(labels: &[String]) -> Option<String> {
+pub(super) fn risk_label(labels: &[String]) -> Option<String> {
     let mut found: Vec<String> = Vec::new();
     for label in labels {
         let normalized = label.trim().to_ascii_lowercase();

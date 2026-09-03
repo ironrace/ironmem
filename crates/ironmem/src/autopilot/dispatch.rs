@@ -475,7 +475,7 @@ type DrainHandle = std::thread::JoinHandle<Vec<u8>>;
 /// On a non-unix target there are no process groups here, so this degrades to
 /// exactly the previous behavior — the direct child only. Stated rather than
 /// silently platform-dependent.
-fn kill_process_group(child: &mut std::process::Child) {
+pub(super) fn kill_process_group(child: &mut std::process::Child) {
     #[cfg(unix)]
     {
         // Negated pid addresses the group, which `process_group(0)` made

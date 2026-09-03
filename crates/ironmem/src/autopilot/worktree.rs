@@ -103,13 +103,34 @@ pub struct Worktree {
     pub quarantined_from: Option<PathBuf>,
 }
 
-/// Run a `git` subcommand, returning trimmed stdout or a descriptive error.
+/// A `git` command with **every inherited `GIT_*` variable stripped**.
+///
+/// The single constructor for this module's git calls, so the scrub cannot be
+/// forgotten at one call site — the shape `collab_checkpoint`'s own helper
+/// uses, for the same reason.
+///
+/// `current_dir` is not enough on its own, and this module is the sharpest
+/// case of that in the crate. An inherited `GIT_DIR` / `GIT_WORK_TREE`
+/// overrides the working directory, so a `git worktree remove` aimed at an
+/// issue's checkout would run against **whatever repository the environment
+/// names instead** — a destructive command pointed at a repo nobody in this
+/// subsystem chose. `collab_session`'s scrub states that every
+/// `Command::new("git")` in the crate must call it; autopilot was the module
+/// that never did.
+fn git_command() -> Command {
+    let mut command = Command::new("git");
+    crate::mcp::tools::scrub_git_environment(&mut command);
+    command
+}
+
+/// Run a `git` subcommand in `cwd` through [`git_command`]'s scrubbed
+/// environment, returning trimmed stdout or a descriptive error.
 fn git(cwd: &Path, args: &[&str]) -> Result<String, MemoryError> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .map_err(|e| MemoryError::NotFound(format!("failed to run git {}: {e}", args.join(" "))))?;
+    let mut command = git_command();
+    let output =
+        command.args(args).current_dir(cwd).output().map_err(|e| {
+            MemoryError::NotFound(format!("failed to run git {}: {e}", args.join(" ")))
+        })?;
     if !output.status.success() {
         return Err(MemoryError::Validation(format!(
             "git {} failed in {} (exit {:?}): {}",
@@ -127,7 +148,8 @@ fn git(cwd: &Path, args: &[&str]) -> Result<String, MemoryError> {
 /// existence probes, where "this ref does not exist" is a normal answer and
 /// not a fault.
 fn git_ok(cwd: &Path, args: &[&str]) -> Result<bool, MemoryError> {
-    let status = Command::new("git")
+    let mut command = git_command();
+    let status = command
         .args(args)
         .current_dir(cwd)
         .stdout(std::process::Stdio::null())
@@ -363,6 +385,94 @@ pub fn ensure_worktree(
     })
 }
 
+// ── rung 10: giving the worktree back ───────────────────────────────────
+
+/// What [`remove_worktree`] did.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum WorktreeRemoval {
+    /// The worktree was registered and clean, and is now gone.
+    Removed { path: String },
+    /// There was nothing to remove. Returned both for a path git never knew
+    /// about and for one whose registration was stale — the second is
+    /// pruned on the way past, so the *next* `ensure_worktree` for this
+    /// issue takes the create path rather than the "registered but missing"
+    /// repair path.
+    Absent,
+    /// The worktree has uncommitted changes, so it was left alone.
+    ///
+    /// **Refusing is the point.** Cleanup runs after a merge, and a dirty
+    /// worktree at that moment means work the merge did not include —
+    /// generated files, a half-finished follow-up, or an IC killed mid-edit.
+    /// Deleting it would destroy the only copy, silently, as a side effect
+    /// of a *successful* merge. [`ensure_worktree`] already quarantines a
+    /// dirty tree when it needs the path back; nothing here needs it back.
+    DirtyRefused { path: String },
+}
+
+impl WorktreeRemoval {
+    /// Whether the worktree is gone now, however it got that way.
+    pub fn cleaned(&self) -> bool {
+        matches!(
+            self,
+            WorktreeRemoval::Removed { .. } | WorktreeRemoval::Absent
+        )
+    }
+}
+
+/// Remove the worktree for `issue`, the spec's *"Lead records outcome, cleans
+/// worktree"* step.
+///
+/// Idempotent by construction: every terminal state is reachable twice with
+/// the same answer, because the caller is a cron-restarted pass that will see
+/// the same merged PR again and must not fail the second time.
+///
+/// Deliberately **not** called when an IC goes green. The worktree is the
+/// reviewer's input — [`super::review::review_pr`] reads the diff from it —
+/// so removing it at success would delete the checkout the next step needs.
+/// It is removed after the PR lands, and not before.
+///
+/// The branch is left alone. Deleting the head branch is
+/// [`super::merge::MergeRequest::delete_branch`]'s decision, made against the
+/// *remote*; a local branch ref costs nothing and is the last on-disk trace
+/// of what an IC did.
+pub fn remove_worktree(
+    repo_root: &Path,
+    worktree_root: &Path,
+    issue: &IssueRef,
+) -> Result<WorktreeRemoval, MemoryError> {
+    super::validate_repo(&issue.repo)?;
+    let root = resolve_repo_root(repo_root)?;
+    let path = worktree_path(worktree_root, issue);
+    let path_str = path.to_string_lossy().to_string();
+
+    if !is_registered_worktree(&root, &path)? {
+        // An unregistered directory at this path is not ours to delete: git
+        // never made it, so something else did.
+        return Ok(WorktreeRemoval::Absent);
+    }
+
+    if !path.exists() {
+        // Registered but gone from disk. `git status` cannot even spawn with
+        // that cwd, so the dirty check below would error rather than answer;
+        // prune the stale registration and report the truth.
+        git(&root, &["worktree", "prune"])?;
+        return Ok(WorktreeRemoval::Absent);
+    }
+
+    if is_dirty(&path)? {
+        return Ok(WorktreeRemoval::DirtyRefused { path: path_str });
+    }
+
+    git(&root, &["worktree", "remove", &path_str])?;
+    // `remove` unregisters the worktree it removed; the prune is for the
+    // administrative files a concurrent `rm -rf` elsewhere may have
+    // orphaned. Cheap, and it keeps `git worktree list` honest for the next
+    // pass's registration check.
+    git(&root, &["worktree", "prune"])?;
+    Ok(WorktreeRemoval::Removed { path: path_str })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -568,6 +678,183 @@ mod tests {
         assert!(
             is_dirty(repo.path()).unwrap(),
             "tracked modifications count as dirty"
+        );
+    }
+
+    // ── rung 10: giving the worktree back ───────────────────────────────
+
+    #[test]
+    fn removing_a_clean_worktree_deletes_it_and_unregisters_it() {
+        let repo = fixture_repo();
+        let roots = tempfile::tempdir().unwrap();
+        let wt = ensure_worktree(repo.path(), roots.path(), &issue(), "HEAD").unwrap();
+        assert!(wt.path.exists());
+
+        let removal = remove_worktree(repo.path(), roots.path(), &issue()).unwrap();
+        assert!(
+            matches!(removal, WorktreeRemoval::Removed { .. }),
+            "got {removal:?}"
+        );
+        assert!(!wt.path.exists(), "the directory is gone");
+        assert!(
+            !is_registered_worktree(&resolve_repo_root(repo.path()).unwrap(), &wt.path).unwrap(),
+            "git no longer lists it"
+        );
+    }
+
+    #[test]
+    fn removing_a_worktree_twice_is_the_same_answer_the_second_time() {
+        // The caller is a cron-restarted pass that sees the same merged PR
+        // again; a second cleanup must not fail.
+        let repo = fixture_repo();
+        let roots = tempfile::tempdir().unwrap();
+        ensure_worktree(repo.path(), roots.path(), &issue(), "HEAD").unwrap();
+
+        assert!(matches!(
+            remove_worktree(repo.path(), roots.path(), &issue()).unwrap(),
+            WorktreeRemoval::Removed { .. }
+        ));
+        assert_eq!(
+            remove_worktree(repo.path(), roots.path(), &issue()).unwrap(),
+            WorktreeRemoval::Absent
+        );
+    }
+
+    #[test]
+    fn removing_a_worktree_that_never_existed_is_absent_not_an_error() {
+        let repo = fixture_repo();
+        let roots = tempfile::tempdir().unwrap();
+        assert_eq!(
+            remove_worktree(repo.path(), roots.path(), &issue()).unwrap(),
+            WorktreeRemoval::Absent
+        );
+    }
+
+    #[test]
+    fn a_dirty_worktree_is_refused_and_left_on_disk() {
+        // Cleanup runs after a merge. A dirty tree then is work the merge did
+        // not include, and deleting it would destroy the only copy as a side
+        // effect of a *successful* merge.
+        let repo = fixture_repo();
+        let roots = tempfile::tempdir().unwrap();
+        let wt = ensure_worktree(repo.path(), roots.path(), &issue(), "HEAD").unwrap();
+        std::fs::write(wt.path.join("uncommitted.txt"), "an IC's unsaved work\n").unwrap();
+
+        let removal = remove_worktree(repo.path(), roots.path(), &issue()).unwrap();
+        assert!(
+            matches!(removal, WorktreeRemoval::DirtyRefused { .. }),
+            "got {removal:?}"
+        );
+        assert!(wt.path.exists(), "the dirty tree survives");
+        assert!(
+            wt.path.join("uncommitted.txt").exists(),
+            "and so does the uncommitted file"
+        );
+        assert!(!removal.cleaned());
+    }
+
+    #[test]
+    fn a_registration_whose_directory_was_deleted_is_pruned_and_reported_absent() {
+        let repo = fixture_repo();
+        let roots = tempfile::tempdir().unwrap();
+        let wt = ensure_worktree(repo.path(), roots.path(), &issue(), "HEAD").unwrap();
+        std::fs::remove_dir_all(&wt.path).unwrap();
+
+        assert_eq!(
+            remove_worktree(repo.path(), roots.path(), &issue()).unwrap(),
+            WorktreeRemoval::Absent
+        );
+        assert!(
+            !is_registered_worktree(&resolve_repo_root(repo.path()).unwrap(), &wt.path).unwrap(),
+            "the stale registration is pruned, so the next ensure_worktree creates rather than repairs"
+        );
+    }
+
+    #[test]
+    fn removal_leaves_the_branch_alone() {
+        // Deleting the head branch is the merge's decision, made against the
+        // remote. The local ref is the last on-disk trace of what an IC did.
+        let repo = fixture_repo();
+        let roots = tempfile::tempdir().unwrap();
+        ensure_worktree(repo.path(), roots.path(), &issue(), "HEAD").unwrap();
+        remove_worktree(repo.path(), roots.path(), &issue()).unwrap();
+
+        let branches = git(repo.path(), &["branch", "--list", &branch_name(&issue())]).unwrap();
+        assert!(
+            branches.contains(&branch_name(&issue())),
+            "branch survives removal, got {branches:?}"
+        );
+    }
+
+    #[test]
+    fn an_unregistered_directory_at_the_path_is_not_deleted() {
+        // git never made it, so something else did.
+        let repo = fixture_repo();
+        let roots = tempfile::tempdir().unwrap();
+        let path = worktree_path(roots.path(), &issue());
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("someones-file.txt"), "not ours\n").unwrap();
+
+        assert_eq!(
+            remove_worktree(repo.path(), roots.path(), &issue()).unwrap(),
+            WorktreeRemoval::Absent
+        );
+        assert!(path.join("someones-file.txt").exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn the_git_environment_is_scrubbed_before_every_call() {
+        // `current_dir` does NOT win against `GIT_DIR`: git reads the variable
+        // first. Unscrubbed, `remove_worktree` would run `git worktree remove`
+        // against whatever repository the environment names — a destructive
+        // command aimed at a repo nobody in this subsystem chose.
+        //
+        // Asserted against a command carrying the variable, rather than by
+        // setting it on the process: environment variables are process-global
+        // and the test suite is threaded, so a test that exports `GIT_DIR`
+        // redirects every *other* test's git call for as long as it holds it.
+        // That is a real defect this repository already has elsewhere, and
+        // reproducing a hazard by inflicting it is not a test.
+        let mut command = Command::new("sh");
+        command.env("GIT_DIR", "/decoy/.git");
+        command.env("GIT_WORK_TREE", "/decoy");
+        crate::mcp::tools::scrub_git_environment(&mut command);
+        let out = command
+            .args(["-c", "echo \"${GIT_DIR:-unset}/${GIT_WORK_TREE:-unset}\""])
+            .output()
+            .expect("sh must be runnable");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "unset/unset",
+            "the scrub must remove git's redirecting variables"
+        );
+    }
+
+    #[test]
+    fn every_git_call_in_this_module_goes_through_the_one_constructor() {
+        // The scrub is only as good as its coverage, and coverage here is a
+        // property of the source: one constructor, and no bare
+        // `Command::new("git")` beside it. Checked by reading this file
+        // rather than by spawning, because a call site that forgot is
+        // invisible at runtime until the day an inherited variable exists.
+        // Production code only: the test fixtures below build their own git
+        // commands, and they are not what an operator's inherited environment
+        // can redirect.
+        let source = include_str!("worktree.rs");
+        let production = source
+            .split_once("\n#[cfg(test)]")
+            .map(|(before, _)| before)
+            .unwrap_or(source);
+        let bare = production
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .filter(|line| line.contains("Command::new(\"git\")"))
+            .count();
+        assert_eq!(
+            bare, 1,
+            "exactly one `Command::new(\"git\")`, inside `git_command`; \
+             every other call site must use it"
         );
     }
 }
