@@ -508,9 +508,34 @@ impl Drop for ScratchDir {
     }
 }
 
+/// Wall-clock bound on one review.
+///
+/// Rung 5 shipped the reviewer unbounded, which was survivable while
+/// `autopilot review` was a command a human typed and could interrupt. Rung
+/// 10 runs it from `autopilot advance`, unattended, so a wedged `codex` stops
+/// every *other* issue's advance behind it — the shape rung 9's review found
+/// in the advisor, in the module that had the same excuse.
+///
+/// **Lesson 26 for the fifth time on this ladder** (rungs 4→5, 5→7, 7→9, and
+/// now 5→10): when a rung makes an existing subprocess run unattended, it
+/// inherits the earlier bound, it does not re-earn the omission.
+///
+/// A fixed constant rather than a per-repo value, unlike
+/// [`super::gate_config::GateConfig::wall_clock_timeout_secs`]: a review
+/// reads a diff and runs no gate suite, so it does not scale with the repo's
+/// tests. Twenty minutes is generous for a read-only agent on a large diff
+/// and still finite.
+pub const REVIEW_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1_200);
+
+/// How often [`run_review_bounded`] checks whether the reviewer has exited.
+const REVIEW_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// Run one review: write the schema, spawn `bin` with [`build_argv`]'s argv
 /// in `repo_dir`, capture stdout, and read the verdict back out of the
 /// last-message file.
+///
+/// Bounded at [`REVIEW_TIMEOUT`]. See [`run_review_bounded`] for the bound
+/// itself and for what a timeout is reported as.
 ///
 /// # Error contract
 ///
@@ -527,6 +552,28 @@ pub fn run_review(
     model: Option<String>,
     prompt: String,
 ) -> Result<ReviewOutcome, MemoryError> {
+    run_review_bounded(bin, repo_dir, model, prompt, REVIEW_TIMEOUT)
+}
+
+/// [`run_review`] with an explicit bound, so the bound is testable against a
+/// stub binary without waiting [`REVIEW_TIMEOUT`].
+///
+/// A timeout is **a review that ran**, not one that failed to launch:
+/// `process_success` is false, which [`review_pr`] routes to
+/// [`HoldReason::ReviewerDidNotRun`] and `decide_merge` holds on, and the
+/// invocation still counts against the day's unpriced-review ceiling. A
+/// wedged reviewer that banked nothing would be retried every pass forever —
+/// rung 9's lesson 41, which is about exactly this: the failure outcomes need
+/// the same accounting the success one gets.
+pub fn run_review_bounded(
+    bin: &Path,
+    repo_dir: &Path,
+    model: Option<String>,
+    prompt: String,
+    timeout: std::time::Duration,
+) -> Result<ReviewOutcome, MemoryError> {
+    use std::io::Read;
+
     let scratch = ScratchDir::create()?;
     let schema_path = scratch.path.join("verdict-schema.json");
     let last_message_path = scratch.path.join("last-message.txt");
@@ -545,17 +592,97 @@ pub fn run_review(
     };
     let args = build_argv(&spec, repo_dir);
 
-    let output = std::process::Command::new(bin)
+    let mut command = std::process::Command::new(bin);
+    command
         .args(&args)
         .current_dir(repo_dir)
-        .output()
+        // Nulled explicitly. `spawn` inherits all three streams where the
+        // `output` call this replaced nulled stdin for you, and inheriting it
+        // hands the reviewer the caller's stdin — a TTY under an interactive
+        // `autopilot review` — so a `codex` that reads it blocks until the
+        // bound fires. That is the wedge the bound exists to prevent, made
+        // likelier by the bound that prevents it.
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    // Its own process group, so the bound reaps what the reviewer *started*.
+    // Unlike rung 9's advisor — which runs with `--tools ""` and therefore
+    // starts nothing, so a group reap there would be untested machinery
+    // guarding an impossible case — `codex exec` is agentic: `-s read-only`
+    // sandboxes what it may write, not whether it may run commands at all, so
+    // a `git log` of its own outliving the kill is a real case.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command
+        .spawn()
         .map_err(|e| MemoryError::NotFound(format!("failed to launch reviewer: {e}")))?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Drain both pipes on their own threads for the whole life of the
+    // process. `--json` makes the reviewer's stdout a JSONL event stream that
+    // routinely exceeds the OS pipe buffer, so reading it only after exit
+    // would deadlock, and the bound would then kill a healthy review and
+    // report it as timed out. Rung 7's finding, carried over rather than
+    // rediscovered.
+    fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut buf);
+            }
+            buf
+        })
+    }
+    let stdout_drain = drain(child.stdout.take());
+    let stderr_drain = drain(child.stderr.take());
+
+    let started = std::time::Instant::now();
+    let timed_out = loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break false,
+            // We cannot tell whether it is running. Reaped rather than left:
+            // a review is minutes of read-only work worth no more than the
+            // certainty that nothing is still holding the checkout.
+            Err(_) => {
+                super::dispatch::kill_process_group(&mut child);
+                let _ = child.wait();
+                break true;
+            }
+            Ok(None) => {}
+        }
+        if started.elapsed() >= timeout {
+            super::dispatch::kill_process_group(&mut child);
+            let _ = child.wait();
+            break true;
+        }
+        std::thread::sleep(REVIEW_POLL_INTERVAL);
+    };
+
+    let status = child.wait();
+    // Not joined on the timeout path: the drain threads block on pipes whose
+    // writer was just killed, and while that normally ends them immediately,
+    // an orphaned grandchild holding the write end would make the join hang
+    // for as long as *it* lives — reintroducing, after the kill, the
+    // unbounded wait the kill just ended.
+    // stderr is drained but not read, exactly as the unbounded path left it:
+    // every fact this outcome carries comes from stdout's event stream or the
+    // last-message file. Draining it is not optional even so — an undrained
+    // pipe is what deadlocks the process the bound is timing.
+    let stdout_bytes = if timed_out {
+        Vec::new()
+    } else {
+        let _ = stderr_drain.join();
+        stdout_drain.join().unwrap_or_default()
+    };
+
+    let stdout = String::from_utf8_lossy(&stdout_bytes);
     let token_usage = parse_codex_token_usage(&stdout);
 
     // A missing last-message file means the reviewer produced no final
-    // message — same fail-closed treatment as an unparseable one.
+    // message — same fail-closed treatment as an unparseable one. A killed
+    // reviewer reaches here too, and reaches it with nothing written.
     let message = std::fs::read_to_string(&last_message_path).unwrap_or_default();
     let (verdict, risk_class, reason) = parse_review_message(&message);
 
@@ -566,7 +693,9 @@ pub fn run_review(
         // Codex reports no price. See the module doc.
         total_cost_usd: None,
         token_usage,
-        process_success: output.status.success(),
+        // A timeout is not a success, and neither is a `wait` that could not
+        // report one: unknown fails closed, exactly as rung 9's advisor does.
+        process_success: !timed_out && status.map(|s| s.success()).unwrap_or(false),
     })
 }
 
@@ -2417,5 +2546,98 @@ not json at all
                 .unpriced_dispatch_count,
             1
         );
+    }
+
+    // ── rung 10: the reviewer's wall-clock bound ────────────────────────
+
+    #[cfg(unix)]
+    fn stub_reviewer(dir: &std::path::Path, name: &str, script: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = dir.join(name);
+        std::fs::write(&bin, script).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        bin
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_wedged_reviewer_is_killed_rather_than_stalling_every_other_issue() {
+        // Rung 5 shipped this unbounded, which was survivable while a human
+        // typed `autopilot review` and could interrupt it. Rung 10 runs it
+        // unattended, where a stuck `codex` stops every issue queued behind
+        // it. Lesson 26, fifth occurrence.
+        let dir = tempfile::tempdir().unwrap();
+        let bin = stub_reviewer(dir.path(), "wedged", "#!/bin/sh\nsleep 120\n");
+
+        let started = std::time::Instant::now();
+        let outcome = run_review_bounded(
+            &bin,
+            dir.path(),
+            None,
+            "prompt".into(),
+            std::time::Duration::from_millis(300),
+        )
+        .unwrap();
+
+        assert!(started.elapsed() < std::time::Duration::from_secs(30));
+        // A timeout is a review that RAN — not a launch failure. It reaches
+        // `decide_merge` as a hold, and it still counts against the day's
+        // unpriced-review ceiling, so a wedged reviewer is not retried
+        // forever (rung 9's lesson 41).
+        assert!(!outcome.process_success);
+        assert_eq!(outcome.verdict, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_reviewer_that_outruns_the_pipe_buffer_is_not_mistaken_for_a_wedged_one() {
+        // `--json` makes stdout a JSONL event stream that routinely exceeds
+        // the ~64 KiB pipe buffer. Draining only after exit deadlocks, and the
+        // bound would then kill a healthy review and call it a timeout.
+        let dir = tempfile::tempdir().unwrap();
+        let bin = stub_reviewer(
+            dir.path(),
+            "chatty",
+            "#!/bin/sh\nyes x | head -c 262144\nyes y | head -c 262144 >&2\nexit 0\n",
+        );
+
+        let outcome = run_review_bounded(
+            &bin,
+            dir.path(),
+            None,
+            "prompt".into(),
+            std::time::Duration::from_secs(20),
+        )
+        .unwrap();
+
+        assert!(
+            outcome.process_success,
+            "a chatty but healthy reviewer must not be reported as failed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_reviewer_that_cannot_be_launched_is_still_an_error_not_a_timeout() {
+        // The error contract rung 5 wrote is unchanged by the bound: a
+        // failure to *start* stays `NotFound`, because a spawn failure and a
+        // wedged process warrant different operator responses.
+        let dir = tempfile::tempdir().unwrap();
+        let err = run_review_bounded(
+            &dir.path().join("does-not-exist"),
+            dir.path(),
+            None,
+            "prompt".into(),
+            std::time::Duration::from_secs(5),
+        )
+        .unwrap_err();
+        assert!(matches!(err, MemoryError::NotFound(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn the_review_bound_is_finite_and_generous() {
+        // Finite is the property that matters; the number is a judgment call
+        // that a change should have to state out loud.
+        assert_eq!(REVIEW_TIMEOUT, std::time::Duration::from_secs(1_200));
     }
 }

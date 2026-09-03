@@ -30,7 +30,7 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use super::labels::AgentLabel;
 use super::IssueRef;
@@ -1127,6 +1127,121 @@ pub fn issue_comments(
     )?)
 }
 
+// ── rung 10: finding the PR an IC opened ────────────────────────────────
+
+/// Fields [`pr_list_head_argv`] asks for.
+///
+/// `headRefOid` is the load-bearing one: rung 6 refuses a merge unless the
+/// commit a review read is still the PR head, and rung 10 decides whether a
+/// PR *needs* reviewing by asking whether a review exists at this SHA. A
+/// listing without it could name a PR but never advance it.
+pub const PR_LIST_HEAD_FIELDS: &str = "number,headRefName,headRefOid,baseRefName,isDraft,url";
+
+/// `gh pr list --repo R --head B --state open --json <PR_LIST_HEAD_FIELDS>`.
+///
+/// `--state open` is explicit for the same reason [`issue_list_argv`] spells
+/// it: a merged or closed PR on this branch is not work waiting to advance,
+/// and leaning on a CLI default to say so puts a correctness property in
+/// someone else's changelog.
+///
+/// `--limit` is 100 rather than 1. Taking the first of an unknown number
+/// would turn the ambiguity [`open_pr_for_branch`] fails closed on into a
+/// silent arbitrary pick — and the whole point of the read is to be certain
+/// *which* PR is about to be merged.
+pub fn pr_list_head_argv(repo: &str, head_branch: &str) -> Vec<String> {
+    vec![
+        "pr".into(),
+        "list".into(),
+        "--repo".into(),
+        repo.into(),
+        "--head".into(),
+        head_branch.into(),
+        "--state".into(),
+        "open".into(),
+        "--json".into(),
+        PR_LIST_HEAD_FIELDS.into(),
+        "--limit".into(),
+        "100".into(),
+    ]
+}
+
+/// One open PR as `gh pr list` reports it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct PrForBranch {
+    pub number: u64,
+    #[serde(default, rename = "headRefName")]
+    pub head_branch: String,
+    #[serde(default, rename = "headRefOid")]
+    pub head_sha: String,
+    #[serde(default, rename = "baseRefName")]
+    pub base_branch: String,
+    #[serde(default, rename = "isDraft")]
+    pub is_draft: bool,
+    #[serde(default)]
+    pub url: String,
+}
+
+/// Parse `gh pr list --json` output.
+///
+/// A PR numbered 0 is dropped on [`parse_issue_list`]'s reasoning: GitHub
+/// never issues one, so its only source is a malformed response, and a `#0`
+/// reaching [`super::merge::execute_merge`] would name a PR no human command
+/// can.
+pub fn parse_pr_list_head(stdout: &str) -> Result<Vec<PrForBranch>, MemoryError> {
+    let prs: Vec<PrForBranch> = serde_json::from_str(stdout.trim()).map_err(|e| {
+        MemoryError::Validation(format!("could not parse `gh pr list --json`: {e}"))
+    })?;
+    Ok(prs.into_iter().filter(|p| p.number != 0).collect())
+}
+
+/// Why [`open_pr_for_branch`] could not name exactly one PR.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "reason", rename_all = "snake_case")]
+pub enum PrLookup {
+    /// Exactly one open PR, and here it is.
+    Found(PrForBranch),
+    /// No open PR on this branch. Not an error: an IC that went green but
+    /// never pushed, a PR a human closed, and a PR already merged all land
+    /// here, and each is a fact about the world rather than a failed read.
+    None,
+    /// More than one open PR shares this head branch. GitHub permits it —
+    /// one branch can target several bases — so it is a real state, not an
+    /// impossible one.
+    ///
+    /// **Fails closed.** Picking one would mean the caller merges a PR it
+    /// never named, and the two candidates can have different bases and
+    /// therefore different blast radii.
+    Ambiguous { numbers: Vec<u64> },
+}
+
+/// The open PR whose head branch is `head_branch`, if there is exactly one.
+///
+/// A failed *read* is an `Err`, never [`PrLookup::None`] — rung 7's lesson,
+/// applied to this collection too: "no PR here" is a claim rung 10 acts on by
+/// reporting the issue as stalled, and an unreadable listing must not be able
+/// to make that claim.
+pub fn open_pr_for_branch(
+    gh: &mut dyn GhRunner,
+    repo: &str,
+    head_branch: &str,
+) -> Result<PrLookup, MemoryError> {
+    let out = gh.run(&pr_list_head_argv(repo, head_branch))?;
+    let mut prs = parse_pr_list_head(out.require_success(
+        &format!("gh pr list --head {head_branch} on {repo}"),
+        GhFailure::NotFound,
+    )?)?;
+
+    match prs.len() {
+        0 => Ok(PrLookup::None),
+        1 => Ok(PrLookup::Found(prs.remove(0))),
+        _ => {
+            let mut numbers: Vec<u64> = prs.iter().map(|p| p.number).collect();
+            numbers.sort_unstable();
+            Ok(PrLookup::Ambiguous { numbers })
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod testing {
     use super::*;
@@ -1997,5 +2112,136 @@ mod tests {
         assert_eq!(argv[1], "view");
         assert_eq!(argv[2], "42");
         assert!(argv.contains(&"title,body".to_string()));
+    }
+
+    // ── rung 10: finding the PR an IC opened ────────────────────────────
+
+    fn pr_list_json(prs: &[(u64, &str, &str)]) -> String {
+        let items: Vec<String> = prs
+            .iter()
+            .map(|(n, sha, base)| {
+                format!(
+                    r#"{{"number":{n},"headRefName":"autopilot/issue-7","headRefOid":"{sha}","baseRefName":"{base}","isDraft":false,"url":"https://github.com/owner/repo/pull/{n}"}}"#
+                )
+            })
+            .collect();
+        format!("[{}]", items.join(","))
+    }
+
+    fn ok(stdout: &str) -> Result<GhOutput, MemoryError> {
+        Ok(GhOutput {
+            stdout: stdout.into(),
+            stderr: String::new(),
+            success: true,
+            code: Some(0),
+        })
+    }
+
+    #[test]
+    fn the_pr_list_argv_names_the_repo_the_head_branch_and_the_open_state() {
+        let argv = pr_list_head_argv("owner/repo", "autopilot/issue-7");
+        assert_eq!(argv[0], "pr");
+        assert_eq!(argv[1], "list");
+        assert!(argv.windows(2).any(|w| w == ["--repo", "owner/repo"]));
+        assert!(argv
+            .windows(2)
+            .any(|w| w == ["--head", "autopilot/issue-7"]));
+        // A merged or closed PR on this branch is not work waiting to
+        // advance, and the exclusion must not depend on a CLI default.
+        assert!(argv.windows(2).any(|w| w == ["--state", "open"]));
+    }
+
+    #[test]
+    fn the_pr_list_argv_asks_for_the_head_sha() {
+        // Without it a listing can name a PR but never advance it: rung 6
+        // refuses to merge a PR whose head moved since the review.
+        assert!(PR_LIST_HEAD_FIELDS.contains("headRefOid"));
+        let argv = pr_list_head_argv("owner/repo", "b");
+        let json = argv
+            .windows(2)
+            .find(|w| w[0] == "--json")
+            .map(|w| w[1].clone())
+            .expect("--json is present");
+        assert!(json.contains("headRefOid"));
+    }
+
+    #[test]
+    fn the_pr_list_argv_does_not_limit_to_one() {
+        // Taking the first of an unknown number turns the ambiguity this
+        // read exists to detect into a silent arbitrary pick.
+        let argv = pr_list_head_argv("owner/repo", "b");
+        let limit = argv
+            .windows(2)
+            .find(|w| w[0] == "--limit")
+            .map(|w| w[1].clone())
+            .expect("--limit is present");
+        assert_ne!(limit, "1");
+    }
+
+    #[test]
+    fn one_open_pr_is_found_with_its_head_sha_and_base() {
+        let mut gh = ScriptedGh::new(vec![ok(&pr_list_json(&[(42, "abc123", "main")]))]);
+        let found = open_pr_for_branch(&mut gh, "owner/repo", "autopilot/issue-7").unwrap();
+        match found {
+            PrLookup::Found(pr) => {
+                assert_eq!(pr.number, 42);
+                assert_eq!(pr.head_sha, "abc123");
+                assert_eq!(pr.base_branch, "main");
+                assert!(!pr.is_draft);
+            }
+            other => panic!("expected one PR, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_open_pr_is_a_fact_not_an_error() {
+        let mut gh = ScriptedGh::new(vec![ok("[]")]);
+        assert_eq!(
+            open_pr_for_branch(&mut gh, "owner/repo", "autopilot/issue-7").unwrap(),
+            PrLookup::None
+        );
+    }
+
+    #[test]
+    fn two_open_prs_on_one_branch_fail_closed_rather_than_picking_one() {
+        // GitHub permits it — one head branch can target several bases — and
+        // the two candidates can have different blast radii. Picking either
+        // would mean merging a PR the caller never named.
+        let mut gh = ScriptedGh::new(vec![ok(&pr_list_json(&[
+            (42, "abc123", "main"),
+            (7, "abc123", "release/1.x"),
+        ]))]);
+        match open_pr_for_branch(&mut gh, "owner/repo", "autopilot/issue-7").unwrap() {
+            PrLookup::Ambiguous { numbers } => assert_eq!(numbers, vec![7, 42]),
+            other => panic!("expected ambiguity, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unreadable_pr_listing_is_an_error_never_an_empty_one() {
+        // Rung 7's lesson, applied here: "no PR on this branch" is a claim
+        // rung 10 acts on, and a failed read must not be able to make it.
+        let mut gh = ScriptedGh::new(vec![Ok(GhOutput {
+            stdout: String::new(),
+            stderr: "gh: could not reach api.github.com".into(),
+            success: false,
+            code: Some(1),
+        })]);
+        let err = open_pr_for_branch(&mut gh, "owner/repo", "autopilot/issue-7").unwrap_err();
+        assert!(matches!(err, MemoryError::NotFound(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn a_pr_numbered_zero_is_dropped() {
+        let prs =
+            parse_pr_list_head(&pr_list_json(&[(0, "abc", "main"), (5, "def", "main")])).unwrap();
+        assert_eq!(prs.len(), 1);
+        assert_eq!(prs[0].number, 5);
+    }
+
+    #[test]
+    fn unparseable_pr_list_output_is_a_validation_error() {
+        let err = parse_pr_list_head("not json").unwrap_err();
+        assert!(matches!(err, MemoryError::Validation(_)), "got {err:?}");
     }
 }

@@ -370,7 +370,7 @@ enum AutopilotCmd {
         #[arg(long, default_value = "claude-sonnet-5")]
         model: String,
         /// Dispatch-time risk class, recorded for the Reviewer to compare against
-        #[arg(long = "class", default_value = "unclassified")]
+        #[arg(long = "class", default_value = ironmem::autopilot::lead::UNCLASSIFIED)]
         dispatch_class: String,
         /// Turns per dispatch (the N in "or stop after N turns")
         #[arg(long)]
@@ -576,7 +576,7 @@ enum AutopilotCmd {
         /// merge decision cannot parse it, so such a PR holds for a human
         /// rather than auto-merging. Overriding this is a decision to let
         /// unjudged issues route as something specific.
-        #[arg(long = "fallback-class", default_value = "unclassified")]
+        #[arg(long = "fallback-class", default_value = ironmem::autopilot::lead::UNCLASSIFIED)]
         fallback_class: String,
         /// Let the Lead make rung 9's three one-shot judgment calls:
         /// classify an unlabeled issue's risk, propose an alternative
@@ -714,6 +714,62 @@ enum AutopilotCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Carry every succeeded issue's PR forward: review it, apply rung 6's
+    /// merge decision, and clean up once it lands (build-ladder rung 10)
+    ///
+    /// The other half of `autopilot lead`. A tick starts work and records a
+    /// success; this finishes it. Run them in that order.
+    ///
+    /// **Reviews by default, merges only with `--merge`.** Without it every
+    /// merge is rehearsed — every guard and every read runs and nothing is
+    /// written to GitHub — because a merge is the one irreversible action in
+    /// this subsystem. Reviewing spends money on `codex`, bounded by the same
+    /// daily ceilings `autopilot review` applies.
+    Advance {
+        /// Path to the database
+        #[arg(long)]
+        db: Option<String>,
+        /// A repo and its local checkout, as `owner/repo=/path/to/checkout`.
+        /// Repeat for each repo this pass covers.
+        #[arg(long = "repo", value_name = "OWNER/REPO=PATH", required = true)]
+        repos: Vec<String>,
+        /// Directory per-issue worktrees live under. Must be the one the
+        /// Lead used: a review reads the issue's worktree, and an issue
+        /// whose worktree is not found is reported rather than reviewed
+        /// against a checkout that cannot see its branch.
+        #[arg(long)]
+        worktree_root: Option<String>,
+        /// Execute merges instead of rehearsing them. **Irreversible.**
+        #[arg(long)]
+        merge: bool,
+        /// Merge strategy for `--merge`
+        #[arg(long, default_value = "squash")]
+        strategy: String,
+        /// Delete the head branch after a successful merge
+        #[arg(long)]
+        delete_branch: bool,
+        /// Model for the Codex reviewer
+        #[arg(long)]
+        model: Option<String>,
+        /// How many issues one pass may carry forward
+        #[arg(long)]
+        max_advances: Option<usize>,
+        /// How many `agent:ready` issues to list per repo
+        #[arg(long)]
+        max_issues_per_repo: Option<u32>,
+        /// Daily ledger ceiling, shared with dispatches and reviews
+        #[arg(long)]
+        daily_budget_usd: Option<f64>,
+        /// How many unpriced reviewer runs one day may make
+        #[arg(long)]
+        max_unpriced_reviews_per_day: Option<u32>,
+        /// Read everything, write nothing, spend nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// Emit JSON instead of text
+        #[arg(long)]
+        json: bool,
+    },
     /// Set or clear a repo's per-dispatch wall-clock bound (rung 7)
     Timeout {
         /// Path to the database
@@ -760,6 +816,125 @@ fn parse_repo_target(
         path: std::path::PathBuf::from(path),
         base: base.to_string(),
     })
+}
+
+/// Human-readable rendering of one advance pass.
+fn print_advance_report(report: &ironmem::autopilot::advance::AdvanceReport) {
+    use ironmem::autopilot::advance::{AdvanceStep, Stall};
+    use ironmem::autopilot::merge::MergeOutcome;
+    use ironmem::autopilot::worktree::WorktreeRemoval;
+
+    println!(
+        "Advance — {} carried forward, {} skipped, {} problem(s){}{}",
+        report.advanced.len(),
+        report.skipped.len(),
+        report.problems.len(),
+        if report.dry_run { " [dry run]" } else { "" },
+        if report.merge_enabled {
+            ""
+        } else {
+            " [merges rehearsed — pass --merge to execute]"
+        }
+    );
+
+    for step in &report.advanced {
+        println!(
+            "  {} (class {})",
+            step.issue.canonical(),
+            step.dispatch_class
+        );
+        match &step.step {
+            AdvanceStep::Stalled(Stall::NoOpenPr { branch }) => {
+                println!("    STALLED: no open PR on {branch}");
+            }
+            AdvanceStep::Stalled(Stall::AmbiguousPr { numbers }) => {
+                println!(
+                    "    STALLED: {} open PRs share this branch ({}) — close all but one",
+                    numbers.len(),
+                    numbers
+                        .iter()
+                        .map(|n| format!("#{n}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+            AdvanceStep::Stalled(Stall::WorktreeMissing { path }) => {
+                println!("    STALLED: needs a review and its worktree is gone ({path})");
+                println!("    a reviewer pointed at a checkout without the branch reviews the wrong thing");
+            }
+            AdvanceStep::Review {
+                pr_number,
+                head_sha,
+                gate_green,
+                ..
+            } => {
+                println!(
+                    "    PR #{pr_number} at {head_sha} — reviewing (gate green: {gate_green})"
+                );
+            }
+            AdvanceStep::Merge {
+                pr_number,
+                head_sha,
+                gate_green,
+            } => {
+                println!(
+                    "    PR #{pr_number} at {head_sha} — already reviewed (gate green: {gate_green})"
+                );
+            }
+        }
+        if let Some(review) = &step.review {
+            println!(
+                "    review: {:?} / {:?}",
+                review.outcome.verdict, review.decision
+            );
+        }
+        if let Some(exec) = &step.merge {
+            match &exec.outcome {
+                MergeOutcome::Merged { strategy, head_sha } => {
+                    println!("    MERGED ({} of {head_sha})", strategy.as_str())
+                }
+                MergeOutcome::WouldMerge { strategy, head_sha } => println!(
+                    "    would merge ({} of {head_sha}) — rehearsal, nothing written",
+                    strategy.as_str()
+                ),
+                MergeOutcome::AlreadyMerged { head_sha } => {
+                    println!("    already merged ({head_sha})")
+                }
+                MergeOutcome::Held(hold) => println!("    HELD: {}", hold.summary()),
+            }
+            if let Some(err) = &exec.label_error {
+                println!("    WARNING: labels were NOT updated: {err}");
+            }
+        }
+        if let Some(cleanup) = &step.cleanup {
+            match &cleanup.worktree {
+                WorktreeRemoval::Removed { path } => println!("    worktree removed: {path}"),
+                WorktreeRemoval::Absent => println!("    worktree: nothing to remove"),
+                WorktreeRemoval::DirtyRefused { path } => println!(
+                    "    worktree KEPT (uncommitted changes the merge did not include): {path}"
+                ),
+            }
+            if cleanup.dispatch_state_cleared {
+                println!("    dispatch state cleared");
+            }
+            if let Some(err) = &cleanup.error {
+                // The merge landed regardless. Silent here, a failed cleanup
+                // would be indistinguishable from a clean one.
+                println!("    WARNING: cleanup did not finish: {err}");
+            }
+        }
+    }
+
+    for skipped in &report.skipped {
+        println!(
+            "  skip {} — {:?}",
+            skipped.issue.canonical(),
+            skipped.reason
+        );
+    }
+    for problem in &report.problems {
+        println!("  PROBLEM {}: {}", problem.what, problem.detail);
+    }
 }
 
 /// Human-readable rendering of one queue plan.
@@ -2088,6 +2263,86 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                 }
                 Ok(())
             }
+            AutopilotCmd::Advance {
+                db,
+                repos,
+                worktree_root,
+                merge,
+                strategy,
+                delete_branch,
+                model,
+                max_advances,
+                max_issues_per_repo,
+                daily_budget_usd,
+                max_unpriced_reviews_per_day,
+                dry_run,
+                json,
+            } => {
+                use ironmem::autopilot::advance::AdvanceConfig;
+
+                let strategy =
+                    ironmem::autopilot::gh::MergeStrategy::parse(&strategy).ok_or_else(|| {
+                        ironmem::error::MemoryError::Config(format!(
+                            "unknown merge strategy {strategy:?} — expected squash, merge or rebase"
+                        ))
+                    })?;
+                let targets = repos
+                    .iter()
+                    // `base` is the committish new branches are cut from, and
+                    // this pass cuts none: every branch it looks at already
+                    // exists and already has a PR.
+                    .map(|spec| parse_repo_target(spec, "HEAD"))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let worktree_root = match worktree_root {
+                    Some(root) => std::path::PathBuf::from(root),
+                    None => default_worktree_root()?,
+                };
+
+                let config = AdvanceConfig {
+                    targets,
+                    max_issues_per_repo: max_issues_per_repo
+                        .unwrap_or(ironmem::autopilot::queue::DEFAULT_MAX_ISSUES_PER_REPO),
+                    max_advances_per_pass: max_advances
+                        .unwrap_or(ironmem::autopilot::advance::DEFAULT_MAX_ADVANCES_PER_PASS),
+                    merge,
+                    strategy,
+                    delete_branch,
+                    dry_run,
+                    daily_budget_usd: daily_budget_usd
+                        .unwrap_or(ironmem::autopilot::run::DEFAULT_DAILY_BUDGET_USD),
+                    max_unpriced_reviews_per_day: max_unpriced_reviews_per_day.unwrap_or(
+                        ironmem::autopilot::review::DEFAULT_MAX_UNPRICED_REVIEWS_PER_DAY,
+                    ),
+                    worktree_root,
+                };
+                // Validated before any binary is resolved: a bad config
+                // should fail on the config, not on a missing `gh`.
+                config.validate()?;
+
+                let database = open_migrated_db(db)?;
+                let mut gh_runner = ironmem::autopilot::gh::GhCli::resolve(
+                    config
+                        .targets
+                        .first()
+                        .map(|t| t.path.clone())
+                        .unwrap_or_else(|| std::path::PathBuf::from(".")),
+                )?;
+                let mut reviewer = ironmem::autopilot::review::CodexReviewer::resolve(model)?;
+
+                let report = ironmem::autopilot::advance::advance_pass(
+                    &database,
+                    &mut gh_runner,
+                    &mut reviewer,
+                    &config,
+                )?;
+
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    print_advance_report(&report);
+                }
+                Ok(())
+            }
             AutopilotCmd::Queue {
                 db,
                 repos,
@@ -2549,6 +2804,56 @@ mod tests {
             }
             _ => panic!("expected Commands::Autopilot(Merge), got a different variant"),
         }
+    }
+
+    #[test]
+    fn autopilot_advance_does_not_merge_unless_asked() {
+        // The one irreversible action in the subsystem. Forgetting the flag
+        // must rehearse, never merge.
+        let cli = Cli::try_parse_from([
+            "ironmem",
+            "autopilot",
+            "advance",
+            "--repo",
+            "owner/repo=/tmp/checkout",
+        ])
+        .expect("expected argv to parse");
+        match cli.command {
+            Commands::Autopilot {
+                cmd:
+                    AutopilotCmd::Advance {
+                        repos,
+                        merge,
+                        strategy,
+                        delete_branch,
+                        dry_run,
+                        max_advances,
+                        ..
+                    },
+            } => {
+                assert_eq!(repos, vec!["owner/repo=/tmp/checkout"]);
+                assert!(!merge, "merging is opt-in");
+                assert!(!delete_branch);
+                assert!(!dry_run);
+                assert_eq!(strategy, "squash");
+                assert_eq!(max_advances, None, "the default lives in the module");
+            }
+            _ => panic!("expected Commands::Autopilot(Advance), got a different variant"),
+        }
+    }
+
+    #[test]
+    fn autopilot_advance_requires_a_repo_and_its_checkout() {
+        // A review reads the issue's worktree, which is cut from a local
+        // checkout. There is nothing to guess from.
+        assert!(
+            Cli::try_parse_from(["ironmem", "autopilot", "advance"]).is_err(),
+            "--repo is required"
+        );
+        assert!(
+            parse_repo_target("owner/repo", "HEAD").is_err(),
+            "a --repo without a path is refused"
+        );
     }
 
     #[test]
