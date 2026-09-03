@@ -234,6 +234,54 @@ pub fn issue_view_labels_argv(issue: &IssueRef) -> Vec<String> {
     ]
 }
 
+/// `gh issue view N --repo R --json title,body`.
+///
+/// Rung 9 only. The queue already carries every backlog issue's title and
+/// body from `gh issue list`, so this exists for the one case that listing
+/// cannot serve: an issue that is *in flight* rather than in a backlog, and
+/// which rung 9 is about to draft a human question for.
+pub fn issue_view_brief_argv(issue: &IssueRef) -> Vec<String> {
+    vec![
+        "issue".into(),
+        "view".into(),
+        issue.number.to_string(),
+        "--repo".into(),
+        issue.repo.clone(),
+        "--json".into(),
+        "title,body".into(),
+    ]
+}
+
+/// One issue's title and body.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct IssueBriefJson {
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub body: String,
+}
+
+/// Parse `gh issue view --json title,body`.
+///
+/// Both fields default to empty, and empty is the *degraded* value
+/// everywhere it is used: rung 9's question prompt renders it as
+/// "(not available)" and the drafted question is worse, rather than the call
+/// failing. Rung 6's lesson 18 — schema drift degrades, it does not break.
+pub fn parse_issue_brief(stdout: &str) -> Result<IssueBriefJson, MemoryError> {
+    serde_json::from_str(stdout.trim()).map_err(|e| {
+        MemoryError::Validation(format!("could not parse `gh issue view --json`: {e}"))
+    })
+}
+
+/// Read one issue's title and body.
+pub fn issue_brief(gh: &mut dyn GhRunner, issue: &IssueRef) -> Result<IssueBriefJson, MemoryError> {
+    let out = gh.run(&issue_view_brief_argv(issue))?;
+    parse_issue_brief(out.require_success(
+        &format!("gh issue view {}", issue.canonical()),
+        GhFailure::NotFound,
+    )?)
+}
+
 /// `gh issue edit N --repo R [--add-label L]... [--remove-label L]...`.
 pub fn issue_edit_labels_argv(issue: &IssueRef, add: &[String], remove: &[String]) -> Vec<String> {
     let mut argv = vec![
@@ -1924,5 +1972,30 @@ mod tests {
                 "markers are compared against a lowercased haystack"
             );
         }
+    }
+
+    #[test]
+    fn an_issue_brief_parses_and_degrades_to_empty_rather_than_failing() {
+        let brief =
+            parse_issue_brief(r#"{"title":"Fix the parser","body":"It drops rows"}"#).unwrap();
+        assert_eq!(brief.title, "Fix the parser");
+        assert_eq!(brief.body, "It drops rows");
+
+        // A missing field is the *degraded* value, not an error: rung 9
+        // renders an empty body as "(not available)" and drafts a worse
+        // question, rather than skipping the notice a human needs.
+        let brief = parse_issue_brief("{}").unwrap();
+        assert!(brief.title.is_empty() && brief.body.is_empty());
+
+        assert!(parse_issue_brief("not json").is_err());
+    }
+
+    #[test]
+    fn the_issue_brief_argv_requests_exactly_the_fields_it_reads() {
+        let argv = issue_view_brief_argv(&IssueRef::new("ironrace/ironmem", 42));
+        assert_eq!(argv[0], "issue");
+        assert_eq!(argv[1], "view");
+        assert_eq!(argv[2], "42");
+        assert!(argv.contains(&"title,body".to_string()));
     }
 }

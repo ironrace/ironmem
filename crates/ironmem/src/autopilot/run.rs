@@ -640,7 +640,11 @@ const TERMINAL_SUMMARY_PREFIX: &str = "terminal: per-issue attempt cap";
 /// [`super::supervise::assess_strategy_health`] must exclude these markers
 /// from its thrash window, since a marker's `why_failed` quotes every attempt
 /// before it and would otherwise look like a repetition of them.
-pub(super) fn is_terminal_summary(approach: &str) -> bool {
+///
+/// `pub` rather than `pub(super)` because `autopilot advise` renders the same
+/// lineage into the same prompt the Lead does, and a preview that quoted
+/// these markers as approaches would disagree with the tick it is previewing.
+pub fn is_terminal_summary(approach: &str) -> bool {
     approach.starts_with(TERMINAL_SUMMARY_PREFIX)
 }
 
@@ -1421,6 +1425,9 @@ mod tests {
                 redirect_signature: None,
                 redirect_issued_after_attempts: None,
                 escalated_signature: Some("the same failure".to_string()),
+                redirect_proposal: None,
+                escalation_notified_signature: None,
+                escalation_question: None,
             },
         )
         .unwrap();
@@ -1468,6 +1475,9 @@ mod tests {
                 redirect_signature: None,
                 redirect_issued_after_attempts: None,
                 escalated_signature: Some("the same failure".to_string()),
+                redirect_proposal: None,
+                escalation_notified_signature: None,
+                escalation_question: None,
             },
         )
         .unwrap();
@@ -1505,6 +1515,9 @@ mod tests {
                 redirect_signature: Some("sig".to_string()),
                 redirect_issued_after_attempts: None,
                 escalated_signature: None,
+                redirect_proposal: None,
+                escalation_notified_signature: None,
+                escalation_question: None,
             },
         )
         .unwrap();

@@ -578,6 +578,27 @@ enum AutopilotCmd {
         /// unjudged issues route as something specific.
         #[arg(long = "fallback-class", default_value = "unclassified")]
         fallback_class: String,
+        /// Let the Lead make rung 9's three one-shot judgment calls:
+        /// classify an unlabeled issue's risk, propose an alternative
+        /// approach for a thrashing one, and draft the question an
+        /// escalation puts to a human.
+        ///
+        /// **Off by default, and it spends money.** Every one of the three
+        /// degrades to the rung-8 behaviour when it is off, refused, or
+        /// fails: an unlabeled issue dispatches as `--fallback-class`, a
+        /// redirect keeps its mechanical text, and an escalation is still
+        /// reported on the issue, just without a drafted question.
+        #[arg(long)]
+        advisor: bool,
+        /// Model for advisor calls
+        #[arg(long, default_value = ironmem::autopilot::advise::DEFAULT_ADVICE_MODEL)]
+        advisor_model: String,
+        /// Per-call spend ceiling for advisor calls
+        #[arg(long)]
+        advice_budget_usd: Option<f64>,
+        /// How many advisor calls one day may make, priced or not
+        #[arg(long)]
+        max_advice_calls: Option<u32>,
         /// How many issues one tick may dispatch
         #[arg(long)]
         max_dispatches: Option<usize>,
@@ -651,6 +672,44 @@ enum AutopilotCmd {
         /// Render the comment and the label plan, but write nothing
         #[arg(long)]
         dry_run: bool,
+        /// Emit JSON instead of text
+        #[arg(long)]
+        json: bool,
+    },
+    /// Make one of rung 9's three judgment calls and print the answer
+    ///
+    /// Spends money: it runs a real, toolless, one-turn `claude` call and
+    /// bills it to the day's ledger. Provided so an operator can see what
+    /// the advisor says about one issue before letting `autopilot lead
+    /// --advisor` act on it.
+    Advise {
+        /// Path to the database
+        #[arg(long)]
+        db: Option<String>,
+        /// Repo identity (e.g. "owner/repo")
+        repo: String,
+        /// Issue number
+        issue: u64,
+        /// Which judgment to ask for
+        #[arg(long, value_parser = ["risk", "redirect", "question"])]
+        kind: String,
+        /// Directory `gh` and the advisor run in
+        #[arg(long, default_value = ".")]
+        path: String,
+        /// The repeated failure to redirect or escalate on. Required for
+        /// `--kind redirect` and `--kind question`; read from the issue's
+        /// supervision record when omitted.
+        #[arg(long)]
+        signature: Option<String>,
+        /// Model for the call
+        #[arg(long, default_value = ironmem::autopilot::advise::DEFAULT_ADVICE_MODEL)]
+        model: String,
+        /// Per-call spend ceiling
+        #[arg(long)]
+        max_budget_usd: Option<f64>,
+        /// Daily ledger ceiling, shared with dispatches and reviews
+        #[arg(long)]
+        daily_budget_usd: Option<f64>,
         /// Emit JSON instead of text
         #[arg(long)]
         json: bool,
@@ -776,6 +835,32 @@ fn print_lead_report(report: &ironmem::autopilot::lead::LeadReport) {
             run.dispatches.len(),
             run.total_cost_usd,
             run.terminal,
+        );
+    }
+    for row in &report.advice {
+        // The cost prints as "unknown" rather than as $0.0000 when it could
+        // not be read: an operator reading a ledger needs to see a floor as
+        // a floor.
+        let cost = row
+            .total_cost_usd
+            .map(|c| format!("${c:.4}"))
+            .unwrap_or_else(|| "unknown cost".to_string());
+        println!(
+            "  advice {} on {}: {:?} ({cost})",
+            row.kind.as_str(),
+            row.issue.canonical(),
+            row.status,
+        );
+    }
+    for notice in &report.escalation_notices {
+        println!(
+            "  escalation reported on {} — {}",
+            notice.issue.canonical(),
+            if notice.drafted_question {
+                "with a drafted question"
+            } else {
+                "no question drafted"
+            },
         );
     }
     for problem in &report.problems {
@@ -1885,6 +1970,10 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                 worktree_root,
                 model,
                 fallback_class,
+                advisor,
+                advisor_model,
+                advice_budget_usd,
+                max_advice_calls,
                 max_dispatches,
                 concurrency_cap,
                 n_turns,
@@ -1938,10 +2027,29 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                 queue.max_budget_usd = run.max_budget_usd;
                 queue.daily_budget_usd = run.daily_budget_usd;
 
+                let mut advice = ironmem::autopilot::advise::AdviceConfig {
+                    enabled: advisor,
+                    model: advisor_model,
+                    // The advisor's dollar ceiling is the *same* day's
+                    // ledger the runner and the queue read, for the reason
+                    // the queue's is kept in step: two spellings of one
+                    // ceiling let one caller authorize what the next
+                    // refuses.
+                    daily_budget_usd: run.daily_budget_usd,
+                    ..Default::default()
+                };
+                if let Some(budget) = advice_budget_usd {
+                    advice.max_budget_usd = budget;
+                }
+                if let Some(calls) = max_advice_calls {
+                    advice.max_calls_per_day = calls;
+                }
+
                 let config = LeadConfig {
                     targets,
                     queue,
                     run,
+                    advice,
                     supervision: ironmem::autopilot::supervise::SupervisionConfig::default(),
                     max_dispatches_per_tick: max_dispatches
                         .unwrap_or(ironmem::autopilot::lead::DEFAULT_MAX_DISPATCHES_PER_TICK),
@@ -1962,12 +2070,14 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                 )?;
                 let mut registry = ironmem::autopilot::registry::ClaudeAgentRegistry::resolve()?;
                 let mut dispatcher = ironmem::autopilot::run::ClaudeDispatcher::resolve()?;
+                let mut advisor = ironmem::autopilot::advise::ClaudeAdvisor::resolve()?;
 
                 let report = ironmem::autopilot::lead::lead_tick(
                     &database,
                     &mut gh_runner,
                     &mut registry,
                     &mut dispatcher,
+                    &mut advisor,
                     &config,
                 )?;
 
@@ -2030,6 +2140,137 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                     println!("{}", serde_json::to_string_pretty(&plan)?);
                 } else {
                     print_queue_plan(&plan);
+                }
+                Ok(())
+            }
+            AutopilotCmd::Advise {
+                db,
+                repo,
+                issue,
+                kind,
+                path,
+                signature,
+                model,
+                max_budget_usd,
+                daily_budget_usd,
+                json,
+            } => {
+                use ironmem::autopilot::advise::{self, AdviceConfig};
+
+                let issue_ref = ironmem::autopilot::IssueRef::new(repo, issue);
+                let repo_path = std::path::PathBuf::from(&path);
+                // Enabled unconditionally: the operator typed the command,
+                // which *is* the opt-in `--advisor` expresses on a tick.
+                let mut config = AdviceConfig {
+                    enabled: true,
+                    model,
+                    ..Default::default()
+                };
+                if let Some(budget) = max_budget_usd {
+                    config.max_budget_usd = budget;
+                }
+                if let Some(daily) = daily_budget_usd {
+                    config.daily_budget_usd = daily;
+                }
+                config.validate()?;
+
+                let database = open_migrated_db(db)?;
+                let mut advisor = advise::ClaudeAdvisor::resolve()?;
+
+                // Read the signature from supervision when it was not given,
+                // so the usual case is one flag shorter and cannot disagree
+                // with the record the redirect is keyed on.
+                let signature = match signature {
+                    Some(signature) => Some(signature),
+                    None => ironmem::autopilot::supervise::get_supervision(&database, &issue_ref)?
+                        .and_then(|record| record.redirect_signature),
+                };
+                // Terminal summaries are filtered out for the same reason the
+                // Lead's own `attempt_approaches` filters them: they are the
+                // run's epitaph, not an approach the IC tried, and quoting
+                // them back would make this preview disagree with the prompt
+                // a real tick sends.
+                let approaches: Vec<String> =
+                    ironmem::autopilot::lineage::attempts_for_issue(&database, &issue_ref)?
+                        .into_iter()
+                        .map(|a| a.approach)
+                        .filter(|approach| !ironmem::autopilot::run::is_terminal_summary(approach))
+                        .collect();
+
+                let advice = match kind.as_str() {
+                    "risk" => {
+                        let brief = ironmem::autopilot::gh::issue_brief(
+                            &mut ironmem::autopilot::gh::GhCli::resolve(repo_path.clone())?,
+                            &issue_ref,
+                        )?;
+                        advise::advise_risk_class(
+                            &database,
+                            &mut advisor,
+                            &repo_path,
+                            &issue_ref,
+                            &brief.title,
+                            &brief.body,
+                            &config,
+                        )?
+                    }
+                    "redirect" | "question" => {
+                        let signature = signature.ok_or_else(|| {
+                            MemoryError::Validation(format!(
+                                "--signature is required for --kind {kind}: {} has no redirect \
+                                 on record to name the repeated failure",
+                                issue_ref.canonical()
+                            ))
+                        })?;
+                        if kind == "redirect" {
+                            advise::advise_strategy_redirect(
+                                &database,
+                                &mut advisor,
+                                &repo_path,
+                                &issue_ref,
+                                &signature,
+                                &approaches,
+                                &config,
+                            )?
+                        } else {
+                            let brief = ironmem::autopilot::gh::issue_brief(
+                                &mut ironmem::autopilot::gh::GhCli::resolve(repo_path.clone())?,
+                                &issue_ref,
+                            )?;
+                            advise::advise_human_question(
+                                &database,
+                                &mut advisor,
+                                &repo_path,
+                                &issue_ref,
+                                &brief.title,
+                                &brief.body,
+                                &signature,
+                                &approaches,
+                                &config,
+                            )?
+                        }
+                    }
+                    other => {
+                        return Err(MemoryError::Validation(format!(
+                            "unknown advice kind '{other}'"
+                        )))
+                    }
+                };
+
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&advice)?);
+                } else {
+                    println!("{} on {}", advice.kind.as_str(), issue_ref.canonical());
+                    println!("  status: {:?}", advice.status);
+                    match advice.total_cost_usd {
+                        Some(cost) => println!("  cost: ${cost:.4}"),
+                        None => println!("  cost: unknown — banked as an unpriced call"),
+                    }
+                    if let Some(answer) = advice.answered() {
+                        println!("  answer: {answer}");
+                    }
+                    if let Some(reason) = &advice.reason {
+                        println!("  reason: {reason}");
+                    }
                 }
                 Ok(())
             }

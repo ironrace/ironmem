@@ -1,4 +1,4 @@
-//! Autopilot backlog runner (build-ladder rungs 1-8 — the whole ladder).
+//! Autopilot backlog runner (build-ladder rungs 1-9).
 //!
 //! See `docs/iron/specs/2026-08-21-autonomous-backlog-runner-design.md` for
 //! the full design. Rung 1 built the storage half — the `backlog-lineage`
@@ -36,6 +36,16 @@
 //! dispatches. [`lead`]'s module doc carries the ladder's answer to the
 //! spec's open question 9.
 //!
+//! Rung 9 builds that answer's stated residual: [`advise`], the three
+//! judgment-shaped one-shot calls rung 8 left *specified and located, not
+//! built* — dispatch-time risk classification, composing a strategy
+//! redirect, and drafting the question an escalation puts to a human. All
+//! three are **off by default**, and every one of them degrades to the
+//! rung-8 behaviour when disabled, refused, or failing, because OQ9's
+//! close-out rests on the loop not depending on them. Rung 9 also gives the
+//! escalation itself a voice: before it, an escalation stopped the work and
+//! said so only in a drawer.
+//!
 //! # The drawer kinds, one room
 //!
 //! The spec's *Storage* section defines five distinct drawer kinds, all
@@ -60,6 +70,16 @@
 //! facts for the same reason a `needs_changes` and a later `pass` are, and
 //! this is the audit trail for the only irreversible action in the whole
 //! subsystem.
+//!
+//! Rung 9 adds a tenth, of kind 1's shape:
+//! [`advise::AdviceRecord`](advise::record_advice) — one drawer per advisor
+//! call, `has_advice` edge, **no `logical_key`**. Two classifications of one
+//! issue are two facts, and the earlier is what a later disagreement is read
+//! against. It is recorded because rung 9 introduces the first model
+//! judgment inside the loop and one of the three produces a value that gates
+//! auto-merge, so "which model said `documentation`, when, at what price,
+//! and why" has to stay answerable — the same reason rung 6 records every
+//! merge.
 //!
 //! Rung 8 adds a ninth, also of kind 2's shape:
 //! [`blocked::BlockedRecord`] — `logical_key` per issue, holding the bounded
@@ -109,6 +129,7 @@
 //! repo inside the logical key or record body instead — a judgment call,
 //! documented here so it's easy to revisit.
 
+pub mod advise;
 pub mod blocked;
 pub mod budget;
 pub mod dispatch;
@@ -142,6 +163,7 @@ use crate::error::MemoryError;
 // original.
 use crate::mcp::tools::{LOGICAL_KEY_ID_PREFIX, LOGICAL_KEY_SOURCE_PREFIX};
 
+pub use advise::{Advice, AdviceConfig, AdviceKind, AdviceStatus, Advisor, ClaudeAdvisor};
 pub use blocked::{ask_human, poll_answer, AskOutcome, BlockedPoll, BlockedRecord, QaPair};
 pub use budget::BudgetLedgerEntry;
 pub use dispatch::{DispatchOutcome, DispatchSpec, SessionMode, Verdict};

@@ -947,6 +947,9 @@ mod tests {
                 redirect_signature: None,
                 redirect_issued_after_attempts: None,
                 escalated_signature: Some("the same failure".to_string()),
+                redirect_proposal: None,
+                escalation_notified_signature: None,
+                escalation_question: None,
             },
         )
         .unwrap();
