@@ -103,13 +103,34 @@ pub struct Worktree {
     pub quarantined_from: Option<PathBuf>,
 }
 
-/// Run a `git` subcommand, returning trimmed stdout or a descriptive error.
+/// A `git` command with **every inherited `GIT_*` variable stripped**.
+///
+/// The single constructor for this module's git calls, so the scrub cannot be
+/// forgotten at one call site — the shape `collab_checkpoint`'s own helper
+/// uses, for the same reason.
+///
+/// `current_dir` is not enough on its own, and this module is the sharpest
+/// case of that in the crate. An inherited `GIT_DIR` / `GIT_WORK_TREE`
+/// overrides the working directory, so a `git worktree remove` aimed at an
+/// issue's checkout would run against **whatever repository the environment
+/// names instead** — a destructive command pointed at a repo nobody in this
+/// subsystem chose. `collab_session`'s scrub states that every
+/// `Command::new("git")` in the crate must call it; autopilot was the module
+/// that never did.
+fn git_command() -> Command {
+    let mut command = Command::new("git");
+    crate::mcp::tools::scrub_git_environment(&mut command);
+    command
+}
+
+/// Run a `git` subcommand in `cwd` through [`git_command`]'s scrubbed
+/// environment, returning trimmed stdout or a descriptive error.
 fn git(cwd: &Path, args: &[&str]) -> Result<String, MemoryError> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .map_err(|e| MemoryError::NotFound(format!("failed to run git {}: {e}", args.join(" "))))?;
+    let mut command = git_command();
+    let output =
+        command.args(args).current_dir(cwd).output().map_err(|e| {
+            MemoryError::NotFound(format!("failed to run git {}: {e}", args.join(" ")))
+        })?;
     if !output.status.success() {
         return Err(MemoryError::Validation(format!(
             "git {} failed in {} (exit {:?}): {}",
@@ -127,7 +148,8 @@ fn git(cwd: &Path, args: &[&str]) -> Result<String, MemoryError> {
 /// existence probes, where "this ref does not exist" is a normal answer and
 /// not a fault.
 fn git_ok(cwd: &Path, args: &[&str]) -> Result<bool, MemoryError> {
-    let status = Command::new("git")
+    let mut command = git_command();
+    let status = command
         .args(args)
         .current_dir(cwd)
         .stdout(std::process::Stdio::null())
@@ -778,5 +800,61 @@ mod tests {
             WorktreeRemoval::Absent
         );
         assert!(path.join("someones-file.txt").exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn the_git_environment_is_scrubbed_before_every_call() {
+        // `current_dir` does NOT win against `GIT_DIR`: git reads the variable
+        // first. Unscrubbed, `remove_worktree` would run `git worktree remove`
+        // against whatever repository the environment names — a destructive
+        // command aimed at a repo nobody in this subsystem chose.
+        //
+        // Asserted against a command carrying the variable, rather than by
+        // setting it on the process: environment variables are process-global
+        // and the test suite is threaded, so a test that exports `GIT_DIR`
+        // redirects every *other* test's git call for as long as it holds it.
+        // That is a real defect this repository already has elsewhere, and
+        // reproducing a hazard by inflicting it is not a test.
+        let mut command = Command::new("sh");
+        command.env("GIT_DIR", "/decoy/.git");
+        command.env("GIT_WORK_TREE", "/decoy");
+        crate::mcp::tools::scrub_git_environment(&mut command);
+        let out = command
+            .args(["-c", "echo \"${GIT_DIR:-unset}/${GIT_WORK_TREE:-unset}\""])
+            .output()
+            .expect("sh must be runnable");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "unset/unset",
+            "the scrub must remove git's redirecting variables"
+        );
+    }
+
+    #[test]
+    fn every_git_call_in_this_module_goes_through_the_one_constructor() {
+        // The scrub is only as good as its coverage, and coverage here is a
+        // property of the source: one constructor, and no bare
+        // `Command::new("git")` beside it. Checked by reading this file
+        // rather than by spawning, because a call site that forgot is
+        // invisible at runtime until the day an inherited variable exists.
+        // Production code only: the test fixtures below build their own git
+        // commands, and they are not what an operator's inherited environment
+        // can redirect.
+        let source = include_str!("worktree.rs");
+        let production = source
+            .split_once("\n#[cfg(test)]")
+            .map(|(before, _)| before)
+            .unwrap_or(source);
+        let bare = production
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .filter(|line| line.contains("Command::new(\"git\")"))
+            .count();
+        assert_eq!(
+            bare, 1,
+            "exactly one `Command::new(\"git\")`, inside `git_command`; \
+             every other call site must use it"
+        );
     }
 }

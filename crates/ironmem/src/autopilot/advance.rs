@@ -162,6 +162,11 @@ pub enum SkipReason {
     /// is the ordinary case for most of a backlog, and it is the exact
     /// complement of the queue's `AlreadySucceeded`.
     NoSuccessYet,
+    /// The backlog names a repo no `--repo` target gives a checkout for, so
+    /// there is nowhere to read a worktree from. Distinct from
+    /// [`SkipReason::RepoNotApproved`], which would tell an operator to
+    /// onboard a repo that is already onboarded.
+    NoCheckout,
     /// The pass's own burst limit was reached before this issue's turn.
     PassLimitReached { limit: usize },
 }
@@ -370,7 +375,7 @@ pub fn plan_advance(
             let Some(repo_path) = repo_path.clone() else {
                 skipped.push(Skipped {
                     issue,
-                    reason: SkipReason::RepoNotApproved,
+                    reason: SkipReason::NoCheckout,
                 });
                 continue;
             };
@@ -430,14 +435,36 @@ pub fn next_step(
     // `decide_merge` requires green for the auto-merge it authorizes.
     //
     // An absent green SHA answers false, not true: unknown fails closed.
+    //
+    // Compared case-insensitively, the way `merge::evaluate` compares the
+    // same two values. A differently-cased spelling of one commit is one
+    // commit, and treating it as two would answer "not green" about a green
+    // gate — silently, and while looking healthy.
     let gate_green = candidate
         .green_commit_sha
         .as_deref()
-        .is_some_and(|sha| !sha.is_empty() && sha == pr.head_sha);
+        .is_some_and(|sha| !sha.is_empty() && sha.eq_ignore_ascii_case(&pr.head_sha));
 
+    // The base is compared as well as the head, for the reason rung 6
+    // compares both before merging: a PR retargeted after its review was
+    // reviewed against a diff that no longer exists. Head-only, a retargeted
+    // PR reports as already reviewed forever — its head never moves, so no
+    // pass ever re-reviews it — and `decide_merge` holds it at
+    // `BaseBranchMismatch` with no way out. `None` is a review that predates
+    // the field: unknown, so the comparison is skipped rather than read as a
+    // mismatch, exactly as `merge::evaluate` skips it.
     let reviewed_this_head = review::reviews_for_issue(db, &candidate.issue)?
         .iter()
-        .any(|r| r.pr_number == pr.number && r.head_sha.as_deref() == Some(pr.head_sha.as_str()));
+        .any(|r| {
+            r.pr_number == pr.number
+                && r.head_sha
+                    .as_deref()
+                    .is_some_and(|sha| sha.eq_ignore_ascii_case(&pr.head_sha))
+                && {
+                    let reviewed_base = r.base_branch.as_deref().unwrap_or_default();
+                    reviewed_base.is_empty() || reviewed_base == pr.base_branch
+                }
+        });
 
     if reviewed_this_head {
         return Ok(AdvanceStep::Merge {
@@ -481,8 +508,16 @@ pub fn advance_pass(
     let (candidates, mut skipped) = plan_advance(db, &backlogs, config)?;
 
     let mut advanced = Vec::new();
+    // Counted separately from `advanced.len()`, because a stall is not a step
+    // taken. A stall is a fact about the world that only a human can change —
+    // an issue left `agent:ready` after its PR was merged and closed, two open
+    // PRs on one branch — so it is reported again on every pass, forever.
+    // Charging those repeats against the burst limit let three of them fill it
+    // permanently, and every other green PR behind them was then never
+    // reviewed, never merged, and never mentioned as anything but "deferred".
+    let mut carried = 0usize;
     for candidate in candidates {
-        if advanced.len() >= config.max_advances_per_pass {
+        if carried >= config.max_advances_per_pass {
             skipped.push(Skipped {
                 issue: candidate.issue.clone(),
                 reason: SkipReason::PassLimitReached {
@@ -492,9 +527,12 @@ pub fn advance_pass(
             continue;
         }
         match advance_issue(db, gh_runner, reviewer, &candidate, config) {
-            Ok(Some(step)) => advanced.push(step),
-            // A stall that could not even be classified is not a step.
-            Ok(None) => {}
+            Ok(step) => {
+                if !matches!(step.step, AdvanceStep::Stalled(_)) {
+                    carried += 1;
+                }
+                advanced.push(step);
+            }
             Err(e) => problems.push(AdvanceProblem {
                 what: format!("advance {}", candidate.issue.canonical()),
                 detail: e.to_string(),
@@ -554,7 +592,7 @@ fn advance_issue(
     reviewer: &mut dyn ReviewRunner,
     candidate: &Candidate,
     config: &AdvanceConfig,
-) -> Result<Option<Advanced>, MemoryError> {
+) -> Result<Advanced, MemoryError> {
     let branch = worktree::branch_name(&candidate.issue);
     let lookup = gh::open_pr_for_branch(gh_runner, &candidate.issue.repo, &branch)?;
     let step = next_step(db, candidate, &lookup, &config.worktree_root)?;
@@ -562,14 +600,14 @@ fn advance_issue(
 
     let (pr_number, head_sha, gate_green) = match &step {
         AdvanceStep::Stalled(_) => {
-            return Ok(Some(Advanced {
+            return Ok(Advanced {
                 issue: candidate.issue.clone(),
                 dispatch_class: class,
                 step,
                 review: None,
                 merge: None,
                 cleanup: None,
-            }))
+            })
         }
         AdvanceStep::Review {
             pr_number,
@@ -590,14 +628,14 @@ fn advance_issue(
             // A rehearsal does not spend money. Reviewing is the one paid
             // step here, and `--dry-run` means "change nothing" — a ledger
             // entry and a review drawer are changes.
-            return Ok(Some(Advanced {
+            return Ok(Advanced {
                 issue: candidate.issue.clone(),
                 dispatch_class: class,
                 step,
                 review: None,
                 merge: None,
                 cleanup: None,
-            }));
+            });
         }
         let gate_commands = super::run::approved_gate_commands(db, &candidate.issue.repo)?;
         let repo_dir = worktree::worktree_path(&config.worktree_root, &candidate.issue);
@@ -635,6 +673,27 @@ fn advance_issue(
         review = Some(done);
     }
 
+    // A review the day's ceilings *refused* is not a verdict, and the merge
+    // must not be reached over it. `review_pr` records nothing when it
+    // refuses, so `execute_merge` would find no review at this head, hold
+    // `NotReviewed`, and — under `--merge` — comment and move the issue to
+    // `agent:blocked`. That label strips `agent:ready`, so the issue leaves
+    // this pass's listing, and a merge hold carries no question marker, so
+    // `blocked::poll_answer` never resumes it either: a budget that rolled
+    // over would need a human to unpick every green issue by hand. The
+    // refusal's own contract is "retry when the day rolls over", so the issue
+    // is left exactly where it was.
+    if review.as_ref().is_some_and(|r| r.refusal.is_some()) {
+        return Ok(Advanced {
+            issue: candidate.issue.clone(),
+            dispatch_class: class,
+            step,
+            review,
+            merge: None,
+            cleanup: None,
+        });
+    }
+
     // Rehearsed unless merging was asked for. Every guard and every read
     // still runs, so the operator learns what would happen; nothing is
     // written to GitHub.
@@ -659,14 +718,14 @@ fn advance_issue(
         None
     };
 
-    Ok(Some(Advanced {
+    Ok(Advanced {
         issue: candidate.issue.clone(),
         dispatch_class: class,
         step,
         review,
         merge: Some(execution),
         cleanup,
-    }))
+    })
 }
 
 /// Give back what a landed issue was holding.
@@ -676,8 +735,17 @@ fn advance_issue(
 /// it — rung 6's rule for a label write that fails after a merge, applied to
 /// the two things that outlive one.
 ///
-/// Both halves are idempotent, because the next pass will see the same merged
-/// PR and run this again.
+/// Both halves are idempotent, because a pass can reach this twice: a merge
+/// whose label write failed leaves `agent:ready` in place, so the next pass
+/// lists the issue again, reads the PR as `AlreadyMerged`, and cleans up a
+/// second time.
+///
+/// **It is not, however, a retry loop.** A merge whose label write *succeeded*
+/// clears every `agent:*` label, so the issue drops out of the `agent:ready`
+/// listing this pass is built from and nothing brings it back. Whatever this
+/// call leaves behind — a refused dirty worktree, a drawer a storage error
+/// kept — is left behind for good, which is why the error is reported on
+/// stdout rather than only stored.
 fn clean_up(db: &Database, candidate: &Candidate, config: &AdvanceConfig) -> Cleanup {
     let mut error = None;
 
@@ -751,6 +819,33 @@ mod tests {
                 best_verdict: Some(AttemptOutcome::Success),
                 best_commit_sha: commit_sha.map(str::to_string),
                 cumulative_attempt_n: 1,
+            },
+        )
+        .unwrap();
+    }
+
+    /// Record a passing review of `pr_number` at `head_sha`, which is what
+    /// makes an issue's next step the merge rather than another review.
+    fn reviewed_at(db: &Database, issue: &IssueRef, pr_number: u64, head_sha: &str) {
+        review::record_review(
+            db,
+            &review::ReviewRecord {
+                issue: issue.clone(),
+                pr_number,
+                dispatch_class: "documentation".into(),
+                head_sha: Some(head_sha.into()),
+                base_branch: Some("main".into()),
+                outcome: ReviewOutcome {
+                    verdict: Some(ReviewVerdict::Pass),
+                    risk_class: Some(RiskClass::Documentation),
+                    reason: None,
+                    total_cost_usd: None,
+                    token_usage: None,
+                    process_success: true,
+                },
+                decision: review::MergeDecision::EligibleForMerge {
+                    class: RiskClass::Documentation,
+                },
             },
         )
         .unwrap();
@@ -1095,28 +1190,7 @@ mod tests {
         // a fresh review every cron tick, forever.
         let db = approved_db();
         let (repo, roots) = checkout_with_worktree();
-        review::record_review(
-            &db,
-            &review::ReviewRecord {
-                issue: issue(),
-                pr_number: 322,
-                dispatch_class: "documentation".into(),
-                head_sha: Some(GREEN.into()),
-                base_branch: Some("main".into()),
-                outcome: ReviewOutcome {
-                    verdict: Some(ReviewVerdict::Pass),
-                    risk_class: Some(RiskClass::Documentation),
-                    reason: None,
-                    total_cost_usd: None,
-                    token_usage: None,
-                    process_success: true,
-                },
-                decision: review::MergeDecision::EligibleForMerge {
-                    class: RiskClass::Documentation,
-                },
-            },
-        )
-        .unwrap();
+        reviewed_at(&db, &issue(), 322, GREEN);
 
         let candidate = Candidate {
             issue: issue(),
@@ -1134,28 +1208,7 @@ mod tests {
         // pushed a fix is re-reviewed automatically.
         let db = approved_db();
         let (repo, roots) = checkout_with_worktree();
-        review::record_review(
-            &db,
-            &review::ReviewRecord {
-                issue: issue(),
-                pr_number: 322,
-                dispatch_class: "documentation".into(),
-                head_sha: Some(GREEN.into()),
-                base_branch: Some("main".into()),
-                outcome: ReviewOutcome {
-                    verdict: Some(ReviewVerdict::Pass),
-                    risk_class: Some(RiskClass::Documentation),
-                    reason: None,
-                    total_cost_usd: None,
-                    token_usage: None,
-                    process_success: true,
-                },
-                decision: review::MergeDecision::EligibleForMerge {
-                    class: RiskClass::Documentation,
-                },
-            },
-        )
-        .unwrap();
+        reviewed_at(&db, &issue(), 322, GREEN);
 
         let candidate = Candidate {
             issue: issue(),
@@ -1250,28 +1303,7 @@ mod tests {
     fn a_missing_worktree_does_not_stall_a_pr_that_is_already_reviewed() {
         // The merge step is pure `gh` and needs no checkout at all.
         let db = approved_db();
-        review::record_review(
-            &db,
-            &review::ReviewRecord {
-                issue: issue(),
-                pr_number: 322,
-                dispatch_class: "documentation".into(),
-                head_sha: Some(GREEN.into()),
-                base_branch: Some("main".into()),
-                outcome: ReviewOutcome {
-                    verdict: Some(ReviewVerdict::Pass),
-                    risk_class: Some(RiskClass::Documentation),
-                    reason: None,
-                    total_cost_usd: None,
-                    token_usage: None,
-                    process_success: true,
-                },
-                decision: review::MergeDecision::EligibleForMerge {
-                    class: RiskClass::Documentation,
-                },
-            },
-        )
-        .unwrap();
+        reviewed_at(&db, &issue(), 322, GREEN);
         let repo = tempfile::tempdir().unwrap();
         let roots = tempfile::tempdir().unwrap();
         let candidate = Candidate {
@@ -1529,24 +1561,33 @@ mod tests {
         assert_eq!(report.advanced[0].issue.number, 284);
     }
 
+    /// The three-issue `agent:ready` listing both burst-limit tests read.
+    const THREE_READY: &str = r#"[{"number":283,"title":"a","body":"b","labels":[{"name":"agent:ready"}],"updatedAt":"2026-09-03T00:00:00Z"},{"number":284,"title":"a","body":"b","labels":[{"name":"agent:ready"}],"updatedAt":"2026-09-03T00:00:00Z"},{"number":285,"title":"a","body":"b","labels":[{"name":"agent:ready"}],"updatedAt":"2026-09-03T00:00:00Z"}]"#;
+
     #[test]
     fn the_pass_limit_bounds_the_burst_and_names_what_it_deferred() {
         let db = approved_db();
         let (repo, roots) = checkout_with_worktree();
         for n in [283u64, 284, 285] {
             record_success(&db, &IssueRef::new(REPO, n), Some(GREEN));
+            reviewed_at(&db, &IssueRef::new(REPO, n), 322, GREEN);
         }
         let mut gh = ScriptedGh::new(vec![
-            ok(
-                r#"[{"number":283,"title":"a","body":"b","labels":[{"name":"agent:ready"}],"updatedAt":"2026-09-03T00:00:00Z"},{"number":284,"title":"a","body":"b","labels":[{"name":"agent:ready"}],"updatedAt":"2026-09-03T00:00:00Z"},{"number":285,"title":"a","body":"b","labels":[{"name":"agent:ready"}],"updatedAt":"2026-09-03T00:00:00Z"}]"#,
-            ),
-            ok("[]"),
+            ok(THREE_READY),
+            // Only issue 283 gets this far: one PR lookup, one snapshot and
+            // the two protection reads. A fourth `gh` call would mean the
+            // limit did not bind, and `ScriptedGh` panics on one.
+            ok(&pr_list_json(322, GREEN)),
+            ok(&pr_view_json(GREEN)),
+            unprotected(),
+            no_rules(),
         ]);
         let mut config = config(roots.path(), repo.path());
         config.max_advances_per_pass = 1;
 
         let report = advance_pass(&db, &mut gh, &mut ForbiddenReviewer, &config).unwrap();
         assert_eq!(report.advanced.len(), 1);
+        assert_eq!(report.advanced[0].issue.number, 283);
         assert_eq!(
             report
                 .skipped
@@ -1554,6 +1595,110 @@ mod tests {
                 .filter(|s| matches!(s.reason, SkipReason::PassLimitReached { .. }))
                 .count(),
             2
+        );
+    }
+
+    #[test]
+    fn a_stall_does_not_spend_the_burst_limit_it_took_no_step_with() {
+        // The starvation this counter used to cause. A stall is a fact only a
+        // human can change — an issue left `agent:ready` after its PR was
+        // merged and closed is the ordinary case — so it is reported again on
+        // every pass, forever. Charging those repeats against the limit let
+        // three of them fill it permanently, and every green PR behind them
+        // was then never reviewed and never merged.
+        let db = approved_db();
+        let (repo, roots) = checkout_with_worktree();
+        for n in [283u64, 284, 285] {
+            record_success(&db, &IssueRef::new(REPO, n), Some(GREEN));
+        }
+        let mut gh = ScriptedGh::new(vec![ok(THREE_READY), ok("[]"), ok("[]"), ok("[]")]);
+        let mut config = config(roots.path(), repo.path());
+        config.max_advances_per_pass = 1;
+
+        let report = advance_pass(&db, &mut gh, &mut ForbiddenReviewer, &config).unwrap();
+        assert_eq!(report.advanced.len(), 3, "all three stalls are reported");
+        assert!(report
+            .advanced
+            .iter()
+            .all(|a| matches!(a.step, AdvanceStep::Stalled(Stall::NoOpenPr { .. }))));
+        assert!(
+            !report
+                .skipped
+                .iter()
+                .any(|s| matches!(s.reason, SkipReason::PassLimitReached { .. })),
+            "a stall took no step, so it spent none of the burst limit"
+        );
+    }
+
+    #[test]
+    fn a_refused_review_stops_the_issue_rather_than_blocking_it_as_unreviewed() {
+        // `review_pr` records nothing when the day's ceilings refuse it, so
+        // falling through to `execute_merge` would hold `NotReviewed`, comment,
+        // and move the issue to `agent:blocked` — which strips `agent:ready`
+        // and never self-resumes, because a merge hold carries no question
+        // marker. A budget that rolls over must not need a human to unpick
+        // every green issue.
+        let db = approved_db();
+        record_success(&db, &issue(), Some(GREEN));
+        let (repo, roots) = checkout_with_worktree();
+        // Spend the day's dollars, which is what `advance` inherits from the
+        // night's dispatches.
+        super::super::budget::accumulate_daily_spend(&db, &super::super::today_utc(), 40.0)
+            .unwrap();
+
+        let mut gh = ScriptedGh::new(vec![
+            ok(&issue_list_json(
+                283,
+                &["agent:ready", "risk:documentation"],
+            )),
+            ok(&pr_list_json(322, GREEN)),
+        ]);
+        let mut config = config(roots.path(), repo.path());
+        config.merge = true;
+
+        let report = advance_pass(&db, &mut gh, &mut ForbiddenReviewer, &config).unwrap();
+        let advanced = &report.advanced[0];
+        assert_eq!(
+            advanced.review.as_ref().unwrap().refusal,
+            Some(review::ReviewRefusal::DailyBudgetExhausted)
+        );
+        assert!(
+            advanced.merge.is_none(),
+            "a refused review must not reach the merge"
+        );
+        assert!(
+            !gh.seen
+                .iter()
+                .any(|argv| argv.contains(&"edit".to_string())),
+            "no label was written: {:?}",
+            gh.seen
+        );
+    }
+
+    #[test]
+    fn a_retargeted_pr_is_reviewed_again_rather_than_held_forever() {
+        // Rung 6 refuses to merge a PR whose base moved since the review. The
+        // head never moves when a PR is retargeted, so a head-only trigger
+        // reported it as already reviewed on every pass and it sat at
+        // `BaseBranchMismatch` with no way out.
+        let db = approved_db();
+        let (repo, roots) = checkout_with_worktree();
+        reviewed_at(&db, &issue(), 322, GREEN);
+
+        let candidate = Candidate {
+            issue: issue(),
+            repo_path: repo.path().to_path_buf(),
+            risk_label: None,
+            green_commit_sha: Some(GREEN.into()),
+        };
+        let mut retargeted = found(322, GREEN);
+        if let PrLookup::Found(pr) = &mut retargeted {
+            pr.base_branch = "release/1.x".to_string();
+        }
+        let step = next_step(&db, &candidate, &retargeted, roots.path()).unwrap();
+        assert!(
+            matches!(step, AdvanceStep::Review { .. }),
+            "a moved base must be reviewed again, got {step:?}"
         );
     }
 

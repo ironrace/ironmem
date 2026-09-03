@@ -818,6 +818,27 @@ fn parse_repo_target(
     })
 }
 
+/// The reviewer a dry run is handed.
+///
+/// Never called: `advance_pass` returns before reviewing when `dry_run` is
+/// set. It exists so the `codex` binary is not required to *rehearse* a
+/// pass, and it fails loudly rather than silently returning a verdict, so a
+/// dry run that somehow reached a review would be visible instead of
+/// fabricating one.
+struct DryRunReviewer;
+
+impl ironmem::autopilot::review::ReviewRunner for DryRunReviewer {
+    fn review(
+        &mut self,
+        _repo_dir: &std::path::Path,
+        _prompt: &str,
+    ) -> Result<ironmem::autopilot::review::ReviewOutcome, MemoryError> {
+        Err(MemoryError::NotFound(
+            "a dry run does not review: this runner should never be called".into(),
+        ))
+    }
+}
+
 /// Human-readable rendering of one advance pass.
 fn print_advance_report(report: &ironmem::autopilot::advance::AdvanceReport) {
     use ironmem::autopilot::advance::{AdvanceStep, Stall};
@@ -883,10 +904,19 @@ fn print_advance_report(report: &ironmem::autopilot::advance::AdvanceReport) {
             }
         }
         if let Some(review) = &step.review {
-            println!(
-                "    review: {:?} / {:?}",
-                review.outcome.verdict, review.decision
-            );
+            match &review.refusal {
+                // Named rather than folded into the verdict line: a ceiling
+                // that refused the review is "retry when the day rolls over",
+                // and the pass stops the issue here rather than letting the
+                // merge report it as unreviewed.
+                Some(refusal) => println!(
+                    "    review: NOT dispatched ({refusal:?}) — the merge was not attempted"
+                ),
+                None => println!(
+                    "    review: {:?} / {:?}",
+                    review.outcome.verdict, review.decision
+                ),
+            }
         }
         if let Some(exec) = &step.merge {
             match &exec.outcome {
@@ -2327,12 +2357,24 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                         .map(|t| t.path.clone())
                         .unwrap_or_else(|| std::path::PathBuf::from(".")),
                 )?;
-                let mut reviewer = ironmem::autopilot::review::CodexReviewer::resolve(model)?;
+                // `codex` is resolved only when a review can actually
+                // happen. A dry run returns before reviewing anything, so
+                // requiring the binary would make the one flag whose whole
+                // promise is "read everything, change nothing" fail on a
+                // machine that has nothing to change.
+                let mut real;
+                let mut refusing = DryRunReviewer;
+                let reviewer: &mut dyn ironmem::autopilot::review::ReviewRunner = if dry_run {
+                    &mut refusing
+                } else {
+                    real = ironmem::autopilot::review::CodexReviewer::resolve(model)?;
+                    &mut real
+                };
 
                 let report = ironmem::autopilot::advance::advance_pass(
                     &database,
                     &mut gh_runner,
-                    &mut reviewer,
+                    reviewer,
                     &config,
                 )?;
 

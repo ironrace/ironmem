@@ -666,6 +666,14 @@ pub fn run_review_bounded(
     // an orphaned grandchild holding the write end would make the join hang
     // for as long as *it* lives — reintroducing, after the kill, the
     // unbounded wait the kill just ended.
+    //
+    // **The exit path's join is not bounded, and that is a residual, not a
+    // guarantee.** A grandchild that outlives a cleanly-exiting `codex` and
+    // holds the pipe's write end blocks this join for as long as it lives.
+    // The bound above does not cover it. Unchanged from the `Command::output`
+    // this replaced — which reads both pipes to EOF and blocks in exactly the
+    // same case — and the same shape as rung 7's `run_dispatch_bounded`, so
+    // it is stated here rather than quietly inherited.
     // stderr is drained but not read, exactly as the unbounded path left it:
     // every fact this outcome carries comes from stdout's event stream or the
     // last-message file. Draining it is not optional even so — an undrained

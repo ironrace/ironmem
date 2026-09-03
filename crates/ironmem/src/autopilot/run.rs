@@ -521,7 +521,12 @@ fn serialize_issue<S: serde::Serializer>(
 /// commit-less HEAD degrades to `None` rather than failing a run that
 /// otherwise succeeded.
 fn head_commit(worktree: &Path) -> Option<String> {
-    let output = std::process::Command::new("git")
+    let mut command = std::process::Command::new("git");
+    // An inherited `GIT_DIR` overrides `current_dir`, so without this the
+    // commit recorded as an attempt's `commit_sha` could be another
+    // repository's HEAD — a wrong answer that looks exactly like a right one.
+    crate::mcp::tools::scrub_git_environment(&mut command);
+    let output = command
         .args(["rev-parse", "HEAD"])
         .current_dir(worktree)
         .output()
