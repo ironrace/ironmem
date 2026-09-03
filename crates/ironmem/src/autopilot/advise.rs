@@ -30,8 +30,16 @@
 //! exhausted call count all produce the same thing: an [`Advice`] carrying
 //! no answer, and a caller that proceeds exactly as rung 8 did. **No
 //! failure of the advisor** can stop a dispatch, hold a merge, or block a
-//! tick, and one wall-clock bound ([`ADVICE_TIMEOUT`]) is what makes that
-//! true of a wedged call as well as a failing one.
+//! tick, and a wall-clock bound ([`ADVICE_TIMEOUT`]) is what makes that true
+//! of a wedged call as well as a failing one.
+//!
+//! That bound is **per call, not per tick**. A tick's advisor time is
+//! additive — [`super::lead::act_on_supervision`] can buy one call per
+//! supervision report and `resolve_class` one per dispatch — so a tick's
+//! worst case is bounded by [`AdviceConfig::max_calls_per_day`] rather than
+//! by [`ADVICE_TIMEOUT`] alone. Nothing blocks; a run of wedged calls can
+//! still push one tick well past a per-minute cron interval, and the next
+//! tick is what absorbs it.
 //!
 //! Stated precisely, because the looser version is false: [`run_advice`]
 //! still returns `Err` for a failure of *this crate's own storage* — a
@@ -362,6 +370,13 @@ impl Advisor for ClaudeAdvisor {
         let mut child = std::process::Command::new(&self.bin)
             .args(build_argv(spec))
             .current_dir(cwd)
+            // Nulled explicitly: `spawn` inherits all three streams, while the
+            // `output` this replaced nulled stdin for you. Inheriting it hands
+            // the advisor the Lead's stdin — a TTY under an interactive
+            // `autopilot lead` — and a `claude` that reads it blocks until
+            // `ADVICE_TIMEOUT`, which is the wedge the bound below exists to
+            // prevent, made likelier by the bound that prevents it.
+            .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
@@ -498,9 +513,11 @@ impl Default for AdviceConfig {
 impl AdviceConfig {
     /// Reject a configuration that cannot produce a usable call.
     ///
-    /// Validated even when disabled: a misconfigured advisor should be named
-    /// at the point it is configured, not discovered the day someone turns it
-    /// on.
+    /// The checks on individual values are run even when the advisor is
+    /// disabled: a value that is wrong however it is read should be named at
+    /// the point it is configured, not discovered the day someone turns the
+    /// advisor on. The one cross-field check below is the exception, and says
+    /// why.
     pub fn validate(&self) -> Result<(), MemoryError> {
         if self.model.trim().is_empty() {
             return Err(MemoryError::Validation(

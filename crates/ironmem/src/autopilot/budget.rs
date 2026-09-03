@@ -53,11 +53,12 @@ pub struct BudgetLedgerEntry {
     ///
     /// It is **not** carved out of `dispatch_count`: a priced advisor call
     /// increments that too, because `dispatch_count` counts what has been
-    /// folded into `total_cost_usd` and a priced call has been. So the two
-    /// overlap by design, and `advice_call_count` is the subset — never a
-    /// disjoint tally. An *unpriced* call is the mirror image: it moves this
-    /// field and `unpriced_advice_count`, and deliberately neither
-    /// `dispatch_count` nor `unpriced_dispatch_count`.
+    /// folded into `total_cost_usd` and a priced call has been. An *unpriced*
+    /// call is the mirror image: it moves this field and
+    /// `unpriced_advice_count`, and deliberately neither `dispatch_count` nor
+    /// `unpriced_dispatch_count`. So the two counters **overlap on priced
+    /// calls** and only there — this is neither a subset of `dispatch_count`
+    /// nor disjoint from it, and summing them double-counts.
     #[serde(default)]
     pub advice_call_count: u32,
     /// Advisor calls whose price could not be read, so their spend is missing

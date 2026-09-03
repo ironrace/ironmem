@@ -358,6 +358,14 @@ pub fn run_dispatch_bounded(
     command
         .args(&args)
         .current_dir(repo)
+        // Nulled explicitly because `spawn` inherits all three streams while
+        // `output` — the unbounded path above — nulls stdin for you. Without
+        // it a dispatch inherits the Lead's stdin: a TTY under an interactive
+        // `autopilot lead`, whatever a cron hands it otherwise. A `claude`
+        // that reads stdin would then either compete with the operator for the
+        // terminal or block until the bound kills it, which is the wedge this
+        // path exists to prevent, caused by the path that prevents it.
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     // Put the dispatch in its own process group so the bound can reap what it

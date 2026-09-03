@@ -533,15 +533,25 @@ fn propose_alternative(
         Some(proposal) => {
             supervise::set_redirect_proposal(db, &report.issue, signature, proposal)?;
         }
-        // A decline, a refusal and a failure are all recorded as *asked*, so
-        // the call is bought once per signature rather than once per tick.
-        // Only a success being idempotent would leave the common case — an
-        // advisor that declines, or one that cannot launch — paying again on
-        // every tick until a new attempt lands, which is how one stuck issue
-        // drains the whole day's advisor ceiling.
-        None => {
+        // A decline and a failure are recorded as *asked*, so the call is
+        // bought once per signature rather than once per tick. Only a success
+        // being idempotent would leave the common case — an advisor that
+        // declines, or one that cannot launch — paying again on every tick
+        // until a new attempt lands, which is how one stuck issue drains the
+        // whole day's advisor ceiling.
+        //
+        // A *refusal* is not recorded, and the distinction is the whole point
+        // of [`AdviceStatus::ran`]: refused means no call was made and nothing
+        // was spent, because the day's dollar ceiling or call count is gone.
+        // Marking it asked would save nothing and forfeit the proposal for
+        // good — the guard above returns early on every later tick, and the
+        // signature only clears when a genuinely different failure lands. One
+        // exhausted afternoon would cost this issue its proposal permanently
+        // rather than until tomorrow.
+        None if advice.status.ran() => {
             supervise::mark_redirect_proposal_asked(db, &report.issue, signature)?;
         }
+        None => {}
     }
     Ok(Some(advice))
 }
@@ -554,6 +564,15 @@ fn propose_alternative(
 /// that matters here — a mark written first would swallow the one
 /// notification the escalation exists to send, and an escalation never
 /// self-resolves, so nothing would ever send it again.
+///
+/// That ordering means a failing `gh` re-runs this whole function on the next
+/// tick, which is why the drafted question is cached the moment it is bought
+/// ([`supervise::cache_escalation_question`]) and read back before any call is
+/// made. The notice is *attempted* once per tick until it lands; the question
+/// inside it is *paid for* once per signature. Without the cache, a `gh` that
+/// stays broken — an expired token, a rate limit — re-buys the same question
+/// every tick and drains the day's advisor ceiling on one issue, which is the
+/// hole rung 9's redirect path closed and this path had left open.
 #[allow(clippy::too_many_arguments)]
 fn notify_escalation(
     db: &Database,
@@ -570,26 +589,46 @@ fn notify_escalation(
 
     let approaches = attempt_approaches(db, &report.issue)?;
     let mut question = None;
-    if config.advice.enabled {
-        if let Some(target) = config.targets.iter().find(|t| t.repo == report.issue.repo) {
-            // The brief is read only here, and only once per signature —
-            // an in-flight issue is not in any backlog listing, so its text
-            // is not already in hand. A failure degrades the prompt rather
-            // than skipping the notice.
-            let brief = gh::issue_brief(gh_runner, &report.issue).unwrap_or_default();
-            let drafted = advise::advise_human_question(
-                db,
-                advisor,
-                &target.path,
-                &report.issue,
-                &brief.title,
-                &brief.body,
-                signature,
-                &approaches,
-                &config.advice,
-            )?;
-            question = drafted.answered().map(str::to_string);
-            advice.push(drafted);
+    match supervise::escalation_question(db, &report.issue, signature)? {
+        // Already bought for this signature on an earlier attempt whose `gh`
+        // call failed. `Some(None)` is "asked, nothing came back" — a real
+        // answer, and one that must not be re-asked.
+        Some(cached) => question = cached,
+        None => {
+            if config.advice.enabled {
+                if let Some(target) = config.targets.iter().find(|t| t.repo == report.issue.repo) {
+                    // The brief is read only here, and only once per signature
+                    // — an in-flight issue is not in any backlog listing, so
+                    // its text is not already in hand. A failure degrades the
+                    // prompt rather than skipping the notice.
+                    let brief = gh::issue_brief(gh_runner, &report.issue).unwrap_or_default();
+                    let drafted = advise::advise_human_question(
+                        db,
+                        advisor,
+                        &target.path,
+                        &report.issue,
+                        &brief.title,
+                        &brief.body,
+                        signature,
+                        &approaches,
+                        &config.advice,
+                    )?;
+                    question = drafted.answered().map(str::to_string);
+                    // Only when a call was actually made. A refusal — the
+                    // day's ceiling spent — bought nothing, so caching it
+                    // would forfeit the question until the escalation is
+                    // cleared rather than until tomorrow.
+                    if drafted.status.ran() {
+                        supervise::cache_escalation_question(
+                            db,
+                            &report.issue,
+                            signature,
+                            question.as_deref(),
+                        )?;
+                    }
+                    advice.push(drafted);
+                }
+            }
         }
     }
 
@@ -814,6 +853,7 @@ mod tests {
     use crate::autopilot::gh::testing::ScriptedGh;
     use crate::autopilot::gh::GhOutput;
     use crate::autopilot::registry::RegistryOutput;
+    use crate::autopilot::supervise::{ProcessHealth, StrategyHealth};
     use crate::autopilot::{dispatch_state, gate_config, DispatchState};
     use std::path::Path;
 
@@ -1640,6 +1680,7 @@ mod tests {
                 escalated_signature: None,
                 redirect_proposal: None,
                 escalation_notified_signature: None,
+                escalation_question: None,
             },
         )
         .unwrap();
@@ -1932,39 +1973,7 @@ mod tests {
         let db = approved_db();
         let f = fixture();
         let issue = IssueRef::new(REPO, 3);
-        {
-            use crate::autopilot::lineage::{self, AttemptOutcome, AttemptRecord};
-            dispatch_state::upsert_dispatch_state(
-                &db,
-                &DispatchState {
-                    issue: issue.clone(),
-                    worktree_path: f.repo_path.display().to_string(),
-                    ic_session_name: crate::autopilot::dispatch::ic_name(&issue),
-                    dispatch_class: "unclassified".to_string(),
-                    attempt_n: 3,
-                    state: "dispatching".to_string(),
-                    started_at: chrono::Utc::now().to_rfc3339(),
-                    session_claimed: true,
-                    session_uuid: "11111111-2222-3333-4444-555555555555".to_string(),
-                    turn_n: 0,
-                },
-            )
-            .unwrap();
-            for n in 1..=3u32 {
-                lineage::record_attempt(
-                    &db,
-                    &AttemptRecord {
-                        issue: issue.clone(),
-                        attempt_n: n,
-                        approach: format!("attempt {n}"),
-                        verdict: AttemptOutcome::Failed,
-                        why_failed: Some("the same failure".to_string()),
-                        commit_sha: None,
-                    },
-                )
-                .unwrap();
-            }
-        }
+        thrashing_issue(&db, &f, &issue);
         let mut advisor = ScriptedAdvisor::new(vec![Ok(AdviceOutput {
             stdout: envelope_json(
                 r#"{"verdict":"no_proposal","proposal":"","reason":"nothing to go on"}"#,
@@ -1993,6 +2002,221 @@ mod tests {
             supervise::active_redirect(&db, &issue).unwrap().unwrap(),
             supervise::redirect_text("the same failure", 3)
         );
+    }
+
+    /// An in-flight issue with three identical failures behind it, which is
+    /// what `plan_supervision` reads as `Thrashing` and answers with a
+    /// redirect.
+    fn thrashing_issue(db: &Database, f: &Fixture, issue: &IssueRef) {
+        use crate::autopilot::lineage::{self, AttemptOutcome, AttemptRecord};
+        dispatch_state::upsert_dispatch_state(
+            db,
+            &DispatchState {
+                issue: issue.clone(),
+                worktree_path: f.repo_path.display().to_string(),
+                ic_session_name: crate::autopilot::dispatch::ic_name(issue),
+                dispatch_class: "unclassified".to_string(),
+                attempt_n: 3,
+                state: "dispatching".to_string(),
+                started_at: chrono::Utc::now().to_rfc3339(),
+                session_claimed: true,
+                session_uuid: "11111111-2222-3333-4444-555555555555".to_string(),
+                turn_n: 0,
+            },
+        )
+        .unwrap();
+        for n in 1..=3u32 {
+            lineage::record_attempt(
+                db,
+                &AttemptRecord {
+                    issue: issue.clone(),
+                    attempt_n: n,
+                    approach: format!("attempt {n}"),
+                    verdict: AttemptOutcome::Failed,
+                    why_failed: Some("the same failure".to_string()),
+                    commit_sha: None,
+                },
+            )
+            .unwrap();
+        }
+    }
+
+    /// [`escalated_issue`] after supervision has actually escalated it — the
+    /// state `notify_escalation` is called against, reached without driving a
+    /// whole tick to get there.
+    fn already_escalated_issue(db: &Database, f: &Fixture, signature: &str) -> IssueRef {
+        let issue = escalated_issue(db, f);
+        let mut record = supervise::get_supervision(db, &issue).unwrap().unwrap();
+        record.escalated_signature = Some(signature.to_string());
+        supervise::upsert_supervision(db, &record).unwrap();
+        issue
+    }
+
+    #[test]
+    fn a_refused_proposal_is_not_recorded_as_asked() {
+        // The mirror of the test above, and the line between them is
+        // `AdviceStatus::ran`. A *refusal* means the day's dollar ceiling or
+        // call count is spent, so no call was made and nothing was bought.
+        // Marking it asked would save nothing and forfeit the proposal
+        // permanently: the guard in `propose_alternative` returns early on
+        // every later tick, and the signature only clears when a genuinely
+        // different failure lands. One exhausted afternoon must cost the
+        // proposal until tomorrow, not for good.
+        let db = approved_db();
+        let f = fixture();
+        let issue = IssueRef::new(REPO, 3);
+        thrashing_issue(&db, &f, &issue);
+
+        // The day's call ceiling spent, which is one of the two ways
+        // `run_advice` refuses before spawning anything.
+        let mut cfg = with_advisor(&f);
+        cfg.advice.max_calls_per_day = 1;
+        crate::autopilot::budget::record_advice_call(
+            &db,
+            &crate::autopilot::today_utc(),
+            Some(0.001),
+        )
+        .unwrap();
+
+        let mut advisor = ScriptedAdvisor::broken();
+        let report = lead_tick(
+            &db,
+            &mut ScriptedGh::new(vec![Ok(GhOutput::ok("[]")), Ok(GhOutput::ok("[]"))]),
+            &mut empty_registry(),
+            &mut RefusingDispatcher,
+            &mut advisor,
+            &cfg,
+        )
+        .unwrap();
+        assert!(report.problems.is_empty());
+        assert!(
+            advisor.seen.is_empty(),
+            "a refusal never reaches the binary"
+        );
+
+        let record = supervise::get_supervision(&db, &issue).unwrap().unwrap();
+        assert_eq!(
+            record.redirect_proposal, None,
+            "a refusal must leave the slot open — marking it asked would \
+             forfeit the proposal for this signature forever"
+        );
+    }
+
+    #[test]
+    fn a_failing_gh_does_not_re_buy_the_escalation_question() {
+        // The escalation's mark is written *after* the comment lands, and must
+        // be: a mark written first would swallow the one notification an
+        // escalation exists to send. That ordering means a failing `gh`
+        // re-runs the whole notice next tick — so the drafted question has to
+        // be cached at the moment it is bought, or a `gh` that stays broken
+        // re-buys it every tick and drains the day's ceiling on one issue that
+        // never self-resolves.
+        const SIGNATURE: &str = "assertion failed: left == right";
+        let db = approved_db();
+        let f = fixture();
+        let issue = already_escalated_issue(&db, &f, SIGNATURE);
+
+        let mut advisor = ScriptedAdvisor::new(vec![Ok(AdviceOutput {
+            stdout: envelope_json(
+                r#"{"verdict":"question","question":"Which fixture is authoritative?","reason":"two disagree"}"#,
+                0.01,
+            ),
+            stderr: String::new(),
+            success: true,
+        })]);
+
+        // Two ticks whose `comment` call fails. The first buys the question
+        // and cannot post it; the second must post without buying again.
+        for tick in 0..2 {
+            let report = notify_once(&db, &f, &mut advisor, &issue, SIGNATURE, true);
+            assert!(report.is_none(), "tick {tick}: the comment did not land");
+        }
+        assert_eq!(
+            advisor.seen.len(),
+            1,
+            "bought once per signature, however many times the notice is attempted"
+        );
+
+        // And when `gh` recovers, the notice still carries the question the
+        // first tick paid for.
+        let posted = notify_once(&db, &f, &mut advisor, &issue, SIGNATURE, false)
+            .expect("the comment landed");
+        assert!(posted.drafted_question, "the cached question was used");
+        assert_eq!(advisor.seen.len(), 1, "and still not re-bought");
+        assert_eq!(
+            supervise::escalation_notified_signature(&db, &issue).unwrap(),
+            Some(SIGNATURE.to_string())
+        );
+    }
+
+    /// A `gh` that answers by *which* call was made rather than by position:
+    /// once the question is cached the brief is not read at all, so a
+    /// positional script would hand the comment the brief's response and the
+    /// test would pass for the wrong reason.
+    struct EscalationGh {
+        comment_fails: bool,
+    }
+
+    impl crate::autopilot::gh::GhRunner for EscalationGh {
+        fn run(&mut self, args: &[String]) -> Result<GhOutput, MemoryError> {
+            match args.get(1).map(String::as_str) {
+                Some("view") => Ok(GhOutput::ok(
+                    r#"{"title":"the title","body":"the body","labels":[]}"#,
+                )),
+                Some("comment") if self.comment_fails => {
+                    Err(MemoryError::NotFound("gh: rate limited".into()))
+                }
+                Some("comment") => Ok(GhOutput::ok("")),
+                other => panic!("unexpected gh call: {other:?}"),
+            }
+        }
+    }
+
+    /// One `notify_escalation`, with `gh::comment_on_issue` scripted to fail
+    /// or succeed. Returns the notice if one was sent.
+    fn notify_once(
+        db: &Database,
+        f: &Fixture,
+        advisor: &mut ScriptedAdvisor,
+        issue: &IssueRef,
+        signature: &str,
+        comment_fails: bool,
+    ) -> Option<EscalationNotice> {
+        let mut gh_runner = EscalationGh { comment_fails };
+        let mut advice = Vec::new();
+        let report = SupervisionReport {
+            issue: issue.clone(),
+            process: ProcessHealth::Healthy,
+            strategy: StrategyHealth::Thrashing {
+                signature: signature.to_string(),
+                consecutive: 3,
+            },
+            action: SupervisionAction::Escalate {
+                signature: signature.to_string(),
+                reason: "the redirect did not change the outcome".to_string(),
+            },
+            in_flight: true,
+        };
+        let out = notify_escalation(
+            db,
+            &mut gh_runner,
+            advisor,
+            &report,
+            signature,
+            &with_advisor(f),
+            &mut advice,
+        );
+        match out {
+            Ok(notice) => notice,
+            // The scripted `gh` failure surfaces here; `act_on_supervision`
+            // collects it as a tick problem and moves on. Asserted rather than
+            // swallowed, so an unrelated error cannot masquerade as the one
+            // this test is arranging.
+            Err(e) => {
+                assert!(e.to_string().contains("rate limited"), "{e}");
+                None
+            }
+        }
     }
 
     // ── the notice itself ───────────────────────────────────────────────

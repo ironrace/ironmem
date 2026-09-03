@@ -949,6 +949,7 @@ mod tests {
                 escalated_signature: Some("the same failure".to_string()),
                 redirect_proposal: None,
                 escalation_notified_signature: None,
+                escalation_question: None,
             },
         )
         .unwrap();

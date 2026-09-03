@@ -274,6 +274,24 @@ pub struct SupervisionRecord {
     /// notified", so an already-escalated issue gets its first notice on the
     /// next tick rather than never.
     pub escalation_notified_signature: Option<String>,
+    /// The question drafted for [`Self::escalated_signature`]'s notice, kept
+    /// so it is *bought* once even though the notice may be attempted many
+    /// times.
+    ///
+    /// The notice cannot mark itself sent before it lands — a mark written
+    /// first would swallow the one notification an escalation exists to send
+    /// (see [`mark_escalation_notified`]) — so a `gh` failure necessarily
+    /// re-runs the whole of [`super::lead::notify_escalation`] on the next
+    /// tick. Without this field that re-run buys the question again, and a
+    /// persistently failing `gh` drains the day's advisor ceiling on an issue
+    /// that never self-resolves. Keyed to `escalated_signature` exactly as
+    /// [`Self::redirect_proposal`] is keyed to
+    /// [`Self::redirect_signature`], and the empty string is the same
+    /// "asked, nothing came back" marker.
+    ///
+    /// `#[serde(default)]` → pre-rung-9 records read back as "not asked",
+    /// which costs at most one drafted question.
+    pub escalation_question: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -293,6 +311,8 @@ struct SupervisionBody {
     redirect_proposal: Option<String>,
     #[serde(default)]
     escalation_notified_signature: Option<String>,
+    #[serde(default)]
+    escalation_question: Option<String>,
 }
 
 fn supervision_key(issue: &IssueRef) -> String {
@@ -318,6 +338,7 @@ pub fn upsert_supervision(
         escalated_signature: record.escalated_signature.clone(),
         redirect_proposal: record.redirect_proposal.clone(),
         escalation_notified_signature: record.escalation_notified_signature.clone(),
+        escalation_question: record.escalation_question.clone(),
     };
     let content = serde_json::to_string(&body)?;
     write_current(db, &supervision_key(&record.issue), &content)
@@ -344,6 +365,7 @@ pub fn get_supervision(
         escalated_signature: body.escalated_signature,
         redirect_proposal: body.redirect_proposal,
         escalation_notified_signature: body.escalation_notified_signature,
+        escalation_question: body.escalation_question,
     }))
 }
 
@@ -460,6 +482,70 @@ pub fn escalation_notified_signature(
     Ok(get_supervision(db, issue)?.and_then(|record| record.escalation_notified_signature))
 }
 
+/// The question already drafted for `signature`'s escalation notice, if one
+/// has been bought.
+///
+/// `Some("")` is "asked, and nothing came back" — the notice goes out with no
+/// question rather than paying for the same non-answer on the next attempt.
+/// `None` is "not asked yet". The distinction is why this returns an
+/// `Option<Option<..>>` rather than flattening: the two mean opposite things
+/// to the caller, and flattening them would restore the re-buy this exists to
+/// stop.
+pub fn escalation_question(
+    db: &Database,
+    issue: &IssueRef,
+    signature: &str,
+) -> Result<Option<Option<String>>, MemoryError> {
+    let Some(record) = get_supervision(db, issue)? else {
+        return Ok(None);
+    };
+    if record.escalated_signature.as_deref() != Some(signature) {
+        return Ok(None);
+    }
+    Ok(record
+        .escalation_question
+        .map(|q| if q.is_empty() { None } else { Some(q) }))
+}
+
+/// Record what a drafted escalation question cost us, so the notice's `gh`
+/// call can fail and be retried without buying it again.
+///
+/// `question` is `None` when the advisor ran and produced nothing usable —
+/// stored as the empty string, the same "asked, nothing came back" marker
+/// [`mark_redirect_proposal_asked`] uses. Call this **only** when the advisor
+/// actually ran ([`super::advise::AdviceStatus::ran`]): a refusal spent
+/// nothing, and recording it would forfeit the question until the escalation
+/// is cleared.
+///
+/// Returns whether anything was written. Refuses when the record has moved on
+/// to a different escalation signature, and overwrites a question cached for
+/// a *stale* one, so the cache can never answer for a failure the issue has
+/// stopped having.
+pub fn cache_escalation_question(
+    db: &Database,
+    issue: &IssueRef,
+    signature: &str,
+    question: Option<&str>,
+) -> Result<bool, MemoryError> {
+    let Some(mut record) = get_supervision(db, issue)? else {
+        return Ok(false);
+    };
+    if record.escalated_signature.as_deref() != Some(signature) {
+        return Ok(false);
+    }
+    let question = question
+        // Bounded at the advisor's own answer ceiling rather than
+        // `MAX_REDIRECT_PROPOSAL_CHARS`: this text goes into a GitHub comment
+        // a human reads, not into an IC's prompt, so the tighter prompt budget
+        // would truncate a legitimate question for no reason. Already scrubbed
+        // and bounded upstream; re-applied here because this is the write.
+        .map(|q| scrub_and_bound(q.trim(), super::advise::MAX_ADVICE_ANSWER_CHARS).text)
+        .unwrap_or_default();
+    record.escalation_question = Some(question);
+    upsert_supervision(db, &record)?;
+    Ok(true)
+}
+
 /// Record that a human has been told about `signature`'s escalation.
 ///
 /// Returns whether anything was written; a second call for the same
@@ -513,8 +599,11 @@ pub fn clear_escalation(db: &Database, issue: &IssueRef) -> Result<bool, MemoryE
     record.redirect_issued_after_attempts = None;
     record.redirect_proposal = None;
     // So a *later* escalation of the same signature notifies again. A human
-    // who cleared one and saw it come back needs telling twice.
+    // who cleared one and saw it come back needs telling twice — and the
+    // second notice drafts its own question, since the first one's was
+    // written for a state the human has since acted on.
     record.escalation_notified_signature = None;
+    record.escalation_question = None;
     upsert_supervision(db, &record)?;
     Ok(true)
 }
@@ -1085,8 +1174,16 @@ pub fn supervise_issue(
         .as_ref()
         .and_then(|r| r.redirect_issued_after_attempts);
     let mut escalated_signature = prior.as_ref().and_then(|r| r.escalated_signature.clone());
+    let mut escalation_question = prior.as_ref().and_then(|r| r.escalation_question.clone());
     match (&action, &strategy) {
         (SupervisionAction::Escalate { signature, .. }, _) => {
+            // A question drafted for the previous signature asks about a
+            // failure the issue has stopped having. Dropped with the
+            // escalation it belonged to, exactly as `redirect_proposal` is
+            // dropped with its redirect, so the next notice buys its own.
+            if escalated_signature.as_deref() != Some(signature.as_str()) {
+                escalation_question = None;
+            }
             escalated_signature = Some(signature.clone());
         }
         (
@@ -1144,6 +1241,7 @@ pub fn supervise_issue(
         escalation_notified_signature: prior
             .as_ref()
             .and_then(|r| r.escalation_notified_signature.clone()),
+        escalation_question,
     };
     upsert_supervision(db, &record)?;
 
@@ -1695,6 +1793,7 @@ mod tests {
             escalated_signature: None,
             redirect_proposal: None,
             escalation_notified_signature: None,
+            escalation_question: None,
         }
     }
 
@@ -1770,6 +1869,7 @@ mod tests {
             escalated_signature: Some("old failure".into()),
             redirect_proposal: None,
             escalation_notified_signature: None,
+            escalation_question: None,
         };
         let action = plan_supervision(
             &ProcessHealth::Healthy,
@@ -1817,6 +1917,7 @@ mod tests {
             escalated_signature: None,
             redirect_proposal: None,
             escalation_notified_signature: None,
+            escalation_question: None,
         };
         assert!(matches!(
             plan_supervision(
@@ -2134,6 +2235,7 @@ mod tests {
                 escalated_signature: Some("sig".into()),
                 redirect_proposal: None,
                 escalation_notified_signature: None,
+                escalation_question: None,
             },
         )
         .unwrap();
@@ -2143,6 +2245,81 @@ mod tests {
         assert_eq!(record.escalated_signature.as_deref(), Some("sig"));
         // Idempotent.
         assert!(!clear_redirect(&db, &issue).unwrap());
+    }
+
+    #[test]
+    fn a_cached_escalation_question_is_keyed_to_the_signature_it_answers() {
+        let db = Database::open_in_memory().unwrap();
+        let issue = issue();
+        let escalated = |signature: &str| SupervisionRecord {
+            issue: issue.clone(),
+            fingerprint: "f".into(),
+            progress_observed_at: ago(10),
+            first_absent_at: None,
+            last_checked_at: ago(10),
+            active_redirect: Some("r".into()),
+            redirect_signature: Some(signature.into()),
+            redirect_issued_after_attempts: None,
+            escalated_signature: Some(signature.into()),
+            redirect_proposal: None,
+            escalation_notified_signature: None,
+            escalation_question: None,
+        };
+        upsert_supervision(&db, &escalated("sig")).unwrap();
+
+        assert_eq!(escalation_question(&db, &issue, "sig").unwrap(), None);
+        assert!(cache_escalation_question(&db, &issue, "sig", Some("which fixture?")).unwrap());
+        assert_eq!(
+            escalation_question(&db, &issue, "sig").unwrap(),
+            Some(Some("which fixture?".to_string()))
+        );
+
+        // A question bought for one signature must never answer for another,
+        // even while it is still stored.
+        assert_eq!(escalation_question(&db, &issue, "other").unwrap(), None);
+        assert!(!cache_escalation_question(&db, &issue, "other", Some("x")).unwrap());
+
+        // And the empty marker is "asked, nothing came back" — distinguishable
+        // from "not asked", or the re-buy comes straight back.
+        upsert_supervision(&db, &escalated("sig2")).unwrap();
+        assert!(cache_escalation_question(&db, &issue, "sig2", None).unwrap());
+        assert_eq!(
+            escalation_question(&db, &issue, "sig2").unwrap(),
+            Some(None),
+            "asked and answered with nothing — not 'not asked'"
+        );
+    }
+
+    #[test]
+    fn clearing_an_escalation_drops_the_question_it_drafted() {
+        // A human who cleared an escalation has acted on what the question
+        // asked about. Leaving it cached would put a stale question in the
+        // notice the *next* escalation sends.
+        let db = Database::open_in_memory().unwrap();
+        let issue = issue();
+        upsert_supervision(
+            &db,
+            &SupervisionRecord {
+                issue: issue.clone(),
+                fingerprint: "f".into(),
+                progress_observed_at: ago(10),
+                first_absent_at: None,
+                last_checked_at: ago(10),
+                active_redirect: Some("r".into()),
+                redirect_signature: Some("sig".into()),
+                redirect_issued_after_attempts: None,
+                escalated_signature: Some("sig".into()),
+                redirect_proposal: None,
+                escalation_notified_signature: Some("sig".into()),
+                escalation_question: Some("which fixture?".into()),
+            },
+        )
+        .unwrap();
+
+        assert!(clear_escalation(&db, &issue).unwrap());
+        let record = get_supervision(&db, &issue).unwrap().unwrap();
+        assert_eq!(record.escalation_question, None);
+        assert_eq!(record.escalation_notified_signature, None);
     }
 
     #[test]
@@ -2161,6 +2338,7 @@ mod tests {
             escalated_signature: None,
             redirect_proposal: None,
             escalation_notified_signature: None,
+            escalation_question: None,
         };
         upsert_supervision(&db, &record).unwrap();
         assert_eq!(get_supervision(&db, &issue).unwrap().unwrap(), record);
