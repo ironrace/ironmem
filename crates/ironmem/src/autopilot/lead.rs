@@ -529,8 +529,19 @@ fn propose_alternative(
         &approaches,
         &config.advice,
     )?;
-    if let Some(proposal) = advice.answered() {
-        supervise::set_redirect_proposal(db, &report.issue, signature, proposal)?;
+    match advice.answered() {
+        Some(proposal) => {
+            supervise::set_redirect_proposal(db, &report.issue, signature, proposal)?;
+        }
+        // A decline, a refusal and a failure are all recorded as *asked*, so
+        // the call is bought once per signature rather than once per tick.
+        // Only a success being idempotent would leave the common case — an
+        // advisor that declines, or one that cannot launch — paying again on
+        // every tick until a new attempt lands, which is how one stuck issue
+        // drains the whole day's advisor ceiling.
+        None => {
+            supervise::mark_redirect_proposal_asked(db, &report.issue, signature)?;
+        }
     }
     Ok(Some(advice))
 }
@@ -1907,6 +1918,80 @@ mod tests {
             redirect,
             supervise::redirect_text("the same failure", 3),
             "unchanged, byte for byte"
+        );
+    }
+
+    #[test]
+    fn a_declined_proposal_is_bought_once_per_signature_not_once_per_tick() {
+        // The advisor that declines or cannot launch is the *common* case,
+        // and it leaves `redirect_proposal` unset. If only a success were
+        // idempotent, a cron ticking every minute would re-buy the same
+        // non-answer until a new attempt landed — draining the day's advisor
+        // ceiling on one stuck issue and starving every other issue's
+        // classification.
+        let db = approved_db();
+        let f = fixture();
+        let issue = IssueRef::new(REPO, 3);
+        {
+            use crate::autopilot::lineage::{self, AttemptOutcome, AttemptRecord};
+            dispatch_state::upsert_dispatch_state(
+                &db,
+                &DispatchState {
+                    issue: issue.clone(),
+                    worktree_path: f.repo_path.display().to_string(),
+                    ic_session_name: crate::autopilot::dispatch::ic_name(&issue),
+                    dispatch_class: "unclassified".to_string(),
+                    attempt_n: 3,
+                    state: "dispatching".to_string(),
+                    started_at: chrono::Utc::now().to_rfc3339(),
+                    session_claimed: true,
+                    session_uuid: "11111111-2222-3333-4444-555555555555".to_string(),
+                    turn_n: 0,
+                },
+            )
+            .unwrap();
+            for n in 1..=3u32 {
+                lineage::record_attempt(
+                    &db,
+                    &AttemptRecord {
+                        issue: issue.clone(),
+                        attempt_n: n,
+                        approach: format!("attempt {n}"),
+                        verdict: AttemptOutcome::Failed,
+                        why_failed: Some("the same failure".to_string()),
+                        commit_sha: None,
+                    },
+                )
+                .unwrap();
+            }
+        }
+        let mut advisor = ScriptedAdvisor::new(vec![Ok(AdviceOutput {
+            stdout: envelope_json(
+                r#"{"verdict":"no_proposal","proposal":"","reason":"nothing to go on"}"#,
+                0.01,
+            ),
+            stderr: String::new(),
+            success: true,
+        })]);
+
+        for tick in 0..2 {
+            let report = lead_tick(
+                &db,
+                &mut ScriptedGh::new(vec![Ok(GhOutput::ok("[]")), Ok(GhOutput::ok("[]"))]),
+                &mut empty_registry(),
+                &mut RefusingDispatcher,
+                &mut advisor,
+                &with_advisor(&f),
+            )
+            .unwrap();
+            assert!(report.problems.is_empty(), "tick {tick}");
+        }
+
+        assert_eq!(advisor.seen.len(), 1, "asked once, not once per tick");
+        // And the mechanical redirect is untouched by the marker.
+        assert_eq!(
+            supervise::active_redirect(&db, &issue).unwrap().unwrap(),
+            supervise::redirect_text("the same failure", 3)
         );
     }
 

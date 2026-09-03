@@ -2185,10 +2185,16 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                     None => ironmem::autopilot::supervise::get_supervision(&database, &issue_ref)?
                         .and_then(|record| record.redirect_signature),
                 };
+                // Terminal summaries are filtered out for the same reason the
+                // Lead's own `attempt_approaches` filters them: they are the
+                // run's epitaph, not an approach the IC tried, and quoting
+                // them back would make this preview disagree with the prompt
+                // a real tick sends.
                 let approaches: Vec<String> =
                     ironmem::autopilot::lineage::attempts_for_issue(&database, &issue_ref)?
                         .into_iter()
                         .map(|a| a.approach)
+                        .filter(|approach| !ironmem::autopilot::run::is_terminal_summary(approach))
                         .collect();
 
                 let advice = match kind.as_str() {
@@ -2210,7 +2216,8 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                     "redirect" | "question" => {
                         let signature = signature.ok_or_else(|| {
                             MemoryError::Validation(format!(
-                                "--signature is required for --kind {kind}: {} has no redirect                                  on record to name the repeated failure",
+                                "--signature is required for --kind {kind}: {} has no redirect \
+                                 on record to name the repeated failure",
                                 issue_ref.canonical()
                             ))
                         })?;

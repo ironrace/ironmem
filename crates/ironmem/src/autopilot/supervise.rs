@@ -417,6 +417,41 @@ pub fn set_redirect_proposal(
     Ok(true)
 }
 
+/// Record that a proposal was *asked for* on `signature` and none came back.
+///
+/// Returns whether anything was written. Without this, only a **successful**
+/// proposal is idempotent: an advisor that declines (`no_proposal`), fails to
+/// launch, or times out leaves [`SupervisionRecord::redirect_proposal`]
+/// unset, [`plan_supervision`] keeps reporting
+/// `Redirect` for the same signature until a new attempt lands, and every
+/// tick in between buys the same non-answer again — draining
+/// [`super::advise::AdviceConfig::max_calls_per_day`] on one stuck issue and
+/// starving every other issue's classification for the rest of the day.
+///
+/// The empty string is the "asked, nothing to add" marker: it is the one
+/// value [`compose_redirect`] ignores and [`set_redirect_proposal`] refuses
+/// to write, so it can never reach an IC as an instruction with no content.
+/// It is dropped with the redirect it belongs to, so a new signature buys a
+/// fresh proposal.
+pub fn mark_redirect_proposal_asked(
+    db: &Database,
+    issue: &IssueRef,
+    signature: &str,
+) -> Result<bool, MemoryError> {
+    let Some(mut record) = get_supervision(db, issue)? else {
+        return Ok(false);
+    };
+    if record.active_redirect.is_none()
+        || record.redirect_signature.as_deref() != Some(signature)
+        || record.redirect_proposal.is_some()
+    {
+        return Ok(false);
+    }
+    record.redirect_proposal = Some(String::new());
+    upsert_supervision(db, &record)?;
+    Ok(true)
+}
+
 /// The signature a human has already been told about on the issue itself.
 pub fn escalation_notified_signature(
     db: &Database,
@@ -2293,6 +2328,30 @@ mod tests {
             .unwrap()
             .unwrap()
             .contains("first"));
+    }
+
+    #[test]
+    fn asking_and_getting_nothing_is_recorded_so_it_is_not_asked_again() {
+        // The decline is the common case, and it is the one that costs money
+        // every tick if only a success is idempotent.
+        let db = Database::open_in_memory().unwrap();
+        let issue = armed(&db, "sig");
+        let mechanical = active_redirect(&db, &issue).unwrap().unwrap();
+
+        assert!(mark_redirect_proposal_asked(&db, &issue, "sig").unwrap());
+        assert!(
+            !mark_redirect_proposal_asked(&db, &issue, "sig").unwrap(),
+            "a second ask for the same signature is refused"
+        );
+        // The marker is invisible to the IC: the redirect it reads is exactly
+        // the mechanical text.
+        assert_eq!(active_redirect(&db, &issue).unwrap().unwrap(), mechanical);
+        // And it cannot be overwritten by a late proposal for the same
+        // signature, which is the same "bought once" rule from the other side.
+        assert!(!set_redirect_proposal(&db, &issue, "sig", "too late").unwrap());
+
+        // A stale signature marks nothing.
+        assert!(!mark_redirect_proposal_asked(&db, &issue, "another failure").unwrap());
     }
 
     #[test]

@@ -45,11 +45,19 @@ pub struct BudgetLedgerEntry {
     pub unpriced_dispatch_count: u32,
     /// Advisor one-shot calls (rung 9) billed to this date, priced or not.
     ///
-    /// Counted separately from `dispatch_count` because it is the quantity
+    /// Its **own field** because it is the quantity
     /// [`super::advise::AdviceConfig::max_calls_per_day`] bounds, and an
     /// advisor call is a different *kind* of thing from an IC dispatch: one
     /// bounded turn with no tools, capped at cents, potentially made several
     /// times per Lead tick.
+    ///
+    /// It is **not** carved out of `dispatch_count`: a priced advisor call
+    /// increments that too, because `dispatch_count` counts what has been
+    /// folded into `total_cost_usd` and a priced call has been. So the two
+    /// overlap by design, and `advice_call_count` is the subset — never a
+    /// disjoint tally. An *unpriced* call is the mirror image: it moves this
+    /// field and `unpriced_advice_count`, and deliberately neither
+    /// `dispatch_count` nor `unpriced_dispatch_count`.
     #[serde(default)]
     pub advice_call_count: u32,
     /// Advisor calls whose price could not be read, so their spend is missing

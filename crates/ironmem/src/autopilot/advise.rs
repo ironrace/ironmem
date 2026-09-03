@@ -28,8 +28,21 @@
 //! spawn failure, a non-zero exit, unparseable stdout, a missing
 //! `structured_output`, an out-of-enum answer, an exhausted budget and an
 //! exhausted call count all produce the same thing: an [`Advice`] carrying
-//! no answer, and a caller that proceeds exactly as rung 8 did. Nothing in
-//! this module can stop a dispatch, hold a merge, or block a tick.
+//! no answer, and a caller that proceeds exactly as rung 8 did. **No
+//! failure of the advisor** can stop a dispatch, hold a merge, or block a
+//! tick, and one wall-clock bound ([`ADVICE_TIMEOUT`]) is what makes that
+//! true of a wedged call as well as a failing one.
+//!
+//! Stated precisely, because the looser version is false: [`run_advice`]
+//! still returns `Err` for a failure of *this crate's own storage* — a
+//! drawer or ledger write that will not land — and
+//! [`super::lead::resolve_class`] propagates it, so that one dispatch is
+//! skipped and the tick records a problem. That is deliberate. Swallowing a
+//! failed ledger write would hide real spend, and a database this subsystem
+//! cannot write is about to fail the dispatch anyway at its own first write.
+//! The guarantee is about the *advisor*, not about the database underneath
+//! it.
+//!
 //! `a_failing_advisor_changes_nothing_about_the_tick` in
 //! [`super::lead`]'s tests is the regression guard for that, and it is the
 //! most important test in the rung.
@@ -96,7 +109,8 @@
 //!
 //! # Storage: a tenth drawer kind
 //!
-//! [`AdviceRecord`], kind 1's shape — append-only, no `logical_key`, a
+//! One drawer per advisor call ([`record_advice`]), kind 1's shape —
+//! append-only, no `logical_key`, a
 //! `has_advice` edge. Recorded because rung 9 introduces the first model
 //! judgment inside the loop, and one of the three
 //! ([`advise_risk_class`]) produces a value that gates auto-merge. "Which
@@ -195,12 +209,6 @@ pub const MAX_ADVICE_ANSWER_CHARS: usize = 1_200;
 /// long-running issue, and the newest few are what "you keep doing this"
 /// actually refers to.
 pub const MAX_QUOTED_APPROACHES: usize = 5;
-
-/// `LIMIT` on every current edge of the issue entity, matching
-/// `MAX_REVIEWS_PER_ISSUE` / `MAX_MERGES_PER_ISSUE` for the reason rung 5's
-/// review finding #4 established: the traversal is not predicate-filtered, so
-/// a smaller limit here would silently drop *other* kinds of record.
-pub const MAX_ADVICE_PER_ISSUE: usize = 10_000;
 
 const ADVICE_ENTITY_TYPE: &str = "advice";
 const HAS_ADVICE_PREDICATE: &str = "has_advice";
@@ -304,9 +312,29 @@ pub trait Advisor {
     fn advise(&mut self, cwd: &Path, spec: &AdviceSpec) -> Result<AdviceOutput, MemoryError>;
 }
 
+/// Wall-clock bound on one advisor call.
+///
+/// `--permission-prompts none` removes the *prompt* that could block
+/// forever; it does nothing about a wedged connection, and a `claude` that
+/// never exits would hang the whole Lead tick — supervision, dispatch and
+/// the escalation notice with it — on the one code path whose stated
+/// property is that the loop does not depend on it. Rung 7 bounded the IC
+/// dispatch for exactly this reason; this is the same bound for the one
+/// process rung 9 adds.
+///
+/// A fixed constant rather than a per-repo config value, unlike the
+/// dispatch's: this is one toolless turn against a prompt bounded at
+/// [`MAX_ADVICE_PROMPT_CHARS`], so it does not vary with the repo's gate
+/// suite. Generous enough that a slow-but-working call is never killed.
+pub const ADVICE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// How often [`ClaudeAdvisor`] checks whether a call has exited.
+const ADVICE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// The real advisor: a toolless one-shot `claude -p`.
 pub struct ClaudeAdvisor {
     bin: std::path::PathBuf,
+    timeout: std::time::Duration,
 }
 
 impl ClaudeAdvisor {
@@ -315,21 +343,104 @@ impl ClaudeAdvisor {
     pub fn resolve() -> Result<Self, MemoryError> {
         Ok(Self {
             bin: super::dispatch::resolve_claude_binary()?,
+            timeout: ADVICE_TIMEOUT,
         })
+    }
+
+    /// The same advisor with a different wall-clock bound, so the bound is
+    /// testable against a stub binary without waiting [`ADVICE_TIMEOUT`].
+    pub fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.timeout = timeout;
+        self
     }
 }
 
 impl Advisor for ClaudeAdvisor {
     fn advise(&mut self, cwd: &Path, spec: &AdviceSpec) -> Result<AdviceOutput, MemoryError> {
-        let output = std::process::Command::new(&self.bin)
+        use std::io::Read;
+
+        let mut child = std::process::Command::new(&self.bin)
             .args(build_argv(spec))
             .current_dir(cwd)
-            .output()
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
             .map_err(|e| MemoryError::NotFound(format!("failed to launch advisor: {e}")))?;
+
+        // Drain both pipes on their own threads for the whole life of the
+        // process. Reading them only after it exits deadlocks a call whose
+        // output outruns the OS pipe buffer, and the bound would then kill a
+        // healthy call and report it as a timeout — rung 7's own finding, in
+        // the module that copied its shape.
+        fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> std::thread::JoinHandle<Vec<u8>> {
+            std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                if let Some(mut pipe) = pipe {
+                    let _ = pipe.read_to_end(&mut buf);
+                }
+                buf
+            })
+        }
+        let stdout_drain = drain(child.stdout.take());
+        let stderr_drain = drain(child.stderr.take());
+
+        let started = std::time::Instant::now();
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                // We cannot tell whether it is running. Reaped rather than
+                // left, unlike `run_dispatch_bounded`: an IC dispatch is
+                // minutes of real work worth preserving on a doubtful read,
+                // and this is one toolless turn worth cents. Reported as a
+                // run that produced nothing — never as an `Err`, which this
+                // module reserves for a call that never launched and
+                // therefore banks nothing.
+                Err(e) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Ok(AdviceOutput {
+                        stdout: String::new(),
+                        stderr: format!("could not check on the advisor process: {e}"),
+                        success: false,
+                    });
+                }
+                Ok(None) => {}
+            }
+            if started.elapsed() >= self.timeout {
+                // `kill`, not `killpg`: rung 7 put the IC dispatch in its own
+                // process group because an IC's whole job is spawning the
+                // repo's gate suite, and reaping only the direct child left
+                // `cargo test` running in the worktree. An advisor call runs
+                // with `--tools ""` and starts nothing, so there is no group
+                // to reap — and adding one here would be untested machinery
+                // guarding a case the argv rules out.
+                let _ = child.kill();
+                let _ = child.wait();
+                // A timeout is a call that ran: `success: false` sends it to
+                // `AdviceStatus::Unavailable`, and the empty stdout leaves its
+                // price unreadable, so the ledger banks it as an *unpriced*
+                // advisor call rather than as free. Never an `Err`, which
+                // this module reserves for a call that never launched.
+                return Ok(AdviceOutput {
+                    stdout: String::new(),
+                    stderr: format!(
+                        "the advisor exceeded its {}s wall-clock bound and was killed",
+                        self.timeout.as_secs()
+                    ),
+                    success: false,
+                });
+            }
+            std::thread::sleep(ADVICE_POLL_INTERVAL);
+        }
+
+        let status = child.wait();
         Ok(AdviceOutput {
-            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-            success: output.status.success(),
+            stdout: String::from_utf8_lossy(&stdout_drain.join().unwrap_or_default()).to_string(),
+            stderr: String::from_utf8_lossy(&stderr_drain.join().unwrap_or_default()).to_string(),
+            // A `wait` that fails leaves the exit status unknown, and unknown
+            // is not success: the answer is refused and the call is still
+            // banked, because the process ran either way.
+            success: status.map(|s| s.success()).unwrap_or(false),
         })
     }
 }
@@ -414,7 +525,15 @@ impl AdviceConfig {
                     .into(),
             ));
         }
-        if self.max_budget_usd > self.daily_budget_usd {
+        // Only when the advisor is on. Unlike the checks above — which name a
+        // value that is wrong however it is read — this one says "no call
+        // could ever be authorized", which is not a fault when no call will
+        // ever be made. A `LeadConfig` carrying a daily ceiling below the
+        // advisor's *default* per-call ceiling is a legitimate rung-8
+        // configuration, and refusing every tick over an advisor the operator
+        // never enabled would be a regression the error message would not
+        // even explain.
+        if self.enabled && self.max_budget_usd > self.daily_budget_usd {
             return Err(MemoryError::Validation(format!(
                 "advisor max_budget_usd ({}) exceeds daily_budget_usd ({}) — no advisor \
                  call could ever be authorized",
@@ -471,6 +590,13 @@ pub struct Advice {
     pub reason: Option<String>,
     /// `None` means **unknown**, never free. See rung 5's lesson 18.
     pub total_cost_usd: Option<f64>,
+    /// The model the call was made against, `None` when no call was made.
+    ///
+    /// Recorded because it is half of the question the drawer exists to
+    /// answer — "**which model** said `documentation`, when, at what price,
+    /// and why" — and the answer stops being reconstructible the moment the
+    /// operator changes `--advisor-model`.
+    pub model: Option<String>,
 }
 
 impl Advice {
@@ -502,6 +628,8 @@ impl Advice {
             answer: None,
             reason: None,
             total_cost_usd: None,
+            // No call was made, so no model answered.
+            model: None,
         }
     }
 }
@@ -706,6 +834,7 @@ pub fn run_advice(
                 answer: None,
                 reason: None,
                 total_cost_usd: None,
+                model: Some(spec.model.clone()),
             };
             record_advice(db, &advice)?;
             return Ok(advice);
@@ -728,6 +857,7 @@ pub fn run_advice(
         answer,
         reason,
         total_cost_usd: cost,
+        model: Some(spec.model.clone()),
     };
     record_advice(db, &advice)?;
     Ok(advice)
@@ -968,6 +1098,9 @@ pub struct RecordedAdvice {
     pub answer: Option<String>,
     pub reason: Option<String>,
     pub total_cost_usd: Option<f64>,
+    /// The model that answered, `None` for a record written before rung 9
+    /// carried it.
+    pub model: Option<String>,
     pub recorded_at: String,
 }
 
@@ -995,7 +1128,7 @@ pub fn record_advice(db: &Database, advice: &Advice) -> Result<String, MemoryErr
             .as_deref()
             .map(|text| scrub_and_bound(text, MAX_LINEAGE_FIELD_CHARS).text),
         total_cost_usd: advice.total_cost_usd,
-        model: None,
+        model: advice.model.clone(),
         record_id: uuid::Uuid::new_v4().to_string(),
         recorded_at: chrono::Utc::now().to_rfc3339(),
     };
@@ -1066,6 +1199,7 @@ pub fn advice_for_issue(
             answer: body.answer,
             reason: body.reason,
             total_cost_usd: body.total_cost_usd,
+            model: body.model,
             recorded_at: body.recorded_at,
         });
     }
@@ -1690,6 +1824,106 @@ mod tests {
     fn an_issue_with_no_advice_reads_back_empty_rather_than_erroring() {
         let db = Database::open_in_memory().unwrap();
         assert!(advice_for_issue(&db, &issue()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_record_says_which_model_answered() {
+        // Half the question the drawer exists to answer. An operator who
+        // changes `--advisor-model` cannot reconstruct it afterwards, and one
+        // of the three answers gates auto-merge.
+        let db = Database::open_in_memory().unwrap();
+        let mut cfg = enabled();
+        cfg.model = "claude-opus-5".to_string();
+        let mut advisor =
+            ScriptedAdvisor::answering(r#"{"risk_class":"documentation","reason":"x"}"#, 0.01);
+        advise_risk_class(&db, &mut advisor, cwd(), &issue(), "t", "b", &cfg).unwrap();
+
+        let records = advice_for_issue(&db, &issue()).unwrap();
+        assert_eq!(records[0].model.as_deref(), Some("claude-opus-5"));
+    }
+
+    // ── the wall-clock bound ────────────────────────────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn a_wedged_advisor_is_killed_rather_than_hanging_the_tick() {
+        // `--permission-prompts none` removes the prompt that could block
+        // forever; it does nothing about a wedged connection. Without this
+        // bound one stuck call hangs supervision, dispatch and the escalation
+        // notice with it — on the module whose stated property is that the
+        // loop does not depend on it.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("wedged");
+        std::fs::write(&bin, "#!/bin/sh\nsleep 120\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let db = Database::open_in_memory().unwrap();
+        let mut advisor = ClaudeAdvisor {
+            bin,
+            timeout: std::time::Duration::from_millis(300),
+        };
+        let started = std::time::Instant::now();
+        let advice = run_advice(
+            &db,
+            &mut advisor,
+            dir.path(),
+            &issue(),
+            AdviceKind::RiskClass,
+            "prompt",
+            &enabled(),
+        )
+        .unwrap();
+
+        assert!(started.elapsed() < std::time::Duration::from_secs(30));
+        assert!(matches!(advice.status, AdviceStatus::Unavailable { .. }));
+        // It ran, so it is banked — and its price is unknown, never $0.00.
+        let ledger = super::super::budget::get_daily_spend(&db, &today_utc())
+            .unwrap()
+            .unwrap();
+        assert_eq!(ledger.advice_call_count, 1);
+        assert_eq!(ledger.unpriced_advice_count, 1);
+        assert_eq!(
+            ledger.unpriced_dispatch_count, 0,
+            "a wedged advisor must never stop IC dispatches"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_advisor_that_outruns_the_pipe_buffer_is_not_mistaken_for_a_wedged_one() {
+        // 256 KiB of stderr, four times the usual pipe buffer. Reading the
+        // pipes only after the process exits deadlocks here, and the bound
+        // would then kill a healthy call — rung 7's own finding.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("chatty");
+        let json = envelope_json(r#"{"risk_class":"documentation","reason":"x"}"#, 0.01);
+        std::fs::write(
+            &bin,
+            format!("#!/bin/sh\nyes x | head -c 262144 >&2\ncat <<'EOF'\n{json}\nEOF\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut advisor = ClaudeAdvisor {
+            bin,
+            timeout: std::time::Duration::from_secs(20),
+        };
+        let output = advisor
+            .advise(
+                dir.path(),
+                &AdviceSpec {
+                    kind: AdviceKind::RiskClass,
+                    model: "m".to_string(),
+                    prompt: "p".to_string(),
+                    max_budget_usd: 0.25,
+                },
+            )
+            .unwrap();
+
+        assert!(output.success, "a chatty advisor is not a wedged one");
+        assert!(output.stdout.contains("documentation"));
     }
 
     #[test]
