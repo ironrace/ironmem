@@ -608,6 +608,17 @@ fn plugin_versions_match_cargo_toml() {
         claude_version, cargo_version,
         "claude plugin.json version ({claude_version}) must match Cargo.toml ({cargo_version})"
     );
+
+    // The generated wrapper (`scripts/sync_mcp_wrappers.py`) hard-fails with
+    // exit 1 when plugin.json's version and the binary's `--version` differ,
+    // so an unguarded plugin.json silently breaks that harness's MCP startup
+    // on the next Cargo version bump.
+    let muse = read_json(".muse-plugin/plugin.json");
+    let muse_version = muse["version"].as_str().unwrap_or("");
+    assert_eq!(
+        muse_version, cargo_version,
+        "muse plugin.json version ({muse_version}) must match Cargo.toml ({cargo_version})"
+    );
 }
 
 /// Return the text between the first two `---` fences of a markdown file.

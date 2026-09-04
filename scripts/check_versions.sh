@@ -18,7 +18,7 @@ PY
 
 echo "Cargo.toml version: $CARGO_VERSION"
 
-for plugin_file in .codex-plugin/plugin.json .claude-plugin/plugin.json; do
+for plugin_file in .codex-plugin/plugin.json .claude-plugin/plugin.json .muse-plugin/plugin.json; do
   plugin_version="$(
     python3 - "$plugin_file" <<'PY'
 import json

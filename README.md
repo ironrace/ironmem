@@ -191,14 +191,18 @@ ironmem claude . "fix the login bug"   # launch with an initial prompt
 ironmem codex /path/to/repo "add tests"
 ironmem gemini .                       # launch Gemini CLI in the current repo
 ironmem grok .                         # launch Grok in the current repo (early scaffolding)
+ironmem muse .                         # launch Muse Code in the current repo (early scaffolding)
 ```
 
-`gemini`/`grok` onboard from the same harness registry as `claude`/`codex`
-(see [Current Status](#current-status)) but are newer and less battle-tested:
-Gemini CLI's config convention (`~/.gemini/settings.json`) is confirmed from
-its own docs, while Grok's (`~/.grok/settings.json`) is a best-effort default
-pending a single confirmed "the" Grok CLI MCP config convention. Neither is a
-default `write-rules` target yet.
+`gemini`/`grok`/`muse` onboard from the same harness registry as
+`claude`/`codex` (see [Current Status](#current-status)) but are newer and
+less battle-tested: Gemini CLI's config convention
+(`~/.gemini/settings.json`) is confirmed from its own docs, while Grok's
+(`~/.grok/settings.json`) is a best-effort default pending a single
+confirmed "the" Grok CLI MCP config convention. Muse Code writes an
+ARRAY-shaped `mcpServers` entry in `~/.config/muse/settings.json` (shape
+measured on Muse Code 1.0.2 — see [docs/MUSE.md](docs/MUSE.md)). None of the
+three is a default `write-rules` target yet.
 
 Each launcher:
 
@@ -416,8 +420,9 @@ args = ["serve", "--connect", "/absolute/path/to/.ironrace-memory/hook_state/dae
 IRONMEM_MCP_MODE = "trusted"
 ```
 
-`ironmem claude`, `ironmem codex`, `ironmem gemini`, and `ironmem grok` (the
-last two are early scaffolding — see [Current Status](#current-status))
+`ironmem claude`, `ironmem codex`, `ironmem gemini`, `ironmem grok`, and
+`ironmem muse` (the last three are early scaffolding — see
+[Current Status](#current-status))
 already write this for you idempotently. A pre-existing bare `["serve"]`
 entry from before this feature is upgraded in place the next time you run the
 launcher; anything else you've hand-customized is left untouched. Bare
@@ -725,6 +730,7 @@ AI agents can query the graph without a shell.
 - Bounded Claude↔Codex collaboration protocol (v1 planning + v3 coding) is available via the `collab_*` MCP tools. Long-poll `wait_my_turn` wakes on actionable state changes and returns compact `{"unchanged": true}` only after an idle timeout — see [docs/COLLAB.md](docs/COLLAB.md)
 - **Shared daemon mode** (`serve --listen`/`--connect`) lets many clients share one `App`/DB/embedding-model behind a Unix socket, with automatic single-flight spawn-on-demand and idle self-shutdown — see [Shared Daemon Mode](#shared-daemon-mode). Bare `serve` is unchanged and remains the always-available fallback.
 - **Grok and Gemini CLI** are registered harnesses (`ironmem grok`/`ironmem gemini`, `harness_grok`/`harness_gemini` in `doctor`) but are scaffolding: neither is a default `write-rules` target yet, and Grok's MCP config convention is a best-effort default rather than a confirmed one — see [First run: one-command launchers](#first-run-one-command-launchers)
+- **Muse Code** is a registered harness (`ironmem muse`, `harness_muse` in `doctor`) with a measured config path and ARRAY-shaped `mcpServers` writer, but the rest is scaffolding: it is not a default `write-rules` target, the `clientInfo.name` attribution alias is a guess, and `.muse-plugin/` packaging is a minimal stand-in — see [docs/MUSE.md](docs/MUSE.md)
 
 ## Shared Memory Across Harnesses
 

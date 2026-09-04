@@ -30,10 +30,11 @@ Codex is one registered harness in the `REGISTRY` constant
   `codex-final` row per session, cached tokens subtracted from input).
 
 Run `ironmem harnesses --format=json` to inspect the current registry at any
-time. The registry also carries `grok` and `gemini` rows (`GROK.md`/`GEMINI.md`
-via `@AGENTS.md` import, `write_rules_default: false`) — scaffolding for the
-`ironmem grok`/`ironmem gemini` launchers, not yet default `write-rules`
-targets. See [First run: one-command launchers](../README.md#first-run-one-command-launchers)
+time. The registry also carries `grok`, `gemini`, and `muse` rows
+(`GROK.md`/`GEMINI.md`/`MUSE.md` via `@AGENTS.md` import,
+`write_rules_default: false`) — scaffolding for the `ironmem grok`/`ironmem
+gemini`/`ironmem muse` launchers, not yet default `write-rules` targets. See
+[First run: one-command launchers](../README.md#first-run-one-command-launchers)
 in the main README.
 
 ## Current Support Level

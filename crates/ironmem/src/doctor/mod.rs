@@ -1360,6 +1360,7 @@ mod tests {
                 "harness_codex",
                 "harness_grok",
                 "harness_gemini",
+                "harness_muse",
                 "daemon",
                 "daemon_autospawn",
             ]
