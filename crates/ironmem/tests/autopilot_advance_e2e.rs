@@ -24,8 +24,23 @@ use ironmem::db::schema::Database;
 
 const REPO: &str = "owner/repo";
 
+/// `current_dir` is **not** a repository selector: git reads `GIT_DIR` first,
+/// so an inherited one aims these calls at whatever repo the environment
+/// names. This suite is threaded and another module's tests set `GIT_DIR`
+/// process-wide, so the variables are stripped here the way
+/// `autopilot::worktree`'s own `git_command` strips them.
 fn git(dir: &Path, args: &[&str]) {
-    let out = std::process::Command::new("git")
+    let mut command = std::process::Command::new("git");
+    for (key, _) in std::env::vars_os() {
+        if key
+            .to_string_lossy()
+            .to_ascii_uppercase()
+            .starts_with("GIT_")
+        {
+            command.env_remove(key);
+        }
+    }
+    let out = command
         .args(args)
         .current_dir(dir)
         .output()
@@ -186,6 +201,10 @@ exit 0
         max_issues_per_repo: 50,
         max_advances_per_pass: DEFAULT_MAX_ADVANCES_PER_PASS,
         merge,
+        // Rung 10's paths, exercised exactly as rung 10 shipped them: a
+        // `needs_changes` verdict here still holds the PR for a human.
+        remediate: false,
+        attempt_cap: 5,
         strategy: MergeStrategy::Squash,
         delete_branch: false,
         dry_run,

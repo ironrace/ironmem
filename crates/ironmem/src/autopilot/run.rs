@@ -90,8 +90,8 @@ use crate::error::MemoryError;
 use super::dispatch::{self, DispatchOutcome, DispatchSpec, SessionMode, Verdict};
 use super::worktree::Worktree;
 use super::{
-    blocked, budget, dispatch_state, gate_config, lineage, supervise, today_utc, turn_prompt,
-    IssueRef,
+    blocked, budget, dispatch_state, gate_config, lineage, remediate, supervise, today_utc,
+    turn_prompt, IssueRef,
 };
 use super::{AttemptOutcome, AttemptRecord, DispatchState, IssueStatus, PriorAttempt};
 
@@ -363,6 +363,11 @@ pub enum TerminalReason {
     /// A prior run already recorded a success for this issue, so nothing was
     /// dispatched. Makes [`run_issue`] idempotent — re-running a finished
     /// issue costs nothing rather than re-doing settled work.
+    ///
+    /// ⟨rung 11⟩ Not returned when a remediation is in force
+    /// ([`super::remediate::active_remediation`]): a reviewer that asked for
+    /// changes is the spec's own reason to re-dispatch a succeeded issue, and
+    /// the attempt cap below is what bounds it.
     AlreadySucceeded { commit_sha: Option<String> },
     /// The per-issue attempt cap was reached. Terminal: per the spec,
     /// `agent:exhausted` *"never self-resumes"*, so the dispatch state is
@@ -773,8 +778,14 @@ pub fn run_issue(
     let wall_clock_timeout = wall_clock_timeout_secs.map(std::time::Duration::from_secs);
 
     let mut status = lineage::get_issue_status(db, issue)?;
+    // Rung 11's second, narrower reason to dispatch a finished issue: a
+    // reviewer read its PR and asked for changes. Read once here and reused
+    // for every dispatch of this run — a remediation cannot arrive mid-run,
+    // because arming one requires a review of a PR this run is still writing
+    // commits to.
+    let remediation = remediate::active_remediation(db, issue)?;
     if let Some(existing) = &status {
-        if existing.best_verdict == Some(AttemptOutcome::Success) {
+        if existing.best_verdict == Some(AttemptOutcome::Success) && remediation.is_none() {
             return Ok(IssueRun {
                 issue: issue.clone(),
                 terminal: TerminalReason::AlreadySucceeded {
@@ -901,6 +912,15 @@ pub fn run_issue(
             .into_iter()
             .filter_map(|pair| pair.answer.map(|answer| (pair.question, answer)))
             .collect();
+        // Rung 11's delivery half, and the reason a remediation is more than
+        // a label flip: without it the IC would be re-dispatched onto an
+        // issue it has already finished, told nothing about why, and handed a
+        // goal condition its own last commit already satisfies.
+        let remediation_brief = remediation.as_ref().map(|r| turn_prompt::RemediationBrief {
+            pr_number: r.pr_number,
+            head_sha: &r.head_sha,
+            findings: r.findings.as_deref(),
+        });
         let condition = turn_prompt::render(&turn_prompt::TurnPromptInputs {
             issue,
             issue_title: &brief.title,
@@ -908,6 +928,7 @@ pub fn run_issue(
             prior_attempts: &attempts,
             strategy_redirect: strategy_redirect.as_deref(),
             human_answers: &human_answers,
+            remediation: remediation_brief,
             gate_commands: &gate_commands,
             n_turns: config.n_turns,
         });
@@ -1849,6 +1870,138 @@ mod tests {
         ));
         assert!(second.seen.is_empty(), "settled work must not be re-run");
         assert_eq!(run.total_cost_usd, 0.0);
+    }
+
+    #[test]
+    fn a_remediation_re_opens_a_succeeded_issue_and_tells_the_ic_what_to_fix() {
+        // Rung 11's whole point. The guard that makes an issue finished is
+        // the guard in the way, and the narrow exception is a reviewer's
+        // recorded objection — delivered into the condition, not merely
+        // recorded.
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        let mut first = ScriptedDispatcher::new(vec![Ok(met())]);
+        run_issue(&db, &issue(), &brief(), &wt, &config(), &mut first).unwrap();
+
+        remediate::arm_remediation(
+            &db,
+            &remediate::ArmRequest {
+                issue: &issue(),
+                pr_number: 42,
+                head_sha: "deadbeef",
+                findings: Some("the retry loop is unbounded"),
+                attempt_cap: config().attempt_cap,
+            },
+        )
+        .unwrap();
+
+        let mut second = ScriptedDispatcher::new(vec![Ok(met())]);
+        let run = run_issue(&db, &issue(), &brief(), &wt, &config(), &mut second).unwrap();
+
+        assert!(
+            matches!(run.terminal, TerminalReason::Met { .. }),
+            "a remediation dispatch runs; got {:?}",
+            run.terminal
+        );
+        assert_eq!(second.seen.len(), 1, "exactly one remediation dispatch");
+        let condition = &second.seen[0].condition;
+        assert!(condition.contains("the retry loop is unbounded"));
+        assert!(condition.contains("pull request #42"));
+        assert!(
+            condition.contains("addressed by a commit you have pushed to this branch"),
+            "the findings must reach the CONDITION, or the already-green gate \
+satisfies it on its own"
+        );
+    }
+
+    #[test]
+    fn a_succeeded_issue_with_no_remediation_is_still_left_alone() {
+        // Rung 9's lesson 43: the new switch must not change the behaviour of
+        // everything that predates it.
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        let mut first = ScriptedDispatcher::new(vec![Ok(met())]);
+        run_issue(&db, &issue(), &brief(), &wt, &config(), &mut first).unwrap();
+
+        let mut second = ScriptedDispatcher::new(vec![]);
+        let run = run_issue(&db, &issue(), &brief(), &wt, &config(), &mut second).unwrap();
+        assert!(matches!(
+            run.terminal,
+            TerminalReason::AlreadySucceeded { .. }
+        ));
+    }
+
+    #[test]
+    fn a_remediation_dispatch_spends_the_same_attempt_cap_and_then_stops() {
+        // "Counting against the same per-issue attempt cap" — the sentence
+        // that makes the red path bounded rather than a money loop. The
+        // remediation is armed while the cap allows, spends what is left, and
+        // the run then stops on the cap rather than on `AlreadySucceeded`.
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        let mut config = config();
+        config.attempt_cap = 2;
+
+        let mut first = ScriptedDispatcher::new(vec![Ok(met())]);
+        run_issue(&db, &issue(), &brief(), &wt, &config, &mut first).unwrap();
+
+        remediate::arm_remediation(
+            &db,
+            &remediate::ArmRequest {
+                issue: &issue(),
+                pr_number: 42,
+                head_sha: "deadbeef",
+                findings: Some("fix it"),
+                attempt_cap: 2,
+            },
+        )
+        .unwrap();
+
+        // The remediation dispatch runs and does not fix it: attempt 2 of 2.
+        let mut second = ScriptedDispatcher::new(vec![Ok(not_met())]);
+        let run = run_issue(&db, &issue(), &brief(), &wt, &config, &mut second).unwrap();
+        assert_eq!(second.seen.len(), 1, "the remediation dispatch did run");
+        assert!(
+            matches!(run.terminal, TerminalReason::AttemptCapExhausted),
+            "got {:?}",
+            run.terminal
+        );
+    }
+
+    #[test]
+    fn a_remediation_is_never_armed_once_the_cap_is_spent() {
+        // The other half of the same bound, and the one that hands the PR
+        // back: at the cap `arm_remediation` writes nothing, so the issue
+        // stays `AlreadySucceeded` here and the advance pass runs rung 6's
+        // real hold, which tells a human.
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        let mut config = config();
+        config.attempt_cap = 1;
+
+        let mut first = ScriptedDispatcher::new(vec![Ok(met())]);
+        run_issue(&db, &issue(), &brief(), &wt, &config, &mut first).unwrap();
+
+        let outcome = remediate::arm_remediation(
+            &db,
+            &remediate::ArmRequest {
+                issue: &issue(),
+                pr_number: 42,
+                head_sha: "deadbeef",
+                findings: Some("fix it"),
+                attempt_cap: 1,
+            },
+        )
+        .unwrap();
+        assert!(!outcome.in_force(), "got {outcome:?}");
+
+        let mut second = ScriptedDispatcher::new(vec![]);
+        let run = run_issue(&db, &issue(), &brief(), &wt, &config, &mut second).unwrap();
+        assert!(matches!(
+            run.terminal,
+            TerminalReason::AlreadySucceeded { .. }
+        ));
+        assert!(second.seen.is_empty());
     }
 
     // ── attempt cap ─────────────────────────────────────────────────────

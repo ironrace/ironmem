@@ -54,14 +54,45 @@
 //! on; a switch that decides whether a new kind of irreversible action
 //! happens at all is an operator's explicit choice.
 //!
+//! # The other branch of the same fork ⟨rung 11⟩
+//!
+//! The reviewer's verdict is a fork, and rung 10 executed one side of it.
+//! `PASS` merged; `NEEDS CHANGES` held the PR, commented, and moved the issue
+//! to `agent:blocked` for a human. [`super::remediate`] executes the other
+//! side, and this module is where it is decided, because this is where the
+//! verdict is read.
+//!
+//! Under `--remediate`, a `needs_changes` verdict about the PR's **current
+//! head** arms a re-dispatch instead of handing the PR over, and the merge is
+//! then rehearsed rather than executed. That last part is the mechanism, not a
+//! detail: rung 6's real hold sets `agent:blocked`, which strips `agent:ready`
+//! and drops the issue out of the very listing [`advance_pass`] and the Lead
+//! are built from — so a re-dispatch armed alongside it would never be
+//! dispatched, and no question marker exists for `blocked::poll_answer` to
+//! recover it by.
+//!
+//! The hand-off to a human still happens; it happens *later*, when the
+//! automation has actually given up. `remediate::arm_remediation` checks the
+//! attempt cap first and answers `CapReached`, which is not `in_force`, so an
+//! exhausted issue falls through to the real merge and rung 6 comments and
+//! labels exactly as it always did. That is the spec's *"on exhaustion the PR
+//! stays open for a human — never merged with an unresolved finding"*, with
+//! both halves reachable.
+//!
 //! # No eleventh drawer kind
 //!
-//! Every action this module takes is already recorded by the rung that owns
+//! Every action *this* module takes is already recorded by the rung that owns
 //! it: rung 5 writes a review record, rung 6 writes a merge record, and both
 //! dedupe their own repeats. A record of *"I orchestrated"* would answer no
 //! question the two of them cannot already answer, and rung 9's rule for the
 //! tenth kind was that a kind earns its place by making a specific question
 //! answerable later. This one does not.
+//!
+//! ⟨rung 11⟩ [`super::remediate::RemediationRecord`] *is* an eleventh kind,
+//! and it earns its place by that same rule: it is not a record of an action
+//! taken, it is the state two other modules read to decide whether to act at
+//! all. Nothing else in the subsystem can answer *"which findings is this
+//! dispatch supposed to be fixing?"*.
 //!
 //! # Ordering, which is this ladder's recurring bug class
 //!
@@ -89,7 +120,8 @@ use super::gh::{self, GhRunner, MergeStrategy, PrLookup};
 use super::labels::{self, AgentLabel, DispatchEligibility};
 use super::lineage::{self, AttemptOutcome};
 use super::merge::{self, serialize_issue, MergeExecution, MergeRequest};
-use super::review::{self, PrReview, ReviewRequest, ReviewRunner};
+use super::remediate::{self, ArmOutcome, ArmRequest};
+use super::review::{self, PrReview, ReviewRequest, ReviewRunner, ReviewVerdict};
 use super::worktree::{self, WorktreeRemoval};
 use super::{dispatch_state, gate_config, queue, validate_repo, IssueRef};
 
@@ -112,6 +144,27 @@ pub struct AdvanceConfig {
     pub max_advances_per_pass: usize,
     /// Whether merges are executed. Off means every merge is rehearsed.
     pub merge: bool,
+    /// Whether a `needs_changes` verdict arms a re-dispatch (rung 11).
+    ///
+    /// Off by default, and off is exactly rung 10's behaviour: the PR is held,
+    /// commented and flipped to `agent:blocked` for a human. On, the same
+    /// verdict instead re-opens the issue for the IC that wrote it, and the
+    /// merge is rehearsed rather than executed so the issue keeps the
+    /// `agent:ready` label the Lead dispatches from.
+    ///
+    /// A switch rather than a default because it decides whether a *new kind*
+    /// of thing happens at all — here, re-opening work a human may believe is
+    /// finished, on a branch a human may be reading. Rung 9's `--advisor` and
+    /// rung 10's `--merge` set the precedent; the bounds on how much a
+    /// remediation may spend are separate and always on.
+    pub remediate: bool,
+    /// The per-issue attempt cap remediations are dispatched under.
+    ///
+    /// Must be the value the Lead's [`super::run::RunConfig`] uses. A
+    /// remediation armed against one cap and dispatched under another either
+    /// never fires or never stops, and this module is the half that decides
+    /// when the automation gives up and tells a human.
+    pub attempt_cap: u32,
     pub strategy: MergeStrategy,
     pub delete_branch: bool,
     /// Change nothing anywhere: no merge, no comment, no label, no cleanup.
@@ -139,6 +192,13 @@ impl AdvanceConfig {
             return Err(MemoryError::Config(
                 "max_advances_per_pass must be at least 1".into(),
             ));
+        }
+        // Checked whether or not `remediate` is set. A cap of zero is a
+        // nonsense configuration however it is read, and validating it only
+        // under the new flag would let the same value pass one command line
+        // and fail the next.
+        if self.attempt_cap == 0 {
+            return Err(MemoryError::Config("attempt_cap must be at least 1".into()));
         }
         for target in &self.targets {
             validate_repo(&target.repo)?;
@@ -237,6 +297,9 @@ pub struct Advanced {
     pub dispatch_class: String,
     pub step: AdvanceStep,
     pub review: Option<PrReview>,
+    /// What rung 11 did about a `needs_changes` verdict. `None` when the
+    /// verdict was not `needs_changes`, or when `--remediate` is off.
+    pub remediation: Option<ArmOutcome>,
     pub merge: Option<MergeExecution>,
     pub cleanup: Option<Cleanup>,
 }
@@ -272,6 +335,9 @@ pub struct AdvanceReport {
     pub dry_run: bool,
     /// Whether merges were executed or rehearsed.
     pub merge_enabled: bool,
+    /// Whether a `needs_changes` verdict re-opened the issue (rung 11) or was
+    /// held for a human (rung 10's behaviour).
+    pub remediate_enabled: bool,
     pub advanced: Vec<Advanced>,
     pub skipped: Vec<Skipped>,
     /// Per-issue and per-repo failures. A pass that reports problems still
@@ -543,6 +609,7 @@ pub fn advance_pass(
     Ok(AdvanceReport {
         dry_run: config.dry_run,
         merge_enabled: config.merge && !config.dry_run,
+        remediate_enabled: config.remediate && !config.dry_run,
         advanced,
         skipped,
         problems,
@@ -605,6 +672,7 @@ fn advance_issue(
                 dispatch_class: class,
                 step,
                 review: None,
+                remediation: None,
                 merge: None,
                 cleanup: None,
             })
@@ -633,6 +701,7 @@ fn advance_issue(
                 dispatch_class: class,
                 step,
                 review: None,
+                remediation: None,
                 merge: None,
                 cleanup: None,
             });
@@ -689,15 +758,63 @@ fn advance_issue(
             dispatch_class: class,
             step,
             review,
+            remediation: None,
             merge: None,
             cleanup: None,
         });
     }
 
+    // ── Rung 11: the red path ────────────────────────────────────────────
+    //
+    // Read back from the *stored* review rather than from the `PrReview` in
+    // hand, for the reason rung 6 re-derives its merge decision instead of
+    // replaying a stored one: the stored review is what `execute_merge` is
+    // about to read, and two sources of truth for "what did the reviewer
+    // say?" is how they drift apart. It is also the only source available on
+    // the `Merge` step, where this pass reviewed nothing at all.
+    //
+    // The head-SHA comparison is the same one rung 6 makes before merging and
+    // rung 10 makes before re-reviewing: a verdict authorizes — or objects to
+    // — the commit it read, and a `needs_changes` about some earlier commit is
+    // not a reason to re-open the one in front of us.
+    let mut remediation = None;
+    if config.remediate && !config.dry_run {
+        let objection = merge::latest_review_for_pr(db, &candidate.issue, pr_number)?.filter(|r| {
+            r.verdict == Some(ReviewVerdict::NeedsChanges)
+                && r.head_sha
+                    .as_deref()
+                    .is_some_and(|sha| sha.eq_ignore_ascii_case(&head_sha))
+        });
+        if let Some(objection) = objection {
+            remediation = Some(remediate::arm_remediation(
+                db,
+                &ArmRequest {
+                    issue: &candidate.issue,
+                    pr_number,
+                    head_sha: &head_sha,
+                    findings: objection.reason.as_deref(),
+                    attempt_cap: config.attempt_cap,
+                },
+            )?);
+        }
+    }
+
     // Rehearsed unless merging was asked for. Every guard and every read
     // still runs, so the operator learns what would happen; nothing is
     // written to GitHub.
-    let merge_dry_run = config.dry_run || !config.merge;
+    //
+    // A remediation in force forces the rehearsal too, and that is the whole
+    // mechanism rather than a nicety. Under `--merge`, rung 6's `NeedsChanges`
+    // hold comments on the issue and sets `agent:blocked` — which strips
+    // `agent:ready`, drops the issue out of the Lead's listing, and carries no
+    // question marker for `blocked::poll_answer` to resume it by. The
+    // re-dispatch this module just armed would then never be dispatched, and
+    // only a human re-labelling could recover it. Holding for a human is the
+    // right answer only once the automation has given up, which is exactly
+    // what `ArmOutcome::CapReached` reports — and it is not `in_force`, so it
+    // falls through to the real merge and the human is told.
+    let remediation_in_force = remediation.as_ref().is_some_and(ArmOutcome::in_force);
+    let merge_dry_run = config.dry_run || !config.merge || remediation_in_force;
     let execution = merge::execute_merge(
         db,
         gh_runner,
@@ -723,6 +840,7 @@ fn advance_issue(
         dispatch_class: class,
         step,
         review,
+        remediation,
         merge: Some(execution),
         cleanup,
     })
@@ -786,6 +904,7 @@ mod tests {
     use crate::autopilot::gh::testing::ScriptedGh;
     use crate::autopilot::gh::GhOutput;
     use crate::autopilot::lineage::IssueStatus;
+    use crate::autopilot::merge::MergeOutcome;
     use crate::autopilot::review::{ReviewOutcome, ReviewVerdict, RiskClass};
     use crate::autopilot::{gate_config, DispatchState};
 
@@ -851,6 +970,37 @@ mod tests {
         .unwrap();
     }
 
+    /// A recorded `needs_changes` review of `pr_number` at `head_sha`.
+    fn reviewed_at_needing_changes(
+        db: &Database,
+        issue: &IssueRef,
+        pr_number: u64,
+        head_sha: &str,
+    ) {
+        review::record_review(
+            db,
+            &review::ReviewRecord {
+                issue: issue.clone(),
+                pr_number,
+                dispatch_class: "documentation".into(),
+                head_sha: Some(head_sha.into()),
+                base_branch: Some("main".into()),
+                outcome: ReviewOutcome {
+                    verdict: Some(ReviewVerdict::NeedsChanges),
+                    risk_class: Some(RiskClass::Documentation),
+                    reason: Some("the retry loop is unbounded".to_string()),
+                    total_cost_usd: None,
+                    token_usage: None,
+                    process_success: true,
+                },
+                decision: review::MergeDecision::HoldForHuman(
+                    crate::autopilot::review::HoldReason::NeedsChanges,
+                ),
+            },
+        )
+        .unwrap();
+    }
+
     fn listing(number: u64, labels: &[&str]) -> gh::IssueListing {
         serde_json::from_str(&format!(
             r#"{{"number":{number},"title":"t","body":"b","labels":[{}],"updatedAt":"2026-09-03T00:00:00Z"}}"#,
@@ -880,6 +1030,8 @@ mod tests {
             max_issues_per_repo: 50,
             max_advances_per_pass: DEFAULT_MAX_ADVANCES_PER_PASS,
             merge: false,
+            remediate: false,
+            attempt_cap: crate::autopilot::run::DEFAULT_ATTEMPT_CAP,
             strategy: MergeStrategy::Squash,
             delete_branch: false,
             dry_run: false,
@@ -1461,6 +1613,312 @@ mod tests {
         assert!(
             !worktree::worktree_path(roots.path(), &issue()).exists(),
             "the checkout is gone from disk"
+        );
+    }
+
+    // ── rung 11: the red path ───────────────────────────────────────────
+
+    /// A reviewer that asks for changes, with a reason.
+    fn needs_changes() -> StubReviewer {
+        StubReviewer {
+            calls: 0,
+            outcome: ReviewOutcome {
+                verdict: Some(ReviewVerdict::NeedsChanges),
+                risk_class: Some(RiskClass::Documentation),
+                reason: Some("the retry loop is unbounded".to_string()),
+                total_cost_usd: None,
+                token_usage: None,
+                process_success: true,
+            },
+        }
+    }
+
+    #[test]
+    fn a_needs_changes_verdict_arms_a_re_dispatch_instead_of_blocking_the_issue() {
+        // Rung 11's central path, and the reason the merge below it must be
+        // rehearsed: rung 6's real `NeedsChanges` hold sets `agent:blocked`,
+        // which strips `agent:ready` and drops the issue out of the Lead's
+        // listing — so the re-dispatch just armed would never be dispatched.
+        let db = approved_db();
+        record_success(&db, &issue(), Some(GREEN));
+        let (repo, roots) = checkout_with_worktree();
+        let mut gh = ScriptedGh::new(vec![
+            ok(&issue_list_json(
+                283,
+                &["agent:ready", "risk:documentation"],
+            )),
+            ok(&pr_list_json(322, GREEN)),
+            ok(&pr_view_json(GREEN)),
+        ]);
+        let mut config = config(roots.path(), repo.path());
+        config.merge = true;
+        config.remediate = true;
+
+        let report = advance_pass(&db, &mut gh, &mut needs_changes(), &config).unwrap();
+        let advanced = &report.advanced[0];
+
+        assert!(
+            matches!(
+                advanced.remediation,
+                Some(ArmOutcome::Armed {
+                    pr_number: 322,
+                    has_findings: true,
+                    ..
+                })
+            ),
+            "got {:?}",
+            advanced.remediation
+        );
+        assert!(
+            matches!(
+                advanced.merge.as_ref().unwrap().outcome,
+                MergeOutcome::Held(_)
+            ),
+            "the PR is still not merged with an unresolved finding"
+        );
+        let execution = advanced.merge.as_ref().unwrap();
+        assert!(
+            execution.label_plan.is_none() && !execution.commented,
+            "an armed remediation forces the rehearsal: `agent:ready` survives \
+and no `agent:blocked` comment is posted, or the Lead never sees the issue again"
+        );
+
+        // And the findings actually reached storage, where the next dispatch
+        // reads them from.
+        let armed = remediate::active_remediation(&db, &issue())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            armed.findings.as_deref(),
+            Some("the retry loop is unbounded")
+        );
+        assert_eq!(armed.head_sha, GREEN);
+    }
+
+    #[test]
+    fn without_remediate_a_needs_changes_verdict_is_held_for_a_human() {
+        // Rung 10's behaviour, byte for byte. Lesson 43: a new optional
+        // feature must not change the configuration that predates it.
+        let db = approved_db();
+        record_success(&db, &issue(), Some(GREEN));
+        let (repo, roots) = checkout_with_worktree();
+        let mut gh = ScriptedGh::new(vec![
+            ok(&issue_list_json(
+                283,
+                &["agent:ready", "risk:documentation"],
+            )),
+            ok(&pr_list_json(322, GREEN)),
+            ok(&pr_view_json(GREEN)),
+            ok(r#"{"labels":[{"name":"agent:ready"}]}"#),
+            ok(""),
+            ok(""),
+            ok(""),
+        ]);
+        let mut config = config(roots.path(), repo.path());
+        config.merge = true;
+
+        let report = advance_pass(&db, &mut gh, &mut needs_changes(), &config).unwrap();
+        let advanced = &report.advanced[0];
+        assert_eq!(advanced.remediation, None);
+        let execution = advanced.merge.as_ref().unwrap();
+        assert!(
+            execution.label_plan.is_some() && execution.commented,
+            "without --remediate the hold runs for real, exactly as rung 10 shipped it"
+        );
+        assert_eq!(remediate::get_remediation(&db, &issue()).unwrap(), None);
+    }
+
+    #[test]
+    fn an_issue_at_its_attempt_cap_falls_through_to_the_human_hold() {
+        // The spec's "on exhaustion the PR stays open for a human". The
+        // automation has given up, so the merge runs for real and rung 6
+        // comments and flips the label — which is the notification.
+        let db = approved_db();
+        lineage::upsert_issue_status(
+            &db,
+            &IssueStatus {
+                issue: issue(),
+                best_verdict: Some(AttemptOutcome::Success),
+                best_commit_sha: Some(GREEN.to_string()),
+                cumulative_attempt_n: 5,
+            },
+        )
+        .unwrap();
+        let (repo, roots) = checkout_with_worktree();
+        let mut gh = ScriptedGh::new(vec![
+            ok(&issue_list_json(
+                283,
+                &["agent:ready", "risk:documentation"],
+            )),
+            ok(&pr_list_json(322, GREEN)),
+            ok(&pr_view_json(GREEN)),
+            ok(r#"{"labels":[{"name":"agent:ready"}]}"#),
+            ok(""),
+            ok(""),
+            ok(""),
+        ]);
+        let mut config = config(roots.path(), repo.path());
+        config.merge = true;
+        config.remediate = true;
+        config.attempt_cap = 5;
+
+        let report = advance_pass(&db, &mut gh, &mut needs_changes(), &config).unwrap();
+        let advanced = &report.advanced[0];
+        assert!(
+            matches!(
+                advanced.remediation,
+                Some(ArmOutcome::CapReached {
+                    cumulative_attempt_n: 5,
+                    attempt_cap: 5
+                })
+            ),
+            "got {:?}",
+            advanced.remediation
+        );
+        let execution = advanced.merge.as_ref().unwrap();
+        assert!(
+            execution.commented,
+            "an exhausted issue must reach the real hold, or nobody is told"
+        );
+        assert_eq!(
+            remediate::get_remediation(&db, &issue()).unwrap(),
+            None,
+            "nothing is armed for an issue that can never be dispatched"
+        );
+    }
+
+    #[test]
+    fn a_needs_changes_about_a_commit_that_is_no_longer_the_head_arms_nothing() {
+        // A verdict objects to the commit it read, and this is the case where
+        // that matters: two `needs_changes` reviews, then a force-push back
+        // to the earlier commit. The head is at GREEN, which review 1 did
+        // read — but the *latest* review is about MOVED, which is no longer
+        // there. Arming from it would hand the IC findings about a diff that
+        // does not exist on the branch.
+        //
+        // The latest review is the one consulted, not the latest matching
+        // one: rung 6's rule, for its reason — looking further back to find a
+        // review that fits is how a re-review's verdict gets ignored.
+        let db = approved_db();
+        record_success(&db, &issue(), Some(GREEN));
+        reviewed_at_needing_changes(&db, &issue(), 322, GREEN);
+        reviewed_at_needing_changes(&db, &issue(), 322, MOVED);
+
+        let (repo, roots) = checkout_with_worktree();
+        let mut gh = ScriptedGh::new(vec![
+            ok(&issue_list_json(
+                283,
+                &["agent:ready", "risk:documentation"],
+            )),
+            ok(&pr_list_json(322, GREEN)),
+            ok(&pr_view_json(GREEN)),
+        ]);
+        let mut config = config(roots.path(), repo.path());
+        config.remediate = true;
+
+        let report = advance_pass(&db, &mut gh, &mut ForbiddenReviewer, &config).unwrap();
+        assert_eq!(
+            report.advanced[0].remediation, None,
+            "findings about a commit that is not the head must not arm a fix"
+        );
+        assert_eq!(remediate::get_remediation(&db, &issue()).unwrap(), None);
+    }
+
+    #[test]
+    fn a_passing_review_at_the_head_arms_nothing() {
+        // The complement: only `needs_changes` opens the red path.
+        let db = approved_db();
+        record_success(&db, &issue(), Some(GREEN));
+        reviewed_at_needing_changes(&db, &issue(), 322, MOVED);
+        reviewed_at(&db, &issue(), 322, GREEN);
+
+        let (repo, roots) = checkout_with_worktree();
+        let mut gh = ScriptedGh::new(vec![
+            ok(&issue_list_json(
+                283,
+                &["agent:ready", "risk:documentation"],
+            )),
+            ok(&pr_list_json(322, GREEN)),
+            ok(&pr_view_json(GREEN)),
+            unprotected(),
+            no_rules(),
+        ]);
+        let mut config = config(roots.path(), repo.path());
+        config.remediate = true;
+
+        let report = advance_pass(&db, &mut gh, &mut ForbiddenReviewer, &config).unwrap();
+        assert_eq!(report.advanced[0].remediation, None);
+    }
+
+    #[test]
+    fn a_dry_run_arms_nothing() {
+        // `--dry-run` means "read everything, change nothing", and an armed
+        // remediation is a change that costs money on the next tick.
+        let db = approved_db();
+        record_success(&db, &issue(), Some(GREEN));
+        reviewed_at(&db, &issue(), 322, GREEN);
+        let (repo, roots) = checkout_with_worktree();
+        let mut gh = ScriptedGh::new(vec![
+            ok(&issue_list_json(
+                283,
+                &["agent:ready", "risk:documentation"],
+            )),
+            ok(&pr_list_json(322, GREEN)),
+            ok(&pr_view_json(GREEN)),
+            unprotected(),
+            no_rules(),
+        ]);
+        let mut config = config(roots.path(), repo.path());
+        config.remediate = true;
+        config.dry_run = true;
+
+        let report = advance_pass(&db, &mut gh, &mut ForbiddenReviewer, &config).unwrap();
+        assert!(!report.remediate_enabled);
+        assert_eq!(remediate::get_remediation(&db, &issue()).unwrap(), None);
+    }
+
+    #[test]
+    fn a_second_pass_over_an_armed_issue_reports_it_and_rewrites_nothing() {
+        // Idempotence keyed on (pr, commit), including the failure outcomes:
+        // a remediation that was armed and dispatched and did not work is the
+        // same remediation, not a new one. Rewriting it would reset the
+        // delivery depth and make "has this been dispatched?" unanswerable.
+        let db = approved_db();
+        record_success(&db, &issue(), Some(GREEN));
+        reviewed_at_needing_changes(&db, &issue(), 322, GREEN);
+        let (repo, roots) = checkout_with_worktree();
+
+        let mut config = config(roots.path(), repo.path());
+        config.remediate = true;
+
+        let script = || {
+            ScriptedGh::new(vec![
+                ok(&issue_list_json(
+                    283,
+                    &["agent:ready", "risk:documentation"],
+                )),
+                ok(&pr_list_json(322, GREEN)),
+                ok(&pr_view_json(GREEN)),
+            ])
+        };
+
+        let first = advance_pass(&db, &mut script(), &mut ForbiddenReviewer, &config).unwrap();
+        assert!(matches!(
+            first.advanced[0].remediation,
+            Some(ArmOutcome::Armed { .. })
+        ));
+
+        let second = advance_pass(&db, &mut script(), &mut ForbiddenReviewer, &config).unwrap();
+        assert!(
+            matches!(
+                second.advanced[0].remediation,
+                Some(ArmOutcome::AlreadyArmed {
+                    dispatches_since: 0,
+                    ..
+                })
+            ),
+            "got {:?}",
+            second.advanced[0].remediation
         );
     }
 

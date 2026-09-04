@@ -742,6 +742,19 @@ enum AutopilotCmd {
         /// Execute merges instead of rehearsing them. **Irreversible.**
         #[arg(long)]
         merge: bool,
+        /// Arm a re-dispatch when a review returns NEEDS CHANGES (rung 11),
+        /// instead of holding the PR for a human straight away. This pass
+        /// arms it; `autopilot lead` (or `autopilot run`) is what actually
+        /// dispatches, so run them in that order. Each attempt costs a
+        /// dispatch and spends the issue's --attempt-cap; on exhaustion the
+        /// PR is held for a human exactly as it is without this flag.
+        #[arg(long)]
+        remediate: bool,
+        /// Per-issue attempt cap. Must match the Lead's, since a remediation
+        /// armed under one cap and dispatched under another either never
+        /// fires or never stops.
+        #[arg(long)]
+        attempt_cap: Option<u32>,
         /// Merge strategy for `--merge`
         #[arg(long, default_value = "squash")]
         strategy: String,
@@ -766,6 +779,29 @@ enum AutopilotCmd {
         /// Read everything, write nothing, spend nothing
         #[arg(long)]
         dry_run: bool,
+        /// Emit JSON instead of text
+        #[arg(long)]
+        json: bool,
+    },
+    /// Read or clear an issue's armed re-dispatch (rung 11)
+    ///
+    /// A remediation is armed by `autopilot advance --remediate` when a
+    /// reviewer returns NEEDS CHANGES, dispatched by `autopilot lead`, and
+    /// ends by itself when the IC pushes a fix that goes green — there is
+    /// nothing to clear on the happy path. `--clear` is the human override: it
+    /// drops the record, so the Lead stops re-dispatching and the next
+    /// `advance` pass holds the PR for a human instead.
+    Remediate {
+        /// Path to the database
+        #[arg(long)]
+        db: Option<String>,
+        /// Repo identity (e.g. "owner/repo")
+        repo: String,
+        /// Issue number
+        issue: u64,
+        /// Drop the armed remediation, handing the PR back to a human
+        #[arg(long)]
+        clear: bool,
         /// Emit JSON instead of text
         #[arg(long)]
         json: bool,
@@ -843,10 +879,11 @@ impl ironmem::autopilot::review::ReviewRunner for DryRunReviewer {
 fn print_advance_report(report: &ironmem::autopilot::advance::AdvanceReport) {
     use ironmem::autopilot::advance::{AdvanceStep, Stall};
     use ironmem::autopilot::merge::MergeOutcome;
+    use ironmem::autopilot::remediate::ArmOutcome;
     use ironmem::autopilot::worktree::WorktreeRemoval;
 
     println!(
-        "Advance — {} carried forward, {} skipped, {} problem(s){}{}",
+        "Advance — {} carried forward, {} skipped, {} problem(s){}{}{}",
         report.advanced.len(),
         report.skipped.len(),
         report.problems.len(),
@@ -855,6 +892,11 @@ fn print_advance_report(report: &ironmem::autopilot::advance::AdvanceReport) {
             ""
         } else {
             " [merges rehearsed — pass --merge to execute]"
+        },
+        if report.remediate_enabled {
+            ""
+        } else {
+            " [NEEDS CHANGES held for a human — pass --remediate to re-dispatch]"
         }
     );
 
@@ -916,6 +958,40 @@ fn print_advance_report(report: &ironmem::autopilot::advance::AdvanceReport) {
                     "    review: {:?} / {:?}",
                     review.outcome.verdict, review.decision
                 ),
+            }
+        }
+        match &step.remediation {
+            None => {}
+            Some(ArmOutcome::Armed {
+                pr_number,
+                head_sha,
+                has_findings,
+            }) => {
+                println!(
+                    "    REMEDIATION armed on PR #{pr_number} at {head_sha}{} — the Lead will re-dispatch the IC to fix it",
+                    if *has_findings {
+                        ""
+                    } else {
+                        " (the reviewer gave no reason)"
+                    }
+                );
+            }
+            Some(ArmOutcome::AlreadyArmed {
+                pr_number,
+                head_sha,
+                dispatches_since,
+            }) => {
+                println!(
+                    "    remediation already in force on PR #{pr_number} at {head_sha} — {dispatches_since} attempt(s) since it was armed"
+                );
+            }
+            Some(ArmOutcome::CapReached {
+                cumulative_attempt_n,
+                attempt_cap,
+            }) => {
+                println!(
+                    "    remediation EXHAUSTED ({cumulative_attempt_n}/{attempt_cap} attempts) — the PR stays open for a human"
+                );
             }
         }
         if let Some(exec) = &step.merge {
@@ -2298,6 +2374,8 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                 repos,
                 worktree_root,
                 merge,
+                remediate,
+                attempt_cap,
                 strategy,
                 delete_branch,
                 model,
@@ -2335,6 +2413,9 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                     max_advances_per_pass: max_advances
                         .unwrap_or(ironmem::autopilot::advance::DEFAULT_MAX_ADVANCES_PER_PASS),
                     merge,
+                    remediate,
+                    attempt_cap: attempt_cap
+                        .unwrap_or(ironmem::autopilot::run::DEFAULT_ATTEMPT_CAP),
                     strategy,
                     delete_branch,
                     dry_run,
@@ -2618,6 +2699,97 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                 }
                 Ok(())
             }
+            AutopilotCmd::Remediate {
+                db,
+                repo,
+                issue,
+                clear,
+                json,
+            } => {
+                use ironmem::autopilot::remediate;
+
+                let database = open_migrated_db(db)?;
+                let issue_ref = ironmem::autopilot::IssueRef::new(repo, issue);
+
+                if clear {
+                    let dropped = remediate::clear_remediation(&database, &issue_ref)?;
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "issue": issue_ref.canonical(),
+                                "cleared": dropped,
+                            }))?
+                        );
+                    } else if dropped {
+                        println!(
+                            "{}: remediation cleared — the Lead will stop re-dispatching, and \
+the next advance pass holds the PR for a human",
+                            issue_ref.canonical()
+                        );
+                    } else {
+                        println!(
+                            "{}: nothing to clear, no remediation was armed",
+                            issue_ref.canonical()
+                        );
+                    }
+                    return Ok(());
+                }
+
+                // Both are reported, because they answer different questions.
+                // `record` is what was armed; `active` is whether it is still
+                // in force, which is derived from whether a newer success has
+                // landed since. An armed record that is no longer active means
+                // the IC pushed the fix and rung 10 will review the new head.
+                let record = remediate::get_remediation(&database, &issue_ref)?;
+                let active = remediate::active_remediation(&database, &issue_ref)?.is_some();
+
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "issue": issue_ref.canonical(),
+                            "armed": record.is_some(),
+                            "in_force": active,
+                            "pr_number": record.as_ref().map(|r| r.pr_number),
+                            "head_sha": record.as_ref().map(|r| r.head_sha.clone()),
+                            "armed_at": record.as_ref().map(|r| r.armed_at.clone()),
+                            "armed_after_attempts": record
+                                .as_ref()
+                                .map(|r| r.armed_after_attempts),
+                            "has_findings": record
+                                .as_ref()
+                                .is_some_and(|r| r.findings.is_some()),
+                            "findings": record.as_ref().and_then(|r| r.findings.clone()),
+                        }))?
+                    );
+                } else {
+                    match record {
+                        None => println!("{}: no remediation armed", issue_ref.canonical()),
+                        Some(record) => {
+                            println!(
+                                "{issue}: remediation {state} — PR #{pr} at {sha}, armed {at} \
+after {n} attempt(s)",
+                                issue = issue_ref.canonical(),
+                                state = if active {
+                                    "IN FORCE"
+                                } else {
+                                    "superseded (a newer success has landed)"
+                                },
+                                pr = record.pr_number,
+                                sha = record.head_sha,
+                                at = record.armed_at,
+                                n = record.armed_after_attempts,
+                            );
+                            match record.findings.as_deref() {
+                                Some(findings) => println!("  the reviewer said: {findings}"),
+                                None => println!("  the reviewer recorded no reason"),
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            }
             AutopilotCmd::Timeout {
                 db,
                 repo,
@@ -2882,6 +3054,59 @@ mod tests {
             }
             _ => panic!("expected Commands::Autopilot(Advance), got a different variant"),
         }
+    }
+
+    #[test]
+    fn autopilot_advance_does_not_remediate_unless_asked() {
+        // Rung 11 re-opens work a human may believe is finished, on a branch
+        // a human may be reading. Forgetting the flag must leave rung 10's
+        // behaviour exactly as it was: hold the PR for a human.
+        let cli = Cli::try_parse_from([
+            "ironmem",
+            "autopilot",
+            "advance",
+            "--repo",
+            "owner/repo=/tmp/checkout",
+        ])
+        .expect("expected argv to parse");
+        match cli.command {
+            Commands::Autopilot {
+                cmd:
+                    AutopilotCmd::Advance {
+                        remediate,
+                        attempt_cap,
+                        ..
+                    },
+            } => {
+                assert!(!remediate, "re-dispatching is opt-in");
+                assert_eq!(attempt_cap, None, "the default lives in the module");
+            }
+            _ => panic!("expected Commands::Autopilot(Advance), got a different variant"),
+        }
+    }
+
+    #[test]
+    fn autopilot_remediate_names_one_issue_and_defaults_to_reading() {
+        // `--clear` is the human override; without it the command reads.
+        let cli = Cli::try_parse_from(["ironmem", "autopilot", "remediate", "owner/repo", "7"])
+            .expect("expected argv to parse");
+        match cli.command {
+            Commands::Autopilot {
+                cmd:
+                    AutopilotCmd::Remediate {
+                        repo, issue, clear, ..
+                    },
+            } => {
+                assert_eq!(repo, "owner/repo");
+                assert_eq!(issue, 7);
+                assert!(!clear, "reading is the default; clearing is deliberate");
+            }
+            _ => panic!("expected Commands::Autopilot(Remediate), got a different variant"),
+        }
+        assert!(
+            Cli::try_parse_from(["ironmem", "autopilot", "remediate", "owner/repo"]).is_err(),
+            "a remediation belongs to one issue, and there is nothing to guess from"
+        );
     }
 
     #[test]

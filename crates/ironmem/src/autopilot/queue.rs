@@ -81,8 +81,8 @@ use super::gh::IssueListing;
 use super::labels::{self, DispatchEligibility};
 use super::registry::{Liveness, RegistrySnapshot};
 use super::{
-    budget, dispatch_state, gate_config, lineage, merge::serialize_issue, supervise, today_utc,
-    validate_repo, AttemptOutcome, IssueRef,
+    budget, dispatch_state, gate_config, lineage, merge::serialize_issue, remediate, supervise,
+    today_utc, validate_repo, AttemptOutcome, IssueRef,
 };
 use crate::db::schema::Database;
 use crate::error::MemoryError;
@@ -297,7 +297,16 @@ pub enum DeferReason {
     RepoNotApproved,
     /// Rung 6's label eligibility said no.
     NotEligible { eligibility: DispatchEligibility },
-    /// Lineage already records a success.
+    /// Lineage already records a success, and no reviewer has asked for
+    /// changes to it.
+    ///
+    /// Both halves matter. This was the queue's one permanent dead end until
+    /// rung 10 gave it an exit forward (`autopilot advance` reviews and merges
+    /// the PR) and rung 11 gave it an exit back
+    /// ([`super::remediate::active_remediation`] re-opens it on a
+    /// `needs_changes` verdict). A succeeded issue with a remediation in force
+    /// is **not** deferred here — it is dispatched, under the same attempt cap
+    /// as any other work.
     AlreadySucceeded,
     /// The per-issue attempt cap is spent.
     AttemptCapReached { cumulative_attempt_n: u32 },
@@ -417,9 +426,17 @@ pub fn plan_queue(
             }
 
             let status = lineage::get_issue_status(db, &issue)?;
-            if status
-                .as_ref()
-                .is_some_and(|s| s.best_verdict == Some(AttemptOutcome::Success))
+            // A recorded success ends the issue — unless rung 11 has re-opened
+            // it. A reviewer's `needs_changes` verdict is the spec's own reason
+            // to dispatch a succeeded issue again ("re-dispatch the IC to fix,
+            // counting against the same per-issue attempt cap"), and the cap
+            // check immediately below is what keeps that bounded rather than
+            // endless — it is deliberately *not* skipped for a remediation.
+            let remediation_in_force = remediate::active_remediation(db, &issue)?.is_some();
+            if !remediation_in_force
+                && status
+                    .as_ref()
+                    .is_some_and(|s| s.best_verdict == Some(AttemptOutcome::Success))
             {
                 defer(DeferReason::AlreadySucceeded);
                 continue;
@@ -668,6 +685,151 @@ mod tests {
             },
         )
         .unwrap();
+    }
+
+    /// Arm a remediation on an issue whose success is recorded at `commit`.
+    fn arm(db: &Database, issue: &IssueRef, commit: Option<&str>, cap: u32) {
+        lineage::upsert_issue_status(
+            db,
+            &lineage::IssueStatus {
+                issue: issue.clone(),
+                cumulative_attempt_n: 1,
+                best_verdict: Some(AttemptOutcome::Success),
+                best_commit_sha: commit.map(str::to_string),
+            },
+        )
+        .unwrap();
+        let outcome = remediate::arm_remediation(
+            db,
+            &remediate::ArmRequest {
+                issue,
+                pr_number: 7,
+                head_sha: commit.unwrap_or("abc123"),
+                findings: Some("the retry loop is unbounded"),
+                attempt_cap: cap,
+            },
+        )
+        .unwrap();
+        assert!(outcome.in_force(), "test setup did not arm: {outcome:?}");
+    }
+
+    #[test]
+    fn a_succeeded_issue_with_a_remediation_in_force_is_dispatched() {
+        // The spec's red path: "re-dispatch the IC to fix, counting against
+        // the same per-issue attempt cap". Without this the reviewer's
+        // findings reach nobody and rung 11 is a drawer nothing reads.
+        let db = approved(&[REPO]);
+        let issue = IssueRef::new(REPO, 1);
+        arm(&db, &issue, Some("abc123"), 5);
+
+        let plan = plan_queue(
+            &db,
+            &[backlog(REPO, vec![ready(1)])],
+            &empty_registry(),
+            &config(),
+        )
+        .unwrap();
+        assert_eq!(
+            numbers(&plan),
+            vec![1],
+            "a succeeded issue a reviewer objected to is dispatchable again"
+        );
+    }
+
+    #[test]
+    fn a_succeeded_issue_is_still_deferred_when_no_remediation_is_armed() {
+        // Rung 10's behaviour, unchanged. The new exit is narrow on purpose.
+        let db = approved(&[REPO]);
+        put_status(&db, &IssueRef::new(REPO, 1), 1, true);
+        let plan = plan_queue(
+            &db,
+            &[backlog(REPO, vec![ready(1)])],
+            &empty_registry(),
+            &config(),
+        )
+        .unwrap();
+        assert_eq!(reason_for(&plan, 1), DeferReason::AlreadySucceeded);
+    }
+
+    #[test]
+    fn a_remediation_does_not_exempt_an_issue_from_the_attempt_cap() {
+        // The bound the spec names. A remediation that skipped the cap would
+        // re-dispatch a stuck issue forever at $2.50 an attempt, and the
+        // "on exhaustion the PR stays open for a human" half would never
+        // arrive.
+        let db = approved(&[REPO]);
+        let issue = IssueRef::new(REPO, 1);
+        let mut cfg = config();
+        cfg.attempt_cap = 5;
+        arm(&db, &issue, Some("abc123"), 5);
+        // Five attempts spent since.
+        put_status(&db, &issue, 5, true);
+
+        let plan = plan_queue(
+            &db,
+            &[backlog(REPO, vec![ready(1)])],
+            &empty_registry(),
+            &cfg,
+        )
+        .unwrap();
+        assert_eq!(
+            reason_for(&plan, 1),
+            DeferReason::AttemptCapReached {
+                cumulative_attempt_n: 5
+            }
+        );
+    }
+
+    #[test]
+    fn a_remediation_superseded_by_a_newer_success_stops_dispatching() {
+        // The IC pushed the fix and it went green: rung 10 reviews the new
+        // head, and the Lead must stop re-dispatching against findings that
+        // have already been addressed.
+        let db = approved(&[REPO]);
+        let issue = IssueRef::new(REPO, 1);
+        arm(&db, &issue, Some("abc123"), 5);
+        put_status(&db, &issue, 2, true);
+        lineage::upsert_issue_status(
+            &db,
+            &lineage::IssueStatus {
+                issue: issue.clone(),
+                cumulative_attempt_n: 2,
+                best_verdict: Some(AttemptOutcome::Success),
+                best_commit_sha: Some("def456".to_string()),
+            },
+        )
+        .unwrap();
+
+        let plan = plan_queue(
+            &db,
+            &[backlog(REPO, vec![ready(1)])],
+            &empty_registry(),
+            &config(),
+        )
+        .unwrap();
+        assert_eq!(reason_for(&plan, 1), DeferReason::AlreadySucceeded);
+    }
+
+    #[test]
+    fn a_remediation_does_not_override_a_human_who_blocked_the_issue() {
+        // Label eligibility is checked before the success test and stays
+        // there: `agent:blocked` is a human taking the issue back, and a
+        // reviewer's objection is not authority to overrule that.
+        let db = approved(&[REPO]);
+        let issue = IssueRef::new(REPO, 1);
+        arm(&db, &issue, Some("abc123"), 5);
+
+        let plan = plan_queue(
+            &db,
+            &[backlog(REPO, vec![listing(1, &["agent:blocked"])])],
+            &empty_registry(),
+            &config(),
+        )
+        .unwrap();
+        assert!(
+            matches!(reason_for(&plan, 1), DeferReason::NotEligible { .. }),
+            "a human's block outranks a reviewer's objection"
+        );
     }
 
     fn numbers(plan: &QueuePlan) -> Vec<u64> {
