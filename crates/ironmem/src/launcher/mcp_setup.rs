@@ -166,6 +166,99 @@ pub(crate) fn ensure_json_mcpservers_registered(
     ensure_claude_registered(config_path, exe, proxy_args)
 }
 
+/// Ensure an `{"id": "ironmem", ...}` entry exists in a Muse
+/// `~/.config/muse/settings.json`-shaped file, whose `mcpServers` value is an
+/// ARRAY of server objects matched by `id` (not Claude's string-keyed object).
+///
+/// Measured (Muse Code 1.0.2): the binary's embedded settings docs say
+/// "`mcpServers`: a stdio `{id, transport?, command}` or HTTP
+/// `{id, transport:\"http\", url}` entry ...", with `env`, `framing`,
+/// `headers` alongside; a live `~/.config/muse/settings.json` with
+/// `schema_version: 1` was read. If a future schema turns out object-shaped
+/// like Claude's, delete this writer and route Muse through
+/// `ensure_json_mcpservers_registered` instead.
+///
+/// Idempotent; upgrades a stale bare `["serve"]` entry in place (preserving
+/// `env` and any other existing keys, mirroring `ensure_claude_registered`),
+/// preserves sibling entries and unrelated top-level keys (e.g. `theme`), and
+/// errors on malformed configs (non-object root, non-array `mcpServers`,
+/// non-object entries) instead of silently rewriting them.
+pub(crate) fn ensure_muse_registered(
+    config_path: &Path,
+    exe: &str,
+    proxy_args: &[String],
+) -> Result<RegisterOutcome, MemoryError> {
+    let mut root: serde_json::Value = if config_path.exists() {
+        let raw =
+            crate::error::read_to_string_with_path(config_path).map_err(MemoryError::Config)?;
+        serde_json::from_str(&raw)
+            .map_err(|e| MemoryError::Config(format!("parse {}: {e}", config_path.display())))?
+    } else {
+        serde_json::json!({})
+    };
+
+    let obj = root.as_object_mut().ok_or_else(|| {
+        MemoryError::Config(format!("{} is not a JSON object", config_path.display()))
+    })?;
+    let servers = obj
+        .entry("mcpServers")
+        .or_insert_with(|| serde_json::json!([]));
+    let servers = servers.as_array_mut().ok_or_else(|| {
+        MemoryError::Config(format!(
+            "mcpServers in {} is not an array",
+            config_path.display()
+        ))
+    })?;
+
+    // Clone the (small) existing entry so the borrow ends before the mutable
+    // write below; non-object entries are malformed, not skippable.
+    let mut existing_idx: Option<usize> = None;
+    let mut existing_entry: Option<serde_json::Value> = None;
+    for (i, entry) in servers.iter().enumerate() {
+        let entry_obj = entry.as_object().ok_or_else(|| {
+            MemoryError::Config(format!(
+                "mcpServers[{i}] in {} is not an object",
+                config_path.display()
+            ))
+        })?;
+        if entry_obj.get("id").and_then(|id| id.as_str()) == Some("ironmem") {
+            existing_idx = Some(i);
+            existing_entry = Some(entry.clone());
+            break;
+        }
+    }
+    let outcome = match existing_idx {
+        Some(i) => {
+            let mut entry = existing_entry.expect("index implies entry");
+            if !is_bare_serve_json(&entry) {
+                return Ok(RegisterOutcome::AlreadyRegistered);
+            }
+            // Upgrade IN PLACE: mutate only `command`/`args`, preserving
+            // `env` and any other existing keys.
+            let entry_obj = entry.as_object_mut().ok_or_else(|| {
+                MemoryError::Config(format!(
+                    "mcpServers[{i}] in {} is not an object",
+                    config_path.display()
+                ))
+            })?;
+            entry_obj.insert("command".to_string(), serde_json::json!(exe));
+            entry_obj.insert("args".to_string(), serde_json::json!(proxy_args));
+            servers[i] = entry;
+            RegisterOutcome::Upgraded
+        }
+        None => {
+            servers
+                .push(serde_json::json!({ "id": "ironmem", "command": exe, "args": proxy_args }));
+            RegisterOutcome::Registered
+        }
+    };
+
+    let pretty = serde_json::to_string_pretty(&root)
+        .map_err(|e| MemoryError::Config(format!("serialize muse config: {e}")))?;
+    write_atomic(config_path, &pretty)?;
+    Ok(outcome)
+}
+
 /// Ensure a `[mcp_servers.ironmem]` block exists in a Codex `config.toml`.
 /// Appends (never rewrites existing content) so manual edits survive.
 /// Idempotent; upgrades a stale bare `args = ["serve"]` line in place (see
@@ -533,5 +626,165 @@ mod tests {
         std::fs::write(&cfg, r#"{"mcpServers": 5}"#).unwrap();
         let err = ensure_claude_registered(&cfg, "/bin/ironmem", &test_proxy_args()).unwrap_err();
         assert!(err.to_string().contains("is not an object"), "got: {err}");
+    }
+
+    // ---- Muse array-shaped writer (array shape MEASURED; see docs above) ----
+
+    fn muse_entry(v: &serde_json::Value) -> &serde_json::Value {
+        v.get("mcpServers")
+            .and_then(|s| s.as_array())
+            .and_then(|arr| {
+                arr.iter()
+                    .find(|e| e.get("id").and_then(|id| id.as_str()) == Some("ironmem"))
+            })
+            .expect("ironmem entry must exist")
+    }
+
+    #[test]
+    fn muse_registers_into_missing_file_then_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("settings.json");
+        let proxy_args = test_proxy_args();
+
+        let first = ensure_muse_registered(&cfg, "/usr/local/bin/ironmem", &proxy_args).unwrap();
+        assert_eq!(first, RegisterOutcome::Registered);
+
+        let raw = std::fs::read_to_string(&cfg).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let entry = muse_entry(&v);
+        assert_eq!(
+            entry.get("command").and_then(|c| c.as_str()),
+            Some("/usr/local/bin/ironmem")
+        );
+        assert_eq!(entry.get("args"), Some(&serde_json::json!(proxy_args)));
+
+        let second = ensure_muse_registered(&cfg, "/usr/local/bin/ironmem", &proxy_args).unwrap();
+        assert_eq!(second, RegisterOutcome::AlreadyRegistered);
+        assert_eq!(std::fs::read_to_string(&cfg).unwrap(), raw);
+    }
+
+    #[test]
+    fn muse_preserves_sibling_entries_and_top_level_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("settings.json");
+        std::fs::write(
+            &cfg,
+            r#"{"mcpServers":[{"id":"other","command":"x"}],"theme":"dark"}"#,
+        )
+        .unwrap();
+
+        let outcome = ensure_muse_registered(&cfg, "/bin/ironmem", &test_proxy_args()).unwrap();
+        assert_eq!(outcome, RegisterOutcome::Registered);
+
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(v.get("theme").and_then(|t| t.as_str()), Some("dark"));
+        let servers = v.get("mcpServers").and_then(|s| s.as_array()).unwrap();
+        assert_eq!(servers.len(), 2, "sibling entry must survive: {v}");
+        assert_eq!(
+            servers[0].get("id").and_then(|id| id.as_str()),
+            Some("other")
+        );
+        assert_eq!(
+            muse_entry(&v).get("command").and_then(|c| c.as_str()),
+            Some("/bin/ironmem")
+        );
+    }
+
+    #[test]
+    fn muse_upgrades_stale_bare_serve_entry_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("settings.json");
+        std::fs::write(
+            &cfg,
+            r#"{"mcpServers":[{"id":"other","command":"x"},{"id":"ironmem","command":"/bin/ironmem","args":["serve"]}]}"#,
+        )
+        .unwrap();
+        let proxy_args = test_proxy_args();
+
+        let outcome = ensure_muse_registered(&cfg, "/bin/ironmem", &proxy_args).unwrap();
+        assert_eq!(outcome, RegisterOutcome::Upgraded);
+
+        let raw = std::fs::read_to_string(&cfg).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            muse_entry(&v).get("args"),
+            Some(&serde_json::json!(proxy_args))
+        );
+        let servers = v.get("mcpServers").and_then(|s| s.as_array()).unwrap();
+        assert_eq!(servers.len(), 2, "upgrade must not duplicate entries");
+
+        let second = ensure_muse_registered(&cfg, "/bin/ironmem", &proxy_args).unwrap();
+        assert_eq!(second, RegisterOutcome::AlreadyRegistered);
+        assert_eq!(std::fs::read_to_string(&cfg).unwrap(), raw);
+    }
+
+    #[test]
+    fn muse_upgrade_preserves_existing_env_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("settings.json");
+        std::fs::write(
+            &cfg,
+            r#"{"mcpServers":[{"id":"ironmem","command":"/bin/ironmem","args":["serve"],"env":{"IRONMEM_MCP_MODE":"trusted"}}]}"#,
+        )
+        .unwrap();
+
+        let outcome = ensure_muse_registered(&cfg, "/bin/ironmem", &test_proxy_args()).unwrap();
+        assert_eq!(outcome, RegisterOutcome::Upgraded);
+
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(
+            muse_entry(&v)
+                .get("env")
+                .and_then(|e| e.get("IRONMEM_MCP_MODE"))
+                .and_then(|m| m.as_str()),
+            Some("trusted"),
+            "env block must survive the automatic args upgrade"
+        );
+    }
+
+    #[test]
+    fn muse_does_not_touch_a_customized_args_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("settings.json");
+        std::fs::write(
+            &cfg,
+            r#"{"mcpServers":[{"id":"ironmem","command":"/bin/ironmem","args":["serve","--custom-flag"]}]}"#,
+        )
+        .unwrap();
+        let raw_before = std::fs::read_to_string(&cfg).unwrap();
+
+        let outcome = ensure_muse_registered(&cfg, "/bin/ironmem", &test_proxy_args()).unwrap();
+        assert_eq!(outcome, RegisterOutcome::AlreadyRegistered);
+        assert_eq!(std::fs::read_to_string(&cfg).unwrap(), raw_before);
+    }
+
+    #[test]
+    fn muse_rejects_non_array_mcpservers() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("settings.json");
+        // Claude-shaped object value is malformed for the array writer.
+        std::fs::write(&cfg, r#"{"mcpServers": {"ironmem": {"command": "x"}}}"#).unwrap();
+        let err = ensure_muse_registered(&cfg, "/bin/ironmem", &test_proxy_args()).unwrap_err();
+        assert!(err.to_string().contains("is not an array"), "got: {err}");
+    }
+
+    #[test]
+    fn muse_rejects_non_object_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("settings.json");
+        std::fs::write(&cfg, "[]").unwrap();
+        let err = ensure_muse_registered(&cfg, "/bin/ironmem", &test_proxy_args()).unwrap_err();
+        assert!(err.to_string().contains("not a JSON object"), "got: {err}");
+    }
+
+    #[test]
+    fn muse_rejects_unparseable_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("settings.json");
+        std::fs::write(&cfg, "{ not valid json").unwrap();
+        let err = ensure_muse_registered(&cfg, "/bin/ironmem", &test_proxy_args()).unwrap_err();
+        assert!(err.to_string().contains("parse"), "got: {err}");
     }
 }

@@ -1,0 +1,39 @@
+{
+  "name": "ironmem",
+  "version": "0.5.1",
+  "description": "Rust MCP memory backend for Muse Code with semantic search, knowledge graph, automatic migrate-or-init bootstrap, and incremental workspace mining.",
+  "author": {
+    "name": "Jeffrey Crum"
+  },
+  "license": "Apache-2.0",
+  "mcpServers": {
+    "ironmem": {
+      "command": "bash",
+      "args": [
+        "-lc",
+        "\"${MUSE_PLUGIN_ROOT}/bin/ironmem-mcp.sh\" serve"
+      ]
+    }
+  },
+  "keywords": [
+    "memory",
+    "mcp",
+    "semantic-search",
+    "knowledge-graph",
+    "muse"
+  ],
+  "repository": "https://github.com/ironrace/ironmem",
+  "interface": {
+    "displayName": "ironmem",
+    "shortDescription": "Persistent workspace memory for Muse Code",
+    "longDescription": "Local Rust memory backend with semantic search, KG lookups, mempalace migration, initial auto-mine, and incremental updates on hooks.",
+    "developerName": "Jeffrey Crum",
+    "category": "Coding",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "brandColor": "#1C5D6B"
+  }
+}

@@ -186,13 +186,16 @@ fn autospawn_check(cfg: &Config) -> Check {
 /// Detection strategy is dispatched per harness `id`:
 /// - `"claude"` → JSON parse of `~/.claude.json`.
 /// - `"codex"` → line-match TOML via `codex_config_path`.
+/// - `"muse"` → JSON parse of `~/.config/muse/settings.json`, matching the
+///   `mcpServers` ARRAY for an `{"id": "ironmem"}` entry (array shape
+///   measured from the Muse 1.0.2 binary's embedded settings docs).
 /// - Any other id → an `Info` check noting detection is not yet implemented.
 ///
-/// Check keys are stable `"harness_<id>"` strings.  For the two production
-/// ids ("claude", "codex") the key is a string literal (`&'static str`).  For
-/// any additional id the key is produced by `Box::leak` — acceptable because
-/// `ironmem doctor` runs once per process and the leaked bytes are tiny and
-/// bounded by the (small, static) registry size.
+/// Check keys are stable `"harness_<id>"` strings.  For the known ids
+/// ("claude", "codex", "muse") the key is a string literal (`&'static str`).
+/// For any additional id the key is produced by `Box::leak` — acceptable
+/// because `ironmem doctor` runs once per process and the leaked bytes are
+/// tiny and bounded by the (small, static) registry size.
 ///
 /// Takes an explicit registry slice so tests can inject a synthetic 3-entry
 /// slice without mutating global state.
@@ -200,11 +203,12 @@ fn harness_checks(home: Option<&Path>, registry: &[crate::harness::HarnessSpec])
     registry
         .iter()
         .map(|spec| {
-            // Stable check key: literal for the two known production ids;
-            // Box::leak for any additional registry entry (see doc comment).
+            // Stable check key: literal for the known ids; Box::leak for any
+            // additional registry entry (see doc comment).
             let key: &'static str = match spec.id {
                 "claude" => "harness_claude",
                 "codex" => "harness_codex",
+                "muse" => "harness_muse",
                 other => Box::leak(format!("harness_{other}").into_boxed_str()),
             };
 
@@ -216,6 +220,7 @@ fn harness_checks(home: Option<&Path>, registry: &[crate::harness::HarnessSpec])
                         with_proxy_wiring_note(
                             harness_check(key, spec.display_name, &path, state.clone()),
                             &state,
+                            "claude",
                             || claude_proxy_wiring(&path),
                         )
                     }
@@ -231,7 +236,25 @@ fn harness_checks(home: Option<&Path>, registry: &[crate::harness::HarnessSpec])
                         with_proxy_wiring_note(
                             harness_check(key, spec.display_name, &path, state.clone()),
                             &state,
+                            "codex",
                             || codex_proxy_wiring(&path),
+                        )
+                    }
+                    None => Check::new(
+                        key,
+                        CheckStatus::Info,
+                        format!("{}: home directory unknown, skipped", spec.display_name),
+                    ),
+                },
+                "muse" => match home {
+                    Some(h) => {
+                        let path = h.join(".config").join("muse").join("settings.json");
+                        let state = detect_muse(&path);
+                        with_proxy_wiring_note(
+                            harness_check(key, spec.display_name, &path, state.clone()),
+                            &state,
+                            "muse",
+                            || muse_proxy_wiring(&path),
                         )
                     }
                     None => Check::new(
@@ -262,21 +285,26 @@ fn harness_checks(home: Option<&Path>, registry: &[crate::harness::HarnessSpec])
 fn with_proxy_wiring_note(
     mut check: Check,
     state: &HarnessState,
+    launcher: &str,
     detect_wiring: impl FnOnce() -> Option<bool>,
 ) -> Check {
     if *state == HarnessState::Registered {
         if let Some(is_wired) = detect_wiring() {
-            check.summary = format!("{}; {}", check.summary, proxy_wiring_note(is_wired));
+            check.summary = format!(
+                "{}; {}",
+                check.summary,
+                proxy_wiring_note(is_wired, launcher)
+            );
         }
     }
     check
 }
 
-fn proxy_wiring_note(is_wired: bool) -> &'static str {
+fn proxy_wiring_note(is_wired: bool, launcher: &str) -> String {
     if is_wired {
-        "wired with the shared-daemon proxy command"
+        "wired with the shared-daemon proxy command".to_string()
     } else {
-        "wired with the legacy bare `serve` command (upgrade available via `ironmem claude`/`ironmem codex`)"
+        format!("wired with the legacy bare `serve` command (upgrade available via `ironmem {launcher}`)")
     }
 }
 
@@ -310,6 +338,24 @@ fn codex_proxy_wiring(path: &Path) -> Option<bool> {
         .map(|i| i + 1)
         .unwrap_or(section.len());
     Some(section[..end].contains("--connect"))
+}
+
+/// Whether Muse's registered `ironmem` array entry uses the shared-daemon
+/// proxy command (`args[1] == "--connect"`).
+///
+/// Array shape measured (see `mcp_setup::ensure_muse_registered`). Scoped to
+/// the `id == "ironmem"` entry specifically so a sibling entry mentioning
+/// `--connect` can never produce a false positive. `None` if the config
+/// can't be read/parsed at all.
+fn muse_proxy_wiring(path: &Path) -> Option<bool> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let arr = v.get("mcpServers")?.as_array()?;
+    let entry = arr
+        .iter()
+        .find(|e| e.get("id").and_then(|id| id.as_str()) == Some("ironmem"))?;
+    let args = entry.get("args")?.as_array()?;
+    Some(args.get(1).and_then(|a| a.as_str()) == Some("--connect"))
 }
 
 fn check_binary(version: &str) -> Check {
@@ -532,6 +578,40 @@ fn detect_codex(path: &Path) -> HarnessState {
     } else {
         HarnessState::NotRegistered
     }
+}
+
+/// Resolve Muse registration from `~/.config/muse/settings.json` by matching
+/// the `mcpServers` ARRAY for an `{"id": "ironmem"}` entry.
+///
+/// Array shape and `"id"` match key measured (see
+/// `mcp_setup::ensure_muse_registered`). A present-but-non-array
+/// `mcpServers`, or a non-object array entry, reports `Malformed` rather
+/// than `NotRegistered` so a schema drift is visible instead of looking like
+/// "not installed".
+fn detect_muse(path: &Path) -> HarnessState {
+    let raw = match read_harness_config(path) {
+        Ok(raw) => raw,
+        Err(state) => return state,
+    };
+    let v: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(e) => return HarnessState::Malformed(e.to_string()),
+    };
+    let Some(servers) = v.get("mcpServers") else {
+        return HarnessState::NotRegistered;
+    };
+    let Some(arr) = servers.as_array() else {
+        return HarnessState::Malformed("mcpServers is not an array".into());
+    };
+    for entry in arr {
+        let Some(obj) = entry.as_object() else {
+            return HarnessState::Malformed("mcpServers entry is not an object".into());
+        };
+        if obj.get("id").and_then(|id| id.as_str()) == Some("ironmem") {
+            return HarnessState::Registered;
+        }
+    }
+    HarnessState::NotRegistered
 }
 
 /// Build the harness [`Check`] from a resolved [`HarnessState`]. `label` is the
@@ -801,6 +881,71 @@ mod tests {
     }
 
     #[test]
+    fn detect_muse_classifies_every_state() {
+        // Array shape MEASURED (see detect_muse docs).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        assert_eq!(detect_muse(&path), HarnessState::Absent);
+        std::fs::write(
+            &path,
+            r#"{"mcpServers":[{"id":"ironmem","command":"ironmem","args":["serve"]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(detect_muse(&path), HarnessState::Registered);
+        std::fs::write(&path, r#"{"mcpServers":[{"id":"other","command":"x"}]}"#).unwrap();
+        assert_eq!(detect_muse(&path), HarnessState::NotRegistered);
+        // Missing mcpServers key is "not registered", not malformed.
+        std::fs::write(&path, r#"{"theme":"dark"}"#).unwrap();
+        assert_eq!(detect_muse(&path), HarnessState::NotRegistered);
+        // Claude-shaped object value is malformed for the array detector.
+        std::fs::write(&path, r#"{"mcpServers":{"ironmem":{"command":"x"}}}"#).unwrap();
+        assert!(matches!(detect_muse(&path), HarnessState::Malformed(_)));
+        // Malformed JSON must be distinguished from "not registered".
+        std::fs::write(&path, "{ not valid json").unwrap();
+        assert!(matches!(detect_muse(&path), HarnessState::Malformed(_)));
+    }
+
+    #[test]
+    fn muse_proxy_wiring_is_scoped_to_the_ironmem_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        // A sibling entry with --connect must not leak into ironmem's verdict.
+        std::fs::write(
+            &path,
+            r#"{"mcpServers":[{"id":"other","command":"x","args":["serve","--connect","/tmp/o.sock"]},{"id":"ironmem","command":"ironmem","args":["serve"]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(muse_proxy_wiring(&path), Some(false));
+        std::fs::write(
+            &path,
+            r#"{"mcpServers":[{"id":"ironmem","command":"ironmem","args":["serve","--connect","/tmp/d.sock"]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(muse_proxy_wiring(&path), Some(true));
+        // No ironmem entry at all: no verdict.
+        std::fs::write(&path, r#"{"mcpServers":[]}"#).unwrap();
+        assert_eq!(muse_proxy_wiring(&path), None);
+    }
+
+    #[test]
+    fn harness_muse_check_key_is_a_literal() {
+        // The muse registry row must surface as harness_muse (literal key,
+        // not Box::leak) with real detection behind it.
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let checks = harness_checks(Some(home), crate::harness::REGISTRY);
+        let muse = checks
+            .iter()
+            .find(|c| c.name == "harness_muse")
+            .expect("harness_muse check must exist");
+        assert_eq!(
+            muse.status,
+            CheckStatus::Info,
+            "absent config is Info: {muse:?}"
+        );
+    }
+
+    #[test]
     fn harness_check_maps_states_to_statuses() {
         let p = Path::new("/tmp/example-config");
         let cases = [
@@ -888,9 +1033,11 @@ mod tests {
                 "harness_codex",
                 // grok + gemini added to REGISTRY by #190 Task 11 (scaffolding
                 // only; detection is "not yet implemented" -> Info, same as
-                // any registry entry beyond claude/codex).
+                // any registry entry beyond claude/codex/muse).
                 "harness_grok",
                 "harness_gemini",
+                // muse: literal key with real array-shape detection.
+                "harness_muse",
             ],
             "the toolable check-key set must stay stable"
         );

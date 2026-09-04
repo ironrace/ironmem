@@ -37,6 +37,7 @@ pub enum Harness {
     Codex,
     Grok,
     Gemini,
+    Muse,
 }
 
 impl Harness {
@@ -48,6 +49,7 @@ impl Harness {
             Harness::Codex => "codex",
             Harness::Grok => "grok",
             Harness::Gemini => "gemini",
+            Harness::Muse => "muse",
         }
     }
 
@@ -147,14 +149,26 @@ fn grok_config_path() -> Result<PathBuf, MemoryError> {
     Ok(home.join(".grok").join("settings.json"))
 }
 
+/// Resolve the Muse config path: `~/.config/muse/settings.json`.
+///
+/// Measured: a live `~/.config/muse/settings.json` with `schema_version: 1`
+/// was read on the Muse Code 1.0.2 host.
+fn muse_config_path() -> Result<PathBuf, MemoryError> {
+    let home = dirs::home_dir()
+        .ok_or_else(|| MemoryError::Config("cannot determine home directory".into()))?;
+    Ok(home.join(".config").join("muse").join("settings.json"))
+}
+
 /// Ensure the ironmem MCP server is registered for `harness`, idempotently.
 ///
 /// Registers the shared-daemon proxy command (`harness::proxy_command_args` —
 /// `["serve", "--connect", <socket>]`), the canonical invocation every
 /// harness should converge on (#190 Task 11/12). Claude, Gemini CLI, and
 /// (best-effort) Grok CLI all share the same `mcpServers`-JSON config shape,
-/// so all three route through `ensure_json_mcpservers_registered`; only Codex
-/// uses a different (TOML) format.
+/// so all three route through `ensure_json_mcpservers_registered`; Codex uses
+/// a different (TOML) format, and Muse uses an array-shaped `mcpServers`
+/// writer (`ensure_muse_registered` — array shape measured from the Muse
+/// binary's embedded settings docs).
 fn register(harness: Harness) -> Result<mcp_setup::RegisterOutcome, MemoryError> {
     let exe = std::env::current_exe()
         .map_err(|e| MemoryError::Config(format!("cannot resolve ironmem path: {e}")))?;
@@ -174,6 +188,7 @@ fn register(harness: Harness) -> Result<mcp_setup::RegisterOutcome, MemoryError>
         Harness::Grok => {
             mcp_setup::ensure_json_mcpservers_registered(&grok_config_path()?, &exe, &proxy_args)
         }
+        Harness::Muse => mcp_setup::ensure_muse_registered(&muse_config_path()?, &exe, &proxy_args),
     }
 }
 
@@ -326,6 +341,32 @@ mod tests {
             crate::harness::by_id(Harness::Gemini.harness_id(), crate::harness::REGISTRY)
                 .expect("gemini must be in REGISTRY");
         assert_eq!(gemini_spec.id, "gemini");
+    }
+
+    /// Muse launcher resolves from the registry exactly the way Claude/Codex
+    /// (and Grok/Gemini scaffolding) already do — one registry row, one
+    /// `harness_id` mapping, everything else derived. Measured: the `muse`
+    /// binary runs (`muse --help`, 1.0.2) and the product names itself
+    /// "Muse Code" (startup banner + embedded identity string).
+    #[test]
+    fn muse_harness_resolves_from_registry() {
+        assert_eq!(Harness::Muse.harness_id(), "muse");
+        assert_eq!(Harness::Muse.binary(), "muse");
+        assert_eq!(Harness::Muse.label(), "Muse Code");
+        let spec = crate::harness::by_id(Harness::Muse.harness_id(), crate::harness::REGISTRY)
+            .expect("muse must be in REGISTRY");
+        assert_eq!(spec.id, "muse");
+    }
+
+    #[test]
+    fn muse_config_path_defaults_to_xdg_muse_settings() {
+        // Measured: live ~/.config/muse/settings.json read (see docs).
+        let path = muse_config_path().unwrap();
+        assert!(
+            path.ends_with(".config/muse/settings.json"),
+            "got: {}",
+            path.display()
+        );
     }
 
     #[test]

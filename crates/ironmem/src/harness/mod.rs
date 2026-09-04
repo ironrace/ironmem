@@ -218,6 +218,34 @@ pub const REGISTRY: &[HarnessSpec] = &[
         occupancy_support: false,
         transcript_parser: TranscriptParserKind::None,
     },
+    HarnessSpec {
+        id: "muse",
+        display_name: "Muse Code",
+        binary: "muse",
+        rules_file: "MUSE.md",
+        rules_strategy: RulesStrategy::Import {
+            directive: "@AGENTS.md",
+        },
+        // Measured (Muse Code 1.0.2, `muse-bin-1.0.2-R2040.1` strings + a live
+        // `~/.config/muse/settings.json` read): MCP-over-stdio client
+        // (`initialize`/`clientInfo`/`capabilities`/`protocolVersion
+        // 2024-11-05`), `schema_version: 1` settings at
+        // `~/.config/muse/settings.json`, and an ARRAY-shaped `mcpServers`
+        // of `{id, transport?, command}` / `{id, transport:"http", url}`
+        // entries (embedded docs quote). Scaffolding remainder: `muse` is
+        // not yet a default write-rules target, `.muse-plugin/` packaging is
+        // a minimal stand-in, and `client_info_aliases: &["muse"]` is a
+        // best-effort default — the exact wire `clientInfo.name` was never
+        // captured (binary internals are `tbh`/`musecode`-named, so do NOT
+        // assume it contains "muse"). Narrow the aliases to a captured wire
+        // value before relying on MCP session attribution.
+        write_rules_default: false,
+        client_info_aliases: &["muse"],
+        env_aliases: &["muse"],
+        additional_context_support: false,
+        occupancy_support: false,
+        transcript_parser: TranscriptParserKind::None,
+    },
 ];
 
 // ---------------------------------------------------------------------------
@@ -431,6 +459,33 @@ mod tests {
         assert!(!spec.additional_context_support);
         assert!(spec.occupancy_support);
         assert_eq!(spec.transcript_parser, TranscriptParserKind::Codex);
+    }
+
+    #[test]
+    fn muse_spec_values_are_scaffolding_defaults() {
+        // Transport, config path, and the mcpServers array shape are MEASURED
+        // (see the registry-row comment); the remaining values are
+        // best-effort scaffolding defaults. If a field gets measured later,
+        // update this test to assert the measured value.
+        let spec = by_id("muse", REGISTRY).expect("muse must be in REGISTRY");
+        assert_eq!(spec.id, "muse");
+        assert_eq!(spec.display_name, "Muse Code");
+        assert_eq!(spec.binary, "muse");
+        assert_eq!(spec.rules_file, "MUSE.md");
+        assert_eq!(
+            spec.rules_strategy,
+            RulesStrategy::Import {
+                directive: "@AGENTS.md"
+            }
+        );
+        assert!(!spec.write_rules_default);
+        assert_eq!(spec.client_info_aliases, &["muse"]);
+        assert_eq!(spec.env_aliases, &["muse"]);
+        assert!(!spec.additional_context_support);
+        assert!(!spec.occupancy_support);
+        assert_eq!(spec.transcript_parser, TranscriptParserKind::None);
+        assert_eq!(canonicalize_input("muse", REGISTRY), Some("muse"));
+        assert_eq!(classify_client_info("muse", REGISTRY), Some("muse"));
     }
 
     // ---- HarnessId construction --------------------------------------------
@@ -777,17 +832,22 @@ mod tests {
     // ---- registry_json / registry_text ------------------------------------
 
     #[test]
-    fn registry_json_parses_as_four_entry_array() {
+    fn registry_json_parses_as_five_entry_array() {
         let json = registry_json(REGISTRY).expect("serialization must succeed");
         let val: serde_json::Value =
             serde_json::from_str(&json).expect("output must be valid JSON");
         let arr = val.as_array().expect("top-level must be an array");
-        assert_eq!(arr.len(), 4, "claude, codex, grok, gemini (#190 Task 11)");
+        assert_eq!(
+            arr.len(),
+            5,
+            "claude, codex, grok, gemini (#190 Task 11), muse"
+        );
         let ids: Vec<&str> = arr.iter().filter_map(|e| e["id"].as_str()).collect();
         assert!(ids.contains(&"claude"), "must contain claude entry");
         assert!(ids.contains(&"codex"), "must contain codex entry");
         assert!(ids.contains(&"grok"), "must contain grok entry");
         assert!(ids.contains(&"gemini"), "must contain gemini entry");
+        assert!(ids.contains(&"muse"), "must contain muse entry");
     }
 
     #[test]

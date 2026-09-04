@@ -329,6 +329,53 @@ fn grok_launcher_registers_mcp_server_by_default() {
     );
 }
 
+/// Muse launcher acceptance: resolves from the registry and registers the
+/// shared-daemon proxy command through the array-shaped `mcpServers` writer
+/// (array shape measured from the Muse 1.0.2 binary's embedded settings docs).
+#[test]
+fn muse_launcher_registers_mcp_server_by_default() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let db_path = temp.path().join("memory.sqlite3");
+    let bin_dir = temp.path().join("bin");
+    let repo = temp.path().join("repo");
+    let record = temp.path().join("rec");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join("README.md"), "# repo\ncontent to mine").unwrap();
+    write_stub(&bin_dir, "muse", &record, 0);
+
+    let out = launcher_command(&home, &db_path, &bin_dir)
+        .arg("muse")
+        .arg(&repo)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "muse launcher failed: {out:?}");
+    assert!(std::fs::metadata(format!("{}.cwd", record.display())).is_ok());
+
+    let cfg_path = home.join(".config").join("muse").join("settings.json");
+    let cfg = std::fs::read_to_string(&cfg_path)
+        .unwrap_or_else(|e| panic!("launcher should create {}: {e}", cfg_path.display()));
+    let v: serde_json::Value = serde_json::from_str(&cfg).unwrap();
+    let servers = v
+        .get("mcpServers")
+        .and_then(|s| s.as_array())
+        .expect("mcpServers must be an array");
+    let server = servers
+        .iter()
+        .find(|e| e.get("id").and_then(|id| id.as_str()) == Some("ironmem"))
+        .expect("ironmem MCP server should be registered");
+    let expected_socket = home
+        .join(".ironrace-memory")
+        .join("hook_state")
+        .join("daemon.sock");
+    assert_eq!(
+        server["args"],
+        serde_json::json!(["serve", "--connect", expected_socket.display().to_string()])
+    );
+}
+
 /// Same acceptance for the gemini launcher.
 #[test]
 fn gemini_launcher_registers_mcp_server_by_default() {
