@@ -839,7 +839,24 @@ fn advance_issue(
     // right answer only once the automation has given up, which is exactly
     // what `ArmOutcome::CapReached` reports — and it is not `in_force`, so it
     // falls through to the real merge and the human is told.
-    let remediation_in_force = remediation.as_ref().is_some_and(ArmOutcome::in_force);
+    //
+    // Confirmed against [`remediate::active_remediation`] rather than taken
+    // from `ArmOutcome` alone, because the two answer different questions and
+    // can disagree. `ArmOutcome::AlreadyArmed` says only *"a record exists for
+    // this (pr, commit)"*; `active_remediation` is the definition the Lead's
+    // `plan_queue` and `run_issue` actually dispatch from, and it also asks
+    // whether a newer success has superseded the record. An IC that commits
+    // locally and fails to push moves `best_commit_sha` past `armed_at_commit`
+    // while the PR head stays exactly where the reviewer left it: the Lead
+    // then defers `AlreadySucceeded` and never re-dispatches, while this
+    // module would answer `AlreadyArmed` and rehearse the merge on every pass
+    // for ever — an issue neither merged, nor re-opened, nor handed to a
+    // human, and `took_a_step` charges nothing for saying so. Reading the same
+    // function the Lead reads keeps the rehearsal tied to a re-dispatch that
+    // will actually happen, and lets the exhausted case reach rung 6's real
+    // hold.
+    let remediation_in_force = remediation.as_ref().is_some_and(ArmOutcome::in_force)
+        && remediate::active_remediation(db, &candidate.issue)?.is_some();
     let merge_dry_run = config.dry_run || !config.merge || remediation_in_force;
     let execution = merge::execute_merge(
         db,
@@ -1814,6 +1831,84 @@ and no `agent:blocked` comment is posted, or the Lead never sees the issue again
     }
 
     #[test]
+    fn the_cap_is_reached_while_a_remediation_is_still_in_force_and_the_human_is_told() {
+        // The ordinary way an unproductive remediation ends, and the one the
+        // record itself can hide. The issue has spent its attempts, so nothing
+        // will re-dispatch it — but its remediation record is still *active*
+        // (no newer success has landed), so a `remediation_in_force` derived
+        // from `active_remediation` alone would rehearse the merge for ever
+        // and rung 6's hold would never comment or label. `CapReached` is not
+        // `in_force`, and that is what keeps the human reachable.
+        //
+        // `an_issue_at_its_attempt_cap_falls_through_to_the_human_hold` does
+        // not cover this: it has no remediation record at all, so both
+        // spellings agree there.
+        let db = approved_db();
+        record_success(&db, &issue(), Some(GREEN));
+        reviewed_at_needing_changes(&db, &issue(), 322, GREEN);
+        remediate::arm_remediation(
+            &db,
+            &ArmRequest {
+                issue: &issue(),
+                pr_number: 322,
+                head_sha: GREEN,
+                findings: Some("the retry loop is unbounded"),
+                attempt_cap: 5,
+            },
+        )
+        .unwrap();
+        // The remediation dispatches spent the cap and never fixed it. Same
+        // commit, so the remediation is still in force.
+        lineage::upsert_issue_status(
+            &db,
+            &IssueStatus {
+                issue: issue(),
+                best_verdict: Some(AttemptOutcome::Success),
+                best_commit_sha: Some(GREEN.to_string()),
+                cumulative_attempt_n: 5,
+            },
+        )
+        .unwrap();
+        assert!(
+            remediate::active_remediation(&db, &issue())
+                .unwrap()
+                .is_some(),
+            "test setup: the record must still be active, or this proves nothing"
+        );
+
+        let (repo, roots) = checkout_with_worktree();
+        let mut gh = ScriptedGh::new(vec![
+            ok(&issue_list_json(
+                283,
+                &["agent:ready", "risk:documentation"],
+            )),
+            ok(&pr_list_json(322, GREEN)),
+            ok(&pr_view_json(GREEN)),
+            ok(r#"{"labels":[{"name":"agent:ready"}]}"#),
+            ok(""),
+            ok(""),
+            ok(""),
+        ]);
+        let mut config = config(roots.path(), repo.path());
+        config.merge = true;
+        config.remediate = true;
+        config.attempt_cap = 5;
+
+        let report = advance_pass(&db, &mut gh, &mut ForbiddenReviewer, &config).unwrap();
+        let advanced = &report.advanced[0];
+        assert!(
+            matches!(advanced.remediation, Some(ArmOutcome::CapReached { .. })),
+            "got {:?}",
+            advanced.remediation
+        );
+        assert!(
+            advanced.merge.as_ref().unwrap().commented,
+            "an exhausted issue reaches rung 6's real hold even with an active \
+remediation record — otherwise the PR sits open and nobody is ever told"
+        );
+    }
+
+    #[test]
     fn a_needs_changes_about_a_commit_that_is_no_longer_the_head_arms_nothing() {
         // A verdict objects to the commit it read, and this is the case where
         // that matters: two `needs_changes` reviews, then a force-push back
@@ -1945,6 +2040,66 @@ and no `agent:blocked` comment is posted, or the Lead never sees the issue again
             ),
             "got {:?}",
             second.advanced[0].remediation
+        );
+    }
+
+    #[test]
+    fn a_superseded_remediation_stops_rehearsing_and_reaches_the_human_hold() {
+        // `ArmOutcome::AlreadyArmed` and `active_remediation` answer different
+        // questions, and this is the state where they disagree: the IC
+        // committed locally and never pushed, so `best_commit_sha` moved to
+        // MOVED while the PR's head stayed at GREEN, where the reviewer left
+        // it. The Lead reads `active_remediation`, sees a newer success, and
+        // defers `AlreadySucceeded` — nothing will ever re-dispatch this
+        // issue. Rehearsing the merge on `AlreadyArmed` alone would then hold
+        // the PR open, un-commented and unlabelled, on every pass for ever,
+        // and `took_a_step` would charge nothing for the repetition.
+        let db = approved_db();
+        record_success(&db, &issue(), Some(GREEN));
+        reviewed_at_needing_changes(&db, &issue(), 322, GREEN);
+        remediate::arm_remediation(
+            &db,
+            &ArmRequest {
+                issue: &issue(),
+                pr_number: 322,
+                head_sha: GREEN,
+                findings: Some("the retry loop is unbounded"),
+                attempt_cap: crate::autopilot::run::DEFAULT_ATTEMPT_CAP,
+            },
+        )
+        .unwrap();
+        // The IC's fix never reached the remote: a newer success, the same PR
+        // head.
+        record_success(&db, &issue(), Some(MOVED));
+        assert_eq!(
+            remediate::active_remediation(&db, &issue()).unwrap(),
+            None,
+            "test setup: the remediation must already be superseded"
+        );
+
+        let (repo, roots) = checkout_with_worktree();
+        let mut gh = ScriptedGh::new(vec![
+            ok(&issue_list_json(
+                283,
+                &["agent:ready", "risk:documentation"],
+            )),
+            ok(&pr_list_json(322, GREEN)),
+            ok(&pr_view_json(GREEN)),
+            ok(r#"{"labels":[{"name":"agent:ready"}]}"#),
+            ok(""),
+            ok(""),
+            ok(""),
+        ]);
+        let mut config = config(roots.path(), repo.path());
+        config.merge = true;
+        config.remediate = true;
+
+        let report = advance_pass(&db, &mut gh, &mut ForbiddenReviewer, &config).unwrap();
+        let execution = report.advanced[0].merge.as_ref().unwrap();
+        assert!(
+            execution.commented,
+            "a remediation nothing will dispatch must fall through to the real \
+hold, or the PR is stranded with nobody told"
         );
     }
 

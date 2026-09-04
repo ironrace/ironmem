@@ -789,8 +789,13 @@ enum AutopilotCmd {
     /// reviewer returns NEEDS CHANGES, dispatched by `autopilot lead`, and
     /// ends by itself when the IC pushes a fix that goes green — there is
     /// nothing to clear on the happy path. `--clear` is the human override: it
-    /// drops the record, so the Lead stops re-dispatching and the next
-    /// `advance` pass holds the PR for a human instead.
+    /// drops the record, so the Lead stops re-dispatching from the next tick.
+    ///
+    /// It does **not** opt the issue out for good. The reviewer's NEEDS
+    /// CHANGES is still the latest review of that commit, so the next
+    /// `advance --remediate` pass arms the same PR and commit again. To hand
+    /// the PR to a human for good, clear it and then either drop `--remediate`
+    /// or take the issue back with `agent:blocked`.
     Remediate {
         /// Path to the database
         #[arg(long)]
@@ -2723,9 +2728,14 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                         );
                     } else if dropped {
                         println!(
-                            "{}: remediation cleared — the Lead will stop re-dispatching, and \
-the next advance pass holds the PR for a human",
+                            "{}: remediation cleared — the Lead stops re-dispatching from the \
+next tick",
                             issue_ref.canonical()
+                        );
+                        println!(
+                            "  the reviewer's NEEDS CHANGES still stands on that commit, so the \
+next `advance --remediate` pass arms it again — drop --remediate, or label the \
+issue agent:blocked, to hand the PR to a human for good"
                         );
                     } else {
                         println!(

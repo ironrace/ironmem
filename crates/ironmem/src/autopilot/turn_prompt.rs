@@ -187,7 +187,7 @@ These answers are decisions, not suggestions — follow them:\n",
                     .to_string(),
             };
             format!(
-                "\n\nA reviewer read pull request #{pr} at commit {sha} and asked for CHANGES. This dispatch exists to address that review. It is not a fresh start on the issue: the work already on the branch is yours to fix, not to redo.\n\nThe gate below is ALREADY GREEN at commit {sha}, so running it and watching it pass proves nothing here. You are done only when the findings are addressed, the gate is still green, and you have PUSHED the result to this issue's branch. A dispatch that reports the gate met without pushing a new commit has changed nothing — the reviewer will read commit {sha} again and return the same verdict.{findings}",
+                "\n\nA reviewer read pull request #{pr} at commit {sha} and asked for CHANGES. This dispatch exists to address that review. It is not a fresh start on the issue: the work already on the branch is yours to fix, not to redo.\n\nThis branch has ALREADY MET the gate below once — that is why there is a pull request to review — so running the gate and watching it pass does not mean you are done. You are done only when the findings are addressed, the gate passes, and you have PUSHED the result to this issue's branch. A dispatch that reports the gate met without pushing a new commit has changed nothing — the reviewer will read commit {sha} again and return the same verdict.{findings}",
                 pr = brief.pr_number,
                 sha = brief.head_sha,
             )
@@ -361,11 +361,20 @@ platform limit, got {}",
     }
 
     #[test]
-    fn a_remediation_says_the_gate_is_already_green() {
+    fn a_remediation_says_why_passing_the_gate_is_not_the_job() {
         // The IC has to be told *why* passing the gate is not the job, or the
         // instruction reads as boilerplate it can satisfy the easy way.
+        //
+        // Phrased as a claim about the BRANCH, not about the reviewed commit.
+        // A remediation is only ever armed on an issue whose lineage records a
+        // success, so "this branch has met the gate once" is true by
+        // construction — whereas "the gate is green at commit X" is false
+        // whenever the head has moved past the commit the gate was green at,
+        // which is exactly the `gate_green == false` case `advance` still arms
+        // in. Telling an IC something false about its own repository is not
+        // worth the extra force of the stronger sentence.
         let text = remediation_text(Some("f"));
-        assert!(text.contains("ALREADY GREEN"));
+        assert!(text.contains("ALREADY MET the gate"));
         assert!(
             text.contains("without pushing a new commit has changed nothing"),
             "the failure mode has to be named, not implied"
@@ -379,7 +388,7 @@ platform limit, got {}",
         // remediation back into an ordinary dispatch against a green gate.
         let text = remediation_text(None);
         assert!(text.contains("asked for CHANGES"));
-        assert!(text.contains("ALREADY GREEN"));
+        assert!(text.contains("ALREADY MET the gate"));
         assert!(text.contains("addressed by a commit you have pushed to this branch"));
         assert!(text.contains("recorded no reason"));
         assert!(!text.contains("The reviewer said:"));

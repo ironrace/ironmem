@@ -257,6 +257,15 @@ pub fn get_remediation(
 /// that, and un-setting a flag that means "a human decided" is the shape rung
 /// 6's `agent:exhausted` exists to refuse.
 ///
+/// **It stops the Lead, not the next advance pass.** Deleting the record does
+/// not delete the review that caused it, and [`super::advance`] arms from that
+/// review: while `--remediate` is on, the next pass finds the same
+/// `needs_changes` at the same head and calls [`arm_remediation`] again, which
+/// arms the same `(pr_number, head_sha)` afresh and resets
+/// `armed_after_attempts`. Clearing is therefore a "stop for now", and the
+/// operator who wants the PR handed over for good must also drop `--remediate`
+/// or take the issue back with `agent:blocked` — the CLI's own output says so.
+///
 /// Idempotent: clearing an issue with no remediation is `Ok(false)`.
 pub fn clear_remediation(db: &Database, issue: &IssueRef) -> Result<bool, MemoryError> {
     let id = super::logical_drawer_id(&remediation_key(issue));

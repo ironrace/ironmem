@@ -432,12 +432,16 @@ pub fn plan_queue(
             // counting against the same per-issue attempt cap"), and the cap
             // check immediately below is what keeps that bounded rather than
             // endless — it is deliberately *not* skipped for a remediation.
-            let remediation_in_force = remediate::active_remediation(db, &issue)?.is_some();
-            if !remediation_in_force
-                && status
-                    .as_ref()
-                    .is_some_and(|s| s.best_verdict == Some(AttemptOutcome::Success))
-            {
+            //
+            // The success is tested first so `&&` short-circuits: only a
+            // succeeded issue can be deferred here, and reading the
+            // remediation drawer unconditionally cost every in-progress issue
+            // an extra drawer read plus a second read of the lineage status
+            // this line already holds — on every issue, on every tick.
+            let succeeded = status
+                .as_ref()
+                .is_some_and(|s| s.best_verdict == Some(AttemptOutcome::Success));
+            if succeeded && remediate::active_remediation(db, &issue)?.is_none() {
                 defer(DeferReason::AlreadySucceeded);
                 continue;
             }
