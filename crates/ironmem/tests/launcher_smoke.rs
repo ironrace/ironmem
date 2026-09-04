@@ -347,11 +347,12 @@ fn muse_launcher_registers_mcp_server_by_default() {
     std::fs::create_dir_all(&repo).unwrap();
     std::fs::write(repo.join("README.md"), "# repo\ncontent to mine").unwrap();
     write_stub(&bin_dir, "muse", &record, 0);
-    // The resolver honors XDG_CONFIG_HOME; clear it so this test pins the
-    // ~/.config/muse fallback deterministically.
-    std::env::remove_var("XDG_CONFIG_HOME");
 
+    // The resolver honors XDG_CONFIG_HOME; strip it from the CHILD only (as
+    // launcher_command_codex does for CODEX_HOME) so this test pins the
+    // ~/.config/muse fallback without touching the test process's own env.
     let out = launcher_command(&home, &db_path, &bin_dir)
+        .env_remove("XDG_CONFIG_HOME")
         .arg("muse")
         .arg(&repo)
         .output()

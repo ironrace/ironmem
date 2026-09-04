@@ -113,10 +113,14 @@ ignores an array `mcpServers` and then fails its own settings saves):
 `ironmem muse` already writes this form for you (and upgrades a
 pre-existing bare `["serve"]` entry in place, preserving `env` and sibling
 entries). Unrelated top-level keys (e.g. `theme`) and sibling server entries
-are preserved; a present-but-non-object `mcpServers` is reported as malformed
-rather than silently rewritten. If your file still carries an array-shaped
-`mcpServers` from an earlier ironmem version, delete the array entry and
-re-run `ironmem muse`.
+are preserved. Anything else shaped is refused rather than silently
+rewritten: a non-object `mcpServers` (including the `[{id, ...}]` array
+from the plugin-manifest docs) or a non-object `ironmem` entry makes
+`ironmem muse` stop with an "is not an object" error and `ironmem doctor`
+report the file as malformed — fix it by hand to the object form above and
+re-run. ironmem reads and writes only the `mcpServers` key; Muse also
+accepts `mcp_servers` as an alias, but ironmem does not manage that key, so
+keep the ironmem entry under `mcpServers`.
 
 The daemon is spawned automatically on first connect (single-flight) and
 shuts itself down after `IRONMEM_DAEMON_IDLE_SECS` (default 300s) of no

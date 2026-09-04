@@ -618,8 +618,12 @@ fn plugin_versions_match_cargo_toml() {
 #[test]
 fn muse_plugin_manifest_has_required_fields() {
     // Minimal structural pin for the muse manifest (mirrors the
-    // codex/claude manifest tests): an ironmem MCP server entry keyed by id
-    // in the object-shaped mcpServers Muse actually reads.
+    // codex/claude manifest tests). This is the Gemini/Grok stand-in
+    // convention — a Claude-style top-level `mcpServers` object — NOT
+    // Muse's native plugin manifest, whose contract is
+    // `compat`/`capabilities.mcpServers: [{id, transport?, command}]`
+    // (unmeasured, so not shipped; see docs/MUSE.md). When the native
+    // shape is measured and adopted, retarget this test with it.
     let manifest = read_json(".muse-plugin/plugin.json");
     assert_eq!(
         manifest["name"].as_str().unwrap_or(""),
