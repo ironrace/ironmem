@@ -81,6 +81,19 @@
 //! and why" has to stay answerable — the same reason rung 6 records every
 //! merge.
 //!
+//! Rung 11 adds an eleventh, of kind 2's shape:
+//! [`remediate::RemediationRecord`] — `logical_key` per issue, holding the
+//! reviewer's `needs_changes` findings and the PR **commit** they are about.
+//! It exists so the spec's *"NEEDS CHANGES → re-dispatch IC to fix"* arrow can
+//! be executed at all: [`remediate::active_remediation`] is the second,
+//! narrower reason [`queue::plan_queue`] and [`run::run_issue`] may dispatch an
+//! issue whose lineage records a success, and its findings fill
+//! [`turn_prompt::TurnPromptInputs::remediation`] so the IC is *told* what to
+//! fix rather than re-dispatched blind. It carries no "resolved" flag on
+//! purpose — a remediation is over when the issue records a newer success than
+//! the one it was armed against, which is a fact about the world rather than a
+//! write that can be lost.
+//!
 //! Rung 8 adds a ninth, also of kind 2's shape:
 //! [`blocked::BlockedRecord`] — `logical_key` per issue, holding the bounded
 //! question/answer history. It exists so a human's answer is **delivered**
@@ -144,6 +157,7 @@ pub mod merge;
 pub mod onboard;
 pub mod queue;
 pub mod registry;
+pub mod remediate;
 pub mod review;
 pub mod review_prompt;
 pub mod run;

@@ -1297,7 +1297,7 @@ fn last_record_for_pr(
 /// other half — a `needs_changes` recorded after a `pass` is the current
 /// answer, and picking the pass out of the history would let a re-review's
 /// finding be ignored by looking further back.
-fn latest_review_for_pr(
+pub(crate) fn latest_review_for_pr(
     db: &Database,
     issue: &IssueRef,
     pr_number: u64,

@@ -37,6 +37,23 @@ impl From<&AttemptRecord> for PriorAttempt {
     }
 }
 
+/// What a remediation dispatch is being asked to fix.
+///
+/// The mechanical half (which PR, which commit, and the instruction that the
+/// fix must be *pushed*) is separate from the optional half (what the reviewer
+/// actually said) so the two can be composed on read — rung 9's lesson 35. A
+/// reviewer that returns `needs_changes` with no reason still produces a
+/// coherent instruction; joining them at write time would make the guaranteed
+/// half loseable with the optional one.
+#[derive(Debug, Clone, Copy)]
+pub struct RemediationBrief<'a> {
+    pub pr_number: u64,
+    /// The commit the reviewer read — the one the head must move *past*.
+    pub head_sha: &'a str,
+    /// The reviewer's recorded reason, if it gave one.
+    pub findings: Option<&'a str>,
+}
+
 /// Inputs to [`render`]. Grouped into a struct, matching
 /// [`super::dispatch_state::DispatchState`]'s pattern, so the call site
 /// stays readable as fields accrue.
@@ -61,6 +78,17 @@ pub struct TurnPromptInputs<'a> {
     /// told the answer, and the IC's only rational move would be to ask it
     /// again — a loop between two halves of the same mechanism.
     pub human_answers: &'a [(String, String)],
+    /// A reviewer's `needs_changes` findings this dispatch exists to address
+    /// — rung 11's [`super::remediate::active_remediation`]. `None` for an
+    /// ordinary dispatch.
+    ///
+    /// **This changes the rendered goal condition, not just the prose.** A
+    /// remediation dispatch re-opens work whose gate is *already green* at the
+    /// reviewed commit, so the ordinary condition would be satisfied the
+    /// instant the IC ran the gate: it would report `met`, push nothing, and
+    /// the next review would read the identical commit and say the identical
+    /// thing. See [`render`]'s remediation clause.
+    pub remediation: Option<RemediationBrief<'a>>,
     /// The repo's approved gate commands, verbatim from
     /// [`super::gate_config::GateConfig::gate_commands`] — never authored
     /// separately from the approved config.
@@ -83,6 +111,20 @@ pub struct TurnPromptInputs<'a> {
 /// gate would render a vacuous condition ("...never authored separately):
 /// .") that an IC could trivially call `met` against, silently defeating
 /// this module's "one definition of done" guarantee.
+///
+/// # The remediation clause
+///
+/// [`TurnPromptInputs::remediation`] does something no other input here does:
+/// it **extends the goal condition**. Every other field adds context the IC
+/// reads on its way to the same target. A remediation dispatch's target is
+/// different, because it re-opens an issue whose gate is already green — so
+/// rendering the ordinary condition would hand the IC a goal it satisfies by
+/// doing nothing, and "the gate passes" would authorize a dispatch that pushed
+/// no commit at all. With a remediation in force the condition is the gate
+/// **and** a pushed commit addressing the findings, and the section above it
+/// says why in the IC's own terms. The two halves are composed here rather
+/// than stored joined, so a reviewer that gave no reason still gets a coherent
+/// instruction.
 pub fn render(inputs: &TurnPromptInputs) -> String {
     assert!(
         inputs.n_turns >= 1,
@@ -130,20 +172,49 @@ These answers are decisions, not suggestions — follow them:\n",
         section
     };
 
+    // Rendered last of the three context blocks and immediately before the
+    // constraints, because it is the only one that changes what "done" means
+    // for this dispatch. The mechanical instruction is emitted whether or not
+    // the reviewer gave a reason: the verdict alone is actionable, and a
+    // remediation that rendered nothing without findings would silently become
+    // an ordinary dispatch against an already-green gate.
+    let remediation_section = match &inputs.remediation {
+        None => String::new(),
+        Some(brief) => {
+            let findings = match brief.findings.map(str::trim).filter(|f| !f.is_empty()) {
+                Some(findings) => format!("\n\nThe reviewer said:\n{findings}"),
+                None => "\n\nThe reviewer recorded no reason with its verdict. Re-read the diff on this branch as a hostile reviewer would and fix what it would object to. If you genuinely find nothing to change, say so in your checkpoint — do not push an empty commit to move the head."
+                    .to_string(),
+            };
+            format!(
+                "\n\nA reviewer read pull request #{pr} at commit {sha} and asked for CHANGES. This dispatch exists to address that review. It is not a fresh start on the issue: the work already on the branch is yours to fix, not to redo.\n\nThis branch has ALREADY MET the gate below once — that is why there is a pull request to review — so running the gate and watching it pass does not mean you are done. You are done only when the findings are addressed, the gate passes, and you have PUSHED the result to this issue's branch. A dispatch that reports the gate met without pushing a new commit has changed nothing — the reviewer will read commit {sha} again and return the same verdict.{findings}",
+                pr = brief.pr_number,
+                sha = brief.head_sha,
+            )
+        }
+    };
+
+    // The condition itself, not just the prose around it. See the doc above.
+    let gate_extra = if inputs.remediation.is_some() {
+        ", and every finding in the review above is addressed by a commit you have pushed to this branch"
+    } else {
+        ""
+    };
+
     let gate_line = inputs.gate_commands.join(" && ");
 
     format!(
         "You are an IC dispatch for issue {issue}: \"{title}\".\n\n\
 {body}\n\n\
 Prior attempts on this issue (read before doing anything else):\n\
-{lineage}{redirect}{answers}\n\n\
+{lineage}{redirect}{answers}{remediation}\n\n\
 Constraints: feature-branch push only, never push to the default branch. Stay \
 inside your worktree. Never touch credential or secret files.\n\n\
 Checkpoint your progress (what you tried, current state, next step) after \
 EVERY turn, not just at the end — you may be re-invoked as a fresh process \
 with only this checkpoint and the transcript to resume from.\n\n\
 The gate condition for this repo (generated from its approved gate config, \
-never authored separately): {gate}.\n\n\
+never authored separately): {gate}{gate_extra}.\n\n\
 Report your verdict using the required output schema when, and only when, \
 you have either satisfied the gate condition above or determined it cannot be \
 satisfied. Do not guess; if you are unsure whether it is met, the verdict is \
@@ -155,7 +226,9 @@ or stop after {n} turns",
         lineage = lineage_section,
         redirect = redirect_line,
         answers = answers_section,
+        remediation = remediation_section,
         gate = gate_line,
+        gate_extra = gate_extra,
         n = inputs.n_turns,
     )
 }
@@ -181,6 +254,192 @@ fn format_prior_attempt(attempt: &PriorAttempt) -> String {
 mod tests {
     use super::*;
 
+    fn remediation_text(findings: Option<&str>) -> String {
+        let issue = base_issue();
+        render(&TurnPromptInputs {
+            issue: &issue,
+            issue_title: "T",
+            issue_body: "B",
+            prior_attempts: &[],
+            strategy_redirect: None,
+            human_answers: &[],
+            remediation: Some(RemediationBrief {
+                pr_number: 42,
+                head_sha: "deadbeef",
+                findings,
+            }),
+            gate_commands: &["cargo test".to_string()],
+            n_turns: 6,
+        })
+    }
+
+    #[test]
+    fn a_realistic_remediation_condition_stays_under_the_4000_char_platform_limit() {
+        // ⟨r5-doc⟩'s 4,000 characters is a `/goal` limit, not a style
+        // preference, and rung 11 is the first thing to add a *large* block to
+        // the condition. Measured: this template renders 1,498 characters for
+        // a realistic dispatch and 2,570 with the remediation block and no
+        // findings, which is where `remediate::MAX_FINDINGS_CHARS` (1,200)
+        // comes from — the two together leave real headroom rather than
+        // landing exactly on the limit.
+        let issue = base_issue();
+        let prior: Vec<PriorAttempt> = (1..=5)
+            .map(|n| PriorAttempt {
+                attempt_n: n,
+                approach: "a reasonably descriptive approach summary".into(),
+                verdict: AttemptOutcome::Failed,
+                why_failed: Some("a reasonably descriptive failure reason".into()),
+            })
+            .collect();
+        let findings = "x".repeat(super::super::remediate::MAX_FINDINGS_CHARS);
+        let text = render(&TurnPromptInputs {
+            issue: &issue,
+            issue_title: "A realistic issue title",
+            issue_body: "A realistic issue body of a few sentences describing the work.",
+            prior_attempts: &prior,
+            strategy_redirect: None,
+            human_answers: &[],
+            remediation: Some(RemediationBrief {
+                pr_number: 42,
+                head_sha: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+                findings: Some(&findings),
+            }),
+            gate_commands: &["cargo test --workspace".to_string()],
+            n_turns: 6,
+        });
+        assert!(
+            text.chars().count() < 4_000,
+            "a remediation condition at the findings bound must still fit the \
+platform limit, got {}",
+            text.chars().count()
+        );
+    }
+
+    #[test]
+    fn a_remediation_extends_the_goal_condition_beyond_the_gate() {
+        // THE load-bearing property of rung 11. The gate is already green at
+        // the reviewed commit, so a condition that says only "the gate passes"
+        // is satisfied by doing nothing: the IC would run the gate, report
+        // `met`, push no commit, and the next review would read the identical
+        // commit and return the identical verdict — forever, at full price.
+        let text = remediation_text(Some("the retry loop is unbounded"));
+        let gate_at = text.find("The gate condition for this repo").unwrap();
+        let condition = &text[gate_at..];
+        assert!(
+            condition.contains("addressed by a commit you have pushed to this branch"),
+            "the pushed fix must be part of the CONDITION, not just the prose: {condition}"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_dispatch_condition_is_left_exactly_as_it_was() {
+        // Rung 9's lesson 43: a new optional feature must not change the
+        // configuration that predates it.
+        let issue = base_issue();
+        let text = render(&TurnPromptInputs {
+            issue: &issue,
+            issue_title: "T",
+            issue_body: "B",
+            prior_attempts: &[],
+            strategy_redirect: None,
+            human_answers: &[],
+            remediation: None,
+            gate_commands: &["cargo test".to_string()],
+            n_turns: 6,
+        });
+        assert!(text.contains("never authored separately): cargo test."));
+        assert!(!text.contains("asked for CHANGES"));
+        assert!(!text.contains("pushed to this branch"));
+    }
+
+    #[test]
+    fn a_remediation_names_the_pr_the_commit_and_the_findings() {
+        let text = remediation_text(Some("the retry loop is unbounded"));
+        assert!(text.contains("pull request #42"));
+        assert!(text.contains("deadbeef"));
+        assert!(text.contains("The reviewer said:\nthe retry loop is unbounded"));
+    }
+
+    #[test]
+    fn a_remediation_says_why_passing_the_gate_is_not_the_job() {
+        // The IC has to be told *why* passing the gate is not the job, or the
+        // instruction reads as boilerplate it can satisfy the easy way.
+        //
+        // Phrased as a claim about the BRANCH, not about the reviewed commit.
+        // A remediation is only ever armed on an issue whose lineage records a
+        // success, so "this branch has met the gate once" is true by
+        // construction — whereas "the gate is green at commit X" is false
+        // whenever the head has moved past the commit the gate was green at,
+        // which is exactly the `gate_green == false` case `advance` still arms
+        // in. Telling an IC something false about its own repository is not
+        // worth the extra force of the stronger sentence.
+        let text = remediation_text(Some("f"));
+        assert!(text.contains("ALREADY MET the gate"));
+        assert!(
+            text.contains("without pushing a new commit has changed nothing"),
+            "the failure mode has to be named, not implied"
+        );
+    }
+
+    #[test]
+    fn a_remediation_with_no_findings_still_carries_the_mechanical_instruction() {
+        // Rung 9's lesson 35: the guaranteed half is composed on read, so a
+        // reviewer that returned a bare verdict cannot silently turn a
+        // remediation back into an ordinary dispatch against a green gate.
+        let text = remediation_text(None);
+        assert!(text.contains("asked for CHANGES"));
+        assert!(text.contains("ALREADY MET the gate"));
+        assert!(text.contains("addressed by a commit you have pushed to this branch"));
+        assert!(text.contains("recorded no reason"));
+        assert!(!text.contains("The reviewer said:"));
+    }
+
+    #[test]
+    fn blank_findings_read_as_no_findings() {
+        let text = remediation_text(Some("   \n "));
+        assert!(
+            !text.contains("The reviewer said:"),
+            "an all-whitespace reason must not render an empty findings block"
+        );
+        assert!(text.contains("recorded no reason"));
+    }
+
+    #[test]
+    fn a_remediation_is_rendered_after_the_lineage_and_before_the_constraints() {
+        // Same placement rule as rung 8's answers, for the same reason: an
+        // instruction buried inside a list of past attempts gets skimmed. It
+        // goes last of the three context blocks because it is the only one
+        // that changes what "done" means.
+        let issue = base_issue();
+        let text = render(&TurnPromptInputs {
+            issue: &issue,
+            issue_title: "T",
+            issue_body: "B",
+            prior_attempts: &[PriorAttempt {
+                attempt_n: 1,
+                approach: "tried A".to_string(),
+                verdict: AttemptOutcome::Success,
+                why_failed: None,
+            }],
+            strategy_redirect: None,
+            human_answers: &[("Q?".to_string(), "A!".to_string())],
+            remediation: Some(RemediationBrief {
+                pr_number: 42,
+                head_sha: "deadbeef",
+                findings: Some("fix it"),
+            }),
+            gate_commands: &["cargo test".to_string()],
+            n_turns: 6,
+        });
+        let attempts_at = text.find("tried A").unwrap();
+        let answers_at = text.find("A!").unwrap();
+        let remediation_at = text.find("asked for CHANGES").unwrap();
+        let constraints_at = text.find("Constraints:").unwrap();
+        assert!(attempts_at < answers_at);
+        assert!(answers_at < remediation_at);
+        assert!(remediation_at < constraints_at);
+    }
+
     fn base_issue() -> IssueRef {
         IssueRef::new("ironrace/ironmem", 283)
     }
@@ -195,6 +454,7 @@ mod tests {
             prior_attempts: &[],
             strategy_redirect: None,
             human_answers: &[],
+            remediation: None,
             gate_commands: &["cargo test --workspace".to_string()],
             n_turns: 6,
         });
@@ -226,6 +486,7 @@ mod tests {
             prior_attempts: &prior,
             strategy_redirect: None,
             human_answers: &[],
+            remediation: None,
             gate_commands: &["cargo test".to_string()],
             n_turns: 1,
         });
@@ -251,6 +512,7 @@ mod tests {
                 "Which schema should this use?".to_string(),
                 "SQLite, with migration 009.".to_string(),
             )],
+            remediation: None,
             gate_commands: &["cargo test".to_string()],
             n_turns: 3,
         });
@@ -278,6 +540,7 @@ mod tests {
             }],
             strategy_redirect: None,
             human_answers: &[("Q?".to_string(), "A!".to_string())],
+            remediation: None,
             gate_commands: &["cargo test".to_string()],
             n_turns: 3,
         });
@@ -297,6 +560,7 @@ mod tests {
             prior_attempts: &[],
             strategy_redirect: None,
             human_answers: &[],
+            remediation: None,
             gate_commands: &["cargo test".to_string()],
             n_turns: 3,
         });
@@ -315,6 +579,7 @@ mod tests {
                 "Do not retry approach A; it failed for reason Y. Try approach C instead.",
             ),
             human_answers: &[],
+            remediation: None,
             gate_commands: &["cargo test".to_string()],
             n_turns: 3,
         });
@@ -340,6 +605,7 @@ mod tests {
             prior_attempts: &[],
             strategy_redirect: None,
             human_answers: &[],
+            remediation: None,
             gate_commands: &commands,
             n_turns: 1,
         });
@@ -359,6 +625,7 @@ mod tests {
             prior_attempts: &[],
             strategy_redirect: None,
             human_answers: &[],
+            remediation: None,
             gate_commands: &["cargo test".to_string()],
             n_turns: 1,
         });
@@ -376,6 +643,7 @@ mod tests {
             prior_attempts: &[],
             strategy_redirect: None,
             human_answers: &[],
+            remediation: None,
             gate_commands: &["cargo test".to_string()],
             n_turns: 0,
         });
@@ -394,6 +662,7 @@ mod tests {
             prior_attempts: &[],
             strategy_redirect: None,
             human_answers: &[],
+            remediation: None,
             gate_commands: &[],
             n_turns: 1,
         });
@@ -421,6 +690,7 @@ mod tests {
             prior_attempts: &prior,
             strategy_redirect: None,
             human_answers: &[],
+            remediation: None,
             gate_commands: &["cargo test --workspace".to_string()],
             n_turns: 6,
         });
