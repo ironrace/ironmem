@@ -594,7 +594,7 @@ pub fn advance_pass(
         }
         match advance_issue(db, gh_runner, reviewer, &candidate, config) {
             Ok(step) => {
-                if !matches!(step.step, AdvanceStep::Stalled(_)) {
+                if took_a_step(&step) {
                     carried += 1;
                 }
                 advanced.push(step);
@@ -614,6 +614,32 @@ pub fn advance_pass(
         skipped,
         problems,
     })
+}
+
+/// Whether this pass actually carried the issue forward, as against
+/// re-reporting a condition it could not act on.
+///
+/// Only what the burst limit is spent on — rung 10's lesson 52, *a burst limit
+/// must be spent by work, not by reports*, which cost that rung a MEDIUM
+/// finding when stalls were charged against it.
+///
+/// A stall is the permanent form. ⟨rung 11⟩ An **already-armed remediation is
+/// the transient form**, and it needs the same treatment: its head has not
+/// moved, so no review was bought, and the merge was rehearsed — the pass did
+/// nothing to it but say so. An IC can take several dispatches to push a fix,
+/// and with the default limit of three, three remediating issues would fill
+/// every pass for that whole window and starve every green PR behind them of
+/// the review and merge they were ready for.
+///
+/// A *newly* armed remediation is not free and is charged: reaching it meant
+/// either paying for the review that produced the verdict, or reading a stored
+/// one and writing the record that re-opens the issue.
+fn took_a_step(advanced: &Advanced) -> bool {
+    if matches!(advanced.step, AdvanceStep::Stalled(_)) {
+        return false;
+    }
+    !(advanced.review.is_none()
+        && matches!(advanced.remediation, Some(ArmOutcome::AlreadyArmed { .. })))
 }
 
 /// List each target repo's `agent:ready` issues.
@@ -1919,6 +1945,78 @@ and no `agent:blocked` comment is posted, or the Lead never sees the issue again
             ),
             "got {:?}",
             second.advanced[0].remediation
+        );
+    }
+
+    const TWO_READY: &str = r#"[{"number":283,"title":"a","body":"b","labels":[{"name":"agent:ready"},{"name":"risk:documentation"}],"updatedAt":"2026-09-03T00:00:00Z"},{"number":284,"title":"a","body":"b","labels":[{"name":"agent:ready"},{"name":"risk:documentation"}],"updatedAt":"2026-09-03T00:00:00Z"}]"#;
+
+    #[test]
+    fn an_already_armed_remediation_does_not_spend_the_burst_limit() {
+        // Rung 10's lesson 52 in its transient form. An IC can take several
+        // dispatches to push a fix; while it does, the issue is re-reported
+        // on every pass with no review bought and no merge written. Charging
+        // those reports against the limit would let three remediating issues
+        // fill every pass and starve the green PRs behind them.
+        let db = approved_db();
+        let (repo, roots) = checkout_with_worktree();
+        let mut config = config(roots.path(), repo.path());
+        config.remediate = true;
+        config.max_advances_per_pass = 1;
+
+        // Issue 283 is mid-remediation; issue 284 is green and ready to merge.
+        record_success(&db, &issue(), Some(GREEN));
+        reviewed_at_needing_changes(&db, &issue(), 322, GREEN);
+        remediate::arm_remediation(
+            &db,
+            &remediate::ArmRequest {
+                issue: &issue(),
+                pr_number: 322,
+                head_sha: GREEN,
+                findings: Some("the retry loop is unbounded"),
+                attempt_cap: config.attempt_cap,
+            },
+        )
+        .unwrap();
+
+        let second = IssueRef::new(REPO, 284);
+        record_success(&db, &second, Some(GREEN));
+        reviewed_at(&db, &second, 323, GREEN);
+
+        let mut gh = ScriptedGh::new(vec![
+            ok(TWO_READY),
+            // 283: already armed, nothing bought.
+            ok(&pr_list_json(322, GREEN)),
+            ok(&pr_view_json(GREEN)),
+            // 284 still gets its turn.
+            ok(&pr_list_json(323, GREEN)),
+            ok(&pr_view_json(GREEN)),
+            unprotected(),
+            no_rules(),
+        ]);
+
+        let report = advance_pass(&db, &mut gh, &mut ForbiddenReviewer, &config).unwrap();
+        assert!(
+            matches!(
+                report.advanced[0].remediation,
+                Some(ArmOutcome::AlreadyArmed { .. })
+            ),
+            "got {:?}",
+            report.advanced[0].remediation
+        );
+        assert_eq!(
+            report.advanced.len(),
+            2,
+            "the green PR behind the remediating issue must still be reached, \
+skipped: {:?}",
+            report.skipped
+        );
+        assert!(
+            report
+                .skipped
+                .iter()
+                .all(|s| !matches!(s.reason, SkipReason::PassLimitReached { .. })),
+            "nothing was deferred on the burst limit: {:?}",
+            report.skipped
         );
     }
 
