@@ -152,11 +152,18 @@ pub struct AdvanceConfig {
     /// merge is rehearsed rather than executed so the issue keeps the
     /// `agent:ready` label the Lead dispatches from.
     ///
-    /// A switch rather than a default because it decides whether a *new kind*
-    /// of thing happens at all — here, re-opening work a human may believe is
-    /// finished, on a branch a human may be reading. Rung 9's `--advisor` and
-    /// rung 10's `--merge` set the precedent; the bounds on how much a
-    /// remediation may spend are separate and always on.
+    /// A switch rather than a default because turning it on changes what an
+    /// existing `advance --merge` cron does: it re-opens work a human may
+    /// believe is finished. A new optional feature must not alter the
+    /// behaviour of a configuration that predates it (rung 9's lesson 43),
+    /// and rungs 9 and 10 set the precedent with `--advisor` and `--merge`.
+    /// The bounds on how much a remediation may spend are separate and
+    /// always on.
+    ///
+    /// It is deliberately *not* justified as a guard against a human pushing
+    /// to the branch at the same time: the spec records the operating
+    /// assumption that this does not happen, and a flag would be a poor guard
+    /// against it in any case.
     pub remediate: bool,
     /// The per-issue attempt cap remediations are dispatched under.
     ///

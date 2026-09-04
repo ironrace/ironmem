@@ -353,7 +353,11 @@ Four decisions in it are load-bearing:
 - **The hand-off to a human still happens — later, when the automation has actually given up.** `arm_remediation` checks the attempt cap **first**, ahead of its own idempotence test, and answers `CapReached`, which arms nothing. The pass then falls through to the real merge and rung 6 comments and labels exactly as before. Checked the other way round, an armed record would shadow the cap forever, the PR would sit open and un-commented, and *"the PR stays open for a human"* would be satisfied only by accident.
 - **Arming is keyed on `(pr_number, head_sha)`** — the same dimension rung 10 keys its review trigger on and rung 6 keys its merge guard on — and the key covers the failure outcomes, not just the success. A remediation that was armed, dispatched, and did not work is the same remediation; re-writing it each pass would reset the delivery depth and make *"has this been dispatched yet?"* unanswerable.
 
-**⟨r10⟩ Residual, stated not hidden.** A remediation re-dispatches an IC onto a branch a human may be reading or pushing to; `--remediate` being an operator's explicit opt-in is the whole of the mitigation, and no detection of concurrent human work exists. **N is still unmeasured — an eighth rung has passed it.**
+**⟨r10⟩ Operating assumption, recorded so it can be found again.** A remediation re-dispatches an IC onto the issue's branch while a pull request for that branch is open, and nothing here detects a human pushing to it at the same time. **Decided 2026-09-03 (Jeff): no human pushes to an Autopilot branch while the workflow is running**, so this is out of scope rather than unhandled. It is written down because the design leans on it: if it ever stops holding — a human pushing a fix onto a PR Autopilot is remediating — the two race with no guard between them, and this paragraph is where to start.
+
+`--remediate` stays opt-in regardless, on a different footing than the one above. Turning it on changes what an operator's existing `advance --merge` cron does, and a new optional feature must not alter the behaviour of a configuration that predates it.
+
+**⟨r10⟩ Residual, stated not hidden.** **N is still unmeasured — an eighth rung has passed it.**
 
 ### Two supervision checks, both required
 
