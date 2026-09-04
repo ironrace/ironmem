@@ -18,14 +18,23 @@ PY
 
 echo "Cargo.toml version: $CARGO_VERSION"
 
-for plugin_file in .codex-plugin/plugin.json .claude-plugin/plugin.json .muse-plugin/plugin.json; do
+for plugin_file in .codex-plugin/plugin.json .claude-plugin/plugin.json .muse-plugin/plugin.json .grok-plugin/plugin.json .gemini-plugin/plugin.json; do
   plugin_version="$(
     python3 - "$plugin_file" <<'PY'
 import json
 import sys
 
-with open(sys.argv[1], "r", encoding="utf-8") as handle:
-    print(json.load(handle)["version"])
+try:
+    with open(sys.argv[1], "r", encoding="utf-8") as handle:
+        data = json.load(handle)
+except (OSError, json.JSONDecodeError) as exc:
+    print(f"ERROR: cannot read version from {sys.argv[1]}: {exc}", file=sys.stderr)
+    sys.exit(1)
+try:
+    print(data["version"])
+except (KeyError, TypeError) as exc:
+    print(f"ERROR: {sys.argv[1]} has no version key: {exc}", file=sys.stderr)
+    sys.exit(1)
 PY
   )"
 

@@ -149,26 +149,46 @@ fn grok_config_path() -> Result<PathBuf, MemoryError> {
     Ok(home.join(".grok").join("settings.json"))
 }
 
-/// Resolve the Muse config path: `~/.config/muse/settings.json`.
+/// Resolve the Muse config path: `$XDG_CONFIG_HOME/muse/settings.json` when
+/// `XDG_CONFIG_HOME` is set and non-empty, else `~/.config/muse/settings.json`.
 ///
-/// Measured: a live `~/.config/muse/settings.json` with `schema_version: 1`
-/// was read on the Muse Code 1.0.2 host.
+/// Measured on Muse Code 1.0.2: a live `~/.config/muse/settings.json` with
+/// `schema_version: 1` was read, and an isolated-`XDG_CONFIG_HOME` run picked
+/// up `$XDG_CONFIG_HOME/muse/settings.json` instead — when the variable is
+/// set, `~/.config/muse` is never consulted, so registration must honor it.
+/// The pure core (`muse_config_path_for`) is shared with `doctor` so both
+/// report the same file.
 fn muse_config_path() -> Result<PathBuf, MemoryError> {
-    let home = dirs::home_dir()
-        .ok_or_else(|| MemoryError::Config("cannot determine home directory".into()))?;
-    Ok(home.join(".config").join("muse").join("settings.json"))
+    muse_config_path_for(dirs::home_dir(), std::env::var_os("XDG_CONFIG_HOME"))
+        .ok_or_else(|| MemoryError::Config("cannot determine home directory".into()))
+}
+
+/// Shared Muse-config resolution: explicit `home` plus the observed
+/// `XDG_CONFIG_HOME`, so launcher, doctor, and tests all resolve one file.
+/// Mirrors the `CODEX_HOME` pattern (env override wins, empty is ignored).
+pub(crate) fn muse_config_path_for(
+    home: Option<PathBuf>,
+    xdg_config_home: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    if let Some(xdg) = xdg_config_home {
+        if !xdg.is_empty() {
+            return Some(PathBuf::from(xdg).join("muse").join("settings.json"));
+        }
+    }
+    Some(home?.join(".config").join("muse").join("settings.json"))
 }
 
 /// Ensure the ironmem MCP server is registered for `harness`, idempotently.
 ///
 /// Registers the shared-daemon proxy command (`harness::proxy_command_args` —
 /// `["serve", "--connect", <socket>]`), the canonical invocation every
-/// harness should converge on (#190 Task 11/12). Claude, Gemini CLI, and
-/// (best-effort) Grok CLI all share the same `mcpServers`-JSON config shape,
-/// so all three route through `ensure_json_mcpservers_registered`; Codex uses
-/// a different (TOML) format, and Muse uses an array-shaped `mcpServers`
-/// writer (`ensure_muse_registered` — array shape measured from the Muse
-/// binary's embedded settings docs).
+/// harness should converge on (#190 Task 11/12). Claude, Gemini CLI,
+/// (best-effort) Grok CLI, and Muse all share the same `mcpServers`-JSON
+/// config shape — Muse's is proven live to be Claude's id-keyed object, not
+/// the `{id, ...}` array from the binary's embedded plugin-manifest docs —
+/// so all four route through `ensure_json_mcpservers_registered`; Codex uses
+/// a different (TOML) format. A missing Muse settings file is first seeded
+/// with the measured `{"schema_version": 1}` envelope.
 fn register(harness: Harness) -> Result<mcp_setup::RegisterOutcome, MemoryError> {
     let exe = std::env::current_exe()
         .map_err(|e| MemoryError::Config(format!("cannot resolve ironmem path: {e}")))?;
@@ -188,7 +208,11 @@ fn register(harness: Harness) -> Result<mcp_setup::RegisterOutcome, MemoryError>
         Harness::Grok => {
             mcp_setup::ensure_json_mcpservers_registered(&grok_config_path()?, &exe, &proxy_args)
         }
-        Harness::Muse => mcp_setup::ensure_muse_registered(&muse_config_path()?, &exe, &proxy_args),
+        Harness::Muse => {
+            let path = muse_config_path()?;
+            mcp_setup::ensure_muse_settings_envelope(&path)?;
+            mcp_setup::ensure_json_mcpservers_registered(&path, &exe, &proxy_args)
+        }
     }
 }
 
@@ -359,14 +383,30 @@ mod tests {
     }
 
     #[test]
-    fn muse_config_path_defaults_to_xdg_muse_settings() {
-        // Measured: live ~/.config/muse/settings.json read (see docs).
-        let path = muse_config_path().unwrap();
-        assert!(
-            path.ends_with(".config/muse/settings.json"),
-            "got: {}",
-            path.display()
-        );
+    fn muse_config_path_honors_xdg_config_home() {
+        // Proven live: with XDG_CONFIG_HOME set, `muse exec` reads
+        // $XDG_CONFIG_HOME/muse/settings.json, never ~/.config/muse.
+        let path = muse_config_path_for(
+            Some(PathBuf::from("/home/u")),
+            Some(std::ffi::OsString::from("/tmp/xdg")),
+        )
+        .unwrap();
+        assert_eq!(path, PathBuf::from("/tmp/xdg/muse/settings.json"));
+    }
+
+    #[test]
+    fn muse_config_path_falls_back_to_home_config() {
+        let path = muse_config_path_for(Some(PathBuf::from("/home/u")), None).unwrap();
+        assert_eq!(path, PathBuf::from("/home/u/.config/muse/settings.json"));
+        // An empty override is ignored, mirroring CODEX_HOME.
+        let path = muse_config_path_for(
+            Some(PathBuf::from("/home/u")),
+            Some(std::ffi::OsString::from("")),
+        )
+        .unwrap();
+        assert_eq!(path, PathBuf::from("/home/u/.config/muse/settings.json"));
+        // No home at all resolves to nothing (caller reports "skipped").
+        assert_eq!(muse_config_path_for(None, None), None);
     }
 
     #[test]

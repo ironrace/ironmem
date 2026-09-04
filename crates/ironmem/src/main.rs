@@ -268,7 +268,7 @@ enum Commands {
         #[arg(long, default_value_t = ironmem::context::DEFAULT_BUDGET_TOKENS)]
         budget: usize,
     },
-    /// Launch Muse Code in a repo with the ironmem MCP server attached (config path and mcpServers array shape measured on Muse Code 1.0.2)
+    /// Launch Muse Code in a repo with the ironmem MCP server attached (settings path, object-shaped mcpServers, and positional prompt all verified live on Muse Code 1.0.2: `muse [OPTIONS] [PROMPT]`)
     Muse {
         /// Repository path to launch in
         #[arg(default_value = ".")]

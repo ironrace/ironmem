@@ -226,21 +226,20 @@ pub const REGISTRY: &[HarnessSpec] = &[
         rules_strategy: RulesStrategy::Import {
             directive: "@AGENTS.md",
         },
-        // Measured (Muse Code 1.0.2, `muse-bin-1.0.2-R2040.1` strings + a live
-        // `~/.config/muse/settings.json` read): MCP-over-stdio client
+        // Measured live on Muse Code 1.0.2 (`muse exec --provider echo`
+        // against a logging MCP shim): MCP-over-stdio client
         // (`initialize`/`clientInfo`/`capabilities`/`protocolVersion
-        // 2024-11-05`), `schema_version: 1` settings at
-        // `~/.config/muse/settings.json`, and an ARRAY-shaped `mcpServers`
-        // of `{id, transport?, command}` / `{id, transport:"http", url}`
-        // entries (embedded docs quote). Scaffolding remainder: `muse` is
-        // not yet a default write-rules target, `.muse-plugin/` packaging is
-        // a minimal stand-in, and `client_info_aliases: &["muse"]` is a
-        // best-effort default — the exact wire `clientInfo.name` was never
-        // captured (binary internals are `tbh`/`musecode`-named, so do NOT
-        // assume it contains "muse"). Narrow the aliases to a captured wire
-        // value before relying on MCP session attribution.
+        // 2024-11-05`) with wire `"clientInfo":{"name":"tbh","version":"0.1.0"}`,
+        // `schema_version: 1` settings at `$XDG_CONFIG_HOME/muse/settings.json`
+        // (else `~/.config/muse/settings.json`), and an OBJECT-shaped
+        // `mcpServers` keyed by server id — the `{id, ...}` array shape in
+        // the binary's embedded docs describes the plugin-manifest context,
+        // not the settings file (an array entry is silently ignored and
+        // breaks Muse's own settings saves). Scaffolding remainder: `muse`
+        // is not yet a default write-rules target, and `.muse-plugin/`
+        // packaging is a minimal stand-in.
         write_rules_default: false,
-        client_info_aliases: &["muse"],
+        client_info_aliases: &["tbh"],
         env_aliases: &["muse"],
         additional_context_support: false,
         occupancy_support: false,
@@ -463,10 +462,11 @@ mod tests {
 
     #[test]
     fn muse_spec_values_are_scaffolding_defaults() {
-        // Transport, config path, and the mcpServers array shape are MEASURED
-        // (see the registry-row comment); the remaining values are
-        // best-effort scaffolding defaults. If a field gets measured later,
-        // update this test to assert the measured value.
+        // Config path, object-shaped mcpServers, and the "tbh" wire
+        // clientInfo.name are MEASURED live (see the registry-row comment);
+        // the remaining values are best-effort scaffolding defaults. If a
+        // field gets measured later, update this test to assert the measured
+        // value.
         let spec = by_id("muse", REGISTRY).expect("muse must be in REGISTRY");
         assert_eq!(spec.id, "muse");
         assert_eq!(spec.display_name, "Muse Code");
@@ -479,13 +479,15 @@ mod tests {
             }
         );
         assert!(!spec.write_rules_default);
-        assert_eq!(spec.client_info_aliases, &["muse"]);
+        // "tbh" is the captured wire clientInfo.name (see registry-row
+        // comment); "muse" survives only as the IRONMEM_HARNESS env alias.
+        assert_eq!(spec.client_info_aliases, &["tbh"]);
         assert_eq!(spec.env_aliases, &["muse"]);
         assert!(!spec.additional_context_support);
         assert!(!spec.occupancy_support);
         assert_eq!(spec.transcript_parser, TranscriptParserKind::None);
         assert_eq!(canonicalize_input("muse", REGISTRY), Some("muse"));
-        assert_eq!(classify_client_info("muse", REGISTRY), Some("muse"));
+        assert_eq!(classify_client_info("tbh", REGISTRY), Some("muse"));
     }
 
     // ---- HarnessId construction --------------------------------------------

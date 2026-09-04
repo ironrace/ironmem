@@ -8,24 +8,26 @@ recall what a repository contains and what was already decided instead of
 re-exploring it every time. This guide explains how to set that up with
 Muse Code today and what is still unconfirmed.
 
-> **Status.** MEASURED on Muse Code 1.0.2 (`muse-bin-1.0.2-R2040.1` strings
-> plus a live `~/.config/muse/settings.json` read): MCP-over-stdio client
-> (`initialize`/`clientInfo`/`capabilities`/`protocolVersion 2024-11-05`),
-> `schema_version: 1` settings at `~/.config/muse/settings.json`, an
-> ARRAY-shaped `mcpServers` of `{id, transport?, command}` /
-> `{id, transport:"http", url}` entries, `permissions.mcp_servers` gating
-> (`allowed_identities`/`denied_identities`/`allowed_sources`/`allowed_digests`/
-> `allowed_kinds`), a `unix_socket` sandbox rule kind with `proxy-only`
-> default network mode, hooks + `managed_hooks_path`/`managed_hooks_env_vars`,
-> `session/tokenUsage` telemetry, and foreign MCP sources whose manifest
-> `mcpServers` "must be an object, path, or path list". Still SCAFFOLDING
-> (best-effort defaults): the exact wire `clientInfo.name` (binary
-> internals are `tbh`/`musecode`-named — do not assume it contains "muse"),
-> runtime permission-gating behavior, unix-socket allowlisting for the
-> `--connect` proxy, `additionalContext` injectability, transcript format,
-> occupancy output, and `.muse-plugin/` packaging. If your real config or
-> wire traffic disagrees with anything below, file the measured shape and
-> this guide plus `ensure_muse_registered` get updated to match.
+> **Status.** PROVEN LIVE on Muse Code 1.0.2 (`muse exec --provider echo`
+> against a logging MCP shim, plus a live `~/.config/muse/settings.json`
+> read): MCP-over-stdio client (`initialize`/`clientInfo`/`capabilities`/
+> `protocolVersion 2024-11-05`) with wire
+> `"clientInfo":{"name":"tbh","version":"0.1.0"}`, `schema_version: 1`
+> settings at `$XDG_CONFIG_HOME/muse/settings.json` (else
+> `~/.config/muse/settings.json` — an isolated-`XDG_CONFIG_HOME` run picks up
+> the override file), and an OBJECT-shaped `mcpServers` keyed by server id,
+> exactly Claude's shape. The `{id, transport?, command}` ARRAY shape in the
+> binary's embedded docs describes the plugin-manifest context, NOT the
+> settings file: an array-shaped `mcpServers` is silently ignored by Muse
+> (zero tools start) and breaks Muse's own settings saves ("could not save
+> the one-time flag"). Still SCAFFOLDING (best-effort defaults): runtime
+> `permissions.mcp_servers` gating behavior, unix-socket allowlisting for
+> the `--connect` proxy under `proxy-only` sandbox mode,
+> `additionalContext` injectability, transcript format, occupancy output,
+> hook wiring (the packaged hook script is inert — see below), and
+> `.muse-plugin/` packaging. If your real config or wire traffic disagrees
+> with anything below, file the measured shape and this guide gets updated
+> to match.
 
 For the bounded Claude↔Codex planning protocol, see [COLLAB.md](COLLAB.md).
 
@@ -40,11 +42,9 @@ Muse is one registered harness in the `REGISTRY` constant
 - **`rules_file`**: `"MUSE.md"` — the target for `ironmem write-rules --harness muse`.
 - **`rules_strategy`**: `"import"` (`@AGENTS.md`) — `MUSE.md` is written with
   the canonical-block import directive, mirroring Grok/Gemini.
-- **`client_info_aliases`**: `["muse"]` — substring matched against
-  `initialize.clientInfo.name` to attribute MCP sessions (scaffolding: the
-  exact wire name was never captured, and binary internals are
-  `tbh`/`musecode`-named, so attribution may miss until the alias is
-  narrowed to a captured value).
+- **`client_info_aliases`**: `["tbh"]` — substring matched against
+  `initialize.clientInfo.name` to attribute MCP sessions (measured live:
+  the wire name is `"tbh"`).
 - **`env_aliases`**: `["muse"]` — accepted by `IRONMEM_HARNESS` for test overrides.
 - **`additional_context_support`**: `false` — no
   `hookSpecificOutput.additionalContext` channel is known for Muse, so
@@ -64,7 +64,7 @@ in the main README.
 
 ## Current Support Level
 
-What works now (measured items above; scaffolding items flagged):
+What works now (proven-live items above; scaffolding items flagged):
 
 - Running `ironmem` as an MCP server over stdio with non-blocking startup
 - Read and write MCP tools
@@ -72,15 +72,18 @@ What works now (measured items above; scaffolding items flagged):
 - Knowledge graph tools
 - Restricted vs trusted access modes
 - `mine` for workspace ingestion with incremental updates
-- `hook` for session-start, stop, and precompact (resolves via the registry;
-  unknown harnesses fall back to the Claude spec, while `muse` resolves to
-  its own row with `additional_context_support: false`, i.e. silent degrade)
-- Muse plugin packaging (`.muse-plugin/` minimal stand-in)
+- `ironmem muse` registration into the object-shaped `mcpServers`
+  (seeded with the measured `{"schema_version": 1}` envelope on a fresh file)
 - Automatic migrate-or-init bootstrap on first use
 
-What does not work yet / is unconfirmed:
+Scaffolding / unconfirmed:
 
-- The exact wire `clientInfo.name` (attribution alias `["muse"]` is a guess)
+- `.muse-plugin/` packaging is a minimal stand-in mirroring the
+  Gemini/Grok plugin convention, not a validated native Muse manifest
+- `.muse-plugin/hooks/ironmem-hook.sh` is packaged but INERT: nothing
+  invokes it (no `hooks` key, no `hooks.json`, `managed_hooks_path` is never
+  written), and the muse registry row disables every hook consumer — so
+  session-start memory injection and transcript capture do not run for Muse
 - Runtime `permissions.mcp_servers` gating behavior (registering the server
   may not be enough to make it callable)
 - Unix-socket allowlisting for the shared-daemon `--connect` proxy under
@@ -90,26 +93,30 @@ What does not work yet / is unconfirmed:
 
 ## Manual Muse MCP Setup
 
-Add a server entry to your Muse MCP config (measured array shape — an
-array of server objects matched by `id`, per the Muse 1.0.2 embedded docs):
+Add a server entry to your Muse MCP config (object shape, keyed by server
+id — proven live; do NOT use the `{id, ...}` array shape from the binary's
+embedded docs, which describes the plugin-manifest context: Muse silently
+ignores an array `mcpServers` and then fails its own settings saves):
 
 ```json
 {
-  "mcpServers": [
-    {
-      "id": "ironmem",
+  "schema_version": 1,
+  "mcpServers": {
+    "ironmem": {
       "command": "/absolute/path/to/.ironrace/bin/ironmem",
       "args": ["serve", "--connect", "/absolute/path/to/.ironrace-memory/hook_state/daemon.sock"]
     }
-  ]
+  }
 }
 ```
 
 `ironmem muse` already writes this form for you (and upgrades a
 pre-existing bare `["serve"]` entry in place, preserving `env` and sibling
 entries). Unrelated top-level keys (e.g. `theme`) and sibling server entries
-are preserved; a present-but-non-array `mcpServers` is reported as malformed
-rather than silently rewritten.
+are preserved; a present-but-non-object `mcpServers` is reported as malformed
+rather than silently rewritten. If your file still carries an array-shaped
+`mcpServers` from an earlier ironmem version, delete the array entry and
+re-run `ironmem muse`.
 
 The daemon is spawned automatically on first connect (single-flight) and
 shuts itself down after `IRONMEM_DAEMON_IDLE_SECS` (default 300s) of no

@@ -330,8 +330,10 @@ fn grok_launcher_registers_mcp_server_by_default() {
 }
 
 /// Muse launcher acceptance: resolves from the registry and registers the
-/// shared-daemon proxy command through the array-shaped `mcpServers` writer
-/// (array shape measured from the Muse 1.0.2 binary's embedded settings docs).
+/// shared-daemon proxy command through the shared Claude-shaped
+/// `mcpServers` OBJECT writer (object shape proven live: `muse exec`
+/// completes `initialize` + `tools/list` on it, while an array-shaped
+/// `mcpServers` is silently ignored by Muse).
 #[test]
 fn muse_launcher_registers_mcp_server_by_default() {
     let temp = tempfile::tempdir().unwrap();
@@ -345,6 +347,9 @@ fn muse_launcher_registers_mcp_server_by_default() {
     std::fs::create_dir_all(&repo).unwrap();
     std::fs::write(repo.join("README.md"), "# repo\ncontent to mine").unwrap();
     write_stub(&bin_dir, "muse", &record, 0);
+    // The resolver honors XDG_CONFIG_HOME; clear it so this test pins the
+    // ~/.config/muse fallback deterministically.
+    std::env::remove_var("XDG_CONFIG_HOME");
 
     let out = launcher_command(&home, &db_path, &bin_dir)
         .arg("muse")
@@ -358,14 +363,13 @@ fn muse_launcher_registers_mcp_server_by_default() {
     let cfg = std::fs::read_to_string(&cfg_path)
         .unwrap_or_else(|e| panic!("launcher should create {}: {e}", cfg_path.display()));
     let v: serde_json::Value = serde_json::from_str(&cfg).unwrap();
-    let servers = v
+    // Fresh file is seeded with the measured envelope before registration.
+    assert_eq!(v.get("schema_version").and_then(|s| s.as_i64()), Some(1));
+    let server = v
         .get("mcpServers")
-        .and_then(|s| s.as_array())
-        .expect("mcpServers must be an array");
-    let server = servers
-        .iter()
-        .find(|e| e.get("id").and_then(|id| id.as_str()) == Some("ironmem"))
-        .expect("ironmem MCP server should be registered");
+        .and_then(|s| s.as_object())
+        .and_then(|s| s.get("ironmem"))
+        .expect("mcpServers.ironmem must be an object entry");
     let expected_socket = home
         .join(".ironrace-memory")
         .join("hook_state")

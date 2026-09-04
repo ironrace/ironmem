@@ -199,10 +199,12 @@ ironmem muse .                         # launch Muse Code in the current repo (e
 less battle-tested: Gemini CLI's config convention
 (`~/.gemini/settings.json`) is confirmed from its own docs, while Grok's
 (`~/.grok/settings.json`) is a best-effort default pending a single
-confirmed "the" Grok CLI MCP config convention. Muse Code writes an
-ARRAY-shaped `mcpServers` entry in `~/.config/muse/settings.json` (shape
-measured on Muse Code 1.0.2 — see [docs/MUSE.md](docs/MUSE.md)). None of the
-three is a default `write-rules` target yet.
+confirmed "the" Grok CLI MCP config convention. Muse Code shares Claude's
+object-shaped `mcpServers` in `$XDG_CONFIG_HOME/muse/settings.json` (else
+`~/.config/muse/settings.json`) — proven live on Muse Code 1.0.2, not the
+array shape from the binary's embedded plugin-manifest docs (see
+[docs/MUSE.md](docs/MUSE.md)). None of the three is a default `write-rules`
+target yet.
 
 Each launcher:
 
@@ -730,7 +732,7 @@ AI agents can query the graph without a shell.
 - Bounded Claude↔Codex collaboration protocol (v1 planning + v3 coding) is available via the `collab_*` MCP tools. Long-poll `wait_my_turn` wakes on actionable state changes and returns compact `{"unchanged": true}` only after an idle timeout — see [docs/COLLAB.md](docs/COLLAB.md)
 - **Shared daemon mode** (`serve --listen`/`--connect`) lets many clients share one `App`/DB/embedding-model behind a Unix socket, with automatic single-flight spawn-on-demand and idle self-shutdown — see [Shared Daemon Mode](#shared-daemon-mode). Bare `serve` is unchanged and remains the always-available fallback.
 - **Grok and Gemini CLI** are registered harnesses (`ironmem grok`/`ironmem gemini`, `harness_grok`/`harness_gemini` in `doctor`) but are scaffolding: neither is a default `write-rules` target yet, and Grok's MCP config convention is a best-effort default rather than a confirmed one — see [First run: one-command launchers](#first-run-one-command-launchers)
-- **Muse Code** is a registered harness (`ironmem muse`, `harness_muse` in `doctor`) with a measured config path and ARRAY-shaped `mcpServers` writer, but the rest is scaffolding: it is not a default `write-rules` target, the `clientInfo.name` attribution alias is a guess, and `.muse-plugin/` packaging is a minimal stand-in — see [docs/MUSE.md](docs/MUSE.md)
+- **Muse Code** is a registered harness (`ironmem muse`, `harness_muse` in `doctor`) with a proven-live config path (`$XDG_CONFIG_HOME`-aware) and object-shaped `mcpServers` writer, but the rest is scaffolding: it is not a default `write-rules` target, the packaged hook script is inert (nothing invokes it), and `.muse-plugin/` packaging is a minimal stand-in — see [docs/MUSE.md](docs/MUSE.md)
 
 ## Shared Memory Across Harnesses
 
