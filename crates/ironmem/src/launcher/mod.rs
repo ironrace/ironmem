@@ -189,7 +189,10 @@ pub(crate) fn json_mcpservers_config_path_for(
 /// so all four route through `ensure_json_mcpservers_registered`, resolving
 /// their file via [`json_mcpservers_config_path`] and seeding a missing file
 /// with [`mcp_setup::fresh_file_seed`] (Muse's measured `{"schema_version":
-/// 1}` envelope; `{}` for the rest). Codex uses a different (TOML) format.
+/// 1}` envelope; `{}` for the rest) and adding
+/// [`mcp_setup::fresh_entry_extras`] to a brand-new entry (Muse's
+/// `"mode": "optional"`, so a stale proxy path cannot abort a Muse session;
+/// nothing for the rest). Codex uses a different (TOML) format.
 fn register(harness: Harness) -> Result<mcp_setup::RegisterOutcome, MemoryError> {
     let exe = std::env::current_exe()
         .map_err(|e| MemoryError::Config(format!("cannot resolve ironmem path: {e}")))?;
@@ -207,6 +210,7 @@ fn register(harness: Harness) -> Result<mcp_setup::RegisterOutcome, MemoryError>
                 &exe,
                 &proxy_args,
                 mcp_setup::fresh_file_seed(id),
+                mcp_setup::fresh_entry_extras(id),
             )
         }
     }

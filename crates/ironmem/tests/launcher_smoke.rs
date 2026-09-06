@@ -379,6 +379,11 @@ fn muse_launcher_registers_mcp_server_by_default() {
         server["args"],
         serde_json::json!(["serve", "--connect", expected_socket.display().to_string()])
     );
+    // Muse's per-server `mode` defaults to `required`, and a required server
+    // that fails to start aborts the whole Muse session. ironmem registers
+    // itself as optional so a stale binary path or an unspawnable daemon
+    // costs Muse its memory, not its session.
+    assert_eq!(server["mode"], serde_json::json!("optional"));
 }
 
 /// Same acceptance for the gemini launcher.

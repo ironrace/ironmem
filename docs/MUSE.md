@@ -73,7 +73,9 @@ What works now (proven-live items above; scaffolding items flagged):
 - Restricted vs trusted access modes
 - `mine` for workspace ingestion with incremental updates
 - `ironmem muse` registration into the object-shaped `mcpServers`
-  (seeded with the measured `{"schema_version": 1}` envelope on a fresh file)
+  (seeded with the measured `{"schema_version": 1}` envelope on a fresh
+  file, and registered as an `optional` server so a failed start never
+  aborts the Muse session)
 - Automatic migrate-or-init bootstrap on first use
 
 Scaffolding / unconfirmed:
@@ -104,16 +106,32 @@ ignores an array `mcpServers` and then fails its own settings saves):
   "mcpServers": {
     "ironmem": {
       "command": "/absolute/path/to/.ironrace/bin/ironmem",
-      "args": ["serve", "--connect", "/absolute/path/to/.ironrace-memory/hook_state/daemon.sock"]
+      "args": ["serve", "--connect", "/absolute/path/to/.ironrace-memory/hook_state/daemon.sock"],
+      "mode": "optional"
     }
   }
 }
 ```
 
-`ironmem muse` already writes this form for you (and upgrades a
-pre-existing bare `["serve"]` entry in place, preserving `env` and sibling
-entries). Unrelated top-level keys (e.g. `theme`) and sibling server entries
-are preserved. Anything else shaped is refused rather than silently
+`"mode": "optional"` matters. Muse's per-server settings (measured from the
+1.0.2 binary: `enabled, mode, transport, command, args, env, framing, url,
+headers`, with `mode` one of `required` | `optional`) default a server to
+`required`, and a required server that fails to start aborts the whole Muse
+session. Measured live (`muse exec --provider echo` with the entry's
+`command` pointing at a missing file): with no `mode` key, or `required`,
+Muse exits 1 with ``Required MCP server `ironmem` failed during startup:
+the configured command is unavailable`` and never answers the prompt; with
+`optional` it exits 0 and answers. So with `optional`, a moved ironmem
+binary or an unspawnable daemon costs Muse its memory, not its session,
+which is how every other registered harness already behaves when the
+server is down. Drop the key only if you want Muse to refuse to start
+without ironmem.
+
+`ironmem muse` already writes this form for you, `mode` included, on a
+fresh entry (and upgrades a pre-existing bare `["serve"]` entry in place,
+preserving `env`, `mode` if you set one, and sibling entries — an upgrade
+never adds keys you did not write). Unrelated top-level keys (e.g. `theme`)
+and sibling server entries are preserved. Anything else shaped is refused rather than silently
 rewritten: a non-object `mcpServers` (including the `[{id, ...}]` array
 from the plugin-manifest docs) or a non-object `ironmem` entry makes
 `ironmem muse` stop with an "is not an object" error and `ironmem doctor`
