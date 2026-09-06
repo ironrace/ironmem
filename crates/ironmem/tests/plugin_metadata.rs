@@ -595,18 +595,49 @@ fn claude_mcp_json_has_required_fields() {
 fn plugin_versions_match_cargo_toml() {
     let cargo_version = env!("CARGO_PKG_VERSION");
 
-    let codex = read_json(".codex-plugin/plugin.json");
-    let codex_version = codex["version"].as_str().unwrap_or("");
-    assert_eq!(
-        codex_version, cargo_version,
-        "codex plugin.json version ({codex_version}) must match Cargo.toml ({cargo_version})"
-    );
+    // The generated wrapper (`scripts/sync_mcp_wrappers.py`) hard-fails with
+    // exit 1 when plugin.json's version and the binary's `--version` differ,
+    // so an unguarded plugin.json silently breaks that harness's MCP startup
+    // on the next Cargo version bump. Every shipped plugin root is gated.
+    for dir in [
+        ".codex-plugin",
+        ".claude-plugin",
+        ".muse-plugin",
+        ".grok-plugin",
+        ".gemini-plugin",
+    ] {
+        let manifest = read_json(&format!("{dir}/plugin.json"));
+        let version = manifest["version"].as_str().unwrap_or("");
+        assert_eq!(
+            version, cargo_version,
+            "{dir} plugin.json version ({version}) must match Cargo.toml ({cargo_version})"
+        );
+    }
+}
 
-    let claude = read_json(".claude-plugin/plugin.json");
-    let claude_version = claude["version"].as_str().unwrap_or("");
+#[test]
+fn muse_plugin_manifest_has_required_fields() {
+    // Minimal structural pin for the muse manifest (mirrors the
+    // codex/claude manifest tests). This is the Gemini/Grok stand-in
+    // convention — a Claude-style top-level `mcpServers` object — NOT
+    // Muse's native plugin manifest, whose contract is
+    // `compat`/`capabilities.mcpServers: [{id, transport?, command}]`
+    // (unmeasured, so not shipped; see docs/MUSE.md). When the native
+    // shape is measured and adopted, retarget this test with it.
+    let manifest = read_json(".muse-plugin/plugin.json");
     assert_eq!(
-        claude_version, cargo_version,
-        "claude plugin.json version ({claude_version}) must match Cargo.toml ({cargo_version})"
+        manifest["name"].as_str().unwrap_or(""),
+        "ironmem",
+        "muse plugin.json: missing name"
+    );
+    let server = &manifest["mcpServers"]["ironmem"];
+    assert!(
+        server.is_object(),
+        "muse plugin.json: missing 'ironmem' server entry"
+    );
+    assert!(
+        server["command"].is_string(),
+        "muse plugin.json: missing 'command'"
     );
 }
 
