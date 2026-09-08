@@ -2807,18 +2807,17 @@ pub(super) fn handle_collab_status(app: &App, args: &Value) -> Result<Value, Mem
         // freshly-recovered session" case, so a pre-flight on `claimable`
         // would refuse exactly the session it was just told to fix.
         //
-        // Read through `cached_generation` — the same cache the guard reads —
-        // rather than re-deriving anything: the guard admits a tokenless call
-        // when `db_active == 0` (binding at zero) or when the cache equals
-        // `db_active`; a cache *ahead* of the DB is dropped there and falls
-        // through to the same two arms, which is why this does not need to
-        // model it. Per server, deliberately: with the launcher's default
-        // `serve --connect <socket>` both harnesses share one daemon, so the
-        // daemon's answer is the dispatch's answer; without a shared daemon
-        // no `collab_status` can speak for another process's cache, and this
-        // reads `false` past generation 0, which is the safe direction.
+        // Ask the guard's own predicate rather than restating it: the same
+        // function decides admission inside `ensure_actor_generation_current`,
+        // so the verdict and the gate cannot drift. Per server, deliberately:
+        // with the launcher's `serve --connect <socket>` wiring both harnesses
+        // share one daemon, so the daemon's answer is the dispatch's answer;
+        // without a shared daemon no `collab_status` can speak for another
+        // process's cache, and this reads `false` past generation 0, which
+        // is the safe direction. The command surfaces carry the wiring
+        // caveat, since nothing in this response identifies the process.
         let tokenless_admitted =
-            generation == 0 || app.cached_generation(session_id, ag) == Some(generation);
+            super::handoff::tokenless_admitted(app, session_id, ag, generation);
 
         // `reclaimable`: not claimable, and locked the way a dead-lease
         // rescue targets — held at generation > 0 with no pending token, and

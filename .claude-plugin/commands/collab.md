@@ -267,12 +267,13 @@ paths, branches, or SHAs.
    **copilot**-owned — read `current_owner` from `collab_status` rather
    than assuming an agent. Under the default `pilot == "claude"` the next
    action is Codex's review turn, driven inline via `codex exec` under the
-   existing "Codex handoff — background `codex exec`" rules — whose step a
+   existing "Codex handoff — background `codex exec`" rules, whose step a
    runs a **lease pre-flight** on `collab_status` first: when
    `codex_lease.tokenless_admitted` is `false`, the shortcut stops with
-   that step's remedy and never dispatches (#299). A session this command
-   has just created sits at generation 0 and passes; the pre-flight is for
-   a session `join` re-enters after its Codex holder died; under
+   that step's remedy and never dispatches (#299). The session this
+   command just created sits at generation 0 for both agents, so its
+   first dispatch passes; the pre-flight bites on a later turn, when the
+   Codex generation is held by a daemon that is gone. Under
    `pilot == "codex"` Claude is the copilot and owns that turn itself (the
    v3 dispatch loop's `CodeReviewFixGlobalPending` row covers both).
 6. Because shortcut sessions have no collab `task_list`, the copilot's
@@ -339,6 +340,16 @@ paths, branches, or SHAs.
    Every branch below is decided from that record. **Passing `--pilot` is
    never by itself authorization to change the pilot** — the flag states an
    intent; `status.pilot` decides whether that intent is even attemptable.
+
+   **Lease guard (`join`, #299).** On that same read, if `--pilot` or
+   `--implementer` was given and `codex_lease.tokenless_admitted` is
+   `false`, **stop before steps 5–6**: a role mutation on a Codex lease no
+   dispatch can take persists a change nobody can act on
+   (`--implementer=codex` would transfer the active batch to a locked
+   lease). Report the lockout with the remedy the Codex handoff's lease
+   pre-flight names (step a of that section, same read, same ladder), and
+   exit without touching a role. Without flags, continue — the pre-flight
+   refuses the dispatch itself, with no side effects.
 5. If `--pilot` was given, branch on `status.pilot` in **exactly this
    order**:
    1. **Requested pilot matches `status.pilot`** → no-op. **Do not call
@@ -1140,34 +1151,77 @@ a. Read a fresh `collab_status`. If `current_owner == "claude"` or
    the turn owner's block; every dispatch from this section is Codex's —
    and branch on `codex_lease.tokenless_admitted`. It is the server's own
    answer to the one question this dispatch turns on: would a call as
-   Codex that presents **no** token be admitted through the daemon this
-   `codex exec` will connect to? Do not re-derive it from `generation` /
+   Codex that presents **no** token be admitted through the server that
+   answered this `collab_status`? Do not re-derive it from `generation` /
    `handoff_pending`, and do not substitute `claimable`: the shim carries
    no token, so `claimable` is `true` with a token pending that the
    dispatch cannot present, and `false` the moment that token is claimed —
    which is exactly when the dispatch would succeed.
+
+   The verdict is per server process, and nothing in the response says
+   which process answered. It is the dispatch's verdict only when this
+   session's `ironmem` MCP entry and `~/.codex/config.toml`'s
+   `[mcp_servers.ironmem]` both run `serve --connect <same socket>` with
+   `IRONMEM_NO_DAEMON` unset — the wiring `ironmem claude` / `ironmem codex`
+   and the Quickstart installer write. `ironmem doctor` reports each
+   harness as wired with the shared-daemon proxy command or with legacy
+   bare `serve` (the checked-in `.claude-plugin` / `.codex-plugin`
+   manifests are bare `serve`: one in-process server per client, sharing
+   nothing). If either side is bare, a `true` here speaks for this process
+   only, and remedy 1 below would claim into a cache the `codex exec` never
+   sees — fix the wiring first (`ironmem claude .` / `ironmem codex .`)
+   rather than dispatching on it.
    - `tokenless_admitted == true` → continue to step b.
    - `tokenless_admitted == false` → **stop. Never dispatch.** The
      `codex exec` would exit 0 in under a minute having done nothing
      (#283's field note), so refuse here instead, naming the session id,
-     the phase, `codex_generation`, and exactly one remedy — the one the
-     same lease block admits in the reported phase, in this order:
-     1. `reclaimable == true` and `ended_at` is null → the holder is dead:
-        `force_reissue: true` on `session_handoff`
+     the phase, `codex_generation`, and exactly one remedy. Pick it from
+     the same `collab_status` read — `reclaimable`, `idle_secs`, and
+     `handoff_pending` from `codex_lease`, plus the top-level `ended_at`
+     and `dead_session_secs` (those two are not repeated inside the lease
+     block) — and it is the one the server admits in the reported state,
+     in this order:
+     0. `ended_at` is not null → the session is sealed (an abandon leaves
+        `phase` unchanged, so the terminal check above does not catch it).
+        No remedy: report it as ended and exit the dispatcher loop —
+        `session_handoff` and `collab_end { abandon: true }` both refuse an
+        ended session.
+     1. `reclaimable == true` → the holder is dead: `force_reissue: true`
+        on `session_handoff`
         (`{ session_id, agent: "codex", force_reissue: true }`), then claim
         the returned `handoff_token` **through this daemon** on the very
         call the shim makes first,
-        `collab_wait_my_turn { session_id, agent: "codex", timeout_secs: 0, handoff_token }`
-        (a wait, so the claim has no protocol effect beyond the lease).
+        `collab_wait_my_turn { session_id, agent: "codex", timeout_secs: 0, handoff_token }`.
+        The claim is a wait — a one-second poll, since `timeout_secs`
+        clamps to at least 1 — so it advances no phase, but it has
+        preconditions of its own: the token branch needs
+        `IRONMEM_MCP_MODE=trusted` on this daemon, and the wait first runs
+        the repo/branch metrics-scope check every wait does, so it is
+        refused while this daemon holds a *different* live session bound
+        to the same repository and branch (end or abandon that one first).
         Re-read `collab_status` and re-run this pre-flight: it now reads
         `tokenless_admitted: true`, and the dispatch proceeds normally.
-     2. `idle_secs >= dead_session_secs` and the session is not worth
+     2. `handoff_pending == true` (`reclaimable` reads `false` here,
+        because `claimable` is `true`) → a token was minted and never
+        claimed — typically remedy 1 interrupted between its two calls.
+        This read does not carry the token, but on a dead session a repeat
+        `session_handoff { session_id, agent: "codex", force_reissue: true }`
+        echoes it (`reused: true`; a forced mint's own stamp does not
+        count as activity, so the session is still dead): claim the echoed
+        token exactly as in remedy 1. If that call refuses because the
+        session is not yet dead, the token belongs to a live handoff in
+        progress — fall through to remedy 4. Reading `handoff_pending` to
+        pick a remedy is not re-deriving the verdict; the verdict stays
+        `tokenless_admitted`.
+     3. `idle_secs >= dead_session_secs` and the session is not worth
         finishing → seal it with
         `collab_end { session_id, agent: "claude", abandon: true, reason: "..." }`.
-        Only the `abandon: true` arm: a plain `collab_end` without
-        `abandon` is refused in every phase this section dispatches, so it
-        is never the remedy here.
-     3. Neither yet → report the remaining wait, `dead_session_secs -
+        Only the `abandon: true` arm: in the lockout this refusal reports,
+        a plain `collab_end` without `abandon` cannot succeed — it is
+        lease-gated (refused for Codex exactly as the dispatch would be)
+        and, in the coding phases, refused outright — so it is never the
+        remedy here.
+     4. None of the above → report the remaining wait, `dead_session_secs -
         idle_secs`, and exit the dispatcher loop. Do not poll the gate.
      The refusal has no side effects: it creates no session, advances no
      phase, writes no review state, and sends no `failure_report` — the
@@ -1646,7 +1700,13 @@ through it is admitted tokenless. `codex_lease.tokenless_admitted` on
 `collab_status` is the read that says whether that is currently so; it is
 what the Codex handoff's lease pre-flight consumes, and it is per daemon —
 a restart drops the claim, and the pre-flight refuses again until it is
-remade.
+remade. "The daemon both harnesses share" is a precondition, not a given:
+it holds under the `serve --connect <same socket>` wiring `ironmem claude`
+/ `ironmem codex` write, and not under the checked-in plugin manifests'
+bare `serve` or with `IRONMEM_NO_DAEMON` set, where a claim made here
+lands in a cache the `codex exec` never sees. The claim call itself needs
+`IRONMEM_MCP_MODE=trusted` on the daemon and passes the same repo/branch
+metrics-scope check as any wait; the pre-flight names both.
 
 **Caveat:** `reclaimable: true` is a hint, not a guarantee. It now folds in
 every precondition that is a property of the *session* — the lease is held

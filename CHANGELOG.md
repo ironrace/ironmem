@@ -21,18 +21,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cannot present and `false` once that token is claimed, i.e. exactly when
   the dispatch would succeed. The Claude dispatcher's Codex handoff now runs
   a lease pre-flight on that field before selecting a prompt or launching
-  anything, and refuses with the one remedy the same block admits in the
-  reported phase — `force_reissue` plus a daemon-side claim on
-  `collab_wait_my_turn` when `reclaimable`, `collab_end { abandon: true }`
-  when idle past `dead_session_secs`, otherwise the remaining wait — with no
-  side effects. The Codex shim consumes the same field before
-  `collab_wait_my_turn`. Neither surface re-derives the predicate, and
-  `scripts/check_collab_turn_templates.py` now pins the pre-flight's
-  presence, its position ahead of the launch, its remedies' phase
-  admissibility (never a plain `collab_end`), and the absence of a
-  re-derived `generation > 0 AND handoff_pending == false` on either surface.
-  No tool and no schema property were added; the `tools/list` surface is
-  unchanged.
+  anything, and refuses with the one remedy the same read admits in the
+  reported state — nothing on a sealed session; `force_reissue` plus a
+  daemon-side claim on `collab_wait_my_turn` when `reclaimable`; the token
+  a repeat `force_reissue` echoes when one is pending unclaimed;
+  `collab_end { abandon: true }` when idle past `dead_session_secs`;
+  otherwise the remaining wait — with no side effects, and the Claude
+  `join` refuses a `--pilot` / `--implementer` mutation on the same read.
+  The Codex shim consumes the same field before `collab_wait_my_turn`. The
+  verdict is per server process, so both surfaces state the precondition
+  it rests on: the shared-daemon wiring (`serve --connect <same socket>` in
+  both harnesses, which `ironmem doctor` reports), not the bare `serve` the
+  checked-in plugin manifests register. The field is computed by the
+  generation guard's own predicate (`tokenless_admitted` in
+  `mcp/tools/handoff.rs`), not a copy of it. Neither surface re-derives it,
+  and `scripts/check_collab_turn_templates.py` now pins the pre-flight's
+  presence and anchor, its position ahead of the launch, its remedies'
+  admissibility (never a plain `collab_end`), the dispatch-row count, and
+  the absence of the literal `generation > 0 AND handoff_pending == false`
+  spelling on either surface. No tool and no schema property were added;
+  the `tools/list` surface is unchanged.
 
 - **Autopilot rung 6: `ironmem autopilot merge` executes the merge decision,
   and `autopilot exhaust` closes out an issue that cannot converge.** Rung 5

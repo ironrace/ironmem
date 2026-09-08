@@ -3193,7 +3193,6 @@ def test_lint_rejects_the_doc_anchor_demoted_to_inline_prose(tmp_path):
 # re-derive it. Every pin below is duplicated from the lint on purpose (see
 # the note above CODEX_PILOT_ROUTING_SNIPPETS).
 
-REVIEW_PREFLIGHT_FIELD = "tokenless_admitted"
 REVIEW_PREFLIGHT_ANCHOR = "Lease pre-flight"
 REVIEW_PREFLIGHT_LAUNCH_ANCHOR = "Launch via Bash with `run_in_background: true`"
 REVIEW_PREFLIGHT_SNIPPETS = [
@@ -3234,16 +3233,14 @@ def _doc(fixture):
     return fixture / "docs" / "COLLAB.md"
 
 
-def _move_block_after(path, block_start, block_end_phrase, after_anchor):
-    """Cut the paragraph starting at `block_start` (through the end of the
-    line containing `block_end_phrase`) and paste it after the line
-    containing `after_anchor`, so every phrase pin stays satisfied and only
-    the ORDER changes."""
+def _move_block_after(path, block_start, after_anchor):
+    """Cut the blank-line-delimited paragraph containing `block_start` and
+    paste it after the line containing `after_anchor`, so every phrase pin
+    stays satisfied and only the ORDER changes."""
     text = path.read_text()
     start = text.index(block_start)
     start = text.rfind("\n", 0, start) + 1
-    end_phrase = text.index(block_end_phrase, start)
-    end = text.index("\n", end_phrase) + 1
+    end = text.index("\n\n", start) + 1
     block = text[start:end]
     rest = text[:start] + text[end:]
     anchor = rest.index(after_anchor)
@@ -3268,7 +3265,7 @@ def test_lint_rejects_the_lease_preflight_moved_below_the_launch(tmp_path):
     # dispatch now happens first, which is the wasted run #299 exists to stop.
     fixture = copy_fixture(tmp_path)
     _move_block_after(_claude_cmd(fixture), REVIEW_PREFLIGHT_ANCHOR,
-                      "no side effects", REVIEW_PREFLIGHT_LAUNCH_ANCHOR)
+                      REVIEW_PREFLIGHT_LAUNCH_ANCHOR)
 
     r = run({"COLLAB_LINT_ROOT": str(fixture)})
 
@@ -3276,6 +3273,37 @@ def test_lint_rejects_the_lease_preflight_moved_below_the_launch(tmp_path):
     assert (".claude-plugin/commands/collab.md: the lease pre-flight "
             f"({REVIEW_PREFLIGHT_ANCHOR!r}) must appear BEFORE "
             f"{REVIEW_PREFLIGHT_LAUNCH_ANCHOR!r}") in r.stdout
+
+
+@pytest.mark.parametrize("rel, anchor", [
+    (".claude-plugin/commands/collab.md", REVIEW_PREFLIGHT_ANCHOR),
+    (".codex-plugin/commands/collab.md", CODEX_LEASE_GUARD_ANCHOR),
+])
+def test_lint_rejects_a_missing_guard_anchor(tmp_path, rel, anchor):
+    # Every phrase pin survives a renamed anchor; without this the ordering
+    # and plain-`collab_end` checks would be silently skipped, not failed.
+    fixture = copy_fixture(tmp_path)
+    mutate(fixture / rel, anchor)
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert f"{rel}: missing the {anchor!r} anchor" in r.stdout
+
+
+def test_lint_rejects_a_fourth_review_dispatch_row(tmp_path):
+    # The row audit selects one of three prefix-sharing rows by its dispatch
+    # cell; a restructured table must fail here, not re-point the audit.
+    fixture = copy_fixture(tmp_path)
+    cmd = _claude_cmd(fixture)
+    text = cmd.read_text()
+    cmd.write_text(text + "\n| `CodeReviewFixGlobalPending` | extra | row |\n")
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert (".claude-plugin/commands/collab.md: expected exactly 3 lines "
+            "starting with '| `CodeReviewFixGlobalPending` |', found 4") in r.stdout
 
 
 def test_lint_rejects_a_plain_collab_end_recommended_by_the_preflight(tmp_path):
@@ -3355,7 +3383,7 @@ def test_lint_rejects_the_codex_lease_guard_moved_below_the_wait(tmp_path):
     # guard below it is reached only by a process the gate already admitted.
     fixture = copy_fixture(tmp_path)
     _move_block_after(_codex_cmd(fixture), CODEX_LEASE_GUARD_ANCHOR,
-                      "select nothing", CODEX_LEASE_GUARD_WAIT)
+                      CODEX_LEASE_GUARD_WAIT)
 
     r = run({"COLLAB_LINT_ROOT": str(fixture)})
 
@@ -3384,7 +3412,10 @@ def test_lint_rejects_a_re_derived_lease_predicate(tmp_path, rel):
 @pytest.mark.parametrize("snippet", DOC_PREFLIGHT_SNIPPETS)
 def test_lint_requires_collab_doc_to_state_the_up_front_refusal(tmp_path, snippet):
     fixture = copy_fixture(tmp_path)
-    mutate(_doc(fixture), snippet)
+    # `mutate_flex`, not `mutate`: the doc names the invariant in wrapped
+    # prose too, and an exact-string mutation leaves that copy for the
+    # lint's `flex()` match to find, proving nothing.
+    mutate_flex(_doc(fixture), snippet)
 
     r = run({"COLLAB_LINT_ROOT": str(fixture)})
 

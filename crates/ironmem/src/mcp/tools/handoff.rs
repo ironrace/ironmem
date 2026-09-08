@@ -88,6 +88,28 @@ impl GenerationClaim {
     }
 }
 
+/// Would a call as `agent` that presents **no** token be admitted by
+/// [`ensure_actor_generation_current`] through *this* process, given the DB's
+/// active generation `db_active`?
+///
+/// The guard's two tokenless admit arms — bind at zero on a never-handed-off
+/// session, or a cache that equals the DB — as one pure predicate, so
+/// `collab_status` can report the verdict the guard will give
+/// (`<agent>_lease.tokenless_admitted`, #299) without restating the rule. The
+/// guard itself decides admission through this function; a cache *ahead* of
+/// the DB is dropped there before the call and so falls into the same two
+/// arms, which is why it needs no arm here. Per process by construction: the
+/// cache is `App`'s advisory one, so the answer speaks for the server that
+/// computed it and no other.
+pub(super) fn tokenless_admitted(
+    app: &App,
+    session_id: &str,
+    agent: Agent,
+    db_active: u64,
+) -> bool {
+    db_active == 0 || app.cached_generation(session_id, agent) == Some(db_active)
+}
+
 /// Validate (and on first-touch/claim, bind) this process's generation for
 /// (session, agent). Call before any actor-bearing mutating/binding collab op.
 /// Must run inside the caller's transaction so a claim is atomic with the op.
@@ -120,9 +142,6 @@ pub(super) fn ensure_actor_generation_current(
         .map(|a| a.generation)
         .unwrap_or(0);
     if let Some(cached) = app.cached_generation(session_id, agent) {
-        if cached == db_active {
-            return Ok(GenerationClaim::Unchanged);
-        }
         if cached > db_active {
             // Defense in depth: callers publish a claim only after their
             // transaction commits (see `GenerationClaim`), so the cache should
@@ -152,7 +171,7 @@ pub(super) fn ensure_actor_generation_current(
             // same reason — a second attempt that finds no entry falls
             // through to the same two arms a first-touch call would.
             app.clear_cached_generation(session_id, agent);
-        } else {
+        } else if cached < db_active {
             return Err(MemoryError::Validation(format!(
                 "stale collab generation for {}: local={cached} current={db_active}; both \
                  remedies require IRONMEM_MCP_MODE=trusted: obtain a session_handoff token \
@@ -167,7 +186,15 @@ pub(super) fn ensure_actor_generation_current(
             )));
         }
     }
-    if db_active == 0 {
+    if tokenless_admitted(app, session_id, agent, db_active) {
+        // A cache entry that survived the arms above equals `db_active`: this
+        // process already holds the binding, and there is nothing to publish.
+        if app.cached_generation(session_id, agent).is_some() {
+            return Ok(GenerationClaim::Unchanged);
+        }
+        // Otherwise the DB is at zero with nothing cached (a first touch, or
+        // the entry just dropped above): bind at zero.
+        //
         // Deferred, like a token claim, even though this path writes no DB
         // state of its own. Writing it immediately would be safe against
         // *this* transaction rolling back — but not against `with_transaction`

@@ -10848,7 +10848,9 @@ fn start_review_session_in(app: &App, repo_path: &str) -> String {
 /// block the pre-flight reads — `tokenless_admitted`, beside `claimable`.
 #[test]
 fn a_fresh_review_session_admits_a_tokenless_codex_dispatch_and_says_so() {
-    let (_dir, _db_path, app) = open_disk_app();
+    // One process, one read: in-memory like every other shortcut test. The
+    // disk-backed app is for the multi-process topology the next test needs.
+    let app = App::open_for_test().unwrap();
     let sid = start_review_session_in(&app, "/repo/review-preflight");
 
     let codex = lease_block(&app, &sid, "codex");
