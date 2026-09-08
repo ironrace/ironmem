@@ -1635,6 +1635,20 @@ mod tests {
     /// paragraphs up. No neighbouring tool's description was trimmed to pay
     /// for it.
     ///
+    /// **Stack tip, #283 as a whole (#297 → #298 → #299).** The three
+    /// paragraphs above are the whole of what that stack cost this listing:
+    /// `collab_end`'s `abandon`/`reason` pair (4_170 → 4_333), then
+    /// `session_handoff`'s `force_reissue` and the `handoff_token` clause
+    /// beside it (4_333 → 4_407 → 4_450). #299 added nothing here by design
+    /// — its `tokenless_admitted` is a `collab_status` *response* field, and
+    /// this budget covers input schemas and descriptions only — so the
+    /// listing at the stack tip still measures 4_412 tokens under the
+    /// unmoved 4_450 cap, ~38 tokens of headroom. Every raise in the stack
+    /// paid for a precondition a caller cannot infer from schema keys
+    /// (refused-on-a-live-session, ignores-the-lease, refused-in-human-gated
+    /// phases, ignored-under-a-sibling-flag), none trimmed a neighbour, and
+    /// each is pinned by a test named in its own paragraph.
+    ///
     /// The budget is deliberately a whole-listing ceiling with no per-tool
     /// allocation, so the cheapest way to land a new field is to delete prose
     /// from whichever unrelated tool happens to be wordiest. That trade is not

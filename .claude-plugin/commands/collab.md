@@ -267,7 +267,12 @@ paths, branches, or SHAs.
    **copilot**-owned — read `current_owner` from `collab_status` rather
    than assuming an agent. Under the default `pilot == "claude"` the next
    action is Codex's review turn, driven inline via `codex exec` under the
-   existing "Codex handoff — background `codex exec`" rules; under
+   existing "Codex handoff — background `codex exec`" rules — whose step a
+   runs a **lease pre-flight** on `collab_status` first: when
+   `codex_lease.tokenless_admitted` is `false`, the shortcut stops with
+   that step's remedy and never dispatches (#299). A session this command
+   has just created sits at generation 0 and passes; the pre-flight is for
+   a session `join` re-enters after its Codex holder died; under
    `pilot == "codex"` Claude is the copilot and owns that turn itself (the
    v3 dispatch loop's `CodeReviewFixGlobalPending` row covers both).
 6. Because shortcut sessions have no collab `task_list`, the copilot's
@@ -983,8 +988,8 @@ sequence before building the payload:
 
 | Phase | What to do (is_my_turn == true) |
 |---|---|
-| `CodeImplementPending` | Owner depends on `implementer`. **Claude is owner** (default or `/collab join --implementer=claude <session_id>`): dispatch the matrix worker `collab-turn-code-implement.md` (mechanical/sonnet) and ingest its ≤3-line verdict; loop. The worker resumes from the session's current `collab_checkpoints` row (checked against live HEAD first — see step 5a), scans plan/code state, continues the local `iron-build` batch with the v3-bridge checkpoint rule, runs pre-send harness gates (no reset — no Codex push to sync), writes `status: batch_complete`, and `collab_send`s `sender="claude"`, `topic="implementation_done"`, `content=<JSON {"head_sha":"<current HEAD>"}>` (payload carries ONLY `head_sha`) on green, or `failure_report` on failure. After send, the phase advances to `CodeReviewFixGlobalPending` (the copilot's turn — the new v3 order has the copilot run `/pr-review-toolkit:review-pr` on the raw post-implementation diff first; the copilot is Codex under the default `pilot == "claude"` and Claude under `pilot == "codex"`, so read `current_owner` rather than assuming). **Codex is owner** (`--implementer=codex`): is_my_turn is false here; dispatch Codex via background `codex exec` (per the Codex handoff section). Codex must resume from its `collab_checkpoints` row, scan the plan/code state, and emit `implementation_done` itself before the bg-exec settled wait wakes on the phase advance. |
-| `CodeReviewFixGlobalPending` | Owner depends on `pilot`, plus a recovery override — the server gates this phase on the **copilot** (`require_actor_or_recovery(session, actor, copilot(session))` in `crates/ironmem/src/collab/state_machine/mod.rs`), so who owns it follows from `pilot`, not from the phase name. Read `current_owner` from `collab_status`. **Recovery override (checked first):** if `pending_failure` makes Claude the recovery owner, preserve the diff and complete the interrupted turn per the recovery override, sending `review_fix_global`; this is valid delegated completion, not an anomaly. **`current_owner == "codex"`** outside recovery (`pilot == "claude"`, the default): dispatch Codex via background `codex exec`, with the timing logs and `/pr-review-toolkit:review-pr` review pass described in the Codex handoff section. **`current_owner == "claude"`** outside recovery (`pilot == "codex"`, so Claude is the copilot): this is Claude's legitimate turn — dispatch the matrix worker `collab-turn-review-fix-global.md` (review/opus), ingest only its ≤3-line verdict, and loop. Do **not** dispatch Codex here: `collab-global-review.md`'s own ownership guard rejects and exits, which the wait loop reads as a dispatch failure and turns into a spurious `codex_dispatch_failed:` that burns a recovery attempt. After `review_fix_global`, the phase advances to `CodeReviewLocalPending` (the pilot's audit turn). |
+| `CodeImplementPending` | Owner depends on `implementer`. **Claude is owner** (default or `/collab join --implementer=claude <session_id>`): dispatch the matrix worker `collab-turn-code-implement.md` (mechanical/sonnet) and ingest its ≤3-line verdict; loop. The worker resumes from the session's current `collab_checkpoints` row (checked against live HEAD first — see step 5a), scans plan/code state, continues the local `iron-build` batch with the v3-bridge checkpoint rule, runs pre-send harness gates (no reset — no Codex push to sync), writes `status: batch_complete`, and `collab_send`s `sender="claude"`, `topic="implementation_done"`, `content=<JSON {"head_sha":"<current HEAD>"}>` (payload carries ONLY `head_sha`) on green, or `failure_report` on failure. After send, the phase advances to `CodeReviewFixGlobalPending` (the copilot's turn — the new v3 order has the copilot run `/pr-review-toolkit:review-pr` on the raw post-implementation diff first; the copilot is Codex under the default `pilot == "claude"` and Claude under `pilot == "codex"`, so read `current_owner` rather than assuming). **Codex is owner** (`--implementer=codex`): is_my_turn is false here; dispatch Codex via background `codex exec` (per the Codex handoff section, lease pre-flight included). Codex must resume from its `collab_checkpoints` row, scan the plan/code state, and emit `implementation_done` itself before the bg-exec settled wait wakes on the phase advance. |
+| `CodeReviewFixGlobalPending` | Owner depends on `pilot`, plus a recovery override — the server gates this phase on the **copilot** (`require_actor_or_recovery(session, actor, copilot(session))` in `crates/ironmem/src/collab/state_machine/mod.rs`), so who owns it follows from `pilot`, not from the phase name. Read `current_owner` from `collab_status`. **Recovery override (checked first):** if `pending_failure` makes Claude the recovery owner, preserve the diff and complete the interrupted turn per the recovery override, sending `review_fix_global`; this is valid delegated completion, not an anomaly. **`current_owner == "codex"`** outside recovery (`pilot == "claude"`, the default): dispatch Codex via background `codex exec` — through that section's lease pre-flight, never on `codex_lease.tokenless_admitted == false` — with the timing logs and `/pr-review-toolkit:review-pr` review pass described in the Codex handoff section. **`current_owner == "claude"`** outside recovery (`pilot == "codex"`, so Claude is the copilot): this is Claude's legitimate turn — dispatch the matrix worker `collab-turn-review-fix-global.md` (review/opus), ingest only its ≤3-line verdict, and loop. Do **not** dispatch Codex here: `collab-global-review.md`'s own ownership guard rejects and exits, which the wait loop reads as a dispatch failure and turns into a spurious `codex_dispatch_failed:` that burns a recovery attempt. After `review_fix_global`, the phase advances to `CodeReviewLocalPending` (the pilot's audit turn). |
 | `CodeReviewLocalPending` | Owner depends on `pilot`, plus a recovery override — the server gates this phase on the **pilot** (`require_actor_or_recovery(session, actor, pilot(session))` in `crates/ironmem/src/collab/state_machine/mod.rs`), so who owns it follows from `pilot`, not from the phase name. Read `current_owner` from `collab_status`: under the default `pilot == "claude"` that is Claude; under `pilot == "codex"` it is Codex, dispatched via the **§ Codex dispatch tuning matrix**, unless a `codex_dispatch_failed:` recovery makes Claude the recovery owner for this turn. When Claude is the owner (normal pilot or recovery owner): dispatch the matrix worker `collab-turn-review-local.md` (review/opus) and ingest its ≤3-line verdict; loop. The worker runs the pre-send harness (with reset to `last_head_sha` — the copilot just pushed at `review_fix_global`), then performs the overlap-mode audit of the copilot's work. It runs full `/ultrareview-local` when the copilot made fix commits or runtime/Rust files changed, and uses `review_local=reduced` when the copilot made no fix commit or the branch diff is docs/config-only. Reduced mode is still an audit: inspect the diff summary, changed files, and the copilot's commits for protocol drift, docs/config breakage, generated metadata inconsistencies, and security-sensitive configuration; escalate to full `/ultrareview-local` on uncertainty or a substantive finding. Confirmed CRITICAL/HIGH/MEDIUM findings are partitioned into temporary worktrees on unique throwaway branches for parallel fix subagents where safe, merged/cherry-picked back, committed + pushed, and `collab_send`s with `$SENDER=<collab_status.current_owner>`, `topic="review_local"`, `content=<JSON {"head_sha":"<current HEAD>"}>` — never a hardcoded sender, because under the recovery override the owner here is not necessarily the pilot. **Log:** `t5_review_local_sent`. **Anti-removal:** under v3 ordering this pilot-owned stage audits the copilot's `review_fix_global` work plus catches issues both agents missed. Its code-quality lens partially overlaps with the copilot's `pr-review-toolkit`-backed branch review but does not fully duplicate it. Removing this stage requires a written overlap audit demonstrating that the copilot's `review_fix_global` reviews catch the code-quality issues `/ultrareview-local` would have flagged AND that the audit-of-the-copilot role is unnecessary. (Under the default `pilot == "claude"` the copilot is Codex, so this reads concretely as "Claude audits Codex's `review_fix_global` work" — an example of the rule, never the whole rule.) |
 | `CodeReviewFinalPending` | **Auto-create the PR — no user-approval gate** (the diff already passed `review_fix_global` + `review_local`, and a PR is editable and unmerged after creation; do NOT enter Plan Mode here). Dispatch the matrix worker `collab-turn-final-review.md` (review/opus) with `$MODE=compose`: it performs pushed-head proof only (no reset, no gate rerun) by requiring a clean worktree, `HEAD == last_head_sha`, and local HEAD equal to the pushed upstream/origin branch head, then drafts the PR title (under 70 chars) + body (summary + test plan derived from task list + prior gate evidence / pushed-head proof), writes `{"title":"...","body":"..."}` to a drawer, and returns `{drawer_id, ≤3-line summary}`. If the proof fails, the worker returns a blocker instead of running tests. Composition is pilot-generic — under `pilot == "claude"` this worker (`collab-turn-final-review.md`) composes as just described; under `pilot == "codex"`, Codex composes the equivalent drawer itself via its own `collab-final-review.md` prompt (proves the pushed head, drafts the PR title/body, stages `{"title":"...","body":"..."}`, and sends nothing and opens no PR). Either way, the orchestrator reads `current_owner` from `collab_status` (confirming `final_review` is the topic authorized for this phase) and dispatches `collab-turn-submit.md` (mechanical/sonnet) **directly** with `$TOPIC=final_review` `$ARTIFACT_REF=<drawer_id>` `$SENDER=<collab_status.current_owner>` (drawer immutability is the integrity anchor — the approved drawer's content cannot change, so no hash recompute is needed): it reads the title/body artifact, then runs a plain `gh pr create --base <base_branch> --head <current branch> --title <title> --body <body>` (a **ready** PR — no `--draft`), and on failure sends `failure_report` `coding_failure: "pr_create_failed: <error>"` (no silent retry). Normally `current_owner == pilot` here; under recovery (`collab_status.pending_failure` non-null), `current_owner` may instead be the recovery owner per the recovery override in step 0 of the **Pre-send Harness Sequence (Claude-owned v3 turns)** and the `CodeReviewLocalPending`/`CodeReviewFinalPending` recovery row in the **Codex dispatch tuning matrix** — `CodeReviewFinalPending` is a coding-active phase, so this substitution is live here, and `$SENDER` must always be read from `current_owner`, never assumed to equal `pilot`. On success, **Log:** `t8_pr_created <pr_url>`, the worker captures `pr_url` and `collab_send`s as `$SENDER`, `topic="final_review"`, `content=<JSON {"head_sha":"<current HEAD>","pr_url":"<https url>"}>`. **Log:** `t9_final_review_sent`. Session advances directly to `CodingComplete`. **Log:** `t10_session_complete CodingComplete`. Exit loop. |
 
@@ -1129,6 +1134,44 @@ allows hang detection via wall-clock timeout on every Codex-owned phase.
 
 a. Read a fresh `collab_status`. If `current_owner == "claude"` or
    `phase` is terminal, skip this step and resume polling / exit.
+
+   **Lease pre-flight (#299).** On that same read, before any prompt is
+   selected and before any `codex exec` is launched, read `codex_lease` —
+   the turn owner's block; every dispatch from this section is Codex's —
+   and branch on `codex_lease.tokenless_admitted`. It is the server's own
+   answer to the one question this dispatch turns on: would a call as
+   Codex that presents **no** token be admitted through the daemon this
+   `codex exec` will connect to? Do not re-derive it from `generation` /
+   `handoff_pending`, and do not substitute `claimable`: the shim carries
+   no token, so `claimable` is `true` with a token pending that the
+   dispatch cannot present, and `false` the moment that token is claimed —
+   which is exactly when the dispatch would succeed.
+   - `tokenless_admitted == true` → continue to step b.
+   - `tokenless_admitted == false` → **stop. Never dispatch.** The
+     `codex exec` would exit 0 in under a minute having done nothing
+     (#283's field note), so refuse here instead, naming the session id,
+     the phase, `codex_generation`, and exactly one remedy — the one the
+     same lease block admits in the reported phase, in this order:
+     1. `reclaimable == true` and `ended_at` is null → the holder is dead:
+        `force_reissue: true` on `session_handoff`
+        (`{ session_id, agent: "codex", force_reissue: true }`), then claim
+        the returned `handoff_token` **through this daemon** on the very
+        call the shim makes first,
+        `collab_wait_my_turn { session_id, agent: "codex", timeout_secs: 0, handoff_token }`
+        (a wait, so the claim has no protocol effect beyond the lease).
+        Re-read `collab_status` and re-run this pre-flight: it now reads
+        `tokenless_admitted: true`, and the dispatch proceeds normally.
+     2. `idle_secs >= dead_session_secs` and the session is not worth
+        finishing → seal it with
+        `collab_end { session_id, agent: "claude", abandon: true, reason: "..." }`.
+        Only the `abandon: true` arm: a plain `collab_end` without
+        `abandon` is refused in every phase this section dispatches, so it
+        is never the remedy here.
+     3. Neither yet → report the remaining wait, `dead_session_secs -
+        idle_secs`, and exit the dispatcher loop. Do not poll the gate.
+     The refusal has no side effects: it creates no session, advances no
+     phase, writes no review state, and sends no `failure_report` — the
+     turn is still Codex's, untouched.
 
 b. Select prompt file, model, and reasoning effort from the "Codex dispatch tuning
    matrix" above using `phase`, `current_owner`, `pilot`, `implementer`, and
@@ -1591,6 +1634,19 @@ waiting changes. The alternative is `collab_end { abandon: true }`, which
 ends the session permanently instead of re-leasing it — and it is a real
 alternative in both directions: a forced reissue that nobody claims does
 not block a later abandon.
+
+**Claiming for Codex.** The Codex shim presents no token — a dispatched
+`codex exec` is `join <session_id>` and nothing else — so a token minted
+for the Codex lease is claimed by this dispatcher on Codex's behalf,
+through the daemon both harnesses share (`serve --connect <socket>`):
+present it on
+`collab_wait_my_turn { session_id, agent: "codex", timeout_secs: 0, handoff_token }`.
+The daemon then holds the Codex generation, and the next `codex exec`
+through it is admitted tokenless. `codex_lease.tokenless_admitted` on
+`collab_status` is the read that says whether that is currently so; it is
+what the Codex handoff's lease pre-flight consumes, and it is per daemon —
+a restart drops the claim, and the pre-flight refuses again until it is
+remade.
 
 **Caveat:** `reclaimable: true` is a hint, not a guarantee. It now folds in
 every precondition that is a property of the *session* — the lease is held

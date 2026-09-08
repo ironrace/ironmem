@@ -703,12 +703,27 @@ Invariants that still apply:
   abandoned on identical terms to a full-flow v3 session (staleness gate,
   `abandoned:` epitaph, phase left unchanged). See "The `collab_end` abandon
   contract" below.
-- `failure_report` is the only escape hatch for a *live* session. A
-  **Terminal**-classified report transitions to `CodingFailed`; a
+- `failure_report` is the escape hatch for a *live* session's interrupted
+  turn. A **Terminal**-classified report transitions to `CodingFailed`; a
   **Tooling**-classified report (seven recoverable prefixes — see "Failure +
   terminal") instead keeps the session at its current phase and flips
-  `current_owner`. For a session that has gone silent rather than merely
-  interrupted, abandon is the escape hatch instead.
+  `current_owner`. It stopped being the only one with #297 and #298: a
+  session that has gone silent rather than merely interrupted is sealed
+  with `collab_end { abandon: true }`, and a session still worth finishing
+  whose lease holder died is re-leased with
+  `session_handoff { force_reissue: true }`.
+- **Up-front lease refusal (#299).** The copilot's `review_fix_global` turn
+  is a tokenless `codex exec` under the default pilot, and a lease held
+  past generation 0 by a process that is gone refuses it — after a full
+  model run has been spent discovering so. The dispatcher therefore reads
+  `codex_lease.tokenless_admitted` from `collab_status` before any dispatch
+  and refuses first, naming the remedy the same block admits in the
+  reported phase (`force_reissue` plus a daemon-side claim when
+  `reclaimable`, `abandon: true` when idle past `dead_session_secs`,
+  otherwise the remaining wait), with no side effects. The Codex shim
+  consumes the same field before selecting a prompt. Neither surface
+  re-derives the predicate — see "Per-agent lease verdict" under
+  `collab_status`.
 - Drift detection applies to every head-advancing coding event, in both the
   `collab_start_code_review` shortcut and the normal full-flow v3 batch:
   `ImplementationDone{head_sha}`, `CodeReviewFixGlobal{head_sha}`,
@@ -1442,6 +1457,13 @@ and never handed to git, so there is no ancestry question for it to answer.
 Both are trimmed before validation, so a value pasted straight from the
 output of `git rev-parse HEAD` is accepted with its trailing newline.
 
+The session it creates is at generation 0 for both agents, so the copilot's
+first turn is always dispatchable. The up-front lease refusal (#299) bites
+on the session `/collab join` attaches to instead: the dispatcher reads
+`codex_lease.tokenless_admitted` before any `codex exec` and refuses with a
+remedy when it is `false` — see "Up-front lease refusal" under the shortcut
+subsection above.
+
 The `head_sha` rule is a **shape** check and nothing more. A branch or tag
 whose name happens to be 7–64 hex characters (`deadbeef`) satisfies it, gets
 stored, and then re-resolves on every later ancestry check — the moving-target
@@ -1649,6 +1671,7 @@ them.
   "generation": 3,
   "handoff_pending": false,
   "claimable": false,
+  "tokenless_admitted": false,
   "last_activity": 1723996800,
   "idle_secs": 22000,
   "reclaimable": true
@@ -1664,6 +1687,22 @@ activity signal at all), not a string.
   `claimable: true` on the pending-token case means claimable *by whoever
   holds that token* — this surface never exposes the token itself, so a
   caller without it cannot act on `claimable: true` there.
+- `tokenless_admitted == (generation == 0 || this server's cached generation
+  == generation)` (#299) — a call as this agent that presents no token
+  would be admitted by `ensure_actor_generation_current` through the server
+  that answered this `collab_status`. This is the verdict a dispatch needs,
+  and it is not `claimable`: a dispatched `codex exec` is `join <session_id>`
+  with no token, so it can act only by a first touch at generation 0 or
+  under a generation this server already bound. `claimable` reads `true`
+  with a token pending (usable by the token's holder, not by the dispatch)
+  and `false` once that token is claimed (held again — through this very
+  server, if the claim was made here), so a pre-flight on `claimable` would
+  refuse the freshly recovered session it was just told to fix. The cache
+  is per server process: with the launcher's default `serve --connect
+  <socket>` both harnesses share one daemon and its answer is the
+  dispatch's answer; a daemon restart drops every claim, and the field
+  reads `false` past generation 0 until one is remade (see "Claiming for
+  Codex" under § `session_handoff`).
 - `reclaimable == (!claimable && session_is_dead(...) && !activity_degraded
   && phase.admits_forced_reissue())` — not claimable, and admitted by
   every precondition of the `force_reissue` gate that is a property of the
@@ -1673,11 +1712,12 @@ activity signal at all), not a string.
   than re-listed, so a new `Phase` cannot be admitted by the diagnostic and
   refused by the gate.
 
-Both are **derived, not new state**: every value they read (`generation`,
-`handoff_pending`, and the staleness snapshot already producing
-`last_activity`/`idle_secs` above) was already computable from keys
-`collab_status` returned before issue #298, and those keys are still
-returned unchanged. What was missing was a server-side *name* for the rule,
+All three are **derived, not new state**: every value they read (`generation`,
+`handoff_pending`, the staleness snapshot already producing
+`last_activity`/`idle_secs` above, and — for `tokenless_admitted` — the
+same per-process advisory cache the generation guard reads) was already
+computable from keys `collab_status` returned before issue #298, or already
+consulted by the guard, and those keys are still returned unchanged. What was missing was a server-side *name* for the rule,
 so every caller re-derived it by hand and could drift from the actual gate.
 `collab_status` is deliberately **not** lease-gated — unlike `collab_send`,
 `collab_approve`, and the other mutating/binding calls, it does not route
@@ -3045,6 +3085,18 @@ inside the `handoff_block`.
 generation > 0), a fresh process with no cached generation and no token is
 rejected — it must present a `session_handoff` token. Tokenless first-touch
 is permitted only at generation 0 (a session that has never been handed off).
+
+**Claiming for Codex.** The Codex shim presents no token — a dispatched
+`codex exec` is `join <session_id>` and nothing else — so a token minted for
+the Codex lease (a `force_reissue`, typically) is claimed by the Claude
+dispatcher on Codex's behalf, through the daemon both harnesses share
+(`serve --connect <socket>`), by presenting it on
+`collab_wait_my_turn { session_id, agent: "codex", timeout_secs: 0, handoff_token }`.
+The daemon then holds the Codex generation, and the next `codex exec` through
+it is admitted tokenless; `codex_lease.tokenless_admitted` is the read that
+says so (#299). `agent` is caller-asserted throughout this protocol, so this
+is not a bypass of anything — it is the same claim a Codex process would make
+if it could carry the token.
 
 **collab_ack actor resolution.** `collab_ack` has no `agent` parameter; it
 resolves the actor from the target message's `receiver` field before
@@ -4495,6 +4547,11 @@ echo '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' \
       assert all(f'collab_{n}' in t for n in ['start','send','recv','ack','status','approve','register_caps','get_caps','wait_my_turn','end']), t; \
       assert 'session_handoff' in t, t; print('OK')"
 ```
+
+#299 changed nothing this test asserts on: it adds no tool and no schema
+property (`tokenless_admitted` is a `collab_status` *response* field, outside
+the listing and its token budget), so the `tools/list` assertion list above
+is unchanged by design, not by omission.
 
 ## Scope and Limits
 

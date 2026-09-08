@@ -68,6 +68,22 @@ not the "extra positional value" this parse rejects — and, with neither flag
 given, leaves `pilot` and `implementer` both untouched. An absent flag means
 "leave that role alone"; only issue a mutation for a flag actually given.
 
+**Lease guard (`join`) — first, before any mutation and before any prompt
+is selected.** Call `collab_status` and read `codex_lease.tokenless_admitted`
+(#299): the server's answer to whether a Codex call presenting no token —
+which is every call this one-shot makes — would be admitted through the
+daemon it is connected to. Do not re-derive it from `generation` or
+`handoff_pending`. When it is `false`, **select nothing**: do not call
+`collab_wait_my_turn`, do not touch a role, and do not open a prompt.
+Report the lockout — session id, phase, `codex_generation` — with the one
+remedy the same block admits: `reclaimable: true` with `ended_at` null →
+`force_reissue: true` on `session_handoff` for `agent: "codex"`, claimed
+through this daemon by the dispatcher; `idle_secs >= dead_session_secs` and
+nobody means to finish → `collab_end` with `abandon: true` (a plain
+`collab_end` without `abandon` is refused in every phase this shim routes);
+otherwise the remaining wait. Then exit. When it is `true`, continue — the
+same `collab_status` read serves everything below.
+
 **Call `collab_status` first, before any mutation**, and read `task`, `phase`,
 `current_owner`, `pilot`, and `implementer`; every branch below is decided from
 that record. Passing `--pilot` is never by itself authorization to change the
