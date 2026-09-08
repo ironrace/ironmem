@@ -2982,6 +2982,224 @@ def check_codex_shim_unrouted_phases_contract() -> None:
                 f"with it and this pin has to be retired deliberately")
 
 
+# ---------------------------------------------------------------- #299
+#
+# `/collab review` refuses BEFORE any `codex exec` dispatch when the copilot's
+# lease cannot be taken by a tokenless one-shot. Both command surfaces consume
+# `collab_status`'s `<agent>_lease.tokenless_admitted` for that; neither
+# re-derives it (R1: two surfaces that each restate the predicate drift, and
+# then one refuses while the other dispatches — the exact waste this exists
+# to stop).
+REVIEW_PREFLIGHT_FIELD = "tokenless_admitted"
+CODEX_HANDOFF_HEADING = "### Codex handoff — background `codex exec`"
+REVIEW_PREFLIGHT_ANCHOR = "Lease pre-flight"
+# The pre-flight paragraph ends where prompt selection (step b) begins.
+REVIEW_PREFLIGHT_END_ANCHOR = "Select prompt file, model, and reasoning effort"
+REVIEW_PREFLIGHT_LAUNCH_ANCHOR = "Launch via Bash with `run_in_background: true`"
+REVIEW_PREFLIGHT_SNIPPETS = [
+    "`codex_lease.tokenless_admitted`",
+    "stop. Never dispatch.",
+    "Do not re-derive it",
+    "`force_reissue: true`",
+    "`abandon: true`",
+    "no side effects",
+]
+REVIEW_SHORTCUT_HEADING = "## `review [--pilot=claude|codex] <short-topic>`"
+REVIEW_SHORTCUT_PREFLIGHT_SNIPPETS = [
+    "`codex_lease.tokenless_admitted`",
+    "never dispatches",
+]
+REVIEW_DISPATCH_ROW_PREFIX = "| `CodeReviewFixGlobalPending` |"
+# Three rows share that prefix (the phase-action row and two Codex tuning
+# rows); the phase-action row is the one that dispatches. The count is
+# pinned for the same reason SENDER_DISPATCH_ROWS pins `row_count`: an
+# added, removed or restructured row must fail here rather than quietly
+# re-point the audit at a different line.
+REVIEW_DISPATCH_ROW_COUNT = 3
+REVIEW_DISPATCH_ROW_MARKER = "dispatch Codex via background `codex exec`"
+REVIEW_DISPATCH_ROW_PHRASE = "lease pre-flight"
+CODEX_LEASE_GUARD_ANCHOR = "Lease guard"
+# The guard paragraph ends where the flag-handling read begins.
+CODEX_LEASE_GUARD_END_ANCHOR = "**Call `collab_status` first, before any mutation**"
+# The first lease-gated call the shim makes. A guard below it is reached only
+# by a process the gate already admitted.
+CODEX_LEASE_GUARD_WAIT = 'collab_wait_my_turn(session_id, "codex", 60)'
+CODEX_LEASE_GUARD_SNIPPETS = [
+    "`codex_lease.tokenless_admitted`",
+    "select nothing",
+    "`force_reissue: true`",
+    "`abandon: true`",
+]
+DOC_PREFLIGHT_SNIPPETS = [
+    "Up-front lease refusal",
+    "`tokenless_admitted`",
+]
+# Stale after #297/#298: abandon and force_reissue are escape hatches too.
+DOC_STALE_ESCAPE_HATCH = "is the only escape hatch"
+# The predicate child B named server-side. Restated on a command surface it
+# is a second copy, and a second copy drifts.
+LEASE_REDERIVATION_RE = re.compile(
+    r"generation\s*>\s*0\s*(?:AND|&&|and)\s*handoff_pending\s*==\s*false")
+
+
+def plain_collab_end_sentences(block: str) -> list[str]:
+    """Sentences in `block` naming `collab_end` without `abandon`.
+
+    A plain `collab_end` cannot succeed in the lockout the pre-flight
+    reports: it is lease-gated (refused for Codex exactly as the dispatch
+    would be), refused outright in every coding phase, and owner-gated in
+    the one planning phase that admits it. A refusal recommending it
+    reproduces #283 remedy 5's defect — a guard naming an action the server
+    rejects — in a new place. Sentence-scoped rather than block-scoped so
+    the block may legitimately say "a plain `collab_end` without `abandon`
+    is refused"; that sentence names both.
+    """
+    return [s for s in ultrareview_sentences(block)
+            if "collab_end" in s and "abandon" not in s]
+
+
+def guarded_block(rel: str, text: str, label: str, anchor: str,
+                  before: str, before_label: str, before_const: str,
+                  end: str, order_why: str) -> str | None:
+    """Locate the guard paragraph at `anchor` in `text`, require it to
+    precede `before`, and return it (cut at `end`, or the text's end).
+
+    One routine for both surfaces: the Claude pre-flight against the
+    `codex exec` launch and the Codex shim's guard against its first
+    lease-gated wait. Every lookup is `flex`, so wrapped prose reflows
+    without silently widening the block, and a MISSING anchor is an error
+    rather than a skipped check — the phrase pins alone say the words are
+    present, not that the gate sits where it must.
+    """
+    guard = flex(anchor).search(text)
+    if guard is None:
+        err(f"{rel}: missing the {anchor!r} anchor — the phrase pins still "
+            f"hold, but without it {label}'s position ahead of "
+            f"{before_label}{before!r} and the admissibility of its remedies "
+            f"can no longer be checked, so the gate is silently unpinned")
+        return None
+    gate = flex(before).search(text)
+    if gate is None:
+        err(f"{rel}: no longer names {before!r}, so {label} can no longer "
+            f"be ordered against the call it guards — re-anchor "
+            f"{before_const}")
+    elif guard.start() > gate.start():
+        err(f"{rel}: {label} ({anchor!r}) must appear BEFORE "
+            f"{before_label}{before!r}. {order_why}")
+    stop = flex(end).search(text, guard.end())
+    return text[guard.start():stop.start() if stop else len(text)]
+
+
+def check_review_preflight_contract() -> None:
+    """The lease pre-flight exists, precedes the launch, and names only
+    admissible remedies — on both surfaces, off one server-computed field.
+
+    Four things, each of which a plain phrase pin misses. The pre-flight must
+    sit BEFORE the `codex exec` launch (a pre-flight stated after the launch
+    is documentation, not a gate). Every remedy it names must be one the
+    server admits in a dispatch phase (never a plain `collab_end`). The Codex
+    shim must guard before its first lease-gated call, not after. And
+    neither surface may restate the predicate the server already names.
+    """
+    text = live_text(COMMAND)
+    handoff = command_section(text, CODEX_HANDOFF_HEADING, ("## ", "### "))
+    if handoff is None:
+        err(f".claude-plugin/commands/collab.md: missing "
+            f"{CODEX_HANDOFF_HEADING!r}, which owns the lease pre-flight")
+    else:
+        for phrase in REVIEW_PREFLIGHT_SNIPPETS:
+            if not flex(phrase).search(handoff):
+                err(f".claude-plugin/commands/collab.md: the Codex handoff is "
+                    f"missing lease pre-flight contract {phrase!r}")
+        block = guarded_block(
+            ".claude-plugin/commands/collab.md", handoff,
+            "the lease pre-flight", REVIEW_PREFLIGHT_ANCHOR,
+            REVIEW_PREFLIGHT_LAUNCH_ANCHOR, "", "REVIEW_PREFLIGHT_LAUNCH_ANCHOR",
+            REVIEW_PREFLIGHT_END_ANCHOR,
+            "A pre-flight stated after the launch it guards is documentation, "
+            "not a gate: the `codex exec` is already running by the time it "
+            "is read, which is the wasted model run #299 exists to stop")
+        for sentence in plain_collab_end_sentences(block or ""):
+            err(f".claude-plugin/commands/collab.md: the lease pre-flight "
+                f"names `collab_end` without `abandon` — {sentence!r}. A "
+                f"plain `collab_end` cannot succeed in the lockout this "
+                f"refusal reports; only the `abandon: true` arm is a remedy "
+                f"the server accepts there")
+    review = command_section(text, REVIEW_SHORTCUT_HEADING)
+    if review is None:
+        err(f".claude-plugin/commands/collab.md: missing "
+            f"{REVIEW_SHORTCUT_HEADING!r} section")
+    else:
+        for phrase in REVIEW_SHORTCUT_PREFLIGHT_SNIPPETS:
+            if not flex(phrase).search(review):
+                err(f".claude-plugin/commands/collab.md: `## review` is missing "
+                    f"lease pre-flight contract {phrase!r}")
+    prefixed = [l for l in text.splitlines()
+                if l.startswith(REVIEW_DISPATCH_ROW_PREFIX)]
+    if len(prefixed) != REVIEW_DISPATCH_ROW_COUNT:
+        err(f".claude-plugin/commands/collab.md: expected exactly "
+            f"{REVIEW_DISPATCH_ROW_COUNT} lines starting with "
+            f"{REVIEW_DISPATCH_ROW_PREFIX!r}, found {len(prefixed)} — the "
+            f"pre-flight row audit selects one of them by its "
+            f"{REVIEW_DISPATCH_ROW_MARKER!r} cell, so an added, removed or "
+            f"restructured row means the audit is reading a different table "
+            f"than the one it was written for")
+    rows = [l for l in prefixed if REVIEW_DISPATCH_ROW_MARKER in l]
+    if len(rows) != 1:
+        err(f".claude-plugin/commands/collab.md: expected exactly one line "
+            f"starting with {REVIEW_DISPATCH_ROW_PREFIX!r} and naming "
+            f"{REVIEW_DISPATCH_ROW_MARKER!r} (the phase-action row), found "
+            f"{len(rows)}")
+    elif REVIEW_DISPATCH_ROW_PHRASE not in rows[0]:
+        err(f".claude-plugin/commands/collab.md: the "
+            f"`CodeReviewFixGlobalPending` dispatch row must route its Codex "
+            f"dispatch through the lease pre-flight — missing "
+            f"{REVIEW_DISPATCH_ROW_PHRASE!r}. This is the row `/collab "
+            f"review` enters the loop at, so it is the one dispatch the "
+            f"shortcut's refusal has to reach")
+    surfaces = [(".claude-plugin/commands/collab.md", text)]
+    if not CODEX_COMMAND.exists():
+        err(".codex-plugin/commands/collab.md: missing Codex slash command, "
+            "so the shim half of the lease pre-flight (report the lockout, "
+            "select nothing) is unpinned")
+    else:
+        shim = live_text(CODEX_COMMAND)
+        surfaces.append((".codex-plugin/commands/collab.md", shim))
+        for phrase in CODEX_LEASE_GUARD_SNIPPETS:
+            if not flex(phrase).search(shim):
+                err(f".codex-plugin/commands/collab.md: missing lease guard "
+                    f"contract {phrase!r}")
+        block = guarded_block(
+            ".codex-plugin/commands/collab.md", shim,
+            "the lease guard", CODEX_LEASE_GUARD_ANCHOR,
+            CODEX_LEASE_GUARD_WAIT, "the first ", "CODEX_LEASE_GUARD_WAIT",
+            CODEX_LEASE_GUARD_END_ANCHOR,
+            "That wait is the first lease-gated call the shim makes; a guard "
+            "below it is reached only by a process the gate already "
+            "admitted, and the locked one has already exited on the gate's "
+            "refusal with nothing reported")
+        for sentence in plain_collab_end_sentences(block or ""):
+            err(f".codex-plugin/commands/collab.md: the lease guard names "
+                f"`collab_end` without `abandon` — {sentence!r}")
+    for rel, body in surfaces:
+        if LEASE_REDERIVATION_RE.search(body):
+            err(f"{rel}: re-derives the lease verdict (`generation > 0 AND "
+                f"handoff_pending == false`). Consume "
+                f"`<agent>_lease.{REVIEW_PREFLIGHT_FIELD}` from `collab_status` "
+                f"instead — a predicate restated on a surface is a predicate "
+                f"that drifts from the gate, and from the other surface")
+    doc = live_text(DOC)
+    for phrase in DOC_PREFLIGHT_SNIPPETS:
+        if not flex(phrase).search(doc):
+            err(f"docs/COLLAB.md: missing lease pre-flight contract {phrase!r}")
+    if flex(DOC_STALE_ESCAPE_HATCH).search(doc):
+        err("docs/COLLAB.md: `failure_report` is no longer the only escape "
+            "hatch for a live session — `collab_end { abandon: true }` (#297) "
+            "and `session_handoff { force_reissue: true }` (#298) are too, "
+            f"and the sentence {DOC_STALE_ESCAPE_HATCH!r} tells a reader of "
+            "the shortcut section otherwise")
+
+
 def check_codex_start_pilot_rejection_contract() -> None:
     """Codex's `start` must reject `--pilot`, not swallow it into `<task>`.
 
@@ -3712,6 +3930,7 @@ def main() -> int:
     check_pilot_join_authorization_contract()
     check_dispatcher_approval_gate_contract()
     check_codex_shim_unrouted_phases_contract()
+    check_review_preflight_contract()
     check_codex_start_pilot_rejection_contract()
     check_unattended_successor_guard_contract()
     check_permission_allowlist_excludes_set_pilot()

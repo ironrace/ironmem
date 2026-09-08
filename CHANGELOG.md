@@ -9,6 +9,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`/collab review` refuses up front when the copilot's lease cannot be
+  taken, instead of burning a `codex exec` to find out (#299, closes #283).**
+  A dispatched `codex exec` is `join <session_id>` with no token, so past
+  generation 0 it is admitted only through a daemon that already holds the
+  claim — and the `codex exec` in #283's field note exited 0 in under a
+  minute having done nothing. `collab_status`'s `<agent>_lease` block gains
+  one derived field, `tokenless_admitted` (`generation == 0 || this server's
+  cached generation == generation`), which is the verdict a dispatch actually
+  needs: `claimable` reads `true` with a token pending that the dispatch
+  cannot present and `false` once that token is claimed, i.e. exactly when
+  the dispatch would succeed. The Claude dispatcher's Codex handoff now runs
+  a lease pre-flight on that field before selecting a prompt or launching
+  anything, and refuses with the one remedy the same read admits in the
+  reported state — nothing on a sealed session; `force_reissue` plus a
+  daemon-side claim on `collab_wait_my_turn` when `reclaimable`; the token
+  a repeat `force_reissue` echoes when one is pending unclaimed;
+  `collab_end { abandon: true }` when idle past `dead_session_secs`;
+  otherwise the remaining wait — with no side effects, and the Claude
+  `join` refuses a `--pilot` / `--implementer` mutation on the same read.
+  The Codex shim consumes the same field before `collab_wait_my_turn`. The
+  verdict is per server process, so both surfaces state the precondition
+  it rests on: the shared-daemon wiring (`serve --connect <same socket>` in
+  both harnesses, which `ironmem doctor` reports), not the bare `serve` the
+  checked-in plugin manifests register. The field is computed by the
+  generation guard's own predicate (`tokenless_admitted` in
+  `mcp/tools/handoff.rs`), not a copy of it. Neither surface re-derives it,
+  and `scripts/check_collab_turn_templates.py` now pins the pre-flight's
+  presence and anchor, its position ahead of the launch, its remedies'
+  admissibility (never a plain `collab_end`), the dispatch-row count, and
+  the absence of the literal `generation > 0 AND handoff_pending == false`
+  spelling on either surface. No tool and no schema property were added;
+  the `tools/list` surface is unchanged.
+
 - **Autopilot rung 6: `ironmem autopilot merge` executes the merge decision,
   and `autopilot exhaust` closes out an issue that cannot converge.** Rung 5
   answered *"may this merge?"* and deliberately stopped there. Rung 6 is that

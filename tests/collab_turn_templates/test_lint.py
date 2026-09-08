@@ -3183,3 +3183,257 @@ def test_lint_rejects_the_doc_anchor_demoted_to_inline_prose(tmp_path):
     assert r.returncode == 1
     assert (f"docs/COLLAB.md: missing the {PR_CREATE_FAILED_HEADING!r} "
             "`####` heading") in r.stdout
+
+
+# ------------------------------------------------------------------ #299
+#
+# `/collab review` must refuse BEFORE any `codex exec` dispatch when the
+# copilot's lease cannot be taken by a tokenless one-shot, and both command
+# surfaces must consume the server's `tokenless_admitted` verdict rather than
+# re-derive it. Every pin below is duplicated from the lint on purpose (see
+# the note above CODEX_PILOT_ROUTING_SNIPPETS).
+
+REVIEW_PREFLIGHT_ANCHOR = "Lease pre-flight"
+REVIEW_PREFLIGHT_LAUNCH_ANCHOR = "Launch via Bash with `run_in_background: true`"
+REVIEW_PREFLIGHT_SNIPPETS = [
+    "`codex_lease.tokenless_admitted`",
+    "stop. Never dispatch.",
+    "Do not re-derive it",
+    "`force_reissue: true`",
+    "`abandon: true`",
+    "no side effects",
+]
+REVIEW_SHORTCUT_PREFLIGHT_SNIPPETS = [
+    "`codex_lease.tokenless_admitted`",
+    "never dispatches",
+]
+CODEX_LEASE_GUARD_ANCHOR = "Lease guard"
+CODEX_LEASE_GUARD_WAIT = 'collab_wait_my_turn(session_id, "codex", 60)'
+CODEX_LEASE_GUARD_SNIPPETS = [
+    "`codex_lease.tokenless_admitted`",
+    "select nothing",
+    "`force_reissue: true`",
+    "`abandon: true`",
+]
+DOC_PREFLIGHT_SNIPPETS = [
+    "Up-front lease refusal",
+    "`tokenless_admitted`",
+]
+
+
+def _claude_cmd(fixture):
+    return fixture / ".claude-plugin" / "commands" / "collab.md"
+
+
+def _codex_cmd(fixture):
+    return fixture / ".codex-plugin" / "commands" / "collab.md"
+
+
+def _doc(fixture):
+    return fixture / "docs" / "COLLAB.md"
+
+
+def _move_block_after(path, block_start, after_anchor):
+    """Cut the blank-line-delimited paragraph containing `block_start` and
+    paste it after the line containing `after_anchor`, so every phrase pin
+    stays satisfied and only the ORDER changes."""
+    text = path.read_text()
+    start = text.index(block_start)
+    start = text.rfind("\n", 0, start) + 1
+    end = text.index("\n\n", start) + 1
+    block = text[start:end]
+    rest = text[:start] + text[end:]
+    anchor = rest.index(after_anchor)
+    anchor_line_end = rest.index("\n", anchor) + 1
+    path.write_text(rest[:anchor_line_end] + "\n" + block + rest[anchor_line_end:])
+
+
+@pytest.mark.parametrize("snippet", REVIEW_PREFLIGHT_SNIPPETS)
+def test_lint_requires_the_codex_handoff_lease_preflight(tmp_path, snippet):
+    fixture = copy_fixture(tmp_path)
+    mutate(_claude_cmd(fixture), snippet)
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert (".claude-plugin/commands/collab.md: the Codex handoff is missing "
+            f"lease pre-flight contract {snippet!r}") in r.stdout
+
+
+def test_lint_rejects_the_lease_preflight_moved_below_the_launch(tmp_path):
+    # Presence is not a gate. Every phrase survives this move; only the
+    # dispatch now happens first, which is the wasted run #299 exists to stop.
+    fixture = copy_fixture(tmp_path)
+    _move_block_after(_claude_cmd(fixture), REVIEW_PREFLIGHT_ANCHOR,
+                      REVIEW_PREFLIGHT_LAUNCH_ANCHOR)
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert (".claude-plugin/commands/collab.md: the lease pre-flight "
+            f"({REVIEW_PREFLIGHT_ANCHOR!r}) must appear BEFORE "
+            f"{REVIEW_PREFLIGHT_LAUNCH_ANCHOR!r}") in r.stdout
+
+
+@pytest.mark.parametrize("rel, anchor", [
+    (".claude-plugin/commands/collab.md", REVIEW_PREFLIGHT_ANCHOR),
+    (".codex-plugin/commands/collab.md", CODEX_LEASE_GUARD_ANCHOR),
+])
+def test_lint_rejects_a_missing_guard_anchor(tmp_path, rel, anchor):
+    # Every phrase pin survives a renamed anchor; without this the ordering
+    # and plain-`collab_end` checks would be silently skipped, not failed.
+    fixture = copy_fixture(tmp_path)
+    mutate(fixture / rel, anchor)
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert f"{rel}: missing the {anchor!r} anchor" in r.stdout
+
+
+def test_lint_rejects_a_fourth_review_dispatch_row(tmp_path):
+    # The row audit selects one of three prefix-sharing rows by its dispatch
+    # cell; a restructured table must fail here, not re-point the audit.
+    fixture = copy_fixture(tmp_path)
+    cmd = _claude_cmd(fixture)
+    text = cmd.read_text()
+    cmd.write_text(text + "\n| `CodeReviewFixGlobalPending` | extra | row |\n")
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert (".claude-plugin/commands/collab.md: expected exactly 3 lines "
+            "starting with '| `CodeReviewFixGlobalPending` |', found 4") in r.stdout
+
+
+def test_lint_rejects_a_plain_collab_end_recommended_by_the_preflight(tmp_path):
+    # The refusal must only name remedies the server admits in a dispatch
+    # phase. Plain `collab_end` is refused in every one of them — the exact
+    # misdirection #283 remedy 5 fixed in the duplicate-session guard.
+    fixture = copy_fixture(tmp_path)
+    cmd = _claude_cmd(fixture)
+    text = cmd.read_text()
+    start = text.index(REVIEW_PREFLIGHT_ANCHOR)
+    end = text.index("no side effects", start)
+    block = text[start:end].replace("abandon", MARK)
+    cmd.write_text(text[:start] + block + text[end:])
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert (".claude-plugin/commands/collab.md: the lease pre-flight names "
+            "`collab_end` without `abandon`") in r.stdout
+
+
+@pytest.mark.parametrize("snippet", REVIEW_SHORTCUT_PREFLIGHT_SNIPPETS)
+def test_lint_requires_the_review_shortcut_to_name_the_preflight(tmp_path, snippet):
+    fixture = copy_fixture(tmp_path)
+    cmd = _claude_cmd(fixture)
+    text = cmd.read_text()
+    # Scope the mutation to the `## review` section so the handoff section's
+    # own copy of the field name stays intact — this pin is about the
+    # shortcut entry stating the rule in its own words.
+    start = text.index("## `review [--pilot=claude|codex] <short-topic>`")
+    end = text.index("## `join [--pilot=claude|codex]", start)
+    section = text[start:end]
+    assert snippet in section, f"{snippet!r} not in the review section"
+    cmd.write_text(text[:start] + section.replace(snippet, MARK) + text[end:])
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert (".claude-plugin/commands/collab.md: `## review` is missing lease "
+            f"pre-flight contract {snippet!r}") in r.stdout
+
+
+def test_lint_requires_the_review_dispatch_row_to_route_through_the_preflight(tmp_path):
+    fixture = copy_fixture(tmp_path)
+    cmd = _claude_cmd(fixture)
+    lines = cmd.read_text().splitlines(keepends=True)
+    rows = [i for i, l in enumerate(lines)
+            if l.startswith("| `CodeReviewFixGlobalPending` |")
+            and "dispatch Codex via background `codex exec`" in l]
+    assert len(rows) == 1, rows
+    assert "lease pre-flight" in lines[rows[0]]
+    lines[rows[0]] = lines[rows[0]].replace("lease pre-flight", MARK)
+    cmd.write_text("".join(lines))
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert (".claude-plugin/commands/collab.md: the `CodeReviewFixGlobalPending` "
+            "dispatch row must route its Codex dispatch through the lease "
+            "pre-flight") in r.stdout
+
+
+@pytest.mark.parametrize("snippet", CODEX_LEASE_GUARD_SNIPPETS)
+def test_lint_requires_the_codex_shim_lease_guard(tmp_path, snippet):
+    fixture = copy_fixture(tmp_path)
+    mutate(_codex_cmd(fixture), snippet)
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert (".codex-plugin/commands/collab.md: missing lease guard contract "
+            f"{snippet!r}") in r.stdout
+
+
+def test_lint_rejects_the_codex_lease_guard_moved_below_the_wait(tmp_path):
+    # `collab_wait_my_turn` is the first lease-gated call the shim makes. A
+    # guard below it is reached only by a process the gate already admitted.
+    fixture = copy_fixture(tmp_path)
+    _move_block_after(_codex_cmd(fixture), CODEX_LEASE_GUARD_ANCHOR,
+                      CODEX_LEASE_GUARD_WAIT)
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert (".codex-plugin/commands/collab.md: the lease guard "
+            f"({CODEX_LEASE_GUARD_ANCHOR!r}) must appear BEFORE the first "
+            f"{CODEX_LEASE_GUARD_WAIT!r}") in r.stdout
+
+
+@pytest.mark.parametrize("rel", [".claude-plugin/commands/collab.md",
+                                 ".codex-plugin/commands/collab.md"])
+def test_lint_rejects_a_re_derived_lease_predicate(tmp_path, rel):
+    # R1: the one way the two surfaces drift is by each restating the rule.
+    fixture = copy_fixture(tmp_path)
+    path = fixture / rel
+    path.write_text(path.read_text() +
+                    "\n\nRefuse when `generation > 0 AND handoff_pending == false`.\n")
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert (f"{rel}: re-derives the lease verdict "
+            "(`generation > 0 AND handoff_pending == false`)") in r.stdout
+
+
+@pytest.mark.parametrize("snippet", DOC_PREFLIGHT_SNIPPETS)
+def test_lint_requires_collab_doc_to_state_the_up_front_refusal(tmp_path, snippet):
+    fixture = copy_fixture(tmp_path)
+    # `mutate_flex`, not `mutate`: the doc names the invariant in wrapped
+    # prose too, and an exact-string mutation leaves that copy for the
+    # lint's `flex()` match to find, proving nothing.
+    mutate_flex(_doc(fixture), snippet)
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert (f"docs/COLLAB.md: missing lease pre-flight contract {snippet!r}"
+            ) in r.stdout
+
+
+def test_lint_rejects_failure_report_as_the_only_escape_hatch(tmp_path):
+    # Stale after #297/#298: abandon and force_reissue are escape hatches too,
+    # and the sentence is what a reader of the shortcut section is told.
+    fixture = copy_fixture(tmp_path)
+    doc = _doc(fixture)
+    doc.write_text(doc.read_text() +
+                   "\n\n`failure_report` is the only escape hatch for a live session.\n")
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert ("docs/COLLAB.md: `failure_report` is no longer the only escape "
+            "hatch") in r.stdout

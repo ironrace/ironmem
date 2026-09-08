@@ -10811,3 +10811,176 @@ fn an_abandoned_lease_reads_reclaimable_yet_refuses_a_forced_reissue() {
         "a refused reissue must mint nothing"
     );
 }
+
+// ── #299: the verdict a tokenless dispatch actually needs ────────────────────
+
+/// A `collab_wait_my_turn` as `agent` with no token and no wait — the first
+/// lease-gated call the Codex shim makes, so its admission or refusal is the
+/// exact outcome a dispatched `codex exec` would meet.
+fn tokenless_probe_args(session_id: &str, agent: &str) -> serde_json::Value {
+    json!({ "session_id": session_id, "agent": agent, "timeout_secs": 0 })
+}
+
+/// A shortcut review session on a disk-backed app, positioned at
+/// `CodeReviewFixGlobalPending` with Codex as the copilot owner — the shape
+/// `/collab review` creates and #283's field note was about.
+fn start_review_session_in(app: &App, repo_path: &str) -> String {
+    let started = call_tool(
+        app,
+        "collab_start_code_review",
+        json!({
+            "repo_path": repo_path,
+            "branch": "feat/review-preflight",
+            "base_sha": "abc123",
+            "head_sha": PLACEHOLDER_HEAD,
+            "initiator": "claude",
+            "task": "review the branch"
+        }),
+    );
+    started["session_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the review shortcut must start a session: {started}"))
+        .to_string()
+}
+
+/// #299 acceptance, healthy half: a fresh review session admits the copilot's
+/// tokenless dispatch, and `collab_status` says so up front through the same
+/// block the pre-flight reads — `tokenless_admitted`, beside `claimable`.
+#[test]
+fn a_fresh_review_session_admits_a_tokenless_codex_dispatch_and_says_so() {
+    // One process, one read: in-memory like every other shortcut test. The
+    // disk-backed app is for the multi-process topology the next test needs.
+    let app = App::open_for_test().unwrap();
+    let sid = start_review_session_in(&app, "/repo/review-preflight");
+
+    let codex = lease_block(&app, &sid, "codex");
+    assert_eq!(codex["generation"], json!(0), "{codex}");
+    assert_eq!(
+        codex["tokenless_admitted"],
+        json!(true),
+        "at generation 0 a tokenless first touch is admitted, and the block must name it: {codex}"
+    );
+    assert_eq!(codex["claimable"], json!(true), "{codex}");
+
+    // The verdict matches the gate: the exact call the shim makes first.
+    let probed = call_tool(
+        &app,
+        "collab_wait_my_turn",
+        tokenless_probe_args(&sid, "codex"),
+    );
+    assert!(
+        probed.get("error").is_none(),
+        "a tokenless probe at generation 0 must be admitted: {probed}"
+    );
+}
+
+/// #299 acceptance, wedged and recovered halves, and the reason the pre-flight
+/// cannot read `claimable`: the lease cache is per server process. A lease
+/// held past generation 0 is admitted tokenless only through the process that
+/// holds it — so the same session reads `tokenless_admitted: true` from the
+/// incumbent and `false` from a fresh process, while `claimable` is `false`
+/// from both. After `force_reissue` a token is pending: `claimable` flips to
+/// `true` (usable by whoever holds the token) while `tokenless_admitted` stays
+/// `false` (a dispatch carries no token). After the claim — through the server
+/// the dispatch will use — `tokenless_admitted` is `true` again and
+/// `claimable` is `false` again. The last read is the one #299's "proceeds
+/// normally for a freshly-recovered session" criterion rests on, and it is the
+/// one `claimable` gets backwards.
+#[test]
+fn tokenless_admitted_tracks_the_server_that_holds_the_lease() {
+    let lease = session_wedged_at_generation(3, "codex");
+    let (incumbent, successor, sid) = (
+        &lease.incumbent,
+        &lease.successor,
+        lease.session_id.as_str(),
+    );
+
+    // Wedged: locked against a fresh process, held by the incumbent.
+    let fresh = lease_block(successor, sid, "codex");
+    assert_eq!(fresh["claimable"], json!(false), "{fresh}");
+    assert_eq!(
+        fresh["tokenless_admitted"],
+        json!(false),
+        "a fresh process holds no cached generation, so a tokenless call is refused: {fresh}"
+    );
+    let refused = call_tool_expect_error(
+        successor,
+        "collab_wait_my_turn",
+        tokenless_probe_args(sid, "codex"),
+    );
+    assert!(
+        refused.contains("this session has been handed off (generation 3)"),
+        "the verdict must match the gate: {refused}"
+    );
+    let held = lease_block(incumbent, sid, "codex");
+    assert_eq!(
+        held["tokenless_admitted"],
+        json!(true),
+        "the process that holds the lease is admitted tokenless — the verdict is per server: {held}"
+    );
+    assert_eq!(
+        held["claimable"],
+        json!(false),
+        "`claimable` cannot express that; it is false from both processes: {held}"
+    );
+
+    // Recovery, step 1: a token is pending. Claimable by its holder, still
+    // not admitted tokenless.
+    let reissued = call_tool(
+        successor,
+        "session_handoff",
+        force_reissue_args(sid, "codex"),
+    );
+    let token = reissued["handoff_token"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the rescue must hand back a token: {reissued}"))
+        .to_string();
+    let pending = lease_block(successor, sid, "codex");
+    assert_eq!(pending["claimable"], json!(true), "{pending}");
+    assert_eq!(
+        pending["tokenless_admitted"],
+        json!(false),
+        "a pending token does not admit a call that presents no token: {pending}"
+    );
+
+    // Recovery, step 2: claim it through the server the dispatch will use —
+    // on the same call the shim makes first, so the claim itself has no
+    // protocol side effect beyond the lease.
+    let mut claim = tokenless_probe_args(sid, "codex");
+    claim["handoff_token"] = json!(token);
+    let claimed = call_tool(successor, "collab_wait_my_turn", claim);
+    assert!(
+        claimed.get("error").is_none(),
+        "presenting the token must claim the lease: {claimed}"
+    );
+    let recovered = lease_block(successor, sid, "codex");
+    assert_eq!(recovered["generation"], json!(4), "{recovered}");
+    assert_eq!(
+        recovered["claimable"],
+        json!(false),
+        "held again, so a `claimable` pre-flight would refuse the recovered session: {recovered}"
+    );
+    assert_eq!(
+        recovered["tokenless_admitted"],
+        json!(true),
+        "the recovered lease is admitted tokenless through the claiming server: {recovered}"
+    );
+    let admitted = call_tool(
+        successor,
+        "collab_wait_my_turn",
+        tokenless_probe_args(sid, "codex"),
+    );
+    assert!(
+        admitted.get("error").is_none(),
+        "the verdict must match the gate after recovery: {admitted}"
+    );
+
+    // A third process that saw none of it is still locked out, and says so.
+    let (_state, restarted) = open_second_disk_app(&lease.db_path);
+    let elsewhere = lease_block(&restarted, sid, "codex");
+    assert_eq!(
+        elsewhere["tokenless_admitted"],
+        json!(false),
+        "the claim lives in one server's cache; a restarted daemon reads false: {elsewhere}"
+    );
+}

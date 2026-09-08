@@ -2790,6 +2790,35 @@ pub(super) fn handle_collab_status(app: &App, args: &Value) -> Result<Value, Mem
         // locked against every successor, only against one without the token.
         let claimable = generation == 0 || pending;
 
+        // `tokenless_admitted` (#299): would a call as this agent that
+        // presents NO token be admitted by `ensure_actor_generation_current`
+        // *through this server process* right now? That is the question a
+        // dispatcher has to answer before launching a `codex exec`, and it is
+        // not `claimable`. The Codex shim carries no token, so a dispatched
+        // turn can act only by a tokenless first touch at generation 0, or
+        // under a generation this process already bound — and the binding
+        // lives in `App`'s advisory cache, which is per server process and
+        // invisible to the two flat keys above. `claimable` gets both
+        // recovery-shaped cases backwards: it reads `true` with a token
+        // pending (usable by the token's holder, not by a tokenless
+        // dispatch) and `false` once that token is claimed (held again — by
+        // the very server the dispatch will go through, if the claim was
+        // made here). The second is the "proceeds normally for a
+        // freshly-recovered session" case, so a pre-flight on `claimable`
+        // would refuse exactly the session it was just told to fix.
+        //
+        // Ask the guard's own predicate rather than restating it: the same
+        // function decides admission inside `ensure_actor_generation_current`,
+        // so the verdict and the gate cannot drift. Per server, deliberately:
+        // with the launcher's `serve --connect <socket>` wiring both harnesses
+        // share one daemon, so the daemon's answer is the dispatch's answer;
+        // without a shared daemon no `collab_status` can speak for another
+        // process's cache, and this reads `false` past generation 0, which
+        // is the safe direction. The command surfaces carry the wiring
+        // caveat, since nothing in this response identifies the process.
+        let tokenless_admitted =
+            super::handoff::tokenless_admitted(app, session_id, ag, generation);
+
         // `reclaimable`: not claimable, and locked the way a dead-lease
         // rescue targets — held at generation > 0 with no pending token, and
         // admitted by every precondition of `session_handoff
@@ -2874,6 +2903,7 @@ pub(super) fn handle_collab_status(app: &App, args: &Value) -> Result<Value, Mem
             "generation": generation,
             "handoff_pending": pending,
             "claimable": claimable,
+            "tokenless_admitted": tokenless_admitted,
             // Session-scoped, not per-agent — one activity clock serves both
             // agents' verdicts. Repeated inside each agent's block anyway (not
             // left as a top-level join) so a caller reading one agent's
