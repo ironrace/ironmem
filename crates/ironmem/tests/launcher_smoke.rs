@@ -329,6 +329,63 @@ fn grok_launcher_registers_mcp_server_by_default() {
     );
 }
 
+/// Muse launcher acceptance: resolves from the registry and registers the
+/// shared-daemon proxy command through the shared Claude-shaped
+/// `mcpServers` OBJECT writer (object shape proven live: `muse exec`
+/// completes `initialize` + `tools/list` on it, while an array-shaped
+/// `mcpServers` is silently ignored by Muse).
+#[test]
+fn muse_launcher_registers_mcp_server_by_default() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let db_path = temp.path().join("memory.sqlite3");
+    let bin_dir = temp.path().join("bin");
+    let repo = temp.path().join("repo");
+    let record = temp.path().join("rec");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join("README.md"), "# repo\ncontent to mine").unwrap();
+    write_stub(&bin_dir, "muse", &record, 0);
+
+    // The resolver honors XDG_CONFIG_HOME; strip it from the CHILD only (as
+    // launcher_command_codex does for CODEX_HOME) so this test pins the
+    // ~/.config/muse fallback without touching the test process's own env.
+    let out = launcher_command(&home, &db_path, &bin_dir)
+        .env_remove("XDG_CONFIG_HOME")
+        .arg("muse")
+        .arg(&repo)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "muse launcher failed: {out:?}");
+    assert!(std::fs::metadata(format!("{}.cwd", record.display())).is_ok());
+
+    let cfg_path = home.join(".config").join("muse").join("settings.json");
+    let cfg = std::fs::read_to_string(&cfg_path)
+        .unwrap_or_else(|e| panic!("launcher should create {}: {e}", cfg_path.display()));
+    let v: serde_json::Value = serde_json::from_str(&cfg).unwrap();
+    // Fresh file is seeded with the measured envelope before registration.
+    assert_eq!(v.get("schema_version").and_then(|s| s.as_i64()), Some(1));
+    let server = v
+        .get("mcpServers")
+        .and_then(|s| s.as_object())
+        .and_then(|s| s.get("ironmem"))
+        .expect("mcpServers.ironmem must be an object entry");
+    let expected_socket = home
+        .join(".ironrace-memory")
+        .join("hook_state")
+        .join("daemon.sock");
+    assert_eq!(
+        server["args"],
+        serde_json::json!(["serve", "--connect", expected_socket.display().to_string()])
+    );
+    // Muse's per-server `mode` defaults to `required`, and a required server
+    // that fails to start aborts the whole Muse session. ironmem registers
+    // itself as optional so a stale binary path or an unspawnable daemon
+    // costs Muse its memory, not its session.
+    assert_eq!(server["mode"], serde_json::json!("optional"));
+}
+
 /// Same acceptance for the gemini launcher.
 #[test]
 fn gemini_launcher_registers_mcp_server_by_default() {

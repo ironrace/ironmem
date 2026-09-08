@@ -7,6 +7,7 @@ mod binary;
 mod context_inject;
 mod mcp_setup;
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use crate::error::MemoryError;
@@ -37,6 +38,7 @@ pub enum Harness {
     Codex,
     Grok,
     Gemini,
+    Muse,
 }
 
 impl Harness {
@@ -48,6 +50,7 @@ impl Harness {
             Harness::Codex => "codex",
             Harness::Grok => "grok",
             Harness::Gemini => "gemini",
+            Harness::Muse => "muse",
         }
     }
 
@@ -114,47 +117,82 @@ fn codex_config_path() -> Result<PathBuf, MemoryError> {
     Ok(home.join(".codex").join("config.toml"))
 }
 
-/// Resolve the Claude config path: `~/.claude.json`. Mirrors `doctor::detect_claude`.
-fn claude_config_path() -> Result<PathBuf, MemoryError> {
-    let home = dirs::home_dir()
-        .ok_or_else(|| MemoryError::Config("cannot determine home directory".into()))?;
-    Ok(home.join(".claude.json"))
+/// Resolve the `mcpServers`-JSON settings file for a harness that shares
+/// Claude's object-shaped `mcpServers` (Claude, Gemini CLI, Grok CLI, Muse),
+/// reading the ambient `XDG_CONFIG_HOME`. The pure core is
+/// [`json_mcpservers_config_path_for`], shared with `doctor` so launcher,
+/// doctor and tests all resolve exactly one file per harness.
+fn json_mcpservers_config_path(id: &str) -> Result<PathBuf, MemoryError> {
+    json_mcpservers_config_path_for(id, dirs::home_dir(), std::env::var_os("XDG_CONFIG_HOME"))
+        .ok_or_else(|| {
+            MemoryError::Config(format!(
+                "cannot resolve the {id} settings path (unknown harness or no home directory)"
+            ))
+        })
 }
 
-/// Resolve the Gemini CLI config path: `~/.gemini/settings.json`. This is
-/// Gemini CLI's documented global settings file, with a top-level
-/// `mcpServers` object in the exact same shape Claude's `~/.claude.json` uses
-/// — hence `ensure_json_mcpservers_registered` reuses the same writer.
-fn gemini_config_path() -> Result<PathBuf, MemoryError> {
-    let home = dirs::home_dir()
-        .ok_or_else(|| MemoryError::Config("cannot determine home directory".into()))?;
-    Ok(home.join(".gemini").join("settings.json"))
-}
-
-/// Resolve a best-effort Grok CLI config path: `~/.grok/settings.json`.
+/// Pure resolution of a JSON-`mcpServers` harness config path from an
+/// explicit `home` and the observed `XDG_CONFIG_HOME`, so launcher, doctor
+/// and tests share one table:
 ///
-/// Unlike Claude/Codex/Gemini, there is no single confirmed "the" Grok CLI
-/// config convention as of #190 Task 13 — multiple tools answer to "grok
-/// cli" (xAI's own "Grok Build" agent vs. community projects), and
-/// documentation for either's MCP client config is thin. `.grok/settings.json`
-/// with an `mcpServers` key is `superagent-ai/grok-cli`'s documented
-/// convention and the best-effort default here; grok registration is
-/// deliberately scaffolding (`write_rules_default: false` on its registry
-/// row) until a real, confirmed convention narrows this down.
-fn grok_config_path() -> Result<PathBuf, MemoryError> {
-    let home = dirs::home_dir()
-        .ok_or_else(|| MemoryError::Config("cannot determine home directory".into()))?;
-    Ok(home.join(".grok").join("settings.json"))
+/// - `claude` → `~/.claude.json`.
+/// - `gemini` → `~/.gemini/settings.json`, Gemini CLI's documented global
+///   settings file, whose top-level `mcpServers` object has the exact same
+///   shape as Claude's — hence the shared writer.
+/// - `grok` → `~/.grok/settings.json`, best-effort. Unlike Claude/Codex/
+///   Gemini there is no single confirmed "the" Grok CLI config convention as
+///   of #190 Task 13 — multiple tools answer to "grok cli" (xAI's own "Grok
+///   Build" agent vs. community projects) and documentation for either's MCP
+///   client config is thin. `.grok/settings.json` with an `mcpServers` key is
+///   `superagent-ai/grok-cli`'s documented convention; grok registration is
+///   deliberately scaffolding (`write_rules_default: false`) until a real,
+///   confirmed convention narrows this down.
+/// - `muse` → `$XDG_CONFIG_HOME/muse/settings.json` when the variable is set
+///   and non-empty, else `~/.config/muse/settings.json`. Measured on Muse
+///   Code 1.0.2: a live `~/.config/muse/settings.json` with `schema_version:
+///   1` was read, and an isolated-`XDG_CONFIG_HOME` run picked up
+///   `$XDG_CONFIG_HOME/muse/settings.json` instead — when the variable is
+///   set, `~/.config/muse` is never consulted, so registration must honor it
+///   (mirrors the `CODEX_HOME` pattern: env override wins, empty is ignored).
+///
+/// `None` for any other id, or when the path needs a home and none is known
+/// (the caller reports "skipped").
+pub(crate) fn json_mcpservers_config_path_for(
+    id: &str,
+    home: Option<PathBuf>,
+    xdg_config_home: Option<OsString>,
+) -> Option<PathBuf> {
+    match id {
+        "claude" => Some(home?.join(".claude.json")),
+        "gemini" => Some(home?.join(".gemini").join("settings.json")),
+        "grok" => Some(home?.join(".grok").join("settings.json")),
+        "muse" => {
+            if let Some(xdg) = xdg_config_home {
+                if !xdg.is_empty() {
+                    return Some(PathBuf::from(xdg).join("muse").join("settings.json"));
+                }
+            }
+            Some(home?.join(".config").join("muse").join("settings.json"))
+        }
+        _ => None,
+    }
 }
 
 /// Ensure the ironmem MCP server is registered for `harness`, idempotently.
 ///
 /// Registers the shared-daemon proxy command (`harness::proxy_command_args` —
 /// `["serve", "--connect", <socket>]`), the canonical invocation every
-/// harness should converge on (#190 Task 11/12). Claude, Gemini CLI, and
-/// (best-effort) Grok CLI all share the same `mcpServers`-JSON config shape,
-/// so all three route through `ensure_json_mcpservers_registered`; only Codex
-/// uses a different (TOML) format.
+/// harness should converge on (#190 Task 11/12). Claude, Gemini CLI,
+/// (best-effort) Grok CLI, and Muse all share the same `mcpServers`-JSON
+/// config shape — Muse's is proven live to be Claude's id-keyed object, not
+/// the `{id, ...}` array from the binary's embedded plugin-manifest docs —
+/// so all four route through `ensure_json_mcpservers_registered`, resolving
+/// their file via [`json_mcpservers_config_path`] and seeding a missing file
+/// with [`mcp_setup::fresh_file_seed`] (Muse's measured `{"schema_version":
+/// 1}` envelope; `{}` for the rest) and adding
+/// [`mcp_setup::fresh_entry_extras`] to a brand-new entry (Muse's
+/// `"mode": "optional"`, so a stale proxy path cannot abort a Muse session;
+/// nothing for the rest). Codex uses a different (TOML) format.
 fn register(harness: Harness) -> Result<mcp_setup::RegisterOutcome, MemoryError> {
     let exe = std::env::current_exe()
         .map_err(|e| MemoryError::Config(format!("cannot resolve ironmem path: {e}")))?;
@@ -162,17 +200,18 @@ fn register(harness: Harness) -> Result<mcp_setup::RegisterOutcome, MemoryError>
     let cfg = config::Config::load(None)?;
     let proxy_args = crate::harness::proxy_command_args(harness.harness_id(), &cfg);
     match harness {
-        Harness::Claude => {
-            mcp_setup::ensure_json_mcpservers_registered(&claude_config_path()?, &exe, &proxy_args)
-        }
         Harness::Codex => {
             mcp_setup::ensure_codex_registered(&codex_config_path()?, &exe, &proxy_args)
         }
-        Harness::Gemini => {
-            mcp_setup::ensure_json_mcpservers_registered(&gemini_config_path()?, &exe, &proxy_args)
-        }
-        Harness::Grok => {
-            mcp_setup::ensure_json_mcpservers_registered(&grok_config_path()?, &exe, &proxy_args)
+        Harness::Claude | Harness::Gemini | Harness::Grok | Harness::Muse => {
+            let id = harness.harness_id();
+            mcp_setup::ensure_json_mcpservers_registered(
+                &json_mcpservers_config_path(id)?,
+                &exe,
+                &proxy_args,
+                mcp_setup::fresh_file_seed(id),
+                mcp_setup::fresh_entry_extras(id),
+            )
         }
     }
 }
@@ -328,24 +367,68 @@ mod tests {
         assert_eq!(gemini_spec.id, "gemini");
     }
 
+    /// Muse launcher resolves from the registry exactly the way Claude/Codex
+    /// (and Grok/Gemini scaffolding) already do — one registry row, one
+    /// `harness_id` mapping, everything else derived. Measured: the `muse`
+    /// binary runs (`muse --help`, 1.0.2) and the product names itself
+    /// "Muse Code" (startup banner + embedded identity string).
     #[test]
-    fn grok_config_path_defaults_to_home_grok_settings() {
-        let path = grok_config_path().unwrap();
-        assert!(
-            path.ends_with(".grok/settings.json"),
-            "got: {}",
-            path.display()
-        );
+    fn muse_harness_resolves_from_registry() {
+        assert_eq!(Harness::Muse.harness_id(), "muse");
+        assert_eq!(Harness::Muse.binary(), "muse");
+        assert_eq!(Harness::Muse.label(), "Muse Code");
+        let spec = crate::harness::by_id(Harness::Muse.harness_id(), crate::harness::REGISTRY)
+            .expect("muse must be in REGISTRY");
+        assert_eq!(spec.id, "muse");
     }
 
     #[test]
-    fn gemini_config_path_defaults_to_home_gemini_settings() {
-        let path = gemini_config_path().unwrap();
-        assert!(
-            path.ends_with(".gemini/settings.json"),
-            "got: {}",
-            path.display()
+    fn muse_config_path_honors_xdg_config_home() {
+        // Proven live: with XDG_CONFIG_HOME set, `muse exec` reads
+        // $XDG_CONFIG_HOME/muse/settings.json, never ~/.config/muse.
+        let path = json_mcpservers_config_path_for(
+            "muse",
+            Some(PathBuf::from("/home/u")),
+            Some(OsString::from("/tmp/xdg")),
+        )
+        .unwrap();
+        assert_eq!(path, PathBuf::from("/tmp/xdg/muse/settings.json"));
+    }
+
+    #[test]
+    fn muse_config_path_falls_back_to_home_config() {
+        let home = || Some(PathBuf::from("/home/u"));
+        let path = json_mcpservers_config_path_for("muse", home(), None).unwrap();
+        assert_eq!(path, PathBuf::from("/home/u/.config/muse/settings.json"));
+        // An empty override is ignored, mirroring CODEX_HOME.
+        let path =
+            json_mcpservers_config_path_for("muse", home(), Some(OsString::from(""))).unwrap();
+        assert_eq!(path, PathBuf::from("/home/u/.config/muse/settings.json"));
+        // No home at all resolves to nothing (caller reports "skipped").
+        assert_eq!(json_mcpservers_config_path_for("muse", None, None), None);
+    }
+
+    #[test]
+    fn json_config_paths_resolve_from_one_table() {
+        // XDG_CONFIG_HOME only affects muse; the others are home-relative.
+        let home = || Some(PathBuf::from("/home/u"));
+        let xdg = || Some(OsString::from("/tmp/xdg"));
+        assert_eq!(
+            json_mcpservers_config_path_for("claude", home(), xdg()).unwrap(),
+            PathBuf::from("/home/u/.claude.json")
         );
+        assert_eq!(
+            json_mcpservers_config_path_for("gemini", home(), xdg()).unwrap(),
+            PathBuf::from("/home/u/.gemini/settings.json")
+        );
+        assert_eq!(
+            json_mcpservers_config_path_for("grok", home(), xdg()).unwrap(),
+            PathBuf::from("/home/u/.grok/settings.json")
+        );
+        // Codex is TOML and unknown ids are not this resolver's business.
+        assert_eq!(json_mcpservers_config_path_for("codex", home(), None), None);
+        assert_eq!(json_mcpservers_config_path_for("zeta", home(), None), None);
+        assert_eq!(json_mcpservers_config_path_for("claude", None, None), None);
     }
 
     const GEMINI_SPEC: HarnessSpec = HarnessSpec {

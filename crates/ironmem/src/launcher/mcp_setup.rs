@@ -81,12 +81,29 @@ fn is_bare_serve_json(entry: &serde_json::Value) -> bool {
 }
 
 /// Ensure `mcpServers.ironmem = { command: <exe>, args: <proxy_args> }` exists
-/// in a Claude `~/.claude.json`-shaped file. Idempotent; upgrades a stale bare
+/// in ANY config file that shares Claude's object-shaped `mcpServers` JSON:
+/// Claude's `~/.claude.json`, Gemini CLI's and (best-effort) Grok CLI's
+/// `settings.json` (#190 Task 13), and Muse's `settings.json` (object shape
+/// proven live on Muse Code 1.0.2). Idempotent; upgrades a stale bare
 /// `["serve"]` entry in place (see module docs).
-pub(crate) fn ensure_claude_registered(
+///
+/// `seed` is the document a MISSING file starts from before the entry is
+/// inserted — see [`fresh_file_seed`]. It is ignored when the file exists,
+/// and must be a JSON object (anything else is refused like a non-object
+/// file would be).
+///
+/// `entry_extras` are harness-specific keys merged into a BRAND-NEW
+/// `ironmem` entry alongside `command`/`args` — see [`fresh_entry_extras`].
+/// They are applied only on the fresh-registration path: an existing entry
+/// (customized, or the bare-`["serve"]` upgrade) keeps exactly the keys the
+/// user already has, so registration never adds behaviour to a config it
+/// did not create.
+pub(crate) fn ensure_json_mcpservers_registered(
     config_path: &Path,
     exe: &str,
     proxy_args: &[String],
+    seed: serde_json::Value,
+    entry_extras: serde_json::Map<String, serde_json::Value>,
 ) -> Result<RegisterOutcome, MemoryError> {
     let mut root: serde_json::Value = if config_path.exists() {
         let raw =
@@ -94,7 +111,7 @@ pub(crate) fn ensure_claude_registered(
         serde_json::from_str(&raw)
             .map_err(|e| MemoryError::Config(format!("parse {}: {e}", config_path.display())))?
     } else {
-        serde_json::json!({})
+        seed
     };
 
     let obj = root.as_object_mut().ok_or_else(|| {
@@ -136,34 +153,61 @@ pub(crate) fn ensure_claude_registered(
             RegisterOutcome::Upgraded
         }
         None => {
-            servers.insert(
-                "ironmem".to_string(),
-                serde_json::json!({ "command": exe, "args": proxy_args }),
-            );
+            let mut entry = entry_extras;
+            entry.insert("command".to_string(), serde_json::json!(exe));
+            entry.insert("args".to_string(), serde_json::json!(proxy_args));
+            servers.insert("ironmem".to_string(), serde_json::Value::Object(entry));
             RegisterOutcome::Registered
         }
     };
 
     let pretty = serde_json::to_string_pretty(&root)
-        .map_err(|e| MemoryError::Config(format!("serialize claude config: {e}")))?;
+        .map_err(|e| MemoryError::Config(format!("serialize {}: {e}", config_path.display())))?;
     write_atomic(config_path, &pretty)?;
     Ok(outcome)
 }
 
-/// Ensure `mcpServers.ironmem` exists in ANY config file that shares Claude's
-/// exact `mcpServers`-JSON shape (#190 Task 13) — Gemini CLI's
-/// `~/.gemini/settings.json` and, best-effort, Grok CLI's
-/// `~/.grok/settings.json` both use this same top-level `mcpServers` object.
-/// `ensure_claude_registered` is the historical name (Claude was first and
-/// remains the primary/most-tested caller); this is a thin, more honestly-named
-/// alias so non-Claude call sites don't read as if they were registering
-/// Claude specifically.
-pub(crate) fn ensure_json_mcpservers_registered(
-    config_path: &Path,
-    exe: &str,
-    proxy_args: &[String],
-) -> Result<RegisterOutcome, MemoryError> {
-    ensure_claude_registered(config_path, exe, proxy_args)
+/// The document a missing JSON-`mcpServers` config starts from, per harness.
+///
+/// Muse's settings file carries a measured `schema_version: 1` envelope
+/// (read live from `~/.config/muse/settings.json` on Muse Code 1.0.2), so a
+/// file ironmem creates from scratch must carry it too rather than be a bare
+/// `{"mcpServers": ...}` in a schema ironmem knows to be incomplete. Every
+/// other JSON harness (Claude, Gemini CLI, Grok CLI) is unversioned and
+/// starts from `{}`. Making this the writer's own seed (rather than a
+/// separate pre-write step) means any caller that registers Muse gets the
+/// envelope, and a fresh file is written exactly once.
+pub(crate) fn fresh_file_seed(harness_id: &str) -> serde_json::Value {
+    match harness_id {
+        "muse" => serde_json::json!({ "schema_version": 1 }),
+        _ => serde_json::json!({}),
+    }
+}
+
+/// Harness-specific keys a freshly written `mcpServers.ironmem` entry
+/// carries beyond `command`/`args`, per harness.
+///
+/// Muse's per-server settings (measured from the Muse Code 1.0.2 binary's
+/// `McpServerSettings` field list: `enabled, mode, transport, command, args,
+/// env, framing, url, headers`) include a `mode` whose values are
+/// `required` (the default) and `optional`. Measured live with `muse exec
+/// --provider echo` and a `command` pointing at a missing file: with no
+/// `mode` key, or `required`, Muse exits 1 ("Required MCP server `ironmem`
+/// failed during startup: the configured command is unavailable") before
+/// answering anything; with `optional` it exits 0 and answers, running on
+/// without the server. Memory is an
+/// enhancement, not a prerequisite for editing code, and the proxy command
+/// depends on a binary path and a daemon socket that can go stale (moved
+/// install, unspawnable daemon) — so ironmem registers itself as
+/// `optional`, matching how the other harnesses behave when the server is
+/// down (Claude, Gemini CLI and Grok CLI have no abort-on-failure mode).
+/// Every other JSON harness gets no extra keys.
+pub(crate) fn fresh_entry_extras(harness_id: &str) -> serde_json::Map<String, serde_json::Value> {
+    let mut extras = serde_json::Map::new();
+    if harness_id == "muse" {
+        extras.insert("mode".to_string(), serde_json::json!("optional"));
+    }
+    extras
 }
 
 /// Ensure a `[mcp_servers.ironmem]` block exists in a Codex `config.toml`.
@@ -225,6 +269,22 @@ pub(crate) fn ensure_codex_registered(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Claude-shaped writer with an empty seed — what every harness
+    /// except Muse registers through.
+    fn ensure_claude_registered(
+        config_path: &Path,
+        exe: &str,
+        proxy_args: &[String],
+    ) -> Result<RegisterOutcome, MemoryError> {
+        ensure_json_mcpservers_registered(
+            config_path,
+            exe,
+            proxy_args,
+            serde_json::json!({}),
+            serde_json::Map::new(),
+        )
+    }
 
     /// Representative proxy args used by tests that don't care about the
     /// exact socket path, only that registration writes/upgrades to it.
@@ -533,5 +593,176 @@ mod tests {
         std::fs::write(&cfg, r#"{"mcpServers": 5}"#).unwrap();
         let err = ensure_claude_registered(&cfg, "/bin/ironmem", &test_proxy_args()).unwrap_err();
         assert!(err.to_string().contains("is not an object"), "got: {err}");
+    }
+
+    #[test]
+    fn claude_rejects_unparseable_config_and_leaves_it_untouched() {
+        // The parse-failure branch is the only guard against clobbering a
+        // settings file with a typo in it: the error must name the parse and
+        // the bytes on disk must survive byte-for-byte.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join(".claude.json");
+        std::fs::write(&cfg, "{ \"mcpServers\": { \"other\": {} }, }").unwrap();
+        let before = std::fs::read_to_string(&cfg).unwrap();
+        let err = ensure_claude_registered(&cfg, "/bin/ironmem", &test_proxy_args()).unwrap_err();
+        assert!(err.to_string().contains("parse"), "got: {err}");
+        assert_eq!(std::fs::read_to_string(&cfg).unwrap(), before);
+    }
+
+    // ---- Fresh-file seed (Muse envelope MEASURED live; see fresh_file_seed) ----
+
+    #[test]
+    fn fresh_file_seed_is_muse_envelope_and_empty_elsewhere() {
+        assert_eq!(
+            fresh_file_seed("muse"),
+            serde_json::json!({ "schema_version": 1 })
+        );
+        for id in ["claude", "gemini", "grok", "zeta"] {
+            assert_eq!(fresh_file_seed(id), serde_json::json!({}), "{id}");
+        }
+    }
+
+    #[test]
+    fn muse_registration_seeds_measured_schema_version_on_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("muse").join("settings.json");
+        let proxy_args = test_proxy_args();
+        let outcome = ensure_json_mcpservers_registered(
+            &cfg,
+            "/bin/ironmem",
+            &proxy_args,
+            fresh_file_seed("muse"),
+            fresh_entry_extras("muse"),
+        )
+        .unwrap();
+        assert_eq!(outcome, RegisterOutcome::Registered);
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(v.get("schema_version").and_then(|s| s.as_i64()), Some(1));
+        assert_eq!(
+            v["mcpServers"]["ironmem"]["args"],
+            serde_json::json!(proxy_args)
+        );
+    }
+
+    #[test]
+    fn seed_is_ignored_for_an_existing_file() {
+        // An existing file keeps exactly its own keys: the seed never
+        // injects schema_version into a file the user already has.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("settings.json");
+        std::fs::write(&cfg, r#"{"mcpServers":{"other":{"command":"x"}}}"#).unwrap();
+        let outcome = ensure_json_mcpservers_registered(
+            &cfg,
+            "/bin/ironmem",
+            &test_proxy_args(),
+            fresh_file_seed("muse"),
+            fresh_entry_extras("muse"),
+        )
+        .unwrap();
+        assert_eq!(outcome, RegisterOutcome::Registered);
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
+        assert!(v.get("schema_version").is_none(), "seed must not leak: {v}");
+        assert_eq!(v["mcpServers"]["other"]["command"].as_str(), Some("x"));
+        assert!(v["mcpServers"]["ironmem"].is_object());
+    }
+
+    #[test]
+    fn non_object_seed_is_refused_like_a_non_object_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("settings.json");
+        let err = ensure_json_mcpservers_registered(
+            &cfg,
+            "/bin/ironmem",
+            &test_proxy_args(),
+            serde_json::json!([]),
+            serde_json::Map::new(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("not a JSON object"), "got: {err}");
+        assert!(!cfg.exists(), "nothing may be written for a refused seed");
+    }
+
+    // ---- Fresh-entry extras (Muse `mode` MEASURED from the binary's
+    // McpServerSettings field list; see fresh_entry_extras) ----
+
+    #[test]
+    fn fresh_entry_extras_is_optional_mode_for_muse_and_empty_elsewhere() {
+        let muse = fresh_entry_extras("muse");
+        assert_eq!(muse.len(), 1, "{muse:?}");
+        assert_eq!(muse.get("mode"), Some(&serde_json::json!("optional")));
+        for id in ["claude", "gemini", "grok", "zeta"] {
+            assert!(fresh_entry_extras(id).is_empty(), "{id}");
+        }
+    }
+
+    #[test]
+    fn muse_fresh_entry_is_registered_as_an_optional_server() {
+        // A required (Muse's default) server that fails to start aborts the
+        // whole Muse session; the entry ironmem creates must opt out of that.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("muse").join("settings.json");
+        let proxy_args = test_proxy_args();
+        let outcome = ensure_json_mcpservers_registered(
+            &cfg,
+            "/bin/ironmem",
+            &proxy_args,
+            fresh_file_seed("muse"),
+            fresh_entry_extras("muse"),
+        )
+        .unwrap();
+        assert_eq!(outcome, RegisterOutcome::Registered);
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
+        let entry = v["mcpServers"]["ironmem"].as_object().unwrap();
+        assert_eq!(entry.get("mode"), Some(&serde_json::json!("optional")));
+        // The extras never displace the canonical keys.
+        assert_eq!(
+            entry.get("command"),
+            Some(&serde_json::json!("/bin/ironmem"))
+        );
+        assert_eq!(entry.get("args"), Some(&serde_json::json!(proxy_args)));
+        assert_eq!(entry.len(), 3, "exactly command/args/mode: {entry:?}");
+    }
+
+    #[test]
+    fn claude_fresh_entry_carries_no_mode_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join(".claude.json");
+        ensure_claude_registered(&cfg, "/bin/ironmem", &test_proxy_args()).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
+        let entry = v["mcpServers"]["ironmem"].as_object().unwrap();
+        assert!(entry.get("mode").is_none(), "{entry:?}");
+        assert_eq!(entry.len(), 2, "exactly command/args: {entry:?}");
+    }
+
+    #[test]
+    fn extras_are_not_applied_to_an_existing_entry_on_upgrade() {
+        // The bare-["serve"] upgrade mutates only command/args; a Muse entry
+        // the user wrote without `mode` keeps its own (required) semantics.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("settings.json");
+        std::fs::write(
+            &cfg,
+            r#"{"schema_version":1,"mcpServers":{"ironmem":{"command":"/bin/ironmem","args":["serve"]}}}"#,
+        )
+        .unwrap();
+        let outcome = ensure_json_mcpservers_registered(
+            &cfg,
+            "/bin/ironmem",
+            &test_proxy_args(),
+            fresh_file_seed("muse"),
+            fresh_entry_extras("muse"),
+        )
+        .unwrap();
+        assert_eq!(outcome, RegisterOutcome::Upgraded);
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
+        assert!(
+            v["mcpServers"]["ironmem"].get("mode").is_none(),
+            "upgrade must not add keys the user did not write: {v}"
+        );
     }
 }
