@@ -521,6 +521,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Autopilot: a session whose goal loop had concluded was resumed, and could
+  only no-op.** The cause under the attempt-burning bug below, found by reading
+  the first live run's two transcripts side by side. Into a *new* session,
+  `-p "/goal …"` arrives as a plain slash command and installs the
+  session-scoped Stop hook that sequences the turn loop. Into a `--resume`d
+  one it is replayed as a local command behind a "DO NOT respond to these
+  messages … unless the user explicitly asks" caveat and arms no hook, so the
+  model correctly obeys the caveat, answers "No response requested", and the
+  process exits having run no turns. Resuming past a verdict is therefore not
+  merely wasteful, it cannot work: the goal loop that drives the turns is
+  precisely what is missing. `run_issue` now rotates to a fresh session uuid
+  whenever a dispatch returned a verdict — a verdict *is* the goal loop's
+  evaluated stop, so returning one is what spends the hook. A dispatch that
+  returned none (killed on the wall-clock bound, cut off by `--max-turns`, or
+  crashed) left the hook armed mid-goal and is still resumed, which is the
+  majority case and the "~5% marginal cost" continuation `--resume` was chosen
+  for. The replacement uuid is written to the dispatch-state drawer *unclaimed*
+  before it is used, so a Lead that crashes in between opens it with
+  `--session-id` rather than resuming a session that never existed. What a
+  fresh session loses is in-context history, not knowledge: prior attempts and
+  their failure reasons already travel in the next turn prompt.
+
+- **Autopilot: `N` and `--max-turns` were treated as the same unit, so the
+  default hard cap killed real work.** `N` counts *goal* turns, one evaluator
+  round each; the CLI's `--max-turns` counts every tool-call round trip, of
+  which one goal turn spends many. The relation was additive
+  (`max_turns = n_turns + 6`), which held only because rung 2's probe task was
+  trivial enough for a goal turn to cost about one tool call. On the first live
+  run `--n-turns 6` derived `--max-turns 12`, while the implementer spent 64
+  tool calls in twelve minutes merely reading code before its first edit: every
+  dispatch was killed roughly four minutes in, mid-edit, returning
+  `is_error: true` with no verdict, and three in a row ended the run without a
+  single gate execution. The relation is now multiplicative —
+  `DEFAULT_TOOL_TURNS_PER_GOAL_TURN` (50) applied per goal turn, with
+  `MIN_TOOL_TURNS_PER_GOAL_TURN` (10) as the validated floor — so the exact
+  pairing that broke is refused where it is made, with a message naming the
+  unit confusion rather than only the number. The default is deliberately
+  generous: `--max-turns` is a runaway backstop, and `--max-budget-usd` and the
+  repo's wall-clock bound are what should bind first, because an operator set
+  those on purpose. `autopilot lead` also gains `--max-turns`, which previously
+  only `autopilot run` exposed, so the ceiling can be set without dropping out
+  of the Lead.
+
+- **Autopilot: a dispatch that did nothing at all burned one of the issue's
+  attempts.** Found on the subsystem's first live run (issue #285). `--resume`
+  into a session whose `/goal` loop had already concluded exchanged one
+  "continue" prompt for one "no response requested" and exited cleanly in
+  about six seconds — `num_turns: 0`, `total_cost_usd: 0.0`, `is_error: false`,
+  exit zero, no verdict. `run::classify` read that as the spec's anti-stall row
+  ("Returns control with the goal still set … it counts as an attempt"), which
+  has no floor, so four such dispatches burned four of the issue's five
+  attempts in 25 seconds and drove the run to `AttemptCapExhausted` — retiring
+  an issue whose branch was in fact complete and gate-green. Any resume that
+  no-ops destroyed an issue's whole attempt budget in under half a minute.
+  `classify` now reads a dispatch carrying **no verdict, no turns and no
+  spend** as an `InfrastructureFailure`: it consumes no attempt and is bounded
+  instead by `max_consecutive_infrastructure_failures`, which is the right
+  escalation because a resume that no-ops is a wedged session — an operator's
+  fix — rather than a failing approach. Both readings are required and neither
+  suffices alone: a `0.0` cost can mean *unknown* rather than *free* (exactly
+  what it means for a killed dispatch, whose arm stays deliberately above the
+  new floor so a timeout is still diagnosed as a timeout and still counts
+  against the unpriced-dispatch ceiling), and a turnless dispatch that was
+  nonetheless billed did engage the model and is a real, if short, attempt.
+  The underlying cause — resuming a concluded goal session does not re-arm the
+  goal — is untouched here; this is the guard that stops it costing an issue.
+
 - **Test harness: `call_tool` silently accepted refused tool calls.** A tool
   refusal comes back as an `isError: true` success response carrying
   `{"error": ...}`, not as the JSON-RPC `error` field — which the sibling

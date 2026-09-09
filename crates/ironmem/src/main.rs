@@ -395,7 +395,8 @@ enum AutopilotCmd {
         /// Turns per dispatch (the N in "or stop after N turns")
         #[arg(long)]
         n_turns: Option<u32>,
-        /// Hard --max-turns ceiling; must clear --n-turns with headroom
+        /// Hard --max-turns ceiling. Counts tool-call turns, not goal turns,
+        /// so it must clear --n-turns times the per-goal-turn floor
         #[arg(long)]
         max_turns: Option<u32>,
         /// Per-dispatch spend ceiling, passed through to --max-budget-usd
@@ -628,6 +629,10 @@ enum AutopilotCmd {
         /// Turns per dispatch (the N in "or stop after N turns")
         #[arg(long)]
         n_turns: Option<u32>,
+        /// Hard --max-turns ceiling. Counts tool-call turns, not goal turns,
+        /// so it must clear --n-turns times the per-goal-turn floor
+        #[arg(long)]
+        max_turns: Option<u32>,
         /// Per-dispatch spend ceiling
         #[arg(long)]
         max_budget_usd: Option<f64>,
@@ -1808,7 +1813,7 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                     // rather than silently failing validation against the
                     // default `max_turns` that was derived from the default N.
                     config.max_turns =
-                        n.saturating_add(ironmem::autopilot::run::DEFAULT_MAX_TURNS_HEADROOM);
+                        n.saturating_mul(ironmem::autopilot::run::DEFAULT_TOOL_TURNS_PER_GOAL_TURN);
                 }
                 if let Some(max) = max_turns {
                     config.max_turns = max;
@@ -2301,6 +2306,7 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                 max_dispatches,
                 concurrency_cap,
                 n_turns,
+                max_turns,
                 max_budget_usd,
                 attempt_cap,
                 daily_budget_usd,
@@ -2325,7 +2331,12 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                 if let Some(n) = n_turns {
                     run.n_turns = n;
                     run.max_turns =
-                        n.saturating_add(ironmem::autopilot::run::DEFAULT_MAX_TURNS_HEADROOM);
+                        n.saturating_mul(ironmem::autopilot::run::DEFAULT_TOOL_TURNS_PER_GOAL_TURN);
+                }
+                // After the N-derived default, so an explicit ceiling wins
+                // over it rather than being silently recomputed.
+                if let Some(max) = max_turns {
+                    run.max_turns = max;
                 }
                 if let Some(budget) = max_budget_usd {
                     run.max_budget_usd = budget;
