@@ -521,6 +521,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Autopilot: `agent:exhausted` could not actually be recovered, so the
+  documented human retry was a no-op.** The spec is explicit that the label
+  "never self-resumes" and that "only a human re-labeling it retries", but the
+  label governs *selection* while the cap is enforced somewhere else entirely —
+  against `cumulative_attempt_n` in the issue-status drawer, which is
+  cumulative across runs and which nothing anywhere reset: not `blocked`, not
+  `labels`, not `autopilot exhaust`, and there was no reset command. A human
+  who did exactly what the spec says got the issue selected and then handed
+  straight back as `AttemptCapExhausted` without a dispatch, on every tick,
+  forever. The only escape was raising `--attempt-cap`, a global knob standing
+  in for a per-issue intent, which lifts the ceiling for every other issue at
+  the same time. New `autopilot retry <repo> <issue>` records a **retry grant**
+  and moves the issue back to `agent:ready`, in that order — `agent:ready` is
+  what makes the Lead pick an issue up, so flipping the label first would
+  advertise an issue that still refuses to dispatch. The grant *forgives*
+  attempts rather than zeroing the counter, because that counter is also the
+  **numbering** for attempt records: zeroing it would hand a re-dispatched
+  implementer two different `attempt 1` lines and degrade exactly the history
+  the turn prompt exists to convey, at the moment it matters most. The cap is
+  now read as attempts *since the last human retry*, both numbers survive, and
+  a grant is idempotent so an operator repeating a command they were unsure had
+  landed does not buy a second budget. A grant deliberately touches only the
+  attempt cap: an escalation, an outstanding `agent:blocked` question and a
+  recorded success are different stop states with their own recovery paths, and
+  a run still stops for those, which is reported rather than silently widened.
+
 - **Autopilot: a session whose goal loop had concluded was resumed, and could
   only no-op.** The cause under the attempt-burning bug below, found by reading
   the first live run's two transcripts side by side. Into a *new* session,

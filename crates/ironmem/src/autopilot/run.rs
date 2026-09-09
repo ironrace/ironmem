@@ -90,7 +90,7 @@ use crate::error::MemoryError;
 use super::dispatch::{self, DispatchOutcome, DispatchSpec, SessionMode, Verdict};
 use super::worktree::Worktree;
 use super::{
-    blocked, budget, dispatch_state, gate_config, lineage, remediate, supervise, today_utc,
+    blocked, budget, dispatch_state, gate_config, lineage, remediate, retry, supervise, today_utc,
     turn_prompt, IssueRef,
 };
 use super::{AttemptOutcome, AttemptRecord, DispatchState, IssueStatus, PriorAttempt};
@@ -936,7 +936,11 @@ pub fn run_issue(
         if let Some(signature) = supervise::escalated_signature(db, issue)? {
             break TerminalReason::StrategyEscalated { signature };
         }
-        if cumulative_attempt_n >= config.attempt_cap {
+        // Read fresh each pass, like the escalation above it: a human who
+        // grants a retry while a run is in flight must be honoured by the
+        // very next dispatch, not the next run.
+        let forgiven = retry::forgiven_through(db, issue)?;
+        if retry::attempts_charged(cumulative_attempt_n, forgiven) >= config.attempt_cap {
             let attempts = prior_attempts(db, issue)?;
             record_terminal_summary(
                 db,
@@ -2457,6 +2461,73 @@ satisfies it on its own"
             dispatcher.seen.is_empty(),
             "`agent:exhausted` never self-resumes"
         );
+    }
+
+    #[test]
+    fn a_human_retry_gives_a_capped_issue_its_budget_back() {
+        // The recovery the spec names — "only a human re-labeling it
+        // retries" — which never worked, because the label governs selection
+        // and the cap is enforced against a counter no label touches. The
+        // grant is what makes re-labeling mean something.
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        lineage::upsert_issue_status(
+            &db,
+            &IssueStatus {
+                issue: issue(),
+                best_verdict: Some(AttemptOutcome::Failed),
+                best_commit_sha: None,
+                cumulative_attempt_n: 5,
+            },
+        )
+        .unwrap();
+        retry::grant_retry(&db, &issue(), 5).unwrap();
+
+        let mut dispatcher = ScriptedDispatcher::new(vec![Ok(met())]);
+        let run = run_issue(&db, &issue(), &brief(), &wt, &config(), &mut dispatcher).unwrap();
+
+        assert!(
+            matches!(run.terminal, TerminalReason::Met { .. }),
+            "a forgiven issue must dispatch, got {:?}",
+            run.terminal
+        );
+        assert_eq!(dispatcher.seen.len(), 1);
+        // The lifetime counter keeps counting, so the next attempt is #6 and
+        // the prompt's history stays unambiguous.
+        assert_eq!(run.cumulative_attempt_n, 6);
+    }
+
+    #[test]
+    fn a_retry_grants_one_cap_not_an_unlimited_one() {
+        // Forgiveness is a one-time credit, not a raised ceiling: the issue
+        // gets `attempt_cap` more attempts and then stops again, which is the
+        // whole point of the cap surviving the recovery.
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        lineage::upsert_issue_status(
+            &db,
+            &IssueStatus {
+                issue: issue(),
+                best_verdict: Some(AttemptOutcome::Failed),
+                best_commit_sha: None,
+                cumulative_attempt_n: 5,
+            },
+        )
+        .unwrap();
+        retry::grant_retry(&db, &issue(), 5).unwrap();
+
+        let mut config = config();
+        config.attempt_cap = 2;
+        let mut dispatcher = ScriptedDispatcher::new(vec![Ok(not_met()), Ok(not_met())]);
+        let run = run_issue(&db, &issue(), &brief(), &wt, &config, &mut dispatcher).unwrap();
+
+        assert_eq!(run.terminal, TerminalReason::AttemptCapExhausted);
+        assert_eq!(
+            dispatcher.seen.len(),
+            2,
+            "exactly the forgiven cap's worth of attempts, then stop again"
+        );
+        assert_eq!(run.cumulative_attempt_n, 7);
     }
 
     // ── impossible ──────────────────────────────────────────────────────

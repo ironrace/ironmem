@@ -531,6 +531,26 @@ enum AutopilotCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Give an issue that hit its attempt cap a fresh budget and put it back
+    /// in the queue — the human recovery `agent:exhausted` names
+    Retry {
+        /// Repo identity (e.g. "owner/repo")
+        repo: String,
+        /// GitHub issue number
+        issue: u64,
+        /// Path to the database
+        #[arg(long)]
+        db: Option<String>,
+        /// Directory `gh` runs in
+        #[arg(long, default_value = ".")]
+        path: String,
+        /// Forgive the attempts but leave the labels alone
+        #[arg(long)]
+        no_label: bool,
+        /// Emit JSON instead of text
+        #[arg(long)]
+        json: bool,
+    },
     /// Run both supervision checks against one in-flight issue (rung 7)
     Supervise {
         /// Path to the database
@@ -2114,6 +2134,78 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                             "  would exhaust: {attempts_summarized} attempt(s) summarized, labels +{:?} -{:?} — dry run, nothing written",
                             label_plan.add, label_plan.remove
                         ),
+                    }
+                }
+                Ok(())
+            }
+            AutopilotCmd::Retry {
+                repo,
+                issue,
+                db,
+                path,
+                no_label,
+                json,
+            } => {
+                use ironmem::autopilot::retry::GrantOutcome;
+                let database = open_migrated_db(db)?;
+                let issue_ref = ironmem::autopilot::IssueRef::new(&repo, issue);
+                // The count is read here and handed to `grant_retry`, so the
+                // decision is made against a status this command actually
+                // saw rather than one re-read underneath it.
+                let attempted =
+                    ironmem::autopilot::lineage::get_issue_status(&database, &issue_ref)?
+                        .map(|status| status.cumulative_attempt_n)
+                        .unwrap_or(0);
+                let outcome =
+                    ironmem::autopilot::retry::grant_retry(&database, &issue_ref, attempted)?;
+                // The label moves only once the budget is actually restored.
+                // Ordering, not taste: `agent:ready` is what makes the Lead
+                // pick the issue up, so flipping it first would advertise an
+                // issue that still returns `AttemptCapExhausted` without
+                // dispatching.
+                let labelled = if no_label {
+                    None
+                } else {
+                    let mut gh = ironmem::autopilot::gh::GhCli::resolve(&path)?;
+                    Some(ironmem::autopilot::labels::set_exclusive_label(
+                        &mut gh,
+                        &issue_ref,
+                        Some(ironmem::autopilot::labels::AgentLabel::Ready),
+                    )?)
+                };
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "issue": issue_ref.canonical(),
+                            "lifetime_attempts": attempted,
+                            "grant": outcome,
+                            "labelled_ready": labelled.is_some(),
+                        }))?
+                    );
+                } else {
+                    match &outcome {
+                        GrantOutcome::Granted { forgiven_through } => println!(
+                            "{}: {forgiven_through} attempt(s) forgiven; the per-issue cap is \
+                             clear again (lifetime attempts: {attempted}).",
+                            issue_ref.canonical()
+                        ),
+                        GrantOutcome::AlreadyForgiven { forgiven_through } => println!(
+                            "{}: already forgiven through attempt {forgiven_through}; nothing \
+                             further to clear.",
+                            issue_ref.canonical()
+                        ),
+                        GrantOutcome::NothingToForgive => println!(
+                            "{}: no attempts recorded, so the cap was never in the way.",
+                            issue_ref.canonical()
+                        ),
+                    }
+                    match &labelled {
+                        Some(plan) if plan.is_noop() => {
+                            println!("  labels: already `agent:ready`.")
+                        }
+                        Some(_) => println!("  labels: now `agent:ready`."),
+                        None => println!("  labels: left alone (--no-label)."),
                     }
                 }
                 Ok(())
