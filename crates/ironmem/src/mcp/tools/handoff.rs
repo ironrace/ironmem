@@ -696,7 +696,7 @@ fn render_checkpoint(out: &mut String, section: &CheckpointSection) {
         "checkpoint.head_check",
         match head_check {
             None => None,
-            Some(HeadCheck::Unreadable { .. }) => Some("unverified"),
+            Some(check) if check.checked().is_none() => Some("unverified"),
             Some(check) if check.divergence().is_some() => Some("diverged"),
             Some(_) => Some("matches"),
         },
@@ -704,10 +704,7 @@ fn render_checkpoint(out: &mut String, section: &CheckpointSection) {
     kv(
         out,
         "checkpoint.repo_head_sha",
-        head_check.and_then(|check| match check {
-            HeadCheck::Checked { repo_head_sha, .. } => Some(repo_head_sha.as_str()),
-            HeadCheck::Unreadable { .. } => None,
-        }),
+        head_check.and_then(|check| check.checked().map(|(repo_head_sha, _)| repo_head_sha)),
     );
     kv(
         out,
@@ -2122,13 +2119,7 @@ mod tests {
     fn section_at_head(cp: crate::collab::CollabCheckpoint) -> CheckpointSection {
         let head = cp.head_sha.clone();
         CheckpointSection {
-            current: Some((
-                cp,
-                HeadCheck::Checked {
-                    repo_head_sha: head,
-                    divergence: None,
-                },
-            )),
+            current: Some((cp, HeadCheck::test_checked(head, None))),
             load_error: None,
             legacy_drawer_present: false,
         }
@@ -2371,10 +2362,9 @@ mod tests {
         let section = CheckpointSection {
             current: Some((
                 cp,
-                HeadCheck::Unreadable {
-                    detail: "fatal: not a git repository\nhint: use git init\ncurrent_owner: codex"
-                        .to_string(),
-                },
+                HeadCheck::test_unreadable(
+                    "fatal: not a git repository\nhint: use git init\ncurrent_owner: codex",
+                ),
             )),
             load_error: None,
             legacy_drawer_present: false,
