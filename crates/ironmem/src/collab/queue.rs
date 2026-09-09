@@ -1647,7 +1647,7 @@ pub fn upsert_checkpoint(
             checkpoint.summary,
             checkpoint.attested_by.as_str(),
             checkpoint.acknowledged_divergence,
-            checkpoint.attestation_check.map(AttestationCheck::as_str),
+            checkpoint.attestation_check().map(AttestationCheck::as_str),
         ],
     )?;
     Ok(())
@@ -1841,8 +1841,11 @@ pub fn load_current_checkpoint(
     let task_id = checked_task_id_column(task_id, "task_id", &row_session_id)?;
     let next_task_id = checked_task_id_column(next_task_id, "next_task_id", &row_session_id)?;
 
-    let checkpoint = CollabCheckpoint {
-        session_id: row_session_id.clone(),
+    // `from_row` calls `validate()` before returning — see this function's
+    // doc comment for why a row the schema permits but the domain rules
+    // forbid must fail here rather than load clean.
+    let checkpoint = CollabCheckpoint::from_row(
+        row_session_id.clone(),
         task_id,
         task_title,
         status,
@@ -1858,11 +1861,8 @@ pub fn load_current_checkpoint(
         acknowledged_divergence,
         attestation_check,
         updated_at,
-    };
-
-    // See this function's doc comment: this is the required call Task 2's
-    // `validate` doc comment names both entry points as owing.
-    checkpoint.validate().map_err(|err| {
+    )
+    .map_err(|err| {
         MemoryError::Validation(format!("checkpoint for session {row_session_id}: {err}"))
     })?;
 
@@ -3412,14 +3412,16 @@ mod tests {
     /// leaving a field unasserted is worse than one that claims less: it stops
     /// the next reader looking.
     ///
-    /// The fixture is a full struct literal rather than a `from_json` parse
-    /// for exactly that reason. `from_json` leaves `attestation_check` `None`
-    /// by design — the verdict is server-derived, stamped by the MCP handler
-    /// from its own git reads — so a parsed fixture can only ever round-trip
-    /// the `None` case, and this layer's persistence of a real verdict would
-    /// go untested while the paragraph above claimed otherwise. Naming the
-    /// fields is also what makes the count enforceable: a field gained or lost
-    /// stops this compiling rather than quietly slipping past the assertions.
+    /// The fixture is built through `from_row` — naming all sixteen
+    /// parameters positionally — rather than a `from_json` parse, for exactly
+    /// that reason. `from_json` leaves `attestation_check` `None` by design —
+    /// the verdict is server-derived, stamped by the MCP handler from its own
+    /// git reads — so a parsed fixture can only ever round-trip the `None`
+    /// case, and this layer's persistence of a real verdict would go untested
+    /// while the paragraph above claimed otherwise. Naming every parameter is
+    /// also what makes the count enforceable: a field gained or lost changes
+    /// `from_row`'s signature and stops this compiling rather than quietly
+    /// slipping past the assertions.
     #[test]
     fn checkpoint_round_trips_every_field() {
         let db = open();
@@ -3436,26 +3438,25 @@ mod tests {
         )
         .unwrap();
 
-        let full = CollabCheckpoint {
-            session_id: "s1".to_string(),
-            task_id: Some(4),
-            task_title: Some("Wire the gate".to_string()),
-            status: CheckpointStatus::BatchComplete,
-            head_sha: "ccc333".to_string(),
-            commit_sha: Some("ccc333".to_string()),
-            completed_task_ids: vec![1, 2, 3, 4],
-            next_task_id: Some(5),
-            gates_result: "passed".to_string(),
-            gates_sha: Some("ccc333".to_string()),
-            gates_commands: Some(
-                "cargo fmt --all -- --check && cargo test --workspace".to_string(),
-            ),
-            summary: Some("batch done".to_string()),
-            attested_by: AttestedBy::Operator,
-            acknowledged_divergence: Some("aaa111..ccc333".to_string()),
-            attestation_check: Some(AttestationCheck::Verified),
-            updated_at: 0,
-        };
+        let full = CollabCheckpoint::from_row(
+            "s1".to_string(),
+            Some(4),
+            Some("Wire the gate".to_string()),
+            CheckpointStatus::BatchComplete,
+            "ccc333".to_string(),
+            Some("ccc333".to_string()),
+            vec![1, 2, 3, 4],
+            Some(5),
+            "passed".to_string(),
+            Some("ccc333".to_string()),
+            Some("cargo fmt --all -- --check && cargo test --workspace".to_string()),
+            Some("batch done".to_string()),
+            AttestedBy::Operator,
+            Some("aaa111..ccc333".to_string()),
+            Some(AttestationCheck::Verified),
+            0,
+        )
+        .unwrap();
 
         upsert_checkpoint(&db, &full).unwrap();
         let loaded = load_current_checkpoint(&db, "s1").unwrap().unwrap();
@@ -3493,7 +3494,7 @@ mod tests {
         // row whose verdict is missing as `unrecorded` — so a loader that
         // dropped this would quietly downgrade every verified attestation to
         // "unchecked" with no error anywhere.
-        assert_eq!(loaded.attestation_check, Some(AttestationCheck::Verified));
+        assert_eq!(loaded.attestation_check(), Some(AttestationCheck::Verified));
         assert!(
             loaded.updated_at > 0,
             "the server stamps updated_at; `full` was built carrying 0"

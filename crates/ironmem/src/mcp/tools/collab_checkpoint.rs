@@ -175,7 +175,9 @@ pub(super) fn handle_collab_checkpoint(app: &App, args: &Value) -> Result<Value,
     // stamped here is the verdict this snapshot supports; the transaction below
     // may weaken it, and the weaker one is what both the row and the response
     // carry (see [`verdict_for_replaced_checkpoint`]).
-    checkpoint.attestation_check = outcome.check;
+    checkpoint
+        .set_attestation_check(outcome.check)
+        .map_err(|err| MemoryError::Validation(err.to_string()))?;
     // A previous row that could not be read is not the same as no previous row,
     // and the difference decides what `verified` is allowed to mean. With no
     // prior checkpoint the span rule has no subject and every rule that could
@@ -183,8 +185,10 @@ pub(super) fn handle_collab_checkpoint(app: &App, args: &Value) -> Result<Value,
     // and nobody established that this attestation covers it. Reporting
     // `verified` there would be the one thing this branch keeps refusing —
     // a check that never ran, rendered as a check that passed.
-    if previous_unreadable && checkpoint.attestation_check == Some(AttestationCheck::Verified) {
-        checkpoint.attestation_check = Some(AttestationCheck::VerifiedWithoutSpan);
+    if previous_unreadable && checkpoint.attestation_check() == Some(AttestationCheck::Verified) {
+        checkpoint
+            .set_attestation_check(Some(AttestationCheck::VerifiedWithoutSpan))
+            .map_err(|err| MemoryError::Validation(err.to_string()))?;
     }
     if let Some(canonical) = outcome.canonical_range {
         checkpoint.acknowledged_divergence = Some(canonical);
@@ -222,8 +226,8 @@ pub(super) fn handle_collab_checkpoint(app: &App, args: &Value) -> Result<Value,
         // to re-derive the stored verdict from the payload's own verdict rather
         // than from what a rolled-back attempt left behind.
         let mut row = checkpoint.clone();
-        row.attestation_check = verdict_for_replaced_checkpoint(
-            checkpoint.attestation_check,
+        let requalified = verdict_for_replaced_checkpoint(
+            checkpoint.attestation_check(),
             judged_head.as_deref(),
             || {
                 // Same degrade as the pre-transaction read, for the same
@@ -241,6 +245,8 @@ pub(super) fn handle_collab_checkpoint(app: &App, args: &Value) -> Result<Value,
                 Ok(replaced.map(|cp| cp.head_sha))
             },
         )?;
+        row.set_attestation_check(requalified)
+            .map_err(|err| MemoryError::Validation(err.to_string()))?;
         // Unconditional last-writer-wins, with no `updated_at` guard. The
         // hazard that carries is NOT a stale in-memory checkpoint — this tool
         // takes a fully-formed payload and never does read-modify-write — it is
@@ -288,11 +294,11 @@ pub(super) fn handle_collab_checkpoint(app: &App, args: &Value) -> Result<Value,
                 "diverged": head_check.diverged(),
                 "head_check": head_check.label(),
                 "acknowledged_divergence": row.acknowledged_divergence,
-                "attestation_check": row.attestation_check.map(AttestationCheck::as_str),
+                "attestation_check": row.attestation_check().map(AttestationCheck::as_str),
             })),
         )?;
 
-        Ok((claim, updated_at, row.attestation_check))
+        Ok((claim, updated_at, row.attestation_check()))
     })?;
     // Only after the commit — publishing a claim whose transaction may still
     // roll back is the cache poisoning `GenerationClaim` exists to prevent.

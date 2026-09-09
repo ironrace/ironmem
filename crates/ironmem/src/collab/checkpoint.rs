@@ -230,12 +230,17 @@ impl std::error::Error for CheckpointError {}
 ///
 /// The field set mirrors the table in migration 020 column for column, so this
 /// type is what both the MCP tool payload and the stored row round-trip
-/// through — which is why every field is `pub`: the loader in `collab::queue`
-/// rebuilds one field-by-field from a row rather than from JSON. That open
-/// construction is exactly why the cross-field rule lives in
-/// [`CollabCheckpoint::validate`] rather than only inside
-/// [`CollabCheckpoint::from_json`]; see that method for what every builder
-/// owes.
+/// through: [`CollabCheckpoint::from_json`] parses the payload, and
+/// [`CollabCheckpoint::from_row`] assembles the row — the loader in
+/// `collab::queue` calls the latter rather than building the struct itself.
+/// Both constructors call [`CollabCheckpoint::validate`] before returning,
+/// which is why every field but one is `pub`: nothing outside this module can
+/// assemble a `CollabCheckpoint` literal (there is no way to name
+/// `attestation_check` to do it), so the constructors are the only route to a
+/// value of this type, and reading the rest of the fields straight off an
+/// already-validated value is exactly as safe as it looks. `attestation_check`
+/// is the one field mutated after construction — see its own doc comment and
+/// [`CollabCheckpoint::set_attestation_check`] for why it stays private.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CollabCheckpoint {
     pub session_id: String,
@@ -287,10 +292,18 @@ pub struct CollabCheckpoint {
     /// its own attestation `verified`.
     ///
     /// `None` means no verdict was recorded. Read it through
-    /// [`CollabCheckpoint::attestation_verdict`] rather than directly, so the
-    /// fail-safe default for an unstamped *operator* row is applied once rather
-    /// than at each of the three reader surfaces.
-    pub attestation_check: Option<AttestationCheck>,
+    /// [`CollabCheckpoint::attestation_verdict`] rather than directly — that is
+    /// exactly why this field is *not* `pub`: unlike every other field, this
+    /// one is legitimately mutated after construction (by
+    /// `mcp::tools::collab_checkpoint`, once it has resolved
+    /// `acknowledged_divergence` against the repository, which `from_json` and
+    /// `from_row` cannot do), and [`CollabCheckpoint::set_attestation_check`]
+    /// is the one place that mutation is allowed to happen through, so the
+    /// implementer-carries-no-verdict rule stays true of a checkpoint between
+    /// construction and the write that persists it, not merely true of the
+    /// moment it was built. Read the raw value back with
+    /// [`CollabCheckpoint::attestation_check`].
+    attestation_check: Option<AttestationCheck>,
     /// Unix seconds, server-stamped at write time rather than parsed from the
     /// payload. `0` means "not yet stamped": that is what
     /// [`CollabCheckpoint::from_json`] leaves here, and
@@ -378,6 +391,67 @@ impl CollabCheckpoint {
             updated_at: 0,
         };
         checkpoint.check_payload_caps()?;
+        checkpoint.validate()?;
+        Ok(checkpoint)
+    }
+
+    /// Build a checkpoint from an already-typed, already-parsed
+    /// `collab_checkpoints` row.
+    ///
+    /// This is the loader's constructor, the way [`CollabCheckpoint::from_json`]
+    /// is the payload's: `collab::queue::load_current_checkpoint` parses every
+    /// stored column into its typed form (`CheckpointStatus`, `AttestedBy`,
+    /// `AttestationCheck`, and the task-id/`completed_task_ids` domain checks)
+    /// before calling this, because that parsing is column-shaped knowledge
+    /// `queue` owns and this module deliberately does not (see the module doc
+    /// comment). What this constructor owes, on top of assembling the struct,
+    /// is exactly what `from_json` already owes: nobody may hold a value of
+    /// this type that has not been through [`CollabCheckpoint::validate`].
+    ///
+    /// Before this existed, the loader built the struct as a bare field
+    /// literal and called `validate()` itself as a second, separate step —
+    /// which only compiled at all because every field was `pub`, and which
+    /// depended on the loader remembering the second step. Neither is true
+    /// anymore: `attestation_check` is private (see its own doc comment), so a
+    /// literal naming every other field will not compile outside this module,
+    /// and this constructor calls `validate()` before returning, the same way
+    /// `from_json` does.
+    pub fn from_row(
+        session_id: String,
+        task_id: Option<u32>,
+        task_title: Option<String>,
+        status: CheckpointStatus,
+        head_sha: String,
+        commit_sha: Option<String>,
+        completed_task_ids: Vec<u32>,
+        next_task_id: Option<u32>,
+        gates_result: String,
+        gates_sha: Option<String>,
+        gates_commands: Option<String>,
+        summary: Option<String>,
+        attested_by: AttestedBy,
+        acknowledged_divergence: Option<String>,
+        attestation_check: Option<AttestationCheck>,
+        updated_at: i64,
+    ) -> Result<Self, CheckpointError> {
+        let checkpoint = Self {
+            session_id,
+            task_id,
+            task_title,
+            status,
+            head_sha,
+            commit_sha,
+            completed_task_ids,
+            next_task_id,
+            gates_result,
+            gates_sha,
+            gates_commands,
+            summary,
+            attested_by,
+            acknowledged_divergence,
+            attestation_check,
+            updated_at,
+        };
         checkpoint.validate()?;
         Ok(checkpoint)
     }
@@ -470,12 +544,17 @@ impl CollabCheckpoint {
     /// Check the cross-field rules that hold for every checkpoint, however it
     /// was built.
     ///
-    /// Separate from [`CollabCheckpoint::from_json`] because every field is
-    /// `pub`: `queue::load_current_checkpoint` reconstructs a checkpoint
-    /// field-by-field from a row and never goes through the parser, so without
-    /// this it could hand Tasks 7-10 a combination the MCP path would have
-    /// rejected. `task_list::validate_task_list_body` is factored out of its
-    /// own parser for exactly this reason. **Both entry points must call it.**
+    /// Separate from [`CollabCheckpoint::from_json`] because it is also called
+    /// by [`CollabCheckpoint::from_row`]: `queue::load_current_checkpoint`
+    /// reconstructs a checkpoint from a stored row rather than from a JSON
+    /// payload, and never goes through the parser, so without this rule living
+    /// somewhere both constructors reach it could hand Tasks 7-10 a
+    /// combination the MCP path would have rejected.
+    /// `task_list::validate_task_list_body` is factored out of its own parser
+    /// for exactly this reason. **Both constructors call it before returning**,
+    /// which is what makes it a property of every `CollabCheckpoint` in
+    /// existence rather than a step a call site could forget: unlike before
+    /// `from_row` existed, there is no longer a way to build one and skip it.
     ///
     /// It enforces two things.
     ///
@@ -627,6 +706,45 @@ impl CollabCheckpoint {
                     .map_or(ATTESTATION_UNRECORDED, AttestationCheck::as_str),
             ),
         }
+    }
+
+    /// The raw stored verdict, `Copy` and cheap. Prefer
+    /// [`CollabCheckpoint::attestation_verdict`] wherever the answer is being
+    /// *rendered* to a reader — this accessor exists for the write path in
+    /// `mcp::tools::collab_checkpoint`, which needs the enum itself (to compare
+    /// against, or to weaken and re-stamp via
+    /// [`CollabCheckpoint::set_attestation_check`]), not its fail-safe string
+    /// rendering.
+    pub fn attestation_check(&self) -> Option<AttestationCheck> {
+        self.attestation_check
+    }
+
+    /// Stamp the server's verdict on `acknowledged_divergence`, resolved
+    /// against the repository by `mcp::tools::collab_checkpoint`.
+    ///
+    /// The only production path that mutates a checkpoint after construction.
+    /// Resolving a range needs a git read, which neither `from_json` nor
+    /// `from_row` performs, so the verdict is necessarily stamped in a second
+    /// step — but a caller stamping it through a plain `pub` field could stamp
+    /// it onto an implementer row, which is exactly the claim
+    /// [`CollabCheckpoint::validate`] exists to refuse. Routing the mutation
+    /// through this method instead means that refusal holds between
+    /// construction and the write that persists the row, not merely at the
+    /// two constructors.
+    pub fn set_attestation_check(
+        &mut self,
+        check: Option<AttestationCheck>,
+    ) -> Result<(), CheckpointError> {
+        if self.attested_by == AttestedBy::Implementer && check.is_some() {
+            return Err(CheckpointError(format!(
+                "attestation_check is only valid with attested_by=operator: an implementer \
+                 checkpoint names no range for the server to resolve, so {:?} describes a \
+                 check that never ran",
+                check.map(AttestationCheck::as_str)
+            )));
+        }
+        self.attestation_check = check;
+        Ok(())
     }
 
     /// Whether this checkpoint carries a *reusable* gate proof: the gates
@@ -1234,18 +1352,22 @@ mod tests {
         }
     }
 
-    /// `validate` exists because every field is `pub`: the `collab::queue`
-    /// loader rebuilds a checkpoint from a row without going through
-    /// `from_json`, and migration 020's one-directional CHECK deliberately
-    /// permits the row below. Nothing else stands between a fabricated
-    /// operator attestation and the head-consistency gate it exempts.
+    /// `validate` exists because a value of this type can be assembled without
+    /// going through `from_json`: `collab::queue`'s loader builds one from a
+    /// stored row via [`CollabCheckpoint::from_row`] instead, and migration
+    /// 020's one-directional CHECK deliberately permits the row below.
+    /// `from_row` calls `validate` itself now (see its doc comment), so this
+    /// exact combination can no longer reach a caller unvalidated — this test
+    /// pins the rule `from_row` leans on rather than a live hole.
     ///
     /// Written as a full struct literal naming all sixteen fields rather than
-    /// as a mutation of a parsed value, because the openness of the type is
-    /// the thing under test — this is the construction Task 3's loader will
-    /// perform. It therefore also stops compiling if a field is later made
-    /// private or the struct gains `#[non_exhaustive]`, which is the change
-    /// that would invalidate the reasoning above.
+    /// through a constructor, so that a field added to the type without a
+    /// matching rule here — in either `validate` or this test — fails to
+    /// compile rather than passing silently. This is possible only from
+    /// *inside* `collab::checkpoint`: `attestation_check` is private (see its
+    /// own doc comment), so the identical literal would not compile from
+    /// `collab::queue` or any other module, which is the property `from_row`
+    /// now provides in place of this test's older, cheaper enforcement.
     #[test]
     fn validate_catches_an_operator_attestation_built_without_the_parser() {
         let mut smuggled = CollabCheckpoint {
