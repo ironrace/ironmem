@@ -341,6 +341,41 @@ const MAX_CHECKPOINT_TEXT_CHARS: usize = 2048;
 /// the widest value the code that reads it emits.
 const MAX_CHECKPOINT_SHA_CHARS: usize = 160;
 
+/// The typed contents of one `collab_checkpoints` row, on its way into
+/// [`CollabCheckpoint::from_row`].
+///
+/// A named struct rather than sixteen positional parameters, and the reason is
+/// not the argument count itself. Six of those fields are `Option<String>` and
+/// four more are plain `String`, so a call that transposed any two of them —
+/// `summary` for `gates_commands`, `commit_sha` for `head_sha` — would compile
+/// silently and persist a checkpoint whose columns had quietly swapped places.
+/// That is the same class of defect this whole change set exists to remove, so
+/// introducing one at the seam would have been a poor trade. Field names at the
+/// call site make the transposition a compile error instead.
+///
+/// Every field is `pub` and the struct carries no invariants of its own: it is
+/// a parameter list, not a checkpoint. [`CollabCheckpoint::from_row`] is what
+/// validates, and it is the only thing that reads one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointRow {
+    pub session_id: String,
+    pub task_id: Option<u32>,
+    pub task_title: Option<String>,
+    pub status: CheckpointStatus,
+    pub head_sha: String,
+    pub commit_sha: Option<String>,
+    pub completed_task_ids: Vec<u32>,
+    pub next_task_id: Option<u32>,
+    pub gates_result: String,
+    pub gates_sha: Option<String>,
+    pub gates_commands: Option<String>,
+    pub summary: Option<String>,
+    pub attested_by: AttestedBy,
+    pub acknowledged_divergence: Option<String>,
+    pub attestation_check: Option<AttestationCheck>,
+    pub updated_at: i64,
+}
+
 impl CollabCheckpoint {
     /// Parse and validate a checkpoint from the MCP tool payload.
     ///
@@ -416,24 +451,25 @@ impl CollabCheckpoint {
     /// literal naming every other field will not compile outside this module,
     /// and this constructor calls `validate()` before returning, the same way
     /// `from_json` does.
-    pub fn from_row(
-        session_id: String,
-        task_id: Option<u32>,
-        task_title: Option<String>,
-        status: CheckpointStatus,
-        head_sha: String,
-        commit_sha: Option<String>,
-        completed_task_ids: Vec<u32>,
-        next_task_id: Option<u32>,
-        gates_result: String,
-        gates_sha: Option<String>,
-        gates_commands: Option<String>,
-        summary: Option<String>,
-        attested_by: AttestedBy,
-        acknowledged_divergence: Option<String>,
-        attestation_check: Option<AttestationCheck>,
-        updated_at: i64,
-    ) -> Result<Self, CheckpointError> {
+    pub fn from_row(row: CheckpointRow) -> Result<Self, CheckpointError> {
+        let CheckpointRow {
+            session_id,
+            task_id,
+            task_title,
+            status,
+            head_sha,
+            commit_sha,
+            completed_task_ids,
+            next_task_id,
+            gates_result,
+            gates_sha,
+            gates_commands,
+            summary,
+            attested_by,
+            acknowledged_divergence,
+            attestation_check,
+            updated_at,
+        } = row;
         let checkpoint = Self {
             session_id,
             task_id,

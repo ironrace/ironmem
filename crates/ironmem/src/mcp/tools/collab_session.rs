@@ -2091,7 +2091,10 @@ impl HeadCheck {
     /// SHA/divergence without spawning git. Not available outside `#[cfg(test)]`
     /// — see [`HeadCheckState`] for why production code has no equivalent.
     #[cfg(test)]
-    pub(super) fn test_checked(repo_head_sha: impl Into<String>, divergence: Option<String>) -> Self {
+    pub(super) fn test_checked(
+        repo_head_sha: impl Into<String>,
+        divergence: Option<String>,
+    ) -> Self {
         Self(HeadCheckState::Checked {
             repo_head_sha: repo_head_sha.into(),
             divergence,

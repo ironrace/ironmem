@@ -47,8 +47,8 @@ mod task_list;
 
 pub use agent::{Agent, CollabRoles};
 pub use checkpoint::{
-    AttestationCheck, AttestedBy, CheckpointError, CheckpointStatus, CollabCheckpoint,
-    ATTESTATION_UNRECORDED,
+    AttestationCheck, AttestedBy, CheckpointError, CheckpointRow, CheckpointStatus,
+    CollabCheckpoint, ATTESTATION_UNRECORDED,
 };
 pub use error::CollabError;
 /// Refusal-formatting helpers shared by the two `head_sha` seed sites.
