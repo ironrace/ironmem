@@ -175,7 +175,9 @@ pub(super) fn handle_collab_checkpoint(app: &App, args: &Value) -> Result<Value,
     // stamped here is the verdict this snapshot supports; the transaction below
     // may weaken it, and the weaker one is what both the row and the response
     // carry (see [`verdict_for_replaced_checkpoint`]).
-    checkpoint.attestation_check = outcome.check;
+    checkpoint
+        .set_attestation_check(outcome.check)
+        .map_err(|err| MemoryError::Validation(err.to_string()))?;
     // A previous row that could not be read is not the same as no previous row,
     // and the difference decides what `verified` is allowed to mean. With no
     // prior checkpoint the span rule has no subject and every rule that could
@@ -183,8 +185,10 @@ pub(super) fn handle_collab_checkpoint(app: &App, args: &Value) -> Result<Value,
     // and nobody established that this attestation covers it. Reporting
     // `verified` there would be the one thing this branch keeps refusing —
     // a check that never ran, rendered as a check that passed.
-    if previous_unreadable && checkpoint.attestation_check == Some(AttestationCheck::Verified) {
-        checkpoint.attestation_check = Some(AttestationCheck::VerifiedWithoutSpan);
+    if previous_unreadable && checkpoint.attestation_check() == Some(AttestationCheck::Verified) {
+        checkpoint
+            .set_attestation_check(Some(AttestationCheck::VerifiedWithoutSpan))
+            .map_err(|err| MemoryError::Validation(err.to_string()))?;
     }
     if let Some(canonical) = outcome.canonical_range {
         checkpoint.acknowledged_divergence = Some(canonical);
@@ -222,8 +226,8 @@ pub(super) fn handle_collab_checkpoint(app: &App, args: &Value) -> Result<Value,
         // to re-derive the stored verdict from the payload's own verdict rather
         // than from what a rolled-back attempt left behind.
         let mut row = checkpoint.clone();
-        row.attestation_check = verdict_for_replaced_checkpoint(
-            checkpoint.attestation_check,
+        let requalified = verdict_for_replaced_checkpoint(
+            checkpoint.attestation_check(),
             judged_head.as_deref(),
             || {
                 // Same degrade as the pre-transaction read, for the same
@@ -241,6 +245,8 @@ pub(super) fn handle_collab_checkpoint(app: &App, args: &Value) -> Result<Value,
                 Ok(replaced.map(|cp| cp.head_sha))
             },
         )?;
+        row.set_attestation_check(requalified)
+            .map_err(|err| MemoryError::Validation(err.to_string()))?;
         // Unconditional last-writer-wins, with no `updated_at` guard. The
         // hazard that carries is NOT a stale in-memory checkpoint — this tool
         // takes a fully-formed payload and never does read-modify-write — it is
@@ -288,11 +294,11 @@ pub(super) fn handle_collab_checkpoint(app: &App, args: &Value) -> Result<Value,
                 "diverged": head_check.diverged(),
                 "head_check": head_check.label(),
                 "acknowledged_divergence": row.acknowledged_divergence,
-                "attestation_check": row.attestation_check.map(AttestationCheck::as_str),
+                "attestation_check": row.attestation_check().map(AttestationCheck::as_str),
             })),
         )?;
 
-        Ok((claim, updated_at, row.attestation_check))
+        Ok((claim, updated_at, row.attestation_check()))
     })?;
     // Only after the commit — publishing a claim whose transaction may still
     // roll back is the cache poisoning `GenerationClaim` exists to prevent.
@@ -523,7 +529,7 @@ fn verify_acknowledged_range(
     // at all?" from the same snapshot, so this reuses that answer rather than
     // spawning git again to ask it a second time and possibly get a different
     // one.
-    let HeadCheck::Checked { .. } = head_check else {
+    if head_check.checked().is_none() {
         return Ok(AttestationOutcome {
             check: Some(AttestationCheck::UnverifiedRepoUnreadable),
             // Nothing resolved, so the operator's expression is stored as
@@ -531,7 +537,7 @@ fn verify_acknowledged_range(
             // never actually looked up.
             canonical_range: None,
         });
-    };
+    }
 
     let from_oid = resolve_commit(repo_path, from).map_err(|detail| {
         range_refusal(
@@ -901,7 +907,7 @@ fn inspect_divergence(
         // could attest *over*. Rendering it as "no divergence" would tell them
         // a comparison came back clean when none was possible.
         response["checkpoint"] = checkpoint_json(None);
-        response["commit_range_status"] = json!("no_checkpoint");
+        response["commit_range_status"] = json!(CommitRangeStatus::NoCheckpoint.as_str());
         response["attestable"] = json!(false);
         response["commit_range"] = Value::Null;
         response["commits"] = Value::Null;
@@ -915,7 +921,7 @@ fn inspect_divergence(
     response["checkpoint"] = checkpoint_json(Some((&checkpoint, &head_check)));
 
     let range = inspect_commit_range(&record.repo_path, &checkpoint, &head_check);
-    response["commit_range_status"] = json!(range.status);
+    response["commit_range_status"] = json!(range.status.as_str());
     response["attestable"] = json!(range.commits.is_some());
     response["commit_range"] = match &range.range {
         Some(spec) => json!(spec),
@@ -947,17 +953,45 @@ fn inspect_divergence(
     Ok(response)
 }
 
+/// The wire contract's six `commit_range_status` values, checked rather than
+/// spelled inline. The review of issue #273 found a count drift across three
+/// doc comments that all meant to say "six" — a typo in a bare `&'static str`
+/// arm compiles silently, and this enum plus [`CommitRangeStatus::as_str`] is
+/// what turns that typo into a compile error instead.
+///
+/// Five variants are produced by [`inspect_commit_range`]; [`Self::NoCheckpoint`]
+/// is written directly by [`inspect_divergence`], because a session that never
+/// checkpointed has no range for that function to describe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommitRangeStatus {
+    NoCheckpoint,
+    NotChecked,
+    NoDivergence,
+    CheckpointHeadUnreachable,
+    EmptyRange,
+    Listed,
+}
+
+impl CommitRangeStatus {
+    /// The wire spelling. See `commit_range_status` in `docs/COLLAB.md`, which
+    /// a client switches on and must see exactly these six words.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NoCheckpoint => "no_checkpoint",
+            Self::NotChecked => "not_checked",
+            Self::NoDivergence => "no_divergence",
+            Self::CheckpointHeadUnreachable => "checkpoint_head_unreachable",
+            Self::EmptyRange => "empty_range",
+            Self::Listed => "listed",
+        }
+    }
+}
+
 /// The post-checkpoint commit listing, or the reason there isn't one.
 struct CommitRange {
     /// Which answer this is. A single machine-readable field so a caller never
     /// has to infer the state from which optional keys are present.
-    ///
-    /// Five of the wire contract's six values are produced here; the sixth,
-    /// `no_checkpoint`, is written directly by [`inspect_divergence`], because
-    /// a session that never checkpointed has no range for this type to
-    /// describe. A client switching on the field still has six to handle —
-    /// see `commit_range_status` in `docs/COLLAB.md`.
-    status: &'static str,
+    status: CommitRangeStatus,
     /// `<checkpoint head>..<live HEAD>`, present only when it is a real,
     /// attestable range.
     range: Option<String>,
@@ -970,7 +1004,7 @@ struct CommitRange {
 }
 
 impl CommitRange {
-    fn refused(status: &'static str, error: String) -> Self {
+    fn refused(status: CommitRangeStatus, error: String) -> Self {
         Self {
             status,
             range: None,
@@ -1040,13 +1074,9 @@ fn inspect_commit_range(
     checkpoint: &CollabCheckpoint,
     head_check: &HeadCheck,
 ) -> CommitRange {
-    let HeadCheck::Checked {
-        repo_head_sha,
-        divergence,
-    } = head_check
-    else {
+    let Some((repo_head_sha, divergence)) = head_check.checked() else {
         return CommitRange::refused(
-            "not_checked",
+            CommitRangeStatus::NotChecked,
             "live HEAD could not be read, so the commits after the checkpoint could not be \
              listed and whether the checkpoint has drifted at all is unknown"
                 .to_string(),
@@ -1054,11 +1084,11 @@ fn inspect_commit_range(
     };
     if divergence.is_none() {
         return CommitRange {
-            status: "no_divergence",
+            status: CommitRangeStatus::NoDivergence,
             range: None,
             commits: None,
             truncated: false,
-            head_sha: Some(repo_head_sha.clone()),
+            head_sha: Some(repo_head_sha.to_string()),
             error: None,
         };
     }
@@ -1066,7 +1096,7 @@ fn inspect_commit_range(
     let from = checkpoint.head_sha.as_str();
     if from.starts_with('-') {
         return CommitRange::refused(
-            "checkpoint_head_unreachable",
+            CommitRangeStatus::CheckpointHeadUnreachable,
             format!(
                 "the checkpoint's head_sha {from:?} would be read by git as an option rather \
                  than a revision, so this is branch drift or a corrupt checkpoint rather than a \
@@ -1078,7 +1108,7 @@ fn inspect_commit_range(
         Ok(true) => {}
         Ok(false) => {
             return CommitRange::refused(
-                "checkpoint_head_unreachable",
+                CommitRangeStatus::CheckpointHeadUnreachable,
                 format!(
                     "the checkpoint's head_sha {from} is not an ancestor of live HEAD \
                      {repo_head_sha}: this is branch drift (history rewritten, or the worktree is \
@@ -1100,7 +1130,7 @@ fn inspect_commit_range(
         // machine-readable verdict that stops overclaiming.
         Err(err) => {
             return CommitRange::refused(
-                "not_checked",
+                CommitRangeStatus::NotChecked,
                 format!(
                     "git could not decide whether the checkpoint's head_sha {from} is in this \
                      repository's history, so the commits after it could not be listed and \
@@ -1125,7 +1155,7 @@ fn inspect_commit_range(
         Ok(output) => output,
         Err(err) => {
             return CommitRange::refused(
-                "not_checked",
+                CommitRangeStatus::NotChecked,
                 format!("the commits after the checkpoint could not be listed: {err}"),
             )
         }
@@ -1138,7 +1168,7 @@ fn inspect_commit_range(
         // shape of this history. Calling it branch drift would contradict the
         // check that just ran.
         return CommitRange::refused(
-            "not_checked",
+            CommitRangeStatus::NotChecked,
             format!(
                 "git could not list {spec}, so the commits after the checkpoint could not be \
                  listed even though its head_sha is in this repository's history ({})",
@@ -1163,7 +1193,7 @@ fn inspect_commit_range(
         .collect();
     if commits.is_empty() {
         return CommitRange::refused(
-            "empty_range",
+            CommitRangeStatus::EmptyRange,
             format!(
                 "{spec} lists no commits even though the checkpoint's head is an ancestor of \
                  live HEAD — there is nothing here to attest to"
@@ -1174,11 +1204,11 @@ fn inspect_commit_range(
     commits.truncate(MAX_INSPECTED_COMMITS);
 
     CommitRange {
-        status: "listed",
+        status: CommitRangeStatus::Listed,
         range: Some(spec),
         commits: Some(commits),
         truncated,
-        head_sha: Some(repo_head_sha.clone()),
+        head_sha: Some(repo_head_sha.to_string()),
         error: None,
     }
 }

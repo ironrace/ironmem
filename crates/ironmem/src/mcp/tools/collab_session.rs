@@ -2014,7 +2014,7 @@ pub(super) fn git_head_sha(repo_path: &str) -> Result<String, MemoryError> {
 /// (`collab_checkpoint`, `session_handoff`, `collab_resume`, `collab_status`)
 /// renders all three.
 ///
-/// **Not an error.** [`Self::Unreadable`] is an *operational* failure, a
+/// **Not an error.** [`HeadCheckState::Unreadable`] is an *operational* failure, a
 /// different condition from a stale checkpoint — the same category distinction
 /// `validate_global_review_head_advance` draws between exit code 1 and any
 /// other git failure. The callers here (a write that must stay retryable, and
@@ -2042,7 +2042,20 @@ pub(super) fn git_head_sha(repo_path: &str) -> Result<String, MemoryError> {
 /// `collab_status` report, and only `handle_collab_resume` refuses. See that
 /// handler for why refusing there does not defeat the operator-attestation
 /// escape hatch.
-pub(super) enum HeadCheck {
+pub(super) struct HeadCheck(HeadCheckState);
+
+/// The two things comparing a checkpoint against live git HEAD can establish.
+///
+/// Private to this module on purpose — see [`HeadCheck`]'s own doc comment for
+/// the three states this exists to keep distinct. Before this split, both
+/// variants lived directly on `HeadCheck`, which is itself `pub(super)`: any
+/// module under `mcp::tools` could write `HeadCheck::Checked { .. }` or
+/// `HeadCheck::Unreadable { .. }` by hand, so "a `HeadCheck` describes a real
+/// git read" rested on nobody doing that. Wrapping the variants in a type this
+/// module never exports makes [`HeadCheck::read`] the only way anywhere in the
+/// crate to produce one outside a test. Code that needs to act on the
+/// `Checked` case from another module goes through [`HeadCheck::checked`].
+enum HeadCheckState {
     /// Live HEAD was read, so `divergence` is a real finding either way:
     /// `Some` carries the `checkpoint_drift:` diagnostic, `None` means the
     /// checkpoint genuinely describes the current HEAD.
@@ -2057,30 +2070,53 @@ pub(super) enum HeadCheck {
 impl HeadCheck {
     pub(super) fn read(repo_path: &str, checkpoint: &crate::collab::CollabCheckpoint) -> Self {
         match git_head_sha(repo_path) {
-            Ok(head) => Self::Checked {
+            Ok(head) => Self(HeadCheckState::Checked {
                 divergence: (head != checkpoint.head_sha)
                     .then(|| checkpoint_drift_message(&head, checkpoint)),
                 repo_head_sha: head,
-            },
+            }),
             // `git_head_sha` reports every failure as `Validation`, whose
             // `Display` prefixes "Validation error:" — misleading for what is
             // an environment problem, and about the repo rather than the
             // caller's arguments. Unwrap that one variant; anything else keeps
             // its full rendering rather than being silently reshaped.
-            Err(MemoryError::Validation(detail)) => Self::Unreadable { detail },
-            Err(other) => Self::Unreadable {
+            Err(MemoryError::Validation(detail)) => Self(HeadCheckState::Unreadable { detail }),
+            Err(other) => Self(HeadCheckState::Unreadable {
                 detail: other.to_string(),
-            },
+            }),
         }
+    }
+
+    /// Build a `Checked` value directly, for tests that need one at a specific
+    /// SHA/divergence without spawning git. Not available outside `#[cfg(test)]`
+    /// — see [`HeadCheckState`] for why production code has no equivalent.
+    #[cfg(test)]
+    pub(super) fn test_checked(
+        repo_head_sha: impl Into<String>,
+        divergence: Option<String>,
+    ) -> Self {
+        Self(HeadCheckState::Checked {
+            repo_head_sha: repo_head_sha.into(),
+            divergence,
+        })
+    }
+
+    /// Build an `Unreadable` value directly, for tests exercising the
+    /// could-not-check path without actually breaking a repository.
+    #[cfg(test)]
+    pub(super) fn test_unreadable(detail: impl Into<String>) -> Self {
+        Self(HeadCheckState::Unreadable {
+            detail: detail.into(),
+        })
     }
 
     /// `true`, `false`, or JSON `null` for "the check did not run". A caller
     /// that treats the value as a plain boolean reads `null` as falsy, which is
     /// why [`Self::label`] is reported beside it in words.
     pub(super) fn diverged(&self) -> Value {
-        match self {
-            Self::Checked { divergence, .. } => json!(divergence.is_some()),
-            Self::Unreadable { .. } => Value::Null,
+        match &self.0 {
+            HeadCheckState::Checked { divergence, .. } => json!(divergence.is_some()),
+            HeadCheckState::Unreadable { .. } => Value::Null,
         }
     }
 
@@ -2095,27 +2131,27 @@ impl HeadCheck {
     /// spelling must not apply it to the other surface. Do not "unify" them
     /// without moving both COLLAB.md sections that cross-reference this.
     pub(super) fn label(&self) -> &'static str {
-        match self {
-            Self::Checked { .. } => "checked",
-            Self::Unreadable { .. } => "unreadable",
+        match &self.0 {
+            HeadCheckState::Checked { .. } => "checked",
+            HeadCheckState::Unreadable { .. } => "unreadable",
         }
     }
 
     /// The HEAD actually read, so a caller told it has drifted can file an
     /// accurate checkpoint without shelling out to git itself.
     pub(super) fn repo_head_sha(&self) -> Value {
-        match self {
-            Self::Checked { repo_head_sha, .. } => json!(repo_head_sha),
-            Self::Unreadable { .. } => Value::Null,
+        match &self.0 {
+            HeadCheckState::Checked { repo_head_sha, .. } => json!(repo_head_sha),
+            HeadCheckState::Unreadable { .. } => Value::Null,
         }
     }
 
     /// The `checkpoint_drift:` diagnostic, present only when live HEAD was
     /// read *and* disagreed.
     pub(super) fn divergence(&self) -> Option<&str> {
-        match self {
-            Self::Checked { divergence, .. } => divergence.as_deref(),
-            Self::Unreadable { .. } => None,
+        match &self.0 {
+            HeadCheckState::Checked { divergence, .. } => divergence.as_deref(),
+            HeadCheckState::Unreadable { .. } => None,
         }
     }
 
@@ -2123,9 +2159,28 @@ impl HeadCheck {
     /// `head_check: "unreadable"`, so a reader is told why rather than left to
     /// infer it from a missing verdict.
     pub(super) fn unreadable_detail(&self) -> Option<&str> {
-        match self {
-            Self::Checked { .. } => None,
-            Self::Unreadable { detail } => Some(detail),
+        match &self.0 {
+            HeadCheckState::Checked { .. } => None,
+            HeadCheckState::Unreadable { detail } => Some(detail),
+        }
+    }
+
+    /// `Some((repo_head_sha, divergence))` when the check ran, `None` when it
+    /// could not — the one accessor that exposes the `Checked` fields
+    /// together, for the callers outside this module
+    /// (`collab_checkpoint::verify_acknowledged_range`,
+    /// `collab_checkpoint::inspect_commit_range`, `handoff::render_checkpoint`)
+    /// that need to branch on or read out of the checked case rather than
+    /// merely report it through [`Self::diverged`]/[`Self::label`]. Matching
+    /// `HeadCheckState` directly is not an option for them: it is private to
+    /// this module, which is the whole point (see [`HeadCheckState`]).
+    pub(super) fn checked(&self) -> Option<(&str, Option<&str>)> {
+        match &self.0 {
+            HeadCheckState::Checked {
+                repo_head_sha,
+                divergence,
+            } => Some((repo_head_sha.as_str(), divergence.as_deref())),
+            HeadCheckState::Unreadable { .. } => None,
         }
     }
 }
