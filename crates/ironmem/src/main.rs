@@ -2163,15 +2163,37 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                 // pick the issue up, so flipping it first would advertise an
                 // issue that still returns `AttemptCapExhausted` without
                 // dispatching.
+                //
+                // A grant forgives the attempt cap and nothing else, so the
+                // flip must not clear a stop state this command never
+                // claimed to clear. `agent:blocked` is the one that bites:
+                // `set_exclusive_label` removes every other `agent:*` label,
+                // so flipping an issue that is waiting on a human answer
+                // would put it straight back in the Lead's queue with the
+                // question still open — a second never-recovers shape, in
+                // the other direction.
+                enum LabelMove {
+                    Applied(ironmem::autopilot::labels::LabelPlan),
+                    LeftBlocked,
+                }
                 let labelled = if no_label {
                     None
                 } else {
                     let mut gh = ironmem::autopilot::gh::GhCli::resolve(&path)?;
-                    Some(ironmem::autopilot::labels::set_exclusive_label(
-                        &mut gh,
-                        &issue_ref,
-                        Some(ironmem::autopilot::labels::AgentLabel::Ready),
-                    )?)
+                    let current = ironmem::autopilot::gh::issue_labels(&mut gh, &issue_ref)?;
+                    if ironmem::autopilot::labels::eligibility(&current)
+                        == ironmem::autopilot::labels::DispatchEligibility::Blocked
+                    {
+                        Some(LabelMove::LeftBlocked)
+                    } else {
+                        Some(LabelMove::Applied(
+                            ironmem::autopilot::labels::set_exclusive_label(
+                                &mut gh,
+                                &issue_ref,
+                                Some(ironmem::autopilot::labels::AgentLabel::Ready),
+                            )?,
+                        ))
+                    }
                 };
                 if json {
                     println!(
@@ -2180,7 +2202,12 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                             "issue": issue_ref.canonical(),
                             "lifetime_attempts": attempted,
                             "grant": outcome,
-                            "labelled_ready": labelled.is_some(),
+                            // The issue *carries* `agent:ready` afterwards —
+                            // which is what a caller acts on — rather than
+                            // "an edit was sent", so an issue already ready
+                            // does not read as un-labelled.
+                            "labelled_ready": matches!(labelled, Some(LabelMove::Applied(_))),
+                            "left_blocked": matches!(labelled, Some(LabelMove::LeftBlocked)),
                         }))?
                     );
                 } else {
@@ -2201,10 +2228,15 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                         ),
                     }
                     match &labelled {
-                        Some(plan) if plan.is_noop() => {
+                        Some(LabelMove::Applied(plan)) if plan.is_noop() => {
                             println!("  labels: already `agent:ready`.")
                         }
-                        Some(_) => println!("  labels: now `agent:ready`."),
+                        Some(LabelMove::Applied(_)) => println!("  labels: now `agent:ready`."),
+                        Some(LabelMove::LeftBlocked) => println!(
+                            "  labels: left `agent:blocked` alone — the cap is clear, but the \
+                             issue is waiting on a human answer and only answering it resumes \
+                             the issue."
+                        ),
                         None => println!("  labels: left alone (--no-label)."),
                     }
                 }

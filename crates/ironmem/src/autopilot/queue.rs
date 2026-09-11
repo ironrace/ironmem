@@ -81,8 +81,8 @@ use super::gh::IssueListing;
 use super::labels::{self, DispatchEligibility};
 use super::registry::{Liveness, RegistrySnapshot};
 use super::{
-    budget, dispatch_state, gate_config, lineage, merge::serialize_issue, remediate, supervise,
-    today_utc, validate_repo, AttemptOutcome, IssueRef,
+    budget, dispatch_state, gate_config, lineage, merge::serialize_issue, remediate, retry,
+    supervise, today_utc, validate_repo, AttemptOutcome, IssueRef,
 };
 use crate::db::schema::Database;
 use crate::error::MemoryError;
@@ -446,7 +446,16 @@ pub fn plan_queue(
                 continue;
             }
             let cumulative_attempt_n = status.as_ref().map(|s| s.cumulative_attempt_n).unwrap_or(0);
-            if cumulative_attempt_n >= config.attempt_cap {
+            // Read through the same forgiveness `run_issue` applies. The cap
+            // is enforced in both places on purpose ("same predicate, one
+            // place each"), so both must read the *charged* count: a queue
+            // that compared the raw lifetime counter would defer a
+            // human-retried issue as `AttemptCapReached` on every tick and
+            // `run_issue` would never see it — which is the very
+            // never-recovers shape `autopilot retry` exists to end.
+            let charged =
+                retry::attempts_charged(cumulative_attempt_n, retry::forgiven_through(db, &issue)?);
+            if charged >= config.attempt_cap {
                 defer(DeferReason::AttemptCapReached {
                     cumulative_attempt_n,
                 });
@@ -782,6 +791,45 @@ mod tests {
                 cumulative_attempt_n: 5
             }
         );
+    }
+
+    #[test]
+    fn a_human_retry_makes_a_capped_issue_selectable_again() {
+        // The other half of `autopilot retry`. `run_issue` reads the grant,
+        // but nothing reaches `run_issue` that the queue did not select
+        // first — so a queue comparing the raw lifetime counter would defer
+        // the retried issue as `AttemptCapReached` on every tick and the
+        // recovery would still never happen.
+        let db = approved(&[REPO]);
+        let issue = IssueRef::new(REPO, 1);
+        let mut cfg = config();
+        cfg.attempt_cap = 5;
+        put_status(&db, &issue, 5, false);
+
+        let plan = plan_queue(
+            &db,
+            &[backlog(REPO, vec![ready(1)])],
+            &empty_registry(),
+            &cfg,
+        )
+        .unwrap();
+        assert_eq!(
+            reason_for(&plan, 1),
+            DeferReason::AttemptCapReached {
+                cumulative_attempt_n: 5
+            },
+            "setup: the issue must be capped before the retry"
+        );
+
+        retry::grant_retry(&db, &issue, 5).unwrap();
+        let plan = plan_queue(
+            &db,
+            &[backlog(REPO, vec![ready(1)])],
+            &empty_registry(),
+            &cfg,
+        )
+        .unwrap();
+        assert_eq!(numbers(&plan), vec![1], "a forgiven issue is selectable");
     }
 
     #[test]

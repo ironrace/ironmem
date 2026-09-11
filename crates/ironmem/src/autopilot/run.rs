@@ -737,7 +737,17 @@ pub(super) fn record_terminal_summary(
     // terminal records — so appending a second one would nest the first
     // one's whole text inside it and grow the lineage (and the prior-attempt
     // prompt every later dispatch reads) on every single re-run.
-    if attempts.iter().any(|a| is_terminal_summary(&a.approach)) {
+    // Bounded by attempt number rather than by mere presence. A human retry
+    // (`autopilot retry`) lets an issue exhaust its cap a *second* time, with
+    // real attempts recorded after the first summary; suppressing on presence
+    // alone would leave that second exhaustion with no record at all, and the
+    // stale summary — which quotes only the pre-retry attempts — as the
+    // lineage's last word. Re-running an already-exhausted issue still
+    // appends nothing, because its summary sits at the same attempt number.
+    if attempts
+        .iter()
+        .any(|a| is_terminal_summary(&a.approach) && a.attempt_n >= attempt_n)
+    {
         return Ok(());
     }
     let summary = if attempts.is_empty() {
