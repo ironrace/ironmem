@@ -1008,6 +1008,11 @@ pub fn run_issue(
             head_sha: &r.head_sha,
             findings: r.findings.as_deref(),
         });
+        // A condition the platform rejects is a dispatch that silently does
+        // not happen: no turn, no verdict, nothing written to the issue, and
+        // `agent:ready` still set so the next tick repeats it. Refuse here,
+        // before the attempt is spent — the same posture as `config.validate`
+        // refusing an `--n-turns`/`--max-turns` pair at config time.
         let condition = turn_prompt::render(&turn_prompt::TurnPromptInputs {
             issue,
             issue_title: &brief.title,
@@ -1023,7 +1028,8 @@ pub fn run_issue(
             branch: &worktree.branch,
             gate_commands: &gate_commands,
             n_turns: config.n_turns,
-        });
+        })
+        .map_err(|e| MemoryError::Validation(e.to_string()))?;
 
         let spec = DispatchSpec {
             session: if resuming {
