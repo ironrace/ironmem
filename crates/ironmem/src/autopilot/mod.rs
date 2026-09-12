@@ -158,6 +158,7 @@ pub mod onboard;
 pub mod queue;
 pub mod registry;
 pub mod remediate;
+pub mod retry;
 pub mod review;
 pub mod review_prompt;
 pub mod run;

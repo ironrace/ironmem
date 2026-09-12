@@ -395,7 +395,8 @@ enum AutopilotCmd {
         /// Turns per dispatch (the N in "or stop after N turns")
         #[arg(long)]
         n_turns: Option<u32>,
-        /// Hard --max-turns ceiling; must clear --n-turns with headroom
+        /// Hard --max-turns ceiling. Counts tool-call turns, not goal turns,
+        /// so it must clear --n-turns times the per-goal-turn floor
         #[arg(long)]
         max_turns: Option<u32>,
         /// Per-dispatch spend ceiling, passed through to --max-budget-usd
@@ -530,6 +531,26 @@ enum AutopilotCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Give an issue that hit its attempt cap a fresh budget and put it back
+    /// in the queue — the human recovery `agent:exhausted` names
+    Retry {
+        /// Repo identity (e.g. "owner/repo")
+        repo: String,
+        /// GitHub issue number
+        issue: u64,
+        /// Path to the database
+        #[arg(long)]
+        db: Option<String>,
+        /// Directory `gh` runs in
+        #[arg(long, default_value = ".")]
+        path: String,
+        /// Forgive the attempts but leave the labels alone
+        #[arg(long)]
+        no_label: bool,
+        /// Emit JSON instead of text
+        #[arg(long)]
+        json: bool,
+    },
     /// Run both supervision checks against one in-flight issue (rung 7)
     Supervise {
         /// Path to the database
@@ -628,6 +649,10 @@ enum AutopilotCmd {
         /// Turns per dispatch (the N in "or stop after N turns")
         #[arg(long)]
         n_turns: Option<u32>,
+        /// Hard --max-turns ceiling. Counts tool-call turns, not goal turns,
+        /// so it must clear --n-turns times the per-goal-turn floor
+        #[arg(long)]
+        max_turns: Option<u32>,
         /// Per-dispatch spend ceiling
         #[arg(long)]
         max_budget_usd: Option<f64>,
@@ -1808,7 +1833,7 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                     // rather than silently failing validation against the
                     // default `max_turns` that was derived from the default N.
                     config.max_turns =
-                        n.saturating_add(ironmem::autopilot::run::DEFAULT_MAX_TURNS_HEADROOM);
+                        n.saturating_mul(ironmem::autopilot::run::DEFAULT_TOOL_TURNS_PER_GOAL_TURN);
                 }
                 if let Some(max) = max_turns {
                     config.max_turns = max;
@@ -2113,6 +2138,110 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                 }
                 Ok(())
             }
+            AutopilotCmd::Retry {
+                repo,
+                issue,
+                db,
+                path,
+                no_label,
+                json,
+            } => {
+                use ironmem::autopilot::retry::GrantOutcome;
+                let database = open_migrated_db(db)?;
+                let issue_ref = ironmem::autopilot::IssueRef::new(&repo, issue);
+                // The count is read here and handed to `grant_retry`, so the
+                // decision is made against a status this command actually
+                // saw rather than one re-read underneath it.
+                let attempted =
+                    ironmem::autopilot::lineage::get_issue_status(&database, &issue_ref)?
+                        .map(|status| status.cumulative_attempt_n)
+                        .unwrap_or(0);
+                let outcome =
+                    ironmem::autopilot::retry::grant_retry(&database, &issue_ref, attempted)?;
+                // The label moves only once the budget is actually restored.
+                // Ordering, not taste: `agent:ready` is what makes the Lead
+                // pick the issue up, so flipping it first would advertise an
+                // issue that still returns `AttemptCapExhausted` without
+                // dispatching.
+                //
+                // A grant forgives the attempt cap and nothing else, so the
+                // flip must not clear a stop state this command never
+                // claimed to clear. `agent:blocked` is the one that bites:
+                // `set_exclusive_label` removes every other `agent:*` label,
+                // so flipping an issue that is waiting on a human answer
+                // would put it straight back in the Lead's queue with the
+                // question still open — a second never-recovers shape, in
+                // the other direction.
+                enum LabelMove {
+                    Applied(ironmem::autopilot::labels::LabelPlan),
+                    LeftBlocked,
+                }
+                let labelled = if no_label {
+                    None
+                } else {
+                    let mut gh = ironmem::autopilot::gh::GhCli::resolve(&path)?;
+                    let current = ironmem::autopilot::gh::issue_labels(&mut gh, &issue_ref)?;
+                    if ironmem::autopilot::labels::eligibility(&current)
+                        == ironmem::autopilot::labels::DispatchEligibility::Blocked
+                    {
+                        Some(LabelMove::LeftBlocked)
+                    } else {
+                        Some(LabelMove::Applied(
+                            ironmem::autopilot::labels::set_exclusive_label(
+                                &mut gh,
+                                &issue_ref,
+                                Some(ironmem::autopilot::labels::AgentLabel::Ready),
+                            )?,
+                        ))
+                    }
+                };
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "issue": issue_ref.canonical(),
+                            "lifetime_attempts": attempted,
+                            "grant": outcome,
+                            // The issue *carries* `agent:ready` afterwards —
+                            // which is what a caller acts on — rather than
+                            // "an edit was sent", so an issue already ready
+                            // does not read as un-labelled.
+                            "labelled_ready": matches!(labelled, Some(LabelMove::Applied(_))),
+                            "left_blocked": matches!(labelled, Some(LabelMove::LeftBlocked)),
+                        }))?
+                    );
+                } else {
+                    match &outcome {
+                        GrantOutcome::Granted { forgiven_through } => println!(
+                            "{}: {forgiven_through} attempt(s) forgiven; the per-issue cap is \
+                             clear again (lifetime attempts: {attempted}).",
+                            issue_ref.canonical()
+                        ),
+                        GrantOutcome::AlreadyForgiven { forgiven_through } => println!(
+                            "{}: already forgiven through attempt {forgiven_through}; nothing \
+                             further to clear.",
+                            issue_ref.canonical()
+                        ),
+                        GrantOutcome::NothingToForgive => println!(
+                            "{}: no attempts recorded, so the cap was never in the way.",
+                            issue_ref.canonical()
+                        ),
+                    }
+                    match &labelled {
+                        Some(LabelMove::Applied(plan)) if plan.is_noop() => {
+                            println!("  labels: already `agent:ready`.")
+                        }
+                        Some(LabelMove::Applied(_)) => println!("  labels: now `agent:ready`."),
+                        Some(LabelMove::LeftBlocked) => println!(
+                            "  labels: left `agent:blocked` alone — the cap is clear, but the \
+                             issue is waiting on a human answer and only answering it resumes \
+                             the issue."
+                        ),
+                        None => println!("  labels: left alone (--no-label)."),
+                    }
+                }
+                Ok(())
+            }
             AutopilotCmd::Labels { repo, path, json } => {
                 let mut gh = ironmem::autopilot::gh::GhCli::resolve(&path)?;
                 let results = ironmem::autopilot::labels::ensure_labels(&mut gh, &repo)?;
@@ -2301,6 +2430,7 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                 max_dispatches,
                 concurrency_cap,
                 n_turns,
+                max_turns,
                 max_budget_usd,
                 attempt_cap,
                 daily_budget_usd,
@@ -2325,7 +2455,12 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                 if let Some(n) = n_turns {
                     run.n_turns = n;
                     run.max_turns =
-                        n.saturating_add(ironmem::autopilot::run::DEFAULT_MAX_TURNS_HEADROOM);
+                        n.saturating_mul(ironmem::autopilot::run::DEFAULT_TOOL_TURNS_PER_GOAL_TURN);
+                }
+                // After the N-derived default, so an explicit ceiling wins
+                // over it rather than being silently recomputed.
+                if let Some(max) = max_turns {
+                    run.max_turns = max;
                 }
                 if let Some(budget) = max_budget_usd {
                     run.max_budget_usd = budget;

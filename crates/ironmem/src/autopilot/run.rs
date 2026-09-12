@@ -56,7 +56,7 @@
 //! Two guards, both new here:
 //!
 //! 1. [`RunConfig::validate`] refuses a `max_turns` that does not clear
-//!    `n_turns` by [`MIN_MAX_TURNS_HEADROOM`] — closing rung 2's flagged
+//!    `n_turns` by [`MIN_TOOL_TURNS_PER_GOAL_TURN`] per goal turn — closing rung 2's flagged
 //!    "N and `--max-turns` are coupled, not independent knobs" at the only
 //!    layer that sees both numbers.
 //! 2. [`RunConfig::max_consecutive_infrastructure_failures`] bounds the
@@ -90,7 +90,7 @@ use crate::error::MemoryError;
 use super::dispatch::{self, DispatchOutcome, DispatchSpec, SessionMode, Verdict};
 use super::worktree::Worktree;
 use super::{
-    blocked, budget, dispatch_state, gate_config, lineage, remediate, supervise, today_utc,
+    blocked, budget, dispatch_state, gate_config, lineage, remediate, retry, supervise, today_utc,
     turn_prompt, IssueRef,
 };
 use super::{AttemptOutcome, AttemptRecord, DispatchState, IssueStatus, PriorAttempt};
@@ -103,22 +103,38 @@ use super::{AttemptOutcome, AttemptRecord, DispatchState, IssueStatus, PriorAtte
 /// measurement.
 pub const DEFAULT_N_TURNS: u32 = 6;
 
-/// Minimum amount by which `max_turns` must exceed `n_turns`.
+/// Floor on how many hard `--max-turns` each goal turn must be allowed.
 ///
-/// Derived from the one real measurement there is. Rung 2 dispatched with
-/// `/goal ... or stop after 1 turns` and `--max-turns 4`; the goal loop
-/// needed 5 turns to reach its own evaluated stop, so the CLI's hard cap
-/// fired first and the dispatch returned `is_error: true` with no
-/// `structured_output` — despite having completed the work correctly on
-/// disk. Four turns of overhead above `N` is what that single data point
-/// showed, so four is the floor. It is a floor from one observation, not a
-/// law; [`DEFAULT_MAX_TURNS_HEADROOM`] leaves more room than the floor
-/// requires for exactly that reason.
-pub const MIN_MAX_TURNS_HEADROOM: u32 = 4;
+/// **`N` and `--max-turns` are not the same unit.** `N` counts *goal* turns —
+/// one evaluator round each — while the CLI's `--max-turns` counts every
+/// tool-call round trip, of which a single goal turn spends many. Rung 2 read
+/// its one data point (N=1 needing 5 turns against a `--max-turns 4`) as four
+/// turns of fixed *overhead* and made the relation additive. That was the
+/// right diagnosis in the wrong unit, and it held only because rung 2's probe
+/// task was trivial enough for one goal turn to cost one tool call.
+///
+/// Measured on the first live run (2026-09-08, issue #285): the IC spent **64
+/// tool calls in twelve minutes** merely reading code and tracing constructors
+/// before its first edit, and completed the whole issue in 48. Against the
+/// additive default that run produced — N=6 giving `--max-turns 12` — every
+/// dispatch was killed roughly four minutes in, mid-edit, returning
+/// `is_error: true` with no verdict; three of those in a row ended the run
+/// without a single gate execution. Ten is a deliberately low floor: it
+/// refuses the configuration now known to be broken without pretending to
+/// know the true ratio, which varies with the task.
+pub const MIN_TOOL_TURNS_PER_GOAL_TURN: u32 = 10;
 
-/// Headroom [`RunConfig::new`] applies over `n_turns` when the caller does
-/// not set `max_turns` explicitly.
-pub const DEFAULT_MAX_TURNS_HEADROOM: u32 = 6;
+/// Hard turns per goal turn [`RunConfig::new`] allows when the caller does not
+/// set `max_turns` explicitly.
+///
+/// Generous on purpose. `--max-turns` is a runaway backstop, not an operating
+/// bound: `--max-budget-usd` and the repo's wall-clock timeout are what should
+/// actually stop a dispatch, because both are denominated in something the
+/// operator set deliberately. A hard turn cap that binds first converts
+/// completed work into an unrecorded failure — which is exactly what rung 2
+/// measured, and what the first live run repeated at a larger scale. Fifty
+/// clears the 48 that one measured real dispatch needed.
+pub const DEFAULT_TOOL_TURNS_PER_GOAL_TURN: u32 = 50;
 
 /// Per-issue attempt cap — the spec's *Cross-dispatch stagnation control*
 /// counter, persisted in the issue-status drawer and therefore cumulative
@@ -210,7 +226,7 @@ impl RunConfig {
             model: model.into(),
             dispatch_class: dispatch_class.into(),
             n_turns: DEFAULT_N_TURNS,
-            max_turns: DEFAULT_N_TURNS + DEFAULT_MAX_TURNS_HEADROOM,
+            max_turns: DEFAULT_N_TURNS.saturating_mul(DEFAULT_TOOL_TURNS_PER_GOAL_TURN),
             max_budget_usd: DEFAULT_MAX_BUDGET_USD,
             attempt_cap: DEFAULT_ATTEMPT_CAP,
             daily_budget_usd: DEFAULT_DAILY_BUDGET_USD,
@@ -223,7 +239,7 @@ impl RunConfig {
     /// Reject a configuration that cannot produce a usable dispatch.
     ///
     /// The `max_turns`/`n_turns` headroom check is the load-bearing one; see
-    /// [`MIN_MAX_TURNS_HEADROOM`]. The budget check is the other: a
+    /// [`MIN_TOOL_TURNS_PER_GOAL_TURN`]. The budget check is the other: a
     /// `max_budget_usd` above `daily_budget_usd` means the pre-authorization
     /// in [`run_issue`] can never clear, so the run would report a budget
     /// stop without ever dispatching — a misconfiguration worth naming at
@@ -257,12 +273,14 @@ impl RunConfig {
                     .into(),
             ));
         }
-        if self.max_turns < self.n_turns.saturating_add(MIN_MAX_TURNS_HEADROOM) {
+        let turn_floor = self.n_turns.saturating_mul(MIN_TOOL_TURNS_PER_GOAL_TURN);
+        if self.max_turns < turn_floor {
             return Err(MemoryError::Validation(format!(
-                "max_turns ({}) must exceed n_turns ({}) by at least {} — a hard --max-turns cap \
-                 that fires before the goal loop's own stop suppresses the verdict schema \
-                 entirely, so a completed dispatch returns as an unrecorded failure",
-                self.max_turns, self.n_turns, MIN_MAX_TURNS_HEADROOM
+                "max_turns ({}) must be at least {} — {} goal turns at {} tool-call turns each. \
+                 The two count different things, and a hard --max-turns cap that fires before \
+                 the goal loop's own stop suppresses the verdict schema entirely, so a completed \
+                 dispatch returns as an unrecorded failure",
+                self.max_turns, turn_floor, self.n_turns, MIN_TOOL_TURNS_PER_GOAL_TURN
             )));
         }
         if !self.max_budget_usd.is_finite() || self.max_budget_usd <= 0.0 {
@@ -321,6 +339,10 @@ impl DispatchClassification {
 ///   infrastructure failure: that is the spec's anti-stall row ("Returns
 ///   control with the goal still set ... it counts as an attempt"). Only an
 ///   *errored* dispatch with no verdict is infrastructure.
+/// - ...**unless it did nothing at all** — no turns and no spend. That floor
+///   is the last guard before the anti-stall fallthrough, and it must stay
+///   below the `timed_out` arm, whose own `0.0` cost means *unknown* rather
+///   than *free* and would otherwise be caught here for the wrong reason.
 pub fn classify(outcome: &DispatchOutcome) -> DispatchClassification {
     if outcome.is_met() {
         return DispatchClassification::Met;
@@ -348,6 +370,39 @@ pub fn classify(outcome: &DispatchOutcome) -> DispatchClassification {
     }
     if outcome.is_impossible() {
         return DispatchClassification::Impossible;
+    }
+    // The anti-stall rule's floor, and the last guard before it. A dispatch
+    // that produced **no turns and no spend** did not "return control with
+    // the goal still set" — it never took the goal up at all, and an attempt
+    // record whose only content is "nothing happened" consumes one of the
+    // issue's five attempts while adding nothing the next dispatch can learn
+    // from. That is the same argument the `timed_out` arm above makes for its
+    // own case, and it lands on the same class for the same reason.
+    //
+    // Measured on the first live run (2026-09-08, issue #285): a `--resume`
+    // into a session whose `/goal` loop had **already concluded** exchanged
+    // one "continue" prompt for one "no response requested" and exited
+    // cleanly in ~6 seconds — `num_turns: 0`, `total_cost_usd: 0.0`, no
+    // verdict, `is_error: false`, exit zero. Read as a `FailedAttempt` it
+    // burned four of the issue's five attempts in 25 seconds and drove the
+    // run straight to `AttemptCapExhausted`. Without this floor, *any* resume
+    // that no-ops destroys an issue's whole attempt budget in under half a
+    // minute.
+    //
+    // **Both readings are required**, because either alone is ambiguous. A
+    // `0.0` cost can mean *unknown* rather than *free* — that is exactly what
+    // it means for a killed dispatch, whose arm sits deliberately above this
+    // one so it never reaches here (see `DispatchOutcome::timed_out`). And a
+    // 0-turn dispatch that was nonetheless billed did engage the model, so it
+    // is a real, if short, attempt.
+    //
+    // Whose problem it is settles the class, exactly as it does for a
+    // timeout: a resume that no-ops is a wedged session rather than a failing
+    // approach, so it is an operator's fix, and
+    // `max_consecutive_infrastructure_failures` is what escalates to them
+    // instead of the attempt cap silently retiring the issue.
+    if outcome.verdict.is_none() && outcome.num_turns == 0 && outcome.total_cost_usd == 0.0 {
+        return DispatchClassification::InfrastructureFailure;
     }
     DispatchClassification::FailedAttempt
 }
@@ -682,7 +737,17 @@ pub(super) fn record_terminal_summary(
     // terminal records — so appending a second one would nest the first
     // one's whole text inside it and grow the lineage (and the prior-attempt
     // prompt every later dispatch reads) on every single re-run.
-    if attempts.iter().any(|a| is_terminal_summary(&a.approach)) {
+    // Bounded by attempt number rather than by mere presence. A human retry
+    // (`autopilot retry`) lets an issue exhaust its cap a *second* time, with
+    // real attempts recorded after the first summary; suppressing on presence
+    // alone would leave that second exhaustion with no record at all, and the
+    // stale summary — which quotes only the pre-retry attempts — as the
+    // lineage's last word. Re-running an already-exhausted issue still
+    // appends nothing, because its summary sits at the same attempt number.
+    if attempts
+        .iter()
+        .any(|a| is_terminal_summary(&a.approach) && a.attempt_n >= attempt_n)
+    {
         return Ok(());
     }
     let summary = if attempts.is_empty() {
@@ -815,6 +880,9 @@ pub fn run_issue(
     // failures) leaves a uuid that no `claude` process has ever seen.
     // Resuming that uuid fails on every subsequent pass, forever — so trust
     // the recorded claim, not the drawer's mere presence.
+    // Mutable because a concluded goal loop rotates it; see the rotation in
+    // the dispatch loop below.
+    let mut session_uuid = session_uuid;
     let mut resuming = existing_state
         .as_ref()
         .is_some_and(|state| state.session_claimed);
@@ -829,27 +897,42 @@ pub fn run_issue(
     let ic_session_name = dispatch::ic_name(issue);
     let worktree_path = worktree.path.to_string_lossy().to_string();
 
-    let write_state =
-        |db: &Database, attempt_n: u32, turn_n: u32, state: &str, session_claimed: bool| {
-            dispatch_state::upsert_dispatch_state(
-                db,
-                &DispatchState {
-                    issue: issue.clone(),
-                    worktree_path: worktree_path.clone(),
-                    ic_session_name: ic_session_name.clone(),
-                    dispatch_class: config.dispatch_class.clone(),
-                    attempt_n,
-                    state: state.to_string(),
-                    started_at: started_at.clone(),
-                    session_uuid: session_uuid.clone(),
-                    turn_n,
-                    session_claimed,
-                },
-            )
-            .map(|_| ())
-        };
+    // `session_uuid` is a parameter rather than a capture because the session
+    // is no longer fixed for the life of a run: a dispatch that concludes its
+    // goal loop rotates it (see the rotation below), and the drawer must
+    // record the uuid the *next* dispatch will use, not the spent one.
+    let write_state = |db: &Database,
+                       attempt_n: u32,
+                       turn_n: u32,
+                       state: &str,
+                       session_uuid: &str,
+                       session_claimed: bool| {
+        dispatch_state::upsert_dispatch_state(
+            db,
+            &DispatchState {
+                issue: issue.clone(),
+                worktree_path: worktree_path.clone(),
+                ic_session_name: ic_session_name.clone(),
+                dispatch_class: config.dispatch_class.clone(),
+                attempt_n,
+                state: state.to_string(),
+                started_at: started_at.clone(),
+                session_uuid: session_uuid.to_string(),
+                turn_n,
+                session_claimed,
+            },
+        )
+        .map(|_| ())
+    };
 
-    write_state(db, cumulative_attempt_n, turn_n, "dispatching", resuming)?;
+    write_state(
+        db,
+        cumulative_attempt_n,
+        turn_n,
+        "dispatching",
+        &session_uuid,
+        resuming,
+    )?;
 
     let mut dispatches = Vec::new();
     let mut total_cost_usd = 0.0;
@@ -863,7 +946,11 @@ pub fn run_issue(
         if let Some(signature) = supervise::escalated_signature(db, issue)? {
             break TerminalReason::StrategyEscalated { signature };
         }
-        if cumulative_attempt_n >= config.attempt_cap {
+        // Read fresh each pass, like the escalation above it: a human who
+        // grants a retry while a run is in flight must be honoured by the
+        // very next dispatch, not the next run.
+        let forgiven = retry::forgiven_through(db, issue)?;
+        if retry::attempts_charged(cumulative_attempt_n, forgiven) >= config.attempt_cap {
             let attempts = prior_attempts(db, issue)?;
             record_terminal_summary(
                 db,
@@ -981,6 +1068,7 @@ pub fn run_issue(
                     cumulative_attempt_n,
                     turn_n,
                     "infrastructure-failure",
+                    &session_uuid,
                     resuming,
                 )?;
                 if consecutive_infrastructure_failures
@@ -994,10 +1082,42 @@ pub fn run_issue(
             }
         };
 
-        // The session exists from here on regardless of how this dispatch
-        // lands: `--session-id` may only be used once, so every subsequent
-        // invocation must be a `--resume`.
+        // The session this dispatch used exists from here on regardless of
+        // how it lands: `--session-id` may only be used once, so that uuid
+        // can only ever be `--resume`d again.
         resuming = true;
+
+        // ...but a session whose `/goal` loop has **concluded** cannot be
+        // resumed usefully at all, so the next dispatch opens a fresh one.
+        //
+        // Measured on the first live run (2026-09-08, issue #285), by reading
+        // the two transcripts side by side. Into a *new* session, `-p "/goal
+        // …"` arrives as a plain slash command and installs the
+        // session-scoped Stop hook that drives the turn loop. Into a
+        // `--resume`d one it is replayed as a local command behind a "DO NOT
+        // respond to these messages ... unless the user explicitly asks"
+        // caveat, and arms no hook. The model correctly obeys the caveat,
+        // answers "No response requested", and the process exits in about six
+        // seconds having run no turns. Resuming past a verdict is therefore
+        // not merely wasteful — it cannot work, because the goal loop that
+        // sequences the turns is precisely what is missing.
+        //
+        // The verdict is the right signal because it *is* the goal loop's own
+        // evaluated stop: returning one is what spends the hook. A dispatch
+        // that returned none — killed on the wall-clock bound, cut off by
+        // `--max-turns`, or crashed — left the hook armed mid-goal, and
+        // resuming it is both correct and cheap, which is the "~5% marginal
+        // cost" resume the spec chose `--resume` for. That case is the
+        // majority of resumes and is deliberately left alone.
+        //
+        // What a fresh session loses is in-context history, not knowledge:
+        // the next turn prompt carries the prior attempts and their failure
+        // reasons, which is the degradation the spec's crash-safe-state
+        // section already designed for ("any Lead can resume any IC").
+        if outcome.verdict.is_some() {
+            session_uuid = uuid::Uuid::new_v4().to_string();
+            resuming = false;
+        }
         turn_n = turn_n.saturating_add(outcome.num_turns);
 
         // Bank spend before deciding anything else. Every dispatch that
@@ -1083,7 +1203,14 @@ pub fn run_issue(
                     status.as_ref(),
                 )?;
                 status = lineage::get_issue_status(db, issue)?;
-                write_state(db, cumulative_attempt_n, turn_n, "dispatching", resuming)?;
+                write_state(
+                    db,
+                    cumulative_attempt_n,
+                    turn_n,
+                    "dispatching",
+                    &session_uuid,
+                    resuming,
+                )?;
             }
             DispatchClassification::InfrastructureFailure => {
                 write_state(
@@ -1091,6 +1218,7 @@ pub fn run_issue(
                     cumulative_attempt_n,
                     turn_n,
                     "infrastructure-failure",
+                    &session_uuid,
                     resuming,
                 )?;
                 if consecutive_infrastructure_failures
@@ -1111,7 +1239,14 @@ pub fn run_issue(
             TerminalReason::DailyBudgetExhausted { .. } => "paused-daily-budget",
             _ => "paused-infrastructure-failure",
         };
-        write_state(db, cumulative_attempt_n, turn_n, state_label, resuming)?;
+        write_state(
+            db,
+            cumulative_attempt_n,
+            turn_n,
+            state_label,
+            &session_uuid,
+            resuming,
+        )?;
     }
 
     Ok(IssueRun {
@@ -1243,6 +1378,27 @@ mod tests {
             reason: Some("dispatch exceeded this repo's wall-clock bound".to_string()),
             process_success: false,
             timed_out: true,
+        }
+    }
+
+    /// The measured shape of a `--resume` that no-ops, from the first live
+    /// run (2026-09-08, issue #285): resuming a session whose `/goal` loop
+    /// had **already concluded** exchanged one "continue" prompt for one "no
+    /// response requested" and exited in about six seconds. Exit zero, no
+    /// error flag, no verdict, no turns, no spend — indistinguishable from
+    /// the spec's anti-stall row on every field except the two that say it
+    /// never started.
+    fn resume_noop() -> DispatchOutcome {
+        DispatchOutcome {
+            total_cost_usd: 0.0,
+            num_turns: 0,
+            duration_ms: 6_000,
+            is_error: false,
+            session_id: "11111111-2222-3333-4444-555555555555".to_string(),
+            verdict: None,
+            reason: None,
+            process_success: true,
+            timed_out: false,
         }
     }
 
@@ -1627,7 +1783,7 @@ mod tests {
     fn default_config_is_valid_and_clears_the_turn_headroom_floor() {
         let config = config();
         config.validate().unwrap();
-        assert!(config.max_turns >= config.n_turns + MIN_MAX_TURNS_HEADROOM);
+        assert!(config.max_turns >= config.n_turns * MIN_TOOL_TURNS_PER_GOAL_TURN);
     }
 
     #[test]
@@ -1639,6 +1795,34 @@ mod tests {
         config.max_turns = 4;
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("max_turns"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn the_turn_ceiling_scales_with_n_rather_than_sitting_a_few_turns_above_it() {
+        // The first live run's configuration (2026-09-08, issue #285):
+        // `--n-turns 6` under the old additive rule derived `--max-turns 12`,
+        // and every dispatch was killed mid-edit, because one goal turn
+        // spends far more than two tool-call turns. The pairing is now
+        // refused where it is made, rather than diagnosed afterwards from
+        // three dead dispatches.
+        let mut broken = config();
+        broken.n_turns = 6;
+        broken.max_turns = 12;
+        let err = broken.validate().unwrap_err().to_string();
+        assert!(err.contains("must be at least 60"), "unexpected: {err}");
+        assert!(
+            err.contains("count different things"),
+            "the message must name the unit confusion, not just the number: {err}"
+        );
+
+        // The floor itself is permitted, and the default clears it with room
+        // to spare — `--max-turns` is a runaway backstop, and budget and
+        // wall-clock are what should bind first.
+        let mut at_floor = config();
+        at_floor.n_turns = 6;
+        at_floor.max_turns = 60;
+        assert!(at_floor.validate().is_ok());
+        assert!(config().max_turns > 6 * MIN_TOOL_TURNS_PER_GOAL_TURN);
     }
 
     #[test]
@@ -1682,6 +1866,98 @@ mod tests {
         // dispatch is infrastructure.
         let anti_stall = outcome(None, false, true, 0.10);
         assert_eq!(classify(&anti_stall), DispatchClassification::FailedAttempt);
+    }
+
+    #[test]
+    fn a_dispatch_that_did_nothing_at_all_is_infrastructure_not_an_attempt() {
+        // The anti-stall row's floor. "Returns control with the goal still
+        // set" describes a dispatch that took the goal up and got nowhere;
+        // this one never started, and has nothing to teach the next one.
+        assert_eq!(
+            classify(&resume_noop()),
+            DispatchClassification::InfrastructureFailure
+        );
+        assert!(
+            !classify(&resume_noop()).consumes_attempt(),
+            "a dispatch that ran no turns and spent nothing must not burn an attempt"
+        );
+    }
+
+    #[test]
+    fn the_floor_needs_both_readings_and_neither_alone() {
+        // Billed but turnless: it engaged the model, so it is a real, if
+        // short, attempt.
+        let billed = DispatchOutcome {
+            total_cost_usd: 0.03,
+            ..resume_noop()
+        };
+        assert_eq!(classify(&billed), DispatchClassification::FailedAttempt);
+
+        // Turns but no recorded spend: `0.0` is not proof of doing nothing —
+        // it is exactly what an unpriced dispatch reports.
+        let unpriced = DispatchOutcome {
+            num_turns: 4,
+            ..resume_noop()
+        };
+        assert_eq!(classify(&unpriced), DispatchClassification::FailedAttempt);
+    }
+
+    #[test]
+    fn a_killed_dispatch_is_still_read_as_a_timeout_not_as_an_empty_one() {
+        // Ordering: `timed_out` reports `0.0`/`0` too, but there the zeroes
+        // mean *unknown*. Its arm sits above the floor so the diagnostic
+        // stays a timeout, and the wall-clock ceiling keeps counting it.
+        assert!(timed_out().num_turns == 0 && timed_out().total_cost_usd == 0.0);
+        assert_eq!(
+            classify(&timed_out()),
+            DispatchClassification::InfrastructureFailure
+        );
+    }
+
+    #[test]
+    fn repeated_noop_resumes_stop_the_run_instead_of_eating_the_attempt_cap() {
+        // The first live run's actual failure (2026-09-08, issue #285): one
+        // real dispatch returned `not_met`, then four resumes no-opped in 25
+        // seconds and were each read as a failed attempt, driving the issue
+        // to `AttemptCapExhausted` with four of its five attempts spent on
+        // dispatches that never ran. The run must now stop on the
+        // consecutive-infrastructure bound instead, leaving the attempt
+        // budget for real work.
+        let db = approved_db();
+        let (_dir, worktree) = fixture_worktree();
+        let mut dispatcher = ScriptedDispatcher::new(vec![
+            Ok(not_met()),
+            Ok(resume_noop()),
+            Ok(resume_noop()),
+            Ok(resume_noop()),
+        ]);
+        let run = run_issue(
+            &db,
+            &issue(),
+            &brief(),
+            &worktree,
+            &config(),
+            &mut dispatcher,
+        )
+        .unwrap();
+
+        assert!(
+            matches!(
+                run.terminal,
+                TerminalReason::InfrastructureFailure { consecutive: 3 }
+            ),
+            "expected the infrastructure bound, got {:?}",
+            run.terminal
+        );
+        assert_eq!(
+            run.dispatches.len(),
+            4,
+            "the run must stop on the third empty dispatch, not keep launching"
+        );
+        assert_eq!(
+            run.cumulative_attempt_n, 1,
+            "only the dispatch that actually ran may count against the cap"
+        );
     }
 
     #[test]
@@ -1779,7 +2055,7 @@ mod tests {
     }
 
     #[test]
-    fn the_first_dispatch_opens_a_session_and_later_ones_resume_it() {
+    fn the_first_dispatch_opens_a_session_and_a_concluded_one_is_replaced() {
         let db = approved_db();
         let (_dir, wt) = fixture_worktree();
         let mut dispatcher = ScriptedDispatcher::new(vec![Ok(not_met()), Ok(met())]);
@@ -1791,9 +2067,116 @@ mod tests {
             SessionMode::New { session_uuid } => session_uuid.clone(),
             other => panic!("first dispatch must open a new session, got {other:?}"),
         };
+        // The first dispatch here returned a verdict, so its goal loop
+        // concluded and its session is spent — see the rotation in
+        // `run_issue`. It is replaced rather than resumed.
+        match &dispatcher.seen[1].session {
+            SessionMode::New { session_uuid } => assert_ne!(
+                session_uuid, &uuid,
+                "the replacement session must not reuse the spent uuid"
+            ),
+            other => panic!("a concluded goal loop must be replaced, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_interrupted_dispatch_is_resumed_rather_than_replaced() {
+        // The majority case, and the one `--resume` was chosen for: a
+        // dispatch that returned **no** verdict was cut off mid-goal — killed
+        // on the wall-clock bound, stopped by `--max-turns`, or crashed — so
+        // its Stop hook is still armed and resuming it is both correct and
+        // cheap. Only a concluded goal loop is replaced.
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        let mut dispatcher = ScriptedDispatcher::new(vec![Ok(timed_out()), Ok(met())]);
+
+        run_issue(&db, &issue(), &brief(), &wt, &config(), &mut dispatcher).unwrap();
+
+        assert_eq!(dispatcher.seen.len(), 2);
+        let uuid = match &dispatcher.seen[0].session {
+            SessionMode::New { session_uuid } => session_uuid.clone(),
+            other => panic!("first dispatch must open a new session, got {other:?}"),
+        };
         match &dispatcher.seen[1].session {
             SessionMode::Resume { session_uuid } => assert_eq!(session_uuid, &uuid),
-            other => panic!("later dispatches must resume, got {other:?}"),
+            other => panic!("an interrupted dispatch must be resumed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_replacement_session_is_recorded_before_it_is_used() {
+        // Crash safety: if the Lead dies between a `not_met` and the next
+        // dispatch, whatever it wrote must send its successor to the *new*
+        // session. Recording the spent uuid — or the new one marked claimed —
+        // would send the successor straight back into the session that cannot
+        // respond, which is the failure this whole rotation exists to end.
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        let mut config = config();
+        // Stop on the first launch failure so the run pauses with its state
+        // intact instead of clearing it on a terminal verdict.
+        config.max_consecutive_infrastructure_failures = 1;
+        let mut dispatcher = ScriptedDispatcher::new(vec![
+            Ok(not_met()),
+            Err(MemoryError::NotFound("launch failed".into())),
+        ]);
+
+        run_issue(&db, &issue(), &brief(), &wt, &config, &mut dispatcher).unwrap();
+
+        let spent = match &dispatcher.seen[0].session {
+            SessionMode::New { session_uuid } => session_uuid.clone(),
+            other => panic!("first dispatch must open a new session, got {other:?}"),
+        };
+        let replacement = match &dispatcher.seen[1].session {
+            SessionMode::New { session_uuid } => session_uuid.clone(),
+            other => panic!("a concluded goal loop must be replaced, got {other:?}"),
+        };
+        assert_ne!(spent, replacement);
+
+        let state = dispatch_state::get_dispatch_state(&db, &issue())
+            .unwrap()
+            .expect("a paused run keeps its dispatch state");
+        assert_eq!(
+            state.session_uuid, replacement,
+            "the drawer must name the session the next dispatch will use"
+        );
+        assert!(
+            !state.session_claimed,
+            "a replacement session no process has opened yet must not be recorded as claimed, \
+             or a resuming Lead would --resume a uuid that has never existed"
+        );
+    }
+
+    #[test]
+    fn a_concluded_goal_loops_replacement_carries_across_runs() {
+        // The crash-recovery half of the rotation. A later run adopts the
+        // replacement uuid from the drawer rather than minting another, and
+        // opens it with `--session-id` — because no process has ever claimed
+        // it. Resuming it instead would `--resume` a session that does not
+        // exist; minting a third would leave the recorded one orphaned.
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        let mut paused = config();
+        paused.daily_budget_usd = 2.6;
+        paused.max_budget_usd = 2.5;
+        let mut first = ScriptedDispatcher::new(vec![Ok(not_met())]);
+        run_issue(&db, &issue(), &brief(), &wt, &paused, &mut first).unwrap();
+
+        let stored = dispatch_state::get_dispatch_state(&db, &issue())
+            .unwrap()
+            .expect("a budget pause must keep the dispatch state");
+        assert!(!stored.session_claimed);
+
+        let mut second = ScriptedDispatcher::new(vec![Ok(met())]);
+        run_issue(&db, &issue(), &brief(), &wt, &config(), &mut second).unwrap();
+        match &second.seen[0].session {
+            SessionMode::New { session_uuid } => {
+                assert_eq!(
+                    session_uuid, &stored.session_uuid,
+                    "the next run must adopt the recorded replacement, not mint another"
+                );
+            }
+            other => panic!("an unclaimed session must be opened, not resumed, got {other:?}"),
         }
     }
 
@@ -1802,10 +2185,14 @@ mod tests {
         let db = approved_db();
         let (_dir, wt) = fixture_worktree();
         // First run stops on the daily budget, leaving the state in place.
+        // The dispatch returns no verdict on purpose: it was interrupted
+        // rather than concluded, so its session is still resumable. A
+        // `not_met` here would rotate the session instead — see
+        // `a_concluded_goal_loops_replacement_carries_across_runs`.
         let mut paused = config();
         paused.daily_budget_usd = 2.6;
         paused.max_budget_usd = 2.5;
-        let mut dispatcher = ScriptedDispatcher::new(vec![Ok(not_met())]);
+        let mut dispatcher = ScriptedDispatcher::new(vec![Ok(no_verdict_error())]);
         run_issue(&db, &issue(), &brief(), &wt, &paused, &mut dispatcher).unwrap();
         let stored = dispatch_state::get_dispatch_state(&db, &issue())
             .unwrap()
@@ -2084,6 +2471,73 @@ satisfies it on its own"
             dispatcher.seen.is_empty(),
             "`agent:exhausted` never self-resumes"
         );
+    }
+
+    #[test]
+    fn a_human_retry_gives_a_capped_issue_its_budget_back() {
+        // The recovery the spec names — "only a human re-labeling it
+        // retries" — which never worked, because the label governs selection
+        // and the cap is enforced against a counter no label touches. The
+        // grant is what makes re-labeling mean something.
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        lineage::upsert_issue_status(
+            &db,
+            &IssueStatus {
+                issue: issue(),
+                best_verdict: Some(AttemptOutcome::Failed),
+                best_commit_sha: None,
+                cumulative_attempt_n: 5,
+            },
+        )
+        .unwrap();
+        retry::grant_retry(&db, &issue(), 5).unwrap();
+
+        let mut dispatcher = ScriptedDispatcher::new(vec![Ok(met())]);
+        let run = run_issue(&db, &issue(), &brief(), &wt, &config(), &mut dispatcher).unwrap();
+
+        assert!(
+            matches!(run.terminal, TerminalReason::Met { .. }),
+            "a forgiven issue must dispatch, got {:?}",
+            run.terminal
+        );
+        assert_eq!(dispatcher.seen.len(), 1);
+        // The lifetime counter keeps counting, so the next attempt is #6 and
+        // the prompt's history stays unambiguous.
+        assert_eq!(run.cumulative_attempt_n, 6);
+    }
+
+    #[test]
+    fn a_retry_grants_one_cap_not_an_unlimited_one() {
+        // Forgiveness is a one-time credit, not a raised ceiling: the issue
+        // gets `attempt_cap` more attempts and then stops again, which is the
+        // whole point of the cap surviving the recovery.
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        lineage::upsert_issue_status(
+            &db,
+            &IssueStatus {
+                issue: issue(),
+                best_verdict: Some(AttemptOutcome::Failed),
+                best_commit_sha: None,
+                cumulative_attempt_n: 5,
+            },
+        )
+        .unwrap();
+        retry::grant_retry(&db, &issue(), 5).unwrap();
+
+        let mut config = config();
+        config.attempt_cap = 2;
+        let mut dispatcher = ScriptedDispatcher::new(vec![Ok(not_met()), Ok(not_met())]);
+        let run = run_issue(&db, &issue(), &brief(), &wt, &config, &mut dispatcher).unwrap();
+
+        assert_eq!(run.terminal, TerminalReason::AttemptCapExhausted);
+        assert_eq!(
+            dispatcher.seen.len(),
+            2,
+            "exactly the forgiven cap's worth of attempts, then stop again"
+        );
+        assert_eq!(run.cumulative_attempt_n, 7);
     }
 
     // ── impossible ──────────────────────────────────────────────────────
@@ -2413,7 +2867,9 @@ satisfies it on its own"
         let mut paused = config();
         paused.daily_budget_usd = 2.6;
         paused.max_budget_usd = 2.5;
-        let mut first = ScriptedDispatcher::new(vec![Ok(not_met())]);
+        // No verdict: interrupted, not concluded, so the session it opened is
+        // still the one to go back to.
+        let mut first = ScriptedDispatcher::new(vec![Ok(no_verdict_error())]);
         run_issue(&db, &issue(), &brief(), &wt, &paused, &mut first).unwrap();
         let state = dispatch_state::get_dispatch_state(&db, &issue())
             .unwrap()

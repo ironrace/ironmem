@@ -418,7 +418,19 @@ pub fn arm_remediation(db: &Database, request: &ArmRequest) -> Result<ArmOutcome
         .map(|s| s.cumulative_attempt_n)
         .unwrap_or_default();
 
-    if cumulative_attempt_n >= request.attempt_cap {
+    // Charged, not lifetime: a human retry forgives attempts against the cap
+    // wherever the cap is read, and reading the raw counter here would keep
+    // reporting `CapReached` for an issue whose budget was just restored —
+    // sending the PR to the human hold instead of arming the re-dispatch.
+    //
+    // Only the *check* reads it. `armed_after_attempts` below stays the
+    // lifetime number, so "dispatches since armed" keeps measuring dispatches
+    // rather than sliding backwards the moment a grant is written.
+    let charged = super::retry::attempts_charged(
+        cumulative_attempt_n,
+        super::retry::forgiven_through(db, request.issue)?,
+    );
+    if charged >= request.attempt_cap {
         return Ok(ArmOutcome::CapReached {
             cumulative_attempt_n,
             attempt_cap: request.attempt_cap,
