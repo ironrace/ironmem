@@ -89,6 +89,15 @@ pub struct TurnPromptInputs<'a> {
     /// the next review would read the identical commit and say the identical
     /// thing. See [`render`]'s remediation clause.
     pub remediation: Option<RemediationBrief<'a>>,
+    /// The branch this dispatch's worktree has checked out, from
+    /// [`super::worktree::Worktree::branch`].
+    ///
+    /// Named in the goal condition rather than left implicit as "the branch
+    /// you are on". A dispatch that cuts its own branch and pushes that
+    /// instead satisfies every other word of the condition while leaving
+    /// nothing on the branch [`super::advance`] looks at, and the failure is
+    /// silent: the issue records a success and stalls with no pull request.
+    pub branch: &'a str,
     /// The repo's approved gate commands, verbatim from
     /// [`super::gate_config::GateConfig::gate_commands`] — never authored
     /// separately from the approved config.
@@ -111,6 +120,25 @@ pub struct TurnPromptInputs<'a> {
 /// gate would render a vacuous condition ("...never authored separately):
 /// .") that an IC could trivially call `met` against, silently defeating
 /// this module's "one definition of done" guarantee.
+///
+/// # Why the push is in the condition
+///
+/// Because the gate alone was never the whole of "done", and for eleven rungs
+/// the ordinary condition said only "the gate passes". A gate runs in the
+/// worktree, so an IC that edits, commits and goes green **without pushing**
+/// satisfies it completely and truthfully — and leaves the remote branch
+/// empty. [`super::advance`] then finds no pull request, and because
+/// [`super::run::run_issue`] refuses to dispatch an issue that already
+/// records a success, there is no path back: the issue stalls on every pass,
+/// forever, with no human action short of an unlabel able to recover it.
+///
+/// So the push is part of the condition and not merely a line of prose above
+/// it, on the same reasoning as the remediation clause below: a dispatch
+/// reports its verdict against *the condition*, and anything the condition
+/// does not name is something an honest IC may report `met` without having
+/// done. It is phrased over the commits the dispatch actually made, so an
+/// issue that turns out to need no code change is still a legitimate success
+/// rather than one that can only be reported by pushing an empty commit.
 ///
 /// # The remediation clause
 ///
@@ -196,10 +224,18 @@ These answers are decisions, not suggestions — follow them:\n",
 
     // The condition itself, not just the prose around it. See the doc above.
     let gate_extra = if inputs.remediation.is_some() {
-        ", and every finding in the review above is addressed by a commit you have pushed to this branch"
+        ", and every finding in the review above is addressed by one of those commits"
     } else {
         ""
     };
+
+    // The push half of the condition, which is NOT optional and NOT a
+    // remediation-only concern — see [`render`]'s "Why the push is in the
+    // condition".
+    let push_clause = format!(
+        ", and every commit you have made is pushed to this issue's branch `{}`",
+        inputs.branch
+    );
 
     let gate_line = inputs.gate_commands.join(" && ");
 
@@ -214,7 +250,11 @@ Checkpoint your progress (what you tried, current state, next step) after \
 EVERY turn, not just at the end — you may be re-invoked as a fresh process \
 with only this checkpoint and the transcript to resume from.\n\n\
 The gate condition for this repo (generated from its approved gate config, \
-never authored separately): {gate}{gate_extra}.\n\n\
+never authored separately): {gate}{push}{gate_extra}.\n\n\
+Push the branch; do NOT open a pull request. Autopilot opens it for you, \
+against the repo's default branch, once your work is on the remote — a pull \
+request you open yourself can target the wrong base, and two open on one \
+branch stop the issue dead.\n\n\
 Report your verdict using the required output schema when, and only when, \
 you have either satisfied the gate condition above or determined it cannot be \
 satisfied. Do not guess; if you are unsure whether it is met, the verdict is \
@@ -228,6 +268,7 @@ or stop after {n} turns",
         answers = answers_section,
         remediation = remediation_section,
         gate = gate_line,
+        push = push_clause,
         gate_extra = gate_extra,
         n = inputs.n_turns,
     )
@@ -268,6 +309,7 @@ mod tests {
                 head_sha: "deadbeef",
                 findings,
             }),
+            branch: "autopilot/owner-repo-7",
             gate_commands: &["cargo test".to_string()],
             n_turns: 6,
         })
@@ -304,6 +346,7 @@ mod tests {
                 head_sha: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
                 findings: Some(&findings),
             }),
+            branch: "autopilot/owner-repo-7",
             gate_commands: &["cargo test --workspace".to_string()],
             n_turns: 6,
         });
@@ -326,17 +369,23 @@ platform limit, got {}",
         let gate_at = text.find("The gate condition for this repo").unwrap();
         let condition = &text[gate_at..];
         assert!(
-            condition.contains("addressed by a commit you have pushed to this branch"),
+            condition.contains("addressed by one of those commits"),
             "the pushed fix must be part of the CONDITION, not just the prose: {condition}"
+        );
+        // "those commits" is only meaningful because the push clause it
+        // refers back to is unconditional. If the base clause ever became
+        // remediation-aware again, this sentence would dangle.
+        assert!(
+            condition.find("is pushed to this issue's branch").unwrap()
+                < condition.find("addressed by one of those commits").unwrap(),
+            "the remediation clause refers back to the push clause and must follow it: {condition}"
         );
     }
 
-    #[test]
-    fn an_ordinary_dispatch_condition_is_left_exactly_as_it_was() {
-        // Rung 9's lesson 43: a new optional feature must not change the
-        // configuration that predates it.
+    /// An ordinary (non-remediation) dispatch's rendered prompt.
+    fn ordinary_text(branch: &str) -> String {
         let issue = base_issue();
-        let text = render(&TurnPromptInputs {
+        render(&TurnPromptInputs {
             issue: &issue,
             issue_title: "T",
             issue_body: "B",
@@ -344,12 +393,69 @@ platform limit, got {}",
             strategy_redirect: None,
             human_answers: &[],
             remediation: None,
+            branch,
             gate_commands: &["cargo test".to_string()],
             n_turns: 6,
-        });
-        assert!(text.contains("never authored separately): cargo test."));
+        })
+    }
+
+    #[test]
+    fn an_ordinary_dispatch_carries_no_remediation_wording() {
+        let text = ordinary_text("autopilot/owner-repo-7");
+        assert!(text.contains("never authored separately): cargo test,"));
         assert!(!text.contains("asked for CHANGES"));
-        assert!(!text.contains("pushed to this branch"));
+        assert!(!text.contains("ALREADY MET the gate"));
+        assert!(!text.contains("addressed by one of those commits"));
+    }
+
+    #[test]
+    fn the_ordinary_goal_condition_requires_the_push_and_names_the_branch() {
+        // The defect that blocked the first unattended run. For eleven rungs
+        // the ordinary condition was the gate and nothing else, and a gate
+        // runs in the worktree: an IC could edit, commit, go green and report
+        // `met` truthfully without the work ever reaching the remote. Nothing
+        // downstream could recover — `run_issue` will not re-dispatch an
+        // issue that records a success — so the issue stalled on every
+        // `advance` pass for ever.
+        //
+        // Asserted against the CONDITION rather than the whole prompt, for
+        // the reason the remediation test is: a dispatch reports its verdict
+        // against the condition, and an instruction that sits only in the
+        // prose above it is one an honest IC may report `met` without having
+        // followed.
+        let text = ordinary_text("autopilot/owner-repo-7");
+        let gate_at = text.find("The gate condition for this repo").unwrap();
+        let condition = &text[gate_at..text[gate_at..].find("\n\n").unwrap() + gate_at];
+        assert!(
+            condition.contains("every commit you have made is pushed"),
+            "the push must be part of the CONDITION, not just the prose: {condition}"
+        );
+        assert!(
+            condition.contains("autopilot/owner-repo-7"),
+            "the condition must name the branch, so a dispatch that cut its own cannot satisfy it: {condition}"
+        );
+    }
+
+    #[test]
+    fn the_condition_is_phrased_over_the_commits_made_not_over_a_commit_existing() {
+        // An issue that turns out to need no code change is a legitimate
+        // success (`run::head_commit` says so). Phrased as "a commit is
+        // pushed", the condition would be unsatisfiable for it, and the only
+        // way to report `met` would be to push an empty commit — which is
+        // exactly what the remediation clause tells an IC never to do.
+        let text = ordinary_text("autopilot/owner-repo-7");
+        assert!(text.contains("every commit you have made is pushed"));
+        assert!(!text.contains("you have pushed a commit"));
+    }
+
+    #[test]
+    fn the_ic_is_told_not_to_open_the_pull_request_itself() {
+        // `advance::open_pull_request` opens it, against the base GitHub
+        // reports. An IC that opens its own can target whatever base its
+        // checkout tracks, and two open pull requests on one branch are
+        // `Stall::AmbiguousPr`, which fails closed and needs a human.
+        let text = ordinary_text("autopilot/owner-repo-7");
+        assert!(text.contains("do NOT open a pull request"));
     }
 
     #[test]
@@ -389,7 +495,7 @@ platform limit, got {}",
         let text = remediation_text(None);
         assert!(text.contains("asked for CHANGES"));
         assert!(text.contains("ALREADY MET the gate"));
-        assert!(text.contains("addressed by a commit you have pushed to this branch"));
+        assert!(text.contains("addressed by one of those commits"));
         assert!(text.contains("recorded no reason"));
         assert!(!text.contains("The reviewer said:"));
     }
@@ -428,6 +534,7 @@ platform limit, got {}",
                 head_sha: "deadbeef",
                 findings: Some("fix it"),
             }),
+            branch: "autopilot/owner-repo-7",
             gate_commands: &["cargo test".to_string()],
             n_turns: 6,
         });
@@ -455,6 +562,7 @@ platform limit, got {}",
             strategy_redirect: None,
             human_answers: &[],
             remediation: None,
+            branch: "autopilot/owner-repo-7",
             gate_commands: &["cargo test --workspace".to_string()],
             n_turns: 6,
         });
@@ -487,6 +595,7 @@ platform limit, got {}",
             strategy_redirect: None,
             human_answers: &[],
             remediation: None,
+            branch: "autopilot/owner-repo-7",
             gate_commands: &["cargo test".to_string()],
             n_turns: 1,
         });
@@ -513,6 +622,7 @@ platform limit, got {}",
                 "SQLite, with migration 009.".to_string(),
             )],
             remediation: None,
+            branch: "autopilot/owner-repo-7",
             gate_commands: &["cargo test".to_string()],
             n_turns: 3,
         });
@@ -541,6 +651,7 @@ platform limit, got {}",
             strategy_redirect: None,
             human_answers: &[("Q?".to_string(), "A!".to_string())],
             remediation: None,
+            branch: "autopilot/owner-repo-7",
             gate_commands: &["cargo test".to_string()],
             n_turns: 3,
         });
@@ -561,6 +672,7 @@ platform limit, got {}",
             strategy_redirect: None,
             human_answers: &[],
             remediation: None,
+            branch: "autopilot/owner-repo-7",
             gate_commands: &["cargo test".to_string()],
             n_turns: 3,
         });
@@ -580,6 +692,7 @@ platform limit, got {}",
             ),
             human_answers: &[],
             remediation: None,
+            branch: "autopilot/owner-repo-7",
             gate_commands: &["cargo test".to_string()],
             n_turns: 3,
         });
@@ -606,6 +719,7 @@ platform limit, got {}",
             strategy_redirect: None,
             human_answers: &[],
             remediation: None,
+            branch: "autopilot/owner-repo-7",
             gate_commands: &commands,
             n_turns: 1,
         });
@@ -626,6 +740,7 @@ platform limit, got {}",
             strategy_redirect: None,
             human_answers: &[],
             remediation: None,
+            branch: "autopilot/owner-repo-7",
             gate_commands: &["cargo test".to_string()],
             n_turns: 1,
         });
@@ -644,6 +759,7 @@ platform limit, got {}",
             strategy_redirect: None,
             human_answers: &[],
             remediation: None,
+            branch: "autopilot/owner-repo-7",
             gate_commands: &["cargo test".to_string()],
             n_turns: 0,
         });
@@ -663,6 +779,7 @@ platform limit, got {}",
             strategy_redirect: None,
             human_answers: &[],
             remediation: None,
+            branch: "autopilot/owner-repo-7",
             gate_commands: &[],
             n_turns: 1,
         });
@@ -691,6 +808,7 @@ platform limit, got {}",
             strategy_redirect: None,
             human_answers: &[],
             remediation: None,
+            branch: "autopilot/owner-repo-7",
             gate_commands: &["cargo test --workspace".to_string()],
             n_turns: 6,
         });

@@ -1149,6 +1149,25 @@ pub const PR_LIST_HEAD_FIELDS: &str = "number,headRefName,headRefOid,baseRefName
 /// silent arbitrary pick — and the whole point of the read is to be certain
 /// *which* PR is about to be merged.
 pub fn pr_list_head_argv(repo: &str, head_branch: &str) -> Vec<String> {
+    pr_list_head_argv_in_state(repo, head_branch, "open")
+}
+
+/// `gh pr list --repo R --head B --state all --json <PR_LIST_HEAD_FIELDS>`.
+///
+/// The complement of [`pr_list_head_argv`], and the read that makes opening a
+/// pull request safe. [`PrLookup::None`] answers *"no PR is open here"*,
+/// which is three different situations — nothing was ever opened, a human
+/// closed one, or one merged and the issue stayed open — and only the first
+/// of them may be answered by opening a new PR. Re-opening a PR a human
+/// closed would overrule the human; opening a second PR for work that already
+/// merged would propose an empty diff on every pass, forever.
+pub fn pr_list_head_all_states_argv(repo: &str, head_branch: &str) -> Vec<String> {
+    pr_list_head_argv_in_state(repo, head_branch, "all")
+}
+
+/// The shape both listings share, so `--limit` and the field set cannot drift
+/// between the two reads that are compared against each other.
+fn pr_list_head_argv_in_state(repo: &str, head_branch: &str, state: &str) -> Vec<String> {
     vec![
         "pr".into(),
         "list".into(),
@@ -1157,7 +1176,7 @@ pub fn pr_list_head_argv(repo: &str, head_branch: &str) -> Vec<String> {
         "--head".into(),
         head_branch.into(),
         "--state".into(),
-        "open".into(),
+        state.into(),
         "--json".into(),
         PR_LIST_HEAD_FIELDS.into(),
         "--limit".into(),
@@ -1239,6 +1258,247 @@ pub fn open_pr_for_branch(
             numbers.sort_unstable();
             Ok(PrLookup::Ambiguous { numbers })
         }
+    }
+}
+
+/// Every pull request ever opened on `head_branch`, open or not, oldest
+/// number first.
+///
+/// The guard on [`create_pr`]. A failed read is an `Err` for
+/// [`open_pr_for_branch`]'s reason, sharpened: this listing's *empty* answer
+/// is what authorizes a GitHub write, so an unreadable one must not be able
+/// to produce it. Degrading to "no PRs here" would open a duplicate PR every
+/// time `gh` had a bad minute.
+pub fn prs_ever_for_branch(
+    gh: &mut dyn GhRunner,
+    repo: &str,
+    head_branch: &str,
+) -> Result<Vec<PrForBranch>, MemoryError> {
+    let out = gh.run(&pr_list_head_all_states_argv(repo, head_branch))?;
+    let mut prs = parse_pr_list_head(out.require_success(
+        &format!("gh pr list --state all --head {head_branch} on {repo}"),
+        GhFailure::NotFound,
+    )?)?;
+    prs.sort_by_key(|p| p.number);
+    Ok(prs)
+}
+
+/// `gh repo view R --json defaultBranchRef`.
+///
+/// The repository is **positional here and a `--repo` flag everywhere else in
+/// this module**, because that is what `gh` accepts: `gh repo view --repo X`
+/// is rejected outright with "unknown flag". Measured against the real binary
+/// rather than assumed from the other subcommands' shape — every scripted
+/// test in this file would pass either way, since a stub sees whatever argv
+/// it is handed.
+pub fn repo_view_default_branch_argv(repo: &str) -> Vec<String> {
+    vec![
+        "repo".into(),
+        "view".into(),
+        repo.into(),
+        "--json".into(),
+        "defaultBranchRef".into(),
+    ]
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct DefaultBranchRef {
+    #[serde(default)]
+    name: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RepoViewJson {
+    #[serde(default, rename = "defaultBranchRef")]
+    default_branch_ref: Option<DefaultBranchRef>,
+}
+
+/// Parse the default branch out of `gh repo view --json defaultBranchRef`.
+///
+/// An absent or empty name is an `Err`, never a guess. This value is the
+/// **base** of a pull request Autopilot is about to open, so it decides what
+/// the diff is measured against and therefore what a reviewer reads and what
+/// a merge would land. Falling back to `"main"` would be right on most repos
+/// and catastrophically wrong on the rest, and silently either way.
+pub fn parse_default_branch(stdout: &str) -> Result<String, MemoryError> {
+    let view: RepoViewJson = serde_json::from_str(stdout.trim()).map_err(|e| {
+        MemoryError::Validation(format!("could not parse `gh repo view --json`: {e}"))
+    })?;
+    let name = view
+        .default_branch_ref
+        .map(|r| r.name.trim().to_string())
+        .unwrap_or_default();
+    if name.is_empty() {
+        return Err(MemoryError::NotFound(
+            "`gh repo view` reported no default branch".into(),
+        ));
+    }
+    Ok(name)
+}
+
+/// The repo's default branch, as GitHub reports it.
+///
+/// Asked of GitHub rather than taken from a local checkout or a stored
+/// config, on rung 6's precedent for branch protection: the authoritative
+/// answer lives on GitHub, and a local `HEAD` — which is what
+/// [`super::lead::RepoTarget::base`] carries on an advance pass — names a
+/// commit, not the branch a pull request should target.
+pub fn default_branch(gh: &mut dyn GhRunner, repo: &str) -> Result<String, MemoryError> {
+    let out = gh.run(&repo_view_default_branch_argv(repo))?;
+    parse_default_branch(out.require_success(&format!("gh repo view {repo}"), GhFailure::NotFound)?)
+}
+
+/// Lowercased substrings identifying GitHub's "there is already a pull
+/// request for this head" refusal.
+///
+/// Benign, and the reason is a race rather than a bug: [`create_pr`] is only
+/// reached after [`prs_ever_for_branch`] answered empty, so reaching this
+/// means a PR appeared between the two reads. The next pass's ordinary
+/// lookup finds it.
+pub(crate) const PR_ALREADY_EXISTS_MARKERS: [&str; 2] =
+    ["already exists", "a pull request already exists"];
+
+/// Lowercased substrings identifying GitHub's "this branch has nothing to
+/// merge" refusal.
+///
+/// Two situations that are the same defect seen from different angles: the
+/// branch is on the remote but level with the base (*no commits between*), or
+/// it is not on the remote at all. Both mean the IC recorded a success and
+/// never pushed.
+///
+/// **Measured, not guessed.** A `gh pr create` against a head branch that
+/// does not exist returns, verbatim:
+///
+/// ```text
+/// pull request create failed: GraphQL: Head sha can't be blank, Base sha
+/// can't be blank, No commits between main and autopilot/x, Head ref must be
+/// a branch (createPullRequest)
+/// ```
+///
+/// — one message carrying all three markers. They are kept separate anyway,
+/// because the *level with the base* case yields only the first.
+pub(crate) const PR_NO_COMMITS_MARKERS: [&str; 3] = [
+    "no commits between",
+    "head ref must be a branch",
+    "head sha can't be blank",
+];
+
+/// What [`create_pr`] did.
+///
+/// The two refusals are values rather than errors for
+/// [`LABEL_ALREADY_EXISTS_MARKERS`]'s reason: both arrive as a non-zero exit
+/// alongside genuine failures, and only the caller knows that one of them is
+/// a lost race and the other is a report about an IC. Anything this cannot
+/// name stays an `Err`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "creation", rename_all = "snake_case")]
+pub enum PrCreation {
+    Created {
+        number: u64,
+        url: String,
+    },
+    /// A pull request for this head already exists. See
+    /// [`PR_ALREADY_EXISTS_MARKERS`].
+    AlreadyExists,
+    /// GitHub refused: the head branch carries nothing the base does not
+    /// already have, or is not on the remote at all. See
+    /// [`PR_NO_COMMITS_MARKERS`].
+    BranchNotPushed {
+        detail: String,
+    },
+}
+
+/// `gh pr create --repo R --head H --base B --title T --body BODY`.
+///
+/// Every field `gh pr create` would otherwise prompt for is supplied, so the
+/// call cannot block an unattended pass waiting on a terminal that is not
+/// there. `--head` and `--base` are explicit for
+/// [`pr_list_head_argv`]'s reason, and the base especially: `gh` would
+/// otherwise infer it from the checkout's tracking configuration, which is
+/// operator state rather than repo policy.
+pub fn pr_create_argv(
+    repo: &str,
+    head_branch: &str,
+    base_branch: &str,
+    title: &str,
+    body: &str,
+) -> Vec<String> {
+    vec![
+        "pr".into(),
+        "create".into(),
+        "--repo".into(),
+        repo.into(),
+        "--head".into(),
+        head_branch.into(),
+        "--base".into(),
+        base_branch.into(),
+        "--title".into(),
+        title.into(),
+        "--body".into(),
+        body.into(),
+    ]
+}
+
+/// The pull request number in `gh pr create`'s output.
+///
+/// `gh` prints the new PR's URL, and the number is its last path segment.
+/// Scanned over every whitespace-separated token rather than by assuming the
+/// URL is alone on the last line, because `gh` also emits notices on stdout
+/// and their placement is not a contract. A `#0` is rejected on
+/// [`parse_pr_list_head`]'s reasoning.
+pub fn parse_pr_create(stdout: &str) -> Option<(u64, String)> {
+    stdout.split_whitespace().rev().find_map(|token| {
+        let url = token.trim_end_matches(['.', ',', ')']);
+        let (_, tail) = url.rsplit_once("/pull/")?;
+        let number: u64 = tail.parse().ok()?;
+        (number != 0).then(|| (number, url.to_string()))
+    })
+}
+
+/// Open a pull request for `head_branch`.
+///
+/// **Callers must have established that no pull request has ever existed on
+/// this branch** ([`prs_ever_for_branch`]). This function does not re-check:
+/// it is the write, not the guard.
+pub fn create_pr(
+    gh: &mut dyn GhRunner,
+    repo: &str,
+    head_branch: &str,
+    base_branch: &str,
+    title: &str,
+    body: &str,
+) -> Result<PrCreation, MemoryError> {
+    let out = gh.run(&pr_create_argv(repo, head_branch, base_branch, title, body))?;
+    if !out.success {
+        // Ordered so the lost race is recognised before the empty-diff
+        // report: GitHub's "already exists" message *quotes the existing PR's
+        // URL*, and that URL contains no marker of its own, but a future
+        // rewording that mentioned both would otherwise be read as the
+        // alarming one.
+        if out.mentions_any(&PR_ALREADY_EXISTS_MARKERS) {
+            return Ok(PrCreation::AlreadyExists);
+        }
+        if out.mentions_any(&PR_NO_COMMITS_MARKERS) {
+            return Ok(PrCreation::BranchNotPushed {
+                detail: out.stderr.trim().to_string(),
+            });
+        }
+        return Err(MemoryError::Validation(format!(
+            "gh pr create {head_branch} -> {base_branch} on {repo} failed (exit {:?}): {}",
+            out.code,
+            out.stderr.trim()
+        )));
+    }
+    match parse_pr_create(&out.stdout) {
+        Some((number, url)) => Ok(PrCreation::Created { number, url }),
+        // A `gh` that exited zero and printed no PR URL has created something
+        // this code cannot name. Failing here rather than returning a
+        // number-less success keeps every downstream step — the review, the
+        // merge — addressed to a pull request that was actually identified.
+        None => Err(MemoryError::Validation(format!(
+            "gh pr create on {repo} succeeded but printed no pull request URL: {}",
+            out.stdout.trim()
+        ))),
     }
 }
 
@@ -2073,6 +2333,184 @@ mod tests {
     fn a_failed_comment_is_an_error() {
         let mut gh = ScriptedGh::new(vec![Ok(GhOutput::failed("", "HTTP 403"))]);
         assert!(comment_on_issue(&mut gh, &issue(), "body").is_err());
+    }
+
+    // ── the pull request nothing used to open ───────────────────────────
+
+    #[test]
+    fn the_all_states_listing_differs_from_the_open_one_in_exactly_the_state() {
+        // The two are compared against each other — an empty `--state all`
+        // answer is what authorizes a write after `--state open` came back
+        // empty — so a drift in the field set or the limit would be comparing
+        // two different questions.
+        let open = pr_list_head_argv("owner/repo", "autopilot/x");
+        let all = pr_list_head_all_states_argv("owner/repo", "autopilot/x");
+        assert_eq!(open.len(), all.len());
+        let differences: Vec<_> = open
+            .iter()
+            .zip(&all)
+            .filter(|(a, b)| a != b)
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
+        assert_eq!(differences, vec![("open", "all")]);
+    }
+
+    #[test]
+    fn the_pr_create_argv_supplies_every_field_gh_would_otherwise_prompt_for() {
+        // An unattended pass has no terminal. A missing `--title` or
+        // `--body` makes `gh` open an editor or prompt, and the pass hangs
+        // until its wall clock kills it.
+        let argv = pr_create_argv("owner/repo", "autopilot/x", "main", "A title", "A body");
+        assert_eq!(argv[0], "pr");
+        assert_eq!(argv[1], "create");
+        for (flag, value) in [
+            ("--repo", "owner/repo"),
+            ("--head", "autopilot/x"),
+            ("--base", "main"),
+            ("--title", "A title"),
+            ("--body", "A body"),
+        ] {
+            let at = argv.iter().position(|a| a == flag).expect(flag);
+            assert_eq!(argv[at + 1], value, "{flag}");
+        }
+    }
+
+    #[test]
+    fn the_pr_number_is_read_from_the_url_gh_prints() {
+        assert_eq!(
+            parse_pr_create("https://github.com/owner/repo/pull/337\n"),
+            Some((337, "https://github.com/owner/repo/pull/337".to_string()))
+        );
+    }
+
+    #[test]
+    fn a_notice_printed_before_the_url_does_not_hide_it() {
+        // `gh` prints advisories on stdout and their placement is not a
+        // contract. Taking "the last line" would break on the next one.
+        let stdout = "Warning: 3 uncommitted changes\nhttps://github.com/o/r/pull/12\n";
+        assert_eq!(parse_pr_create(stdout).map(|(n, _)| n), Some(12));
+    }
+
+    #[test]
+    fn a_pr_numbered_zero_is_not_a_pr() {
+        // `parse_pr_list_head`'s rule, at the other end of the same pipe: a
+        // `#0` would name a pull request no human command can address.
+        assert_eq!(parse_pr_create("https://github.com/o/r/pull/0"), None);
+        assert_eq!(parse_pr_create("https://github.com/o/r/pull/abc"), None);
+        assert_eq!(parse_pr_create("created it"), None);
+    }
+
+    #[test]
+    fn an_existing_pull_request_is_a_lost_race_not_a_failure() {
+        let mut gh = ScriptedGh::new(vec![Ok(GhOutput::failed(
+            "",
+            "a pull request for branch \"autopilot/x\" into branch \"main\" already exists: \
+             https://github.com/o/r/pull/9",
+        ))]);
+        let got = create_pr(&mut gh, "o/r", "autopilot/x", "main", "t", "b").unwrap();
+        assert_eq!(got, PrCreation::AlreadyExists);
+    }
+
+    #[test]
+    fn a_branch_that_never_reached_the_remote_is_named_as_such() {
+        // The defect this whole path exists to stop being silent about: an
+        // IC that recorded a success and never pushed.
+        for stderr in [
+            "pull request create failed: GraphQL: No commits between main and autopilot/x",
+            "GraphQL: Head sha can't be blank, Head ref must be a branch (createPullRequest)",
+        ] {
+            let mut gh = ScriptedGh::new(vec![Ok(GhOutput::failed("", stderr))]);
+            let got = create_pr(&mut gh, "o/r", "autopilot/x", "main", "t", "b").unwrap();
+            assert!(
+                matches!(got, PrCreation::BranchNotPushed { .. }),
+                "{stderr} => {got:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unrecognised_refusal_stays_an_error() {
+        // The dangerous direction is a refusal read as one of the two benign
+        // shapes: an HTTP 403 reported as "the IC never pushed" sends an
+        // operator to read a dispatch transcript about a permissions problem.
+        let mut gh = ScriptedGh::new(vec![Ok(GhOutput::failed(
+            "",
+            "HTTP 403: Resource not accessible",
+        ))]);
+        let err = create_pr(&mut gh, "o/r", "autopilot/x", "main", "t", "b").unwrap_err();
+        assert!(err.to_string().contains("403"), "{err}");
+    }
+
+    #[test]
+    fn a_success_that_names_no_pull_request_is_an_error() {
+        // A number-less success would be carried forward as a step taken, and
+        // every stage after this one addresses a pull request by number.
+        let mut gh = ScriptedGh::new(vec![Ok(GhOutput::ok("done\n"))]);
+        let err = create_pr(&mut gh, "o/r", "autopilot/x", "main", "t", "b").unwrap_err();
+        assert!(
+            err.to_string().contains("printed no pull request URL"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn the_pr_create_markers_are_matched_lowercased() {
+        for marker in PR_ALREADY_EXISTS_MARKERS
+            .iter()
+            .chain(PR_NO_COMMITS_MARKERS.iter())
+        {
+            assert_eq!(
+                *marker,
+                marker.to_lowercase(),
+                "markers are compared against a lowercased haystack"
+            );
+        }
+    }
+
+    #[test]
+    fn the_repo_view_argv_names_the_repo_positionally_not_as_a_flag() {
+        // `gh repo view --repo X` is rejected with "unknown flag: --repo",
+        // and every other subcommand in this module takes `--repo`. No
+        // scripted test can catch the difference — a stub is handed whatever
+        // argv it is given — so the shape is pinned here and was measured
+        // against the real binary.
+        let argv = repo_view_default_branch_argv("owner/repo");
+        assert_eq!(
+            argv,
+            ["repo", "view", "owner/repo", "--json", "defaultBranchRef"]
+        );
+        assert!(!argv.iter().any(|a| a == "--repo"));
+    }
+
+    #[test]
+    fn the_default_branch_is_read_from_github_and_never_guessed() {
+        let mut gh = ScriptedGh::new(vec![Ok(GhOutput::ok(
+            r#"{"defaultBranchRef":{"name":"trunk"}}"#,
+        ))]);
+        assert_eq!(default_branch(&mut gh, "o/r").unwrap(), "trunk");
+    }
+
+    #[test]
+    fn an_absent_default_branch_is_an_error_not_main() {
+        // This value is the base of a pull request, so it decides what the
+        // diff is measured against and therefore what a merge would land.
+        // `"main"` is right on most repos and silently catastrophic on the
+        // rest.
+        for stdout in [
+            r#"{"defaultBranchRef":null}"#,
+            r#"{"defaultBranchRef":{"name":"  "}}"#,
+            r#"{}"#,
+        ] {
+            assert!(parse_default_branch(stdout).is_err(), "{stdout}");
+        }
+    }
+
+    #[test]
+    fn an_unreadable_branch_listing_never_reads_as_no_pull_requests() {
+        // The empty answer authorizes a write. A `gh` outage that degraded to
+        // "none here" would open a duplicate pull request on every pass.
+        let mut gh = ScriptedGh::new(vec![Ok(GhOutput::failed("", "boom"))]);
+        assert!(prs_ever_for_branch(&mut gh, "o/r", "autopilot/x").is_err());
     }
 
     #[test]
