@@ -972,6 +972,9 @@ fn print_advance_report(report: &ironmem::autopilot::advance::AdvanceReport) {
                 // missing from the pass.
                 println!("    needs a PR on {branch} — nothing tried yet");
             }
+            AdvanceStep::WouldOpenPr { base_branch } => {
+                println!("    would open a PR -> {base_branch} [dry run]");
+            }
             AdvanceStep::OpenedPr {
                 pr_number,
                 base_branch,
@@ -1008,9 +1011,6 @@ fn print_advance_report(report: &ironmem::autopilot::advance::AdvanceReport) {
                         "    no open PR on {branch} when this pass looked, but one exists now — \
                          the next pass picks it up"
                     );
-                }
-                NoPrReason::DryRun { base_branch } => {
-                    println!("    would open a PR: {branch} -> {base_branch} [dry run]");
                 }
             },
             AdvanceStep::Stalled(Stall::AmbiguousPr { numbers }) => {

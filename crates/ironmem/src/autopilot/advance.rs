@@ -330,8 +330,6 @@ pub enum NoPrReason {
     /// the create. Nothing is wrong and nothing needs doing: the next pass's
     /// ordinary lookup finds it.
     RaceLost,
-    /// `--dry-run`. A pull request would have been opened against `base`.
-    DryRun { base_branch: String },
 }
 
 /// The step an issue is at.
@@ -350,6 +348,20 @@ pub enum AdvanceStep {
     /// [`next_step`] would have cost that purity, which is what makes the
     /// step table exhaustively testable without a network.
     NeedsPr { branch: String },
+    /// `--dry-run`: a pull request **would** have been opened against
+    /// `base_branch`, and was not.
+    ///
+    /// A step rather than a [`Stall`], though nothing was written. Every
+    /// `Stall` is a fact about the world that only a human can change, and is
+    /// re-reported on every pass for ever; this is neither — it is an
+    /// artifact of the flag, and it stands in for the write a real pass would
+    /// have made. Modelled as a stall it would also have been free of the
+    /// burst limit ([`took_a_step`]), so a rehearsal over twenty green issues
+    /// would predict twenty pull requests for a pass that in fact opens
+    /// `max_advances_per_pass` of them and stops. This is the same shape as
+    /// the rehearsed *review*, which has always been an
+    /// [`AdvanceStep::Review`] under `--dry-run` and has always been charged.
+    WouldOpenPr { base_branch: String },
     /// This pass opened the pull request.
     ///
     /// A step in its own right, and the pass stops here rather than flowing
@@ -742,6 +754,10 @@ pub fn advance_pass(
 /// no already-armed remediation. It should be charged — a pull request is a
 /// GitHub write, and a pass that opened one for every issue that went green
 /// overnight is exactly the burst this limit exists to stop.
+///
+/// ⟨defect 7⟩ [`AdvanceStep::WouldOpenPr`] is charged too, and needs no clause
+/// here: a rehearsed pull request is a step, not a stall, which is exactly why
+/// it is not modelled as one. See that variant's doc.
 fn took_a_step(advanced: &Advanced) -> bool {
     if matches!(advanced.step, AdvanceStep::Stalled(_)) {
         return false;
@@ -803,9 +819,11 @@ fn advance_issue(
     // review for the reason every stage here runs before the next one: its
     // output is the next stage's input, and there is nothing to review until
     // a pull request exists.
-    if let AdvanceStep::NeedsPr { branch } = &step {
-        let needs = branch.clone();
-        step = open_pull_request(gh_runner, candidate, &needs, config)?;
+    if matches!(step, AdvanceStep::NeedsPr { .. }) {
+        // The same `branch` the lookup above asked about, deliberately: the
+        // guard and the write must name one branch, not two derivations of
+        // one.
+        step = open_pull_request(gh_runner, candidate, &branch, config)?;
     }
 
     let (pr_number, head_sha, gate_green) = match &step {
@@ -814,7 +832,10 @@ fn advance_issue(
         // terminals rather than given an `unreachable!`, because the cost of
         // being wrong about that is a panic in an unattended pass, and the
         // cost of being right about it is one honest line in the report.
-        AdvanceStep::Stalled(_) | AdvanceStep::OpenedPr { .. } | AdvanceStep::NeedsPr { .. } => {
+        AdvanceStep::Stalled(_)
+        | AdvanceStep::OpenedPr { .. }
+        | AdvanceStep::WouldOpenPr { .. }
+        | AdvanceStep::NeedsPr { .. } => {
             return Ok(Advanced {
                 issue: candidate.issue.clone(),
                 dispatch_class: class,
@@ -1070,9 +1091,27 @@ fn open_pull_request(
     // fact that makes the rehearsal worth printing. It is also the read most
     // likely to fail on a repo nobody has tried this against, and finding
     // that out during the rehearsal is the point of having one.
+    //
+    // ⚠️ **Known hazard: this assumes the branch was cut from the default
+    // branch, and nothing here can check it.** `autopilot lead --base` sets
+    // the committish issue branches are cut from, for every repo, and
+    // defaults to the checkout's `HEAD`. Cut from `develop` on a repo whose
+    // default is `main`, the pull request opened here targets `main` and its
+    // diff carries every commit `develop` has that `main` lacks — which a
+    // reviewer then reads, and which `--merge` could land.
+    //
+    // Not guarded here, because the guard would be worse than the gap. The
+    // dispatch-time base is not recoverable at this point: `advance` is a
+    // separate invocation from `lead` and its own CLI hardcodes `base:
+    // "HEAD"` for every target, so the only local signal is the checkout's
+    // *current* HEAD, which may have moved since the dispatch. Refusing on
+    // that proxy would stall issues whose base was in fact correct, on the
+    // one path that opens pull requests at all — re-creating the permanent
+    // stall this module exists to remove. The fix is to record the base in
+    // lineage at dispatch time and read it back here.
     let base = gh::default_branch(gh_runner, repo)?;
     if config.dry_run {
-        return Ok(stalled(NoPrReason::DryRun { base_branch: base }));
+        return Ok(AdvanceStep::WouldOpenPr { base_branch: base });
     }
 
     match gh::create_pr(
@@ -1103,11 +1142,32 @@ fn open_pull_request(
 fn pr_title(candidate: &Candidate) -> String {
     let title = candidate.issue_title.trim();
     if title.is_empty() {
-        format!("Autopilot: {}", candidate.issue.canonical())
-    } else {
-        title.to_string()
+        return format!("Autopilot: {}", candidate.issue.canonical());
     }
+    if title.chars().count() <= MAX_PR_TITLE_CHARS {
+        return title.to_string();
+    }
+    title
+        .chars()
+        .take(MAX_PR_TITLE_CHARS - 1)
+        .chain(std::iter::once('…'))
+        .collect()
 }
+
+/// GitHub's limit on a pull request title.
+///
+/// **Defensive, not a live hazard.** A GitHub *issue* title is capped at the
+/// same 256, so a title arriving through [`plan_advance`] cannot exceed it —
+/// but [`Candidate`] is public and its fields are public, so the cap is not a
+/// property this function may assume.
+///
+/// Cut rather than passed through because a refusal for this reason is not one
+/// [`gh::create_pr`] can name: it would become an `Err`, reported as a problem
+/// on every tick for ever, with no path back — `run_issue` will not
+/// re-dispatch an issue that records a success. Cheap insurance against
+/// re-entering the exact stall ⟨defect 7⟩ exists to remove. Cut on a character
+/// boundary, never a byte one.
+const MAX_PR_TITLE_CHARS: usize = 256;
 
 /// The pull request's body.
 ///
@@ -1774,10 +1834,7 @@ mod tests {
         assert!(
             matches!(
                 &report.advanced[0].step,
-                AdvanceStep::Stalled(Stall::NoOpenPr {
-                    reason: NoPrReason::DryRun { base_branch },
-                    ..
-                }) if base_branch == "release"
+                AdvanceStep::WouldOpenPr { base_branch } if base_branch == "release"
             ),
             "got {:?}",
             report.advanced[0].step
@@ -1786,6 +1843,79 @@ mod tests {
             .seen
             .iter()
             .any(|argv| argv[0] == "pr" && argv[1] == "create"));
+    }
+
+    #[test]
+    fn a_rehearsed_pull_request_spends_the_burst_limit_like_the_real_one() {
+        // A rehearsal exists to predict the pass. Charged like every other
+        // stall — that is, not at all — `--dry-run` over twenty green issues
+        // would print twenty "would open a PR" lines and make twenty
+        // `gh repo view` calls, for a pass that in fact opens
+        // `max_advances_per_pass` of them and stops.
+        let db = approved_db();
+        for n in [283u64, 284] {
+            record_success(&db, &IssueRef::new(REPO, n), Some(GREEN));
+        }
+        let (repo, roots) = checkout_with_worktree();
+        let mut config = config(roots.path(), repo.path());
+        config.dry_run = true;
+        config.max_advances_per_pass = 1;
+
+        let mut gh = ScriptedGh::new(vec![
+            ok(
+                r#"[{"number":283,"title":"t","body":"b","labels":[{"name":"agent:ready"}],"updatedAt":"2026-09-03T00:00:00Z"},{"number":284,"title":"t","body":"b","labels":[{"name":"agent:ready"}],"updatedAt":"2026-09-03T00:00:00Z"}]"#,
+            ),
+            ok("[]"),
+            ok("[]"),
+            ok(&default_branch_json("main")),
+        ]);
+        let report = advance_pass(&db, &mut gh, &mut ForbiddenReviewer, &config).unwrap();
+        assert_eq!(report.advanced.len(), 1);
+        assert!(report
+            .skipped
+            .iter()
+            .any(|s| matches!(s.reason, SkipReason::PassLimitReached { .. })));
+        assert!(
+            !gh.seen
+                .iter()
+                .any(|argv| argv[0] == "pr" && argv[1] == "create"),
+            "a rehearsal still writes nothing"
+        );
+    }
+
+    #[test]
+    fn a_pull_request_title_too_long_for_github_is_cut_rather_than_refused() {
+        // GitHub refuses a title over 256 characters, and `create_pr` cannot
+        // name that refusal: it would become an `Err`, reported as a problem
+        // on every pass for ever with no path back, because `run_issue` will
+        // not re-dispatch an issue that records a success. A GitHub issue
+        // title is capped at 256 too, so this cannot arrive through
+        // `plan_advance` — but `Candidate`'s fields are public, so the cap is
+        // not something `pr_title` may assume.
+        let candidate = Candidate {
+            issue: issue(),
+            issue_title: "é".repeat(400),
+            repo_path: PathBuf::from("/nowhere"),
+            risk_label: None,
+            green_commit_sha: Some(GREEN.into()),
+        };
+        let title = pr_title(&candidate);
+        assert_eq!(title.chars().count(), MAX_PR_TITLE_CHARS);
+        assert!(title.ends_with('…'));
+    }
+
+    #[test]
+    fn a_blank_issue_title_still_names_the_issue() {
+        // `gh pr create --title ""` is refused, and that refusal would be
+        // reported as an unexplained create failure.
+        let candidate = Candidate {
+            issue: issue(),
+            issue_title: "   ".into(),
+            repo_path: PathBuf::from("/nowhere"),
+            risk_label: None,
+            green_commit_sha: None,
+        };
+        assert!(pr_title(&candidate).contains(&issue().canonical()));
     }
 
     #[test]

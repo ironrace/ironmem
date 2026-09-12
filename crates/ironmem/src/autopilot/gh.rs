@@ -1479,8 +1479,17 @@ pub fn create_pr(
             return Ok(PrCreation::AlreadyExists);
         }
         if out.mentions_any(&PR_NO_COMMITS_MARKERS) {
+            // Taken from whichever stream carried it. The classification
+            // above reads stdout *and* stderr, so a `gh` that reported the
+            // refusal on stdout would otherwise be named `BranchNotPushed`
+            // with an empty `detail` — an operator told "the IC recorded a
+            // success without pushing:" and then nothing.
+            let detail = match out.stderr.trim() {
+                "" => out.stdout.trim(),
+                stderr => stderr,
+            };
             return Ok(PrCreation::BranchNotPushed {
-                detail: out.stderr.trim().to_string(),
+                detail: detail.to_string(),
             });
         }
         return Err(MemoryError::Validation(format!(
