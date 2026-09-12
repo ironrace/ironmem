@@ -183,10 +183,16 @@ fn exact_entry(dir: &std::path::Path, name: &str) -> Result<Option<std::path::Pa
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(format!("failed to read '{}': {err}", dir.display())),
     };
-    Ok(entries
-        .filter_map(Result::ok)
-        .find(|entry| entry.file_name() == std::ffi::OsStr::new(name))
-        .map(|entry| entry.path()))
+    // A per-entry failure is not "not found": on a network or fuse mount an
+    // entry can fail to stat while the directory lists fine, and reporting
+    // that as absence is the conflation this function exists to prevent.
+    for entry in entries {
+        let entry = entry.map_err(|err| format!("failed to read '{}': {err}", dir.display()))?;
+        if entry.file_name() == std::ffi::OsStr::new(name) {
+            return Ok(Some(entry.path()));
+        }
+    }
+    Ok(None)
 }
 
 pub mod advance;

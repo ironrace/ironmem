@@ -543,17 +543,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `continue-on-error:` step or job is not required to pass, and
   a `working-directory:` step — or one whose shell has `cd`'d, on the same line
   or an earlier line of the same `run:` block — does not run at the repo root.
-  None of those become a gate. A repo whose *only* invocation of a tool
-  rewrites the tree gets **no command for that check at all**, not the
-  canonical one: CI fixing your formatting for you is not evidence the repo is
-  checked for it, and it is the repo least likely to pass a strict `--check`. Where two workflows run the same tool
-  differently, neither is chosen: nothing here reads `on:` triggers or
-  required-check status, so the disagreement is reported instead. Taking CI's
-  own command is the faithful thing to propose, and it is satisfiable by
-  construction: CI runs it on every merge to the default branch. Where CI's
-  text cannot be run as written —
-  multi-line shell, a `${{ }}` expression only a runner resolves, an absolute
-  toolchain path — a canonical command (`cargo fmt --all -- --check`,
+  None of those become a gate command as written.
+
+  Two cases get **no command for that check at all**, not even the canonical
+  one. A tool CI only ever *rewrites* with (`cargo fmt --all`, `cargo clippy
+  --fix`): fixing your formatting for you is not evidence the repo is checked
+  for it, and it is the repo least likely to pass a strict `--check`. And a
+  check CI does not require to pass — a `continue-on-error:` step or job, or
+  the `|| true` spelling of the same thing: a repo marks its lint job advisory
+  precisely because it is not clean yet, so proposing anything there would
+  hand the strictest possible gate to the one repo that certainly cannot pass
+  it. A job's `continue-on-error:` covers that job and not its siblings.
+
+  Where two workflows run the same tool differently *and a gate could take
+  either*, neither is chosen: nothing here reads `on:` triggers, `if:`
+  conditions or required-check status, so the disagreement is reported
+  instead. Where only one is takeable it is adopted and the disagreement is
+  still reported, since the takeable one may be the nightly workflow's
+  stricter command. Taking CI's own command is the faithful thing to propose,
+  and it is one the repo can satisfy — CI is presumed to run it on merge to
+  the default branch, presumed rather than verified, which is among the
+  reasons the result is a proposal a human approves. Where CI's text cannot be
+  taken — a `${{ }}` expression only a runner resolves, an absolute toolchain
+  path, an environment prefix, a command that does not run at the repo root — a canonical command (`cargo fmt --all -- --check`,
   `cargo clippy … -- -D warnings`, `--workspace` tracking the same
   `[workspace]` detection as the test command) is proposed instead, and the
   proposal says which workflow it came from and that it may be stricter than
@@ -567,7 +579,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   steps out of `.github/workflows/*.yml`, with no anchors, matrices, job
   graph or expression resolution, and no claim to know which jobs are
   required — a check that runs only on a schedule or behind an `if:` reads
-  exactly like one that runs on every merge, which is part of why a proposal is
+  exactly like one that runs on every merge. It does read enough YAML not to
+  fabricate: a plain `run:` scalar wrapped onto a second line is joined
+  (reading only the first would adopt a clippy without its `-- -D warnings`,
+  which passes on every warning), a folded `run: >-` block is joined the way
+  YAML joins it *including* leaving a more-indented line alone, a `run:` under
+  `with:` or `defaults:` is an argument rather than a command, and
+  `RUSTFLAGS="-D warnings" cargo clippy …` is recognised as a clippy
+  invocation rather than disappearing on the quoted value's space. That the
+  blind spots are symmetric is part of why a proposal is
   something a human approves rather than something that takes effect. A folded
   `run: >-` block is joined the way YAML joins it, because
   reading its lines separately would adopt a *truncated* command — `cargo
@@ -583,7 +603,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for a narrower gate, and nothing else in the proposal would say so. What it
   was calibrated against is now recorded on the config (`set_wall_clock_timeout`
   stores the commands in force), so the warning survives a second re-onboard
-  rather than comparing against whatever was proposed last.
+  rather than comparing against whatever was proposed last; approving
+  re-calibrates it, since a human approving a gate is saying the bound is right
+  for that gate. `autopilot approve` now prints the commands it approved and
+  any warnings they carried — it is the decision point, and it had been
+  consuming warnings it never showed anyone. A stored config that cannot be
+  deserialized is reported rather than silently replaced, since replacing it
+  destroys both the bound and the evidence it ever existed.
 
 - **Autopilot: `agent:exhausted` could not actually be recovered, so the
   documented human retry was a no-op.** The spec is explicit that the label

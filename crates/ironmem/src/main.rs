@@ -1792,7 +1792,22 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                 if json {
                     println!("{}", serde_json::to_string_pretty(&config)?);
                 } else {
-                    println!("Approved gate config for '{}'.", config.repo);
+                    // Approval is the decision point, so it must show what is
+                    // being decided. `onboard` printed these, but approving is
+                    // a separate command in a possibly much later shell — and
+                    // it is what re-calibrates a carried wall-clock bound, so
+                    // a human who never saw the warnings would silently
+                    // consume them.
+                    println!("Approved gate config for '{}':", config.repo);
+                    for gate_command in config.gate_commands() {
+                        println!("  - {gate_command}");
+                    }
+                    if !config.manifest_warnings.is_empty() {
+                        println!("Warnings carried on the proposal you just approved:");
+                        for warning in &config.manifest_warnings {
+                            println!("  - {warning}");
+                        }
+                    }
                 }
                 Ok(())
             }

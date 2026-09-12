@@ -16,10 +16,11 @@ pub(crate) fn read_to_string_with_path(path: &Path) -> Result<String, String> {
         .map_err(|err| format!("failed to read '{}': {err}", path.display()))
 }
 
-/// [`read_to_string_with_path`], with a size cap enforced *before* the read
-/// and a leading UTF-8 BOM stripped after it. `kind` names what is being read
-/// ("build manifest", "CI workflow") so the refusal message tells a human
-/// which limit they hit.
+/// [`read_to_string_with_path`], with three guarantees its callers rely on:
+/// anything that is not a regular file is refused, a size cap is enforced
+/// *before* the read, and a leading UTF-8 BOM is stripped after it. `kind`
+/// names what is being read ("build manifest", "CI workflow") so a refusal
+/// tells a human which limit they hit.
 ///
 /// Both halves exist because of the same class of bug. `read_to_string` has
 /// no size limit of its own, so a path that resolves — directly, or through a
@@ -137,6 +138,18 @@ mod tests {
             err.contains("big.toml") && err.contains("build manifest"),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn a_file_of_exactly_the_limit_is_read_not_refused() {
+        // The cap is `>`, not `>=`. Nothing else pins which.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("exact.toml");
+        std::fs::write(&path, "x".repeat(8)).unwrap();
+
+        let content = read_to_string_capped(&path, 8, "build manifest").unwrap();
+
+        assert_eq!(content, "xxxxxxxx");
     }
 
     #[test]

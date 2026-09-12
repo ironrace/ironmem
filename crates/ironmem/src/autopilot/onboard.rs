@@ -38,8 +38,11 @@
 //! all, and supplies the command itself wherever CI's text can be run as
 //! written — a gate is a proxy for CI, and CI's own command is both the
 //! faithful thing to propose and satisfiable by construction. A canonical
-//! command this module holds is the fallback for runner-dependent text only,
-//! and taking one is always reported on the proposal.
+//! command this module holds is the fallback — for text that cannot be run as
+//! written, for a command CI runs somewhere other than the repo root, and for
+//! two workflows that run the same tool differently — and taking one is always
+//! reported on the proposal. A tool CI only rewrites with, or does not require
+//! to pass, gets no command at all.
 //!
 //! # Multi-stack repos
 //!
@@ -105,8 +108,13 @@ impl<'a> LazyCiCommands<'a> {
     }
 }
 
-/// The result of [`infer_gate_commands`]: every recognized stack's command,
-/// plus any non-fatal problems hit while inferring them.
+/// The result of [`infer_gate_commands`]: every recognized stack's commands
+/// — a stack may contribute several — plus any non-fatal problems hit while
+/// inferring them.
+///
+/// The non-empty guarantee belongs to [`infer_gate_commands`] and to
+/// `gate_config::propose_gate_config`, not to this type: nothing stops a
+/// caller constructing an empty one.
 #[derive(Debug)]
 pub struct InferredGates {
     pub commands: Vec<String>,
@@ -144,6 +152,17 @@ pub fn infer_gate_commands(repo_path: &Path) -> Result<InferredGates, MemoryErro
     // if no stack was recognized at all, in place of the generic "nothing
     // found" message below — otherwise it becomes a warning (see below),
     // never silently vanishing either way.
+    // One listing up front, so a checkout that cannot be listed at all says
+    // so. Every manifest probe below answers "absent" on a listing failure —
+    // correct per probe, and collectively a report that a repo with a
+    // `Cargo.toml` has no recognized build manifest.
+    super::exact_entry(repo_path, "Cargo.toml").map_err(|err| {
+        MemoryError::Validation(format!(
+            "cannot list '{}' to look for build manifests: {err}",
+            repo_path.display()
+        ))
+    })?;
+
     let mut commands = Vec::new();
     let mut manifest_error: Option<MemoryError> = None;
     // Read at most once, and only if a stack that consults it is
@@ -273,14 +292,18 @@ fn exact_file_exists(dir: &Path, name: &str) -> bool {
 }
 
 /// The check tools a Rust repo's gate may cover, each with the canonical
-/// command to **fall back to** when CI's own invocation of it cannot be run
-/// as written (see [`ci_evidence::Invocation::is_plainly_runnable`]).
+/// command to **fall back to** when CI's own invocation cannot be taken — not
+/// runnable as written ([`ci_evidence::Invocation::is_plainly_runnable`]), not
+/// run at the repo root ([`ci_evidence::Invocation::adoptable`]), or two
+/// workflows running the tool differently.
 ///
 /// A fallback is a guess — it may be stricter than what CI enforces, which
 /// is a gate the repo might not pass — so taking one is always reported on
 /// the proposal for the human approving it to judge. CI's own command is
-/// preferred precisely because it is not a guess: CI runs it on every merge
-/// to the default branch, so it is satisfiable by construction.
+/// preferred precisely because it is not a guess: CI is presumed to run it on
+/// merge to the default branch, so it is one the repo can satisfy. (Presumed,
+/// not verified — `on:` triggers and `if:` conditions are not read, which is
+/// among the reasons the result is a proposal a human approves.)
 ///
 /// `--workspace` tracks the same `[workspace]` detection as the test
 /// command, for the same reason: on a workspace root, a clippy run without
@@ -289,6 +312,7 @@ fn rust_checks(is_workspace: bool) -> [RustCheck; 2] {
     [
         RustCheck {
             tool: &["cargo", "fmt"],
+            name: "cargo fmt",
             canonical: "cargo fmt --all -- --check".to_string(),
             // Without `--check`, `cargo fmt` *rewrites* the tree — that is
             // the disqualifying part, not merely that it then exits 0. A gate
@@ -305,6 +329,7 @@ fn rust_checks(is_workspace: bool) -> [RustCheck; 2] {
         },
         RustCheck {
             tool: &["cargo", "clippy"],
+            name: "cargo clippy",
             canonical: if is_workspace {
                 "cargo clippy --workspace --all-targets --all-features -- -D warnings"
             } else {
@@ -317,11 +342,29 @@ fn rust_checks(is_workspace: bool) -> [RustCheck; 2] {
     ]
 }
 
+/// Whether two CI invocations are the same command wearing different
+/// clothes. The first word is compared by base name, so the macOS job's
+/// `$HOME/.cargo/bin/cargo fmt --all -- --check` is not reported as
+/// disagreeing with the Linux job's `cargo fmt --all -- --check`. Warning
+/// about a difference that is not one is how an approver learns to skim.
+fn same_command(left: &str, right: &str) -> bool {
+    fn base_named(command: &str) -> Vec<&str> {
+        let mut words: Vec<&str> = command.split_whitespace().collect();
+        if let Some(first) = words.first_mut() {
+            *first = first.rsplit('/').next().unwrap_or(first);
+        }
+        words
+    }
+    base_named(left) == base_named(right)
+}
+
 /// One check a Rust repo's gate may cover: which tool it is, what to propose
 /// when CI's own invocation cannot be used, and which invocations are checks
 /// at all rather than rewrites.
 struct RustCheck {
     tool: &'static [&'static str],
+    /// The tool as a human reads it, for warnings.
+    name: &'static str,
     canonical: String,
     /// A flag CI's invocation must carry for it to be a check.
     requires: Option<&'static str>,
@@ -345,9 +388,10 @@ impl RustCheck {
 /// `--workspace` is required for the gate to actually cover them; a plain
 /// package gets the simpler `cargo test`.
 ///
-/// Format and lint checks are added **only when `ci` shows the repo runs
-/// that tool**, and are CI's own command wherever that command can be run as
-/// written. Proposing checks unconditionally would be the same mistake this
+/// Format and lint checks are added **only when `ci` shows the repo is
+/// *checked* by that tool** — a step that rewrites the tree, or one CI does
+/// not require to pass, is evidence about the tool and not about the check —
+/// and are CI's own command wherever that command can be taken. Proposing checks unconditionally would be the same mistake this
 /// module already refuses for an Xcode `-scheme` guess and for npm's
 /// placeholder test script: a gate command the repo cannot satisfy makes
 /// *every* dispatch fail, and a repo that has never been clippy-clean would
@@ -377,9 +421,13 @@ fn infer_rust(
     let is_workspace = is_cargo_workspace(&content);
 
     let mut commands = Vec::new();
+    // Tools CI was read for and never seen invoking.
+    let mut unseen: Vec<&str> = Vec::new();
+    let warnings_before = warnings.len();
     for check in rust_checks(is_workspace) {
         let candidates: Vec<&ci_evidence::Invocation> = ci.invocations_of(check.tool).collect();
         let Some(any) = candidates.first() else {
+            unseen.push(check.name);
             continue;
         };
         // Only the invocations that *check*. A repo whose sole `cargo fmt`
@@ -393,24 +441,44 @@ fn infer_rust(
             .copied()
             .filter(|invocation| check.accepts(&invocation.command))
             .collect();
-        let Some(first) = checked.first() else {
+        let Some(any_check) = checked.first() else {
             warnings.push(format!(
                 "{} runs `{}`, which does not check the tree (a rewrite, or no check at all), \
                  so no `{}` command is proposed — nothing in CI says this repo is checked for \
                  it",
-                any.workflow,
-                any.command,
-                check.tool.join(" ")
+                any.workflow, any.command, check.name
+            ));
+            continue;
+        };
+        // A check CI does not require to pass is not a check this gate may
+        // require either — not even in canonical form. A repo marks its lint
+        // job `continue-on-error:` (or writes `|| true`) precisely because it
+        // is not clean yet, so proposing any command here would fail every
+        // dispatch into a repo CI is perfectly happy with. This is the same
+        // reasoning as the rewrite case above, for the other half of
+        // "evidence about the tool is not evidence about the check".
+        let enforced: Vec<&ci_evidence::Invocation> = checked
+            .iter()
+            .copied()
+            .filter(|invocation| invocation.enforced)
+            .collect();
+        let Some(first) = enforced.first() else {
+            warnings.push(format!(
+                "{} runs `{}` but does not require it to pass, so no `{}` command is proposed \
+                 — a gate that required it would fail every dispatch into a repo CI is happy \
+                 with",
+                any_check.workflow, any_check.command, check.name
             ));
             continue;
         };
         // Distinct, because two workflows running the byte-identical command
         // is agreement, not ambiguity.
         let mut usable: Vec<&str> = Vec::new();
-        for invocation in &checked {
-            let is_usable = invocation.adoptable && invocation.is_plainly_runnable(check.tool);
-            if is_usable && !usable.contains(&invocation.command.as_str()) {
-                usable.push(&invocation.command);
+        for invocation in &enforced {
+            if let Some(command) = invocation.gate_command(check.tool) {
+                if !usable.contains(&command) {
+                    usable.push(command);
+                }
             }
         }
         match usable.as_slice() {
@@ -420,16 +488,16 @@ fn infer_rust(
                 // elsewhere hides the disagreement that matters: the adopted
                 // one may be the nightly workflow's stricter command, and a
                 // gate stricter than CI blocks work CI would have accepted.
-                let disagreeing: Vec<&str> = checked
+                let disagreeing: Vec<&str> = enforced
                     .iter()
                     .map(|invocation| invocation.command.as_str())
-                    .filter(|command| command != only)
+                    .filter(|command| !same_command(command, only))
                     .collect();
                 if let Some(other) = disagreeing.first() {
                     warnings.push(format!(
                         "the gate takes `{only}` from {}, but CI also runs `{other}` — check \
                          they agree before approving",
-                        checked
+                        enforced
                             .iter()
                             .find(|invocation| invocation.command == **only)
                             .map(|invocation| invocation.workflow.as_str())
@@ -439,12 +507,22 @@ fn infer_rust(
                 commands.push((*only).to_string());
                 continue;
             }
-            // Nothing usable: CI runs the tool in a form a gate cannot take.
+            // Nothing usable: CI runs the tool, and requires it to pass, in
+            // a form a gate cannot take. Naming *which* form matters —
+            // "as written" would be false for a command that is perfectly
+            // runnable and simply does not run at the repo root, and would
+            // send the human looking for a quoting problem.
             [] => warnings.push(format!(
-                "{} runs `{}`, which a gate cannot take as written, so `{}` is \
-                 proposed instead — it may be stricter than what CI enforces; check it passes \
-                 before approving",
-                first.workflow, first.command, check.canonical
+                "{} runs `{}`, {}, so `{}` is proposed instead — it may be stricter than what \
+                 CI enforces; check it passes before approving",
+                first.workflow,
+                first.command,
+                if first.adoptable {
+                    "which a gate cannot run as written"
+                } else {
+                    "which CI runs somewhere other than the repo root"
+                },
+                check.canonical
             )),
             // Several, disagreeing. Nothing here knows which workflow runs on
             // a merge to the default branch — `on:` triggers and required
@@ -456,12 +534,32 @@ fn infer_rust(
                  gate; `{}` is proposed instead — it may be stricter than what CI \
                  enforces; check it passes before approving",
                 many.len(),
-                check.tool.join(" "),
+                check.name,
                 many.join("`, `"),
                 check.canonical
             )),
         }
         commands.push(check.canonical);
+    }
+    // Said once, and only when a readable CI config produced *no* check at
+    // all: that is the shape of the original defect — a gate that looks
+    // complete while CI judges the branch by something this reader cannot
+    // see. Warning per missing tool instead would fire on every repo that
+    // runs one of the two and not the other, which is the noise that teaches
+    // an approver to skim.
+    // `commands` holds only check commands at this point — the stack's test
+    // command is appended below.
+    if ci.workflows_read() > 0
+        && commands.is_empty()
+        && !unseen.is_empty()
+        && warnings.len() == warnings_before
+    {
+        warnings.push(format!(
+            "CI config was read, but nothing in it invokes {} directly, so the gate has no \
+             check commands — if CI enforces them through an action, a Makefile target or an \
+             expression this reader cannot follow, the gate is narrower than CI",
+            unseen.join(" or ")
+        ));
     }
     commands.push(
         if is_workspace {
@@ -691,10 +789,10 @@ fn has_test_target(content: &str) -> bool {
 /// symlink a monorepo might legitimately use — to an unexpectedly large
 /// regular file would otherwise be loaded into memory in full with no
 /// bound. (A symlink to a device or other special file, e.g. `/dev/zero`,
-/// is already excluded upstream: both `exact_file_exists` and this
-/// function's own `fs::metadata` call follow symlinks and check the
-/// *destination's* type, and neither ever reports such a target as a
-/// regular file.)
+/// is already excluded upstream: both `exact_file_exists` and
+/// [`crate::error::read_to_string_capped`]'s own `fs::metadata` call follow
+/// symlinks and check the *destination's* type, and neither ever reports such
+/// a target as a regular file.)
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 
 /// [`crate::error::read_to_string_capped`] at [`MAX_MANIFEST_BYTES`], wrapped
@@ -1581,6 +1679,264 @@ mod tests {
             ]
         );
         assert!(inferred.warnings.is_empty(), "{:?}", inferred.warnings);
+    }
+
+    #[test]
+    fn every_canonical_fallback_is_itself_a_check_a_gate_can_run() {
+        // The `requires`/`refuses` rule is applied to CI's text; nothing
+        // applied it to our own fallback. Editing the constructor to
+        // `cargo fmt --all` would ship a gate command that rewrites the
+        // worktree under the IC, and no other test would fail.
+        for is_workspace in [true, false] {
+            for check in rust_checks(is_workspace) {
+                assert!(
+                    check.accepts(&check.canonical),
+                    "canonical is not a check: {}",
+                    check.canonical
+                );
+                let starts_with_tool = check
+                    .canonical
+                    .split_whitespace()
+                    .take(check.tool.len())
+                    .eq(check.tool.iter().copied());
+                assert!(
+                    starts_with_tool,
+                    "canonical is not the tool: {}",
+                    check.canonical
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_working_directory_step_falls_back_rather_than_lifting_the_command_to_the_root() {
+        // Plainly runnable, and still not text a gate may take: CI runs it
+        // somewhere else. Lifting it would lint a different tree — or none.
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"crates/*\"]\n",
+        );
+        workflow(
+            dir.path(),
+            "ci.yml",
+            "steps:\n  - run: cargo clippy --all-targets -- -D warnings\n    working-directory: crates/engine\n",
+        );
+
+        let inferred = infer_gate_commands(dir.path()).unwrap();
+
+        assert_eq!(
+            inferred.commands,
+            vec![
+                "cargo clippy --workspace --all-targets --all-features -- -D warnings".to_string(),
+                "cargo test --workspace".to_string(),
+            ]
+        );
+        assert_eq!(inferred.warnings.len(), 1, "{:?}", inferred.warnings);
+        assert!(
+            inferred.warnings[0].contains("somewhere other than the repo root"),
+            "the warning must name the real reason, got: {:?}",
+            inferred.warnings
+        );
+    }
+
+    #[test]
+    fn a_cd_earlier_in_the_same_run_block_falls_back_too() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "Cargo.toml", "[package]\nname = \"x\"\n");
+        workflow(
+            dir.path(),
+            "ci.yml",
+            "steps:\n  - run: |\n      cd crates/engine\n      cargo clippy --all-targets -- -D warnings\n",
+        );
+
+        let inferred = infer_gate_commands(dir.path()).unwrap();
+
+        assert_eq!(
+            inferred.commands,
+            vec![
+                "cargo clippy --all-targets --all-features -- -D warnings".to_string(),
+                "cargo test".to_string(),
+            ]
+        );
+        assert_eq!(inferred.warnings.len(), 1, "{:?}", inferred.warnings);
+    }
+
+    #[test]
+    fn a_check_ci_does_not_require_to_pass_gets_no_command_at_all() {
+        // THE regression this pair of flags exists for. A repo marks its
+        // lint job advisory precisely because it is not clean yet; proposing
+        // the canonical command here hands the strictest possible gate to the
+        // one repo that certainly cannot pass it, and every dispatch fails
+        // forever.
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"crates/*\"]\n",
+        );
+        workflow(
+            dir.path(),
+            "ci.yml",
+            "jobs:\n  lint:\n    continue-on-error: true\n    steps:\n      - run: cargo clippy --workspace --all-targets -- -D warnings\n  test:\n    steps:\n      - run: cargo test --workspace\n",
+        );
+
+        let inferred = infer_gate_commands(dir.path()).unwrap();
+
+        assert_eq!(
+            inferred.commands,
+            vec!["cargo test --workspace".to_string()]
+        );
+        assert!(
+            inferred
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("does not require it to pass")),
+            "got: {:?}",
+            inferred.warnings
+        );
+    }
+
+    #[test]
+    fn an_advisory_spelling_with_or_true_behaves_the_same_way() {
+        // `|| true` and `continue-on-error:` are two spellings of one fact,
+        // and they must not produce opposite gates.
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "Cargo.toml", "[package]\nname = \"x\"\n");
+        workflow(
+            dir.path(),
+            "ci.yml",
+            "steps:\n  - run: cargo clippy --all-targets -- -D warnings || true\n",
+        );
+
+        let inferred = infer_gate_commands(dir.path()).unwrap();
+
+        assert_eq!(inferred.commands, vec!["cargo test".to_string()]);
+        assert!(
+            inferred
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("does not require it to pass")),
+            "got: {:?}",
+            inferred.warnings
+        );
+    }
+
+    #[test]
+    fn adopting_one_command_while_ci_runs_another_says_so() {
+        // The adopted one may be the nightly workflow's stricter command.
+        // Silence here is a gate stricter than CI, chosen without anyone
+        // deciding to.
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "Cargo.toml", "[package]\nname = \"x\"\n");
+        workflow(
+            dir.path(),
+            "ci.yml",
+            "steps:\n  - run: cargo clippy --all-targets -- -D warnings\n",
+        );
+        workflow(
+            dir.path(),
+            "nightly.yml",
+            "steps:\n  - run: cargo +nightly clippy --all-targets -- -D warnings -W clippy::pedantic\n",
+        );
+
+        let inferred = infer_gate_commands(dir.path()).unwrap();
+
+        assert_eq!(
+            inferred.commands,
+            vec![
+                "cargo clippy --all-targets -- -D warnings".to_string(),
+                "cargo test".to_string(),
+            ]
+        );
+        assert_eq!(inferred.warnings.len(), 1, "{:?}", inferred.warnings);
+        assert!(
+            inferred.warnings[0].contains("ci.yml")
+                && inferred.warnings[0].contains("clippy::pedantic"),
+            "the warning must name the adopted workflow and the other command, got: {:?}",
+            inferred.warnings
+        );
+    }
+
+    #[test]
+    fn the_same_command_called_by_absolute_path_is_not_a_disagreement() {
+        // The macOS job calls cargo by absolute path. Reporting that as a
+        // disagreement is the warning noise that teaches an approver to skim.
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "Cargo.toml", "[package]\nname = \"x\"\n");
+        workflow(
+            dir.path(),
+            "ci.yml",
+            "steps:\n  - run: cargo fmt --all -- --check\n",
+        );
+        workflow(
+            dir.path(),
+            "macos.yml",
+            "steps:\n  - run: \"$HOME/.cargo/bin/cargo fmt --all -- --check\"\n",
+        );
+
+        let inferred = infer_gate_commands(dir.path()).unwrap();
+
+        assert_eq!(
+            inferred.commands,
+            vec![
+                "cargo fmt --all -- --check".to_string(),
+                "cargo test".to_string()
+            ]
+        );
+        assert!(inferred.warnings.is_empty(), "{:?}", inferred.warnings);
+    }
+
+    #[test]
+    fn a_readable_ci_config_that_yields_no_check_at_all_says_so() {
+        // The shape of the original defect: a gate that looks complete while
+        // CI judges the branch by something this reader cannot see.
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "Cargo.toml", "[package]\nname = \"x\"\n");
+        workflow(
+            dir.path(),
+            "ci.yml",
+            "steps:\n  - uses: actions-rs/clippy-check@v1\n  - run: cargo test\n",
+        );
+
+        let inferred = infer_gate_commands(dir.path()).unwrap();
+
+        assert_eq!(inferred.commands, vec!["cargo test".to_string()]);
+        assert_eq!(inferred.warnings.len(), 1, "{:?}", inferred.warnings);
+        assert!(
+            inferred.warnings[0].contains("no check commands"),
+            "got: {:?}",
+            inferred.warnings
+        );
+    }
+
+    #[test]
+    fn a_workspace_repo_falls_back_to_the_workspace_canonical_commands() {
+        // The workspace arm of `rust_checks` is otherwise only ever reached
+        // when CI's text matches it exactly, where adoption and fallback are
+        // indistinguishable.
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"crates/*\"]\n",
+        );
+        workflow(
+            dir.path(),
+            "ci.yml",
+            "steps:\n  - run: \"$HOME/.cargo/bin/cargo clippy --all-targets\"\n",
+        );
+
+        let inferred = infer_gate_commands(dir.path()).unwrap();
+
+        assert_eq!(
+            inferred.commands,
+            vec![
+                "cargo clippy --workspace --all-targets --all-features -- -D warnings".to_string(),
+                "cargo test --workspace".to_string(),
+            ]
+        );
     }
 
     #[test]

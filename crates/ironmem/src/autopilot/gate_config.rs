@@ -64,9 +64,21 @@ pub struct GateConfig {
     /// approving a `pending` config should read these first: an inferred
     /// gate that looks complete may be silently missing a stack whose
     /// manifest was broken.
+    ///
+    /// Not only the Onboarder's, and not always empty on a hand-authored
+    /// proposal: [`propose_gate_config`] adds one of its own when a carried
+    /// wall-clock bound no longer matches the gate being proposed, or when
+    /// the stored config could not be read.
+    ///
+    /// Not always the Onboarder's, and not always empty on a hand-authored
+    /// proposal: [`propose_gate_config`] adds one of its own when a carried
+    /// wall-clock bound no longer matches the gate being proposed, or when
+    /// the stored config could not be read.
     pub manifest_warnings: Vec<String>,
-    /// The gate commands in force when [`set_wall_clock_timeout`] last ran —
-    /// i.e. what the bound above was actually calibrated against.
+    /// The gate commands this bound was last blessed against — written by
+    /// [`set_wall_clock_timeout`] when the bound is set, and again by
+    /// [`approve_gate_config`], since a human approving a gate is saying the
+    /// bound is right for *that* gate.
     ///
     /// Recorded rather than inferred because the alternative, comparing
     /// against whatever was proposed last, is edge-triggered: running
@@ -148,7 +160,16 @@ impl TryFrom<GateConfigShadow> for GateConfig {
             state: raw.state,
             gate_commands: raw.gate_commands,
             manifest_warnings: raw.manifest_warnings,
-            wall_clock_timeout_commands: raw.wall_clock_timeout_commands,
+            // Normalized rather than rejected, unlike `gate_commands`. A
+            // calibration record with no bound to calibrate is stale data,
+            // not a lie worth refusing a whole repo's config over — and
+            // refusing would make every dispatch into that repo fail, which
+            // is a worse answer than dropping a field nothing reads. Dropped
+            // here, on the one path every `GateConfig` comes through, so it
+            // cannot be carried forward or read back as a bound.
+            wall_clock_timeout_commands: raw
+                .wall_clock_timeout_secs
+                .and(raw.wall_clock_timeout_commands),
             proposed_at: raw.proposed_at,
             approved_at: raw.approved_at,
             wall_clock_timeout_secs: raw.wall_clock_timeout_secs,
@@ -208,8 +229,24 @@ pub fn propose_gate_config(
     // field's doc), so re-inference has nothing to say about it, and dropping
     // it would silently un-bound the repo's dispatches as a side effect of an
     // unrelated re-onboard.
-    let existing = read_current(db, &gate_config_key(repo))?
-        .and_then(|drawer| serde_json::from_str::<GateConfig>(&drawer.content).ok());
+    // Every other read path propagates a deserialize failure with `?`. This
+    // one must not: a broken row has to stay re-onboardable. But it must not
+    // *vanish* either — this is the one path that then overwrites the row, so
+    // a silent `.ok()` destroys both the bound and the evidence it ever
+    // existed, and the operator approves a normal-looking gate whose
+    // dispatches are now unbounded.
+    let existing = match read_current(db, &gate_config_key(repo))? {
+        None => None,
+        Some(drawer) => match serde_json::from_str::<GateConfig>(&drawer.content) {
+            Ok(config) => Some(config),
+            Err(err) => {
+                manifest_warnings.push(format!(
+                    "the stored gate config for '{repo}' could not be read ({err}) and is being                      replaced — any per-dispatch wall-clock bound it carried is lost; re-set it                      before approving"
+                ));
+                None
+            }
+        },
+    };
     let carried = existing
         .as_ref()
         .and_then(|existing| existing.wall_clock_timeout_secs);
@@ -220,11 +257,16 @@ pub fn propose_gate_config(
     // — those durations measured something else, and a bound that is now too
     // tight kills dispatches mid-gate as "wedged". Nothing else in the
     // proposal would say so.
-    let calibrated_for = existing.as_ref().and_then(|existing| {
-        existing
-            .wall_clock_timeout_commands
-            .clone()
-            .or_else(|| carried.map(|_| existing.gate_commands().to_vec()))
+    // Only meaningful alongside a bound: a calibration record with nothing to
+    // calibrate is stale data, and carrying it forward would keep it alive
+    // through every future proposal.
+    let calibrated_for = carried.and_then(|_| {
+        existing.as_ref().and_then(|existing| {
+            existing
+                .wall_clock_timeout_commands
+                .clone()
+                .or_else(|| Some(existing.gate_commands().to_vec()))
+        })
     });
     if let (Some(secs), Some(calibrated_for)) = (carried, calibrated_for.as_ref()) {
         if calibrated_for != &gate_commands {
@@ -444,6 +486,14 @@ mod tests {
             "the human has checked this bound against this gate: {:?}",
             after.manifest_warnings
         );
+        assert_eq!(
+            after.wall_clock_timeout_commands,
+            Some(vec![
+                "cargo fmt --all -- --check".to_string(),
+                "cargo test".to_string()
+            ]),
+            "approval re-calibrates the record, not just the warning"
+        );
     }
 
     #[test]
@@ -505,6 +555,71 @@ mod tests {
             reproposed.manifest_warnings.is_empty(),
             "{:?}",
             reproposed.manifest_warnings
+        );
+    }
+
+    #[test]
+    fn a_bound_set_before_the_calibration_record_existed_still_warns_when_the_gate_widens() {
+        // The rollout path: every already-onboarded repo has a bound with no
+        // calibration record, and this PR's whole purpose is to widen those
+        // repos' gates. If the legacy fallback regressed, the bound would
+        // carry onto a materially longer gate with no warning, killing
+        // dispatches mid-gate as "wedged".
+        let db = Database::open_in_memory().unwrap();
+        let legacy = r#"{"repo":"ironmem","state":"approved","gate_commands":["cargo test"],
+            "manifest_warnings":[],"proposed_at":"2026-08-27T00:00:00Z",
+            "approved_at":"2026-08-27T00:00:00Z","wall_clock_timeout_secs":1200}"#;
+        write_current(&db, &gate_config_key("ironmem"), legacy).unwrap();
+
+        let widened = propose_gate_config(
+            &db,
+            "ironmem",
+            vec!["cargo fmt --all -- --check".into(), "cargo test".into()],
+            vec![],
+        )
+        .unwrap();
+
+        assert_eq!(widened.wall_clock_timeout_secs, Some(1_200));
+        assert_eq!(
+            widened.wall_clock_timeout_commands,
+            Some(vec!["cargo test".to_string()]),
+            "the legacy record is the gate the bound was measured against"
+        );
+        assert_eq!(widened.manifest_warnings.len(), 1);
+        assert!(widened.manifest_warnings[0].contains("cargo test"));
+    }
+
+    #[test]
+    fn a_calibration_record_with_no_bound_to_calibrate_is_dropped_on_read() {
+        // Normalized rather than rejected: refusing would make every dispatch
+        // into that repo fail over a field nothing reads.
+        let raw = r#"{"repo":"ironmem","state":"approved","gate_commands":["cargo test"],
+            "manifest_warnings":[],"wall_clock_timeout_commands":["cargo nextest run"],
+            "proposed_at":"2026-08-27T00:00:00Z","approved_at":"2026-08-27T00:00:00Z"}"#;
+
+        let config: GateConfig = serde_json::from_str(raw).unwrap();
+
+        assert_eq!(config.wall_clock_timeout_secs, None);
+        assert_eq!(config.wall_clock_timeout_commands, None);
+    }
+
+    #[test]
+    fn a_stored_config_that_cannot_be_read_is_replaced_but_reported() {
+        // The only read path that does not propagate a deserialize failure —
+        // because a broken row must stay re-onboardable — and also the only
+        // one that then overwrites it. Silence here destroys the bound and
+        // the evidence it existed.
+        let db = Database::open_in_memory().unwrap();
+        write_current(&db, &gate_config_key("ironmem"), "{ not json").unwrap();
+
+        let config =
+            propose_gate_config(&db, "ironmem", vec!["cargo test".into()], vec![]).unwrap();
+
+        assert_eq!(config.manifest_warnings.len(), 1);
+        assert!(
+            config.manifest_warnings[0].contains("could not be read"),
+            "got: {:?}",
+            config.manifest_warnings
         );
     }
 

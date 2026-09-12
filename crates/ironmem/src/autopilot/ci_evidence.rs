@@ -10,18 +10,22 @@
 //!
 //! # The gate is a proxy for CI, so prefer CI's own command
 //!
-//! An invocation this module reads becomes a gate command only when it is
-//! **plainly runnable** as written ([`Invocation::is_plainly_runnable`]) *and*
-//! **adoptable** ([`Invocation::adoptable`]) — nothing about the step qualifies
-//! how it runs. Such a command is the faithful thing to propose: CI runs it on
-//! every merge to the default branch, so it is satisfiable by construction, and
-//! matching it exactly is the whole point (a gate stricter than CI blocks work
-//! CI would have accepted; a gate looser than CI is the defect above).
+//! An invocation this module reads becomes a gate command only when all three
+//! of [`Invocation::gate_command`]'s questions answer yes: CI **requires it to
+//! pass** ([`Invocation::enforced`]), it is **plainly runnable** as written
+//! ([`Invocation::is_plainly_runnable`]), and it runs at the **repo root**
+//! ([`Invocation::adoptable`]). Such a command is the faithful thing to
+//! propose: CI is presumed to run it on merge to the default branch, so it is
+//! one the repo can satisfy, and matching CI exactly is the whole point (a gate
+//! stricter than CI blocks work CI would have accepted; a gate looser than CI
+//! is the defect above). Presumed, not verified — see the blind spots below.
 //!
-//! Everything else the caller falls back to its own canonical command for, and
-//! says so on the proposal. The two failure modes this module must never cause
-//! are a gate that **cannot pass** and a gate that **enforces nothing**, so
-//! every ambiguity resolves toward "tell the human" rather than toward a guess.
+//! Most of the rest the caller falls back to its own canonical command for,
+//! saying so on the proposal — except a tool CI only ever *rewrites* with, or
+//! runs without requiring it to pass, which contributes no gate command at all.
+//! The two failure modes this module must never cause are a gate that **cannot
+//! pass** and a gate that **enforces nothing**, so every ambiguity resolves
+//! toward "tell the human" rather than toward a guess.
 //!
 //! # Bounded reader, not a YAML parser
 //!
@@ -31,12 +35,12 @@
 //! schedule, or only under some condition, reads exactly like one that runs on
 //! every merge — the same blind spot in both directions, and the reason a
 //! proposal is something a human approves rather than something that takes
-//! effect. It does read three facts that decide whether a command
-//! means what it appears to mean — `working-directory:`, `continue-on-error:`
-//! (on a step, on a job, or under `defaults: run:`), and the `||` a step uses
-//! to make a check advisory — because ignoring those is how a command CI
-//! tolerates failing, or runs somewhere else entirely, becomes a hard gate at
-//! the repo root.
+//! effect. It does read three facts that decide whether a command means what
+//! it appears to mean — `continue-on-error:` (on a step or a job),
+//! `working-directory:` (on a step, or under a `defaults: run:`), and the `||`
+//! a step uses to make a check advisory — because ignoring those is how a
+//! command CI tolerates failing, or runs somewhere else entirely, becomes a
+//! hard gate at the repo root.
 //!
 //! A tool enforced only through a third-party action (`uses:
 //! actions-rs/clippy-check@v1`) or behind an indirection (`make lint`, `cargo
@@ -68,17 +72,24 @@ const MAX_WORKFLOW_BYTES: u64 = 1024 * 1024;
 /// gate every dispatch then fails on.
 const PLAIN_COMMAND_CHARS: &[char] = &['_', '.', '/', ':', '=', '+', ',', '-', '@'];
 
-/// Keys that change what running a command would mean, and so disqualify its
-/// text from being adopted verbatim. `working-directory:` runs it somewhere
-/// other than the repo root — the gate has no such notion — and
-/// `continue-on-error:` means CI does not actually require it to pass, so
-/// promoting it to a gate command would enforce something CI does not.
+/// Keys that change what running a command would mean. Both are read
+/// wherever they appear, not only on a step: GitHub Actions also accepts
+/// `continue-on-error:` on a *job*, and `working-directory:` under
+/// `defaults: run:`.
 ///
-/// Both are read wherever they appear, not only on a step: GitHub Actions
-/// also accepts `continue-on-error:` on a *job* and `working-directory:`
-/// under `defaults: run:`, and a reader that only knew the step form would
-/// lift an advisory job's command straight into a hard gate.
-const QUALIFYING_STEP_KEYS: &[&str] = &["working-directory:", "continue-on-error:"];
+/// The two say **opposite** things, and are kept apart everywhere downstream.
+/// `working-directory:` means the command runs somewhere other than the repo
+/// root, which a gate has no way to express — so its text cannot be lifted
+/// out, but the tool is still enforced and a canonical command is a
+/// reasonable substitute. `continue-on-error:` means CI does not require the
+/// command to pass at all — so proposing *any* command for that check,
+/// canonical included, enforces something CI does not and fails every
+/// dispatch into a repo CI is perfectly happy with. Collapsing them into one
+/// flag turns the second into the first, which is the "gate that cannot
+/// pass" this module exists to avoid.
+const WORKING_DIRECTORY_KEY: &str = "working-directory:";
+const CONTINUE_ON_ERROR_KEY: &str = "continue-on-error:";
+const QUALIFYING_STEP_KEYS: &[&str] = &[WORKING_DIRECTORY_KEY, CONTINUE_ON_ERROR_KEY];
 
 /// One command a repo's CI runs, and the workflow it came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,26 +100,39 @@ pub struct Invocation {
     /// tell a human where to look.
     pub workflow: String,
     /// Whether the *context* allows this text to become a gate command:
-    /// false when the step qualified how it runs (see
-    /// [`QUALIFYING_STEP_KEYS`]) or when the shell it runs in moved somewhere
-    /// else first — `cd sub && …` on this line, or a bare `cd` on an earlier
-    /// line of the same `run:` block, which is one shell. Still evidence that
-    /// the tool is enforced — just not text that can be lifted out and run at
-    /// the repo root.
+    /// false when a `working-directory:` — on the step, or under a
+    /// `defaults: run:` — or a `cd`/`pushd` earlier in the same
+    /// shell means it does not run at the repo root (`cd sub && …` on this
+    /// line, or a bare `cd` on an earlier line of the same `run:` block,
+    /// which is one shell). Still evidence that the tool is enforced — just
+    /// not text that can be lifted out and run at the repo root.
     pub adoptable: bool,
+    /// Whether CI actually requires this command to pass. False for a
+    /// `continue-on-error:` step or job, and for the `|| true` spelling of
+    /// the same intent. A command CI tolerates failing must produce no gate
+    /// command at all — not even a canonical one.
+    pub enforced: bool,
 }
 
 impl Invocation {
     /// Whether this command can be run as written: it starts with `tool`'s
     /// own words — no environment assignment, no `+toolchain`, no directory
-    /// prefix in front of them — and contains only [`PLAIN_COMMAND_CHARS`]
-    /// and alphanumerics.
+    /// prefix in front of them — and contains only the plain-command
+    /// characters this module allows (no `$`, quotes, braces, redirections
+    /// or globs).
     ///
-    /// Deliberately stricter than [`segment_invokes`], which decides the
+    /// Deliberately stricter than `segment_invokes`, which decides the
     /// looser question *is this tool enforced here*: a `$HOME/.cargo/bin/cargo
     /// clippy …` step is evidence that clippy is enforced, and is still not
     /// text a gate can execute.
     pub fn is_plainly_runnable(&self, tool: &[&str]) -> bool {
+        if tool.is_empty() {
+            // The predicate below is an `all()` over `tool`, vacuously true
+            // on an empty slice — which would make *any* plain text a
+            // runnable invocation of nothing. A caller asking about no tool
+            // gets no for an answer.
+            return false;
+        }
         let mut words = self.command.split_whitespace();
         let starts_with_tool = tool.iter().all(|expected| words.next() == Some(*expected));
         starts_with_tool
@@ -116,12 +140,31 @@ impl Invocation {
                 ch.is_ascii_alphanumeric() || ch == ' ' || PLAIN_COMMAND_CHARS.contains(&ch)
             })
     }
+
+    /// The text a gate may take for `tool`, or `None` when CI's own
+    /// invocation cannot be lifted out — not enforced, not runnable as
+    /// written, or not run at the repo root.
+    ///
+    /// This exists so the three questions are answered together, in one
+    /// place. Each is necessary and none is sufficient, and a caller that
+    /// remembers two of the three writes code that compiles, reads
+    /// correctly, and lifts a `working-directory: frontend` command into a
+    /// root-level gate.
+    pub fn gate_command(&self, tool: &[&str]) -> Option<&str> {
+        (self.enforced && self.adoptable && self.is_plainly_runnable(tool))
+            .then_some(self.command.as_str())
+    }
 }
 
 /// The commands a repo's CI runs, gathered from `run:` steps.
 #[derive(Debug, Default)]
 pub struct CiCommands {
     invocations: Vec<Invocation>,
+    /// How many workflow files were read. The difference between "this repo
+    /// does not check that" and "this repo checks it in a way I cannot see"
+    /// is invisible from the invocations alone, and the caller needs it: the
+    /// second is #334 wearing a different hat.
+    workflows_read: usize,
     /// Workflow files that exist but could not be inspected. Surfaced rather
     /// than swallowed: a skipped workflow is precisely how a gate ends up
     /// narrower than CI without anyone noticing, which is the defect this
@@ -140,7 +183,7 @@ impl CiCommands {
     ///
     /// Both path segments are resolved by exact name from a directory
     /// listing rather than through `Path::join`, for the reason
-    /// [`super::exact_entry`] documents.
+    /// `autopilot::exact_entry` documents.
     pub fn read(repo_path: &Path) -> Self {
         let mut evidence = Self::default();
 
@@ -189,7 +232,10 @@ impl CiCommands {
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_default();
             match crate::error::read_to_string_capped(&file, MAX_WORKFLOW_BYTES, "CI workflow") {
-                Ok(content) => evidence.absorb(&workflow, &content),
+                Ok(content) => {
+                    evidence.workflows_read += 1;
+                    evidence.absorb(&workflow, &content);
+                }
                 Err(err) => evidence.warn_unreadable(&err),
             }
         }
@@ -208,14 +254,20 @@ impl CiCommands {
             if shell.0 != raw.run {
                 shell = (raw.run, false);
             }
-            for (segment, adoptable) in enforced_segments(&raw.text, &mut shell.1) {
+            for (segment, adoptable, enforced) in enforced_segments(&raw.text, &mut shell.1) {
                 self.invocations.push(Invocation {
                     command: segment.to_string(),
                     workflow: workflow.to_string(),
                     adoptable: adoptable && !raw.qualified,
+                    enforced: enforced && !raw.advisory,
                 });
             }
         }
+    }
+
+    /// How many workflow files were successfully read.
+    pub fn workflows_read(&self) -> usize {
+        self.workflows_read
     }
 
     fn warn_unreadable(&mut self, err: &str) {
@@ -247,7 +299,10 @@ impl CiCommands {
 /// that decides whether its text may be adopted.
 struct RawCommand {
     text: String,
+    /// Its context says it does not run at the repo root.
     qualified: bool,
+    /// CI does not require it to pass.
+    advisory: bool,
     /// Which `run:` value this line came from. Lines that share one are lines
     /// of one shell, so a `cd` on an earlier one is still in effect on this
     /// one; lines from different `run:` keys are different shells, each
@@ -293,24 +348,42 @@ struct Scanner {
     /// `continue-on-error:` may sit *after* the `run:` key it qualifies.
     pending: Vec<(String, usize)>,
     qualified: bool,
+    advisory: bool,
     /// Counter identifying the `run:` value currently being read — the
     /// shell its lines share. See [`RawCommand::run`].
     run_id: usize,
-    /// Set by a qualifying key that sits *outside* any step — a job's own
-    /// `continue-on-error:`, or a `defaults: run:` block's
-    /// `working-directory:`. Nothing here maps a step back to the job it
-    /// belongs to, so such a key disqualifies every command in the file: the
-    /// tool still counts as enforced, its text just cannot be lifted into a
-    /// gate that runs at the repo root.
+    /// Index into `commands` where the job being read began. A job-level
+    /// qualifier is applied to that range and no further: a job's
+    /// `continue-on-error:` says nothing about its *siblings*, and stamping
+    /// it on the whole file would strip verbatim adoption from every other
+    /// job — substituting a canonical command that may be stricter than the
+    /// one CI actually runs.
+    job_start: usize,
+    job_qualified: bool,
+    job_advisory: bool,
+    /// Set only by the workflow's own top-level `defaults: run:`, which
+    /// genuinely does cover every job in the file.
     file_qualified: bool,
-    /// Column of an open `defaults:` key. Its subtree configures how steps
-    /// run; nothing inside it is a command the workflow executes.
-    defaults_indent: Option<usize>,
+    /// Column of the `jobs:` key, and of the job *names* under it — the
+    /// level at which one job ends and the next begins.
+    jobs_indent: Option<usize>,
+    job_name_indent: Option<usize>,
+    /// Column of an open `defaults:` or `with:` key. Their subtrees
+    /// configure how a step runs, or are arguments handed to an action;
+    /// nothing inside either is a command this workflow executes.
+    suppressed_indent: Option<usize>,
     item_indent: Option<usize>,
     block: Option<Block>,
     /// A folded block's accumulated text, or a literal block's pending
     /// backslash continuation.
     joined: Option<String>,
+    /// Indentation of an open folded block's first content line. YAML folds
+    /// lines at that column into one; a *more*-indented line keeps its
+    /// newline and is a separate command.
+    fold_indent: Option<usize>,
+    /// Column of a `run:` key whose plain inline scalar may continue onto
+    /// following more-indented lines.
+    scalar_indent: Option<usize>,
 }
 
 struct Block {
@@ -328,9 +401,31 @@ impl Scanner {
         let without_comment = strip_comment(line);
         let trimmed = without_comment.trim();
         if trimmed.is_empty() {
+            self.scalar_indent = None;
             return;
         }
         let indent = indent_of(without_comment);
+
+        // A plain inline scalar continues onto more-indented lines that are
+        // neither mapping keys nor sequence items — `run: cargo clippy …`
+        // wrapped onto a second line holding `-- -D warnings`. Reading only
+        // the first line would adopt a *truncated* command as the gate: a
+        // clippy without its `-D warnings` passes on every warning, which is
+        // the "enforces nothing" failure this module exists to close.
+        if let Some(key_indent) = self.scalar_indent {
+            let continues = indent > key_indent
+                && !trimmed.starts_with("- ")
+                && trimmed != "-"
+                && scalar_value(without_comment).is_none();
+            if continues {
+                if let Some((text, _)) = self.pending.last_mut() {
+                    text.push(' ');
+                    text.push_str(trimmed);
+                }
+                return;
+            }
+            self.scalar_indent = None;
+        }
 
         if trimmed.starts_with("- ") || trimmed == "-" {
             // A deeper sequence (an action's list argument, say) is not a new
@@ -344,34 +439,32 @@ impl Scanner {
         let Some((value, key_indent, is_run)) = scalar_value(without_comment) else {
             return;
         };
+        let key = key_of(trimmed);
 
-        // A `defaults:` subtree ends at the first key back at its own column.
-        if self.defaults_indent.is_some_and(|open| key_indent <= open) {
-            self.defaults_indent = None;
+        // A `defaults:`/`with:` subtree ends at the first key back at its own
+        // column.
+        if self
+            .suppressed_indent
+            .is_some_and(|open| key_indent <= open)
+        {
+            self.suppressed_indent = None;
+        }
+        self.track_job_boundary(key, &value, key_indent);
+
+        if qualifies(key, &value) {
+            self.record_qualifier(key, key_indent);
         }
 
-        if qualifies(key_of(trimmed), &value) {
-            // Inside the step being read, the qualifier is that step's alone.
-            // Outside one it covers everything the workflow runs — see
-            // `file_qualified`.
-            if self.defaults_indent.is_none()
-                && self.item_indent.is_some_and(|dash| key_indent > dash)
-            {
-                self.qualified = true;
-            } else {
-                self.file_qualified = true;
-            }
-        }
-
-        if value.is_empty() && key_of(trimmed) == Some("defaults:") {
-            self.defaults_indent = Some(key_indent);
+        if value.is_empty() && matches!(key, Some("defaults:") | Some("with:")) {
+            self.suppressed_indent = Some(key_indent);
         }
 
         // `run:` under `defaults:` is a *mapping* (`shell:`,
-        // `working-directory:`), not a command. Reading it as a block scalar
-        // would swallow the very `working-directory:` that says every step in
-        // the workflow runs somewhere other than the repo root.
-        let is_run = is_run && self.defaults_indent.is_none();
+        // `working-directory:`), not a command, and `run:` under `with:` is
+        // an argument the workflow hands to an action rather than something
+        // it runs itself. Reading either as a block scalar would swallow the
+        // very `working-directory:` that says the steps run elsewhere.
+        let is_run = is_run && self.suppressed_indent.is_none();
         if is_run {
             // A new shell, at the repo root whatever the last one `cd`'d to.
             self.run_id += 1;
@@ -387,10 +480,71 @@ impl Scanner {
                 folded: value.starts_with('>'),
                 is_run,
             });
+            self.fold_indent = None;
         } else if is_run {
+            let quoted = value.starts_with('"') || value.starts_with('\'');
             if let Some(command) = command_text(&value, true) {
                 self.pending.push((command, self.run_id));
+                // A quoted scalar is already delimited; only a plain one can
+                // continue onto the next line.
+                if !quoted {
+                    self.scalar_indent = Some(key_indent);
+                }
             }
+        }
+    }
+
+    /// Note where one job ends and the next begins, so a job-level qualifier
+    /// can be scoped to the job that carries it.
+    fn track_job_boundary(&mut self, key: Option<&str>, value: &str, key_indent: usize) {
+        if key == Some("jobs:") && value.is_empty() {
+            self.jobs_indent = Some(key_indent);
+            return;
+        }
+        if !self.jobs_indent.is_some_and(|jobs| key_indent > jobs) {
+            return;
+        }
+        match self.job_name_indent {
+            // The first key under `jobs:` establishes the column job names
+            // sit at; every later key at that same column is the next job.
+            None => {
+                self.job_name_indent = Some(key_indent);
+                self.start_job();
+            }
+            Some(names) if key_indent == names => self.start_job(),
+            _ => {}
+        }
+    }
+
+    /// Attribute a `working-directory:`/`continue-on-error:` to the narrowest
+    /// thing that carries it — the step, the job, or (for the workflow's own
+    /// `defaults:`) the file.
+    fn record_qualifier(&mut self, key: Option<&str>, key_indent: usize) {
+        let advisory = key == Some(CONTINUE_ON_ERROR_KEY);
+        let in_step = self.suppressed_indent.is_none()
+            && self.item_indent.is_some_and(|dash| key_indent > dash);
+        if in_step {
+            if advisory {
+                self.advisory = true;
+            } else {
+                self.qualified = true;
+            }
+            return;
+        }
+        // A `defaults:` block above the jobs covers the whole workflow; one
+        // inside a job covers that job. (`continue-on-error:` cannot appear
+        // under `defaults: run:` at all — GitHub accepts only `shell:` and
+        // `working-directory:` there — so this branch is the file-wide
+        // working directory.)
+        let workflow_defaults = self
+            .suppressed_indent
+            .is_some_and(|open| self.jobs_indent.is_none_or(|jobs| open <= jobs));
+        if workflow_defaults {
+            self.file_qualified = true;
+        } else if advisory {
+            self.job_advisory = true;
+        } else {
+            self.job_qualified = true;
         }
     }
 
@@ -413,23 +567,39 @@ impl Scanner {
         if indent_of(line) <= block.key_indent {
             self.flush_joined();
             self.block = None;
+            self.fold_indent = None;
             return false;
         }
         if !block.is_run {
             return true;
         }
         let folded = block.folded;
+        let content_indent = indent_of(line);
         let Some(command) = command_text(line, false) else {
             return true;
         };
+        if folded {
+            // YAML folds lines at the block's own indentation into one, but
+            // keeps the newline before a *more*-indented line. Joining those
+            // too would synthesise a command CI never runs — and a
+            // fabricated command is adopted verbatim, so it must not be
+            // invented here.
+            if self.fold_indent.is_some_and(|first| content_indent > first) {
+                self.flush_joined();
+                self.pending.push((command, self.run_id));
+                return true;
+            }
+            self.fold_indent.get_or_insert(content_indent);
+            self.joined = Some(match self.joined.take() {
+                Some(head) => format!("{head} {command}"),
+                None => command,
+            });
+            return true;
+        }
         let joined = match self.joined.take() {
             Some(head) => format!("{head} {command}"),
             None => command,
         };
-        if folded {
-            self.joined = Some(joined);
-            return true;
-        }
         match strip_line_continuation(&joined) {
             Some(head) => self.joined = Some(head),
             None => self.pending.push((joined, self.run_id)),
@@ -444,22 +614,40 @@ impl Scanner {
     }
 
     fn flush_item(&mut self) {
-        let qualified = self.qualified;
+        let (qualified, advisory) = (self.qualified, self.advisory);
         self.commands
             .extend(self.pending.drain(..).map(|(text, run)| RawCommand {
                 text,
                 qualified,
+                advisory,
                 run,
             }));
         self.qualified = false;
+        self.advisory = false;
+    }
+
+    /// Close the job being read, applying its qualifiers to its own commands
+    /// only, and begin the next.
+    fn start_job(&mut self) {
+        self.flush_item();
+        let (qualified, advisory) = (self.job_qualified, self.job_advisory);
+        if qualified || advisory {
+            // Applied at the end because a job-level key may be read after
+            // some of the steps it covers.
+            for command in &mut self.commands[self.job_start..] {
+                command.qualified |= qualified;
+                command.advisory |= advisory;
+            }
+        }
+        self.job_start = self.commands.len();
+        self.job_qualified = false;
+        self.job_advisory = false;
     }
 
     fn finish(mut self) -> Vec<RawCommand> {
         self.flush_joined();
-        self.flush_item();
+        self.start_job();
         if self.file_qualified {
-            // Applied last because a job-level qualifier may be read after
-            // some of the steps it covers have already been flushed.
             for command in &mut self.commands {
                 command.qualified = true;
             }
@@ -583,36 +771,65 @@ fn indent_of(line: &str) -> usize {
 /// and reading each line from the repo root would lift a subdirectory's
 /// command straight into a root-level gate. The caller resets it at each new
 /// `run:`, which really is a fresh shell at the repo root.
-fn enforced_segments<'a>(command: &'a str, moved: &mut bool) -> Vec<(&'a str, bool)> {
+fn enforced_segments<'a>(command: &'a str, moved: &mut bool) -> Vec<(&'a str, bool, bool)> {
     let (pieces, operators) = split_on_operators(command);
     let mut segments = Vec::new();
-    let mut previous_was_or = false;
-    // `cmd || (echo "run cargo fmt"; exit 1)` is not advisory: the fallback
-    // re-fails the step, so CI does require `cmd` to pass. Reading the `||`
-    // alone would drop the evidence and leave a genuinely enforced check out
-    // of the gate — silently, with no warning, which is the failure this
-    // module exists to close. A fallback that exits non-zero anywhere in the
-    // line rescues every `||` in it; that is coarse, and coarse in the safe
-    // direction, since the alternative is losing the check.
-    let rescued = pieces.iter().any(|piece| exits_non_zero(piece));
-    for (position, piece) in pieces.iter().enumerate() {
-        let piece = piece.trim();
-        let followed_by_or = operators.get(position).copied() == Some("||");
-        let is_advisory = (previous_was_or || followed_by_or) && !rescued;
-        previous_was_or = followed_by_or;
-        if piece.is_empty() {
-            continue;
+    let mut index = 0;
+    while index < pieces.len() {
+        let end = chain_end(&pieces, &operators, index);
+        // `cmd || true` is how a repo runs a check it does not enforce.
+        // `cmd || (echo "run cargo fmt"; exit 1)` is the opposite: the
+        // fallback re-fails the step, so CI does require `cmd` to pass, and
+        // dropping it would leave a genuinely enforced check out of the gate
+        // — silently. The question is asked of this `||` chain alone, not of
+        // the whole line, so a hint-and-exit fallback cannot rescue an
+        // unrelated `|| true` sitting beside it.
+        let rescued = pieces[index..=end]
+            .iter()
+            .skip(1)
+            .any(|piece| exits_non_zero(piece));
+        for (position, piece) in pieces[index..=end].iter().enumerate() {
+            let piece = piece.trim();
+            if piece.is_empty() {
+                continue;
+            }
+            if matches!(piece.split_whitespace().next(), Some("cd") | Some("pushd")) {
+                *moved = true;
+                continue;
+            }
+            // Only the command that *starts* a chain is one CI runs on its
+            // own terms; everything after a `||` runs because that one
+            // failed.
+            let enforced = position == 0 && (end == index || rescued);
+            segments.push((piece, !*moved, enforced));
         }
-        if piece.split_whitespace().next() == Some("cd") {
-            *moved = true;
-            continue;
-        }
-        if is_advisory {
-            continue;
-        }
-        segments.push((piece, !*moved));
+        index = end + 1;
     }
     segments
+}
+
+/// The last piece belonging to the `||` chain that starts at `start`.
+///
+/// A chain runs on while the separator is `||`, and also while a bracketed
+/// group is still open — `cmd || (echo hint; exit 1)` is split at the `;`
+/// inside the parentheses, and the `exit 1` that rescues the chain sits on
+/// the far side of it.
+fn chain_end(pieces: &[&str], operators: &[&str], start: usize) -> usize {
+    let mut end = start;
+    while end + 1 < pieces.len() {
+        let open: i32 = pieces[start..=end]
+            .iter()
+            .map(|piece| {
+                piece.matches(['(', '{']).count() as i32 - piece.matches([')', '}']).count() as i32
+            })
+            .sum();
+        if operators.get(end).copied() == Some("||") || open > 0 {
+            end += 1;
+        } else {
+            break;
+        }
+    }
+    end
 }
 
 /// A command line's pieces and the separator that follows each — the last
@@ -659,9 +876,11 @@ fn split_on_operators(command: &str) -> (Vec<&str>, Vec<&str>) {
 /// text this way is never enough to make it a gate command; see
 /// [`Invocation::is_plainly_runnable`] and [`Invocation::adoptable`].
 fn segment_invokes(segment: &str, tool: &[&str]) -> bool {
-    let mut words = segment
+    if tool.is_empty() {
+        return false;
+    }
+    let mut words = strip_env_assignments(segment)
         .split_whitespace()
-        .skip_while(|word| is_env_assignment(word))
         .enumerate()
         .filter(|(position, word)| !(*position > 0 && word.starts_with('+')))
         .map(|(_, word)| word);
@@ -696,16 +915,41 @@ fn exits_non_zero(piece: &str) -> bool {
         .is_none_or(|status| status.trim_matches(|ch| ch == '(' || ch == ')') != "0")
 }
 
-/// Whether a word is a leading `KEY=value` environment assignment rather
-/// than the command itself.
-fn is_env_assignment(word: &str) -> bool {
-    let Some((key, _)) = word.split_once('=') else {
-        return false;
-    };
-    !key.is_empty()
-        && key
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+/// `segment` with any leading `KEY=value` environment assignments removed.
+///
+/// Quoting is the whole reason this works on the string rather than on
+/// whitespace-separated words. `RUSTFLAGS="-D warnings" cargo clippy
+/// --all-targets` is the standard way a Rust workflow denies warnings, and
+/// splitting it on whitespace yields `RUSTFLAGS="-D` and `warnings"` — the
+/// second of which is not an assignment, so a word-wise skip stops there and
+/// never reaches `cargo`. The clippy invocation would then go unseen
+/// entirely and the gate would be silently narrower than CI, which is the
+/// defect this module exists to close.
+fn strip_env_assignments(segment: &str) -> &str {
+    let mut rest = segment.trim_start();
+    loop {
+        let Some(equals) = rest.find('=') else {
+            return rest;
+        };
+        let key = &rest[..equals];
+        if key.is_empty()
+            || !key
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        {
+            return rest;
+        }
+        let value = &rest[equals + 1..];
+        let consumed = match value.chars().next() {
+            Some(quote @ ('"' | '\'')) => match value[1..].find(quote) {
+                Some(closing) => closing + 2,
+                // An unterminated quote is not something to guess at.
+                None => return rest,
+            },
+            _ => value.find(char::is_whitespace).unwrap_or(value.len()),
+        };
+        rest = value[consumed..].trim_start();
+    }
 }
 
 #[cfg(test)]
@@ -784,9 +1028,21 @@ mod tests {
     }
 
     #[test]
-    fn a_run_line_inside_another_keys_block_is_not_a_command_this_workflow_runs() {
+    fn a_command_inside_another_keys_block_is_not_a_command_this_workflow_runs() {
+        // The body is a bare invocation on purpose: a fixture whose body
+        // starts with `run: ` would pass even without the guard, because the
+        // literal `run:` prefix is what stops it matching a tool.
         let evidence = read(
-            "steps:\n  - uses: some/action@v1\n    with:\n      script: |\n        run: cargo clippy --fix --allow-dirty\n",
+            "steps:\n  - uses: some/action@v1\n    with:\n      script: |\n        cargo fmt --all -- --check\n",
+        );
+        assert_eq!(command_of(&evidence, FMT), None);
+        assert_eq!(evidence.invocations.len(), 0, "{:?}", evidence.invocations);
+    }
+
+    #[test]
+    fn a_run_key_handed_to_an_action_as_an_argument_is_not_a_command() {
+        let evidence = read(
+            "steps:\n  - uses: some/action@v1\n    with:\n      run: cargo clippy --all-targets -- -D warnings\n",
         );
         assert_eq!(command_of(&evidence, CLIPPY), None);
     }
@@ -859,7 +1115,7 @@ mod tests {
     }
 
     #[test]
-    fn a_job_level_continue_on_error_disqualifies_the_steps_it_covers() {
+    fn a_job_level_continue_on_error_covers_the_steps_of_that_job() {
         // `jobs.<id>.continue-on-error` marks a whole job advisory. Its steps
         // are still evidence the tool runs, but CI does not require them to
         // pass, so lifting one into a gate would enforce something CI does
@@ -868,7 +1124,34 @@ mod tests {
             "jobs:\n  lint:\n    continue-on-error: true\n    steps:\n      - run: cargo clippy --all-targets -- -D warnings\n",
         );
         let invocation = first(&evidence, CLIPPY).unwrap();
-        assert!(!invocation.adoptable, "{invocation:?}");
+        assert!(!invocation.enforced, "{invocation:?}");
+    }
+
+    #[test]
+    fn a_job_level_continue_on_error_read_after_its_steps_still_covers_them() {
+        // Job keys are unordered, so the qualifier can follow the steps it
+        // covers — which is why a job's commands are held and stamped when
+        // the job ends rather than as each step is read.
+        let evidence = read(
+            "jobs:\n  lint:\n    steps:\n      - run: cargo clippy --all-targets -- -D warnings\n    continue-on-error: true\n",
+        );
+        assert!(!first(&evidence, CLIPPY).unwrap().enforced);
+    }
+
+    #[test]
+    fn one_advisory_job_does_not_disqualify_another_jobs_commands() {
+        // A job's `continue-on-error:` says nothing about its siblings.
+        // Stamping it on the whole file would strip verbatim adoption from
+        // the required job too, substituting a canonical command that may be
+        // stricter than the one CI actually runs.
+        let evidence = read(
+            "jobs:\n  lint:\n    steps:\n      - run: cargo clippy --all-targets -- -D warnings\n  nightly:\n    continue-on-error: true\n    steps:\n      - run: cargo +nightly test --workspace\n",
+        );
+        let invocation = first(&evidence, CLIPPY).unwrap();
+        assert!(
+            invocation.enforced && invocation.adoptable,
+            "{invocation:?}"
+        );
     }
 
     #[test]
@@ -919,12 +1202,16 @@ mod tests {
     }
 
     #[test]
-    fn an_advisory_invocation_is_not_evidence_at_all() {
+    fn an_advisory_invocation_is_evidence_but_not_enforced() {
         // `|| true` is how a repo runs a check it does not enforce. CI
-        // ignores the exit status; a gate would not, and every dispatch
-        // into a repo CI is happy with would fail.
+        // ignores the exit status; a gate would not, and every dispatch into
+        // a repo CI is happy with would fail. So it stays visible as
+        // evidence the tool runs — the caller needs that to explain itself —
+        // and carries `enforced: false` so no command is proposed for it.
         let evidence = read("steps:\n  - run: cargo clippy --all-targets -- -D warnings || true\n");
-        assert_eq!(command_of(&evidence, CLIPPY), None);
+        let invocation = first(&evidence, CLIPPY).unwrap();
+        assert!(!invocation.enforced, "{invocation:?}");
+        assert_eq!(invocation.gate_command(CLIPPY), None);
     }
 
     #[test]
@@ -943,7 +1230,7 @@ mod tests {
     #[test]
     fn a_fallback_that_swallows_the_failure_is_still_advisory() {
         let evidence = read("steps:\n  - run: cargo clippy --all-targets -- -D warnings || true\n");
-        assert_eq!(command_of(&evidence, CLIPPY), None);
+        assert!(!first(&evidence, CLIPPY).unwrap().enforced);
     }
 
     #[test]
@@ -1023,13 +1310,20 @@ mod tests {
     }
 
     #[test]
-    fn a_continue_on_error_step_is_evidence_but_not_adoptable() {
+    fn a_continue_on_error_step_is_evidence_but_not_enforced() {
         // The key sits *after* the `run:` it qualifies, which is why a step's
         // commands are held until the whole step has been read.
+        //
+        // Not *adoptable*: the command runs at the repo root and is perfectly
+        // runnable. What it is not is required to pass — which is a different
+        // fact with a different consequence, and collapsing the two is how an
+        // advisory check becomes the strictest possible gate.
         let evidence = read(
             "steps:\n  - run: cargo clippy --all-targets -- -D warnings\n    continue-on-error: true\n",
         );
-        assert!(!first(&evidence, CLIPPY).unwrap().adoptable);
+        let invocation = first(&evidence, CLIPPY).unwrap();
+        assert!(invocation.adoptable, "{invocation:?}");
+        assert!(!invocation.enforced, "{invocation:?}");
     }
 
     #[test]
@@ -1074,6 +1368,120 @@ mod tests {
     fn a_step_name_that_merely_mentions_a_tool_is_not_evidence() {
         let evidence = read("steps:\n  - name: cargo clippy\n    uses: some/action@v1\n");
         assert_eq!(command_of(&evidence, CLIPPY), None);
+    }
+
+    #[test]
+    fn a_quoted_env_assignment_does_not_hide_the_command_after_it() {
+        // `RUSTFLAGS="-D warnings" cargo clippy …` is the standard way a
+        // workflow denies warnings. Splitting on whitespace yields
+        // `RUSTFLAGS="-D` and `warnings"`, so a word-wise skip stops before
+        // `cargo` and the invocation is never seen at all — the gate is then
+        // silently narrower than CI, for a repo whose CI is stricter than
+        // most.
+        let evidence =
+            read("steps:\n  - run: RUSTFLAGS=\"-D warnings\" cargo clippy --all-targets\n");
+        let invocation = first(&evidence, CLIPPY).unwrap();
+        assert!(invocation.enforced);
+        // Still not adoptable text: the env prefix is part of what CI runs.
+        assert!(!invocation.is_plainly_runnable(CLIPPY));
+    }
+
+    #[test]
+    fn a_single_quoted_env_assignment_is_skipped_too() {
+        let evidence = read("steps:\n  - run: FOO='a b' cargo fmt --all -- --check\n");
+        assert!(first(&evidence, FMT).is_some());
+    }
+
+    #[test]
+    fn an_unterminated_quote_is_not_guessed_at() {
+        let evidence = read("steps:\n  - run: FOO=\"oops cargo fmt --all -- --check\n");
+        assert_eq!(command_of(&evidence, FMT), None);
+    }
+
+    #[test]
+    fn a_pushd_moves_the_shell_the_same_way_cd_does() {
+        let evidence = read(
+            "steps:\n  - run: pushd crates/engine && cargo clippy --all-targets -- -D warnings\n",
+        );
+        assert!(!first(&evidence, CLIPPY).unwrap().adoptable);
+    }
+
+    #[test]
+    fn a_more_indented_line_of_a_folded_block_is_its_own_command() {
+        // YAML folds a folded block's lines at its own indentation into one
+        // and keeps the newline before a more-indented line. Joining those
+        // too would synthesise `cargo clippy --all-targets -- -D warnings`
+        // out of three separate commands — a command CI never runs, adopted
+        // verbatim as the gate.
+        let evidence = read(
+            "steps:\n  - run: >-\n      cargo clippy\n        --all-targets\n      -- -D warnings\n",
+        );
+        assert_eq!(command_of(&evidence, CLIPPY), Some("cargo clippy"));
+    }
+
+    #[test]
+    fn a_plain_inline_scalar_continues_onto_more_indented_lines() {
+        // Reading only the first line would adopt `cargo clippy
+        // --all-targets` — no `-D warnings`, so it passes on every warning —
+        // as the gate. That is the "enforces nothing" mode.
+        let evidence = read(
+            "steps:\n  - name: clippy\n    run: cargo clippy --workspace --all-targets\n      -- -D warnings\n",
+        );
+        assert_eq!(
+            command_of(&evidence, CLIPPY),
+            Some("cargo clippy --workspace --all-targets -- -D warnings")
+        );
+    }
+
+    #[test]
+    fn a_following_key_does_not_continue_an_inline_scalar() {
+        let evidence = read("steps:\n  - run: cargo fmt --all -- --check\n    name: formatting\n");
+        assert_eq!(
+            command_of(&evidence, FMT),
+            Some("cargo fmt --all -- --check")
+        );
+    }
+
+    #[test]
+    fn an_exit_zero_fallback_does_not_rescue_an_advisory_check() {
+        let evidence = read(
+            "steps:\n  - run: cargo clippy --all-targets -- -D warnings || (echo skipping; exit 0)\n",
+        );
+        assert!(!first(&evidence, CLIPPY).unwrap().enforced);
+    }
+
+    #[test]
+    fn a_brace_fallback_that_exits_non_zero_rescues_the_check() {
+        let evidence =
+            read("steps:\n  - run: cargo fmt --all -- --check || { echo run fmt; exit 1; }\n");
+        assert!(first(&evidence, FMT).unwrap().enforced);
+    }
+
+    #[test]
+    fn a_rescue_does_not_reach_an_unrelated_advisory_check_on_the_same_line() {
+        // Scoped to its own `||` chain. A hint-and-exit fallback beside a
+        // `|| true` must not promote the advisory one into a hard gate.
+        let evidence = read(
+            "steps:\n  - run: cargo clippy --all-targets -- -D warnings || true; cargo fmt --all -- --check || (echo hint; exit 1)\n",
+        );
+        assert!(!first(&evidence, CLIPPY).unwrap().enforced);
+        assert!(first(&evidence, FMT).unwrap().enforced);
+    }
+
+    #[test]
+    fn a_quoted_qualifier_value_is_read_like_an_unquoted_one() {
+        let evidence =
+            read("steps:\n  - run: cargo fmt --all -- --check\n    working-directory: \".\"\n");
+        assert!(first(&evidence, FMT).unwrap().adoptable);
+    }
+
+    #[test]
+    fn an_empty_tool_matches_nothing() {
+        let evidence = read("steps:\n  - run: rm -rf /tmp/x\n");
+        assert!(evidence.invocations_of(&[]).next().is_none());
+        let invocation = &evidence.invocations[0];
+        assert!(!invocation.is_plainly_runnable(&[]));
+        assert_eq!(invocation.gate_command(&[]), None);
     }
 
     #[test]
