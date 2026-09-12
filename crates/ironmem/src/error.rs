@@ -107,3 +107,46 @@ pub enum MemoryError {
     #[error("Not ready: {0}")]
     NotReady(String),
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_capped_read_refuses_anything_that_is_not_a_regular_file() {
+        // The cap bounds a regular file's bytes; a directory or a character
+        // device has no length to bound, and a caller that skipped the check
+        // would read unbounded. Both callers happen to pre-screen today, so
+        // without this the guard is never executed by any test.
+        let dir = tempfile::tempdir().unwrap();
+
+        let err = read_to_string_capped(dir.path(), 1024, "build manifest").unwrap_err();
+
+        assert!(err.contains("not a regular file"), "got: {err}");
+    }
+
+    #[test]
+    fn a_capped_read_refuses_a_file_over_the_limit_and_names_both_it_and_the_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.toml");
+        std::fs::write(&path, "x".repeat(64)).unwrap();
+
+        let err = read_to_string_capped(&path, 8, "build manifest").unwrap_err();
+
+        assert!(
+            err.contains("big.toml") && err.contains("build manifest"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_capped_read_strips_a_leading_bom() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manifest.toml");
+        std::fs::write(&path, "\u{FEFF}[workspace]\n").unwrap();
+
+        let content = read_to_string_capped(&path, 1024, "build manifest").unwrap();
+
+        assert!(content.starts_with("[workspace]"), "got: {content:?}");
+    }
+}

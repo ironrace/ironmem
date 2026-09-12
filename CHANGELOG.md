@@ -539,13 +539,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wherever that command can be executed as written *and* means what it
   appears to mean — a `cargo fmt --all` with no `--check` (an auto-format
   workflow) rewrites the tree and always exits 0, a `cargo clippy … || true`
-  is advisory, a `continue-on-error:` step is not required to pass, and a
-  `working-directory:` or `cd sub &&` command does not run at the repo root.
-  None of those become a gate. Where two workflows run the same tool
+  is advisory, a `continue-on-error:` step or job is not required to pass, and
+  a `working-directory:` or `cd sub &&` command does not run at the repo root.
+  None of those become a gate. A repo whose *only* invocation of a tool
+  rewrites the tree gets **no command for that check at all**, not the
+  canonical one: CI fixing your formatting for you is not evidence the repo is
+  checked for it, and it is the repo least likely to pass a strict `--check`. Where two workflows run the same tool
   differently, neither is chosen: nothing here reads `on:` triggers or
-  required-check status, so the disagreement is reported instead. That is the faithful
-  thing to propose and it is satisfiable by construction: CI runs it on every
-  merge to the default branch. Where CI's text cannot be run as written —
+  required-check status, so the disagreement is reported instead. Taking CI's
+  own command is the faithful thing to propose, and it is satisfiable by
+  construction: CI runs it on every merge to the default branch. Where CI's
+  text cannot be run as written —
   multi-line shell, a `${{ }}` expression only a runner resolves, an absolute
   toolchain path — a canonical command (`cargo fmt --all -- --check`,
   `cargo clippy … -- -D warnings`, `--workspace` tracking the same
@@ -560,7 +564,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   New `autopilot::ci_evidence` is the bounded reader behind this — `run:`
   steps out of `.github/workflows/*.yml`, with no anchors, matrices, job
   graph or expression resolution, and no claim to know which jobs are
-  required. A folded `run: >-` block is joined the way YAML joins it, because
+  required — a check that runs only on a schedule or behind an `if:` reads
+  exactly like one that runs on every merge, which is part of why a proposal is
+  something a human approves rather than something that takes effect. A folded
+  `run: >-` block is joined the way YAML joins it, because
   reading its lines separately would adopt a *truncated* command — `cargo
   clippy --all-targets` without the `-- -D warnings` on the next line — as the
   gate, which is this defect over again. A tool enforced only through a

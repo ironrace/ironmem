@@ -375,21 +375,38 @@ fn infer_rust(
     let mut commands = Vec::new();
     for check in rust_checks(is_workspace) {
         let candidates: Vec<&ci_evidence::Invocation> = ci.invocations_of(check.tool).collect();
-        let Some(first) = candidates.first() else {
+        let Some(any) = candidates.first() else {
+            continue;
+        };
+        // Only the invocations that *check*. A repo whose sole `cargo fmt`
+        // step rewrites the tree is not a repo that enforces formatting — it
+        // is one that fixes it for you — so there is no check here to put in a
+        // gate, and proposing the canonical one would hand the strictest
+        // possible gate to the repo least likely to pass it. Evidence of a
+        // rewrite is evidence about the tool, not about the check.
+        let checked: Vec<&&ci_evidence::Invocation> = candidates
+            .iter()
+            .filter(|invocation| check.accepts(&invocation.command))
+            .collect();
+        let Some(first) = checked.first() else {
+            warnings.push(format!(
+                "{} runs `{}`, which rewrites the tree rather than checking it, so no `{}` \
+                 command is proposed — nothing in CI says this repo is checked for it",
+                any.workflow,
+                any.command,
+                check.tool.join(" ")
+            ));
             continue;
         };
         // Distinct, because two workflows running the byte-identical command
         // is agreement, not ambiguity.
         let mut usable: Vec<&str> = Vec::new();
-        for invocation in &candidates {
-            let is_usable = invocation.adoptable
-                && invocation.is_plainly_runnable(check.tool)
-                && check.accepts(&invocation.command);
+        for invocation in &checked {
+            let is_usable = invocation.adoptable && invocation.is_plainly_runnable(check.tool);
             if is_usable && !usable.contains(&invocation.command.as_str()) {
                 usable.push(&invocation.command);
             }
         }
-        let canonical = check.canonical.clone();
         match usable.as_slice() {
             [only] => {
                 commands.push((*only).to_string());
@@ -397,10 +414,10 @@ fn infer_rust(
             }
             // Nothing usable: CI runs the tool in a form a gate cannot take.
             [] => warnings.push(format!(
-                "{} runs `{}`, which a gate cannot take as written, so `{canonical}` is \
+                "{} runs `{}`, which a gate cannot take as written, so `{}` is \
                  proposed instead — it may be stricter than what CI enforces; check it passes \
                  before approving",
-                first.workflow, first.command
+                first.workflow, first.command, check.canonical
             )),
             // Several, disagreeing. Nothing here knows which workflow runs on
             // a merge to the default branch — `on:` triggers and required
@@ -408,15 +425,16 @@ fn infer_rust(
             // one direction that matters, and the stricter guess blocks work
             // CI would have accepted.
             many => warnings.push(format!(
-                "CI runs {} different `{}` commands ({}), so none of them can be taken as the \
-                 gate; `{canonical}` is proposed instead — it may be stricter than what CI \
+                "CI runs {} different `{}` commands (`{}`), so none of them can be taken as the \
+                 gate; `{}` is proposed instead — it may be stricter than what CI \
                  enforces; check it passes before approving",
                 many.len(),
                 check.tool.join(" "),
-                many.join("`, `")
+                many.join("`, `"),
+                check.canonical
             )),
         }
-        commands.push(canonical);
+        commands.push(check.canonical);
     }
     commands.push(
         if is_workspace {
@@ -1395,16 +1413,74 @@ mod tests {
     }
 
     #[test]
-    fn a_tree_rewriting_invocation_is_never_adopted_as_a_check() {
+    fn a_repo_whose_only_invocation_rewrites_the_tree_gets_no_check_at_all() {
         // An auto-format workflow's `cargo fmt --all` exits 0 whatever it
-        // finds *and* rewrites the worktree. As a gate command it would
-        // enforce nothing while editing files under the IC.
+        // finds *and* rewrites the worktree, so it can never be the gate
+        // command. Nor is it grounds for proposing the canonical one: a repo
+        // that has CI fix its formatting is the repo least likely to pass a
+        // strict `--check`, and evidence-gating exists to keep exactly that
+        // repo out of a gate it can never satisfy.
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "Cargo.toml", "[package]\nname = \"x\"\n");
         workflow(
             dir.path(),
             "autofmt.yml",
             "steps:\n  - run: cargo fmt --all\n",
+        );
+
+        let inferred = infer_gate_commands(dir.path()).unwrap();
+
+        assert_eq!(inferred.commands, vec!["cargo test".to_string()]);
+        assert_eq!(inferred.warnings.len(), 1, "{:?}", inferred.warnings);
+        assert!(
+            inferred.warnings[0].contains("rewrites the tree"),
+            "got: {:?}",
+            inferred.warnings
+        );
+    }
+
+    #[test]
+    fn a_rewriting_workflow_does_not_shadow_a_real_check_elsewhere() {
+        // The autofix workflow sorts first. The gate must still come from the
+        // workflow that actually checks.
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "Cargo.toml", "[package]\nname = \"x\"\n");
+        workflow(
+            dir.path(),
+            "autofix.yml",
+            "steps:\n  - run: cargo clippy --fix --allow-dirty\n",
+        );
+        workflow(
+            dir.path(),
+            "ci.yml",
+            "steps:\n  - run: cargo clippy --all-targets -- -D warnings\n",
+        );
+
+        let inferred = infer_gate_commands(dir.path()).unwrap();
+
+        assert_eq!(
+            inferred.commands,
+            vec![
+                "cargo clippy --all-targets -- -D warnings".to_string(),
+                "cargo test".to_string(),
+            ]
+        );
+        assert!(inferred.warnings.is_empty(), "{:?}", inferred.warnings);
+    }
+
+    #[test]
+    fn a_fallback_warning_names_the_workflow_that_checks_not_the_one_that_rewrites() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "Cargo.toml", "[package]\nname = \"x\"\n");
+        workflow(
+            dir.path(),
+            "autofmt.yml",
+            "steps:\n  - run: cargo fmt --all\n",
+        );
+        workflow(
+            dir.path(),
+            "ci.yml",
+            "steps:\n  - run: \"$HOME/.cargo/bin/cargo fmt --all -- --check\"\n",
         );
 
         let inferred = infer_gate_commands(dir.path()).unwrap();
@@ -1417,28 +1493,11 @@ mod tests {
             ]
         );
         assert_eq!(inferred.warnings.len(), 1, "{:?}", inferred.warnings);
-    }
-
-    #[test]
-    fn a_clippy_fix_invocation_is_never_adopted_as_a_check() {
-        let dir = tempfile::tempdir().unwrap();
-        write(dir.path(), "Cargo.toml", "[package]\nname = \"x\"\n");
-        workflow(
-            dir.path(),
-            "autofix.yml",
-            "steps:\n  - run: cargo clippy --fix --allow-dirty\n",
+        assert!(
+            inferred.warnings[0].contains("ci.yml"),
+            "the warning must point at the workflow that checks, got: {:?}",
+            inferred.warnings
         );
-
-        let inferred = infer_gate_commands(dir.path()).unwrap();
-
-        assert_eq!(
-            inferred.commands,
-            vec![
-                "cargo clippy --all-targets --all-features -- -D warnings".to_string(),
-                "cargo test".to_string(),
-            ]
-        );
-        assert_eq!(inferred.warnings.len(), 1, "{:?}", inferred.warnings);
     }
 
     #[test]
