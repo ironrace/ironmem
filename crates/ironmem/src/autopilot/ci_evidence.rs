@@ -10,30 +10,34 @@
 //!
 //! # The gate is a proxy for CI, so prefer CI's own command
 //!
-//! An invocation this module reads becomes a gate command **only when it is
-//! plainly runnable as written** — see [`Invocation::is_plainly_runnable`].
-//! That is the faithful thing to propose: a command CI runs on every merge to
-//! the default branch is, by construction, one the repo can satisfy, and
+//! An invocation this module reads becomes a gate command only when it is
+//! **plainly runnable** as written ([`Invocation::is_plainly_runnable`]) *and*
+//! **adoptable** ([`Invocation::adoptable`]) — nothing about the step qualifies
+//! how it runs. Such a command is the faithful thing to propose: CI runs it on
+//! every merge to the default branch, so it is satisfiable by construction, and
 //! matching it exactly is the whole point (a gate stricter than CI blocks work
 //! CI would have accepted; a gate looser than CI is the defect above).
 //!
-//! When the invocation is *not* plainly runnable — multi-line shell, a `${{ }}`
-//! expression only a workflow runner resolves, an absolute toolchain path that
-//! exists only on the runner — the caller falls back to its own canonical
-//! command and says so on the proposal, because inventing a local equivalent
-//! of runner-specific text is exactly the guess that produces a gate nobody
-//! can pass.
+//! Everything else the caller falls back to its own canonical command for, and
+//! says so on the proposal. The two failure modes this module must never cause
+//! are a gate that **cannot pass** and a gate that **enforces nothing**, so
+//! every ambiguity resolves toward "tell the human" rather than toward a guess.
 //!
 //! # Bounded reader, not a YAML parser
 //!
-//! This finds command text and stops: no anchors, no matrices, no job graph,
-//! no `env`/expression resolution, no knowledge of which jobs are required,
-//! `if:`-conditional or `continue-on-error:`. A tool enforced only through a
-//! third-party action (`uses: actions-rs/clippy-check@v1`) or behind an
-//! indirection (`make lint`, `cargo xtask ci`) is therefore invisible here,
-//! and such a repo onboards exactly as it did before this module existed. The
-//! human approval step is the backstop the spec's own risk table names for a
-//! wrongly inferred gate command.
+//! This finds command text and stops: no anchors, no matrices, no job graph, no
+//! `env`/expression resolution, no `on:` triggers, and no knowledge of which
+//! jobs are *required*. It does read three step-level facts that decide whether
+//! a command means what it appears to mean — `working-directory:`,
+//! `continue-on-error:`, and the `||` a step uses to make a check advisory —
+//! because ignoring those is how a command CI tolerates failing, or runs
+//! somewhere else entirely, becomes a hard gate at the repo root.
+//!
+//! A tool enforced only through a third-party action (`uses:
+//! actions-rs/clippy-check@v1`) or behind an indirection (`make lint`, `cargo
+//! xtask ci`) is invisible here, and such a repo onboards exactly as it did
+//! before this module existed. The human approval step is the backstop the
+//! spec's own risk table names for a wrongly inferred gate command.
 //!
 //! # Scope: GitHub Actions
 //!
@@ -48,7 +52,7 @@ use std::path::{Path, PathBuf};
 /// Generous cap on a workflow file's size, mirroring `onboard`'s manifest
 /// cap: a real workflow is a few KB, and `read_to_string` has no bound of
 /// its own.
-pub(super) const MAX_WORKFLOW_BYTES: u64 = 1024 * 1024;
+const MAX_WORKFLOW_BYTES: u64 = 1024 * 1024;
 
 /// Characters a command may contain and still be run as written. Everything
 /// outside this set — `$`, quotes, braces, backslashes, redirections, globs
@@ -59,6 +63,13 @@ pub(super) const MAX_WORKFLOW_BYTES: u64 = 1024 * 1024;
 /// gate every dispatch then fails on.
 const PLAIN_COMMAND_CHARS: &[char] = &['_', '.', '/', ':', '=', '+', ',', '-', '@'];
 
+/// Step keys that change what running the step's command would mean, and so
+/// disqualify its text from being adopted verbatim. `working-directory:`
+/// runs it somewhere other than the repo root — the gate has no such notion
+/// — and `continue-on-error:` means CI does not actually require it to pass,
+/// so promoting it to a gate command would enforce something CI does not.
+const QUALIFYING_STEP_KEYS: &[&str] = &["working-directory:", "continue-on-error:"];
+
 /// One command a repo's CI runs, and the workflow it came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Invocation {
@@ -67,6 +78,12 @@ pub struct Invocation {
     /// File name of the workflow it was read from, for a warning that has to
     /// tell a human where to look.
     pub workflow: String,
+    /// Whether the *context* allows this text to become a gate command:
+    /// false when the step qualified how it runs (see
+    /// [`QUALIFYING_STEP_KEYS`]) or when the command line moved somewhere
+    /// else first (`cd sub && …`). Still evidence that the tool is enforced
+    /// — just not text that can be lifted out and run at the repo root.
+    pub adoptable: bool,
 }
 
 impl Invocation {
@@ -111,15 +128,12 @@ impl CiCommands {
     ///
     /// Both path segments are resolved by exact name from a directory
     /// listing rather than through `Path::join`, for the reason
-    /// `onboard::exact_file_exists` documents: the OS path layer is
-    /// case-insensitive on a default macOS filesystem and case-sensitive on
-    /// the Linux runners these commands actually run on, so joining would let
-    /// the same commit infer different gates on different machines.
+    /// [`super::exact_entry`] documents.
     pub fn read(repo_path: &Path) -> Self {
         let mut evidence = Self::default();
 
-        let workflows = match exact_child(repo_path, ".github")
-            .and_then(|github| github.map_or(Ok(None), |dir| exact_child(&dir, "workflows")))
+        let workflows = match super::exact_entry(repo_path, ".github")
+            .and_then(|github| github.map_or(Ok(None), |dir| super::exact_entry(&dir, "workflows")))
         {
             Ok(Some(dir)) => dir,
             Ok(None) => return evidence,
@@ -157,12 +171,15 @@ impl CiCommands {
                 .unwrap_or_default();
             match crate::error::read_to_string_capped(&file, MAX_WORKFLOW_BYTES, "CI workflow") {
                 Ok(content) => {
-                    for command in run_commands(&content) {
+                    for raw in run_commands(&content) {
                         evidence
                             .invocations
-                            .extend(shell_segments(&command).map(|segment| Invocation {
-                                command: segment.to_string(),
-                                workflow: workflow.clone(),
+                            .extend(enforced_segments(&raw.text).map(|(segment, adoptable)| {
+                                Invocation {
+                                    command: segment.to_string(),
+                                    workflow: workflow.clone(),
+                                    adoptable: adoptable && !raw.qualified,
+                                }
                             }));
                     }
                 }
@@ -179,118 +196,218 @@ impl CiCommands {
         ));
     }
 
-    /// The CI invocation of `tool` (a word sequence, e.g.
-    /// `["cargo", "clippy"]`) a gate should be built from, or `None` if CI
-    /// never runs it.
+    /// Every CI invocation of `tool` (a word sequence, e.g.
+    /// `["cargo", "clippy"]`), in workflow file-name order.
     ///
-    /// Prefers a plainly runnable invocation over one that merely proves the
-    /// tool is enforced, wherever each sits: a repo whose nightly workflow
-    /// sorts before `ci.yml` must not be judged by the nightly wording when
-    /// the required job's command could have been used verbatim.
-    pub fn invocation_of(&self, tool: &[&str]) -> Option<&Invocation> {
-        let mut first_match = None;
-        for invocation in self
-            .invocations
+    /// All of them, not the first: which one a gate should be built from is
+    /// the caller's policy decision, and a caller that cannot tell two
+    /// disagreeing invocations apart must be able to see that there are two.
+    /// This module has no way to know which workflow runs on merge to the
+    /// default branch.
+    pub fn invocations_of<'a>(
+        &'a self,
+        tool: &'a [&'a str],
+    ) -> impl Iterator<Item = &'a Invocation> {
+        self.invocations
             .iter()
-            .filter(|invocation| segment_invokes(&invocation.command, tool))
-        {
-            if invocation.is_plainly_runnable(tool) {
-                return Some(invocation);
-            }
-            first_match.get_or_insert(invocation);
-        }
-        first_match
+            .filter(move |invocation| segment_invokes(&invocation.command, tool))
     }
 }
 
-/// `<parent>/<name>`, but only when an entry with *exactly* that name is in
-/// `parent`'s listing (see [`CiCommands::read`] on why the path layer is not
-/// trusted to answer this). A missing `parent` is `Ok(None)`: nothing to
-/// read, nothing to report. Any other listing failure is the caller's to
-/// report, because a directory that exists and cannot be read is not the
-/// same as one that does not exist.
-fn exact_child(parent: &Path, name: &str) -> Result<Option<PathBuf>, String> {
-    let entries = match std::fs::read_dir(parent) {
-        Ok(entries) => entries,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(format!("failed to read '{}': {err}", parent.display())),
-    };
-    Ok(entries
-        .filter_map(Result::ok)
-        .find(|entry| entry.file_name() == std::ffi::OsStr::new(name))
-        .map(|entry| entry.path()))
+/// One command line read out of a `run:` step, with the step-level context
+/// that decides whether its text may be adopted.
+struct RawCommand {
+    text: String,
+    qualified: bool,
 }
 
-/// Every command line a workflow's `run:` steps execute, in file order.
+/// Every command line a workflow's `run:` steps execute, in file order, each
+/// tagged with whether its step qualified how it runs.
 ///
-/// Handles the two forms a `run:` value takes: an inline scalar
-/// (`run: cargo test`, optionally quoted) and a block scalar (`run: |`,
-/// `run: >-`, …) whose more-indented lines are the script. A block ends at
-/// the first non-blank line indented no further than the **`run:` key
-/// itself** — not the `- ` that may precede it, which sits two columns
-/// further left and would swallow the step's sibling keys (`name:`, `env:`)
-/// as commands.
+/// Handles the forms a `run:` value takes: an inline scalar (`run: cargo
+/// test`, optionally quoted), a literal block (`run: |`) whose lines are
+/// separate commands, and a **folded** block (`run: >`, `run: >-`) whose
+/// lines YAML joins into one. Folding is not cosmetic: `run: >-` is the
+/// common way to wrap a long command, and reading its lines separately would
+/// adopt a *truncated* command — `cargo clippy --all-targets` without the
+/// `-- -D warnings` on the next line — as the gate, which is the #334 defect
+/// all over again.
 ///
-/// A line ending in `\` continues onto the next, as the shell reads it:
-/// without that, a wrapped invocation is captured in truncated form and then
-/// reported as disagreeing with the command it is character-for-character
-/// identical to.
-fn run_commands(content: &str) -> Vec<String> {
-    let mut commands = Vec::new();
-    let mut block_key_indent: Option<usize> = None;
-    let mut continued: Option<String> = None;
-
+/// A block ends at the first non-blank line indented no further than the
+/// **`run:` key itself** — not the `- ` that may precede it, which sits two
+/// columns further left and would swallow the step's sibling keys (`name:`,
+/// `env:`) as commands. A block scalar under any *other* key is skipped
+/// entirely, so a `run:` line inside e.g. a `script: |` payload is not read
+/// as a command this workflow runs.
+///
+/// Inside a literal block a line ending in an odd number of `\` continues
+/// onto the next, as the shell reads it: without that, a wrapped invocation
+/// is captured in truncated form.
+fn run_commands(content: &str) -> Vec<RawCommand> {
+    let mut scanner = Scanner::default();
     for line in content.lines() {
-        if let Some(key_indent) = block_key_indent {
-            if line.trim().is_empty() {
-                continue;
-            }
-            if indent_of(line) > key_indent {
-                if let Some(command) = command_text(line) {
-                    match continued.take() {
-                        Some(head) => continued = Some(format!("{head} {command}")),
-                        None => continued = Some(command),
-                    }
-                    let joined = continued.as_ref().expect("just assigned");
-                    if joined.ends_with('\\') {
-                        continued = Some(joined.trim_end_matches('\\').trim_end().to_string());
-                        continue;
-                    }
-                    commands.push(continued.take().expect("just checked"));
-                }
-                continue;
-            }
-            commands.extend(continued.take());
-            // Dedented out of the block — fall through and read this line as
-            // an ordinary one; it may itself be the next `run:` key.
-            block_key_indent = None;
-        }
-
-        let Some((value, key_indent)) = run_value(line) else {
-            continue;
-        };
-        if value.is_empty() || value.starts_with('|') || value.starts_with('>') {
-            block_key_indent = Some(key_indent);
-        } else if let Some(command) = command_text(&value) {
-            commands.push(command);
-        }
+        scanner.read_line(line);
     }
-    commands.extend(continued);
-
-    commands
+    scanner.finish()
 }
 
-/// The value of a `run:` mapping key on this line and the column the key
-/// itself starts at, if it is one. Accepts the `- run:` sequence-item form
-/// as well as a bare `run:`; anything else (including a `name: cargo clippy`
-/// step *label*, which names a tool without running it) is not a command.
-fn run_value(line: &str) -> Option<(String, usize)> {
-    let without_comment = strip_comment(line);
+#[derive(Default)]
+struct Scanner {
+    commands: Vec<RawCommand>,
+    /// Commands from the step being read, held until the whole step has been
+    /// seen: `continue-on-error:` may sit *after* the `run:` key it
+    /// qualifies.
+    pending: Vec<String>,
+    qualified: bool,
+    item_indent: Option<usize>,
+    block: Option<Block>,
+    /// A folded block's accumulated text, or a literal block's pending
+    /// backslash continuation.
+    joined: Option<String>,
+}
+
+struct Block {
+    key_indent: usize,
+    folded: bool,
+    is_run: bool,
+}
+
+impl Scanner {
+    fn read_line(&mut self, line: &str) {
+        if self.read_block_line(line) {
+            return;
+        }
+
+        let without_comment = strip_comment(line);
+        let trimmed = without_comment.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let indent = indent_of(without_comment);
+
+        if trimmed.starts_with("- ") || trimmed == "-" {
+            // A deeper sequence (an action's list argument, say) is not a new
+            // step; a same-or-shallower one is.
+            if self.item_indent.is_none_or(|current| indent <= current) {
+                self.flush_item();
+                self.item_indent = Some(indent);
+            }
+        }
+
+        if QUALIFYING_STEP_KEYS
+            .iter()
+            .any(|key| key_of(trimmed) == Some(*key))
+        {
+            self.qualified = true;
+        }
+
+        let Some((value, key_indent, is_run)) = scalar_value(without_comment) else {
+            return;
+        };
+        // An empty value under a key other than `run:` is a nested *mapping*
+        // (`jobs:`, `steps:`, `with:`), not a block scalar — treating it as
+        // one would swallow the rest of the file.
+        let starts_block =
+            value.starts_with('|') || value.starts_with('>') || (is_run && value.is_empty());
+        if starts_block {
+            self.block = Some(Block {
+                key_indent,
+                folded: value.starts_with('>'),
+                is_run,
+            });
+        } else if is_run {
+            if let Some(command) = command_text(&value) {
+                self.pending.push(command);
+            }
+        }
+    }
+
+    /// Consume `line` as part of an open block scalar. Returns false once the
+    /// block has ended, so the caller reads the line normally — it may itself
+    /// be the next key.
+    fn read_block_line(&mut self, line: &str) -> bool {
+        let Some(block) = &self.block else {
+            return false;
+        };
+        if line.trim().is_empty() {
+            // A blank line ends a folded paragraph; inside a literal block it
+            // is simply not a command.
+            if block.folded {
+                self.flush_joined();
+            }
+            return true;
+        }
+        if indent_of(line) <= block.key_indent {
+            self.flush_joined();
+            self.block = None;
+            return false;
+        }
+        if !block.is_run {
+            return true;
+        }
+        let folded = block.folded;
+        let Some(command) = command_text(line) else {
+            return true;
+        };
+        let joined = match self.joined.take() {
+            Some(head) => format!("{head} {command}"),
+            None => command,
+        };
+        if folded {
+            self.joined = Some(joined);
+            return true;
+        }
+        match strip_line_continuation(&joined) {
+            Some(head) => self.joined = Some(head),
+            None => self.pending.push(joined),
+        }
+        true
+    }
+
+    fn flush_joined(&mut self) {
+        if let Some(joined) = self.joined.take() {
+            self.pending.push(joined);
+        }
+    }
+
+    fn flush_item(&mut self) {
+        let qualified = self.qualified;
+        self.commands.extend(
+            self.pending
+                .drain(..)
+                .map(|text| RawCommand { text, qualified }),
+        );
+        self.qualified = false;
+    }
+
+    fn finish(mut self) -> Vec<RawCommand> {
+        self.flush_joined();
+        self.flush_item();
+        self.commands
+    }
+}
+
+/// The bare `key:` at the start of a trimmed line, including its colon, with
+/// any `- ` sequence marker removed.
+fn key_of(trimmed: &str) -> Option<&str> {
+    let key = trimmed.strip_prefix("- ").unwrap_or(trimmed).trim_start();
+    key.find(':').map(|colon| &key[..=colon])
+}
+
+/// The scalar value of a mapping key on this line, the column the key itself
+/// starts at, and whether that key is `run:`. Non-`run:` keys are reported
+/// too, so their block scalars can be skipped rather than read as commands.
+fn scalar_value(without_comment: &str) -> Option<(String, usize, bool)> {
     let trimmed = without_comment.trim_start();
     let key = trimmed.strip_prefix("- ").unwrap_or(trimmed).trim_start();
     let key_indent = without_comment.len() - key.len();
-    key.strip_prefix("run:")
-        .map(|value| (value.trim().to_string(), key_indent))
+    let colon = key.find(':')?;
+    let (name, rest) = key.split_at(colon);
+    if name.is_empty() || name.contains(char::is_whitespace) {
+        return None;
+    }
+    let value = rest.strip_prefix(':')?.trim().to_string();
+    Some((value, key_indent, name == "run"))
 }
 
 /// A command line's runnable text: comment stripped, unquoted, trimmed.
@@ -301,26 +418,83 @@ fn command_text(line: &str) -> Option<String> {
     (!text.is_empty()).then(|| text.to_string())
 }
 
-/// Truncate at the first `#` that starts a comment — YAML's own rule (and
-/// the shell's inside a block scalar): at line start, or preceded by
-/// whitespace. A `#` mid-word (`--foo=#1`) is not a comment.
+/// `line` without its trailing shell line-continuation, or `None` if it does
+/// not end in one. An *odd* number of trailing backslashes continues the
+/// line; an even number is escaped literal backslashes and ends it.
+fn strip_line_continuation(line: &str) -> Option<String> {
+    let trailing = line.chars().rev().take_while(|ch| *ch == '\\').count();
+    (trailing % 2 == 1).then(|| line[..line.len() - 1].trim_end().to_string())
+}
+
+/// Truncate at the first `#` that starts a comment — YAML's own rule (and the
+/// shell's inside a block scalar): at line start or preceded by whitespace,
+/// and not inside a quoted string. Without the quote tracking, a command like
+/// `grep "TODO #1" && cargo clippy …` is truncated and the clippy evidence
+/// silently lost.
 fn strip_comment(line: &str) -> &str {
-    line.char_indices()
-        .find(|(i, ch)| *ch == '#' && (*i == 0 || line[..*i].ends_with(char::is_whitespace)))
-        .map_or(line, |(i, _)| &line[..i])
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut after_whitespace = true;
+    for (i, ch) in line.char_indices() {
+        match ch {
+            '\'' if !in_double => in_single = !in_single,
+            '"' if !in_single => in_double = !in_double,
+            '#' if !in_single && !in_double && after_whitespace => return &line[..i],
+            _ => {}
+        }
+        after_whitespace = ch.is_whitespace();
+    }
+    line
 }
 
 fn indent_of(line: &str) -> usize {
     line.len() - line.trim_start().len()
 }
 
-/// Split a command line on shell separators so a tool invoked after `&&`,
-/// `||`, `;` or a pipe is found. Splitting on the bare characters (rather
-/// than the two-character operators) is deliberate: it costs an empty
-/// segment per `&&`, which never matches anything, and needs no operator
-/// table.
-fn shell_segments(command: &str) -> impl Iterator<Item = &str> {
-    command.split(['&', '|', ';']).map(str::trim)
+/// The segments of a command line that CI actually requires to succeed, each
+/// with whether its text may be adopted as a gate command.
+///
+/// Two shell facts decide this, and both are the difference between a gate
+/// that means something and one that does not:
+///
+/// * A segment adjacent to `||` is **dropped entirely**. `cargo clippy … ||
+///   true` is how a repo runs a check advisorily: CI ignores its exit status,
+///   so it is not evidence of enforcement, and promoting it to a gate command
+///   would fail every dispatch into a repo CI is perfectly happy with.
+/// * A segment after a `cd` is not adoptable. Its text runs somewhere other
+///   than the repo root, which a gate command has no way to express — the
+///   same reason `working-directory:` disqualifies a step.
+fn enforced_segments(command: &str) -> impl Iterator<Item = (&str, bool)> {
+    let mut segments = Vec::new();
+    let mut moved = false;
+    let mut previous_was_or = false;
+    let pieces: Vec<&str> = command.split(&['&', '|', ';'][..]).collect();
+    let mut operators = Vec::new();
+    let bytes = command.as_bytes();
+    let mut index = 0;
+    for piece in &pieces {
+        index += piece.len();
+        operators.push(bytes.get(index).copied());
+        index += 1;
+    }
+    for (position, piece) in pieces.iter().enumerate() {
+        let piece = piece.trim();
+        let followed_by_or = operators.get(position).copied().flatten() == Some(b'|');
+        let is_advisory = previous_was_or || followed_by_or;
+        previous_was_or = followed_by_or;
+        if piece.is_empty() {
+            continue;
+        }
+        if piece.split_whitespace().next() == Some("cd") {
+            moved = true;
+            continue;
+        }
+        if is_advisory {
+            continue;
+        }
+        segments.push((piece, !moved));
+    }
+    segments.into_iter()
 }
 
 /// Whether `segment` invokes `tool`: its words — after any leading
@@ -331,7 +505,7 @@ fn shell_segments(command: &str) -> impl Iterator<Item = &str> {
 ///
 /// This is the loose question — *is this tool enforced here* — and matching
 /// text this way is never enough to make it a gate command; see
-/// [`Invocation::is_plainly_runnable`].
+/// [`Invocation::is_plainly_runnable`] and [`Invocation::adoptable`].
 fn segment_invokes(segment: &str, tool: &[&str]) -> bool {
     let mut words = segment
         .split_whitespace()
@@ -376,35 +550,37 @@ mod tests {
         std::fs::write(workflows.join(name), content).unwrap();
     }
 
-    fn command_of<'a>(evidence: &'a CiCommands, tool: &[&str]) -> Option<&'a str> {
-        evidence
-            .invocation_of(tool)
-            .map(|invocation| invocation.command.as_str())
+    fn read(content: &str) -> CiCommands {
+        let dir = tempfile::tempdir().unwrap();
+        workflow(dir.path(), "ci.yml", content);
+        CiCommands::read(dir.path())
+    }
+
+    fn first<'a>(evidence: &'a CiCommands, tool: &'a [&'a str]) -> Option<&'a Invocation> {
+        evidence.invocations_of(tool).next()
+    }
+
+    fn command_of<'a>(evidence: &'a CiCommands, tool: &'a [&'a str]) -> Option<&'a str> {
+        first(evidence, tool).map(|invocation| invocation.command.as_str())
     }
 
     #[test]
     fn finds_an_inline_run_command() {
-        let dir = tempfile::tempdir().unwrap();
-        workflow(
-            dir.path(),
-            "ci.yml",
+        let evidence = read(
             "jobs:\n  check:\n    steps:\n      - run: cargo clippy --workspace -- -D warnings\n",
         );
         assert_eq!(
-            command_of(&CiCommands::read(dir.path()), CLIPPY),
+            command_of(&evidence, CLIPPY),
             Some("cargo clippy --workspace -- -D warnings")
         );
+        assert!(first(&evidence, CLIPPY).unwrap().adoptable);
     }
 
     #[test]
-    fn finds_a_command_in_a_block_scalar_and_stops_at_the_dedent() {
-        let dir = tempfile::tempdir().unwrap();
-        workflow(
-            dir.path(),
-            "ci.yml",
+    fn finds_a_command_in_a_literal_block_and_stops_at_the_dedent() {
+        let evidence = read(
             "steps:\n  - run: |\n      rustup component add rustfmt\n      cargo fmt --all -- --check\n  - name: after\n    uses: actions/checkout@v4\n",
         );
-        let evidence = CiCommands::read(dir.path());
         assert_eq!(
             command_of(&evidence, FMT),
             Some("cargo fmt --all -- --check")
@@ -413,46 +589,111 @@ mod tests {
     }
 
     #[test]
-    fn a_block_scalar_ends_at_its_own_key_column_not_the_sequence_dash() {
-        // `- run: |` puts the key two columns right of the dash. Comparing
-        // against the dash swallows the step's sibling keys as commands,
-        // which are junk evidence at best and a tool CI never runs at worst.
-        let dir = tempfile::tempdir().unwrap();
-        workflow(
-            dir.path(),
-            "ci.yml",
-            "steps:\n  - run: |\n      make build\n    name: Build\n    env:\n      TOOL: cargo clippy --fix\n",
-        );
-        let evidence = CiCommands::read(dir.path());
-        assert_eq!(evidence.invocations.len(), 1, "{:?}", evidence.invocations);
-        assert_eq!(command_of(&evidence, CLIPPY), None);
-    }
-
-    #[test]
-    fn a_backslash_continued_command_is_joined_before_it_is_matched() {
-        let dir = tempfile::tempdir().unwrap();
-        workflow(
-            dir.path(),
-            "ci.yml",
-            "steps:\n  - run: |\n      cargo clippy --workspace --all-targets \\\n        -- -D warnings\n",
+    fn a_folded_block_is_joined_into_one_command() {
+        // `run: >-` is the common way to wrap a long command. Reading its
+        // lines separately would adopt `cargo clippy --workspace
+        // --all-targets` — without the `-D warnings` that makes it a check —
+        // as the gate, which is defect #334 all over again.
+        let evidence = read(
+            "steps:\n  - run: >-\n      cargo clippy --workspace --all-targets\n      -- -D warnings\n",
         );
         assert_eq!(
-            command_of(&CiCommands::read(dir.path()), CLIPPY),
+            command_of(&evidence, CLIPPY),
             Some("cargo clippy --workspace --all-targets -- -D warnings")
         );
     }
 
     #[test]
-    fn unquotes_a_quoted_run_scalar_and_matches_cargo_by_base_name() {
-        // This repo's own macOS job calls cargo by absolute path.
-        let dir = tempfile::tempdir().unwrap();
-        workflow(
-            dir.path(),
-            "ci.yml",
-            "steps:\n  - run: \"$HOME/.cargo/bin/cargo clippy --all-targets\"\n",
+    fn a_block_scalar_ends_at_its_own_key_column_not_the_sequence_dash() {
+        let evidence = read(
+            "steps:\n  - run: |\n      make build\n    name: Build\n    env:\n      TOOL: cargo clippy --fix\n",
         );
-        let evidence = CiCommands::read(dir.path());
-        let invocation = evidence.invocation_of(CLIPPY).unwrap();
+        assert_eq!(evidence.invocations.len(), 1, "{:?}", evidence.invocations);
+        assert_eq!(command_of(&evidence, CLIPPY), None);
+    }
+
+    #[test]
+    fn a_run_line_inside_another_keys_block_is_not_a_command_this_workflow_runs() {
+        let evidence = read(
+            "steps:\n  - uses: some/action@v1\n    with:\n      script: |\n        run: cargo clippy --fix --allow-dirty\n",
+        );
+        assert_eq!(command_of(&evidence, CLIPPY), None);
+    }
+
+    #[test]
+    fn a_backslash_continued_command_is_joined_before_it_is_matched() {
+        let evidence = read(
+            "steps:\n  - run: |\n      cargo clippy --workspace --all-targets \\\n        -- -D warnings\n",
+        );
+        assert_eq!(
+            command_of(&evidence, CLIPPY),
+            Some("cargo clippy --workspace --all-targets -- -D warnings")
+        );
+    }
+
+    #[test]
+    fn an_escaped_trailing_backslash_does_not_continue_the_line() {
+        // `printf 'a\\'` ends in a literal backslash, not a continuation.
+        // Joining it would swallow the next line's real invocation.
+        let evidence = read(
+            "steps:\n  - run: |\n      printf 'a\\\\'\n      cargo clippy --workspace -- -D warnings\n",
+        );
+        assert_eq!(
+            command_of(&evidence, CLIPPY),
+            Some("cargo clippy --workspace -- -D warnings")
+        );
+    }
+
+    #[test]
+    fn an_advisory_invocation_is_not_evidence_at_all() {
+        // `|| true` is how a repo runs a check it does not enforce. CI
+        // ignores the exit status; a gate would not, and every dispatch
+        // into a repo CI is happy with would fail.
+        let evidence = read("steps:\n  - run: cargo clippy --all-targets -- -D warnings || true\n");
+        assert_eq!(command_of(&evidence, CLIPPY), None);
+    }
+
+    #[test]
+    fn a_command_after_cd_is_evidence_but_not_adoptable() {
+        let evidence = read(
+            "steps:\n  - run: cd crates/engine && cargo clippy --all-targets -- -D warnings\n",
+        );
+        let invocation = first(&evidence, CLIPPY).unwrap();
+        assert!(!invocation.adoptable);
+    }
+
+    #[test]
+    fn a_step_with_working_directory_is_evidence_but_not_adoptable() {
+        let evidence = read(
+            "steps:\n  - run: cargo clippy --all-targets -- -D warnings\n    working-directory: crates/engine\n",
+        );
+        let invocation = first(&evidence, CLIPPY).unwrap();
+        assert!(!invocation.adoptable, "{invocation:?}");
+    }
+
+    #[test]
+    fn a_continue_on_error_step_is_evidence_but_not_adoptable() {
+        // The key sits *after* the `run:` it qualifies, which is why a step's
+        // commands are held until the whole step has been read.
+        let evidence = read(
+            "steps:\n  - run: cargo clippy --all-targets -- -D warnings\n    continue-on-error: true\n",
+        );
+        assert!(!first(&evidence, CLIPPY).unwrap().adoptable);
+    }
+
+    #[test]
+    fn a_qualifying_key_does_not_leak_into_the_next_step() {
+        let evidence = read(
+            "steps:\n  - run: cargo fmt --all -- --check\n    working-directory: sub\n  - run: cargo clippy --all-targets -- -D warnings\n",
+        );
+        assert!(!first(&evidence, FMT).unwrap().adoptable);
+        assert!(first(&evidence, CLIPPY).unwrap().adoptable);
+    }
+
+    #[test]
+    fn unquotes_a_quoted_run_scalar_and_matches_cargo_by_base_name() {
+        let evidence = read("steps:\n  - run: \"$HOME/.cargo/bin/cargo clippy --all-targets\"\n");
+        let invocation = first(&evidence, CLIPPY).unwrap();
         assert_eq!(
             invocation.command,
             "$HOME/.cargo/bin/cargo clippy --all-targets"
@@ -462,84 +703,31 @@ mod tests {
     }
 
     #[test]
-    fn a_plainly_runnable_invocation_is_preferred_over_one_that_is_not() {
-        // File-name order puts the nightly workflow first; the required job's
-        // command is the one a gate can actually use.
-        let dir = tempfile::tempdir().unwrap();
-        workflow(
-            dir.path(),
-            "a-nightly.yml",
-            "steps:\n  - run: cargo +nightly clippy --all-targets\n",
-        );
-        workflow(
-            dir.path(),
-            "ci.yml",
-            "steps:\n  - run: cargo clippy --workspace -- -D warnings\n",
-        );
-        let evidence = CiCommands::read(dir.path());
-        let invocation = evidence.invocation_of(CLIPPY).unwrap();
-        assert_eq!(
-            invocation.command,
-            "cargo clippy --workspace -- -D warnings"
-        );
-        assert_eq!(invocation.workflow, "ci.yml");
-    }
-
-    #[test]
     fn a_toolchain_selector_is_evidence_but_not_plainly_runnable() {
-        let dir = tempfile::tempdir().unwrap();
-        workflow(
-            dir.path(),
-            "ci.yml",
-            "steps:\n  - run: cargo +nightly fmt --all -- --check\n",
-        );
-        let evidence = CiCommands::read(dir.path());
-        let invocation = evidence.invocation_of(FMT).unwrap();
-        assert!(!invocation.is_plainly_runnable(FMT));
+        let evidence = read("steps:\n  - run: cargo +nightly fmt --all -- --check\n");
+        assert!(!first(&evidence, FMT).unwrap().is_plainly_runnable(FMT));
     }
 
     #[test]
     fn an_expression_or_env_prefixed_command_is_not_plainly_runnable() {
-        let dir = tempfile::tempdir().unwrap();
-        workflow(
-            dir.path(),
-            "ci.yml",
+        let evidence = read(
             "steps:\n  - run: RUSTFLAGS=-Dwarnings cargo clippy --all-targets\n  - run: cargo fmt --all -- --check ${{ matrix.extra }}\n",
         );
-        let evidence = CiCommands::read(dir.path());
-        assert!(!evidence
-            .invocation_of(CLIPPY)
+        assert!(!first(&evidence, CLIPPY)
             .unwrap()
             .is_plainly_runnable(CLIPPY));
-        assert!(!evidence
-            .invocation_of(FMT)
-            .unwrap()
-            .is_plainly_runnable(FMT));
+        assert!(!first(&evidence, FMT).unwrap().is_plainly_runnable(FMT));
     }
 
     #[test]
     fn a_step_name_that_merely_mentions_a_tool_is_not_evidence() {
-        // `- name: cargo clippy` labels a step; the real invocation is the
-        // `run:` below it. A reader that matched any line would call a
-        // workflow that only *documents* a tool evidence that it runs one.
-        let dir = tempfile::tempdir().unwrap();
-        workflow(
-            dir.path(),
-            "ci.yml",
-            "steps:\n  - name: cargo clippy\n    uses: some/action@v1\n",
-        );
-        assert_eq!(command_of(&CiCommands::read(dir.path()), CLIPPY), None);
+        let evidence = read("steps:\n  - name: cargo clippy\n    uses: some/action@v1\n");
+        assert_eq!(command_of(&evidence, CLIPPY), None);
     }
 
     #[test]
     fn a_commented_out_run_line_is_not_evidence() {
-        let dir = tempfile::tempdir().unwrap();
-        workflow(
-            dir.path(),
-            "ci.yml",
-            "steps:\n  # - run: cargo clippy --workspace\n  - run: cargo test\n",
-        );
-        let evidence = CiCommands::read(dir.path());
+        let evidence = read("steps:\n  # - run: cargo clippy --workspace\n  - run: cargo test\n");
         assert_eq!(command_of(&evidence, CLIPPY), None);
         assert_eq!(
             command_of(&evidence, &["cargo", "test"]),
@@ -549,37 +737,73 @@ mod tests {
 
     #[test]
     fn a_trailing_comment_is_stripped_from_the_command() {
-        let dir = tempfile::tempdir().unwrap();
-        workflow(
-            dir.path(),
-            "ci.yml",
-            "steps:\n  - run: cargo fmt --all -- --check # keep the tree formatted\n",
-        );
+        let evidence =
+            read("steps:\n  - run: cargo fmt --all -- --check # keep the tree formatted\n");
         assert_eq!(
-            command_of(&CiCommands::read(dir.path()), FMT),
+            command_of(&evidence, FMT),
             Some("cargo fmt --all -- --check")
         );
     }
 
     #[test]
-    fn finds_a_tool_invoked_after_a_shell_separator() {
-        let dir = tempfile::tempdir().unwrap();
-        workflow(
-            dir.path(),
-            "ci.yml",
-            "steps:\n  - run: cargo build && cargo clippy --all-targets\n",
+    fn a_hash_inside_quotes_does_not_truncate_the_command() {
+        // Truncating here would lose the clippy invocation entirely and read
+        // as "this repo enforces nothing" — narrower than CI, silently.
+        let evidence = read(
+            "steps:\n  - run: |\n      grep -n \"TODO #1\" . && cargo clippy --all-targets -- -D warnings\n",
         );
-        let evidence = CiCommands::read(dir.path());
-        let invocation = evidence.invocation_of(CLIPPY).unwrap();
+        assert_eq!(
+            command_of(&evidence, CLIPPY),
+            Some("cargo clippy --all-targets -- -D warnings")
+        );
+    }
+
+    #[test]
+    fn finds_a_tool_invoked_after_a_shell_separator() {
+        let evidence = read("steps:\n  - run: cargo build && cargo clippy --all-targets\n");
+        let invocation = first(&evidence, CLIPPY).unwrap();
         assert_eq!(invocation.command, "cargo clippy --all-targets");
-        assert!(invocation.is_plainly_runnable(CLIPPY));
+        assert!(invocation.is_plainly_runnable(CLIPPY) && invocation.adoptable);
     }
 
     #[test]
     fn a_tool_the_workflow_never_runs_is_not_found() {
+        assert_eq!(
+            command_of(&read("steps:\n  - run: cargo test\n"), CLIPPY),
+            None
+        );
+    }
+
+    #[test]
+    fn every_invocation_of_a_tool_is_reported_in_file_name_order() {
+        // Which one a gate should use is the caller's policy, and it cannot
+        // choose between two disagreeing commands it never sees.
         let dir = tempfile::tempdir().unwrap();
-        workflow(dir.path(), "ci.yml", "steps:\n  - run: cargo test\n");
-        assert_eq!(command_of(&CiCommands::read(dir.path()), CLIPPY), None);
+        workflow(
+            dir.path(),
+            "a-nightly.yml",
+            "steps:\n  - run: cargo clippy --all-targets -- -D warnings -W clippy::pedantic\n",
+        );
+        workflow(
+            dir.path(),
+            "ci.yml",
+            "steps:\n  - run: cargo clippy --workspace -- -D warnings\n",
+        );
+        let evidence = CiCommands::read(dir.path());
+        let found: Vec<(&str, &str)> = evidence
+            .invocations_of(CLIPPY)
+            .map(|invocation| (invocation.workflow.as_str(), invocation.command.as_str()))
+            .collect();
+        assert_eq!(
+            found,
+            vec![
+                (
+                    "a-nightly.yml",
+                    "cargo clippy --all-targets -- -D warnings -W clippy::pedantic"
+                ),
+                ("ci.yml", "cargo clippy --workspace -- -D warnings"),
+            ]
+        );
     }
 
     #[test]
@@ -592,8 +816,6 @@ mod tests {
 
     #[test]
     fn a_workflow_directory_that_cannot_be_listed_warns() {
-        // Missing is silent; present-and-unreadable must not be, or the
-        // human approves a gate with no idea CI was never read.
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".github")).unwrap();
         std::fs::write(dir.path().join(".github").join("workflows"), "not a dir").unwrap();
@@ -621,22 +843,6 @@ mod tests {
     }
 
     #[test]
-    fn reads_every_workflow_in_file_name_order() {
-        // Fixed order so the same checkout always produces the same
-        // evidence, and therefore the same proposed gate.
-        let dir = tempfile::tempdir().unwrap();
-        workflow(dir.path(), "z-lint.yaml", "steps:\n  - run: cargo clippy\n");
-        workflow(dir.path(), "a-test.yml", "steps:\n  - run: cargo test\n");
-        let evidence = CiCommands::read(dir.path());
-        let commands: Vec<&str> = evidence
-            .invocations
-            .iter()
-            .map(|invocation| invocation.command.as_str())
-            .collect();
-        assert_eq!(commands, vec!["cargo test", "cargo clippy"]);
-    }
-
-    #[test]
     fn a_non_workflow_file_in_the_directory_is_ignored() {
         let dir = tempfile::tempdir().unwrap();
         workflow(dir.path(), "ci.yml", "steps:\n  - run: cargo test\n");
@@ -646,18 +852,10 @@ mod tests {
 
     #[test]
     fn an_oversized_workflow_is_skipped_with_a_warning() {
-        // Silence here is the defect this module exists to close: a skipped
-        // workflow is exactly how a gate ends up narrower than CI.
-        let dir = tempfile::tempdir().unwrap();
-        workflow(
-            dir.path(),
-            "ci.yml",
-            &format!(
-                "steps:\n  - run: cargo clippy\n# {}\n",
-                "x".repeat(MAX_WORKFLOW_BYTES as usize)
-            ),
-        );
-        let evidence = CiCommands::read(dir.path());
+        let evidence = read(&format!(
+            "steps:\n  - run: cargo clippy\n# {}\n",
+            "x".repeat(MAX_WORKFLOW_BYTES as usize)
+        ));
         assert_eq!(command_of(&evidence, CLIPPY), None);
         assert_eq!(evidence.warnings.len(), 1);
         assert!(

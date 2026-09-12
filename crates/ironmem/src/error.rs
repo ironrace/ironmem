@@ -24,7 +24,9 @@ pub(crate) fn read_to_string_with_path(path: &Path) -> Result<String, String> {
 /// Both halves exist because of the same class of bug. `read_to_string` has
 /// no size limit of its own, so a path that resolves — directly, or through a
 /// symlink a monorepo might legitimately use — to an unexpectedly large
-/// regular file would be loaded into memory in full. And a BOM (U+FEFF) is
+/// regular file would be loaded into memory in full, and one that resolves to
+/// something other than a regular file has no meaningful length to bound at
+/// all. And a BOM (U+FEFF) is
 /// not Unicode whitespace, so it survives every caller's trimming and hides
 /// the very first line's real content: a `[workspace]` header, the opening
 /// `{` of a JSON manifest (`serde_json` does not skip a BOM either), or a
@@ -35,9 +37,20 @@ pub(crate) fn read_to_string_capped(
     max_bytes: u64,
     kind: &str,
 ) -> Result<String, String> {
-    let size = std::fs::metadata(path)
-        .map_err(|err| format!("failed to read '{}': {err}", path.display()))?
-        .len();
+    let metadata = std::fs::metadata(path)
+        .map_err(|err| format!("failed to read '{}': {err}", path.display()))?;
+    // The cap bounds a *regular file's* bytes. A character device reports
+    // `len() == 0`, sails past the check, and then reads unbounded or blocks
+    // forever — so the type check belongs here, with the guarantee this
+    // function's doc advertises, rather than in each caller that happens to
+    // have listed the path already.
+    if !metadata.is_file() {
+        return Err(format!(
+            "'{}' is not a regular file — refusing to read it",
+            path.display()
+        ));
+    }
+    let size = metadata.len();
     if size > max_bytes {
         return Err(format!(
             "'{}' is {size} bytes, over the {max_bytes}-byte limit for a {kind} — refusing to \

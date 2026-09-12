@@ -536,7 +536,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rather than a full suite run.
 
   The check a Rust repo gets is **the one its own CI runs**, taken verbatim
-  wherever that command can be executed as written. That is the faithful
+  wherever that command can be executed as written *and* means what it
+  appears to mean — a `cargo fmt --all` with no `--check` (an auto-format
+  workflow) rewrites the tree and always exits 0, a `cargo clippy … || true`
+  is advisory, a `continue-on-error:` step is not required to pass, and a
+  `working-directory:` or `cd sub &&` command does not run at the repo root.
+  None of those become a gate. Where two workflows run the same tool
+  differently, neither is chosen: nothing here reads `on:` triggers or
+  required-check status, so the disagreement is reported instead. That is the faithful
   thing to propose and it is satisfiable by construction: CI runs it on every
   merge to the default branch. Where CI's text cannot be run as written —
   multi-line shell, a `${{ }}` expression only a runner resolves, an absolute
@@ -553,15 +560,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   New `autopilot::ci_evidence` is the bounded reader behind this — `run:`
   steps out of `.github/workflows/*.yml`, with no anchors, matrices, job
   graph or expression resolution, and no claim to know which jobs are
-  required. A tool enforced only through a third-party action or an
-  indirection like `make lint` stays invisible, and such a repo onboards
-  exactly as before. CI config that exists and cannot be read now **warns**
+  required. A folded `run: >-` block is joined the way YAML joins it, because
+  reading its lines separately would adopt a *truncated* command — `cargo
+  clippy --all-targets` without the `-- -D warnings` on the next line — as the
+  gate, which is this defect over again. A tool enforced only through a
+  third-party action or an indirection like `make lint` stays invisible, and
+  such a repo onboards exactly as before. CI config that exists and cannot be read now **warns**
   rather than reading as "no CI" — a silently skipped workflow is precisely
   how a gate ends up narrower than CI — and that warning is folded into the
   error on the paths where no proposal is written at all. Re-onboarding also
   warns when a per-dispatch wall-clock bound is carried forward onto a gate
   whose commands changed: the bound was calibrated against dispatch durations
-  for a narrower gate, and nothing else in the proposal would say so.
+  for a narrower gate, and nothing else in the proposal would say so. What it
+  was calibrated against is now recorded on the config (`set_wall_clock_timeout`
+  stores the commands in force), so the warning survives a second re-onboard
+  rather than comparing against whatever was proposed last.
 
 - **Autopilot: `agent:exhausted` could not actually be recovered, so the
   documented human retry was a no-op.** The spec is explicit that the label

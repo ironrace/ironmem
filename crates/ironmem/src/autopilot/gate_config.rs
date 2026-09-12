@@ -65,6 +65,18 @@ pub struct GateConfig {
     /// gate that looks complete may be silently missing a stack whose
     /// manifest was broken.
     pub manifest_warnings: Vec<String>,
+    /// The gate commands in force when [`set_wall_clock_timeout`] last ran —
+    /// i.e. what the bound above was actually calibrated against.
+    ///
+    /// Recorded rather than inferred because the alternative, comparing
+    /// against whatever was proposed last, is edge-triggered: running
+    /// `onboard` twice before approving would compare the second proposal
+    /// against the first, find them identical, and drop the warning that the
+    /// bound no longer measures this gate. Absent on configs written before
+    /// this field existed, where the previous proposal's commands are the
+    /// best available stand-in.
+    #[serde(default)]
+    pub wall_clock_timeout_commands: Option<Vec<String>>,
     pub proposed_at: String,
     pub approved_at: Option<String>,
     /// How long one dispatch into this repo may run before it is considered
@@ -88,6 +100,9 @@ pub struct GateConfig {
     /// would be the single-arm-probe mistake the spec's method notes warn
     /// against. A human sets it, from
     /// [`super::lineage`]'s recorded dispatch durations once there are some.
+    ///
+    /// See [`GateConfig::wall_clock_timeout_commands`] for what keeps it
+    /// honest across a re-onboard.
     #[serde(default)]
     pub wall_clock_timeout_secs: Option<u64>,
 }
@@ -114,6 +129,8 @@ struct GateConfigShadow {
     gate_commands: Vec<String>,
     #[serde(default)]
     manifest_warnings: Vec<String>,
+    #[serde(default)]
+    wall_clock_timeout_commands: Option<Vec<String>>,
     proposed_at: String,
     approved_at: Option<String>,
     #[serde(default)]
@@ -131,6 +148,7 @@ impl TryFrom<GateConfigShadow> for GateConfig {
             state: raw.state,
             gate_commands: raw.gate_commands,
             manifest_warnings: raw.manifest_warnings,
+            wall_clock_timeout_commands: raw.wall_clock_timeout_commands,
             proposed_at: raw.proposed_at,
             approved_at: raw.approved_at,
             wall_clock_timeout_secs: raw.wall_clock_timeout_secs,
@@ -202,12 +220,18 @@ pub fn propose_gate_config(
     // — those durations measured something else, and a bound that is now too
     // tight kills dispatches mid-gate as "wedged". Nothing else in the
     // proposal would say so.
-    if let (Some(secs), Some(previous)) = (carried, existing.as_ref()) {
-        if previous.gate_commands() != gate_commands {
+    let calibrated_for = existing.as_ref().and_then(|existing| {
+        existing
+            .wall_clock_timeout_commands
+            .clone()
+            .or_else(|| carried.map(|_| existing.gate_commands().to_vec()))
+    });
+    if let (Some(secs), Some(calibrated_for)) = (carried, calibrated_for.as_ref()) {
+        if calibrated_for != &gate_commands {
             manifest_warnings.push(format!(
-                "the {secs}s per-dispatch wall-clock bound is carried forward from a config \
-                 whose gate commands were different — it was calibrated against that gate, \
-                 not this one; re-check it before approving"
+                "the {secs}s per-dispatch wall-clock bound was calibrated against `{}`, not the \
+                 gate proposed here — re-check it before approving",
+                calibrated_for.join(" && ")
             ));
         }
     }
@@ -216,6 +240,7 @@ pub fn propose_gate_config(
         state: GateConfigState::Pending,
         gate_commands,
         manifest_warnings,
+        wall_clock_timeout_commands: calibrated_for,
         proposed_at: chrono::Utc::now().to_rfc3339(),
         approved_at: None,
         wall_clock_timeout_secs: carried,
@@ -272,6 +297,10 @@ pub fn set_wall_clock_timeout(
         }
     };
     config.wall_clock_timeout_secs = secs;
+    // What the bound was calibrated against, recorded at the moment it is
+    // set. A later re-onboard compares against this rather than against the
+    // last proposal, so the warning survives being re-proposed.
+    config.wall_clock_timeout_commands = secs.map(|_| config.gate_commands().to_vec());
     let content = serde_json::to_string(&config)?;
     write_current(db, &key, &content)?;
     Ok(config)
@@ -383,9 +412,38 @@ mod tests {
         // be told the bound was calibrated against the old one.
         assert_eq!(reproposed.manifest_warnings.len(), 1);
         assert!(
-            reproposed.manifest_warnings[0].contains("1200s"),
-            "expected the warning to quote the carried bound, got: {:?}",
+            reproposed.manifest_warnings[0].contains("1200s")
+                && reproposed.manifest_warnings[0].contains("cargo test"),
+            "expected the warning to quote the bound and the gate it measured, got: {:?}",
             reproposed.manifest_warnings
+        );
+    }
+
+    #[test]
+    fn the_carried_bound_warning_survives_a_second_re_onboard() {
+        // Comparing against the *last proposal* would be edge-triggered: the
+        // second re-onboard sees identical commands and drops the warning,
+        // and `approve` then blesses a gate bounded by a timeout calibrated
+        // for a narrower one.
+        let db = Database::open_in_memory().unwrap();
+        propose_gate_config(&db, "ironmem", vec!["cargo test".into()], vec![]).unwrap();
+        set_wall_clock_timeout(&db, "ironmem", Some(1_200)).unwrap();
+        let wider = vec!["cargo fmt --all -- --check".into(), "cargo test".into()];
+
+        propose_gate_config(&db, "ironmem", wider.clone(), vec![]).unwrap();
+        let second = propose_gate_config(&db, "ironmem", wider, vec![]).unwrap();
+
+        assert_eq!(
+            second.manifest_warnings.len(),
+            1,
+            "{:?}",
+            second.manifest_warnings
+        );
+        assert!(
+            second.manifest_warnings[0].contains("cargo test")
+                && !second.manifest_warnings[0].contains("--check"),
+            "the warning must still name the gate the bound measured, got: {:?}",
+            second.manifest_warnings
         );
     }
 

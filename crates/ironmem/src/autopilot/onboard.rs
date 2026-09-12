@@ -196,14 +196,17 @@ pub fn infer_gate_commands(repo_path: &Path) -> Result<InferredGates, MemoryErro
             format!(" (also: {})", warnings.join("; "))
         };
         if let Some(err) = manifest_error {
-            if context.is_empty() {
-                return Err(err);
-            }
-            let message = match err {
-                MemoryError::Validation(message) => message,
-                other => other.to_string(),
-            };
-            return Err(MemoryError::Validation(format!("{message}{context}")));
+            // Only a `Validation` error is re-wrapped, and then into its own
+            // variant. Flattening some other variant into `Validation` to
+            // carry a CI warning would make the same underlying failure
+            // classify differently depending on whether an unrelated workflow
+            // directory happened to be readable.
+            return Err(match (err, context.is_empty()) {
+                (MemoryError::Validation(message), false) => {
+                    MemoryError::Validation(format!("{message}{context}"))
+                }
+                (err, _) => err,
+            });
         }
         return Err(MemoryError::Validation(format!(
             "could not infer any gate commands for '{}' — no recognized build manifest \
@@ -252,27 +255,21 @@ fn record<I: IntoIterator<Item = String>>(
     }
 }
 
-/// Whether `dir` contains an entry whose file name is *exactly* `name`,
-/// verified via a directory listing rather than `dir.join(name).is_file()`
-/// — the latter resolves through the OS's own path-lookup semantics, which
-/// on a case-insensitive-but-case-preserving filesystem (e.g. default macOS
-/// APFS) silently matches a differently-cased file that a case-sensitive one
-/// (Linux, where these gate commands actually run in CI) would not. Without
-/// this, the identical checkout content could infer a different gate for
-/// the same repo depending on which machine ran onboarding. Uses
-/// `DirEntry::metadata` (which follows symlinks, like `Path::is_file`) —
-/// not `DirEntry::file_type` (which reports the symlink itself without
-/// following it) — so a manifest symlinked in from elsewhere in a monorepo
-/// is still recognized, matching the prior `.is_file()` behavior for that
-/// case.
+/// Whether `dir` contains a *regular file* named exactly `name` — see
+/// [`super::exact_entry`] for why the name is matched against a directory
+/// listing rather than through `dir.join(name).is_file()`.
+///
+/// Uses `Path::metadata` (which follows symlinks, like `Path::is_file`) — not
+/// `DirEntry::file_type` (which reports the symlink itself without following
+/// it) — so a manifest symlinked in from elsewhere in a monorepo is still
+/// recognized. A listing failure reads as "absent": this answers a yes/no
+/// question about one manifest, and the caller has nothing to do with the
+/// distinction. [`super::ci_evidence`] does, and reports it.
 fn exact_file_exists(dir: &Path, name: &str) -> bool {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return false;
-    };
-    entries.filter_map(Result::ok).any(|entry| {
-        entry.file_name() == std::ffi::OsStr::new(name)
-            && entry.metadata().map(|m| m.is_file()).unwrap_or(false)
-    })
+    super::exact_entry(dir, name)
+        .ok()
+        .flatten()
+        .is_some_and(|path| path.metadata().map(|m| m.is_file()).unwrap_or(false))
 }
 
 /// The check tools a Rust repo's gate may cover, each with the canonical
@@ -288,22 +285,55 @@ fn exact_file_exists(dir: &Path, name: &str) -> bool {
 /// `--workspace` tracks the same `[workspace]` detection as the test
 /// command, for the same reason: on a workspace root, a clippy run without
 /// it lints the root package alone and reports green over unlinted members.
-fn rust_checks(is_workspace: bool) -> [(&'static [&'static str], String); 2] {
+fn rust_checks(is_workspace: bool) -> [RustCheck; 2] {
     [
-        (
-            &["cargo", "fmt"][..],
-            "cargo fmt --all -- --check".to_string(),
-        ),
-        (
-            &["cargo", "clippy"][..],
-            if is_workspace {
+        RustCheck {
+            tool: &["cargo", "fmt"],
+            canonical: "cargo fmt --all -- --check".to_string(),
+            // Without `--check`, `cargo fmt` *rewrites* the tree and exits 0
+            // whatever it finds. As a gate command that is the worst of both
+            // worlds: it can never fail, so the gate enforces nothing, and it
+            // edits the IC's worktree while claiming to check it. A repo's
+            // auto-format workflow is a real and common source of exactly
+            // that text.
+            requires: Some("--check"),
+            refuses: &[],
+        },
+        RustCheck {
+            tool: &["cargo", "clippy"],
+            canonical: if is_workspace {
                 "cargo clippy --workspace --all-targets --all-features -- -D warnings"
             } else {
                 "cargo clippy --all-targets --all-features -- -D warnings"
             }
             .to_string(),
-        ),
+            requires: None,
+            refuses: &["--fix"],
+        },
     ]
+}
+
+/// One check a Rust repo's gate may cover: which tool it is, what to propose
+/// when CI's own invocation cannot be used, and which invocations are checks
+/// at all rather than rewrites.
+struct RustCheck {
+    tool: &'static [&'static str],
+    canonical: String,
+    /// A flag CI's invocation must carry for it to be a check.
+    requires: Option<&'static str>,
+    /// Flags that make it modify the tree instead of judging it.
+    refuses: &'static [&'static str],
+}
+
+impl RustCheck {
+    /// Whether CI's own text describes a *check* — something that judges the
+    /// tree and fails when it is wrong. A command that rewrites the tree is
+    /// evidence the tool is run, and is never a gate command.
+    fn accepts(&self, command: &str) -> bool {
+        let words: Vec<&str> = command.split_whitespace().collect();
+        self.requires.is_none_or(|flag| words.contains(&flag))
+            && !self.refuses.iter().any(|flag| words.contains(flag))
+    }
 }
 
 /// `Cargo.toml` present → Rust. A root `[workspace]` table means member
@@ -343,20 +373,49 @@ fn infer_rust(
     let is_workspace = is_cargo_workspace(&content);
 
     let mut commands = Vec::new();
-    for (tool, canonical) in rust_checks(is_workspace) {
-        let Some(invocation) = ci.invocation_of(tool) else {
+    for check in rust_checks(is_workspace) {
+        let candidates: Vec<&ci_evidence::Invocation> = ci.invocations_of(check.tool).collect();
+        let Some(first) = candidates.first() else {
             continue;
         };
-        if invocation.is_plainly_runnable(tool) {
-            commands.push(invocation.command.clone());
-            continue;
+        // Distinct, because two workflows running the byte-identical command
+        // is agreement, not ambiguity.
+        let mut usable: Vec<&str> = Vec::new();
+        for invocation in &candidates {
+            let is_usable = invocation.adoptable
+                && invocation.is_plainly_runnable(check.tool)
+                && check.accepts(&invocation.command);
+            if is_usable && !usable.contains(&invocation.command.as_str()) {
+                usable.push(&invocation.command);
+            }
         }
-        warnings.push(format!(
-            "{} runs `{}`, which a gate cannot run as written, so `{canonical}` is proposed \
-             instead — it may be stricter than what CI enforces; check it passes before \
-             approving",
-            invocation.workflow, invocation.command
-        ));
+        let canonical = check.canonical.clone();
+        match usable.as_slice() {
+            [only] => {
+                commands.push((*only).to_string());
+                continue;
+            }
+            // Nothing usable: CI runs the tool in a form a gate cannot take.
+            [] => warnings.push(format!(
+                "{} runs `{}`, which a gate cannot take as written, so `{canonical}` is \
+                 proposed instead — it may be stricter than what CI enforces; check it passes \
+                 before approving",
+                first.workflow, first.command
+            )),
+            // Several, disagreeing. Nothing here knows which workflow runs on
+            // a merge to the default branch — `on:` triggers and required
+            // checks are not read — so picking one would be a guess in the
+            // one direction that matters, and the stricter guess blocks work
+            // CI would have accepted.
+            many => warnings.push(format!(
+                "CI runs {} different `{}` commands ({}), so none of them can be taken as the \
+                 gate; `{canonical}` is proposed instead — it may be stricter than what CI \
+                 enforces; check it passes before approving",
+                many.len(),
+                check.tool.join(" "),
+                many.join("`, `")
+            )),
+        }
         commands.push(canonical);
     }
     commands.push(
@@ -1329,6 +1388,109 @@ mod tests {
             inferred.commands,
             vec![
                 "cargo clippy --all-features -- -D clippy::pedantic".to_string(),
+                "cargo test".to_string(),
+            ]
+        );
+        assert!(inferred.warnings.is_empty(), "{:?}", inferred.warnings);
+    }
+
+    #[test]
+    fn a_tree_rewriting_invocation_is_never_adopted_as_a_check() {
+        // An auto-format workflow's `cargo fmt --all` exits 0 whatever it
+        // finds *and* rewrites the worktree. As a gate command it would
+        // enforce nothing while editing files under the IC.
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "Cargo.toml", "[package]\nname = \"x\"\n");
+        workflow(
+            dir.path(),
+            "autofmt.yml",
+            "steps:\n  - run: cargo fmt --all\n",
+        );
+
+        let inferred = infer_gate_commands(dir.path()).unwrap();
+
+        assert_eq!(
+            inferred.commands,
+            vec![
+                "cargo fmt --all -- --check".to_string(),
+                "cargo test".to_string()
+            ]
+        );
+        assert_eq!(inferred.warnings.len(), 1, "{:?}", inferred.warnings);
+    }
+
+    #[test]
+    fn a_clippy_fix_invocation_is_never_adopted_as_a_check() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "Cargo.toml", "[package]\nname = \"x\"\n");
+        workflow(
+            dir.path(),
+            "autofix.yml",
+            "steps:\n  - run: cargo clippy --fix --allow-dirty\n",
+        );
+
+        let inferred = infer_gate_commands(dir.path()).unwrap();
+
+        assert_eq!(
+            inferred.commands,
+            vec![
+                "cargo clippy --all-targets --all-features -- -D warnings".to_string(),
+                "cargo test".to_string(),
+            ]
+        );
+        assert_eq!(inferred.warnings.len(), 1, "{:?}", inferred.warnings);
+    }
+
+    #[test]
+    fn disagreeing_ci_invocations_are_reported_rather_than_chosen_between() {
+        // Nothing here reads `on:` triggers or required-check status, so
+        // there is no basis for calling one of these the real gate — and the
+        // stricter guess blocks work CI would have accepted.
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "Cargo.toml", "[package]\nname = \"x\"\n");
+        workflow(
+            dir.path(),
+            "a-nightly.yml",
+            "steps:\n  - run: cargo clippy --all-targets -- -D warnings -W clippy::pedantic\n",
+        );
+        workflow(
+            dir.path(),
+            "ci.yml",
+            "steps:\n  - run: cargo clippy --all-targets -- -D warnings\n",
+        );
+
+        let inferred = infer_gate_commands(dir.path()).unwrap();
+
+        assert_eq!(
+            inferred.commands,
+            vec![
+                "cargo clippy --all-targets --all-features -- -D warnings".to_string(),
+                "cargo test".to_string(),
+            ]
+        );
+        assert_eq!(inferred.warnings.len(), 1, "{:?}", inferred.warnings);
+        assert!(
+            inferred.warnings[0].contains("2 different")
+                && inferred.warnings[0].contains("clippy::pedantic"),
+            "expected the warning to quote the disagreement, got: {:?}",
+            inferred.warnings
+        );
+    }
+
+    #[test]
+    fn two_workflows_running_the_same_command_are_agreement_not_ambiguity() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "Cargo.toml", "[package]\nname = \"x\"\n");
+        let step = "steps:\n  - run: cargo clippy --all-targets -- -D warnings\n";
+        workflow(dir.path(), "ci.yml", step);
+        workflow(dir.path(), "release.yml", step);
+
+        let inferred = infer_gate_commands(dir.path()).unwrap();
+
+        assert_eq!(
+            inferred.commands,
+            vec![
+                "cargo clippy --all-targets -- -D warnings".to_string(),
                 "cargo test".to_string(),
             ]
         );

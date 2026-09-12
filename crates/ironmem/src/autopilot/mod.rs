@@ -153,13 +153,40 @@
 /// (e.g. `["workspace".package]`) — closing that fully needs a real TOML
 /// parser, the same limitation `onboard::is_cargo_workspace` documents for
 /// the unquoted dotted-key-only form.
-pub(super) fn strip_matching_quotes(s: &str) -> &str {
+fn strip_matching_quotes(s: &str) -> &str {
     for quote in ['"', '\''] {
         if s.len() >= 2 && s.starts_with(quote) && s.ends_with(quote) {
             return &s[1..s.len() - 1];
         }
     }
     s
+}
+
+/// `<dir>/<name>`, but only when an entry with *exactly* that name is in
+/// `dir`'s listing.
+///
+/// The listing is the point. `Path::join` resolves through the OS's own
+/// path lookup, which on a case-insensitive-but-case-preserving filesystem
+/// (default macOS APFS) silently matches a differently-cased entry that a
+/// case-sensitive one (Linux, where gate commands actually run in CI) would
+/// not — so the identical checkout could infer a different gate depending on
+/// which machine ran onboarding.
+///
+/// A missing `dir` is `Ok(None)`: nothing to read and nothing to report. Any
+/// other listing failure is the caller's to report, because a directory that
+/// exists and cannot be read is not the same as one that does not exist —
+/// the difference between "this repo has no CI" and "this repo's CI is
+/// invisible to me".
+fn exact_entry(dir: &std::path::Path, name: &str) -> Result<Option<std::path::PathBuf>, String> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(format!("failed to read '{}': {err}", dir.display())),
+    };
+    Ok(entries
+        .filter_map(Result::ok)
+        .find(|entry| entry.file_name() == std::ffi::OsStr::new(name))
+        .map(|entry| entry.path()))
 }
 
 pub mod advance;
