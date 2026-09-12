@@ -267,6 +267,14 @@ pub fn approve_gate_config(db: &Database, repo: &str) -> Result<GateConfig, Memo
     if config.state != GateConfigState::Approved {
         config.state = GateConfigState::Approved;
         config.approved_at = Some(chrono::Utc::now().to_rfc3339());
+        // Approving is a human saying this bound is right for *this* gate, so
+        // it re-calibrates the record. Without this the carried-bound warning
+        // is level-triggered against a gate two proposals ago and re-fires on
+        // every future re-onboard, long after the human checked it — which is
+        // how an approver learns to skim warnings.
+        if config.wall_clock_timeout_secs.is_some() {
+            config.wall_clock_timeout_commands = Some(config.gate_commands().to_vec());
+        }
         let content = serde_json::to_string(&config)?;
         write_current(db, &key, &content)?;
     }
@@ -416,6 +424,25 @@ mod tests {
                 && reproposed.manifest_warnings[0].contains("cargo test"),
             "expected the warning to quote the bound and the gate it measured, got: {:?}",
             reproposed.manifest_warnings
+        );
+    }
+
+    #[test]
+    fn approving_re_calibrates_the_bound_so_the_warning_does_not_re_fire() {
+        let db = Database::open_in_memory().unwrap();
+        propose_gate_config(&db, "ironmem", vec!["cargo test".into()], vec![]).unwrap();
+        set_wall_clock_timeout(&db, "ironmem", Some(1_200)).unwrap();
+        let wider = vec!["cargo fmt --all -- --check".into(), "cargo test".into()];
+        let warned = propose_gate_config(&db, "ironmem", wider.clone(), vec![]).unwrap();
+        assert_eq!(warned.manifest_warnings.len(), 1);
+
+        approve_gate_config(&db, "ironmem").unwrap();
+        let after = propose_gate_config(&db, "ironmem", wider, vec![]).unwrap();
+
+        assert!(
+            after.manifest_warnings.is_empty(),
+            "the human has checked this bound against this gate: {:?}",
+            after.manifest_warnings
         );
     }
 

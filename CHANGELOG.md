@@ -539,8 +539,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wherever that command can be executed as written *and* means what it
   appears to mean — a `cargo fmt --all` with no `--check` (an auto-format
   workflow) rewrites the tree and always exits 0, a `cargo clippy … || true`
-  is advisory, a `continue-on-error:` step or job is not required to pass, and
-  a `working-directory:` or `cd sub &&` command does not run at the repo root.
+  is advisory (unless its fallback exits non-zero, which re-fails the step), a
+  `continue-on-error:` step or job is not required to pass, and
+  a `working-directory:` step — or one whose shell has `cd`'d, on the same line
+  or an earlier line of the same `run:` block — does not run at the repo root.
   None of those become a gate. A repo whose *only* invocation of a tool
   rewrites the tree gets **no command for that check at all**, not the
   canonical one: CI fixing your formatting for you is not evidence the repo is

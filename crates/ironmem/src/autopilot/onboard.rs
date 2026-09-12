@@ -290,12 +290,16 @@ fn rust_checks(is_workspace: bool) -> [RustCheck; 2] {
         RustCheck {
             tool: &["cargo", "fmt"],
             canonical: "cargo fmt --all -- --check".to_string(),
-            // Without `--check`, `cargo fmt` *rewrites* the tree and exits 0
-            // whatever it finds. As a gate command that is the worst of both
-            // worlds: it can never fail, so the gate enforces nothing, and it
-            // edits the IC's worktree while claiming to check it. A repo's
-            // auto-format workflow is a real and common source of exactly
-            // that text.
+            // Without `--check`, `cargo fmt` *rewrites* the tree — that is
+            // the disqualifying part, not merely that it then exits 0. A gate
+            // command must judge the worktree, never edit it under the IC,
+            // and a repo's auto-format workflow is a real and common source
+            // of exactly this text. (`cargo clippy` needs no equivalent
+            // requirement: a clippy run that does not deny is weaker than
+            // this one but still read-only, and whether warnings are denied
+            // may come from `[lints]` or `RUSTFLAGS` rather than the command
+            // line — so demanding a `-D` flag would refuse commands CI really
+            // does enforce.)
             requires: Some("--check"),
             refuses: &[],
         },
@@ -384,14 +388,16 @@ fn infer_rust(
         // gate, and proposing the canonical one would hand the strictest
         // possible gate to the repo least likely to pass it. Evidence of a
         // rewrite is evidence about the tool, not about the check.
-        let checked: Vec<&&ci_evidence::Invocation> = candidates
+        let checked: Vec<&ci_evidence::Invocation> = candidates
             .iter()
+            .copied()
             .filter(|invocation| check.accepts(&invocation.command))
             .collect();
         let Some(first) = checked.first() else {
             warnings.push(format!(
-                "{} runs `{}`, which rewrites the tree rather than checking it, so no `{}` \
-                 command is proposed — nothing in CI says this repo is checked for it",
+                "{} runs `{}`, which does not check the tree (a rewrite, or no check at all), \
+                 so no `{}` command is proposed — nothing in CI says this repo is checked for \
+                 it",
                 any.workflow,
                 any.command,
                 check.tool.join(" ")
@@ -409,6 +415,27 @@ fn infer_rust(
         }
         match usable.as_slice() {
             [only] => {
+                // Adopting the one command a gate *can* take is right, but
+                // doing it silently while CI runs the tool differently
+                // elsewhere hides the disagreement that matters: the adopted
+                // one may be the nightly workflow's stricter command, and a
+                // gate stricter than CI blocks work CI would have accepted.
+                let disagreeing: Vec<&str> = checked
+                    .iter()
+                    .map(|invocation| invocation.command.as_str())
+                    .filter(|command| command != only)
+                    .collect();
+                if let Some(other) = disagreeing.first() {
+                    warnings.push(format!(
+                        "the gate takes `{only}` from {}, but CI also runs `{other}` — check \
+                         they agree before approving",
+                        checked
+                            .iter()
+                            .find(|invocation| invocation.command == **only)
+                            .map(|invocation| invocation.workflow.as_str())
+                            .unwrap_or("CI")
+                    ));
+                }
                 commands.push((*only).to_string());
                 continue;
             }
@@ -1433,7 +1460,7 @@ mod tests {
         assert_eq!(inferred.commands, vec!["cargo test".to_string()]);
         assert_eq!(inferred.warnings.len(), 1, "{:?}", inferred.warnings);
         assert!(
-            inferred.warnings[0].contains("rewrites the tree"),
+            inferred.warnings[0].contains("does not check the tree"),
             "got: {:?}",
             inferred.warnings
         );
