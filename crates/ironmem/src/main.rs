@@ -759,11 +759,19 @@ enum AutopilotCmd {
         #[arg(long)]
         json: bool,
     },
-    /// Carry every succeeded issue's PR forward: review it, apply rung 6's
-    /// merge decision, and clean up once it lands (build-ladder rung 10)
+    /// Carry every succeeded issue's PR forward: open it if the branch has
+    /// none, review it, apply rung 6's merge decision, and clean up once it
+    /// lands (build-ladder rung 10)
     ///
     /// The other half of `autopilot lead`. A tick starts work and records a
     /// success; this finishes it. Run them in that order.
+    ///
+    /// **Opens the pull request by default.** An IC pushes its branch and
+    /// nothing else opens one, so without this the issue would sit at "no
+    /// open PR" on every pass for ever — there is no path back, because a
+    /// dispatch is never re-run for an issue that already recorded a success.
+    /// A pull request that has *ever* existed on the branch — closed or
+    /// merged — stops this: a human closing one is a decision, not a gap.
     ///
     /// **Reviews by default, merges only with `--merge`.** Without it every
     /// merge is rehearsed — every guard and every read runs and nothing is
@@ -927,7 +935,7 @@ impl ironmem::autopilot::review::ReviewRunner for DryRunReviewer {
 
 /// Human-readable rendering of one advance pass.
 fn print_advance_report(report: &ironmem::autopilot::advance::AdvanceReport) {
-    use ironmem::autopilot::advance::{AdvanceStep, Stall};
+    use ironmem::autopilot::advance::{AdvanceStep, NoPrReason, Stall};
     use ironmem::autopilot::merge::MergeOutcome;
     use ironmem::autopilot::remediate::ArmOutcome;
     use ironmem::autopilot::worktree::WorktreeRemoval;
@@ -957,9 +965,54 @@ fn print_advance_report(report: &ironmem::autopilot::advance::AdvanceReport) {
             step.dispatch_class
         );
         match &step.step {
-            AdvanceStep::Stalled(Stall::NoOpenPr { branch }) => {
-                println!("    STALLED: no open PR on {branch}");
+            AdvanceStep::NeedsPr { branch } => {
+                // Unreachable in a report: `advance_issue` always replaces
+                // this step. Printed rather than ignored so that if it ever
+                // is reached, it is visible instead of an issue silently
+                // missing from the pass.
+                println!("    needs a PR on {branch} — nothing tried yet");
             }
+            AdvanceStep::WouldOpenPr { base_branch } => {
+                println!("    would open a PR -> {base_branch} [dry run]");
+            }
+            AdvanceStep::OpenedPr {
+                pr_number,
+                base_branch,
+                url,
+            } => {
+                println!("    OPENED PR #{pr_number} -> {base_branch}: {url}");
+                println!("    the next pass reviews it");
+            }
+            AdvanceStep::Stalled(Stall::NoOpenPr { branch, reason }) => match reason {
+                NoPrReason::PriorPr { numbers } => {
+                    println!(
+                        "    STALLED: no open PR on {branch}, and {} already existed here ({}) — \
+                         Autopilot will not open a second one",
+                        numbers.len(),
+                        numbers
+                            .iter()
+                            .map(|n| format!("#{n}"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                    println!(
+                        "    close the issue if that PR merged, or re-label it if you closed the PR"
+                    );
+                }
+                NoPrReason::BranchNotPushed { detail } => {
+                    println!(
+                        "    STALLED: GitHub will not open a PR for {branch} — it carries no \
+                         commits the base does not have"
+                    );
+                    println!("    the IC recorded a success without pushing: {detail}");
+                }
+                NoPrReason::RaceLost => {
+                    println!(
+                        "    no open PR on {branch} when this pass looked, but one exists now — \
+                         the next pass picks it up"
+                    );
+                }
+            },
             AdvanceStep::Stalled(Stall::AmbiguousPr { numbers }) => {
                 println!(
                     "    STALLED: {} open PRs share this branch ({}) — close all but one",
@@ -2589,9 +2642,12 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                     })?;
                 let targets = repos
                     .iter()
-                    // `base` is the committish new branches are cut from, and
-                    // this pass cuts none: every branch it looks at already
-                    // exists and already has a PR.
+                    // `base` is the committish new branches are cut from,
+                    // and this pass cuts none — every branch it looks at was
+                    // created by a dispatch. It is *not* the base of a pull
+                    // request this pass opens: that is read from GitHub per
+                    // repo by `gh::default_branch`, because `HEAD` names a
+                    // commit and a pull request needs a branch.
                     .map(|spec| parse_repo_target(spec, "HEAD"))
                     .collect::<Result<Vec<_>, _>>()?;
                 let worktree_root = match worktree_root {

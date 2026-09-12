@@ -11,7 +11,8 @@
 use std::path::{Path, PathBuf};
 
 use ironmem::autopilot::advance::{
-    advance_pass, AdvanceConfig, AdvanceStep, SkipReason, Stall, DEFAULT_MAX_ADVANCES_PER_PASS,
+    advance_pass, AdvanceConfig, AdvanceStep, NoPrReason, SkipReason, Stall,
+    DEFAULT_MAX_ADVANCES_PER_PASS,
 };
 use ironmem::autopilot::gh::{GhCli, MergeStrategy};
 use ironmem::autopilot::lead::RepoTarget;
@@ -92,9 +93,31 @@ fn the_loop_closes_end_to_end() {
 echo "gh $*" >> "$AP_LOG"
 case "$1 $2" in
   "issue list") cat "$AP_FIXTURES/issue_list.json"; exit 0 ;;
-  "pr list")    cat "$AP_FIXTURES/pr_list.json"; exit 0 ;;
+  # `--state open` and `--state all` are two different questions, and the
+  # whole PR-opening guard turns on telling them apart.
+  "pr list")
+    case "$*" in
+      *"--state all"*) cat "$AP_FIXTURES/pr_list_all.json" ;;
+      *)               cat "$AP_FIXTURES/pr_list.json" ;;
+    esac
+    exit 0 ;;
   "pr view")    cat "$AP_FIXTURES/pr_view.json"; exit 0 ;;
   "pr merge")   echo "merged"; exit 0 ;;
+  # A body starting with `!` is GitHub refusing, on stderr, non-zero — the
+  # shape `create_pr` classifies rather than errors on.
+  "pr create")
+    body=$(cat "$AP_FIXTURES/pr_create.txt")
+    case "$body" in
+      "!"*) echo "${body#!}" >&2; exit 1 ;;
+      *)    echo "$body"; exit 0 ;;
+    esac ;;
+  # `gh repo view` takes the repo POSITIONALLY. Asserted here because the
+  # real binary rejects `--repo` outright and no fixture would notice.
+  "repo view")
+    if [ "$3" != "owner/repo" ]; then
+      echo "repo view wants the repo positionally, got: $*" >&2; exit 1
+    fi
+    cat "$AP_FIXTURES/repo_view.json"; exit 0 ;;
   "issue view") echo '{"labels":[{"name":"agent:ready"}]}'; exit 0 ;;
   "issue edit") exit 0 ;;
   "issue comment") exit 0 ;;
@@ -167,6 +190,18 @@ exit 0
         )
         .unwrap();
         std::fs::write(fixtures.join("pr_list.json"), pr_list).unwrap();
+        // Default: whatever is open is also all there has ever been.
+        std::fs::write(fixtures.join("pr_list_all.json"), pr_list).unwrap();
+        std::fs::write(
+            fixtures.join("repo_view.json"),
+            r#"{"defaultBranchRef":{"name":"main"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            fixtures.join("pr_create.txt"),
+            "https://github.com/owner/repo/pull/42",
+        )
+        .unwrap();
         std::fs::write(
             fixtures.join("pr_view.json"),
             format!(
@@ -217,6 +252,15 @@ exit 0
         let mut reviewer = CodexReviewer::resolve(None).unwrap();
         advance_pass(&db, &mut gh, &mut reviewer, &base_config(merge, dry_run)).unwrap()
     };
+    // Every logged `gh` invocation whose line starts with `prefix`.
+    let gh_calls = |prefix: &str| -> Vec<String> {
+        std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.starts_with(prefix))
+            .map(str::to_string)
+            .collect()
+    };
     let codex_calls = || {
         std::fs::read_to_string(&log)
             .unwrap_or_default()
@@ -263,14 +307,100 @@ exit 0
     assert!(report.advanced[0].merge.is_none());
     assert_eq!(codex_calls(), 0, "a dry run must not pay for a review");
 
-    // ── path 4: no open PR is a stall, not a merge ───────────────────────
+    // ── path 4: no PR has ever existed, so this pass opens one ───────────
+    //
+    // ⟨defect 7⟩ Rung 10 asserted a stall here, and that assertion was the
+    // defect wearing a test: the IC was supposed to have opened the pull
+    // request and nothing ever did, so an issue that went green sat at
+    // `NoOpenPr` on every pass for ever — unrecoverable, because `run_issue`
+    // will not re-dispatch an issue whose lineage records a success.
     std::fs::write(fixtures.join("pr_list.json"), "[]").unwrap();
+    std::fs::write(fixtures.join("pr_list_all.json"), "[]").unwrap();
     let report = run(false, false);
-    assert!(matches!(
-        report.advanced[0].step,
-        AdvanceStep::Stalled(Stall::NoOpenPr { .. })
-    ));
-    assert_eq!(codex_calls(), 0);
+    match &report.advanced[0].step {
+        AdvanceStep::OpenedPr {
+            pr_number,
+            base_branch,
+            ..
+        } => {
+            assert_eq!(*pr_number, 42);
+            assert_eq!(base_branch, "main", "read from `gh repo view`");
+        }
+        other => panic!("expected a pull request to be opened, got {other:?}"),
+    }
+    assert_eq!(codex_calls(), 0, "opening the PR is the whole step");
+    let created = gh_calls("gh pr create");
+    assert_eq!(created.len(), 1);
+    assert!(
+        created[0].contains(&format!("--head {}", worktree::branch_name(&issue()))),
+        "{}",
+        created[0]
+    );
+    assert!(
+        created[0].contains("--base main"),
+        "the base is GitHub's default branch, never the target's `HEAD` \
+         committish: {}",
+        created[0]
+    );
+
+    // ── path 4b: a PR that already existed here is never re-opened ────────
+    //
+    // The guard that makes path 4 safe. A human closing a pull request is a
+    // decision; a cron entry re-opening it every few minutes overrules that
+    // decision, silently.
+    std::fs::write(
+        fixtures.join("pr_list_all.json"),
+        format!(
+            r#"[{{"number":41,"headRefName":"{}","headRefOid":"{head_sha}","baseRefName":"main","isDraft":false,"url":"u"}}]"#,
+            worktree::branch_name(&issue())
+        ),
+    )
+    .unwrap();
+    let before = gh_calls("gh pr create").len();
+    let report = run(false, false);
+    match &report.advanced[0].step {
+        AdvanceStep::Stalled(Stall::NoOpenPr {
+            reason: NoPrReason::PriorPr { numbers },
+            ..
+        }) => assert_eq!(numbers, &vec![41]),
+        other => panic!("expected a prior-PR stall, got {other:?}"),
+    }
+    assert_eq!(
+        gh_calls("gh pr create").len(),
+        before,
+        "nothing may be created once a pull request has existed here"
+    );
+
+    // ── path 4c: a branch that never reached the remote says so ───────────
+    std::fs::write(fixtures.join("pr_list_all.json"), "[]").unwrap();
+    std::fs::write(
+        fixtures.join("pr_create.txt"),
+        "!pull request create failed: GraphQL: No commits between main and \
+         autopilot/owner-repo-7",
+    )
+    .unwrap();
+    let report = run(false, false);
+    assert!(
+        matches!(
+            &report.advanced[0].step,
+            AdvanceStep::Stalled(Stall::NoOpenPr {
+                reason: NoPrReason::BranchNotPushed { .. },
+                ..
+            })
+        ),
+        "got {:?}",
+        report.advanced[0].step
+    );
+    assert!(
+        report.problems.is_empty(),
+        "GitHub refusing for a reason we can name is a stall, not a problem: {:?}",
+        report.problems
+    );
+    std::fs::write(
+        fixtures.join("pr_create.txt"),
+        "https://github.com/owner/repo/pull/42",
+    )
+    .unwrap();
 
     // ── path 5: two open PRs fail closed ─────────────────────────────────
     std::fs::write(
@@ -289,6 +419,7 @@ exit 0
     assert_eq!(codex_calls(), 0, "an ambiguous PR must not be reviewed");
 
     std::fs::write(fixtures.join("pr_list.json"), one_pr(&head_sha)).unwrap();
+    std::fs::write(fixtures.join("pr_list_all.json"), one_pr(&head_sha)).unwrap();
 
     // ── path 6: the review runs, and the merge is only rehearsed ─────────
     let report = run(false, false);

@@ -6,18 +6,43 @@
 //! [`super::queue::DeferReason::AlreadySucceeded`] is reported on every tick,
 //! forever, and until this module nothing anywhere acted on it.
 //!
-//! That is the open end of the spec's data flow. An IC goes green, pushes its
-//! branch and opens a PR; `run_issue` records the success and clears the
-//! dispatch-state drawer; and then the arc the spec draws — *"Lead dispatches
-//! REVIEWER … PASS + low-risk + class matches → Lead merges … records
-//! outcome, cleans worktree"* — simply stopped. Every piece of it was built:
-//! rung 5 reviews and decides, rung 6 merges and labels. Nothing joined them,
-//! so a green PR waited on a human to notice it and type two more commands.
+//! That is the open end of the spec's data flow. An IC goes green and pushes
+//! its branch; `run_issue` records the success and clears the dispatch-state
+//! drawer; and then the arc the spec draws — *"Lead dispatches REVIEWER …
+//! PASS + low-risk + class matches → Lead merges … records outcome, cleans
+//! worktree"* — simply stopped. Every piece of it was built: rung 5 reviews
+//! and decides, rung 6 merges and labels. Nothing joined them, so a green PR
+//! waited on a human to notice it and type two more commands.
 //!
 //! [`advance_pass`] is that join. For each issue whose lineage records a
-//! success, it finds the open PR on the issue's branch, reviews it if no
-//! review has read the PR's current head commit, applies rung 6's merge
+//! success, it opens the pull request if the branch has none, reviews it if
+//! no review has read the PR's current head commit, applies rung 6's merge
 //! authority, and — once the PR has landed — gives the worktree back.
+//!
+//! # The pull request nobody opened ⟨defect 7⟩
+//!
+//! This header used to read *"an IC goes green, pushes its branch and opens a
+//! PR"*, and for eleven rungs that was an assumption rather than a
+//! description. The spec says it — *"every IC terminal state is an open PR"*,
+//! and its data flow draws *"push feature branch, open PR"* — but no code
+//! anywhere implemented the second half. [`super::turn_prompt`] never asked
+//! the IC for a pull request, or even for a push; [`super::gh`] had `pr
+//! view`, `pr list` and `pr merge`, and no `pr create`. The first live run's
+//! pull request was opened by hand, and nothing in the loop could have
+//! noticed.
+//!
+//! It is the ladder's worst stall because it is the one nothing recovers
+//! from. [`super::run::run_issue`] refuses to dispatch an issue whose lineage
+//! records a success, so an IC cannot be sent back to open the pull request
+//! it did not open; this pass then reports `NoOpenPr` on every tick, forever,
+//! and only a human unlabelling the issue breaks the cycle.
+//!
+//! [`open_pull_request`] closes it, by the same move rung 10 made on
+//! `AlreadySucceeded`: a permanent dead end becomes a step. The other half is
+//! in [`super::turn_prompt`], where the **push** is now part of the goal
+//! condition rather than a line of prose — a gate runs in the worktree, so
+//! until now an IC could edit, commit, go green and report `met` truthfully
+//! without the work ever reaching the remote.
 //!
 //! # What this module does not decide
 //!
@@ -96,7 +121,8 @@
 //!
 //! # Ordering, which is this ladder's recurring bug class
 //!
-//! Within one issue: **look up the PR → review → merge → clean up.** The
+//! Within one issue: **look up the PR → open it if there is none → review →
+//! merge → clean up.** The
 //! cleanup is last and every part of it is idempotent, because by then the
 //! merge has happened and cannot be undone — a cleanup failure is reported,
 //! never propagated, exactly as rung 6 treats a label write that fails after
@@ -255,10 +281,9 @@ pub struct Skipped {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "stall", rename_all = "snake_case")]
 pub enum Stall {
-    /// No open PR on the issue's branch. The IC recorded a success and never
-    /// pushed one, a human closed it, or it has already been merged and the
-    /// issue left open.
-    NoOpenPr { branch: String },
+    /// No open pull request on the issue's branch, and Autopilot did not
+    /// open one. Every reason is a fact about the world; see [`NoPrReason`].
+    NoOpenPr { branch: String, reason: NoPrReason },
     /// More than one open PR shares the branch. GitHub permits it, and the
     /// candidates can target different bases, so picking one would mean
     /// merging a PR nobody named. See [`super::gh::PrLookup::Ambiguous`].
@@ -273,10 +298,85 @@ pub enum Stall {
     WorktreeMissing { path: String },
 }
 
+/// Why an issue with a recorded success has no open pull request.
+///
+/// Only one of these — nothing was ever opened, and the branch carries
+/// commits — is a situation Autopilot resolves by itself, and it does not
+/// appear here at all: it becomes [`AdvanceStep::OpenedPr`]. What is left is
+/// the set of answers that are **not** "open a pull request", and keeping
+/// them apart is the whole point. Rung 10 collapsed them into a bare
+/// `NoOpenPr` and the operator could not tell a human's decision from a
+/// dispatch that never reached the remote.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "why", rename_all = "snake_case")]
+pub enum NoPrReason {
+    /// A pull request was opened on this branch and is now closed or merged.
+    ///
+    /// **Autopilot does not open a second one**, and this is the guard that
+    /// makes opening the first one safe at all. A human closing a PR is a
+    /// decision, and re-opening it every few minutes would overrule that
+    /// decision with a cron entry. A *merged* one means the work landed and
+    /// only the issue's label is stale — a second PR there would propose an
+    /// empty diff forever.
+    PriorPr { numbers: Vec<u64> },
+    /// GitHub refused the create: the branch carries nothing the base does
+    /// not already have, or is not on the remote at all.
+    ///
+    /// The loud form of the defect this module exists to stop being silent
+    /// about. It names a dispatch that recorded a success without pushing —
+    /// or, legitimately but rarely, an issue that needed no code change.
+    BranchNotPushed { detail: String },
+    /// A pull request appeared between the "has one ever existed?" read and
+    /// the create. Nothing is wrong and nothing needs doing: the next pass's
+    /// ordinary lookup finds it.
+    RaceLost,
+}
+
 /// The step an issue is at.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "step", rename_all = "snake_case")]
 pub enum AdvanceStep {
+    /// No pull request is open on the branch, and the pass has not yet asked
+    /// GitHub whether one ever was. The transient step [`next_step`] returns
+    /// and [`advance_issue`] always replaces — with [`AdvanceStep::OpenedPr`]
+    /// or with a [`Stall::NoOpenPr`] naming the reason.
+    ///
+    /// It exists because the two halves need different powers. Deciding
+    /// *which step an issue is at* is pure over the database, and rung 10
+    /// made it so on purpose; deciding *whether a pull request may be opened*
+    /// needs two GitHub reads and a write. Folding the second into
+    /// [`next_step`] would have cost that purity, which is what makes the
+    /// step table exhaustively testable without a network.
+    NeedsPr { branch: String },
+    /// `--dry-run`: a pull request **would** have been opened against
+    /// `base_branch`, and was not.
+    ///
+    /// A step rather than a [`Stall`], though nothing was written. Every
+    /// `Stall` is a fact about the world that only a human can change, and is
+    /// re-reported on every pass for ever; this is neither — it is an
+    /// artifact of the flag, and it stands in for the write a real pass would
+    /// have made. Modelled as a stall it would also have been free of the
+    /// burst limit ([`took_a_step`]), so a rehearsal over twenty green issues
+    /// would predict twenty pull requests for a pass that in fact opens
+    /// `max_advances_per_pass` of them and stops. This is the same shape as
+    /// the rehearsed *review*, which has always been an
+    /// [`AdvanceStep::Review`] under `--dry-run` and has always been charged.
+    WouldOpenPr { base_branch: String },
+    /// This pass opened the pull request.
+    ///
+    /// A step in its own right, and the pass stops here rather than flowing
+    /// into the review. `advance_issue`'s contract is one step per issue per
+    /// pass, and the alternative — create, then review, then merge in a
+    /// single call — would make the first pass after a green IC the single
+    /// most expensive thing the subsystem does, on an issue whose pull
+    /// request has existed for under a second. The next pass reviews it
+    /// through the ordinary path, from a lookup rather than from a value
+    /// this pass is holding.
+    OpenedPr {
+        pr_number: u64,
+        base_branch: String,
+        url: String,
+    },
     /// The PR's current head has never been reviewed.
     Review {
         pr_number: u64,
@@ -357,6 +457,12 @@ pub struct AdvanceReport {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Candidate {
     pub issue: IssueRef,
+    /// The issue's title, verbatim from the backlog listing — the title of
+    /// the pull request this pass may have to open. Taken from the listing
+    /// already in hand rather than re-read per issue: `gh issue list` returns
+    /// it, and a second `gh issue view` would buy nothing but a chance for
+    /// the two to disagree.
+    pub issue_title: String,
     /// Where the repo is checked out.
     pub repo_path: PathBuf,
     /// The `risk:*` label's value, by [`super::queue::risk_label`]'s rules.
@@ -454,6 +560,7 @@ pub fn plan_advance(
             };
             candidates.push(Candidate {
                 issue,
+                issue_title: listing.title.clone(),
                 repo_path,
                 risk_label: queue::risk_label(&listing.labels),
                 green_commit_sha: status.best_commit_sha,
@@ -490,9 +597,9 @@ pub fn next_step(
 ) -> Result<AdvanceStep, MemoryError> {
     let pr = match lookup {
         PrLookup::None => {
-            return Ok(AdvanceStep::Stalled(Stall::NoOpenPr {
+            return Ok(AdvanceStep::NeedsPr {
                 branch: worktree::branch_name(&candidate.issue),
-            }))
+            })
         }
         PrLookup::Ambiguous { numbers } => {
             return Ok(AdvanceStep::Stalled(Stall::AmbiguousPr {
@@ -641,6 +748,16 @@ pub fn advance_pass(
 /// A *newly* armed remediation is not free and is charged: reaching it meant
 /// either paying for the review that produced the verdict, or reading a stored
 /// one and writing the record that re-opens the issue.
+///
+/// ⟨defect 7⟩ [`AdvanceStep::OpenedPr`] is charged too, and falls out of the
+/// rule above rather than needing a clause: it is not a stall, and it carries
+/// no already-armed remediation. It should be charged — a pull request is a
+/// GitHub write, and a pass that opened one for every issue that went green
+/// overnight is exactly the burst this limit exists to stop.
+///
+/// ⟨defect 7⟩ [`AdvanceStep::WouldOpenPr`] is charged too, and needs no clause
+/// here: a rehearsed pull request is a step, not a stall, which is exactly why
+/// it is not modelled as one. See that variant's doc.
 fn took_a_step(advanced: &Advanced) -> bool {
     if matches!(advanced.step, AdvanceStep::Stalled(_)) {
         return false;
@@ -695,11 +812,30 @@ fn advance_issue(
 ) -> Result<Advanced, MemoryError> {
     let branch = worktree::branch_name(&candidate.issue);
     let lookup = gh::open_pr_for_branch(gh_runner, &candidate.issue.repo, &branch)?;
-    let step = next_step(db, candidate, &lookup, &config.worktree_root)?;
+    let mut step = next_step(db, candidate, &lookup, &config.worktree_root)?;
     let class = dispatch_class(candidate.risk_label.as_deref());
 
+    // Step zero, and for eleven rungs it did not exist. Runs before the
+    // review for the reason every stage here runs before the next one: its
+    // output is the next stage's input, and there is nothing to review until
+    // a pull request exists.
+    if matches!(step, AdvanceStep::NeedsPr { .. }) {
+        // The same `branch` the lookup above asked about, deliberately: the
+        // guard and the write must name one branch, not two derivations of
+        // one.
+        step = open_pull_request(gh_runner, candidate, &branch, config)?;
+    }
+
     let (pr_number, head_sha, gate_green) = match &step {
-        AdvanceStep::Stalled(_) => {
+        // `NeedsPr` is listed for exhaustiveness and is unreachable:
+        // `open_pull_request` never returns it. Grouped with the genuine
+        // terminals rather than given an `unreachable!`, because the cost of
+        // being wrong about that is a panic in an unattended pass, and the
+        // cost of being right about it is one honest line in the report.
+        AdvanceStep::Stalled(_)
+        | AdvanceStep::OpenedPr { .. }
+        | AdvanceStep::WouldOpenPr { .. }
+        | AdvanceStep::NeedsPr { .. } => {
             return Ok(Advanced {
                 issue: candidate.issue.clone(),
                 dispatch_class: class,
@@ -894,6 +1030,170 @@ fn advance_issue(
         merge: Some(execution),
         cleanup,
     })
+}
+
+/// Open the pull request the IC's dispatch did not.
+///
+/// # Why this is not behind a flag
+///
+/// `--merge`, `--remediate` and `--advisor` are each opt-in, and the rule
+/// behind all three (rung 9's lesson 43) is that a new optional feature must
+/// not change what an existing configuration does. Opening the pull request
+/// is not one of those, on every test the three of them pass and this does
+/// not:
+///
+/// - **It is reversible.** Merging is not, which is the whole reason
+///   `--merge` exists. A pull request opened in error is closed in one click,
+///   and [`NoPrReason::PriorPr`] guarantees Autopilot will not re-open it.
+/// - **It spends nothing.** No model is called; `--advisor` gates a cost.
+/// - **It re-opens no finished work.** `--remediate` gates exactly that.
+/// - **It is not new behaviour.** The spec has said since rev 1 that *"every
+///   IC terminal state is an open PR"* and draws *"push feature branch, open
+///   PR"* in its data flow. The pull request was always meant to exist by
+///   now; the only thing that changes is which component creates it. An
+///   operator whose cron runs `advance` is already asking for their green
+///   issues to be carried to a merge, and a pass that refused to open the
+///   pull request that carry depends on would be honouring the letter of a
+///   rule written about irreversible actions.
+///
+/// `--dry-run` is honoured, because that flag means *change nothing* rather
+/// than *do less*.
+///
+/// # Ordering
+///
+/// Ask whether a pull request ever existed → resolve the base → rehearse or
+/// write. The guard is first and is the only thing standing between a cron
+/// entry and a pull request re-opened over a human's decision every few
+/// minutes, so it runs before anything can fail for an unrelated reason and
+/// tempt a later reader to move it.
+fn open_pull_request(
+    gh_runner: &mut dyn GhRunner,
+    candidate: &Candidate,
+    branch: &str,
+    config: &AdvanceConfig,
+) -> Result<AdvanceStep, MemoryError> {
+    let repo = &candidate.issue.repo;
+    let stalled = |reason: NoPrReason| {
+        AdvanceStep::Stalled(Stall::NoOpenPr {
+            branch: branch.to_string(),
+            reason,
+        })
+    };
+
+    let prior = gh::prs_ever_for_branch(gh_runner, repo, branch)?;
+    if !prior.is_empty() {
+        return Ok(stalled(NoPrReason::PriorPr {
+            numbers: prior.iter().map(|pr| pr.number).collect(),
+        }));
+    }
+
+    // Read even on a dry run: reads change nothing, and the base is the one
+    // fact that makes the rehearsal worth printing. It is also the read most
+    // likely to fail on a repo nobody has tried this against, and finding
+    // that out during the rehearsal is the point of having one.
+    //
+    // ⚠️ **Known hazard: this assumes the branch was cut from the default
+    // branch, and nothing here can check it.** `autopilot lead --base` sets
+    // the committish issue branches are cut from, for every repo, and
+    // defaults to the checkout's `HEAD`. Cut from `develop` on a repo whose
+    // default is `main`, the pull request opened here targets `main` and its
+    // diff carries every commit `develop` has that `main` lacks — which a
+    // reviewer then reads, and which `--merge` could land.
+    //
+    // Not guarded here, because the guard would be worse than the gap. The
+    // dispatch-time base is not recoverable at this point: `advance` is a
+    // separate invocation from `lead` and its own CLI hardcodes `base:
+    // "HEAD"` for every target, so the only local signal is the checkout's
+    // *current* HEAD, which may have moved since the dispatch. Refusing on
+    // that proxy would stall issues whose base was in fact correct, on the
+    // one path that opens pull requests at all — re-creating the permanent
+    // stall this module exists to remove. The fix is to record the base in
+    // lineage at dispatch time and read it back here.
+    let base = gh::default_branch(gh_runner, repo)?;
+    if config.dry_run {
+        return Ok(AdvanceStep::WouldOpenPr { base_branch: base });
+    }
+
+    match gh::create_pr(
+        gh_runner,
+        repo,
+        branch,
+        &base,
+        &pr_title(candidate),
+        &pr_body(candidate, &base),
+    )? {
+        gh::PrCreation::Created { number, url } => Ok(AdvanceStep::OpenedPr {
+            pr_number: number,
+            base_branch: base,
+            url,
+        }),
+        gh::PrCreation::AlreadyExists => Ok(stalled(NoPrReason::RaceLost)),
+        gh::PrCreation::BranchNotPushed { detail } => {
+            Ok(stalled(NoPrReason::BranchNotPushed { detail }))
+        }
+    }
+}
+
+/// The pull request's title: the issue's own, verbatim.
+///
+/// Falls back to naming the issue when the title is blank, because
+/// `gh pr create --title ""` is refused and a refusal here would be reported
+/// as an unexplained create failure rather than as the empty title it is.
+fn pr_title(candidate: &Candidate) -> String {
+    let title = candidate.issue_title.trim();
+    if title.is_empty() {
+        return format!("Autopilot: {}", candidate.issue.canonical());
+    }
+    if title.chars().count() <= MAX_PR_TITLE_CHARS {
+        return title.to_string();
+    }
+    title
+        .chars()
+        .take(MAX_PR_TITLE_CHARS - 1)
+        .chain(std::iter::once('…'))
+        .collect()
+}
+
+/// GitHub's limit on a pull request title.
+///
+/// **Defensive, not a live hazard.** A GitHub *issue* title is capped at the
+/// same 256, so a title arriving through [`plan_advance`] cannot exceed it —
+/// but [`Candidate`] is public and its fields are public, so the cap is not a
+/// property this function may assume.
+///
+/// Cut rather than passed through because a refusal for this reason is not one
+/// [`gh::create_pr`] can name: it would become an `Err`, reported as a problem
+/// on every tick for ever, with no path back — `run_issue` will not
+/// re-dispatch an issue that records a success. Cheap insurance against
+/// re-entering the exact stall ⟨defect 7⟩ exists to remove. Cut on a character
+/// boundary, never a byte one.
+const MAX_PR_TITLE_CHARS: usize = 256;
+
+/// The pull request's body.
+///
+/// Deliberately mechanical. It is written from values this module can point
+/// at — the issue, the branch, the base, the commit the gate was recorded
+/// green at — and claims nothing about the diff, because nothing here has
+/// read the diff. The reviewer reads the diff; a body that summarised it
+/// would be a second, unreviewed account of the change sitting directly above
+/// the reviewed one.
+///
+/// `Closes #n` is deliberate: it is what makes a merged pull request close
+/// the issue, and an issue left open behind landed work is one of the
+/// situations [`NoPrReason::PriorPr`] otherwise reports on every pass forever.
+fn pr_body(candidate: &Candidate, base: &str) -> String {
+    let green = match candidate.green_commit_sha.as_deref().map(str::trim) {
+        Some(sha) if !sha.is_empty() => format!(
+            "The gate was recorded green at `{sha}` — the commit the IC's worktree was on when it reported the gate met."
+        ),
+        _ => "No green commit was recorded for this issue.".to_string(),
+    };
+    format!(
+        "Closes #{number}.\n\nOpened by Autopilot, which dispatched the work on {issue} and recorded a successful attempt. No human wrote this description.\n\n{green}\n\nBase: `{base}`. Risk class: `{class}`.\n",
+        number = candidate.issue.number,
+        issue = candidate.issue.canonical(),
+        class = dispatch_class(candidate.risk_label.as_deref()),
+    )
 }
 
 /// Give back what a landed issue was holding.
@@ -1163,6 +1463,17 @@ mod tests {
         ok("[[]]")
     }
 
+    /// A `gh` that ran and exited non-zero — not an `Err`, which is a `gh`
+    /// that failed to start. [`gh::create_pr`] reads the two differently.
+    fn ran_and_failed(stderr: &str) -> Result<GhOutput, MemoryError> {
+        Ok(GhOutput {
+            stdout: String::new(),
+            stderr: stderr.into(),
+            success: false,
+            code: Some(1),
+        })
+    }
+
     fn ok(stdout: &str) -> Result<GhOutput, MemoryError> {
         Ok(GhOutput {
             stdout: stdout.into(),
@@ -1330,18 +1641,395 @@ mod tests {
 
     // ── next_step: which step an issue is at ────────────────────────────
 
+    // ── the pull request nothing used to open ───────────────────────────
+
+    /// `gh repo view --json defaultBranchRef`.
+    fn default_branch_json(name: &str) -> String {
+        format!(r#"{{"defaultBranchRef":{{"name":"{name}"}}}}"#)
+    }
+
+    /// A pass over one green issue whose branch has no open pull request.
+    /// `after_lookup` scripts every `gh` call from the all-states listing on.
+    fn pass_with_no_open_pr(
+        config: &AdvanceConfig,
+        db: &Database,
+        after_lookup: Vec<Result<GhOutput, MemoryError>>,
+    ) -> (AdvanceReport, ScriptedGh) {
+        let mut responses = vec![ok(&issue_list_json(283, &["agent:ready"])), ok("[]")];
+        responses.extend(after_lookup);
+        let mut gh = ScriptedGh::new(responses);
+        let report = advance_pass(db, &mut gh, &mut ForbiddenReviewer, config).unwrap();
+        (report, gh)
+    }
+
     #[test]
-    fn a_succeeded_issue_with_no_open_pr_is_stalled_not_advanced() {
+    fn a_green_issue_whose_branch_has_no_pull_request_gets_one_opened() {
+        // Defect 7, and the reason the first live run's pull request had to
+        // be opened by hand. The IC pushes; nothing in the loop opened the
+        // pull request, and `advance` reported `NoOpenPr` forever because
+        // `run_issue` will not re-dispatch an issue that records a success.
+        let db = approved_db();
+        record_success(&db, &issue(), Some(GREEN));
+        let (repo, roots) = checkout_with_worktree();
+
+        let (report, gh) = pass_with_no_open_pr(
+            &config(roots.path(), repo.path()),
+            &db,
+            vec![
+                ok("[]"),
+                ok(&default_branch_json("main")),
+                ok("https://github.com/ironrace/ironmem/pull/341\n"),
+            ],
+        );
+
+        assert_eq!(report.advanced.len(), 1);
+        assert!(
+            matches!(
+                &report.advanced[0].step,
+                AdvanceStep::OpenedPr { pr_number: 341, base_branch, .. } if base_branch == "main"
+            ),
+            "got {:?}",
+            report.advanced[0].step
+        );
+        assert!(report.problems.is_empty(), "{:?}", report.problems);
+
+        let create = gh
+            .seen
+            .iter()
+            .find(|argv| argv.first().map(String::as_str) == Some("pr") && argv[1] == "create")
+            .expect("a pull request was created");
+        let value_of = |flag: &str| {
+            create
+                .iter()
+                .position(|a| a == flag)
+                .map(|at| create[at + 1].as_str())
+                .unwrap_or_default()
+        };
+        assert_eq!(value_of("--head"), "autopilot/ironrace-ironmem-283");
+        assert_eq!(value_of("--base"), "main");
+        assert_eq!(value_of("--title"), "t", "the issue's own title");
+        assert!(
+            value_of("--body").contains("Closes #283"),
+            "a merged pull request must close the issue, or its stale \
+             `agent:ready` label stalls every later pass: {}",
+            value_of("--body")
+        );
+    }
+
+    #[test]
+    fn opening_the_pull_request_is_the_whole_step_and_no_review_is_bought() {
+        // `advance_issue`'s contract is one step per issue per pass.
+        // `ForbiddenReviewer` panics if called, so this passing is the
+        // assertion: the pull request is seconds old and the next pass
+        // reviews it through the ordinary lookup.
+        let db = approved_db();
+        record_success(&db, &issue(), Some(GREEN));
+        let (repo, roots) = checkout_with_worktree();
+        let mut config = config(roots.path(), repo.path());
+        config.max_advances_per_pass = 1;
+
+        let (report, gh) = pass_with_no_open_pr(
+            &config,
+            &db,
+            vec![
+                ok("[]"),
+                ok(&default_branch_json("main")),
+                ok("https://github.com/ironrace/ironmem/pull/341"),
+            ],
+        );
+        assert!(report.advanced[0].review.is_none());
+        assert!(report.advanced[0].merge.is_none());
+        assert!(
+            !gh.seen
+                .iter()
+                .any(|argv| argv[0] == "pr" && argv[1] == "merge"),
+            "nothing may merge a pull request opened this same pass"
+        );
+    }
+
+    #[test]
+    fn opening_a_pull_request_spends_the_burst_limit() {
+        // Unlike a stall, it is real work with a real cost to GitHub, and a
+        // pass that opened one for every green issue at once is exactly the
+        // "morning after a productive night" burst the limit exists for.
+        let db = approved_db();
+        for n in [283u64, 284] {
+            record_success(&db, &IssueRef::new(REPO, n), Some(GREEN));
+        }
+        let (repo, roots) = checkout_with_worktree();
+        let mut config = config(roots.path(), repo.path());
+        config.max_advances_per_pass = 1;
+
+        let mut gh = ScriptedGh::new(vec![
+            ok(
+                r#"[{"number":283,"title":"t","body":"b","labels":[{"name":"agent:ready"}],"updatedAt":"2026-09-03T00:00:00Z"},{"number":284,"title":"t","body":"b","labels":[{"name":"agent:ready"}],"updatedAt":"2026-09-03T00:00:00Z"}]"#,
+            ),
+            ok("[]"),
+            ok("[]"),
+            ok(&default_branch_json("main")),
+            ok("https://github.com/ironrace/ironmem/pull/341"),
+        ]);
+        let report = advance_pass(&db, &mut gh, &mut ForbiddenReviewer, &config).unwrap();
+        assert_eq!(report.advanced.len(), 1);
+        assert!(report
+            .skipped
+            .iter()
+            .any(|s| matches!(s.reason, SkipReason::PassLimitReached { .. })));
+    }
+
+    #[test]
+    fn a_pull_request_a_human_closed_is_never_re_opened() {
+        // The guard that makes opening the first one safe. `PrLookup::None`
+        // is three situations, and only one of them may be answered with a
+        // write: re-opening a pull request a human closed would overrule that
+        // human with a cron entry, every few minutes, forever.
+        let db = approved_db();
+        record_success(&db, &issue(), Some(GREEN));
+        let (repo, roots) = checkout_with_worktree();
+
+        let (report, gh) = pass_with_no_open_pr(
+            &config(roots.path(), repo.path()),
+            &db,
+            vec![ok(&pr_list_json(900, "bbbb"))],
+        );
+        assert!(
+            matches!(
+                &report.advanced[0].step,
+                AdvanceStep::Stalled(Stall::NoOpenPr {
+                    reason: NoPrReason::PriorPr { numbers },
+                    ..
+                }) if numbers == &[900]
+            ),
+            "got {:?}",
+            report.advanced[0].step
+        );
+        assert!(
+            !gh.seen
+                .iter()
+                .any(|argv| argv[0] == "pr" && argv[1] == "create"),
+            "the guard runs before the write, not alongside it"
+        );
+        assert!(
+            !gh.seen.iter().any(|argv| argv[0] == "repo"),
+            "a stall this certain does not need the base resolved"
+        );
+    }
+
+    #[test]
+    fn a_dry_run_resolves_the_base_and_writes_nothing() {
+        // `--dry-run` means change nothing, not do less: the reads still run,
+        // so the rehearsal reports the base it would have targeted and fails
+        // here rather than on the real pass if the repo cannot be read.
+        let db = approved_db();
+        record_success(&db, &issue(), Some(GREEN));
+        let (repo, roots) = checkout_with_worktree();
+        let mut config = config(roots.path(), repo.path());
+        config.dry_run = true;
+
+        let (report, gh) = pass_with_no_open_pr(
+            &config,
+            &db,
+            vec![ok("[]"), ok(&default_branch_json("release"))],
+        );
+        assert!(
+            matches!(
+                &report.advanced[0].step,
+                AdvanceStep::WouldOpenPr { base_branch } if base_branch == "release"
+            ),
+            "got {:?}",
+            report.advanced[0].step
+        );
+        assert!(!gh
+            .seen
+            .iter()
+            .any(|argv| argv[0] == "pr" && argv[1] == "create"));
+    }
+
+    #[test]
+    fn a_rehearsed_pull_request_spends_the_burst_limit_like_the_real_one() {
+        // A rehearsal exists to predict the pass. Charged like every other
+        // stall — that is, not at all — `--dry-run` over twenty green issues
+        // would print twenty "would open a PR" lines and make twenty
+        // `gh repo view` calls, for a pass that in fact opens
+        // `max_advances_per_pass` of them and stops.
+        let db = approved_db();
+        for n in [283u64, 284] {
+            record_success(&db, &IssueRef::new(REPO, n), Some(GREEN));
+        }
+        let (repo, roots) = checkout_with_worktree();
+        let mut config = config(roots.path(), repo.path());
+        config.dry_run = true;
+        config.max_advances_per_pass = 1;
+
+        let mut gh = ScriptedGh::new(vec![
+            ok(
+                r#"[{"number":283,"title":"t","body":"b","labels":[{"name":"agent:ready"}],"updatedAt":"2026-09-03T00:00:00Z"},{"number":284,"title":"t","body":"b","labels":[{"name":"agent:ready"}],"updatedAt":"2026-09-03T00:00:00Z"}]"#,
+            ),
+            ok("[]"),
+            ok("[]"),
+            ok(&default_branch_json("main")),
+        ]);
+        let report = advance_pass(&db, &mut gh, &mut ForbiddenReviewer, &config).unwrap();
+        assert_eq!(report.advanced.len(), 1);
+        assert!(report
+            .skipped
+            .iter()
+            .any(|s| matches!(s.reason, SkipReason::PassLimitReached { .. })));
+        assert!(
+            !gh.seen
+                .iter()
+                .any(|argv| argv[0] == "pr" && argv[1] == "create"),
+            "a rehearsal still writes nothing"
+        );
+    }
+
+    #[test]
+    fn a_pull_request_title_too_long_for_github_is_cut_rather_than_refused() {
+        // GitHub refuses a title over 256 characters, and `create_pr` cannot
+        // name that refusal: it would become an `Err`, reported as a problem
+        // on every pass for ever with no path back, because `run_issue` will
+        // not re-dispatch an issue that records a success. A GitHub issue
+        // title is capped at 256 too, so this cannot arrive through
+        // `plan_advance` — but `Candidate`'s fields are public, so the cap is
+        // not something `pr_title` may assume.
+        let candidate = Candidate {
+            issue: issue(),
+            issue_title: "é".repeat(400),
+            repo_path: PathBuf::from("/nowhere"),
+            risk_label: None,
+            green_commit_sha: Some(GREEN.into()),
+        };
+        let title = pr_title(&candidate);
+        assert_eq!(title.chars().count(), MAX_PR_TITLE_CHARS);
+        assert!(title.ends_with('…'));
+    }
+
+    #[test]
+    fn a_blank_issue_title_still_names_the_issue() {
+        // `gh pr create --title ""` is refused, and that refusal would be
+        // reported as an unexplained create failure.
+        let candidate = Candidate {
+            issue: issue(),
+            issue_title: "   ".into(),
+            repo_path: PathBuf::from("/nowhere"),
+            risk_label: None,
+            green_commit_sha: None,
+        };
+        assert!(pr_title(&candidate).contains(&issue().canonical()));
+    }
+
+    #[test]
+    fn a_branch_that_never_reached_the_remote_stalls_loudly_and_says_why() {
+        // The IC recorded a success without pushing. Before this path that
+        // was a bare "no open PR" an operator could not tell from a pull
+        // request they had closed themselves.
+        let db = approved_db();
+        record_success(&db, &issue(), Some(GREEN));
+        let (repo, roots) = checkout_with_worktree();
+
+        let (report, _) = pass_with_no_open_pr(
+            &config(roots.path(), repo.path()),
+            &db,
+            vec![
+                ok("[]"),
+                ok(&default_branch_json("main")),
+                ran_and_failed("GraphQL: No commits between main and autopilot/x"),
+            ],
+        );
+        assert!(
+            matches!(
+                &report.advanced[0].step,
+                AdvanceStep::Stalled(Stall::NoOpenPr {
+                    reason: NoPrReason::BranchNotPushed { detail },
+                    ..
+                }) if detail.contains("No commits between")
+            ),
+            "got {:?}",
+            report.advanced[0].step
+        );
+    }
+
+    #[test]
+    fn a_pull_request_that_appeared_mid_pass_is_a_lost_race_not_a_problem() {
+        let db = approved_db();
+        record_success(&db, &issue(), Some(GREEN));
+        let (repo, roots) = checkout_with_worktree();
+
+        let (report, _) = pass_with_no_open_pr(
+            &config(roots.path(), repo.path()),
+            &db,
+            vec![
+                ok("[]"),
+                ok(&default_branch_json("main")),
+                ran_and_failed(
+                    "a pull request for branch \"autopilot/x\" already exists: https://x/pull/9",
+                ),
+            ],
+        );
+        assert!(
+            matches!(
+                &report.advanced[0].step,
+                AdvanceStep::Stalled(Stall::NoOpenPr {
+                    reason: NoPrReason::RaceLost,
+                    ..
+                })
+            ),
+            "got {:?}",
+            report.advanced[0].step
+        );
+        assert!(report.problems.is_empty(), "a lost race is not a problem");
+    }
+
+    #[test]
+    fn the_base_comes_from_github_and_never_from_the_targets_committish() {
+        // `advance`'s CLI passes `base: "HEAD"` on every target, because the
+        // pass cuts no branches. `HEAD` names a commit; a pull request needs
+        // a branch, and `gh pr create --base HEAD` would be refused or, worse,
+        // accepted against a branch literally named `HEAD`.
+        let db = approved_db();
+        record_success(&db, &issue(), Some(GREEN));
+        let (repo, roots) = checkout_with_worktree();
+        let config = config(roots.path(), repo.path());
+        assert_eq!(config.targets[0].base, "HEAD", "the trap this guards");
+
+        let (_, gh) = pass_with_no_open_pr(
+            &config,
+            &db,
+            vec![
+                ok("[]"),
+                ok(&default_branch_json("trunk")),
+                ok("https://github.com/ironrace/ironmem/pull/341"),
+            ],
+        );
+        let create = gh
+            .seen
+            .iter()
+            .find(|argv| argv[0] == "pr" && argv[1] == "create")
+            .unwrap();
+        let at = create.iter().position(|a| a == "--base").unwrap();
+        assert_eq!(create[at + 1], "trunk");
+    }
+
+    #[test]
+    fn a_succeeded_issue_with_no_open_pr_needs_one_rather_than_stalling() {
+        // `next_step` is pure over the database, so it cannot ask GitHub
+        // whether a pull request ever existed here — and that question is the
+        // whole difference between "open one" and "a human closed it". It
+        // reports the need and `advance_issue` answers it.
         let db = approved_db();
         let root = tempfile::tempdir().unwrap();
         let candidate = Candidate {
             issue: issue(),
+            issue_title: "A test issue".into(),
             repo_path: root.path().to_path_buf(),
             risk_label: None,
             green_commit_sha: Some(GREEN.into()),
         };
         let step = next_step(&db, &candidate, &PrLookup::None, root.path()).unwrap();
-        assert!(matches!(step, AdvanceStep::Stalled(Stall::NoOpenPr { .. })));
+        assert!(
+            matches!(&step, AdvanceStep::NeedsPr { branch } if branch == "autopilot/ironrace-ironmem-283"),
+            "got {step:?}"
+        );
     }
 
     #[test]
@@ -1350,6 +2038,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let candidate = Candidate {
             issue: issue(),
+            issue_title: "A test issue".into(),
             repo_path: root.path().to_path_buf(),
             risk_label: None,
             green_commit_sha: Some(GREEN.into()),
@@ -1377,6 +2066,7 @@ mod tests {
         let (repo, roots) = checkout_with_worktree();
         let candidate = Candidate {
             issue: issue(),
+            issue_title: "A test issue".into(),
             repo_path: repo.path().to_path_buf(),
             risk_label: None,
             green_commit_sha: Some(GREEN.into()),
@@ -1396,6 +2086,7 @@ mod tests {
 
         let candidate = Candidate {
             issue: issue(),
+            issue_title: "A test issue".into(),
             repo_path: repo.path().to_path_buf(),
             risk_label: None,
             green_commit_sha: Some(GREEN.into()),
@@ -1414,6 +2105,7 @@ mod tests {
 
         let candidate = Candidate {
             issue: issue(),
+            issue_title: "A test issue".into(),
             repo_path: repo.path().to_path_buf(),
             risk_label: None,
             green_commit_sha: Some(GREEN.into()),
@@ -1434,6 +2126,7 @@ mod tests {
         let (repo, roots) = checkout_with_worktree();
         let candidate = Candidate {
             issue: issue(),
+            issue_title: "A test issue".into(),
             repo_path: repo.path().to_path_buf(),
             risk_label: None,
             green_commit_sha: Some(GREEN.into()),
@@ -1469,6 +2162,7 @@ mod tests {
         let (repo, roots) = checkout_with_worktree();
         let candidate = Candidate {
             issue: issue(),
+            issue_title: "A test issue".into(),
             repo_path: repo.path().to_path_buf(),
             risk_label: None,
             green_commit_sha: None,
@@ -1490,6 +2184,7 @@ mod tests {
         let roots = tempfile::tempdir().unwrap();
         let candidate = Candidate {
             issue: issue(),
+            issue_title: "A test issue".into(),
             repo_path: repo.path().to_path_buf(),
             risk_label: None,
             green_commit_sha: Some(GREEN.into()),
@@ -1510,6 +2205,7 @@ mod tests {
         let roots = tempfile::tempdir().unwrap();
         let candidate = Candidate {
             issue: issue(),
+            issue_title: "A test issue".into(),
             repo_path: repo.path().to_path_buf(),
             risk_label: None,
             green_commit_sha: Some(GREEN.into()),
@@ -2263,8 +2959,11 @@ skipped: {:?}",
                 success: false,
                 code: Some(1),
             }),
-            // Issue 284's lookup answers: no open PR.
+            // Issue 284's lookup answers: no open PR, and one already
+            // merged on the branch — so nothing is opened and nothing else
+            // is read.
             ok("[]"),
+            ok(MERGED_PR),
         ]);
 
         let report = advance_pass(
@@ -2280,6 +2979,10 @@ skipped: {:?}",
     }
 
     /// The three-issue `agent:ready` listing both burst-limit tests read.
+    /// One pull request on the branch, already merged — the listing
+    /// `prs_ever_for_branch` returns and `open_pr_for_branch` does not.
+    const MERGED_PR: &str = r#"[{"number":900,"headRefName":"autopilot/x","headRefOid":"bbbb","baseRefName":"main","isDraft":false,"url":"https://github.com/ironrace/ironmem/pull/900"}]"#;
+
     const THREE_READY: &str = r#"[{"number":283,"title":"a","body":"b","labels":[{"name":"agent:ready"}],"updatedAt":"2026-09-03T00:00:00Z"},{"number":284,"title":"a","body":"b","labels":[{"name":"agent:ready"}],"updatedAt":"2026-09-03T00:00:00Z"},{"number":285,"title":"a","body":"b","labels":[{"name":"agent:ready"}],"updatedAt":"2026-09-03T00:00:00Z"}]"#;
 
     #[test]
@@ -2329,16 +3032,31 @@ skipped: {:?}",
         for n in [283u64, 284, 285] {
             record_success(&db, &IssueRef::new(REPO, n), Some(GREEN));
         }
-        let mut gh = ScriptedGh::new(vec![ok(THREE_READY), ok("[]"), ok("[]"), ok("[]")]);
+        // Two reads per issue: no PR is open, and one already merged here —
+        // which is exactly the "left `agent:ready` after its PR was merged
+        // and closed" case above, and the reason Autopilot does not open a
+        // replacement.
+        let mut gh = ScriptedGh::new(vec![
+            ok(THREE_READY),
+            ok("[]"),
+            ok(MERGED_PR),
+            ok("[]"),
+            ok(MERGED_PR),
+            ok("[]"),
+            ok(MERGED_PR),
+        ]);
         let mut config = config(roots.path(), repo.path());
         config.max_advances_per_pass = 1;
 
         let report = advance_pass(&db, &mut gh, &mut ForbiddenReviewer, &config).unwrap();
         assert_eq!(report.advanced.len(), 3, "all three stalls are reported");
-        assert!(report
-            .advanced
-            .iter()
-            .all(|a| matches!(a.step, AdvanceStep::Stalled(Stall::NoOpenPr { .. }))));
+        assert!(report.advanced.iter().all(|a| matches!(
+            &a.step,
+            AdvanceStep::Stalled(Stall::NoOpenPr {
+                reason: NoPrReason::PriorPr { .. },
+                ..
+            })
+        )));
         assert!(
             !report
                 .skipped
@@ -2405,6 +3123,7 @@ skipped: {:?}",
 
         let candidate = Candidate {
             issue: issue(),
+            issue_title: "A test issue".into(),
             repo_path: repo.path().to_path_buf(),
             risk_label: None,
             green_commit_sha: Some(GREEN.into()),

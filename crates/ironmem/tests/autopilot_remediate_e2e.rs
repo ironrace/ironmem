@@ -334,9 +334,16 @@ survives and the Lead can still see the issue"
         "the IC is told which PR it is fixing"
     );
     assert!(
-        condition.contains("addressed by a commit you have pushed to this branch"),
+        condition.contains("addressed by one of those commits"),
         "the goal condition must extend past the already-green gate, or the IC \
 satisfies it by doing nothing"
+    );
+    // ⟨defect 7⟩ The push clause the remediation clause refers back to, in
+    // the real argv. It is unconditional now, so the two compose rather than
+    // the remediation carrying the only mention of pushing.
+    assert!(
+        condition.contains("every commit you have made is pushed to this issue's branch"),
+        "the push must be part of the condition on every dispatch: {condition}"
     );
 
     // ── 4. the pushed fix supersedes the remediation ────────────────────

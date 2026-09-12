@@ -1016,6 +1016,11 @@ pub fn run_issue(
             strategy_redirect: strategy_redirect.as_deref(),
             human_answers: &human_answers,
             remediation: remediation_brief,
+            // The worktree's own branch, not `worktree::branch_name(issue)`
+            // re-derived: `ensure_worktree` is the thing that guarantees the
+            // checkout is on that branch, and it is the value it hands back
+            // that the IC will actually be committing onto.
+            branch: &worktree.branch,
             gate_commands: &gate_commands,
             n_turns: config.n_turns,
         });
@@ -2295,9 +2300,16 @@ mod tests {
         assert!(condition.contains("the retry loop is unbounded"));
         assert!(condition.contains("pull request #42"));
         assert!(
-            condition.contains("addressed by a commit you have pushed to this branch"),
+            condition.contains("addressed by one of those commits"),
             "the findings must reach the CONDITION, or the already-green gate \
 satisfies it on its own"
+        );
+        // The worktree's real branch, not a re-derivation, reaches the
+        // condition — `run_issue` is the only place that holds both the
+        // `Worktree` and the prompt.
+        assert!(
+            condition.contains(&wt.branch),
+            "the condition must name the branch the dispatch is actually on"
         );
     }
 
