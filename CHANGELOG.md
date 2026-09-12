@@ -521,6 +521,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Autopilot: `onboard` inferred a gate narrower than CI, so "the approved
+  gate passes" was satisfiable by code CI rejects (#334).** Inference read
+  build manifests, which name a stack's *test* command and say nothing about
+  the checks a repo is actually judged by: this repo onboarded as
+  `cargo test --workspace` alone while its CI also runs
+  `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets
+  --all-features -- -D warnings`. The first live Autopilot run paid for the
+  gap — PR #332 met its gate and then failed CI twice, on a rustfmt violation
+  and a real `too_many_arguments` lint — and the implementer could not have
+  known, because by design it is told the gate condition and nothing else. A
+  recognized stack now contributes **check commands alongside its test
+  command**, ordered checks-first so a formatting violation costs seconds
+  rather than a full suite run.
+
+  The check a Rust repo gets is **the one its own CI runs**, taken verbatim
+  wherever that command can be executed as written. That is the faithful
+  thing to propose and it is satisfiable by construction: CI runs it on every
+  merge to the default branch. Where CI's text cannot be run as written —
+  multi-line shell, a `${{ }}` expression only a runner resolves, an absolute
+  toolchain path — a canonical command (`cargo fmt --all -- --check`,
+  `cargo clippy … -- -D warnings`, `--workspace` tracking the same
+  `[workspace]` detection as the test command) is proposed instead, and the
+  proposal says which workflow it came from and that it may be stricter than
+  what CI enforces. Checks are added **only where CI shows the tool runs at
+  all**: proposing them unconditionally would repeat the mistake this module
+  already refuses for an Xcode `-scheme` guess, since a repo that has never
+  been clippy-clean would be onboarded into a gate that can never go green.
+  With no evidence, inference is byte-for-byte what it was before.
+
+  New `autopilot::ci_evidence` is the bounded reader behind this — `run:`
+  steps out of `.github/workflows/*.yml`, with no anchors, matrices, job
+  graph or expression resolution, and no claim to know which jobs are
+  required. A tool enforced only through a third-party action or an
+  indirection like `make lint` stays invisible, and such a repo onboards
+  exactly as before. CI config that exists and cannot be read now **warns**
+  rather than reading as "no CI" — a silently skipped workflow is precisely
+  how a gate ends up narrower than CI — and that warning is folded into the
+  error on the paths where no proposal is written at all. Re-onboarding also
+  warns when a per-dispatch wall-clock bound is carried forward onto a gate
+  whose commands changed: the bound was calibrated against dispatch durations
+  for a narrower gate, and nothing else in the proposal would say so.
+
 - **Autopilot: `agent:exhausted` could not actually be recovered, so the
   documented human retry was a no-op.** The spec is explicit that the label
   "never self-resumes" and that "only a human re-labeling it retries", but the

@@ -142,10 +142,31 @@
 //! repo inside the logical key or record body instead — a judgment call,
 //! documented here so it's easy to revisit.
 
+/// Strip one layer of matching `"`/`'` quoting from a token, e.g. a TOML
+/// bare-or-quoted key segment (`"workspace"` → `workspace`) or a quoted YAML
+/// scalar (`"$HOME/.cargo/bin/cargo test"`). TOML allows a table header's key
+/// to be quoted (`["workspace"]` is exactly as valid as `[workspace]`) and
+/// YAML allows any scalar to be, so both of gate inference's readers need the
+/// same one-layer strip.
+///
+/// Does not handle a *dotted* TOML header with only some segments quoted
+/// (e.g. `["workspace".package]`) — closing that fully needs a real TOML
+/// parser, the same limitation `onboard::is_cargo_workspace` documents for
+/// the unquoted dotted-key-only form.
+pub(super) fn strip_matching_quotes(s: &str) -> &str {
+    for quote in ['"', '\''] {
+        if s.len() >= 2 && s.starts_with(quote) && s.ends_with(quote) {
+            return &s[1..s.len() - 1];
+        }
+    }
+    s
+}
+
 pub mod advance;
 pub mod advise;
 pub mod blocked;
 pub mod budget;
+pub mod ci_evidence;
 pub mod dispatch;
 pub mod dispatch_state;
 pub mod gate_config;

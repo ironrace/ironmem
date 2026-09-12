@@ -8,23 +8,34 @@
 //! [`onboard_repo`] is the glue that calls [`infer_gate_commands`] and hands
 //! the result to [`gate_config::propose_gate_config`].
 //!
-//! # Scope: manifest files, not CI config
+//! # Scope: manifest files for commands, CI config for evidence
 //!
 //! The spec's phrase "CI config, `Cargo.toml`/`package.json`/`Makefile`"
 //! names CI config first, but a real `.github/workflows/*.yml` (or other CI
 //! provider) can express arbitrary matrix builds, multi-step jobs, and
 //! shell logic — parsing that reliably enough to *trust its output as an
-//! unattended gate* is a much larder problem than this rung's testing bar
-//! ("Gate inference against fixture repos (Rust, Python, Swift)"). Inference
-//! here is deliberately limited to deterministic, root-level build-manifest
-//! detection — the same signal a human skimming the repo root would use.
-//! Nothing here recurses into subdirectories: a monorepo's vendored or
-//! example subtrees must not silently contribute a gate command a human
-//! onboarding the *repo* never intended to run. A repo whose real gate can
-//! only be read out of CI config still onboards — a human just supplies the
-//! commands directly via [`gate_config::propose_gate_config`] instead of this
-//! module's inference path; [`propose_gate_config`] never required inference
-//! to be its only caller.
+//! unattended gate* is a much larger problem than this rung's testing bar
+//! ("Gate inference against fixture repos (Rust, Python, Swift)"). The
+//! commands proposed here are therefore always canonical ones this module
+//! holds, chosen by deterministic, root-level build-manifest detection — the
+//! same signal a human skimming the repo root would use. Nothing here
+//! recurses into subdirectories: a monorepo's vendored or example subtrees
+//! must not silently contribute a gate command a human onboarding the *repo*
+//! never intended to run. A repo whose real gate can only be read out of CI
+//! config still onboards — a human just supplies the commands directly via
+//! [`gate_config::propose_gate_config`] instead of this module's inference
+//! path; [`propose_gate_config`] never required inference to be its only
+//! caller.
+//!
+//! Manifests alone, though, name only a stack's *test* command, and the first
+//! live Autopilot run showed what that costs: a branch met its approved gate
+//! (`cargo test --workspace`) and then failed CI twice on `cargo fmt` and
+//! `cargo clippy`, neither of which the gate mentioned. A gate narrower than
+//! CI makes "the approved gate passes" satisfiable by code CI rejects, and
+//! the IC cannot know — it is told the gate condition and nothing else, by
+//! design. So a repo's CI config is now read for one thing only: **whether a
+//! check tool is enforced**. See [`super::ci_evidence`] — it decides which
+//! canonical check commands are proposed, and never supplies their text.
 //!
 //! # Multi-stack repos
 //!
@@ -40,6 +51,7 @@ use std::path::Path;
 use crate::db::schema::Database;
 use crate::error::MemoryError;
 
+use super::ci_evidence;
 use super::gate_config::{propose_gate_config, GateConfig};
 
 /// Build-manifest markers that indicate a Python project. Any one is
@@ -55,6 +67,40 @@ const PYTHON_MARKERS: &[&str] = &[
     "Pipfile",
 ];
 
+/// [`ci_evidence::CiCommands`], read on first use.
+///
+/// Only a stack that can contribute check commands ever asks, so a
+/// Python-only repo does no workflow I/O and — more importantly — cannot
+/// surface a warning about a workflow that could not have changed its
+/// proposal anyway. A warning a human has no way to act on is worse than
+/// none: it is what trains an approver to skim past the ones that matter.
+struct LazyCiCommands<'a> {
+    repo_path: &'a Path,
+    cell: std::cell::OnceCell<ci_evidence::CiCommands>,
+}
+
+impl<'a> LazyCiCommands<'a> {
+    fn new(repo_path: &'a Path) -> Self {
+        Self {
+            repo_path,
+            cell: std::cell::OnceCell::new(),
+        }
+    }
+
+    fn get(&self) -> &ci_evidence::CiCommands {
+        self.cell
+            .get_or_init(|| ci_evidence::CiCommands::read(self.repo_path))
+    }
+
+    /// The warnings from the read, or none at all if nothing ever asked.
+    fn into_warnings(self) -> Vec<String> {
+        self.cell
+            .into_inner()
+            .map(|evidence| evidence.warnings)
+            .unwrap_or_default()
+    }
+}
+
 /// The result of [`infer_gate_commands`]: every recognized stack's command,
 /// plus any non-fatal problems hit while inferring them.
 #[derive(Debug)]
@@ -66,11 +112,14 @@ pub struct InferredGates {
 }
 
 /// Infer gate commands for the repo checked out at `repo_path`, by
-/// deterministic root-level build-manifest detection (see module docs for
-/// scope). Returns every recognized stack's command, in a fixed order
-/// (Rust, Python, Swift, Node), so the same repo always infers the same
-/// list. Errors if `repo_path` is not a directory, or if nothing recognized
-/// was found — an empty gate is never proposed silently (rung 2's
+/// deterministic root-level build-manifest detection, plus the check
+/// commands its CI config shows it enforces (see module docs for scope).
+/// Returns every recognized stack's commands, in a fixed order (Rust,
+/// Python, Swift, Node — and within a stack, its checks before its test
+/// command, cheapest first, matching the order a human runs them locally),
+/// so the same repo always infers the same list. Errors if `repo_path` is
+/// not a directory, or if nothing recognized was found — an empty gate is
+/// never proposed silently (rung 2's
 /// `turn_prompt::render` already panics on an empty `gate_commands`; failing
 /// here, with a message a human can act on, is strictly better than that
 /// panic firing downstream at dispatch time).
@@ -93,8 +142,18 @@ pub fn infer_gate_commands(repo_path: &Path) -> Result<InferredGates, MemoryErro
     // never silently vanishing either way.
     let mut commands = Vec::new();
     let mut manifest_error: Option<MemoryError> = None;
+    // Read at most once, and only if a stack that consults it is
+    // recognized: every such stack asks the same evidence the same
+    // question. A repo with no CI config yields empty evidence, and every
+    // stack then infers exactly what it inferred before this existed.
+    let ci = LazyCiCommands::new(repo_path);
+    let mut warnings: Vec<String> = Vec::new();
 
-    record(infer_rust(repo_path), &mut commands, &mut manifest_error);
+    record(
+        infer_rust(repo_path, &ci, &mut warnings),
+        &mut commands,
+        &mut manifest_error,
+    );
     if let Some(cmd) = infer_python(repo_path) {
         commands.push(cmd);
     }
@@ -119,14 +178,33 @@ pub fn infer_gate_commands(repo_path: &Path) -> Result<InferredGates, MemoryErro
         );
     }
 
+    warnings.extend(ci.into_warnings());
+
     if commands.is_empty() {
+        // Both error paths carry the warnings with them. A caller that gets
+        // only "could not infer any gate commands" while the real story is
+        // "your CI config could not be read either" has been told the
+        // symptom and denied the cause — and an `InferredGates` these would
+        // have travelled in is never constructed on this path.
+        let context = if warnings.is_empty() {
+            String::new()
+        } else {
+            format!(" (also: {})", warnings.join("; "))
+        };
         if let Some(err) = manifest_error {
-            return Err(err);
+            if context.is_empty() {
+                return Err(err);
+            }
+            let message = match err {
+                MemoryError::Validation(message) => message,
+                other => other.to_string(),
+            };
+            return Err(MemoryError::Validation(format!("{message}{context}")));
         }
         return Err(MemoryError::Validation(format!(
             "could not infer any gate commands for '{}' — no recognized build manifest \
              (Cargo.toml, {}, Package.swift, package.json) or Makefile 'test:' target found; \
-             propose a gate config manually via `propose_gate_config`",
+             propose a gate config manually via `propose_gate_config`{context}",
             repo_path.display(),
             PYTHON_MARKERS.join("/"),
         )));
@@ -137,13 +215,11 @@ pub fn infer_gate_commands(repo_path: &Path) -> Result<InferredGates, MemoryErro
     // also not allowed to disappear with zero trace: a human approving what
     // looks like a complete gate deserves to know a different manifest sat
     // broken and was skipped rather than contributing its own command.
-    let warnings = manifest_error
-        .map(|err| {
-            vec![format!(
-                "a build manifest could not be inspected and was skipped: {err}"
-            )]
-        })
-        .unwrap_or_default();
+    if let Some(err) = manifest_error {
+        warnings.push(format!(
+            "a build manifest could not be inspected and was skipped: {err}"
+        ));
+    }
 
     Ok(InferredGates { commands, warnings })
 }
@@ -154,14 +230,18 @@ pub fn infer_gate_commands(repo_path: &Path) -> Result<InferredGates, MemoryErro
 /// in [`infer_gate_commands`], pulled out once rather than repeated at every
 /// call site. Only the first error is kept, matching the "one root cause at
 /// a time" contract described there.
-fn record(
-    result: Result<Option<String>, MemoryError>,
+///
+/// Generic over the success type so a detector may contribute *any* number
+/// of commands: `Option<String>` for a stack with only a test command,
+/// `Vec<String>` for one that also proposes check commands. Both are
+/// `IntoIterator<Item = String>`, so neither call site has to say which.
+fn record<I: IntoIterator<Item = String>>(
+    result: Result<I, MemoryError>,
     commands: &mut Vec<String>,
     manifest_error: &mut Option<MemoryError>,
 ) {
     match result {
-        Ok(Some(cmd)) => commands.push(cmd),
-        Ok(None) => {}
+        Ok(inferred) => commands.extend(inferred),
         Err(err) => {
             manifest_error.get_or_insert(err);
         }
@@ -191,38 +271,99 @@ fn exact_file_exists(dir: &Path, name: &str) -> bool {
     })
 }
 
+/// The check tools a Rust repo's gate may cover, each with the canonical
+/// command to **fall back to** when CI's own invocation of it cannot be run
+/// as written (see [`ci_evidence::Invocation::is_plainly_runnable`]).
+///
+/// A fallback is a guess — it may be stricter than what CI enforces, which
+/// is a gate the repo might not pass — so taking one is always reported on
+/// the proposal for the human approving it to judge. CI's own command is
+/// preferred precisely because it is not a guess: CI runs it on every merge
+/// to the default branch, so it is satisfiable by construction.
+///
+/// `--workspace` tracks the same `[workspace]` detection as the test
+/// command, for the same reason: on a workspace root, a clippy run without
+/// it lints the root package alone and reports green over unlinted members.
+fn rust_checks(is_workspace: bool) -> [(&'static [&'static str], String); 2] {
+    [
+        (
+            &["cargo", "fmt"][..],
+            "cargo fmt --all -- --check".to_string(),
+        ),
+        (
+            &["cargo", "clippy"][..],
+            if is_workspace {
+                "cargo clippy --workspace --all-targets --all-features -- -D warnings"
+            } else {
+                "cargo clippy --all-targets --all-features -- -D warnings"
+            }
+            .to_string(),
+        ),
+    ]
+}
+
 /// `Cargo.toml` present → Rust. A root `[workspace]` table means member
 /// crates typically don't all build/test from the root package alone, so
 /// `--workspace` is required for the gate to actually cover them; a plain
 /// package gets the simpler `cargo test`.
-fn infer_rust(repo_path: &Path) -> Result<Option<String>, MemoryError> {
+///
+/// Format and lint checks are added **only when `ci` shows the repo runs
+/// that tool**, and are CI's own command wherever that command can be run as
+/// written. Proposing checks unconditionally would be the same mistake this
+/// module already refuses for an Xcode `-scheme` guess and for npm's
+/// placeholder test script: a gate command the repo cannot satisfy makes
+/// *every* dispatch fail, and a repo that has never been clippy-clean would
+/// be onboarded into a gate that can never go green. Absent evidence the
+/// inference is exactly what it was before CI was read at all.
+///
+/// Checks come before the test command because the gate is rendered as a
+/// single `&&` chain: a formatting violation then costs seconds rather than
+/// a full suite run, which is also the order `CONTRIBUTING.md` gives for the
+/// local loop.
+fn infer_rust(
+    repo_path: &Path,
+    ci: &LazyCiCommands,
+    warnings: &mut Vec<String>,
+) -> Result<Vec<String>, MemoryError> {
     if !exact_file_exists(repo_path, "Cargo.toml") {
-        return Ok(None);
+        return Ok(Vec::new());
     }
+    // Consulted before the manifest is read, not after: this repo *is* a
+    // stack that consults CI, so the read is warranted the moment the
+    // manifest is present. Doing it after would mean an unreadable
+    // `Cargo.toml` returned early with the CI evidence never gathered, and
+    // an unreadable CI config alongside it — the one case where the two
+    // problems compound — would be reported to nobody.
+    let ci = ci.get();
     let content = read_manifest(&repo_path.join("Cargo.toml"))?;
-    Ok(Some(if is_cargo_workspace(&content) {
-        "cargo test --workspace".to_string()
-    } else {
-        "cargo test".to_string()
-    }))
-}
+    let is_workspace = is_cargo_workspace(&content);
 
-/// Strip one layer of matching `"`/`'` quoting from a TOML bare-or-quoted
-/// key segment, e.g. `"workspace"` or `'workspace'` → `workspace` — TOML
-/// allows a table header's key to be quoted (`["workspace"]` is exactly as
-/// valid as `[workspace]`), and [`is_cargo_workspace`]'s heuristic must
-/// recognize both forms the same way a real TOML parser would. Does not
-/// handle a *dotted* header with only some segments quoted (e.g.
-/// `["workspace".package]`) — closing that fully needs a real TOML parser,
-/// the same limitation already documented on `is_cargo_workspace` for the
-/// unquoted dotted-key-only form.
-fn strip_matching_quotes(s: &str) -> &str {
-    for quote in ['"', '\''] {
-        if s.len() >= 2 && s.starts_with(quote) && s.ends_with(quote) {
-            return &s[1..s.len() - 1];
+    let mut commands = Vec::new();
+    for (tool, canonical) in rust_checks(is_workspace) {
+        let Some(invocation) = ci.invocation_of(tool) else {
+            continue;
+        };
+        if invocation.is_plainly_runnable(tool) {
+            commands.push(invocation.command.clone());
+            continue;
         }
+        warnings.push(format!(
+            "{} runs `{}`, which a gate cannot run as written, so `{canonical}` is proposed \
+             instead — it may be stricter than what CI enforces; check it passes before \
+             approving",
+            invocation.workflow, invocation.command
+        ));
+        commands.push(canonical);
     }
-    s
+    commands.push(
+        if is_workspace {
+            "cargo test --workspace"
+        } else {
+            "cargo test"
+        }
+        .to_string(),
+    );
+    Ok(commands)
 }
 
 /// Whether a `Cargo.toml`'s content declares a `[workspace]` table — either
@@ -281,7 +422,7 @@ fn is_cargo_workspace(content: &str) -> bool {
             .strip_prefix('[')
             .and_then(|rest| rest.strip_suffix(']'))
             .map(str::trim)
-            .map(strip_matching_quotes)
+            .map(super::strip_matching_quotes)
             .is_some_and(|name| name == "workspace" || name.starts_with("workspace."));
         if is_workspace_header {
             return true;
@@ -448,35 +589,13 @@ fn has_test_target(content: &str) -> bool {
 /// regular file.)
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 
-/// `std::fs::read_to_string`, but with the failing path folded into the
-/// error message (via [`crate::error::read_to_string_with_path`]) and a size
-/// cap enforced first (see [`MAX_MANIFEST_BYTES`]).
-///
-/// A leading UTF-8 BOM (U+FEFF), if present, is stripped before returning:
-/// it is not Unicode whitespace, so it would otherwise survive every
-/// caller's own trimming and hide the very first line's real content — a
-/// `[workspace]` header for [`is_cargo_workspace`], or the opening `{` for
-/// `infer_node`'s JSON parse (`serde_json` does not skip a BOM either).
-/// Stripped once here, at the shared read boundary, rather than patched
-/// into each format-specific parser separately.
+/// [`crate::error::read_to_string_capped`] at [`MAX_MANIFEST_BYTES`], wrapped
+/// into a [`MemoryError::Validation`] — the size cap, the path-in-the-message
+/// and the BOM strip all live in that one shared reader so this module and
+/// [`super::ci_evidence`] cannot drift apart on any of them.
 fn read_manifest(path: &Path) -> Result<String, MemoryError> {
-    let size = std::fs::metadata(path)
-        .map_err(|err| {
-            MemoryError::Validation(format!("failed to read '{}': {err}", path.display()))
-        })?
-        .len();
-    if size > MAX_MANIFEST_BYTES {
-        return Err(MemoryError::Validation(format!(
-            "'{}' is {size} bytes, over the {MAX_MANIFEST_BYTES}-byte limit for a build \
-             manifest — refusing to read it",
-            path.display()
-        )));
-    }
-    let content = crate::error::read_to_string_with_path(path).map_err(MemoryError::Validation)?;
-    Ok(content
-        .strip_prefix('\u{FEFF}')
-        .map(str::to_string)
-        .unwrap_or(content))
+    crate::error::read_to_string_capped(path, MAX_MANIFEST_BYTES, "build manifest")
+        .map_err(MemoryError::Validation)
 }
 
 /// End-to-end onboarding (spec steps 1-2): infer gate commands for the local
@@ -1052,6 +1171,276 @@ mod tests {
         assert!(super::super::gate_config::get_gate_config(&db, "some/repo")
             .unwrap()
             .is_none());
+    }
+
+    /// Write a GitHub Actions workflow into a fixture repo — the only
+    /// evidence source the check-command inference consults.
+    fn workflow(dir: &Path, name: &str, content: &str) {
+        let workflows = dir.join(".github").join("workflows");
+        std::fs::create_dir_all(&workflows).unwrap();
+        std::fs::write(workflows.join(name), content).unwrap();
+    }
+
+    /// Put a regular file where the workflow directory belongs, so it
+    /// exists and cannot be listed — the cheap stand-in for any unreadable
+    /// CI config (the size-cap path has its own test in `ci_evidence`).
+    fn unreadable_workflows(dir: &Path) {
+        std::fs::create_dir_all(dir.join(".github")).unwrap();
+        std::fs::write(dir.join(".github").join("workflows"), "not a dir").unwrap();
+    }
+
+    #[test]
+    fn infers_fmt_and_clippy_before_the_test_command_when_ci_runs_them() {
+        // The defect this closes: the gate said `cargo test --workspace` and
+        // nothing else, so an IC met it with code CI then rejected twice.
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"crates/*\"]\n",
+        );
+        workflow(
+            dir.path(),
+            "ci.yml",
+            "jobs:\n  check:\n    steps:\n      - run: cargo fmt --all -- --check\n      \
+             - run: cargo clippy --workspace --all-targets --all-features -- -D warnings\n  \
+             test:\n    steps:\n      - run: cargo test --workspace\n",
+        );
+
+        let inferred = infer_gate_commands(dir.path()).unwrap();
+
+        assert_eq!(
+            inferred.commands,
+            vec![
+                "cargo fmt --all -- --check".to_string(),
+                "cargo clippy --workspace --all-targets --all-features -- -D warnings".to_string(),
+                "cargo test --workspace".to_string(),
+            ]
+        );
+        // CI runs exactly the canonical commands here, so there is nothing
+        // for a human to reconcile.
+        assert!(inferred.warnings.is_empty(), "{:?}", inferred.warnings);
+    }
+
+    #[test]
+    fn a_non_workspace_crate_falls_back_to_clippy_without_workspace() {
+        // The fallback command is only reached when CI's own text cannot be
+        // run as written — here an absolute runner path. The same
+        // `[workspace]` detection then governs both commands: a gate must
+        // not claim `--workspace` coverage a plain package has no members
+        // for.
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "Cargo.toml", "[package]\nname = \"x\"\n");
+        workflow(
+            dir.path(),
+            "ci.yml",
+            "steps:\n  - run: \"$HOME/.cargo/bin/cargo clippy --all-targets\"\n",
+        );
+
+        let inferred = infer_gate_commands(dir.path()).unwrap();
+
+        assert_eq!(
+            inferred.commands,
+            vec![
+                "cargo clippy --all-targets --all-features -- -D warnings".to_string(),
+                "cargo test".to_string(),
+            ]
+        );
+        assert_eq!(inferred.warnings.len(), 1, "{:?}", inferred.warnings);
+    }
+
+    #[test]
+    fn a_rust_repo_whose_ci_runs_no_checks_infers_exactly_what_it_did_before() {
+        // Evidence-gated, deliberately: a repo that has never been
+        // clippy-clean must not be onboarded into a gate that can never go
+        // green. No evidence degrades to the old behaviour, never to an
+        // unsatisfiable gate.
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"crates/*\"]\n",
+        );
+        workflow(
+            dir.path(),
+            "ci.yml",
+            "steps:\n  - run: cargo test --workspace\n",
+        );
+
+        assert_eq!(
+            infer_gate_commands(dir.path()).unwrap().commands,
+            vec!["cargo test --workspace".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_repo_with_no_ci_config_at_all_infers_exactly_what_it_did_before() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"crates/*\"]\n",
+        );
+
+        let inferred = infer_gate_commands(dir.path()).unwrap();
+
+        assert_eq!(
+            inferred.commands,
+            vec!["cargo test --workspace".to_string()]
+        );
+        assert!(inferred.warnings.is_empty());
+    }
+
+    #[test]
+    fn ci_evidence_for_a_stack_the_repo_does_not_have_contributes_nothing() {
+        // Evidence never introduces a stack; it only decides which of a
+        // recognized stack's checks are proposed.
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "pyproject.toml", "[project]\nname = \"x\"\n");
+        workflow(dir.path(), "ci.yml", "steps:\n  - run: cargo clippy\n");
+
+        assert_eq!(
+            infer_gate_commands(dir.path()).unwrap().commands,
+            vec!["pytest".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_runnable_ci_invocation_is_adopted_verbatim_rather_than_normalized() {
+        // The gate is a proxy for CI, so CI's own command is the faithful
+        // one to propose — and it is satisfiable by construction, which a
+        // stricter canonical command is not. Normalizing this to
+        // `-D warnings` would block work CI would have accepted.
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "Cargo.toml", "[package]\nname = \"x\"\n");
+        workflow(
+            dir.path(),
+            "ci.yml",
+            "steps:\n  - run: cargo clippy --all-features -- -D clippy::pedantic\n",
+        );
+
+        let inferred = infer_gate_commands(dir.path()).unwrap();
+
+        assert_eq!(
+            inferred.commands,
+            vec![
+                "cargo clippy --all-features -- -D clippy::pedantic".to_string(),
+                "cargo test".to_string(),
+            ]
+        );
+        assert!(inferred.warnings.is_empty(), "{:?}", inferred.warnings);
+    }
+
+    #[test]
+    fn a_fallback_command_names_the_workflow_and_says_it_may_be_stricter() {
+        // The fallback is a guess. A human approving one has to be able to
+        // find what CI actually runs, which means naming the file.
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "Cargo.toml", "[package]\nname = \"x\"\n");
+        workflow(
+            dir.path(),
+            "lint.yml",
+            "steps:\n  - run: cargo fmt --all -- --check ${{ matrix.extra }}\n",
+        );
+
+        let inferred = infer_gate_commands(dir.path()).unwrap();
+
+        assert_eq!(
+            inferred.commands,
+            vec![
+                "cargo fmt --all -- --check".to_string(),
+                "cargo test".to_string()
+            ]
+        );
+        assert_eq!(inferred.warnings.len(), 1, "{:?}", inferred.warnings);
+        assert!(
+            inferred.warnings[0].contains("lint.yml") && inferred.warnings[0].contains("stricter"),
+            "expected the warning to name the workflow and the risk, got: {:?}",
+            inferred.warnings
+        );
+    }
+
+    #[test]
+    fn ci_config_that_could_not_be_read_warns_rather_than_narrowing_the_gate_silently() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "Cargo.toml", "[package]\nname = \"x\"\n");
+        unreadable_workflows(dir.path());
+
+        let inferred = infer_gate_commands(dir.path()).unwrap();
+
+        assert_eq!(inferred.commands, vec!["cargo test".to_string()]);
+        assert_eq!(inferred.warnings.len(), 1, "{:?}", inferred.warnings);
+        assert!(
+            inferred.warnings[0].contains("narrower than CI"),
+            "expected the skipped-workflow warning, got: {:?}",
+            inferred.warnings
+        );
+    }
+
+    #[test]
+    fn unreadable_ci_config_is_not_reported_to_a_repo_whose_gate_could_not_use_it() {
+        // Nothing about the workflow could have changed a Python-only
+        // proposal, so a warning about it is one an approver cannot act on
+        // — and unactionable warnings are what teach people to skim.
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "pyproject.toml", "[project]\nname = \"x\"\n");
+        unreadable_workflows(dir.path());
+
+        let inferred = infer_gate_commands(dir.path()).unwrap();
+
+        assert_eq!(inferred.commands, vec!["pytest".to_string()]);
+        assert!(inferred.warnings.is_empty(), "{:?}", inferred.warnings);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_inference_failure_still_reports_why_the_ci_config_was_not_read() {
+        // On this path there is no `InferredGates` for a warning to travel
+        // in, so a warning that is not folded into the error reaches nobody.
+        use std::os::unix::fs::PermissionsExt;
+
+        if test_runner_is_root() {
+            return; // root reads a 0o000 file regardless
+        }
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "Cargo.toml", "[package]\nname = \"x\"\n");
+        std::fs::set_permissions(
+            dir.path().join("Cargo.toml"),
+            std::fs::Permissions::from_mode(0o000),
+        )
+        .unwrap();
+        unreadable_workflows(dir.path());
+
+        let err = infer_gate_commands(dir.path()).unwrap_err().to_string();
+
+        assert!(err.contains("Cargo.toml"), "got: {err}");
+        assert!(err.contains("narrower than CI"), "got: {err}");
+    }
+
+    #[test]
+    fn onboard_repo_carries_a_ci_warning_into_the_pending_proposal() {
+        // `manifest_warnings` is what a human reads before approving; a
+        // warning that stops at `infer_gate_commands` reaches nobody.
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "Cargo.toml", "[package]\nname = \"x\"\n");
+        workflow(
+            dir.path(),
+            "ci.yml",
+            "steps:\n  - run: \"$HOME/.cargo/bin/cargo fmt --all -- --check\"\n",
+        );
+        let db = Database::open_in_memory().unwrap();
+
+        let config = onboard_repo(&db, "ironrace/ironmem", dir.path()).unwrap();
+
+        assert_eq!(
+            config.gate_commands(),
+            vec![
+                "cargo fmt --all -- --check".to_string(),
+                "cargo test".to_string()
+            ]
+        );
+        assert_eq!(config.manifest_warnings.len(), 1);
+        assert!(config.manifest_warnings[0].contains("$HOME/.cargo/bin/cargo fmt"));
     }
 
     #[test]

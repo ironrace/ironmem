@@ -4,6 +4,7 @@
 - `cargo test --workspace` - run the full test suite
 - `cargo fmt --all -- --check` - run the format task
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings` - run the lint task
+- Run these three sequentially and read each command's own exit status - never pipe one through `tail`, which reports the pager's status and hides a red gate. See `docs/agent-guides/development.md`.
 
 ## Code Map
 - `crates` - crates

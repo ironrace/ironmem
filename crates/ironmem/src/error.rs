@@ -16,6 +16,42 @@ pub(crate) fn read_to_string_with_path(path: &Path) -> Result<String, String> {
         .map_err(|err| format!("failed to read '{}': {err}", path.display()))
 }
 
+/// [`read_to_string_with_path`], with a size cap enforced *before* the read
+/// and a leading UTF-8 BOM stripped after it. `kind` names what is being read
+/// ("build manifest", "CI workflow") so the refusal message tells a human
+/// which limit they hit.
+///
+/// Both halves exist because of the same class of bug. `read_to_string` has
+/// no size limit of its own, so a path that resolves — directly, or through a
+/// symlink a monorepo might legitimately use — to an unexpectedly large
+/// regular file would be loaded into memory in full. And a BOM (U+FEFF) is
+/// not Unicode whitespace, so it survives every caller's trimming and hides
+/// the very first line's real content: a `[workspace]` header, the opening
+/// `{` of a JSON manifest (`serde_json` does not skip a BOM either), or a
+/// workflow's first `run:` key. Stripping it once at the shared read boundary
+/// is what keeps the format-specific parsers from each needing their own.
+pub(crate) fn read_to_string_capped(
+    path: &Path,
+    max_bytes: u64,
+    kind: &str,
+) -> Result<String, String> {
+    let size = std::fs::metadata(path)
+        .map_err(|err| format!("failed to read '{}': {err}", path.display()))?
+        .len();
+    if size > max_bytes {
+        return Err(format!(
+            "'{}' is {size} bytes, over the {max_bytes}-byte limit for a {kind} — refusing to \
+             read it",
+            path.display()
+        ));
+    }
+    let content = read_to_string_with_path(path)?;
+    Ok(content
+        .strip_prefix('\u{FEFF}')
+        .map(str::to_string)
+        .unwrap_or(content))
+}
+
 /// All error types for the `ironmem` crate.
 #[derive(Debug, thiserror::Error)]
 pub enum MemoryError {

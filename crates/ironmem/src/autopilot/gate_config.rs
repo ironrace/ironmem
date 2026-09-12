@@ -53,7 +53,8 @@ pub struct GateConfig {
     pub repo: String,
     pub state: GateConfigState,
     gate_commands: Vec<String>,
-    /// Non-fatal problems the Onboarder hit while inferring `gate_commands`
+    /// Non-fatal problems a human must read before approving. Mostly the
+    /// Onboarder's: problems it hit while inferring `gate_commands`
     /// — e.g. a build manifest that exists but couldn't be read or parsed,
     /// encountered while a *different* stack was still recognized (see
     /// `onboard`'s module docs: one broken manifest must not veto a
@@ -172,13 +173,14 @@ fn gate_config_key(repo: &str) -> String {
 /// entirely to supply commands read out of CI config by hand (see that
 /// module's docs) — so it must not rely on [`super::onboard`] being the only
 /// caller that happens to already refuse these. `manifest_warnings` is
-/// carried through verbatim (a hand-authored proposal has none to report;
-/// pass an empty vec).
+/// carried through (a hand-authored proposal has none to report; pass an
+/// empty vec), and this function may add one of its own — see the carried
+/// wall-clock bound below.
 pub fn propose_gate_config(
     db: &Database,
     repo: &str,
     gate_commands: Vec<String>,
-    manifest_warnings: Vec<String>,
+    mut manifest_warnings: Vec<String>,
 ) -> Result<GateConfig, MemoryError> {
     validate_repo(repo)?;
     validate_gate_commands(&gate_commands).map_err(MemoryError::Validation)?;
@@ -188,9 +190,27 @@ pub fn propose_gate_config(
     // field's doc), so re-inference has nothing to say about it, and dropping
     // it would silently un-bound the repo's dispatches as a side effect of an
     // unrelated re-onboard.
-    let carried = read_current(db, &gate_config_key(repo))?
-        .and_then(|drawer| serde_json::from_str::<GateConfig>(&drawer.content).ok())
+    let existing = read_current(db, &gate_config_key(repo))?
+        .and_then(|drawer| serde_json::from_str::<GateConfig>(&drawer.content).ok());
+    let carried = existing
+        .as_ref()
         .and_then(|existing| existing.wall_clock_timeout_secs);
+    // Carrying it forward silently is only safe while the gate it was
+    // calibrated against is the gate it now bounds. A human sets the bound
+    // from recorded dispatch durations; once re-inference changes what the
+    // gate executes — a check command inference did not used to propose, say
+    // — those durations measured something else, and a bound that is now too
+    // tight kills dispatches mid-gate as "wedged". Nothing else in the
+    // proposal would say so.
+    if let (Some(secs), Some(previous)) = (carried, existing.as_ref()) {
+        if previous.gate_commands() != gate_commands {
+            manifest_warnings.push(format!(
+                "the {secs}s per-dispatch wall-clock bound is carried forward from a config \
+                 whose gate commands were different — it was calibrated against that gate, \
+                 not this one; re-check it before approving"
+            ));
+        }
+    }
     let config = GateConfig {
         repo: repo.to_string(),
         state: GateConfigState::Pending,
@@ -359,6 +379,48 @@ mod tests {
         );
         assert_eq!(reproposed.gate_commands(), ["cargo nextest run"]);
         assert_eq!(reproposed.wall_clock_timeout_secs, Some(1_200));
+        // Carried onto a *different* gate, so the human re-approving has to
+        // be told the bound was calibrated against the old one.
+        assert_eq!(reproposed.manifest_warnings.len(), 1);
+        assert!(
+            reproposed.manifest_warnings[0].contains("1200s"),
+            "expected the warning to quote the carried bound, got: {:?}",
+            reproposed.manifest_warnings
+        );
+    }
+
+    #[test]
+    fn re_proposing_the_same_commands_carries_the_bound_without_a_warning() {
+        // The bound still measures what it measured, so saying anything
+        // here would be noise on every re-onboard that changed nothing.
+        let db = Database::open_in_memory().unwrap();
+        propose_gate_config(&db, "ironmem", vec!["cargo test".into()], vec![]).unwrap();
+        set_wall_clock_timeout(&db, "ironmem", Some(1_200)).unwrap();
+
+        let reproposed =
+            propose_gate_config(&db, "ironmem", vec!["cargo test".into()], vec![]).unwrap();
+
+        assert_eq!(reproposed.wall_clock_timeout_secs, Some(1_200));
+        assert!(
+            reproposed.manifest_warnings.is_empty(),
+            "{:?}",
+            reproposed.manifest_warnings
+        );
+    }
+
+    #[test]
+    fn a_changed_gate_with_no_bound_set_has_nothing_to_warn_about() {
+        let db = Database::open_in_memory().unwrap();
+        propose_gate_config(&db, "ironmem", vec!["cargo test".into()], vec![]).unwrap();
+
+        let reproposed =
+            propose_gate_config(&db, "ironmem", vec!["cargo nextest run".into()], vec![]).unwrap();
+
+        assert!(
+            reproposed.manifest_warnings.is_empty(),
+            "{:?}",
+            reproposed.manifest_warnings
+        );
     }
 
     #[test]
