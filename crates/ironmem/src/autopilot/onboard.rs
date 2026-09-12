@@ -15,10 +15,10 @@
 //! provider) can express arbitrary matrix builds, multi-step jobs, and
 //! shell logic — parsing that reliably enough to *trust its output as an
 //! unattended gate* is a much larger problem than this rung's testing bar
-//! ("Gate inference against fixture repos (Rust, Python, Swift)"). The
-//! commands proposed here are therefore always canonical ones this module
-//! holds, chosen by deterministic, root-level build-manifest detection — the
-//! same signal a human skimming the repo root would use. Nothing here
+//! ("Gate inference against fixture repos (Rust, Python, Swift)"). Which
+//! stacks a repo has is therefore decided by deterministic, root-level
+//! build-manifest detection — the same signal a human skimming the repo root
+//! would use, and nothing a CI file says can introduce one. Nothing here
 //! recurses into subdirectories: a monorepo's vendored or example subtrees
 //! must not silently contribute a gate command a human onboarding the *repo*
 //! never intended to run. A repo whose real gate can only be read out of CI
@@ -33,9 +33,13 @@
 //! `cargo clippy`, neither of which the gate mentioned. A gate narrower than
 //! CI makes "the approved gate passes" satisfiable by code CI rejects, and
 //! the IC cannot know — it is told the gate condition and nothing else, by
-//! design. So a repo's CI config is now read for one thing only: **whether a
-//! check tool is enforced**. See [`super::ci_evidence`] — it decides which
-//! canonical check commands are proposed, and never supplies their text.
+//! design. So a recognized stack's *check* commands come from the repo's own
+//! CI config: [`super::ci_evidence`] decides whether a tool is enforced at
+//! all, and supplies the command itself wherever CI's text can be run as
+//! written — a gate is a proxy for CI, and CI's own command is both the
+//! faithful thing to propose and satisfiable by construction. A canonical
+//! command this module holds is the fallback for runner-dependent text only,
+//! and taking one is always reported on the proposal.
 //!
 //! # Multi-stack repos
 //!
