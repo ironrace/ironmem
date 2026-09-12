@@ -142,10 +142,64 @@
 //! repo inside the logical key or record body instead — a judgment call,
 //! documented here so it's easy to revisit.
 
+/// Strip one layer of matching `"`/`'` quoting from a token, e.g. a TOML
+/// bare-or-quoted key segment (`"workspace"` → `workspace`) or a quoted YAML
+/// scalar (`"$HOME/.cargo/bin/cargo test"`). TOML allows a table header's key
+/// to be quoted (`["workspace"]` is exactly as valid as `[workspace]`) and
+/// YAML allows any scalar to be, so both of gate inference's readers need the
+/// same one-layer strip.
+///
+/// Does not handle a *dotted* TOML header with only some segments quoted
+/// (e.g. `["workspace".package]`) — closing that fully needs a real TOML
+/// parser, the same limitation `onboard::is_cargo_workspace` documents for
+/// the unquoted dotted-key-only form.
+fn strip_matching_quotes(s: &str) -> &str {
+    for quote in ['"', '\''] {
+        if s.len() >= 2 && s.starts_with(quote) && s.ends_with(quote) {
+            return &s[1..s.len() - 1];
+        }
+    }
+    s
+}
+
+/// `<dir>/<name>`, but only when an entry with *exactly* that name is in
+/// `dir`'s listing.
+///
+/// The listing is the point. `Path::join` resolves through the OS's own
+/// path lookup, which on a case-insensitive-but-case-preserving filesystem
+/// (default macOS APFS) silently matches a differently-cased entry that a
+/// case-sensitive one (Linux, where gate commands actually run in CI) would
+/// not — so the identical checkout could infer a different gate depending on
+/// which machine ran onboarding.
+///
+/// A missing `dir` is `Ok(None)`: nothing to read and nothing to report. Any
+/// other listing failure is the caller's to report, because a directory that
+/// exists and cannot be read is not the same as one that does not exist —
+/// the difference between "this repo has no CI" and "this repo's CI is
+/// invisible to me".
+fn exact_entry(dir: &std::path::Path, name: &str) -> Result<Option<std::path::PathBuf>, String> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(format!("failed to read '{}': {err}", dir.display())),
+    };
+    // A per-entry failure is not "not found": on a network or fuse mount an
+    // entry can fail to stat while the directory lists fine, and reporting
+    // that as absence is the conflation this function exists to prevent.
+    for entry in entries {
+        let entry = entry.map_err(|err| format!("failed to read '{}': {err}", dir.display()))?;
+        if entry.file_name() == std::ffi::OsStr::new(name) {
+            return Ok(Some(entry.path()));
+        }
+    }
+    Ok(None)
+}
+
 pub mod advance;
 pub mod advise;
 pub mod blocked;
 pub mod budget;
+pub mod ci_evidence;
 pub mod dispatch;
 pub mod dispatch_state;
 pub mod gate_config;

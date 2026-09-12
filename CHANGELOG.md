@@ -521,6 +521,96 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Autopilot: `onboard` inferred a gate narrower than CI, so "the approved
+  gate passes" was satisfiable by code CI rejects (#334).** Inference read
+  build manifests, which name a stack's *test* command and say nothing about
+  the checks a repo is actually judged by: this repo onboarded as
+  `cargo test --workspace` alone while its CI also runs
+  `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets
+  --all-features -- -D warnings`. The first live Autopilot run paid for the
+  gap — PR #332 met its gate and then failed CI twice, on a rustfmt violation
+  and a real `too_many_arguments` lint — and the implementer could not have
+  known, because by design it is told the gate condition and nothing else. A
+  recognized stack now contributes **check commands alongside its test
+  command**, ordered checks-first so a formatting violation costs seconds
+  rather than a full suite run.
+
+  The check a Rust repo gets is **the one its own CI runs**, taken verbatim
+  wherever that command can be executed as written *and* means what it
+  appears to mean — a `cargo fmt --all` with no `--check` (an auto-format
+  workflow) rewrites the tree and always exits 0, a `cargo clippy … || true`
+  is advisory (unless its fallback exits non-zero, which re-fails the step), a
+  `continue-on-error:` step or job is not required to pass, and
+  a `working-directory:` step — or one whose shell has `cd`'d, on the same line
+  or an earlier line of the same `run:` block — does not run at the repo root.
+  None of those become a gate command as written.
+
+  Two cases get **no command for that check at all**, not even the canonical
+  one. A tool CI only ever *rewrites* with (`cargo fmt --all`, `cargo clippy
+  --fix`): fixing your formatting for you is not evidence the repo is checked
+  for it, and it is the repo least likely to pass a strict `--check`. And a
+  check CI does not require to pass — a `continue-on-error:` step or job, or
+  the `|| true` spelling of the same thing: a repo marks its lint job advisory
+  precisely because it is not clean yet, so proposing anything there would
+  hand the strictest possible gate to the one repo that certainly cannot pass
+  it. A job's `continue-on-error:` covers that job and not its siblings.
+
+  Where two workflows run the same tool differently *and a gate could take
+  either*, neither is chosen: nothing here reads `on:` triggers, `if:`
+  conditions or required-check status, so the disagreement is reported
+  instead. Where only one is takeable it is adopted and the disagreement is
+  still reported, since the takeable one may be the nightly workflow's
+  stricter command. Taking CI's own command is the faithful thing to propose,
+  and it is one the repo can satisfy — CI is presumed to run it on merge to
+  the default branch, presumed rather than verified, which is among the
+  reasons the result is a proposal a human approves. Where CI's text cannot be
+  taken — a `${{ }}` expression only a runner resolves, an absolute toolchain
+  path, an environment prefix, a command that does not run at the repo root — a canonical command (`cargo fmt --all -- --check`,
+  `cargo clippy … -- -D warnings`, `--workspace` tracking the same
+  `[workspace]` detection as the test command) is proposed instead, and the
+  proposal says which workflow it came from and that it may be stricter than
+  what CI enforces. Checks are added **only where CI shows the tool runs at
+  all**: proposing them unconditionally would repeat the mistake this module
+  already refuses for an Xcode `-scheme` guess, since a repo that has never
+  been clippy-clean would be onboarded into a gate that can never go green.
+  With no evidence, inference is byte-for-byte what it was before.
+
+  New `autopilot::ci_evidence` is the bounded reader behind this — `run:`
+  steps out of `.github/workflows/*.yml`, with no anchors, matrices, job
+  graph or expression resolution, and no claim to know which jobs are
+  required — a check that runs only on a schedule or behind an `if:` reads
+  exactly like one that runs on every merge. It does read enough YAML not to
+  fabricate: a plain `run:` scalar wrapped onto a second line is joined
+  (reading only the first would adopt a clippy without its `-- -D warnings`,
+  which passes on every warning), a folded `run: >-` block is joined the way
+  YAML joins it *including* leaving a more-indented line alone, a `run:` under
+  `with:` or `defaults:` is an argument rather than a command, and
+  `RUSTFLAGS="-D warnings" cargo clippy …` is recognised as a clippy
+  invocation rather than disappearing on the quoted value's space. That the
+  blind spots are symmetric is part of why a proposal is
+  something a human approves rather than something that takes effect. A folded
+  `run: >-` block is joined the way YAML joins it, because
+  reading its lines separately would adopt a *truncated* command — `cargo
+  clippy --all-targets` without the `-- -D warnings` on the next line — as the
+  gate, which is this defect over again. A tool enforced only through a
+  third-party action or an indirection like `make lint` stays invisible, and
+  such a repo onboards exactly as before. CI config that exists and cannot be read now **warns**
+  rather than reading as "no CI" — a silently skipped workflow is precisely
+  how a gate ends up narrower than CI — and that warning is folded into the
+  error on the paths where no proposal is written at all. Re-onboarding also
+  warns when a per-dispatch wall-clock bound is carried forward onto a gate
+  whose commands changed: the bound was calibrated against dispatch durations
+  for a narrower gate, and nothing else in the proposal would say so. What it
+  was calibrated against is now recorded on the config (`set_wall_clock_timeout`
+  stores the commands in force), so the warning survives a second re-onboard
+  rather than comparing against whatever was proposed last; approving
+  re-calibrates it, since a human approving a gate is saying the bound is right
+  for that gate. `autopilot approve` now prints the commands it approved and
+  any warnings they carried — it is the decision point, and it had been
+  consuming warnings it never showed anyone. A stored config that cannot be
+  deserialized is reported rather than silently replaced, since replacing it
+  destroys both the bound and the evidence it ever existed.
+
 - **Autopilot: `agent:exhausted` could not actually be recovered, so the
   documented human retry was a no-op.** The spec is explicit that the label
   "never self-resumes" and that "only a human re-labeling it retries", but the
