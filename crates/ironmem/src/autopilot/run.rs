@@ -1013,7 +1013,7 @@ pub fn run_issue(
         // `agent:ready` still set so the next tick repeats it. Refuse here,
         // before the attempt is spent — the same posture as `config.validate`
         // refusing an `--n-turns`/`--max-turns` pair at config time.
-        let condition = turn_prompt::render(&turn_prompt::TurnPromptInputs {
+        let condition = match turn_prompt::render(&turn_prompt::TurnPromptInputs {
             issue,
             issue_title: &brief.title,
             issue_body: &brief.body,
@@ -1028,8 +1028,27 @@ pub fn run_issue(
             branch: &worktree.branch,
             gate_commands: &gate_commands,
             n_turns: config.n_turns,
-        })
-        .map_err(|e| MemoryError::Validation(e.to_string()))?;
+        }) {
+            Ok(condition) => condition,
+            Err(e) => {
+                // Leave the drawer telling the truth on the way out. The
+                // state written before the loop says "dispatching", and
+                // `queue::plan_queue` reads drawers, not labels: a drawer
+                // left mid-dispatch holds a concurrency slot *and* sorts its
+                // issue ahead of every new one as an in-flight resume. A
+                // refusal that never clears would hold both for ever under a
+                // state that never happened.
+                write_state(
+                    db,
+                    cumulative_attempt_n,
+                    turn_n,
+                    "paused-condition-too-long",
+                    &session_uuid,
+                    resuming,
+                )?;
+                return Err(MemoryError::Validation(e.to_string()));
+            }
+        };
 
         let spec = DispatchSpec {
             session: if resuming {
