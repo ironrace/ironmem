@@ -60,8 +60,13 @@ pub struct RemediationBrief<'a> {
 pub struct TurnPromptInputs<'a> {
     pub issue: &'a IssueRef,
     pub issue_title: &'a str,
-    /// Issue body, or a summary if it exceeds budget — the caller decides
-    /// what "exceeds budget" means; this module just prints what it's given.
+    /// Issue body, verbatim from `gh issue view --json body`.
+    ///
+    /// **Bounded here, not by the caller.** This field used to say the
+    /// caller decided what "exceeds budget" meant; no caller ever did, and a
+    /// body that pushed the condition past [`MAX_CONDITION_CHARS`] was
+    /// rejected by the platform with no assistant turn at all — see
+    /// [`render`]'s *Fitting the limit*. [`render`] now truncates it to fit.
     pub issue_body: &'a str,
     /// Oldest-first, as returned by [`super::lineage::attempts_for_issue`].
     pub prior_attempts: &'a [PriorAttempt],
@@ -107,6 +112,191 @@ pub struct TurnPromptInputs<'a> {
     pub n_turns: u32,
 }
 
+/// The platform's hard ceiling on a `/goal` condition, in characters.
+///
+/// **Measured, not assumed.** Dispatching ironrace/ironmem#339 with a
+/// 4,463-character issue body put this on the IC's stdout and produced no
+/// assistant turn whatsoever:
+///
+/// ```text
+/// Goal condition is limited to 4000 characters (got 5521)
+/// ```
+///
+/// The dispatch cost nothing, took no turns and returned no verdict, so it
+/// classified as [`super::run`]'s `InfrastructureFailure` — a name for a
+/// transient condition that, in this case, would never have cleared. See
+/// issue #340.
+pub const MAX_CONDITION_CHARS: usize = 4000;
+
+/// A condition that cannot be made to fit [`MAX_CONDITION_CHARS`].
+///
+/// Returned rather than rendered-and-hoped, because the platform's rejection
+/// is silent: an over-long condition produces no turn, no verdict and no
+/// comment on the issue, and the issue keeps `agent:ready` — so the next tick
+/// picks it up and fails identically, for ever. A dispatch that cannot be
+/// composed must not be spent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConditionTooLong {
+    /// The issue whose dispatch could not be composed.
+    pub issue: String,
+    /// What the condition measured after every reduction was applied —
+    /// always greater than `limit`, since that is the only thing that gets
+    /// here. It keeps the body's pointer, which no reduction may drop.
+    pub rendered: usize,
+    /// [`MAX_CONDITION_CHARS`], carried so the message is self-contained.
+    pub limit: usize,
+}
+
+impl std::fmt::Display for ConditionTooLong {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "goal condition for {issue} is {rendered} characters after cutting the \
+issue body down to a pointer and dropping every prior attempt and human answer, \
+over the {limit}-character limit",
+            issue = self.issue,
+            rendered = self.rendered,
+            limit = self.limit,
+        )
+    }
+}
+
+impl std::error::Error for ConditionTooLong {}
+
+/// Characters, not bytes — **measured, not inferred.**
+///
+/// The condition that #339's dispatch was rejected for is preserved verbatim
+/// in the IC transcript's `<command-args>`. It is **5,521 characters and 5,537
+/// bytes**, and the platform reported `got 5521`: the limit is counted in
+/// Unicode scalar values. `len()` would over-count any non-ASCII body and
+/// truncate it harder than necessary; worse, had the platform counted bytes,
+/// a CJK or emoji-heavy body would still have been silently rejected.
+fn char_len(s: &str) -> usize {
+    s.chars().count()
+}
+
+/// Truncate `text` so the result *including* a marker is at most `budget`
+/// characters, cutting on a character boundary.
+///
+/// `markers` is tried longest-first (see [`body_markers`]); whichever one fits
+/// the budget is the one appended, so a cut is **always** visible. Returns
+/// `None` only when not even the shortest marker fits — a body dropped with no
+/// marker at all is the same silent-loss defect this module exists to prevent,
+/// so the caller reduces something else instead of emitting one.
+fn truncate_with_marker(text: &str, budget: usize, markers: &[String]) -> Option<String> {
+    if char_len(text) <= budget {
+        return Some(text.to_string());
+    }
+    for marker in markers {
+        let marker_len = char_len(marker);
+        if budget >= marker_len {
+            let mut out: String = text.chars().take(budget - marker_len).collect();
+            out.push_str(marker);
+            return Some(out);
+        }
+    }
+    None
+}
+
+/// The markers left in place of the cut part of a body, longest first.
+///
+/// Each names the issue and the command that reads it in full, which is what
+/// makes truncation *recoverable*: the IC runs in a worktree with `gh`
+/// available, so a shortened body costs it one tool call rather than the
+/// information. A dropped attempt history has no such fallback — nothing in
+/// the worktree records it — which is why the body is cut first.
+///
+/// The short form exists because the budget left for the body is whatever the
+/// rest of the condition did not take, and it is routinely smaller than the
+/// long marker: at four accumulated prior attempts this repo's own template
+/// leaves 15 characters. Without a short form the body was dropped *in
+/// silence* there — no text, no pointer, an IC with nothing but a title.
+fn body_markers(issue: &super::IssueRef) -> [String; 2] {
+    [
+        format!(
+            "\n\n[... issue body truncated to fit the {MAX_CONDITION_CHARS}-character \
+goal-condition limit. Read the whole issue before you start: \
+`gh issue view {number} --repo {repo}`]",
+            number = issue.number,
+            repo = issue.repo,
+        ),
+        format!(
+            "\n[... issue body truncated: `gh issue view {number} --repo {repo}`]",
+            number = issue.number,
+            repo = issue.repo,
+        ),
+    ]
+}
+
+/// The "Prior attempts" block, keeping the `keep_newest` most recent.
+///
+/// Newest-first retention on purpose: when attempts must be dropped to fit,
+/// the ones that matter are the most recent, and an omission the IC cannot
+/// see would let it repeat an approach the record says already failed.
+fn lineage_section_for(attempts: &[PriorAttempt], keep_newest: usize) -> String {
+    if attempts.is_empty() {
+        return "none yet".to_string();
+    }
+    let dropped = attempts.len().saturating_sub(keep_newest);
+    let mut out = String::new();
+    if dropped > 0 {
+        out.push_str(&format!(
+            "({dropped} earlier attempt(s) omitted so this condition fits the \
+{MAX_CONDITION_CHARS}-character limit)\n"
+        ));
+    }
+    out.push_str(
+        &attempts[dropped..]
+            .iter()
+            .map(format_prior_attempt)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+    out.trim_end().to_string()
+}
+
+/// The human-answers block, keeping the `keep_newest` most recent pairs.
+///
+/// Reducible, and the *last* thing reduced, because an answer is a human
+/// decision for this dispatch. But it is not irreducible: `blocked` bounds a
+/// pair at [`super::blocked::MAX_QA_CHARS`] each side and keeps up to
+/// [`super::blocked::MAX_QA_PAIRS`] of them, so three ordinary answers can
+/// exceed [`MAX_CONDITION_CHARS`] on their own — and an un-reducible answers
+/// block would mean an issue that a human just answered can never be
+/// dispatched again, which is the failure this module exists to prevent.
+///
+/// Dropped pairs are named, and the omission note points at the issue thread
+/// they came from, so the IC can read what was cut.
+fn answers_section_for(
+    answers: &[(String, String)],
+    keep_newest: usize,
+    issue: &super::IssueRef,
+) -> String {
+    if answers.is_empty() {
+        return String::new();
+    }
+    let dropped = answers.len().saturating_sub(keep_newest);
+    let mut section = String::from(
+        "\n\nA human answered the question(s) you asked on this issue. \
+These answers are decisions, not suggestions — follow them:\n",
+    );
+    if dropped > 0 {
+        section.push_str(&format!(
+            "({dropped} earlier answer(s) omitted so this condition fits the \
+{MAX_CONDITION_CHARS}-character limit — read them with \
+`gh issue view {number} --repo {repo}`)\n",
+            number = issue.number,
+            repo = issue.repo,
+        ));
+    }
+    for (question, answer) in &answers[dropped..] {
+        section.push_str(&format!(
+            "- you asked: {question}\n  the answer: {answer}\n"
+        ));
+    }
+    section
+}
+
 /// Render the `/goal` condition text for one IC dispatch.
 ///
 /// # Panics
@@ -120,6 +310,27 @@ pub struct TurnPromptInputs<'a> {
 /// gate would render a vacuous condition ("...never authored separately):
 /// .") that an IC could trivially call `met` against, silently defeating
 /// this module's "one definition of done" guarantee.
+///
+/// # Fitting the limit
+///
+/// The platform caps a condition at [`MAX_CONDITION_CHARS`] and rejects an
+/// over-long one outright — no turn, no verdict, no spend, nothing written to
+/// the issue. So this module reduces the condition until it fits, in a fixed
+/// order: the issue body first (recoverable — the marker names the `gh`
+/// command that reads it in full), then the oldest prior attempts, then the
+/// oldest human answers. Everything else — the gate line, the push clause, the
+/// constraints, the verdict instruction — is load-bearing and is never cut.
+///
+/// Every reduction leaves a marker saying what was cut and how to read it. A
+/// cut the IC cannot see is the same defect as the rejection this guards
+/// against, one level down: it dispatches, and works from a body it has no
+/// reason to believe is partial.
+///
+/// # Errors
+///
+/// [`ConditionTooLong`] when the irreducible part alone exceeds the limit.
+/// Refusing is the point: the alternative is a dispatch that is spent, does
+/// nothing, and leaves the issue looking exactly as it did before.
 ///
 /// # Why the push is in the condition
 ///
@@ -153,7 +364,7 @@ pub struct TurnPromptInputs<'a> {
 /// says why in the IC's own terms. The two halves are composed here rather
 /// than stored joined, so a reviewer that gave no reason still gets a coherent
 /// instruction.
-pub fn render(inputs: &TurnPromptInputs) -> String {
+pub fn render(inputs: &TurnPromptInputs) -> Result<String, ConditionTooLong> {
     assert!(
         inputs.n_turns >= 1,
         "n_turns must be at least 1, got {}",
@@ -165,16 +376,7 @@ pub fn render(inputs: &TurnPromptInputs) -> String {
         super::EMPTY_GATE_COMMANDS_MSG
     );
 
-    let lineage_section = if inputs.prior_attempts.is_empty() {
-        "none yet".to_string()
-    } else {
-        inputs
-            .prior_attempts
-            .iter()
-            .map(format_prior_attempt)
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
+    let lineage_section = lineage_section_for(inputs.prior_attempts, inputs.prior_attempts.len());
 
     let redirect_line = inputs
         .strategy_redirect
@@ -185,20 +387,11 @@ pub fn render(inputs: &TurnPromptInputs) -> String {
     // block: an answer is a human *instruction* for this dispatch, not a
     // record of a past attempt, and burying it inside a list of failures is
     // how it gets skimmed past.
-    let answers_section = if inputs.human_answers.is_empty() {
-        String::new()
-    } else {
-        let mut section = String::from(
-            "\n\nA human answered the question(s) you asked on this issue. \
-These answers are decisions, not suggestions — follow them:\n",
-        );
-        for (question, answer) in inputs.human_answers {
-            section.push_str(&format!(
-                "- you asked: {question}\n  the answer: {answer}\n"
-            ));
-        }
-        section
-    };
+    let answers_section = answers_section_for(
+        inputs.human_answers,
+        inputs.human_answers.len(),
+        inputs.issue,
+    );
 
     // Rendered last of the three context blocks and immediately before the
     // constraints, because it is the only one that changes what "done" means
@@ -239,8 +432,9 @@ These answers are decisions, not suggestions — follow them:\n",
 
     let gate_line = inputs.gate_commands.join(" && ");
 
-    format!(
-        "You are an IC dispatch for issue {issue}: \"{title}\".\n\n\
+    let compose = |body: &str, lineage: &str, answers: &str| {
+        format!(
+            "You are an IC dispatch for issue {issue}: \"{title}\".\n\n\
 {body}\n\n\
 Prior attempts on this issue (read before doing anything else):\n\
 {lineage}{redirect}{answers}{remediation}\n\n\
@@ -260,18 +454,87 @@ you have either satisfied the gate condition above or determined it cannot be \
 satisfied. Do not guess; if you are unsure whether it is met, the verdict is \
 not_met and you take another turn.\n\n\
 or stop after {n} turns",
-        issue = inputs.issue.canonical(),
-        title = inputs.issue_title,
-        body = inputs.issue_body,
-        lineage = lineage_section,
-        redirect = redirect_line,
-        answers = answers_section,
-        remediation = remediation_section,
-        gate = gate_line,
-        push = push_clause,
-        gate_extra = gate_extra,
-        n = inputs.n_turns,
-    )
+            issue = inputs.issue.canonical(),
+            title = inputs.issue_title,
+            body = body,
+            lineage = lineage,
+            redirect = redirect_line,
+            answers = answers,
+            remediation = remediation_section,
+            gate = gate_line,
+            push = push_clause,
+            gate_extra = gate_extra,
+            n = inputs.n_turns,
+        )
+    };
+
+    // The common case: it already fits, and nothing is cut.
+    let full = compose(inputs.issue_body, &lineage_section, &answers_section);
+    if char_len(&full) <= MAX_CONDITION_CHARS {
+        return Ok(full);
+    }
+
+    // One candidate at a given (lineage, answers) reduction: the body gets
+    // whatever the rest of the condition leaves. The budget is measured
+    // against a compose with an empty body rather than by subtracting a
+    // guessed constant, so it stays correct as the template changes — and
+    // `truncate_with_marker` returns `None` rather than dropping the body
+    // unmarked, which the caller answers by reducing something else.
+    let markers = body_markers(inputs.issue);
+    let candidate = |lineage: &str, answers: &str| -> Option<String> {
+        let budget = MAX_CONDITION_CHARS.saturating_sub(char_len(&compose("", lineage, answers)));
+        let body = truncate_with_marker(inputs.issue_body, budget, &markers)?;
+        let rendered = compose(&body, lineage, answers);
+        (char_len(&rendered) <= MAX_CONDITION_CHARS).then_some(rendered)
+    };
+
+    // Reduction 1 — the issue body alone.
+    if let Some(rendered) = candidate(&lineage_section, &answers_section) {
+        return Ok(rendered);
+    }
+
+    // Reduction 2 — prior attempts, oldest first. Only reached when the
+    // lineage block alone will not fit, which the attempt cap makes rare and
+    // free-text `approach`/`why_failed` values make possible.
+    for keep in (0..inputs.prior_attempts.len()).rev() {
+        let lineage = lineage_section_for(inputs.prior_attempts, keep);
+        if let Some(rendered) = candidate(&lineage, &answers_section) {
+            return Ok(rendered);
+        }
+    }
+
+    // Reduction 3 — human answers, oldest first, with every prior attempt
+    // already gone. Last because an answer is a human decision for this
+    // dispatch; reducible at all because `blocked` bounds a pair only at
+    // `MAX_QA_CHARS` a side, so a few ordinary answers outrun the limit on
+    // their own — and refusing there would strand the issue a human had just
+    // unblocked.
+    let lineage_floor = lineage_section_for(inputs.prior_attempts, 0);
+    for keep in (0..inputs.human_answers.len()).rev() {
+        let answers = answers_section_for(inputs.human_answers, keep, inputs.issue);
+        if let Some(rendered) = candidate(&lineage_floor, &answers) {
+            return Ok(rendered);
+        }
+    }
+
+    // Everything reducible is gone and it still does not fit: the gate
+    // commands, the title, the redirect or the reviewer findings are
+    // themselves over the limit. Refuse rather than spend a dispatch the
+    // platform will drop. The floor keeps the shortest body marker, because
+    // that pointer is what the reductions above are not allowed to drop — so
+    // `rendered` is the length that actually has to fit, and is over the
+    // limit exactly when this branch is reached.
+    let shortest_marker = &markers[markers.len() - 1];
+    let floor = compose(
+        shortest_marker,
+        &lineage_floor,
+        &answers_section_for(inputs.human_answers, 0, inputs.issue),
+    );
+    Err(ConditionTooLong {
+        issue: inputs.issue.canonical(),
+        rendered: char_len(&floor),
+        limit: MAX_CONDITION_CHARS,
+    })
 }
 
 fn format_prior_attempt(attempt: &PriorAttempt) -> String {
@@ -313,6 +576,7 @@ mod tests {
             gate_commands: &["cargo test".to_string()],
             n_turns: 6,
         })
+        .unwrap()
     }
 
     #[test]
@@ -349,7 +613,8 @@ mod tests {
             branch: "autopilot/owner-repo-7",
             gate_commands: &["cargo test --workspace".to_string()],
             n_turns: 6,
-        });
+        })
+        .unwrap();
         assert!(
             text.chars().count() < 4_000,
             "a remediation condition at the findings bound must still fit the \
@@ -397,6 +662,7 @@ platform limit, got {}",
             gate_commands: &["cargo test".to_string()],
             n_turns: 6,
         })
+        .unwrap()
     }
 
     #[test]
@@ -537,7 +803,8 @@ platform limit, got {}",
             branch: "autopilot/owner-repo-7",
             gate_commands: &["cargo test".to_string()],
             n_turns: 6,
-        });
+        })
+        .unwrap();
         let attempts_at = text.find("tried A").unwrap();
         let answers_at = text.find("A!").unwrap();
         let remediation_at = text.find("asked for CHANGES").unwrap();
@@ -565,7 +832,8 @@ platform limit, got {}",
             branch: "autopilot/owner-repo-7",
             gate_commands: &["cargo test --workspace".to_string()],
             n_turns: 6,
-        });
+        })
+        .unwrap();
         assert!(text
             .contains("Prior attempts on this issue (read before doing anything else):\nnone yet"));
     }
@@ -598,7 +866,8 @@ platform limit, got {}",
             branch: "autopilot/owner-repo-7",
             gate_commands: &["cargo test".to_string()],
             n_turns: 1,
-        });
+        })
+        .unwrap();
         assert!(text.contains("attempt 1: tried approach A — failed (test X failed)"));
         assert!(text.contains("attempt 2: tried approach B — success"));
         assert!(!text.contains("none yet"));
@@ -625,7 +894,8 @@ platform limit, got {}",
             branch: "autopilot/owner-repo-7",
             gate_commands: &["cargo test".to_string()],
             n_turns: 3,
-        });
+        })
+        .unwrap();
         assert!(text.contains("Which schema should this use?"));
         assert!(text.contains("SQLite, with migration 009."));
         assert!(
@@ -654,7 +924,8 @@ platform limit, got {}",
             branch: "autopilot/owner-repo-7",
             gate_commands: &["cargo test".to_string()],
             n_turns: 3,
-        });
+        })
+        .unwrap();
         let attempts_at = text.find("tried A").unwrap();
         let answer_at = text.find("A!").unwrap();
         let constraints_at = text.find("Constraints:").unwrap();
@@ -675,7 +946,8 @@ platform limit, got {}",
             branch: "autopilot/owner-repo-7",
             gate_commands: &["cargo test".to_string()],
             n_turns: 3,
-        });
+        })
+        .unwrap();
         assert!(!text.contains("A human answered"));
     }
 
@@ -695,7 +967,8 @@ platform limit, got {}",
             branch: "autopilot/owner-repo-7",
             gate_commands: &["cargo test".to_string()],
             n_turns: 3,
-        });
+        })
+        .unwrap();
         assert!(text
             .contains("Do not retry approach A; it failed for reason Y. Try approach C instead."));
     }
@@ -722,7 +995,8 @@ platform limit, got {}",
             branch: "autopilot/owner-repo-7",
             gate_commands: &commands,
             n_turns: 1,
-        });
+        })
+        .unwrap();
         assert!(text.contains("cargo fmt --all -- --check && cargo test --workspace"));
     }
 
@@ -743,7 +1017,8 @@ platform limit, got {}",
             branch: "autopilot/owner-repo-7",
             gate_commands: &["cargo test".to_string()],
             n_turns: 1,
-        });
+        })
+        .unwrap();
         assert!(text.ends_with("or stop after 1 turns"));
     }
 
@@ -762,7 +1037,8 @@ platform limit, got {}",
             branch: "autopilot/owner-repo-7",
             gate_commands: &["cargo test".to_string()],
             n_turns: 0,
-        });
+        })
+        .unwrap();
     }
 
     #[test]
@@ -782,15 +1058,18 @@ platform limit, got {}",
             branch: "autopilot/owner-repo-7",
             gate_commands: &[],
             n_turns: 1,
-        });
+        })
+        .unwrap();
     }
 
     #[test]
     fn condition_never_exceeds_the_documented_4000_char_limit_for_a_realistic_case() {
-        // ⟨r5-doc⟩: the condition may be up to 4,000 characters. Not a hard
-        // guard here (issue bodies are the caller's to bound), but a
-        // regression check that a realistic dispatch (a handful of prior
-        // attempts, one gate command) stays comfortably under it.
+        // ⟨r5-doc⟩: the condition may be up to 4,000 characters. This is the
+        // *comfort* check — a realistic dispatch stays well under the limit
+        // without any reduction being applied. The limit itself is enforced
+        // by `the_condition_is_never_longer_than_the_limit_whatever_the_body_size`
+        // and friends below; this test passed while nothing enforced it, which
+        // is how #340 shipped.
         let issue = base_issue();
         let prior: Vec<PriorAttempt> = (1..=5)
             .map(|n| PriorAttempt {
@@ -811,7 +1090,286 @@ platform limit, got {}",
             branch: "autopilot/owner-repo-7",
             gate_commands: &["cargo test --workspace".to_string()],
             n_turns: 6,
-        });
+        })
+        .unwrap();
         assert!(text.chars().count() < 4_000);
+    }
+
+    // ---------------------------------------------------------------
+    // #340 — the condition is bounded here, and these tests fail if the
+    // reduction in `render` is removed. The two tests that predate them
+    // (`..._for_a_realistic_case`, `a_realistic_remediation_...`) assert a
+    // hand-picked short fixture and pass with or without a clamp, which is
+    // exactly why the defect reached a live dispatch.
+    // ---------------------------------------------------------------
+
+    /// Every reduction test renders through here, with this repo's real
+    /// three-command gate so the overhead is the one production actually pays.
+    fn condition_for(body: &str, prior: &[PriorAttempt]) -> Result<String, ConditionTooLong> {
+        let issue = base_issue();
+        render(&TurnPromptInputs {
+            issue: &issue,
+            issue_title: "docs(autopilot): write the operator guide the subsystem has never had",
+            issue_body: body,
+            prior_attempts: prior,
+            strategy_redirect: None,
+            human_answers: &[],
+            remediation: None,
+            branch: "autopilot/ironrace-ironmem-339",
+            gate_commands: &[
+                "cargo fmt --all -- --check".to_string(),
+                "cargo clippy --workspace --all-targets --all-features -- -D warnings".to_string(),
+                "cargo test --workspace".to_string(),
+            ],
+            n_turns: 6,
+        })
+    }
+
+    fn long_attempts(n: u32) -> Vec<PriorAttempt> {
+        (1..=n)
+            .map(|i| PriorAttempt {
+                attempt_n: i,
+                approach: format!("approach {i}: {}", "d".repeat(300)),
+                verdict: AttemptOutcome::Failed,
+                why_failed: Some(format!("why {i}: {}", "e".repeat(300))),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_condition_is_never_longer_than_the_limit_whatever_the_body_size() {
+        // The enforcing test. Deleting the reduction in `render` fails this at
+        // the 4,001-char case and every case above it.
+        for size in [
+            0, 1, 512, 2_900, 3_999, 4_000, 4_001, 4_463, 20_000, 200_000,
+        ] {
+            let text = condition_for(&"x".repeat(size), &[])
+                .unwrap_or_else(|e| panic!("body of {size} chars should compose, got {e}"));
+            assert!(
+                text.chars().count() <= MAX_CONDITION_CHARS,
+                "body of {size} chars rendered {} chars, over the {MAX_CONDITION_CHARS} limit",
+                text.chars().count(),
+            );
+        }
+    }
+
+    #[test]
+    fn the_body_that_actually_failed_issue_339_now_composes() {
+        // ironrace/ironmem#339's body was 4,463 characters and produced
+        // "Goal condition is limited to 4000 characters (got 5521)" — no
+        // assistant turn, no verdict, three dispatches burned as
+        // InfrastructureFailure.
+        let text = condition_for(&"x".repeat(4_463), &[]).unwrap();
+        assert!(text.chars().count() <= MAX_CONDITION_CHARS);
+    }
+
+    #[test]
+    fn a_body_that_fits_is_passed_through_untouched() {
+        // The clamp must not fire when it is not needed: an unnecessary
+        // truncation costs the IC a tool call and the marker is a lie.
+        let text = condition_for("A short issue body.", &[]).unwrap();
+        assert!(text.contains("A short issue body."));
+        assert!(!text.contains("truncated"));
+    }
+
+    #[test]
+    fn truncation_is_visible_and_names_how_to_recover_the_body() {
+        // Silent truncation is the same class of defect as the silent
+        // rejection this fixes: the IC must be able to tell that it is
+        // reading a shortened body, and to go read the rest.
+        let text = condition_for(&"x".repeat(50_000), &[]).unwrap();
+        assert!(text.contains("issue body truncated"));
+        assert!(text.contains("gh issue view 283 --repo ironrace/ironmem"));
+    }
+
+    #[test]
+    fn the_load_bearing_tail_survives_any_truncation() {
+        // Guards against the naive fix — truncating the whole condition —
+        // which would cut the gate line, the push clause and the turn bound
+        // and leave an IC with no definition of done at all.
+        let text = condition_for(&"x".repeat(200_000), &[]).unwrap();
+        assert!(text.contains("cargo test --workspace"));
+        assert!(text.contains("is pushed to this issue's branch"));
+        assert!(text.contains("Report your verdict using the required output schema"));
+        assert!(text.ends_with("or stop after 6 turns"));
+    }
+
+    #[test]
+    fn the_clamp_holds_as_prior_attempts_accumulate() {
+        // The growth path: prior attempts are appended to the condition, so an
+        // issue that composed at attempt 1 can stop composing by attempt 3.
+        // A dispatch loop that works and then silently stops working is worse
+        // than one that never worked.
+        let body = "y".repeat(2_000);
+        for n in 0..=20 {
+            let text = condition_for(&body, &long_attempts(n))
+                .unwrap_or_else(|e| panic!("{n} prior attempts should compose, got {e}"));
+            assert!(
+                text.chars().count() <= MAX_CONDITION_CHARS,
+                "{n} prior attempts rendered {} chars",
+                text.chars().count(),
+            );
+        }
+    }
+
+    #[test]
+    fn the_newest_attempts_are_kept_when_the_lineage_must_be_cut() {
+        // Dropping the *newest* attempt would let the IC repeat the approach
+        // that just failed, which is the one thing the lineage block exists
+        // to prevent.
+        let text = condition_for("a body", &long_attempts(30)).unwrap();
+        assert!(text.chars().count() <= MAX_CONDITION_CHARS);
+        assert!(text.contains("attempt 30:"));
+        assert!(text.contains("omitted so this condition fits"));
+        assert!(!text.contains("attempt 1:"));
+    }
+
+    #[test]
+    fn a_condition_that_cannot_be_reduced_to_fit_is_refused() {
+        // Nothing reducible is left and the irreducible part is still over.
+        // Refusing is the point: rendering it anyway spends a dispatch the
+        // platform silently drops.
+        let issue = base_issue();
+        let err = render(&TurnPromptInputs {
+            issue: &issue,
+            issue_title: "t",
+            issue_body: "b",
+            prior_attempts: &[],
+            strategy_redirect: None,
+            human_answers: &[],
+            remediation: None,
+            branch: "autopilot/ironrace-ironmem-339",
+            gate_commands: &["cargo test ".to_string() + &"--flag ".repeat(2_000)],
+            n_turns: 6,
+        })
+        .expect_err("an irreducibly over-long condition must be refused");
+        assert_eq!(err.limit, MAX_CONDITION_CHARS);
+        assert!(err.rendered > MAX_CONDITION_CHARS);
+        assert!(err.to_string().contains("ironrace/ironmem#283"));
+    }
+
+    #[test]
+    fn a_truncated_body_still_leaves_room_for_the_marker_itself() {
+        // The budget counts the marker. A reduction that fit the body and
+        // then appended the marker would overflow by exactly the marker.
+        let text = condition_for(&"x".repeat(MAX_CONDITION_CHARS), &[]).unwrap();
+        assert!(text.contains("issue body truncated"));
+        assert!(text.chars().count() <= MAX_CONDITION_CHARS);
+    }
+
+    #[test]
+    fn a_body_is_never_dropped_without_saying_so() {
+        // The hole the first fix left: the budget for the body is whatever
+        // the rest of the condition did not take, and at four accumulated
+        // attempts it was 15 characters — too small for the marker, so the
+        // body was dropped *entirely and in silence*. The IC got a title, a
+        // lineage block and no issue at all, with nothing to tell it so.
+        for n in 0..=12 {
+            for body_size in [800usize, 1_500, 2_500, 3_500, 50_000] {
+                let body = "z".repeat(body_size);
+                let text = condition_for(&body, &long_attempts(n))
+                    .unwrap_or_else(|e| panic!("n={n} body={body_size} should compose, got {e}"));
+                assert!(
+                    text.chars().count() <= MAX_CONDITION_CHARS,
+                    "n={n} body={body_size} rendered {} chars",
+                    text.chars().count(),
+                );
+                assert!(
+                    text.contains("zzz") || text.contains("issue body truncated"),
+                    "n={n} body={body_size}: the body vanished with no marker — the IC \
+cannot tell it is missing, nor how to read it",
+                );
+                assert!(
+                    text.contains(&format!("gh issue view {}", base_issue().number))
+                        || text.contains("zzz"),
+                    "n={n} body={body_size}: a cut body must name the command that reads it",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn human_answers_are_reduced_rather_than_refused() {
+        // `blocked` bounds a Q&A pair at MAX_QA_CHARS (2,000) a side and
+        // keeps MAX_QA_PAIRS (5) of them, so three ordinary answers exceed
+        // the limit by themselves. Refusing there would strand the issue in
+        // the one state a human had just cleared: answered, flipped back to
+        // `agent:ready`, and undispatchable for ever.
+        let issue = base_issue();
+        let answers: Vec<(String, String)> = (0..5)
+            .map(|i| {
+                (
+                    format!("question {i}"),
+                    format!("answer {i}: {}", "s".repeat(1_000)),
+                )
+            })
+            .collect();
+        let text = render(&TurnPromptInputs {
+            issue: &issue,
+            issue_title: "t",
+            issue_body: "the body",
+            prior_attempts: &[],
+            strategy_redirect: None,
+            human_answers: &answers,
+            remediation: None,
+            branch: "autopilot/ironrace-ironmem-339",
+            gate_commands: &["cargo test --workspace".to_string()],
+            n_turns: 6,
+        })
+        .expect("answered issues must stay dispatchable");
+        assert!(text.chars().count() <= MAX_CONDITION_CHARS);
+        // Newest kept, oldest dropped, and the omission is visible.
+        assert!(text.contains("answer 4:"));
+        assert!(text.contains("answer(s) omitted"));
+        assert!(!text.contains("answer 0:"));
+    }
+
+    #[test]
+    fn every_answer_fits_when_they_are_short() {
+        // The reduction must not fire when it is not needed.
+        let issue = base_issue();
+        let answers = vec![
+            ("q1".to_string(), "a1".to_string()),
+            ("q2".to_string(), "a2".to_string()),
+        ];
+        let text = render(&TurnPromptInputs {
+            issue: &issue,
+            issue_title: "t",
+            issue_body: "the body",
+            prior_attempts: &[],
+            strategy_redirect: None,
+            human_answers: &answers,
+            remediation: None,
+            branch: "autopilot/ironrace-ironmem-339",
+            gate_commands: &["cargo test --workspace".to_string()],
+            n_turns: 6,
+        })
+        .unwrap();
+        assert!(text.contains("the answer: a1"));
+        assert!(text.contains("the answer: a2"));
+        assert!(!text.contains("omitted"));
+    }
+
+    #[test]
+    fn a_refused_condition_reports_a_length_that_is_actually_over_the_limit() {
+        // `rendered` is the floor that still has to fit — the irreducible
+        // text plus the pointer to the dropped body — so it is over the
+        // limit exactly when the refusal happens. A number under the limit
+        // in a "does not fit" message would send the reader hunting.
+        let issue = base_issue();
+        let err = render(&TurnPromptInputs {
+            issue: &issue,
+            issue_title: "t",
+            issue_body: &"b".repeat(10_000),
+            prior_attempts: &long_attempts(3),
+            strategy_redirect: None,
+            human_answers: &[("q".to_string(), "a".to_string())],
+            remediation: None,
+            branch: "autopilot/ironrace-ironmem-339",
+            gate_commands: &["cargo test ".to_string() + &"--flag ".repeat(2_000)],
+            n_turns: 6,
+        })
+        .expect_err("an irreducibly over-long condition must be refused");
+        assert!(err.rendered > err.limit);
     }
 }
