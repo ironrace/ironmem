@@ -9,13 +9,18 @@ implementation, see `crates/ironmem/src/autopilot/`.
 
 ## What Autopilot is
 
-The Lead picks one `agent:ready` issue per repo, highest `priority:*` first,
-dispatches a single IC (implementer) into its own git worktree against the
-repo's approved gate command, and records the result. `ironmem autopilot
-advance` then finishes the job: it opens the pull request the IC's push
-never does on its own, reviews the diff with a fresh-context reviewer, and
-applies the merge decision that review produces — merge, or hold the PR for
-a human.
+Each tick, the Lead dispatches a single IC (implementer) into its own git
+worktree against the repo's approved gate command, and records the result.
+By default (`max_dispatches_per_tick = 1`) that is **one dispatch per tick
+across every configured repo combined, not one per repo** — a five-repo
+Lead still starts exactly one issue per tick unless an operator raises the
+limit. The queue that slot is drawn from puts any resumed in-flight issue
+ahead of every other candidate; `priority:*` (highest first) only orders
+the *new* work competing for the slot once nothing is waiting to resume.
+`ironmem autopilot advance` then finishes the job: it opens the pull
+request the IC's push never does on its own, reviews the diff with a
+fresh-context reviewer, and applies the merge decision that review
+produces — merge, or hold the PR for a human.
 
 ## The two-command loop
 
@@ -91,7 +96,7 @@ run more than once; an existing label is left untouched.
 | Label | Set by | Cleared by |
 |---|---|---|
 | `agent:ready` | A human opting an issue in; `lead` un-blocking an answered `agent:blocked` issue; `retry` forgiving an exhausted issue | Automatically, the moment any other `agent:*` label is applied |
-| `agent:blocked` | `lead`, when an IC hits a human-only decision and `ask` posts a question | `lead`, on seeing a human comment newer than its own question — flips back to `agent:ready` automatically |
+| `agent:blocked` | `lead`/`ask`, when an IC hits a human-only decision and posts a question; also `advance`, when rung 6's merge decision holds a PR for a human (see *Human recovery paths* below) | `lead`, on seeing a human comment newer than its own **question-marked** comment — flips back to `agent:ready` automatically. A merge hold posts no such marker and does **not** self-resume this way; see *Human recovery paths*. |
 | `agent:exhausted` | `lead`/`exhaust`, when an issue's per-issue attempt cap is hit | Only `ironmem autopilot retry` — never self-resumes |
 
 An issue with none of these three labels is invisible to Autopilot: it is
@@ -109,15 +114,23 @@ groups, and nothing between them:
 
 **An issue carrying no `risk:*` label is `unclassified`, which fails
 closed.** The merge decision compares the class the reviewer derives from
-the diff against the class read from the issue's `risk:*` label **at
-`advance` time** — not a value frozen when the Lead dispatched the IC. The
-dispatch-time class recorded when the work started is deliberately not
-consulted, so relabeling the issue any time before `advance` runs changes
-which class its PR is compared against. `unclassified` matches neither
-group, so the comparison can never succeed and the PR holds for a human.
-Applying a `risk:*` label is the operator's authorization for how that
-issue's PR may resolve — there is no other switch — and it stays live
-until the merge decision is actually made, not just until dispatch.
+the diff against the class read from the issue's `risk:*` label — but only
+once. That comparison is made, and frozen, the first time `advance` reviews
+a given commit on the PR: `review_pr` reads whatever `risk:*` label the
+issue carries *at that moment* and stores it on the review record as
+`dispatch_class`, alongside the reviewer's own `risk_class` verdict.
+`unclassified` matches neither group at that point, so the comparison can
+never succeed and the PR holds for a human.
+
+**Relabeling the issue afterward does not revoke or grant merge
+eligibility.** Every later `advance` pass against the same commit finds a
+review already on file (`advance::next_step`'s `reviewed_this_head` check)
+and goes straight to the merge decision without reviewing again;
+`merge::evaluate` reads the class comparison off that *stored* review, not
+off the issue's current label. Changing, removing, or adding a `risk:*`
+label after the first review of a commit is a no-op until the IC pushes a
+new commit — a new head SHA is what forces `advance` to review again and
+capture the label as it stands at that later moment.
 
 ## The auto-merge envelope
 
@@ -127,12 +140,13 @@ A PR auto-merges only when every one of these holds:
 - The fresh-context reviewer returns PASS.
 - The diff's own risk class — as the reviewer classifies it, not as the
   Lead dispatched it — is one of the four low-risk classes above.
-- The reviewer's classification of the diff matches the class currently
-  read from the issue's `risk:*` label (see above — this is re-read at
-  `advance` time, not the class recorded when the Lead dispatched the IC).
-  A mismatch always holds for a human, even if both classes happen to be
-  low-risk, because a diff that reclassifies itself mid-flight is exactly
-  the case fail-closed exists for.
+- The reviewer's classification of the diff matches the class stored on
+  the review that `advance` recorded the first time it reviewed the PR's
+  current commit (see above — captured once, from whatever `risk:*` label
+  the issue carried at that moment, and not re-read from the issue on any
+  later pass). A mismatch always holds for a human, even if both classes
+  happen to be low-risk, because a diff that reclassifies itself mid-flight
+  is exactly the case fail-closed exists for.
 
 Everything touching `logic`, `protocol`, `security`, or `public_api` opens a
 PR and waits for a human regardless of what the reviewer says. Applying a
@@ -157,15 +171,26 @@ grants it independently of the label.
   makes degrades to mechanical behavior (dispatch as the fallback class,
   keep the mechanical redirect text, escalate without a drafted question)
   when it's off, refused, or fails.
-- The daily budget ceiling (`--daily-budget-usd`) is shared across IC
-  dispatches, advisor calls, and reviewer invocations — it is one ledger,
-  not one per command.
+- The daily budget ceiling (`--daily-budget-usd`) tracks IC dispatches and
+  advisor calls in one shared dollar ledger — but **it does not bound the
+  reviewer**. Codex, unlike Claude, reports no `total_cost_usd` for a
+  review, so every reviewer invocation is banked as *unpriced* spend
+  (`unpriced_dispatch_count`) rather than added to the dollar total; a
+  reviewer-only workload can run indefinitely under a `--daily-budget-usd`
+  that never sees it move. What actually bounds the reviewer is
+  `--max-unpriced-reviews-per-day` (default 20) — an invocation-count
+  ceiling, not a spending ceiling. Do not rely on `--daily-budget-usd` to
+  cap reviewer cost; size `--max-unpriced-reviews-per-day` instead.
 
 ## Human recovery paths
 
-- **`agent:blocked`** resumes on its own: `lead` polls every blocked issue
-  for a comment newer than the question Autopilot posted, and flips it back
-  to `agent:ready` the moment it finds one.
+- **`agent:blocked`** resumes on its own *only* when Autopilot itself posted
+  a marked question there (the `ask`/IC-escalation path): `lead` polls every
+  such issue for a comment newer than that question, and flips it back to
+  `agent:ready` the moment it finds one. A **merge hold** also sets
+  `agent:blocked`, but posts no marked question, so this poll never
+  resumes it — see *Branch protection* below for the manual recovery a
+  merge hold actually needs.
 - **`agent:exhausted`** never self-resumes. The only escape is
   `ironmem autopilot retry owner/repo <issue>`, which **forgives** attempts
   made so far rather than zeroing the attempt counter — the counter also
@@ -184,5 +209,16 @@ grants it independently of the label.
 Where the PR's base branch requires an approving human review, the merge
 holds as `HumanApprovalRequired`, exactly like any other held PR — Autopilot
 is not the reviewer of record for that requirement and cannot satisfy it
-itself. There is no bot bypass. Once a human supplies the required approval,
-the hold clears and the PR merges on a later `advance --merge` pass.
+itself. There is no bot bypass.
+
+**A GitHub approval alone does not resume this.** Any merge hold — this one
+included — sets `agent:blocked`, and `advance` only ever looks at
+`agent:ready` issues; a blocked issue drops out of its backlog listing
+entirely. `lead`'s auto-resume watches for a human *issue comment* posted
+after one of Autopilot's own question comments (marked internally so it can
+tell the two apart), and a merge hold posts a plain notice, not a marked
+question — there is nothing for that check to find. Approving the PR on
+GitHub, or commenting on the issue, changes nothing on its own. The only way
+back is the manual step the hold comment itself names: re-label the issue
+`agent:ready` once the approval (or whatever the hold required) is in
+place, and the next `advance --merge` pass picks it up and re-evaluates it.
