@@ -1,0 +1,163 @@
+# Autopilot
+
+Autopilot is the only IronRace subsystem that can merge to `main`
+unattended. This is the operator guide: which command to run, in what
+order, and what a label authorizes. For the design rationale behind these
+decisions, see
+`docs/iron/specs/2026-08-21-autonomous-backlog-runner-design.md`; for the
+implementation, see `crates/ironmem/src/autopilot/`.
+
+## What Autopilot is
+
+The Lead picks one `agent:ready` issue per repo, highest `priority:*` first,
+dispatches a single IC (implementer) into its own git worktree against the
+repo's approved gate command, and records the result. `ironmem autopilot
+advance` then finishes the job: it opens the pull request the IC's push
+never does on its own, reviews the diff with a fresh-context reviewer, and
+applies the merge decision that review produces — merge, or hold the PR for
+a human.
+
+## The two-command loop
+
+Run these two commands, in this order:
+
+```
+ironmem autopilot lead --repo owner/repo=/path/to/checkout ...
+ironmem autopilot advance --repo owner/repo=/path/to/checkout ...
+```
+
+`lead` reconciles in-flight work, un-blocks any `agent:blocked` issue that
+has a newer human answer, supervises what is already running, and dispatches
+the next issue off the queue. It starts work; it does not finish it. An IC's
+dispatch ends with a push to its branch and nothing else — no PR is opened,
+no review runs, no merge decision is made.
+
+`advance` is the other half of that same loop: it opens the pull request for
+any issue whose dispatch succeeded, reviews it with a fresh-context Codex
+reviewer, and applies rung 5's merge decision. Running `advance` before
+`lead` has nothing new to advance; running `lead` without ever running
+`advance` leaves every successful dispatch sitting as a pushed branch with
+no open PR, forever.
+
+`ironmem autopilot queue --repo owner/repo ...` is a free, read-only
+preview: it shows what the Lead would dispatch next — the same ordering and
+the same budget/concurrency/attempt-cap checks `lead` applies — without
+touching anything. Run it any time to see what a `lead` tick would do before
+running one.
+
+## Onboarding a repo
+
+Onboard a repo before Autopilot can work its issues:
+
+```
+ironmem autopilot onboard owner/repo --path /path/to/checkout
+ironmem autopilot approve owner/repo
+ironmem autopilot labels owner/repo
+```
+
+`onboard` inspects the checkout's build manifests and CI configuration and
+writes a **pending** gate-config proposal; it does not take effect on its
+own. `approve` is the separate, explicit step that confirms it. Run them in
+one sitting: a pending proposal that never gets approved leaves the repo
+unable to dispatch anything, and a proposal approved long after it was
+written may no longer match the checkout it was inferred from.
+
+The gate itself is inferred from the repo's own CI configuration — the
+commands its `run:` steps actually enforce — rather than authored by hand,
+so the gate an IC is held to matches what CI would reject, not a
+hand-guessed subset of it.
+
+`labels` creates the three `agent:*` labels (`agent:ready`, `agent:blocked`,
+`agent:exhausted`) in the repo if they don't already exist. It is safe to
+run more than once; an existing label is left untouched.
+
+## The label taxonomy
+
+### `agent:*` — who may dispatch this issue
+
+| Label | Set by | Cleared by |
+|---|---|---|
+| `agent:ready` | A human opting an issue in; `lead` un-blocking an answered `agent:blocked` issue; `retry` forgiving an exhausted issue | Automatically, the moment any other `agent:*` label is applied |
+| `agent:blocked` | `lead`, when an IC hits a human-only decision and `ask` posts a question | `lead`, on seeing a human comment newer than its own question — flips back to `agent:ready` automatically |
+| `agent:exhausted` | `lead`/`exhaust`, when an issue's per-issue attempt cap is hit | Only `ironmem autopilot retry` — never self-resumes |
+
+An issue with none of these three labels is invisible to Autopilot: it is
+not dispatched until a human adds `agent:ready`.
+
+### `risk:*` — the eight classes, in two groups
+
+`RiskClass::is_low_risk` splits the eight classes into exactly these two
+groups, and nothing between them:
+
+- **Eligible for auto-merge**, on green **and** a reviewer PASS:
+  `documentation`, `dependency_bump`, `mechanical_rename`, `test_only`.
+- **Always holds for a human**, regardless of reviewer verdict: `logic`,
+  `protocol`, `security`, `public_api`.
+
+**An issue carrying no `risk:*` label is `unclassified`, which fails
+closed.** The merge decision compares the class the Lead dispatched against
+the class the reviewer derives from the diff; `unclassified` matches
+neither group, so the comparison can never succeed and the PR holds for a
+human. Applying a `risk:*` label is the operator's authorization for how
+that issue's PR may resolve — there is no other switch.
+
+## The auto-merge envelope
+
+A PR auto-merges only when every one of these holds:
+
+- The repo's approved gate is green.
+- The fresh-context reviewer returns PASS.
+- The diff's own risk class — as the reviewer classifies it, not as the
+  Lead dispatched it — is one of the four low-risk classes above.
+- The reviewer's classification of the diff matches the class the Lead
+  dispatched it under. A mismatch always holds for a human, even if both
+  classes happen to be low-risk, because a diff that reclassifies itself
+  mid-flight is exactly the case fail-closed exists for.
+
+Everything touching `logic`, `protocol`, `security`, or `public_api` opens a
+PR and waits for a human regardless of what the reviewer says. Applying a
+`risk:*` label is the authorization for auto-merge; there is no flag that
+grants it independently of the label.
+
+## What spends and what is irreversible
+
+- `--merge` (on `ironmem autopilot advance`) is the one irreversible action
+  in this subsystem — it executes `gh pr merge`. It is opt-in: without it,
+  `advance` still opens PRs and runs reviews, but every merge is rehearsed,
+  not executed.
+- `--dry-run` (on `lead`, `advance`, `merge`, `exhaust`, `ask`) reads and
+  plans everything and writes nothing.
+- `--advisor` (on `lead`) and the reviewer Codex invocation `advance` runs
+  both spend real money. `--advisor` is off by default; every judgment it
+  makes degrades to mechanical behavior (dispatch as the fallback class,
+  keep the mechanical redirect text, escalate without a drafted question)
+  when it's off, refused, or fails.
+- The daily budget ceiling (`--daily-budget-usd`) is shared across IC
+  dispatches, advisor calls, and reviewer invocations — it is one ledger,
+  not one per command.
+
+## Human recovery paths
+
+- **`agent:blocked`** resumes on its own: `lead` polls every blocked issue
+  for a comment newer than the question Autopilot posted, and flips it back
+  to `agent:ready` the moment it finds one.
+- **`agent:exhausted`** never self-resumes. The only escape is
+  `ironmem autopilot retry owner/repo <issue>`, which **forgives** attempts
+  made so far rather than zeroing the attempt counter — the counter also
+  numbers the attempt history an IC's prompt is built from, so resetting it
+  to zero would relabel that history rather than clear it. `retry` also
+  flips the issue back to `agent:ready` unless `--no-label` is passed, and
+  leaves a still-`agent:blocked` issue alone rather than pulling it back
+  into the queue out from under an open question.
+- **`ironmem autopilot ask`** and **`ironmem autopilot exhaust`** are the
+  manual arms of the two label transitions above — an operator can post a
+  question and block an issue, or close one out as exhausted, without
+  waiting for `lead` to do it as part of a tick.
+
+## Branch protection
+
+Where the PR's base branch requires an approving human review, the merge
+holds as `HumanApprovalRequired`, exactly like any other held PR — Autopilot
+is not the reviewer of record for that requirement and cannot satisfy it
+itself. There is no bot bypass. Once a human supplies the required approval,
+the hold clears and the PR merges on a later `advance --merge` pass.
