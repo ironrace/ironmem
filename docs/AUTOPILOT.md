@@ -62,10 +62,23 @@ one sitting: a pending proposal that never gets approved leaves the repo
 unable to dispatch anything, and a proposal approved long after it was
 written may no longer match the checkout it was inferred from.
 
-The gate itself is inferred from the repo's own CI configuration — the
-commands its `run:` steps actually enforce — rather than authored by hand,
-so the gate an IC is held to matches what CI would reject, not a
-hand-guessed subset of it.
+The gate itself is inferred, not authored by hand: which stacks a repo has
+is decided by root-level build manifests (`Cargo.toml`, `package.json`,
+`Makefile`, ...), and for each recognized stack's format/lint checks,
+`onboard` looks at the repo's own CI config to decide whether that check is
+enforced at all, and takes CI's own command wherever it can be run as
+written at the repo root. Where it can't — a command that isn't plainly
+runnable, one CI runs outside the repo root, or two workflows running the
+same tool differently — `onboard` falls back to a canonical guess, and
+**always reports that on the proposal**, because the guess may be stricter
+or looser than what CI actually enforces. A check CI doesn't require to
+pass, or only uses to rewrite the tree, gets no gate command at all. This
+is CI-*informed*, not CI-*equivalent*: a repo's first live Autopilot run
+met an approved gate of `cargo test --workspace` and then failed CI twice
+on `cargo fmt` and `cargo clippy`, neither of which the gate mentioned.
+**Read the pending proposal's warnings before running `approve`** — that is
+the point at which a human catches an inference the CI config didn't
+support.
 
 `labels` creates the three `agent:*` labels (`agent:ready`, `agent:blocked`,
 `agent:exhausted`) in the repo if they don't already exist. It is safe to
@@ -95,11 +108,16 @@ groups, and nothing between them:
   `protocol`, `security`, `public_api`.
 
 **An issue carrying no `risk:*` label is `unclassified`, which fails
-closed.** The merge decision compares the class the Lead dispatched against
-the class the reviewer derives from the diff; `unclassified` matches
-neither group, so the comparison can never succeed and the PR holds for a
-human. Applying a `risk:*` label is the operator's authorization for how
-that issue's PR may resolve — there is no other switch.
+closed.** The merge decision compares the class the reviewer derives from
+the diff against the class read from the issue's `risk:*` label **at
+`advance` time** — not a value frozen when the Lead dispatched the IC. The
+dispatch-time class recorded when the work started is deliberately not
+consulted, so relabeling the issue any time before `advance` runs changes
+which class its PR is compared against. `unclassified` matches neither
+group, so the comparison can never succeed and the PR holds for a human.
+Applying a `risk:*` label is the operator's authorization for how that
+issue's PR may resolve — there is no other switch — and it stays live
+until the merge decision is actually made, not just until dispatch.
 
 ## The auto-merge envelope
 
@@ -109,10 +127,12 @@ A PR auto-merges only when every one of these holds:
 - The fresh-context reviewer returns PASS.
 - The diff's own risk class — as the reviewer classifies it, not as the
   Lead dispatched it — is one of the four low-risk classes above.
-- The reviewer's classification of the diff matches the class the Lead
-  dispatched it under. A mismatch always holds for a human, even if both
-  classes happen to be low-risk, because a diff that reclassifies itself
-  mid-flight is exactly the case fail-closed exists for.
+- The reviewer's classification of the diff matches the class currently
+  read from the issue's `risk:*` label (see above — this is re-read at
+  `advance` time, not the class recorded when the Lead dispatched the IC).
+  A mismatch always holds for a human, even if both classes happen to be
+  low-risk, because a diff that reclassifies itself mid-flight is exactly
+  the case fail-closed exists for.
 
 Everything touching `logic`, `protocol`, `security`, or `public_api` opens a
 PR and waits for a human regardless of what the reviewer says. Applying a
@@ -125,8 +145,13 @@ grants it independently of the label.
   in this subsystem — it executes `gh pr merge`. It is opt-in: without it,
   `advance` still opens PRs and runs reviews, but every merge is rehearsed,
   not executed.
-- `--dry-run` (on `lead`, `advance`, `merge`, `exhaust`, `ask`) reads and
-  plans everything and writes nothing.
+- `--dry-run` (on `lead`, `advance`, `merge`, `exhaust`, `ask`) makes no
+  GitHub writes — no `gh pr merge`, no label edit, no comment. That is not
+  the same as writing nothing at all: `merge` still persists a rehearsal
+  record to the local database (verified by
+  `a_dry_run_is_recorded_as_a_dry_run`), tagged `dry_run: true` so it can
+  never be read back as an executed merge. Nothing it records is visible
+  outside Autopilot's own storage.
 - `--advisor` (on `lead`) and the reviewer Codex invocation `advance` runs
   both spend real money. `--advisor` is off by default; every judgment it
   makes degrades to mechanical behavior (dispatch as the fallback class,
