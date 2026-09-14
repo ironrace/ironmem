@@ -11,12 +11,16 @@ implementation, see `crates/ironmem/src/autopilot/`.
 
 Each tick, the Lead dispatches a single IC (implementer) into its own git
 worktree against the repo's approved gate command, and records the result.
-By default (`max_dispatches_per_tick = 1`) that is **one dispatch per tick
-across every configured repo combined, not one per repo** — a five-repo
-Lead still starts exactly one issue per tick unless an operator raises the
-limit. The queue that slot is drawn from puts any resumed in-flight issue
-ahead of every other candidate; `priority:*` (highest first) only orders
-the *new* work competing for the slot once nothing is waiting to resume.
+By default (`max_dispatches_per_tick = 1`) that is **one issue per tick
+across every configured repo combined, not one per repo** — a five-repo Lead
+still starts exactly one issue per tick unless an operator raises the limit.
+Count issues, not model calls: the limit is applied as
+`plan.dispatch.iter().take(max_dispatches_per_tick)`, and the single
+`run_issue` it admits may spend several paid attempts inside that one tick.
+The queue that slot is drawn from sorts on `resuming` first and `priority:*`
+(highest first) second (`sort_candidates`), so a resumed in-flight issue
+outranks every new candidate — but priority still orders the resumed issues
+among themselves, not only the new work competing for the slot.
 `ironmem autopilot advance` then finishes the job: it opens the pull
 request the IC's push never does on its own, reviews the diff with a
 fresh-context reviewer, and applies the merge decision that review
@@ -151,10 +155,20 @@ base branch: the IC pushes a new commit, or the PR is retargeted at a
 different base. Retargeting an open PR — `main` to `release/1.x`, say —
 re-reviews the same commit against the branch it would now land on, rather
 than holding for ever on a review of a base that no longer applies
-(`a_retargeted_pr_is_reviewed_again_rather_than_held_forever`). The one
-exception is a review recorded before the base was stored at all: its base
-reads back as `None`, which matches any base, so a retarget does not
-re-review it.
+(`a_retargeted_pr_is_reviewed_again_rather_than_held_forever`).
+
+Two exceptions. A review recorded before the base was stored at all has a
+base of `None`, which matches any base, so a retarget does not re-review it.
+And **retargeting *back* strands the PR**: `reviewed_this_head` asks whether
+*any* stored review matches this head and base, while `merge::evaluate`
+reads the *latest* review for the PR (`rfind`, no base filter). Review a
+head against `main`, retarget to `release/1.x` (re-reviewed), then retarget
+back to `main`, and `advance` finds the first review still matching and
+skips the review, while the merge decision reads the `release/1.x` review
+and holds at `BaseBranchMismatch` — with nothing left to re-review it. That
+is the same never-recovers shape the base comparison was added to prevent,
+reached by a second retarget instead of a first. Filed as #348. The cited
+test covers only the first retarget.
 
 ## The auto-merge envelope
 
@@ -246,7 +260,14 @@ typing the command.
   to zero would relabel that history rather than clear it. `retry` also
   flips the issue back to `agent:ready` unless `--no-label` is passed, and
   leaves a still-`agent:blocked` issue alone rather than pulling it back
-  into the queue out from under an open question.
+  into the queue out from under an open question — **but only when
+  `agent:exhausted` is absent.** `eligibility` returns `Exhausted` on sight
+  of that label, before it ever considers `agent:blocked` (labels.rs:161),
+  so an issue carrying both does not trip `retry`'s blocked guard and the
+  exclusive move to `agent:ready` takes the blocking label with it. The same
+  exclusivity runs the other way: `ask` moves an issue to `agent:blocked`,
+  which clears `agent:exhausted`. Forgiving attempts and removing labels are
+  separate acts, and only the first is what `retry` promises.
 - **`ironmem autopilot ask`** and **`ironmem autopilot exhaust`** are not
   manual arms of something `lead` also does on its own: they are the *only*
   callers of `ask_human` and `exhaust_issue` outside tests. Blocking an
