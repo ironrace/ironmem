@@ -116,8 +116,8 @@ groups, and nothing between them:
 closed.** The merge decision compares the class the reviewer derives from
 the diff against the class read from the issue's `risk:*` label — but only
 once. That comparison is made, and frozen, the first time `advance` reviews
-a given commit on the PR: `review_pr` reads whatever `risk:*` label the
-issue carries *at that moment* and stores it on the review record as
+a given commit against a given base: `review_pr` reads whatever `risk:*`
+label the issue carries *at that moment* and stores it on the review record as
 `dispatch_class`, alongside the reviewer's own `risk_class` verdict.
 `unclassified` matches neither group at that point, so the comparison can
 never succeed and the PR holds for a human.
@@ -128,9 +128,17 @@ review already on file (`advance::next_step`'s `reviewed_this_head` check)
 and goes straight to the merge decision without reviewing again;
 `merge::evaluate` reads the class comparison off that *stored* review, not
 off the issue's current label. Changing, removing, or adding a `risk:*`
-label after the first review of a commit is a no-op until the IC pushes a
-new commit — a new head SHA is what forces `advance` to review again and
-capture the label as it stands at that later moment.
+label after the first review is a no-op until something forces `advance` to
+review again and capture the label as it stands at that later moment. Two
+things do, because `reviewed_this_head` matches on the head SHA **and** the
+base branch: the IC pushes a new commit, or the PR is retargeted at a
+different base. Retargeting an open PR — `main` to `release/1.x`, say —
+re-reviews the same commit against the branch it would now land on, rather
+than holding for ever on a review of a base that no longer applies
+(`a_retargeted_pr_is_reviewed_again_rather_than_held_forever`). The one
+exception is a review recorded before the base was stored at all: its base
+reads back as `None`, which matches any base, so a retarget does not
+re-review it.
 
 ## The auto-merge envelope
 
@@ -142,16 +150,30 @@ A PR auto-merges only when every one of these holds:
   Lead dispatched it — is one of the four low-risk classes above.
 - The reviewer's classification of the diff matches the class stored on
   the review that `advance` recorded the first time it reviewed the PR's
-  current commit (see above — captured once, from whatever `risk:*` label
-  the issue carried at that moment, and not re-read from the issue on any
-  later pass). A mismatch always holds for a human, even if both classes
-  happen to be low-risk, because a diff that reclassifies itself mid-flight
-  is exactly the case fail-closed exists for.
+  current commit against its current base (see above — captured once, from
+  whatever `risk:*` label the issue carried at that moment, and not re-read
+  from the issue on any later pass). A mismatch always holds for a human,
+  even if both classes happen to be low-risk, because a diff that
+  reclassifies itself mid-flight is exactly the case fail-closed exists for.
 
 Everything touching `logic`, `protocol`, `security`, or `public_api` opens a
-PR and waits for a human regardless of what the reviewer says. Applying a
-`risk:*` label is the authorization for auto-merge; there is no flag that
+PR and waits for a human regardless of what the reviewer says. In the
+`advance` workflow — the only path that runs unattended — applying a
+`risk:*` label is the authorization for auto-merge: the dispatch class comes
+from the issue's label by way of `advance::dispatch_class`, and no flag
 grants it independently of the label.
+
+**The two standalone subcommands are the exception**, and they are operator
+tools rather than part of the unattended loop.
+`ironmem autopilot review --class <class>` takes the dispatch class as a
+*required argument* and never reads the issue's labels, and
+`ironmem autopilot merge` then decides on the class that review stored
+(`merge::evaluate` hands `review.dispatch_class` to `decide_merge`) without
+reading a `risk:*` label either. So a human who runs
+`review --class documentation` and then `merge` can merge a PR whose issue
+carries no `risk:*` label at all. The label rule bounds what Autopilot may
+merge on its own; it does not bound what an operator can authorize by
+typing the command.
 
 ## What spends and what is irreversible
 
