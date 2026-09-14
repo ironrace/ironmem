@@ -2,8 +2,9 @@
 
 **Date:** 2026-09-12
 **Scope:** Amends `2026-08-21-autonomous-backlog-runner-design.md` (rev 11). Changes **what the IC is dispatched against** (a sub-issue, not a whole issue), adds a **second classification axis**, proposes **feature flags as an autonomy mechanism**, and proposes **merge authority**, which rung 6 decided against. Does not touch `collab`, `iron-spec`, `iron-tdd`, or the HumanLayer epic. **Does touch `iron-build`** — see *What this reverses*.
-**Status:** Draft
-**Revision:** rev 2 — rewritten after a three-agent review of rev 1 found a self-contradiction in Decision 5, a circular trigger in Decision 4, and an overstated reading of the parent spec's Goal 5. Rev 1 is superseded, not amended; where it was wrong this document says so rather than quietly correcting.
+**Status:** Approved design, pending implementation plan
+**Revision:** rev 3 — approved at rev 2, then amended with evidence from PR #343's rounds 4-6 (2026-09-14): a fourth prerequisite in Decision 4, and a materially stronger version of Decision 5's own argument. Rev 2's decisions are unchanged; nothing here reverses them.
+rev 2 — rewritten after a three-agent review of rev 1 found a self-contradiction in Decision 5, a circular trigger in Decision 4, and an overstated reading of the parent spec's Goal 5. Rev 1 is superseded, not amended; where it was wrong this document says so rather than quietly correcting.
 
 > Architecture, Error handling and Validation log are deliberately deferred until approval. Testing and Data flow are **not** deferred, because rev 1's review showed both were load-bearing for decisions it made.
 
@@ -42,9 +43,9 @@ Three underlying problems:
 
 **1. The outer loop's bound was miscomputed, not misdesigned.** Three rounds produced 3, then 4, then 2 findings — nine distinct, none repeated, all verified. But #339 got exactly three rounds by accident: writing the document consumed 2 of its 5 *attempts*, and the remediation inherited the remaining 3 (#344). Attempts and review rounds are different units, and rev 1 conflated them.
 
-**2. The unit of work is too large.** Nine distinct defects in one 224-line document is a property of the unit, not of the IC.
+**2. The unit of work is too large.** Nine distinct defects in one 224-line document is a property of the unit, not of the IC. Three further rounds on 2026-09-14 took that to **seventeen**, with rounds 4, 5 and 6 each finding a defect introduced by the previous round's fix — a unit large enough that correcting it reliably damages it.
 
-**3. Nothing can merge.** See the three blockers above.
+**3. Nothing can merge.** See the three blockers above — and a fourth found on 2026-09-14, that a human commit on the branch sets `gate_green` false permanently (Decision 4, step 3).
 
 ---
 
@@ -156,7 +157,7 @@ With Decision 3 withdrawn to its narrower claim, that composition no longer aris
 
 This **reverses rung 6** (`merge.rs:59-63`, *"cannot become one"*). It is argued on merits, not on a claimed prior approval.
 
-Three ordered steps. **The first is worth doing whether or not any of the rest is approved.**
+Four ordered steps. **The first is worth doing whether or not any of the rest is approved.**
 
 **1. Required status checks on `main`.** Read 2026-09-12:
 
@@ -167,11 +168,17 @@ codeowners: false   last_push_approval: false   required_status_checks: absent
 
 **No status checks are required.** Nothing at the branch level requires CI to pass; the sole gate is the human approval. That is masked today because a human reads every PR, and it means the 13 CI checks are advisory as far as protection is concerned. The objective gate must exist before any approval automation does.
 
-**Stated plainly, because it is a reduction:** today `main`'s protection is *"a human read it."* After steps 1–3 it is *"software decided, and CI was green."* Goal 5 says deterministic gates alone are never sufficient authority — so step 1 is a prerequisite, **not** the thing that makes steps 2–3 safe.
+**Stated plainly, because it is a reduction:** today `main`'s protection is *"a human read it."* After steps 1–4 it is *"software decided, and CI was green."* Goal 5 says deterministic gates alone are never sufficient authority — so step 1 is a prerequisite, **not** the thing that makes steps 2–4 safe.
 
 **2. Fix #346.** A merge hold parks the issue in `agent:blocked`; `advance` skips that label; and `agent:blocked` resumes on *a newer human comment*. An approval is not a comment. **Today even a human approving does not resume a held PR.** Until this is fixed no PASS reaches a merge by any route.
 
-**3. A second approving identity.** A GitHub App with `pull_requests:write` that posts an approving review when — and only when — `decide_merge` returns **`MergeDecision::EligibleForMerge`**.
+**3. Make `gate_green` reachable once a human has touched the branch.** `advance` asserts the gate green only when the lineage's recorded green commit *equals* the PR head (`advance.rs:623-626`); unknown fails closed, which is right. But **only an IC dispatch records a green attempt, and no command records one for a human-authored commit.** So a human who answers a review finding by hand and pushes holds that PR at `HoldForHuman(GateNotGreen)` permanently, whatever the reviewer says next. CI is irrelevant to this: `advance` never reads it.
+
+Measured on PR #343, 2026-09-14: **six review rounds, every one held at `GateNotGreen` rather than on its verdict**, because the head carried human commits. The verdicts never got a chance to matter.
+
+This belongs in the ordered list because **the remediation loop invites exactly the thing that breaks it.** A human answering a finding is the fastest way to make a PR permanently unmergeable by the loop — and the more valuable the human's contribution, the more certain the hold. Two ways out, and they are not equivalent: require that the IC author the last commit on any branch the loop may merge (brittle — it forbids human help on precisely the PRs under review), or give `advance` an objective green it can read for a commit nobody dispatched. **Step 1 supplies exactly that signal** — once required status checks exist on `main`, CI *is* the branch-level gate, and `gate_green` can be derived from a check-run conclusion at the head rather than from a lineage record only an IC can write.
+
+**4. A second approving identity.** A GitHub App with `pull_requests:write` that posts an approving review when — and only when — `decide_merge` returns **`MergeDecision::EligibleForMerge`**.
 
 > Rev 1 wrote this trigger as `WouldMerge`. That was **wrong and circular**: `WouldMerge` is a `MergeOutcome` variant (`merge.rs:330`) produced only under `dry_run` (`merge.rs:631`), *after* the approval guard at `merge.rs:610`. A bot firing on it would wait for a signal that requires the approval the bot exists to give.
 
@@ -196,6 +203,13 @@ Two constraints already agree with this: `dismiss_stale: true` requires the appr
 
 **The bound stays a counter.** Per the design rule above, only a counter can supply termination where no objective gate constrains the outcome.
 
+**Rounds 4-6 on #343 turned that argument from an inference into a measurement.** The document was reviewed six times: **3 → 4 → 2 → 3 → 2 → 3 findings, seventeen distinct, none repeated, every one verified true at source.** A novelty-based detector would have scored all six rounds as progress. Two of the failure modes listed below did not stay hypothetical:
+
+- **Regression** — rounds 4, 5 *and* 6 each found a defect introduced by the previous round's fix. Round 5 caught a claim that had restated #345's framing without checking it; round 6 caught an unstated exception inside round 3's own correction.
+- **Trivial novelty** — several rounds turned on a single imprecise clause, at full review cost.
+
+And round 6 found something the earlier rounds had not: an underlying **code** defect rather than a prose error (#348). So the findings were not merely novel, they were still *deepening* at round six on 250 lines of unchanged-in-substance prose. **A bound that waits for novelty to run out would not have stopped at any point in this run.**
+
 **What changes is that the counter is the remediation's own** (#344). #339 got three rounds not by policy but because writing the document consumed 2 of its 5 attempts. A remediation must have a budget that does not depend on how hard the original work was — today, *the harder an issue was to get right, the less budget it has to answer review.* An issue that succeeds on attempt 5 of 5 has none.
 
 **Convergence detection is added as an early exit only.** It may end a loop *sooner*; it may never extend one. This preserves what `remediate.rs:103-104` was protecting — that the human is **told** — because the counter still always fires.
@@ -211,7 +225,7 @@ Failure modes the detector must handle, all identified by rev 1's review:
 
 **On spend as a bound.** Rev 1 proposed "count reviews separately" as new. It already exists: `DEFAULT_MAX_UNPRICED_REVIEWS_PER_DAY = 20` (`review.rs:129`), documented as *"the only bound on reviewer spend that actually holds today."* What is genuinely absent is a per-*invocation* dollar ceiling, because `codex exec` emits no price and has no `--max-budget-usd` equivalent (`review.rs:45-48`). Any wall-clock bound must name a value and an exhaustion behavior; rev 1 named neither.
 
-**Review depth should be routed, not uniform** — a deep multi-lens review may be cheaper end-to-end than N cheap rounds plus N remediation dispatches. Two cautions: depth is not accuracy (`ultrareview` ran ~75% false-positive on #273; the single Codex reviewer went 9-for-9 on #343 — **two tools, two diffs, two classes, n=1 each, not yet one measurement**), and an auto-fixing reviewer is a second writer on the branch, which rung 11 scoped out and whose "all fixed" reports have been true-but-uncommitted eight times here.
+**Review depth should be routed, not uniform** — a deep multi-lens review may be cheaper end-to-end than N cheap rounds plus N remediation dispatches. Two cautions: depth is not accuracy (`ultrareview` ran ~75% false-positive on #273; the single Codex reviewer went **17-for-17 across six rounds** on #343 — **two tools, two diffs, two classes, n=1 each, not yet one measurement**), and an auto-fixing reviewer is a second writer on the branch, which rung 11 scoped out and whose "all fixed" reports have been true-but-uncommitted eight times here.
 
 ---
 
@@ -233,7 +247,7 @@ Rev 1 had no Testing section, in a document whose thesis is that unvalidated ter
 - Sequential merging makes wall-clock scale with unit count.
 - **Cost under decomposition is unestimated.** One live run cost $7.05 of a $25 ceiling for a single 224-line document that did not merge. Decomposition multiplies PRs, each carrying at least one review whose per-invocation spend cannot be metered. Whether a decomposed issue finishes inside one day's ceiling is an open question, not an answered one.
 - A second approving identity is a real credential with merge reach, bounded only by `decide_merge` failing closed.
-- **There is no post-merge failure path.** Every mechanism here is preventive: no revert path, no detection of a merge that should not have happened, no containment. The parent spec maintains an error table; this amendment adds an irreversible action without extending it. **This is a gap, not an omission, and it blocks step 3.**
+- **There is no post-merge failure path.** Every mechanism here is preventive: no revert path, no detection of a merge that should not have happened, no containment. The parent spec maintains an error table; this amendment adds an irreversible action without extending it. **This is a gap, not an omission, and it blocks step 4.**
 
 ---
 
@@ -264,8 +278,9 @@ Rev 1 had no Testing section, in a document whose thesis is that unvalidated ter
 ## Evidence log
 
 - **First end-to-end live run**, 2026-09-12/13, #339 → PR #343, **$7.05**, **9 dispatches** across four Lead ticks (2 + 3 + 1 + 3, per tick summaries), **3 fresh reviews** at 3 distinct head SHAs, plus 2 passes that reused a cached verdict.
-- **Review rounds:** 3 → 4 → 2 findings; nine distinct, none repeated. **Verified by the same agent that wrote rev 1 of this document** — self-verification, not independent confirmation.
-- **Defects found by living through them:** #344, #345, #346 — all open.
+- **Review rounds:** 3 → 4 → 2 → 3 → 2 → 3 findings across six rounds (rounds 4-6 on 2026-09-14); **seventeen distinct, none repeated, every one verified true at source.** Rounds 4, 5 and 6 each found a defect introduced by the previous round's fix. **Verified by the same agent that wrote rev 1 of this document** — self-verification, not independent confirmation, and that caveat now covers six rounds rather than three.
+- **Never a PASS, and never on the verdict.** Rounds 4-6 all ended `HoldForHuman(GateNotGreen)` — the gate check precedes the verdict, and the head carried human commits (see Decision 4, step 3). The merge leg remains unexecuted.
+- **Defects found by living through them:** #344, #345, #346 — all open. **#348** (2026-09-14, found by round 6): `advance::next_step` matches *any* stored review on head+base while `merge::evaluate` reads the *latest* via `rfind` with no base filter, so `main` → `release/1.x` → `main` strands the PR at `BaseBranchMismatch` with nothing left that would re-review it — the never-recovers shape the base comparison was added to prevent, reopened by a second retarget. **#345's body was corrected**: a capped issue is deferred as `AttemptCapReached` before selection (`queue.rs:458-459`), so it is stuck and invisible rather than re-dispatched in a loop; its acceptance criteria stand.
 - **The ladder:** eleven rungs as PRs #318-#320 and #322-#329, each merged independently; #317 is the design spec. Rungs 9 and 11 off by default; rung 10 enabled with `--merge` withheld. **Every one human-planned and human-approved.**
 - **Prior decomposition:** #283 → #297 → #298 → #299, all merged — with #299 revising the split mid-flight.
 - **Branch protection read** 2026-09-12: no required status checks.
