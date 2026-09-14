@@ -69,21 +69,33 @@ written may no longer match the checkout it was inferred from.
 
 The gate itself is inferred, not authored by hand: which stacks a repo has
 is decided by root-level build manifests (`Cargo.toml`, `package.json`,
-`Makefile`, ...), and for each recognized stack's format/lint checks,
-`onboard` looks at the repo's own CI config to decide whether that check is
-enforced at all, and takes CI's own command wherever it can be run as
-written at the repo root. Where it can't — a command that isn't plainly
-runnable, one CI runs outside the repo root, or two workflows running the
-same tool differently — `onboard` falls back to a canonical guess, and
-**always reports that on the proposal**, because the guess may be stricter
-or looser than what CI actually enforces. A check CI doesn't require to
-pass, or only uses to rewrite the tree, gets no gate command at all. This
-is CI-*informed*, not CI-*equivalent*: a repo's first live Autopilot run
-met an approved gate of `cargo test --workspace` and then failed CI twice
-on `cargo fmt` and `cargo clippy`, neither of which the gate mentioned.
+`Makefile`, ...). **Only Rust's gate consults CI.** For a Rust repo,
+`onboard` looks at the repo's own CI config to decide whether a format or
+lint check is enforced at all, and takes CI's own command wherever it can be
+run as written at the repo root. Where it can't — a command that isn't
+plainly runnable, one CI runs outside the repo root, or two workflows
+running the same tool differently — `onboard` falls back to a canonical
+guess, and **always reports that on the proposal**, because the guess may be
+stricter or looser than what CI actually enforces. A check CI doesn't
+require to pass, or only uses to rewrite the tree, gets no gate command at
+all. This is CI-*informed*, not CI-*equivalent*: a repo's first live
+Autopilot run met an approved gate of `cargo test --workspace` and then
+failed CI twice on `cargo fmt` and `cargo clippy`, neither of which the gate
+mentioned.
+
 **Read the pending proposal's warnings before running `approve`** — that is
 the point at which a human catches an inference the CI config didn't
 support.
+
+Every other stack is inferred from the manifest alone and reads no CI config
+at all: Python markers propose `pytest`, `Package.swift` proposes
+`swift test`, a `package.json` with a real `scripts.test` proposes
+`npm test`, and a makefile with a `test` target proposes `make test`
+(`infer_python`, `infer_swift`, `infer_node`, `infer_makefile_fallback` —
+only `infer_rust` is passed the CI evidence). Those gates are **test
+commands only**: no format or lint check is proposed for them, and none is
+warned about either. On a non-Rust repo, a proposal with no lint warnings
+means no lint coverage — not that CI declined to require it.
 
 `labels` creates the three `agent:*` labels (`agent:ready`, `agent:blocked`,
 `agent:exhausted`) in the repo if they don't already exist. It is safe to
@@ -96,8 +108,8 @@ run more than once; an existing label is left untouched.
 | Label | Set by | Cleared by |
 |---|---|---|
 | `agent:ready` | A human opting an issue in; `lead` un-blocking an answered `agent:blocked` issue; `retry` forgiving an exhausted issue | Automatically, the moment any other `agent:*` label is applied |
-| `agent:blocked` | `lead`/`ask`, when an IC hits a human-only decision and posts a question; also `advance`, when rung 6's merge decision holds a PR for a human (see *Human recovery paths* below) | `lead`, on seeing a human comment newer than its own **question-marked** comment — flips back to `agent:ready` automatically. A merge hold posts no such marker and does **not** self-resume this way; see *Human recovery paths*. |
-| `agent:exhausted` | `lead`/`exhaust`, when an issue's per-issue attempt cap is hit | Only `ironmem autopilot retry` — never self-resumes |
+| `agent:blocked` | `ironmem autopilot ask`, when a human posts a question on an issue; also `advance`, when rung 6's merge decision holds a PR for a human (see *Human recovery paths* below). **`lead` never applies it** — it calls neither `ask_human` nor `exhaust_issue` | `lead`, on seeing a human comment newer than its own **question-marked** comment — flips back to `agent:ready` automatically. A merge hold posts no such marker and does **not** self-resume this way; see *Human recovery paths*. |
+| `agent:exhausted` | Only `ironmem autopilot exhaust`, typed by a human. **Hitting the attempt cap does not apply it**: `lead` records the exhaustion locally and leaves the issue `agent:ready`, so an unattended loop keeps re-picking it (filed as #345) | Only `ironmem autopilot retry` — never self-resumes |
 
 An issue with none of these three labels is invisible to Autopilot: it is
 not dispatched until a human adds `agent:ready`.
@@ -116,9 +128,13 @@ groups, and nothing between them:
 closed.** The merge decision compares the class the reviewer derives from
 the diff against the class read from the issue's `risk:*` label — but only
 once. That comparison is made, and frozen, the first time `advance` reviews
-a given commit against a given base: `review_pr` reads whatever `risk:*`
-label the issue carries *at that moment* and stores it on the review record as
-`dispatch_class`, alongside the reviewer's own `risk_class` verdict.
+a given commit against a given base — and the label it freezes was read
+earlier still. `advance` snapshots every issue's labels when it lists the
+backlog at the *start* of the pass (`fetch_backlogs`, then `advance.rs:565`)
+and hands that snapshot to `review_pr` as `dispatch_class`; the reviewer
+never re-reads the issue. So in a pass carrying several issues, a `risk:*`
+label removed while an earlier PR is being reviewed is still the label a
+later PR in the same pass is measured against.
 `unclassified` matches neither group at that point, so the comparison can
 never succeed and the PR holds for a human.
 
@@ -206,13 +222,23 @@ typing the command.
 
 ## Human recovery paths
 
-- **`agent:blocked`** resumes on its own *only* when Autopilot itself posted
-  a marked question there (the `ask`/IC-escalation path): `lead` polls every
-  such issue for a comment newer than that question, and flips it back to
-  `agent:ready` the moment it finds one. A **merge hold** also sets
-  `agent:blocked`, but posts no marked question, so this poll never
-  resumes it — see *Branch protection* below for the manual recovery a
-  merge hold actually needs.
+- **`agent:blocked`** resumes on its own *only* when a marked question was
+  posted there, which today means `ironmem autopilot ask`: `lead` polls
+  every such issue for a comment newer than that question, and flips it back
+  to `agent:ready` the moment it finds one. A **merge hold** also sets
+  `agent:blocked`, but posts no marked question, so this poll never resumes
+  it — see *Branch protection* below for the manual recovery a merge hold
+  actually needs.
+- **A supervisor escalation is not this round trip, and sets no label at
+  all.** When an issue's attempts keep failing the same way and a redirect
+  fails the same way too, `lead` posts an escalation notice
+  (`render_escalation_comment`) that carries Autopilot's comment marker but
+  deliberately **not** the question marker, and flips nothing: the issue
+  stays as it was. Replying to it does not resume the work — the notice
+  names the command that does, `ironmem autopilot supervise owner/repo
+  <issue> --clear-escalation`. The reasoning is in the code: what was
+  escalated is an approach the supervisor has already proved does not
+  converge, so an answer is not enough to restart it.
 - **`agent:exhausted`** never self-resumes. The only escape is
   `ironmem autopilot retry owner/repo <issue>`, which **forgives** attempts
   made so far rather than zeroing the attempt counter — the counter also
@@ -221,10 +247,11 @@ typing the command.
   flips the issue back to `agent:ready` unless `--no-label` is passed, and
   leaves a still-`agent:blocked` issue alone rather than pulling it back
   into the queue out from under an open question.
-- **`ironmem autopilot ask`** and **`ironmem autopilot exhaust`** are the
-  manual arms of the two label transitions above — an operator can post a
-  question and block an issue, or close one out as exhausted, without
-  waiting for `lead` to do it as part of a tick.
+- **`ironmem autopilot ask`** and **`ironmem autopilot exhaust`** are not
+  manual arms of something `lead` also does on its own: they are the *only*
+  callers of `ask_human` and `exhaust_issue` outside tests. Blocking an
+  issue on a question, and closing one out as exhausted, happen when an
+  operator types those commands and at no other time.
 
 ## Branch protection
 
