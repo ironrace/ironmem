@@ -437,7 +437,7 @@ enum AutopilotCmd {
         /// Head branch the IC pushed. Defaults to this issue's autopilot branch.
         #[arg(long)]
         head: Option<String>,
-        /// Model for the reviewer; defaults to Codex's own configured model
+        /// Model for the reviewer; defaults to Muse's own configured model
         #[arg(long)]
         model: Option<String>,
         /// Assert the repo's gate was green when the PR was opened.
@@ -776,7 +776,7 @@ enum AutopilotCmd {
     /// **Reviews by default, merges only with `--merge`.** Without it every
     /// merge is rehearsed — every guard and every read runs and nothing is
     /// written to GitHub — because a merge is the one irreversible action in
-    /// this subsystem. Reviewing spends money on `codex`, bounded by the same
+    /// this subsystem. Reviewing spends money on `muse`, bounded by the same
     /// daily ceilings `autopilot review` applies.
     Advance {
         /// Path to the database
@@ -814,7 +814,7 @@ enum AutopilotCmd {
         /// Delete the head branch after a successful merge
         #[arg(long)]
         delete_branch: bool,
-        /// Model for the Codex reviewer
+        /// Model for the Muse reviewer
         #[arg(long)]
         model: Option<String>,
         /// How many issues one pass may carry forward
@@ -2687,7 +2687,7 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                         .map(|t| t.path.clone())
                         .unwrap_or_else(|| std::path::PathBuf::from(".")),
                 )?;
-                // `codex` is resolved only when a review can actually
+                // `muse` is resolved only when a review can actually
                 // happen. A dry run returns before reviewing anything, so
                 // requiring the binary would make the one flag whose whole
                 // promise is "read everything, change nothing" fail on a

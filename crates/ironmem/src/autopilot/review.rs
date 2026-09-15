@@ -7,6 +7,22 @@
 //! **Codex** ... giving cross-model adversarial review rather than same-model
 //! self-agreement. Not a tier — it supervises nothing and holds no state."
 //!
+//! # Which harness runs it
+//!
+//! **Muse, since 2026-09-15**, when the Codex subscription the spec's routing
+//! assumed ended — see [`MuseReviewer`], [`build_muse_argv`] and
+//! [`parse_muse_terminal`]. The spec's *reason* for the routing is what
+//! survives the swap: Muse is cross-model with respect to the Claude IC,
+//! which is the property "rather than same-model self-agreement" names.
+//! [`CodexReviewer`] is kept and still correct for anyone with `codex` on
+//! `PATH`, and everything below that says "Codex" is about that path.
+//!
+//! One guarantee does **not** survive it: `codex exec --output-schema` forced
+//! the verdict's shape, and `muse exec` has no equivalent, so the shape is
+//! stated in the prompt ([`super::review_prompt`]) and
+//! [`parse_review_message`] refuses anything else. Fail-closed either way — a
+//! non-conforming reply is [`HoldReason::NoVerdict`], not a guess.
+//!
 //! This module builds that invocation, runs it, parses its verdict, banks its
 //! spend, records it to lineage, and computes the **merge decision**. It does
 //! not *execute* a merge: `gh pr merge`, label flips, and the human
@@ -721,9 +737,8 @@ pub fn run_review_bounded(
     };
     let args = build_argv(&spec, repo_dir);
     let run = spawn_bounded(bin, &args, repo_dir, timeout)?;
-    let (stdout_bytes, timed_out, status) = (run.stdout, run.timed_out, run.status);
 
-    let stdout = String::from_utf8_lossy(&stdout_bytes);
+    let stdout = String::from_utf8_lossy(&run.stdout);
     let token_usage = parse_codex_token_usage(&stdout);
 
     // A missing last-message file means the reviewer produced no final
@@ -741,7 +756,7 @@ pub fn run_review_bounded(
         token_usage,
         // A timeout is not a success, and neither is a `wait` that could not
         // report one: unknown fails closed, exactly as rung 9's advisor does.
-        process_success: !timed_out && status.map(|s| s.success()).unwrap_or(false),
+        process_success: !run.timed_out && run.status.map(|s| s.success()).unwrap_or(false),
     })
 }
 
@@ -1245,10 +1260,12 @@ pub struct MuseTerminal {
 /// skill reminder) — so treating a task failure as the run's verdict would
 /// report a failure the run did not have, and hold a PR on it.
 ///
-/// The **last** `run_terminal` wins, and lines that are not JSON are skipped:
-/// Muse writes human-readable notices to stdout before the stream starts
-/// ("muse: workspace root: ..."), and a strict parse would reject the whole
-/// stream over a line that carries no events.
+/// The **last** `run_terminal` wins, and lines that are not JSON are skipped.
+/// Measured on 1.3.0, Muse's human-readable notices ("muse: workspace root:
+/// ...", "tbh: reasoning effort ...") go to **stderr**, so today's stream is
+/// pure JSONL — but tolerating a non-JSON line costs nothing and a strict
+/// parse would reject a whole completed review over one line that carries no
+/// events.
 pub fn parse_muse_terminal(stdout: &str) -> Option<MuseTerminal> {
     let mut found = None;
     for line in stdout.lines() {
@@ -2886,9 +2903,10 @@ not json at all
 
     #[test]
     fn a_human_readable_notice_does_not_discard_the_stream() {
-        // Muse writes plain lines to stdout before the JSONL starts. A strict
-        // parse would reject the whole stream over a line carrying no events,
-        // and report a completed review as one that produced nothing.
+        // Muse's own notices go to stderr on 1.3.0, but the parser must not
+        // depend on that: a strict parse would reject the whole stream over
+        // one line carrying no events, and report a completed review as one
+        // that produced nothing.
         let stream = format!(
             "tbh: reasoning effort ultra is not available\nmuse: workspace root: /x\n{}\n",
             muse_terminal_event("ok"),

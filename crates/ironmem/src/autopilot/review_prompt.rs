@@ -4,8 +4,9 @@
 //! Reviewer the spec's *Roles* section defines. Pure text construction, in
 //! the same shape as rung 2's [`super::turn_prompt`]: it takes already-loaded
 //! data (the issue, the PR, the dispatch-time class, the approved gate
-//! commands) and produces the exact string that becomes `codex exec
-//! <prompt>`.
+//! commands) and produces the exact string the reviewer is handed — today
+//! `muse exec --prompt-file <path>`, and `codex exec <prompt>` for anyone
+//! still running [`super::review::CodexReviewer`].
 //!
 //! # Why the prompt states both jobs explicitly
 //!
@@ -20,11 +21,21 @@
 //!
 //! # Why "read-only" is stated as well as sandboxed
 //!
-//! [`super::review::build_argv`] passes `codex exec -s read-only`, so the sandbox
-//! already refuses writes. The prompt repeats the constraint because a
-//! sandbox denial surfaces to the model as a *tool failure* mid-review —
-//! something it may burn turns retrying or route around — whereas an
-//! instruction it read up front stops it attempting the write at all.
+//! The argv already refuses writes — `codex exec -s read-only` for
+//! [`super::review::build_argv`], `muse exec --disable-write` plus Muse's
+//! default sandbox for [`super::review::build_muse_argv`]. The prompt
+//! repeats the constraint because a sandbox denial surfaces to the model as
+//! a *tool failure* mid-review — something it may burn turns retrying or
+//! route around — whereas an instruction it read up front stops it
+//! attempting the write at all.
+//!
+//! # Why the verdict's shape is stated in the prompt
+//!
+//! `codex exec --output-schema` made the reply's shape a flag's guarantee.
+//! `muse exec` has no equivalent, so the shape is spelled out in the text
+//! below and [`super::review::parse_review_message`] still refuses anything
+//! else — a non-conforming reply is no verdict, which holds the PR for a
+//! human rather than guessing at one.
 
 use super::IssueRef;
 
