@@ -475,6 +475,12 @@ pub fn resolve_codex_binary() -> Result<PathBuf, MemoryError> {
     crate::launcher::find_on_path(crate::launcher::Harness::Codex.binary())
 }
 
+/// Resolve `muse` on `PATH`, through the harness registry rather than a
+/// literal — the registry is the single place a harness's binary name lives.
+pub fn resolve_muse_binary() -> Result<PathBuf, MemoryError> {
+    crate::launcher::find_on_path(crate::launcher::Harness::Muse.binary())
+}
+
 /// A scratch directory holding the schema and last-message files for one
 /// review, removed on drop.
 ///
@@ -555,46 +561,34 @@ pub fn run_review(
     run_review_bounded(bin, repo_dir, model, prompt, REVIEW_TIMEOUT)
 }
 
-/// [`run_review`] with an explicit bound, so the bound is testable against a
-/// stub binary without waiting [`REVIEW_TIMEOUT`].
+/// What one bounded reviewer invocation produced, before any harness decides
+/// what it means.
 ///
-/// A timeout is **a review that ran**, not one that failed to launch:
-/// `process_success` is false, which [`review_pr`] routes to
-/// [`HoldReason::ReviewerDidNotRun`] and `decide_merge` holds on, and the
-/// invocation still counts against the day's unpriced-review ceiling. A
-/// wedged reviewer that banked nothing would be retried every pass forever —
-/// rung 9's lesson 41, which is about exactly this: the failure outcomes need
-/// the same accounting the success one gets.
-pub fn run_review_bounded(
+/// Split out because the spawn, the two drain threads and the bound are the
+/// same work whichever reviewer runs — only the argv that goes in and the
+/// meaning read out of stdout differ. Keeping one copy keeps the reasoning in
+/// the comments below true of every reviewer rather than of whichever one was
+/// written first.
+struct BoundedRun {
+    /// stdout, empty on the timeout path (see the join note below).
+    stdout: Vec<u8>,
+    timed_out: bool,
+    status: std::io::Result<std::process::ExitStatus>,
+}
+
+/// Spawn `bin` with `args` in `repo_dir`, drain both pipes, and reap it if it
+/// outlives `timeout`.
+fn spawn_bounded(
     bin: &Path,
+    args: &[String],
     repo_dir: &Path,
-    model: Option<String>,
-    prompt: String,
     timeout: std::time::Duration,
-) -> Result<ReviewOutcome, MemoryError> {
+) -> Result<BoundedRun, MemoryError> {
     use std::io::Read;
-
-    let scratch = ScratchDir::create()?;
-    let schema_path = scratch.path.join("verdict-schema.json");
-    let last_message_path = scratch.path.join("last-message.txt");
-    std::fs::write(&schema_path, REVIEW_VERDICT_JSON_SCHEMA).map_err(|e| {
-        MemoryError::Config(format!(
-            "cannot write reviewer schema to {}: {e}",
-            schema_path.display()
-        ))
-    })?;
-
-    let spec = ReviewSpec {
-        model,
-        prompt,
-        schema_path,
-        last_message_path: last_message_path.clone(),
-    };
-    let args = build_argv(&spec, repo_dir);
 
     let mut command = std::process::Command::new(bin);
     command
-        .args(&args)
+        .args(args)
         .current_dir(repo_dir)
         // Nulled explicitly. `spawn` inherits all three streams where the
         // `output` call this replaced nulled stdin for you, and inheriting it
@@ -678,12 +672,56 @@ pub fn run_review_bounded(
     // every fact this outcome carries comes from stdout's event stream or the
     // last-message file. Draining it is not optional even so — an undrained
     // pipe is what deadlocks the process the bound is timing.
-    let stdout_bytes = if timed_out {
+    let stdout = if timed_out {
         Vec::new()
     } else {
         let _ = stderr_drain.join();
         stdout_drain.join().unwrap_or_default()
     };
+
+    Ok(BoundedRun {
+        stdout,
+        timed_out,
+        status,
+    })
+}
+
+/// [`run_review`] with an explicit bound, so the bound is testable against a
+/// stub binary without waiting [`REVIEW_TIMEOUT`].
+///
+/// A timeout is **a review that ran**, not one that failed to launch:
+/// `process_success` is false, which [`review_pr`] routes to
+/// [`HoldReason::ReviewerDidNotRun`] and `decide_merge` holds on, and the
+/// invocation still counts against the day's unpriced-review ceiling. A
+/// wedged reviewer that banked nothing would be retried every pass forever —
+/// rung 9's lesson 41, which is about exactly this: the failure outcomes need
+/// the same accounting the success one gets.
+pub fn run_review_bounded(
+    bin: &Path,
+    repo_dir: &Path,
+    model: Option<String>,
+    prompt: String,
+    timeout: std::time::Duration,
+) -> Result<ReviewOutcome, MemoryError> {
+    let scratch = ScratchDir::create()?;
+    let schema_path = scratch.path.join("verdict-schema.json");
+    let last_message_path = scratch.path.join("last-message.txt");
+    std::fs::write(&schema_path, REVIEW_VERDICT_JSON_SCHEMA).map_err(|e| {
+        MemoryError::Config(format!(
+            "cannot write reviewer schema to {}: {e}",
+            schema_path.display()
+        ))
+    })?;
+
+    let spec = ReviewSpec {
+        model,
+        prompt,
+        schema_path,
+        last_message_path: last_message_path.clone(),
+    };
+    let args = build_argv(&spec, repo_dir);
+    let run = spawn_bounded(bin, &args, repo_dir, timeout)?;
+    let (stdout_bytes, timed_out, status) = (run.stdout, run.timed_out, run.status);
 
     let stdout = String::from_utf8_lossy(&stdout_bytes);
     let token_usage = parse_codex_token_usage(&stdout);
@@ -1124,6 +1162,208 @@ pub fn reviews_for_issue(
 /// for the operator reading the error, not for control flow.
 pub trait ReviewRunner {
     fn review(&mut self, repo_dir: &Path, prompt: &str) -> Result<ReviewOutcome, MemoryError>;
+}
+
+/// Inputs to one `muse exec` review.
+pub struct MuseReviewSpec {
+    /// `--model`. `None` leaves Muse on its configured default, for the same
+    /// reason [`ReviewSpec::model`] does: this repo has no measurement
+    /// justifying a pin.
+    pub model: Option<String>,
+    /// Where the rendered prompt was written, for `--prompt-file`.
+    pub prompt_path: PathBuf,
+}
+
+/// Build the argv for one `muse exec` review.
+///
+/// Measured against **Muse Code 1.3.0** (`muse exec --help`, 2026-09-15)
+/// rather than written by analogy with [`build_argv`] — a stub accepts
+/// whatever argv it is handed, so unit tests here pass whether these flags
+/// exist or not.
+///
+/// What differs from Codex's argv, and why:
+///
+/// - **No `--output-schema`.** `muse exec` has no such flag, so the verdict's
+///   shape is stated in the prompt ([`super::review_prompt::render`]) and read
+///   back out of the terminal event. The schema constant stays for
+///   [`CodexReviewer`].
+/// - **No `-o`/`--output-last-message`.** Muse has no equivalent; the final
+///   message arrives in the `run.terminal.*` event that `--json` streams, so
+///   there is no scratch file to read and none to miss.
+/// - **`--prompt-file`, not a trailing positional.** [`build_argv`]'s note
+///   applies — a prompt beginning with `-` is dispatched on the dash and a
+///   lone `-` means "read stdin". A path closes both, so the guarantee the
+///   ordering only suggested there is real here.
+/// - **Read-only is `--disable-write` plus Muse's default sandbox**, the
+///   nearest equivalent to `codex -s read-only`. `--approval-mode never`
+///   because a headless run has nobody to answer an approval prompt, and the
+///   default `on-request` would wedge until the bound fired.
+/// - **`--workspace`** is passed as well as `current_dir`. Muse reports
+///   "workspace root: <cwd> (cwd default)" when it is omitted, so naming it
+///   makes the root the reviewer reads explicit instead of inherited.
+pub fn build_muse_argv(spec: &MuseReviewSpec, repo_dir: &Path) -> Vec<String> {
+    let mut args = vec![
+        "exec".to_string(),
+        "--json".to_string(),
+        "--approval-mode".to_string(),
+        "never".to_string(),
+        "--disable-write".to_string(),
+        "--workspace".to_string(),
+        repo_dir.to_string_lossy().to_string(),
+        "--prompt-file".to_string(),
+        spec.prompt_path.to_string_lossy().to_string(),
+    ];
+    if let Some(model) = &spec.model {
+        args.push("--model".to_string());
+        args.push(model.clone());
+    }
+    args
+}
+
+/// The terminal outcome Muse reported for one run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MuseTerminal {
+    /// The outcome word — `"completed"` for a run that finished.
+    pub terminal: String,
+    /// The agent's final message.
+    pub text: String,
+}
+
+/// Find a run's terminal event in a `muse exec --json` stream.
+///
+/// Muse emits an event-sourced JSONL stream; every line carries a `payload`,
+/// and the run's outcome is the record whose `payload.kind` is
+/// `"run_terminal"`. Measured on Muse Code 1.3.0:
+///
+/// ```text
+/// {"payload_type":"run.terminal.completed", ...,
+///  "payload":{"kind":"run_terminal","terminal":"completed","text":"...","reason":null}}
+/// ```
+///
+/// **`task.lifecycle.failed` records are deliberately not read here.** A
+/// subtask can fail while the run completes — one did in the measured run (a
+/// skill reminder) — so treating a task failure as the run's verdict would
+/// report a failure the run did not have, and hold a PR on it.
+///
+/// The **last** `run_terminal` wins, and lines that are not JSON are skipped:
+/// Muse writes human-readable notices to stdout before the stream starts
+/// ("muse: workspace root: ..."), and a strict parse would reject the whole
+/// stream over a line that carries no events.
+pub fn parse_muse_terminal(stdout: &str) -> Option<MuseTerminal> {
+    let mut found = None;
+    for line in stdout.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let payload = &value["payload"];
+        if payload["kind"].as_str() != Some("run_terminal") {
+            continue;
+        }
+        let Some(terminal) = payload["terminal"].as_str() else {
+            continue;
+        };
+        found = Some(MuseTerminal {
+            terminal: terminal.to_string(),
+            text: payload["text"].as_str().unwrap_or_default().to_string(),
+        });
+    }
+    found
+}
+
+/// Run one review with `muse exec`, bounded at [`REVIEW_TIMEOUT`].
+pub fn run_muse_review(
+    bin: &Path,
+    repo_dir: &Path,
+    model: Option<String>,
+    prompt: String,
+) -> Result<ReviewOutcome, MemoryError> {
+    run_muse_review_bounded(bin, repo_dir, model, prompt, REVIEW_TIMEOUT)
+}
+
+/// [`run_muse_review`] with an explicit bound, so the bound is testable
+/// against a stub binary without waiting [`REVIEW_TIMEOUT`].
+///
+/// `process_success` requires three things, not two: the process was not
+/// reaped by the bound, it exited zero, **and** the stream carried a
+/// `run_terminal` saying `completed`. The third is not redundant — a run that
+/// ends some other way still exits, and without it an unfinished review would
+/// be recorded as one that ran and simply had no verdict.
+pub fn run_muse_review_bounded(
+    bin: &Path,
+    repo_dir: &Path,
+    model: Option<String>,
+    prompt: String,
+    timeout: std::time::Duration,
+) -> Result<ReviewOutcome, MemoryError> {
+    let scratch = ScratchDir::create()?;
+    let prompt_path = scratch.path.join("review-prompt.txt");
+    std::fs::write(&prompt_path, &prompt).map_err(|e| {
+        MemoryError::Config(format!(
+            "cannot write reviewer prompt to {}: {e}",
+            prompt_path.display()
+        ))
+    })?;
+
+    let spec = MuseReviewSpec { model, prompt_path };
+    let args = build_muse_argv(&spec, repo_dir);
+    let run = spawn_bounded(bin, &args, repo_dir, timeout)?;
+
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    let terminal = parse_muse_terminal(&stdout);
+    let completed = terminal
+        .as_ref()
+        .is_some_and(|t| t.terminal == MUSE_TERMINAL_COMPLETED);
+    let message = terminal
+        .as_ref()
+        .map(|t| t.text.as_str())
+        .unwrap_or_default();
+    let (verdict, risk_class, reason) = parse_review_message(message);
+
+    Ok(ReviewOutcome {
+        verdict,
+        risk_class,
+        reason,
+        // Muse reports no price, exactly as Codex does not. See the module doc.
+        total_cost_usd: None,
+        // **Not measured.** No usage record appeared in a `--provider echo`
+        // run, and no live-provider run has been captured, so this reports
+        // nothing rather than guessing at an envelope. The per-day invocation
+        // ceiling is what bounds reviewer spend either way.
+        token_usage: None,
+        process_success: !run.timed_out
+            && run.status.map(|s| s.success()).unwrap_or(false)
+            && completed,
+    })
+}
+
+/// The `terminal` value Muse reports for a run that finished.
+pub const MUSE_TERMINAL_COMPLETED: &str = "completed";
+
+/// The production [`ReviewRunner`]: a real `muse exec` invocation.
+///
+/// Muse replaced Codex here on 2026-09-15, when the Codex subscription it
+/// depended on ended. [`CodexReviewer`] is kept — it is correct for anyone who
+/// still has `codex` on `PATH` — but nothing in this crate constructs it now.
+pub struct MuseReviewer {
+    bin: PathBuf,
+    model: Option<String>,
+}
+
+impl MuseReviewer {
+    /// Resolve `muse` on `PATH` now, so a missing binary is reported before
+    /// any state is written rather than at the moment of dispatch.
+    pub fn resolve(model: Option<String>) -> Result<Self, MemoryError> {
+        Ok(Self {
+            bin: resolve_muse_binary()?,
+            model,
+        })
+    }
+}
+
+impl ReviewRunner for MuseReviewer {
+    fn review(&mut self, repo_dir: &Path, prompt: &str) -> Result<ReviewOutcome, MemoryError> {
+        run_muse_review(&self.bin, repo_dir, self.model.clone(), prompt.to_string())
+    }
 }
 
 /// The production [`ReviewRunner`]: a real `codex exec` invocation.
@@ -2554,6 +2794,188 @@ not json at all
                 .unpriced_dispatch_count,
             1
         );
+    }
+
+    // ── the Muse reviewer ───────────────────────────────────────────────
+
+    /// One line of a real `muse exec --json` stream, trimmed to the fields
+    /// this module reads. Shaped from Muse Code 1.3.0's own output.
+    ///
+    /// Built with `json!` rather than a hand-escaped literal: the first
+    /// version of these tests used raw strings, and three of them asserted
+    /// against JSON that was quietly malformed.
+    fn muse_event(payload: serde_json::Value) -> String {
+        serde_json::json!({
+            "schema_version": 1,
+            "sequence": 1,
+            "record_type": "event",
+            "payload_type": "x",
+            "payload": payload,
+        })
+        .to_string()
+    }
+
+    fn muse_terminal_event(text: &str) -> String {
+        muse_event(serde_json::json!({
+            "kind": "run_terminal",
+            "terminal": "completed",
+            "text": text,
+            "reason": serde_json::Value::Null,
+        }))
+    }
+
+    #[test]
+    fn the_muse_argv_names_every_flag_measured_against_the_real_binary() {
+        let spec = MuseReviewSpec {
+            model: None,
+            prompt_path: std::path::PathBuf::from("/tmp/p.txt"),
+        };
+        let args = build_muse_argv(&spec, std::path::Path::new("/repo"));
+
+        // `exec` must lead, as it must for Codex: it is the subcommand.
+        assert_eq!(args[0], "exec");
+        // The prompt travels as a file, so a prompt opening with `-` can
+        // never be dispatched as a flag.
+        let i = args.iter().position(|a| a == "--prompt-file").unwrap();
+        assert_eq!(args[i + 1], "/tmp/p.txt");
+        // Read-only, and nobody to answer an approval prompt.
+        assert!(args.contains(&"--disable-write".to_string()));
+        let i = args.iter().position(|a| a == "--approval-mode").unwrap();
+        assert_eq!(args[i + 1], "never");
+        // The workspace root is named, not inherited from the cwd.
+        let i = args.iter().position(|a| a == "--workspace").unwrap();
+        assert_eq!(args[i + 1], "/repo");
+        // Flags Codex has and Muse does not. Asserted because writing them by
+        // analogy is exactly how this breaks: `muse exec` rejects an unknown
+        // flag, and a stub accepts one silently.
+        assert!(!args.contains(&"--output-schema".to_string()));
+        assert!(!args.contains(&"-o".to_string()));
+        assert!(!args.contains(&"-s".to_string()));
+        assert!(!args.contains(&"--ephemeral".to_string()));
+    }
+
+    #[test]
+    fn a_muse_model_is_passed_only_when_one_was_asked_for() {
+        let spec = MuseReviewSpec {
+            model: Some("some-model".into()),
+            prompt_path: std::path::PathBuf::from("/tmp/p.txt"),
+        };
+        let args = build_muse_argv(&spec, std::path::Path::new("/repo"));
+        let i = args.iter().position(|a| a == "--model").unwrap();
+        assert_eq!(args[i + 1], "some-model");
+
+        let spec = MuseReviewSpec {
+            model: None,
+            prompt_path: std::path::PathBuf::from("/tmp/p.txt"),
+        };
+        let args = build_muse_argv(&spec, std::path::Path::new("/repo"));
+        assert!(!args.contains(&"--model".to_string()));
+    }
+
+    #[test]
+    fn the_terminal_event_supplies_the_message_and_the_outcome() {
+        let stream = format!(
+            "muse: workspace root: /repo (cwd default)\n{}\n{}\n",
+            muse_event(serde_json::json!({"kind": "run_output_delta", "text": "partial"})),
+            muse_terminal_event(r#"{"verdict":"pass"}"#),
+        );
+        let terminal = parse_muse_terminal(&stream).unwrap();
+        assert_eq!(terminal.terminal, MUSE_TERMINAL_COMPLETED);
+        assert_eq!(terminal.text, r#"{"verdict":"pass"}"#);
+    }
+
+    #[test]
+    fn a_human_readable_notice_does_not_discard_the_stream() {
+        // Muse writes plain lines to stdout before the JSONL starts. A strict
+        // parse would reject the whole stream over a line carrying no events,
+        // and report a completed review as one that produced nothing.
+        let stream = format!(
+            "tbh: reasoning effort ultra is not available\nmuse: workspace root: /x\n{}\n",
+            muse_terminal_event("ok"),
+        );
+        assert!(parse_muse_terminal(&stream).is_some());
+    }
+
+    #[test]
+    fn a_failed_subtask_is_not_the_runs_verdict() {
+        // Measured: a skill-reminder task failed while the run completed.
+        // Reading task failures as the outcome would hold a PR on a failure
+        // the run did not have.
+        let stream = format!(
+            "{}\n{}\n",
+            muse_event(serde_json::json!({
+                "kind": "task_lifecycle",
+                "event": {"kind": "failed", "reason": "invalid run configuration"},
+            })),
+            muse_terminal_event("ok"),
+        );
+        let terminal = parse_muse_terminal(&stream).unwrap();
+        assert_eq!(terminal.terminal, MUSE_TERMINAL_COMPLETED);
+    }
+
+    #[test]
+    fn a_stream_with_no_terminal_event_yields_nothing() {
+        let stream = format!(
+            "{}\n",
+            muse_event(serde_json::json!({"kind": "run_output_delta", "text": "x"})),
+        );
+        assert!(parse_muse_terminal(&stream).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_muse_review_that_never_reached_a_terminal_event_is_not_a_success() {
+        // Exit zero is not enough. A run that ends without a `run_terminal`
+        // still exits, and recording it as "ran, no verdict" would count an
+        // unfinished review as a completed one — the same conflation that
+        // lets an infrastructure failure read as a judgment.
+        let dir = tempfile::tempdir().unwrap();
+        let bin = stub_reviewer(
+            dir.path(),
+            "muse-silent",
+            "#!/bin/sh\necho not-json\nexit 0\n",
+        );
+
+        let outcome = run_muse_review_bounded(
+            &bin,
+            dir.path(),
+            None,
+            "prompt".into(),
+            std::time::Duration::from_secs(30),
+        )
+        .unwrap();
+
+        assert!(!outcome.process_success);
+        assert!(outcome.verdict.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_completed_muse_review_carries_its_verdict_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let event = muse_terminal_event(
+            r#"{"verdict":"needs_changes","risk_class":"documentation","reason":"a reason"}"#,
+        );
+        // Heredoc-quoted so the shell expands nothing inside the JSON.
+        let script = format!("#!/bin/sh\ncat <<'MUSEEOF'\n{event}\nMUSEEOF\nexit 0\n");
+        let bin = stub_reviewer(dir.path(), "muse-ok", &script);
+
+        let outcome = run_muse_review_bounded(
+            &bin,
+            dir.path(),
+            None,
+            "prompt".into(),
+            std::time::Duration::from_secs(30),
+        )
+        .unwrap();
+
+        assert!(outcome.process_success);
+        assert_eq!(outcome.verdict, Some(ReviewVerdict::NeedsChanges));
+        assert_eq!(outcome.risk_class, Some(RiskClass::Documentation));
+        assert_eq!(outcome.reason.as_deref(), Some("a reason"));
+        // Never fabricated: no usage envelope has been measured.
+        assert!(outcome.token_usage.is_none());
+        assert!(outcome.total_cost_usd.is_none());
     }
 
     // ── rung 10: the reviewer's wall-clock bound ────────────────────────

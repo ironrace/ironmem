@@ -101,7 +101,16 @@ a defect here.\n\n\
 Constraints: you are read-only. Do not edit files, do not commit, do not \
 push, do not comment on the PR, and do not merge. You hold no state and \
 supervise nothing; this is a single review pass.\n\n\
-Report your verdict and your risk class using the required output schema.",
+Report your verdict and your risk class as a single JSON object and \
+nothing else, in this exact shape:\n\n\
+{{\"verdict\": \"pass\" | \"needs_changes\", \"risk_class\": \
+\"documentation\" | \"dependency_bump\" | \"mechanical_rename\" | \
+\"test_only\" | \"logic\" | \"protocol\" | \"security\" | \
+\"public_api\", \"reason\": \"...\"}}\n\n\
+The shape is stated here rather than enforced by a flag: `muse exec` has no \
+`--output-schema`, so this text is the only thing that makes the verdict \
+machine-readable. A reply that is not one JSON object of exactly these \
+fields is read as no verdict at all, which holds the PR for a human.",
         pr = inputs.pr_number,
         repo = inputs.issue.repo,
         issue = inputs.issue.canonical(),
@@ -125,6 +134,24 @@ mod tests {
             dispatch_class: "documentation",
             gate_commands: gates,
         }
+    }
+
+    #[test]
+    fn the_prompt_states_the_verdict_shape_because_no_flag_enforces_it() {
+        // `codex exec --output-schema` used to guarantee the reply's shape.
+        // `muse exec` has no equivalent, so this text is the only thing
+        // making the verdict machine-readable — and `parse_review_message`
+        // returns "no verdict" for anything else, which holds the PR.
+        let issue = IssueRef::new("ironrace/ironmem", 283);
+        let gates = vec!["cargo test --workspace".to_string()];
+        let prompt = render(&sample_inputs(&issue, &gates));
+        assert!(prompt.contains("\"verdict\""));
+        assert!(prompt.contains("\"risk_class\""));
+        assert!(prompt.contains("\"reason\""));
+        assert!(prompt.contains("pass"));
+        assert!(prompt.contains("needs_changes"));
+        // The old wording pointed at a flag that is no longer passed.
+        assert!(!prompt.contains("required output schema"));
     }
 
     #[test]

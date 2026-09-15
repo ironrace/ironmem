@@ -2000,7 +2000,7 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                 let gate_commands =
                     ironmem::autopilot::run::approved_gate_commands(&database, &issue_ref.repo)?;
 
-                let mut runner = ironmem::autopilot::review::CodexReviewer::resolve(model)?;
+                let mut runner = ironmem::autopilot::review::MuseReviewer::resolve(model)?;
                 let mut review = ironmem::autopilot::review::review_pr(
                     &database,
                     &mut runner,
@@ -2697,7 +2697,7 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                 let reviewer: &mut dyn ironmem::autopilot::review::ReviewRunner = if dry_run {
                     &mut refusing
                 } else {
-                    real = ironmem::autopilot::review::CodexReviewer::resolve(model)?;
+                    real = ironmem::autopilot::review::MuseReviewer::resolve(model)?;
                     &mut real
                 };
 
