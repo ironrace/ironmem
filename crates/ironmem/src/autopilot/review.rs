@@ -1209,10 +1209,23 @@ pub struct MuseReviewSpec {
 ///   applies — a prompt beginning with `-` is dispatched on the dash and a
 ///   lone `-` means "read stdin". A path closes both, so the guarantee the
 ///   ordering only suggested there is real here.
-/// - **Read-only is `--disable-write` plus Muse's default sandbox**, the
-///   nearest equivalent to `codex -s read-only`. `--approval-mode never`
-///   because a headless run has nobody to answer an approval prompt, and the
-///   default `on-request` would wedge until the bound fired.
+/// - **`--disable-write` is not `codex -s read-only`, and nothing here is.**
+///   Measured on 1.3.0 against a live tool-calling run: with
+///   `--approval-mode never --disable-write`, a shell
+///   `echo MUTATED > probe.txt` **succeeded, unprompted**. `--disable-write`
+///   stops the non-shell write tools (`write_file`/`edit_file`/`apply_patch`)
+///   and nothing else; `--approval-mode untrusted` allows the same write;
+///   there is no built-in `readonly` permission profile (the id does not
+///   exist); and `--disable-shell` would stop the reviewer running the
+///   `git diff` the prompt tells it to run. **Muse exposes no flag that makes
+///   the workspace read-only to the shell.** The guarantee comes from
+///   [`run_muse_review_bounded`] checking the checkout afterwards instead.
+/// - **`--approval-mode never` does not deny tools.** The same live run read a
+///   file successfully, so `never` is the "do not prompt" setting a headless
+///   run needs, not a deny-everything one. Worth measuring: had it denied, the
+///   reviewer would have answered from the prompt alone, reported `completed`,
+///   and produced a verdict indistinguishable downstream from one that had
+///   actually read the diff.
 /// - **`--workspace`** is passed as well as `current_dir`. Muse reports
 ///   "workspace root: <cwd> (cwd default)" when it is omitted, so naming it
 ///   makes the root the reviewer reads explicit instead of inherited.
@@ -1305,6 +1318,10 @@ pub fn run_muse_review(
 /// `run_terminal` saying `completed`. The third is not redundant — a run that
 /// ends some other way still exits, and without it an unfinished review would
 /// be recorded as one that ran and simply had no verdict.
+///
+/// A fourth condition can only fail it: a reviewer that **modified the
+/// checkout** loses its verdict entirely, because Muse has no read-only
+/// sandbox to prevent the write. See the comment at the check.
 pub fn run_muse_review_bounded(
     bin: &Path,
     repo_dir: &Path,
@@ -1323,6 +1340,13 @@ pub fn run_muse_review_bounded(
 
     let spec = MuseReviewSpec { model, prompt_path };
     let args = build_muse_argv(&spec, repo_dir);
+
+    // What the checkout looked like before the reviewer touched it. `Err`
+    // means "cannot tell" — `repo_dir` need not be a git checkout — and is
+    // carried as `None` so the check below is skipped rather than turning an
+    // unknowable into a failure.
+    let before = super::worktree::status_porcelain(repo_dir).ok();
+
     let run = spawn_bounded(bin, &args, repo_dir, timeout)?;
 
     let stdout = String::from_utf8_lossy(&run.stdout);
@@ -1335,6 +1359,41 @@ pub fn run_muse_review_bounded(
         .map(|t| t.text.as_str())
         .unwrap_or_default();
     let (verdict, risk_class, reason) = parse_review_message(message);
+
+    // Did the reviewer write to the checkout it was judging?
+    //
+    // It can: see [`build_muse_argv`] — no flag Muse offers makes the
+    // workspace read-only to the shell, and a live run proved a shell write
+    // goes through unprompted. `advance` runs this against the issue's own
+    // worktree, whose branch is what a merge would take, so a reviewer that
+    // edits a file and then reports on what it edited is both judging its own
+    // work and leaving that work where the next dispatch will find it.
+    //
+    // Compared as porcelain *text* rather than a dirty/clean flag, so a
+    // checkout that was already dirty is still answerable: same text, nothing
+    // changed.
+    //
+    // The verdict is discarded, not merely flagged. A run that wrote to the
+    // tree is not one whose judgment about that tree can be trusted, and
+    // leaving a `pass` on the record with only `process_success` false invites
+    // exactly the misreading #350 is about — a row that looks like a judgment
+    // because it carries one.
+    if let Some(before) = before {
+        let after = super::worktree::status_porcelain(repo_dir).ok();
+        if after.as_deref().is_some_and(|after| after != before) {
+            return Ok(ReviewOutcome {
+                verdict: None,
+                risk_class: None,
+                reason: Some(
+                    "reviewer modified the checkout it was reviewing; verdict discarded"
+                        .to_string(),
+                ),
+                total_cost_usd: None,
+                token_usage: None,
+                process_success: false,
+            });
+        }
+    }
 
     Ok(ReviewOutcome {
         verdict,
@@ -2965,6 +3024,106 @@ not json at all
 
         assert!(!outcome.process_success);
         assert!(outcome.verdict.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_reviewer_that_edits_the_checkout_loses_its_verdict() {
+        // Muse has no flag that makes the workspace read-only to the shell —
+        // measured live on 1.3.0, a shell write goes through unprompted. So
+        // the guarantee is this check, and a reviewer that writes to the tree
+        // it is judging must not be able to hand back a `pass` on it.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "t@example.com"],
+            vec!["config", "user.name", "t"],
+        ] {
+            std::process::Command::new("git")
+                .args(&args)
+                .current_dir(repo)
+                .output()
+                .unwrap();
+        }
+        std::fs::write(repo.join("tracked.txt"), "original\n").unwrap();
+        for args in [vec!["add", "-A"], vec!["commit", "-qm", "seed"]] {
+            std::process::Command::new("git")
+                .args(&args)
+                .current_dir(repo)
+                .output()
+                .unwrap();
+        }
+
+        let event = muse_terminal_event(
+            r#"{"verdict":"pass","risk_class":"documentation","reason":"looks fine"}"#,
+        );
+        // The stub reports a clean PASS *and* edits the checkout, which is
+        // exactly the shape that must not be trusted.
+        let script = format!(
+            "#!/bin/sh\necho MUTATED > \"{}/tracked.txt\"\ncat <<'MUSEEOF'\n{event}\nMUSEEOF\nexit 0\n",
+            repo.display()
+        );
+        let bin = stub_reviewer(dir.path(), "muse-writer", &script);
+
+        let outcome = run_muse_review_bounded(
+            &bin,
+            repo,
+            None,
+            "prompt".into(),
+            std::time::Duration::from_secs(30),
+        )
+        .unwrap();
+
+        assert!(!outcome.process_success, "a write must fail the review");
+        assert!(
+            outcome.verdict.is_none(),
+            "the verdict must be discarded, not merely flagged"
+        );
+        assert!(outcome
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("modified the checkout"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_checkout_that_was_already_dirty_does_not_fail_an_honest_review() {
+        // The check compares porcelain text, not a dirty/clean flag,
+        // precisely so a pre-existing edit cannot be read as the reviewer's.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "t@example.com"],
+            vec!["config", "user.name", "t"],
+        ] {
+            std::process::Command::new("git")
+                .args(&args)
+                .current_dir(repo)
+                .output()
+                .unwrap();
+        }
+        std::fs::write(repo.join("untracked.txt"), "left behind\n").unwrap();
+
+        let event = muse_terminal_event(
+            r#"{"verdict":"pass","risk_class":"documentation","reason":"looks fine"}"#,
+        );
+        let script = format!("#!/bin/sh\ncat <<'MUSEEOF'\n{event}\nMUSEEOF\nexit 0\n");
+        let bin = stub_reviewer(dir.path(), "muse-clean", &script);
+
+        let outcome = run_muse_review_bounded(
+            &bin,
+            repo,
+            None,
+            "prompt".into(),
+            std::time::Duration::from_secs(30),
+        )
+        .unwrap();
+
+        assert!(outcome.process_success);
+        assert_eq!(outcome.verdict, Some(ReviewVerdict::Pass));
     }
 
     #[cfg(unix)]
