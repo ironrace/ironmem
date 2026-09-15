@@ -1220,6 +1220,25 @@ pub struct MuseReviewSpec {
 ///   `git diff` the prompt tells it to run. **Muse exposes no flag that makes
 ///   the workspace read-only to the shell.** The guarantee comes from
 ///   [`run_muse_review_bounded`] checking the checkout afterwards instead.
+/// - **`--sandbox-network restricted` is the network half of
+///   `codex exec -s read-only`.** Without it nothing but the prompt's wording
+///   stopped the reviewer running `git push`, `gh pr comment` or
+///   `gh pr merge` — the actions the spec reserves for `merge.rs` and for a
+///   human — and the checkout comparison below cannot see a remote action at
+///   all. Measured on 1.3.0 in one live tool-calling run: with it,
+///   `git status --porcelain` still exits 0, while `curl https://example.com`
+///   exits 6 and `git ls-remote https://github.com/...` exits 128, both
+///   "Could not resolve host".
+///
+///   Note the **shape** of the refusal: DNS simply fails. No sandbox or
+///   permission message is emitted, so neither the prompt nor any parser here
+///   should expect a typed denial — a reviewer that tries the network sees an
+///   ordinary network error.
+/// - **`--no-session-log`** is Muse's `--ephemeral`. Without it a review
+///   writes a resumable ~100 KB transcript under
+///   `~/.local/share/muse/sessions/`, one per review, for ever. It costs
+///   local session messaging, which a reviewer that holds no state and is
+///   never messaged does not use.
 /// - **`--approval-mode never` does not deny tools.** The same live run read a
 ///   file successfully, so `never` is the "do not prompt" setting a headless
 ///   run needs, not a deny-everything one. Worth measuring: had it denied, the
@@ -1246,6 +1265,9 @@ pub fn build_muse_argv(spec: &MuseReviewSpec, repo_dir: &Path) -> Vec<String> {
         "--approval-mode".to_string(),
         "never".to_string(),
         "--disable-write".to_string(),
+        // The network half of `codex exec -s read-only`. See the doc above.
+        "--sandbox-network".to_string(),
+        "restricted".to_string(),
         "--no-session-log".to_string(),
         "--workspace".to_string(),
         repo_dir.to_string_lossy().to_string(),
@@ -2961,6 +2983,10 @@ not json at all
         assert_eq!(args[i + 1], "/tmp/p.txt");
         // Read-only, and nobody to answer an approval prompt.
         assert!(args.contains(&"--disable-write".to_string()));
+        // The network half. Measured: without it the reviewer can reach
+        // GitHub, and nothing else in this module can see a remote action.
+        let i = args.iter().position(|a| a == "--sandbox-network").unwrap();
+        assert_eq!(args[i + 1], "restricted");
         let i = args.iter().position(|a| a == "--approval-mode").unwrap();
         assert_eq!(args[i + 1], "never");
         // "Holds no state", enforced — Muse's spelling of `--ephemeral`.

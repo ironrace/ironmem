@@ -382,7 +382,7 @@ commit having moved"
     // ── nothing was ever paid for ───────────────────────────────────────
     let calls = std::fs::read_to_string(&log).unwrap();
     assert!(
-        calls.contains("muse exec --json --approval-mode never --disable-write --no-session-log"),
+        calls.contains("muse exec --json --approval-mode never --disable-write --sandbox-network restricted --no-session-log"),
         "the real reviewer argv ran"
     );
     assert!(

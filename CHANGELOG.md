@@ -234,12 +234,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   resumable session transcript per review, forever, under an unattended
   `autopilot advance`.
 
-  **Known residual, not fixed here.** `codex exec -s read-only` sandboxed the
-  network as well as the filesystem; `muse exec` under `--approval-mode never`
-  does not, and the checkout comparison above cannot see a remote action. A
-  reviewer that runs `git push`, `gh pr merge` or `gh pr comment` is stopped
-  today only by the prompt telling it not to. Closing it means measuring
-  `--sandbox-network restricted` against a live tool-calling run.
+  `--sandbox-network restricted` carries over the *network* half of
+  `codex exec -s read-only`, which `--approval-mode never` does not supply and
+  the checkout comparison above cannot see: without it, a reviewer running
+  `git push`, `gh pr merge` or `gh pr comment` was stopped only by the prompt
+  telling it not to. Measured in a live tool-calling run —
+  `git status --porcelain` still exits 0, while `curl https://example.com`
+  exits 6 and `git ls-remote https://github.com/...` exits 128, both "Could
+  not resolve host". The refusal arrives as **DNS failure, not a typed
+  denial**, so nothing expects a permission message; and since `gh pr diff`
+  cannot work under it either, the review prompt now names only the local
+  `git diff`.
 
 - **`initialize` now negotiates the MCP protocol version instead of always
   answering with a hardcoded one (#275).** Every `initialize` call used to get

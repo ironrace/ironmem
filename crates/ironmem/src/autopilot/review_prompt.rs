@@ -91,7 +91,9 @@ pub fn render(inputs: &ReviewPromptInputs) -> String {
     format!(
         "You are a fresh-context, read-only reviewer for pull request #{pr} on \
 {repo}, which was opened by an autonomous agent to close issue {issue}.\n\n\
-Read the diff first: `git diff {base}...{head}` (or `gh pr diff {pr}`). Review \
+Read the diff first: `git diff {base}...{head}`. Work locally — you have no \
+network, so `gh pr diff` and anything else that reaches GitHub will fail to \
+resolve the host. Review \
 the whole diff, not a sample of it.\n\n\
 You have TWO jobs, and both must be answered from the diff you just read:\n\n\
 1. CLASSIFY the actual change. Choose exactly one risk class:\n\

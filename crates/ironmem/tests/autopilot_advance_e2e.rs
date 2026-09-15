@@ -439,7 +439,7 @@ exit 0
     );
     // The real argv, asserted rather than assumed.
     assert!(
-        calls.contains("muse exec --json --approval-mode never --disable-write --no-session-log"),
+        calls.contains("muse exec --json --approval-mode never --disable-write --sandbox-network restricted --no-session-log"),
         "{calls}"
     );
     assert!(
