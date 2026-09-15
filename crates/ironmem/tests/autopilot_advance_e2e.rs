@@ -439,7 +439,7 @@ exit 0
     );
     // The real argv, asserted rather than assumed.
     assert!(
-        calls.contains("muse exec --json --approval-mode never --disable-write"),
+        calls.contains("muse exec --json --approval-mode never --disable-write --no-session-log"),
         "{calls}"
     );
     assert!(
@@ -498,7 +498,7 @@ exit 0
         .is_none());
 
     // ── the money question, asked explicitly ─────────────────────────────
-    // Codex reports no price, so the ledger's dollars stay at zero and the
+    // Muse reports no price, so the ledger's dollars stay at zero and the
     // reviews are counted as unpriced — never as free.
     let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
     let ledger = ironmem::autopilot::budget::get_daily_spend(&db, &today).unwrap();

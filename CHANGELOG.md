@@ -207,6 +207,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The autopilot Reviewer runs on Muse instead of Codex (#350).** The Codex
+  subscription the spec's routing assumed ended on 2026-09-15. The routing's
+  stated *reason* survives the swap — Muse is as cross-model with respect to a
+  Claude IC as Codex was — but one guarantee does not: `codex exec
+  --output-schema` forced the verdict's shape, `muse exec` has no equivalent,
+  so the shape is now stated in the Reviewer's prompt and
+  `parse_review_message` refuses anything else. Fail-closed either way: a
+  non-conforming reply is `HoldReason::NoVerdict`, which holds the PR for a
+  human, never a guessed verdict. `CodexReviewer` is kept and still correct
+  for anyone with `codex` on `PATH`; nothing in the crate constructs it.
+
+  Two properties of `muse exec` were measured rather than assumed, and both
+  changed the code. `--approval-mode never` does **not** deny tool calls — a
+  reviewer whose tools were denied would answer from the prompt alone, report
+  `completed`, and hand back a verdict indistinguishable from one that had
+  read the diff. And **no Muse flag makes the workspace read-only to the
+  shell**: `--disable-write` stops only the non-shell write tools, and a live
+  run wrote to the checkout unprompted. So the spec's read-only property is
+  enforced after the fact — `run_muse_review_bounded` snapshots the checkout's
+  `git status --porcelain` *and* its `HEAD` before and after the run, and
+  discards the verdict of any reviewer that changed either. Both halves are
+  needed: a reviewer that commits what it wrote leaves the porcelain output it
+  started from while moving the branch a merge would take. `--no-session-log`
+  carries over `--ephemeral`'s "holds no state", which is otherwise a
+  resumable session transcript per review, forever, under an unattended
+  `autopilot advance`.
+
+  **Known residual, not fixed here.** `codex exec -s read-only` sandboxed the
+  network as well as the filesystem; `muse exec` under `--approval-mode never`
+  does not, and the checkout comparison above cannot see a remote action. A
+  reviewer that runs `git push`, `gh pr merge` or `gh pr comment` is stopped
+  today only by the prompt telling it not to. Closing it means measuring
+  `--sandbox-network restricted` against a live tool-calling run.
+
 - **`initialize` now negotiates the MCP protocol version instead of always
   answering with a hardcoded one (#275).** Every `initialize` call used to get
   back `"2024-11-05"` no matter what the client requested — a silent,

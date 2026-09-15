@@ -1227,8 +1227,18 @@ pub struct MuseReviewSpec {
 ///   and produced a verdict indistinguishable downstream from one that had
 ///   actually read the diff.
 /// - **`--workspace`** is passed as well as `current_dir`. Muse reports
-///   "workspace root: <cwd> (cwd default)" when it is omitted, so naming it
+///   `workspace root: <cwd> (cwd default)` when it is omitted, so naming it
 ///   makes the root the reviewer reads explicit instead of inherited.
+/// - **`--no-session-log` is Muse's `--ephemeral`.** The spec's "holds no
+///   state" is an *enforced* property for Codex, not a wish, and it does not
+///   lapse just because the flag is spelled differently. Measured on 1.3.0:
+///   without it a `muse exec` writes a full session directory under
+///   `$XDG_DATA_HOME/muse/sessions/<date>/<uuid>/` (a 100 KB `session.jsonl`
+///   for a one-line echo run), so an unattended `autopilot advance` would
+///   accrue one resumable transcript per review forever. With it no session
+///   directory is created and the terminal event still arrives on stdout —
+///   the only thing given up is local session messaging, which a role that
+///   "supervises nothing and is never messaged" has no use for.
 pub fn build_muse_argv(spec: &MuseReviewSpec, repo_dir: &Path) -> Vec<String> {
     let mut args = vec![
         "exec".to_string(),
@@ -1236,6 +1246,7 @@ pub fn build_muse_argv(spec: &MuseReviewSpec, repo_dir: &Path) -> Vec<String> {
         "--approval-mode".to_string(),
         "never".to_string(),
         "--disable-write".to_string(),
+        "--no-session-log".to_string(),
         "--workspace".to_string(),
         repo_dir.to_string_lossy().to_string(),
         "--prompt-file".to_string(),
@@ -1300,6 +1311,33 @@ pub fn parse_muse_terminal(stdout: &str) -> Option<MuseTerminal> {
     found
 }
 
+/// Everything about a checkout that a reviewer must not have changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CheckoutSnapshot {
+    /// `git status --porcelain`, verbatim.
+    porcelain: String,
+    /// The commit `HEAD` names, or `None` on a checkout with no commits yet.
+    head: Option<String>,
+}
+
+/// Snapshot `repo_dir`, or `None` when it cannot be read as a git checkout.
+///
+/// Both halves are load-bearing and neither is sufficient alone. Porcelain
+/// text catches an uncommitted edit but not a *committed* one — `git add -A &&
+/// git commit` restores the porcelain output it started from. `HEAD` catches
+/// the commit but not the edit. Together they cover both, which is the whole
+/// property [`run_muse_review_bounded`] is enforcing after the fact because
+/// Muse offers no flag that enforces it up front.
+fn checkout_snapshot(repo_dir: &Path) -> Option<CheckoutSnapshot> {
+    Some(CheckoutSnapshot {
+        porcelain: super::worktree::status_porcelain(repo_dir).ok()?,
+        // `None` here is a legitimate state (an initialised repo with no
+        // commits), not a read failure — `status_porcelain` above is what
+        // answers "is this a checkout at all".
+        head: super::worktree::resolve_commit(repo_dir, "HEAD"),
+    })
+}
+
 /// Run one review with `muse exec`, bounded at [`REVIEW_TIMEOUT`].
 pub fn run_muse_review(
     bin: &Path,
@@ -1341,11 +1379,11 @@ pub fn run_muse_review_bounded(
     let spec = MuseReviewSpec { model, prompt_path };
     let args = build_muse_argv(&spec, repo_dir);
 
-    // What the checkout looked like before the reviewer touched it. `Err`
-    // means "cannot tell" — `repo_dir` need not be a git checkout — and is
-    // carried as `None` so the check below is skipped rather than turning an
-    // unknowable into a failure.
-    let before = super::worktree::status_porcelain(repo_dir).ok();
+    // What the checkout looked like before the reviewer touched it. `None`
+    // means "cannot tell" — `repo_dir` need not be a git checkout — and the
+    // check below is then skipped rather than turning an unknowable into a
+    // failure.
+    let before = checkout_snapshot(repo_dir);
 
     let run = spawn_bounded(bin, &args, repo_dir, timeout)?;
 
@@ -1371,7 +1409,15 @@ pub fn run_muse_review_bounded(
     //
     // Compared as porcelain *text* rather than a dirty/clean flag, so a
     // checkout that was already dirty is still answerable: same text, nothing
-    // changed.
+    // changed. And compared alongside `HEAD`, because porcelain text alone
+    // answers the wrong question for the worst case: a reviewer that runs
+    // `git add -A && git commit` leaves the porcelain output it started with
+    // (usually empty) while moving the branch a merge would take, so the edit
+    // this check exists to catch would pass it *because* it was committed.
+    //
+    // A snapshot that reads before and not after is a change too, not a
+    // "cannot tell": the checkout was answerable a moment ago, so whatever
+    // made it unanswerable happened during the review.
     //
     // The verdict is discarded, not merely flagged. A run that wrote to the
     // tree is not one whose judgment about that tree can be trusted, and
@@ -1379,8 +1425,7 @@ pub fn run_muse_review_bounded(
     // exactly the misreading #350 is about — a row that looks like a judgment
     // because it carries one.
     if let Some(before) = before {
-        let after = super::worktree::status_porcelain(repo_dir).ok();
-        if after.as_deref().is_some_and(|after| after != before) {
+        if checkout_snapshot(repo_dir).as_ref() != Some(&before) {
             return Ok(ReviewOutcome {
                 verdict: None,
                 risk_class: None,
@@ -2918,6 +2963,10 @@ not json at all
         assert!(args.contains(&"--disable-write".to_string()));
         let i = args.iter().position(|a| a == "--approval-mode").unwrap();
         assert_eq!(args[i + 1], "never");
+        // "Holds no state", enforced — Muse's spelling of `--ephemeral`.
+        // Without it every review leaves a resumable session transcript on
+        // disk, forever, under an unattended `advance`.
+        assert!(args.contains(&"--no-session-log".to_string()));
         // The workspace root is named, not inherited from the cwd.
         let i = args.iter().position(|a| a == "--workspace").unwrap();
         assert_eq!(args[i + 1], "/repo");
@@ -2927,6 +2976,8 @@ not json at all
         assert!(!args.contains(&"--output-schema".to_string()));
         assert!(!args.contains(&"-o".to_string()));
         assert!(!args.contains(&"-s".to_string()));
+        // `--ephemeral` is spelled `--no-session-log` here, asserted above.
+        // Absence of Codex's spelling is not absence of the property.
         assert!(!args.contains(&"--ephemeral".to_string()));
     }
 
@@ -3080,6 +3131,78 @@ not json at all
             outcome.verdict.is_none(),
             "the verdict must be discarded, not merely flagged"
         );
+        assert!(outcome
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("modified the checkout"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_reviewer_that_commits_its_edit_also_loses_its_verdict() {
+        // The case a porcelain-only check cannot see. `git add -A && git
+        // commit` leaves `git status --porcelain` exactly as it found it —
+        // empty — while moving the branch a merge would take, so the write
+        // this guard exists to catch would pass it *because* the reviewer
+        // tidied up after itself. `HEAD` is what answers it.
+        let dir = tempfile::tempdir().unwrap();
+        // The repo is a subdirectory so the stub binary itself is not an
+        // untracked file inside the checkout under test — this test asserts
+        // on a *clean* tree, which is the point of it.
+        let repo = &dir.path().join("repo");
+        std::fs::create_dir(repo).unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .output()
+                .unwrap();
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(repo.join("tracked.txt"), "original\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "seed"]);
+
+        let event = muse_terminal_event(
+            r#"{"verdict":"pass","risk_class":"documentation","reason":"looks fine"}"#,
+        );
+        // Edits, commits, and reports a clean PASS — a spotless worktree with
+        // the reviewer's own work now on the branch.
+        let script = format!(
+            "#!/bin/sh\n\
+             cd \"{repo}\"\n\
+             echo MUTATED > tracked.txt\n\
+             git add tracked.txt\n\
+             git commit -qm 'reviewer was here'\n\
+             cat <<'MUSEEOF'\n{event}\nMUSEEOF\nexit 0\n",
+            repo = repo.display(),
+        );
+        let bin = stub_reviewer(dir.path(), "muse-committer", &script);
+
+        let outcome = run_muse_review_bounded(
+            &bin,
+            repo,
+            None,
+            "prompt".into(),
+            std::time::Duration::from_secs(30),
+        )
+        .unwrap();
+
+        assert!(
+            std::process::Command::new("git")
+                .args(["status", "--porcelain"])
+                .current_dir(repo)
+                .output()
+                .unwrap()
+                .stdout
+                .is_empty(),
+            "the premise: the tree the reviewer left behind is clean"
+        );
+        assert!(!outcome.process_success, "a commit must fail the review");
+        assert!(outcome.verdict.is_none(), "the verdict must be discarded");
         assert!(outcome
             .reason
             .as_deref()

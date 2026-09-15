@@ -21,13 +21,21 @@
 //!
 //! # Why "read-only" is stated as well as sandboxed
 //!
-//! The argv already refuses writes — `codex exec -s read-only` for
-//! [`super::review::build_argv`], `muse exec --disable-write` plus Muse's
-//! default sandbox for [`super::review::build_muse_argv`]. The prompt
-//! repeats the constraint because a sandbox denial surfaces to the model as
-//! a *tool failure* mid-review — something it may burn turns retrying or
-//! route around — whereas an instruction it read up front stops it
-//! attempting the write at all.
+//! Under Codex the argv already refused writes: `codex exec -s read-only`
+//! ([`super::review::build_argv`]) made "read-only" a sandbox property, and
+//! the prompt repeated the constraint only because a sandbox denial surfaces
+//! to the model as a *tool failure* mid-review — something it may burn turns
+//! retrying or route around — whereas an instruction it read up front stops
+//! it attempting the write at all.
+//!
+//! **Under Muse the prompt is doing more than repeating itself.**
+//! [`super::review::build_muse_argv`] documents the measurement:
+//! `--disable-write` stops only the non-shell write tools, and no `muse exec`
+//! flag makes the workspace read-only to the *shell*. So this text is the
+//! reviewer's only up-front reason not to write, and the enforcement is after
+//! the fact — [`super::review::run_muse_review_bounded`] compares the
+//! checkout across the run and discards the verdict of a reviewer that
+//! changed it.
 //!
 //! # Why the verdict's shape is stated in the prompt
 //!
