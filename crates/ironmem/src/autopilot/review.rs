@@ -632,8 +632,11 @@ fn spawn_bounded(
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
-    let mut child = command
-        .spawn()
+    // Same `ETXTBSY` retry the IC dispatch uses, and for the same reason: this
+    // process spawns from several threads, and a reviewer binary an installer
+    // or updater wrote moments ago is briefly unexecutable through no fault of
+    // the launch.
+    let mut child = super::dispatch::retry_on_etxtbsy(|| command.spawn())
         .map_err(|e| MemoryError::NotFound(format!("failed to launch reviewer: {e}")))?;
 
     // Drain both pipes on their own threads for the whole life of the
