@@ -271,7 +271,7 @@ fn harness_checks(
                             let check = if state == HarnessState::NotRegistered && spec.id != "claude"
                             {
                                 check.with_hint(if spec.id == "muse" {
-                                    "re-run scripts/install-ironmem.sh to register it (or `ironmem muse` for just the registration)".to_string()
+                                    "re-run scripts/install-ironmem.sh to register it (`ironmem muse` also registers, but needs the muse binary on PATH and then launches a session)".to_string()
                                 } else {
                                     format!(
                                         "run `ironmem {}` to register it (scripts/install-ironmem.sh covers Claude, Codex and Muse)",
@@ -999,8 +999,9 @@ mod tests {
 
     #[test]
     fn json_harnesses_not_registered_hint_points_at_their_launcher() {
-        // scripts/install-ironmem.sh wires only Claude and Codex; the other
-        // JSON harnesses must send the user to `ironmem <id>` instead.
+        // scripts/install-ironmem.sh wires Claude, Codex and Muse; the JSON
+        // harnesses it does NOT cover (Gemini, Grok) must send the user to
+        // `ironmem <id>` instead.
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path();
         std::fs::create_dir_all(home.join(".config").join("muse")).unwrap();

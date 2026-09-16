@@ -582,6 +582,21 @@ register_json_mcpservers() {
       '.mcpServers = ((.mcpServers // {}) + {ironmem: ($extras + {command: $cmd, args: ["serve", "--connect", $sock], env: {IRONMEM_MCP_MODE: "trusted"}})})' \
       "$config" > "$tmp" && mv -f "$tmp" "$config"
   elif [[ "$existing_cmd" == "$TARGET" ]]; then
+    # Mirror `mcp_setup::is_bare_serve_json`: an entry still carrying the
+    # pre-daemon `args: ["serve"]` is upgraded in place to the shared-daemon
+    # proxy command. Without this an install that repaired everything else
+    # still left doctor reporting "wired with the legacy bare `serve` command
+    # (upgrade available via `ironmem <harness>`)" -- sending the user to the
+    # launcher this script exists to make unnecessary.
+    if jq -e '.mcpServers.ironmem.args == ["serve"]' "$config" >/dev/null 2>&1; then
+      echo "==> Upgrading the $label MCP registration to the shared-daemon proxy command"
+      tmp="$(mktemp)"
+      jq --arg sock "$DAEMON_SOCKET_PATH" \
+        '.mcpServers.ironmem.args = ["serve", "--connect", $sock]' \
+        "$config" > "$tmp" && mv -f "$tmp" "$config"
+      repaired=1
+    fi
+
     if jq -e '.mcpServers.ironmem.env.IRONMEM_MCP_MODE == null' \
       "$config" >/dev/null 2>&1; then
       echo "==> Adding trusted mode to the existing $label MCP registration"
@@ -727,7 +742,9 @@ if [[ "$SKIP_WIRING" -eq 0 ]]; then
     echo "          Install jq, or add this manually to $CLAUDE_CONFIG_JSON:" >&2
     echo "          { \"mcpServers\": { \"ironmem\": { \"command\": \"$TARGET\", \"args\": [\"serve\", \"--connect\", \"$DAEMON_SOCKET_PATH\"], \"env\": { \"IRONMEM_MCP_MODE\": \"trusted\" } } } }" >&2
     echo "          ...and the same to $MUSE_CONFIG_JSON, with \"mode\": \"optional\" added to" >&2
-    echo "          the ironmem entry so a stale command cannot abort a Muse session." >&2
+    echo "          the ironmem entry so a stale command cannot abort a Muse session, and" >&2
+    echo "          \"schema_version\": 1 alongside \"mcpServers\" if you are creating that file:" >&2
+    echo "          { \"schema_version\": 1, \"mcpServers\": { \"ironmem\": { \"command\": \"$TARGET\", \"args\": [\"serve\", \"--connect\", \"$DAEMON_SOCKET_PATH\"], \"env\": { \"IRONMEM_MCP_MODE\": \"trusted\" }, \"mode\": \"optional\" } } }" >&2
   else
     register_json_mcpservers "Claude" "$CLAUDE_CONFIG_JSON" '{}' '{}'
     register_json_mcpservers "Muse" "$MUSE_CONFIG_JSON" \

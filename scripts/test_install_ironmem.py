@@ -135,6 +135,11 @@ class InstallIronmemSelfTest(unittest.TestCase):
 
             server = self.read_claude_server(config)
             self.assertEqual(server.get("env", {}).get("IRONMEM_MCP_MODE"), "trusted")
+            # A pre-daemon entry must also reach the proxy command; leaving it
+            # bare makes doctor report "wired with the legacy bare `serve`
+            # command" right after a successful install.
+            self.assertEqual(server.get("args", [])[:2], ["serve", "--connect"])
+            self.assertEqual(len(server.get("args", [])), 3)
 
     def test_explicit_claude_mode_is_preserved(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -245,6 +250,11 @@ class InstallIronmemSelfTest(unittest.TestCase):
             server = self.read_muse_server(muse_config)
             self.assertEqual(server.get("mode"), "optional")
             self.assertEqual(server.get("env", {}).get("IRONMEM_MCP_MODE"), "trusted")
+            # The same entry is still on the pre-daemon `["serve"]` args, so the
+            # install must upgrade those too -- otherwise doctor sends the user
+            # to `ironmem muse` for an upgrade the installer should have done.
+            self.assertEqual(server.get("args", [])[:2], ["serve", "--connect"])
+            self.assertEqual(len(server.get("args", [])), 3)
             # Unrelated settings survive the edit.
             payload = json.loads(muse_config.read_text(encoding="utf-8"))
             self.assertEqual(payload.get("provider"), "anthropic")
@@ -276,6 +286,9 @@ class InstallIronmemSelfTest(unittest.TestCase):
             server = self.read_muse_server(muse_config)
             self.assertEqual(server["mode"], "required")
             self.assertEqual(server["env"]["IRONMEM_MCP_MODE"], "read-only")
+            # Preserving deliberate settings does not mean skipping the repair
+            # the entry actually needs.
+            self.assertEqual(server.get("args", [])[:2], ["serve", "--connect"])
 
     def test_skip_wiring_leaves_muse_untouched(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

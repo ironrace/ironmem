@@ -563,10 +563,10 @@ the first `[FAIL]`:
 
 Codex's config location honors `CODEX_HOME` (default `~/.codex/config.toml`);
 Claude Code's is `~/.claude.json`; Muse Code's is `$XDG_CONFIG_HOME/muse/settings.json`,
-falling back to `~/.config/muse/settings.json` when that variable is unset. Muse's
-entry is registered as `"mode": "optional"` so an ironmem binary that later moves
-cannot abort a Muse session at startup. `doctor` reports each harness
-independently, so you do **not** need all three installed.
+falling back to `~/.config/muse/settings.json` when that variable is unset or
+empty. Muse's entry is registered as `"mode": "optional"` so an ironmem binary
+that later moves cannot abort a Muse session at startup. `doctor` reports each
+harness independently, so you do **not** need all three installed.
 
 ### `ironmem context`
 
