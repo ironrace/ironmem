@@ -89,7 +89,7 @@ This is not an ironmem-only problem. It applies across all repos — ironmem is 
 
 ⟨r4⟩ An IC is **not one long-lived process**. It is a *supervised re-invocation loop*: each turn is a fresh `claude -p --resume <uuid> --output-format json` process against a Lead-assigned session id, which exits when the turn ends. The session, not the process, is the durable thing. See *IC lifecycle*.
 
-**Reviewer** ⟨r2⟩ — a short-lived, fresh-context, read-only agent the Lead dispatches once an IC's PR is open. It performs **both** merge-time jobs: re-classify the diff's risk, and review the diff for correctness/security, returning `PASS` or `NEEDS CHANGES`. ⟨r12⟩ Routed to **Muse** via `launcher`'s existing multi-harness support, giving cross-model adversarial review rather than same-model self-agreement. **Codex until 2026-09-15**, when the subscription it required ended; the *reason* for the routing is what mattered and survives unchanged, since Muse is as cross-model with respect to a Claude IC as Codex was. Not a tier — it supervises nothing and holds no state.
+**Reviewer** ⟨r2⟩ — a short-lived, fresh-context, read-only agent the Lead dispatches once an IC's PR is open. It performs **both** merge-time jobs: re-classify the diff's risk, and review the diff for correctness/security, returning `PASS` or `NEEDS CHANGES`. ⟨r12⟩ Routed to **Muse by default, and selectable with `--reviewer muse|codex`**, via `launcher`'s existing multi-harness support, giving cross-model adversarial review rather than same-model self-agreement. **Codex was the default until 2026-09-15**, when the subscription it required ended — it is kept rather than retired, so a repo with `codex` on `PATH` can still route to it; the *reason* for the routing is what mattered and survives unchanged, since Muse is as cross-model with respect to a Claude IC as Codex was. Not a tier — it supervises nothing and holds no state.
 
 **Onboarder** ⟨r2⟩ — a one-shot agent, invoked by a human per repo, that infers gate commands. Outside the autonomous loop entirely.
 
@@ -288,7 +288,7 @@ Four distinct model slots, decided 2026-08-24:
 | Goal evaluator | **small fast model (Haiku default)** | Its errors are bounded on both sides: a false *met* is caught by the Lead's gate check and then the reviewer, costing one dispatch; a false *not met* is capped by the `stop after N turns` clause. It is a loop-continuation heuristic, never an authority. |
 | IC | **Sonnet**, escalating to Opus by risk class | Where capability converts into merged rather than abandoned issues. Ports `wiggum`'s existing model-tiering. |
 | Lead | **Opus** | Cross-repo prioritisation and judgement — and at N > 1 it runs far fewer turns. |
-| Reviewer | **Muse** ⟨r12⟩ | Cross-model on purpose — the property, not the vendor. Codex until 2026-09-15, when its subscription ended. |
+| Reviewer | **Muse** by default, `--reviewer` selects ⟨r12⟩ | Cross-model on purpose — the property, not the vendor, which is why either harness satisfies it. Codex was the default until 2026-09-15, when its subscription ended. |
 
 **Do not upgrade the evaluator to buy accuracy.** Two reasons.
 

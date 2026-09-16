@@ -251,7 +251,7 @@ pub use review::{
     decide_merge, record_review, review_pr, run_muse_review, run_review, CodexReviewer, HoldReason,
     MergeDecision, MuseReviewSpec, MuseReviewer, PrReview, RecordedReview, RecordedReviewSummary,
     ReviewOutcome, ReviewRecord, ReviewRefusal, ReviewRequest, ReviewRunner, ReviewSpec,
-    ReviewTokenUsage, ReviewVerdict, RiskClass, DEFAULT_MAX_UNPRICED_REVIEWS_PER_DAY,
+    ReviewTokenUsage, ReviewVerdict, ReviewerKind, RiskClass, DEFAULT_MAX_UNPRICED_REVIEWS_PER_DAY,
 };
 pub use review_prompt::ReviewPromptInputs;
 pub use run::{

@@ -437,9 +437,19 @@ enum AutopilotCmd {
         /// Head branch the IC pushed. Defaults to this issue's autopilot branch.
         #[arg(long)]
         head: Option<String>,
-        /// Model for the reviewer; defaults to Muse's own configured model
+        /// Model for the reviewer; defaults to the harness's own configured model
         #[arg(long)]
         model: Option<String>,
+        /// Which harness reviews: muse (default) or codex.
+        ///
+        /// Both are supported. They differ in what they guarantee — Codex
+        /// forces the verdict's shape with `--output-schema` and reports
+        /// token usage; Muse does neither, and its read-only property is
+        /// enforced by comparing the checkout across the run. See
+        /// `autopilot::review::ReviewerKind`.
+        #[arg(long, default_value = "muse")]
+        reviewer: String,
+
         /// Assert the repo's gate was green when the PR was opened.
         ///
         /// Off by default, and deliberately an *opt-in assertion* rather than
@@ -814,9 +824,19 @@ enum AutopilotCmd {
         /// Delete the head branch after a successful merge
         #[arg(long)]
         delete_branch: bool,
-        /// Model for the Muse reviewer
+        /// Model for the reviewer
         #[arg(long)]
         model: Option<String>,
+        /// Which harness reviews: muse (default) or codex.
+        ///
+        /// Both are supported. They differ in what they guarantee — Codex
+        /// forces the verdict's shape with `--output-schema` and reports
+        /// token usage; Muse does neither, and its read-only property is
+        /// enforced by comparing the checkout across the run. See
+        /// `autopilot::review::ReviewerKind`.
+        #[arg(long, default_value = "muse")]
+        reviewer: String,
+
         /// How many issues one pass may carry forward
         #[arg(long)]
         max_advances: Option<usize>,
@@ -919,6 +939,23 @@ fn parse_repo_target(
 /// pass, and it fails loudly rather than silently returning a verdict, so a
 /// dry run that somehow reached a review would be visible instead of
 /// fabricating one.
+/// Parse `--reviewer` into a [`ReviewerKind`], naming the valid spellings
+/// when it does not.
+///
+/// The error lists `ReviewerKind::ALL` rather than a hand-written string, so
+/// a harness added there can never be missing from the message that tells an
+/// operator what they may pass.
+fn parse_reviewer(
+    s: &str,
+) -> Result<ironmem::autopilot::review::ReviewerKind, ironmem::MemoryError> {
+    ironmem::autopilot::review::ReviewerKind::parse(s).ok_or_else(|| {
+        ironmem::MemoryError::Validation(format!(
+            "unknown --reviewer '{s}'; expected one of: {}",
+            ironmem::autopilot::review::ReviewerKind::ALL.join(", ")
+        ))
+    })
+}
+
 struct DryRunReviewer;
 
 impl ironmem::autopilot::review::ReviewRunner for DryRunReviewer {
@@ -1983,6 +2020,7 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                 base,
                 head,
                 model,
+                reviewer,
                 gate_green,
                 daily_budget_usd,
                 max_unpriced_reviews_per_day,
@@ -2000,10 +2038,10 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                 let gate_commands =
                     ironmem::autopilot::run::approved_gate_commands(&database, &issue_ref.repo)?;
 
-                let mut runner = ironmem::autopilot::review::MuseReviewer::resolve(model)?;
+                let mut runner = parse_reviewer(&reviewer)?.resolve(model)?;
                 let mut review = ironmem::autopilot::review::review_pr(
                     &database,
-                    &mut runner,
+                    &mut *runner,
                     &ironmem::autopilot::review::ReviewRequest {
                         issue: &issue_ref,
                         pr_number: pr,
@@ -2625,6 +2663,7 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                 strategy,
                 delete_branch,
                 model,
+                reviewer,
                 max_advances,
                 max_issues_per_repo,
                 daily_budget_usd,
@@ -2692,19 +2731,19 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                 // requiring the binary would make the one flag whose whole
                 // promise is "read everything, change nothing" fail on a
                 // machine that has nothing to change.
-                let mut real;
+                let mut real: Box<dyn ironmem::autopilot::review::ReviewRunner>;
                 let mut refusing = DryRunReviewer;
-                let reviewer: &mut dyn ironmem::autopilot::review::ReviewRunner = if dry_run {
+                let runner: &mut dyn ironmem::autopilot::review::ReviewRunner = if dry_run {
                     &mut refusing
                 } else {
-                    real = ironmem::autopilot::review::MuseReviewer::resolve(model)?;
-                    &mut real
+                    real = parse_reviewer(&reviewer)?.resolve(model)?;
+                    &mut *real
                 };
 
                 let report = ironmem::autopilot::advance::advance_pass(
                     &database,
                     &mut gh_runner,
-                    reviewer,
+                    runner,
                     &config,
                 )?;
 

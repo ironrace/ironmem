@@ -207,8 +207,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **The autopilot Reviewer runs on Muse instead of Codex (#350).** The Codex
-  subscription the spec's routing assumed ended on 2026-09-15. The routing's
+- **The autopilot Reviewer runs on Muse by default, and is switchable with
+  `--reviewer muse|codex` (#350).** The Codex subscription the spec's routing
+  assumed ended on 2026-09-15. The routing's
   stated *reason* survives the swap — Muse is as cross-model with respect to a
   Claude IC as Codex was — but one guarantee does not: `codex exec
   --output-schema` forced the verdict's shape, `muse exec` has no equivalent,
@@ -216,7 +217,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `parse_review_message` refuses anything else. Fail-closed either way: a
   non-conforming reply is `HoldReason::NoVerdict`, which holds the PR for a
   human, never a guessed verdict. `CodexReviewer` is kept and still correct
-  for anyone with `codex` on `PATH`; nothing in the crate constructs it.
+  for anyone with `codex` on `PATH` — `--reviewer codex` selects it on both
+  `autopilot review` and `autopilot advance`, and `ReviewerKind` carries the
+  table of what each harness guarantees, because they do not guarantee the
+  same things. An unrecognized value is refused, naming the valid spellings,
+  rather than falling back to the default: a typo'd `--reviewer codx` that
+  quietly ran Muse would be a reviewer swap the operator did not ask for and
+  could not see.
 
   Two properties of `muse exec` were measured rather than assumed, and both
   changed the code. `--approval-mode never` does **not** deny tool calls — a

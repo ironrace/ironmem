@@ -9,13 +9,17 @@
 //!
 //! # Which harness runs it
 //!
-//! **Muse, since 2026-09-15**, when the Codex subscription the spec's routing
-//! assumed ended — see [`MuseReviewer`], [`build_muse_argv`] and
+//! **Selectable, `--reviewer muse|codex`, defaulting to Muse since
+//! 2026-09-15**, when the Codex subscription the spec's routing assumed
+//! ended — Codex is kept, not retired, and either satisfies the property the
+//! routing is actually for — see [`MuseReviewer`], [`build_muse_argv`] and
 //! [`parse_muse_terminal`]. The spec's *reason* for the routing is what
 //! survives the swap: Muse is cross-model with respect to the Claude IC,
 //! which is the property "rather than same-model self-agreement" names.
-//! [`CodexReviewer`] is kept and still correct for anyone with `codex` on
-//! `PATH`, and everything below that says "Codex" is about that path.
+//! [`CodexReviewer`] is still correct for anyone with `codex` on `PATH`, and
+//! everything below that says "Codex" is about that path. [`ReviewerKind`]
+//! carries the table of what each one guarantees, because they do not
+//! guarantee the same things and a caller switching should know which.
 //!
 //! One guarantee does **not** survive it: `codex exec --output-schema` forced
 //! the verdict's shape, and `muse exec` has no equivalent, so the shape is
@@ -1482,6 +1486,67 @@ pub fn run_muse_review_bounded(
 /// The `terminal` value Muse reports for a run that finished.
 pub const MUSE_TERMINAL_COMPLETED: &str = "completed";
 
+/// Which harness runs the review.
+///
+/// Two are implemented, and the choice is a real one rather than a migration
+/// artifact. Muse is the default because Codex's subscription ended on
+/// 2026-09-15, but Codex remains correct for anyone who has `codex` on
+/// `PATH`, and the property the spec actually asks for — a reviewer that is
+/// *cross-model* with respect to a Claude IC — is satisfied by either.
+///
+/// The two are not interchangeable in what they guarantee, and a caller
+/// switching between them should know which one they are getting:
+///
+/// | | Codex | Muse |
+/// |---|---|---|
+/// | verdict shape | forced by `--output-schema` | asked for in the prompt, refused if not met |
+/// | read-only | `-s read-only`, filesystem **and** network | `--disable-write` + `--sandbox-network restricted`, plus an after-the-fact checkout check |
+/// | token usage | reported | not reported |
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReviewerKind {
+    /// `muse exec`. The default since 2026-09-15.
+    #[default]
+    Muse,
+    /// `codex exec`. Still supported; requires a Codex subscription.
+    Codex,
+}
+
+impl ReviewerKind {
+    /// The spelling used on the command line and in messages.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReviewerKind::Muse => "muse",
+            ReviewerKind::Codex => "codex",
+        }
+    }
+
+    /// Parse a `--reviewer` value, case-insensitively.
+    ///
+    /// `None` for anything unrecognized rather than a silent fallback to the
+    /// default: a typo'd `--reviewer codx` that quietly ran Muse would be a
+    /// reviewer swap the operator did not ask for and could not see.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "muse" => Some(ReviewerKind::Muse),
+            "codex" => Some(ReviewerKind::Codex),
+            _ => None,
+        }
+    }
+
+    /// Every spelling [`parse`](Self::parse) accepts, for error messages and
+    /// for the CLI's own help text — so the two can never drift apart.
+    pub const ALL: &'static [&'static str] = &["muse", "codex"];
+
+    /// Resolve this harness's binary now, so a missing one is reported before
+    /// any state is written rather than at the moment of dispatch.
+    pub fn resolve(self, model: Option<String>) -> Result<Box<dyn ReviewRunner>, MemoryError> {
+        Ok(match self {
+            ReviewerKind::Muse => Box::new(MuseReviewer::resolve(model)?),
+            ReviewerKind::Codex => Box::new(CodexReviewer::resolve(model)?),
+        })
+    }
+}
+
 /// The production [`ReviewRunner`]: a real `muse exec` invocation.
 ///
 /// Muse replaced Codex here on 2026-09-15, when the Codex subscription it
@@ -2937,6 +3002,38 @@ not json at all
                 .unpriced_dispatch_count,
             1
         );
+    }
+
+    // ── choosing a reviewer ─────────────────────────────────────────────
+
+    #[test]
+    fn the_default_reviewer_is_muse_and_codex_is_still_reachable() {
+        assert_eq!(ReviewerKind::default(), ReviewerKind::Muse);
+        assert_eq!(ReviewerKind::parse("muse"), Some(ReviewerKind::Muse));
+        assert_eq!(ReviewerKind::parse("codex"), Some(ReviewerKind::Codex));
+        assert_eq!(ReviewerKind::parse("  CODEX "), Some(ReviewerKind::Codex));
+    }
+
+    #[test]
+    fn an_unrecognized_reviewer_is_refused_rather_than_defaulted() {
+        // A typo that silently ran the default would be a reviewer swap the
+        // operator did not ask for and could not see in the output.
+        assert_eq!(ReviewerKind::parse("codx"), None);
+        assert_eq!(ReviewerKind::parse(""), None);
+    }
+
+    #[test]
+    fn every_accepted_spelling_is_listed_for_the_help_text() {
+        // ALL feeds both the CLI help and the error message, so a variant
+        // added without a spelling here would be unreachable from the command
+        // line while looking supported in code.
+        for spelling in ReviewerKind::ALL {
+            assert!(
+                ReviewerKind::parse(spelling).is_some(),
+                "ALL lists {spelling}, which parse() rejects"
+            );
+        }
+        assert_eq!(ReviewerKind::ALL.len(), 2);
     }
 
     // ── the Muse reviewer ───────────────────────────────────────────────
