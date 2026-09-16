@@ -191,7 +191,19 @@ pub fn resolve_repo_root(repo_root: &Path) -> Result<PathBuf, MemoryError> {
 /// unusable as one that modified a tracked file, and the spec's quarantine
 /// rule does not distinguish the two.
 pub fn is_dirty(worktree: &Path) -> Result<bool, MemoryError> {
-    Ok(!git(worktree, &["status", "--porcelain"])?.is_empty())
+    Ok(!status_porcelain(worktree)?.is_empty())
+}
+
+/// The checkout's `git status --porcelain` output, verbatim.
+///
+/// [`is_dirty`] answers "is anything uncommitted"; this answers "*what* is
+/// uncommitted", which is what a caller needs to tell whether a checkout
+/// changed **during** some operation rather than whether it was clean before
+/// it. A checkout that was already dirty is the case a boolean cannot serve:
+/// dirty before and dirty after says nothing, while the same porcelain text
+/// before and after says nothing changed.
+pub fn status_porcelain(worktree: &Path) -> Result<String, MemoryError> {
+    git(worktree, &["status", "--porcelain"])
 }
 
 /// Resolve `path` through symlinks when it exists, falling back to the path

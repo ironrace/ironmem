@@ -207,6 +207,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The autopilot Reviewer runs on Muse by default, and is switchable with
+  `--reviewer muse|codex` (#350).** The Codex subscription the spec's routing
+  assumed ended on 2026-09-15. The routing's
+  stated *reason* survives the swap — Muse is as cross-model with respect to a
+  Claude IC as Codex was — but one guarantee does not: `codex exec
+  --output-schema` forced the verdict's shape, `muse exec` has no equivalent,
+  so the shape is now stated in the Reviewer's prompt and
+  `parse_review_message` refuses anything else. Fail-closed either way: a
+  non-conforming reply is `HoldReason::NoVerdict`, which holds the PR for a
+  human, never a guessed verdict. `CodexReviewer` is kept and still correct
+  for anyone with `codex` on `PATH` — `--reviewer codex` selects it on both
+  `autopilot review` and `autopilot advance`, and `ReviewerKind` carries the
+  table of what each harness guarantees, because they do not guarantee the
+  same things. An unrecognized value is refused, naming the valid spellings,
+  rather than falling back to the default: a typo'd `--reviewer codx` that
+  quietly ran Muse would be a reviewer swap the operator did not ask for and
+  could not see.
+
+  Two properties of `muse exec` were measured rather than assumed, and both
+  changed the code. `--approval-mode never` does **not** deny tool calls — a
+  reviewer whose tools were denied would answer from the prompt alone, report
+  `completed`, and hand back a verdict indistinguishable from one that had
+  read the diff. And **no Muse flag makes the workspace read-only to the
+  shell**: `--disable-write` stops only the non-shell write tools, and a live
+  run wrote to the checkout unprompted. So the spec's read-only property is
+  enforced after the fact — `run_muse_review_bounded` snapshots the checkout's
+  `git status --porcelain` *and* its `HEAD` before and after the run, and
+  discards the verdict of any reviewer that changed either. Both halves are
+  needed: a reviewer that commits what it wrote leaves the porcelain output it
+  started from while moving the branch a merge would take. `--no-session-log`
+  carries over `--ephemeral`'s "holds no state", which is otherwise a
+  resumable session transcript per review, forever, under an unattended
+  `autopilot advance`.
+
+  A review counts as having run only if the stream carried a `run_terminal`
+  saying `completed`, and a run that said anything else **loses its verdict**
+  rather than keeping one beside a false `process_success`. A run can end some
+  other way after the model has already printed a verdict-shaped last message,
+  and the stored row is read without that flag: `advance --remediate` arms an
+  IC re-dispatch off a stored `needs_changes` alone, so an unfinished review
+  would otherwise cost a real attempt against the cap.
+
+  `--sandbox-network restricted` carries over the *network* half of
+  `codex exec -s read-only`, which `--approval-mode never` does not supply and
+  the checkout comparison above cannot see: without it, a reviewer running
+  `git push`, `gh pr merge` or `gh pr comment` was stopped only by the prompt
+  telling it not to. Measured in a live tool-calling run —
+  `git status --porcelain` still exits 0, while `curl https://example.com`
+  exits 6 and `git ls-remote https://github.com/...` exits 128, both "Could
+  not resolve host". The refusal arrives as **DNS failure, not a typed
+  denial**, so nothing expects a permission message; and since `gh pr diff`
+  cannot work under it either, the review prompt now names only the local
+  `git diff`.
+
 - **`initialize` now negotiates the MCP protocol version instead of always
   answering with a hardcoded one (#275).** Every `initialize` call used to get
   back `"2024-11-05"` no matter what the client requested — a silent,

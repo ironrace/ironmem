@@ -1,7 +1,7 @@
 //! Rung 11 end-to-end: the red path, against real everything.
 //!
 //! A real SQLite database, a real git checkout with a real worktree on the
-//! issue's branch, the real `GhCli`, `CodexReviewer` and `ClaudeDispatcher`
+//! issue's branch, the real `GhCli`, `MuseReviewer` and `ClaudeDispatcher`
 //! runners, and the real argv each of them builds. Only the three binaries are
 //! stubbed — behind an **asserted PATH guard**, so a stub that fails to shadow
 //! the real thing fails the test rather than quietly spending money.
@@ -22,7 +22,7 @@ use ironmem::autopilot::gh::{GhCli, MergeStrategy};
 use ironmem::autopilot::lead::RepoTarget;
 use ironmem::autopilot::merge::MergeOutcome;
 use ironmem::autopilot::remediate::{self, ArmOutcome};
-use ironmem::autopilot::review::CodexReviewer;
+use ironmem::autopilot::review::MuseReviewer;
 use ironmem::autopilot::run::{run_issue, ClaudeDispatcher, IssueBrief, RunConfig, TerminalReason};
 use ironmem::autopilot::worktree;
 use ironmem::autopilot::{gate_config, IssueRef};
@@ -116,20 +116,18 @@ exit 0
 "#,
     );
 
-    // The reviewer's verdict comes from a file, so the same real
-    // `CodexReviewer` can say NEEDS CHANGES on one pass and PASS on the next.
+    // The reviewer's verdict comes from a fixture file, so the same real
+    // `MuseReviewer` can say NEEDS CHANGES on one pass and PASS on the next.
+    // `muse exec --json` carries the final message in the run's terminal
+    // event, so the fixture is escaped into that event's `text` — the same
+    // JSONL line shape `parse_muse_terminal` reads off a real 1.3.0 stream.
     stub(
         &stubs,
-        "codex",
+        "muse",
         r#"#!/bin/bash
-echo "codex $*" >> "$AP_LOG"
-out=""; prev=""
-for a in "$@"; do
-  if [ "$prev" = "-o" ]; then out="$a"; fi
-  prev="$a"
-done
-if [ -n "$out" ]; then cat "$AP_FIXTURES/verdict.json" > "$out"; fi
-echo '{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5}}}'
+echo "muse $*" >> "$AP_LOG"
+verdict=$(sed 's/"/\\"/g' "$AP_FIXTURES/verdict.json" | tr -d '\n')
+printf '{"record_type":"event","payload_type":"run.terminal.completed","payload":{"kind":"run_terminal","terminal":"completed","text":"%s","reason":null}}\n' "$verdict"
 exit 0
 "#,
     );
@@ -178,9 +176,9 @@ exit 0
         "gh must resolve to the stub"
     );
     assert_eq!(
-        ironmem::autopilot::review::resolve_codex_binary().unwrap(),
-        stubs.join("codex"),
-        "codex must resolve to the stub"
+        ironmem::autopilot::review::resolve_muse_binary().unwrap(),
+        stubs.join("muse"),
+        "muse must resolve to the stub"
     );
     assert_eq!(
         ironmem::autopilot::dispatch::resolve_claude_binary().unwrap(),
@@ -262,7 +260,7 @@ exit 0
     };
     let advance = |remediate: bool| {
         let mut gh = GhCli::resolve(&checkout).unwrap();
-        let mut reviewer = CodexReviewer::resolve(None).unwrap();
+        let mut reviewer = MuseReviewer::resolve(None).unwrap();
         advance_pass(&db, &mut gh, &mut reviewer, &advance_config(remediate)).unwrap()
     };
     let dispatch_ic = || {
@@ -383,7 +381,10 @@ commit having moved"
 
     // ── nothing was ever paid for ───────────────────────────────────────
     let calls = std::fs::read_to_string(&log).unwrap();
-    assert!(calls.contains("codex exec"), "the real reviewer argv ran");
+    assert!(
+        calls.contains("muse exec --json --approval-mode never --disable-write --sandbox-network restricted --no-session-log"),
+        "the real reviewer argv ran"
+    );
     assert!(
         calls.contains("--dangerously-skip-permissions"),
         "the real IC argv ran"

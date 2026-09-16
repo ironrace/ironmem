@@ -4,8 +4,9 @@
 //! Reviewer the spec's *Roles* section defines. Pure text construction, in
 //! the same shape as rung 2's [`super::turn_prompt`]: it takes already-loaded
 //! data (the issue, the PR, the dispatch-time class, the approved gate
-//! commands) and produces the exact string that becomes `codex exec
-//! <prompt>`.
+//! commands) and produces the exact string the reviewer is handed — today
+//! `muse exec --prompt-file <path>`, and `codex exec <prompt>` for anyone
+//! still running [`super::review::CodexReviewer`].
 //!
 //! # Why the prompt states both jobs explicitly
 //!
@@ -20,11 +21,29 @@
 //!
 //! # Why "read-only" is stated as well as sandboxed
 //!
-//! [`super::review::build_argv`] passes `codex exec -s read-only`, so the sandbox
-//! already refuses writes. The prompt repeats the constraint because a
-//! sandbox denial surfaces to the model as a *tool failure* mid-review —
-//! something it may burn turns retrying or route around — whereas an
-//! instruction it read up front stops it attempting the write at all.
+//! Under Codex the argv already refused writes: `codex exec -s read-only`
+//! ([`super::review::build_argv`]) made "read-only" a sandbox property, and
+//! the prompt repeated the constraint only because a sandbox denial surfaces
+//! to the model as a *tool failure* mid-review — something it may burn turns
+//! retrying or route around — whereas an instruction it read up front stops
+//! it attempting the write at all.
+//!
+//! **Under Muse the prompt is doing more than repeating itself.**
+//! [`super::review::build_muse_argv`] documents the measurement:
+//! `--disable-write` stops only the non-shell write tools, and no `muse exec`
+//! flag makes the workspace read-only to the *shell*. So this text is the
+//! reviewer's only up-front reason not to write, and the enforcement is after
+//! the fact — [`super::review::run_muse_review_bounded`] compares the
+//! checkout across the run and discards the verdict of a reviewer that
+//! changed it.
+//!
+//! # Why the verdict's shape is stated in the prompt
+//!
+//! `codex exec --output-schema` made the reply's shape a flag's guarantee.
+//! `muse exec` has no equivalent, so the shape is spelled out in the text
+//! below and [`super::review::parse_review_message`] still refuses anything
+//! else — a non-conforming reply is no verdict, which holds the PR for a
+//! human rather than guessing at one.
 
 use super::IssueRef;
 
@@ -72,7 +91,9 @@ pub fn render(inputs: &ReviewPromptInputs) -> String {
     format!(
         "You are a fresh-context, read-only reviewer for pull request #{pr} on \
 {repo}, which was opened by an autonomous agent to close issue {issue}.\n\n\
-Read the diff first: `git diff {base}...{head}` (or `gh pr diff {pr}`). Review \
+Read the diff first: `git diff {base}...{head}`. Work locally — you have no \
+network, so `gh pr diff` and anything else that reaches GitHub will fail to \
+resolve the host. Review \
 the whole diff, not a sample of it.\n\n\
 You have TWO jobs, and both must be answered from the diff you just read:\n\n\
 1. CLASSIFY the actual change. Choose exactly one risk class:\n\
@@ -101,7 +122,16 @@ a defect here.\n\n\
 Constraints: you are read-only. Do not edit files, do not commit, do not \
 push, do not comment on the PR, and do not merge. You hold no state and \
 supervise nothing; this is a single review pass.\n\n\
-Report your verdict and your risk class using the required output schema.",
+Report your verdict and your risk class as a single JSON object and \
+nothing else, in this exact shape:\n\n\
+{{\"verdict\": \"pass\" | \"needs_changes\", \"risk_class\": \
+\"documentation\" | \"dependency_bump\" | \"mechanical_rename\" | \
+\"test_only\" | \"logic\" | \"protocol\" | \"security\" | \
+\"public_api\", \"reason\": \"...\"}}\n\n\
+The shape is stated here rather than enforced by a flag: `muse exec` has no \
+`--output-schema`, so this text is the only thing that makes the verdict \
+machine-readable. A reply that is not one JSON object of exactly these \
+fields is read as no verdict at all, which holds the PR for a human.",
         pr = inputs.pr_number,
         repo = inputs.issue.repo,
         issue = inputs.issue.canonical(),
@@ -125,6 +155,24 @@ mod tests {
             dispatch_class: "documentation",
             gate_commands: gates,
         }
+    }
+
+    #[test]
+    fn the_prompt_states_the_verdict_shape_because_no_flag_enforces_it() {
+        // `codex exec --output-schema` used to guarantee the reply's shape.
+        // `muse exec` has no equivalent, so this text is the only thing
+        // making the verdict machine-readable — and `parse_review_message`
+        // returns "no verdict" for anything else, which holds the PR.
+        let issue = IssueRef::new("ironrace/ironmem", 283);
+        let gates = vec!["cargo test --workspace".to_string()];
+        let prompt = render(&sample_inputs(&issue, &gates));
+        assert!(prompt.contains("\"verdict\""));
+        assert!(prompt.contains("\"risk_class\""));
+        assert!(prompt.contains("\"reason\""));
+        assert!(prompt.contains("pass"));
+        assert!(prompt.contains("needs_changes"));
+        // The old wording pointed at a flag that is no longer passed.
+        assert!(!prompt.contains("required output schema"));
     }
 
     #[test]

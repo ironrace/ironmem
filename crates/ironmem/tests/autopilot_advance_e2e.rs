@@ -1,7 +1,7 @@
 //! Rung 10 end-to-end: the loop closing, against real everything.
 //!
 //! A real SQLite database, a real git checkout with a real worktree on the
-//! issue's branch, the real `GhCli` and `CodexReviewer` runners, and the real
+//! issue's branch, the real `GhCli` and `MuseReviewer` runners, and the real
 //! argv each of them builds. Only the two binaries are stubbed — behind an
 //! **asserted PATH guard**, so a stub that fails to shadow the real thing
 //! fails the test rather than quietly spending money.
@@ -18,7 +18,7 @@ use ironmem::autopilot::gh::{GhCli, MergeStrategy};
 use ironmem::autopilot::lead::RepoTarget;
 use ironmem::autopilot::lineage::{self, AttemptOutcome, IssueStatus};
 use ironmem::autopilot::merge::MergeOutcome;
-use ironmem::autopilot::review::CodexReviewer;
+use ironmem::autopilot::review::MuseReviewer;
 use ironmem::autopilot::worktree::{self, WorktreeRemoval};
 use ironmem::autopilot::{dispatch_state, gate_config, DispatchState, IssueRef};
 use ironmem::db::schema::Database;
@@ -131,20 +131,16 @@ fi
 exit 0
 "#,
     );
+    // The reviewer. `muse exec --json` carries its verdict in the run's
+    // terminal event, not in a file, so the stub emits the same JSONL line
+    // shape `parse_muse_terminal` reads off a real 1.3.0 stream.
     stub(
         &stubs,
-        "codex",
+        "muse",
         r#"#!/bin/bash
-echo "codex $*" >> "$AP_LOG"
-out=""; prev=""
-for a in "$@"; do
-  if [ "$prev" = "-o" ]; then out="$a"; fi
-  prev="$a"
-done
-if [ -n "$out" ]; then
-  printf '{"verdict":"pass","risk_class":"documentation","reason":"stubbed reviewer"}' > "$out"
-fi
-echo '{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5}}}'
+echo "muse $*" >> "$AP_LOG"
+verdict='{\"verdict\":\"pass\",\"risk_class\":\"documentation\",\"reason\":\"stubbed reviewer\"}'
+printf '{"record_type":"event","payload_type":"run.terminal.completed","payload":{"kind":"run_terminal","terminal":"completed","text":"%s","reason":null}}\n' "$verdict"
 exit 0
 "#,
     );
@@ -166,9 +162,9 @@ exit 0
         "gh must resolve to the stub"
     );
     assert_eq!(
-        ironmem::autopilot::review::resolve_codex_binary().unwrap(),
-        stubs.join("codex"),
-        "codex must resolve to the stub"
+        ironmem::autopilot::review::resolve_muse_binary().unwrap(),
+        stubs.join("muse"),
+        "muse must resolve to the stub"
     );
 
     // ── a real checkout with a real worktree on the issue's branch ───────
@@ -249,7 +245,7 @@ exit 0
     };
     let run = |merge: bool, dry_run: bool| {
         let mut gh = GhCli::resolve(&checkout).unwrap();
-        let mut reviewer = CodexReviewer::resolve(None).unwrap();
+        let mut reviewer = MuseReviewer::resolve(None).unwrap();
         advance_pass(&db, &mut gh, &mut reviewer, &base_config(merge, dry_run)).unwrap()
     };
     // Every logged `gh` invocation whose line starts with `prefix`.
@@ -261,10 +257,10 @@ exit 0
             .map(str::to_string)
             .collect()
     };
-    let codex_calls = || {
+    let reviewer_calls = || {
         std::fs::read_to_string(&log)
             .unwrap_or_default()
-            .matches("codex ")
+            .matches("muse ")
             .count()
     };
 
@@ -272,7 +268,11 @@ exit 0
     let report = run(false, false);
     assert_eq!(report.skipped[0].reason, SkipReason::RepoNotApproved);
     assert!(report.advanced.is_empty());
-    assert_eq!(codex_calls(), 0, "an unapproved repo must not be reviewed");
+    assert_eq!(
+        reviewer_calls(),
+        0,
+        "an unapproved repo must not be reviewed"
+    );
 
     gate_config::propose_gate_config(
         &db,
@@ -286,7 +286,7 @@ exit 0
     // ── path 2: approved, but nothing has gone green yet ─────────────────
     let report = run(false, false);
     assert_eq!(report.skipped[0].reason, SkipReason::NoSuccessYet);
-    assert_eq!(codex_calls(), 0);
+    assert_eq!(reviewer_calls(), 0);
 
     // The green run this rung exists to finish.
     lineage::upsert_issue_status(
@@ -305,7 +305,7 @@ exit 0
     assert!(report.dry_run);
     assert!(report.advanced[0].review.is_none());
     assert!(report.advanced[0].merge.is_none());
-    assert_eq!(codex_calls(), 0, "a dry run must not pay for a review");
+    assert_eq!(reviewer_calls(), 0, "a dry run must not pay for a review");
 
     // ── path 4: no PR has ever existed, so this pass opens one ───────────
     //
@@ -328,7 +328,7 @@ exit 0
         }
         other => panic!("expected a pull request to be opened, got {other:?}"),
     }
-    assert_eq!(codex_calls(), 0, "opening the PR is the whole step");
+    assert_eq!(reviewer_calls(), 0, "opening the PR is the whole step");
     let created = gh_calls("gh pr create");
     assert_eq!(created.len(), 1);
     assert!(
@@ -416,14 +416,14 @@ exit 0
         AdvanceStep::Stalled(Stall::AmbiguousPr { numbers }) => assert_eq!(numbers, &vec![42, 43]),
         other => panic!("expected an ambiguity stall, got {other:?}"),
     }
-    assert_eq!(codex_calls(), 0, "an ambiguous PR must not be reviewed");
+    assert_eq!(reviewer_calls(), 0, "an ambiguous PR must not be reviewed");
 
     std::fs::write(fixtures.join("pr_list.json"), one_pr(&head_sha)).unwrap();
     std::fs::write(fixtures.join("pr_list_all.json"), one_pr(&head_sha)).unwrap();
 
     // ── path 6: the review runs, and the merge is only rehearsed ─────────
     let report = run(false, false);
-    assert_eq!(codex_calls(), 1, "the reviewer ran exactly once");
+    assert_eq!(reviewer_calls(), 1, "the reviewer ran exactly once");
     let advanced = &report.advanced[0];
     assert!(matches!(advanced.step, AdvanceStep::Review { .. }));
     assert_eq!(advanced.dispatch_class, "documentation");
@@ -438,7 +438,10 @@ exit 0
         "no merge was executed: {calls}"
     );
     // The real argv, asserted rather than assumed.
-    assert!(calls.contains("codex exec -s read-only"), "{calls}");
+    assert!(
+        calls.contains("muse exec --json --approval-mode never --disable-write --sandbox-network restricted --no-session-log"),
+        "{calls}"
+    );
     assert!(
         calls.contains("gh pr list --repo owner/repo --head"),
         "{calls}"
@@ -447,7 +450,7 @@ exit 0
     // ── path 7: the same head is not reviewed, or re-billed, twice ───────
     let report = run(false, false);
     assert_eq!(
-        codex_calls(),
+        reviewer_calls(),
         1,
         "a head that has not moved is not re-reviewed"
     );
@@ -495,7 +498,7 @@ exit 0
         .is_none());
 
     // ── the money question, asked explicitly ─────────────────────────────
-    // Codex reports no price, so the ledger's dollars stay at zero and the
+    // Muse reports no price, so the ledger's dollars stay at zero and the
     // reviews are counted as unpriced — never as free.
     let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
     let ledger = ironmem::autopilot::budget::get_daily_spend(&db, &today).unwrap();
