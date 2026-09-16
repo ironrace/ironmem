@@ -346,11 +346,13 @@ pub fn run_dispatch_bounded(
 ) -> Result<DispatchOutcome, MemoryError> {
     let args = build_argv(spec);
     let Some(timeout) = timeout else {
-        let output = std::process::Command::new(bin)
-            .args(&args)
-            .current_dir(repo)
-            .output()
-            .map_err(|e| MemoryError::NotFound(format!("failed to launch IC dispatch: {e}")))?;
+        let output = retry_on_etxtbsy(|| {
+            std::process::Command::new(bin)
+                .args(&args)
+                .current_dir(repo)
+                .output()
+        })
+        .map_err(|e| MemoryError::NotFound(format!("failed to launch IC dispatch: {e}")))?;
         return finish_dispatch(output);
     };
 
@@ -384,8 +386,7 @@ pub fn run_dispatch_bounded(
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
-    let mut child = command
-        .spawn()
+    let mut child = retry_on_etxtbsy(|| command.spawn())
         .map_err(|e| MemoryError::NotFound(format!("failed to launch IC dispatch: {e}")))?;
 
     // Drain both pipes for the whole life of the process, on their own
@@ -464,6 +465,50 @@ pub fn run_dispatch_bounded(
 
 /// A background reader collecting one of a bounded dispatch's pipes.
 type DrainHandle = std::thread::JoinHandle<Vec<u8>>;
+
+/// `ETXTBSY`, which Linux and macOS both number 26.
+const ETXTBSY: i32 = 26;
+
+/// How many times a launch refused with `ETXTBSY` is retried, and how long
+/// between attempts. The window this closes is microseconds wide, so a few
+/// short retries cover it without delaying a launch failing for any other
+/// reason — those return on the first attempt.
+const ETXTBSY_RETRIES: u32 = 5;
+const ETXTBSY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// Run `attempt`, retrying briefly while it is refused with `ETXTBSY`.
+///
+/// The kernel refuses to `exec` a file that any process still holds open for
+/// writing, and a multi-threaded program hits that without doing anything
+/// wrong: every `Command::spawn` forks, the child inherits every open file
+/// descriptor, and a binary another thread wrote moments ago stays "busy" for
+/// as long as that child sits between its fork and its own exec.
+/// close-on-exec does not help, because it acts *at* the child's exec, which
+/// is the far end of the window that matters.
+///
+/// **Not only a test condition.** `scripts/install-ironmem.sh` writes the
+/// binary this subsystem then runs, and an updater may rewrite a harness
+/// binary underneath a dispatch. It was first observed as an intermittent
+/// `ubuntu-24.04` CI failure (2026-09-16) in a suite that writes stub
+/// binaries and executes them from several threads at once; macOS does not
+/// enforce `ETXTBSY`, so the same suite passed there every time.
+///
+/// Retries **only** on errno 26, so no other launch failure is masked or
+/// slowed — a missing binary still fails on the first attempt.
+pub(crate) fn retry_on_etxtbsy<T>(
+    mut attempt: impl FnMut() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    let mut last = attempt();
+    for _ in 0..ETXTBSY_RETRIES {
+        match &last {
+            Err(e) if e.raw_os_error() == Some(ETXTBSY) => {}
+            _ => return last,
+        }
+        std::thread::sleep(ETXTBSY_BACKOFF);
+        last = attempt();
+    }
+    last
+}
 
 /// SIGKILL the whole process group a bounded dispatch was spawned into, then
 /// the child itself as a backstop.
@@ -557,6 +602,45 @@ mod tests {
         assert!(!args.iter().any(|a| a.contains("wall")));
         assert!(!args.iter().any(|a| a.contains("timeout")));
         assert!(!args.contains(&"900".to_string()));
+    }
+
+    #[test]
+    fn a_launch_failure_that_is_not_etxtbsy_returns_on_the_first_attempt() {
+        // The retry exists for one transient errno. Anything else — a missing
+        // binary above all — must fail immediately, or every mistyped path
+        // would cost the full backoff before reporting what was wrong.
+        let mut attempts = 0;
+        let started = std::time::Instant::now();
+        let err = retry_on_etxtbsy(|| {
+            attempts += 1;
+            std::process::Command::new("/nonexistent/definitely-not-here").output()
+        })
+        .unwrap_err();
+
+        assert_eq!(attempts, 1, "a non-ETXTBSY error must not be retried");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        assert!(started.elapsed() < ETXTBSY_BACKOFF);
+    }
+
+    #[test]
+    fn an_etxtbsy_launch_is_retried_and_then_succeeds() {
+        // Simulated rather than raced: a real ETXTBSY needs a second thread
+        // holding a write fd across a fork, which is not reproducible on
+        // demand. What is testable is the policy — keep trying while errno is
+        // 26, stop the moment it is not.
+        let mut attempts = 0;
+        let out = retry_on_etxtbsy(|| {
+            attempts += 1;
+            if attempts < 3 {
+                Err(std::io::Error::from_raw_os_error(ETXTBSY))
+            } else {
+                Ok("launched")
+            }
+        })
+        .unwrap();
+
+        assert_eq!(out, "launched");
+        assert_eq!(attempts, 3);
     }
 
     #[cfg(unix)]
