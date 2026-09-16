@@ -556,13 +556,17 @@ the first `[FAIL]`:
 - **`database` schema behind** (a `[WARN]`) → harmless; migrations apply
   automatically the next time the server starts.
 - **`harness_*` not registered** (a `[WARN]`) → run `scripts/install-ironmem.sh`
-  to register the MCP server with Claude Code and/or Codex. If a harness config
-  is reported **unreadable** or **malformed** (also a `[WARN]`), fix the file by
-  hand (permissions/encoding, or the JSON/TOML syntax) before re-registering.
+  to register the MCP server with Claude Code, Codex and/or Muse Code. If a
+  harness config is reported **unreadable** or **malformed** (also a `[WARN]`),
+  fix the file by hand (permissions/encoding, or the JSON/TOML syntax) before
+  re-registering.
 
 Codex's config location honors `CODEX_HOME` (default `~/.codex/config.toml`);
-Claude Code's is `~/.claude.json`. `doctor` reports each harness independently,
-so you do **not** need both installed.
+Claude Code's is `~/.claude.json`; Muse Code's is `$XDG_CONFIG_HOME/muse/settings.json`,
+falling back to `~/.config/muse/settings.json` when that variable is unset or
+empty. Muse's entry is registered as `"mode": "optional"` so an ironmem binary
+that later moves cannot abort a Muse session at startup. `doctor` reports each
+harness independently, so you do **not** need all three installed.
 
 ### `ironmem context`
 

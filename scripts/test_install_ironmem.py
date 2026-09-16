@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
-"""Self-test for Claude MCP registration performed by install-ironmem.sh.
+"""Self-test for the MCP registrations performed by install-ironmem.sh.
 
 The installer must put Claude's direct binary registration into trusted mode,
 and a rerun must repair an older registration that is missing the mode. An
 explicit user-selected mode remains untouched.
+
+Muse Code shares Claude's object-shaped `mcpServers`, so it shares the writer,
+but carries two things Claude does not: its settings file lives under
+XDG_CONFIG_HOME rather than $HOME, and its entry needs `"mode": "optional"` --
+without it Muse treats the server as required and aborts the whole session when
+the command is unavailable. Both are pinned here.
 """
 from __future__ import annotations
 
@@ -54,6 +60,7 @@ class InstallIronmemSelfTest(unittest.TestCase):
         claude_config: pathlib.Path,
         *,
         skip_skills: bool = True,
+        skip_wiring: bool = False,
         extra_env: dict[str, str] | None = None,
         expected_returncode: int = 0,
     ) -> subprocess.CompletedProcess[str]:
@@ -62,6 +69,8 @@ class InstallIronmemSelfTest(unittest.TestCase):
         command = ["bash", str(INSTALLER), "--skip-build"]
         if skip_skills:
             command.append("--skip-skills")
+        if skip_wiring:
+            command.append("--skip-wiring")
         result = subprocess.run(
             command,
             cwd=ROOT,
@@ -72,6 +81,10 @@ class InstallIronmemSelfTest(unittest.TestCase):
                 "CLAUDE_CONFIG_JSON": str(claude_config),
                 "CODEX_HOME": str(codex_home),
                 "CODEX_CONFIG_TOML": str(codex_home / "config.toml"),
+                # Pinned, not inherited: the installer now writes a Muse config,
+                # and an ambient XDG_CONFIG_HOME would send it to the developer's
+                # real ~/.config/muse instead of this temp home.
+                "XDG_CONFIG_HOME": str(home / ".config"),
                 **(extra_env or {}),
             },
             capture_output=True,
@@ -122,6 +135,11 @@ class InstallIronmemSelfTest(unittest.TestCase):
 
             server = self.read_claude_server(config)
             self.assertEqual(server.get("env", {}).get("IRONMEM_MCP_MODE"), "trusted")
+            # A pre-daemon entry must also reach the proxy command; leaving it
+            # bare makes doctor report "wired with the legacy bare `serve`
+            # command" right after a successful install.
+            self.assertEqual(server.get("args", [])[:2], ["serve", "--connect"])
+            self.assertEqual(len(server.get("args", [])), 3)
 
     def test_explicit_claude_mode_is_preserved(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -148,6 +166,137 @@ class InstallIronmemSelfTest(unittest.TestCase):
 
             server = self.read_claude_server(config)
             self.assertEqual(server["env"]["IRONMEM_MCP_MODE"], "read-only")
+
+    def read_muse_server(self, config: pathlib.Path) -> dict[str, object]:
+        payload = json.loads(config.read_text(encoding="utf-8"))
+        return payload["mcpServers"]["ironmem"]
+
+    def test_fresh_muse_registration_is_trusted_and_optional(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            muse_config = home / ".config" / "muse" / "settings.json"
+
+            self.run_installer(home, home / ".claude.json")
+
+            server = self.read_muse_server(muse_config)
+            self.assertEqual(server.get("env", {}).get("IRONMEM_MCP_MODE"), "trusted")
+            # A required server whose command is unavailable aborts the whole
+            # Muse session; ironmem's entry must opt out of that.
+            self.assertEqual(server.get("mode"), "optional")
+            self.assertEqual(server.get("command"), str(home / ".ironrace" / "bin" / "ironmem"))
+            self.assertEqual(server.get("args", [])[:2], ["serve", "--connect"])
+
+    def test_fresh_muse_file_carries_the_measured_schema_envelope(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            muse_config = home / ".config" / "muse" / "settings.json"
+
+            self.run_installer(home, home / ".claude.json")
+
+            payload = json.loads(muse_config.read_text(encoding="utf-8"))
+            self.assertEqual(payload.get("schema_version"), 1)
+
+    def test_muse_registration_honors_xdg_config_home(self) -> None:
+        # Muse consults $XDG_CONFIG_HOME/muse/settings.json when the variable is
+        # set and ~/.config/muse only when it is not -- never both -- so writing
+        # the wrong one registers nothing at all.
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            xdg = home / "xdg-elsewhere"
+
+            self.run_installer(
+                home, home / ".claude.json", extra_env={"XDG_CONFIG_HOME": str(xdg)}
+            )
+
+            self.assertTrue((xdg / "muse" / "settings.json").is_file())
+            self.assertFalse((home / ".config" / "muse" / "settings.json").exists())
+
+    def test_empty_xdg_config_home_falls_back_to_dot_config(self) -> None:
+        # An empty value is not a location. The script ignores it the way the
+        # Rust path table does, rather than writing to "/muse/settings.json".
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+
+            self.run_installer(home, home / ".claude.json", extra_env={"XDG_CONFIG_HOME": ""})
+
+            self.assertTrue((home / ".config" / "muse" / "settings.json").is_file())
+
+    def test_existing_muse_entry_without_mode_gains_optional(self) -> None:
+        # The hazard this repairs: an entry written before `mode` existed (by
+        # hand, or by an older `ironmem muse` upgrading a bare serve line) is
+        # `required` by default, so a stale command kills every Muse session.
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            muse_config = home / ".config" / "muse" / "settings.json"
+            muse_config.parent.mkdir(parents=True, exist_ok=True)
+            muse_config.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "provider": "anthropic",
+                        "mcpServers": {
+                            "ironmem": {
+                                "command": str(home / ".ironrace" / "bin" / "ironmem"),
+                                "args": ["serve"],
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            self.run_installer(home, home / ".claude.json")
+
+            server = self.read_muse_server(muse_config)
+            self.assertEqual(server.get("mode"), "optional")
+            self.assertEqual(server.get("env", {}).get("IRONMEM_MCP_MODE"), "trusted")
+            # The same entry is still on the pre-daemon `["serve"]` args, so the
+            # install must upgrade those too -- otherwise doctor sends the user
+            # to `ironmem muse` for an upgrade the installer should have done.
+            self.assertEqual(server.get("args", [])[:2], ["serve", "--connect"])
+            self.assertEqual(len(server.get("args", [])), 3)
+            # Unrelated settings survive the edit.
+            payload = json.loads(muse_config.read_text(encoding="utf-8"))
+            self.assertEqual(payload.get("provider"), "anthropic")
+
+    def test_explicit_muse_mode_is_preserved(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            muse_config = home / ".config" / "muse" / "settings.json"
+            muse_config.parent.mkdir(parents=True, exist_ok=True)
+            muse_config.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "mcpServers": {
+                            "ironmem": {
+                                "command": str(home / ".ironrace" / "bin" / "ironmem"),
+                                "args": ["serve"],
+                                "mode": "required",
+                                "env": {"IRONMEM_MCP_MODE": "read-only"},
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            self.run_installer(home, home / ".claude.json")
+
+            server = self.read_muse_server(muse_config)
+            self.assertEqual(server["mode"], "required")
+            self.assertEqual(server["env"]["IRONMEM_MCP_MODE"], "read-only")
+            # Preserving deliberate settings does not mean skipping the repair
+            # the entry actually needs.
+            self.assertEqual(server.get("args", [])[:2], ["serve", "--connect"])
+
+    def test_skip_wiring_leaves_muse_untouched(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+
+            self.run_installer(home, home / ".claude.json", skip_wiring=True)
+
+            self.assertFalse((home / ".config" / "muse" / "settings.json").exists())
 
     def test_full_install_moves_bases_outside_discovery_roots(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

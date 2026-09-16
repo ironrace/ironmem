@@ -72,7 +72,8 @@ What works now (proven-live items above; scaffolding items flagged):
 - Knowledge graph tools
 - Restricted vs trusted access modes
 - `mine` for workspace ingestion with incremental updates
-- `ironmem muse` registration into the object-shaped `mcpServers`
+- `ironmem muse` and `scripts/install-ironmem.sh` registration into the
+  object-shaped `mcpServers`
   (seeded with the measured `{"schema_version": 1}` envelope on a fresh
   file, and registered as an `optional` server so a failed start never
   aborts the Muse session)
@@ -126,6 +127,12 @@ binary or an unspawnable daemon costs Muse its memory, not its session,
 which is how every other registered harness already behaves when the
 server is down. Drop the key only if you want Muse to refuse to start
 without ironmem.
+
+You rarely need to do this by hand: `scripts/install-ironmem.sh` registers
+Muse alongside Claude and Codex (seeding `{"schema_version": 1}` on a fresh
+file, adding `IRONMEM_MCP_MODE=trusted`, and backfilling a missing `mode`
+on an entry that predates the key), and `ironmem muse` registers before it
+launches.
 
 `ironmem muse` already writes this form for you, `mode` included, on a
 fresh entry (and upgrades a pre-existing bare `["serve"]` entry in place,
