@@ -613,7 +613,7 @@ fn spawn_bounded(
         // Nulled explicitly. `spawn` inherits all three streams where the
         // `output` call this replaced nulled stdin for you, and inheriting it
         // hands the reviewer the caller's stdin — a TTY under an interactive
-        // `autopilot review` — so a `codex` that reads it blocks until the
+        // `autopilot review` — so a reviewer that reads it blocks until the
         // bound fires. That is the wedge the bound exists to prevent, made
         // likelier by the bound that prevents it.
         .stdin(std::process::Stdio::null())
@@ -622,9 +622,11 @@ fn spawn_bounded(
     // Its own process group, so the bound reaps what the reviewer *started*.
     // Unlike rung 9's advisor — which runs with `--tools ""` and therefore
     // starts nothing, so a group reap there would be untested machinery
-    // guarding an impossible case — `codex exec` is agentic: `-s read-only`
-    // sandboxes what it may write, not whether it may run commands at all, so
-    // a `git log` of its own outliving the kill is a real case.
+    // guarding an impossible case — every reviewer this spawns is agentic.
+    // Neither harness's read-only posture (`codex exec -s read-only`,
+    // `muse exec --disable-write --sandbox-network restricted`) constrains
+    // *whether* it may run commands, only what those commands may touch, so a
+    // `git log` of its own outliving the kill is a real case for both.
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -682,16 +684,17 @@ fn spawn_bounded(
     // unbounded wait the kill just ended.
     //
     // **The exit path's join is not bounded, and that is a residual, not a
-    // guarantee.** A grandchild that outlives a cleanly-exiting `codex` and
+    // guarantee.** A grandchild that outlives a cleanly-exiting reviewer and
     // holds the pipe's write end blocks this join for as long as it lives.
     // The bound above does not cover it. Unchanged from the `Command::output`
     // this replaced — which reads both pipes to EOF and blocks in exactly the
     // same case — and the same shape as rung 7's `run_dispatch_bounded`, so
     // it is stated here rather than quietly inherited.
     // stderr is drained but not read, exactly as the unbounded path left it:
-    // every fact this outcome carries comes from stdout's event stream or the
-    // last-message file. Draining it is not optional even so — an undrained
-    // pipe is what deadlocks the process the bound is timing.
+    // every fact a caller reads out of this run comes from stdout's event
+    // stream (or, on the Codex path, the last-message file it names). Draining
+    // it is not optional even so — an undrained pipe is what deadlocks the
+    // process the bound is timing.
     let stdout = if timed_out {
         Vec::new()
     } else {
@@ -1222,8 +1225,14 @@ pub struct MuseReviewSpec {
 ///   there is no built-in `readonly` permission profile (the id does not
 ///   exist); and `--disable-shell` would stop the reviewer running the
 ///   `git diff` the prompt tells it to run. **Muse exposes no flag that makes
-///   the workspace read-only to the shell.** The guarantee comes from
-///   [`run_muse_review_bounded`] checking the checkout afterwards instead.
+///   the workspace read-only to the shell.** What stands in for it is
+///   [`run_muse_review_bounded`] checking the checkout afterwards — an
+///   *after-the-fact detection*, and narrower than a sandbox in two ways
+///   worth naming rather than discovering: it sees only what `git` reports
+///   inside `repo_dir`, so a write to an ignored path (`target/`, a local
+///   `.env`) or to anything outside that directory is invisible to it, and
+///   it detects rather than prevents — the write has already happened, and
+///   what the check buys is that its author's verdict is not trusted.
 /// - **`--sandbox-network restricted` is the network half of
 ///   `codex exec -s read-only`.** Without it nothing but the prompt's wording
 ///   stopped the reviewer running `git push`, `gh pr comment` or
@@ -1238,11 +1247,6 @@ pub struct MuseReviewSpec {
 ///   permission message is emitted, so neither the prompt nor any parser here
 ///   should expect a typed denial — a reviewer that tries the network sees an
 ///   ordinary network error.
-/// - **`--no-session-log`** is Muse's `--ephemeral`. Without it a review
-///   writes a resumable ~100 KB transcript under
-///   `~/.local/share/muse/sessions/`, one per review, for ever. It costs
-///   local session messaging, which a reviewer that holds no state and is
-///   never messaged does not use.
 /// - **`--approval-mode never` does not deny tools.** The same live run read a
 ///   file successfully, so `never` is the "do not prompt" setting a headless
 ///   run needs, not a deny-everything one. Worth measuring: had it denied, the
@@ -1381,7 +1385,10 @@ pub fn run_muse_review(
 /// reaped by the bound, it exited zero, **and** the stream carried a
 /// `run_terminal` saying `completed`. The third is not redundant — a run that
 /// ends some other way still exits, and without it an unfinished review would
-/// be recorded as one that ran and simply had no verdict.
+/// be recorded as one that ran and simply had no verdict. A run that did not
+/// say `completed` also **loses its verdict**, rather than keeping one
+/// alongside a false `process_success`: the stored row is what `advance`'s
+/// remediation arm consults, and it reads the verdict without the flag.
 ///
 /// A fourth condition can only fail it: a reviewer that **modified the
 /// checkout** loses its verdict entirely, because Muse has no read-only
@@ -1418,11 +1425,32 @@ pub fn run_muse_review_bounded(
     let completed = terminal
         .as_ref()
         .is_some_and(|t| t.terminal == MUSE_TERMINAL_COMPLETED);
-    let message = terminal
-        .as_ref()
-        .map(|t| t.text.as_str())
-        .unwrap_or_default();
-    let (verdict, risk_class, reason) = parse_review_message(message);
+
+    // The verdict is read *only* out of a run that said `completed`, for the
+    // reason the checkout check below discards one rather than flagging it: a
+    // row that carries a verdict looks like a judgment to every later reader,
+    // and `process_success` is not what they all consult. `advance`'s
+    // remediation arm reads the *stored* `needs_changes` and re-dispatches the
+    // IC against its attempt cap on the strength of it alone — so a run that
+    // ended `aborted` after printing a verdict-shaped last message would cost
+    // an attempt on a review that never finished. Not a verdict, then; the
+    // terminal word is kept as the reason so a human holding the PR can see
+    // how it ended.
+    let (verdict, risk_class, reason) = if completed {
+        let message = terminal
+            .as_ref()
+            .map(|t| t.text.as_str())
+            .unwrap_or_default();
+        parse_review_message(message)
+    } else {
+        let reason = terminal.as_ref().map(|t| {
+            format!(
+                "reviewer run ended '{}' without completing; verdict discarded",
+                t.terminal
+            )
+        });
+        (None, None, reason)
+    };
 
     // Did the reviewer write to the checkout it was judging?
     //
@@ -3198,6 +3226,49 @@ not json at all
 
         assert!(!outcome.process_success);
         assert!(outcome.verdict.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_run_that_did_not_complete_loses_its_verdict_too() {
+        // A run can end some other way *after* the model has printed a
+        // verdict-shaped last message. Keeping that verdict while flipping
+        // `process_success` is not enough: `advance`'s remediation arm reads
+        // the stored `needs_changes` and re-dispatches the IC against its
+        // attempt cap without consulting the flag, so an unfinished review
+        // would cost a real attempt.
+        let dir = tempfile::tempdir().unwrap();
+        let event = muse_event(serde_json::json!({
+            "kind": "run_terminal",
+            "terminal": "aborted",
+            "text": r#"{"verdict":"needs_changes","risk_class":"logic","reason":"a finding"}"#,
+            "reason": "turn limit reached",
+        }));
+        let script = format!("#!/bin/sh\ncat <<'MUSEEOF'\n{event}\nMUSEEOF\nexit 0\n");
+        let bin = stub_reviewer(dir.path(), "muse-aborted", &script);
+
+        let outcome = run_muse_review_bounded(
+            &bin,
+            dir.path(),
+            None,
+            "prompt".into(),
+            std::time::Duration::from_secs(30),
+        )
+        .unwrap();
+
+        assert!(!outcome.process_success);
+        assert!(
+            outcome.verdict.is_none(),
+            "an unfinished run's verdict must be discarded, not merely flagged"
+        );
+        assert!(outcome.risk_class.is_none());
+        // How it ended is still reported, so a human holding the PR can see
+        // the difference between "no reply" and "stopped part-way".
+        assert!(outcome
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("aborted"));
     }
 
     #[cfg(unix)]

@@ -932,15 +932,8 @@ fn parse_repo_target(
     })
 }
 
-/// The reviewer a dry run is handed.
-///
-/// Never called: `advance_pass` returns before reviewing when `dry_run` is
-/// set. It exists so the `codex` binary is not required to *rehearse* a
-/// pass, and it fails loudly rather than silently returning a verdict, so a
-/// dry run that somehow reached a review would be visible instead of
-/// fabricating one.
-/// Parse `--reviewer` into a [`ReviewerKind`], naming the valid spellings
-/// when it does not.
+/// Parse `--reviewer` into a `ReviewerKind`, naming the valid spellings when
+/// it does not.
 ///
 /// The error lists `ReviewerKind::ALL` rather than a hand-written string, so
 /// a harness added there can never be missing from the message that tells an
@@ -956,6 +949,13 @@ fn parse_reviewer(
     })
 }
 
+/// The reviewer a dry run is handed.
+///
+/// Never called: `advance_pass` returns before reviewing when `dry_run` is
+/// set. It exists so the reviewer's binary is not required to *rehearse* a
+/// pass, and it fails loudly rather than silently returning a verdict, so a
+/// dry run that somehow reached a review would be visible instead of
+/// fabricating one.
 struct DryRunReviewer;
 
 impl ironmem::autopilot::review::ReviewRunner for DryRunReviewer {
@@ -2726,17 +2726,22 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                         .map(|t| t.path.clone())
                         .unwrap_or_else(|| std::path::PathBuf::from(".")),
                 )?;
-                // `muse` is resolved only when a review can actually
-                // happen. A dry run returns before reviewing anything, so
-                // requiring the binary would make the one flag whose whole
-                // promise is "read everything, change nothing" fail on a
-                // machine that has nothing to change.
+                // `--reviewer` is *parsed* on every path, including the dry
+                // run: a rehearsal that accepted `--reviewer codx` and then
+                // failed on the real pass would hide the one mistake the
+                // rehearsal exists to surface. Only the *binary* is resolved
+                // conditionally — a dry run returns before reviewing
+                // anything, so requiring `muse` (or `codex`) on `PATH` would
+                // make the one flag whose whole promise is "read everything,
+                // change nothing" fail on a machine that has nothing to
+                // change.
+                let kind = parse_reviewer(&reviewer)?;
                 let mut real: Box<dyn ironmem::autopilot::review::ReviewRunner>;
                 let mut refusing = DryRunReviewer;
                 let runner: &mut dyn ironmem::autopilot::review::ReviewRunner = if dry_run {
                     &mut refusing
                 } else {
-                    real = parse_reviewer(&reviewer)?.resolve(model)?;
+                    real = kind.resolve(model)?;
                     &mut *real
                 };
 

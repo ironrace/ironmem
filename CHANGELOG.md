@@ -241,6 +241,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   resumable session transcript per review, forever, under an unattended
   `autopilot advance`.
 
+  A review counts as having run only if the stream carried a `run_terminal`
+  saying `completed`, and a run that said anything else **loses its verdict**
+  rather than keeping one beside a false `process_success`. A run can end some
+  other way after the model has already printed a verdict-shaped last message,
+  and the stored row is read without that flag: `advance --remediate` arms an
+  IC re-dispatch off a stored `needs_changes` alone, so an unfinished review
+  would otherwise cost a real attempt against the cap.
+
   `--sandbox-network restricted` carries over the *network* half of
   `codex exec -s read-only`, which `--approval-mode never` does not supply and
   the checkout comparison above cannot see: without it, a reviewer running
