@@ -262,15 +262,22 @@ fn harness_checks(
                         Some(path) => {
                             let (state, wired) = detect_json_mcpservers(&path);
                             let check = harness_check(key, spec.display_name, &path, state.clone());
-                            // scripts/install-ironmem.sh wires only Claude and
-                            // Codex, so every other JSON harness points at its
-                            // launcher instead of the script.
+                            // scripts/install-ironmem.sh wires Claude, Codex
+                            // and Muse. Muse therefore has two ways back to a
+                            // registration and the script is the one that also
+                            // refreshes the binary, so it leads. Gemini and Grok
+                            // have no script coverage at all and point at their
+                            // launcher, which is their only route.
                             let check = if state == HarnessState::NotRegistered && spec.id != "claude"
                             {
-                                check.with_hint(format!(
-                                    "run `ironmem {}` to register it (scripts/install-ironmem.sh covers only Claude and Codex)",
-                                    spec.id
-                                ))
+                                check.with_hint(if spec.id == "muse" {
+                                    "re-run scripts/install-ironmem.sh to register it (or `ironmem muse` for just the registration)".to_string()
+                                } else {
+                                    format!(
+                                        "run `ironmem {}` to register it (scripts/install-ironmem.sh covers Claude, Codex and Muse)",
+                                        spec.id
+                                    )
+                                })
                             } else {
                                 check
                             };
@@ -1018,14 +1025,16 @@ mod tests {
                 .unwrap_or_default()
         };
         assert!(hint("harness_claude").contains("install-ironmem.sh"));
-        for (name, id) in [
-            ("harness_muse", "muse"),
-            ("harness_gemini", "gemini"),
-            ("harness_grok", "grok"),
-        ] {
+        // Muse is script-covered now, so its hint leads with the script rather
+        // than sending the user to a launcher the script already runs past.
+        let muse = hint("harness_muse");
+        assert!(muse.contains("install-ironmem.sh"), "harness_muse: {muse}");
+        assert!(muse.contains("ironmem muse"), "harness_muse: {muse}");
+        assert!(!muse.contains("covers"), "harness_muse: {muse}");
+        for (name, id) in [("harness_gemini", "gemini"), ("harness_grok", "grok")] {
             let h = hint(name);
             assert!(h.contains(&format!("ironmem {id}")), "{name}: {h}");
-            assert!(h.contains("covers only Claude and Codex"), "{name}: {h}");
+            assert!(h.contains("covers Claude, Codex and Muse"), "{name}: {h}");
         }
     }
 

@@ -10,7 +10,8 @@
 #
 # The script builds release (unless --skip-build), atomically replaces
 # ~/.ironrace/bin/ironmem, installs bundled Codex/Claude skill dependencies,
-# and verifies the resulting binary runs.
+# registers the MCP server for Claude, Codex and Muse, and verifies the
+# resulting binary runs.
 
 set -euo pipefail
 
@@ -139,14 +140,15 @@ Options:
   --skip-build     Install the existing target/release/ironmem binary.
   --skip-skills    Do not install bundled Codex/Claude skill, agent, command,
                    and prompt dependencies.
-  --skip-wiring    Do not register the ironmem MCP server in Claude/Codex
+  --skip-wiring    Do not register the ironmem MCP server in Claude/Codex/Muse
                    config.
   --force-skills   Compatibility flag. Bundled skill/agent/command/prompt
                    files are merged with packaged updates by default; use
                    --skip-skills to leave existing copies untouched.
-  --force-wiring   Replace an existing 'ironmem' MCP entry in
-                   ~/.claude.json or ~/.codex/config.toml with the bundled one
-                   (use only when the config has drifted from a fresh install).
+  --force-wiring   Replace an existing 'ironmem' MCP entry in ~/.claude.json,
+                   ~/.codex/config.toml or ~/.config/muse/settings.json with
+                   the bundled one (use only when the config has drifted from
+                   a fresh install).
 EOF
 }
 
@@ -534,6 +536,90 @@ install_md_set() {
   install_ext_set "$label" md "$source_root" "$target_root" "$base_root" "$@"
 }
 
+# Register the ironmem MCP server in a harness config that keys its servers by
+# id in a top-level `mcpServers` object -- Claude Code and Muse Code both do,
+# so one writer serves both. This mirrors the Rust
+# `mcp_setup::ensure_json_mcpservers_registered`, which routes Claude, Gemini
+# CLI, Grok CLI and Muse through a single function; keeping the two writers in
+# the same shape matters because either can create the entry (this script on
+# install, `ironmem <harness>` on launch) and neither should surprise the other.
+#
+# Two per-harness knobs, named after their Rust counterparts:
+#   seed   -- the document a missing config starts from
+#             (`mcp_setup::fresh_file_seed`): `{}` for Claude, Muse's measured
+#             `{"schema_version": 1}` envelope for Muse, so a file this script
+#             creates is not a bare `mcpServers` in a schema known to be
+#             incomplete.
+#   extras -- keys a brand-new entry carries beyond command/args/env
+#             (`mcp_setup::fresh_entry_extras`): none for Claude,
+#             `{"mode": "optional"}` for Muse.
+#
+# Unlike the Rust side, absent `extras` keys are also filled in on an EXISTING
+# ironmem entry. That asymmetry is deliberate and Muse-shaped: a Muse server
+# entry with no `mode` defaults to `required`, and a required server whose
+# command has gone stale aborts the whole Muse session before it answers
+# anything. Entries predating the key -- hand-written ones, or a bare
+# `args: ["serve"]` upgraded in place by an older `ironmem muse` -- would
+# otherwise keep exactly the hazard `optional` exists to prevent. A `mode` the
+# user set deliberately is left alone; only a missing key is filled.
+register_json_mcpservers() {
+  local label="$1" config="$2" seed="$3" extras="$4"
+  local existing_cmd tmp missing repaired=0
+
+  if [[ ! -f "$config" ]]; then
+    # ~/.claude.json's parent is $HOME and always exists; Muse's
+    # ~/.config/muse/ may not, on a machine where Muse has never run.
+    mkdir -p "$(dirname "$config")"
+    printf '%s\n' "$seed" > "$config"
+  fi
+
+  existing_cmd="$(jq -r '.mcpServers.ironmem.command // empty' "$config" 2>/dev/null || echo "")"
+
+  if [[ -z "$existing_cmd" ]]; then
+    echo "==> Registering 'ironmem' MCP server in $config"
+    tmp="$(mktemp)"
+    jq --arg cmd "$TARGET" --arg sock "$DAEMON_SOCKET_PATH" --argjson extras "$extras" \
+      '.mcpServers = ((.mcpServers // {}) + {ironmem: ($extras + {command: $cmd, args: ["serve", "--connect", $sock], env: {IRONMEM_MCP_MODE: "trusted"}})})' \
+      "$config" > "$tmp" && mv -f "$tmp" "$config"
+  elif [[ "$existing_cmd" == "$TARGET" ]]; then
+    if jq -e '.mcpServers.ironmem.env.IRONMEM_MCP_MODE == null' \
+      "$config" >/dev/null 2>&1; then
+      echo "==> Adding trusted mode to the existing $label MCP registration"
+      tmp="$(mktemp)"
+      jq '.mcpServers.ironmem.env = ((.mcpServers.ironmem.env // {}) + {IRONMEM_MCP_MODE: "trusted"})' \
+        "$config" > "$tmp" && mv -f "$tmp" "$config"
+      repaired=1
+    fi
+
+    # `$extras + entry` keeps the entry's own value wherever both carry a key,
+    # so this only ever fills gaps.
+    missing="$(jq -r --argjson extras "$extras" \
+      '[($extras | keys[])] - [(.mcpServers.ironmem | keys[])] | join(", ")' \
+      "$config" 2>/dev/null || echo "")"
+    if [[ -n "$missing" ]]; then
+      echo "==> Adding $missing to the existing $label MCP registration"
+      tmp="$(mktemp)"
+      jq --argjson extras "$extras" \
+        '.mcpServers.ironmem = ($extras + .mcpServers.ironmem)' \
+        "$config" > "$tmp" && mv -f "$tmp" "$config"
+      repaired=1
+    fi
+
+    if [[ "$repaired" -eq 0 ]]; then
+      echo "    'ironmem' MCP server already registered for $label"
+    fi
+  elif [[ "$FORCE_WIRING" -eq 1 ]]; then
+    echo "==> Replacing divergent 'ironmem' MCP entry (was: $existing_cmd)"
+    tmp="$(mktemp)"
+    jq --arg cmd "$TARGET" --arg sock "$DAEMON_SOCKET_PATH" --argjson extras "$extras" \
+      '.mcpServers.ironmem = ($extras + {command: $cmd, args: ["serve", "--connect", $sock], env: {IRONMEM_MCP_MODE: "trusted"}})' \
+      "$config" > "$tmp" && mv -f "$tmp" "$config"
+  else
+    echo "    WARN: 'ironmem' MCP entry already exists with command=$existing_cmd" >&2
+    echo "          Expected: $TARGET. Re-run with --force-wiring to replace." >&2
+  fi
+}
+
 if [[ "$SKIP_BUILD" -eq 0 ]]; then
   echo "==> Building ironmem release"
   (cd "$REPO_ROOT" && cargo build --release -p ironmem --bin ironmem)
@@ -623,43 +709,29 @@ if [[ "$SKIP_WIRING" -eq 0 ]]; then
   CLAUDE_CONFIG_JSON="${CLAUDE_CONFIG_JSON:-$HOME/.claude.json}"
   CODEX_CONFIG_TOML="${CODEX_CONFIG_TOML:-$CODEX_HOME/config.toml}"
 
-  # ---- Claude Code: ~/.claude.json mcpServers.ironmem -----------------------
+  # Muse reads $XDG_CONFIG_HOME/muse/settings.json when that variable is set
+  # and non-empty, and ~/.config/muse/settings.json otherwise -- never both, so
+  # writing the wrong one registers nothing. Mirrors the same env-override-wins
+  # table as `launcher::json_mcpservers_config_path_for`, which was measured
+  # live: an isolated-XDG_CONFIG_HOME Muse run never consulted ~/.config/muse.
+  if [[ -n "${XDG_CONFIG_HOME:-}" ]]; then
+    MUSE_CONFIG_DEFAULT="$XDG_CONFIG_HOME/muse/settings.json"
+  else
+    MUSE_CONFIG_DEFAULT="$HOME/.config/muse/settings.json"
+  fi
+  MUSE_CONFIG_JSON="${MUSE_CONFIG_JSON:-$MUSE_CONFIG_DEFAULT}"
+
+  # ---- Claude Code and Muse Code: object-shaped mcpServers ------------------
   if ! command -v jq >/dev/null 2>&1; then
-    echo "==> WARN: jq not installed; skipping Claude MCP registration check." >&2
+    echo "==> WARN: jq not installed; skipping Claude and Muse MCP registration checks." >&2
     echo "          Install jq, or add this manually to $CLAUDE_CONFIG_JSON:" >&2
     echo "          { \"mcpServers\": { \"ironmem\": { \"command\": \"$TARGET\", \"args\": [\"serve\", \"--connect\", \"$DAEMON_SOCKET_PATH\"], \"env\": { \"IRONMEM_MCP_MODE\": \"trusted\" } } } }" >&2
+    echo "          ...and the same to $MUSE_CONFIG_JSON, with \"mode\": \"optional\" added to" >&2
+    echo "          the ironmem entry so a stale command cannot abort a Muse session." >&2
   else
-    if [[ ! -f "$CLAUDE_CONFIG_JSON" ]]; then
-      echo "{}" > "$CLAUDE_CONFIG_JSON"
-    fi
-
-    EXISTING_CMD="$(jq -r '.mcpServers.ironmem.command // empty' "$CLAUDE_CONFIG_JSON" 2>/dev/null || echo "")"
-    if [[ -z "$EXISTING_CMD" ]]; then
-      echo "==> Registering 'ironmem' MCP server in $CLAUDE_CONFIG_JSON"
-      TMP="$(mktemp)"
-      jq --arg cmd "$TARGET" --arg sock "$DAEMON_SOCKET_PATH" \
-        '.mcpServers = ((.mcpServers // {}) + {ironmem: {command: $cmd, args: ["serve", "--connect", $sock], env: {IRONMEM_MCP_MODE: "trusted"}}})' \
-        "$CLAUDE_CONFIG_JSON" > "$TMP" && mv -f "$TMP" "$CLAUDE_CONFIG_JSON"
-    elif [[ "$EXISTING_CMD" == "$TARGET" ]]; then
-      if jq -e '.mcpServers.ironmem.env.IRONMEM_MCP_MODE == null' \
-        "$CLAUDE_CONFIG_JSON" >/dev/null 2>&1; then
-        echo "==> Adding trusted mode to the existing Claude MCP registration"
-        TMP="$(mktemp)"
-        jq '.mcpServers.ironmem.env = ((.mcpServers.ironmem.env // {}) + {IRONMEM_MCP_MODE: "trusted"})' \
-          "$CLAUDE_CONFIG_JSON" > "$TMP" && mv -f "$TMP" "$CLAUDE_CONFIG_JSON"
-      else
-        echo "    'ironmem' MCP server already registered for Claude"
-      fi
-    elif [[ "$FORCE_WIRING" -eq 1 ]]; then
-      echo "==> Replacing divergent 'ironmem' MCP entry (was: $EXISTING_CMD)"
-      TMP="$(mktemp)"
-      jq --arg cmd "$TARGET" --arg sock "$DAEMON_SOCKET_PATH" \
-        '.mcpServers.ironmem = {command: $cmd, args: ["serve", "--connect", $sock], env: {IRONMEM_MCP_MODE: "trusted"}}' \
-        "$CLAUDE_CONFIG_JSON" > "$TMP" && mv -f "$TMP" "$CLAUDE_CONFIG_JSON"
-    else
-      echo "    WARN: 'ironmem' MCP entry already exists with command=$EXISTING_CMD" >&2
-      echo "          Expected: $TARGET. Re-run with --force-wiring to replace." >&2
-    fi
+    register_json_mcpservers "Claude" "$CLAUDE_CONFIG_JSON" '{}' '{}'
+    register_json_mcpservers "Muse" "$MUSE_CONFIG_JSON" \
+      '{"schema_version": 1}' '{"mode": "optional"}'
   fi
 
   # ---- Codex: ~/.codex/config.toml [mcp_servers.ironmem] --------------------
@@ -711,8 +783,8 @@ fi
 # crates/ironmem/src/mcp/daemon.rs). Such a daemon stops admitting new clients
 # immediately, but every connection already attached when the signal lands is
 # served to its natural end and the process only exits once the last one
-# disconnects. So it does NOT break anyone's live session: an attached Claude
-# Code / Codex keeps working (on the old build, until it is restarted), while
+# disconnects. So it does NOT break anyone's live session: an attached client
+# keeps working (on the old build, until it is restarted), while
 # any NEW client is refused, auto-spawns a fresh daemon, and gets this build.
 # Repeat signals are no-ops there, so re-signalling a daemon that is still
 # draining a days-old session across several installs is safe.
@@ -727,7 +799,7 @@ fi
 # start times, version guesses) would be fragile and could only ever change the
 # wording, never the outcome, since signalling is the point. So the message
 # below states both cases plainly instead of claiming the good one. Cost of the
-# cutover: restart the affected Claude Code / Codex session once. Every install
+# cutover: restart the affected client session once. Every install
 # after it is graceful for real.
 #
 # No "is it idle?" pre-check is needed here -- and none is possible anyway,
@@ -781,10 +853,10 @@ if [[ -n "$DAEMON_PIDS" ]]; then
     fi
   done
   echo ""
-  echo "    New Claude Code / Codex sessions auto-spawn a daemon running the"
-  echo "    freshly installed binary. What happens to sessions attached RIGHT"
-  echo "    NOW depends on which build the signalled daemon was running, and"
-  echo "    this script cannot tell from the outside:"
+  echo "    New Claude Code / Codex / Muse sessions auto-spawn a daemon running"
+  echo "    the freshly installed binary. What happens to sessions attached"
+  echo "    RIGHT NOW depends on which build the signalled daemon was running,"
+  echo "    and this script cannot tell from the outside:"
   echo "      - Built from this change onward: SIGTERM is a graceful retire."
   echo "        Every attached session is served to its end (on the previous"
   echo "        build) and the daemon exits only once the last one detaches."
