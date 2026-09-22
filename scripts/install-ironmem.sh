@@ -345,6 +345,13 @@ install_muse_skills() {
   local source_root="$1"
   shift
   local skills=("$@")
+
+  # bash 3.2 (macOS's default /bin/bash) aborts on "${skills[@]}" for an empty
+  # array under set -u. The call site always passes four skills today, but a
+  # future zero-length list must be a clean no-op, not an unbound-variable
+  # abort. Mirrors the guard in install_ext_set.
+  (( ${#skills[@]} == 0 )) && return 0
+
   local muse_bin="${MUSE_BIN:-muse}"
 
   validate_packaged_skills "Muse" "$source_root" "${skills[@]}"
@@ -355,6 +362,7 @@ install_muse_skills() {
     for skill in "${skills[@]}"; do
       echo "          $muse_bin skills install $source_root/$skill --scope user --force" >&2
     done
+    UNCHANGED_FILES+=("Muse skills (${skills[*]}) — $muse_bin not installed; run the printed 'muse skills install' commands after installing Muse")
     return 0
   fi
 
@@ -363,6 +371,9 @@ install_muse_skills() {
   for skill in "${skills[@]}"; do
     if ! "$muse_bin" skills install "$source_root/$skill" --scope user --force; then
       echo "ERROR: failed to install Muse skill $skill from $source_root/$skill" >&2
+      echo "       Retry with: $muse_bin skills install $source_root/$skill --scope user --force" >&2
+      echo "       (Re-running is safe: --force makes install idempotent. MCP wiring below did NOT run.)" >&2
+      echo "       If the failure names an unknown flag, upgrade Muse: this installer needs 'skills install --force'." >&2
       exit 1
     fi
     echo "    installed $skill"

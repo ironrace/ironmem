@@ -54,6 +54,16 @@ class InstallIronmemSelfTest(unittest.TestCase):
         if cls.created_fixture:
             RELEASE_BINARY.unlink(missing_ok=True)
 
+    def setUp(self) -> None:
+        # Defensive restore: test_missing_packaged_muse_skill_fails_the_run
+        # renames a real packaged file aside and back in try/finally, but a
+        # SIGKILL mid-test would leave the parked copy behind and break every
+        # later run confusingly. Never overwrite a real file.
+        skill_file = ROOT / ".muse-plugin" / "skills" / "iron-tdd" / "SKILL.md"
+        parked = skill_file.with_suffix(".md.parked-for-test")
+        if parked.is_file() and not skill_file.is_file():
+            parked.rename(skill_file)
+
     def run_installer(
         self,
         home: pathlib.Path,
@@ -668,11 +678,15 @@ class InstallIronmemSelfTest(unittest.TestCase):
             self.assertTrue(
                 (pathlib.Path(env["CODEX_SKILLS_DIR"]) / "iron-plan" / "SKILL.md").is_file()
             )
-            # The warn path skips the skills, not the wiring: the Muse MCP
+            # The warn path skips the Muse skills, not the wiring: the Muse MCP
             # entry must still land.
             muse_config = home / ".config" / "muse" / "settings.json"
             payload = json.loads(muse_config.read_text(encoding="utf-8"))
             self.assertIn("ironmem", payload["mcpServers"])
+            # The skipped skills must also reach the end-of-run summary: a
+            # lone mid-output WARN is easy to scroll past on a green run.
+            self.assertIn("left unchanged", result.stdout)
+            self.assertIn("Muse skills", result.stdout)
 
     def test_skip_skills_never_invokes_muse(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -705,6 +719,7 @@ class InstallIronmemSelfTest(unittest.TestCase):
             )
 
             self.assertIn("failed to install Muse skill iron-spec", result.stderr)
+            self.assertIn("Retry with:", result.stderr)
             # Muse runs last in the skills block, so every other harness's
             # file installs already landed -- but MCP wiring below it must
             # not run for a kind that installed nothing.
@@ -719,10 +734,11 @@ class InstallIronmemSelfTest(unittest.TestCase):
             )
 
     def test_missing_packaged_muse_skill_fails_the_run(self) -> None:
-        # validate_packaged_skills is the preflight that keeps a broken
-        # package from half-installing: with a SKILL.md missing from the
-        # packaged tree the run must die naming the skill before anything
-        # installs, not after three skills landed.
+        # validate_packaged_skills is the preflight for the managed-store
+        # installs: with a SKILL.md missing from the packaged tree the run
+        # must die naming the skill before any managed-store install runs,
+        # not after three skills landed. (Other harnesses' file installs land
+        # first -- Muse runs last -- so this guards the store, not the run.)
         skill_file = ROOT / ".muse-plugin" / "skills" / "iron-tdd" / "SKILL.md"
         parked = skill_file.with_suffix(".md.parked-for-test")
         skill_file.rename(parked)

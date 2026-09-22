@@ -200,17 +200,19 @@ the latest state overwrites the previous copy rather than accumulating:
         "task_shape":    "<one line: what kind of work this was>",
         "tier_assigned": "cheap|standard|deep|frontier",
         "tier_used":     "cheap|standard|deep|frontier",
-        "dispatch_path": "workflow|agent",
+        "dispatch_path": "workflow|subagent_spawn",
         "effort_applied": "<value>|null",
         "review_rounds": <int>,
         "escalated":     true|false
       }
     )
 
-`dispatch_path` and `effort_applied` are not bookkeeping. On the plain agent
-path, effort is inert (see `./references/tiers.md`), so a drawer that records
-an effort it never applied poisons the dataset this table is meant to improve.
-Write `null` when no effort was passed.
+`dispatch_path` and `effort_applied` are not bookkeeping. On the
+`subagent_spawn` path the whole tier is inert (see
+`./references/tiers.md`): the child inherits the parent route, so neither
+model nor effort was applied. Write `null` for `effort_applied` there. A
+drawer that records values never applied poisons the dataset this table is
+meant to improve.
 
 ## Finishing the Branch
 

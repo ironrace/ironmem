@@ -117,8 +117,8 @@ costs the task. Count the files the task must read, not just the files it
 writes.
 <!-- /harness -->
 <!-- harness:codex -->
-**Never assign `cheap` to a task whose file set will not fit Haiku 4.5's 200K
-context / 64K output.** Over-routing costs money; mid-implementation truncation
+**Never assign `cheap` to a task whose file set will not fit the cheap model's
+context window.** Over-routing costs money; mid-implementation truncation
 costs the task. Count the files the task must read, not just the files it
 writes.
 <!-- /harness -->
