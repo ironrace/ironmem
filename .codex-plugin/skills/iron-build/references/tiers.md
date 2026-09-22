@@ -16,3 +16,4 @@ is a hard error at plan-parse time — never default to `standard`.
 Both values are settable on every dispatch — `reasoning_effort` is a direct
 parameter of `spawn_agent`, so unlike the Claude lineup there is no
 best-effort caveat here. Record the values you passed.
+

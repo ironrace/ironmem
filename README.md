@@ -164,16 +164,24 @@ Codex also receives the `pr-review-toolkit` skill used by the `/collab`
 `review_fix_global` turn before Codex fans confirmed fixes out to
 subagents and Claude runs `/ultrareview-local`.
 
+Muse receives the same four skills, rendered for the `muse` harness and
+installed into its managed skills store
+(`$XDG_CONFIG_HOME/muse/skills`, else `~/.config/muse/skills`), where they
+take precedence over the Claude/Codex copies Muse also reads. The Muse
+store has no three-way merge: an upgrade overwrites the managed copies,
+including any hand edits — see [docs/MUSE.md](docs/MUSE.md).
+
 The collab workflow uses explicit Codex model defaults: Luna at `max` for
 implementation, Luna at `medium` for exploration/docs/mechanical work, and
 Terra at `high` for planning and normal review. Sol at `high` is reserved for
 architecture/security escalation. These protocol defaults do not modify a
 user's personal Codex configuration.
 
-Existing identical files are skipped. The installer records hidden packaged
-baselines under each target root's `.ironmem-bases/` directory; on later
-installs it three-way merges packaged updates into locally edited skills,
-agents, commands, and prompts. If no baseline exists, the target is a symlink,
+For Codex and Claude, existing identical files are skipped. The installer
+records hidden packaged baselines under each target root's
+`.ironmem-bases/` directory; on later installs it three-way merges
+packaged updates into locally edited skills, agents, commands, and
+prompts. If no baseline exists, the target is a symlink,
 or a merge conflict occurs, the local file is left unchanged and the packaged
 update is written next to it as `*.ironmem-packaged` (conflict drafts use
 `*.ironmem-merge-conflict`). Use `--skip-skills` when you only want to replace
@@ -736,7 +744,7 @@ AI agents can query the graph without a shell.
 - Bounded Claude↔Codex collaboration protocol (v1 planning + v3 coding) is available via the `collab_*` MCP tools. Long-poll `wait_my_turn` wakes on actionable state changes and returns compact `{"unchanged": true}` only after an idle timeout — see [docs/COLLAB.md](docs/COLLAB.md)
 - **Shared daemon mode** (`serve --listen`/`--connect`) lets many clients share one `App`/DB/embedding-model behind a Unix socket, with automatic single-flight spawn-on-demand and idle self-shutdown — see [Shared Daemon Mode](#shared-daemon-mode). Bare `serve` is unchanged and remains the always-available fallback.
 - **Grok and Gemini CLI** are registered harnesses (`ironmem grok`/`ironmem gemini`, `harness_grok`/`harness_gemini` in `doctor`) but are scaffolding: neither is a default `write-rules` target yet, and Grok's MCP config convention is a best-effort default rather than a confirmed one — see [First run: one-command launchers](#first-run-one-command-launchers)
-- **Muse Code** is a registered harness (`ironmem muse`, `harness_muse` in `doctor`) with a proven-live config path (`$XDG_CONFIG_HOME`-aware) and object-shaped `mcpServers` writer, but the rest is scaffolding: it is not a default `write-rules` target, the packaged hook script is inert (nothing invokes it), and `.muse-plugin/` packaging is a minimal stand-in — see [docs/MUSE.md](docs/MUSE.md)
+- **Muse Code** is a registered harness (`ironmem muse`, `harness_muse` in `doctor`) with a proven-live config path (`$XDG_CONFIG_HOME`-aware) and object-shaped `mcpServers` writer, plus the four `iron-*` skills installed into its managed skills store — but the rest is scaffolding: it is not a default `write-rules` target, the packaged hook script is inert (nothing invokes it), and installing the repo as a plugin is unsupported — see [docs/MUSE.md](docs/MUSE.md)
 
 ## Shared Memory Across Harnesses
 

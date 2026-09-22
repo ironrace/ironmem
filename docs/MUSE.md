@@ -24,10 +24,16 @@ Muse Code today and what is still unconfirmed.
 > `permissions.mcp_servers` gating behavior, unix-socket allowlisting for
 > the `--connect` proxy under `proxy-only` sandbox mode,
 > `additionalContext` injectability, transcript format, occupancy output,
-> hook wiring (the packaged hook script is inert — see below), and
-> `.muse-plugin/` packaging. If your real config or wire traffic disagrees
-> with anything below, file the measured shape and this guide gets updated
-> to match.
+> hook wiring (the packaged hook script is inert — see below). The
+> `.muse-plugin/` manifest is the native shape (`schemaVersion: 1` with a
+> `capabilities` block) and validates clean under `muse plugins validate`
+> when checked as an isolated package (the monorepo root adds
+> sibling-manifest and symlink diagnostics); installing the whole repo as a
+> plugin is still not supported (measured: the package exceeds the install
+> entry limit), so skills ship through the managed skills store instead —
+> see below. If your real config or wire
+> traffic disagrees with anything below, file the measured shape and this
+> guide gets updated to match.
 
 For the bounded Claude↔Codex planning protocol, see [COLLAB.md](COLLAB.md).
 
@@ -78,11 +84,19 @@ What works now (proven-live items above; scaffolding items flagged):
   file, and registered as an `optional` server so a failed start never
   aborts the Muse session)
 - Automatic migrate-or-init bootstrap on first use
+- `iron-spec` / `iron-plan` / `iron-build` / `iron-tdd` skills, generated
+  from `skills/` for the `muse` harness and installed by
+  `scripts/install-ironmem.sh` into the managed skills store
+  (`$CONFIG_DIR/skills/`), where they take precedence over the
+  Claude/Codex copies Muse also reads — see [Muse Skills](#muse-skills)
 
 Scaffolding / unconfirmed:
 
-- `.muse-plugin/` packaging is a minimal stand-in mirroring the
-  Gemini/Grok plugin convention, not a validated native Muse manifest
+- Installing the repo as a Muse plugin (`muse plugins install <repo>`) is
+  not supported: the package exceeds the install entry limit, so the
+  manifest's skills entries are descriptive until a slimmer plugin package
+  exists. Skills and MCP wiring both ship through
+  `scripts/install-ironmem.sh` instead.
 - `.muse-plugin/hooks/ironmem-hook.sh` is packaged but INERT: nothing
   invokes it (no `hooks` key, no `hooks.json`, `managed_hooks_path` is never
   written), and the muse registry row disables every hook consumer — so
@@ -93,6 +107,42 @@ Scaffolding / unconfirmed:
   `proxy-only` sandbox mode
 - Hook behavior specific to Muse transcripts (token persistence, occupancy
   sampling, review capture all assume Claude/Codex-shaped hook input)
+
+## Muse Skills
+
+Muse reads skills from several roots. Without ironmem's install, the
+`iron-*` skills resolve to the Claude/Codex copies (`~/.claude/skills`,
+`~/.codex/skills`) — Claude-flavored bodies naming tools Muse does not
+have. The install below replaces those with Muse-native renders.
+
+`skills/` is the single authored source; `scripts/sync_skills.py` renders
+a `muse` harness into `.muse-plugin/skills/` (drift-gated by
+`scripts/check_skills_sync.py` like the other harnesses). The Muse
+vocabulary (`skills/vocab.toml`) is:
+
+- tracking: `write_todos`
+- dispatch: Workflow `agent(input=<full task text>, model=<model>,
+  effort=<effort>)` — the only Muse dispatch path that accepts per-call
+  routing; `subagent_spawn` inherits the parent route, so a tier routed
+  that way does not take effect (see the Muse block in
+  `iron-build/references/tiers.md`)
+- workspaces: `git worktree add ../<branch> -b <branch>`
+
+Tiers resolve to one model family with effort as the only dial —
+`cheap`/`low`, `standard`/`medium`, `deep`/`high`, `frontier`/`max` on
+`muse-spark-1.3` (pass the `-contributor` id when the session runs it).
+That lineup is a judgment call from the installed model catalog, not a
+measured optimum — if it routes badly, the table gets updated.
+
+`scripts/install-ironmem.sh` installs all four through the managed store
+(`muse skills install <dir> --scope user --force` each; `--force` covers
+both the fresh install and the upgrade). The store owns the write, so the
+installer never copies into `$CONFIG_DIR/skills/` directly, keeps no
+`.ironmem-bases` snapshot for Muse, and performs no three-way merge: an
+upgrade overwrites the managed copies, including hand edits. Managed
+copies take precedence over the foreign Claude/Codex copies, which show
+as shadowed in `muse skills list`. With no `muse` binary on `PATH` the
+installer warns and prints the four manual commands instead of failing.
 
 ## Manual Muse MCP Setup
 
@@ -169,3 +219,6 @@ After registering the MCP server, validate the basics:
 2. Call `status`.
 3. Add a small drawer with `add_drawer`.
 4. Search for it with `search`.
+5. Confirm the skills resolve to the managed store: `muse skills list
+   --source user` shows `iron-build`, `iron-plan`, `iron-spec`, and
+   `iron-tdd` at `$CONFIG_DIR/skills/...`.

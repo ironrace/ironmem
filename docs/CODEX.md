@@ -603,7 +603,8 @@ The shared collab skill dependencies are bundled for Claude Code under `.claude-
 (default `~/.codex/commands`), the Codex protocol prompts into `$CODEX_HOME/prompts`
 (default `~/.codex/prompts`), the Codex skills into `$CODEX_HOME/skills`
 (default `~/.codex/skills`), and the Claude copies into `$CLAUDE_HOME/skills`
-(default `~/.claude/skills`).
+(default `~/.claude/skills`). The same four skills also ship to Muse through
+its managed skills store — see [docs/MUSE.md](MUSE.md).
 The shared required set is:
 
 - `iron-spec`

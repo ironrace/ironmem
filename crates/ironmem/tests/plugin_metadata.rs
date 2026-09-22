@@ -1,4 +1,4 @@
-//! Validate plugin metadata files for both Codex and Claude Code.
+//! Validate plugin metadata files for Codex, Claude Code, and Muse.
 //!
 //! Ensures required JSON fields are present and plugin versions stay in sync
 //! with the crate version in Cargo.toml.
@@ -617,28 +617,99 @@ fn plugin_versions_match_cargo_toml() {
 
 #[test]
 fn muse_plugin_manifest_has_required_fields() {
-    // Minimal structural pin for the muse manifest (mirrors the
-    // codex/claude manifest tests). This is the Gemini/Grok stand-in
-    // convention — a Claude-style top-level `mcpServers` object — NOT
-    // Muse's native plugin manifest, whose contract is
-    // `compat`/`capabilities.mcpServers: [{id, transport?, command}]`
-    // (unmeasured, so not shipped; see docs/MUSE.md). When the native
-    // shape is measured and adopted, retarget this test with it.
+    // Structural pin for the muse NATIVE manifest: `schemaVersion` plus a
+    // `compat` block and `capabilities` arrays, not the Claude-style
+    // top-level `mcpServers` object the Gemini/Grok stand-in convention
+    // used. The contract is measured, not guessed — it is what
+    // `muse plugins validate` accepts (see docs/MUSE.md) — so this test
+    // pins that shape: the four iron skills must be declared and present,
+    // the MCP server must carry its exact stdio argv, and the retired
+    // top-level `mcpServers` object must be gone.
     let manifest = read_json(".muse-plugin/plugin.json");
+    assert_eq!(
+        manifest["schemaVersion"].as_u64().unwrap_or(0),
+        1,
+        "muse plugin.json: missing schemaVersion 1"
+    );
     assert_eq!(
         manifest["name"].as_str().unwrap_or(""),
         "ironmem",
         "muse plugin.json: missing name"
     );
-    let server = &manifest["mcpServers"]["ironmem"];
-    assert!(
-        server.is_object(),
-        "muse plugin.json: missing 'ironmem' server entry"
+    assert_eq!(
+        manifest["compat"]["source"].as_str().unwrap_or(""),
+        "native",
+        "muse plugin.json: compat.source must be 'native'"
+    );
+    assert_eq!(
+        manifest["compat"]["manifestDir"].as_str().unwrap_or(""),
+        ".muse-plugin",
+        "muse plugin.json: compat.manifestDir must be '.muse-plugin'"
     );
     assert!(
-        server["command"].is_string(),
-        "muse plugin.json: missing 'command'"
+        manifest.get("mcpServers").is_none(),
+        "muse plugin.json: top-level 'mcpServers' is the retired stand-in \
+         shape -- servers live in capabilities.mcpServers now"
     );
+    let skills = manifest["capabilities"]["skills"]
+        .as_array()
+        .expect("muse plugin.json: capabilities.skills must be an array");
+    let mut ids = BTreeSet::new();
+    for skill in skills {
+        let id = skill["id"].as_str().unwrap_or("");
+        assert!(!id.is_empty(), "muse plugin.json: skill entry missing id");
+        let path = skill["path"].as_str().unwrap_or("");
+        assert!(
+            workspace_root().join(path).is_file(),
+            "muse plugin.json: skill '{id}' path missing: {path}"
+        );
+        ids.insert(id.to_string());
+    }
+    for expected in ["iron-spec", "iron-plan", "iron-build", "iron-tdd"] {
+        assert!(
+            ids.contains(expected),
+            "muse plugin.json: skill '{expected}' is not declared"
+        );
+    }
+    let servers = manifest["capabilities"]["mcpServers"]
+        .as_array()
+        .expect("muse plugin.json: capabilities.mcpServers must be an array");
+    let server = servers
+        .iter()
+        .find(|s| s["id"].as_str().unwrap_or("") == "ironmem")
+        .expect("muse plugin.json: missing 'ironmem' server entry");
+    assert_eq!(
+        server["transport"].as_str().unwrap_or(""),
+        "stdio",
+        "muse plugin.json: server transport must be 'stdio'"
+    );
+    let command = server["command"]
+        .as_array()
+        .expect("muse plugin.json: server command must be argv");
+    let argv: Vec<&str> = command
+        .iter()
+        .map(|element| {
+            element
+                .as_str()
+                .expect("muse plugin.json: server command must be strings")
+        })
+        .collect();
+    assert_eq!(
+        argv.as_slice(),
+        &["bash", ".muse-plugin/bin/ironmem-mcp.sh", "serve"],
+        "muse plugin.json: unexpected server argv"
+    );
+    // A relative argv element naming a file beneath the plugin root must
+    // exist; anything else (an interpreter, a flag, a subcommand) is left
+    // for the runtime to resolve.
+    for text in &argv {
+        if text.contains('/') && !text.starts_with('-') {
+            assert!(
+                workspace_root().join(text).is_file(),
+                "muse plugin.json: server command file missing: {text}"
+            );
+        }
+    }
 }
 
 /// Return the text between the first two `---` fences of a markdown file.

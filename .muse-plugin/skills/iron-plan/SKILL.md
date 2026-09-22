@@ -111,10 +111,10 @@ Two rules make routing pay off:
    stops and asks the human. Under-routing is therefore self-correcting, so
    guess low.
 
-**Never assign `cheap` to a task whose file set will not fit the cheap model's
-context window.** Over-routing costs money; mid-implementation truncation
-costs the task. Count the files the task must read, not just the files it
-writes.
+**Never assign `cheap` to a task whose file set will not fit muse-spark's 1M
+context / 128K output.** Over-routing costs time and tokens;
+mid-implementation truncation costs the task. Count the files the task must
+read, not just the files it writes.
 
 An unrecognized tier string is a hard error when `iron-build` parses the plan.
 There is no default. A typo must not route work to the wrong model.
@@ -146,7 +146,7 @@ Fix issues inline and move on — no re-review pass.
 
 ## Plan Review
 
-Skip for a short plan; worth it for anything an implementer will run unattended. Dispatch a reviewer with spawn_agent(agent_type="worker", model=<model>, reasoning_effort=<effort>, message=<full task text>) carrying this prompt:
+Skip for a short plan; worth it for anything an implementer will run unattended. Dispatch a reviewer with agent(input=<full task text>, model=<model>, effort=<effort>) carrying this prompt:
 
 ```
 You are a plan document reviewer. Verify this plan is complete and ready for implementation.

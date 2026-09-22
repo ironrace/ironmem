@@ -9,9 +9,9 @@
 # old copy and new invocations get a clean binary.
 #
 # The script builds release (unless --skip-build), atomically replaces
-# ~/.ironrace/bin/ironmem, installs bundled Codex/Claude skill dependencies,
-# registers the MCP server for Claude, Codex and Muse, and verifies the
-# resulting binary runs.
+# ~/.ironrace/bin/ironmem, installs bundled Codex/Claude skill dependencies
+# and Muse managed-store skills, registers the MCP server for Claude, Codex
+# and Muse, and verifies the resulting binary runs.
 
 set -euo pipefail
 
@@ -138,13 +138,14 @@ Usage: scripts/install-ironmem.sh [--skip-build] [--skip-skills] [--skip-wiring]
 
 Options:
   --skip-build     Install the existing target/release/ironmem binary.
-  --skip-skills    Do not install bundled Codex/Claude skill, agent, command,
-                   and prompt dependencies.
+  --skip-skills    Do not install bundled Codex/Claude/Muse skill, agent,
+                   command, and prompt dependencies.
   --skip-wiring    Do not register the ironmem MCP server in Claude/Codex/Muse
                    config.
   --force-skills   Compatibility flag. Bundled skill/agent/command/prompt
-                   files are merged with packaged updates by default; use
-                   --skip-skills to leave existing copies untouched.
+                   files update by default (three-way merged for Codex/Claude,
+                   overwritten in the Muse managed store); use --skip-skills
+                   to leave existing copies untouched.
   --force-wiring   Replace an existing 'ironmem' MCP entry in ~/.claude.json,
                    ~/.codex/config.toml or ~/.config/muse/settings.json with
                    the bundled one (use only when the config has drifted from
@@ -328,6 +329,54 @@ remove_legacy_skills() {
     rm -rf "$target"
     rm -rf "$base"
     echo "    removed superseded $harness skill $skill"
+  done
+}
+
+# Install the iron-* skills into Muse's managed skills store. Unlike the
+# Claude/Codex file-copy path, the Muse store owns the write: `muse skills
+# install` records files + provenance in its lockfile, so a raw copy into
+# $CONFIG_DIR/skills would leave files the store can neither update nor
+# uninstall. --force covers both the fresh install and the upgrade (a plain
+# reinstall exits skill-already-installed); bundled files update by default,
+# and a managed copy the user edited by hand is overwritten -- the store has
+# no three-way merge. Nothing is ever removed here: the LEGACY_SHARED_SKILLS
+# were never installed to the Muse scope, so there is nothing to clean.
+install_muse_skills() {
+  local source_root="$1"
+  shift
+  local skills=("$@")
+
+  # bash 3.2 (macOS's default /bin/bash) aborts on "${skills[@]}" for an empty
+  # array under set -u. The call site always passes four skills today, but a
+  # future zero-length list must be a clean no-op, not an unbound-variable
+  # abort. Mirrors the guard in install_ext_set.
+  (( ${#skills[@]} == 0 )) && return 0
+
+  local muse_bin="${MUSE_BIN:-muse}"
+
+  validate_packaged_skills "Muse" "$source_root" "${skills[@]}"
+
+  if ! command -v "$muse_bin" >/dev/null 2>&1; then
+    echo "==> WARN: $muse_bin not installed; skipping Muse skill registration." >&2
+    echo "          Install Muse, then run for each iron-* skill:" >&2
+    for skill in "${skills[@]}"; do
+      echo "          $muse_bin skills install $source_root/$skill --scope user --force" >&2
+    done
+    UNCHANGED_FILES+=("Muse skills (${skills[*]}) — $muse_bin not installed; run the printed 'muse skills install' commands after installing Muse")
+    return 0
+  fi
+
+  echo "==> Installing Muse skill dependencies (managed store)"
+
+  for skill in "${skills[@]}"; do
+    if ! "$muse_bin" skills install "$source_root/$skill" --scope user --force; then
+      echo "ERROR: failed to install Muse skill $skill from $source_root/$skill" >&2
+      echo "       Retry with: $muse_bin skills install $source_root/$skill --scope user --force" >&2
+      echo "       (Re-running is safe: --force makes install idempotent. MCP wiring below did NOT run.)" >&2
+      echo "       If the failure names an unknown flag, upgrade Muse: this installer needs 'skills install --force'." >&2
+      exit 1
+    fi
+    echo "    installed $skill"
   done
 }
 
@@ -714,6 +763,12 @@ if [[ "$SKIP_SKILLS" -eq 0 ]]; then
   install_md_set "Codex prompt" "$REPO_ROOT/.codex-plugin/prompts" \
     "$CODEX_PROMPTS_DIR" "$CODEX_HOME/.ironmem-bases/prompts" \
     "${REQUIRED_CODEX_PROMPTS[@]}"
+  # Muse last: a failed managed-store install exits 1, and running it here
+  # keeps that failure from skipping any other harness's file installs. MCP
+  # wiring below is still skipped on failure -- a kind that installed
+  # nothing must fail the run.
+  install_muse_skills "$REPO_ROOT/.muse-plugin/skills" \
+    "${REQUIRED_SHARED_SKILLS[@]}"
 else
   echo "==> Skipping skill / command / prompt install"
 fi

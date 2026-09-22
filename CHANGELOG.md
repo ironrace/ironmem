@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Muse gets the `iron-*` skills: `skills/` now renders a `muse` harness
+  into `.muse-plugin/skills/`, and `install-ironmem.sh` installs all four
+  into Muse's managed skills store on upgrade.** Without the install, the
+  `iron-*` skills resolve to the Claude/Codex copies Muse also reads —
+  Claude-flavored bodies naming tools Muse does not have. The Muse
+  vocabulary is `write_todos` tracking, Workflow
+  `agent(model, effort)` dispatch (the only Muse dispatch path that
+  accepts per-call routing; `subagent_spawn` inherits the parent route),
+  and `git worktree` workspaces, with tiers resolving to one `muse-spark`
+  model family on an effort dial (`cheap`/`low` through `frontier`/`max`).
+  The installer goes through `muse skills install --scope user --force`
+  per skill — the store owns the write, so there is no `.ironmem-bases`
+  snapshot and no three-way merge: an upgrade overwrites the managed
+  copies, including hand edits. Managed copies take precedence over the
+  foreign Claude/Codex copies, and a missing `muse` binary warns with the
+  manual commands instead of failing. `.muse-plugin/plugin.json` is now
+  the native manifest shape and validates clean under
+  `muse plugins validate`; installing the repo itself as a plugin remains
+  unsupported (the package exceeds the install entry limit).
 - **`/collab review` refuses up front when the copilot's lease cannot be
   taken, instead of burning a `codex exec` to find out (#299, closes #283).**
   A dispatched `codex exec` is `join <session_id>` with no token, so past

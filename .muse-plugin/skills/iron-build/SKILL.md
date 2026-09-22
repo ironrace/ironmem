@@ -2,6 +2,7 @@
 name: iron-build
 description: Use when executing an implementation plan - dispatches a fresh subagent per task at the task's routed tier, with spec-compliance then code-quality review after each, and runs the whole plan without handing control back.
 ---
+<!-- GENERATED from skills/ — do not edit -->
 
 # Iron Build
 
@@ -31,7 +32,7 @@ complete only when:
 - spec compliance review is approved
 - code quality review is approved
 - the task-scoped work is committed
-- the task is marked complete in {{TODO}}
+- the task is marked complete in write_todos
 
 Then immediately dispatch the next task.
 
@@ -56,7 +57,7 @@ For a project-local directory, confirm git ignores it — `git check-ignore -q
 .worktrees` — before creating anything. If it is not ignored, add it to
 `.gitignore` and commit that first, or the worktree's contents get tracked.
 
-Create the workspace with {{WORKTREE_NEW}}, then:
+Create the workspace with git worktree add ../<branch> -b <branch>, then:
 
 - Install dependencies if the project has them (`npm install`, `cargo build`,
   `pip install -r requirements.txt`, `go mod download` — detect, don't assume).
@@ -68,7 +69,7 @@ Create the workspace with {{WORKTREE_NEW}}, then:
 ## Per-Task Cycle
 
 Read the plan once, up front. Extract every task's full text plus the context
-around it, and put the whole task list into {{TODO}}. Implementers never read
+around it, and put the whole task list into write_todos. Implementers never read
 the plan file — you hand them the text.
 
 Then, for each task in plan order:
@@ -94,7 +95,7 @@ Then, for each task in plan order:
    is uncommitted, dispatch the implementer back to commit it rather than
    committing for it.
 9. **Record the outcome** as an ironmem drawer — see below.
-10. **Mark the task complete** in {{TODO}}, then immediately start the next one.
+10. **Mark the task complete** in write_todos, then immediately start the next one.
 
 **Passing the review range.** Every reviewer dispatch gets the git range
 explicitly: `BASE_SHA` is the value from step 1, and `HEAD_SHA` is `git
@@ -193,45 +194,6 @@ expect a different result.
 After each completed task, write one ironmem drawer with a `logical_key` so
 the latest state overwrites the previous copy rather than accumulating:
 
-<!-- harness:claude -->
-    add_drawer(
-      logical_key = "iron-build:<plan-slug>:task-<n>",
-      content = {
-        "task_shape":    "<one line: what kind of work this was>",
-        "tier_assigned": "cheap|standard|deep|frontier",
-        "tier_used":     "cheap|standard|deep|frontier",
-        "dispatch_path": "workflow|agent",
-        "effort_applied": "<value>|null",
-        "review_rounds": <int>,
-        "escalated":     true|false
-      }
-    )
-
-`dispatch_path` and `effort_applied` are not bookkeeping. On the plain agent
-path, effort is inert (see `./references/tiers.md`), so a drawer that records
-an effort it never applied poisons the dataset this table is meant to improve.
-Write `null` when no effort was passed.
-<!-- /harness -->
-<!-- harness:codex -->
-    add_drawer(
-      logical_key = "iron-build:<plan-slug>:task-<n>",
-      content = {
-        "task_shape":    "<one line: what kind of work this was>",
-        "tier_assigned": "cheap|standard|deep|frontier",
-        "tier_used":     "cheap|standard|deep|frontier",
-        "dispatch_path": "workflow|agent",
-        "effort_applied": "<value>|null",
-        "review_rounds": <int>,
-        "escalated":     true|false
-      }
-    )
-
-`dispatch_path` and `effort_applied` are not bookkeeping. On the plain agent
-path, effort is inert (see `./references/tiers.md`), so a drawer that records
-an effort it never applied poisons the dataset this table is meant to improve.
-Write `null` when no effort was passed.
-<!-- /harness -->
-<!-- harness:muse -->
     add_drawer(
       logical_key = "iron-build:<plan-slug>:task-<n>",
       content = {
@@ -251,7 +213,6 @@ Write `null` when no effort was passed.
 model nor effort was applied. Write `null` for `effort_applied` there. A
 drawer that records values never applied poisons the dataset this table is
 meant to improve.
-<!-- /harness -->
 
 ## Finishing the Branch
 
