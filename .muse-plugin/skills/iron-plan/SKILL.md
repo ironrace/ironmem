@@ -111,10 +111,10 @@ Two rules make routing pay off:
    stops and asks the human. Under-routing is therefore self-correcting, so
    guess low.
 
-**Never assign `cheap` to a task whose file set will not fit Haiku 4.5's 200K
-context / 64K output.** Over-routing costs money; mid-implementation truncation
-costs the task. Count the files the task must read, not just the files it
-writes.
+**Never assign `cheap` to a task whose file set will not fit muse-spark's 1M
+context / 128K output.** Over-routing costs time and tokens;
+mid-implementation truncation costs the task. Count the files the task must
+read, not just the files it writes.
 
 An unrecognized tier string is a hard error when `iron-build` parses the plan.
 There is no default. A typo must not route work to the wrong model.

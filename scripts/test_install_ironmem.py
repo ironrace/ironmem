@@ -658,12 +658,21 @@ class InstallIronmemSelfTest(unittest.TestCase):
             self.assertIn("skipping Muse skill registration", result.stderr)
             self.assertIn("skills install", result.stderr)
             self.assertIn(".muse-plugin/skills/iron-build", result.stderr)
+            # The recovery hint must carry --force: without it the commands
+            # fail skill-already-installed on any machine whose store already
+            # holds the skills.
+            self.assertIn("--force", result.stderr)
             self.assertTrue(
                 (pathlib.Path(env["CLAUDE_SKILLS_DIR"]) / "iron-plan" / "SKILL.md").is_file()
             )
             self.assertTrue(
                 (pathlib.Path(env["CODEX_SKILLS_DIR"]) / "iron-plan" / "SKILL.md").is_file()
             )
+            # The warn path skips the skills, not the wiring: the Muse MCP
+            # entry must still land.
+            muse_config = home / ".config" / "muse" / "settings.json"
+            payload = json.loads(muse_config.read_text(encoding="utf-8"))
+            self.assertIn("ironmem", payload["mcpServers"])
 
     def test_skip_skills_never_invokes_muse(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -696,6 +705,69 @@ class InstallIronmemSelfTest(unittest.TestCase):
             )
 
             self.assertIn("failed to install Muse skill iron-spec", result.stderr)
+            # Muse runs last in the skills block, so every other harness's
+            # file installs already landed -- but MCP wiring below it must
+            # not run for a kind that installed nothing.
+            agents_dir = pathlib.Path(env["CLAUDE_AGENTS_DIR"])
+            self.assertTrue(
+                (agents_dir / "code-reviewer.md").is_file(),
+                "a Muse failure must not skip other harnesses' file installs",
+            )
+            self.assertFalse(
+                (home / ".claude.json").exists(),
+                "a Muse failure must fail before MCP wiring runs",
+            )
+
+    def test_missing_packaged_muse_skill_fails_the_run(self) -> None:
+        # validate_packaged_skills is the preflight that keeps a broken
+        # package from half-installing: with a SKILL.md missing from the
+        # packaged tree the run must die naming the skill before anything
+        # installs, not after three skills landed.
+        skill_file = ROOT / ".muse-plugin" / "skills" / "iron-tdd" / "SKILL.md"
+        parked = skill_file.with_suffix(".md.parked-for-test")
+        skill_file.rename(parked)
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                home = pathlib.Path(directory)
+                env = self._full_install_env(home)
+                shim, log = self._write_muse_shim(home / "bin")
+                env["MUSE_BIN"] = str(shim)
+                env["MUSE_SHIM_LOG"] = str(log)
+
+                result = self.run_installer(
+                    home,
+                    home / ".claude.json",
+                    skip_skills=False,
+                    extra_env=env,
+                    expected_returncode=1,
+                )
+
+                self.assertIn("bundled Muse skill missing", result.stderr)
+                self.assertIn("iron-tdd", result.stderr)
+                self.assertFalse(
+                    log.exists(), "no managed-store install may run on a broken package"
+                )
+        finally:
+            parked.rename(skill_file)
+        self.assertTrue(skill_file.is_file(), "packaged tree was not restored")
+
+    def test_muse_binary_resolves_from_path_by_default(self) -> None:
+        # Every other Muse test pins MUSE_BIN, so the production default --
+        # a bare `muse` resolved from PATH -- would otherwise run nowhere.
+        # An empty MUSE_BIN falls back to `muse` exactly like an unset one
+        # (`${MUSE_BIN:-muse}`), which is what makes this expressible as an
+        # env override at all.
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            env = self._full_install_env(home)
+            shim, log = self._write_muse_shim(home / "bin")
+            env["MUSE_BIN"] = ""
+            env["MUSE_SHIM_LOG"] = str(log)
+            env["PATH"] = str(home / "bin") + os.pathsep + os.environ["PATH"]
+
+            self.run_installer(home, home / ".claude.json", skip_skills=False, extra_env=env)
+
+            self.assertEqual(len(log.read_text(encoding="utf-8").splitlines()), 4)
 
     def test_cleanup_covers_the_codex_side_too(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

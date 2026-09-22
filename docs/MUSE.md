@@ -26,10 +26,12 @@ Muse Code today and what is still unconfirmed.
 > `additionalContext` injectability, transcript format, occupancy output,
 > hook wiring (the packaged hook script is inert — see below). The
 > `.muse-plugin/` manifest is the native shape (`schemaVersion: 1` with a
-> `capabilities` block) and validates clean under `muse plugins validate`;
-> installing the whole repo as a plugin is still not supported (measured:
-> the package exceeds the install entry limit), so skills ship through the
-> managed skills store instead — see below. If your real config or wire
+> `capabilities` block) and validates clean under `muse plugins validate`
+> when checked as an isolated package (the monorepo root adds
+> sibling-manifest and symlink diagnostics); installing the whole repo as a
+> plugin is still not supported (measured: the package exceeds the install
+> entry limit), so skills ship through the managed skills store instead —
+> see below. If your real config or wire
 > traffic disagrees with anything below, file the measured shape and this
 > guide gets updated to match.
 

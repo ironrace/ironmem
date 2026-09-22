@@ -188,8 +188,8 @@ def render(text: str, harness: str, vocab: dict[str, dict[str, str]], *, origin:
 def inject_header(text: str) -> str:
     """Place GENERATED_HEADER after YAML frontmatter, or at the top.
 
-    Frontmatter must remain the very first bytes of a SKILL.md -- both
-    harnesses parse `name`/`description` from it for discovery -- so the
+    Frontmatter must remain the very first bytes of a SKILL.md -- every
+    harness parses `name`/`description` from it for discovery -- so the
     header cannot simply be prepended.
     """
     if GENERATED_HEADER in text:

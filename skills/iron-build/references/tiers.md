@@ -71,10 +71,6 @@ best-effort caveat here. Record the values you passed.
 | `deep` | `muse-spark-1.3` | `high` |
 | `frontier` | `muse-spark-1.3` | `max` |
 
-The tier names are fixed: `cheap`, `standard`, `deep`, `frontier`. An
-unrecognized tier is a hard error at plan-parse time — never default to
-`standard`.
-
 All four rows share one model family: on Muse, effort is the only routing
 dial. The model column names the installed `muse-spark` id; if the session
 runs the `-contributor` variant, pass that id instead — same model, same

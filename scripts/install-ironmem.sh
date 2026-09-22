@@ -353,7 +353,7 @@ install_muse_skills() {
     echo "==> WARN: $muse_bin not installed; skipping Muse skill registration." >&2
     echo "          Install Muse, then run for each iron-* skill:" >&2
     for skill in "${skills[@]}"; do
-      echo "          $muse_bin skills install $source_root/$skill --scope user" >&2
+      echo "          $muse_bin skills install $source_root/$skill --scope user --force" >&2
     done
     return 0
   fi
@@ -735,8 +735,6 @@ if [[ "$SKIP_SKILLS" -eq 0 ]]; then
   fi
   remove_legacy_skills "Codex" "$CODEX_SKILLS_DIR" "$CODEX_HOME/.ironmem-bases/skills"
   remove_legacy_skills "Claude" "$CLAUDE_SKILLS_DIR" "$CLAUDE_HOME/.ironmem-bases/skills"
-  install_muse_skills "$REPO_ROOT/.muse-plugin/skills" \
-    "${REQUIRED_SHARED_SKILLS[@]}"
   install_agent_set "Claude" "$REPO_ROOT/.claude-plugin/agents" "$CLAUDE_AGENTS_DIR" \
     "$CLAUDE_HOME/.ironmem-bases/agents"
   install_md_set "Claude command" "$REPO_ROOT/.claude-plugin/commands" \
@@ -754,6 +752,12 @@ if [[ "$SKIP_SKILLS" -eq 0 ]]; then
   install_md_set "Codex prompt" "$REPO_ROOT/.codex-plugin/prompts" \
     "$CODEX_PROMPTS_DIR" "$CODEX_HOME/.ironmem-bases/prompts" \
     "${REQUIRED_CODEX_PROMPTS[@]}"
+  # Muse last: a failed managed-store install exits 1, and running it here
+  # keeps that failure from skipping any other harness's file installs. MCP
+  # wiring below is still skipped on failure -- a kind that installed
+  # nothing must fail the run.
+  install_muse_skills "$REPO_ROOT/.muse-plugin/skills" \
+    "${REQUIRED_SHARED_SKILLS[@]}"
 else
   echo "==> Skipping skill / command / prompt install"
 fi
