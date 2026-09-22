@@ -16,3 +16,12 @@ WORKTREE_NEW   = "EnterWorktree (native), or `git worktree add ../<branch> -b <b
 TODO           = "update_plan"
 AGENT_DISPATCH = "spawn_agent(agent_type=\"worker\", model=<model>, reasoning_effort=<effort>, message=<full task text>)"
 WORKTREE_NEW   = "git worktree add ../<branch> -b <branch>"
+
+# Muse dispatches through Workflow's agent(): it is the only Muse dispatch path
+# that accepts per-call model/effort, and tier routing needs both.
+# subagent_spawn inherits the parent route with no routing parameters — see
+# the Muse block in iron-build/references/tiers.md for the caveat.
+[muse]
+TODO           = "write_todos"
+AGENT_DISPATCH = "agent(input=<full task text>, model=<model>, effort=<effort>)"
+WORKTREE_NEW   = "git worktree add ../<branch> -b <branch>"

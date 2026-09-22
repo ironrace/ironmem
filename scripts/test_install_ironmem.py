@@ -85,6 +85,12 @@ class InstallIronmemSelfTest(unittest.TestCase):
                 # and an ambient XDG_CONFIG_HOME would send it to the developer's
                 # real ~/.config/muse instead of this temp home.
                 "XDG_CONFIG_HOME": str(home / ".config"),
+                # Pinned, not inherited: the installer now installs Muse skills
+                # through the `muse` CLI, and a developer machine with Muse on
+                # PATH would otherwise perform real managed-store installs on
+                # every full-install test. Tests that pin the Muse argv override
+                # MUSE_BIN with a recording shim.
+                "MUSE_BIN": str(home / ".no-muse-here"),
                 **(extra_env or {}),
             },
             capture_output=True,
@@ -607,6 +613,89 @@ class InstallIronmemSelfTest(unittest.TestCase):
             )
             self.assertIn("writing-plans", result.stderr)
             self.assertIn("no ironmem base snapshot", result.stderr)
+
+    def _write_muse_shim(self, directory: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path]:
+        directory.mkdir(parents=True, exist_ok=True)
+        log = directory / "muse-argv.log"
+        shim = directory / "muse"
+        shim.write_text(
+            "#!/bin/sh\n"
+            'echo "$@" >> "$MUSE_SHIM_LOG"\n'
+            "exit ${MUSE_SHIM_EXIT:-0}\n",
+            encoding="utf-8",
+        )
+        shim.chmod(shim.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        return shim, log
+
+    def test_muse_skills_install_through_the_managed_store(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            env = self._full_install_env(home)
+            shim, log = self._write_muse_shim(home / "bin")
+            env["MUSE_BIN"] = str(shim)
+            env["MUSE_SHIM_LOG"] = str(log)
+
+            self.run_installer(home, home / ".claude.json", skip_skills=False, extra_env=env)
+
+            source = ROOT / ".muse-plugin" / "skills"
+            self.assertEqual(
+                log.read_text(encoding="utf-8").splitlines(),
+                [
+                    f"skills install {source / skill} --scope user --force"
+                    for skill in ("iron-spec", "iron-plan", "iron-build", "iron-tdd")
+                ],
+            )
+
+    def test_missing_muse_binary_warns_and_installs_everything_else(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            env = self._full_install_env(home)
+
+            result = self.run_installer(
+                home, home / ".claude.json", skip_skills=False, extra_env=env
+            )
+
+            self.assertIn("skipping Muse skill registration", result.stderr)
+            self.assertIn("skills install", result.stderr)
+            self.assertIn(".muse-plugin/skills/iron-build", result.stderr)
+            self.assertTrue(
+                (pathlib.Path(env["CLAUDE_SKILLS_DIR"]) / "iron-plan" / "SKILL.md").is_file()
+            )
+            self.assertTrue(
+                (pathlib.Path(env["CODEX_SKILLS_DIR"]) / "iron-plan" / "SKILL.md").is_file()
+            )
+
+    def test_skip_skills_never_invokes_muse(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            shim, log = self._write_muse_shim(home / "bin")
+
+            self.run_installer(
+                home,
+                home / ".claude.json",
+                extra_env={"MUSE_BIN": str(shim), "MUSE_SHIM_LOG": str(log)},
+            )
+
+            self.assertFalse(log.exists())
+
+    def test_failing_muse_install_fails_the_run(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            env = self._full_install_env(home)
+            shim, log = self._write_muse_shim(home / "bin")
+            env["MUSE_BIN"] = str(shim)
+            env["MUSE_SHIM_LOG"] = str(log)
+            env["MUSE_SHIM_EXIT"] = "1"
+
+            result = self.run_installer(
+                home,
+                home / ".claude.json",
+                skip_skills=False,
+                extra_env=env,
+                expected_returncode=1,
+            )
+
+            self.assertIn("failed to install Muse skill iron-spec", result.stderr)
 
     def test_cleanup_covers_the_codex_side_too(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

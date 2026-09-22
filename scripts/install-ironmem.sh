@@ -9,9 +9,9 @@
 # old copy and new invocations get a clean binary.
 #
 # The script builds release (unless --skip-build), atomically replaces
-# ~/.ironrace/bin/ironmem, installs bundled Codex/Claude skill dependencies,
-# registers the MCP server for Claude, Codex and Muse, and verifies the
-# resulting binary runs.
+# ~/.ironrace/bin/ironmem, installs bundled Codex/Claude skill dependencies
+# and Muse managed-store skills, registers the MCP server for Claude, Codex
+# and Muse, and verifies the resulting binary runs.
 
 set -euo pipefail
 
@@ -138,13 +138,14 @@ Usage: scripts/install-ironmem.sh [--skip-build] [--skip-skills] [--skip-wiring]
 
 Options:
   --skip-build     Install the existing target/release/ironmem binary.
-  --skip-skills    Do not install bundled Codex/Claude skill, agent, command,
-                   and prompt dependencies.
+  --skip-skills    Do not install bundled Codex/Claude/Muse skill, agent,
+                   command, and prompt dependencies.
   --skip-wiring    Do not register the ironmem MCP server in Claude/Codex/Muse
                    config.
   --force-skills   Compatibility flag. Bundled skill/agent/command/prompt
-                   files are merged with packaged updates by default; use
-                   --skip-skills to leave existing copies untouched.
+                   files update by default (three-way merged for Codex/Claude,
+                   overwritten in the Muse managed store); use --skip-skills
+                   to leave existing copies untouched.
   --force-wiring   Replace an existing 'ironmem' MCP entry in ~/.claude.json,
                    ~/.codex/config.toml or ~/.config/muse/settings.json with
                    the bundled one (use only when the config has drifted from
@@ -328,6 +329,43 @@ remove_legacy_skills() {
     rm -rf "$target"
     rm -rf "$base"
     echo "    removed superseded $harness skill $skill"
+  done
+}
+
+# Install the iron-* skills into Muse's managed skills store. Unlike the
+# Claude/Codex file-copy path, the Muse store owns the write: `muse skills
+# install` records files + provenance in its lockfile, so a raw copy into
+# $CONFIG_DIR/skills would leave files the store can neither update nor
+# uninstall. --force covers both the fresh install and the upgrade (a plain
+# reinstall exits skill-already-installed); bundled files update by default,
+# and a managed copy the user edited by hand is overwritten -- the store has
+# no three-way merge. Nothing is ever removed here: the LEGACY_SHARED_SKILLS
+# were never installed to the Muse scope, so there is nothing to clean.
+install_muse_skills() {
+  local source_root="$1"
+  shift
+  local skills=("$@")
+  local muse_bin="${MUSE_BIN:-muse}"
+
+  validate_packaged_skills "Muse" "$source_root" "${skills[@]}"
+
+  if ! command -v "$muse_bin" >/dev/null 2>&1; then
+    echo "==> WARN: $muse_bin not installed; skipping Muse skill registration." >&2
+    echo "          Install Muse, then run for each iron-* skill:" >&2
+    for skill in "${skills[@]}"; do
+      echo "          $muse_bin skills install $source_root/$skill --scope user" >&2
+    done
+    return 0
+  fi
+
+  echo "==> Installing Muse skill dependencies (managed store)"
+
+  for skill in "${skills[@]}"; do
+    if ! "$muse_bin" skills install "$source_root/$skill" --scope user --force; then
+      echo "ERROR: failed to install Muse skill $skill from $source_root/$skill" >&2
+      exit 1
+    fi
+    echo "    installed $skill"
   done
 }
 
@@ -697,6 +735,8 @@ if [[ "$SKIP_SKILLS" -eq 0 ]]; then
   fi
   remove_legacy_skills "Codex" "$CODEX_SKILLS_DIR" "$CODEX_HOME/.ironmem-bases/skills"
   remove_legacy_skills "Claude" "$CLAUDE_SKILLS_DIR" "$CLAUDE_HOME/.ironmem-bases/skills"
+  install_muse_skills "$REPO_ROOT/.muse-plugin/skills" \
+    "${REQUIRED_SHARED_SKILLS[@]}"
   install_agent_set "Claude" "$REPO_ROOT/.claude-plugin/agents" "$CLAUDE_AGENTS_DIR" \
     "$CLAUDE_HOME/.ironmem-bases/agents"
   install_md_set "Claude command" "$REPO_ROOT/.claude-plugin/commands" \

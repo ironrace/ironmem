@@ -148,7 +148,8 @@ class LoadVocabTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = self._write(
                 pathlib.Path(tmp),
-                'claude = "oops"\n\n[codex]\nDISPATCH = "spawn_agent"\n',
+                'claude = "oops"\n\n[codex]\nDISPATCH = "spawn_agent"\n\n'
+                '[muse]\nDISPATCH = "agent"\n',
             )
             with self.assertRaises(sync_skills.SkillSyncError) as ctx:
                 sync_skills.load_vocab(path)
@@ -160,7 +161,8 @@ class LoadVocabTests(unittest.TestCase):
             path = self._write(
                 pathlib.Path(tmp),
                 '[claude]\nDISPATCH = "Task tool"\nTODO = "TodoWrite"\n\n'
-                '[codex]\nDISPATCH = "spawn_agent"\n',
+                '[codex]\nDISPATCH = "spawn_agent"\n\n'
+                '[muse]\nDISPATCH = "agent"\n',
             )
             with self.assertRaises(sync_skills.SkillSyncError) as ctx:
                 sync_skills.load_vocab(path)
@@ -197,7 +199,8 @@ class WalkTests(unittest.TestCase):
         self.source = self.tmp / "skills"
         (self.source / "iron-demo").mkdir(parents=True)
         (self.source / "vocab.toml").write_text(
-            '[claude]\nDISPATCH = "Task tool"\n\n[codex]\nDISPATCH = "spawn_agent"\n',
+            '[claude]\nDISPATCH = "Task tool"\n\n[codex]\nDISPATCH = "spawn_agent"\n\n'
+            '[muse]\nDISPATCH = "agent"\n',
             encoding="utf-8",
         )
         (self.source / "iron-demo" / "SKILL.md").write_text(
@@ -207,13 +210,15 @@ class WalkTests(unittest.TestCase):
         self.targets = {
             "claude": self.tmp / "claude" / "skills",
             "codex": self.tmp / "codex" / "skills",
+            "muse": self.tmp / "muse" / "skills",
         }
 
     def test_plan_renders_every_harness(self) -> None:
         rendered = sync_skills.plan(self.source)
-        self.assertEqual(sorted(rendered), ["claude", "codex"])
+        self.assertEqual(sorted(rendered), ["claude", "codex", "muse"])
         self.assertIn("Use the Task tool.", rendered["claude"]["iron-demo/SKILL.md"])
         self.assertIn("Use the spawn_agent.", rendered["codex"]["iron-demo/SKILL.md"])
+        self.assertIn("Use the agent.", rendered["muse"]["iron-demo/SKILL.md"])
 
     def test_vocab_is_never_emitted(self) -> None:
         rendered = sync_skills.plan(self.source)
@@ -314,8 +319,8 @@ class WalkTests(unittest.TestCase):
 
 class LabelRootTests(unittest.TestCase):
     """_label_root is what makes write()/diff() output name *which* plugin
-    root a path belongs to -- .claude-plugin/skills and .codex-plugin/skills
-    share the leaf name `skills`, so this is the fix for that ambiguity.
+    root a path belongs to -- every target shares the leaf name `skills`,
+    so this is the fix for that ambiguity.
     """
 
     def test_real_targets_get_repo_relative_labels(self) -> None:
@@ -326,6 +331,10 @@ class LabelRootTests(unittest.TestCase):
         self.assertEqual(
             sync_skills._label_root(sync_skills.TARGETS["codex"]),
             ".codex-plugin/skills",
+        )
+        self.assertEqual(
+            sync_skills._label_root(sync_skills.TARGETS["muse"]),
+            ".muse-plugin/skills",
         )
 
     def test_target_outside_repo_falls_back_without_crashing(self) -> None:
@@ -446,6 +455,11 @@ class TierParityTests(unittest.TestCase):
     def test_claude_lineup_states_the_agent_tool_effort_caveat(self) -> None:
         lineup = self.rendered["claude"]["iron-build/references/tiers.md"]
         self.assertIn("no `effort` parameter", lineup)
+
+    def test_muse_lineup_states_the_subagent_spawn_routing_caveat(self) -> None:
+        lineup = self.rendered["muse"]["iron-build/references/tiers.md"]
+        self.assertIn("subagent_spawn", lineup)
+        self.assertIn("inherits the parent route", lineup)
 
     def test_iron_build_records_the_dispatch_path(self) -> None:
         for harness, files in self.rendered.items():

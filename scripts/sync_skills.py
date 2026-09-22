@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Generate the per-harness skill trees under .claude-plugin/skills/ and
-.codex-plugin/skills/ from the single authored source in skills/.
+"""Generate the per-harness skill trees under .claude-plugin/skills/,
+.codex-plugin/skills/, and .muse-plugin/skills/ from the single authored
+source in skills/.
 
 Two substitution mechanisms, deliberately only two:
 
@@ -32,10 +33,11 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "skills"
 VOCAB_PATH = SOURCE / "vocab.toml"
 
-HARNESSES = ("claude", "codex")
+HARNESSES = ("claude", "codex", "muse")
 TARGETS = {
     "claude": ROOT / ".claude-plugin" / "skills",
     "codex": ROOT / ".codex-plugin" / "skills",
+    "muse": ROOT / ".muse-plugin" / "skills",
 }
 
 GENERATED_HEADER = "<!-- GENERATED from skills/ — do not edit -->"
@@ -70,9 +72,10 @@ UNINSTALLED_SKILL_NAMES = (
     "worktree_cleanup",
 )
 
-# The generator owns only `iron-*` subtrees inside each target. ATTRIBUTION.md
-# and .codex-plugin/skills/pr-review-toolkit/ are hand-maintained and must
-# survive regeneration untouched.
+# The generator owns only `iron-*` subtrees inside each target. Each target's
+# ATTRIBUTION.md is hand-maintained, as is
+# .codex-plugin/skills/pr-review-toolkit/ (a Codex-only vendored skill), and
+# all of them must survive regeneration untouched.
 OWNED_PREFIX = "iron-"
 
 _TOKEN_RE = re.compile(r"\{\{([A-Z0-9_]+)\}\}")
@@ -227,11 +230,11 @@ def plan(source: pathlib.Path = SOURCE) -> dict[str, dict[str, str]]:
 def _label_root(root: pathlib.Path) -> str:
     """Repo-relative label for a target root, e.g. '.claude-plugin/skills'.
 
-    Both `.claude-plugin/skills` and `.codex-plugin/skills` share the leaf
-    name `skills`, so `root.name` alone can't tell them apart in log/diff
-    output -- exactly the ambiguity this subsystem exists to catch. Targets
-    passed in tests are temp directories outside ROOT, so fall back to an
-    unambiguous two-component label rather than raising.
+    Every target shares the leaf name `skills`, so `root.name` alone can't
+    tell them apart in log/diff output -- exactly the ambiguity this
+    subsystem exists to catch. Targets passed in tests are temp directories
+    outside ROOT, so fall back to an unambiguous two-component label rather
+    than raising.
     """
     try:
         return root.relative_to(ROOT).as_posix()
@@ -244,8 +247,8 @@ def write(
 ) -> list[str]:
     """Write rendered output and prune stale generated files.
 
-    Only `iron-*` subtrees are owned. ATTRIBUTION.md and Codex's
-    pr-review-toolkit are hand-maintained and survive untouched.
+    Only `iron-*` subtrees are owned. Each target's ATTRIBUTION.md and
+    Codex's pr-review-toolkit are hand-maintained and survive untouched.
     """
     changed: list[str] = []
     for harness, files in rendered.items():
