@@ -77,7 +77,10 @@ The canonical release version lives in `crates/ironmem/Cargo.toml`.
 
 Before tagging a release:
 
-1. Update `CHANGELOG.md`.
+1. Update `CHANGELOG.md`: move the Unreleased entries under a
+   `## [X.Y.Z] - YYYY-MM-DD` heading. That section becomes the GitHub
+   release's description; preview it with
+   `python3 scripts/release_notes.py vX.Y.Z`.
 2. Ensure plugin metadata versions match by running `bash scripts/check_versions.sh`.
 3. Run the full local development loop.
 
@@ -103,7 +106,7 @@ git tag v0.1.0
 git push origin v0.1.0
 ```
 
-The release workflow builds macOS and Linux archives and attaches them to the GitHub release automatically.
+The release workflow builds macOS and Linux archives and attaches them to the GitHub release automatically. The release's description is the tag's `CHANGELOG.md` section; a tag whose version has no section fails before the builds start.
 
 ## Adding a Harness
 

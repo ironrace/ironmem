@@ -46,6 +46,9 @@ jobs:
       - name: site/README drift guard self-test
         run: python3 scripts/test_check_site_readme_sync.py
 
+      - name: release notes extractor self-test
+        run: python3 scripts/test_release_notes.py
+
       # Two pytest suites need this install. The git hook runner self-test is
       # pytest because its parametrized cases are derived from the GATES
       # manifest, so it cannot be plain unittest; the collab turn-template
