@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **GitHub releases now carry their version's `CHANGELOG.md` section as the
+  description.** Until now the release workflow published every release with
+  an empty body. `scripts/release_notes.py` extracts the tag's
+  `## [X.Y.Z]` section, and a tag without one fails before the builds start.
+  A section over GitHub's 125,000-character limit is cut at a line and links
+  to the full CHANGELOG.
+
 ## [0.6.0] - 2026-10-17
 
 ### Added
