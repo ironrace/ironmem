@@ -116,7 +116,7 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "id": { "type": "string" },
+                    "id": { "type": "string", "description": "Exclusive with logical_key." },
                     "wing": { "type": "string", "description": "Required with logical_key." },
                     "room": { "type": "string", "default": "general" },
                     "logical_key": {
@@ -137,11 +137,7 @@ pub fn tool_definitions(app: &App) -> Vec<Value> {
                         "default": false,
                         "description": "Omit content and return content_hash unless restricted mode redacts it. Overrides include_content."
                     }
-                },
-                "anyOf": [
-                    { "required": ["id"] },
-                    { "required": ["wing", "logical_key"] }
-                ]
+                }
             }
         }),
         json!({
@@ -1321,6 +1317,62 @@ mod tests {
                  READ_ONLY_TOOLS (got mutating={}, conditional={}, read-only={})",
                 classifications[0], classifications[1], classifications[2]
             );
+        }
+    }
+
+    /// MCP clients may reject a tool whose `inputSchema` has a top-level
+    /// combinator, and Claude Code then drops the WHOLE listing, not just that
+    /// tool. `get_drawer`'s `anyOf` (id XOR wing+logical_key) did exactly that.
+    /// Express such constraints in descriptions and enforce them in the
+    /// handler, as `handle_get_drawer` does.
+    #[test]
+    fn no_tool_schema_has_a_top_level_combinator() {
+        let app = App::open_for_test().unwrap();
+        for tool in tool_definitions(&app) {
+            let name = tool["name"].as_str().expect("advertised tool needs a name");
+            let schema = &tool["inputSchema"];
+            assert_eq!(
+                schema["type"], "object",
+                "{name} inputSchema must be an object"
+            );
+            for key in ["anyOf", "oneOf", "allOf"] {
+                assert!(
+                    schema.get(key).is_none(),
+                    "{name} inputSchema has a top-level `{key}`; some MCP clients reject \
+                     it and drop every tool. Enforce the constraint in the handler instead"
+                );
+            }
+        }
+    }
+
+    /// With the schema `anyOf` gone, the handler is the only enforcement of
+    /// "id XOR wing+logical_key", so pin each rejected shape here.
+    #[test]
+    fn get_drawer_rejects_args_the_schema_no_longer_constrains() {
+        let app = App::open_for_test().unwrap();
+        let id = "0".repeat(32);
+        for (args, expected) in [
+            (json!({}), "id or logical_key with wing is required"),
+            (
+                json!({ "wing": "w" }),
+                "id or logical_key with wing is required",
+            ),
+            (
+                json!({ "id": id, "wing": "w", "logical_key": "k" }),
+                "id and logical_key are mutually exclusive",
+            ),
+            (
+                json!({ "logical_key": "k" }),
+                "wing is required with logical_key",
+            ),
+        ] {
+            match call_tool(&app, "get_drawer", &args) {
+                Err(MemoryError::Validation(message)) => assert!(
+                    message.contains(expected),
+                    "{args} -> {message:?}, expected {expected:?}"
+                ),
+                other => panic!("{args} should fail validation, got {other:?}"),
+            }
         }
     }
 

@@ -594,6 +594,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`get_drawer` no longer advertises a top-level `anyOf`, so Claude Code
+  loads the ironmem tool list again.** The schema's `anyOf` (id, or wing +
+  logical_key) made Claude Code reject the whole listing ("fetching tools
+  failed"), so every ironmem tool vanished from Claude sessions while Codex
+  and Muse kept working. `handle_get_drawer` already enforces the rule; it is
+  now pinned by tests, and a guard test fails any tool whose `inputSchema`
+  has a top-level `anyOf`/`oneOf`/`allOf`.
+
 - **Autopilot: `onboard` inferred a gate narrower than CI, so "the approved
   gate passes" was satisfiable by code CI rejects (#334).** Inference read
   build manifests, which name a stack's *test* command and say nothing about
