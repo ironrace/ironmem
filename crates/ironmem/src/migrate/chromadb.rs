@@ -30,6 +30,9 @@ const BLOCKED_MIGRATE_PREFIXES: &[&str] = &[
 
 /// Migrate from ChromaDB store to ironmem.
 pub fn migrate_from_chromadb(chromadb_path: &str, app: &App) -> Result<(), MemoryError> {
+    // Same fail-closed guard as `mine_directory`: never embed through a
+    // DB-only `App`'s noop embedder.
+    app.ensure_embedder_ready()?;
     let path = Path::new(chromadb_path);
 
     if !path.exists() {

@@ -9,7 +9,9 @@ use std::time::{Duration, Instant};
 use regex::Regex;
 use serde::Serialize;
 
-use crate::bootstrap::{ensure_bootstrapped, record_workspace_mine, resolve_workspace_root};
+use crate::bootstrap::{
+    ensure_bootstrapped, ensure_store_bootstrapped, record_workspace_mine, resolve_workspace_root,
+};
 use crate::config::Config;
 use crate::db::drawers::generate_id;
 use crate::diary;
@@ -33,14 +35,26 @@ const SESSION_CONTEXT_SHORT_ID: usize = 8;
 /// Prefix for the always-included memory-protocol line. A `const` so the
 /// compile-time budget check below and the runtime `format!` agree byte-for-byte.
 const MEMORY_PROTOCOL_PREFIX: &str = "MEMORY_PROTOCOL: ";
+/// Always-included line that makes a failed tool load loud. When Claude Code
+/// drops the server's tools (a schema it rejects, a server that never starts)
+/// the session can run with no ironmem tools and no visible error; this hook
+/// still runs, so it asks the model to say so instead of silently working
+/// without memory.
+const TOOLS_CHECK_LINE: &str = "If no ironmem MCP tools (names containing \"ironmem\") are \
+     available to you, not even as deferred tools, say \"ironmem tools failed to load\" in \
+     the first line of your first reply.";
 
-// The protocol-only fallback returns the `MEMORY_PROTOCOL` line verbatim with no
-// byte cap, so it must fit the budget on its own. Guard at compile time: if the
-// protocol text ever grows past the budget, fail the build, not a live session.
+// The floor-only fallback returns the `MEMORY_PROTOCOL` and tools-check lines
+// verbatim with no byte cap, so they must fit the budget on their own. Guard at
+// compile time: if either grows past the budget, fail the build, not a live
+// session.
 const _: () = assert!(
-    MEMORY_PROTOCOL_PREFIX.len() + crate::bootstrap::MEMORY_PROTOCOL.len()
+    MEMORY_PROTOCOL_PREFIX.len()
+        + crate::bootstrap::MEMORY_PROTOCOL.len()
+        + 1
+        + TOOLS_CHECK_LINE.len()
         <= SESSION_CONTEXT_MAX_BYTES,
-    "MEMORY_PROTOCOL line exceeds SESSION_CONTEXT_MAX_BYTES"
+    "MEMORY_PROTOCOL and tools-check lines exceed SESSION_CONTEXT_MAX_BYTES"
 );
 
 static REVIEW_FILE_REF_RE: LazyLock<Regex> =
@@ -173,7 +187,7 @@ fn run_hook_with_input(
         ));
     }
 
-    let app = App::new(config)?;
+    let app = open_hook_app(config)?;
     let allows_writes = app.config.mcp_access_mode.allows_writes();
     // Occupancy sampling is metrics-only telemetry (token counts / occupancy %,
     // no memory content), so it is decoupled from `allows_writes` and fires in
@@ -204,10 +218,16 @@ fn run_hook_with_input(
             );
         }
     }
-    let bootstrap_workspace = if allows_writes {
-        workspace_root.as_deref()
-    } else {
-        None
+    // Only a hook with write access mines the workspace. A read-only one
+    // bootstraps the store alone: passing it a `None` root is not enough, since
+    // `ensure_bootstrapped` then falls back to `IRONMEM_WORKSPACE_ROOT` (which
+    // the plugin launcher always exports) and would mine behind the gate.
+    let bootstrap = |app: &App| {
+        if allows_writes {
+            ensure_bootstrapped(app, workspace_root.as_deref())
+        } else {
+            ensure_store_bootstrapped(app)
+        }
     };
     let mut response = HookResponse {
         decision: None,
@@ -222,7 +242,7 @@ fn run_hook_with_input(
 
     match hook_name {
         "session-start" => {
-            ensure_bootstrapped(&app, bootstrap_workspace)?;
+            bootstrap(&app)?;
             // Capability-driven: push a compact memory status block via
             // hookSpecificOutput.additionalContext. Harnesses without
             // additional_context_support (e.g. Codex) silently degrade
@@ -234,7 +254,7 @@ fn run_hook_with_input(
             }
         }
         "precompact" | "stop" => {
-            ensure_bootstrapped(&app, bootstrap_workspace)?;
+            bootstrap(&app)?;
             if allows_writes {
                 if let Some(root) = workspace_root.as_deref() {
                     mine_directory(&app, root.to_string_lossy().as_ref())?;
@@ -265,7 +285,82 @@ fn run_hook_with_input(
         }
     }
 
+    if hook_name == "stop" {
+        if let Some(reason) = handoff_nudge_reason(
+            &app,
+            harness,
+            &input,
+            session_id.as_deref(),
+            transcript_path.as_deref(),
+            workspace_root.as_deref(),
+        ) {
+            response.decision = Some("block".to_string());
+            response.reason = Some(reason);
+        }
+    }
+
     Ok(response)
+}
+
+/// Open `App` for a lifecycle hook. Without write access a hook never mines,
+/// writes a diary or searches, so nothing it does needs the embedder or the
+/// HNSW index: it opens the DB only, skipping a load that takes seconds on a
+/// large store and would otherwise run on every Stop. An empty store still gets
+/// the full `App`, because bootstrap may migrate a legacy store into it and
+/// migration embeds.
+fn open_hook_app(config: Config) -> Result<App, MemoryError> {
+    if config.mcp_access_mode.allows_writes() {
+        return App::new(config);
+    }
+    let app = App::new_server_ready(config.clone())?;
+    if app.db.count_drawers(None)? > 0 {
+        return Ok(app);
+    }
+    drop(app);
+    App::new(config)
+}
+
+/// Block a Claude Code stop once after real work and ask the session to save a
+/// handoff drawer (see [`crate::handoff_nudge`]). Independent of
+/// `allows_writes`: the hook only asks, and whether the write is allowed is up
+/// to the session's own MCP server, not this process's access mode.
+fn handoff_nudge_reason(
+    app: &App,
+    harness: &str,
+    input: &serde_json::Value,
+    session_id: Option<&str>,
+    transcript_path: Option<&Path>,
+    workspace_root: Option<&Path>,
+) -> Option<String> {
+    if !crate::search::tunables::handoff_nudge_enabled() {
+        return None;
+    }
+    if resolve_harness_spec(harness, crate::harness::REGISTRY).transcript_parser
+        != crate::harness::TranscriptParserKind::Claude
+    {
+        return None;
+    }
+    // Same rule as occupancy: never key state on the sanitizer's fallback id.
+    let session_id = session_id.filter(|id| *id != "unknown")?;
+    let event = crate::handoff_nudge::StopEvent {
+        session_id,
+        transcript_path: transcript_path?,
+        stop_hook_active: input
+            .get("stop_hook_active")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+    };
+    let now = chrono::Utc::now().timestamp();
+    if !crate::handoff_nudge::should_nudge(&app.config.state_dir, &event, now) {
+        return None;
+    }
+    let wing = workspace_root
+        .and_then(repository_name)
+        .unwrap_or_else(|| "workspace".to_string());
+    let branch = workspace_root
+        .and_then(current_workspace_branch)
+        .unwrap_or_else(|| "detached".to_string());
+    Some(crate::handoff_nudge::reason(&wing, &branch))
 }
 
 /// Resolve collab attribution for a transcript row from the hook process.
@@ -324,6 +419,32 @@ fn resolve_transcript_context(
 /// return `None`: hook attribution must remain absent rather than guessing a
 /// session from another branch.
 fn current_workspace_branch(workspace_root: &Path) -> Option<String> {
+    workspace_git_output(workspace_root, &["branch", "--show-current"])
+}
+
+/// The repository's name, for a handoff wing: the main worktree's directory,
+/// so every worktree of one repository shares a wing. Outside git, the
+/// workspace directory's own name. Sanitized the way mining names a wing.
+fn repository_name(workspace_root: &Path) -> Option<String> {
+    let common_dir = workspace_git_output(
+        workspace_root,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+    .map(PathBuf::from);
+    let repo_dir = match common_dir {
+        Some(dir) if dir.file_name() == Some(".git".as_ref()) => dir.parent()?.to_path_buf(),
+        // A bare repository is its own common dir (`name.git`).
+        Some(dir) => dir,
+        None => workspace_root.to_path_buf(),
+    };
+    let name = repo_dir.file_name()?.to_str()?;
+    let name = name.strip_suffix(".git").unwrap_or(name);
+    Some(crate::ingest::sanitize_segment(name, "workspace"))
+}
+
+/// Run `git -C <workspace_root> <args>` and return its trimmed stdout; `None`
+/// on failure, non-UTF-8 or empty output.
+fn workspace_git_output(workspace_root: &Path, args: &[&str]) -> Option<String> {
     let mut command = Command::new("git");
     // Git treats GIT_* variables as repository-selection and configuration
     // overrides. Retain the normal process environment (especially PATH) but
@@ -341,15 +462,15 @@ fn current_workspace_branch(workspace_root: &Path) -> Option<String> {
     let output = command
         .arg("-C")
         .arg(workspace_root)
-        .args(["branch", "--show-current"])
+        .args(args)
         .output()
         .ok()?;
     if !output.status.success() {
         return None;
     }
-    let branch = String::from_utf8(output.stdout).ok()?;
-    let branch = branch.trim();
-    (!branch.is_empty()).then(|| branch.to_string())
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    let stdout = stdout.trim();
+    (!stdout.is_empty()).then(|| stdout.to_string())
 }
 
 /// Return the collab session that owns exactly the workspace's current Git
@@ -1798,12 +1919,13 @@ fn join_within_budget(lines: &[String], budget: usize) -> String {
 /// Build the compact session-start memory block (Claude Code only).
 ///
 /// Every read is best-effort: a DB error on any line is logged with `warn!` and
-/// that line dropped rather than failing the hook. `MEMORY_PROTOCOL` is always
-/// included with a reserved byte budget, so a pile of long wing/room names can
-/// never crowd out the one behavior-changing line; the status lines share what
-/// budget is left and whole lines are dropped (never byte-sliced) when they
-/// don't fit. Because `MEMORY_PROTOCOL` is that floor this always returns `Some`
-/// — the `Option` lets callers treat an empty block as "nothing to inject".
+/// that line dropped rather than failing the hook. `MEMORY_PROTOCOL` and the
+/// tools-check line are always included with a reserved byte budget, so a pile
+/// of long wing/room names can never crowd out the behavior-changing lines; the
+/// status lines share what budget is left and whole lines are dropped (never
+/// byte-sliced) when they don't fit. Because those two lines are that floor this
+/// always returns `Some` — the `Option` lets callers treat an empty block as
+/// "nothing to inject".
 ///
 /// The active collab session and diary pointer are read from the DB (not from
 /// `App`'s in-process scope bindings) because this hook runs in a separate
@@ -1823,21 +1945,21 @@ fn build_session_start_context(app: &App, workspace_root: Option<&Path>) -> Opti
     }
     lines.extend(diary_line(app));
 
-    let protocol_line = format!(
-        "{MEMORY_PROTOCOL_PREFIX}{}",
+    let floor = format!(
+        "{MEMORY_PROTOCOL_PREFIX}{}\n{TOOLS_CHECK_LINE}",
         crate::bootstrap::MEMORY_PROTOCOL
     );
     if lines.is_empty() {
-        return Some(protocol_line);
+        return Some(floor);
     }
-    // Reserve the protocol line's bytes (+1 for the joining newline) so the
-    // status lines, never the protocol, absorb any truncation.
-    let reserved = SESSION_CONTEXT_MAX_BYTES.saturating_sub(protocol_line.len() + 1);
+    // Reserve the floor's bytes (+1 for the joining newline) so the status
+    // lines, never the floor, absorb any truncation.
+    let reserved = SESSION_CONTEXT_MAX_BYTES.saturating_sub(floor.len() + 1);
     let status = join_within_budget(&lines, reserved);
     if status.is_empty() {
-        Some(protocol_line)
+        Some(floor)
     } else {
-        Some(format!("{status}\n{protocol_line}"))
+        Some(format!("{status}\n{floor}"))
     }
 }
 
@@ -2885,6 +3007,10 @@ mod tests {
             "memory protocol must survive truncation under long wing/room names"
         );
         assert!(
+            block.ends_with(TOOLS_CHECK_LINE),
+            "tools-check line must survive truncation too"
+        );
+        assert!(
             block.len() <= SESSION_CONTEXT_MAX_BYTES,
             "still within byte budget"
         );
@@ -2917,6 +3043,10 @@ mod tests {
             .unwrap();
         assert!(!ctx.is_empty());
         assert!(ctx.contains("MEMORY_PROTOCOL"));
+        assert!(
+            ctx.contains("ironmem tools failed to load"),
+            "Claude sessions are told to report a failed tool load"
+        );
         assert!(ctx.len() <= SESSION_CONTEXT_MAX_BYTES);
     }
 
@@ -2965,8 +3095,11 @@ mod tests {
             .expect("MEMORY_PROTOCOL floor always yields Some");
         assert_eq!(
             block,
-            format!("MEMORY_PROTOCOL: {}", crate::bootstrap::MEMORY_PROTOCOL),
-            "all status reads failed → degrade to protocol-only, never error"
+            format!(
+                "MEMORY_PROTOCOL: {}\n{TOOLS_CHECK_LINE}",
+                crate::bootstrap::MEMORY_PROTOCOL
+            ),
+            "all status reads failed → degrade to the floor lines, never error"
         );
         assert!(block.len() <= SESSION_CONTEXT_MAX_BYTES);
     }
@@ -2978,11 +3111,206 @@ mod tests {
         assert_eq!(
             block,
             format!(
-                "[ironmem] 0 drawers\nMEMORY_PROTOCOL: {}",
+                "[ironmem] 0 drawers\nMEMORY_PROTOCOL: {}\n{TOOLS_CHECK_LINE}",
                 crate::bootstrap::MEMORY_PROTOCOL
             )
         );
         assert!(block.len() <= SESSION_CONTEXT_MAX_BYTES);
+    }
+
+    fn hook_test_config(root: &Path, mode: McpAccessMode) -> Config {
+        Config {
+            db_path: root.join("memory.sqlite3"),
+            model_dir: root.join("model"),
+            model_dir_explicit: true,
+            state_dir: root.join("hook_state"),
+            mcp_access_mode: mode,
+            embed_mode: EmbedMode::Noop,
+        }
+    }
+
+    /// A Claude Code transcript whose only tool call is a `git push`.
+    fn push_transcript(dir: &Path) -> PathBuf {
+        let transcript = dir.join("push.jsonl");
+        let line = serde_json::json!({
+            "type": "assistant",
+            "message": { "content": [{
+                "type": "tool_use",
+                "id": "t1",
+                "name": "Bash",
+                "input": { "command": "git push -u origin HEAD" }
+            }] }
+        });
+        std::fs::write(&transcript, format!("{line}\n")).unwrap();
+        transcript
+    }
+
+    #[test]
+    fn read_only_hooks_skip_the_index_load_on_a_populated_store() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = hook_test_config(temp.path(), McpAccessMode::ReadOnly);
+        assert!(
+            !open_hook_app(config.clone()).unwrap().is_warming_up(),
+            "an empty store gets the full App: bootstrap may migrate into it"
+        );
+        seed_drawer(&App::new(config.clone()).unwrap(), "body", "wing", "room");
+        assert!(
+            open_hook_app(config.clone()).unwrap().is_warming_up(),
+            "a read-only hook on a populated store opens the DB only"
+        );
+        // Not named `trusted`: CodeQL's cleartext-logging heuristic treats that
+        // name as sensitive and follows the config into the model-download log.
+        let writable = Config {
+            mcp_access_mode: McpAccessMode::Trusted,
+            ..config
+        };
+        assert!(
+            !open_hook_app(writable).unwrap().is_warming_up(),
+            "a hook that may mine gets the full App"
+        );
+    }
+
+    #[test]
+    fn read_only_hooks_never_mine_even_with_a_workspace_root_env() {
+        let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _no_migration = ScopedEnvVar::set("IRONMEM_DISABLE_MIGRATION", "1");
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("README.md"), "# Workspace\n\nMine me.").unwrap();
+        // The plugin launcher exports this for every hook it runs.
+        let _root = ScopedEnvVar::set("IRONMEM_WORKSPACE_ROOT", &workspace);
+        let config = hook_test_config(temp.path(), McpAccessMode::ReadOnly);
+        // Populated, so the hooks below take the DB-only path.
+        seed_drawer(&App::new(config.clone()).unwrap(), "body", "wing", "room");
+
+        for hook in ["session-start", "stop", "precompact"] {
+            run_hook_with_input(
+                hook,
+                "claude-code",
+                config.clone(),
+                serde_json::json!({ "session_id": "s-ro" }),
+            )
+            .unwrap_or_else(|e| panic!("{hook} must not fail: {e}"));
+        }
+        assert_eq!(
+            App::new(config).unwrap().db.count_drawers(None).unwrap(),
+            1,
+            "a read-only hook must not mine the env workspace"
+        );
+    }
+
+    #[test]
+    fn mining_through_a_db_only_app_fails_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("README.md"), "# Workspace\n\nMine me.").unwrap();
+        let config = hook_test_config(temp.path(), McpAccessMode::Trusted);
+        let app = App::new_server_ready(config).unwrap();
+        assert!(
+            mine_directory(&app, workspace.to_string_lossy().as_ref()).is_err(),
+            "the noop embedder would store vectors no search can match"
+        );
+        assert_eq!(app.db.count_drawers(None).unwrap(), 0);
+    }
+
+    #[test]
+    fn stop_after_a_push_asks_claude_for_a_handoff_drawer() {
+        let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("IRONMEM_HANDOFF_NUDGE");
+        let _no_migration = ScopedEnvVar::set("IRONMEM_DISABLE_MIGRATION", "1");
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("shop-api");
+        init_git_test_repo(&repo);
+        git_test_repo(&repo, &["checkout", "-q", "-b", "feat/login"]);
+        let transcript = push_transcript(temp.path());
+        let config = hook_test_config(temp.path(), McpAccessMode::ReadOnly);
+        // Populated, so the stop runs on the DB-only App real stores get.
+        seed_drawer(&App::new(config.clone()).unwrap(), "body", "wing", "room");
+        let input = |retry: bool| {
+            serde_json::json!({
+                "cwd": repo,
+                "session_id": "s-nudge",
+                "transcript_path": transcript.to_string_lossy(),
+                "stop_hook_active": retry,
+            })
+        };
+
+        let retry =
+            run_hook_with_input("stop", "claude-code", config.clone(), input(true)).unwrap();
+        assert!(
+            retry.decision.is_none(),
+            "a retrying stop passes, even with fresh work"
+        );
+
+        let response = run_hook_with_input("stop", "claude-code", config, input(false)).unwrap();
+        let v = serde_json::to_value(&response).unwrap();
+        assert_eq!(v["decision"], "block");
+        let reason = v["reason"].as_str().unwrap();
+        assert!(reason.contains("wing \"shop-api\""), "{reason}");
+        assert!(reason.contains("room \"handoffs\""), "{reason}");
+        assert!(
+            reason.contains("logical_key \"feat-login-handoff\""),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn stop_nudge_is_claude_only_and_can_be_disabled() {
+        let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("IRONMEM_HANDOFF_NUDGE");
+        let _no_migration = ScopedEnvVar::set("IRONMEM_DISABLE_MIGRATION", "1");
+        let temp = tempfile::tempdir().unwrap();
+        let config = hook_test_config(temp.path(), McpAccessMode::ReadOnly);
+        let input = serde_json::json!({
+            "cwd": temp.path(),
+            "session_id": "s-gate",
+            "transcript_path": push_transcript(temp.path()).to_string_lossy(),
+        });
+
+        let codex = run_hook_with_input("stop", "codex", config.clone(), input.clone()).unwrap();
+        assert!(codex.decision.is_none(), "Codex transcripts are not parsed");
+        {
+            let _off = ScopedEnvVar::set("IRONMEM_HANDOFF_NUDGE", "0");
+            let off =
+                run_hook_with_input("stop", "claude-code", config.clone(), input.clone()).unwrap();
+            assert!(
+                off.decision.is_none(),
+                "IRONMEM_HANDOFF_NUDGE=0 disables it"
+            );
+        }
+        let on = run_hook_with_input("stop", "claude-code", config, input).unwrap();
+        assert_eq!(
+            on.decision.as_deref(),
+            Some("block"),
+            "control: the same stop nudges once enabled"
+        );
+    }
+
+    #[test]
+    fn repository_name_is_shared_by_linked_worktrees() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("shop-api");
+        init_git_test_repo(&repo);
+        let linked = temp.path().join("shop-api-feature");
+        git_test_repo(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feature",
+                linked.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(repository_name(&repo).as_deref(), Some("shop-api"));
+        assert_eq!(repository_name(&linked).as_deref(), Some("shop-api"));
+
+        let plain = temp.path().join("notes");
+        std::fs::create_dir_all(&plain).unwrap();
+        assert_eq!(repository_name(&plain).as_deref(), Some("notes"));
     }
 
     #[test]

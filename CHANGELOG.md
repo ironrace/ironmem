@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Claude Code sessions now ask for a handoff after real work, and say so
+  when ironmem's tools failed to load.** The `stop` hook blocks the stop once
+  after a commit, push or PR, or 5+ file edits since the session last saved
+  to ironmem, asking for a handoff drawer (wing = repository name, shared by
+  its worktrees; room `handoffs`; logical_key `<branch>-handoff`) so the next
+  session in any harness resumes from memory. It reads only the transcript
+  lines appended since the previous stop, nudges at most once per 30 minutes
+  per session, always lets a retrying stop (`stop_hook_active`) through, and
+  fails open. A save clears the counted work only once its result shows it
+  succeeded, so a rejected write still gets the nudge. `IRONMEM_HANDOFF_NUDGE=0` turns it off. The `session-start`
+  context now always ends with a line telling the model to say "ironmem tools
+  failed to load" when no ironmem tools reached it — the failure mode behind
+  two weeks of sessions silently saving nothing when Claude Code rejected
+  `get_drawer`'s schema.
+
 - **Muse gets the `iron-*` skills: `skills/` now renders a `muse` harness
   into `.muse-plugin/skills/`, and `install-ironmem.sh` installs all four
   into Muse's managed skills store on upgrade.** Without the install, the
@@ -601,6 +616,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and Muse kept working. `handle_get_drawer` already enforces the rule; it is
   now pinned by tests, and a guard test fails any tool whose `inputSchema`
   has a top-level `anyOf`/`oneOf`/`allOf`.
+
+- **Read-only hooks no longer load the embedder and vector index, and no
+  longer mine.** A `session-start`, `stop` or `precompact` hook without write
+  access (`ironmem hook` with `IRONMEM_MCP_MODE` unset or `read-only`, the
+  default for hand-registered hook commands; the plugin's hooks run
+  `trusted` and are unchanged) only records metrics and reads counts, yet
+  built the full `App` — ONNX model plus an HNSW rebuild over every drawer,
+  about 5 s on a 49k-drawer store — on every Stop. It now opens the database
+  only (an empty store still gets the full `App`, since bootstrap may migrate
+  into it), so a hook wrapped in a short timeout finishes instead of being
+  killed mid-write. Read-only hooks also stop mining the
+  `IRONMEM_WORKSPACE_ROOT` workspace: a `None` root fell back to that
+  variable, so the content-write gate leaked. `mine_directory` and the
+  ChromaDB migration now refuse an `App` whose embedder is not ready, instead
+  of storing all-zero vectors no search can match.
 
 - **Autopilot: `onboard` inferred a gate narrower than CI, so "the approved
   gate passes" was satisfiable by code CI rejects (#334).** Inference read

@@ -78,6 +78,18 @@ pub fn ensure_bootstrapped(
     app: &App,
     workspace_root: Option<&Path>,
 ) -> Result<BootstrapReport, MemoryError> {
+    bootstrap(app, resolve_workspace_root(workspace_root))
+}
+
+/// Store-level bootstrap only: initialize (or migrate into) an empty store,
+/// but never mine a workspace — not even the `IRONMEM_WORKSPACE_ROOT` fallback
+/// [`ensure_bootstrapped`] applies to a `None` root. For callers without
+/// content-write access.
+pub fn ensure_store_bootstrapped(app: &App) -> Result<BootstrapReport, MemoryError> {
+    bootstrap(app, None)
+}
+
+fn bootstrap(app: &App, workspace: Option<PathBuf>) -> Result<BootstrapReport, MemoryError> {
     if !auto_bootstrap_enabled() {
         return Ok(BootstrapReport::default());
     }
@@ -104,7 +116,7 @@ pub fn ensure_bootstrapped(
         save_json(&global_state_path, &global_state)?;
     }
 
-    if let Some(workspace) = resolve_workspace_root(workspace_root) {
+    if let Some(workspace) = workspace {
         let workspace_state_path = workspace_state_path(&app.config, &workspace);
         let mut workspace_state = load_workspace_state(&workspace_state_path, &workspace)?;
         if !workspace_state.initial_mine_completed {

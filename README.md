@@ -752,9 +752,10 @@ Codex and Claude Code read from and write to the **same database by default** (`
 
 The DB is updated automatically as you work:
 
-- **Session start** — bootstrap runs if this is the first time; the workspace is mined if it hasn't been indexed yet
+- **Session start** — bootstrap runs if this is the first time; the workspace is mined if it hasn't been indexed yet. In Claude Code the injected status block also tells the session to say "ironmem tools failed to load" when no ironmem tools reached it, so a rejected tool list or dead server is loud instead of a session silently working without memory
 - **UserPromptSubmit** (Claude Code only) — every prompt triggers bounded local BM25/KG/diary recall (with opt-in ready-daemon hybrid vector recall; embedder never loaded by the hook) that injects sanitized untrusted-memory excerpts as `additionalContext`; see [docs/CODEX.md](docs/CODEX.md) for all prompt-recall tunables and daemon cost caveats
-- **Stop / PreCompact** — changed files are detected via SHA-256 manifest and re-mined incrementally; a session summary is appended to the diary
+- **Stop / PreCompact** — changed files are detected via SHA-256 manifest and re-mined incrementally; a session summary is appended to the diary. A hook without write access (`ironmem hook` run with `IRONMEM_MCP_MODE` unset or `read-only`, the default for hand-registered hook commands) never mines and only records metrics, from the database alone: the embedder and vector index are never loaded, so a Stop costs milliseconds instead of seconds on a large store. The plugin's hooks run `trusted` and still load them to mine
+- **Stop handoff nudge** (Claude Code only) — after a commit, push or PR, or 5+ file edits since the session last saved to ironmem, the Stop is blocked once with a request to save a handoff drawer (wing = repository name, room `handoffs`, logical_key `<branch>-handoff`), so the next session in any harness resumes from memory. At most once per 30 minutes per session, never on a stop that is already retrying; `IRONMEM_HANDOFF_NUDGE=0` (or `false`/`no`/`off`) turns it off
 - **Later sessions** — only files whose content hash changed since the last hook run are re-embedded, so updates are fast
 
 SQLite WAL mode handles concurrent access safely when both harnesses are running at the same time.

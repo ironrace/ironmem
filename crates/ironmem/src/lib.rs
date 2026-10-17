@@ -20,6 +20,8 @@ pub mod db;
 pub mod diary;
 /// Shared error types returned across the crate.
 pub mod error;
+/// Stop-hook nudge that asks a session to save a handoff after real work.
+pub mod handoff_nudge;
 /// Hook entrypoints for Codex and Claude Code session lifecycle events.
 pub mod hook;
 /// Workspace mining and incremental re-indexing.
