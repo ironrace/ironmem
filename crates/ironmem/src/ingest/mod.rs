@@ -43,6 +43,10 @@ const BLOCKED_SYSTEM_PREFIXES: &[&str] = &[
 ];
 
 pub fn mine_directory(app: &App, path: &str) -> Result<(), MemoryError> {
+    // Fail closed on a DB-only `App` (`App::new_server_ready` before warm-up,
+    // as read-only hooks open it): its noop embedder would store all-zero
+    // vectors no search can match, and the manifest would mark the files done.
+    app.ensure_embedder_ready()?;
     let root = PathBuf::from(path);
     if !root.is_dir() {
         return Err(MemoryError::NotFound(format!(
@@ -456,7 +460,7 @@ fn save_manifest(path: &Path, manifest: &MineManifest) -> Result<(), MemoryError
     Ok(())
 }
 
-fn sanitize_segment(raw: &str, fallback: &str) -> String {
+pub(crate) fn sanitize_segment(raw: &str, fallback: &str) -> String {
     let mut sanitized = raw
         .trim_matches(|c: char| !c.is_alphanumeric())
         .chars()

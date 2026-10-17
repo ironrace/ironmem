@@ -454,10 +454,12 @@ The database is kept up to date automatically through hooks:
 
 | Hook | What happens |
 |------|-------------|
-| `session-start` | Bootstrap if first run; initial mine if workspace not yet indexed. On the Claude Code harness, also emits a compact memory-status block via `hookSpecificOutput.additionalContext` (drawer/wing/room counts, active collab session + phase, last-diary pointer, `MEMORY_PROTOCOL`); Codex receives no such output (silent degrade) |
+| `session-start` | Bootstrap if first run; initial mine if workspace not yet indexed. On the Claude Code harness, also emits a compact memory-status block via `hookSpecificOutput.additionalContext` (drawer/wing/room counts, active collab session + phase, last-diary pointer, `MEMORY_PROTOCOL`, and a line telling the model to say "ironmem tools failed to load" when no ironmem tools reached it); Codex receives no such output (silent degrade) |
 | `user-prompt-submit` | Claude Code only — bounded local BM25/KG/diary recall with optional ready-daemon hybrid vector recall and context injection (see below). Codex registers no UserPromptSubmit hook |
-| `stop` | Persist measured transcript token rows and occupancy samples under `IRONMEM_METRICS`; persist session summary to diary and re-mine changed files when writes are allowed |
+| `stop` | Persist measured transcript token rows and occupancy samples under `IRONMEM_METRICS`; persist session summary to diary and re-mine changed files when writes are allowed. Claude Code only: after a commit, push or PR, or 5+ file edits since the last ironmem save, block the stop once and ask for a handoff drawer (`IRONMEM_HANDOFF_NUDGE=0` disables) |
 | `precompact` | Persist measured transcript token rows and occupancy samples under `IRONMEM_METRICS`; snapshot pending session context and re-mine changed files when writes are allowed |
+
+Without write access (`IRONMEM_MCP_MODE` unset or `read-only`), `session-start`, `stop` and `precompact` never mine — not even the `IRONMEM_WORKSPACE_ROOT` fallback — and open the database only: the embedder and vector index are never loaded, unless the store is empty, where bootstrap may migrate a legacy store. The plugin launchers default hooks to `trusted`, so plugin hooks still load them to mine.
 
 ### UserPromptSubmit recall (Claude Code only)
 

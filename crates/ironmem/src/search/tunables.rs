@@ -383,6 +383,15 @@ pub fn metrics_enabled() -> bool {
     )
 }
 
+/// Stop-hook handoff nudge (see `crate::handoff_nudge`). Default enabled; `0`,
+/// `false`, `no`, `off` disable.
+pub fn handoff_nudge_enabled() -> bool {
+    !matches!(
+        std::env::var("IRONMEM_HANDOFF_NUDGE").as_deref(),
+        Ok("0" | "false" | "no" | "off")
+    )
+}
+
 // ── UserPromptSubmit hook knobs (fresh-read; tests flip per-test) ────────────
 
 /// Hard wall-clock budget for the UserPromptSubmit hook, milliseconds.
