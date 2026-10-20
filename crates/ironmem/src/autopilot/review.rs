@@ -78,9 +78,13 @@
 //! ("best-effort by design ... silently under-counts").
 //!
 //! So: [`ReviewOutcome::total_cost_usd`] is an `Option`, `None` means
-//! *unknown, not free*, and [`super::budget::record_unpriced_dispatch`]
-//! increments a distinct `unpriced_dispatch_count` on the day's ledger. A
-//! reader of that drawer sees a total that is explicitly a floor.
+//! *unknown, not free*, and [`super::budget::record_unpriced_review`]
+//! increments a distinct `unpriced_review_count` on the day's ledger. A
+//! reader of that drawer sees a total that is explicitly a floor (either
+//! unpriced counter non-zero). Reviews have their own counter so they
+//! cannot consume the IC dispatch headroom
+//! (`max_unpriced_dispatches_per_day`) — the same split rung 9 gave the
+//! advisor.
 //!
 //! Two consequences are accepted deliberately for rung 5, both worth
 //! revisiting when rung 6 gives the Lead real merge authority:
@@ -1756,7 +1760,7 @@ pub fn review_pr(
     let spent_today = ledger.as_ref().map(|e| e.total_cost_usd).unwrap_or(0.0);
     let unpriced_today = ledger
         .as_ref()
-        .map(|e| e.unpriced_dispatch_count)
+        .map(|e| e.unpriced_review_count)
         .unwrap_or(0);
 
     // Two ceilings, because one of them cannot see the reviewer at all: an
@@ -1846,10 +1850,10 @@ pub fn review_pr(
                     cost,
                     "autopilot reviewer reported an unusable price; banking it as unpriced"
                 );
-                super::budget::record_unpriced_dispatch(db, &today)?;
+                super::budget::record_unpriced_review(db, &today)?;
             }
             None => {
-                super::budget::record_unpriced_dispatch(db, &today)?;
+                super::budget::record_unpriced_review(db, &today)?;
             }
         }
     }
@@ -2763,7 +2767,8 @@ not json at all
         let ledger = super::super::budget::get_daily_spend(&db, &today)
             .unwrap()
             .expect("the review must appear on the day's ledger");
-        assert_eq!(ledger.unpriced_dispatch_count, 1);
+        assert_eq!(ledger.unpriced_review_count, 1);
+        assert_eq!(ledger.unpriced_dispatch_count, 0);
         assert_eq!(ledger.dispatch_count, 0);
         assert_eq!(ledger.total_cost_usd, 0.0);
     }
@@ -2797,9 +2802,10 @@ not json at all
             None => {}
             Some(ledger) => {
                 assert_eq!(
-                    ledger.unpriced_dispatch_count, 0,
+                    ledger.unpriced_review_count, 0,
                     "a reviewer that never spawned spent nothing"
                 );
+                assert_eq!(ledger.unpriced_dispatch_count, 0);
                 assert_eq!(ledger.dispatch_count, 0);
             }
         }
@@ -2834,10 +2840,11 @@ not json at all
         assert_eq!(ledger.total_cost_usd, 0.0);
         assert_eq!(ledger.dispatch_count, 0);
         assert_eq!(
-            ledger.unpriced_dispatch_count,
+            ledger.unpriced_review_count,
             bogus_prices.len() as u32,
             "an unusable price is unknown spend, not zero spend"
         );
+        assert_eq!(ledger.unpriced_dispatch_count, 0);
     }
 
     #[test]
@@ -2891,6 +2898,7 @@ not json at all
         assert!((ledger.total_cost_usd - 0.04).abs() < 1e-9);
         assert_eq!(ledger.dispatch_count, 1);
         assert_eq!(ledger.unpriced_dispatch_count, 0);
+        assert_eq!(ledger.unpriced_review_count, 0);
     }
 
     #[test]
@@ -2979,6 +2987,39 @@ not json at all
     }
 
     #[test]
+    fn the_review_cap_trips_on_its_own_counter_and_ignores_ic_timeouts() {
+        let db = Database::open_in_memory().unwrap();
+        let issue = IssueRef::new("ironrace/ironmem", 283);
+        let gates = vec!["cargo test".to_string()];
+        let today = super::super::today_utc();
+        for _ in 0..10 {
+            super::super::budget::record_unpriced_dispatch(&db, &today).unwrap();
+        }
+        let mut runner = StubRunner::returning(passing_outcome(RiskClass::Documentation));
+        for _ in 0..2 {
+            let request = ReviewRequest {
+                max_unpriced_reviews_per_day: 2,
+                ..sample_request(&issue, &gates, Path::new("/repo"))
+            };
+            assert!(review_pr(&db, &mut runner, &request).unwrap().dispatched());
+        }
+        let request = ReviewRequest {
+            max_unpriced_reviews_per_day: 2,
+            ..sample_request(&issue, &gates, Path::new("/repo"))
+        };
+        let review = review_pr(&db, &mut runner, &request).unwrap();
+        assert_eq!(
+            review.refusal,
+            Some(ReviewRefusal::UnpricedReviewCapReached)
+        );
+        let ledger = super::super::budget::get_daily_spend(&db, &today)
+            .unwrap()
+            .unwrap();
+        assert_eq!(ledger.unpriced_review_count, 2);
+        assert_eq!(ledger.unpriced_dispatch_count, 10);
+    }
+
+    #[test]
     fn a_priced_reviewer_is_still_bounded_by_the_dollar_ceiling() {
         // The count cap must not have displaced the dollar one: a harness
         // that does report a price stays bounded by spend, as the spec's
@@ -3030,7 +3071,7 @@ not json at all
             super::super::budget::get_daily_spend(&db, &today)
                 .unwrap()
                 .unwrap()
-                .unpriced_dispatch_count,
+                .unpriced_review_count,
             1
         );
     }

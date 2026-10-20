@@ -20,6 +20,7 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum Commands {
     /// Start the MCP server (JSON-RPC over stdio)
     Serve {
@@ -408,6 +409,9 @@ enum AutopilotCmd {
         /// Daily ledger ceiling across all dispatches
         #[arg(long)]
         daily_budget_usd: Option<f64>,
+        /// How many unpriced (timed-out) IC dispatches may run today
+        #[arg(long)]
+        max_unpriced_dispatches_per_day: Option<u32>,
         /// Emit JSON instead of text
         #[arg(long)]
         json: bool,
@@ -672,6 +676,9 @@ enum AutopilotCmd {
         /// Daily ledger ceiling across all dispatches
         #[arg(long)]
         daily_budget_usd: Option<f64>,
+        /// How many unpriced (timed-out) IC dispatches may run today
+        #[arg(long)]
+        max_unpriced_dispatches_per_day: Option<u32>,
         /// Read everything, plan everything, write nothing and spend nothing
         #[arg(long)]
         dry_run: bool,
@@ -1191,7 +1198,8 @@ fn print_queue_plan(plan: &ironmem::autopilot::queue::QueuePlan) {
         // slots too. Both are named rather than one being printed under the
         // other's label.
         "Queue — {} to dispatch, {} deferred, {}/{} slots in use after this pass \
-         ({} held by work not picked), ${:.4} of ${:.2} spent today",
+         ({} held by work not picked), ${:.4} of ${:.2} spent today{} \
+         ({} unpriced dispatches, {} unpriced reviews)",
         plan.dispatch.len(),
         plan.deferred.len(),
         plan.occupied_slots + plan.dispatch.len(),
@@ -1199,6 +1207,13 @@ fn print_queue_plan(plan: &ironmem::autopilot::queue::QueuePlan) {
         plan.occupied_slots,
         plan.spent_today_usd,
         plan.daily_budget_usd,
+        if plan.has_unpriced_spend() {
+            " (floor, not total)"
+        } else {
+            ""
+        },
+        plan.unpriced_dispatch_count,
+        plan.unpriced_review_count,
     );
     for (i, queued) in plan.dispatch.iter().enumerate() {
         println!(
@@ -1918,6 +1933,7 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                 max_budget_usd,
                 attempt_cap,
                 daily_budget_usd,
+                max_unpriced_dispatches_per_day,
                 json,
             } => {
                 use ironmem::autopilot::run::RunConfig;
@@ -1951,6 +1967,9 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                 }
                 if let Some(daily) = daily_budget_usd {
                     config.daily_budget_usd = daily;
+                }
+                if let Some(cap) = max_unpriced_dispatches_per_day {
+                    config.max_unpriced_dispatches_per_day = cap;
                 }
                 // Validate before provisioning a worktree: a bad config
                 // should not leave a checkout behind.
@@ -2540,6 +2559,7 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                 max_budget_usd,
                 attempt_cap,
                 daily_budget_usd,
+                max_unpriced_dispatches_per_day,
                 dry_run,
                 json,
             } => {
@@ -2576,6 +2596,9 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                 }
                 if let Some(daily) = daily_budget_usd {
                     run.daily_budget_usd = daily;
+                }
+                if let Some(cap) = max_unpriced_dispatches_per_day {
+                    run.max_unpriced_dispatches_per_day = cap;
                 }
 
                 let mut queue = QueueConfig::default();
@@ -3673,6 +3696,56 @@ mod tests {
             } => assert!(gate_green),
             _ => panic!("expected Commands::Autopilot(Review), got a different variant"),
         }
+    }
+
+    #[test]
+    fn autopilot_run_and_lead_parse_max_unpriced_dispatches_per_day() {
+        let cli = Cli::try_parse_from([
+            "ironmem",
+            "autopilot",
+            "run",
+            "owner/repo",
+            "283",
+            "--title",
+            "t",
+            "--max-unpriced-dispatches-per-day",
+            "7",
+        ])
+        .expect("run args should parse");
+        match cli.command {
+            Commands::Autopilot {
+                cmd:
+                    AutopilotCmd::Run {
+                        max_unpriced_dispatches_per_day,
+                        ..
+                    },
+            } => assert_eq!(max_unpriced_dispatches_per_day, Some(7)),
+            _ => panic!("expected autopilot run"),
+        }
+        let cli = Cli::try_parse_from([
+            "ironmem",
+            "autopilot",
+            "lead",
+            "--repo",
+            "owner/repo=/tmp/x",
+            "--max-unpriced-dispatches-per-day",
+            "9",
+        ])
+        .expect("lead args should parse");
+        match cli.command {
+            Commands::Autopilot {
+                cmd:
+                    AutopilotCmd::Lead {
+                        max_unpriced_dispatches_per_day,
+                        ..
+                    },
+            } => assert_eq!(max_unpriced_dispatches_per_day, Some(9)),
+            _ => panic!("expected autopilot lead"),
+        }
+        // 0 reaches RunConfig::validate, which rejects it.
+        let mut config = ironmem::autopilot::run::RunConfig::new("m", "logic");
+        config.max_unpriced_dispatches_per_day = 0;
+        assert!(config.validate().is_err());
     }
 
     #[test]

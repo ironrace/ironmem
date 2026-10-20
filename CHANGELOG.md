@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Unpriced Codex reviews no longer stop IC dispatching.** Reviews now
+  bank to a new `unpriced_review_count` ledger field (bounded by
+  `--max-unpriced-reviews-per-day`, default 20) instead of the shared
+  `unpriced_dispatch_count`, which now counts only timed-out IC
+  dispatches, fix/remediation runs included (bounded by the new
+  `autopilot run`/`autopilot lead --max-unpriced-dispatches-per-day`,
+  default 5). Five reviews previously exhausted the IC headroom and
+  every dispatch ended `UnpricedDispatchesExhausted`. Existing ledger
+  drawers stay compatible: the new field defaults to 0 and old fields
+  are preserved. Queue/Lead output now shows both unpriced counts and
+  marks the day's total as a floor when either is non-zero.
+
 ### Changed
 
 - **GitHub releases now carry their version's `CHANGELOG.md` section as the

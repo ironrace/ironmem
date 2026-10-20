@@ -111,9 +111,10 @@
 //!
 //! Unpriced calls get their **own** counter
 //! ([`super::budget::BudgetLedgerEntry::unpriced_advice_count`]) rather than
-//! rung 5's shared `unpriced_dispatch_count`. See that field's doc: it is
-//! rung 7's lesson 26 read correctly — inherit the earlier mechanism's fix,
-//! not its counter.
+//! the IC dispatch counter `unpriced_dispatch_count`. See that field's doc:
+//! it is rung 7's lesson 26 read correctly — inherit the earlier mechanism's
+//! fix, not its counter. Reviews later got the same split
+//! (`unpriced_review_count`).
 //!
 //! # Storage: a tenth drawer kind
 //!
