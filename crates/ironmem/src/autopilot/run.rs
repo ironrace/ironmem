@@ -176,11 +176,13 @@ pub const DEFAULT_MAX_CONSECUTIVE_INFRASTRUCTURE_FAILURES: u32 = 3;
 /// and visibly less than the ceiling it cannot be seen by. Operator-tunable
 /// placeholder like every other default here; the spec names no figure.
 ///
-/// **The counter is shared with [`super::review`]'s unpriced reviews**, since
-/// both are unpriced invocations against one day's ledger. Each consumes the
-/// other's headroom, which is conservative in both directions — the effective
-/// bound is the smaller of the two — but it is a real coupling, so it is said
-/// out loud here rather than discovered.
+/// **The counter is not shared with [`super::review`]'s unpriced reviews.**
+/// Reviews have their own `unpriced_review_count`, bounded by
+/// `max_unpriced_reviews_per_day`. Sharing one counter let five reviews
+/// exhaust this headroom and stop every IC dispatch — the same coupling
+/// rung 9 removed for the advisor by giving it `unpriced_advice_count`.
+/// This counter counts only timed-out IC dispatches, fix/remediation
+/// runs included.
 pub const DEFAULT_MAX_UNPRICED_DISPATCHES_PER_DAY: u32 = 5;
 
 /// The issue's natural-language content, as the turn prompt needs it.
@@ -971,9 +973,10 @@ pub fn run_issue(
         }
         // The second ceiling. Checked only when this repo can actually
         // produce an unpriced dispatch: without a wall-clock bound no
-        // dispatch here can time out, so unpriced invocations banked by
-        // *other* work (a reviewer, another repo's timeouts) must not stop a
-        // repo that cannot contribute to the counter.
+        // dispatch here can time out, so unpriced dispatches banked by
+        // *other* work (another repo's timeouts — reviews and advice bank
+        // to their own counters) must not stop a repo that cannot
+        // contribute to the counter.
         if wall_clock_timeout.is_some() {
             let unpriced_today = ledger
                 .as_ref()
@@ -1595,8 +1598,9 @@ mod tests {
     #[test]
     fn a_repo_without_a_wall_clock_bound_is_not_stopped_by_other_work_unpriced_spend() {
         // A repo with no bound cannot produce a timed-out dispatch, so
-        // unpriced invocations banked elsewhere — a Codex reviewer, another
-        // repo's timeouts, which share this counter — must not stop it.
+        // unpriced dispatches banked elsewhere — another repo's timeouts,
+        // which share this counter — must not stop it. Reviews bank to a
+        // separate counter and never touch this one.
         let db = approved_db();
         for _ in 0..10 {
             budget::record_unpriced_dispatch(&db, &today_utc()).unwrap();
@@ -1608,6 +1612,31 @@ mod tests {
         let mut dispatcher = ScriptedDispatcher::new(vec![Ok(met())]);
         let run = run_issue(&db, &issue(), &brief(), &worktree, &config, &mut dispatcher).unwrap();
         assert!(matches!(run.terminal, TerminalReason::Met { .. }));
+    }
+
+    #[test]
+    fn twenty_unpriced_reviews_do_not_stop_an_ic_dispatch_with_a_wall_clock_bound() {
+        let db = approved_db();
+        gate_config::set_wall_clock_timeout(&db, &issue().repo, Some(60)).unwrap();
+        for _ in 0..20 {
+            budget::record_unpriced_review(&db, &today_utc()).unwrap();
+        }
+        let (_dir, worktree) = fixture_worktree();
+        let mut dispatcher = ScriptedDispatcher::new(vec![Ok(met())]);
+        let run = run_issue(
+            &db,
+            &issue(),
+            &brief(),
+            &worktree,
+            &config(),
+            &mut dispatcher,
+        )
+        .unwrap();
+        assert!(
+            matches!(run.terminal, TerminalReason::Met { .. }),
+            "got {:?}",
+            run.terminal
+        );
     }
 
     #[test]

@@ -347,9 +347,24 @@ pub struct QueuePlan {
     pub concurrency_cap: usize,
     pub spent_today_usd: f64,
     pub daily_budget_usd: f64,
+    /// Unpriced IC dispatches today (timed-out runs). Any unpriced
+    /// counter non-zero means `spent_today_usd` is a floor.
+    pub unpriced_dispatch_count: u32,
+    /// Unpriced reviews today. See `unpriced_dispatch_count`.
+    pub unpriced_review_count: u32,
+    /// Unpriced advisor calls today. See `unpriced_dispatch_count`.
+    pub unpriced_advice_count: u32,
 }
 
 impl QueuePlan {
+    /// Whether the day's total is a floor, not a total: any unpriced
+    /// counter (dispatch, review, or advice) is non-zero.
+    pub fn has_unpriced_spend(&self) -> bool {
+        self.unpriced_dispatch_count > 0
+            || self.unpriced_review_count > 0
+            || self.unpriced_advice_count > 0
+    }
+
     pub fn is_empty(&self) -> bool {
         self.dispatch.is_empty()
     }
@@ -384,9 +399,23 @@ pub fn plan_queue(
     // on the repo having a wall-clock bound, and duplicating the condition
     // here to get it subtly wrong would be worse than letting `run_issue`
     // report it — which it does, terminally and without spending anything.
-    let spent_today_usd = budget::get_daily_spend(db, &today_utc())?
+    let ledger_today = budget::get_daily_spend(db, &today_utc())?;
+    let spent_today_usd = ledger_today
+        .as_ref()
         .map(|entry| entry.total_cost_usd)
         .unwrap_or(0.0);
+    let unpriced_dispatch_count = ledger_today
+        .as_ref()
+        .map(|e| e.unpriced_dispatch_count)
+        .unwrap_or(0);
+    let unpriced_review_count = ledger_today
+        .as_ref()
+        .map(|e| e.unpriced_review_count)
+        .unwrap_or(0);
+    let unpriced_advice_count = ledger_today
+        .as_ref()
+        .map(|e| e.unpriced_advice_count)
+        .unwrap_or(0);
     let budget_exhausted = spent_today_usd + config.max_budget_usd > config.daily_budget_usd;
 
     let mut candidates: Vec<QueuedIssue> = Vec::new();
@@ -543,6 +572,9 @@ pub fn plan_queue(
         concurrency_cap: config.concurrency_cap,
         spent_today_usd,
         daily_budget_usd: config.daily_budget_usd,
+        unpriced_dispatch_count,
+        unpriced_review_count,
+        unpriced_advice_count,
     })
 }
 
@@ -724,6 +756,53 @@ mod tests {
         )
         .unwrap();
         assert!(outcome.in_force(), "test setup did not arm: {outcome:?}");
+    }
+
+    #[test]
+    fn plan_shows_both_unpriced_counts_and_marks_the_total_a_floor() {
+        let db = approved(&[REPO]);
+        budget::record_unpriced_dispatch(&db, &today_utc()).unwrap();
+        budget::record_unpriced_review(&db, &today_utc()).unwrap();
+        budget::record_unpriced_review(&db, &today_utc()).unwrap();
+        let plan = plan_queue(
+            &db,
+            &[backlog(REPO, vec![ready(1)])],
+            &empty_registry(),
+            &config(),
+        )
+        .unwrap();
+        assert_eq!(plan.unpriced_dispatch_count, 1);
+        assert_eq!(plan.unpriced_review_count, 2);
+        assert!(plan.has_unpriced_spend());
+    }
+
+    #[test]
+    fn floor_predicate_fires_on_a_single_unpriced_counter() {
+        // Mutation guard for `||`, including the advice arm.
+        let db = approved(&[REPO]);
+        budget::record_unpriced_review(&db, &today_utc()).unwrap();
+        let plan = plan_queue(
+            &db,
+            &[backlog(REPO, vec![ready(1)])],
+            &empty_registry(),
+            &config(),
+        )
+        .unwrap();
+        assert_eq!(plan.unpriced_dispatch_count, 0);
+        assert_eq!(plan.unpriced_review_count, 1);
+        assert!(plan.has_unpriced_spend(), "review alone is a floor");
+
+        let db = approved(&[REPO]);
+        budget::record_advice_call(&db, &today_utc(), None).unwrap();
+        let plan = plan_queue(
+            &db,
+            &[backlog(REPO, vec![ready(1)])],
+            &empty_registry(),
+            &config(),
+        )
+        .unwrap();
+        assert_eq!(plan.unpriced_advice_count, 1);
+        assert!(plan.has_unpriced_spend(), "advice alone is a floor");
     }
 
     #[test]

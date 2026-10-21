@@ -25,24 +25,46 @@ pub struct BudgetLedgerEntry {
     /// Number of invocations (IC + Reviewer dispatches) folded into
     /// `total_cost_usd` so far today.
     pub dispatch_count: u32,
-    /// Invocations that happened today but reported **no price**, so their
-    /// spend is missing from `total_cost_usd`.
+    /// IC dispatches (fix/remediation runs included) that happened today
+    /// but reported **no price**, so their spend is missing from
+    /// `total_cost_usd`. Only a dispatch killed on the wall-clock bound
+    /// lands here: its result JSON — the only meter — died with it.
     ///
-    /// Non-zero means `total_cost_usd` is a **floor, not a total**. The
-    /// Codex reviewer (rung 5) lands here: `codex exec --json` reports token
-    /// counts and no dollar figure, and the spec's authoritative meter is
-    /// "the sum of `total_cost_usd` across IC **and Reviewer**
-    /// invocations". Banking `0.0` for those would satisfy the type and
-    /// quietly under-report the day — the exact failure mode the spec's
-    /// *Budget accounting* section rejects transcript ingestion for. So an
-    /// unpriced invocation increments this instead, and a reader can see
-    /// the ledger is incomplete rather than trusting a wrong total.
+    /// Non-zero (or any other unpriced counter non-zero — see
+    /// [`Self::has_unpriced_spend`]) means
+    /// `total_cost_usd` is a **floor, not a total**. Banking `0.0` for
+    /// those would satisfy the type and quietly under-report the day —
+    /// the exact failure mode the spec's *Budget accounting* section
+    /// rejects transcript ingestion for. So an unpriced dispatch
+    /// increments this instead, and a reader can see the ledger is
+    /// incomplete rather than trusting a wrong total.
+    ///
+    /// Bounded by
+    /// [`super::run::RunConfig::max_unpriced_dispatches_per_day`]. Reviews
+    /// have their own counter ([`Self::unpriced_review_count`]) so they
+    /// cannot consume this headroom.
     ///
     /// `#[serde(default)]` so ledger drawers written before rung 5 read
     /// back as "nothing unpriced", which is true of them: every writer that
     /// existed then reported a price.
     #[serde(default)]
     pub unpriced_dispatch_count: u32,
+    /// Codex/Muse reviews that happened today but reported **no price**,
+    /// so their spend is missing from `total_cost_usd`.
+    ///
+    /// Its own field for the same reason the advisor got one at rung 9:
+    /// inherit the earlier mechanism's *fix* (bound unpriced spend by
+    /// count) rather than its *shape* (the same counter). Until this
+    /// split, every review incremented `unpriced_dispatch_count`, so five
+    /// reviews exhausted the IC dispatch headroom
+    /// (`max_unpriced_dispatches_per_day`, default 5) and the Lead stopped
+    /// dispatching with `UnpricedDispatchesExhausted`. Bounded by
+    /// `max_unpriced_reviews_per_day` (default 20).
+    ///
+    /// `#[serde(default)]` so ledger drawers written before this split
+    /// read back as "no unpriced reviews", and existing fields are kept.
+    #[serde(default)]
+    pub unpriced_review_count: u32,
     /// Advisor one-shot calls (rung 9) billed to this date, priced or not.
     ///
     /// Its **own field** because it is the quantity
@@ -64,17 +86,27 @@ pub struct BudgetLedgerEntry {
     /// Advisor calls whose price could not be read, so their spend is missing
     /// from `total_cost_usd`.
     ///
-    /// **Deliberately not `unpriced_dispatch_count`.** Rung 7 already shares
-    /// that counter between IC dispatches and Codex reviews, and
-    /// [`super::run::RunConfig::max_unpriced_dispatches_per_day`] bounds it
-    /// at a value sized for `$2.50` dispatches. Folding a third writer into
-    /// it — one whose calls are cheap but frequent — would let a flaky
-    /// advisor stop every IC dispatch on any repo with a wall-clock bound.
-    /// That is rung 7's lesson 26 read correctly: inherit the earlier
-    /// mechanism's *fix* (bound unpriced spend by count) rather than its
-    /// *shape* (the same counter).
+    /// **Deliberately not `unpriced_dispatch_count`.**
+    /// [`super::run::RunConfig::max_unpriced_dispatches_per_day`] bounds
+    /// that counter at a value sized for `$2.50` dispatches. Folding
+    /// another writer into it — one whose calls are cheap but frequent —
+    /// would let a flaky advisor stop every IC dispatch on any repo with
+    /// a wall-clock bound. Reviews learned the same lesson and now have
+    /// `unpriced_review_count`. Inherit the earlier mechanism's *fix*
+    /// (bound unpriced spend by count) rather than its *shape* (the same
+    /// counter).
     #[serde(default)]
     pub unpriced_advice_count: u32,
+}
+
+impl BudgetLedgerEntry {
+    /// Whether the day's dollar total is a floor, not a total: any
+    /// unpriced counter (dispatch, review, or advice) is non-zero.
+    pub fn has_unpriced_spend(&self) -> bool {
+        self.unpriced_dispatch_count > 0
+            || self.unpriced_review_count > 0
+            || self.unpriced_advice_count > 0
+    }
 }
 
 fn budget_key(date: &str) -> String {
@@ -134,6 +166,16 @@ pub fn record_unpriced_dispatch(
     })
 }
 
+/// Record that a review happened today whose cost could not be
+/// determined, without moving `total_cost_usd` or the dispatch counter.
+/// See [`BudgetLedgerEntry::unpriced_review_count`].
+pub fn record_unpriced_review(db: &Database, date: &str) -> Result<BudgetLedgerEntry, MemoryError> {
+    validate_date(date)?;
+    update_ledger(db, date, |entry| {
+        entry.unpriced_review_count += 1;
+    })
+}
+
 /// Bill one advisor one-shot call (rung 9) to `date`.
 ///
 /// One ledger write, not two: the call's price and the fact that a call
@@ -182,6 +224,7 @@ fn update_ledger(
             total_cost_usd: 0.0,
             dispatch_count: 0,
             unpriced_dispatch_count: 0,
+            unpriced_review_count: 0,
             advice_call_count: 0,
             unpriced_advice_count: 0,
         },
@@ -341,6 +384,62 @@ mod tests {
         assert_eq!(entry.advice_call_count, 2);
         assert_eq!(entry.unpriced_advice_count, 2, "NaN is not a price");
         assert_eq!(entry.unpriced_dispatch_count, 0);
+    }
+
+    #[test]
+    fn an_unpriced_review_moves_the_review_counter_not_the_dispatch_counter() {
+        let db = Database::open_in_memory().unwrap();
+        record_unpriced_dispatch(&db, "2026-09-03").unwrap();
+        let entry = record_unpriced_review(&db, "2026-09-03").unwrap();
+        assert_eq!(entry.unpriced_review_count, 1);
+        assert_eq!(entry.unpriced_dispatch_count, 1);
+        assert_eq!(entry.total_cost_usd, 0.0);
+        assert_eq!(entry.dispatch_count, 0);
+        assert!(entry.has_unpriced_spend());
+    }
+
+    #[test]
+    fn floor_predicate_fires_on_any_single_unpriced_counter() {
+        // Mutation guard for `||`: each counter alone must mark the total
+        // a floor. An `&&` (or a dropped advice arm) stays red here.
+        let mut entry = BudgetLedgerEntry {
+            date: "2026-09-03".to_string(),
+            total_cost_usd: 0.0,
+            dispatch_count: 0,
+            unpriced_dispatch_count: 0,
+            unpriced_review_count: 0,
+            advice_call_count: 0,
+            unpriced_advice_count: 0,
+        };
+        assert!(!entry.has_unpriced_spend());
+        entry.unpriced_review_count = 1;
+        assert!(entry.has_unpriced_spend(), "review alone is a floor");
+        entry.unpriced_review_count = 0;
+        entry.unpriced_dispatch_count = 1;
+        assert!(entry.has_unpriced_spend(), "dispatch alone is a floor");
+        entry.unpriced_dispatch_count = 0;
+        entry.unpriced_advice_count = 1;
+        assert!(entry.has_unpriced_spend(), "advice alone is a floor");
+    }
+
+    #[test]
+    fn a_pre_split_ledger_drawer_deserializes_with_zero_review_count() {
+        let db = Database::open_in_memory().unwrap();
+        write_current(
+            &db,
+            &budget_key("2026-09-01"),
+            r#"{"date":"2026-09-01","total_cost_usd":1.5,"dispatch_count":3,
+                "unpriced_dispatch_count":2,"advice_call_count":1,"unpriced_advice_count":1}"#,
+        )
+        .unwrap();
+        let entry = get_daily_spend(&db, "2026-09-01").unwrap().unwrap();
+        assert_eq!(entry.unpriced_review_count, 0);
+        assert_eq!(entry.unpriced_dispatch_count, 2, "old fields preserved");
+        assert_eq!(entry.dispatch_count, 3);
+        assert!((entry.total_cost_usd - 1.5).abs() < 1e-9);
+        let entry = record_unpriced_review(&db, "2026-09-01").unwrap();
+        assert_eq!(entry.unpriced_review_count, 1);
+        assert_eq!(entry.unpriced_dispatch_count, 2);
     }
 
     #[test]
