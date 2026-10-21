@@ -30,7 +30,8 @@ pub struct BudgetLedgerEntry {
     /// `total_cost_usd`. Only a dispatch killed on the wall-clock bound
     /// lands here: its result JSON — the only meter — died with it.
     ///
-    /// Non-zero (or `unpriced_review_count` non-zero) means
+    /// Non-zero (or any other unpriced counter non-zero — see
+    /// [`Self::has_unpriced_spend`]) means
     /// `total_cost_usd` is a **floor, not a total**. Banking `0.0` for
     /// those would satisfy the type and quietly under-report the day —
     /// the exact failure mode the spec's *Budget accounting* section
@@ -99,10 +100,12 @@ pub struct BudgetLedgerEntry {
 }
 
 impl BudgetLedgerEntry {
-    /// Whether the day's dollar total is a floor, not a total: either
-    /// unpriced counter (dispatch or review) is non-zero.
+    /// Whether the day's dollar total is a floor, not a total: any
+    /// unpriced counter (dispatch, review, or advice) is non-zero.
     pub fn has_unpriced_spend(&self) -> bool {
-        self.unpriced_dispatch_count > 0 || self.unpriced_review_count > 0
+        self.unpriced_dispatch_count > 0
+            || self.unpriced_review_count > 0
+            || self.unpriced_advice_count > 0
     }
 }
 
@@ -393,6 +396,30 @@ mod tests {
         assert_eq!(entry.total_cost_usd, 0.0);
         assert_eq!(entry.dispatch_count, 0);
         assert!(entry.has_unpriced_spend());
+    }
+
+    #[test]
+    fn floor_predicate_fires_on_any_single_unpriced_counter() {
+        // Mutation guard for `||`: each counter alone must mark the total
+        // a floor. An `&&` (or a dropped advice arm) stays red here.
+        let mut entry = BudgetLedgerEntry {
+            date: "2026-09-03".to_string(),
+            total_cost_usd: 0.0,
+            dispatch_count: 0,
+            unpriced_dispatch_count: 0,
+            unpriced_review_count: 0,
+            advice_call_count: 0,
+            unpriced_advice_count: 0,
+        };
+        assert!(!entry.has_unpriced_spend());
+        entry.unpriced_review_count = 1;
+        assert!(entry.has_unpriced_spend(), "review alone is a floor");
+        entry.unpriced_review_count = 0;
+        entry.unpriced_dispatch_count = 1;
+        assert!(entry.has_unpriced_spend(), "dispatch alone is a floor");
+        entry.unpriced_dispatch_count = 0;
+        entry.unpriced_advice_count = 1;
+        assert!(entry.has_unpriced_spend(), "advice alone is a floor");
     }
 
     #[test]

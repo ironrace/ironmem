@@ -18,8 +18,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   default 5). Five reviews previously exhausted the IC headroom and
   every dispatch ended `UnpricedDispatchesExhausted`. Existing ledger
   drawers stay compatible: the new field defaults to 0 and old fields
-  are preserved. Queue/Lead output now shows both unpriced counts and
-  marks the day's total as a floor when either is non-zero.
+  are preserved. Queue/Lead output now shows all unpriced counts
+  (dispatches, reviews, advisor calls) and marks the day's total as a
+  floor when any is non-zero. Note: reviews banked before this change
+  remain inside `unpriced_dispatch_count` until the day rolls over, so
+  the old headroom effect can persist for the rest of the merge day —
+  conservative, and gone at midnight UTC.
 
 ### Changed
 

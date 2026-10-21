@@ -973,9 +973,10 @@ pub fn run_issue(
         }
         // The second ceiling. Checked only when this repo can actually
         // produce an unpriced dispatch: without a wall-clock bound no
-        // dispatch here can time out, so unpriced invocations banked by
-        // *other* work (a reviewer, another repo's timeouts) must not stop a
-        // repo that cannot contribute to the counter.
+        // dispatch here can time out, so unpriced dispatches banked by
+        // *other* work (another repo's timeouts — reviews and advice bank
+        // to their own counters) must not stop a repo that cannot
+        // contribute to the counter.
         if wall_clock_timeout.is_some() {
             let unpriced_today = ledger
                 .as_ref()

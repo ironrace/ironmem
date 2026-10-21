@@ -1199,7 +1199,7 @@ fn print_queue_plan(plan: &ironmem::autopilot::queue::QueuePlan) {
         // other's label.
         "Queue — {} to dispatch, {} deferred, {}/{} slots in use after this pass \
          ({} held by work not picked), ${:.4} of ${:.2} spent today{} \
-         ({} unpriced dispatches, {} unpriced reviews)",
+         ({} unpriced dispatches, {} unpriced reviews, {} unpriced advisor calls)",
         plan.dispatch.len(),
         plan.deferred.len(),
         plan.occupied_slots + plan.dispatch.len(),
@@ -1214,6 +1214,7 @@ fn print_queue_plan(plan: &ironmem::autopilot::queue::QueuePlan) {
         },
         plan.unpriced_dispatch_count,
         plan.unpriced_review_count,
+        plan.unpriced_advice_count,
     );
     for (i, queued) in plan.dispatch.iter().enumerate() {
         println!(

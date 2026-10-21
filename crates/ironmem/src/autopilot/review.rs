@@ -80,7 +80,7 @@
 //! So: [`ReviewOutcome::total_cost_usd`] is an `Option`, `None` means
 //! *unknown, not free*, and [`super::budget::record_unpriced_review`]
 //! increments a distinct `unpriced_review_count` on the day's ledger. A
-//! reader of that drawer sees a total that is explicitly a floor (either
+//! reader of that drawer sees a total that is explicitly a floor (any
 //! unpriced counter non-zero). Reviews have their own counter so they
 //! cannot consume the IC dispatch headroom
 //! (`max_unpriced_dispatches_per_day`) — the same split rung 9 gave the
