@@ -17,6 +17,9 @@
 //!    ([`super::queue::plan_queue`]).
 //! 5. Dispatch the top of the queue (rung 4's `run_issue`), up to
 //!    [`LeadConfig::max_dispatches_per_tick`].
+//! 6. Close out every issue found at its attempt cap — one whose run ended
+//!    there, or one the queue deferred for it — with rung 6's summary
+//!    comment and `agent:exhausted` ([`close_out_exhausted`], #345).
 //!
 //! # OQ9: is the Lead a Claude session at all?
 //!
@@ -63,8 +66,8 @@
 //!
 //! # What one tick will and will not do
 //!
-//! It will read GitHub, write labels and comments on blocked issues, and
-//! spend money on dispatches. It will **not** review or merge: rungs 5 and 6
+//! It will read GitHub, write labels and comments on blocked and exhausted
+//! issues, comment on escalated ones, and spend money on dispatches. It will **not** review or merge: rungs 5 and 6
 //! stay behind their own commands this rung. A tick that dispatched, then
 //! reviewed, then merged would make the smallest unit of Lead activity the
 //! largest possible blast radius, and merge is the one irreversible action
@@ -79,11 +82,13 @@ use super::advise::{self, Advice, AdviceConfig, Advisor};
 use super::blocked::{self, BlockedPoll};
 use super::gh::{self, GhRunner};
 use super::labels::AgentLabel;
+use super::lineage::{self, AttemptOutcome};
 use super::merge::serialize_issue;
 use super::queue::{self, QueueConfig, QueuePlan, RepoBacklog, IN_FLIGHT_SCAN_LIMIT};
 use super::registry::{self, AgentRegistry, RegistrySnapshot};
 use super::run::{self, Dispatcher, IssueBrief, IssueRun, RunConfig};
 use super::scrub::scrub_and_bound;
+use super::stagnation::{self, ExhaustExecution};
 use super::supervise::{self, SupervisionAction, SupervisionConfig, SupervisionReport};
 use super::worktree;
 use super::{validate_repo, IssueRef};
@@ -268,6 +273,10 @@ pub struct LeadReport {
     /// tick. Independent of the advisor: the notice is mechanical, and the
     /// advisor only adds a drafted question to it when it has one.
     pub escalation_notices: Vec<EscalationNotice>,
+    /// Every issue this tick found at its attempt cap and closed out (or, on
+    /// a dry run, would have): rung 6's summary comment plus
+    /// `agent:exhausted`. See [`close_out_exhausted`].
+    pub exhausted: Vec<ExhaustExecution>,
     pub problems: Vec<TickProblem>,
 }
 
@@ -283,7 +292,7 @@ pub struct EscalationNotice {
 
 /// Run one Lead tick.
 ///
-/// See the module doc for the five steps and their order. Every step is
+/// See the module doc for the six steps and their order. Every step is
 /// bounded and none of them can block: the registry read folds every failure
 /// into [`RegistrySnapshot::Unavailable`], `gh` failures are collected into
 /// [`LeadReport::problems`], and each dispatch is bounded by the repo's
@@ -351,6 +360,9 @@ pub fn lead_tick(
         }
     }
 
+    // ── 6. close out every issue at its attempt cap ─────────────────────
+    let exhausted = close_out_exhausted(db, gh_runner, &plan, &runs, config, &mut problems);
+
     Ok(LeadReport {
         dry_run: config.dry_run,
         registry_available: snapshot.is_available(),
@@ -361,8 +373,92 @@ pub fn lead_tick(
         runs,
         advice,
         escalation_notices,
+        exhausted,
         problems,
     })
+}
+
+/// Close out every issue this tick found at its attempt cap: post rung 6's
+/// summary comment and flip the issue to `agent:exhausted` (#345).
+///
+/// Before this, `run_issue` returned `AttemptCapExhausted` and the tick wrote
+/// nothing. The queue then deferred the issue on every later tick, so it was
+/// stuck rather than looping — but it kept `agent:ready` with no comment, and
+/// an operator reading GitHub saw an issue waiting for its turn rather than
+/// one that had stopped. The label whose whole purpose is to say so was only
+/// ever applied by a human typing `ironmem autopilot exhaust`.
+///
+/// Two sources, and both are needed:
+///
+/// - a run this tick that **ended** at the cap, which is the normal path; and
+/// - an issue the queue **deferred** as `AttemptCapReached`. That is the only
+///   place a capped issue is ever seen again, because it is never dispatched
+///   again: it is where a close-out whose label write failed is retried, and
+///   where an issue stranded at its cap before this existed is reached.
+///
+/// One exception: an issue with a recorded success, which can only be at its
+/// cap through rung 11's remediation, is left for `advance`'s human hold.
+///
+/// Calling [`stagnation::exhaust_issue`] on every such tick is safe because
+/// it is idempotent by construction: it reads the labels fresh and leaves an
+/// `agent:exhausted` issue alone, and its posted-notice drawer stops a retry
+/// after a failed label write from posting the summary twice. A dry run reads
+/// the labels and reports what it would do, and writes nothing.
+///
+/// Failures are collected, not propagated, like every other GitHub write on
+/// the tick: the dispatch already happened and is already banked.
+fn close_out_exhausted(
+    db: &Database,
+    gh_runner: &mut dyn GhRunner,
+    plan: &QueuePlan,
+    runs: &[IssueRun],
+    config: &LeadConfig,
+    problems: &mut Vec<TickProblem>,
+) -> Vec<ExhaustExecution> {
+    let ended_at_cap = runs
+        .iter()
+        .filter(|r| r.terminal == run::TerminalReason::AttemptCapExhausted)
+        .map(|r| &r.issue);
+    let deferred_at_cap = plan
+        .deferred
+        .iter()
+        .filter(|d| matches!(d.reason, queue::DeferReason::AttemptCapReached { .. }))
+        .map(|d| &d.issue);
+
+    let mut exhausted = Vec::new();
+    for issue in ended_at_cap.chain(deferred_at_cap) {
+        // A succeeded issue only reaches its cap through rung 11's red path,
+        // and that exhaustion already has an owner: `advance` holds the PR for
+        // a human with the reviewer's findings and flips the issue to
+        // `agent:blocked`. It finds the issue through the `agent:ready`
+        // listing, so applying `agent:exhausted` here would strip the label
+        // the hold needs and swallow the hand-off.
+        match lineage::get_issue_status(db, issue) {
+            Ok(status)
+                if status
+                    .as_ref()
+                    .is_some_and(|s| s.best_verdict == Some(AttemptOutcome::Success)) =>
+            {
+                continue;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                problems.push(TickProblem {
+                    what: format!("close out exhausted {}", issue.canonical()),
+                    detail: e.to_string(),
+                });
+                continue;
+            }
+        }
+        match stagnation::exhaust_issue(gh_runner, db, issue, config.dry_run) {
+            Ok(exec) => exhausted.push(exec),
+            Err(e) => problems.push(TickProblem {
+                what: format!("close out exhausted {}", issue.canonical()),
+                detail: e.to_string(),
+            }),
+        }
+    }
+    exhausted
 }
 
 /// Poll every repo's `agent:blocked` issues for human answers.
@@ -865,6 +961,7 @@ mod tests {
     use crate::autopilot::gh::testing::ScriptedGh;
     use crate::autopilot::gh::GhOutput;
     use crate::autopilot::registry::RegistryOutput;
+    use crate::autopilot::stagnation::ExhaustOutcome;
     use crate::autopilot::supervise::{ProcessHealth, StrategyHealth};
     use crate::autopilot::{dispatch_state, gate_config, DispatchState};
     use std::path::Path;
@@ -2264,5 +2361,395 @@ mod tests {
         );
         assert!(!body.contains("sk-ant-api03-AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHHIIIIJJJJKKKK"));
         assert!(body.chars().count() <= MAX_NOTICE_CHARS);
+    }
+
+    // ── closing out an exhausted issue (#345) ───────────────────────────
+
+    /// A dispatcher whose every attempt runs, is billed, and fails: a real
+    /// `NotMet`, so each one is charged against the attempt cap.
+    struct NotMetDispatcher {
+        calls: usize,
+    }
+
+    impl Dispatcher for NotMetDispatcher {
+        fn dispatch(
+            &mut self,
+            _repo: &Path,
+            _spec: &DispatchSpec,
+        ) -> Result<DispatchOutcome, MemoryError> {
+            self.calls += 1;
+            Ok(DispatchOutcome {
+                total_cost_usd: 0.10,
+                num_turns: 2,
+                duration_ms: 1_000,
+                is_error: false,
+                session_id: "11111111-2222-3333-4444-555555555555".to_string(),
+                verdict: Some(Verdict::NotMet),
+                reason: Some("scripted failure".to_string()),
+                process_success: true,
+                timed_out: false,
+            })
+        }
+    }
+
+    /// The cap is enforced in the queue *and* in `run_issue`, so a test that
+    /// lowers it must lower both, exactly as the CLI does.
+    fn capped_config(f: &Fixture, cap: u32) -> LeadConfig {
+        let mut cfg = config(f);
+        cfg.run.attempt_cap = cap;
+        cfg.queue.attempt_cap = cap;
+        cfg
+    }
+
+    fn labels_json(labels: &[&str]) -> String {
+        let labels: Vec<String> = labels
+            .iter()
+            .map(|l| format!(r#"{{"name":"{l}"}}"#))
+            .collect();
+        format!(r#"{{"labels":[{}]}}"#, labels.join(","))
+    }
+
+    fn posted_a_comment(gh_runner: &ScriptedGh) -> bool {
+        gh_runner
+            .seen
+            .iter()
+            .any(|argv| argv.contains(&"comment".to_string()))
+    }
+
+    #[test]
+    fn a_tick_that_exhausts_an_issue_closes_it_out_on_the_issue() {
+        // The live run's defect: `run_issue` returned `AttemptCapExhausted`
+        // and the tick wrote nothing, so the issue kept `agent:ready` with no
+        // comment — stuck, and indistinguishable on GitHub from one waiting
+        // for its turn. Removing the close-out call must fail this test.
+        let db = approved_db();
+        let f = fixture();
+        let mut gh_runner = ScriptedGh::new(vec![
+            Ok(GhOutput::ok("[]")), // blocked listing
+            Ok(GhOutput::ok(&issue_list_json(&[(3, &["agent:ready"])]))),
+            Ok(GhOutput::ok(&labels_json(&["agent:ready"]))), // exhaust: label read
+            Ok(GhOutput::ok("")),                             // the summary comment
+            Ok(GhOutput::failed("", "label already exists")), // provision agent:exhausted
+            Ok(GhOutput::ok("")),                             // the label edit
+        ]);
+        let mut dispatcher = NotMetDispatcher { calls: 0 };
+        let report = lead_tick(
+            &db,
+            &mut gh_runner,
+            &mut empty_registry(),
+            &mut dispatcher,
+            &mut no_advisor(),
+            &capped_config(&f, 1),
+        )
+        .unwrap();
+
+        assert_eq!(dispatcher.calls, 1);
+        assert_eq!(report.runs.len(), 1);
+        assert_eq!(
+            report.runs[0].terminal,
+            run::TerminalReason::AttemptCapExhausted
+        );
+        assert!(report.problems.is_empty(), "{:?}", report.problems);
+
+        assert_eq!(report.exhausted.len(), 1, "{:?}", report.exhausted);
+        assert_eq!(report.exhausted[0].issue, IssueRef::new(REPO, 3));
+        let ExhaustOutcome::Exhausted {
+            label_plan,
+            commented,
+            ..
+        } = &report.exhausted[0].outcome
+        else {
+            panic!("expected Exhausted, got {:?}", report.exhausted[0].outcome);
+        };
+        assert!(commented);
+        assert_eq!(label_plan.add, vec!["agent:exhausted".to_string()]);
+        assert_eq!(label_plan.remove, vec!["agent:ready".to_string()]);
+
+        // Asserted on what reached `gh`, not only on the report.
+        let comment = gh_runner
+            .seen
+            .iter()
+            .find(|argv| argv.contains(&"comment".to_string()))
+            .expect("the summary comment is posted");
+        assert!(comment.contains(&"3".to_string()), "{comment:?}");
+        assert!(
+            comment
+                .iter()
+                .any(|a| a.contains("Autopilot stopped working")),
+            "{comment:?}"
+        );
+        assert!(
+            gh_runner.seen.iter().any(|argv| argv
+                .windows(2)
+                .any(|w| w == ["--add-label", "agent:exhausted"])),
+            "{:?}",
+            gh_runner.seen
+        );
+    }
+
+    #[test]
+    fn a_repeat_tick_on_an_exhausted_issue_posts_no_second_summary() {
+        // GitHub's issue listing can lag a label edit, so the next tick may
+        // still see `agent:ready` on an issue this Lead has already closed
+        // out. The close-out reads the labels fresh and leaves it alone.
+        let db = approved_db();
+        let f = fixture();
+        let cfg = capped_config(&f, 1);
+        let mut gh_runner = ScriptedGh::new(vec![
+            Ok(GhOutput::ok("[]")),
+            Ok(GhOutput::ok(&issue_list_json(&[(3, &["agent:ready"])]))),
+            Ok(GhOutput::ok(&labels_json(&["agent:ready"]))),
+            Ok(GhOutput::ok("")),
+            Ok(GhOutput::failed("", "label already exists")),
+            Ok(GhOutput::ok("")),
+        ]);
+        lead_tick(
+            &db,
+            &mut gh_runner,
+            &mut empty_registry(),
+            &mut NotMetDispatcher { calls: 0 },
+            &mut no_advisor(),
+            &cfg,
+        )
+        .unwrap();
+
+        let mut gh_runner = ScriptedGh::new(vec![
+            Ok(GhOutput::ok("[]")),
+            Ok(GhOutput::ok(&issue_list_json(&[(3, &["agent:ready"])]))),
+            Ok(GhOutput::ok(&labels_json(&["agent:exhausted"]))),
+        ]);
+        let report = lead_tick(
+            &db,
+            &mut gh_runner,
+            &mut empty_registry(),
+            &mut RefusingDispatcher,
+            &mut no_advisor(),
+            &cfg,
+        )
+        .unwrap();
+
+        assert!(report.runs.is_empty());
+        assert_eq!(report.exhausted.len(), 1);
+        assert_eq!(
+            report.exhausted[0].outcome,
+            ExhaustOutcome::AlreadyExhausted
+        );
+        assert!(!posted_a_comment(&gh_runner), "{:?}", gh_runner.seen);
+        assert!(report.problems.is_empty(), "{:?}", report.problems);
+    }
+
+    #[test]
+    fn a_failed_close_out_is_retried_by_the_next_tick_without_a_second_comment() {
+        // The close-out is not a one-shot side effect of the dispatching
+        // tick. If its label write fails, the issue is still `agent:ready`
+        // and still at its cap, so every later tick defers it — and that
+        // deferral is where the close-out is retried. Without the retry the
+        // issue would be stranded exactly as before, with a comment but no
+        // stop label.
+        let db = approved_db();
+        let f = fixture();
+        let cfg = capped_config(&f, 1);
+        let mut gh_runner = ScriptedGh::new(vec![
+            Ok(GhOutput::ok("[]")),
+            Ok(GhOutput::ok(&issue_list_json(&[(3, &["agent:ready"])]))),
+            Ok(GhOutput::ok(&labels_json(&["agent:ready"]))),
+            Ok(GhOutput::ok("")),
+            Ok(GhOutput::failed("", "label already exists")),
+            Ok(GhOutput::failed("", "HTTP 403: Forbidden")),
+        ]);
+        let report = lead_tick(
+            &db,
+            &mut gh_runner,
+            &mut empty_registry(),
+            &mut NotMetDispatcher { calls: 0 },
+            &mut no_advisor(),
+            &cfg,
+        )
+        .unwrap();
+        assert!(report.exhausted.is_empty(), "{:?}", report.exhausted);
+        assert_eq!(report.problems.len(), 1, "{:?}", report.problems);
+        assert!(report.problems[0].detail.contains("403"));
+
+        let mut gh_runner = ScriptedGh::new(vec![
+            Ok(GhOutput::ok("[]")),
+            Ok(GhOutput::ok(&issue_list_json(&[(3, &["agent:ready"])]))),
+            Ok(GhOutput::ok(&labels_json(&["agent:ready"]))),
+            Ok(GhOutput::failed("", "label already exists")),
+            Ok(GhOutput::ok("")),
+        ]);
+        let report = lead_tick(
+            &db,
+            &mut gh_runner,
+            &mut empty_registry(),
+            &mut RefusingDispatcher,
+            &mut no_advisor(),
+            &cfg,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            report.plan.deferred[0].reason,
+            queue::DeferReason::AttemptCapReached { .. }
+        ));
+        let ExhaustOutcome::Exhausted { commented, .. } = &report.exhausted[0].outcome else {
+            panic!("expected Exhausted, got {:?}", report.exhausted[0].outcome);
+        };
+        assert!(
+            !commented,
+            "the summary was already posted by the first tick"
+        );
+        assert!(!posted_a_comment(&gh_runner), "{:?}", gh_runner.seen);
+        assert!(report.problems.is_empty(), "{:?}", report.problems);
+    }
+
+    #[test]
+    fn an_issue_already_stranded_at_its_cap_is_closed_out_by_the_next_tick() {
+        // An issue that reached its cap before the Lead closed issues out
+        // (the live run's #339) is deferred on every tick and never
+        // dispatched again, so the deferral is the only place it can be
+        // reached.
+        let db = approved_db();
+        let f = fixture();
+        lineage::upsert_issue_status(
+            &db,
+            &lineage::IssueStatus {
+                issue: IssueRef::new(REPO, 3),
+                cumulative_attempt_n: 1,
+                best_verdict: None,
+                best_commit_sha: None,
+            },
+        )
+        .unwrap();
+        let mut gh_runner = ScriptedGh::new(vec![
+            Ok(GhOutput::ok("[]")),
+            Ok(GhOutput::ok(&issue_list_json(&[(3, &["agent:ready"])]))),
+            Ok(GhOutput::ok(&labels_json(&["agent:ready"]))),
+            Ok(GhOutput::ok("")),
+            Ok(GhOutput::failed("", "label already exists")),
+            Ok(GhOutput::ok("")),
+        ]);
+        let report = lead_tick(
+            &db,
+            &mut gh_runner,
+            &mut empty_registry(),
+            &mut RefusingDispatcher,
+            &mut no_advisor(),
+            &capped_config(&f, 1),
+        )
+        .unwrap();
+
+        assert!(report.runs.is_empty());
+        assert!(matches!(
+            report.exhausted[0].outcome,
+            ExhaustOutcome::Exhausted {
+                commented: true,
+                ..
+            }
+        ));
+        assert!(posted_a_comment(&gh_runner));
+    }
+
+    #[test]
+    fn an_exhausted_remediation_is_left_for_advances_human_hold() {
+        // Rung 11's red path spends the same attempt cap, and its exhaustion
+        // already has an owner: `advance` holds the PR for a human, with the
+        // reviewer's findings, and flips the issue to `agent:blocked`
+        // (`an_issue_at_its_attempt_cap_falls_through_to_the_human_hold`).
+        // `advance` only sees issues that still carry `agent:ready`, so a
+        // Lead that applied `agent:exhausted` first would strip the label
+        // that hold needs and swallow the hand-off the spec requires.
+        let db = approved_db();
+        let f = fixture();
+        let issue = IssueRef::new(REPO, 3);
+        let status = |attempts| lineage::IssueStatus {
+            issue: issue.clone(),
+            cumulative_attempt_n: attempts,
+            best_verdict: Some(lineage::AttemptOutcome::Success),
+            best_commit_sha: Some("abc123".to_string()),
+        };
+        lineage::upsert_issue_status(&db, &status(1)).unwrap();
+        let armed = crate::autopilot::remediate::arm_remediation(
+            &db,
+            &crate::autopilot::remediate::ArmRequest {
+                issue: &issue,
+                pr_number: 7,
+                head_sha: "abc123",
+                findings: Some("the retry loop is unbounded"),
+                attempt_cap: 2,
+            },
+        )
+        .unwrap();
+        assert!(armed.in_force(), "test setup did not arm: {armed:?}");
+        // The remediation dispatch ran and failed: the cap is now spent.
+        lineage::upsert_issue_status(&db, &status(2)).unwrap();
+
+        let mut gh_runner = ScriptedGh::new(vec![
+            Ok(GhOutput::ok("[]")),
+            Ok(GhOutput::ok(&issue_list_json(&[(3, &["agent:ready"])]))),
+        ]);
+        let report = lead_tick(
+            &db,
+            &mut gh_runner,
+            &mut empty_registry(),
+            &mut RefusingDispatcher,
+            &mut no_advisor(),
+            &capped_config(&f, 2),
+        )
+        .unwrap();
+
+        assert!(
+            matches!(
+                report.plan.deferred[0].reason,
+                queue::DeferReason::AttemptCapReached { .. }
+            ),
+            "{:?}",
+            report.plan.deferred
+        );
+        assert!(report.exhausted.is_empty(), "{:?}", report.exhausted);
+        assert_eq!(
+            gh_runner.seen.len(),
+            2,
+            "no GitHub write: {:?}",
+            gh_runner.seen
+        );
+        assert!(report.problems.is_empty(), "{:?}", report.problems);
+    }
+
+    #[test]
+    fn a_dry_run_reports_the_close_out_and_writes_nothing() {
+        let db = approved_db();
+        let f = fixture();
+        lineage::upsert_issue_status(
+            &db,
+            &lineage::IssueStatus {
+                issue: IssueRef::new(REPO, 3),
+                cumulative_attempt_n: 1,
+                best_verdict: None,
+                best_commit_sha: None,
+            },
+        )
+        .unwrap();
+        let mut cfg = capped_config(&f, 1);
+        cfg.dry_run = true;
+        let mut gh_runner = ScriptedGh::new(vec![
+            Ok(GhOutput::ok("[]")),
+            Ok(GhOutput::ok(&issue_list_json(&[(3, &["agent:ready"])]))),
+            Ok(GhOutput::ok(&labels_json(&["agent:ready"]))),
+        ]);
+        let report = lead_tick(
+            &db,
+            &mut gh_runner,
+            &mut empty_registry(),
+            &mut RefusingDispatcher,
+            &mut no_advisor(),
+            &cfg,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            report.exhausted[0].outcome,
+            ExhaustOutcome::WouldExhaust { .. }
+        ));
+        assert_eq!(gh_runner.seen.len(), 3, "reads only: {:?}", gh_runner.seen);
     }
 }

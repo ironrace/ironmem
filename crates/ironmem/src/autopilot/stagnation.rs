@@ -198,8 +198,8 @@ pub fn exhaust_issue(
     // its job and must not outlive it.
     //
     // Leaving it behind was worse than the bug it fixed. A human who reads
-    // the summary and does what it asks — re-label `agent:ready` for another
-    // pass — hits the cumulative attempt cap again, arrives back here with
+    // the summary and asks for another pass — `retry`, or a re-label by
+    // hand — hits the cumulative attempt cap again, arrives back here with
     // no `agent:exhausted` label, and finds a notice that suppresses the
     // comment. Autopilot would then re-apply the stop label with *no*
     // explanation on the issue, silently reverting the one intervention the
@@ -321,10 +321,16 @@ pub fn render_exhaustion_comment(issue: &IssueRef, attempts: &[lineage::AttemptR
         "**Autopilot stopped working {issue}.**\n\n\
 The per-issue attempt cap was reached, so this issue is now labeled `{label}`. \
 It **will not be retried automatically** — that is the point of the label. A \
-human who wants another pass should re-label it `{ready}`.\n\n",
+human who wants another pass should run\n\n\
+```\nironmem autopilot retry {repo} {number}\n```\n\n\
+which forgives the attempts made so far and re-labels it `{ready}`. Re-labeling \
+it `{ready}` by hand is not enough: the attempt cap still applies, so Autopilot \
+would close it out again.\n\n",
         issue = issue.canonical(),
         label = AgentLabel::Exhausted.as_str(),
         ready = AgentLabel::Ready.as_str(),
+        repo = issue.repo,
+        number = issue.number,
     );
 
     if attempts.is_empty() {
@@ -534,8 +540,8 @@ are read once, not again inside the label write: {:?}",
 
     #[test]
     fn a_second_exhaustion_after_a_human_resume_still_explains_itself() {
-        // The summary tells the human to re-label `agent:ready` for another
-        // pass. Doing so hits the cumulative cap again and arrives back here
+        // The summary invites the human to ask for another pass. Taking it
+        // hits the cumulative cap again and arrives back here
         // with no `agent:exhausted` label — so a notice that outlived its
         // label write would suppress the comment and Autopilot would
         // re-apply the stop label with *no* explanation, silently reverting
@@ -697,6 +703,13 @@ are read once, not again inside the label write: {:?}",
         assert!(body.contains("agent:exhausted"));
         assert!(body.contains("will not be retried automatically"));
         assert!(body.contains("agent:ready"), "the way back must be stated");
+        // And it must be the way back that works. Re-labeling by hand leaves
+        // the cap in force, so the Lead defers the issue at its cap and closes
+        // it out again (#345); only `retry` forgives the attempts.
+        assert!(
+            body.contains("ironmem autopilot retry owner/repo 42"),
+            "the comment must name the command that resumes it: {body}"
+        );
         assert!(body.contains("tests red"));
     }
 
