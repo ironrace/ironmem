@@ -453,7 +453,12 @@ fn close_out_one(
     attempt_cap: u32,
     dry_run: bool,
 ) -> Result<Option<ExhaustExecution>, MemoryError> {
-    let status = lineage::get_issue_status(db, issue)?;
+    // The status key goes through `repo_slug`, so `own/er-repo#7` and
+    // `own-er/repo#7` share one drawer. A status naming the other issue is
+    // not this one's: acting on it would close this issue out on a foreign
+    // count and publish the other repo's lineage here. Same check as
+    // `retry::read_grant`.
+    let status = lineage::get_issue_status(db, issue)?.filter(|s| s.issue == *issue);
     // A succeeded issue only reaches its cap through rung 11's red path, and
     // that exhaustion already has an owner: `advance` holds the PR for a
     // human with the reviewer's findings and flips the issue to

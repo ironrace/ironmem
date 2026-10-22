@@ -70,8 +70,8 @@ pub enum ExhaustOutcome {
         label_plan: labels::LabelPlan,
         attempts_summarized: usize,
         /// Whether *this* run posted the summary. False when a previous run
-        /// posted it and then failed to apply the label — see
-        /// [`exhaustion_notice_posted`].
+        /// posted it, covering the same attempts, and then failed to apply
+        /// the label — see [`exhaustion_notice_covers`].
         commented: bool,
     },
 }
@@ -169,7 +169,13 @@ pub fn exhaust_issue_with_labels(
 
     // Read only once the issue is known to need a summary — an already-
     // exhausted issue walks none of its lineage.
-    let attempts = lineage::attempts_for_issue(db, issue)?;
+    //
+    // Filtered to this issue's own records: the lineage entity is named
+    // through `repo_slug`, so `own/er-repo#7` and `own-er/repo#7` share it,
+    // and the other issue's approaches and failure reasons must not be
+    // published on this one.
+    let mut attempts = lineage::attempts_for_issue(db, issue)?;
+    attempts.retain(|attempt| attempt.issue == *issue);
     let body = render_exhaustion_comment(issue, &attempts);
     if dry_run {
         return Ok(ExhaustExecution {
@@ -720,6 +726,36 @@ are read once, not again inside the label write: {:?}",
             panic!("expected Exhausted for {}", b.canonical());
         };
         assert!(commented, "{} must get its own summary", b.canonical());
+    }
+
+    #[test]
+    fn a_slug_colliding_issues_lineage_is_not_published_on_this_one() {
+        // The lineage entity is named through `repo_slug` too, so `b`'s
+        // attempts are reachable from `a`. Its approaches and failure reasons
+        // belong to a different repo and must not be posted on `a`.
+        let database = db();
+        let a = IssueRef::new("own/er-repo", 7);
+        let b = IssueRef::new("own-er/repo", 7);
+        lineage::record_attempt(
+            &database,
+            &lineage::AttemptRecord {
+                issue: b.clone(),
+                approach: "a private approach from the other repo".to_string(),
+                ..attempt(1, AttemptOutcome::Failed, Some("red"))
+            },
+        )
+        .unwrap();
+
+        let mut gh_runner = ScriptedGh::new(vec![Ok(GhOutput::ok(r#"{"labels":[]}"#))]);
+        let exec = exhaust_issue(&mut gh_runner, &database, &a, true).unwrap();
+        let ExhaustOutcome::WouldExhaust {
+            attempts_summarized,
+            ..
+        } = exec.outcome
+        else {
+            panic!("expected WouldExhaust, got {:?}", exec.outcome);
+        };
+        assert_eq!(attempts_summarized, 0, "b's attempt was counted for a");
     }
 
     #[test]
