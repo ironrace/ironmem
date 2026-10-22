@@ -2623,6 +2623,99 @@ remediation record — otherwise the PR sits open and nobody is ever told"
     }
 
     #[test]
+    fn a_new_head_after_the_remediation_is_spent_still_reaches_the_human() {
+        // A remediation that spent its own cap at one commit, then a
+        // `needs_changes` about a *new* head (a failing dispatch still pushed
+        // it). The new round is not a new budget (#344): `arm_remediation`
+        // answers `CapReached` without writing a record, so the merge runs for
+        // real and rung 6's hold tells a human, rather than a fresh cap being
+        // armed for every pushed commit.
+        let db = approved_db();
+        record_success(&db, &issue(), Some(GREEN));
+        lineage::record_attempt(
+            &db,
+            &lineage::AttemptRecord {
+                issue: issue(),
+                attempt_n: 1,
+                approach: "went green".into(),
+                verdict: AttemptOutcome::Success,
+                why_failed: None,
+                commit_sha: Some(GREEN.to_string()),
+            },
+        )
+        .unwrap();
+        remediate::arm_remediation(
+            &db,
+            &ArmRequest {
+                issue: &issue(),
+                pr_number: 322,
+                head_sha: GREEN,
+                findings: Some("the retry loop is unbounded"),
+                attempt_cap: 5,
+            },
+        )
+        .unwrap();
+        // Five failed remediation dispatches since the success at attempt 1;
+        // the last of them pushed MOVED, which a reviewer then objected to.
+        lineage::upsert_issue_status(
+            &db,
+            &IssueStatus {
+                issue: issue(),
+                best_verdict: Some(AttemptOutcome::Success),
+                best_commit_sha: Some(GREEN.to_string()),
+                cumulative_attempt_n: 6,
+            },
+        )
+        .unwrap();
+        reviewed_at_needing_changes(&db, &issue(), 322, MOVED);
+
+        let (repo, roots) = checkout_with_worktree();
+        let mut gh = ScriptedGh::new(vec![
+            ok(&issue_list_json(
+                283,
+                &["agent:ready", "risk:documentation"],
+            )),
+            ok(&pr_list_json(322, MOVED)),
+            ok(&pr_view_json(MOVED)),
+            ok(r#"{"labels":[{"name":"agent:ready"}]}"#),
+            ok(""),
+            ok(""),
+            ok(""),
+        ]);
+        let mut config = config(roots.path(), repo.path());
+        config.merge = true;
+        config.remediate = true;
+        config.attempt_cap = 5;
+
+        let report = advance_pass(&db, &mut gh, &mut ForbiddenReviewer, &config).unwrap();
+        let advanced = &report.advanced[0];
+        assert!(
+            matches!(
+                advanced.remediation,
+                Some(ArmOutcome::CapReached {
+                    attempts_charged: 5,
+                    attempt_cap: 5,
+                    ..
+                })
+            ),
+            "got {:?}",
+            advanced.remediation
+        );
+        assert!(
+            advanced.merge.as_ref().unwrap().commented,
+            "the spent remediation reaches rung 6's real hold"
+        );
+        assert_eq!(
+            remediate::get_remediation(&db, &issue())
+                .unwrap()
+                .unwrap()
+                .head_sha,
+            GREEN,
+            "no record is armed for the new head"
+        );
+    }
+
+    #[test]
     fn a_needs_changes_about_a_commit_that_is_no_longer_the_head_arms_nothing() {
         // A verdict objects to the commit it read, and this is the case where
         // that matters: two `needs_changes` reviews, then a force-push back

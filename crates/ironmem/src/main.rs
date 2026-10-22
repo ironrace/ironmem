@@ -403,7 +403,8 @@ enum AutopilotCmd {
         /// Per-dispatch spend ceiling, passed through to --max-budget-usd
         #[arg(long)]
         max_budget_usd: Option<f64>,
-        /// Per-issue attempt cap, cumulative across runs
+        /// Per-issue attempt cap, cumulative across runs; a remediation gets
+        /// its own, counted from the issue's first success
         #[arg(long)]
         attempt_cap: Option<u32>,
         /// Daily ledger ceiling across all dispatches
@@ -670,7 +671,8 @@ enum AutopilotCmd {
         /// Per-dispatch spend ceiling
         #[arg(long)]
         max_budget_usd: Option<f64>,
-        /// Per-issue attempt cap, cumulative across runs
+        /// Per-issue attempt cap, cumulative across runs; a remediation gets
+        /// its own, counted from the issue's first success
         #[arg(long)]
         attempt_cap: Option<u32>,
         /// Daily ledger ceiling across all dispatches
@@ -701,7 +703,8 @@ enum AutopilotCmd {
         /// Ceiling on concurrently in-flight ICs across every repo
         #[arg(long)]
         concurrency_cap: Option<usize>,
-        /// Per-issue attempt cap, cumulative across runs
+        /// Per-issue attempt cap, cumulative across runs; a remediation gets
+        /// its own, counted from the issue's first success
         #[arg(long)]
         attempt_cap: Option<u32>,
         /// Per-dispatch spend ceiling, used for the same pre-authorization

@@ -35,7 +35,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   loop still halts; a re-arm for a new commit or `remediate --clear` does
   not reset it, and `autopilot retry` does. `remediation EXHAUSTED` output
   and the `cap_reached` JSON report that count (new `attempts_charged`
-  field).
+  field). On upgrade, an issue whose remediation was exhausted under the old
+  counter is charged afresh from its first success, so once a human
+  re-labels it `agent:ready` it may get the rest of that cap without an
+  `autopilot retry`.
 
 ### Changed
 

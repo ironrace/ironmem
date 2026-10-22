@@ -59,8 +59,8 @@
 //! own, shared by every round, see [`attempts_charged`]), reviews are bounded
 //! by rung 10's head-SHA trigger (no new commit, no new review, so a stuck
 //! remediation is never re-billed for a second opinion on the same diff), and
-//! the day is bounded by rung 5's ledger. Nothing here adds a fourth kind of spend; it adds a new *reason* to
-//! spend on the two that exist.
+//! the day is bounded by rung 5's ledger. Nothing here adds a fourth kind of
+//! spend; it adds a new *reason* to spend on the two that exist.
 //!
 //! # What is stored, and what is derived
 //!
@@ -383,11 +383,15 @@ pub fn active_remediation(
 /// remediation, and a remediation is never charged for attempts a retry
 /// already forgave.
 ///
-/// `succeeded` only spares the lineage read for an issue that cannot have a
-/// remediation. It fails closed either way: an issue with no recorded
-/// successful attempt (or one numbered past the counter, which only a
-/// hand-edited drawer could produce) gets no credit and is charged exactly as
-/// before #344.
+/// `succeeded` must be whether the issue's **status** records a success —
+/// every caller derives it from `best_verdict`. It is not merely an
+/// optimisation: the lineage and status writes are not one transaction, so a
+/// crash between them can leave a success in the lineage that the status
+/// never recorded, and passing `true` for that issue would credit attempts
+/// it never earned. Given an honest `succeeded`, it fails closed: an issue
+/// with no recorded successful attempt (or one numbered past the counter,
+/// which only a hand-edited drawer could produce) gets no credit and is
+/// charged exactly as before #344.
 pub fn attempts_charged(
     db: &Database,
     issue: &IssueRef,
@@ -409,10 +413,14 @@ pub fn attempts_charged(
 }
 
 /// The attempt number on which the issue first recorded a success, if any.
+///
+/// Records are filtered to this issue, as [`super::retry::read_grant`] filters
+/// its grant: two repos whose names collide on one knowledge-graph entity
+/// would otherwise charge one issue's remediation for the other's attempts.
 fn first_success_attempt(db: &Database, issue: &IssueRef) -> Result<Option<u32>, MemoryError> {
     Ok(lineage::attempts_for_issue(db, issue)?
         .into_iter()
-        .filter(|attempt| attempt.verdict == AttemptOutcome::Success)
+        .filter(|attempt| attempt.issue == *issue && attempt.verdict == AttemptOutcome::Success)
         .map(|attempt| attempt.attempt_n)
         .min())
 }
@@ -465,8 +473,9 @@ pub enum ArmOutcome {
         cumulative_attempt_n: u32,
         attempt_cap: u32,
         /// Attempts charged to the remediation — dispatched since the issue
-        /// first succeeded (or since a later human retry). This, not the
-        /// lifetime `cumulative_attempt_n`, is what reached `attempt_cap`.
+        /// first succeeded (or since a later human retry; the lifetime count
+        /// when the lineage records no success). This, not the lifetime
+        /// `cumulative_attempt_n`, is what reached `attempt_cap`.
         attempts_charged: u32,
     },
 }
@@ -746,7 +755,7 @@ depth resets and 'has this been dispatched?' stops being answerable"
 
         // One remediation dispatch ran and failed: the attempt count moves,
         // the success's commit does not.
-        succeeded(&db, 3, Some(HEAD));
+        spent(&db, 3, Some(HEAD));
 
         assert_eq!(
             arm(&db, HEAD, Some("f"), 5),
@@ -766,7 +775,7 @@ depth resets and 'has this been dispatched?' stops being answerable"
         succeeded(&db, 2, Some(HEAD));
         arm(&db, HEAD, Some("f"), 5);
 
-        succeeded(&db, 3, Some(HEAD));
+        spent(&db, 3, Some(HEAD));
 
         assert!(
             active_remediation(&db, &issue()).unwrap().is_some(),
@@ -803,7 +812,7 @@ is done and rung 10 reviews the new head"
         succeeded(&db, 2, Some(HEAD));
         arm(&db, HEAD, Some("f"), 5);
 
-        succeeded(&db, 2, Some(&HEAD.to_uppercase()));
+        spent(&db, 2, Some(&HEAD.to_uppercase()));
 
         assert!(
             active_remediation(&db, &issue()).unwrap().is_some(),
@@ -940,40 +949,69 @@ for any issue whose success recorded no commit"
             },
             "a third head is still charged from the first success"
         );
+        assert_eq!(
+            get_remediation(&db, &issue()).unwrap().unwrap().head_sha,
+            OTHER_HEAD,
+            "a refused arm writes nothing: the record in force is untouched"
+        );
     }
 
     #[test]
     fn the_remediation_loop_halts_within_its_own_cap_for_any_sequence_of_rounds() {
         // The amendment's termination requirement: "for any sequence of
         // reviewer verdicts, the remediation loop halts within its own cap".
-        // Every round here is a fresh `needs_changes` about a new head —
-        // the worst case — whether the round went green or only pushed.
+        // Each round is a `needs_changes` — about a new head or the same one
+        // again — followed by a run that spends one to three attempts
+        // (bounded, like `run_issue`, by the same `attempts_charged`), and
+        // which may or may not go green. Whatever the sequence, exactly one
+        // cap of remediation attempts is spent, and the loop ends on
+        // `CapReached`, which is what sends the PR to the human hold.
         for cap in 1..=5u32 {
             for first_success in 1..=cap {
-                for rounds_go_green in [false, true] {
+                for pattern in 0..8u32 {
+                    let rounds_go_green = pattern & 1 == 1;
+                    let reuse_heads = pattern & 2 == 2;
+                    let multi_attempt = pattern & 4 == 4;
                     let db = db();
                     succeeded(&db, first_success, Some("c0"));
                     let mut attempts = first_success;
-                    let mut dispatched = 0u32;
+                    let mut spent_since = 0u32;
+                    let mut ended_on_cap = false;
                     for round in 1..=100u32 {
-                        let head = format!("{round:040x}");
-                        if !arm(&db, &head, Some("again"), cap).in_force() {
-                            break;
-                        }
-                        // One dispatch for this round.
-                        attempts += 1;
-                        dispatched += 1;
-                        let commit = format!("c{round}");
-                        if rounds_go_green {
-                            succeeded(&db, attempts, Some(&commit));
+                        let head = if reuse_heads {
+                            format!("{:040x}", round / 2)
                         } else {
+                            format!("{round:040x}")
+                        };
+                        match arm(&db, &head, Some("again"), cap) {
+                            ArmOutcome::CapReached { .. } => {
+                                ended_on_cap = true;
+                                break;
+                            }
+                            outcome => assert!(outcome.in_force(), "{outcome:?}"),
+                        }
+                        let wanted = if multi_attempt { 1 + round % 3 } else { 1 };
+                        for _ in 0..wanted {
+                            if attempts_charged(&db, &issue(), attempts, true).unwrap() >= cap {
+                                break;
+                            }
+                            attempts += 1;
+                            spent_since += 1;
                             spent(&db, attempts, Some("c0"));
                         }
+                        if rounds_go_green {
+                            succeeded(&db, attempts, Some(&format!("c{round}")));
+                        }
                     }
+                    assert!(
+                        ended_on_cap,
+                        "cap {cap}, first success {first_success}, pattern {pattern}: \
+the loop must end on CapReached"
+                    );
                     assert_eq!(
-                        dispatched, cap,
-                        "cap {cap}, first success at {first_success}, green rounds \
-{rounds_go_green}: exactly one cap of remediation dispatches"
+                        spent_since, cap,
+                        "cap {cap}, first success {first_success}, pattern {pattern}: \
+exactly one cap of remediation attempts"
                     );
                 }
             }
@@ -997,12 +1035,19 @@ for any issue whose success recorded no commit"
             !arm(&db, HEAD, Some("f"), 5).in_force(),
             "a cleared remediation re-armed is still exhausted"
         );
+        assert_eq!(
+            get_remediation(&db, &issue()).unwrap(),
+            None,
+            "and nothing is written: a record here would put the issue back in \
+front of the Lead"
+        );
     }
 
     #[test]
     fn a_human_retry_restores_an_exhausted_remediation() {
         // The later mark wins: a retry granted after the remediation spent
-        // its cap gives it a full one back, at all three cap sites.
+        // its cap gives it a full one back. The queue and the run loop read
+        // the same `attempts_charged`, so they agree.
         let db = db();
         succeeded(&db, 5, Some(HEAD));
         arm(&db, HEAD, Some("f"), 5);
@@ -1018,8 +1063,8 @@ for any issue whose success recorded no commit"
 
     #[test]
     fn an_issue_with_no_recorded_success_gets_no_remediation_credit() {
-        // Fails closed. A status that claims a success the lineage never
-        // recorded (a hand-edited drawer, or one older than the lineage) is
+        // Fails closed. A status that claims a success the lineage does not
+        // hold (a hand-edited drawer, or lineage removed from under it) is
         // charged exactly as before #344 rather than handed a budget.
         let db = db();
         spent(&db, 5, Some(HEAD));
@@ -1056,6 +1101,19 @@ for any issue whose success recorded no commit"
             1,
             "a later retry wins"
         );
+    }
+
+    #[test]
+    fn a_success_after_a_retry_is_still_the_remediation_baseline() {
+        // #333's recovery followed by #344's: the original work exhausts its
+        // cap, a human retries, and it goes green two attempts later. The
+        // remediation is charged from that success, not from the retry —
+        // otherwise the attempts after the retry are taken from it again.
+        let db = db();
+        spent(&db, 5, None);
+        retry::grant_retry(&db, &issue(), 5).unwrap();
+        succeeded(&db, 7, Some(HEAD));
+        assert_eq!(attempts_charged(&db, &issue(), 9, true).unwrap(), 2);
     }
 
     #[test]

@@ -121,17 +121,18 @@ pub fn read_grant(db: &Database, issue: &IssueRef) -> Result<Option<RetryGrant>,
     Ok(Some(grant))
 }
 
-/// Attempts charged against the cap since `forgiven_through`.
+/// Attempts charged against the cap since `baseline` — a retry grant's
+/// `forgiven_through`, or the later of that and a remediation's start.
 ///
 /// The arithmetic only: cap enforcement goes through
-/// [`super::remediate::attempts_charged`], which also starts a remediation's
-/// count at the issue's first success.
+/// [`super::remediate::attempts_charged`], which picks the baseline, so this
+/// is not public outside the module tree.
 ///
-/// Saturating on both sides: a grant forgiving more than has been attempted
-/// (a cap lowered between runs, or a hand-edited drawer) leaves the full cap
-/// rather than wrapping into a huge budget.
-pub fn attempts_charged(cumulative_attempt_n: u32, forgiven_through: u32) -> u32 {
-    cumulative_attempt_n.saturating_sub(forgiven_through)
+/// Saturating: a baseline past what has been attempted (a cap lowered between
+/// runs, or a hand-edited drawer) charges nothing rather than wrapping into a
+/// huge count.
+pub(super) fn attempts_charged(cumulative_attempt_n: u32, baseline: u32) -> u32 {
+    cumulative_attempt_n.saturating_sub(baseline)
 }
 
 /// What a retry request did.
