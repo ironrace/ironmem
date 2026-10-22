@@ -866,6 +866,15 @@ pub fn run_issue(
         }
     }
     let mut cumulative_attempt_n = status.as_ref().map(|s| s.cumulative_attempt_n).unwrap_or(0);
+    // The remediation whose own budget this run spends (#344). Only one that
+    // re-opens a recorded success counts, which is the same predicate
+    // `plan_queue` applies before it reads the remediation at all — the two
+    // places that enforce the cap must charge the same attempts.
+    let budget_remediation = remediation.as_ref().filter(|_| {
+        status
+            .as_ref()
+            .is_some_and(|s| s.best_verdict == Some(AttemptOutcome::Success))
+    });
 
     // Resume the issue's existing session if one is in flight; otherwise open
     // a new one. The spec's crash-safe-state section is why the session uuid
@@ -952,7 +961,9 @@ pub fn run_issue(
         // grants a retry while a run is in flight must be honoured by the
         // very next dispatch, not the next run.
         let forgiven = retry::forgiven_through(db, issue)?;
-        if retry::attempts_charged(cumulative_attempt_n, forgiven) >= config.attempt_cap {
+        if remediate::attempts_charged(cumulative_attempt_n, forgiven, budget_remediation)
+            >= config.attempt_cap
+        {
             let attempts = prior_attempts(db, issue)?;
             record_terminal_summary(
                 db,
@@ -2385,11 +2396,54 @@ satisfies it on its own"
     }
 
     #[test]
-    fn a_remediation_dispatch_spends_the_same_attempt_cap_and_then_stops() {
-        // "Counting against the same per-issue attempt cap" — the sentence
-        // that makes the red path bounded rather than a money loop. The
-        // remediation is armed while the cap allows, spends what is left, and
-        // the run then stops on the cap rather than on `AlreadySucceeded`.
+    fn a_success_on_the_last_attempt_can_still_be_remediated() {
+        // Issue #344's boundary. The original work succeeds on attempt N of
+        // N, a reviewer asks for changes, and the remediation must still
+        // dispatch: its budget is its own, counted from when it was armed,
+        // not whatever the success happened to leave over. Before the fix the
+        // first remediation dispatch here was `AttemptCapExhausted` without
+        // a dispatch.
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        let mut config = config();
+        config.attempt_cap = 2;
+
+        let mut first = ScriptedDispatcher::new(vec![Ok(not_met()), Ok(met())]);
+        let run = run_issue(&db, &issue(), &brief(), &wt, &config, &mut first).unwrap();
+        assert!(matches!(run.terminal, TerminalReason::Met { .. }));
+        assert_eq!(run.cumulative_attempt_n, 2, "setup: success at 2 of 2");
+
+        let outcome = remediate::arm_remediation(
+            &db,
+            &remediate::ArmRequest {
+                issue: &issue(),
+                pr_number: 42,
+                head_sha: "deadbeef",
+                findings: Some("fix it"),
+                attempt_cap: 2,
+            },
+        )
+        .unwrap();
+        assert!(outcome.in_force(), "got {outcome:?}");
+
+        let mut second = ScriptedDispatcher::new(vec![Ok(met())]);
+        let run = run_issue(&db, &issue(), &brief(), &wt, &config, &mut second).unwrap();
+        assert_eq!(second.seen.len(), 1, "the remediation dispatch ran");
+        assert!(
+            matches!(run.terminal, TerminalReason::Met { .. }),
+            "got {:?}",
+            run.terminal
+        );
+        // The lifetime counter keeps numbering, so the prompt's history of
+        // attempts stays unambiguous.
+        assert_eq!(run.cumulative_attempt_n, 3);
+    }
+
+    #[test]
+    fn a_remediation_gets_a_full_cap_of_its_own_and_then_stops() {
+        // The budget is independent of the original work, and still a bound:
+        // the remediation spends exactly `attempt_cap` dispatches and the run
+        // then stops on the cap rather than re-dispatching for ever.
         let db = approved_db();
         let (_dir, wt) = fixture_worktree();
         let mut config = config();
@@ -2410,51 +2464,25 @@ satisfies it on its own"
         )
         .unwrap();
 
-        // The remediation dispatch runs and does not fix it: attempt 2 of 2.
-        let mut second = ScriptedDispatcher::new(vec![Ok(not_met())]);
+        let mut second = ScriptedDispatcher::new(vec![Ok(not_met()), Ok(not_met())]);
         let run = run_issue(&db, &issue(), &brief(), &wt, &config, &mut second).unwrap();
-        assert_eq!(second.seen.len(), 1, "the remediation dispatch did run");
+        assert_eq!(
+            second.seen.len(),
+            2,
+            "a full cap of remediation dispatches, not the one the success left"
+        );
         assert!(
             matches!(run.terminal, TerminalReason::AttemptCapExhausted),
             "got {:?}",
             run.terminal
         );
-    }
+        assert_eq!(run.cumulative_attempt_n, 3);
 
-    #[test]
-    fn a_remediation_is_never_armed_once_the_cap_is_spent() {
-        // The other half of the same bound, and the one that hands the PR
-        // back: at the cap `arm_remediation` writes nothing, so the issue
-        // stays `AlreadySucceeded` here and the advance pass runs rung 6's
-        // real hold, which tells a human.
-        let db = approved_db();
-        let (_dir, wt) = fixture_worktree();
-        let mut config = config();
-        config.attempt_cap = 1;
-
-        let mut first = ScriptedDispatcher::new(vec![Ok(met())]);
-        run_issue(&db, &issue(), &brief(), &wt, &config, &mut first).unwrap();
-
-        let outcome = remediate::arm_remediation(
-            &db,
-            &remediate::ArmRequest {
-                issue: &issue(),
-                pr_number: 42,
-                head_sha: "deadbeef",
-                findings: Some("fix it"),
-                attempt_cap: 1,
-            },
-        )
-        .unwrap();
-        assert!(!outcome.in_force(), "got {outcome:?}");
-
-        let mut second = ScriptedDispatcher::new(vec![]);
-        let run = run_issue(&db, &issue(), &brief(), &wt, &config, &mut second).unwrap();
-        assert!(matches!(
-            run.terminal,
-            TerminalReason::AlreadySucceeded { .. }
-        ));
-        assert!(second.seen.is_empty());
+        // And it stays stopped: the next run does not dispatch again.
+        let mut third = ScriptedDispatcher::new(vec![]);
+        let run = run_issue(&db, &issue(), &brief(), &wt, &config, &mut third).unwrap();
+        assert_eq!(run.terminal, TerminalReason::AttemptCapExhausted);
+        assert!(third.seen.is_empty());
     }
 
     // ── attempt cap ─────────────────────────────────────────────────────

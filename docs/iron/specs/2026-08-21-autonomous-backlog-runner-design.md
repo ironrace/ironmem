@@ -342,7 +342,7 @@ Five decisions in it are load-bearing:
 
 ### The red path — rung 11 ⟨r10⟩
 
-Rev 9 recorded rung 10's residual: the data flow's *"NEEDS CHANGES → re-dispatch IC to fix"* arrow was drawn and never run, so a held PR was reviewed, commented and labeled exactly as rungs 5 and 6 specify, and then waited for a human. `autopilot/remediate.rs` executes it, under `autopilot advance --remediate`, and the error table's own bound — *"counting against the same per-issue attempt cap"* — is what makes it terminate.
+Rev 9 recorded rung 10's residual: the data flow's *"NEEDS CHANGES → re-dispatch IC to fix"* arrow was drawn and never run, so a held PR was reviewed, commented and labeled exactly as rungs 5 and 6 specify, and then waited for a human. `autopilot/remediate.rs` executes it, under `autopilot advance --remediate`, and the error table's own bound — *"counting against the same per-issue attempt cap"* — is what makes it terminate. (#344: the same cap *value*, but a remediation is charged only for the dispatches since it was armed, not the remainder the original work left — so an issue that went green on its last attempt can still answer its review.)
 
 Rev 9 also said why it was deferred: *re-opening work whose lineage records a success is a distinct capability with its own hazards*. There are three, and they are what the module is shaped by.
 
@@ -552,7 +552,7 @@ The lineage store is shaped so the AVO loop is additive: add a `score` field to 
 | ⟨r2⟩ Lead restart finds a live IC with no dispatch drawer | Orphan: flag for human. Never silently adopted. |
 | Gate command inferred wrongly | Caught at the human approval step. If wrong post-approval, the gate fails → task blocks and does **not** merge. Fails safe. |
 | Diff's risk class ≠ dispatch-time class | Fail closed: PR stays open for human review. Never merge on the stale class. |
-| Reviewer uncertain, or returns NEEDS CHANGES | ⟨r2⟩ Re-dispatch the IC to fix, counting against the same per-issue attempt cap. On exhaustion the PR stays open for a human — never merged with an unresolved finding. ⟨r10⟩ **Built, rung 11** (`autopilot/remediate.rs`), behind `autopilot advance --remediate`; without the flag the PR is held for a human immediately, which is rung 10's behaviour. |
+| Reviewer uncertain, or returns NEEDS CHANGES | ⟨r2⟩ Re-dispatch the IC to fix, counting against the same per-issue attempt cap (#344: charged from when the remediation was armed, so it never inherits only what the success left over). On exhaustion the PR stays open for a human — never merged with an unresolved finding. ⟨r10⟩ **Built, rung 11** (`autopilot/remediate.rs`), behind `autopilot advance --remediate`; without the flag the PR is held for a human immediately, which is rung 10's behaviour. |
 | ⟨r2⟩ Reviewer itself fails to run | Treated as NOT reviewed. No auto-merge; PR waits for a human. Infrastructure failure never becomes implicit approval. |
 | IC hits a human-only decision | Message the Lead. Lead answers from cross-repo context if it can; otherwise posts the question on the issue, flips to `agent:blocked`. IC checkpoints findings to lineage and **exits** rather than holding a process. |
 | ⟨r2⟩ Human answers a blocked issue | Lead polls `agent:blocked` issues for human comments newer than its own question, appends the answer to lineage, flips back to `agent:ready`, re-dispatches. Closes the one-way door rev 1 left open. |

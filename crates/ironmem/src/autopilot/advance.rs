@@ -2475,10 +2475,11 @@ and no `agent:blocked` comment is posted, or the Lead never sees the issue again
     }
 
     #[test]
-    fn an_issue_at_its_attempt_cap_falls_through_to_the_human_hold() {
-        // The spec's "on exhaustion the PR stays open for a human". The
-        // automation has given up, so the merge runs for real and rung 6
-        // comments and flips the label — which is the notification.
+    fn a_success_on_its_last_attempt_is_still_remediated_not_handed_over() {
+        // Issue #344. The original work succeeded on attempt 5 of 5, and a
+        // remediation's budget is its own rather than what the success left
+        // over — so a `needs_changes` here arms a re-dispatch instead of
+        // going straight to the human hold.
         let db = approved_db();
         lineage::upsert_issue_status(
             &db,
@@ -2498,10 +2499,6 @@ and no `agent:blocked` comment is posted, or the Lead never sees the issue again
             )),
             ok(&pr_list_json(322, GREEN)),
             ok(&pr_view_json(GREEN)),
-            ok(r#"{"labels":[{"name":"agent:ready"}]}"#),
-            ok(""),
-            ok(""),
-            ok(""),
         ]);
         let mut config = config(roots.path(), repo.path());
         config.merge = true;
@@ -2511,26 +2508,18 @@ and no `agent:blocked` comment is posted, or the Lead never sees the issue again
         let report = advance_pass(&db, &mut gh, &mut needs_changes(), &config).unwrap();
         let advanced = &report.advanced[0];
         assert!(
-            matches!(
-                advanced.remediation,
-                Some(ArmOutcome::CapReached {
-                    cumulative_attempt_n: 5,
-                    attempt_cap: 5
-                })
-            ),
+            matches!(advanced.remediation, Some(ArmOutcome::Armed { .. })),
             "got {:?}",
             advanced.remediation
         );
         let execution = advanced.merge.as_ref().unwrap();
         assert!(
-            execution.commented,
-            "an exhausted issue must reach the real hold, or nobody is told"
+            execution.label_plan.is_none() && !execution.commented,
+            "a remediation in force rehearses the merge; the hold is for exhaustion"
         );
-        assert_eq!(
-            remediate::get_remediation(&db, &issue()).unwrap(),
-            None,
-            "nothing is armed for an issue that can never be dispatched"
-        );
+        assert!(remediate::active_remediation(&db, &issue())
+            .unwrap()
+            .is_some());
     }
 
     #[test]
@@ -2560,15 +2549,16 @@ and no `agent:blocked` comment is posted, or the Lead never sees the issue again
             },
         )
         .unwrap();
-        // The remediation dispatches spent the cap and never fixed it. Same
-        // commit, so the remediation is still in force.
+        // Armed at attempt 1, the remediation dispatches spent its own cap of
+        // five and never fixed it. Same commit, so the remediation is still
+        // in force.
         lineage::upsert_issue_status(
             &db,
             &IssueStatus {
                 issue: issue(),
                 best_verdict: Some(AttemptOutcome::Success),
                 best_commit_sha: Some(GREEN.to_string()),
-                cumulative_attempt_n: 5,
+                cumulative_attempt_n: 6,
             },
         )
         .unwrap();

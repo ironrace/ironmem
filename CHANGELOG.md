@@ -24,6 +24,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   remain inside `unpriced_dispatch_count` until the day rolls over, so
   the old headroom effect can persist for the rest of the merge day —
   conservative, and gone at midnight UTC.
+- **A remediation gets its own attempt budget (#344).** A re-dispatch armed
+  by a reviewer's NEEDS CHANGES used to get only the attempts the original
+  work had left, so an issue that went green on its last attempt went
+  straight to `AttemptCapExhausted`. The queue, the run loop and
+  `advance --remediate` now count a remediation's attempts from when it was
+  armed, against the same `--attempt-cap`. `remediation EXHAUSTED` output
+  and the `cap_reached` JSON now report that count (new `attempts_charged`
+  field).
 
 ### Changed
 

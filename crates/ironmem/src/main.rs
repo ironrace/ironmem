@@ -1133,11 +1133,12 @@ fn print_advance_report(report: &ironmem::autopilot::advance::AdvanceReport) {
                 );
             }
             Some(ArmOutcome::CapReached {
-                cumulative_attempt_n,
                 attempt_cap,
+                attempts_charged,
+                ..
             }) => {
                 println!(
-                    "    remediation EXHAUSTED ({cumulative_attempt_n}/{attempt_cap} attempts) — the PR stays open for a human"
+                    "    remediation EXHAUSTED ({attempts_charged}/{attempt_cap} attempts since it was armed) — the PR stays open for a human"
                 );
             }
         }

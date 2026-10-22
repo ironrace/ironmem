@@ -457,33 +457,42 @@ pub fn plan_queue(
             let status = lineage::get_issue_status(db, &issue)?;
             // A recorded success ends the issue — unless rung 11 has re-opened
             // it. A reviewer's `needs_changes` verdict is the spec's own reason
-            // to dispatch a succeeded issue again ("re-dispatch the IC to fix,
-            // counting against the same per-issue attempt cap"), and the cap
-            // check immediately below is what keeps that bounded rather than
+            // to dispatch a succeeded issue again, and the cap check
+            // immediately below is what keeps that bounded rather than
             // endless — it is deliberately *not* skipped for a remediation.
+            // The remediation is charged against a cap of its own, counted
+            // from when it was armed (#344), not the remainder of the issue's.
             //
-            // The success is tested first so `&&` short-circuits: only a
-            // succeeded issue can be deferred here, and reading the
-            // remediation drawer unconditionally cost every in-progress issue
-            // an extra drawer read plus a second read of the lineage status
-            // this line already holds — on every issue, on every tick.
+            // The success is tested first so only a succeeded issue reads the
+            // remediation drawer: reading it unconditionally cost every
+            // in-progress issue an extra drawer read plus a second read of the
+            // lineage status this line already holds — on every issue, on
+            // every tick.
             let succeeded = status
                 .as_ref()
                 .is_some_and(|s| s.best_verdict == Some(AttemptOutcome::Success));
-            if succeeded && remediate::active_remediation(db, &issue)?.is_none() {
+            let remediation = if succeeded {
+                remediate::active_remediation(db, &issue)?
+            } else {
+                None
+            };
+            if succeeded && remediation.is_none() {
                 defer(DeferReason::AlreadySucceeded);
                 continue;
             }
             let cumulative_attempt_n = status.as_ref().map(|s| s.cumulative_attempt_n).unwrap_or(0);
-            // Read through the same forgiveness `run_issue` applies. The cap
-            // is enforced in both places on purpose ("same predicate, one
-            // place each"), so both must read the *charged* count: a queue
-            // that compared the raw lifetime counter would defer a
-            // human-retried issue as `AttemptCapReached` on every tick and
-            // `run_issue` would never see it — which is the very
-            // never-recovers shape `autopilot retry` exists to end.
-            let charged =
-                retry::attempts_charged(cumulative_attempt_n, retry::forgiven_through(db, &issue)?);
+            // Read through the same count `run_issue` applies. The cap is
+            // enforced in both places on purpose ("same predicate, one place
+            // each"), so both must read the *charged* count: a queue that
+            // compared the raw lifetime counter would defer a human-retried
+            // issue — or a remediation of a success that spent the whole cap —
+            // as `AttemptCapReached` on every tick and `run_issue` would never
+            // see it.
+            let charged = remediate::attempts_charged(
+                cumulative_attempt_n,
+                retry::forgiven_through(db, &issue)?,
+                remediation.as_ref(),
+            );
             if charged >= config.attempt_cap {
                 defer(DeferReason::AttemptCapReached {
                     cumulative_attempt_n,
@@ -854,8 +863,8 @@ mod tests {
         let mut cfg = config();
         cfg.attempt_cap = 5;
         arm(&db, &issue, Some("abc123"), 5);
-        // Five attempts spent since.
-        put_status(&db, &issue, 5, true);
+        // Armed at attempt 1, so five remediation attempts spent since.
+        put_status(&db, &issue, 6, true);
 
         let plan = plan_queue(
             &db,
@@ -867,9 +876,43 @@ mod tests {
         assert_eq!(
             reason_for(&plan, 1),
             DeferReason::AttemptCapReached {
-                cumulative_attempt_n: 5
+                cumulative_attempt_n: 6
             }
         );
+    }
+
+    #[test]
+    fn a_success_on_the_last_attempt_is_still_selected_for_its_remediation() {
+        // Issue #344: the remediation's budget is its own, counted from when
+        // it was armed. A success at attempt 5 of 5 used to leave nothing, so
+        // the queue deferred the remediation as `AttemptCapReached` before it
+        // ever dispatched.
+        let db = approved(&[REPO]);
+        let issue = IssueRef::new(REPO, 1);
+        let mut cfg = config();
+        cfg.attempt_cap = 5;
+        put_status(&db, &issue, 5, true);
+        let outcome = remediate::arm_remediation(
+            &db,
+            &remediate::ArmRequest {
+                issue: &issue,
+                pr_number: 7,
+                head_sha: "abc123",
+                findings: Some("the retry loop is unbounded"),
+                attempt_cap: 5,
+            },
+        )
+        .unwrap();
+        assert!(outcome.in_force(), "setup did not arm: {outcome:?}");
+
+        let plan = plan_queue(
+            &db,
+            &[backlog(REPO, vec![ready(1)])],
+            &empty_registry(),
+            &cfg,
+        )
+        .unwrap();
+        assert_eq!(numbers(&plan), vec![1]);
     }
 
     #[test]
