@@ -428,7 +428,8 @@ pub enum TerminalReason {
     AlreadySucceeded { commit_sha: Option<String> },
     /// The per-issue attempt cap was reached. Terminal: per the spec,
     /// `agent:exhausted` *"never self-resumes"*, so the dispatch state is
-    /// cleared and only a human re-labeling retries.
+    /// cleared and only a human `autopilot retry` brings it back (a re-label
+    /// alone leaves the cap in force).
     AttemptCapExhausted,
     /// The goal evaluator judged the condition unsatisfiable.
     Impossible { reason: Option<String> },

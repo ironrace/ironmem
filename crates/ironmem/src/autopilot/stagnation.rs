@@ -114,6 +114,23 @@ pub fn exhaust_issue(
     validate_repo(&issue.repo)?;
 
     let current = gh::issue_labels(gh_runner, issue)?;
+    exhaust_issue_with_labels(gh_runner, db, issue, current, dry_run)
+}
+
+/// [`exhaust_issue`] against labels the caller has already read.
+///
+/// For a caller that must judge the fresh labels itself before closing an
+/// issue out — the Lead, which must not overwrite an `agent:blocked` or
+/// opted-out issue — without a second `gh issue view` for the same labels.
+pub fn exhaust_issue_with_labels(
+    gh_runner: &mut dyn GhRunner,
+    db: &Database,
+    issue: &IssueRef,
+    current: Vec<String>,
+    dry_run: bool,
+) -> Result<ExhaustExecution, MemoryError> {
+    validate_repo(&issue.repo)?;
+
     let already = current
         .iter()
         .any(|l| AgentLabel::from_label_str(l) == Some(AgentLabel::Exhausted));
@@ -175,7 +192,12 @@ pub fn exhaust_issue(
     // identical exhaustion summary. The notice is written *after* the
     // comment succeeds and *before* the label is attempted, so a retry
     // skips the comment and retries only the half that failed.
-    let commented = if exhaustion_notice_posted(db, issue)? {
+    //
+    // The notice only covers the attempts it summarized. One left behind by
+    // a failed label write survives `retry` (which never sees it), so a later
+    // exhaustion with new attempts recorded would otherwise be labeled with
+    // no summary of them at all.
+    let commented = if exhaustion_notice_covers(db, issue, attempts.len())? {
         false
     } else {
         gh::comment_on_issue(gh_runner, issue, &body)?;
@@ -241,8 +263,33 @@ fn exhaustion_notice_key(issue: &IssueRef) -> String {
 /// run that posts the comment and then fails to label is precisely the run
 /// whose work must not be repeated.
 fn exhaustion_notice_posted(db: &Database, issue: &IssueRef) -> Result<bool, MemoryError> {
+    Ok(owned_exhaustion_notice(db, issue)?.is_some())
+}
+
+/// Whether this issue's notice summarized at least `attempts` attempts — that
+/// is, whether the summary it stands for is still the current one.
+///
+/// A notice written before `attempts_summarized` existed reads as current, as
+/// every notice did before.
+fn exhaustion_notice_covers(
+    db: &Database,
+    issue: &IssueRef,
+    attempts: usize,
+) -> Result<bool, MemoryError> {
+    Ok(owned_exhaustion_notice(db, issue)?.is_some_and(|body| {
+        body["attempts_summarized"]
+            .as_u64()
+            .is_none_or(|summarized| summarized >= attempts as u64)
+    }))
+}
+
+/// This issue's notice body, if one is stored and belongs to this issue.
+fn owned_exhaustion_notice(
+    db: &Database,
+    issue: &IssueRef,
+) -> Result<Option<serde_json::Value>, MemoryError> {
     let Some(drawer) = super::read_current(db, &exhaustion_notice_key(issue))? else {
-        return Ok(false);
+        return Ok(None);
     };
     // The key goes through `repo_slug`, which maps `/` and every other
     // unsafe character to `-` — so `own/er-repo#42` and `own-er/repo#42`
@@ -259,7 +306,7 @@ fn exhaustion_notice_posted(db: &Database, issue: &IssueRef) -> Result<bool, Mem
     // is shared with `add_drawer`, so a foreign writer landing on this id is
     // reachable, not theoretical.
     let Ok(body) = serde_json::from_str::<serde_json::Value>(&drawer.content) else {
-        return Ok(false);
+        return Ok(None);
     };
     // Compared case-insensitively for consistency with this module's other
     // canonical comparisons, though unlike those it is not load-bearing:
@@ -268,9 +315,10 @@ fn exhaustion_notice_posted(db: &Database, issue: &IssueRef) -> Result<bool, Mem
     // drawer ids and never reach this line. The keys that do collide differ
     // by `/` versus `-`, which no case folding can conflate — so this
     // comparison can only ever be more permissive than the key, never less.
-    Ok(body["issue"]
+    let owned = body["issue"]
         .as_str()
-        .is_some_and(|stored| stored.eq_ignore_ascii_case(&issue.canonical())))
+        .is_some_and(|stored| stored.eq_ignore_ascii_case(&issue.canonical()));
+    Ok(owned.then_some(body))
 }
 
 /// Delete the notice once the label it was covering for has landed.
@@ -585,6 +633,39 @@ are read once, not again inside the label write: {:?}",
             "{:?}",
             gh_runner.seen
         );
+    }
+
+    #[test]
+    fn a_notice_left_by_a_failed_label_write_does_not_silence_a_later_exhaustion() {
+        // The close-out posts its summary, then the label write fails, so
+        // the notice survives. The human runs `retry` as the summary says —
+        // `retry` never sees the notice — and the issue exhausts again with
+        // new attempts. Those attempts must be summarized, not silently
+        // labeled under the first summary's notice.
+        let database = db();
+        lineage::record_attempt(&database, &attempt(1, AttemptOutcome::Failed, Some("red")))
+            .unwrap();
+        let mut gh_runner = ScriptedGh::new(vec![
+            Ok(GhOutput::ok(r#"{"labels":[{"name":"agent:ready"}]}"#)),
+            Ok(GhOutput::ok("")),
+            Ok(GhOutput::failed("", "label already exists")),
+            Ok(GhOutput::failed("", "HTTP 403: Forbidden")),
+        ]);
+        exhaust_issue(&mut gh_runner, &database, &issue(), false).unwrap_err();
+
+        lineage::record_attempt(&database, &attempt(2, AttemptOutcome::Failed, Some("red")))
+            .unwrap();
+        let mut gh_runner = ScriptedGh::new(vec![
+            Ok(GhOutput::ok(r#"{"labels":[{"name":"agent:ready"}]}"#)),
+            Ok(GhOutput::ok("")),
+            Ok(GhOutput::failed("", "label already exists")),
+            Ok(GhOutput::ok("")),
+        ]);
+        let exec = exhaust_issue(&mut gh_runner, &database, &issue(), false).unwrap();
+        let ExhaustOutcome::Exhausted { commented, .. } = exec.outcome else {
+            panic!("expected Exhausted, got {:?}", exec.outcome);
+        };
+        assert!(commented, "the new attempts must be summarized");
     }
 
     #[test]

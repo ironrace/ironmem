@@ -81,11 +81,12 @@ use serde::Serialize;
 use super::advise::{self, Advice, AdviceConfig, Advisor};
 use super::blocked::{self, BlockedPoll};
 use super::gh::{self, GhRunner};
-use super::labels::AgentLabel;
+use super::labels::{self, AgentLabel, DispatchEligibility};
 use super::lineage::{self, AttemptOutcome};
 use super::merge::serialize_issue;
 use super::queue::{self, QueueConfig, QueuePlan, RepoBacklog, IN_FLIGHT_SCAN_LIMIT};
 use super::registry::{self, AgentRegistry, RegistrySnapshot};
+use super::retry;
 use super::run::{self, Dispatcher, IssueBrief, IssueRun, RunConfig};
 use super::scrub::scrub_and_bound;
 use super::stagnation::{self, ExhaustExecution};
@@ -399,11 +400,13 @@ pub fn lead_tick(
 /// One exception: an issue with a recorded success, which can only be at its
 /// cap through rung 11's remediation, is left for `advance`'s human hold.
 ///
-/// Calling [`stagnation::exhaust_issue`] on every such tick is safe because
-/// it is idempotent by construction: it reads the labels fresh and leaves an
-/// `agent:exhausted` issue alone, and its posted-notice drawer stops a retry
-/// after a failed label write from posting the summary twice. A dry run reads
-/// the labels and reports what it would do, and writes nothing.
+/// Closing out on every such tick is safe because it is idempotent by
+/// construction: [`close_out_one`] reads the labels fresh, leaves an
+/// `agent:exhausted` issue alone, and leaves an `agent:blocked` or opted-out
+/// one alone too; it re-checks the cap against a `retry` granted since the
+/// plan was made; and the posted-notice drawer stops a retry after a failed
+/// label write from posting the summary twice. A dry run reads the labels and
+/// reports what it would do, and writes nothing.
 ///
 /// Failures are collected, not propagated, like every other GitHub write on
 /// the tick: the dispatch already happened and is already banked.
@@ -418,40 +421,18 @@ fn close_out_exhausted(
     let ended_at_cap = runs
         .iter()
         .filter(|r| r.terminal == run::TerminalReason::AttemptCapExhausted)
-        .map(|r| &r.issue);
+        .map(|r| (&r.issue, config.run.attempt_cap));
     let deferred_at_cap = plan
         .deferred
         .iter()
         .filter(|d| matches!(d.reason, queue::DeferReason::AttemptCapReached { .. }))
-        .map(|d| &d.issue);
+        .map(|d| (&d.issue, config.queue.attempt_cap));
 
     let mut exhausted = Vec::new();
-    for issue in ended_at_cap.chain(deferred_at_cap) {
-        // A succeeded issue only reaches its cap through rung 11's red path,
-        // and that exhaustion already has an owner: `advance` holds the PR for
-        // a human with the reviewer's findings and flips the issue to
-        // `agent:blocked`. It finds the issue through the `agent:ready`
-        // listing, so applying `agent:exhausted` here would strip the label
-        // the hold needs and swallow the hand-off.
-        match lineage::get_issue_status(db, issue) {
-            Ok(status)
-                if status
-                    .as_ref()
-                    .is_some_and(|s| s.best_verdict == Some(AttemptOutcome::Success)) =>
-            {
-                continue;
-            }
-            Ok(_) => {}
-            Err(e) => {
-                problems.push(TickProblem {
-                    what: format!("close out exhausted {}", issue.canonical()),
-                    detail: e.to_string(),
-                });
-                continue;
-            }
-        }
-        match stagnation::exhaust_issue(gh_runner, db, issue, config.dry_run) {
-            Ok(exec) => exhausted.push(exec),
+    for (issue, attempt_cap) in ended_at_cap.chain(deferred_at_cap) {
+        match close_out_one(db, gh_runner, issue, attempt_cap, config.dry_run) {
+            Ok(Some(exec)) => exhausted.push(exec),
+            Ok(None) => {}
             Err(e) => problems.push(TickProblem {
                 what: format!("close out exhausted {}", issue.canonical()),
                 detail: e.to_string(),
@@ -459,6 +440,50 @@ fn close_out_exhausted(
         }
     }
     exhausted
+}
+
+/// Close out one issue found at its cap, or `None` when it must be left
+/// alone. Every guard reads fresh state: the plan was made before this
+/// tick's dispatches ran, and those can take as long as their wall-clock
+/// timeout.
+fn close_out_one(
+    db: &Database,
+    gh_runner: &mut dyn GhRunner,
+    issue: &IssueRef,
+    attempt_cap: u32,
+    dry_run: bool,
+) -> Result<Option<ExhaustExecution>, MemoryError> {
+    let status = lineage::get_issue_status(db, issue)?;
+    // A succeeded issue only reaches its cap through rung 11's red path, and
+    // that exhaustion already has an owner: `advance` holds the PR for a
+    // human with the reviewer's findings and flips the issue to
+    // `agent:blocked`. It finds the issue through the `agent:ready` listing,
+    // so applying `agent:exhausted` here would strip the label the hold needs
+    // and swallow the hand-off.
+    if status
+        .as_ref()
+        .is_some_and(|s| s.best_verdict == Some(AttemptOutcome::Success))
+    {
+        return Ok(None);
+    }
+    // Re-checked against the retry grant as it stands now, not as the queue
+    // saw it: a human who ran `autopilot retry` while this tick's dispatches
+    // were running must not have the issue closed out from under them.
+    let attempted = status.map(|s| s.cumulative_attempt_n).unwrap_or(0);
+    if retry::attempts_charged(attempted, retry::forgiven_through(db, issue)?) < attempt_cap {
+        return Ok(None);
+    }
+    // And the labels, read fresh, must still say this is Autopilot's to
+    // close: the exclusive transition would strip an `agent:blocked` a human
+    // applied since the listing (losing the open question), or label an
+    // issue they have since opted out. An already-exhausted issue goes
+    // through, for `exhaust_issue`'s own idempotent cleanup.
+    let current = gh::issue_labels(gh_runner, issue)?;
+    match labels::eligibility(&current) {
+        DispatchEligibility::Eligible | DispatchEligibility::Exhausted => {}
+        DispatchEligibility::Blocked | DispatchEligibility::NotOptedIn => return Ok(None),
+    }
+    stagnation::exhaust_issue_with_labels(gh_runner, db, issue, current, dry_run).map(Some)
 }
 
 /// Poll every repo's `agent:blocked` issues for human answers.
@@ -963,7 +988,7 @@ mod tests {
     use crate::autopilot::registry::RegistryOutput;
     use crate::autopilot::stagnation::ExhaustOutcome;
     use crate::autopilot::supervise::{ProcessHealth, StrategyHealth};
-    use crate::autopilot::{dispatch_state, gate_config, DispatchState};
+    use crate::autopilot::{dispatch_state, gate_config, remediate, DispatchState};
     use std::path::Path;
 
     const REPO: &str = "ironrace/ironmem";
@@ -2668,9 +2693,9 @@ mod tests {
             best_commit_sha: Some("abc123".to_string()),
         };
         lineage::upsert_issue_status(&db, &status(1)).unwrap();
-        let armed = crate::autopilot::remediate::arm_remediation(
+        let armed = remediate::arm_remediation(
             &db,
-            &crate::autopilot::remediate::ArmRequest {
+            &remediate::ArmRequest {
                 issue: &issue,
                 pr_number: 7,
                 head_sha: "abc123",
@@ -2751,5 +2776,113 @@ mod tests {
             ExhaustOutcome::WouldExhaust { .. }
         ));
         assert_eq!(gh_runner.seen.len(), 3, "reads only: {:?}", gh_runner.seen);
+    }
+
+    fn strand_at_cap(db: &Database, number: u64, attempts: u32) {
+        lineage::upsert_issue_status(
+            db,
+            &lineage::IssueStatus {
+                issue: IssueRef::new(REPO, number),
+                cumulative_attempt_n: attempts,
+                best_verdict: None,
+                best_commit_sha: None,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_capped_issue_a_human_blocked_since_the_listing_is_not_overwritten() {
+        // The listing said `agent:ready`, but by the close-out a human has
+        // moved it to `agent:blocked`. The exclusive transition would strip
+        // that label, and the open question with it.
+        let db = approved_db();
+        let f = fixture();
+        strand_at_cap(&db, 3, 1);
+        let mut gh_runner = ScriptedGh::new(vec![
+            Ok(GhOutput::ok("[]")),
+            Ok(GhOutput::ok(&issue_list_json(&[(3, &["agent:ready"])]))),
+            Ok(GhOutput::ok(&labels_json(&["agent:blocked"]))),
+        ]);
+        let report = lead_tick(
+            &db,
+            &mut gh_runner,
+            &mut empty_registry(),
+            &mut RefusingDispatcher,
+            &mut no_advisor(),
+            &capped_config(&f, 1),
+        )
+        .unwrap();
+
+        assert!(report.exhausted.is_empty(), "{:?}", report.exhausted);
+        assert_eq!(gh_runner.seen.len(), 3, "no write: {:?}", gh_runner.seen);
+        assert!(report.problems.is_empty(), "{:?}", report.problems);
+    }
+
+    /// Fails every dispatch, and grants a retry to `forgive` while doing so —
+    /// a human running `autopilot retry` while the tick's dispatch is running.
+    struct RetryingMidTick<'a> {
+        db: &'a Database,
+        forgive: IssueRef,
+    }
+
+    impl Dispatcher for RetryingMidTick<'_> {
+        fn dispatch(
+            &mut self,
+            repo: &Path,
+            spec: &DispatchSpec,
+        ) -> Result<DispatchOutcome, MemoryError> {
+            let attempted = lineage::get_issue_status(self.db, &self.forgive)?
+                .map(|s| s.cumulative_attempt_n)
+                .unwrap_or(0);
+            retry::grant_retry(self.db, &self.forgive, attempted)?;
+            NotMetDispatcher { calls: 0 }.dispatch(repo, spec)
+        }
+    }
+
+    #[test]
+    fn a_retry_granted_during_the_tick_is_not_closed_out_by_it() {
+        // The plan deferred #3 at its cap before #4's dispatch ran. A human
+        // forgave #3 meanwhile, so closing it out on the plan's word would
+        // revert their retry.
+        let db = approved_db();
+        let f = fixture();
+        strand_at_cap(&db, 3, 1);
+        let mut gh_runner = ScriptedGh::new(vec![
+            Ok(GhOutput::ok("[]")),
+            Ok(GhOutput::ok(&issue_list_json(&[
+                (3, &["agent:ready"]),
+                (4, &["agent:ready"]),
+            ]))),
+            // #4 ended at its cap: its close-out
+            Ok(GhOutput::ok(&labels_json(&["agent:ready"]))),
+            Ok(GhOutput::ok("")),
+            Ok(GhOutput::failed("", "label already exists")),
+            Ok(GhOutput::ok("")),
+        ]);
+        let mut dispatcher = RetryingMidTick {
+            db: &db,
+            forgive: IssueRef::new(REPO, 3),
+        };
+        let report = lead_tick(
+            &db,
+            &mut gh_runner,
+            &mut empty_registry(),
+            &mut dispatcher,
+            &mut no_advisor(),
+            &capped_config(&f, 1),
+        )
+        .unwrap();
+
+        assert!(report
+            .plan
+            .deferred
+            .iter()
+            .any(|d| d.issue == IssueRef::new(REPO, 3)
+                && matches!(d.reason, queue::DeferReason::AttemptCapReached { .. })));
+        let closed: Vec<_> = report.exhausted.iter().map(|e| &e.issue).collect();
+        assert_eq!(closed, vec![&IssueRef::new(REPO, 4)]);
+        assert_eq!(gh_runner.seen.len(), 6, "{:?}", gh_runner.seen);
+        assert!(report.problems.is_empty(), "{:?}", report.problems);
     }
 }
