@@ -98,8 +98,8 @@
 //!
 //! The hand-off to a human still happens; it happens *later*, when the
 //! automation has actually given up. `remediate::arm_remediation` checks the
-//! attempt cap first and answers `CapReached`, which is not `in_force`, so an
-//! exhausted issue falls through to the real merge and rung 6 comments and
+//! attempt cap first and answers `CapReached`, which is not `in_force`, so a
+//! remediation that has spent its own cap falls through to the real merge and rung 6 comments and
 //! labels exactly as it always did. That is the spec's *"on exhaustion the PR
 //! stays open for a human — never merged with an unresolved finding"*, with
 //! both halves reachable.
@@ -2481,6 +2481,19 @@ and no `agent:blocked` comment is posted, or the Lead never sees the issue again
         // over — so a `needs_changes` here arms a re-dispatch instead of
         // going straight to the human hold.
         let db = approved_db();
+        record_success(&db, &issue(), Some(GREEN));
+        lineage::record_attempt(
+            &db,
+            &lineage::AttemptRecord {
+                issue: issue(),
+                attempt_n: 5,
+                approach: "went green".into(),
+                verdict: AttemptOutcome::Success,
+                why_failed: None,
+                commit_sha: Some(GREEN.to_string()),
+            },
+        )
+        .unwrap();
         lineage::upsert_issue_status(
             &db,
             &IssueStatus {
@@ -2525,18 +2538,26 @@ and no `agent:blocked` comment is posted, or the Lead never sees the issue again
     #[test]
     fn the_cap_is_reached_while_a_remediation_is_still_in_force_and_the_human_is_told() {
         // The ordinary way an unproductive remediation ends, and the one the
-        // record itself can hide. The issue has spent its attempts, so nothing
+        // record itself can hide. The remediation has spent its own cap, so nothing
         // will re-dispatch it — but its remediation record is still *active*
         // (no newer success has landed), so a `remediation_in_force` derived
         // from `active_remediation` alone would rehearse the merge for ever
         // and rung 6's hold would never comment or label. `CapReached` is not
         // `in_force`, and that is what keeps the human reachable.
-        //
-        // `an_issue_at_its_attempt_cap_falls_through_to_the_human_hold` does
-        // not cover this: it has no remediation record at all, so both
-        // spellings agree there.
         let db = approved_db();
         record_success(&db, &issue(), Some(GREEN));
+        lineage::record_attempt(
+            &db,
+            &lineage::AttemptRecord {
+                issue: issue(),
+                attempt_n: 1,
+                approach: "went green".into(),
+                verdict: AttemptOutcome::Success,
+                why_failed: None,
+                commit_sha: Some(GREEN.to_string()),
+            },
+        )
+        .unwrap();
         reviewed_at_needing_changes(&db, &issue(), 322, GREEN);
         remediate::arm_remediation(
             &db,
@@ -2549,7 +2570,7 @@ and no `agent:blocked` comment is posted, or the Lead never sees the issue again
             },
         )
         .unwrap();
-        // Armed at attempt 1, the remediation dispatches spent its own cap of
+        // Green at attempt 1, the remediation dispatches spent its own cap of
         // five and never fixed it. Same commit, so the remediation is still
         // in force.
         lineage::upsert_issue_status(

@@ -816,8 +816,10 @@ enum AutopilotCmd {
         /// instead of holding the PR for a human straight away. This pass
         /// arms it; `autopilot lead` (or `autopilot run`) is what actually
         /// dispatches, so run them in that order. Each attempt costs a
-        /// dispatch and spends the issue's --attempt-cap; on exhaustion the
-        /// PR is held for a human exactly as it is without this flag.
+        /// dispatch; a remediation gets --attempt-cap attempts of its own,
+        /// shared by every round of review and counted from the issue's first
+        /// success, not what the original work left. On exhaustion the PR is
+        /// held for a human exactly as it is without this flag.
         #[arg(long)]
         remediate: bool,
         /// Per-issue attempt cap. Must match the Lead's, since a remediation
@@ -1138,7 +1140,7 @@ fn print_advance_report(report: &ironmem::autopilot::advance::AdvanceReport) {
                 ..
             }) => {
                 println!(
-                    "    remediation EXHAUSTED ({attempts_charged}/{attempt_cap} attempts since it was armed) — the PR stays open for a human"
+                    "    remediation EXHAUSTED ({attempts_charged}/{attempt_cap} remediation attempts) — the PR stays open for a human"
                 );
             }
         }

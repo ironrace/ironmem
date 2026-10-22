@@ -46,7 +46,8 @@
 //! forgiveness beside it: a grant says *"attempts up to and including N are
 //! spent, and do not count against the cap any more."* The cap is then read
 //! as `cumulative_attempt_n - forgiven_through`, which is attempts **since
-//! the last human retry** — exactly the quantity the spec's per-issue cap is
+//! the last human retry** (or, for a remediation, since the later of that and
+//! the issue's first success — [`super::remediate::attempts_charged`]) — exactly the quantity the spec's per-issue cap is
 //! trying to bound. Both numbers survive, so "12 attempts over three human
 //! retries" stays a readable fact rather than three indistinguishable runs of
 //! four.
@@ -120,7 +121,11 @@ pub fn read_grant(db: &Database, issue: &IssueRef) -> Result<Option<RetryGrant>,
     Ok(Some(grant))
 }
 
-/// Remaining attempts against `cap`, given what has been forgiven.
+/// Attempts charged against the cap since `forgiven_through`.
+///
+/// The arithmetic only: cap enforcement goes through
+/// [`super::remediate::attempts_charged`], which also starts a remediation's
+/// count at the issue's first success.
 ///
 /// Saturating on both sides: a grant forgiving more than has been attempted
 /// (a cap lowered between runs, or a hand-edited drawer) leaves the full cap
