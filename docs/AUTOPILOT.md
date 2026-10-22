@@ -112,7 +112,7 @@ run more than once; an existing label is left untouched.
 | Label | Set by | Cleared by |
 |---|---|---|
 | `agent:ready` | A human opting an issue in; `lead` un-blocking an answered `agent:blocked` issue; `retry` forgiving an exhausted issue | Whenever **Autopilot** applies another `agent:*` label, which it always does as an exclusive transition (`plan_exclusive` adds the target and removes the other two). GitHub enforces nothing: labels added by hand coexist, and `agent:ready` alongside `agent:blocked` reads as **Blocked** (`blocked_beats_ready`) |
-| `agent:blocked` | `ironmem autopilot ask`, when a human posts a question on an issue; also `advance`, when rung 6's merge decision holds a PR for a human — **except** a PR held only for a missing approval, which keeps `agent:ready` (see *Branch protection* below). **`lead` never applies it** — it calls neither `ask_human` nor `exhaust_issue` | `lead`, on seeing a human comment newer than its own **question-marked** comment — flips back to `agent:ready` automatically. A merge hold posts no such marker and does **not** self-resume this way; see *Human recovery paths*. |
+| `agent:blocked` | `ironmem autopilot ask`, when a human posts a question on an issue; also `advance` (and `ironmem autopilot merge`), when rung 6's merge decision holds a PR for a human — **except** a PR held only for a missing approval, which keeps `agent:ready` (see *Branch protection* below). **`lead` never applies it** — it calls neither `ask_human` nor `exhaust_issue` | `lead`, on seeing a human comment newer than its own **question-marked** comment — flips back to `agent:ready` automatically. A merge hold posts no such marker and does **not** self-resume this way; see *Human recovery paths*. |
 | `agent:exhausted` | Only `ironmem autopilot exhaust`, typed by a human. **Hitting the attempt cap does not apply it**: the issue keeps `agent:ready` and stays in every backlog listing, though `queue::plan_queue` defers it as `AttemptCapReached` before selection rather than dispatching it (`an_issue_at_its_attempt_cap_is_deferred_rather_than_dispatched`). It is stuck, not looping — and nothing on the issue says so (#345) | Only `ironmem autopilot retry` — never self-resumes |
 
 An issue with none of these three labels is invisible to Autopilot: it is
@@ -242,8 +242,9 @@ typing the command.
   to `agent:ready` the moment it finds one. A **merge hold** also sets
   `agent:blocked`, but posts no marked question, so this poll never resumes
   it: resolve what the hold names, then re-label the issue `agent:ready`
-  (removing `agent:blocked`). The one merge hold that sets no label at all
-  is a missing approval — see *Branch protection* below.
+  (removing `agent:blocked`). The one merge hold that leaves an
+  `agent:ready` issue's labels alone is a missing approval — see *Branch
+  protection* below.
 - **A supervisor escalation is not this round trip, and sets no label at
   all.** When an issue's attempts keep failing the same way and a redirect
   fails the same way too, `lead` posts an escalation notice
@@ -287,13 +288,26 @@ unlike every other merge hold, does not move the issue to `agent:blocked`:
 the issue keeps `agent:ready`, so it stays in `advance`'s listing, and each
 `advance --merge` pass re-reads the PR's `reviewDecision`. Once a human
 approves, the next pass merges it — provided nothing else has changed, since
-every other guard (head SHA, base, mergeability) is still checked — with no
-label edit and no comment needed. The hold comment is posted once; while the
-approval is outstanding, later passes re-read the PR, say nothing new, and do
-not spend the `--max-advances` burst limit on it. To take the issue back instead,
-label it `agent:blocked`.
+every other guard (the PR is open and not a draft, the review and the gate at
+the current head, the base, mergeability) is still checked — with no label
+edit and no comment needed. The hold comment is posted once per distinct hold;
+while the approval is outstanding, later passes re-read the PR, say nothing
+new, and do not spend the `--max-advances` burst limit on it. To take the
+issue back instead, label it `agent:blocked`.
+
+A human who **requests changes** is not an approval pending: GitHub then
+reports `CHANGES_REQUESTED`, nothing in Autopilot will make the change asked
+for, and the hold moves the issue to `agent:blocked` like any other, with a
+fresh comment. A **transient** read — `mergeStateStatus: UNKNOWN` just after
+the approval, or a protection endpoint that fails — is a different hold
+(`PrNotMergeable`, `ProtectionUnknown`) and also sets `agent:blocked`, as
+documented under `mergeable_state_permits`: re-label the issue `agent:ready`
+once GitHub answers again.
 
 (Before #346 this hold set `agent:blocked` like the others, and because
 `agent:blocked` resumes only on a comment after a marked question, an
 approval never resumed it. An issue parked that way by an older binary still
-needs the manual step: make `agent:ready` its only `agent:*` label.)
+needs the manual step: make `agent:ready` its only `agent:*` label. `labels`
+never rewrites an existing label, so a repo whose `agent:blocked` was created
+earlier keeps the old description, which said it resumes on any newer human
+comment.)

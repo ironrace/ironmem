@@ -760,13 +760,14 @@ pub fn advance_pass(
 /// it is not modelled as one. See that variant's doc.
 ///
 /// ⟨#346⟩ A **pull request still waiting on its approval** is the third
-/// form. A [`merge::MergeHold::HumanApprovalRequired`] hold leaves the issue
+/// form. That hold ([`merge::MergeHold::awaits_approval`]) leaves the issue
 /// `agent:ready` so that the pass which sees the approval arrive can merge
 /// it, which means the issue is re-read on every pass until a human gets to
 /// it. A re-read that bought no review and found the same hold as last time
 /// posted nothing and recorded nothing (`record_appended` is false), so it is
-/// not charged. The first hold, and any hold that has *changed* — a human
-/// now requesting changes, say — is new, is commented on, and is charged.
+/// not charged — rehearsed or real, since each footing dedupes its own
+/// records. The first hold, and any hold that has *changed* — a human now
+/// requesting changes, say — is new, is commented on, and is charged.
 fn took_a_step(advanced: &Advanced) -> bool {
     if matches!(advanced.step, AdvanceStep::Stalled(_)) {
         return false;
@@ -774,10 +775,9 @@ fn took_a_step(advanced: &Advanced) -> bool {
     if advanced.review.is_none()
         && advanced.merge.as_ref().is_some_and(|m| {
             !m.record_appended
-                && matches!(
-                    m.outcome.hold(),
-                    Some(merge::MergeHold::HumanApprovalRequired { .. })
-                )
+                && m.outcome
+                    .hold()
+                    .is_some_and(merge::MergeHold::awaits_approval)
         })
     {
         return false;
@@ -2433,6 +2433,11 @@ mod tests {
             self.issues.get_mut(&number).unwrap().review_decision = "APPROVED".into();
         }
 
+        /// A human submitting a "request changes" review on the PR.
+        fn request_changes(&mut self, number: u64) {
+            self.issues.get_mut(&number).unwrap().review_decision = "CHANGES_REQUESTED".into();
+        }
+
         fn issue(&self, number: u64) -> &FakeIssue {
             &self.issues[&number]
         }
@@ -2550,8 +2555,8 @@ mod tests {
 
     #[test]
     fn approving_a_held_pull_request_is_all_a_human_has_to_do_for_it_to_merge() {
-        // #346. A protected branch holds every auto-merge candidate at
-        // `HumanApprovalRequired` on its first pass — that is the commonest
+        // #346. A protected branch holds every auto-merge candidate nobody
+        // has approved yet at `HumanApprovalRequired` on its first pass — that is the commonest
         // hold there is. The recovery the hold describes is "a human
         // approves, and the next pass merges it". That recovery used to be
         // fiction: the hold moved the issue to `agent:blocked`, `advance`
@@ -2662,6 +2667,27 @@ mod tests {
         };
 
         let report = advance_pass(&db, &mut github, &mut ForbiddenReviewer, &config).unwrap();
+        assert_eq!(
+            report.advanced.len(),
+            2,
+            "both issues are reached, skipped: {:?}",
+            report.skipped
+        );
+        let waiting = report
+            .advanced
+            .iter()
+            .find(|a| a.issue == issue())
+            .and_then(|a| a.merge.as_ref())
+            .expect("the waiting issue was re-read");
+        assert!(
+            waiting
+                .outcome
+                .hold()
+                .is_some_and(merge::MergeHold::awaits_approval)
+                && !waiting.record_appended
+                && !waiting.commented,
+            "an unchanged approval hold: {waiting:?}"
+        );
         assert!(
             report
                 .skipped
@@ -2672,6 +2698,103 @@ mod tests {
         );
         assert!(github.issue(284).merged, "the PR behind it still merges");
         assert!(!github.issue(283).merged);
+    }
+
+    #[test]
+    fn a_human_requesting_changes_is_handed_back_rather_than_waited_on() {
+        // `CHANGES_REQUESTED` is a human objecting, not an approval pending.
+        // Nothing in Autopilot makes the change they asked for, so the issue
+        // goes to `agent:blocked` like any other hold — told so in a fresh
+        // comment, and charged, because the hold changed.
+        let db = approved_db();
+        let (repo, roots) = checkout_with_worktree();
+        let mut config = config(roots.path(), repo.path());
+        config.merge = true;
+        config.max_advances_per_pass = 1;
+
+        record_success(&db, &issue(), Some(GREEN));
+        reviewed_at(&db, &issue(), 322, GREEN);
+        let mut github =
+            ProtectedGitHub::new().with_issue(283, 322, &["agent:ready", "risk:documentation"]);
+        advance_pass(&db, &mut github, &mut ForbiddenReviewer, &config).unwrap();
+        assert_eq!(github.issue(283).comments, 1);
+
+        github.request_changes(283);
+        let second = IssueRef::new(REPO, 284);
+        record_success(&db, &second, Some(GREEN));
+        reviewed_at(&db, &second, 323, GREEN);
+        github = {
+            let mut g = github.with_issue(284, 323, &["agent:ready", "risk:documentation"]);
+            g.approve(284);
+            g
+        };
+
+        let report = advance_pass(&db, &mut github, &mut ForbiddenReviewer, &config).unwrap();
+        let held = report.advanced[0].merge.as_ref().unwrap();
+        assert!(
+            matches!(
+                held.outcome.hold(),
+                Some(merge::MergeHold::HumanApprovalRequired { review_decision, .. })
+                    if review_decision == "CHANGES_REQUESTED"
+            ),
+            "got {:?}",
+            held.outcome
+        );
+        assert_eq!(
+            github.issue(283).comments,
+            2,
+            "a changed hold is new information"
+        );
+        assert!(
+            github
+                .issue(283)
+                .labels
+                .iter()
+                .any(|l| l == "agent:blocked")
+                && !github.issue(283).labels.iter().any(|l| l == "agent:ready"),
+            "handed back to a human: {:?}",
+            github.issue(283).labels
+        );
+        assert!(
+            report
+                .skipped
+                .iter()
+                .any(|s| s.issue == second
+                    && matches!(s.reason, SkipReason::PassLimitReached { .. })),
+            "a changed hold is a step and spends the limit: {:?}",
+            report.skipped
+        );
+
+        // A human puts `agent:ready` back without withdrawing the objection.
+        // The hold is a repeat — nothing new to say — but it still writes
+        // `agent:blocked` to GitHub, so it is not the free re-read an
+        // approval hold is, and it is still charged.
+        {
+            let labels = &mut github.issues.get_mut(&283).unwrap().labels;
+            labels.retain(|l| l != "agent:blocked");
+            labels.push("agent:ready".into());
+        }
+        let again = advance_pass(&db, &mut github, &mut ForbiddenReviewer, &config).unwrap();
+        let repeat = again.advanced[0].merge.as_ref().unwrap();
+        assert!(!repeat.record_appended && !repeat.commented, "{repeat:?}");
+        assert!(
+            github
+                .issue(283)
+                .labels
+                .iter()
+                .any(|l| l == "agent:blocked"),
+            "re-blocked: {:?}",
+            github.issue(283).labels
+        );
+        assert!(
+            again
+                .skipped
+                .iter()
+                .any(|s| s.issue == second
+                    && matches!(s.reason, SkipReason::PassLimitReached { .. })),
+            "a re-block is a GitHub write and is charged: {:?}",
+            again.skipped
+        );
     }
 
     // ── rung 11: the red path ───────────────────────────────────────────
