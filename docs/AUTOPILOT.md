@@ -44,8 +44,9 @@ dispatch ends with a push to its branch and nothing else — no PR is opened,
 no review runs, no merge decision is made.
 
 `advance` is the other half of that same loop: it opens the pull request for
-any issue whose dispatch succeeded, reviews it with a fresh-context Codex
-reviewer, and applies rung 5's merge decision. Running `advance` before
+any issue whose dispatch succeeded, reviews it with a fresh-context reviewer
+(Muse by default, or Codex with `--reviewer codex`), and applies rung 5's
+merge decision. Running `advance` before
 `lead` has nothing new to advance; running `lead` without ever running
 `advance` leaves every successful dispatch sitting as a pushed branch with
 no open PR, forever.
@@ -55,6 +56,124 @@ preview: it shows what the Lead would dispatch next — the same ordering and
 the same budget/concurrency/attempt-cap checks `lead` applies — without
 touching anything. Run it any time to see what a `lead` tick would do before
 running one.
+
+## Choose the implementation and review harnesses independently
+
+Claude remains the default implementation harness, and an omitted
+implementation model still resolves to `claude-sonnet-5`:
+
+```
+ironmem autopilot run owner/repo 364 --title "..."
+ironmem autopilot lead --repo owner/repo=/path
+```
+
+Codex is explicit, including its model:
+
+```
+ironmem autopilot run owner/repo 364 --title "..." --implementer codex --model <codex-model>
+ironmem autopilot lead --repo owner/repo=/path --implementer codex --model <codex-model>
+```
+
+An empty model is rejected for either harness. A known cross-harness prefix
+is also rejected (`claude-*` with Codex, `gpt-*` with Claude), but Autopilot
+does not impose a model allowlist: provider aliases such as a Claude `opus`
+alias remain valid. A Codex implementation never resolves or launches
+`claude`; `lead` also does not resolve the Claude advisor unless `--advisor`
+is enabled.
+
+The implementer choice is separate from `advance --reviewer muse|codex`.
+The reviewer always gets a fresh invocation and review context, and its
+accounting remains separate from implementation dispatch accounting:
+
+| Implementer | Muse reviewer | Codex reviewer |
+|---|---|---|
+| Claude | Fresh Muse review; independent of the Claude implementation session | Fresh Codex review; independent of the Claude implementation session |
+| Codex | Fresh Muse review; the Codex implementation does not replace or suppress it | Fresh Codex review with separate context/session and review accounting; using the same harness does **not** by itself guarantee cross-model independence |
+
+Different harnesses need not guarantee different underlying model families;
+that depends on their provider configuration. The enforced property is fresh,
+independent review context and accounting, not a claim about vendor model
+lineage.
+
+### Codex implementation bounds and accounting
+
+The native Codex argv was verified against `codex-cli 0.163.0`. It has no
+Autopilot-supplied session name or controller session ID, and it has no native
+`--max-budget-usd` or `--max-turns` flags. Passing either of those two flags
+with `--implementer codex` is therefore an error; Autopilot does not pretend
+the shared `RunConfig` fields become native Codex enforcement. `--n-turns`
+still appears as prompt guidance.
+
+Every Codex invocation has an enforced wall-clock bound: the repo's approved
+`autopilot timeout` value when configured, otherwise a 1200-second backend
+fallback. Unknown-price implementation spend is bounded by
+`--max-unpriced-dispatches-per-day`. The existing daily known-dollar
+pre-authorization policy remains conservative, but its dollar total is only a
+known floor when Codex ran.
+
+Each Codex invocation reserves one unpriced slot before spawn, including an
+invocation that later exits nonzero, times out, or produces malformed output.
+An ambiguous crash in the narrow reservation-before-spawn window can
+conservatively consume a slot even when no child can later be proved. Human
+output labels known spend and the unpriced dispatch count; JSON keeps each
+Codex dispatch's `total_cost_usd` as `null`, the run total as the known-dollar
+floor, and reports `unpriced_dispatches` separately. Unknown Codex cost is
+never rendered as free.
+
+### Codex identity, restart recovery, and supervision limits
+
+Codex session identity comes only from the native JSONL
+`thread.started.thread_id`. A resume uses that native UUID. Persisted state
+also records its implementation harness; Claude state cannot be resumed as
+Codex, or vice versa.
+
+Before spawn, Autopilot creates private schema, journal, final-message,
+stderr, exit, and process-identity artifacts under the repository's absolute
+common Git directory. That location survives worktree quarantine and lets a
+replacement controller inspect the same evidence. Canonical artifact paths
+containing whitespace are currently refused because the `ps` evidence parser
+cannot recover an argv boundary safely from them.
+
+Restart recovery is deliberately conservative. Missing or inconsistent
+kernel identity, process evidence, or trusted supervisor completion produces
+`Unknown` and holds the issue for inspection. Fresh authenticated live-process
+evidence wins over a stale completion record. If `ps` is unavailable, only
+Codex liveness becomes unknown; if the Claude registry source is unavailable,
+only Claude liveness does. An operator may need to inspect and resolve an
+invocation whose process evidence remains uncertain rather than forcing a
+retry that could duplicate live work.
+
+Direct native `codex` processes are the verified path. A launcher wrapper is
+adopted conservatively after restart: a marker visible only on a different
+native child is not treated as proof that the recorded root is the invocation.
+The process tracker authenticates and cleans ordinary tool descendants,
+including observed `setsid` children, but it is practical supervision rather
+than hostile fork containment; a deliberate double-fork escape between polls
+is outside its guarantee. The macOS runtime path is exercised. Linux-specific
+kernel identity and cleanup code is covered by code/tests but has not been
+run end to end on a Linux host.
+
+Verification records are intentionally separated:
+
+- On 2026-10-22, native `codex-cli 0.163.0` new and resume **no-tools format
+  probes** both exited 0, reused thread
+  `01a16674-d173-7f53-b344-915194918f91`, and returned a valid `met` result.
+  Those probes measured CLI format and resume identity; they were not
+  implementation dispatches.
+- A separate native timeout probe ran an actual tool child and verified that
+  timed-out process-tree cleanup removed it. That was supervision validation,
+  not the full implementation smoke described by a release/test report.
+- On 2026-10-23, the public `autopilot run` command performed a full
+  implementation dispatch through `/opt/homebrew/bin/codex` 0.163.0 with
+  `gpt-6.1-sol`: it changed only `answer.txt` from `wrong` to `42`, passed the
+  unchanged `make test` gate, committed and pushed the local issue branch,
+  and returned strict `met`. JSON reported one dispatch with
+  `total_cost_usd: null`, one unpriced dispatch, and a `$0.00` known floor.
+  During the live window, public `reconcile` conservatively held the npm
+  launcher/native-child identity twice rather than claiming `Adopt`; after
+  trusted completion it returned an empty reconciliation and the dispatch
+  state was clear. Logs and common-Git artifacts are preserved under the
+  smoke directory named in the corresponding test report.
 
 ## Onboarding a repo
 
@@ -220,16 +339,18 @@ typing the command.
   `a_dry_run_is_recorded_as_a_dry_run`), tagged `dry_run: true` so it can
   never be read back as an executed merge. Nothing it records is visible
   outside Autopilot's own storage.
-- `--advisor` (on `lead`) and the reviewer Codex invocation `advance` runs
+- `--advisor` (on `lead`), implementation dispatches, and the reviewer
+  invocation `advance` runs
   both spend real money. `--advisor` is off by default; every judgment it
   makes degrades to mechanical behavior (dispatch as the fallback class,
   keep the mechanical redirect text, escalate without a drafted question)
   when it's off, refused, or fails.
-- The daily budget ceiling (`--daily-budget-usd`) tracks IC dispatches and
-  advisor calls in one shared dollar ledger — but **it does not bound the
-  reviewer**. Codex, unlike Claude, reports no `total_cost_usd` for a
-  review, so every reviewer invocation is banked as *unpriced* spend
-  (`unpriced_dispatch_count`) rather than added to the dollar total; a
+- The daily budget ceiling (`--daily-budget-usd`) tracks known-price IC
+  dispatches and advisor calls in one shared dollar ledger — but **it does
+  not bound an unpriced reviewer or Codex implementer by dollars**. Muse and
+  Codex reviewers report no `total_cost_usd`, so every reviewer invocation is
+  banked as *unpriced* spend (`unpriced_review_count`) rather than added to
+  the dollar total; a
   reviewer-only workload can run indefinitely under a `--daily-budget-usd`
   that never sees it move. What actually bounds the reviewer is
   `--max-unpriced-reviews-per-day` (default 20) — an invocation-count

@@ -3,23 +3,24 @@
 //! Implements the spec's *Roles* entry: "a short-lived, fresh-context,
 //! read-only agent the Lead dispatches once an IC's PR is open. It performs
 //! **both** merge-time jobs: re-classify the diff's risk, and review the diff
-//! for correctness/security, returning `PASS` or `NEEDS CHANGES`. Routed to
-//! **Codex** ... giving cross-model adversarial review rather than same-model
-//! self-agreement. Not a tier — it supervises nothing and holds no state."
+//! for correctness/security, returning `PASS` or `NEEDS CHANGES`. The
+//! original routing sent a Claude IC to **Codex** for cross-model review.
+//! Not a tier — it supervises nothing and holds no state."
 //!
 //! # Which harness runs it
 //!
 //! **Selectable, `--reviewer muse|codex`, defaulting to Muse since
 //! 2026-09-15**, when the Codex subscription the spec's routing assumed
-//! ended — Codex is kept, not retired, and either satisfies the property the
-//! routing is actually for — see [`MuseReviewer`], [`build_muse_argv`] and
-//! [`parse_muse_terminal`]. The spec's *reason* for the routing is what
-//! survives the swap: Muse is cross-model with respect to the Claude IC,
-//! which is the property "rather than same-model self-agreement" names.
-//! [`CodexReviewer`] is still correct for anyone with `codex` on `PATH`, and
-//! everything below that says "Codex" is about that path. [`ReviewerKind`]
-//! carries the table of what each one guarantees, because they do not
-//! guarantee the same things and a caller switching should know which.
+//! ended — Codex is kept, not retired; see [`MuseReviewer`],
+//! [`build_muse_argv`] and [`parse_muse_terminal`]. Implementation and review
+//! harnesses are now selected independently. Both reviewer paths preserve the
+//! enforceable property — fresh invocation, no implementation session state,
+//! and separate accounting — but a harness name is not proof of the
+//! underlying model family, and Codex reviewing a Codex implementation is not
+//! cross-model by construction. [`CodexReviewer`] remains available to anyone
+//! with `codex` on `PATH`, and everything below that says "Codex" is about
+//! that path. [`ReviewerKind`] carries the table of what each one guarantees,
+//! because they do not guarantee the same things.
 //!
 //! One guarantee does **not** survive it: `codex exec --output-schema` forced
 //! the verdict's shape, and `muse exec` has no equivalent, so the shape is
@@ -1526,8 +1527,10 @@ pub const MUSE_TERMINAL_COMPLETED: &str = "completed";
 /// Two are implemented, and the choice is a real one rather than a migration
 /// artifact. Muse is the default because Codex's subscription ended on
 /// 2026-09-15, but Codex remains correct for anyone who has `codex` on
-/// `PATH`, and the property the spec actually asks for — a reviewer that is
-/// *cross-model* with respect to a Claude IC — is satisfied by either.
+/// `PATH`. Review always uses a fresh invocation and independent accounting;
+/// harness selection alone does not prove underlying model-family diversity,
+/// and a Codex implementer followed by a Codex reviewer is not cross-model
+/// merely because the two roles are separate.
 ///
 /// The two are not interchangeable in what they guarantee, and a caller
 /// switching between them should know which one they are getting:

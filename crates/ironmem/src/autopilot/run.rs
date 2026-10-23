@@ -252,7 +252,25 @@ impl RunConfig {
     /// the point it is made rather than diagnosing from a silent no-op.
     pub fn validate(&self) -> Result<(), MemoryError> {
         if self.model.trim().is_empty() {
-            return Err(MemoryError::Validation("model must not be empty".into()));
+            let harness = match self.implementer {
+                Implementer::Claude => "Claude",
+                Implementer::Codex => "Codex",
+            };
+            return Err(MemoryError::Validation(format!(
+                "model must not be empty for the {harness} implementer"
+            )));
+        }
+        if self.implementer == Implementer::Codex && self.model.starts_with("claude-") {
+            return Err(MemoryError::Validation(format!(
+                "model '{}' is incompatible with the Codex implementer; choose a Codex model",
+                self.model
+            )));
+        }
+        if self.implementer == Implementer::Claude && self.model.starts_with("gpt-") {
+            return Err(MemoryError::Validation(format!(
+                "model '{}' is incompatible with the Claude implementer; choose a Claude model",
+                self.model
+            )));
         }
         if self.dispatch_class.trim().is_empty() {
             return Err(MemoryError::Validation(
@@ -2310,6 +2328,43 @@ printf '%s\n' '{"verdict":"met","reason":"gate"}' > "$final"
 
     fn config() -> RunConfig {
         RunConfig::new("claude-sonnet-5", "logic")
+    }
+
+    #[test]
+    fn codex_implementer_rejects_a_claude_model_name() {
+        let mut config = config();
+        config.implementer = Implementer::Codex;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("Codex"), "error must name the harness: {err}");
+        assert!(
+            err.contains("claude-sonnet-5"),
+            "error must name the incompatible model: {err}"
+        );
+    }
+
+    #[test]
+    fn claude_implementer_rejects_a_gpt_model_name() {
+        let config = RunConfig::new("gpt-6.1-sol", "logic");
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("Claude"), "error must name the harness: {err}");
+        assert!(
+            err.contains("gpt-6.1-sol"),
+            "error must name the incompatible model: {err}"
+        );
+    }
+
+    #[test]
+    fn empty_model_error_names_the_selected_implementer() {
+        for (implementer, name) in [
+            (Implementer::Claude, "Claude"),
+            (Implementer::Codex, "Codex"),
+        ] {
+            let mut config = RunConfig::new("  ", "logic");
+            config.implementer = implementer;
+            let err = config.validate().unwrap_err().to_string();
+            assert!(err.contains(name), "got: {err}");
+            assert!(err.contains("model"), "got: {err}");
+        }
     }
 
     fn approved_db() -> Database {
