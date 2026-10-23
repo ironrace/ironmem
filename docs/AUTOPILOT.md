@@ -36,8 +36,10 @@ ironmem autopilot advance --repo owner/repo=/path/to/checkout ...
 ```
 
 `lead` reconciles in-flight work, un-blocks any `agent:blocked` issue that
-has a newer human answer, supervises what is already running, and dispatches
-the next issue off the queue. It starts work; it does not finish it. An IC's
+has a newer human answer, supervises what is already running, dispatches
+the next issue off the queue, and closes out any issue at its attempt cap
+(a summary comment plus `agent:exhausted`). It starts work; it does not
+finish it. An IC's
 dispatch ends with a push to its branch and nothing else — no PR is opened,
 no review runs, no merge decision is made.
 
@@ -112,8 +114,8 @@ run more than once; an existing label is left untouched.
 | Label | Set by | Cleared by |
 |---|---|---|
 | `agent:ready` | A human opting an issue in; `lead` un-blocking an answered `agent:blocked` issue; `retry` forgiving an exhausted issue | Whenever **Autopilot** applies another `agent:*` label, which it always does as an exclusive transition (`plan_exclusive` adds the target and removes the other two). GitHub enforces nothing: labels added by hand coexist, and `agent:ready` alongside `agent:blocked` reads as **Blocked** (`blocked_beats_ready`) |
-| `agent:blocked` | `ironmem autopilot ask`, when a human posts a question on an issue; also `advance` (and `ironmem autopilot merge`), when rung 6's merge decision holds a PR for a human — **except** a PR held only for a missing approval, which keeps `agent:ready` (see *Branch protection* below). **`lead` never applies it** — it calls neither `ask_human` nor `exhaust_issue` | `lead`, on seeing a human comment newer than its own **question-marked** comment — flips back to `agent:ready` automatically. A merge hold posts no such marker and does **not** self-resume this way; see *Human recovery paths*. |
-| `agent:exhausted` | Only `ironmem autopilot exhaust`, typed by a human. **Hitting the attempt cap does not apply it**: the issue keeps `agent:ready` and stays in every backlog listing, though `queue::plan_queue` defers it as `AttemptCapReached` before selection rather than dispatching it (`an_issue_at_its_attempt_cap_is_deferred_rather_than_dispatched`). It is stuck, not looping — and nothing on the issue says so (#345) | Only `ironmem autopilot retry` — never self-resumes |
+| `agent:blocked` | `ironmem autopilot ask`, when a human posts a question on an issue; also `advance` (and `ironmem autopilot merge`), when rung 6's merge decision holds a PR for a human — **except** a PR held only for a missing approval, which keeps `agent:ready` (see *Branch protection* below). **`lead` never applies it** — it never calls `ask_human` | `lead`, on seeing a human comment newer than its own **question-marked** comment — flips back to `agent:ready` automatically. A merge hold posts no such marker and does **not** self-resume this way; see *Human recovery paths*. |
+| `agent:exhausted` | `lead`, on an issue at its attempt cap: one whose run this tick ended `AttemptCapExhausted`, or one `queue::plan_queue` deferred as `AttemptCapReached` (the deferral is how a close-out whose label write failed is retried, and how an issue stranded at its cap is reached). An issue with a recorded success is skipped: it can only be at its cap through `--remediate`, and `advance` holds that PR for a human with `agent:blocked` instead. The close-out re-reads the issue's labels and leaves it alone if a human has since moved it to `agent:blocked` or removed `agent:ready`, and re-checks the cap so a `retry` granted mid-tick is honoured. It posts the summary comment, then applies the label; idempotent, so a repeat tick posts no second comment (`a_repeat_tick_on_an_exhausted_issue_posts_no_second_summary`, #345). Also `ironmem autopilot exhaust`, typed by a human | Only `ironmem autopilot retry` — never self-resumes. Re-labeling `agent:ready` by hand leaves the cap in force, so the next `lead` tick closes the issue out again |
 
 An issue with none of these three labels is invisible to Autopilot: it is
 not dispatched until a human adds `agent:ready`.
@@ -270,11 +272,12 @@ typing the command.
   exclusivity runs the other way: `ask` moves an issue to `agent:blocked`,
   which clears `agent:exhausted`. Forgiving attempts and removing labels are
   separate acts, and only the first is what `retry` promises.
-- **`ironmem autopilot ask`** and **`ironmem autopilot exhaust`** are not
-  manual arms of something `lead` also does on its own: they are the *only*
-  callers of `ask_human` and `exhaust_issue` outside tests. Blocking an
-  issue on a question, and closing one out as exhausted, happen when an
-  operator types those commands and at no other time.
+- **`ironmem autopilot ask`** is not a manual arm of something `lead` also
+  does on its own: it is the *only* caller of `ask_human` outside tests.
+  Blocking an issue on a question happens when an operator types that
+  command and at no other time. **`ironmem autopilot exhaust`** is
+  different: `lead` closes out an issue at its attempt cap on its own, and
+  the command is the manual arm of that same close-out.
 
 ## Branch protection
 

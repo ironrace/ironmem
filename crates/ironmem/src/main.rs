@@ -1306,6 +1306,29 @@ fn print_lead_report(report: &ironmem::autopilot::lead::LeadReport) {
             },
         );
     }
+    for exec in &report.exhausted {
+        use ironmem::autopilot::stagnation::ExhaustOutcome;
+        let what = match &exec.outcome {
+            ExhaustOutcome::AlreadyExhausted => "already agent:exhausted".to_string(),
+            ExhaustOutcome::WouldExhaust {
+                attempts_summarized,
+                ..
+            } => format!("would close out ({attempts_summarized} attempt(s) summarized)"),
+            ExhaustOutcome::Exhausted {
+                attempts_summarized,
+                commented,
+                ..
+            } => format!(
+                "closed out as agent:exhausted ({}, {attempts_summarized} attempt(s))",
+                if *commented {
+                    "summary posted"
+                } else {
+                    "summary already posted"
+                }
+            ),
+        };
+        println!("  exhausted {}: {what}", exec.issue.canonical());
+    }
     for problem in &report.problems {
         println!("  PROBLEM {}: {}", problem.what, problem.detail);
     }

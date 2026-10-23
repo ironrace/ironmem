@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`autopilot lead` now closes out an issue at its attempt cap (#345).**
+  Before, a tick whose run ended `AttemptCapExhausted` wrote nothing, so
+  the issue kept `agent:ready` with no comment. The queue deferred it on
+  every later tick, so it was stuck, and GitHub showed it as ready and
+  waiting. The tick now posts rung 6's summary comment and applies
+  `agent:exhausted`, both for a run that ends at the cap and for an issue
+  the queue defers as `AttemptCapReached`. That second case retries a
+  close-out whose label write failed and reaches issues already stranded at
+  their cap. A repeat tick posts no second comment. A `--remediate` issue
+  that runs out of attempts is still left for `advance`'s human hold. `lead --dry-run` reports
+  the close-out and writes nothing. The lead report gains an `exhausted`
+  field. The summary comment now names `ironmem autopilot retry <repo>
+  <issue>` as the way back: re-labeling `agent:ready` by hand leaves the cap
+  in force.
 - **Unpriced Codex reviews no longer stop IC dispatching.** Reviews now
   bank to a new `unpriced_review_count` ledger field (bounded by
   `--max-unpriced-reviews-per-day`, default 20) instead of the shared

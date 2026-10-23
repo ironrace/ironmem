@@ -24,9 +24,9 @@
 //!
 //! Rung 6 writes `agent:blocked` on a held PR, except a PR held only for a
 //! missing approval, whose labels it leaves alone (#346). `agent:exhausted`
-//! is written only by `ironmem autopilot exhaust`, which a human runs:
-//! reaching the attempt cap does not apply it (#345), and the way out of it
-//! is `ironmem autopilot retry`. [`eligibility`] is the rule
+//! is written by the Lead on an issue at its attempt cap (#345), and by
+//! `ironmem autopilot exhaust`, which a human runs; the way out of it is
+//! `ironmem autopilot retry`. [`eligibility`] is the rule
 //! stated once, in the module that owns the vocabulary, for every reader —
 //! the Lead's queue, `advance`'s candidate filter, `retry`, and rung 6's own
 //! choice of what a hold does to the labels.
