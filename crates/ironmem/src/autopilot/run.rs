@@ -2044,6 +2044,7 @@ printf '%s\n' '{"verdict":"met","reason":"gate"}' > "$final"
     fn codex_config() -> RunConfig {
         let mut c = config();
         c.implementer = Implementer::Codex;
+        c.model = "gpt-6.1-sol".into();
         c
     }
     fn pending_codex(db: &Database, worktree: &Worktree, native: Option<&str>) -> DispatchState {
@@ -4054,5 +4055,180 @@ satisfies it on its own"
         assert_eq!(after.best_verdict, Some(AttemptOutcome::Success));
         assert_eq!(after.best_commit_sha, succeeded.best_commit_sha);
         assert_eq!(after.cumulative_attempt_n, 2);
+    }
+    #[test]
+    fn completed_codex_pauses_reenter_queue_and_resume_native_identity_once() {
+        use crate::autopilot::codex_process::CodexProcessSnapshot;
+        use crate::autopilot::gh::IssueListing;
+        use crate::autopilot::queue::{plan_queue, QueueConfig, RepoBacklog};
+        use crate::autopilot::registry::{HarnessSnapshots, RegistrySnapshot};
+        use crate::autopilot::supervise::{reconcile, ReconcileVerdict};
+        struct PausingDispatch<'a> {
+            db: &'a Database,
+            outcome: Option<DispatchOutcome>,
+            spend_after: bool,
+            invocation: Option<String>,
+        }
+        impl Dispatcher for PausingDispatch<'_> {
+            fn implementer(&self) -> Implementer {
+                Implementer::Codex
+            }
+            fn dispatch(
+                &mut self,
+                _repo: &Path,
+                spec: &DispatchSpec,
+            ) -> Result<DispatchOutcome, MemoryError> {
+                let state = dispatch_state::get_dispatch_state(self.db, &issue())?.unwrap();
+                assert_eq!(state.state, "dispatching");
+                assert_eq!(
+                    state.codex_artifacts, spec.codex_artifacts,
+                    "pending invocation is durable before launch"
+                );
+                self.invocation =
+                    Some(spec.codex_artifacts.as_ref().unwrap().invocation_id.clone());
+                if self.spend_after {
+                    budget::accumulate_daily_spend(self.db, &today_utc(), 1.5)?;
+                }
+                let mut outcome = self
+                    .outcome
+                    .take()
+                    .expect("only one invocation before pause");
+                outcome.cost_usd = None;
+                Ok(outcome)
+            }
+        }
+        for (first, daily, infrastructure) in [
+            (not_met(), false, false),
+            (timed_out(), false, false),
+            (not_met(), true, false),
+            (no_verdict_error(), false, true),
+        ] {
+            let db = approved_db();
+            let (_dir, wt) = fixture_worktree();
+            let mut cfg = codex_config();
+            cfg.max_budget_usd = 1.0;
+            cfg.daily_budget_usd = 2.0;
+            cfg.max_unpriced_dispatches_per_day = 1;
+            if infrastructure {
+                cfg.max_consecutive_infrastructure_failures = 1;
+            }
+            let mut dispatcher = PausingDispatch {
+                db: &db,
+                outcome: Some(first),
+                spend_after: daily,
+                invocation: None,
+            };
+            let paused = run_issue(&db, &issue(), &brief(), &wt, &cfg, &mut dispatcher).unwrap();
+            assert_eq!(paused.unpriced_dispatches, 1);
+            if daily {
+                assert!(matches!(
+                    paused.terminal,
+                    TerminalReason::DailyBudgetExhausted { .. }
+                ));
+            } else if infrastructure {
+                assert!(matches!(
+                    paused.terminal,
+                    TerminalReason::InfrastructureFailure { .. }
+                ));
+            } else {
+                assert!(matches!(
+                    paused.terminal,
+                    TerminalReason::UnpricedDispatchesExhausted { .. }
+                ));
+            }
+            let state = dispatch_state::get_dispatch_state(&db, &issue())
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                state.state,
+                if daily {
+                    "paused-daily-budget"
+                } else {
+                    "paused-infrastructure-failure"
+                }
+            );
+            assert!(state.codex_artifacts.is_none());
+            let native = state.native_session_id.clone().unwrap();
+            assert_eq!(native, "11111111-2222-3333-4444-555555555555");
+            let ledger = budget::get_daily_spend(&db, &today_utc()).unwrap().unwrap();
+            assert_eq!(ledger.unpriced_dispatch_count, 1);
+            assert_eq!(
+                ledger.reserved_unpriced_dispatch_ids,
+                vec![dispatcher.invocation.unwrap()]
+            );
+            let snapshots = HarnessSnapshots {
+                claude: RegistrySnapshot::Unavailable {
+                    reason: "Claude unrelated".into(),
+                },
+                codex: CodexProcessSnapshot::Available(Vec::new()),
+            };
+            let backlog = [RepoBacklog {
+                repo: issue().repo,
+                issues: vec![IssueListing {
+                    number: issue().number,
+                    title: brief().title,
+                    body: brief().body,
+                    labels: vec!["agent:ready".into()],
+                    updated_at: "2026-09-02T00:00:00Z".into(),
+                }],
+            }];
+            let queue_cfg = QueueConfig {
+                max_budget_usd: 1.0,
+                daily_budget_usd: 4.0,
+                ..QueueConfig::default()
+            };
+            let plan = plan_queue(&db, &backlog, &snapshots, &queue_cfg).unwrap();
+            assert_eq!(
+                plan.dispatch.len(),
+                1,
+                "a completed paused Codex invocation must be selectable: {:?}",
+                plan.deferred
+            );
+            assert_eq!(plan.dispatch[0].issue, issue());
+            assert!(matches!(
+                reconcile(&db, &snapshots).unwrap()[0].verdict,
+                ReconcileVerdict::RestartFromCheckpoint { .. }
+            ));
+            assert_eq!(
+                budget::get_daily_spend(&db, &today_utc()).unwrap().unwrap(),
+                ledger,
+                "liveness planning does not reserve the old invocation again"
+            );
+            cfg.daily_budget_usd = 4.0;
+            cfg.max_unpriced_dispatches_per_day = 2;
+            let mut resumed = codex_script(vec![met()]);
+            resumed.recovery = Some(CodexRecovery::Unknown {
+                reason: "completed invocation must not be recovered again".into(),
+            });
+            let result = run_issue(&db, &issue(), &brief(), &wt, &cfg, &mut resumed).unwrap();
+            assert!(matches!(result.terminal, TerminalReason::Met { .. }));
+            assert_eq!(result.unpriced_dispatches, 1);
+            assert!(
+                matches!(&resumed.inner.seen[0].session, SessionMode::Resume { session_uuid } if session_uuid == &native)
+            );
+            let after = budget::get_daily_spend(&db, &today_utc()).unwrap().unwrap();
+            assert_eq!(after.unpriced_dispatch_count, 2);
+            assert_eq!(after.reserved_unpriced_dispatch_ids.len(), 2);
+            assert_eq!(
+                after.reserved_unpriced_dispatch_ids[1],
+                resumed.inner.seen[0]
+                    .codex_artifacts
+                    .as_ref()
+                    .unwrap()
+                    .invocation_id
+            );
+            assert_eq!(
+                after.reserved_unpriced_dispatch_ids[0],
+                ledger.reserved_unpriced_dispatch_ids[0]
+            );
+            assert_ne!(
+                after.reserved_unpriced_dispatch_ids[0],
+                after.reserved_unpriced_dispatch_ids[1]
+            );
+            assert_eq!(after.total_cost_usd, ledger.total_cost_usd);
+            assert!(dispatch_state::get_dispatch_state(&db, &issue())
+                .unwrap()
+                .is_none());
+        }
     }
 }

@@ -3015,6 +3015,7 @@ mod tests {
         let f = fixture();
         let mut cfg = config(&f);
         cfg.run.implementer = crate::autopilot::implementer::Implementer::Codex;
+        cfg.run.model = "gpt-6.1-sol".into();
         let mut monitor = Monitor { calls: 0 };
         let mut gh = ScriptedGh::new(vec![Ok(GhOutput::ok("[]")), Ok(GhOutput::ok("[]"))]);
         let report = lead_tick(
