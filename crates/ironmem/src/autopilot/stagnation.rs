@@ -158,7 +158,10 @@ pub fn exhaust_issue_with_labels(
         // Ignored on failure for the same reason it is safe to repeat: this
         // path runs on every poll of an exhausted issue, so the next one
         // tries again.
-        if exhaustion_notice_posted(db, issue).unwrap_or(false) {
+        //
+        // Skipped on a dry run, which changes no state: the next real pass
+        // through here does the cleanup instead.
+        if !dry_run && exhaustion_notice_posted(db, issue).unwrap_or(false) {
             let _ = clear_exhaustion_notice(db, issue);
         }
         return Ok(ExhaustExecution {
@@ -795,6 +798,34 @@ are read once, not again inside the label write: {:?}",
 
         assert_eq!(exec.outcome, ExhaustOutcome::AlreadyExhausted);
         assert_eq!(gh_runner.seen.len(), 1, "only the label read happened");
+    }
+
+    #[test]
+    fn a_rehearsal_on_an_already_exhausted_issue_keeps_its_notice() {
+        // A close-out whose cleanup failed leaves its notice behind under an
+        // `agent:exhausted` label. The real path deletes it on the next
+        // pass; a dry run must not, because a rehearsal changes no state.
+        let database = db();
+        lineage::record_attempt(&database, &attempt(1, AttemptOutcome::Failed, Some("red")))
+            .unwrap();
+        record_exhaustion_notice(&database, &issue(), 1).unwrap();
+
+        let exhausted = vec!["agent:exhausted".to_string()];
+        let mut gh_runner = ScriptedGh::new(vec![]);
+        let exec =
+            exhaust_issue_with_labels(&mut gh_runner, &database, &issue(), exhausted.clone(), true)
+                .unwrap();
+        assert_eq!(exec.outcome, ExhaustOutcome::AlreadyExhausted);
+        assert!(
+            exhaustion_notice_posted(&database, &issue()).unwrap(),
+            "a dry run deleted the notice"
+        );
+
+        exhaust_issue_with_labels(&mut gh_runner, &database, &issue(), exhausted, false).unwrap();
+        assert!(
+            !exhaustion_notice_posted(&database, &issue()).unwrap(),
+            "the real pass still cleans it up"
+        );
     }
 
     #[test]

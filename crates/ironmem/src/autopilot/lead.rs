@@ -2783,6 +2783,87 @@ mod tests {
         assert_eq!(gh_runner.seen.len(), 3, "reads only: {:?}", gh_runner.seen);
     }
 
+    #[test]
+    fn a_dry_run_keeps_the_notice_of_an_issue_already_exhausted_since_the_listing() {
+        // A close-out whose label write failed keeps its notice so the next
+        // real tick skips a second summary. A dry run that finds the label
+        // applied since a stale `agent:ready` listing takes the
+        // already-exhausted path, which must not delete that notice.
+        let db = approved_db();
+        let f = fixture();
+        strand_at_cap(&db, 3, 1);
+        let mut gh_runner = ScriptedGh::new(vec![
+            Ok(GhOutput::ok("[]")),
+            Ok(GhOutput::ok(&issue_list_json(&[(3, &["agent:ready"])]))),
+            Ok(GhOutput::ok(&labels_json(&["agent:ready"]))),
+            Ok(GhOutput::ok("")),
+            Ok(GhOutput::failed("", "label already exists")),
+            Ok(GhOutput::failed("", "HTTP 403: Forbidden")),
+        ]);
+        lead_tick(
+            &db,
+            &mut gh_runner,
+            &mut empty_registry(),
+            &mut RefusingDispatcher,
+            &mut no_advisor(),
+            &capped_config(&f, 1),
+        )
+        .unwrap();
+        assert!(posted_a_comment(&gh_runner), "setup posted no summary");
+
+        let mut cfg = capped_config(&f, 1);
+        cfg.dry_run = true;
+        let mut gh_runner = ScriptedGh::new(vec![
+            Ok(GhOutput::ok("[]")),
+            Ok(GhOutput::ok(&issue_list_json(&[(3, &["agent:ready"])]))),
+            Ok(GhOutput::ok(&labels_json(&["agent:exhausted"]))),
+        ]);
+        let report = lead_tick(
+            &db,
+            &mut gh_runner,
+            &mut empty_registry(),
+            &mut RefusingDispatcher,
+            &mut no_advisor(),
+            &cfg,
+        )
+        .unwrap();
+        assert_eq!(
+            report.exhausted[0].outcome,
+            ExhaustOutcome::AlreadyExhausted
+        );
+
+        // The label is gone again (a human removed it, say). The notice the
+        // dry run left alone still says the summary was posted.
+        let mut gh_runner = ScriptedGh::new(vec![
+            Ok(GhOutput::ok("[]")),
+            Ok(GhOutput::ok(&issue_list_json(&[(3, &["agent:ready"])]))),
+            Ok(GhOutput::ok(&labels_json(&["agent:ready"]))),
+            Ok(GhOutput::failed("", "label already exists")),
+            Ok(GhOutput::ok("")),
+        ]);
+        let report = lead_tick(
+            &db,
+            &mut gh_runner,
+            &mut empty_registry(),
+            &mut RefusingDispatcher,
+            &mut no_advisor(),
+            &capped_config(&f, 1),
+        )
+        .unwrap();
+        // Without the notice the close-out posts a second summary, which
+        // takes the scripted label-create reply and fails the close-out.
+        assert!(
+            report.problems.is_empty(),
+            "the dry run deleted the notice: {:?}",
+            report.problems
+        );
+        let ExhaustOutcome::Exhausted { commented, .. } = &report.exhausted[0].outcome else {
+            panic!("expected Exhausted, got {:?}", report.exhausted[0].outcome);
+        };
+        assert!(!commented, "the dry run deleted the notice");
+        assert!(!posted_a_comment(&gh_runner), "{:?}", gh_runner.seen);
+    }
+
     fn strand_at_cap(db: &Database, number: u64, attempts: u32) {
         lineage::upsert_issue_status(
             db,
