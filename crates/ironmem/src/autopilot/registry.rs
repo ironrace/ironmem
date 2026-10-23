@@ -300,6 +300,142 @@ pub fn snapshot(registry: &mut dyn AgentRegistry) -> RegistrySnapshot {
     }
 }
 
+pub use crate::autopilot::codex_process::{parse_codex_processes, CodexProcessSnapshot};
+use crate::autopilot::dispatch_state::DispatchState;
+use crate::autopilot::implementer::Implementer;
+
+/// The decision seam routes exclusively by the persisted dispatch harness.
+pub trait LivenessSnapshot {
+    fn liveness(&self, state: &DispatchState) -> Liveness;
+    fn reason(&self, implementer: Implementer) -> String;
+    fn state_reason(&self, state: &DispatchState) -> String {
+        self.reason(state.implementer)
+    }
+    fn claude_names(&self) -> Vec<&str>;
+    fn codex_markers(&self) -> Vec<&str> {
+        Vec::new()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct HarnessSnapshots {
+    pub claude: RegistrySnapshot,
+    pub codex: CodexProcessSnapshot,
+}
+impl HarnessSnapshots {
+    pub fn is_available(&self, implementer: Implementer) -> bool {
+        match implementer {
+            Implementer::Claude => self.claude.is_available(),
+            Implementer::Codex => self.codex.is_available(),
+        }
+    }
+}
+impl LivenessSnapshot for HarnessSnapshots {
+    fn liveness(&self, state: &DispatchState) -> Liveness {
+        match state.implementer {
+            Implementer::Claude => self.claude.liveness(&state.ic_session_name),
+            Implementer::Codex => self.codex.liveness(state.codex_artifacts.as_ref()),
+        }
+    }
+    fn reason(&self, implementer: Implementer) -> String {
+        match implementer {
+            Implementer::Claude => LivenessSnapshot::reason(&self.claude, implementer),
+            Implementer::Codex => self.codex.reason(),
+        }
+    }
+    fn state_reason(&self, state: &DispatchState) -> String {
+        match state.implementer {
+            Implementer::Claude => self.reason(state.implementer),
+            Implementer::Codex => self.codex.invocation_reason(state.codex_artifacts.as_ref()),
+        }
+    }
+    fn claude_names(&self) -> Vec<&str> {
+        self.claude.names()
+    }
+    fn codex_markers(&self) -> Vec<&str> {
+        self.codex.orphan_markers()
+    }
+}
+/// Compatibility for callers providing only Claude evidence: never infer a
+/// Codex death from the absence of a Claude session.
+impl LivenessSnapshot for RegistrySnapshot {
+    fn liveness(&self, state: &DispatchState) -> Liveness {
+        match state.implementer {
+            Implementer::Claude => self.liveness(&state.ic_session_name),
+            Implementer::Codex => Liveness::Unknown,
+        }
+    }
+    fn reason(&self, implementer: Implementer) -> String {
+        if implementer == Implementer::Codex {
+            return "Codex process source was not supplied".into();
+        }
+        match self {
+            Self::Unavailable { reason } => reason.clone(),
+            Self::Available(_) => "session liveness unavailable".into(),
+        }
+    }
+    fn claude_names(&self) -> Vec<&str> {
+        self.names()
+    }
+}
+
+pub trait HarnessMonitor {
+    fn snapshot(&mut self) -> HarnessSnapshots;
+}
+impl<T: AgentRegistry + ?Sized> HarnessMonitor for T {
+    fn snapshot(&mut self) -> HarnessSnapshots {
+        // Keep this adapter Claude-only; real controllers use TwoHarnessMonitor.
+        let claude = match self.list() {
+            Ok(output) if output.success => match parse_agents(&output.stdout) {
+                Ok(rows) => RegistrySnapshot::Available(rows),
+                Err(reason) => RegistrySnapshot::Unavailable { reason },
+            },
+            Ok(output) => RegistrySnapshot::Unavailable {
+                reason: format!(
+                    "session registry exited non-zero: {}",
+                    super::scrub::scrub_and_bound(&output.stderr, 500).text
+                ),
+            },
+            Err(e) => RegistrySnapshot::Unavailable {
+                reason: e.to_string(),
+            },
+        };
+        HarnessSnapshots {
+            claude,
+            codex: CodexProcessSnapshot::Unavailable {
+                reason: "Codex process source was not supplied".into(),
+            },
+        }
+    }
+}
+
+pub struct TwoHarnessMonitor {
+    claude: Result<ClaudeAgentRegistry, String>,
+    codex: super::codex_process::UnixCodexProcesses,
+}
+impl Default for TwoHarnessMonitor {
+    fn default() -> Self {
+        Self {
+            claude: ClaudeAgentRegistry::resolve().map_err(|e| e.to_string()),
+            codex: super::codex_process::UnixCodexProcesses,
+        }
+    }
+}
+impl HarnessMonitor for TwoHarnessMonitor {
+    fn snapshot(&mut self) -> HarnessSnapshots {
+        let claude = match &mut self.claude {
+            Ok(registry) => snapshot(registry),
+            Err(reason) => RegistrySnapshot::Unavailable {
+                reason: reason.clone(),
+            },
+        };
+        HarnessSnapshots {
+            claude,
+            codex: super::codex_process::snapshot(&mut self.codex),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -559,5 +695,52 @@ mod tests {
             !snap.is_available(),
             "an empty names() must be distinguishable from a genuinely empty registry"
         );
+    }
+}
+
+#[cfg(test)]
+mod harness_tests {
+    use super::*;
+    use crate::autopilot::implementer::Implementer;
+
+    #[test]
+    fn harness_sources_do_not_cross_contaminate() {
+        let snapshots = HarnessSnapshots {
+            claude: RegistrySnapshot::Available(vec![AgentEntry {
+                name: "ic-test".into(),
+                status: None,
+            }]),
+            codex: CodexProcessSnapshot::Unavailable {
+                reason: "ps unavailable".into(),
+            },
+        };
+        assert!(snapshots.is_available(Implementer::Claude));
+        assert!(!snapshots.is_available(Implementer::Codex));
+        assert_eq!(snapshots.reason(Implementer::Codex), "ps unavailable");
+    }
+
+    #[test]
+    fn codex_parser_uses_executable_and_option_position() {
+        let rows = parse_codex_processes("10 1 10 S /opt/codex exec --output-schema /tmp/.git/ironmem/autopilot/repo/uuid/schema.json prompt\n11 1 11 S /bin/sh -c codex exec --output-schema /tmp/.git/ironmem/autopilot/repo/uuid/schema.json\n12 1 12 S codex exec --json reviewer prompt\n13 1 13 S codex exec resume --output-schema /tmp/.git/ironmem/autopilot/repo/other/schema.json native prompt\n").unwrap();
+        assert_eq!(rows.len(), 4);
+        assert_eq!(
+            rows[0].marker().unwrap(),
+            Some("/tmp/.git/ironmem/autopilot/repo/uuid/schema.json")
+        );
+        assert_eq!(rows[1].marker().unwrap(), None);
+        assert_eq!(rows[2].marker().unwrap(), None);
+        let reviewer =
+            parse_codex_processes("16 1 16 S codex exec --future-review-flag reviewer\n").unwrap();
+        assert_eq!(reviewer[0].marker().unwrap(), None);
+        assert_eq!(
+            rows[3].marker().unwrap(),
+            Some("/tmp/.git/ironmem/autopilot/repo/other/schema.json")
+        );
+        let bad = parse_codex_processes("14 1 14 S codex exec --output-schema\n").unwrap();
+        assert!(bad[0].marker().is_err());
+        let prompt =
+            parse_codex_processes("15 1 15 S codex exec prompt --output-schema /tmp/false\n")
+                .unwrap();
+        assert_eq!(prompt[0].marker().unwrap(), None);
     }
 }

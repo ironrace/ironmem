@@ -4,7 +4,7 @@
 //! *deciding* to a human at a command line: which issue, which class, when.
 //! [`lead_tick`] is that human. One tick is one full pass over the world:
 //!
-//! 1. Read the session registry **once** ([`super::registry::snapshot`]) and
+//! 1. Read both harness sources **once** ([`super::registry::HarnessMonitor`]) and
 //!    reconcile it against the dispatch-state drawers (rung 7).
 //! 2. Poll every `agent:blocked` issue for a human answer (rung 8's
 //!    [`super::blocked`]), un-blocking the ones that have been answered
@@ -85,7 +85,9 @@ use super::labels::{self, AgentLabel, DispatchEligibility};
 use super::lineage::{self, AttemptOutcome};
 use super::merge::serialize_issue;
 use super::queue::{self, QueueConfig, QueuePlan, RepoBacklog, IN_FLIGHT_SCAN_LIMIT};
-use super::registry::{self, AgentRegistry, RegistrySnapshot};
+#[cfg(test)]
+use super::registry::AgentRegistry;
+use super::registry::{HarnessMonitor, LivenessSnapshot};
 use super::retry;
 use super::run::{self, Dispatcher, IssueBrief, IssueRun, RunConfig};
 use super::scrub::scrub_and_bound;
@@ -261,6 +263,8 @@ pub struct TickProblem {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct LeadReport {
     pub dry_run: bool,
+    /// Availability of the configured implementation harness source.
+    /// Individual invocation identity uncertainty may still require a hold.
     pub registry_available: bool,
     pub reconciliation: Vec<supervise::Reconciliation>,
     pub blocked: Vec<BlockedOutcome>,
@@ -301,7 +305,7 @@ pub struct EscalationNotice {
 pub fn lead_tick(
     db: &Database,
     gh_runner: &mut dyn GhRunner,
-    agent_registry: &mut dyn AgentRegistry,
+    agent_registry: &mut dyn HarnessMonitor,
     dispatcher: &mut dyn Dispatcher,
     advisor: &mut dyn Advisor,
     config: &LeadConfig,
@@ -316,7 +320,7 @@ pub fn lead_tick(
     // Once, not per step: two reads inside one tick could disagree, and a
     // reconciliation that adopted a session the queue then treated as dead
     // would be a wrong answer rather than an error.
-    let snapshot = registry::snapshot(agent_registry);
+    let snapshot = agent_registry.snapshot();
     let reconciliation = supervise::reconcile(db, &snapshot)?;
 
     // ── 2. answered questions, before the backlog is read ───────────────
@@ -366,7 +370,7 @@ pub fn lead_tick(
 
     Ok(LeadReport {
         dry_run: config.dry_run,
-        registry_available: snapshot.is_available(),
+        registry_available: snapshot.is_available(config.run.implementer),
         reconciliation,
         blocked,
         supervision,
@@ -538,7 +542,7 @@ fn poll_blocked_issues(
 /// responsible for.
 fn supervise_in_flight(
     db: &Database,
-    snapshot: &RegistrySnapshot,
+    snapshot: &dyn LivenessSnapshot,
     config: &LeadConfig,
     problems: &mut Vec<TickProblem>,
 ) -> Result<Vec<SupervisionReport>, MemoryError> {
@@ -2988,5 +2992,42 @@ mod tests {
         assert_eq!(closed, vec![&IssueRef::new(REPO, 4)]);
         assert_eq!(gh_runner.seen.len(), 6, "{:?}", gh_runner.seen);
         assert!(report.problems.is_empty(), "{:?}", report.problems);
+    }
+    #[test]
+    fn lead_snapshots_harnesses_once_and_reports_selected_availability() {
+        use crate::autopilot::codex_process::CodexProcessSnapshot;
+        use crate::autopilot::registry::{HarnessSnapshots, RegistrySnapshot};
+        struct Monitor {
+            calls: usize,
+        }
+        impl HarnessMonitor for Monitor {
+            fn snapshot(&mut self) -> HarnessSnapshots {
+                self.calls += 1;
+                HarnessSnapshots {
+                    claude: RegistrySnapshot::Unavailable {
+                        reason: "no Claude installed".into(),
+                    },
+                    codex: CodexProcessSnapshot::Available(Vec::new()),
+                }
+            }
+        }
+        let db = approved_db();
+        let f = fixture();
+        let mut cfg = config(&f);
+        cfg.run.implementer = crate::autopilot::implementer::Implementer::Codex;
+        let mut monitor = Monitor { calls: 0 };
+        let mut gh = ScriptedGh::new(vec![Ok(GhOutput::ok("[]")), Ok(GhOutput::ok("[]"))]);
+        let report = lead_tick(
+            &db,
+            &mut gh,
+            &mut monitor,
+            &mut RefusingDispatcher,
+            &mut no_advisor(),
+            &cfg,
+        )
+        .unwrap();
+        assert_eq!(monitor.calls, 1);
+        assert!(report.registry_available);
+        assert!(report.problems.is_empty());
     }
 }

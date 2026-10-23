@@ -93,7 +93,9 @@ use crate::error::MemoryError;
 
 use super::dispatch_state::{self, DispatchState};
 use super::lineage::{self, AttemptOutcome, AttemptRecord, IssueStatus};
-use super::registry::{Liveness, RegistrySnapshot};
+#[cfg(test)]
+use super::registry::RegistrySnapshot;
+use super::registry::{Liveness, LivenessSnapshot};
 use super::scrub::scrub_and_bound;
 use super::{read_current, validate_repo, write_current, IssueRef};
 
@@ -1100,7 +1102,7 @@ pub fn plan_supervision(
 pub fn supervise_issue(
     db: &Database,
     issue: &IssueRef,
-    snapshot: &RegistrySnapshot,
+    snapshot: &dyn LivenessSnapshot,
     config: &SupervisionConfig,
 ) -> Result<SupervisionReport, MemoryError> {
     validate_repo(&issue.repo)?;
@@ -1129,7 +1131,7 @@ pub fn supervise_issue(
     // an issue with no dispatch-state drawer being absent from the registry is
     // the normal finished state, not a death.
     let liveness = match &state {
-        Some(state) => snapshot.liveness(&state.ic_session_name),
+        Some(state) => snapshot.liveness(state),
         None => Liveness::Alive,
     };
 
@@ -1147,7 +1149,14 @@ pub fn supervise_issue(
         Liveness::Unknown => prior.as_ref().and_then(|r| r.first_absent_at.clone()),
     };
 
-    let process = if state.is_some() {
+    let process = if liveness == Liveness::Unknown {
+        ProcessHealth::Unknown {
+            reason: state
+                .as_ref()
+                .map(|s| snapshot.state_reason(s))
+                .unwrap_or_else(|| "no dispatch state".into()),
+        }
+    } else if state.is_some() {
         assess_process_health(
             liveness,
             &progress_observed_at,
@@ -1316,27 +1325,23 @@ where
 /// also acted would be a second dispatch path with none of that machinery.
 pub fn reconcile(
     db: &Database,
-    snapshot: &RegistrySnapshot,
+    snapshot: &dyn LivenessSnapshot,
 ) -> Result<Vec<Reconciliation>, MemoryError> {
     let states = dispatch_state::all_dispatch_states(db, MAX_IN_FLIGHT_DISPATCH_STATES)?;
     let mut out = Vec::new();
     let mut known_sessions = std::collections::HashSet::new();
 
     for state in &states {
-        known_sessions.insert(state.ic_session_name.clone());
-        let verdict = match snapshot.liveness(&state.ic_session_name) {
+        if state.implementer == super::implementer::Implementer::Claude {
+            known_sessions.insert(state.ic_session_name.clone());
+        }
+        let verdict = match snapshot.liveness(state) {
             Liveness::Alive => ReconcileVerdict::Adopt,
             Liveness::NotListed => ReconcileVerdict::RestartFromCheckpoint {
                 session_claimed: state.session_claimed,
             },
             Liveness::Unknown => ReconcileVerdict::Hold {
-                reason: match snapshot {
-                    RegistrySnapshot::Unavailable { reason } => reason.clone(),
-                    // Unreachable: an Available snapshot never answers
-                    // Unknown. Spelled out rather than unwrapped so a future
-                    // change to `liveness` cannot turn this into a panic.
-                    RegistrySnapshot::Available(_) => "liveness unavailable".to_string(),
-                },
+                reason: snapshot.state_reason(state),
             },
         };
         out.push(Reconciliation {
@@ -1351,8 +1356,8 @@ pub fn reconcile(
     // be distinguished from "we could not see any sessions at all", and the
     // spec's orphan row calls for flagging a human — which would then mean
     // paging a human every time the registry hiccuped.
-    if snapshot.is_available() {
-        for name in snapshot.names() {
+    {
+        for name in snapshot.claude_names() {
             if name.starts_with(IC_SESSION_PREFIX) && !known_sessions.contains(name) {
                 out.push(Reconciliation {
                     issue: None,
@@ -1360,6 +1365,21 @@ pub fn reconcile(
                     verdict: ReconcileVerdict::Orphan,
                 });
             }
+        }
+    }
+
+    let known_markers: std::collections::HashSet<_> = states
+        .iter()
+        .filter(|s| s.implementer == super::implementer::Implementer::Codex)
+        .filter_map(|s| s.codex_artifacts.as_ref().map(|a| a.schema_path.as_str()))
+        .collect();
+    for marker in snapshot.codex_markers() {
+        if !known_markers.contains(marker) {
+            out.push(Reconciliation {
+                issue: None,
+                session_name: marker.into(),
+                verdict: ReconcileVerdict::Orphan,
+            });
         }
     }
 
@@ -2682,5 +2702,45 @@ mod tests {
             active_redirect(&db, &issue).unwrap().as_deref(),
             Some("old")
         );
+    }
+    #[test]
+    fn codex_reconciliation_adopts_restarts_and_holds_its_own_source() {
+        use crate::autopilot::codex_process::{testing, CodexProcessSnapshot};
+        use crate::autopilot::registry::HarnessSnapshots;
+        let db = Database::open_in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (a, row) = testing::invocation(dir.path());
+        let mut state = state_for(&issue(), true);
+        state.implementer = crate::autopilot::implementer::Implementer::Codex;
+        state.codex_artifacts = Some(a.clone());
+        dispatch_state::upsert_dispatch_state(&db, &state).unwrap();
+        let mut snapshots = HarnessSnapshots {
+            claude: RegistrySnapshot::Available(Vec::new()),
+            codex: CodexProcessSnapshot::Available(vec![row]),
+        };
+        assert_eq!(
+            reconcile(&db, &snapshots).unwrap()[0].verdict,
+            ReconcileVerdict::Adopt
+        );
+        snapshots.codex = CodexProcessSnapshot::Available(Vec::new());
+        assert!(matches!(
+            reconcile(&db, &snapshots).unwrap()[0].verdict,
+            ReconcileVerdict::Hold { .. }
+        ));
+        assert!(
+            matches!(
+                reconcile(&db, &alive_snapshot(&issue())).unwrap()[0].verdict,
+                ReconcileVerdict::Hold { .. }
+            ),
+            "legacy Claude evidence must hold Codex"
+        );
+        testing::complete(&a);
+        snapshots.claude = RegistrySnapshot::Unavailable {
+            reason: "no Claude".into(),
+        };
+        assert!(matches!(
+            reconcile(&db, &snapshots).unwrap()[0].verdict,
+            ReconcileVerdict::RestartFromCheckpoint { .. }
+        ));
     }
 }

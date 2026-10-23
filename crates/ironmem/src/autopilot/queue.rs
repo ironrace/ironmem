@@ -79,7 +79,9 @@ use serde::Serialize;
 
 use super::gh::IssueListing;
 use super::labels::{self, DispatchEligibility};
-use super::registry::{Liveness, RegistrySnapshot};
+#[cfg(test)]
+use super::registry::RegistrySnapshot;
+use super::registry::{Liveness, LivenessSnapshot};
 use super::{
     budget, dispatch_state, gate_config, lineage, merge::serialize_issue, remediate, supervise,
     today_utc, validate_repo, AttemptOutcome, IssueRef,
@@ -383,7 +385,7 @@ impl QueuePlan {
 pub fn plan_queue(
     db: &Database,
     backlogs: &[RepoBacklog],
-    snapshot: &RegistrySnapshot,
+    snapshot: &dyn LivenessSnapshot,
     config: &QueueConfig,
 ) -> Result<QueuePlan, MemoryError> {
     config.validate()?;
@@ -504,7 +506,7 @@ pub fn plan_queue(
 
             let state = in_flight.iter().find(|s| s.issue == issue);
             if let Some(state) = state {
-                match snapshot.liveness(&state.ic_session_name) {
+                match snapshot.liveness(state) {
                     Liveness::Alive => {
                         defer(DeferReason::SessionLive {
                             session_name: state.ic_session_name.clone(),
@@ -513,17 +515,7 @@ pub fn plan_queue(
                     }
                     Liveness::Unknown => {
                         defer(DeferReason::RegistryUnreadable {
-                            detail: match snapshot {
-                                RegistrySnapshot::Unavailable { reason } => reason.clone(),
-                                // Unreachable: `Available` never answers
-                                // `Unknown`. Spelled rather than
-                                // `unreachable!` because a panic in the
-                                // Lead's planning pass would take out every
-                                // other repo's work too.
-                                RegistrySnapshot::Available(_) => {
-                                    "registry liveness was indeterminate".to_string()
-                                }
-                            },
+                            detail: snapshot.state_reason(state),
                         });
                         continue;
                     }
@@ -1545,5 +1537,49 @@ mod tests {
         assert!(lineage::get_issue_status(&db, &IssueRef::new(REPO, 1))
             .unwrap()
             .is_none());
+    }
+    #[test]
+    fn codex_queue_routes_by_persisted_harness_and_holds_uncertainty() {
+        use crate::autopilot::codex_process::{testing, CodexProcessSnapshot};
+        use crate::autopilot::registry::HarnessSnapshots;
+        let db = approved(&[REPO]);
+        let issue = IssueRef::new(REPO, 1);
+        put_state(&db, &issue, "ic-test");
+        let mut state = dispatch_state::get_dispatch_state(&db, &issue)
+            .unwrap()
+            .unwrap();
+        state.implementer = crate::autopilot::implementer::Implementer::Codex;
+        let dir = tempfile::tempdir().unwrap();
+        let (a, row) = testing::invocation(dir.path());
+        state.codex_artifacts = Some(a.clone());
+        dispatch_state::upsert_dispatch_state(&db, &state).unwrap();
+        let mut snapshots = HarnessSnapshots {
+            claude: RegistrySnapshot::Available(Vec::new()),
+            codex: CodexProcessSnapshot::Available(vec![row]),
+        };
+        let backlogs = [backlog(REPO, vec![ready(1)])];
+        let plan = plan_queue(&db, &backlogs, &snapshots, &config()).unwrap();
+        assert!(matches!(
+            reason_for(&plan, 1),
+            DeferReason::SessionLive { .. }
+        ));
+        snapshots.codex = CodexProcessSnapshot::Available(Vec::new());
+        let plan = plan_queue(&db, &backlogs, &snapshots, &config()).unwrap();
+        assert!(matches!(
+            reason_for(&plan, 1),
+            DeferReason::RegistryUnreadable { .. }
+        ));
+        testing::complete(&a);
+        snapshots.claude = RegistrySnapshot::Available(vec![AgentEntry {
+            name: "ic-test".into(),
+            status: None,
+        }]);
+        let plan = plan_queue(&db, &backlogs, &snapshots, &config()).unwrap();
+        assert_eq!(
+            plan.dispatch.len(),
+            1,
+            "Claude name must not hold a dead Codex invocation"
+        );
+        assert_eq!(plan.dispatch[0].issue, issue);
     }
 }

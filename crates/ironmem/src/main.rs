@@ -2460,8 +2460,9 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                     return Ok(());
                 }
 
-                let mut registry = ironmem::autopilot::registry::ClaudeAgentRegistry::resolve()?;
-                let snapshot = ironmem::autopilot::registry::snapshot(&mut registry);
+                let mut registry = ironmem::autopilot::registry::TwoHarnessMonitor::default();
+                let snapshot =
+                    ironmem::autopilot::registry::HarnessMonitor::snapshot(&mut registry);
                 let report = ironmem::autopilot::supervise::supervise_issue(
                     &database, &issue_ref, &snapshot, &config,
                 )?;
@@ -2532,8 +2533,9 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
             AutopilotCmd::Reconcile { db, json } => {
                 use ironmem::autopilot::supervise::ReconcileVerdict;
                 let database = open_migrated_db(db)?;
-                let mut registry = ironmem::autopilot::registry::ClaudeAgentRegistry::resolve()?;
-                let snapshot = ironmem::autopilot::registry::snapshot(&mut registry);
+                let mut registry = ironmem::autopilot::registry::TwoHarnessMonitor::default();
+                let snapshot =
+                    ironmem::autopilot::registry::HarnessMonitor::snapshot(&mut registry);
                 let rows = ironmem::autopilot::supervise::reconcile(&database, &snapshot)?;
 
                 if json {
@@ -2689,7 +2691,7 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                         .map(|t| t.path.clone())
                         .unwrap_or_else(|| std::path::PathBuf::from(".")),
                 )?;
-                let mut registry = ironmem::autopilot::registry::ClaudeAgentRegistry::resolve()?;
+                let mut registry = ironmem::autopilot::registry::TwoHarnessMonitor::default();
                 let mut dispatcher = ironmem::autopilot::run::ClaudeDispatcher::resolve()?;
                 let mut advisor = ironmem::autopilot::advise::ClaudeAdvisor::resolve()?;
 
@@ -2845,8 +2847,9 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                 let database = open_migrated_db(db)?;
                 let mut gh_runner =
                     ironmem::autopilot::gh::GhCli::resolve(std::path::PathBuf::from(&path))?;
-                let mut registry = ironmem::autopilot::registry::ClaudeAgentRegistry::resolve()?;
-                let snapshot = ironmem::autopilot::registry::snapshot(&mut registry);
+                let mut registry = ironmem::autopilot::registry::TwoHarnessMonitor::default();
+                let snapshot =
+                    ironmem::autopilot::registry::HarnessMonitor::snapshot(&mut registry);
 
                 let mut backlogs = Vec::new();
                 for repo in &repos {

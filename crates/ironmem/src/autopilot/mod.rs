@@ -201,6 +201,7 @@ pub mod blocked;
 pub mod budget;
 pub mod ci_evidence;
 pub mod codex_dispatch;
+pub mod codex_process;
 pub mod dispatch;
 pub mod dispatch_state;
 pub mod gate_config;
@@ -249,7 +250,10 @@ pub use onboard::{infer_gate_commands, onboard_repo, InferredGates};
 pub use queue::{
     plan_queue, DeferReason, Deferred, Priority, QueueConfig, QueuePlan, QueuedIssue, RepoBacklog,
 };
-pub use registry::{AgentRegistry, ClaudeAgentRegistry, Liveness, RegistrySnapshot};
+pub use registry::{
+    AgentRegistry, ClaudeAgentRegistry, HarnessMonitor, HarnessSnapshots, Liveness,
+    LivenessSnapshot, RegistrySnapshot, TwoHarnessMonitor,
+};
 pub use review::reviews_for_issue;
 pub use review::{
     decide_merge, record_review, review_pr, run_muse_review, run_review, CodexReviewer, HoldReason,

@@ -580,8 +580,8 @@ impl Dispatcher for ClaudeDispatcher {
     }
 }
 
-/// Codex implementation backend. Until the process registry supplies confirmed
-/// liveness, only a valid supervisor exit record permits artifact recovery.
+/// Codex implementation backend. Process evidence is checked before durable
+/// artifacts; only trusted supervisor cleanup permits completed recovery.
 pub struct CodexDispatcher {
     bin: std::path::PathBuf,
 }
@@ -607,11 +607,16 @@ impl Dispatcher for CodexDispatcher {
         let Some(artifacts) = state.codex_artifacts.as_ref() else {
             return Ok(CodexRecovery::NoPriorInvocation);
         };
-        if codex_dispatch::has_valid_exit_record(artifacts) {
-            // The supervisor writes this only after wait observed completion.
-            codex_dispatch::recover_artifacts(Some(artifacts))
-        } else {
-            Ok(CodexRecovery::Unknown { reason: "Codex invocation has no valid supervisor exit record; process completion is unproven".into() })
+        let snapshot =
+            super::codex_process::snapshot(&mut super::codex_process::UnixCodexProcesses);
+        match snapshot.liveness(Some(artifacts)) {
+            super::registry::Liveness::Alive => Ok(CodexRecovery::Alive),
+            super::registry::Liveness::NotListed => {
+                codex_dispatch::recover_artifacts(Some(artifacts))
+            }
+            super::registry::Liveness::Unknown => Ok(CodexRecovery::Unknown {
+                reason: snapshot.invocation_reason(Some(artifacts)),
+            }),
         }
     }
 

@@ -186,6 +186,8 @@ pub fn run_codex(
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ExitRecord {
+    #[serde(default)]
+    completion: Option<CompletionRecord>,
     exit_code: Option<i32>,
     timed_out: bool,
     limit_exceeded: Option<String>,
@@ -193,6 +195,21 @@ struct ExitRecord {
     duration_ms: u64,
     #[serde(default)]
     expected_native_id: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CompletionRecord {
+    version: u32,
+    invocation_id: String,
+    schema_path: String,
+}
+impl ExitRecord {
+    fn proves_completion(&self, a: &CodexArtifacts) -> bool {
+        self.completion.as_ref().is_some_and(|c| {
+            c.version == 1 && c.invocation_id == a.invocation_id && c.schema_path == a.schema_path
+        })
+    }
 }
 
 fn open_existing(path: &str, write: bool) -> Result<File, MemoryError> {
@@ -287,27 +304,61 @@ pub fn run_codex_bounded(
     let mut child = super::dispatch::retry_on_etxtbsy(|| command.spawn())
         .map_err(|e| MemoryError::NotFound(format!("failed to launch Codex dispatch: {e}")))?;
     let started = Instant::now();
+    let mut identity = super::codex_process::ProcessIdentity {
+        version: 1,
+        root_pid: child.id(),
+        root_pgid: child.id(),
+        schema_path: a.schema_path.clone(),
+        invocation_id: a.invocation_id.clone(),
+        descendants: Vec::new(),
+    };
+    let mut tracker = super::codex_process::ProcessTracker::new(child.id());
+    if let Err(e) = super::codex_process::persist_identity(a, &identity) {
+        // The root is still our unreaped Child; cleanup is authenticated by
+        // kernel birth identity, and cannot authorize a retry on uncertainty.
+        let _ = tracker.cleanup(false);
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(e);
+    }
     let mut timed_out = false;
     let mut limit_exceeded;
     let status = loop {
+        if let Err(e) = tracker.observe() {
+            let _ = tracker.cleanup(false);
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(e);
+        }
         limit_exceeded = limits(a);
         if limit_exceeded.is_some() || started.elapsed() >= timeout {
             timed_out = limit_exceeded.is_none();
-            super::dispatch::kill_process_group(&mut child);
-            break child.wait()?;
+            let cleanup = tracker.cleanup(false);
+            if cleanup.is_err() {
+                let _ = child.kill();
+            }
+            let waited = child.wait();
+            cleanup?;
+            break waited?;
         }
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => std::thread::sleep(POLL_INTERVAL),
             Err(e) => {
-                super::dispatch::kill_process_group(&mut child);
+                let _ = tracker.cleanup(false);
+                let _ = child.kill();
                 let _ = child.wait();
                 return Err(e.into());
             }
         }
     };
+    identity.descendants = tracker.descendants();
+    if let Err(e) = super::codex_process::persist_identity(a, &identity) {
+        let _ = tracker.cleanup(true);
+        return Err(e);
+    }
     finish_codex_dispatch(
-        &mut child,
+        &mut tracker,
         a,
         spec,
         status,
@@ -320,7 +371,7 @@ pub fn run_codex_bounded(
 /// Complete supervision after the root process has been observed and reaped.
 /// Descendants may still be running and writing the invocation's artifacts.
 fn finish_codex_dispatch(
-    child: &mut std::process::Child,
+    tracker: &mut super::codex_process::ProcessTracker,
     a: &CodexArtifacts,
     spec: &DispatchSpec,
     status: std::process::ExitStatus,
@@ -330,13 +381,18 @@ fn finish_codex_dispatch(
 ) -> Result<DispatchOutcome, MemoryError> {
     // Catch an artifact that crossed the limit just before process exit.
     let limit_exceeded = limit_exceeded.or_else(|| limits(a));
-    if limit_exceeded.is_some() {
-        // try_wait may already have reaped the root while gate descendants
-        // still belong to its process group. A failed outcome alone would
-        // leave those processes running in the worktree.
-        super::dispatch::kill_process_group(child);
+    if !status.success() && !tracker.observed_root() {
+        return Err(validation("Codex root exited unsuccessfully before process-tree observation; descendant completion is unproven"));
     }
+    // Even a successful root can leave a gate in a separate process group.
+    // Unknown cleanup returns Err so run.rs retains the invocation and slot.
+    tracker.cleanup(true)?;
     let record = ExitRecord {
+        completion: Some(CompletionRecord {
+            version: 1,
+            invocation_id: a.invocation_id.clone(),
+            schema_path: a.schema_path.clone(),
+        }),
         exit_code: status.code(),
         timed_out,
         limit_exceeded,
@@ -446,6 +502,9 @@ pub fn read_artifacts(a: &CodexArtifacts) -> Result<DispatchOutcome, MemoryError
     });
     let (process_success, timed_out, duration_ms) = match &exit {
         Ok(record) => {
+            if !record.proves_completion(a) {
+                errors.push("untrusted Codex supervisor completion evidence".into());
+            }
             if record
                 .expected_native_id
                 .as_ref()
@@ -464,7 +523,10 @@ pub fn read_artifacts(a: &CodexArtifacts) -> Result<DispatchOutcome, MemoryError
                 errors.push(format!("Codex process exited with {:?}", record.exit_code));
             }
             (
-                record.exit_code == Some(0) && !record.timed_out && record.limit_exceeded.is_none(),
+                record.proves_completion(a)
+                    && record.exit_code == Some(0)
+                    && !record.timed_out
+                    && record.limit_exceeded.is_none(),
                 record.timed_out,
                 record.duration_ms,
             )
@@ -510,7 +572,7 @@ pub fn has_valid_exit_record(artifacts: &CodexArtifacts) -> bool {
     read_capped(&artifacts.exit_path, EXIT_LIMIT)
         .ok()
         .and_then(|text| serde_json::from_str::<ExitRecord>(&text).ok())
-        .is_some()
+        .is_some_and(|record| record.proves_completion(artifacts))
 }
 
 /// The caller MUST first confirm the invocation is dead. This file-only
@@ -681,7 +743,7 @@ mod contract_tests {
             std::fs::write(
                 &a.exit_path,
                 serde_json::to_vec(
-                    &serde_json::json!({"exit_code":code,"timed_out":false,"limit_exceeded":null}),
+                    &serde_json::json!({"exit_code":code,"timed_out":false,"limit_exceeded":null,"completion":{"version":1,"invocation_id":a.invocation_id,"schema_path":a.schema_path}}),
                 )
                 .unwrap(),
             )
@@ -1056,6 +1118,7 @@ exit {code}"#
             .process_group(0);
         let mut child = crate::autopilot::dispatch::retry_on_etxtbsy(|| command.spawn()).unwrap();
         let started = Instant::now();
+        let mut tracker = super::super::codex_process::ProcessTracker::new(child.id());
         let ready = dir.path().join("descendant-ready");
         while !ready.exists() && started.elapsed() < Duration::from_secs(3) {
             std::thread::sleep(Duration::from_millis(5));
@@ -1065,6 +1128,7 @@ exit {code}"#
             let _ = child.wait();
             panic!("descendant did not reach its gate");
         }
+        tracker.observe().unwrap();
         // This is the supervisor's pre-try_wait snapshot: still under cap.
         let previous_limit = limits(a);
         assert_eq!(previous_limit, None);
@@ -1083,7 +1147,7 @@ exit {code}"#
         assert!(status.success());
         assert!(limits(a).is_some());
         let outcome =
-            finish_codex_dispatch(&mut child, a, &s, status, started, false, previous_limit)
+            finish_codex_dispatch(&mut tracker, a, &s, status, started, false, previous_limit)
                 .unwrap();
         assert!(!outcome.is_met());
         assert!(outcome.reason.unwrap().contains("limit"));
@@ -1117,6 +1181,22 @@ exit {code}"#
             read_artifacts(s.codex_artifacts.as_ref().unwrap())
                 .unwrap()
                 .timed_out
+        );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn timeout_kills_tool_in_a_separate_process_group() {
+        let (dir, s) = setup();
+        let python = "/usr/bin/python3";
+        let extra = format!("{python} -c 'import os,time; os.setsid(); open(\"detached-ready\",\"w\").close(); time.sleep(1); open(\"detached-survived\",\"w\").close()' &\nwhile [ ! -f detached-ready ]; do sleep 0.01; done\nsleep 10");
+        let bin = binary(dir.path(), &script(&extra, 0));
+        let o = run_codex_bounded(&bin, dir.path(), &s, Duration::from_millis(400)).unwrap();
+        assert!(o.timed_out);
+        assert!(dir.path().join("detached-ready").exists());
+        std::thread::sleep(Duration::from_millis(1200));
+        assert!(
+            !dir.path().join("detached-survived").exists(),
+            "escaped tool survived timeout"
         );
     }
 }
