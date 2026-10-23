@@ -144,14 +144,8 @@ impl CodexProcessSource for UnixCodexProcesses {
     fn list(&mut self) -> Result<Vec<ProcessRow>, String> {
         #[cfg(unix)]
         {
-            let output = Command::new("ps")
-                .args(["-axww", "-o", "pid=,ppid=,pgid=,stat=,args="])
-                .output()
-                .map_err(|e| format!("cannot execute ps: {e}"))?;
-            if !output.status.success() {
-                return Err("ps exited unsuccessfully".into());
-            }
-            let text = std::str::from_utf8(&output.stdout).map_err(|_| "ps output is not UTF-8")?;
+            let output = bounded_process_table()?;
+            let text = std::str::from_utf8(&output).map_err(|_| "ps output is not UTF-8")?;
             if text.trim().is_empty() {
                 return Err("ps returned no process table".into());
             }
@@ -162,6 +156,93 @@ impl CodexProcessSource for UnixCodexProcesses {
             Err("Codex process observation is unsupported on this platform".into())
         }
     }
+}
+
+/// Keep process observation inside the dispatch's finite supervision bound.
+/// Nonblocking reads also bound a pipe left open after ps itself exits.
+#[cfg(unix)]
+fn bounded_process_table() -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+    const TIMEOUT: Duration = Duration::from_secs(2);
+    const OUTPUT_LIMIT: usize = 16 * 1024 * 1024;
+    let mut command = Command::new("ps");
+    command
+        .args(["-axww", "-o", "pid=,ppid=,pgid=,stat=,args="])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .process_group(0);
+    let mut child = crate::autopilot::dispatch::retry_on_etxtbsy(|| command.spawn())
+        .map_err(|e| format!("cannot execute ps: {e}"))?;
+    let started = Instant::now();
+    let mut status = None;
+    let result = (|| {
+        let mut pipe = child.stdout.take().ok_or("ps stdout is unavailable")?;
+        let fd = pipe.as_raw_fd();
+        // SAFETY: the descriptor is our owned stdout pipe; preserve its flags
+        // and add nonblocking mode so neither EOF nor a reader join can hang.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            return Err(format!(
+                "cannot bound ps output: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let mut output = Vec::new();
+        let mut eof = false;
+        let mut buffer = [0; 8192];
+        loop {
+            if started.elapsed() >= TIMEOUT {
+                return Err("ps exceeded its 2s process observation bound".into());
+            }
+            while !eof {
+                if started.elapsed() >= TIMEOUT {
+                    return Err("ps exceeded its 2s process observation bound".into());
+                }
+                match pipe.read(&mut buffer) {
+                    Ok(0) => eof = true,
+                    Ok(count) => {
+                        if output.len() + count > OUTPUT_LIMIT {
+                            return Err("ps exceeded its process-table output limit".into());
+                        }
+                        output.extend_from_slice(&buffer[..count]);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(format!("cannot read ps output: {e}")),
+                }
+                if started.elapsed() >= TIMEOUT {
+                    return Err("ps exceeded its 2s process observation bound".into());
+                }
+            }
+            if status.is_none() {
+                status = child
+                    .try_wait()
+                    .map_err(|e| format!("cannot observe ps completion: {e}"))?;
+            }
+            if let Some(status) = status {
+                if eof {
+                    return if status.success() {
+                        Ok(output)
+                    } else {
+                        Err("ps exited unsuccessfully".into())
+                    };
+                }
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    })();
+    if result.is_err() && status.is_none() {
+        // Only signal the group while the spawned ps PID is still reserved
+        // by our unreaped Child. Never signal a stale group after try_wait.
+        crate::autopilot::dispatch::kill_process_group(&mut child);
+        let _ = child.wait();
+    }
+    result
 }
 
 pub fn snapshot(source: &mut dyn CodexProcessSource) -> CodexProcessSnapshot {
@@ -402,7 +483,19 @@ const KILL_SIGNAL: i32 = 0;
 /// Kernel birth identity prevents a recycled PID from authorizing a signal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Birth(u64, u64);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct KernelProcess {
+    pid: u32,
+    ppid: u32,
+    pgid: u32,
+    birth: Birth,
+}
 fn birth(pid: u32) -> Result<Option<Birth>, String> {
+    kernel_observation(pid).map(|process| process.map(|p| p.birth))
+}
+
+/// Ancestry and birth come from the same kernel record, never a stale ps row.
+fn kernel_observation(pid: u32) -> Result<Option<KernelProcess>, String> {
     #[cfg(target_os = "macos")]
     {
         let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
@@ -431,7 +524,12 @@ fn birth(pid: u32) -> Result<Option<Birth>, String> {
         if info.pbi_pid != pid {
             return Err("kernel process identity mismatch".into());
         }
-        Ok(Some(Birth(info.pbi_start_tvsec, info.pbi_start_tvusec)))
+        Ok(Some(KernelProcess {
+            pid: info.pbi_pid,
+            ppid: info.pbi_ppid,
+            pgid: info.pbi_pgid,
+            birth: Birth(info.pbi_start_tvsec, info.pbi_start_tvusec),
+        }))
     }
     #[cfg(target_os = "linux")]
     {
@@ -451,7 +549,31 @@ fn birth(pid: u32) -> Result<Option<Birth>, String> {
             .ok_or("missing proc birth identity")?
             .parse()
             .map_err(|_| "invalid proc birth identity")?;
-        Ok(Some(Birth(start, 0)))
+        let record_pid = text
+            .split_once(' ')
+            .ok_or("missing proc pid")?
+            .0
+            .parse::<u32>()
+            .map_err(|_| "invalid proc pid")?;
+        if record_pid != pid {
+            return Err("kernel process identity mismatch".into());
+        }
+        let ppid = fields
+            .get(1)
+            .ok_or("missing proc parent")?
+            .parse()
+            .map_err(|_| "invalid proc parent")?;
+        let pgid = fields
+            .get(2)
+            .ok_or("missing proc group")?
+            .parse()
+            .map_err(|_| "invalid proc group")?;
+        Ok(Some(KernelProcess {
+            pid,
+            ppid,
+            pgid,
+            birth: Birth(start, 0),
+        }))
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
@@ -480,46 +602,130 @@ impl ProcessTracker {
     }
 
     pub(crate) fn observe(&mut self) -> Result<Vec<ProcessRow>, MemoryError> {
-        let rows = Self::rows()?;
-        // PID ownership is reserved until Child::try_wait/wait reaps the root.
-        // Known descendants are revalidated against their kernel birth token.
-        let mut seeds = std::collections::HashSet::new();
+        self.observe_rows(Self::rows()?, kernel_observation)
+    }
+
+    fn observe_rows(
+        &mut self,
+        rows: Vec<ProcessRow>,
+        mut kernel: impl FnMut(u32) -> Result<Option<KernelProcess>, String>,
+    ) -> Result<Vec<ProcessRow>, MemoryError> {
+        // Existing descendants remain owned only while their kernel birth
+        // token matches. Keep those tokens with the ancestry seeds; a bare
+        // PID from ps must never authorize enrollment of a new subtree.
+        let mut seeds = std::collections::HashMap::new();
         for (old, expected) in &self.known {
-            match birth(old.pid).map_err(MemoryError::Validation)? {
-                Some(actual) if actual == *expected => {
-                    seeds.insert(old.pid);
+            match kernel(old.pid).map_err(MemoryError::Validation)? {
+                Some(actual) if actual.pid == old.pid && actual.birth == *expected => {
+                    seeds.insert(old.pid, *expected);
                 }
                 Some(_) => {
                     return Err(MemoryError::Validation(
                         "tracked Codex PID was reused; cleanup cannot be authenticated".into(),
-                    ))
+                    ));
                 }
-                None => {}
+                None => {
+                    if rows.iter().any(|row| {
+                        row.active()
+                            && row.ppid == old.pid
+                            && !self.known.iter().any(|(known, _)| known.pid == row.pid)
+                    }) {
+                        return Err(MemoryError::Validation(
+                            "Codex ancestry seed disappeared before descendant authentication"
+                                .into(),
+                        ));
+                    }
+                }
             }
         }
+        // The spawned root's PID is reserved by our unreaped Child. Still
+        // bind its ps ancestry/group to the same kernel birth observation.
         if let Some(root) = rows
             .iter()
             .find(|r| !self.root_reaped && r.pid == self.root_pid && r.active())
         {
-            self.observed_root = true;
-            seeds.insert(root.pid);
+            match kernel(root.pid).map_err(MemoryError::Validation)? {
+                Some(actual) => {
+                    if actual.pid != root.pid
+                        || actual.ppid != root.ppid
+                        || actual.pgid != root.pgid
+                        || seeds
+                            .get(&root.pid)
+                            .is_some_and(|expected| *expected != actual.birth)
+                    {
+                        return Err(MemoryError::Validation(
+                            "Codex root identity changed during authentication".into(),
+                        ));
+                    }
+                    self.observed_root = true;
+                    seeds.insert(root.pid, actual.birth);
+                    if !self.known.iter().any(|(old, _)| old.pid == root.pid) {
+                        self.known.push((root.clone(), actual.birth));
+                    }
+                }
+                None => {
+                    // The owned, unreaped root cannot be PID-reused. A stale
+                    // active ps row may already have become an inert exit.
+                    seeds.remove(&root.pid);
+                }
+            }
         }
         loop {
-            let before = seeds.len();
+            let mut enrolled = false;
             for row in rows.iter().filter(|r| r.active()) {
-                if seeds.contains(&row.ppid) {
-                    seeds.insert(row.pid);
+                if self.known.iter().any(|(old, _)| old.pid == row.pid) {
+                    continue;
                 }
+                let Some(expected_parent) = seeds.get(&row.ppid).copied() else {
+                    continue;
+                };
+                let parent_before = kernel(row.ppid).map_err(MemoryError::Validation)?;
+                if !parent_before.is_some_and(|p| p.pid == row.ppid && p.birth == expected_parent) {
+                    return Err(MemoryError::Validation(
+                        "Codex ancestry seed changed before descendant authentication".into(),
+                    ));
+                }
+                let Some(actual) = kernel(row.pid).map_err(MemoryError::Validation)? else {
+                    // A genuinely gone row supplies neither a signal target
+                    // nor an ancestry seed. Ordinary short-lived tools race
+                    // ps this way; it is distinct from an observed replacement.
+                    continue;
+                };
+                // A fresh unrelated replacement cannot inherit an old ps
+                // row's ownership: parent, group and birth are one record.
+                if actual.pid != row.pid || actual.ppid != row.ppid {
+                    return Err(MemoryError::Validation(
+                        "Codex descendant ancestry changed during authentication".into(),
+                    ));
+                }
+                let parent_after = kernel(row.ppid).map_err(MemoryError::Validation)?;
+                if !parent_after.is_some_and(|p| p.pid == row.ppid && p.birth == expected_parent) {
+                    return Err(MemoryError::Validation(
+                        "Codex ancestry seed changed during descendant authentication".into(),
+                    ));
+                }
+                let Some(candidate_after) = kernel(row.pid).map_err(MemoryError::Validation)?
+                else {
+                    // Completion between the two captures still supplies no
+                    // signal target or seed, just as a gone first capture.
+                    continue;
+                };
+                if candidate_after != actual {
+                    return Err(MemoryError::Validation(
+                        "Codex descendant kernel identity changed during authentication".into(),
+                    ));
+                }
+                // The same owned parent bracketed a stable kernel capture.
+                // setsid may have changed the group since ps: kernel PGID is
+                // authoritative metadata, not an ownership input to PID kills.
+                let mut authenticated = row.clone();
+                authenticated.pgid = actual.pgid;
+                self.known.push((authenticated, actual.birth));
+                seeds.insert(row.pid, actual.birth);
+                enrolled = true;
             }
-            if before == seeds.len() {
+            if !enrolled {
                 break;
-            }
-        }
-        for row in rows.iter().filter(|r| r.active() && seeds.contains(&r.pid)) {
-            if !self.known.iter().any(|(old, _)| old.pid == row.pid) {
-                if let Some(token) = birth(row.pid).map_err(MemoryError::Validation)? {
-                    self.known.push((row.clone(), token));
-                }
             }
         }
         Ok(rows)
@@ -878,5 +1084,309 @@ mod tests {
             CodexProcessSnapshot::Available(Vec::new()).liveness(Some(&a)),
             Liveness::Unknown
         );
+    }
+    fn process_row(pid: u32, ppid: u32, pgid: u32) -> ProcessRow {
+        ProcessRow {
+            pid,
+            ppid,
+            pgid,
+            stat: "S".into(),
+            args: "fixture".into(),
+        }
+    }
+    fn kernel_process(pid: u32, ppid: u32, pgid: u32, start: u64) -> KernelProcess {
+        KernelProcess {
+            pid,
+            ppid,
+            pgid,
+            birth: Birth(start, 0),
+        }
+    }
+
+    #[test]
+    fn stale_descendant_row_cannot_enroll_a_reused_unrelated_pid() {
+        let root = kernel_process(10, 1, 10, 1);
+        for replacement in [Some(kernel_process(20, 999, 999, 2)), None] {
+            let mut tracker = ProcessTracker::new(10);
+            let result = tracker.observe_rows(
+                vec![process_row(10, 1, 10), process_row(20, 10, 20)],
+                |pid| Ok(if pid == 10 { Some(root) } else { replacement }),
+            );
+            if replacement.is_some() {
+                assert!(
+                    result.is_err(),
+                    "stale ancestry must hold, not enroll the replacement"
+                );
+            } else {
+                assert!(
+                    result.is_ok(),
+                    "a genuinely gone tool must not abort an ordinary live invocation"
+                );
+            }
+            assert!(!tracker.known.iter().any(|(row, _)| row.pid == 20));
+            assert!(tracker
+                .signal(20, STOP_SIGNAL)
+                .unwrap_err()
+                .to_string()
+                .contains("unauthenticated"));
+        }
+    }
+
+    #[test]
+    fn replaced_parent_cannot_authorize_a_new_subtree() {
+        let root = kernel_process(10, 1, 10, 1);
+        let parent = kernel_process(20, 10, 20, 2);
+        let replacement_parent = kernel_process(20, 999, 999, 3);
+        let child = kernel_process(30, 20, 30, 4);
+        let mut tracker = ProcessTracker::new(10);
+        tracker.known.push((process_row(20, 10, 20), parent.birth));
+        let mut parent_reads = 0;
+        let result = tracker.observe_rows(
+            vec![
+                process_row(10, 1, 10),
+                process_row(20, 10, 20),
+                process_row(30, 20, 30),
+            ],
+            |pid| {
+                Ok(match pid {
+                    10 => Some(root),
+                    20 => {
+                        parent_reads += 1;
+                        Some(if parent_reads <= 2 {
+                            parent
+                        } else {
+                            replacement_parent
+                        })
+                    }
+                    30 => Some(child),
+                    _ => unreachable!(),
+                })
+            },
+        );
+        assert!(result.is_err(), "parent birth changed during enrollment");
+        assert!(!tracker.known.iter().any(|(row, _)| row.pid == 30));
+        assert!(tracker
+            .signal(30, STOP_SIGNAL)
+            .unwrap_err()
+            .to_string()
+            .contains("unauthenticated"));
+    }
+
+    #[test]
+    fn authenticated_detached_child_is_enrolled_by_its_real_parent() {
+        let root = kernel_process(10, 1, 10, 1);
+        let child = kernel_process(20, 10, 20, 2);
+        let mut tracker = ProcessTracker::new(10);
+        tracker
+            .observe_rows(
+                vec![process_row(10, 1, 10), process_row(20, 10, 10)],
+                |pid| Ok(Some(if pid == 10 { root } else { child })),
+            )
+            .unwrap();
+        assert!(tracker.known.iter().any(|(row, token)| row.pid == 20
+            && row.pgid != tracker.root_pid
+            && *token == child.birth));
+    }
+    #[test]
+    fn vanished_known_parent_cannot_authorize_a_snapshot_child() {
+        let root = kernel_process(10, 1, 10, 1);
+        let mut tracker = ProcessTracker::new(10);
+        tracker.known.push((process_row(20, 10, 20), Birth(2, 0)));
+        let result = tracker.observe_rows(
+            vec![
+                process_row(10, 1, 10),
+                process_row(20, 10, 20),
+                process_row(30, 20, 30),
+            ],
+            |pid| {
+                Ok(match pid {
+                    10 => Some(root),
+                    20 => None,
+                    30 => Some(kernel_process(30, 20, 30, 4)),
+                    _ => unreachable!(),
+                })
+            },
+        );
+        assert!(
+            result.is_err(),
+            "lost ancestry evidence must hold the snapshot child"
+        );
+        assert!(!tracker.known.iter().any(|(row, _)| row.pid == 30));
+        assert!(tracker
+            .signal(30, STOP_SIGNAL)
+            .unwrap_err()
+            .to_string()
+            .contains("unauthenticated"));
+    }
+
+    #[test]
+    fn kernel_lookup_failure_does_not_authorize_a_descendant_signal() {
+        let root = kernel_process(10, 1, 10, 1);
+        let mut tracker = ProcessTracker::new(10);
+        let result = tracker.observe_rows(
+            vec![process_row(10, 1, 10), process_row(20, 10, 20)],
+            |pid| {
+                if pid == 10 {
+                    Ok(Some(root))
+                } else {
+                    Err("kernel source failed".into())
+                }
+            },
+        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("kernel source failed"));
+        assert!(!tracker.known.iter().any(|(row, _)| row.pid == 20));
+        assert!(tracker
+            .signal(20, STOP_SIGNAL)
+            .unwrap_err()
+            .to_string()
+            .contains("unauthenticated"));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn hung_ps_is_bounded_in_an_isolated_environment() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Stdio;
+        use std::time::{Duration, Instant};
+        const CHILD: &str = "IRONMEM_BOUNDED_PS_TEST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let started = Instant::now();
+            let error = UnixCodexProcesses.list().unwrap_err();
+            assert!(error.contains("exceeded"), "{error}");
+            assert!(started.elapsed() < Duration::from_secs(5));
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let ps = dir.path().join("ps");
+        let pid_file = dir.path().join("ps.pid");
+        std::fs::write(
+            &ps,
+            "#!/bin/sh\nprintf '%s' \"$$\" > \"$IRONMEM_BOUNDED_PS_PID\"\nexec /bin/sleep 30\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&ps, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "autopilot::codex_process::tests::hung_ps_is_bounded_in_an_isolated_environment",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("PATH", dir.path())
+            .env("IRONMEM_BOUNDED_PS_PID", &pid_file)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let started = Instant::now();
+        let mut observed_ps = None;
+        let finished = loop {
+            if observed_ps.is_none() {
+                if let Ok(text) = std::fs::read_to_string(&pid_file) {
+                    if let Ok(pid) = text.parse::<u32>() {
+                        observed_ps = Some((pid, birth(pid).unwrap()));
+                    }
+                }
+            }
+            if child.try_wait().unwrap().is_some() {
+                break true;
+            }
+            if started.elapsed() >= Duration::from_secs(6) {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        if !finished {
+            let _ = child.kill();
+        }
+        // The watchdog cleans the recorded fake ps even on red. Its birth
+        // identity must still match before this test sends any signal.
+        if let Some((pid, Some(expected))) = observed_ps {
+            if birth(pid).unwrap() == Some(expected) {
+                unsafe {
+                    libc::kill(pid as i32, libc::SIGKILL);
+                }
+            }
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(finished, "hung ps outlived the process-source bound");
+        assert!(
+            output.status.success(),
+            "isolated source test failed: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            observed_ps.is_some(),
+            "the hanging ps fixture was actually invoked"
+        );
+    }
+    #[test]
+    fn candidate_kernel_identity_must_be_stable_across_parent_authentication() {
+        let root = kernel_process(10, 1, 10, 1);
+        let candidate = kernel_process(20, 10, 20, 2);
+        for changed in [
+            kernel_process(20, 10, 20, 3),
+            kernel_process(20, 10, 30, 2),
+            kernel_process(20, 999, 20, 2),
+        ] {
+            let mut tracker = ProcessTracker::new(10);
+            let mut candidate_reads = 0;
+            let result = tracker.observe_rows(
+                vec![process_row(10, 1, 10), process_row(20, 10, 10)],
+                |pid| {
+                    Ok(Some(if pid == 10 {
+                        root
+                    } else {
+                        candidate_reads += 1;
+                        if candidate_reads == 1 {
+                            candidate
+                        } else {
+                            changed
+                        }
+                    }))
+                },
+            );
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("kernel identity changed"));
+            assert!(!tracker.known.iter().any(|(row, _)| row.pid == 20));
+            assert!(tracker
+                .signal(20, STOP_SIGNAL)
+                .unwrap_err()
+                .to_string()
+                .contains("unauthenticated"));
+        }
+    }
+    #[test]
+    fn candidate_gone_before_final_capture_is_neither_enrolled_nor_signaled() {
+        let root = kernel_process(10, 1, 10, 1);
+        let candidate = kernel_process(20, 10, 20, 2);
+        let mut tracker = ProcessTracker::new(10);
+        let mut reads = 0;
+        let result = tracker.observe_rows(
+            vec![process_row(10, 1, 10), process_row(20, 10, 10)],
+            |pid| {
+                if pid == 10 {
+                    Ok(Some(root))
+                } else {
+                    reads += 1;
+                    Ok(if reads == 1 { Some(candidate) } else { None })
+                }
+            },
+        );
+        assert!(
+            result.is_ok(),
+            "a completed short-lived tool is not a PID replacement"
+        );
+        assert!(!tracker.known.iter().any(|(row, _)| row.pid == 20));
+        assert!(tracker
+            .signal(20, STOP_SIGNAL)
+            .unwrap_err()
+            .to_string()
+            .contains("unauthenticated"));
     }
 }
