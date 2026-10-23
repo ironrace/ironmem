@@ -403,7 +403,7 @@ pub fn classify(outcome: &DispatchOutcome) -> DispatchClassification {
     // approach, so it is an operator's fix, and
     // `max_consecutive_infrastructure_failures` is what escalates to them
     // instead of the attempt cap silently retiring the issue.
-    if outcome.verdict.is_none() && outcome.num_turns == 0 && outcome.total_cost_usd == 0.0 {
+    if outcome.verdict.is_none() && outcome.num_turns == 0 && outcome.cost_usd == Some(0.0) {
         return DispatchClassification::InfrastructureFailure;
     }
     DispatchClassification::FailedAttempt
@@ -626,7 +626,8 @@ fn approach_text(outcome: &DispatchOutcome, classification: DispatchClassificati
         Some(reason) if !reason.trim().is_empty() => reason.to_string(),
         _ => format!(
             "dispatch returned no verdict reason ({classification:?}); {} turns, session {}",
-            outcome.num_turns, outcome.session_id
+            outcome.num_turns,
+            outcome.native_session_id.as_deref().unwrap_or("unknown")
         ),
     }
 }
@@ -1064,6 +1065,8 @@ pub fn run_issue(
         };
 
         let spec = DispatchSpec {
+            implementer: super::implementer::Implementer::Claude,
+            codex_artifacts: None,
             session: if resuming {
                 SessionMode::Resume {
                     session_uuid: session_uuid.clone(),
@@ -1166,17 +1169,18 @@ pub fn run_issue(
         // Bank spend before deciding anything else. Every dispatch that
         // returned a result is billed, met or not.
         //
-        // A dispatch killed on the wall-clock bound is the exception, and
-        // the reason rung 5's unpriced counter exists: it really did spend
-        // money, and its result JSON — the only meter there is — died with
-        // it. Banking its synthesized `0.0` as *spend* would record a
-        // measurement that was never taken; banking it as *unpriced* marks
-        // the day's total as a floor, which is the true statement.
-        if outcome.timed_out {
+        // An unknown meter (including a dispatch killed on its wall-clock
+        // bound) belongs in the unpriced counter. No cost measurement
+        // exists to bank; the day's dollar total remains a floor.
+        if outcome.cost_usd.is_none() {
             budget::record_unpriced_dispatch(db, &today_utc())?;
         } else {
-            budget::accumulate_daily_spend(db, &today_utc(), outcome.total_cost_usd.max(0.0))?;
-            total_cost_usd += outcome.total_cost_usd.max(0.0);
+            budget::accumulate_daily_spend(
+                db,
+                &today_utc(),
+                outcome.cost_usd.unwrap_or(0.0).max(0.0),
+            )?;
+            total_cost_usd += outcome.cost_usd.unwrap_or(0.0).max(0.0);
         }
 
         let classification = classify(&outcome);
@@ -1192,7 +1196,7 @@ pub fn run_issue(
         dispatches.push(DispatchSummary {
             attempt_n,
             classification,
-            total_cost_usd: outcome.total_cost_usd,
+            total_cost_usd: outcome.cost_usd.unwrap_or(0.0),
             num_turns: outcome.num_turns,
             verdict: outcome.verdict,
             reason: outcome.reason.clone(),
@@ -1349,11 +1353,12 @@ mod tests {
         cost: f64,
     ) -> DispatchOutcome {
         DispatchOutcome {
-            total_cost_usd: cost,
+            cost_usd: Some(cost),
             num_turns: 3,
             duration_ms: 1_000,
             is_error,
-            session_id: "11111111-2222-3333-4444-555555555555".to_string(),
+            native_session_id: Some("11111111-2222-3333-4444-555555555555".to_string()),
+            invocation_started: true,
             verdict,
             reason: verdict.map(|v| format!("scripted {v:?}")),
             process_success,
@@ -1409,14 +1414,15 @@ mod tests {
 
     /// Rung 7: a dispatch killed on the repo's wall-clock bound. No result
     /// JSON survives such a process, so every field but `timed_out` is a
-    /// placeholder — `total_cost_usd: 0.0` means *unknown*, not *free*.
+    /// placeholder — `cost_usd: None` means unknown spend.
     fn timed_out() -> DispatchOutcome {
         DispatchOutcome {
-            total_cost_usd: 0.0,
+            cost_usd: None,
             num_turns: 0,
             duration_ms: 600_000,
             is_error: true,
-            session_id: "11111111-2222-3333-4444-555555555555".to_string(),
+            native_session_id: Some("11111111-2222-3333-4444-555555555555".to_string()),
+            invocation_started: true,
             verdict: None,
             reason: Some("dispatch exceeded this repo's wall-clock bound".to_string()),
             process_success: false,
@@ -1433,11 +1439,12 @@ mod tests {
     /// never started.
     fn resume_noop() -> DispatchOutcome {
         DispatchOutcome {
-            total_cost_usd: 0.0,
+            cost_usd: Some(0.0),
             num_turns: 0,
             duration_ms: 6_000,
             is_error: false,
-            session_id: "11111111-2222-3333-4444-555555555555".to_string(),
+            native_session_id: Some("11111111-2222-3333-4444-555555555555".to_string()),
+            invocation_started: true,
             verdict: None,
             reason: None,
             process_success: true,
@@ -1957,7 +1964,7 @@ mod tests {
         // Billed but turnless: it engaged the model, so it is a real, if
         // short, attempt.
         let billed = DispatchOutcome {
-            total_cost_usd: 0.03,
+            cost_usd: Some(0.03),
             ..resume_noop()
         };
         assert_eq!(classify(&billed), DispatchClassification::FailedAttempt);
@@ -1973,10 +1980,10 @@ mod tests {
 
     #[test]
     fn a_killed_dispatch_is_still_read_as_a_timeout_not_as_an_empty_one() {
-        // Ordering: `timed_out` reports `0.0`/`0` too, but there the zeroes
-        // mean *unknown*. Its arm sits above the floor so the diagnostic
+        // Ordering: a timeout reports no meter and zero turns. Its arm
+        // sits above the floor so the diagnostic
         // stays a timeout, and the wall-clock ceiling keeps counting it.
-        assert!(timed_out().num_turns == 0 && timed_out().total_cost_usd == 0.0);
+        assert!(timed_out().num_turns == 0 && timed_out().cost_usd.is_none());
         assert_eq!(
             classify(&timed_out()),
             DispatchClassification::InfrastructureFailure

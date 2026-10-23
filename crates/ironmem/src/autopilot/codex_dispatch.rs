@@ -1,0 +1,1018 @@
+//! Durable Codex exec dispatch. Artifacts live in the common Git directory,
+//! so a replacement controller can inspect them after the checkout disappears.
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
+use std::path::Path;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+use serde::{Deserialize, Serialize};
+
+use crate::autopilot::dispatch::{DispatchOutcome, DispatchSpec, SessionMode, Verdict};
+use crate::autopilot::implementer::Implementer;
+use crate::autopilot::scrub::scrub_and_bound;
+use crate::autopilot::IssueRef;
+use crate::error::MemoryError;
+
+pub const CODEX_VERDICT_JSON_SCHEMA: &str = super::dispatch::IC_VERDICT_JSON_SCHEMA;
+pub const CODEX_DISPATCH_TIMEOUT_SECS: u64 = 1200;
+const JOURNAL_LIMIT: u64 = 16 * 1024 * 1024;
+const STDERR_LIMIT: u64 = 1024 * 1024;
+const FINAL_LIMIT: u64 = 64 * 1024;
+const EXIT_LIMIT: u64 = 4096;
+const POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodexArtifacts {
+    pub invocation_id: String,
+    pub schema_path: String,
+    pub journal_path: String,
+    pub final_path: String,
+    pub stderr_path: String,
+    pub exit_path: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum CodexRecovery {
+    NoPriorInvocation,
+    Alive,
+    Unknown { reason: String },
+    Finished(DispatchOutcome),
+}
+
+fn validation(message: impl Into<String>) -> MemoryError {
+    MemoryError::Validation(message.into())
+}
+
+fn supported_path(path: &Path) -> Result<&str, MemoryError> {
+    let text = path.to_str().ok_or_else(|| {
+        validation("unsupported Codex artifact path: use a UTF-8 path without whitespace")
+    })?;
+    if !path.is_absolute() || text.chars().any(char::is_whitespace) {
+        return Err(validation("unsupported Codex artifact path: move the repository to an absolute path without whitespace; process identity recovery cannot parse whitespace"));
+    }
+    Ok(text)
+}
+
+fn create_private(path: &Path) -> Result<File, MemoryError> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    Ok(options.open(path)?)
+}
+
+/// Allocate once, then persist these exact paths before spawning the dispatch.
+/// Reject unsupported paths before creating any artifact directories or files.
+pub fn prepare_artifacts(worktree: &Path, issue: &IssueRef) -> Result<CodexArtifacts, MemoryError> {
+    let mut git = Command::new("git");
+    git.args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .current_dir(worktree);
+    crate::mcp::tools::scrub_git_environment(&mut git);
+    let output = git.output()?;
+    if !output.status.success() {
+        return Err(validation(format!(
+            "cannot resolve common Git directory for Codex artifacts: {}",
+            scrub_and_bound(&String::from_utf8_lossy(&output.stderr), 500).text
+        )));
+    }
+    let common_dir = std::str::from_utf8(&output.stdout)
+        .map_err(|_| validation("common Git directory is not UTF-8"))?
+        .trim_end_matches(['\n', '\r']);
+    let invocation_id = uuid::Uuid::new_v4().to_string();
+    let dir = Path::new(common_dir)
+        .join("ironmem/autopilot")
+        .join(issue.slug())
+        .join(&invocation_id);
+    supported_path(&dir)?;
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(&dir)?;
+    let a = CodexArtifacts {
+        invocation_id,
+        schema_path: supported_path(&dir.join("schema.json"))?.into(),
+        journal_path: supported_path(&dir.join("journal.jsonl"))?.into(),
+        final_path: supported_path(&dir.join("final.json"))?.into(),
+        stderr_path: supported_path(&dir.join("stderr.log"))?.into(),
+        exit_path: supported_path(&dir.join("exit.json"))?.into(),
+    };
+    let mut schema = create_private(Path::new(&a.schema_path))?;
+    schema.write_all(CODEX_VERDICT_JSON_SCHEMA.as_bytes())?;
+    schema.sync_all()?;
+    for path in [&a.journal_path, &a.final_path, &a.stderr_path, &a.exit_path] {
+        create_private(Path::new(path))?;
+    }
+    Ok(a)
+}
+
+fn validate_spec(spec: &DispatchSpec) -> Result<&CodexArtifacts, MemoryError> {
+    if spec.implementer != Implementer::Codex {
+        return Err(validation(
+            "Codex dispatch requires implementer codex and persisted Codex artifacts",
+        ));
+    }
+    let a = spec.codex_artifacts.as_ref().ok_or_else(|| validation("Codex dispatch requires persisted Codex artifacts; prepare and save them before spawning"))?;
+    for path in [
+        &a.schema_path,
+        &a.journal_path,
+        &a.final_path,
+        &a.stderr_path,
+        &a.exit_path,
+    ] {
+        supported_path(Path::new(path))?;
+    }
+    if let SessionMode::Resume { session_uuid } = &spec.session {
+        uuid::Uuid::parse_str(session_uuid).map_err(|_| {
+            validation("Codex resume requires the native UUID from thread.started.thread_id")
+        })?;
+    }
+    Ok(a)
+}
+
+/// argv verified against codex-cli 0.163.0. Resume has no `-C`; cwd is set
+/// by the supervisor. Controller UUIDs and Claude-specific limits stay out.
+pub fn build_argv(repo: &Path, spec: &DispatchSpec) -> Result<Vec<String>, MemoryError> {
+    let a = validate_spec(spec)?;
+    let mut args = vec!["exec".into()];
+    if matches!(spec.session, SessionMode::Resume { .. }) {
+        args.push("resume".into());
+    }
+    args.extend([
+        "--json".into(),
+        "--output-schema".into(),
+        a.schema_path.clone(),
+        "-o".into(),
+        a.final_path.clone(),
+        "--dangerously-bypass-approvals-and-sandbox".into(),
+        "--dangerously-bypass-hook-trust".into(),
+    ]);
+    if matches!(spec.session, SessionMode::New { .. }) {
+        args.extend([
+            "-C".into(),
+            repo.to_str()
+                .ok_or_else(|| validation("Codex repository path must be UTF-8"))?
+                .into(),
+        ]);
+    }
+    args.extend(["-m".into(), spec.model.clone()]);
+    if let SessionMode::Resume { session_uuid } = &spec.session {
+        args.push(session_uuid.clone());
+    }
+    args.push(spec.condition.clone());
+    Ok(args)
+}
+
+pub fn dispatch_timeout(spec: &DispatchSpec) -> Duration {
+    spec.wall_clock_timeout
+        .unwrap_or(Duration::from_secs(CODEX_DISPATCH_TIMEOUT_SECS))
+}
+
+pub fn run_codex(
+    bin: &Path,
+    repo: &Path,
+    spec: &DispatchSpec,
+) -> Result<DispatchOutcome, MemoryError> {
+    run_codex_bounded(bin, repo, spec, dispatch_timeout(spec))
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExitRecord {
+    exit_code: Option<i32>,
+    timed_out: bool,
+    limit_exceeded: Option<String>,
+    #[serde(default)]
+    duration_ms: u64,
+    #[serde(default)]
+    expected_native_id: Option<String>,
+}
+
+fn open_existing(path: &str, write: bool) -> Result<File, MemoryError> {
+    let mut options = OpenOptions::new();
+    options.read(!write).write(write);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(validation("Codex artifacts must be regular files"));
+    }
+    Ok(file)
+}
+
+fn limits(a: &CodexArtifacts) -> Option<String> {
+    [
+        (&a.journal_path, JOURNAL_LIMIT, "journal"),
+        (&a.stderr_path, STDERR_LIMIT, "stderr"),
+        (&a.final_path, FINAL_LIMIT, "final"),
+    ]
+    .into_iter()
+    .find_map(|(path, limit, name)| match std::fs::metadata(path) {
+        Ok(meta) if meta.is_file() && meta.len() <= limit => None,
+        _ => Some(format!(
+            "Codex {name} artifact exceeded its {limit}-byte limit or is unavailable"
+        )),
+    })
+}
+
+fn persist_exit(a: &CodexArtifacts, record: &ExitRecord) -> Result<(), MemoryError> {
+    let path = Path::new(&a.exit_path);
+    let tmp = path.with_file_name(format!("exit-{}.tmp", uuid::Uuid::new_v4()));
+    let result = (|| {
+        let mut file = create_private(&tmp)?;
+        file.write_all(&serde_json::to_vec(record)?)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, path)?;
+        File::open(
+            path.parent()
+                .ok_or_else(|| validation("exit artifact requires a parent directory"))?,
+        )?
+        .sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(tmp);
+    }
+    result
+}
+
+/// Every invocation has a wall-clock ceiling. stdout/stderr are inherited
+/// regular file handles, so no pipe can wedge the child or die with its parent.
+pub fn run_codex_bounded(
+    bin: &Path,
+    repo: &Path,
+    spec: &DispatchSpec,
+    timeout: Duration,
+) -> Result<DispatchOutcome, MemoryError> {
+    let args = build_argv(repo, spec)?;
+    let a = validate_spec(spec)?;
+    // Never overwrite evidence from a prior invocation. A retry must allocate
+    // a new invocation directory, even when it resumes the same native thread.
+    for path in [&a.journal_path, &a.stderr_path, &a.final_path, &a.exit_path] {
+        if open_existing(path, false)?.metadata()?.len() != 0 {
+            return Err(validation("Codex artifacts already contain invocation data; prepare a new invocation before retrying"));
+        }
+    }
+    let schema = read_capped(&a.schema_path, FINAL_LIMIT)?;
+    if schema != CODEX_VERDICT_JSON_SCHEMA {
+        return Err(validation(
+            "Codex artifacts must contain the strict verdict schema",
+        ));
+    }
+    let mut command = Command::new(bin);
+    command
+        .args(args)
+        .current_dir(repo)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(open_existing(&a.journal_path, true)?))
+        .stderr(Stdio::from(open_existing(&a.stderr_path, true)?));
+    // Git subprocesses inside Codex must resolve this invocation's checkout,
+    // rather than a controller's inherited repository-selection overrides.
+    crate::mcp::tools::scrub_git_environment(&mut command);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = super::dispatch::retry_on_etxtbsy(|| command.spawn())
+        .map_err(|e| MemoryError::NotFound(format!("failed to launch Codex dispatch: {e}")))?;
+    let started = Instant::now();
+    let mut timed_out = false;
+    let mut limit_exceeded;
+    let status = loop {
+        limit_exceeded = limits(a);
+        if limit_exceeded.is_some() || started.elapsed() >= timeout {
+            timed_out = limit_exceeded.is_none();
+            super::dispatch::kill_process_group(&mut child);
+            break child.wait()?;
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => std::thread::sleep(POLL_INTERVAL),
+            Err(e) => {
+                super::dispatch::kill_process_group(&mut child);
+                let _ = child.wait();
+                return Err(e.into());
+            }
+        }
+    };
+    // Catch an artifact that crossed the limit just before process exit.
+    limit_exceeded = limit_exceeded.or_else(|| limits(a));
+    let record = ExitRecord {
+        exit_code: status.code(),
+        timed_out,
+        limit_exceeded,
+        duration_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+        expected_native_id: match &spec.session {
+            SessionMode::Resume { session_uuid } => Some(session_uuid.clone()),
+            SessionMode::New { .. } => None,
+        },
+    };
+    persist_exit(a, &record)?;
+    let mut outcome = read_artifacts(a)?;
+    outcome.invocation_started = true;
+    Ok(outcome)
+}
+
+fn read_capped(path: &str, cap: u64) -> Result<String, MemoryError> {
+    let file = open_existing(path, false)?;
+    let mut data = Vec::new();
+    file.take(cap + 1).read_to_end(&mut data)?;
+    if data.len() as u64 > cap {
+        return Err(validation(format!(
+            "Codex artifact exceeds {cap}-byte limit"
+        )));
+    }
+    String::from_utf8(data).map_err(|_| validation("Codex artifact is not UTF-8"))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FinalVerdict {
+    verdict: Verdict,
+    reason: String,
+}
+
+/// Parse bounded durable evidence. A final file alone never proves success:
+/// only the supervisor's valid exit-zero record can authorize a met verdict.
+/// A truncated journal invalidates the verdict but retains an earlier unique
+/// native thread ID so a replacement controller can resume it.
+pub fn read_artifacts(a: &CodexArtifacts) -> Result<DispatchOutcome, MemoryError> {
+    for path in [
+        &a.schema_path,
+        &a.journal_path,
+        &a.final_path,
+        &a.stderr_path,
+        &a.exit_path,
+    ] {
+        supported_path(Path::new(path))?;
+    }
+    let mut errors = Vec::new();
+    let mut native_id = None;
+    let mut conflict = false;
+    let mut turns = 0u32;
+    let mut observed_output = false;
+    match read_capped(&a.journal_path, JOURNAL_LIMIT) {
+        Ok(journal) => {
+            observed_output |= !journal.is_empty();
+            for line in journal.lines().filter(|line| !line.trim().is_empty()) {
+                match serde_json::from_str::<serde_json::Value>(line) {
+                    Ok(value) if value.is_object() => {
+                        match value.get("type").and_then(|v| v.as_str()) {
+                            Some("thread.started") => {
+                                if let Some(id) = value
+                                    .get("thread_id")
+                                    .and_then(|v| v.as_str())
+                                    .filter(|s| uuid::Uuid::parse_str(s).is_ok())
+                                {
+                                    if native_id.as_deref().is_some_and(|prior| prior != id) {
+                                        conflict = true;
+                                        errors.push("conflicting native Codex thread IDs".into());
+                                    } else {
+                                        native_id = Some(id.to_owned());
+                                    }
+                                } else {
+                                    errors.push("invalid native Codex thread ID".into());
+                                }
+                            }
+                            Some("turn.completed") => turns = turns.saturating_add(1),
+                            _ => {}
+                        }
+                    }
+                    _ => errors.push("malformed Codex JSONL journal".into()),
+                }
+            }
+        }
+        Err(e) => errors.push(e.to_string()),
+    }
+    if conflict {
+        native_id = None;
+    }
+    if native_id.is_none() {
+        errors.push("missing unique native Codex thread.started ID".into());
+    }
+    let final_result = read_capped(&a.final_path, FINAL_LIMIT).and_then(|text| {
+        observed_output |= !text.is_empty();
+        serde_json::from_str::<FinalVerdict>(&text)
+            .map_err(|e| validation(format!("invalid Codex final verdict: {e}")))
+    });
+    if let Err(e) = &final_result {
+        errors.push(e.to_string());
+    }
+    let exit = read_capped(&a.exit_path, EXIT_LIMIT).and_then(|text| {
+        serde_json::from_str::<ExitRecord>(&text).map_err(|e| {
+            validation(format!(
+                "missing or invalid Codex supervisor exit record: {e}"
+            ))
+        })
+    });
+    let (process_success, timed_out, duration_ms) = match &exit {
+        Ok(record) => {
+            if record
+                .expected_native_id
+                .as_ref()
+                .is_some_and(|expected| native_id.as_ref() != Some(expected))
+            {
+                errors.push("Codex thread.started ID did not match requested resume thread".into());
+                native_id = None;
+            }
+            if let Some(limit) = &record.limit_exceeded {
+                errors.push(limit.clone());
+            }
+            if record.timed_out {
+                errors.push("Codex dispatch exceeded wall-clock timeout and was killed".into());
+            }
+            if record.exit_code != Some(0) {
+                errors.push(format!("Codex process exited with {:?}", record.exit_code));
+            }
+            (
+                record.exit_code == Some(0) && !record.timed_out && record.limit_exceeded.is_none(),
+                record.timed_out,
+                record.duration_ms,
+            )
+        }
+        Err(e) => {
+            errors.push(e.to_string());
+            (false, false, 0)
+        }
+    };
+    // Also enforce caps at recovery, even if an exit record says zero.
+    if let Some(limit) = limits(a) {
+        errors.push(limit);
+    }
+    let stderr = read_capped(&a.stderr_path, STDERR_LIMIT).unwrap_or_default();
+    observed_output |= !stderr.is_empty();
+    let valid = errors.is_empty();
+    let (verdict, reason) = if valid {
+        let final_result = final_result.map_err(|e| validation(e.to_string()))?;
+        (Some(final_result.verdict), Some(final_result.reason))
+    } else {
+        if !stderr.trim().is_empty() {
+            errors.push(format!("stderr: {}", stderr.trim()));
+        }
+        (None, Some(scrub_and_bound(&errors.join("; "), 500).text))
+    };
+    Ok(DispatchOutcome {
+        cost_usd: None,
+        num_turns: turns,
+        duration_ms,
+        is_error: !valid,
+        native_session_id: native_id,
+        verdict,
+        reason,
+        process_success,
+        timed_out,
+        invocation_started: exit.is_ok() || observed_output,
+    })
+}
+
+/// The caller MUST first confirm the invocation is dead. This file-only
+/// primitive cannot establish liveness; registry callers supply Alive/Unknown.
+/// Prepared, empty artifacts carry invocation_started=false and no native ID.
+pub fn recover_artifacts(artifacts: Option<&CodexArtifacts>) -> Result<CodexRecovery, MemoryError> {
+    match artifacts {
+        None => Ok(CodexRecovery::NoPriorInvocation),
+        Some(a) => Ok(CodexRecovery::Finished(read_artifacts(a)?)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::{build_argv, CODEX_VERDICT_JSON_SCHEMA};
+    use crate::autopilot::dispatch::{CodexArtifacts, DispatchSpec, SessionMode};
+    use crate::autopilot::implementer::Implementer;
+
+    fn artifacts() -> CodexArtifacts {
+        CodexArtifacts {
+            invocation_id: "invocation".into(),
+            schema_path: "/tmp/schema.json".into(),
+            journal_path: "/tmp/journal.jsonl".into(),
+            final_path: "/tmp/final.json".into(),
+            stderr_path: "/tmp/stderr.log".into(),
+            exit_path: "/tmp/exit.json".into(),
+        }
+    }
+
+    fn spec(session: SessionMode) -> DispatchSpec {
+        DispatchSpec {
+            implementer: Implementer::Codex,
+            codex_artifacts: Some(artifacts()),
+            session,
+            name: "unused-by-codex".into(),
+            model: "gpt-test".into(),
+            max_budget_usd: 1.0,
+            max_turns: 2,
+            condition: "make the gate pass".into(),
+            wall_clock_timeout: None,
+        }
+    }
+
+    #[test]
+    fn codex_schema_is_the_exact_strict_verdict_contract() {
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(CODEX_VERDICT_JSON_SCHEMA).unwrap(),
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "verdict": {"type": "string", "enum": ["met", "impossible", "not_met"]},
+                    "reason": {"type": "string"}
+                },
+                "required": ["verdict", "reason"],
+                "additionalProperties": false
+            })
+        );
+    }
+
+    #[test]
+    fn new_invocation_uses_verified_codex_exec_arguments() {
+        let args = build_argv(
+            Path::new("/repo"),
+            &spec(SessionMode::New {
+                session_uuid: "ignored-controller-id".into(),
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            args,
+            [
+                "exec",
+                "--json",
+                "--output-schema",
+                "/tmp/schema.json",
+                "-o",
+                "/tmp/final.json",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "--dangerously-bypass-hook-trust",
+                "-C",
+                "/repo",
+                "-m",
+                "gpt-test",
+                "make the gate pass"
+            ]
+        );
+    }
+
+    #[test]
+    fn resume_uses_native_thread_id_and_omits_c_and_goal_prefix() {
+        let args = build_argv(
+            Path::new("/repo"),
+            &spec(SessionMode::Resume {
+                session_uuid: "11111111-2222-3333-4444-555555555555".into(),
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            args,
+            [
+                "exec",
+                "resume",
+                "--json",
+                "--output-schema",
+                "/tmp/schema.json",
+                "-o",
+                "/tmp/final.json",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "--dangerously-bypass-hook-trust",
+                "-m",
+                "gpt-test",
+                "11111111-2222-3333-4444-555555555555",
+                "make the gate pass"
+            ]
+        );
+    }
+}
+
+#[cfg(test)]
+mod contract_tests {
+    use std::path::Path;
+    use std::time::Duration;
+
+    use super::*;
+    use crate::autopilot::dispatch::{DispatchSpec, SessionMode, Verdict};
+    use crate::autopilot::implementer::Implementer;
+    use crate::autopilot::IssueRef;
+
+    const THREAD: &str = "11111111-2222-3333-4444-555555555555";
+    fn git(repo: &Path) -> std::process::Command {
+        let mut command = std::process::Command::new("git");
+        command.current_dir(repo);
+        crate::mcp::tools::scrub_git_environment(&mut command);
+        command
+    }
+    fn setup() -> (tempfile::TempDir, DispatchSpec) {
+        let dir = tempfile::tempdir().unwrap();
+        let status = git(dir.path()).args(["init", "-q"]).status().unwrap();
+        assert!(status.success());
+        let artifacts = prepare_artifacts(dir.path(), &IssueRef::new("owner/repo", 42)).unwrap();
+        let spec = DispatchSpec {
+            implementer: Implementer::Codex,
+            codex_artifacts: Some(artifacts),
+            session: SessionMode::New {
+                session_uuid: "controller-only".into(),
+            },
+            name: "unused".into(),
+            model: "gpt-test".into(),
+            max_budget_usd: 1.0,
+            max_turns: 2,
+            condition: "gate".into(),
+            wall_clock_timeout: None,
+        };
+        (dir, spec)
+    }
+    fn completed(
+        spec: &DispatchSpec,
+        final_json: &str,
+        journal: &str,
+        exit: Option<i32>,
+    ) -> DispatchOutcome {
+        let a = spec.codex_artifacts.as_ref().unwrap();
+        std::fs::write(&a.final_path, final_json).unwrap();
+        std::fs::write(&a.journal_path, journal).unwrap();
+        if let Some(code) = exit {
+            std::fs::write(
+                &a.exit_path,
+                serde_json::to_vec(
+                    &serde_json::json!({"exit_code":code,"timed_out":false,"limit_exceeded":null}),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        }
+        read_artifacts(a).unwrap()
+    }
+    fn journal() -> String {
+        format!("{{\"type\":\"thread.started\",\"thread_id\":\"{THREAD}\"}}\n{{\"type\":\"turn.completed\",\"usage\":{{}}}}\n")
+    }
+
+    #[test]
+    fn strict_final_and_native_identity_and_supervisor_exit_are_all_required() {
+        for verdict in ["met", "impossible", "not_met"] {
+            let (_dir, s) = setup();
+            let o = completed(
+                &s,
+                &format!("{{\"verdict\":\"{verdict}\",\"reason\":\"gate\"}}"),
+                &journal(),
+                Some(0),
+            );
+            assert_eq!(o.is_met(), verdict == "met");
+            assert_eq!(o.native_session_id.as_deref(), Some(THREAD));
+            assert_eq!(o.num_turns, 1);
+            assert_eq!(o.cost_usd, None);
+            assert_eq!(
+                o.verdict,
+                Some(match verdict {
+                    "met" => Verdict::Met,
+                    "impossible" => Verdict::Impossible,
+                    _ => Verdict::NotMet,
+                })
+            );
+        }
+        for final_json in [
+            "",
+            "{",
+            "{}",
+            r#"{"verdict":"met"}"#,
+            r#"{"verdict":"unknown","reason":"x"}"#,
+            r#"{"verdict":"met","reason":"x","extra":1}"#,
+        ] {
+            let (_dir, s) = setup();
+            assert!(
+                !completed(&s, final_json, &journal(), Some(0)).is_met(),
+                "{final_json}"
+            );
+        }
+        for log in ["".into(), "{bad\n".into(), "{\"type\":\"thread.started\",\"thread_id\":\"\"}\n".into(), "{\"type\":\"thread.started\",\"thread_id\":\"not-uuid\"}\n".into(), format!("{}{{\"type\":\"thread.started\",\"thread_id\":\"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\"}}\n", journal())] {
+            let (_dir, s) = setup();
+            assert!(!completed(&s, r#"{"verdict":"met","reason":"gate"}"#, &log, Some(0)).is_met(), "{log}");
+        }
+        for code in [None, Some(1)] {
+            let (_dir, s) = setup();
+            let o = completed(&s, r#"{"verdict":"met","reason":"gate"}"#, &journal(), code);
+            assert!(!o.is_met());
+            assert_eq!(o.native_session_id.as_deref(), Some(THREAD));
+        }
+    }
+    #[test]
+    fn artifacts_are_private_absolute_and_in_common_git_directory() {
+        let (dir, s) = setup();
+        let a = s.codex_artifacts.unwrap();
+        for p in [
+            &a.schema_path,
+            &a.journal_path,
+            &a.final_path,
+            &a.stderr_path,
+            &a.exit_path,
+        ] {
+            assert!(Path::new(p).is_absolute());
+            assert!(Path::new(p).starts_with(
+                dir.path()
+                    .canonicalize()
+                    .unwrap()
+                    .join(".git/ironmem/autopilot/owner-repo-42")
+            ));
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    std::fs::metadata(p).unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
+            }
+        }
+        assert_eq!(
+            std::fs::read_to_string(&a.schema_path).unwrap(),
+            CODEX_VERDICT_JSON_SCHEMA
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(Path::new(&a.schema_path).parent().unwrap())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+        }
+    }
+    #[test]
+    fn whitespace_is_rejected_before_artifact_creation_and_spawn() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("has space");
+        std::fs::create_dir(&repo).unwrap();
+        assert!(git(&repo).args(["init", "-q"]).status().unwrap().success());
+        let err = prepare_artifacts(&repo, &IssueRef::new("o/r", 1))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("unsupported") && err.contains("whitespace"),
+            "{err}"
+        );
+        assert!(!repo.join(".git/ironmem").exists());
+        let (_d, mut s) = setup();
+        s.codex_artifacts.as_mut().unwrap().final_path = "/tmp/has space/final".into();
+        assert!(run_codex_bounded(
+            Path::new("/missing-binary"),
+            dir.path(),
+            &s,
+            Duration::from_secs(1)
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("whitespace"));
+    }
+    #[test]
+    fn timeout_default_override_and_backend_artifact_pairing() {
+        let (dir, mut s) = setup();
+        assert_eq!(dispatch_timeout(&s), Duration::from_secs(1200));
+        s.wall_clock_timeout = Some(Duration::from_millis(15));
+        assert_eq!(dispatch_timeout(&s), Duration::from_millis(15));
+        s.codex_artifacts = None;
+        assert!(build_argv(dir.path(), &s).is_err());
+        let (_, mut s) = setup();
+        s.implementer = Implementer::Claude;
+        assert!(run_codex_bounded(
+            Path::new("/missing-binary"),
+            dir.path(),
+            &s,
+            Duration::from_secs(1)
+        )
+        .is_err());
+        assert!(crate::autopilot::dispatch::run_dispatch(
+            Path::new("/missing-binary"),
+            dir.path(),
+            &s
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("artifacts"));
+    }
+    #[cfg(unix)]
+    fn binary(dir: &Path, body: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("fake-codex");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+    #[cfg(unix)]
+    fn script(extra: &str, code: i32) -> String {
+        format!(
+            r#"while [ "$#" -gt 0 ]; do
+if [ "$1" = '-o' ]; then shift; final="$1"; fi
+shift
+done
+pwd > actual-cwd
+printf '%s\n' '{{"type":"thread.started","thread_id":"{THREAD}"}}'
+printf '%s\n' '{{"type":"turn.completed","usage":{{}}}}'
+printf '%s\n' '{{"verdict":"met","reason":"gate"}}' > "$final"
+{extra}
+exit {code}"#
+        )
+    }
+    #[cfg(unix)]
+    #[test]
+    fn real_runner_uses_cwd_durable_files_and_refuses_nonzero_after_met() {
+        for code in [0, 7] {
+            let (dir, s) = setup();
+            let bin = binary(dir.path(), &script("", code));
+            let o = run_codex_bounded(&bin, dir.path(), &s, Duration::from_secs(3)).unwrap();
+            assert_eq!(o.is_met(), code == 0);
+            assert!(o.invocation_started);
+            assert_eq!(o.native_session_id.as_deref(), Some(THREAD));
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("actual-cwd"))
+                    .unwrap()
+                    .trim(),
+                dir.path().canonicalize().unwrap().to_str().unwrap()
+            );
+            let recovered = read_artifacts(s.codex_artifacts.as_ref().unwrap()).unwrap();
+            assert_eq!(recovered.is_met(), code == 0);
+        }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn large_journal_does_not_deadlock_and_limits_kill_with_scrubbed_bounded_reason() {
+        let (dir, s) = setup();
+        let extra = "i=0; while [ \"$i\" -lt 3000 ]; do printf '%s\\n' '{\"type\":\"item.completed\",\"item\":\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"}'; i=$((i+1)); done";
+        let o = run_codex_bounded(
+            &binary(dir.path(), &script(extra, 0)),
+            dir.path(),
+            &s,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert!(o.is_met(), "{o:?}");
+        for (field, bytes) in [
+            ("journal", 17 * 1024 * 1024),
+            ("stderr", 2 * 1024 * 1024),
+            ("final", 65 * 1024),
+        ] {
+            let (dir, s) = setup();
+            let a = s.codex_artifacts.as_ref().unwrap();
+            let target = match field {
+                "journal" => a.journal_path.as_str(),
+                "stderr" => a.stderr_path.as_str(),
+                _ => a.final_path.as_str(),
+            };
+            // Build a synthetic credential at runtime so secret scanners do
+            // not mistake the redaction fixture for a checked-in credential.
+            let fixture_token = format!("sk-{}", "abcdefghijklmnopqrstuvwxyz1234567890");
+            let extra=format!("printf '%s' 'OPENAI_API_KEY={fixture_token}' >&2\nhead -c {bytes} /dev/zero > '{target}'\nsleep 10");
+            let start = std::time::Instant::now();
+            let o = run_codex_bounded(
+                &binary(dir.path(), &script(&extra, 0)),
+                dir.path(),
+                &s,
+                Duration::from_secs(5),
+            )
+            .unwrap();
+            assert!(start.elapsed() < Duration::from_secs(4), "{field}");
+            assert!(!o.is_met());
+            let reason = o.reason.unwrap();
+            assert!(reason.contains("limit"), "{reason}");
+            assert!(reason.chars().count() <= 500);
+            assert!(!reason.contains(&fixture_token));
+        }
+    }
+    #[test]
+    fn truncated_journal_retains_unique_native_id_without_trusting_verdict() {
+        let (_dir, s) = setup();
+        let o = completed(
+            &s,
+            r#"{"verdict":"met","reason":"gate"}"#,
+            &format!("{}{{broken", journal()),
+            Some(0),
+        );
+        assert_eq!(o.native_session_id.as_deref(), Some(THREAD));
+        assert!(!o.is_met());
+        assert_eq!(o.verdict, None);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn resume_never_switches_to_an_unrequested_native_thread() {
+        let (dir, mut s) = setup();
+        s.session = SessionMode::Resume {
+            session_uuid: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".into(),
+        };
+        let o = run_codex_bounded(
+            &binary(dir.path(), &script("", 0)),
+            dir.path(),
+            &s,
+            Duration::from_secs(3),
+        )
+        .unwrap();
+        assert!(!o.is_met());
+        assert_eq!(
+            o.native_session_id, None,
+            "an unrequested thread must never replace the caller's native session"
+        );
+        assert!(o.reason.unwrap().contains("requested"));
+        assert!(!read_artifacts(s.codex_artifacts.as_ref().unwrap())
+            .unwrap()
+            .is_met());
+    }
+    #[test]
+    fn linked_worktree_artifacts_live_outside_the_checkout() {
+        let (dir, _) = setup();
+        let worktree = dir.path().join("linked");
+        let mut git = git(dir.path());
+        let status = git
+            .args([
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.test",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "initial",
+            ])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert!(self::git(dir.path())
+            .args(["worktree", "add", "--detach", "-q"])
+            .arg(&worktree)
+            .current_dir(dir.path())
+            .status()
+            .unwrap()
+            .success());
+        let a = prepare_artifacts(&worktree, &IssueRef::new("o/r", 3)).unwrap();
+        assert!(
+            Path::new(&a.journal_path).starts_with(dir.path().canonicalize().unwrap().join(".git"))
+        );
+        assert!(!Path::new(&a.journal_path).starts_with(&worktree));
+        std::fs::remove_dir_all(worktree).unwrap();
+        assert!(Path::new(&a.journal_path).exists());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn codex_process_git_commands_are_isolated_from_inherited_git_overrides() {
+        const CHILD_MARKER: &str = "IRONMEM_CODEX_GIT_ISOLATION_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "autopilot::codex_dispatch::contract_tests::codex_process_git_commands_are_isolated_from_inherited_git_overrides", "--nocapture"])
+                .env(CHILD_MARKER, "1")
+                .env("GIT_DIR", "/nonexistent/hostile-git-dir")
+                .env("GIT_WORK_TREE", "/nonexistent/hostile-worktree")
+                .output().unwrap();
+            assert!(
+                output.status.success(),
+                "child test failed: {} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let (dir, s) = setup();
+        let extra = "git rev-parse --show-toplevel > git-cwd || exit 8";
+        let o = run_codex_bounded(
+            &binary(dir.path(), &script(extra, 0)),
+            dir.path(),
+            &s,
+            Duration::from_secs(3),
+        )
+        .unwrap();
+        assert!(o.is_met(), "{o:?}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("git-cwd"))
+                .unwrap()
+                .trim(),
+            dir.path().canonicalize().unwrap().to_str().unwrap()
+        );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn timeout_kills_descendant_gate_process() {
+        let (dir, s) = setup();
+        let bin = binary(
+            dir.path(),
+            &script("(sleep 1; touch descendant-survived) &\nsleep 10", 0),
+        );
+        let o = run_codex_bounded(&bin, dir.path(), &s, Duration::from_millis(100)).unwrap();
+        assert!(o.timed_out);
+        assert!(!o.is_met());
+        std::thread::sleep(Duration::from_millis(1200));
+        assert!(!dir.path().join("descendant-survived").exists());
+        assert!(
+            read_artifacts(s.codex_artifacts.as_ref().unwrap())
+                .unwrap()
+                .timed_out
+        );
+    }
+}

@@ -1418,7 +1418,7 @@ mod tests {
         let dispatch = super::super::dispatch::parse_dispatch_output(&sample).unwrap();
         let envelope: AdviceEnvelope = serde_json::from_str(&sample).unwrap();
 
-        assert_eq!(envelope.total_cost_usd, Some(dispatch.total_cost_usd));
+        assert_eq!(envelope.total_cost_usd, dispatch.cost_usd);
         assert_eq!(envelope.is_error, dispatch.is_error);
         assert!(envelope.structured_output.is_some());
     }

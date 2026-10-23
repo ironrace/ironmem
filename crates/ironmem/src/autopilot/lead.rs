@@ -1046,11 +1046,12 @@ mod tests {
         ) -> Result<DispatchOutcome, MemoryError> {
             self.seen.push((repo.to_path_buf(), spec.clone()));
             Ok(DispatchOutcome {
-                total_cost_usd: 0.10,
+                cost_usd: Some(0.10),
                 num_turns: 2,
                 duration_ms: 1_000,
                 is_error: false,
-                session_id: "11111111-2222-3333-4444-555555555555".to_string(),
+                native_session_id: Some("11111111-2222-3333-4444-555555555555".to_string()),
+                invocation_started: true,
                 verdict: Some(Verdict::Met),
                 reason: Some("scripted".to_string()),
                 process_success: true,
@@ -1080,11 +1081,12 @@ mod tests {
         ) -> Result<DispatchOutcome, MemoryError> {
             self.calls += 1;
             Ok(DispatchOutcome {
-                total_cost_usd: 0.0,
+                cost_usd: None,
                 num_turns: 0,
                 duration_ms: 10,
                 is_error: true,
-                session_id: "11111111-2222-3333-4444-555555555555".to_string(),
+                native_session_id: Some("11111111-2222-3333-4444-555555555555".to_string()),
+                invocation_started: true,
                 verdict: None,
                 reason: Some("scripted infrastructure failure".to_string()),
                 process_success: false,
@@ -2409,11 +2411,12 @@ mod tests {
         ) -> Result<DispatchOutcome, MemoryError> {
             self.calls += 1;
             Ok(DispatchOutcome {
-                total_cost_usd: 0.10,
+                cost_usd: Some(0.10),
                 num_turns: 2,
                 duration_ms: 1_000,
                 is_error: false,
-                session_id: "11111111-2222-3333-4444-555555555555".to_string(),
+                native_session_id: Some("11111111-2222-3333-4444-555555555555".to_string()),
+                invocation_started: true,
                 verdict: Some(Verdict::NotMet),
                 reason: Some("scripted failure".to_string()),
                 process_success: true,

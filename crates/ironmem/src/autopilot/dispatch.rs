@@ -35,6 +35,8 @@ use serde::Deserialize;
 
 use crate::error::MemoryError;
 
+pub use super::codex_dispatch::CodexArtifacts;
+use super::implementer::Implementer;
 use super::IssueRef;
 
 /// The schema forced onto every IC dispatch via `--json-schema`, verbatim
@@ -65,6 +67,8 @@ impl SessionMode {
 /// Everything [`build_argv`] needs to construct one dispatch invocation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DispatchSpec {
+    pub implementer: Implementer,
+    pub codex_artifacts: Option<CodexArtifacts>,
     pub session: SessionMode,
     /// `--name`, giving the IC a deterministic address for `ListAgents` and
     /// the abort path. See [`ic_name`] for how this is derived from an issue.
@@ -132,7 +136,7 @@ pub fn build_argv(spec: &DispatchSpec) -> Vec<String> {
 /// The evaluator's verdict, as forced through `--json-schema`. Serialized in
 /// the schema's own lowercase spelling so a `--json` run report round-trips
 /// the exact strings the enum was parsed from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Verdict {
     Met,
@@ -159,7 +163,7 @@ impl Verdict {
 #[derive(Debug, Clone, Deserialize)]
 struct RawDispatchResult {
     #[serde(default)]
-    total_cost_usd: f64,
+    total_cost_usd: Option<f64>,
     #[serde(default)]
     num_turns: u32,
     #[serde(default)]
@@ -182,11 +186,15 @@ struct RawDispatchResult {
 /// decide what happens next.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DispatchOutcome {
-    pub total_cost_usd: f64,
+    /// A reported finite nonnegative meter, including a real zero. None means unknown.
+    pub cost_usd: Option<f64>,
     pub num_turns: u32,
     pub duration_ms: u64,
     pub is_error: bool,
-    pub session_id: String,
+    /// Harness-native session identity; Codex IDs come only from thread.started.
+    pub native_session_id: Option<String>,
+    /// True only after spawn (or evidence of a previously started invocation).
+    pub invocation_started: bool,
     /// `None` when `structured_output` was absent, malformed, or carried a
     /// `verdict` value outside the schema's enum — see [`Self::is_met`].
     pub verdict: Option<Verdict>,
@@ -204,9 +212,8 @@ pub struct DispatchOutcome {
     /// Whether this dispatch was killed for exceeding its repo's wall-clock
     /// bound (rung 7). A timed-out dispatch has **no result JSON at all** —
     /// the process never got to write one — so every other field here is a
-    /// synthesized placeholder rather than a measurement, and
-    /// `total_cost_usd` in particular is a `0.0` that means *unknown*, not
-    /// *free*. [`run_dispatch`]'s caller is responsible for banking it to
+    /// synthesized placeholder rather than a measurement; `cost_usd: None`
+    /// means the spend is unknown. [`run_dispatch`]'s caller is responsible for banking it to
     /// the ledger's unpriced counter rather than its total; see
     /// [`super::run::run_issue`].
     pub timed_out: bool,
@@ -221,7 +228,11 @@ impl DispatchOutcome {
     /// failed) is never treated as met, no matter what the JSON says on its
     /// own.
     pub fn is_met(&self) -> bool {
-        self.process_success && !self.is_error && self.verdict == Some(Verdict::Met)
+        self.invocation_started
+            && self.process_success
+            && !self.timed_out
+            && !self.is_error
+            && self.verdict == Some(Verdict::Met)
     }
 
     /// The evaluator judged the goal condition unsatisfiable. Per the spec's
@@ -265,11 +276,14 @@ pub fn parse_dispatch_output(stdout: &str) -> Result<DispatchOutcome, MemoryErro
     })?;
     let (verdict, reason) = extract_verdict(&raw.structured_output);
     Ok(DispatchOutcome {
-        total_cost_usd: raw.total_cost_usd,
+        cost_usd: raw
+            .total_cost_usd
+            .filter(|cost| cost.is_finite() && *cost >= 0.0),
         num_turns: raw.num_turns,
         duration_ms: raw.duration_ms,
         is_error: raw.is_error,
-        session_id: raw.session_id,
+        native_session_id: (!raw.session_id.is_empty()).then_some(raw.session_id),
+        invocation_started: true,
         verdict,
         reason,
         process_success: true,
@@ -307,6 +321,15 @@ pub fn run_dispatch(
     run_dispatch_bounded(bin, repo, spec, spec.wall_clock_timeout)
 }
 
+fn validate_claude_spec(spec: &DispatchSpec) -> Result<(), MemoryError> {
+    if spec.implementer != Implementer::Claude || spec.codex_artifacts.is_some() {
+        return Err(MemoryError::Validation(
+            "Claude dispatch requires implementer claude and no Codex artifacts".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// How often [`run_dispatch_bounded`] checks whether a bounded dispatch has
 /// exited. A dispatch runs for minutes at least, so a one-second granularity
 /// is far finer than any bound worth setting and costs one `waitpid` per
@@ -329,7 +352,7 @@ const TIMEOUT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_sec
 /// meter there is: the spec's own error table says a killed IC's tokens are
 /// never recorded. So a timed-out dispatch really did spend money that
 /// nothing can report. The outcome it synthesizes therefore carries
-/// `timed_out: true` and a `total_cost_usd` of `0.0` that means **unknown**,
+/// `timed_out: true` and `cost_usd: None`, meaning **unknown** spend,
 /// and [`super::run::run_issue`] banks it to the ledger's *unpriced* counter
 /// — rung 5's `unpriced_dispatch_count`, which exists to mark a total as a
 /// floor rather than a total. Recording `$0.00` as spend would make the
@@ -344,6 +367,7 @@ pub fn run_dispatch_bounded(
     spec: &DispatchSpec,
     timeout: Option<std::time::Duration>,
 ) -> Result<DispatchOutcome, MemoryError> {
+    validate_claude_spec(spec)?;
     let args = build_argv(spec);
     let Some(timeout) = timeout else {
         let output = retry_on_etxtbsy(|| {
@@ -434,11 +458,12 @@ pub fn run_dispatch_bounded(
             kill_process_group(&mut child);
             let _ = child.wait();
             return Ok(DispatchOutcome {
-                total_cost_usd: 0.0,
+                cost_usd: None,
                 num_turns: 0,
                 duration_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
                 is_error: true,
-                session_id: spec.session.session_uuid().to_string(),
+                native_session_id: Some(spec.session.session_uuid().to_string()),
+                invocation_started: true,
                 verdict: None,
                 reason: Some(format!(
                     "dispatch exceeded this repo's wall-clock bound of {}s and was killed; \
@@ -563,6 +588,8 @@ mod tests {
 
     fn sample_spec(session: SessionMode) -> DispatchSpec {
         DispatchSpec {
+            implementer: Implementer::Claude,
+            codex_artifacts: None,
             session,
             name: "ic-ironmem-283".to_string(),
             model: "claude-sonnet-5".to_string(),
@@ -670,12 +697,13 @@ mod tests {
         assert!(outcome.is_error);
         assert_eq!(outcome.verdict, None);
         assert_eq!(
-            outcome.total_cost_usd, 0.0,
-            "a killed dispatch has no meter; this 0.0 means unknown and the caller banks it \
+            outcome.cost_usd, None,
+            "a killed dispatch has no meter; None means unknown and the caller banks it \
              as unpriced"
         );
         assert_eq!(
-            outcome.session_id, "abc",
+            outcome.native_session_id.as_deref(),
+            Some("abc"),
             "the session id must survive so the next dispatch can --resume it"
         );
     }
@@ -837,7 +865,7 @@ mod tests {
         assert!(!outcome.timed_out);
         assert!(!outcome.process_success);
         assert!(!outcome.is_met(), "a non-zero exit's 'met' is not believed");
-        assert!((outcome.total_cost_usd - 0.42).abs() < 1e-9);
+        assert!((outcome.cost_usd.unwrap() - 0.42).abs() < 1e-9);
     }
 
     #[test]
@@ -1057,8 +1085,8 @@ mod tests {
         });
         let outcome = run_dispatch(&bin, dir.path(), &spec).unwrap();
         assert!(outcome.is_met());
-        assert_eq!(outcome.session_id, "s-fake");
-        assert!((outcome.total_cost_usd - 0.03).abs() < 1e-9);
+        assert_eq!(outcome.native_session_id.as_deref(), Some("s-fake"));
+        assert!((outcome.cost_usd.unwrap() - 0.03).abs() < 1e-9);
     }
 
     #[cfg(unix)]
@@ -1122,9 +1150,36 @@ exit 1
         assert!(!outcome.process_success);
         assert_eq!(outcome.verdict, Some(Verdict::Met));
         assert!(
-            (outcome.total_cost_usd - 0.03).abs() < 1e-9,
+            (outcome.cost_usd.unwrap() - 0.03).abs() < 1e-9,
             "cost must still be recoverable from a failed-process dispatch, not discarded"
         );
-        assert_eq!(outcome.session_id, "s-fake");
+        assert_eq!(outcome.native_session_id.as_deref(), Some("s-fake"));
+    }
+}
+
+#[cfg(test)]
+mod cost_tests {
+    use super::*;
+    #[test]
+    fn unknown_cost_is_distinct_from_reported_zero() {
+        for json in [
+            "{}",
+            r#"{"total_cost_usd":null}"#,
+            r#"{"total_cost_usd":-1}"#,
+        ] {
+            assert_eq!(parse_dispatch_output(json).unwrap().cost_usd, None);
+        }
+        assert_eq!(
+            parse_dispatch_output(r#"{"total_cost_usd":0}"#)
+                .unwrap()
+                .cost_usd,
+            Some(0.0)
+        );
+        assert_eq!(
+            parse_dispatch_output(r#"{"total_cost_usd":1.25}"#)
+                .unwrap()
+                .cost_usd,
+            Some(1.25)
+        );
     }
 }
