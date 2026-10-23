@@ -306,8 +306,36 @@ pub fn run_codex_bounded(
             }
         }
     };
+    finish_codex_dispatch(
+        &mut child,
+        a,
+        spec,
+        status,
+        started,
+        timed_out,
+        limit_exceeded,
+    )
+}
+
+/// Complete supervision after the root process has been observed and reaped.
+/// Descendants may still be running and writing the invocation's artifacts.
+fn finish_codex_dispatch(
+    child: &mut std::process::Child,
+    a: &CodexArtifacts,
+    spec: &DispatchSpec,
+    status: std::process::ExitStatus,
+    started: Instant,
+    timed_out: bool,
+    limit_exceeded: Option<String>,
+) -> Result<DispatchOutcome, MemoryError> {
     // Catch an artifact that crossed the limit just before process exit.
-    limit_exceeded = limit_exceeded.or_else(|| limits(a));
+    let limit_exceeded = limit_exceeded.or_else(|| limits(a));
+    if limit_exceeded.is_some() {
+        // try_wait may already have reaped the root while gate descendants
+        // still belong to its process group. A failed outcome alone would
+        // leave those processes running in the worktree.
+        super::dispatch::kill_process_group(child);
+    }
     let record = ExitRecord {
         exit_code: status.code(),
         timed_out,
@@ -994,6 +1022,73 @@ exit {code}"#
                 .unwrap()
                 .trim(),
             dir.path().canonicalize().unwrap().to_str().unwrap()
+        );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn post_exit_artifact_overflow_kills_the_surviving_gate_process() {
+        use std::os::unix::process::CommandExt;
+
+        let (dir, s) = setup();
+        let a = s.codex_artifacts.as_ref().unwrap();
+        let script = format!(
+            "(touch descendant-ready; while [ ! -f gate-release ]; do sleep 0.02; done; touch descendant-survived) &\n\
+             while [ ! -f root-release ]; do sleep 0.02; done\n\
+             head -c {} /dev/zero > '{}'\nexit 0",
+            FINAL_LIMIT + 1,
+            a.final_path
+        );
+        let mut command = std::process::Command::new(binary(dir.path(), &script));
+        command
+            .current_dir(dir.path())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .process_group(0);
+        let mut child = crate::autopilot::dispatch::retry_on_etxtbsy(|| command.spawn()).unwrap();
+        let started = Instant::now();
+        let ready = dir.path().join("descendant-ready");
+        while !ready.exists() && started.elapsed() < Duration::from_secs(3) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        if !ready.exists() {
+            crate::autopilot::dispatch::kill_process_group(&mut child);
+            let _ = child.wait();
+            panic!("descendant did not reach its gate");
+        }
+        // This is the supervisor's pre-try_wait snapshot: still under cap.
+        let previous_limit = limits(a);
+        assert_eq!(previous_limit, None);
+        std::fs::write(dir.path().join("root-release"), "release").unwrap();
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if started.elapsed() >= Duration::from_secs(3) {
+                crate::autopilot::dispatch::kill_process_group(&mut child);
+                let _ = child.wait();
+                panic!("root did not finish writing the oversized artifact");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert!(status.success());
+        assert!(limits(a).is_some());
+        let outcome =
+            finish_codex_dispatch(&mut child, a, &s, status, started, false, previous_limit)
+                .unwrap();
+        assert!(!outcome.is_met());
+        assert!(outcome.reason.unwrap().contains("limit"));
+        std::fs::write(dir.path().join("gate-release"), "release").unwrap();
+        let survived = dir.path().join("descendant-survived");
+        let released = Instant::now();
+        while !survived.exists() && released.elapsed() < Duration::from_millis(300) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // Also clean up on red, before asserting, to avoid leaking fixtures.
+        crate::autopilot::dispatch::kill_process_group(&mut child);
+        assert!(
+            !survived.exists(),
+            "post-exit overflow left the gate process alive"
         );
     }
     #[cfg(unix)]
