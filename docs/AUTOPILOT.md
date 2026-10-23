@@ -295,6 +295,13 @@ while the approval is outstanding, later passes re-read the PR, say nothing
 new, and do not spend the `--max-advances` burst limit on it. To take the
 issue back instead, label it `agent:blocked`.
 
+That holds only for an issue `advance` tracks: its repo's gate is approved
+and Autopilot has recorded a successful attempt on it. A PR prepared by hand
+and taken through `ironmem autopilot review` and `ironmem autopilot merge`
+has no recorded success, so `advance` skips it as `NoSuccessYet` whatever its
+labels. Its hold comment says so, and names the way back: re-run `ironmem
+autopilot merge … --gate-green` once the PR is approved.
+
 A human who **requests changes** is not an approval pending: GitHub then
 reports `CHANGES_REQUESTED`, nothing in Autopilot will make the change asked
 for, and the hold moves the issue to `agent:blocked` like any other, with a

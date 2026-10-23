@@ -493,6 +493,25 @@ pub fn dispatch_class(risk_label: Option<&str>) -> String {
     super::lead::class_for(risk_label, super::lead::UNCLASSIFIED)
 }
 
+/// Whether [`plan_advance`] would list `issue`, labels aside: the two facts
+/// it reads from the database before it looks at any PR — an approved gate
+/// config for the repo, and a recorded [`AttemptOutcome::Success`].
+///
+/// For rung 6's approval hold, which must not tell a human that approving
+/// is all it takes when this pass would skip the issue as
+/// [`SkipReason::RepoNotApproved`] or [`SkipReason::NoSuccessYet`]. A PR
+/// prepared by hand and taken through `autopilot review` and `autopilot
+/// merge` has no recorded success, so `advance` never picks it up, whatever
+/// its labels say. Kept beside `plan_advance` so the two cannot drift.
+///
+/// [`SkipReason::NoCheckout`] is not covered: the configured targets are an
+/// `advance` argument, and rung 6 does not see them.
+pub(super) fn advance_would_track(db: &Database, issue: &IssueRef) -> Result<bool, MemoryError> {
+    Ok(gate_config::is_gate_config_approved(db, &issue.repo)?
+        && lineage::get_issue_status(db, issue)?
+            .is_some_and(|s| s.best_verdict == Some(AttemptOutcome::Success)))
+}
+
 /// Choose the issues one pass will look at.
 ///
 /// Pure over the database and `backlogs` — no network, no writes — for the
