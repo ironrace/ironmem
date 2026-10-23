@@ -22,13 +22,14 @@
 //! human is guaranteed to be looking. Lineage still bounds the work (rung
 //! 4's cumulative attempt cap); the label is what a human can *undo*.
 //!
-//! ⚠️ **Nothing calls [`eligibility`] yet.** Rung 6 *writes* the labels — it
-//! sets `agent:exhausted` on the attempt cap and `agent:blocked` on a held
-//! PR — but the issue *picking* that would consult them is the Lead's, and
-//! the Lead loop is rung 7. This function is the rule stated once, in the
-//! module that owns the vocabulary, for that loop to call; it is not a gate
-//! rung 6 enforces. Do not read the paragraph above as a description of
-//! current behavior.
+//! Rung 6 writes `agent:blocked` on a held PR, except a PR held only for a
+//! missing approval, whose labels it leaves alone (#346). `agent:exhausted`
+//! is written only by `ironmem autopilot exhaust`, which a human runs:
+//! reaching the attempt cap does not apply it (#345), and the way out of it
+//! is `ironmem autopilot retry`. [`eligibility`] is the rule
+//! stated once, in the module that owns the vocabulary, for every reader —
+//! the Lead's queue, `advance`'s candidate filter, `retry`, and rung 6's own
+//! choice of what a hold does to the labels.
 //!
 //! # Why the transitions are exclusive
 //!
@@ -102,7 +103,9 @@ impl AgentLabel {
     pub fn description(self) -> &'static str {
         match self {
             AgentLabel::Ready => "Autopilot: opted in, eligible for dispatch",
-            AgentLabel::Blocked => "Autopilot: awaiting a human; resumes on a newer human comment",
+            AgentLabel::Blocked => {
+                "Autopilot: awaiting a human; a reply to its question resumes it, else re-label agent:ready"
+            }
             AgentLabel::Exhausted => {
                 "Autopilot: attempt cap reached; never self-resumes, a human must re-label"
             }

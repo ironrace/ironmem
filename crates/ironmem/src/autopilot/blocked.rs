@@ -1065,7 +1065,7 @@ mod tests {
                 delete_branch: false,
             },
             &crate::autopilot::merge::MergeHold::NotReviewed,
-            AgentLabel::Blocked,
+            crate::autopilot::merge::HoldDisposition::Blocked,
         );
         assert!(
             hold.contains(AUTOPILOT_COMMENT_MARKER),

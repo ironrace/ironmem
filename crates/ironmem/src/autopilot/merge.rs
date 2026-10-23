@@ -6,7 +6,8 @@
 //! three things the spec's data flow puts after the review:
 //!
 //! - **`PASS` + low-risk + class match ─► `Lead merges via gh pr merge`.**
-//! - **otherwise ─► `PR stays open, labeled, human notified`.**
+//! - **otherwise ─► `PR stays open, labeled, human notified`** — except a
+//!   PR waiting only on an approval, which is not relabeled (see below).
 //! - **retries exhausted ─► `agent:exhausted`**, with a comment summarizing
 //!   everything that was tried.
 //!
@@ -57,10 +58,18 @@
 //!
 //! A requirement that is unmet holds with
 //! [`MergeHold::HumanApprovalRequired`]. Autopilot is not the reviewer of
-//! record there and cannot become one; the honest outcome is a labeled PR
-//! and a notified human, which is the same terminal state the spec already
-//! defines for every non-low-risk change. A requirement that is *met* is not
-//! a hold — the human supplied exactly what the rule asked for.
+//! record there and cannot become one; the honest outcome is an open PR and
+//! a notified human. A requirement that is *met* is not a hold — the human
+//! supplied exactly what the rule asked for.
+//!
+//! That hold, when it waits only on an approval
+//! ([`MergeHold::awaits_approval`]), alone among them does **not** move the
+//! issue to `agent:blocked` (#346): its labels are left as they are, so an
+//! `agent:ready` issue stays in the next `advance --merge` pass, which
+//! re-reads `reviewDecision` — and the approval by itself is what lets the
+//! merge through. A human who requested changes (`CHANGES_REQUESTED`) is not
+//! waiting on an approval, and that hold goes to `agent:blocked` like any
+//! other. See [`HoldDisposition`].
 //!
 //! The guard runs before the mergeability check, because GitHub reports
 //! `mergeStateStatus: BLOCKED` for a PR whose only problem is the missing
@@ -283,6 +292,28 @@ pull request before doing anything else"
         }
     }
 
+    /// Whether this hold is waiting on nothing but a human approving the PR —
+    /// the one hold that leaves the issue's labels alone (#346; see
+    /// [`HoldDisposition::AwaitsApproval`]).
+    ///
+    /// Not every [`MergeHold::HumanApprovalRequired`]. `CHANGES_REQUESTED`
+    /// means a human objected: nothing in Autopilot will make the change
+    /// they asked for, so telling them "approving is all it needs" would be
+    /// false, and re-reading the PR every pass would wait on an approval
+    /// nobody intends to give. That one goes to `agent:blocked` like any
+    /// other hold.
+    ///
+    /// The single definition both readers use — [`hold_disposition`], and
+    /// `advance`'s burst-limit accounting — so the label that keeps the issue
+    /// in the pass and the rule that makes re-reading it free cannot drift.
+    pub fn awaits_approval(&self) -> bool {
+        matches!(
+            self,
+            MergeHold::HumanApprovalRequired { review_decision, .. }
+                if !review_decision.eq_ignore_ascii_case("CHANGES_REQUESTED")
+        )
+    }
+
     /// Whether this hold leaves the pull request open.
     ///
     /// A positive list, not an exclusion list. Written as "everything except
@@ -388,8 +419,8 @@ pub struct MergeExecution {
     /// The PR as GitHub described it, when we got far enough to ask.
     pub snapshot: Option<PrSnapshot>,
     /// The label transition applied to the issue. `None` when no `agent:*`
-    /// label was touched — a dry run, or a hold on an already-exhausted
-    /// issue.
+    /// label was touched — a dry run, a hold on an already-exhausted issue,
+    /// or a hold waiting on a pull-request approval.
     pub label_plan: Option<labels::LabelPlan>,
     /// Why the label transition did not happen, when the outcome was a
     /// merge and the label write failed.
@@ -726,8 +757,8 @@ fn evaluate(
 ///
 /// `UNKNOWN` — and [`MergeHold::ProtectionUnknown`] with it — is often
 /// *transient*: GitHub has not finished computing the answer and would give
-/// a real one seconds later. Rung 6 nonetheless escalates it like any other
-/// hold, with a comment and `agent:blocked`, because it has no retry or
+/// a real one seconds later. Rung 6 nonetheless escalates it like every hold
+/// but a missing approval, with a comment and `agent:blocked`, because it has no retry or
 /// backoff of its own and the alternative is worse: silently declining to
 /// notify anybody would leave a genuinely stuck PR spinning with no human
 /// ever told. Escalating a self-resolving condition costs one comment, which
@@ -749,7 +780,8 @@ fn mergeable_state_permits(status: &str) -> bool {
 /// Every terminal path in [`execute_merge`] funnels through here so that no
 /// outcome can be returned without the label and notification the spec
 /// attaches to it ("PR stays open, **labeled, human notified**"), and so that
-/// the record is written exactly once.
+/// the record is written exactly once. The one deliberate exception to the
+/// label is a PR waiting only on an approval — see [`hold_disposition`].
 ///
 /// # Where the record goes in the order, and why it differs by outcome
 ///
@@ -861,13 +893,15 @@ fn finish(
         // not changed.
         (MergeOutcome::Held(hold), _) => {
             // The labels are read *first*, before the comment is written,
-            // because the comment names the label the issue will carry —
-            // and on an exhausted issue that is not `agent:blocked`. Writing
+            // because the comment says what happens to them — and that is
+            // not `agent:blocked` on an exhausted issue, nor on one waiting
+            // only on an approval. Writing
             // a fixed string first told the human "labeled `agent:blocked`"
             // on every hold against an exhausted issue, which was both false
             // and, thanks to the dedup below, never corrected.
             let current = gh::issue_labels(gh_runner, request.issue)?;
-            let stop = hold_stop_label(&current);
+            let tracked = super::advance::advance_would_track(db, request.issue)?;
+            let disposition = hold_disposition(&current, hold, tracked);
 
             // Not re-posted when the previous attempt on this PR held for
             // the *same* reason: `HumanApprovalRequired` on a protected
@@ -879,21 +913,23 @@ fn finish(
                 gh::comment_on_issue(
                     gh_runner,
                     request.issue,
-                    &render_hold_comment(request, hold, stop),
+                    &render_hold_comment(request, hold, disposition),
                 )?;
                 commented = true;
             }
             record_drawer_id = record_once(db, &record, repeat.as_ref())?;
-            label_plan = match stop {
-                // Already carrying the permanent stop sign: nothing to do,
-                // and `plan_exclusive` toward `agent:blocked` would take it
-                // down. See [`hold_stop_label`].
-                AgentLabel::Exhausted => None,
-                target => Some(labels::apply_plan(
+            label_plan = match disposition {
+                HoldDisposition::Blocked => Some(labels::apply_plan(
                     gh_runner,
                     request.issue,
-                    labels::plan_exclusive(&current, Some(target)),
+                    labels::plan_exclusive(&current, Some(AgentLabel::Blocked)),
                 )?),
+                // Nothing to write. An exhausted issue keeps its permanent
+                // stop sign, which `plan_exclusive` toward `agent:blocked`
+                // would take down; an issue waiting on an approval keeps the
+                // label that lets the next pass see the approval arrive. See
+                // [`hold_disposition`].
+                HoldDisposition::StaysExhausted | HoldDisposition::AwaitsApproval { .. } => None,
             };
         }
     }
@@ -945,31 +981,92 @@ fn record_once(
     }
 }
 
-/// Which `agent:*` label an issue should carry after a hold.
+/// What a hold does to the issue's `agent:*` labels — and so what its
+/// comment tells the human.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HoldDisposition {
+    /// The issue carries `agent:exhausted` and keeps it. Nothing is written.
+    StaysExhausted,
+    /// The pull request is waiting on nothing but an approval
+    /// ([`MergeHold::awaits_approval`]) — not on an answer — so **no label is
+    /// touched**. An exhausted issue is [`HoldDisposition::StaysExhausted`]
+    /// instead, whatever the hold.
+    ///
+    /// `resume` says what will pick the approval up, so the comment can say
+    /// truthfully whether approving is all it takes.
+    AwaitsApproval { resume: ApprovalResume },
+    /// The issue is moved to `agent:blocked` for a human.
+    Blocked,
+}
+
+/// What resumes a [`HoldDisposition::AwaitsApproval`] hold once the PR is
+/// approved.
 ///
-/// `agent:blocked` is the right label for a held PR — "awaiting a human" is
-/// exactly what it means, and its auto-resume-on-a-newer-human-comment
-/// semantics are the right ones, since a human who approves or comments has
-/// supplied the thing that was missing. The spec defines three labels and
-/// inventing a fourth here would put a state in the repo that nothing else
-/// in the design knows how to clear.
+/// Three cases, not a `queued` flag: the labels are only one of the things
+/// `advance` checks. A PR taken through `autopilot review` and `autopilot
+/// merge` by hand carries `agent:ready` but has no recorded success, so a
+/// label check alone promised a resume that `advance` would skip as
+/// `NoSuccessYet` — and pointed at a label edit that would not help either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalResume {
+    /// `advance` tracks the issue ([`super::advance::advance_would_track`])
+    /// and its labels list it — `agent:ready`, and nothing that overrides
+    /// it. Approving is all it takes.
+    Advance,
+    /// `advance` tracks the issue, but its labels keep it out of the
+    /// listing. Re-running `merge` or making `agent:ready` its only label
+    /// both work.
+    Relabel,
+    /// `advance` does not track the issue whatever its labels, so only
+    /// re-running `merge` works.
+    MergeCommand,
+}
+
+/// What a hold should do to an issue's labels. See [`HoldDisposition`].
 ///
-/// But `set_exclusive_label` removes every *other* `agent:*` label, so
-/// applying it unconditionally took an exhausted issue — one the spec says
-/// **never self-resumes** — and moved it to the one label that does. An
-/// exhausted issue therefore keeps `agent:exhausted`: the stop sign stays
-/// up, and the comment still explains why this attempt stopped.
+/// `agent:blocked` is the right label for most holds — "awaiting a human" is
+/// what it means. The spec defines three labels and inventing a fourth here
+/// would put a state in the repo that nothing else in the design knows how
+/// to clear.
+///
+/// **Except a missing approval** (#346). `agent:blocked` resumes on a newer
+/// human *comment* after a question Autopilot asked; a merge hold asks no
+/// question, and an approval is not a comment. Worse, the label strips
+/// `agent:ready`, and `advance` lists only `agent:ready` issues — so a held
+/// PR left the one pass that would have seen the approval arrive, and the
+/// commonest hold on any protected branch needed a hand-edited label to get
+/// out of. The issue therefore keeps the labels it has: on the normal path
+/// that is `agent:ready`, the next `advance --merge` re-reads
+/// `reviewDecision`, and the approval alone is what lets it merge. Nothing
+/// is *added* either — an issue that was never opted in must not be opted
+/// in by a hold.
+///
+/// `set_exclusive_label` removes every *other* `agent:*` label, so applying
+/// `agent:blocked` unconditionally took an exhausted issue — one the spec
+/// says **never self-resumes** — and moved it to the one label that does. An
+/// exhausted issue therefore keeps `agent:exhausted`, whatever the hold: the
+/// stop sign stays up, and the comment still explains why this attempt
+/// stopped.
+///
+/// `tracked` is [`super::advance::advance_would_track`], read by the caller
+/// so this stays pure. It decides only what the comment says about resuming
+/// ([`ApprovalResume`]), never the labels.
 ///
 /// Pure, so the comment and the label write cannot disagree about the
 /// answer: both are derived from one call on one reading of the labels.
-fn hold_stop_label(current: &[String]) -> AgentLabel {
-    if current
-        .iter()
-        .any(|l| AgentLabel::from_label_str(l) == Some(AgentLabel::Exhausted))
-    {
-        AgentLabel::Exhausted
+fn hold_disposition(current: &[String], hold: &MergeHold, tracked: bool) -> HoldDisposition {
+    let eligibility = labels::eligibility(current);
+    if eligibility == labels::DispatchEligibility::Exhausted {
+        HoldDisposition::StaysExhausted
+    } else if hold.awaits_approval() {
+        let resume = match (tracked, eligibility.is_eligible()) {
+            (true, true) => ApprovalResume::Advance,
+            (true, false) => ApprovalResume::Relabel,
+            (false, _) => ApprovalResume::MergeCommand,
+        };
+        HoldDisposition::AwaitsApproval { resume }
     } else {
-        AgentLabel::Blocked
+        HoldDisposition::Blocked
     }
 }
 
@@ -1013,26 +1110,73 @@ Autopilot did not merge it on this run. {labels}\n\n\
 /// discovered in production. Scrubbed and bounded because a hold reason can
 /// quote `gh`'s stderr and a review's reason, both of which quote the diff.
 ///
-/// `stop` is the label the issue will actually carry, passed in rather than
-/// assumed: the sentence naming it was once a fixed string, and on an
-/// exhausted issue it named a label that was deliberately not applied.
-pub fn render_hold_comment(request: &MergeRequest, hold: &MergeHold, stop: AgentLabel) -> String {
-    let disposition = match stop {
-        AgentLabel::Exhausted => format!(
+/// `disposition` is what actually happens to the issue's labels, passed in
+/// rather than assumed: the sentence naming the label was once a fixed
+/// string, and on an exhausted issue it named a label that was deliberately
+/// not applied.
+pub fn render_hold_comment(
+    request: &MergeRequest,
+    hold: &MergeHold,
+    disposition: HoldDisposition,
+) -> String {
+    // `pub`, so a caller could pair a disposition with a hold it does not
+    // describe — and `AwaitsApproval`'s text tells a human to approve.
+    debug_assert!(
+        disposition == HoldDisposition::StaysExhausted
+            || matches!(disposition, HoldDisposition::AwaitsApproval { .. })
+                == hold.awaits_approval(),
+        "{disposition:?} does not describe {hold:?}"
+    );
+    let still_open = if hold.pr_definitely_still_open() {
+        "The pull request stays open. "
+    } else {
+        ""
+    };
+    let disposition = match disposition {
+        HoldDisposition::StaysExhausted => format!(
             "The issue keeps `{}` and Autopilot will not retry it; a human must re-label it \
 `{}` to put it back in the queue.",
             AgentLabel::Exhausted.as_str(),
             AgentLabel::Ready.as_str()
         ),
-        target => format!(
-            "{}It is labeled `{}` for a human. Autopilot will not merge it on its own; \
-re-labeling the issue `{}` after resolving the above puts it back in the queue.",
-            if hold.pr_definitely_still_open() {
-                "The pull request stays open. "
-            } else {
-                ""
-            },
-            target.as_str(),
+        HoldDisposition::AwaitsApproval {
+            resume: ApprovalResume::Advance,
+        } => format!(
+            "{still_open}**Approving the pull request is all it needs.** The issue keeps \
+`{ready}`, and the next `ironmem autopilot advance --merge` pass re-checks the approval and \
+merges it if nothing else has changed — no label edit is needed. To take the issue back \
+instead, label it `{blocked}`.",
+            ready = AgentLabel::Ready.as_str(),
+            blocked = AgentLabel::Blocked.as_str(),
+        ),
+        HoldDisposition::AwaitsApproval {
+            resume: ApprovalResume::Relabel,
+        } => format!(
+            "{still_open}Its labels were left as they are, and they do not queue it for \
+`ironmem autopilot advance`. Once the pull request is approved, re-run `ironmem autopilot \
+merge {repo} {issue} --pr {pr} --gate-green` (asserting the gate only if it is green), or \
+make `{ready}` its only `agent:*` label so the next `advance --merge` pass merges it.",
+            repo = request.issue.repo,
+            issue = request.issue.number,
+            pr = request.pr_number,
+            ready = AgentLabel::Ready.as_str(),
+        ),
+        HoldDisposition::AwaitsApproval {
+            resume: ApprovalResume::MergeCommand,
+        } => format!(
+            "{still_open}Its labels were left as they are. `ironmem autopilot advance` will not \
+pick this issue up whatever its labels: Autopilot has no successful attempt on record for it, \
+or the repository's gate is not approved. Once the pull request is approved, re-run \
+`ironmem autopilot merge {repo} {issue} --pr {pr} --gate-green` (asserting the gate only if \
+it is green).",
+            repo = request.issue.repo,
+            issue = request.issue.number,
+            pr = request.pr_number,
+        ),
+        HoldDisposition::Blocked => format!(
+            "{still_open}It is labeled `{}` for a human. Autopilot will not merge it on its \
+own; re-labeling the issue `{}` after resolving the above puts it back in the queue.",
+            AgentLabel::Blocked.as_str(),
             AgentLabel::Ready.as_str()
         ),
     };
@@ -2218,8 +2362,6 @@ mod tests {
             Ok(protected_requiring_one_approval()),
             Ok(GhOutput::ok(r#"{"labels":[{"name":"agent:ready"}]}"#)),
             Ok(GhOutput::ok("")),
-            Ok(label_created()),
-            Ok(GhOutput::ok("")),
         ]);
 
         let exec = execute_merge(&database, &mut gh_runner, &request(false)).unwrap();
@@ -2241,8 +2383,22 @@ mod tests {
                 .any(|a| a.contains(&"merge".to_string())),
             "no merge may be attempted against a protected branch"
         );
-        let plan = exec.label_plan.expect("a hold labels the issue");
-        assert_eq!(plan.add, vec!["agent:blocked".to_string()]);
+        // #346: not `agent:blocked`. That label strips `agent:ready`, drops
+        // the issue out of `advance`'s listing, and resumes only on a comment
+        // — so the approval this hold is waiting for could never resume it.
+        assert!(
+            exec.label_plan.is_none(),
+            "an approval hold leaves the labels alone: {:?}",
+            exec.label_plan
+        );
+        assert!(
+            !gh_runner
+                .seen
+                .iter()
+                .any(|a| a.starts_with(&["issue".to_string(), "edit".to_string()])),
+            "no label may be written: {:?}",
+            gh_runner.seen
+        );
         assert!(exec.commented, "the human must be notified");
     }
 
@@ -2285,8 +2441,6 @@ mod tests {
             ))),
             Ok(protected_requiring_one_approval()),
             Ok(GhOutput::ok(r#"{"labels":[]}"#)),
-            Ok(GhOutput::ok("")),
-            Ok(label_created()),
             Ok(GhOutput::ok("")),
         ]);
 
@@ -2577,9 +2731,7 @@ mod tests {
             let mut gh_runner = ScriptedGh::new(vec![
                 Ok(pr_view_reviewed("OPEN", HEAD, "REVIEW_REQUIRED")),
                 Ok(protected_requiring_one_approval()),
-                Ok(GhOutput::ok(r#"{"labels":[]}"#)),
-                Ok(GhOutput::ok("")),
-                Ok(label_created()),
+                Ok(GhOutput::ok(r#"{"labels":[{"name":"agent:ready"}]}"#)),
                 Ok(GhOutput::ok("")),
             ]);
             execute_merge(&database, &mut gh_runner, &request(false)).unwrap()
@@ -2589,7 +2741,7 @@ mod tests {
         let mut gh_runner = ScriptedGh::new(vec![
             Ok(pr_view_reviewed("OPEN", HEAD, "REVIEW_REQUIRED")),
             Ok(protected_requiring_one_approval()),
-            Ok(GhOutput::ok(r#"{"labels":[{"name":"agent:blocked"}]}"#)),
+            Ok(GhOutput::ok(r#"{"labels":[{"name":"agent:ready"}]}"#)),
         ]);
         let second = execute_merge(&database, &mut gh_runner, &request(false)).unwrap();
 
@@ -2632,8 +2784,6 @@ mod tests {
             Ok(pr_view_reviewed("OPEN", HEAD, "REVIEW_REQUIRED")),
             Ok(protected_requiring_one_approval()),
             Ok(GhOutput::ok(r#"{"labels":[]}"#)),
-            Ok(GhOutput::ok("")),
-            Ok(label_created()),
             Ok(GhOutput::ok("")),
         ]);
         let second = execute_merge(&database, &mut gh_runner, &request(false)).unwrap();
@@ -2883,14 +3033,18 @@ mod tests {
                 read_failure: "HTTP 502".into(),
             },
         ] {
-            let body = render_hold_comment(&request(false), &hold, AgentLabel::Blocked);
+            let body = render_hold_comment(&request(false), &hold, HoldDisposition::Blocked);
             assert!(
                 !body.contains("stays open"),
                 "{hold:?} must not claim the PR is open:\n{body}"
             );
         }
         // …while a hold that genuinely leaves it open still says so.
-        let body = render_hold_comment(&request(false), &MergeHold::PrIsDraft, AgentLabel::Blocked);
+        let body = render_hold_comment(
+            &request(false),
+            &MergeHold::PrIsDraft,
+            HoldDisposition::Blocked,
+        );
         assert!(body.contains("stays open"), "{body}");
     }
 
@@ -2933,7 +3087,9 @@ mod tests {
                 enforce_admins: true,
                 review_decision: "REVIEW_REQUIRED".into(),
             },
-            AgentLabel::Blocked,
+            HoldDisposition::AwaitsApproval {
+                resume: ApprovalResume::Advance,
+            },
         );
         assert!(body.contains("was not merged"));
         assert!(body.contains("main requires 1 approving review"));
@@ -2947,14 +3103,210 @@ mod tests {
                     enforce_admins: true,
                     review_decision: "REVIEW_REQUIRED".into(),
                 },
-                AgentLabel::Blocked,
+                HoldDisposition::AwaitsApproval {
+                    resume: ApprovalResume::Advance,
+                },
             )
             .contains("0 approving review"),
             "a code-owner requirement must not read to a human as \"requires 0\""
         );
         assert!(body.contains("administrators"));
-        assert!(body.contains("agent:blocked"));
-        assert!(body.contains("agent:ready"));
+        // #346: the way back from a missing approval is the approval.
+        assert!(
+            body.contains("Approving the pull request is all it needs"),
+            "{body}"
+        );
+        assert!(body.contains("keeps `agent:ready`"), "{body}");
+        assert!(body.contains("advance --merge"), "{body}");
+        assert!(
+            !body.contains("labeled `agent:blocked`"),
+            "an approval hold does not block the issue: {body}"
+        );
+    }
+
+    #[test]
+    fn an_approval_hold_on_an_unqueued_issue_does_not_promise_advance_will_merge_it() {
+        // No label is touched on an approval hold, so an issue `advance`
+        // does not list — never opted in, or blocked by hand — is not picked
+        // up by the approval alone, and the comment must not say it is.
+        let body = render_hold_comment(
+            &request(false),
+            &MergeHold::HumanApprovalRequired {
+                base: "main".into(),
+                required_approving_review_count: 1,
+                require_code_owner_reviews: false,
+                enforce_admins: false,
+                review_decision: "REVIEW_REQUIRED".into(),
+            },
+            HoldDisposition::AwaitsApproval {
+                resume: ApprovalResume::Relabel,
+            },
+        );
+        assert!(!body.contains("all it needs"), "{body}");
+        assert!(body.contains("ironmem autopilot merge"), "{body}");
+        assert!(body.contains("agent:ready"), "{body}");
+    }
+
+    #[test]
+    fn an_approval_hold_advance_does_not_track_offers_only_the_merge_command() {
+        // A PR taken through `autopilot review` and `autopilot merge` by
+        // hand has no recorded success, so `advance` skips it as
+        // `NoSuccessYet` whatever its labels: neither "approving is all it
+        // needs" nor "re-label it `agent:ready`" is true of it.
+        let body = render_hold_comment(
+            &request(false),
+            &MergeHold::HumanApprovalRequired {
+                base: "main".into(),
+                required_approving_review_count: 1,
+                require_code_owner_reviews: false,
+                enforce_admins: false,
+                review_decision: "REVIEW_REQUIRED".into(),
+            },
+            HoldDisposition::AwaitsApproval {
+                resume: ApprovalResume::MergeCommand,
+            },
+        );
+        assert!(!body.contains("all it needs"), "{body}");
+        assert!(
+            body.contains("ironmem autopilot merge owner/repo 42 --pr 7 --gate-green"),
+            "{body}"
+        );
+        assert!(body.contains("no successful attempt"), "{body}");
+        assert!(
+            !body.contains("agent:ready"),
+            "a label edit would not help, so none is offered: {body}"
+        );
+    }
+
+    #[test]
+    fn an_approval_hold_without_a_recorded_success_does_not_promise_a_resume() {
+        // End to end: `agent:ready` on the issue, but no lineage success, so
+        // the comment actually posted must not tell the human that
+        // approving is all it takes.
+        let database = db();
+        store_review(&database, 7, Some(HEAD), pass_outcome());
+        let mut gh_runner = ScriptedGh::new(vec![
+            Ok(pr_view_reviewed("OPEN", HEAD, "REVIEW_REQUIRED")),
+            Ok(protected_requiring_one_approval()),
+            Ok(GhOutput::ok(r#"{"labels":[{"name":"agent:ready"}]}"#)),
+            Ok(GhOutput::ok("")),
+        ]);
+
+        let exec = execute_merge(&database, &mut gh_runner, &request(false)).unwrap();
+
+        assert!(exec.commented);
+        let body = gh_runner
+            .seen
+            .iter()
+            .find(|a| a.contains(&"comment".to_string()))
+            .expect("the issue must be commented on")
+            .join(" ");
+        assert!(!body.contains("all it needs"), "{body}");
+        assert!(body.contains("ironmem autopilot merge"), "{body}");
+    }
+
+    #[test]
+    fn an_approval_hold_advance_tracks_promises_the_resume() {
+        // The other half: with an approved gate and a recorded success,
+        // `advance` lists an `agent:ready` issue, so approving is all it
+        // takes.
+        let database = db();
+        crate::autopilot::gate_config::propose_gate_config(
+            &database,
+            "owner/repo",
+            vec!["cargo test --workspace".to_string()],
+            Vec::new(),
+        )
+        .unwrap();
+        crate::autopilot::gate_config::approve_gate_config(&database, "owner/repo").unwrap();
+        crate::autopilot::lineage::upsert_issue_status(
+            &database,
+            &crate::autopilot::lineage::IssueStatus {
+                issue: issue(),
+                best_verdict: Some(crate::autopilot::lineage::AttemptOutcome::Success),
+                best_commit_sha: Some(HEAD.into()),
+                cumulative_attempt_n: 1,
+            },
+        )
+        .unwrap();
+        store_review(&database, 7, Some(HEAD), pass_outcome());
+        let mut gh_runner = ScriptedGh::new(vec![
+            Ok(pr_view_reviewed("OPEN", HEAD, "REVIEW_REQUIRED")),
+            Ok(protected_requiring_one_approval()),
+            Ok(GhOutput::ok(r#"{"labels":[{"name":"agent:ready"}]}"#)),
+            Ok(GhOutput::ok("")),
+        ]);
+
+        execute_merge(&database, &mut gh_runner, &request(false)).unwrap();
+
+        let body = gh_runner
+            .seen
+            .iter()
+            .find(|a| a.contains(&"comment".to_string()))
+            .expect("the issue must be commented on")
+            .join(" ");
+        assert!(body.contains("all it needs"), "{body}");
+    }
+
+    #[test]
+    fn a_missing_approval_is_the_one_hold_that_leaves_the_labels_alone() {
+        let approval = MergeHold::HumanApprovalRequired {
+            base: "main".into(),
+            required_approving_review_count: 1,
+            require_code_owner_reviews: false,
+            enforce_admins: true,
+            review_decision: "REVIEW_REQUIRED".into(),
+        };
+        let ready = vec!["agent:ready".to_string()];
+        let awaits = |resume| HoldDisposition::AwaitsApproval { resume };
+        assert_eq!(
+            hold_disposition(&ready, &approval, true),
+            awaits(ApprovalResume::Advance)
+        );
+        assert_eq!(
+            hold_disposition(&[], &approval, true),
+            awaits(ApprovalResume::Relabel),
+            "a hold must not opt an issue in"
+        );
+        assert_eq!(
+            hold_disposition(
+                &["agent:ready".to_string(), "agent:blocked".to_string()],
+                &approval,
+                true
+            ),
+            awaits(ApprovalResume::Relabel),
+            "a human's `agent:blocked` stays up and is not read as queued"
+        );
+        assert_eq!(
+            hold_disposition(&ready, &approval, false),
+            awaits(ApprovalResume::MergeCommand),
+            "`agent:ready` is not enough when `advance` would skip the issue"
+        );
+        assert_eq!(
+            hold_disposition(&[], &approval, false),
+            awaits(ApprovalResume::MergeCommand)
+        );
+        assert_eq!(
+            hold_disposition(&["Agent:Exhausted".to_string()], &approval, true),
+            HoldDisposition::StaysExhausted
+        );
+        assert_eq!(
+            hold_disposition(&ready, &MergeHold::PrIsDraft, true),
+            HoldDisposition::Blocked,
+            "every other hold still goes to a human"
+        );
+        let objection = MergeHold::HumanApprovalRequired {
+            base: "main".into(),
+            required_approving_review_count: 1,
+            require_code_owner_reviews: false,
+            enforce_admins: true,
+            review_decision: "CHANGES_REQUESTED".into(),
+        };
+        assert_eq!(
+            hold_disposition(&ready, &objection, true),
+            HoldDisposition::Blocked,
+            "a human who requested changes is not waiting on an approval"
+        );
     }
 
     #[test]
