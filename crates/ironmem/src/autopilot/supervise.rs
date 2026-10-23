@@ -1391,6 +1391,9 @@ mod tests {
 
     fn state_for(issue: &IssueRef, claimed: bool) -> DispatchState {
         DispatchState {
+            implementer: crate::autopilot::implementer::Implementer::Claude,
+            native_session_id: None,
+            codex_artifacts: None,
             issue: issue.clone(),
             worktree_path: "/tmp/wt".into(),
             ic_session_name: super::super::dispatch::ic_name(issue),

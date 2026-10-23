@@ -2042,11 +2042,14 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                     println!("  dispatches: {}", run.dispatches.len());
                     for (i, dispatch) in run.dispatches.iter().enumerate() {
                         println!(
-                            "    {}. {:?} — {} turns, ${:.4}{}",
+                            "    {}. {:?} — {} turns, {}{}",
                             i + 1,
                             dispatch.classification,
                             dispatch.num_turns,
-                            dispatch.total_cost_usd,
+                            dispatch
+                                .total_cost_usd
+                                .map(|cost| format!("${cost:.4}"))
+                                .unwrap_or_else(|| "unpriced".into()),
                             dispatch
                                 .attempt_n
                                 .map(|n| format!(" (attempt {n})"))

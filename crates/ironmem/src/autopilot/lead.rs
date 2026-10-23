@@ -1503,6 +1503,9 @@ mod tests {
         dispatch_state::upsert_dispatch_state(
             &db,
             &DispatchState {
+                implementer: crate::autopilot::implementer::Implementer::Claude,
+                native_session_id: None,
+                codex_artifacts: None,
                 issue: IssueRef::new("ironrace/elsewhere", 1),
                 worktree_path: "/tmp/wt".to_string(),
                 ic_session_name: "ic-ironrace-elsewhere-1".to_string(),
@@ -1778,6 +1781,9 @@ mod tests {
         dispatch_state::upsert_dispatch_state(
             db,
             &DispatchState {
+                implementer: crate::autopilot::implementer::Implementer::Claude,
+                native_session_id: None,
+                codex_artifacts: None,
                 issue: issue.clone(),
                 worktree_path: f.repo_path.display().to_string(),
                 ic_session_name: crate::autopilot::dispatch::ic_name(&issue),
@@ -1994,6 +2000,9 @@ mod tests {
             dispatch_state::upsert_dispatch_state(
                 &db,
                 &DispatchState {
+                    implementer: crate::autopilot::implementer::Implementer::Claude,
+                    native_session_id: None,
+                    codex_artifacts: None,
                     issue: issue.clone(),
                     worktree_path: f.repo_path.display().to_string(),
                     ic_session_name: crate::autopilot::dispatch::ic_name(&issue),
@@ -2056,6 +2065,9 @@ mod tests {
             dispatch_state::upsert_dispatch_state(
                 &db,
                 &DispatchState {
+                    implementer: crate::autopilot::implementer::Implementer::Claude,
+                    native_session_id: None,
+                    codex_artifacts: None,
                     issue: issue.clone(),
                     worktree_path: f.repo_path.display().to_string(),
                     ic_session_name: crate::autopilot::dispatch::ic_name(&issue),
@@ -2153,6 +2165,9 @@ mod tests {
         dispatch_state::upsert_dispatch_state(
             db,
             &DispatchState {
+                implementer: crate::autopilot::implementer::Implementer::Claude,
+                native_session_id: None,
+                codex_artifacts: None,
                 issue: issue.clone(),
                 worktree_path: f.repo_path.display().to_string(),
                 ic_session_name: crate::autopilot::dispatch::ic_name(issue),

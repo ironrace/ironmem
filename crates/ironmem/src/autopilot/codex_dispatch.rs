@@ -504,6 +504,15 @@ pub fn read_artifacts(a: &CodexArtifacts) -> Result<DispatchOutcome, MemoryError
     })
 }
 
+/// A typed supervisor record proves that wait observed process completion.
+/// A missing, truncated or malformed record does not establish liveness.
+pub fn has_valid_exit_record(artifacts: &CodexArtifacts) -> bool {
+    read_capped(&artifacts.exit_path, EXIT_LIMIT)
+        .ok()
+        .and_then(|text| serde_json::from_str::<ExitRecord>(&text).ok())
+        .is_some()
+}
+
 /// The caller MUST first confirm the invocation is dead. This file-only
 /// primitive cannot establish liveness; registry callers supply Alive/Unknown.
 /// Prepared, empty artifacts carry invocation_started=false and no native ID.

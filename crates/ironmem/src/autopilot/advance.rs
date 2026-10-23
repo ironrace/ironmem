@@ -2337,6 +2337,9 @@ mod tests {
         dispatch_state::upsert_dispatch_state(
             &db,
             &DispatchState {
+                implementer: crate::autopilot::implementer::Implementer::Claude,
+                native_session_id: None,
+                codex_artifacts: None,
                 issue: issue(),
                 worktree_path: worktree::worktree_path(roots.path(), &issue())
                     .to_string_lossy()
