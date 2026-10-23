@@ -923,12 +923,106 @@ exit {code}"#
         )
     }
     #[cfg(unix)]
+    fn spawn_fixture_invocation(
+        bin: &Path,
+        repo: &Path,
+        spec: &DispatchSpec,
+    ) -> std::process::Child {
+        use std::os::unix::process::CommandExt;
+        let a = spec.codex_artifacts.as_ref().unwrap();
+        let mut command = Command::new(bin);
+        command
+            .args(build_argv(repo, spec).unwrap())
+            .current_dir(repo)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(open_existing(&a.journal_path, true).unwrap()))
+            .stderr(Stdio::from(open_existing(&a.stderr_path, true).unwrap()))
+            .process_group(0);
+        crate::mcp::tools::scrub_git_environment(&mut command);
+        let child = super::super::dispatch::retry_on_etxtbsy(|| command.spawn()).unwrap();
+        super::super::codex_process::persist_identity(
+            a,
+            &super::super::codex_process::ProcessIdentity {
+                version: 1,
+                root_pid: child.id(),
+                root_pgid: child.id(),
+                schema_path: a.schema_path.clone(),
+                invocation_id: a.invocation_id.clone(),
+                descendants: Vec::new(),
+            },
+        )
+        .unwrap();
+        child
+    }
+
+    #[cfg(unix)]
+    fn run_observed_fixture(bin: &Path, repo: &Path, spec: &DispatchSpec) -> DispatchOutcome {
+        let started = Instant::now();
+        let mut child = spawn_fixture_invocation(bin, repo, spec);
+        let mut tracker = super::super::codex_process::ProcessTracker::new(child.id());
+        let result = (|| {
+            while !repo.join("root-ready").exists() {
+                if child.try_wait()?.is_some() || started.elapsed() >= Duration::from_secs(3) {
+                    return Err(validation("fixture did not wait for process observation"));
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            // The release follows this actual ps/kernel observation, rather
+            // than an arbitrary delay intended to make observation likely.
+            tracker.observe()?;
+            if !tracker.observed_root() {
+                return Err(validation("fixture root was not observed"));
+            }
+            std::fs::write(repo.join("root-release"), "release")?;
+            let status = loop {
+                if let Some(status) = child.try_wait()? {
+                    break status;
+                }
+                if started.elapsed() >= Duration::from_secs(3) {
+                    return Err(validation("fixture did not exit after release"));
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            finish_codex_dispatch(
+                &mut tracker,
+                spec.codex_artifacts.as_ref().unwrap(),
+                spec,
+                status,
+                started,
+                false,
+                None,
+            )
+        })();
+        if result.is_err() {
+            let _ = tracker.cleanup(false);
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        result.unwrap()
+    }
+
+    #[cfg(unix)]
     #[test]
     fn real_runner_uses_cwd_durable_files_and_refuses_nonzero_after_met() {
         for code in [0, 7] {
             let (dir, s) = setup();
-            let bin = binary(dir.path(), &script("", code));
-            let o = run_codex_bounded(&bin, dir.path(), &s, Duration::from_secs(3)).unwrap();
+            let extra = if code == 0 {
+                ""
+            } else {
+                "touch root-ready; while [ ! -f root-release ]; do sleep 0.01; done"
+            };
+            let bin = binary(dir.path(), &script(extra, code));
+            let o = if code == 0 {
+                run_codex_bounded(&bin, dir.path(), &s, Duration::from_secs(3)).unwrap()
+            } else {
+                run_observed_fixture(&bin, dir.path(), &s)
+            };
+            assert!(
+                !o.timed_out,
+                "the nonzero fixture must exit normally after observation"
+            );
+            assert_eq!(o.process_success, code == 0);
+            assert_eq!(o.is_error, code != 0);
             assert_eq!(o.is_met(), code == 0);
             assert!(o.invocation_started);
             assert_eq!(o.native_session_id.as_deref(), Some(THREAD));
@@ -942,6 +1036,43 @@ exit {code}"#
             assert_eq!(recovered.is_met(), code == 0);
         }
     }
+    #[cfg(unix)]
+    #[test]
+    fn abnormal_exit_before_any_process_observation_holds_even_after_met_output() {
+        let (dir, spec) = setup();
+        let a = spec.codex_artifacts.as_ref().unwrap();
+        let bin = binary(dir.path(), &script("", 7));
+        let started = Instant::now();
+        let mut child = spawn_fixture_invocation(&bin, dir.path(), &spec);
+        let mut tracker = super::super::codex_process::ProcessTracker::new(child.id());
+        // Reap first, deliberately making useful root observation impossible.
+        // This is the scheduler ordering the old combined fixture assumed away.
+        let status = child.wait().unwrap();
+        assert_eq!(status.code(), Some(7));
+        assert!(!tracker.observed_root());
+        let final_verdict: FinalVerdict =
+            serde_json::from_str(&std::fs::read_to_string(&a.final_path).unwrap()).unwrap();
+        assert_eq!(final_verdict.verdict, Verdict::Met);
+        let error = finish_codex_dispatch(&mut tracker, a, &spec, status, started, false, None)
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("before process-tree observation"));
+        assert!(!has_valid_exit_record(a));
+        let process = super::super::codex_process::snapshot(
+            &mut super::super::codex_process::UnixCodexProcesses,
+        );
+        assert!(process.is_available());
+        assert_eq!(
+            process.liveness(Some(a)),
+            super::super::registry::Liveness::Unknown
+        );
+        let outcome = read_artifacts(a).unwrap();
+        assert_eq!(outcome.native_session_id.as_deref(), Some(THREAD));
+        assert!(!outcome.is_met());
+        assert!(!outcome.process_success);
+    }
+
     #[cfg(unix)]
     #[test]
     fn large_journal_does_not_deadlock_and_limits_kill_with_scrubbed_bounded_reason() {
