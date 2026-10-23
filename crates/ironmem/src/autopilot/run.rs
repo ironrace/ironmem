@@ -499,7 +499,9 @@ pub struct DispatchSummary {
 /// The result of driving one issue.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct IssueRun {
-    /// Unknown-price outcomes or reservations observed by this run; recovered outcomes are not billed again.
+    /// Unknown-price outcomes or reservations observed by this run, including
+    /// a held invocation reserved on an earlier day. Observing a reservation
+    /// or recovering an outcome never bills it again.
     pub unpriced_dispatches: u32,
     #[serde(serialize_with = "serialize_issue")]
     pub issue: IssueRef,
@@ -1010,8 +1012,15 @@ pub fn run_issue(
                         CodexRecovery::Unknown { reason } => reason,
                         _ => "Codex implementation is still alive".into(),
                     };
+                    let unpriced_dispatches = match &state.codex_artifacts {
+                        Some(artifacts) => u32::from(budget::has_unpriced_dispatch_reservation(
+                            db,
+                            &artifacts.invocation_id,
+                        )?),
+                        None => 0,
+                    };
                     return Ok(IssueRun {
-                        unpriced_dispatches: 0,
+                        unpriced_dispatches,
                         issue: issue.clone(),
                         terminal: TerminalReason::ImplementationInFlight { detail },
                         dispatches: Vec::new(),
@@ -1090,15 +1099,17 @@ pub fn run_issue(
         .map(|_| ())
     };
 
-    write_state(
-        db,
-        cumulative_attempt_n,
-        turn_n,
-        "dispatching",
-        &session_uuid,
-        resuming,
-        (&native_session_id, &codex_artifacts),
-    )?;
+    if config.implementer == Implementer::Claude {
+        write_state(
+            db,
+            cumulative_attempt_n,
+            turn_n,
+            "dispatching",
+            &session_uuid,
+            resuming,
+            (&native_session_id, &codex_artifacts),
+        )?;
+    }
 
     let mut dispatches = Vec::new();
     let mut total_cost_usd = 0.0;
@@ -1222,24 +1233,14 @@ pub fn run_issue(
                 }
             };
 
-            if config.implementer == Implementer::Codex {
-                let artifacts = codex_dispatch::prepare_artifacts(&worktree.path, issue)?;
-                codex_artifacts = Some(artifacts.clone());
-                write_state(
-                    db,
-                    cumulative_attempt_n,
-                    turn_n,
-                    "dispatching",
-                    &session_uuid,
-                    resuming,
-                    (&native_session_id, &codex_artifacts),
-                )?;
-                budget::reserve_unpriced_dispatch(db, &today_utc(), &artifacts.invocation_id)?;
-                unpriced_dispatches += 1;
-            }
+            let prepared_artifacts = if config.implementer == Implementer::Codex {
+                Some(codex_dispatch::prepare_artifacts(&worktree.path, issue)?)
+            } else {
+                codex_artifacts.clone()
+            };
             let spec = DispatchSpec {
                 implementer: config.implementer,
-                codex_artifacts: codex_artifacts.clone(),
+                codex_artifacts: prepared_artifacts,
                 session: if config.implementer == Implementer::Codex {
                     match &native_session_id {
                         Some(id) => SessionMode::Resume {
@@ -1266,6 +1267,26 @@ pub fn run_issue(
                 wall_clock_timeout,
             };
 
+            if config.implementer == Implementer::Codex {
+                // Validate the exact backend argv before publishing a new
+                // invocation or charging unknown spend. Definite input errors
+                // prove no process launched and must leave prior state intact.
+                codex_dispatch::build_argv(&worktree.path, &spec)?;
+                if let Some(artifacts) = &spec.codex_artifacts {
+                    codex_artifacts = Some(artifacts.clone());
+                    write_state(
+                        db,
+                        cumulative_attempt_n,
+                        turn_n,
+                        "dispatching",
+                        &session_uuid,
+                        resuming,
+                        (&native_session_id, &codex_artifacts),
+                    )?;
+                    budget::reserve_unpriced_dispatch(db, &today_utc(), &artifacts.invocation_id)?;
+                    unpriced_dispatches += 1;
+                }
+            }
             dispatcher.dispatch(&worktree.path, &spec)
         };
         let mut outcome = match outcome_result {
@@ -1546,6 +1567,83 @@ mod tests {
     use super::*;
     use crate::autopilot::{retry, worktree};
 
+    #[test]
+    fn invalid_codex_resume_refuses_before_reservation_or_state_overwrite() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        let mut state = pending_codex(&db, &wt, Some("invalid-native-uuid"));
+        state.codex_artifacts = None;
+        state.state = "previous-safe-state".into();
+        dispatch_state::upsert_dispatch_state(&db, &state).unwrap();
+        let ledger =
+            budget::reserve_unpriced_dispatch(&db, &today_utc(), "prior-reservation").unwrap();
+        let mut d = codex_script(vec![met()]);
+        let result = run_issue(&db, &issue(), &brief(), &wt, &codex_config(), &mut d);
+        assert!(
+            result.is_err(),
+            "invalid native ID must refuse before dispatch: {result:?}"
+        );
+        assert!(d.inner.seen.is_empty());
+        assert_eq!(
+            dispatch_state::get_dispatch_state(&db, &issue()).unwrap(),
+            Some(state)
+        );
+        assert_eq!(
+            budget::get_daily_spend(&db, &today_utc()).unwrap(),
+            Some(ledger)
+        );
+    }
+    #[test]
+    fn held_codex_reports_only_its_existing_reservation_including_prior_days() {
+        for recovery in [
+            CodexRecovery::Alive,
+            CodexRecovery::Unknown {
+                reason: "unproven completion".into(),
+            },
+        ] {
+            for reserved_date in [None, Some(today_utc()), Some("2026-01-01".into())] {
+                let db = approved_db();
+                let (_dir, wt) = fixture_worktree();
+                let state = pending_codex(&db, &wt, None);
+                let id = &state.codex_artifacts.as_ref().unwrap().invocation_id;
+                let unrelated =
+                    budget::reserve_unpriced_dispatch(&db, &today_utc(), "unrelated-invocation")
+                        .unwrap();
+                let ledger = reserved_date
+                    .as_ref()
+                    .map(|date| budget::reserve_unpriced_dispatch(&db, date, id).unwrap());
+                let before_today = budget::get_daily_spend(&db, &today_utc()).unwrap();
+                let mut d = codex_script(vec![]);
+                d.recovery = Some(recovery.clone());
+                let run = run_issue(&db, &issue(), &brief(), &wt, &codex_config(), &mut d).unwrap();
+                assert!(matches!(
+                    run.terminal,
+                    TerminalReason::ImplementationInFlight { .. }
+                ));
+                assert_eq!(
+                    run.unpriced_dispatches,
+                    u32::from(reserved_date.is_some()),
+                    "a hold must report only a durable reservation for this invocation"
+                );
+                assert_eq!(run.total_cost_usd, 0.0);
+                assert!(run.dispatches.is_empty());
+                assert!(d.inner.seen.is_empty());
+                assert_eq!(
+                    dispatch_state::get_dispatch_state(&db, &issue()).unwrap(),
+                    Some(state)
+                );
+                assert_eq!(
+                    budget::get_daily_spend(&db, &today_utc()).unwrap(),
+                    before_today
+                );
+                if let Some(date) = &reserved_date {
+                    assert_eq!(budget::get_daily_spend(&db, date).unwrap(), ledger);
+                } else {
+                    assert_eq!(before_today, Some(unrelated));
+                }
+            }
+        }
+    }
     #[test]
     fn recovery_finishes_a_partially_recorded_attempt_without_duplicate_lineage() {
         let db = approved_db();

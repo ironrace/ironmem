@@ -241,6 +241,34 @@ pub fn reserve_unpriced_dispatch(
     })
 }
 
+/// Whether this exact invocation was durably reserved. Check every retained
+/// daily ledger: an invocation may cross midnight or remain held for several
+/// days, and the issue's start date is not its per-invocation reservation date.
+/// This is read-only and never infers spend from prepared artifact files alone.
+pub(crate) fn has_unpriced_dispatch_reservation(
+    db: &Database,
+    invocation_id: &str,
+) -> Result<bool, MemoryError> {
+    let prefix = format!(
+        "{}{}",
+        crate::mcp::tools::LOGICAL_KEY_SOURCE_PREFIX,
+        budget_key("")
+    );
+    let drawers =
+        db.get_drawers_by_source_prefix(super::WING, super::ROOM, &prefix, i64::MAX as usize)?;
+    for drawer in drawers {
+        let entry: BudgetLedgerEntry = serde_json::from_str(&drawer.content)?;
+        if entry
+            .reserved_unpriced_dispatch_ids
+            .iter()
+            .any(|id| id == invocation_id)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Read the day's ledger, apply `mutate`, write it back.
 fn update_ledger(
     db: &Database,
