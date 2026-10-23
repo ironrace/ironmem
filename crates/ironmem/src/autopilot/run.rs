@@ -1032,7 +1032,36 @@ pub fn run_issue(
                 CodexRecovery::Finished(outcome) => {
                     if state.attempt_n < cumulative_attempt_n {
                         // The lineage/status write completed before the Lead crashed
-                        // clearing this artifact. Preserve its proven conversation,
+                        // clearing this artifact. Its terminal Impossible decision
+                        // still ends this run, without recording or charging again.
+                        // Apply the completion and identity checks before trusting
+                        // the verdict; a later manual run is allowed after clearing.
+                        if outcome.invocation_started
+                            && outcome.process_success
+                            && !outcome.is_error
+                            && !outcome.timed_out
+                            && outcome.is_impossible()
+                            && outcome.native_session_id.as_ref().is_some_and(|id| {
+                                !id.trim().is_empty()
+                                    && native_session_id
+                                        .as_ref()
+                                        .is_none_or(|expected| expected == id)
+                            })
+                        {
+                            dispatch_state::clear_dispatch_state(db, issue)?;
+                            return Ok(IssueRun {
+                                unpriced_dispatches: 1,
+                                issue: issue.clone(),
+                                terminal: TerminalReason::Impossible {
+                                    reason: outcome.reason,
+                                },
+                                dispatches: Vec::new(),
+                                total_cost_usd: 0.0,
+                                cumulative_attempt_n,
+                                wall_clock_timeout_secs,
+                            });
+                        }
+                        // Preserve the proven conversation for a continuing run,
                         // but never classify or charge the same attempt again.
                         if native_session_id.is_none() {
                             native_session_id =
@@ -1740,6 +1769,139 @@ mod tests {
             Some(state)
         );
         assert!(d.inner.seen.is_empty());
+    }
+    #[test]
+    fn consumed_impossible_recovery_preserves_terminal_without_rebilling_or_sticking() {
+        for native in [None, Some("11111111-2222-3333-4444-555555555555")] {
+            let db = approved_db();
+            let (_dir, wt) = fixture_worktree();
+            let state = pending_codex(&db, &wt, native);
+            let ledger = budget::reserve_unpriced_dispatch(
+                &db,
+                &today_utc(),
+                &state.codex_artifacts.as_ref().unwrap().invocation_id,
+            )
+            .unwrap();
+            let mut result = impossible();
+            result.cost_usd = None;
+            record_and_advance(
+                &db,
+                &AttemptRecord {
+                    issue: issue(),
+                    attempt_n: 1,
+                    approach: approach_text(&result, DispatchClassification::Impossible),
+                    verdict: AttemptOutcome::Failed,
+                    why_failed: Some(why_failed_text(&result, DispatchClassification::Impossible)),
+                    commit_sha: None,
+                },
+                None,
+                true,
+            )
+            .unwrap();
+            let attempts = lineage::attempts_for_issue(&db, &issue()).unwrap();
+            let status = lineage::get_issue_status(&db, &issue()).unwrap();
+            let mut d = codex_script(vec![met()]);
+            d.recovery = Some(CodexRecovery::Finished(result.clone()));
+            let run = run_issue(&db, &issue(), &brief(), &wt, &codex_config(), &mut d).unwrap();
+            assert_eq!(
+                run.terminal,
+                TerminalReason::Impossible {
+                    reason: result.reason,
+                }
+            );
+            assert_eq!(run.cumulative_attempt_n, 1);
+            assert_eq!(run.unpriced_dispatches, 1);
+            assert_eq!(run.total_cost_usd, 0.0);
+            assert!(run.dispatches.is_empty());
+            assert!(d.inner.seen.is_empty());
+            assert_eq!(
+                lineage::attempts_for_issue(&db, &issue()).unwrap(),
+                attempts
+            );
+            assert_eq!(lineage::get_issue_status(&db, &issue()).unwrap(), status);
+            assert_eq!(
+                budget::get_daily_spend(&db, &today_utc()).unwrap(),
+                Some(ledger)
+            );
+            assert!(dispatch_state::get_dispatch_state(&db, &issue())
+                .unwrap()
+                .is_none());
+
+            // A later explicitly requested run is fresh, not globally blocked
+            // by an Impossible whose recovered dispatch state was cleared.
+            let later = run_issue(&db, &issue(), &brief(), &wt, &codex_config(), &mut d).unwrap();
+            assert!(matches!(later.terminal, TerminalReason::Met { .. }));
+            assert_eq!(later.cumulative_attempt_n, 2);
+            assert_eq!(d.inner.seen.len(), 1);
+            assert!(matches!(d.inner.seen[0].session, SessionMode::New { .. }));
+        }
+    }
+    #[test]
+    fn consumed_nonterminal_or_untrusted_recovery_continues_the_shared_loop() {
+        let mut nonzero = impossible();
+        nonzero.process_success = false;
+        let mut errored = impossible();
+        errored.is_error = true;
+        let mut killed = impossible();
+        killed.timed_out = true;
+        let mut unstarted = impossible();
+        unstarted.invocation_started = false;
+        let mut missing = impossible();
+        missing.native_session_id = None;
+        let mut conflicting = impossible();
+        conflicting.native_session_id = Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".into());
+        for mut result in [
+            not_met(),
+            nonzero,
+            errored,
+            killed,
+            unstarted,
+            missing,
+            conflicting,
+        ] {
+            let db = approved_db();
+            let (_dir, wt) = fixture_worktree();
+            let native = "11111111-2222-3333-4444-555555555555";
+            let state = pending_codex(&db, &wt, Some(native));
+            budget::reserve_unpriced_dispatch(
+                &db,
+                &today_utc(),
+                &state.codex_artifacts.as_ref().unwrap().invocation_id,
+            )
+            .unwrap();
+            record_and_advance(
+                &db,
+                &AttemptRecord {
+                    issue: issue(),
+                    attempt_n: 1,
+                    approach: "durable failed attempt".into(),
+                    verdict: AttemptOutcome::Failed,
+                    why_failed: Some("not met".into()),
+                    commit_sha: None,
+                },
+                None,
+                true,
+            )
+            .unwrap();
+            result.cost_usd = None;
+            let mut d = codex_script(vec![met()]);
+            d.recovery = Some(CodexRecovery::Finished(result));
+            let run = run_issue(&db, &issue(), &brief(), &wt, &codex_config(), &mut d).unwrap();
+            assert!(matches!(run.terminal, TerminalReason::Met { .. }));
+            assert_eq!(run.cumulative_attempt_n, 2);
+            assert_eq!(d.inner.seen.len(), 1);
+            assert!(
+                matches!(&d.inner.seen[0].session, SessionMode::Resume { session_uuid } if session_uuid == native)
+            );
+            assert_eq!(lineage::attempts_for_issue(&db, &issue()).unwrap().len(), 2);
+            assert_eq!(
+                budget::get_daily_spend(&db, &today_utc())
+                    .unwrap()
+                    .unwrap()
+                    .unpriced_dispatch_count,
+                2
+            );
+        }
     }
     #[test]
     fn consumed_recovery_is_not_replayed_when_lineage_already_advanced() {
