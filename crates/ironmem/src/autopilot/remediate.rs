@@ -55,11 +55,12 @@
 //! **Three: the loop has to be bounded on every axis it can spend on.** There
 //! are three, and each already had an owner: dispatches are bounded by the
 //! per-issue attempt cap (the spec's own answer, and this module checks it
-//! *before* anything else), reviews are bounded by rung 10's head-SHA trigger
-//! (no new commit, no new review, so a stuck remediation is never re-billed
-//! for a second opinion on the same diff), and the day is bounded by rung 5's
-//! ledger. Nothing here adds a fourth kind of spend; it adds a new *reason* to
-//! spend on the two that exist.
+//! *before* anything else — a remediation is charged against a cap of its
+//! own, shared by every round, see [`attempts_charged`]), reviews are bounded
+//! by rung 10's head-SHA trigger (no new commit, no new review, so a stuck
+//! remediation is never re-billed for a second opinion on the same diff), and
+//! the day is bounded by rung 5's ledger. Nothing here adds a fourth kind of
+//! spend; it adds a new *reason* to spend on the two that exist.
 //!
 //! # What is stored, and what is derived
 //!
@@ -95,13 +96,29 @@
 //! # Where it ends
 //!
 //! At the attempt cap, and only there. [`ArmOutcome::CapReached`] is checked
-//! **first**, ahead of the already-armed test, so an issue that has spent its
-//! attempts stops being carried by this module even though its remediation
+//! **first**, ahead of the already-armed test, so a remediation that has spent
+//! its own cap stops being carried by this module even though its remediation
 //! record still exists — and rung 6's hold then runs for real, comments, and
 //! flips the issue to `agent:blocked`. That is the spec's *"on exhaustion the
 //! PR stays open for a human"*, and the ordering is what makes it reachable:
 //! the other way round, an armed record would shadow the cap forever and the
 //! human would never be told.
+//!
+//! # Its own budget, not the remainder ⟨#344⟩
+//!
+//! The spec's *"counting against the same per-issue attempt cap"* was first
+//! built as one counter spanning the original work and every remediation
+//! armed against it. The first live run showed what that means: an issue that
+//! took two of five attempts to go green left its remediation three, and one
+//! that went green on attempt five of five left it none — the harder an issue
+//! was to get right, the less budget it had to answer its review. The cap is
+//! still the same *value* (the caller passes the Lead's own `attempt_cap`),
+//! but once an issue has succeeded it is charged only for the attempts since
+//! its **first** success — every round of remediation shares that one
+//! allowance, so the loop still halts. The baseline is derived from the
+//! lineage rather than stored here, so neither a re-arm for a new commit nor
+//! `--clear` can reset it; [`attempts_charged`] says why, and every place that
+//! enforces the cap reads it.
 
 use serde::{Deserialize, Serialize};
 
@@ -262,7 +279,10 @@ pub fn get_remediation(
 /// review: while `--remediate` is on, the next pass finds the same
 /// `needs_changes` at the same head and calls [`arm_remediation`] again, which
 /// arms the same `(pr_number, head_sha)` afresh and resets
-/// `armed_after_attempts`. Clearing is therefore a "stop for now", and the
+/// `armed_after_attempts`. It does **not** reset the remediation's budget,
+/// which is counted from the issue's first success in the lineage
+/// ([`attempts_charged`]) — only `autopilot retry` restores that. Clearing is
+/// therefore a "stop for now", and the
 /// operator who wants the PR handed over for good must also drop `--remediate`
 /// or take the issue back with `agent:blocked` — the CLI's own output says so.
 ///
@@ -296,9 +316,9 @@ pub fn clear_remediation(db: &Database, issue: &IssueRef) -> Result<bool, Memory
 /// A remediation is in force from the moment it is armed until the issue
 /// records a **newer success than the one it was armed against**. Nothing
 /// else ends it — not a failed dispatch (which leaves `best_commit_sha`
-/// untouched by the no-downgrade rule, so the next tick tries again, which is
-/// the spec's own *"counting against the same per-issue attempt cap"*), and
-/// not the passage of time. The cap is what ends an unproductive one, and the
+/// untouched by the no-downgrade rule, so the next tick tries again, against
+/// the remediation's own cap — see [`attempts_charged`]), and not the passage
+/// of time. The cap is what ends an unproductive one, and the
 /// cap is checked by the callers that can act on it.
 pub fn active_remediation(
     db: &Database,
@@ -328,6 +348,81 @@ pub fn active_remediation(
         _ => false,
     };
     Ok((!superseded).then_some(record))
+}
+
+/// Attempts charged against the per-issue cap for an issue's next dispatch.
+///
+/// The single definition of the cap's operand, read by every place that
+/// enforces it — [`super::run::run_issue`], [`super::queue::plan_queue`] and
+/// [`arm_remediation`] — so a remediation is never armed under one count and
+/// dispatched under another (it would either never fire or never stop).
+///
+/// # A remediation's own budget (#344)
+///
+/// The counter used to span the original work and every remediation armed
+/// against it, so the harder an issue was to get right, the less budget it
+/// had to answer its review: #339 went green on attempt 2 of 5 and its
+/// remediation exhausted the 3 that were left, and an issue that went green
+/// on its last attempt was never armed at all. So once an issue has
+/// succeeded, the count starts at the attempt on which it **first**
+/// succeeded: everything before that was the original work, and — because a
+/// succeeded issue is only ever dispatched again by a remediation —
+/// everything after it is remediation.
+///
+/// That baseline is *derived* from the append-only lineage, never stored on
+/// the [`RemediationRecord`], and that is what keeps the loop bounded. A
+/// pushed fix reviewed again arms a fresh record for a new commit, and
+/// `--clear` deletes the record outright; a baseline kept on the record would
+/// reset on both, and every new head would buy another full cap. Derived from
+/// the first success, every round of review shares the one allowance, which
+/// is the amendment's *"for any sequence of reviewer verdicts, the
+/// remediation loop halts within its own cap"*.
+///
+/// A human retry still wins when it is later: the baseline is the later of
+/// the two marks, so `autopilot retry` restores a full cap to an exhausted
+/// remediation, and a remediation is never charged for attempts a retry
+/// already forgave.
+///
+/// `succeeded` must be whether the issue's **status** records a success —
+/// every caller derives it from `best_verdict`. It is not merely an
+/// optimisation: the lineage and status writes are not one transaction, so a
+/// crash between them can leave a success in the lineage that the status
+/// never recorded, and passing `true` for that issue would credit attempts
+/// it never earned. Given an honest `succeeded`, it fails closed: an issue
+/// with no recorded successful attempt (or one numbered past the counter,
+/// which only a hand-edited drawer could produce) gets no credit and is
+/// charged exactly as before #344.
+pub fn attempts_charged(
+    db: &Database,
+    issue: &IssueRef,
+    cumulative_attempt_n: u32,
+    succeeded: bool,
+) -> Result<u32, MemoryError> {
+    let forgiven = super::retry::forgiven_through(db, issue)?;
+    let original_work = if succeeded {
+        first_success_attempt(db, issue)?
+            .filter(|&n| n <= cumulative_attempt_n)
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    Ok(super::retry::attempts_charged(
+        cumulative_attempt_n,
+        forgiven.max(original_work),
+    ))
+}
+
+/// The attempt number on which the issue first recorded a success, if any.
+///
+/// Records are filtered to this issue, as [`super::retry::read_grant`] filters
+/// its grant: two repos whose names collide on one knowledge-graph entity
+/// would otherwise charge one issue's remediation for the other's attempts.
+fn first_success_attempt(db: &Database, issue: &IssueRef) -> Result<Option<u32>, MemoryError> {
+    Ok(lineage::attempts_for_issue(db, issue)?
+        .into_iter()
+        .filter(|attempt| attempt.issue == *issue && attempt.verdict == AttemptOutcome::Success)
+        .map(|attempt| attempt.attempt_n)
+        .min())
 }
 
 /// What [`arm_remediation`] was asked to arm.
@@ -368,13 +463,20 @@ pub enum ArmOutcome {
         /// tell "waiting for the next tick" from "tried and did not work".
         dispatches_since: u32,
     },
-    /// The issue has spent its attempts. **Nothing is armed, deliberately**:
-    /// this is the spec's *"on exhaustion the PR stays open for a human"*, and
+    /// The remediation has spent its own cap — every round of it, since the
+    /// issue first succeeded. **Nothing is written, deliberately** (an
+    /// existing record is left as it is, and keeps the Lead at the cap): this
+    /// is the spec's *"on exhaustion the PR stays open for a human"*, and
     /// the caller's next step is rung 6's real hold, which comments and flips
     /// the issue to `agent:blocked` so a human is actually told.
     CapReached {
         cumulative_attempt_n: u32,
         attempt_cap: u32,
+        /// Attempts charged to the remediation — dispatched since the issue
+        /// first succeeded (or since a later human retry; the lifetime count
+        /// when the lineage records no success). This, not the lifetime
+        /// `cumulative_attempt_n`, is what reached `attempt_cap`.
+        attempts_charged: u32,
     },
 }
 
@@ -399,17 +501,17 @@ impl ArmOutcome {
 /// # Ordering
 ///
 /// The cap is checked **first**, before the already-armed test, and that order
-/// is load-bearing rather than incidental. An issue can reach its cap while a
-/// remediation is in force — that is the ordinary way an unproductive
-/// remediation ends — and testing "already armed" first would return
+/// is load-bearing rather than incidental. A remediation reaches its own cap
+/// while it is still in force — that is the ordinary way an unproductive one
+/// ends — and testing "already armed" first would return
 /// `AlreadyArmed` forever, so the caller would rehearse the merge on every
 /// pass and rung 6's hold would never run for real. The PR would then sit
 /// open, unmerged and un-commented, with nobody told: *"never merged with an
 /// unresolved finding"* satisfied by accident and *"the PR stays open for a
 /// human"* silently unsatisfied.
 ///
-/// Pure enough to test exhaustively: it reads the issue's status and its own
-/// record, and writes at most one drawer.
+/// Pure enough to test exhaustively: it reads the issue's status, lineage and
+/// retry grant and its own record, and writes at most one drawer.
 pub fn arm_remediation(db: &Database, request: &ArmRequest) -> Result<ArmOutcome, MemoryError> {
     validate_repo(&request.issue.repo)?;
     let status = lineage::get_issue_status(db, request.issue)?;
@@ -418,22 +520,27 @@ pub fn arm_remediation(db: &Database, request: &ArmRequest) -> Result<ArmOutcome
         .map(|s| s.cumulative_attempt_n)
         .unwrap_or_default();
 
+    // The remediation's own budget (#344), read through the same
+    // [`attempts_charged`] the Lead enforces, on every path — including a
+    // fresh arm for a new commit. A pushed fix reviewed again is a new round
+    // of the same remediation, not a new budget; charging a fresh record at
+    // zero would let every new head buy another full cap.
+    //
     // Charged, not lifetime: a human retry forgives attempts against the cap
     // wherever the cap is read, and reading the raw counter here would keep
-    // reporting `CapReached` for an issue whose budget was just restored —
-    // sending the PR to the human hold instead of arming the re-dispatch.
-    //
-    // Only the *check* reads it. `armed_after_attempts` below stays the
-    // lifetime number, so "dispatches since armed" keeps measuring dispatches
-    // rather than sliding backwards the moment a grant is written.
-    let charged = super::retry::attempts_charged(
-        cumulative_attempt_n,
-        super::retry::forgiven_through(db, request.issue)?,
-    );
+    // reporting `CapReached` for an issue whose budget was just restored.
+    // `armed_after_attempts` below stays the lifetime number, so "dispatches
+    // since armed" keeps measuring dispatches rather than sliding backwards
+    // the moment a grant is written.
+    let succeeded = status
+        .as_ref()
+        .is_some_and(|s| s.best_verdict == Some(AttemptOutcome::Success));
+    let charged = attempts_charged(db, request.issue, cumulative_attempt_n, succeeded)?;
     if charged >= request.attempt_cap {
         return Ok(ArmOutcome::CapReached {
             cumulative_attempt_n,
             attempt_cap: request.attempt_cap,
+            attempts_charged: charged,
         });
     }
 
@@ -478,7 +585,10 @@ pub fn arm_remediation(db: &Database, request: &ArmRequest) -> Result<ArmOutcome
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::autopilot::lineage::{upsert_issue_status, IssueStatus};
+    use crate::autopilot::lineage::{
+        record_attempt, upsert_issue_status, AttemptRecord, IssueStatus,
+    };
+    use crate::autopilot::retry;
 
     const REPO: &str = "ironrace/ironmem";
     const HEAD: &str = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
@@ -492,8 +602,31 @@ mod tests {
         Database::open_in_memory().unwrap()
     }
 
-    /// A succeeded issue at `attempts`, green at `commit`.
+    /// A succeeded issue at `attempts`, green at `commit`: a successful
+    /// attempt numbered `attempts` is appended to the lineage, as `run_issue`
+    /// records one. Only the *first* such attempt sets the remediation
+    /// budget's baseline, so calling this again models a remediation round
+    /// that went green.
     fn succeeded(db: &Database, attempts: u32, commit: Option<&str>) {
+        record_attempt(
+            db,
+            &AttemptRecord {
+                issue: issue(),
+                attempt_n: attempts,
+                approach: "went green".to_string(),
+                verdict: AttemptOutcome::Success,
+                why_failed: None,
+                commit_sha: commit.map(str::to_string),
+            },
+        )
+        .unwrap();
+        spent(db, attempts, commit);
+    }
+
+    /// Move the counter to `attempts` without recording a success — failed
+    /// dispatches since. `commit` stays the issue's best (the no-downgrade
+    /// rule), so a remediation armed against it stays in force.
+    fn spent(db: &Database, attempts: u32, commit: Option<&str>) {
         upsert_issue_status(
             db,
             &IssueStatus {
@@ -622,7 +755,7 @@ depth resets and 'has this been dispatched?' stops being answerable"
 
         // One remediation dispatch ran and failed: the attempt count moves,
         // the success's commit does not.
-        succeeded(&db, 3, Some(HEAD));
+        spent(&db, 3, Some(HEAD));
 
         assert_eq!(
             arm(&db, HEAD, Some("f"), 5),
@@ -642,7 +775,7 @@ depth resets and 'has this been dispatched?' stops being answerable"
         succeeded(&db, 2, Some(HEAD));
         arm(&db, HEAD, Some("f"), 5);
 
-        succeeded(&db, 3, Some(HEAD));
+        spent(&db, 3, Some(HEAD));
 
         assert!(
             active_remediation(&db, &issue()).unwrap().is_some(),
@@ -679,7 +812,7 @@ is done and rung 10 reviews the new head"
         succeeded(&db, 2, Some(HEAD));
         arm(&db, HEAD, Some("f"), 5);
 
-        succeeded(&db, 2, Some(&HEAD.to_uppercase()));
+        spent(&db, 2, Some(&HEAD.to_uppercase()));
 
         assert!(
             active_remediation(&db, &issue()).unwrap().is_some(),
@@ -717,35 +850,270 @@ for any issue whose success recorded no commit"
         succeeded(&db, 2, Some(HEAD));
         arm(&db, HEAD, Some("f"), 5);
 
-        succeeded(&db, 5, Some(HEAD));
+        // Five failed remediation dispatches since the success at attempt 2.
+        spent(&db, 7, Some(HEAD));
 
         let outcome = arm(&db, HEAD, Some("f"), 5);
         assert_eq!(
             outcome,
             ArmOutcome::CapReached {
-                cumulative_attempt_n: 5,
+                cumulative_attempt_n: 7,
                 attempt_cap: 5,
+                attempts_charged: 5,
             }
         );
         assert!(!outcome.in_force());
     }
 
     #[test]
-    fn an_exhausted_issue_is_never_armed_in_the_first_place() {
+    fn a_remediation_budget_is_counted_from_the_first_success() {
+        // Issue #344. The attempts the original work spent are not the
+        // remediation's to lose: green at attempt 4 of a cap of 5, the
+        // remediation still has five dispatches, not one.
+        let db = db();
+        succeeded(&db, 4, Some(HEAD));
+        arm(&db, HEAD, Some("f"), 5);
+
+        spent(&db, 8, Some(HEAD));
+        assert_eq!(
+            arm(&db, HEAD, Some("f"), 5),
+            ArmOutcome::AlreadyArmed {
+                pr_number: 12,
+                head_sha: HEAD.to_string(),
+                dispatches_since: 4,
+            },
+            "four remediation dispatches of five: still in force"
+        );
+
+        spent(&db, 9, Some(HEAD));
+        assert!(
+            !arm(&db, HEAD, Some("f"), 5).in_force(),
+            "the fifth spends the remediation's own cap"
+        );
+    }
+
+    #[test]
+    fn a_success_on_the_last_attempt_can_still_be_remediated() {
+        // Issue #344's boundary: success at attempt N of N used to leave a
+        // remediation no budget at all — `arm_remediation` answered
+        // `CapReached`, so the first review asking for changes went straight
+        // to the human hold.
         let db = db();
         succeeded(&db, 5, Some(HEAD));
         assert_eq!(
             arm(&db, HEAD, Some("f"), 5),
-            ArmOutcome::CapReached {
-                cumulative_attempt_n: 5,
-                attempt_cap: 5,
+            ArmOutcome::Armed {
+                pr_number: 12,
+                head_sha: HEAD.to_string(),
+                has_findings: true,
             }
+        );
+        assert_eq!(
+            get_remediation(&db, &issue())
+                .unwrap()
+                .unwrap()
+                .armed_after_attempts,
+            5
+        );
+    }
+
+    #[test]
+    fn a_new_head_reviewed_again_does_not_buy_a_fresh_cap() {
+        // The round is new; the budget is not. A remediation dispatch that
+        // pushes a commit and fails the gate still moves the PR head, rung 10
+        // reviews the new head, and a second `needs_changes` arms a record
+        // for a different commit. Charging that record from zero would hand
+        // every pushed commit another full cap and the loop would never end.
+        let db = db();
+        succeeded(&db, 2, Some(HEAD));
+        assert!(arm(&db, HEAD, Some("round 1"), 5).in_force());
+
+        spent(&db, 6, Some(HEAD));
+        assert!(
+            arm(&db, OTHER_HEAD, Some("round 2"), 5).in_force(),
+            "four of five spent: the new round is armed"
+        );
+
+        spent(&db, 7, Some(HEAD));
+        assert_eq!(
+            arm(
+                &db,
+                "0123456789abcdef0123456789abcdef01234567",
+                Some("round 3"),
+                5
+            ),
+            ArmOutcome::CapReached {
+                cumulative_attempt_n: 7,
+                attempt_cap: 5,
+                attempts_charged: 5,
+            },
+            "a third head is still charged from the first success"
+        );
+        assert_eq!(
+            get_remediation(&db, &issue()).unwrap().unwrap().head_sha,
+            OTHER_HEAD,
+            "a refused arm writes nothing: the record in force is untouched"
+        );
+    }
+
+    #[test]
+    fn the_remediation_loop_halts_within_its_own_cap_for_any_sequence_of_rounds() {
+        // The amendment's termination requirement: "for any sequence of
+        // reviewer verdicts, the remediation loop halts within its own cap".
+        // Each round is a `needs_changes` — about a new head or the same one
+        // again — followed by a run that spends one to three attempts
+        // (bounded, like `run_issue`, by the same `attempts_charged`), and
+        // which may or may not go green. Whatever the sequence, exactly one
+        // cap of remediation attempts is spent, and the loop ends on
+        // `CapReached`, which is what sends the PR to the human hold.
+        for cap in 1..=5u32 {
+            for first_success in 1..=cap {
+                for pattern in 0..8u32 {
+                    let rounds_go_green = pattern & 1 == 1;
+                    let reuse_heads = pattern & 2 == 2;
+                    let multi_attempt = pattern & 4 == 4;
+                    let db = db();
+                    succeeded(&db, first_success, Some("c0"));
+                    let mut attempts = first_success;
+                    let mut spent_since = 0u32;
+                    let mut ended_on_cap = false;
+                    for round in 1..=100u32 {
+                        let head = if reuse_heads {
+                            format!("{:040x}", round / 2)
+                        } else {
+                            format!("{round:040x}")
+                        };
+                        match arm(&db, &head, Some("again"), cap) {
+                            ArmOutcome::CapReached { .. } => {
+                                ended_on_cap = true;
+                                break;
+                            }
+                            outcome => assert!(outcome.in_force(), "{outcome:?}"),
+                        }
+                        let wanted = if multi_attempt { 1 + round % 3 } else { 1 };
+                        for _ in 0..wanted {
+                            if attempts_charged(&db, &issue(), attempts, true).unwrap() >= cap {
+                                break;
+                            }
+                            attempts += 1;
+                            spent_since += 1;
+                            spent(&db, attempts, Some("c0"));
+                        }
+                        if rounds_go_green {
+                            succeeded(&db, attempts, Some(&format!("c{round}")));
+                        }
+                    }
+                    assert!(
+                        ended_on_cap,
+                        "cap {cap}, first success {first_success}, pattern {pattern}: \
+the loop must end on CapReached"
+                    );
+                    assert_eq!(
+                        spent_since, cap,
+                        "cap {cap}, first success {first_success}, pattern {pattern}: \
+exactly one cap of remediation attempts"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn clearing_a_remediation_does_not_refill_its_budget() {
+        // `--clear` deletes the record, and the next advance pass re-arms the
+        // same commit. That is a "stop for now", not `autopilot retry` under
+        // another name: the budget is counted from the lineage, which a clear
+        // does not touch.
+        let db = db();
+        succeeded(&db, 2, Some(HEAD));
+        arm(&db, HEAD, Some("f"), 5);
+        spent(&db, 7, Some(HEAD));
+        assert!(!arm(&db, HEAD, Some("f"), 5).in_force());
+
+        assert!(clear_remediation(&db, &issue()).unwrap());
+        assert!(
+            !arm(&db, HEAD, Some("f"), 5).in_force(),
+            "a cleared remediation re-armed is still exhausted"
         );
         assert_eq!(
             get_remediation(&db, &issue()).unwrap(),
             None,
-            "no record is written for an issue that can never be dispatched"
+            "and nothing is written: a record here would put the issue back in \
+front of the Lead"
         );
+    }
+
+    #[test]
+    fn a_human_retry_restores_an_exhausted_remediation() {
+        // The later mark wins: a retry granted after the remediation spent
+        // its cap gives it a full one back. The queue and the run loop read
+        // the same `attempts_charged`, so they agree.
+        let db = db();
+        succeeded(&db, 5, Some(HEAD));
+        arm(&db, HEAD, Some("f"), 5);
+        spent(&db, 10, Some(HEAD));
+        assert!(!arm(&db, HEAD, Some("f"), 5).in_force());
+
+        retry::grant_retry(&db, &issue(), 10).unwrap();
+        assert!(
+            arm(&db, HEAD, Some("f"), 5).in_force(),
+            "a forgiven remediation is in force again"
+        );
+    }
+
+    #[test]
+    fn an_issue_with_no_recorded_success_gets_no_remediation_credit() {
+        // Fails closed. A status that claims a success the lineage does not
+        // hold (a hand-edited drawer, or lineage removed from under it) is
+        // charged exactly as before #344 rather than handed a budget.
+        let db = db();
+        spent(&db, 5, Some(HEAD));
+        assert!(!arm(&db, HEAD, Some("f"), 5).in_force());
+    }
+
+    #[test]
+    fn attempts_charged_counts_from_the_later_of_the_first_success_and_a_retry() {
+        let db = db();
+        // No success recorded: lifetime count, less any retry.
+        assert_eq!(attempts_charged(&db, &issue(), 5, true).unwrap(), 5);
+
+        succeeded(&db, 3, Some(HEAD));
+        succeeded(&db, 4, Some(OTHER_HEAD));
+        assert_eq!(
+            attempts_charged(&db, &issue(), 6, true).unwrap(),
+            3,
+            "from the FIRST success (3), not the latest (4)"
+        );
+        assert_eq!(
+            attempts_charged(&db, &issue(), 6, false).unwrap(),
+            6,
+            "an issue that has not succeeded gets no remediation credit"
+        );
+        assert_eq!(
+            attempts_charged(&db, &issue(), 2, true).unwrap(),
+            2,
+            "a success numbered past the counter is a corrupt read: no credit"
+        );
+
+        retry::grant_retry(&db, &issue(), 5).unwrap();
+        assert_eq!(
+            attempts_charged(&db, &issue(), 6, true).unwrap(),
+            1,
+            "a later retry wins"
+        );
+    }
+
+    #[test]
+    fn a_success_after_a_retry_is_still_the_remediation_baseline() {
+        // #333's recovery followed by #344's: the original work exhausts its
+        // cap, a human retries, and it goes green two attempts later. The
+        // remediation is charged from that success, not from the retry —
+        // otherwise the attempts after the retry are taken from it again.
+        let db = db();
+        spent(&db, 5, None);
+        retry::grant_retry(&db, &issue(), 5).unwrap();
+        succeeded(&db, 7, Some(HEAD));
+        assert_eq!(attempts_charged(&db, &issue(), 9, true).unwrap(), 2);
     }
 
     #[test]

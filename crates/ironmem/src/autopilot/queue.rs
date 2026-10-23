@@ -81,8 +81,8 @@ use super::gh::IssueListing;
 use super::labels::{self, DispatchEligibility};
 use super::registry::{Liveness, RegistrySnapshot};
 use super::{
-    budget, dispatch_state, gate_config, lineage, merge::serialize_issue, remediate, retry,
-    supervise, today_utc, validate_repo, AttemptOutcome, IssueRef,
+    budget, dispatch_state, gate_config, lineage, merge::serialize_issue, remediate, supervise,
+    today_utc, validate_repo, AttemptOutcome, IssueRef,
 };
 use crate::db::schema::Database;
 use crate::error::MemoryError;
@@ -194,8 +194,10 @@ pub struct QueueConfig {
     /// 7's review found three times in one rung. Same predicate, one place
     /// each.
     pub max_budget_usd: f64,
-    /// Compared against the issue's *cumulative* attempt count, matching
-    /// [`super::run::RunConfig::attempt_cap`]. Checked here as well as in
+    /// Compared against [`super::remediate::attempts_charged`] — attempts
+    /// since the last human retry or, for a remediation, since the issue
+    /// first succeeded — the same operand
+    /// [`super::run::RunConfig::attempt_cap`] is compared against. Checked here as well as in
     /// `run_issue` so an exhausted issue is reported as such by the queue
     /// rather than dispatched and immediately terminated.
     pub attempt_cap: u32,
@@ -306,9 +308,12 @@ pub enum DeferReason {
     /// ([`super::remediate::active_remediation`] re-opens it on a
     /// `needs_changes` verdict). A succeeded issue with a remediation in force
     /// is **not** deferred here — it is dispatched, under the same attempt cap
-    /// as any other work.
+    /// value as any other work, counted from the issue's first success.
     AlreadySucceeded,
-    /// The per-issue attempt cap is spent.
+    /// The per-issue attempt cap is spent. `cumulative_attempt_n` is the
+    /// lifetime count, so it can exceed the cap after a retry or a
+    /// remediation; what reached the cap is
+    /// [`super::remediate::attempts_charged`].
     AttemptCapReached { cumulative_attempt_n: u32 },
     /// Rung 7's strategy-health escalated this issue; only a human clears it.
     StrategyEscalated { signature: String },
@@ -457,10 +462,12 @@ pub fn plan_queue(
             let status = lineage::get_issue_status(db, &issue)?;
             // A recorded success ends the issue — unless rung 11 has re-opened
             // it. A reviewer's `needs_changes` verdict is the spec's own reason
-            // to dispatch a succeeded issue again ("re-dispatch the IC to fix,
-            // counting against the same per-issue attempt cap"), and the cap
-            // check immediately below is what keeps that bounded rather than
+            // to dispatch a succeeded issue again, and the cap check
+            // immediately below is what keeps that bounded rather than
             // endless — it is deliberately *not* skipped for a remediation.
+            // The remediation is charged against a cap of its own, counted
+            // from the issue's first success (#344), not the remainder of the
+            // issue's.
             //
             // The success is tested first so `&&` short-circuits: only a
             // succeeded issue can be deferred here, and reading the
@@ -475,15 +482,14 @@ pub fn plan_queue(
                 continue;
             }
             let cumulative_attempt_n = status.as_ref().map(|s| s.cumulative_attempt_n).unwrap_or(0);
-            // Read through the same forgiveness `run_issue` applies. The cap
-            // is enforced in both places on purpose ("same predicate, one
-            // place each"), so both must read the *charged* count: a queue
-            // that compared the raw lifetime counter would defer a
-            // human-retried issue as `AttemptCapReached` on every tick and
-            // `run_issue` would never see it — which is the very
-            // never-recovers shape `autopilot retry` exists to end.
-            let charged =
-                retry::attempts_charged(cumulative_attempt_n, retry::forgiven_through(db, &issue)?);
+            // Read through the same count `run_issue` applies. The cap is
+            // enforced in both places on purpose ("same predicate, one place
+            // each"), so both must read the *charged* count: a queue that
+            // compared the raw lifetime counter would defer a human-retried
+            // issue — or a remediation of a success that spent the whole cap —
+            // as `AttemptCapReached` on every tick and `run_issue` would never
+            // see it.
+            let charged = remediate::attempts_charged(db, &issue, cumulative_attempt_n, succeeded)?;
             if charged >= config.attempt_cap {
                 defer(DeferReason::AttemptCapReached {
                     cumulative_attempt_n,
@@ -651,7 +657,7 @@ pub(crate) const IN_FLIGHT_SCAN_LIMIT: usize = 1_000;
 mod tests {
     use super::*;
     use crate::autopilot::registry::AgentEntry;
-    use crate::autopilot::{lineage, DispatchState};
+    use crate::autopilot::{lineage, retry, DispatchState};
 
     const REPO: &str = "ironrace/ironmem";
     const OTHER: &str = "ironrace/other";
@@ -732,18 +738,38 @@ mod tests {
         .unwrap();
     }
 
-    /// Arm a remediation on an issue whose success is recorded at `commit`.
-    fn arm(db: &Database, issue: &IssueRef, commit: Option<&str>, cap: u32) {
+    /// Record the issue's original work going green on attempt `attempts`,
+    /// in the lineage (which the remediation budget is counted from) and in
+    /// its status.
+    fn succeed_at(db: &Database, issue: &IssueRef, attempts: u32, commit: Option<&str>) {
+        lineage::record_attempt(
+            db,
+            &lineage::AttemptRecord {
+                issue: issue.clone(),
+                attempt_n: attempts,
+                approach: "went green".to_string(),
+                verdict: AttemptOutcome::Success,
+                why_failed: None,
+                commit_sha: commit.map(str::to_string),
+            },
+        )
+        .unwrap();
         lineage::upsert_issue_status(
             db,
             &lineage::IssueStatus {
                 issue: issue.clone(),
-                cumulative_attempt_n: 1,
+                cumulative_attempt_n: attempts,
                 best_verdict: Some(AttemptOutcome::Success),
                 best_commit_sha: commit.map(str::to_string),
             },
         )
         .unwrap();
+    }
+
+    /// Arm a remediation on an issue whose success is recorded at `commit`,
+    /// on attempt 1.
+    fn arm(db: &Database, issue: &IssueRef, commit: Option<&str>, cap: u32) {
+        succeed_at(db, issue, 1, commit);
         let outcome = remediate::arm_remediation(
             db,
             &remediate::ArmRequest {
@@ -854,8 +880,19 @@ mod tests {
         let mut cfg = config();
         cfg.attempt_cap = 5;
         arm(&db, &issue, Some("abc123"), 5);
-        // Five attempts spent since.
+        // Four remediation attempts since the success at attempt 1: one left.
         put_status(&db, &issue, 5, true);
+        let plan = plan_queue(
+            &db,
+            &[backlog(REPO, vec![ready(1)])],
+            &empty_registry(),
+            &cfg,
+        )
+        .unwrap();
+        assert_eq!(numbers(&plan), vec![1], "four of five: still selectable");
+
+        // The fifth spends the remediation's own cap.
+        put_status(&db, &issue, 6, true);
 
         let plan = plan_queue(
             &db,
@@ -867,9 +904,43 @@ mod tests {
         assert_eq!(
             reason_for(&plan, 1),
             DeferReason::AttemptCapReached {
-                cumulative_attempt_n: 5
+                cumulative_attempt_n: 6
             }
         );
+    }
+
+    #[test]
+    fn a_success_on_the_last_attempt_is_still_selected_for_its_remediation() {
+        // Issue #344: the remediation's budget is its own, counted from the
+        // issue's first success. A success at attempt 5 of 5 used to leave
+        // nothing: `arm_remediation` refused, and an issue whose cap was
+        // spent was never selected again.
+        let db = approved(&[REPO]);
+        let issue = IssueRef::new(REPO, 1);
+        let mut cfg = config();
+        cfg.attempt_cap = 5;
+        succeed_at(&db, &issue, 5, None);
+        let outcome = remediate::arm_remediation(
+            &db,
+            &remediate::ArmRequest {
+                issue: &issue,
+                pr_number: 7,
+                head_sha: "abc123",
+                findings: Some("the retry loop is unbounded"),
+                attempt_cap: 5,
+            },
+        )
+        .unwrap();
+        assert!(outcome.in_force(), "setup did not arm: {outcome:?}");
+
+        let plan = plan_queue(
+            &db,
+            &[backlog(REPO, vec![ready(1)])],
+            &empty_registry(),
+            &cfg,
+        )
+        .unwrap();
+        assert_eq!(numbers(&plan), vec![1]);
     }
 
     #[test]

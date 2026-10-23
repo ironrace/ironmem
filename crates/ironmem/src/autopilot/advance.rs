@@ -98,8 +98,8 @@
 //!
 //! The hand-off to a human still happens; it happens *later*, when the
 //! automation has actually given up. `remediate::arm_remediation` checks the
-//! attempt cap first and answers `CapReached`, which is not `in_force`, so an
-//! exhausted issue falls through to the real merge and rung 6 comments and
+//! attempt cap first and answers `CapReached`, which is not `in_force`, so a
+//! remediation that has spent its own cap falls through to the real merge and rung 6 comments and
 //! labels exactly as it always did. That is the spec's *"on exhaustion the PR
 //! stays open for a human — never merged with an unresolved finding"*, with
 //! both halves reachable.
@@ -2475,11 +2475,25 @@ and no `agent:blocked` comment is posted, or the Lead never sees the issue again
     }
 
     #[test]
-    fn an_issue_at_its_attempt_cap_falls_through_to_the_human_hold() {
-        // The spec's "on exhaustion the PR stays open for a human". The
-        // automation has given up, so the merge runs for real and rung 6
-        // comments and flips the label — which is the notification.
+    fn a_success_on_its_last_attempt_is_still_remediated_not_handed_over() {
+        // Issue #344. The original work succeeded on attempt 5 of 5, and a
+        // remediation's budget is its own rather than what the success left
+        // over — so a `needs_changes` here arms a re-dispatch instead of
+        // going straight to the human hold.
         let db = approved_db();
+        record_success(&db, &issue(), Some(GREEN));
+        lineage::record_attempt(
+            &db,
+            &lineage::AttemptRecord {
+                issue: issue(),
+                attempt_n: 5,
+                approach: "went green".into(),
+                verdict: AttemptOutcome::Success,
+                why_failed: None,
+                commit_sha: Some(GREEN.to_string()),
+            },
+        )
+        .unwrap();
         lineage::upsert_issue_status(
             &db,
             &IssueStatus {
@@ -2498,10 +2512,6 @@ and no `agent:blocked` comment is posted, or the Lead never sees the issue again
             )),
             ok(&pr_list_json(322, GREEN)),
             ok(&pr_view_json(GREEN)),
-            ok(r#"{"labels":[{"name":"agent:ready"}]}"#),
-            ok(""),
-            ok(""),
-            ok(""),
         ]);
         let mut config = config(roots.path(), repo.path());
         config.merge = true;
@@ -2511,43 +2521,43 @@ and no `agent:blocked` comment is posted, or the Lead never sees the issue again
         let report = advance_pass(&db, &mut gh, &mut needs_changes(), &config).unwrap();
         let advanced = &report.advanced[0];
         assert!(
-            matches!(
-                advanced.remediation,
-                Some(ArmOutcome::CapReached {
-                    cumulative_attempt_n: 5,
-                    attempt_cap: 5
-                })
-            ),
+            matches!(advanced.remediation, Some(ArmOutcome::Armed { .. })),
             "got {:?}",
             advanced.remediation
         );
         let execution = advanced.merge.as_ref().unwrap();
         assert!(
-            execution.commented,
-            "an exhausted issue must reach the real hold, or nobody is told"
+            execution.label_plan.is_none() && !execution.commented,
+            "a remediation in force rehearses the merge; the hold is for exhaustion"
         );
-        assert_eq!(
-            remediate::get_remediation(&db, &issue()).unwrap(),
-            None,
-            "nothing is armed for an issue that can never be dispatched"
-        );
+        assert!(remediate::active_remediation(&db, &issue())
+            .unwrap()
+            .is_some());
     }
 
     #[test]
     fn the_cap_is_reached_while_a_remediation_is_still_in_force_and_the_human_is_told() {
         // The ordinary way an unproductive remediation ends, and the one the
-        // record itself can hide. The issue has spent its attempts, so nothing
+        // record itself can hide. The remediation has spent its own cap, so nothing
         // will re-dispatch it — but its remediation record is still *active*
         // (no newer success has landed), so a `remediation_in_force` derived
         // from `active_remediation` alone would rehearse the merge for ever
         // and rung 6's hold would never comment or label. `CapReached` is not
         // `in_force`, and that is what keeps the human reachable.
-        //
-        // `an_issue_at_its_attempt_cap_falls_through_to_the_human_hold` does
-        // not cover this: it has no remediation record at all, so both
-        // spellings agree there.
         let db = approved_db();
         record_success(&db, &issue(), Some(GREEN));
+        lineage::record_attempt(
+            &db,
+            &lineage::AttemptRecord {
+                issue: issue(),
+                attempt_n: 1,
+                approach: "went green".into(),
+                verdict: AttemptOutcome::Success,
+                why_failed: None,
+                commit_sha: Some(GREEN.to_string()),
+            },
+        )
+        .unwrap();
         reviewed_at_needing_changes(&db, &issue(), 322, GREEN);
         remediate::arm_remediation(
             &db,
@@ -2560,15 +2570,16 @@ and no `agent:blocked` comment is posted, or the Lead never sees the issue again
             },
         )
         .unwrap();
-        // The remediation dispatches spent the cap and never fixed it. Same
-        // commit, so the remediation is still in force.
+        // Green at attempt 1, the remediation dispatches spent its own cap of
+        // five and never fixed it. Same commit, so the remediation is still
+        // in force.
         lineage::upsert_issue_status(
             &db,
             &IssueStatus {
                 issue: issue(),
                 best_verdict: Some(AttemptOutcome::Success),
                 best_commit_sha: Some(GREEN.to_string()),
-                cumulative_attempt_n: 5,
+                cumulative_attempt_n: 6,
             },
         )
         .unwrap();
@@ -2608,6 +2619,99 @@ and no `agent:blocked` comment is posted, or the Lead never sees the issue again
             advanced.merge.as_ref().unwrap().commented,
             "an exhausted issue reaches rung 6's real hold even with an active \
 remediation record — otherwise the PR sits open and nobody is ever told"
+        );
+    }
+
+    #[test]
+    fn a_new_head_after_the_remediation_is_spent_still_reaches_the_human() {
+        // A remediation that spent its own cap at one commit, then a
+        // `needs_changes` about a *new* head (a failing dispatch still pushed
+        // it). The new round is not a new budget (#344): `arm_remediation`
+        // answers `CapReached` without writing a record, so the merge runs for
+        // real and rung 6's hold tells a human, rather than a fresh cap being
+        // armed for every pushed commit.
+        let db = approved_db();
+        record_success(&db, &issue(), Some(GREEN));
+        lineage::record_attempt(
+            &db,
+            &lineage::AttemptRecord {
+                issue: issue(),
+                attempt_n: 1,
+                approach: "went green".into(),
+                verdict: AttemptOutcome::Success,
+                why_failed: None,
+                commit_sha: Some(GREEN.to_string()),
+            },
+        )
+        .unwrap();
+        remediate::arm_remediation(
+            &db,
+            &ArmRequest {
+                issue: &issue(),
+                pr_number: 322,
+                head_sha: GREEN,
+                findings: Some("the retry loop is unbounded"),
+                attempt_cap: 5,
+            },
+        )
+        .unwrap();
+        // Five failed remediation dispatches since the success at attempt 1;
+        // the last of them pushed MOVED, which a reviewer then objected to.
+        lineage::upsert_issue_status(
+            &db,
+            &IssueStatus {
+                issue: issue(),
+                best_verdict: Some(AttemptOutcome::Success),
+                best_commit_sha: Some(GREEN.to_string()),
+                cumulative_attempt_n: 6,
+            },
+        )
+        .unwrap();
+        reviewed_at_needing_changes(&db, &issue(), 322, MOVED);
+
+        let (repo, roots) = checkout_with_worktree();
+        let mut gh = ScriptedGh::new(vec![
+            ok(&issue_list_json(
+                283,
+                &["agent:ready", "risk:documentation"],
+            )),
+            ok(&pr_list_json(322, MOVED)),
+            ok(&pr_view_json(MOVED)),
+            ok(r#"{"labels":[{"name":"agent:ready"}]}"#),
+            ok(""),
+            ok(""),
+            ok(""),
+        ]);
+        let mut config = config(roots.path(), repo.path());
+        config.merge = true;
+        config.remediate = true;
+        config.attempt_cap = 5;
+
+        let report = advance_pass(&db, &mut gh, &mut ForbiddenReviewer, &config).unwrap();
+        let advanced = &report.advanced[0];
+        assert!(
+            matches!(
+                advanced.remediation,
+                Some(ArmOutcome::CapReached {
+                    attempts_charged: 5,
+                    attempt_cap: 5,
+                    ..
+                })
+            ),
+            "got {:?}",
+            advanced.remediation
+        );
+        assert!(
+            advanced.merge.as_ref().unwrap().commented,
+            "the spent remediation reaches rung 6's real hold"
+        );
+        assert_eq!(
+            remediate::get_remediation(&db, &issue())
+                .unwrap()
+                .unwrap()
+                .head_sha,
+            GREEN,
+            "no record is armed for the new head"
         );
     }
 
