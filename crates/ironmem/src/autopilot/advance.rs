@@ -98,8 +98,8 @@
 //!
 //! The hand-off to a human still happens; it happens *later*, when the
 //! automation has actually given up. `remediate::arm_remediation` checks the
-//! attempt cap first and answers `CapReached`, which is not `in_force`, so an
-//! exhausted issue falls through to the real merge and rung 6 comments and
+//! attempt cap first and answers `CapReached`, which is not `in_force`, so a
+//! remediation that has spent its own cap falls through to the real merge and rung 6 comments and
 //! labels exactly as it always did. That is the spec's *"on exhaustion the PR
 //! stays open for a human — never merged with an unresolved finding"*, with
 //! both halves reachable.
@@ -493,6 +493,25 @@ pub fn dispatch_class(risk_label: Option<&str>) -> String {
     super::lead::class_for(risk_label, super::lead::UNCLASSIFIED)
 }
 
+/// Whether [`plan_advance`] would list `issue`, labels aside: the two facts
+/// it reads from the database before it looks at any PR — an approved gate
+/// config for the repo, and a recorded [`AttemptOutcome::Success`].
+///
+/// For rung 6's approval hold, which must not tell a human that approving
+/// is all it takes when this pass would skip the issue as
+/// [`SkipReason::RepoNotApproved`] or [`SkipReason::NoSuccessYet`]. A PR
+/// prepared by hand and taken through `autopilot review` and `autopilot
+/// merge` has no recorded success, so `advance` never picks it up, whatever
+/// its labels say. Kept beside `plan_advance` so the two cannot drift.
+///
+/// [`SkipReason::NoCheckout`] is not covered: the configured targets are an
+/// `advance` argument, and rung 6 does not see them.
+pub(super) fn advance_would_track(db: &Database, issue: &IssueRef) -> Result<bool, MemoryError> {
+    Ok(gate_config::is_gate_config_approved(db, &issue.repo)?
+        && lineage::get_issue_status(db, issue)?
+            .is_some_and(|s| s.best_verdict == Some(AttemptOutcome::Success)))
+}
+
 /// Choose the issues one pass will look at.
 ///
 /// Pure over the database and `backlogs` — no network, no writes — for the
@@ -758,8 +777,28 @@ pub fn advance_pass(
 /// ⟨defect 7⟩ [`AdvanceStep::WouldOpenPr`] is charged too, and needs no clause
 /// here: a rehearsed pull request is a step, not a stall, which is exactly why
 /// it is not modelled as one. See that variant's doc.
+///
+/// ⟨#346⟩ A **pull request still waiting on its approval** is the third
+/// form. That hold ([`merge::MergeHold::awaits_approval`]) leaves the issue
+/// `agent:ready` so that the pass which sees the approval arrive can merge
+/// it, which means the issue is re-read on every pass until a human gets to
+/// it. A re-read that bought no review and found the same hold as last time
+/// posted nothing and recorded nothing (`record_appended` is false), so it is
+/// not charged — rehearsed or real, since each footing dedupes its own
+/// records. The first hold, and any hold that has *changed* — a human now
+/// requesting changes, say — is new, is commented on, and is charged.
 fn took_a_step(advanced: &Advanced) -> bool {
     if matches!(advanced.step, AdvanceStep::Stalled(_)) {
+        return false;
+    }
+    if advanced.review.is_none()
+        && advanced.merge.as_ref().is_some_and(|m| {
+            !m.record_appended
+                && m.outcome
+                    .hold()
+                    .is_some_and(merge::MergeHold::awaits_approval)
+        })
+    {
         return false;
     }
     !(advanced.review.is_none()
@@ -2362,6 +2401,421 @@ mod tests {
         );
     }
 
+    // ── #346: an approval hold resumes on the approval ─────────────────
+
+    /// One issue and its pull request, as [`ProtectedGitHub`] keeps them.
+    struct FakeIssue {
+        labels: Vec<String>,
+        pr_number: u64,
+        review_decision: String,
+        merged: bool,
+        comments: usize,
+    }
+
+    /// A GitHub that *remembers*: a base branch requiring one approving
+    /// review, issues whose labels `gh issue edit` really changes, and a
+    /// `gh issue list --label` that really filters on them.
+    ///
+    /// [`ScriptedGh`] replays a fixed script, so it cannot show the one thing
+    /// #346 is about — a label written on one pass deciding whether the issue
+    /// is even listed on the next.
+    struct ProtectedGitHub {
+        issues: std::collections::BTreeMap<u64, FakeIssue>,
+        seen: Vec<Vec<String>>,
+    }
+
+    impl ProtectedGitHub {
+        fn new() -> Self {
+            Self {
+                issues: std::collections::BTreeMap::new(),
+                seen: Vec::new(),
+            }
+        }
+
+        fn with_issue(mut self, number: u64, pr_number: u64, labels: &[&str]) -> Self {
+            self.issues.insert(
+                number,
+                FakeIssue {
+                    labels: labels.iter().map(|l| l.to_string()).collect(),
+                    pr_number,
+                    review_decision: "REVIEW_REQUIRED".into(),
+                    merged: false,
+                    comments: 0,
+                },
+            );
+            self
+        }
+
+        /// A human approving the pull request on GitHub — and doing nothing
+        /// else: no comment, no label.
+        fn approve(&mut self, number: u64) {
+            self.issues.get_mut(&number).unwrap().review_decision = "APPROVED".into();
+        }
+
+        /// A human submitting a "request changes" review on the PR.
+        fn request_changes(&mut self, number: u64) {
+            self.issues.get_mut(&number).unwrap().review_decision = "CHANGES_REQUESTED".into();
+        }
+
+        fn issue(&self, number: u64) -> &FakeIssue {
+            &self.issues[&number]
+        }
+
+        fn number_arg(args: &[String]) -> u64 {
+            args[2].parse().expect("a number in argv[2]")
+        }
+
+        fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
+            args.iter()
+                .position(|a| a == name)
+                .and_then(|i| args.get(i + 1))
+                .map(String::as_str)
+        }
+    }
+
+    impl GhRunner for ProtectedGitHub {
+        fn run(&mut self, args: &[String]) -> Result<GhOutput, MemoryError> {
+            self.seen.push(args.to_vec());
+            match (args[0].as_str(), args[1].as_str()) {
+                ("issue", "list") => {
+                    let label = Self::flag(args, "--label").unwrap();
+                    let listed: Vec<String> = self
+                        .issues
+                        .iter()
+                        .filter(|(_, i)| i.labels.iter().any(|l| l.eq_ignore_ascii_case(label)))
+                        .map(|(n, i)| {
+                            let labels: Vec<&str> = i.labels.iter().map(String::as_str).collect();
+                            let one = issue_list_json(*n, &labels);
+                            one[1..one.len() - 1].to_string()
+                        })
+                        .collect();
+                    ok(&format!("[{}]", listed.join(",")))
+                }
+                ("pr", "list") => {
+                    let head = Self::flag(args, "--head").unwrap();
+                    let open = Self::flag(args, "--state") == Some("open");
+                    let found = self
+                        .issues
+                        .iter()
+                        .find(|(n, _)| worktree::branch_name(&IssueRef::new(REPO, **n)) == head)
+                        .map(|(_, i)| i);
+                    match found {
+                        Some(i) if !(open && i.merged) => ok(&format!(
+                            r#"[{{"number":{},"headRefName":"{head}","headRefOid":"{GREEN}","baseRefName":"main","isDraft":false,"url":"u"}}]"#,
+                            i.pr_number
+                        )),
+                        _ => ok("[]"),
+                    }
+                }
+                ("pr", "view") => {
+                    let pr = Self::number_arg(args);
+                    let i = self.issues.values().find(|i| i.pr_number == pr).unwrap();
+                    ok(&format!(
+                        r#"{{"number":{pr},"state":"{}","isDraft":false,"mergeable":"MERGEABLE","mergeStateStatus":"{}","baseRefName":"main","headRefName":"h","headRefOid":"{GREEN}","reviewDecision":"{}"}}"#,
+                        if i.merged { "MERGED" } else { "OPEN" },
+                        // What GitHub really reports for a PR missing only
+                        // its required approval.
+                        if i.review_decision == "APPROVED" {
+                            "CLEAN"
+                        } else {
+                            "BLOCKED"
+                        },
+                        i.review_decision
+                    ))
+                }
+                ("pr", "merge") => {
+                    let pr = Self::number_arg(args);
+                    let i = self
+                        .issues
+                        .values_mut()
+                        .find(|i| i.pr_number == pr)
+                        .unwrap();
+                    assert_eq!(
+                        i.review_decision, "APPROVED",
+                        "GitHub refuses a merge the protection rule has not been satisfied for"
+                    );
+                    i.merged = true;
+                    ok("merged")
+                }
+                ("issue", "view") => {
+                    let i = self.issue(Self::number_arg(args));
+                    let labels: Vec<String> = i
+                        .labels
+                        .iter()
+                        .map(|l| format!(r#"{{"name":"{l}"}}"#))
+                        .collect();
+                    ok(&format!(r#"{{"labels":[{}]}}"#, labels.join(",")))
+                }
+                ("issue", "edit") => {
+                    let n = Self::number_arg(args);
+                    let i = self.issues.get_mut(&n).unwrap();
+                    for pair in args.windows(2) {
+                        match pair[0].as_str() {
+                            "--add-label" => i.labels.push(pair[1].clone()),
+                            "--remove-label" => i.labels.retain(|l| l != &pair[1]),
+                            _ => {}
+                        }
+                    }
+                    ok("")
+                }
+                ("issue", "comment") => {
+                    let n = Self::number_arg(args);
+                    self.issues.get_mut(&n).unwrap().comments += 1;
+                    ok("")
+                }
+                ("label", "create") => ok(""),
+                ("api", path) if path.ends_with("/protection") => ok(
+                    r#"{"required_pull_request_reviews":{"required_approving_review_count":1},"enforce_admins":{"enabled":true}}"#,
+                ),
+                other => panic!("ProtectedGitHub was not expecting {other:?}: {args:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn approving_a_held_pull_request_is_all_a_human_has_to_do_for_it_to_merge() {
+        // #346. A protected branch holds every auto-merge candidate nobody
+        // has approved yet at `HumanApprovalRequired` on its first pass — that is the commonest
+        // hold there is. The recovery the hold describes is "a human
+        // approves, and the next pass merges it". That recovery used to be
+        // fiction: the hold moved the issue to `agent:blocked`, `advance`
+        // lists only `agent:ready`, and an approval is not the comment
+        // `agent:blocked` resumes on — so the approved PR sat there until a
+        // human edited labels by hand.
+        let db = approved_db();
+        record_success(&db, &issue(), Some(GREEN));
+        let (repo, roots) = checkout_with_worktree();
+        let mut config = config(roots.path(), repo.path());
+        config.merge = true;
+        let mut github =
+            ProtectedGitHub::new().with_issue(283, 322, &["agent:ready", "risk:documentation"]);
+
+        // Pass 1: reviewed, passed, and held on the missing approval.
+        let first = advance_pass(&db, &mut github, &mut StubReviewer::passing(), &config).unwrap();
+        let held = first.advanced[0].merge.as_ref().expect("the merge ran");
+        assert!(
+            matches!(
+                held.outcome.hold(),
+                Some(merge::MergeHold::HumanApprovalRequired { .. })
+            ),
+            "got {:?}",
+            held.outcome
+        );
+        assert!(
+            held.commented,
+            "the human is told what the PR is waiting on"
+        );
+        assert_eq!(github.issue(283).comments, 1);
+
+        // Pass 2, nobody has approved yet: still held, and nothing new said.
+        let waiting = advance_pass(&db, &mut github, &mut ForbiddenReviewer, &config).unwrap();
+        assert_eq!(
+            waiting.advanced.len(),
+            1,
+            "an issue waiting on an approval must stay in the pass, skipped: {:?}",
+            waiting.skipped
+        );
+        assert_eq!(
+            github.issue(283).comments,
+            1,
+            "the same hold is not re-posted"
+        );
+
+        // The human approves the pull request. Nothing else: no comment, no
+        // label edit.
+        github.approve(283);
+
+        // Pass 3 merges it. No review is bought — the head has not moved.
+        let after = advance_pass(&db, &mut github, &mut ForbiddenReviewer, &config).unwrap();
+        assert_eq!(
+            after.advanced.len(),
+            1,
+            "the approved issue must be picked up, skipped: {:?}",
+            after.skipped
+        );
+        let merged = after.advanced[0].merge.as_ref().unwrap();
+        assert!(merged.outcome.merged(), "got {:?}", merged.outcome);
+        assert!(github.issue(283).merged);
+        assert!(
+            github
+                .issue(283)
+                .labels
+                .iter()
+                .all(|l| !l.starts_with("agent:")),
+            "a merged issue leaves every queue: {:?}",
+            github.issue(283).labels
+        );
+        assert!(
+            after.advanced[0].cleanup.is_some(),
+            "and the worktree is given back"
+        );
+    }
+
+    #[test]
+    fn a_pull_request_waiting_on_an_approval_does_not_spend_the_burst_limit() {
+        // The cost of #346's fix, paid for here. Keeping a held issue in the
+        // listing means it is re-read on every pass until somebody approves —
+        // which may be days. That re-read buys no review, posts nothing and
+        // records nothing; charged against the limit, three such PRs would
+        // fill every pass and starve every green PR behind them (rung 10's
+        // lesson 52).
+        let db = approved_db();
+        let (repo, roots) = checkout_with_worktree();
+        let mut config = config(roots.path(), repo.path());
+        config.merge = true;
+        config.max_advances_per_pass = 1;
+
+        record_success(&db, &issue(), Some(GREEN));
+        reviewed_at(&db, &issue(), 322, GREEN);
+        let mut github =
+            ProtectedGitHub::new().with_issue(283, 322, &["agent:ready", "risk:documentation"]);
+        let first = advance_pass(&db, &mut github, &mut ForbiddenReviewer, &config).unwrap();
+        assert!(
+            first.advanced[0].merge.as_ref().unwrap().commented,
+            "the first hold is new, is commented on, and is charged"
+        );
+
+        // A second green PR arrives, already approved, behind the waiting one.
+        let second = IssueRef::new(REPO, 284);
+        record_success(&db, &second, Some(GREEN));
+        reviewed_at(&db, &second, 323, GREEN);
+        github = {
+            let mut g = github.with_issue(284, 323, &["agent:ready", "risk:documentation"]);
+            g.approve(284);
+            g
+        };
+
+        let report = advance_pass(&db, &mut github, &mut ForbiddenReviewer, &config).unwrap();
+        assert_eq!(
+            report.advanced.len(),
+            2,
+            "both issues are reached, skipped: {:?}",
+            report.skipped
+        );
+        let waiting = report
+            .advanced
+            .iter()
+            .find(|a| a.issue == issue())
+            .and_then(|a| a.merge.as_ref())
+            .expect("the waiting issue was re-read");
+        assert!(
+            waiting
+                .outcome
+                .hold()
+                .is_some_and(merge::MergeHold::awaits_approval)
+                && !waiting.record_appended
+                && !waiting.commented,
+            "an unchanged approval hold: {waiting:?}"
+        );
+        assert!(
+            report
+                .skipped
+                .iter()
+                .all(|s| !matches!(s.reason, SkipReason::PassLimitReached { .. })),
+            "re-reading an unchanged approval hold took no step: {:?}",
+            report.skipped
+        );
+        assert!(github.issue(284).merged, "the PR behind it still merges");
+        assert!(!github.issue(283).merged);
+    }
+
+    #[test]
+    fn a_human_requesting_changes_is_handed_back_rather_than_waited_on() {
+        // `CHANGES_REQUESTED` is a human objecting, not an approval pending.
+        // Nothing in Autopilot makes the change they asked for, so the issue
+        // goes to `agent:blocked` like any other hold — told so in a fresh
+        // comment, and charged, because the hold changed.
+        let db = approved_db();
+        let (repo, roots) = checkout_with_worktree();
+        let mut config = config(roots.path(), repo.path());
+        config.merge = true;
+        config.max_advances_per_pass = 1;
+
+        record_success(&db, &issue(), Some(GREEN));
+        reviewed_at(&db, &issue(), 322, GREEN);
+        let mut github =
+            ProtectedGitHub::new().with_issue(283, 322, &["agent:ready", "risk:documentation"]);
+        advance_pass(&db, &mut github, &mut ForbiddenReviewer, &config).unwrap();
+        assert_eq!(github.issue(283).comments, 1);
+
+        github.request_changes(283);
+        let second = IssueRef::new(REPO, 284);
+        record_success(&db, &second, Some(GREEN));
+        reviewed_at(&db, &second, 323, GREEN);
+        github = {
+            let mut g = github.with_issue(284, 323, &["agent:ready", "risk:documentation"]);
+            g.approve(284);
+            g
+        };
+
+        let report = advance_pass(&db, &mut github, &mut ForbiddenReviewer, &config).unwrap();
+        let held = report.advanced[0].merge.as_ref().unwrap();
+        assert!(
+            matches!(
+                held.outcome.hold(),
+                Some(merge::MergeHold::HumanApprovalRequired { review_decision, .. })
+                    if review_decision == "CHANGES_REQUESTED"
+            ),
+            "got {:?}",
+            held.outcome
+        );
+        assert_eq!(
+            github.issue(283).comments,
+            2,
+            "a changed hold is new information"
+        );
+        assert!(
+            github
+                .issue(283)
+                .labels
+                .iter()
+                .any(|l| l == "agent:blocked")
+                && !github.issue(283).labels.iter().any(|l| l == "agent:ready"),
+            "handed back to a human: {:?}",
+            github.issue(283).labels
+        );
+        assert!(
+            report
+                .skipped
+                .iter()
+                .any(|s| s.issue == second
+                    && matches!(s.reason, SkipReason::PassLimitReached { .. })),
+            "a changed hold is a step and spends the limit: {:?}",
+            report.skipped
+        );
+
+        // A human puts `agent:ready` back without withdrawing the objection.
+        // The hold is a repeat — nothing new to say — but it still writes
+        // `agent:blocked` to GitHub, so it is not the free re-read an
+        // approval hold is, and it is still charged.
+        {
+            let labels = &mut github.issues.get_mut(&283).unwrap().labels;
+            labels.retain(|l| l != "agent:blocked");
+            labels.push("agent:ready".into());
+        }
+        let again = advance_pass(&db, &mut github, &mut ForbiddenReviewer, &config).unwrap();
+        let repeat = again.advanced[0].merge.as_ref().unwrap();
+        assert!(!repeat.record_appended && !repeat.commented, "{repeat:?}");
+        assert!(
+            github
+                .issue(283)
+                .labels
+                .iter()
+                .any(|l| l == "agent:blocked"),
+            "re-blocked: {:?}",
+            github.issue(283).labels
+        );
+        assert!(
+            again
+                .skipped
+                .iter()
+                .any(|s| s.issue == second
+                    && matches!(s.reason, SkipReason::PassLimitReached { .. })),
+            "a re-block is a GitHub write and is charged: {:?}",
+            again.skipped
+        );
+    }
+
     // ── rung 11: the red path ───────────────────────────────────────────
 
     /// A reviewer that asks for changes, with a reason.
@@ -2475,11 +2929,25 @@ and no `agent:blocked` comment is posted, or the Lead never sees the issue again
     }
 
     #[test]
-    fn an_issue_at_its_attempt_cap_falls_through_to_the_human_hold() {
-        // The spec's "on exhaustion the PR stays open for a human". The
-        // automation has given up, so the merge runs for real and rung 6
-        // comments and flips the label — which is the notification.
+    fn a_success_on_its_last_attempt_is_still_remediated_not_handed_over() {
+        // Issue #344. The original work succeeded on attempt 5 of 5, and a
+        // remediation's budget is its own rather than what the success left
+        // over — so a `needs_changes` here arms a re-dispatch instead of
+        // going straight to the human hold.
         let db = approved_db();
+        record_success(&db, &issue(), Some(GREEN));
+        lineage::record_attempt(
+            &db,
+            &lineage::AttemptRecord {
+                issue: issue(),
+                attempt_n: 5,
+                approach: "went green".into(),
+                verdict: AttemptOutcome::Success,
+                why_failed: None,
+                commit_sha: Some(GREEN.to_string()),
+            },
+        )
+        .unwrap();
         lineage::upsert_issue_status(
             &db,
             &IssueStatus {
@@ -2498,10 +2966,6 @@ and no `agent:blocked` comment is posted, or the Lead never sees the issue again
             )),
             ok(&pr_list_json(322, GREEN)),
             ok(&pr_view_json(GREEN)),
-            ok(r#"{"labels":[{"name":"agent:ready"}]}"#),
-            ok(""),
-            ok(""),
-            ok(""),
         ]);
         let mut config = config(roots.path(), repo.path());
         config.merge = true;
@@ -2511,43 +2975,43 @@ and no `agent:blocked` comment is posted, or the Lead never sees the issue again
         let report = advance_pass(&db, &mut gh, &mut needs_changes(), &config).unwrap();
         let advanced = &report.advanced[0];
         assert!(
-            matches!(
-                advanced.remediation,
-                Some(ArmOutcome::CapReached {
-                    cumulative_attempt_n: 5,
-                    attempt_cap: 5
-                })
-            ),
+            matches!(advanced.remediation, Some(ArmOutcome::Armed { .. })),
             "got {:?}",
             advanced.remediation
         );
         let execution = advanced.merge.as_ref().unwrap();
         assert!(
-            execution.commented,
-            "an exhausted issue must reach the real hold, or nobody is told"
+            execution.label_plan.is_none() && !execution.commented,
+            "a remediation in force rehearses the merge; the hold is for exhaustion"
         );
-        assert_eq!(
-            remediate::get_remediation(&db, &issue()).unwrap(),
-            None,
-            "nothing is armed for an issue that can never be dispatched"
-        );
+        assert!(remediate::active_remediation(&db, &issue())
+            .unwrap()
+            .is_some());
     }
 
     #[test]
     fn the_cap_is_reached_while_a_remediation_is_still_in_force_and_the_human_is_told() {
         // The ordinary way an unproductive remediation ends, and the one the
-        // record itself can hide. The issue has spent its attempts, so nothing
+        // record itself can hide. The remediation has spent its own cap, so nothing
         // will re-dispatch it — but its remediation record is still *active*
         // (no newer success has landed), so a `remediation_in_force` derived
         // from `active_remediation` alone would rehearse the merge for ever
         // and rung 6's hold would never comment or label. `CapReached` is not
         // `in_force`, and that is what keeps the human reachable.
-        //
-        // `an_issue_at_its_attempt_cap_falls_through_to_the_human_hold` does
-        // not cover this: it has no remediation record at all, so both
-        // spellings agree there.
         let db = approved_db();
         record_success(&db, &issue(), Some(GREEN));
+        lineage::record_attempt(
+            &db,
+            &lineage::AttemptRecord {
+                issue: issue(),
+                attempt_n: 1,
+                approach: "went green".into(),
+                verdict: AttemptOutcome::Success,
+                why_failed: None,
+                commit_sha: Some(GREEN.to_string()),
+            },
+        )
+        .unwrap();
         reviewed_at_needing_changes(&db, &issue(), 322, GREEN);
         remediate::arm_remediation(
             &db,
@@ -2560,15 +3024,16 @@ and no `agent:blocked` comment is posted, or the Lead never sees the issue again
             },
         )
         .unwrap();
-        // The remediation dispatches spent the cap and never fixed it. Same
-        // commit, so the remediation is still in force.
+        // Green at attempt 1, the remediation dispatches spent its own cap of
+        // five and never fixed it. Same commit, so the remediation is still
+        // in force.
         lineage::upsert_issue_status(
             &db,
             &IssueStatus {
                 issue: issue(),
                 best_verdict: Some(AttemptOutcome::Success),
                 best_commit_sha: Some(GREEN.to_string()),
-                cumulative_attempt_n: 5,
+                cumulative_attempt_n: 6,
             },
         )
         .unwrap();
@@ -2608,6 +3073,99 @@ and no `agent:blocked` comment is posted, or the Lead never sees the issue again
             advanced.merge.as_ref().unwrap().commented,
             "an exhausted issue reaches rung 6's real hold even with an active \
 remediation record — otherwise the PR sits open and nobody is ever told"
+        );
+    }
+
+    #[test]
+    fn a_new_head_after_the_remediation_is_spent_still_reaches_the_human() {
+        // A remediation that spent its own cap at one commit, then a
+        // `needs_changes` about a *new* head (a failing dispatch still pushed
+        // it). The new round is not a new budget (#344): `arm_remediation`
+        // answers `CapReached` without writing a record, so the merge runs for
+        // real and rung 6's hold tells a human, rather than a fresh cap being
+        // armed for every pushed commit.
+        let db = approved_db();
+        record_success(&db, &issue(), Some(GREEN));
+        lineage::record_attempt(
+            &db,
+            &lineage::AttemptRecord {
+                issue: issue(),
+                attempt_n: 1,
+                approach: "went green".into(),
+                verdict: AttemptOutcome::Success,
+                why_failed: None,
+                commit_sha: Some(GREEN.to_string()),
+            },
+        )
+        .unwrap();
+        remediate::arm_remediation(
+            &db,
+            &ArmRequest {
+                issue: &issue(),
+                pr_number: 322,
+                head_sha: GREEN,
+                findings: Some("the retry loop is unbounded"),
+                attempt_cap: 5,
+            },
+        )
+        .unwrap();
+        // Five failed remediation dispatches since the success at attempt 1;
+        // the last of them pushed MOVED, which a reviewer then objected to.
+        lineage::upsert_issue_status(
+            &db,
+            &IssueStatus {
+                issue: issue(),
+                best_verdict: Some(AttemptOutcome::Success),
+                best_commit_sha: Some(GREEN.to_string()),
+                cumulative_attempt_n: 6,
+            },
+        )
+        .unwrap();
+        reviewed_at_needing_changes(&db, &issue(), 322, MOVED);
+
+        let (repo, roots) = checkout_with_worktree();
+        let mut gh = ScriptedGh::new(vec![
+            ok(&issue_list_json(
+                283,
+                &["agent:ready", "risk:documentation"],
+            )),
+            ok(&pr_list_json(322, MOVED)),
+            ok(&pr_view_json(MOVED)),
+            ok(r#"{"labels":[{"name":"agent:ready"}]}"#),
+            ok(""),
+            ok(""),
+            ok(""),
+        ]);
+        let mut config = config(roots.path(), repo.path());
+        config.merge = true;
+        config.remediate = true;
+        config.attempt_cap = 5;
+
+        let report = advance_pass(&db, &mut gh, &mut ForbiddenReviewer, &config).unwrap();
+        let advanced = &report.advanced[0];
+        assert!(
+            matches!(
+                advanced.remediation,
+                Some(ArmOutcome::CapReached {
+                    attempts_charged: 5,
+                    attempt_cap: 5,
+                    ..
+                })
+            ),
+            "got {:?}",
+            advanced.remediation
+        );
+        assert!(
+            advanced.merge.as_ref().unwrap().commented,
+            "the spent remediation reaches rung 6's real hold"
+        );
+        assert_eq!(
+            remediate::get_remediation(&db, &issue())
+                .unwrap()
+                .unwrap()
+                .head_sha,
+            GREEN,
+            "no record is armed for the new head"
         );
     }
 

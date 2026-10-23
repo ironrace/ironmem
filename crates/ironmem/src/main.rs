@@ -403,7 +403,8 @@ enum AutopilotCmd {
         /// Per-dispatch spend ceiling, passed through to --max-budget-usd
         #[arg(long)]
         max_budget_usd: Option<f64>,
-        /// Per-issue attempt cap, cumulative across runs
+        /// Per-issue attempt cap, cumulative across runs; a remediation gets
+        /// its own, counted from the issue's first success
         #[arg(long)]
         attempt_cap: Option<u32>,
         /// Daily ledger ceiling across all dispatches
@@ -670,7 +671,8 @@ enum AutopilotCmd {
         /// Per-dispatch spend ceiling
         #[arg(long)]
         max_budget_usd: Option<f64>,
-        /// Per-issue attempt cap, cumulative across runs
+        /// Per-issue attempt cap, cumulative across runs; a remediation gets
+        /// its own, counted from the issue's first success
         #[arg(long)]
         attempt_cap: Option<u32>,
         /// Daily ledger ceiling across all dispatches
@@ -701,7 +703,8 @@ enum AutopilotCmd {
         /// Ceiling on concurrently in-flight ICs across every repo
         #[arg(long)]
         concurrency_cap: Option<usize>,
-        /// Per-issue attempt cap, cumulative across runs
+        /// Per-issue attempt cap, cumulative across runs; a remediation gets
+        /// its own, counted from the issue's first success
         #[arg(long)]
         attempt_cap: Option<u32>,
         /// Per-dispatch spend ceiling, used for the same pre-authorization
@@ -816,8 +819,10 @@ enum AutopilotCmd {
         /// instead of holding the PR for a human straight away. This pass
         /// arms it; `autopilot lead` (or `autopilot run`) is what actually
         /// dispatches, so run them in that order. Each attempt costs a
-        /// dispatch and spends the issue's --attempt-cap; on exhaustion the
-        /// PR is held for a human exactly as it is without this flag.
+        /// dispatch; a remediation gets --attempt-cap attempts of its own,
+        /// shared by every round of review and counted from the issue's first
+        /// success, not what the original work left. On exhaustion the PR is
+        /// held for a human exactly as it is without this flag.
         #[arg(long)]
         remediate: bool,
         /// Per-issue attempt cap. Must match the Lead's, since a remediation
@@ -1133,11 +1138,12 @@ fn print_advance_report(report: &ironmem::autopilot::advance::AdvanceReport) {
                 );
             }
             Some(ArmOutcome::CapReached {
-                cumulative_attempt_n,
                 attempt_cap,
+                attempts_charged,
+                ..
             }) => {
                 println!(
-                    "    remediation EXHAUSTED ({cumulative_attempt_n}/{attempt_cap} attempts) — the PR stays open for a human"
+                    "    remediation EXHAUSTED ({attempts_charged}/{attempt_cap} remediation attempts) — the PR stays open for a human"
                 );
             }
         }
