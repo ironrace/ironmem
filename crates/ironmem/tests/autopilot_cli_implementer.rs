@@ -86,6 +86,72 @@ impl Drop for KillOnDrop {
 }
 
 #[test]
+fn public_run_defaults_to_claude_and_passes_the_claude_default_model() {
+    let root = tempfile::tempdir().unwrap();
+    let checkout = root.path().join("checkout");
+    let worktrees = root.path().join("worktrees");
+    let stubs = root.path().join("stubs");
+    let db_path = root.path().join("memory.sqlite3");
+    let calls = root.path().join("claude.calls");
+    make_repo(&checkout);
+    std::fs::create_dir_all(&stubs).unwrap();
+    approve(&db_path);
+    executable(
+        &stubs.join("claude"),
+        r#"#!/bin/sh
+printf '%s\n' "$PWD|$*" >> "$CLAUDE_CALLS"
+printf '%s\n' '{"total_cost_usd":0.0,"num_turns":1,"duration_ms":5,"is_error":false,"session_id":"11111111-2222-3333-4444-555555555555","structured_output":{"verdict":"met"}}'
+"#,
+    );
+    assert!(
+        !stubs.join("codex").exists(),
+        "the isolated harness directory must not provide Codex"
+    );
+
+    let output = Command::new(bin())
+        .args([
+            "autopilot",
+            "run",
+            REPO,
+            "6",
+            "--title",
+            "exercise the public default",
+            "--attempt-cap",
+            "1",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--path",
+            checkout.to_str().unwrap(),
+            "--worktree-root",
+            worktrees.to_str().unwrap(),
+            "--json",
+        ])
+        .env("PATH", isolated_path(&stubs))
+        .env("CLAUDE_CALLS", &calls)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "default run failed:\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["terminal"]["terminal"], "met", "{report}");
+    let calls = std::fs::read_to_string(calls).unwrap();
+    assert!(
+        calls.contains("--model claude-sonnet-5"),
+        "the omitted model must resolve to the Claude implementation default: {calls}"
+    );
+    assert_eq!(
+        calls.matches("|-p ").count(),
+        1,
+        "unexpected dispatches: {calls}"
+    );
+}
+
+#[test]
 fn public_run_selects_codex_without_resolving_claude() {
     let root = tempfile::tempdir().unwrap();
     let checkout = root.path().join("checkout");
@@ -357,6 +423,79 @@ fn codex_requires_an_explicit_model_before_database_creation() {
         !db_path.exists(),
         "validation must precede database creation"
     );
+}
+
+#[test]
+fn invalid_model_spelling_is_rejected_before_all_cli_side_effects() {
+    for (case, implementer, model, expected) in [
+        (
+            "claude-leading-opposite",
+            "claude",
+            " gpt-6.1-sol",
+            "whitespace",
+        ),
+        (
+            "claude-trailing-opposite",
+            "claude",
+            "gpt-6.1-sol ",
+            "whitespace",
+        ),
+        (
+            "codex-leading-opposite",
+            "codex",
+            " claude-sonnet-5",
+            "whitespace",
+        ),
+        ("codex-trailing-alias", "codex", "gpt-custom ", "whitespace"),
+        ("claude-empty", "claude", "", "must not be empty"),
+        ("codex-empty", "codex", "   ", "must not be empty"),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let db_path = root.path().join("memory.sqlite3");
+        let worktrees = root.path().join("worktrees");
+        let checkout = root.path().join("checkout");
+        let empty_path = root.path().join("empty-path");
+        std::fs::create_dir_all(&empty_path).unwrap();
+
+        let output = Command::new(bin())
+            .args([
+                "autopilot",
+                "run",
+                REPO,
+                "7",
+                "--title",
+                "reject model whitespace",
+                "--implementer",
+                implementer,
+                "--model",
+                model,
+                "--db",
+                db_path.to_str().unwrap(),
+                "--path",
+                checkout.to_str().unwrap(),
+                "--worktree-root",
+                worktrees.to_str().unwrap(),
+            ])
+            .env("PATH", &empty_path)
+            .output()
+            .unwrap();
+
+        assert!(!output.status.success(), "{case} must fail");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(expected), "{case}: got: {stderr}");
+        assert!(
+            !db_path.exists(),
+            "{case}: validation must precede database creation"
+        );
+        assert!(
+            !checkout.exists(),
+            "{case}: validation must precede checkout inspection"
+        );
+        assert!(
+            !worktrees.exists(),
+            "{case}: validation must precede worktree provisioning"
+        );
+    }
 }
 
 #[test]

@@ -223,6 +223,43 @@ pub struct RunConfig {
     pub max_unpriced_dispatches_per_day: u32,
 }
 
+/// Validate a model name against the selected implementation harness.
+///
+/// Model aliases are intentionally unrestricted, but their spelling is
+/// preserved exactly in durable state and subprocess argv. Refusing
+/// surrounding whitespace avoids validating one identity while dispatching
+/// a subtly different one.
+pub fn validate_implementation_model(
+    implementer: Implementer,
+    model: &str,
+) -> Result<(), MemoryError> {
+    let harness = match implementer {
+        Implementer::Claude => "Claude",
+        Implementer::Codex => "Codex",
+    };
+    if model.trim().is_empty() {
+        return Err(MemoryError::Validation(format!(
+            "model must not be empty for the {harness} implementer"
+        )));
+    }
+    if model.trim() != model {
+        return Err(MemoryError::Validation(format!(
+            "model must not contain leading or trailing whitespace for the {harness} implementer"
+        )));
+    }
+    if implementer == Implementer::Codex && model.starts_with("claude-") {
+        return Err(MemoryError::Validation(format!(
+            "model '{model}' is incompatible with the Codex implementer; choose a Codex model"
+        )));
+    }
+    if implementer == Implementer::Claude && model.starts_with("gpt-") {
+        return Err(MemoryError::Validation(format!(
+            "model '{model}' is incompatible with the Claude implementer; choose a Claude model"
+        )));
+    }
+    Ok(())
+}
+
 impl RunConfig {
     /// A config with every documented default, for the two values that have
     /// no sensible default: the model and the dispatch-time risk class.
@@ -251,27 +288,7 @@ impl RunConfig {
     /// stop without ever dispatching — a misconfiguration worth naming at
     /// the point it is made rather than diagnosing from a silent no-op.
     pub fn validate(&self) -> Result<(), MemoryError> {
-        if self.model.trim().is_empty() {
-            let harness = match self.implementer {
-                Implementer::Claude => "Claude",
-                Implementer::Codex => "Codex",
-            };
-            return Err(MemoryError::Validation(format!(
-                "model must not be empty for the {harness} implementer"
-            )));
-        }
-        if self.implementer == Implementer::Codex && self.model.starts_with("claude-") {
-            return Err(MemoryError::Validation(format!(
-                "model '{}' is incompatible with the Codex implementer; choose a Codex model",
-                self.model
-            )));
-        }
-        if self.implementer == Implementer::Claude && self.model.starts_with("gpt-") {
-            return Err(MemoryError::Validation(format!(
-                "model '{}' is incompatible with the Claude implementer; choose a Claude model",
-                self.model
-            )));
-        }
+        validate_implementation_model(self.implementer, &self.model)?;
         if self.dispatch_class.trim().is_empty() {
             return Err(MemoryError::Validation(
                 "dispatch_class must not be empty".into(),
@@ -2426,6 +2443,38 @@ printf '%s\n' '{"verdict":"met","reason":"gate"}' > "$final"
             let err = config.validate().unwrap_err().to_string();
             assert!(err.contains(name), "got: {err}");
             assert!(err.contains("model"), "got: {err}");
+        }
+    }
+
+    #[test]
+    fn model_surrounding_whitespace_is_rejected_before_prefix_compatibility() {
+        for (implementer, model, name) in [
+            (Implementer::Claude, " gpt-6.1-sol", "Claude"),
+            (Implementer::Claude, "gpt-6.1-sol ", "Claude"),
+            (Implementer::Codex, " claude-sonnet-5", "Codex"),
+            (Implementer::Codex, "claude-sonnet-5 ", "Codex"),
+            (Implementer::Claude, " opus", "Claude"),
+            (Implementer::Codex, "gpt-custom ", "Codex"),
+        ] {
+            let mut config = RunConfig::new(model, "logic");
+            config.implementer = implementer;
+            let err = config.validate().unwrap_err().to_string();
+            assert!(err.contains(name), "got: {err}");
+            assert!(err.contains("whitespace"), "got: {err}");
+        }
+    }
+
+    #[test]
+    fn model_aliases_without_surrounding_whitespace_remain_valid() {
+        for (implementer, model) in [
+            (Implementer::Claude, "opus"),
+            (Implementer::Claude, "custom-model"),
+            (Implementer::Codex, "gpt-6.1-sol"),
+            (Implementer::Codex, "custom-model"),
+        ] {
+            let mut config = RunConfig::new(model, "logic");
+            config.implementer = implementer;
+            config.validate().unwrap();
         }
     }
 

@@ -989,22 +989,20 @@ fn resolve_implementation_model(
                 .into(),
         ));
     }
-    match model {
-        Some(model) if model.trim().is_empty() => Err(MemoryError::Validation(format!(
-            "--model must not be empty for the {} implementer",
-            match implementer {
-                ironmem::autopilot::Implementer::Claude => "Claude",
-                ironmem::autopilot::Implementer::Codex => "Codex",
-            }
-        ))),
-        Some(model) => Ok(model),
+    let model = match model {
+        Some(model) => model,
         None if implementer == ironmem::autopilot::Implementer::Claude => {
-            Ok(DEFAULT_CLAUDE_IMPLEMENTATION_MODEL.to_string())
+            DEFAULT_CLAUDE_IMPLEMENTATION_MODEL.to_string()
         }
-        None => Err(MemoryError::Validation(
-            "--model is required for the Codex implementer; pass an explicit Codex model".into(),
-        )),
-    }
+        None => {
+            return Err(MemoryError::Validation(
+                "--model is required for the Codex implementer; pass an explicit Codex model"
+                    .into(),
+            ))
+        }
+    };
+    ironmem::autopilot::run::validate_implementation_model(implementer, &model)?;
+    Ok(model)
 }
 
 /// The reviewer a dry run is handed.
