@@ -494,7 +494,8 @@ impl CodexProcessSnapshot {
     /// Fresh evidence that an issue's Codex work may still be running, or
     /// `None` when an available table shows nothing that could be it: its
     /// marker, another Autopilot marker for the issue, an ambiguous Codex row,
-    /// or the recorded root, process group, or a recorded descendant.
+    /// or the recorded tree as [`recorded_tree_evidence`] judges it (recorded
+    /// PIDs count only before a trusted completion record; the group after).
     pub fn live_evidence(
         &self,
         issue_slug: &str,
@@ -960,6 +961,35 @@ impl ProcessTracker {
         Err(MemoryError::Validation(
             "Codex descendants remained alive after cleanup".into(),
         ))
+    }
+    /// Once the root is reaped its children reparent, so PPID enrollment can
+    /// no longer reach a tool it started after the last scan. The root's
+    /// group still can: an active member cleanup never enrolled is
+    /// unaccounted for, and completion must not be recorded over it. It gets
+    /// a second's grace to finish a shutdown it began.
+    pub(crate) fn verify_group_drained(&self) -> Result<(), MemoryError> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let mut straggler = None;
+        while std::time::Instant::now() < deadline {
+            straggler = Self::rows()?
+                .into_iter()
+                .find(|r| {
+                    r.active()
+                        && r.pgid == self.root_pid
+                        && !self.known.iter().any(|(k, _)| k.pid == r.pid)
+                })
+                .map(|r| r.pid);
+            if straggler.is_none() {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        Err(MemoryError::Validation(format!(
+            "untracked process {} remained in Codex process group {} after cleanup; \
+             completion is unproven",
+            straggler.unwrap_or_default(),
+            self.root_pid
+        )))
     }
     pub(crate) fn observed_root(&self) -> bool {
         self.observed_root

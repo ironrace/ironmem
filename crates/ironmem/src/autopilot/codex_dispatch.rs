@@ -25,8 +25,9 @@ const POLL_INTERVAL: Duration = Duration::from_millis(25);
 /// tens of milliseconds of CPU on a busy machine, so scanning on every exit
 /// poll kept a core busy for a whole dispatch. Exit and artifact limits stay
 /// on [`POLL_INTERVAL`]; descendants enrol at this pace, and cleanup rescans
-/// the frozen tree until it is stable, so the slower scan only widens the
-/// between-scan window the module doc already leaves to double-fork escapes.
+/// the frozen tree until it is stable. A tool the root starts after the last
+/// scan and leaves running at exit is reparented before any scan can enrol
+/// it, so completion also requires the root's process group to drain.
 const OBSERVE_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -490,6 +491,7 @@ fn finish_codex_dispatch(
     // Even a successful root can leave a gate in a separate process group.
     // Unknown cleanup returns Err so run.rs retains the invocation and slot.
     tracker.cleanup(true)?;
+    tracker.verify_group_drained()?;
     let record = exit_record(
         a,
         spec,
@@ -1421,6 +1423,46 @@ exit {code}"#
                 .trim(),
             dir.path().canonicalize().unwrap().to_str().unwrap()
         );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn a_tool_started_after_the_last_scan_and_left_running_withholds_completion() {
+        let (dir, s) = setup();
+        let a = s.codex_artifacts.as_ref().unwrap();
+        let bin = binary(
+            dir.path(),
+            &script(
+                "while [ ! -f root-release ]; do sleep 0.01; done\n\
+                 sh -c 'echo $$ > straggler.pid; exec sleep 5' &\n\
+                 while [ ! -f straggler.pid ]; do sleep 0.01; done",
+                0,
+            ),
+        );
+        let started = Instant::now();
+        let mut child = spawn_fixture_invocation(&bin, dir.path(), &s);
+        let mut tracker = super::super::codex_process::ProcessTracker::new(child.id());
+        // The supervisor's last scan sees only the root...
+        tracker.observe().unwrap();
+        std::fs::write(dir.path().join("root-release"), "release").unwrap();
+        // ...which then starts a tool and exits before the next one.
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            assert!(started.elapsed() < Duration::from_secs(3), "root hung");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        let result = finish_codex_dispatch(&mut tracker, a, &s, status, started, false, None);
+        if let Some(pid) = std::fs::read_to_string(dir.path().join("straggler.pid"))
+            .ok()
+            .and_then(|pid| pid.trim().parse::<i32>().ok())
+        {
+            // SAFETY: the fixture's own sleep, still alive and in its group.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("process group"), "{err}");
+        assert!(!has_valid_exit_record(a));
     }
     #[cfg(unix)]
     #[test]

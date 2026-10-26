@@ -1627,7 +1627,7 @@ pub fn run_issue(
         // An unknown meter (including a dispatch killed on its wall-clock
         // bound) belongs in the unpriced counter. No cost measurement
         // exists to bank; the day's dollar total remains a floor.
-        if !config.implementer.reports_cost() {
+        if config.implementer.recovers_invocations() {
             // Reserved before launch; recovery and completion never bill it again.
             outcome.cost_usd = None;
         } else if outcome.cost_usd.is_none() {

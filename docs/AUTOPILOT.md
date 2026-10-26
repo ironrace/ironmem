@@ -171,7 +171,8 @@ no child existed, so the supervisor records that, and the invocation is an
 ordinary infrastructure failure rather than a hold. What stays held is
 completion that really is unproven: a controller killed by Ctrl-C while
 Codex kept running in its own process group, a root that failed before the
-first `ps` sample, or an observation error mid-run. Stop any Lead or `run`
+first `ps` sample, an observation error mid-run, or a tool still running in
+Codex's process group after Codex exited that no sample caught. Stop any Lead or `run`
 working the repo, confirm nothing is still working on the issue, then release
 it with:
 

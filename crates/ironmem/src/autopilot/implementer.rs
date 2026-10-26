@@ -28,7 +28,9 @@ impl Implementer {
 
     /// Each invocation leaves durable artifacts that restart recovery must
     /// adopt or hold, and a dispatch error does not prove its process dead.
-    /// Claude's sessions are found through its registry instead.
+    /// Its unknown spend is reserved before launch against that invocation's
+    /// ID, so its outcome's cost is never banked after. Claude's sessions are
+    /// found through its registry instead, and Claude reports its cost.
     pub fn recovers_invocations(self) -> bool {
         self == Self::Codex
     }
@@ -38,12 +40,6 @@ impl Implementer {
     /// from the first outcome and checked on every later one.
     pub fn assigns_own_session_id(self) -> bool {
         self == Self::Codex
-    }
-
-    /// The harness reports what a dispatch cost. One that does not has its
-    /// unknown spend reserved before launch instead of banked after.
-    pub fn reports_cost(self) -> bool {
-        self == Self::Claude
     }
 
     /// A returned verdict spends the session's goal loop, so the next

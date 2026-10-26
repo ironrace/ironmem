@@ -72,10 +72,8 @@
 //! unmeasured thing fail toward "unknown", never toward a number) applied to a
 //! set rather than a scalar.
 
-use std::io::Read;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
@@ -146,50 +144,28 @@ impl AgentRegistry for ClaudeAgentRegistry {
         }
         let mut child = super::dispatch::retry_on_etxtbsy(|| command.spawn())
             .map_err(|e| MemoryError::NotFound(format!("failed to start claude agents: {e}")))?;
-        // Drained on their own threads so a full pipe cannot read as a hang,
-        // and collected against the same deadline: a descendant that keeps a
-        // pipe open after the CLI exits must not stall the read either.
-        let (tx, rx) = mpsc::channel();
-        for (stream, pipe) in [
-            (
-                0,
-                child
-                    .stdout
-                    .take()
-                    .map(|p| Box::new(p) as Box<dyn Read + Send>),
-            ),
-            (
-                1,
-                child
-                    .stderr
-                    .take()
-                    .map(|p| Box::new(p) as Box<dyn Read + Send>),
-            ),
-        ] {
-            let tx = tx.clone();
-            std::thread::spawn(move || {
-                let mut buf = Vec::new();
-                if let Some(mut pipe) = pipe {
-                    let _ = pipe.read_to_end(&mut buf);
-                }
-                let _ = tx.send((stream, buf));
-            });
-        }
+        // Drained on their own threads so a full pipe cannot read as a hang.
+        let stdout = super::dispatch::drain(child.stdout.take());
+        let stderr = super::dispatch::drain(child.stderr.take());
         let deadline = Instant::now() + self.timeout;
-        let timed_out = || {
-            MemoryError::Validation(format!(
-                "claude agents did not answer within {}s",
-                self.timeout.as_secs()
-            ))
-        };
+        // Reaped only once both pipes close: until then the unreaped child
+        // reserves its group's ID, so the bound can still kill a descendant
+        // that outlived the CLI holding its output open.
         let status = loop {
-            match child.try_wait() {
+            let waited = if stdout.is_finished() && stderr.is_finished() {
+                child.try_wait()
+            } else {
+                Ok(None)
+            };
+            match waited {
                 Ok(Some(status)) => break status,
                 Ok(None) if Instant::now() >= deadline => {
-                    // The unreaped child still reserves its group's ID.
                     super::dispatch::kill_process_group(&mut child);
                     let _ = child.wait();
-                    return Err(timed_out());
+                    return Err(MemoryError::Validation(format!(
+                        "claude agents did not answer within {}s",
+                        self.timeout.as_secs()
+                    )));
                 }
                 Ok(None) => std::thread::sleep(Duration::from_millis(10)),
                 Err(e) => {
@@ -199,14 +175,8 @@ impl AgentRegistry for ClaudeAgentRegistry {
                 }
             }
         };
-        let mut streams = [Vec::new(), Vec::new()];
-        for _ in 0..2 {
-            let (stream, buf) = rx
-                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                .map_err(|_| timed_out())?;
-            streams[stream] = buf;
-        }
-        let [stdout, stderr] = streams;
+        let stdout = stdout.join().unwrap_or_default();
+        let stderr = stderr.join().unwrap_or_default();
         Ok(RegistryOutput {
             stdout: String::from_utf8_lossy(&stdout).to_string(),
             stderr: String::from_utf8_lossy(&stderr).to_string(),
@@ -604,7 +574,11 @@ mod tests {
             }
         };
         // Hung outright, and exited while a child holds its output open.
-        for (name, script) in [("hung", "sleep 5"), ("leaky", "(sleep 2) &\necho '[]'")] {
+        // Either way the bound reaps what the CLI started.
+        for (name, script) in [
+            ("hung", "(sleep 2; touch \"$0.survived\") &\nsleep 5"),
+            ("leaky", "(sleep 2; touch \"$0.survived\") &\necho '[]'"),
+        ] {
             let started = Instant::now();
             match snapshot(&mut registry(name, script)) {
                 RegistrySnapshot::Unavailable { reason } => {
@@ -612,7 +586,13 @@ mod tests {
                 }
                 other => panic!("{name}: {other:?}"),
             }
-            assert!(started.elapsed() < Duration::from_secs(2), "{name}");
+            // Well inside the descendant's 2s, even on a loaded machine.
+            assert!(started.elapsed() < Duration::from_millis(1500), "{name}");
+            std::thread::sleep(Duration::from_millis(2500).saturating_sub(started.elapsed()));
+            assert!(
+                !dir.path().join(format!("{name}.survived")).exists(),
+                "{name}: the bound left the CLI's descendant running"
+            );
         }
         assert_eq!(
             snapshot(&mut registry("prompt", "echo '[]'")),

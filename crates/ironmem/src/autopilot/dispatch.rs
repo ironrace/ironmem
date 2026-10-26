@@ -421,15 +421,6 @@ pub fn run_dispatch_bounded(
     // it as timed out, forfeiting its work and its unrecorded spend. The
     // unbounded path's `Command::output` drains concurrently for exactly this
     // reason, and the two paths are supposed to differ only in how they wait.
-    fn drain<R: std::io::Read + Send + 'static>(pipe: Option<R>) -> DrainHandle {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            if let Some(mut pipe) = pipe {
-                let _ = pipe.read_to_end(&mut buf);
-            }
-            buf
-        })
-    }
     let stdout_drain = drain(child.stdout.take());
     let stderr_drain = drain(child.stderr.take());
 
@@ -489,7 +480,19 @@ pub fn run_dispatch_bounded(
 }
 
 /// A background reader collecting one of a bounded dispatch's pipes.
-type DrainHandle = std::thread::JoinHandle<Vec<u8>>;
+pub(super) type DrainHandle = std::thread::JoinHandle<Vec<u8>>;
+
+/// Read `pipe` to its end on its own thread, so a full pipe buffer cannot
+/// stall a child that a bounded caller is polling for exit.
+pub(super) fn drain<R: std::io::Read + Send + 'static>(pipe: Option<R>) -> DrainHandle {
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut pipe) = pipe {
+            let _ = pipe.read_to_end(&mut buf);
+        }
+        buf
+    })
+}
 
 /// `ETXTBSY`, which Linux and macOS both number 26.
 const ETXTBSY: i32 = 26;
