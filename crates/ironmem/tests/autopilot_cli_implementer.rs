@@ -186,6 +186,8 @@ else
   printf '42\n' > answer.txt
   printf '%s\n' '{"verdict":"met","reason":"schema-valid completion"}' > "$final"
 fi
+# Outlive the supervisor's first process sample, as a real Codex does.
+/bin/sleep 0.5
 "#,
     );
 

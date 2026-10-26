@@ -1364,6 +1364,12 @@ fn print_lead_report(report: &ironmem::autopilot::lead::LeadReport) {
             row.verdict
         );
     }
+    for issue in &report.released {
+        println!(
+            "  released {}: finished, its leftover dispatch state no longer holds a slot",
+            issue.canonical()
+        );
+    }
     for row in &report.blocked {
         println!("  blocked {}: {:?}", row.issue.canonical(), row.poll);
     }

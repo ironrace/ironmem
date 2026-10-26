@@ -1,7 +1,7 @@
 //! The operator's way out of a hold Autopilot cannot resolve by itself.
 //!
 //! Restart recovery holds a Codex invocation whose completion it cannot
-//! prove — a controller killed by Ctrl-C, a root that failed before the first
+//! prove — a controller killed by Ctrl-C, a root that exited before the first
 //! `ps` sample, an observation error mid-run. That hold is correct: nothing a
 //! controller can read distinguishes "finished" from "still running somewhere
 //! it cannot see". A human can, and this is how they say so.
@@ -18,7 +18,7 @@ use super::dispatch::CodexArtifacts;
 use super::dispatch_state::{self, DispatchState};
 use super::implementer::Implementer;
 use super::registry::{HarnessSnapshots, Liveness, LivenessSnapshot};
-use super::IssueRef;
+use super::{lineage, remediate, AttemptOutcome, IssueRef};
 use crate::db::schema::Database;
 use crate::error::MemoryError;
 
@@ -45,7 +45,7 @@ pub fn clear_dispatch(
     let refuse = |reason: String| {
         MemoryError::Validation(format!("refusing to clear {}: {reason}", issue.canonical()))
     };
-    if let Some(reason) = refusal(&observe(), &state) {
+    if let Some(reason) = refusal(&observe(), &state, attempt_recorded(db, &state)?) {
         return Err(refuse(reason));
     }
     if !dispatch_state::clear_dispatch_state_if_unchanged(db, &state)? {
@@ -63,7 +63,19 @@ pub fn clear_dispatch(
     })
 }
 
-fn refusal(snapshots: &HarnessSnapshots, state: &DispatchState) -> Option<String> {
+/// Whether lineage already holds the attempt the state was dispatching: the
+/// state is written with the count before that attempt, and recording it
+/// raises the count past it.
+fn attempt_recorded(db: &Database, state: &DispatchState) -> Result<bool, MemoryError> {
+    Ok(lineage::get_issue_status(db, &state.issue)?
+        .is_some_and(|status| status.cumulative_attempt_n > state.attempt_n))
+}
+
+fn refusal(
+    snapshots: &HarnessSnapshots,
+    state: &DispatchState,
+    attempt_recorded: bool,
+) -> Option<String> {
     match (state.implementer, snapshots.liveness(state)) {
         (_, Liveness::Alive) => Some(format!(
             "its {:?} implementation is alive",
@@ -71,10 +83,14 @@ fn refusal(snapshots: &HarnessSnapshots, state: &DispatchState) -> Option<String
         )),
         // Idle with pending artifacts is a finished invocation `run_issue` has
         // not recorded yet; clearing would drop its attempt from lineage.
-        (Implementer::Codex, Liveness::NotListed) if state.codex_artifacts.is_some() => {
+        (Implementer::Codex, Liveness::NotListed)
+            if state.codex_artifacts.is_some() && !attempt_recorded =>
+        {
             Some(format!(
-                "a finished Codex invocation is waiting to be recorded; `ironmem autopilot \
-                 run {} {} --implementer codex` records it",
+                "a finished Codex invocation is waiting to be recorded. A Lead records it \
+                 when it next resumes the issue, or run `ironmem autopilot run {} {} \
+                 --implementer codex --model <model> --title <issue title>` from the checkout \
+                 it was dispatched in (add --path and --db if they are not the defaults)",
                 state.issue.repo, state.issue.number
             ))
         }
@@ -88,6 +104,44 @@ fn refusal(snapshots: &HarnessSnapshots, state: &DispatchState) -> Option<String
         // evidence to clear against.
         (Implementer::Claude, Liveness::Unknown) => Some(snapshots.state_reason(state)),
     }
+}
+
+/// Release the dispatch state of every issue the queue will never run again.
+///
+/// The queue counts every dispatch-state drawer as a held slot, but defers an
+/// issue that already succeeded or reached its attempt cap before
+/// `run_issue` — the one place that clears a finished state — could see it.
+/// A controller that crashed between recording the outcome and clearing the
+/// state would hold that slot for ever. A state is released only when its
+/// harness shows nothing running, the issue is finished, and any invocation
+/// it names is already in lineage; the delete is conditional, as
+/// [`clear_dispatch`]'s is.
+pub fn release_settled_dispatches(
+    db: &Database,
+    snapshots: &HarnessSnapshots,
+    attempt_cap: u32,
+) -> Result<Vec<IssueRef>, MemoryError> {
+    let mut released = Vec::new();
+    for state in dispatch_state::all_dispatch_states(db, super::queue::IN_FLIGHT_SCAN_LIMIT)? {
+        if snapshots.liveness(&state) != Liveness::NotListed {
+            continue;
+        }
+        let status = lineage::get_issue_status(db, &state.issue)?;
+        let cumulative_attempt_n = status.as_ref().map_or(0, |s| s.cumulative_attempt_n);
+        let succeeded = status
+            .as_ref()
+            .is_some_and(|s| s.best_verdict == Some(AttemptOutcome::Success));
+        // The queue's own two "never again" deferrals, read the same way.
+        let finished = (succeeded && remediate::active_remediation(db, &state.issue)?.is_none())
+            || remediate::attempts_charged(db, &state.issue, cumulative_attempt_n, succeeded)?
+                >= attempt_cap;
+        let unrecorded = state.codex_artifacts.is_some() && cumulative_attempt_n <= state.attempt_n;
+        if finished && !unrecorded && dispatch_state::clear_dispatch_state_if_unchanged(db, &state)?
+        {
+            released.push(state.issue);
+        }
+    }
+    Ok(released)
 }
 
 #[cfg(test)]
@@ -248,6 +302,87 @@ mod tests {
         assert!(dispatch_state::get_dispatch_state(&db, &issue())
             .unwrap()
             .is_some());
+    }
+
+    fn record_status(db: &Database, best: Option<AttemptOutcome>, cumulative_attempt_n: u32) {
+        lineage::upsert_issue_status(
+            db,
+            &lineage::IssueStatus {
+                issue: issue(),
+                best_verdict: best,
+                best_commit_sha: None,
+                cumulative_attempt_n,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn the_unrecorded_refusal_names_a_runnable_command_and_a_recorded_attempt_clears() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_in_memory().unwrap();
+        let (a, _) = testing::invocation(dir.path());
+        testing::complete(&a);
+        dispatch_state::upsert_dispatch_state(&db, &held_codex_state(a)).unwrap();
+        let err = clear_dispatch(&db, &issue(), || snapshots(Vec::new()))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("--model <model> --title <issue title>"),
+            "{err}"
+        );
+        // The attempt (attempt_n 1) is already in lineage: a crash came
+        // between recording it and clearing the state.
+        record_status(&db, Some(AttemptOutcome::Failed), 2);
+        clear_dispatch(&db, &issue(), || snapshots(Vec::new())).unwrap();
+        assert!(dispatch_state::get_dispatch_state(&db, &issue())
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn only_a_finished_recorded_and_idle_dispatch_gives_its_slot_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_in_memory().unwrap();
+        let (a, live) = testing::invocation(dir.path());
+        testing::complete(&a);
+        dispatch_state::upsert_dispatch_state(&db, &held_codex_state(a)).unwrap();
+        let kept = |rows: Vec<ProcessRow>| {
+            assert!(release_settled_dispatches(&db, &snapshots(rows), 3)
+                .unwrap()
+                .is_empty());
+            assert!(dispatch_state::get_dispatch_state(&db, &issue())
+                .unwrap()
+                .is_some());
+        };
+        // Not finished: the queue will resume it.
+        record_status(&db, Some(AttemptOutcome::Failed), 2);
+        kept(Vec::new());
+        // Succeeded, but the invocation the state names is not in lineage.
+        record_status(&db, Some(AttemptOutcome::Success), 1);
+        kept(Vec::new());
+        // Succeeded and recorded, but its process is still visible.
+        record_status(&db, Some(AttemptOutcome::Success), 2);
+        kept(vec![live]);
+        assert_eq!(
+            release_settled_dispatches(&db, &snapshots(Vec::new()), 3).unwrap(),
+            vec![issue()]
+        );
+        assert!(dispatch_state::get_dispatch_state(&db, &issue())
+            .unwrap()
+            .is_none());
+
+        // A Claude state at its attempt cap, gone from a readable registry.
+        let mut claude = held_codex_state(testing::invocation(dir.path()).0);
+        claude.implementer = Implementer::Claude;
+        claude.codex_artifacts = None;
+        claude.attempt_n = 3;
+        dispatch_state::upsert_dispatch_state(&db, &claude).unwrap();
+        record_status(&db, Some(AttemptOutcome::Failed), 3);
+        assert_eq!(
+            release_settled_dispatches(&db, &snapshots(Vec::new()), 3).unwrap(),
+            vec![issue()]
+        );
     }
 
     #[test]

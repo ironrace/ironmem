@@ -170,7 +170,7 @@ A spawn that fails outright (for example, `codex` missing from `PATH`) proves
 no child existed, so the supervisor records that, and the invocation is an
 ordinary infrastructure failure rather than a hold. What stays held is
 completion that really is unproven: a controller killed by Ctrl-C while
-Codex kept running in its own process group, a root that failed before the
+Codex kept running in its own process group, a root that exited before the
 first `ps` sample, an observation error mid-run, or a tool still running in
 Codex's process group after Codex exited that no sample caught. Stop any Lead or `run`
 working the repo, confirm nothing is still working on the issue, then release
@@ -192,12 +192,20 @@ that process gone, so the PID has been reused. Descendants are recorded only onc
 so after a controller crash the check sees the root, its process group, and
 markers, but not a tool that left the group with `setsid`; that part of the
 confirmation is yours. It also refuses a finished invocation that is only
-waiting to be recorded (`autopilot run` records it), and it deletes nothing if
+waiting to be recorded (a Lead resuming the issue records it, as does
+`autopilot run <repo> <issue> --implementer codex --model <model> --title
+<title>`), unless lineage already holds that attempt, and it deletes nothing if
 the state changes while it checks. It deletes only the dispatch state; lineage,
 attempt counts, and the unpriced reservation stand, the artifacts stay on
 disk for inspection, and the next dispatch starts a fresh Codex thread. A
 Claude state clears only against a readable registry that does not list its
 session.
+
+You rarely need it for finished issues: each Lead tick (except a dry run)
+first releases the leftover state of any issue that already succeeded or
+reached its attempt cap, once nothing of it is running and its last
+invocation is in lineage, so a crash between recording an outcome and
+clearing its state cannot hold a concurrency slot for ever.
 
 Direct native `codex` processes are the verified path. A launcher wrapper is
 adopted conservatively after restart: a marker visible only on a different

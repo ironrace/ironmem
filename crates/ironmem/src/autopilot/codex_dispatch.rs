@@ -485,8 +485,12 @@ fn finish_codex_dispatch(
 ) -> Result<DispatchOutcome, MemoryError> {
     // Catch an artifact that crossed the limit just before process exit.
     let limit_exceeded = limit_exceeded.or_else(|| limits(a));
-    if !status.success() && !tracker.observed_root() {
-        return Err(validation("Codex root exited unsuccessfully before process-tree observation; descendant completion is unproven"));
+    // Success included: a root gone before the first sample could have
+    // started a tool that left its group, and nothing tracked it.
+    if !tracker.observed_root() {
+        return Err(validation(
+            "Codex root exited before process-tree observation; descendant completion is unproven",
+        ));
     }
     // Even a successful root can leave a gate in a separate process group.
     // Unknown cleanup returns Err so run.rs retains the invocation and slot.
@@ -1106,6 +1110,11 @@ mod contract_tests {
         path
     }
     #[cfg(unix)]
+    /// A stub that outlives the supervisor's first process sample, as any
+    /// real Codex does; one that exits first is held as unobserved.
+    fn observable(extra: &str) -> String {
+        format!("sleep 0.5\n{extra}")
+    }
     fn script(extra: &str, code: i32) -> String {
         format!(
             r#"while [ "$#" -gt 0 ]; do
@@ -1205,11 +1214,11 @@ exit {code}"#
         for code in [0, 7] {
             let (dir, s) = setup();
             let extra = if code == 0 {
-                ""
+                observable("")
             } else {
-                "touch root-ready; while [ ! -f root-release ]; do sleep 0.01; done"
+                "touch root-ready; while [ ! -f root-release ]; do sleep 0.01; done".into()
             };
-            let bin = binary(dir.path(), &script(extra, code));
+            let bin = binary(dir.path(), &script(&extra, code));
             let o = if code == 0 {
                 run_codex_bounded(&bin, dir.path(), &s, Duration::from_secs(3)).unwrap()
             } else {
@@ -1337,7 +1346,7 @@ exit {code}"#
             session_uuid: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".into(),
         };
         let o = run_codex_bounded(
-            &binary(dir.path(), &script("", 0)),
+            &binary(dir.path(), &script(&observable(""), 0)),
             dir.path(),
             &s,
             Duration::from_secs(3),
@@ -1408,9 +1417,9 @@ exit {code}"#
             return;
         }
         let (dir, s) = setup();
-        let extra = "git rev-parse --show-toplevel > git-cwd || exit 8";
+        let extra = observable("git rev-parse --show-toplevel > git-cwd || exit 8");
         let o = run_codex_bounded(
-            &binary(dir.path(), &script(extra, 0)),
+            &binary(dir.path(), &script(&extra, 0)),
             dir.path(),
             &s,
             Duration::from_secs(3),

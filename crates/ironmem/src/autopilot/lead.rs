@@ -261,6 +261,10 @@ pub struct TickProblem {
     pub detail: String,
 }
 
+fn serialize_issues<S: serde::Serializer>(issues: &[IssueRef], s: S) -> Result<S::Ok, S::Error> {
+    s.collect_seq(issues.iter().map(IssueRef::canonical))
+}
+
 /// One full pass of the Lead.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct LeadReport {
@@ -269,6 +273,10 @@ pub struct LeadReport {
     /// Individual invocation identity uncertainty may still require a hold.
     pub registry_available: bool,
     pub reconciliation: Vec<supervise::Reconciliation>,
+    /// Finished issues whose leftover dispatch state this tick removed, so
+    /// they no longer hold a concurrency slot. Empty on a dry run.
+    #[serde(serialize_with = "serialize_issues")]
+    pub released: Vec<IssueRef>,
     pub blocked: Vec<BlockedOutcome>,
     pub supervision: Vec<SupervisionReport>,
     pub plan: QueuePlan,
@@ -325,6 +333,25 @@ pub fn lead_tick(
     let snapshot = agent_registry.snapshot();
     let reconciliation = supervise::reconcile(db, &snapshot)?;
 
+    // ── 1b. give back the slots of issues that will never run again ──────
+    //
+    // Before the queue counts slots: it defers a finished issue before
+    // `run_issue` could clear a state a crash left behind.
+    let released = if config.dry_run {
+        Vec::new()
+    } else {
+        match super::clear::release_settled_dispatches(db, &snapshot, config.queue.attempt_cap) {
+            Ok(released) => released,
+            Err(e) => {
+                problems.push(TickProblem {
+                    what: "release settled dispatch states".into(),
+                    detail: e.to_string(),
+                });
+                Vec::new()
+            }
+        }
+    };
+
     // ── 2. answered questions, before the backlog is read ───────────────
     let blocked = poll_blocked_issues(db, gh_runner, config, &mut problems);
 
@@ -380,6 +407,7 @@ pub fn lead_tick(
         dry_run: config.dry_run,
         registry_available: snapshot.is_available(config.run.implementer),
         reconciliation,
+        released,
         blocked,
         supervision,
         plan,

@@ -2133,6 +2133,7 @@ done
 printf '%s\n' '{"type":"thread.started","thread_id":"11111111-2222-3333-4444-555555555555"}'
 printf '%s\n' '{"type":"turn.completed","usage":{}}'
 printf '%s\n' '{"verdict":"met","reason":"gate"}' > "$final"
+sleep 0.5
 "#,
         )
         .unwrap();
