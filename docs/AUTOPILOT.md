@@ -127,6 +127,11 @@ Codex session identity comes only from the native JSONL
 also records its implementation harness; Claude state cannot be resumed as
 Codex, or vice versa.
 
+Public `run` and `lead` revalidate that persisted owner and Codex liveness
+before provisioning or quarantining an issue worktree. Live or uncertain
+process evidence therefore holds without moving, detaching, or replacing the
+active checkout.
+
 Before spawn, Autopilot creates private schema, journal, final-message,
 stderr, exit, and process-identity artifacts under the repository's absolute
 common Git directory. That location survives worktree quarantine and lets a

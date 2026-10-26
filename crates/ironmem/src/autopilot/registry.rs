@@ -373,17 +373,33 @@ fn idle_codex_pause(snapshot: &CodexProcessSnapshot, state: &DispatchState) -> R
     Ok(())
 }
 
+pub(crate) fn codex_state_liveness(
+    snapshot: &CodexProcessSnapshot,
+    state: &DispatchState,
+) -> Liveness {
+    match state.codex_artifacts.as_ref() {
+        Some(artifacts) => snapshot.liveness(Some(artifacts)),
+        None => match idle_codex_pause(snapshot, state) {
+            Ok(()) => Liveness::NotListed,
+            Err(_) => Liveness::Unknown,
+        },
+    }
+}
+
+pub(crate) fn codex_state_reason(snapshot: &CodexProcessSnapshot, state: &DispatchState) -> String {
+    match state.codex_artifacts.as_ref() {
+        Some(artifacts) => snapshot.invocation_reason(Some(artifacts)),
+        None => idle_codex_pause(snapshot, state)
+            .err()
+            .unwrap_or_else(|| "Codex has no pending invocation in a durable paused state".into()),
+    }
+}
+
 impl LivenessSnapshot for HarnessSnapshots {
     fn liveness(&self, state: &DispatchState) -> Liveness {
         match state.implementer {
             Implementer::Claude => self.claude.liveness(&state.ic_session_name),
-            Implementer::Codex => match state.codex_artifacts.as_ref() {
-                Some(artifacts) => self.codex.liveness(Some(artifacts)),
-                None => match idle_codex_pause(&self.codex, state) {
-                    Ok(()) => Liveness::NotListed,
-                    Err(_) => Liveness::Unknown,
-                },
-            },
+            Implementer::Codex => codex_state_liveness(&self.codex, state),
         }
     }
     fn reason(&self, implementer: Implementer) -> String {
@@ -395,14 +411,7 @@ impl LivenessSnapshot for HarnessSnapshots {
     fn state_reason(&self, state: &DispatchState) -> String {
         match state.implementer {
             Implementer::Claude => self.reason(state.implementer),
-            Implementer::Codex => match state.codex_artifacts.as_ref() {
-                Some(artifacts) => self.codex.invocation_reason(Some(artifacts)),
-                None => idle_codex_pause(&self.codex, state)
-                    .err()
-                    .unwrap_or_else(|| {
-                        "Codex has no pending invocation in a durable paused state".into()
-                    }),
-            },
+            Implementer::Codex => codex_state_reason(&self.codex, state),
         }
     }
     fn claude_names(&self) -> Vec<&str> {

@@ -622,18 +622,16 @@ impl Dispatcher for CodexDispatcher {
         _repo: &Path,
         state: &DispatchState,
     ) -> Result<CodexRecovery, MemoryError> {
-        let Some(artifacts) = state.codex_artifacts.as_ref() else {
-            return Ok(CodexRecovery::NoPriorInvocation);
-        };
         let snapshot =
             super::codex_process::snapshot(&mut super::codex_process::UnixCodexProcesses);
-        match snapshot.liveness(Some(artifacts)) {
+        match super::registry::codex_state_liveness(&snapshot, state) {
             super::registry::Liveness::Alive => Ok(CodexRecovery::Alive),
-            super::registry::Liveness::NotListed => {
-                codex_dispatch::recover_artifacts(Some(artifacts))
-            }
+            super::registry::Liveness::NotListed => match state.codex_artifacts.as_ref() {
+                Some(artifacts) => codex_dispatch::recover_artifacts(Some(artifacts)),
+                None => Ok(CodexRecovery::NoPriorInvocation),
+            },
             super::registry::Liveness::Unknown => Ok(CodexRecovery::Unknown {
-                reason: snapshot.invocation_reason(Some(artifacts)),
+                reason: super::registry::codex_state_reason(&snapshot, state),
             }),
         }
     }
@@ -934,6 +932,72 @@ pub fn approved_gate_commands(db: &Database, repo: &str) -> Result<Vec<String>, 
     Ok(gate.gate_commands().to_vec())
 }
 
+/// Validate ownership of any persisted dispatch before a caller provisions
+/// or replaces the issue worktree. Returning the state lets callers perform
+/// harness-specific liveness checks without a second database read.
+pub fn validate_dispatch_owner(
+    db: &Database,
+    issue: &IssueRef,
+    implementer: Implementer,
+) -> Result<Option<DispatchState>, MemoryError> {
+    let state = dispatch_state::get_dispatch_state(db, issue)?;
+    if let Some(state) = &state {
+        if state.implementer != implementer {
+            return Err(MemoryError::Validation(format!(
+                "implementation harness mismatch: persisted {:?}, configured {:?}; resume with \
+                 the persisted harness or explicitly clear its state",
+                state.implementer, implementer
+            )));
+        }
+    }
+    Ok(state)
+}
+
+/// Refuse unsafe worktree provisioning for a persisted Codex dispatch.
+///
+/// A dirty worktree may belong to a still-running process. Quarantining it
+/// before checking the persisted invocation would move that process's cwd and
+/// detach its branch. Completed or explicitly idle pauses may proceed; live or
+/// uncertain evidence holds without touching the checkout.
+pub fn preflight_worktree_provisioning(
+    db: &Database,
+    issue: &IssueRef,
+    implementer: Implementer,
+    dispatcher: &mut dyn Dispatcher,
+) -> Result<(), MemoryError> {
+    if dispatcher.implementer() != implementer {
+        return Err(MemoryError::Validation(format!(
+            "implementation harness mismatch: configured {:?}, dispatcher {:?}; select the \
+             matching dispatcher",
+            implementer,
+            dispatcher.implementer()
+        )));
+    }
+    let Some(state) = validate_dispatch_owner(db, issue, implementer)? else {
+        return Ok(());
+    };
+    if implementer != Implementer::Codex {
+        return Ok(());
+    }
+    match dispatcher.recover(Path::new(&state.worktree_path), &state)? {
+        CodexRecovery::Alive => Err(MemoryError::Validation(format!(
+            "cannot provision {} while its Codex implementation is still alive",
+            issue.canonical()
+        ))),
+        CodexRecovery::Unknown { reason } => Err(MemoryError::Validation(format!(
+            "cannot provision {} while Codex process completion is uncertain: {reason}",
+            issue.canonical()
+        ))),
+        CodexRecovery::Finished(_) => Ok(()),
+        CodexRecovery::NoPriorInvocation if state.codex_artifacts.is_none() => Ok(()),
+        CodexRecovery::NoPriorInvocation => Err(MemoryError::Validation(
+            "Codex recovery returned no invocation for persisted artifacts; process completion \
+             is unproven"
+                .into(),
+        )),
+    }
+}
+
 /// Drive one issue to a terminal state.
 ///
 /// Refuses outright, before writing anything, if the repo has no approved
@@ -952,12 +1016,7 @@ pub fn run_issue(
     if config.implementer != dispatcher.implementer() {
         return Err(MemoryError::Validation(format!("implementation harness mismatch: configured {:?}, dispatcher {:?}; select the matching dispatcher", config.implementer, dispatcher.implementer())));
     }
-    let existing_state = dispatch_state::get_dispatch_state(db, issue)?;
-    if let Some(state) = &existing_state {
-        if state.implementer != config.implementer {
-            return Err(MemoryError::Validation(format!("implementation harness mismatch: persisted {:?}, configured {:?}; resume with the persisted harness or explicitly clear its state", state.implementer, config.implementer)));
-        }
-    }
+    let existing_state = validate_dispatch_owner(db, issue, config.implementer)?;
     let gate_commands = approved_gate_commands(db, &issue.repo)?;
     // Report the effective bound, including Codex's mandatory finite fallback.
     // Claude retains the repo's optional bound.
@@ -1025,10 +1084,7 @@ pub fn run_issue(
         .and_then(|s| s.codex_artifacts.clone());
     let mut recovered_outcome = None;
     if config.implementer == Implementer::Codex {
-        if let Some(state) = existing_state
-            .as_ref()
-            .filter(|s| s.codex_artifacts.is_some())
-        {
+        if let Some(state) = existing_state.as_ref() {
             match dispatcher.recover(&worktree.path, state)? {
                 recovery @ (CodexRecovery::Alive | CodexRecovery::Unknown { .. }) => {
                     let detail = match recovery {
@@ -1095,8 +1151,13 @@ pub fn run_issue(
                         recovered_outcome = Some(outcome);
                     }
                 }
+                CodexRecovery::NoPriorInvocation if state.codex_artifacts.is_none() => {}
                 CodexRecovery::NoPriorInvocation => {
-                    return Err(MemoryError::Validation("Codex recovery returned no invocation for persisted artifacts; process completion is unproven".into()));
+                    return Err(MemoryError::Validation(
+                        "Codex recovery returned no invocation for persisted artifacts; process \
+                     completion is unproven"
+                            .into(),
+                    ))
                 }
             }
         }
@@ -4197,9 +4258,7 @@ satisfies it on its own"
             cfg.daily_budget_usd = 4.0;
             cfg.max_unpriced_dispatches_per_day = 2;
             let mut resumed = codex_script(vec![met()]);
-            resumed.recovery = Some(CodexRecovery::Unknown {
-                reason: "completed invocation must not be recovered again".into(),
-            });
+            resumed.recovery = Some(CodexRecovery::NoPriorInvocation);
             let result = run_issue(&db, &issue(), &brief(), &wt, &cfg, &mut resumed).unwrap();
             assert!(matches!(result.terminal, TerminalReason::Met { .. }));
             assert_eq!(result.unpriced_dispatches, 1);

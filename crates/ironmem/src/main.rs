@@ -2106,6 +2106,12 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                         Box::new(ironmem::autopilot::run::CodexDispatcher::resolve()?)
                     }
                 };
+                ironmem::autopilot::run::preflight_worktree_provisioning(
+                    &database,
+                    &issue_ref,
+                    implementer,
+                    dispatcher.as_mut(),
+                )?;
 
                 let worktree_root = match worktree_root {
                     Some(dir) => std::path::PathBuf::from(dir),

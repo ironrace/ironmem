@@ -7,9 +7,15 @@
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Child, Command, Output};
 
+use ironmem::autopilot::budget;
+use ironmem::autopilot::codex_dispatch;
+use ironmem::autopilot::dispatch_state;
 use ironmem::autopilot::gate_config;
+use ironmem::autopilot::implementer::Implementer;
+use ironmem::autopilot::worktree;
+use ironmem::autopilot::{DispatchState, IssueRef};
 use ironmem::db::schema::Database;
 
 const REPO: &str = "owner/repo";
@@ -68,6 +74,15 @@ fn isolated_path(stubs: &Path) -> PathBuf {
             .map(PathBuf::from),
     );
     std::env::join_paths(paths).unwrap().into()
+}
+
+struct KillOnDrop(Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
 }
 
 #[test]
@@ -646,4 +661,339 @@ printf '%s\n' '{"verdict":"not_met","reason":"not done"}' > "$final"
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("known spend $0.0000"), "{stdout}");
     assert!(stdout.contains("1 unpriced dispatch"), "{stdout}");
+}
+
+#[test]
+fn public_run_checks_pending_codex_liveness_before_touching_a_dirty_worktree() {
+    use std::os::unix::process::CommandExt;
+
+    let root = tempfile::tempdir().unwrap();
+    let checkout = root.path().join("checkout");
+    let worktrees = root.path().join("worktrees");
+    let stubs = root.path().join("stubs");
+    let db_path = root.path().join("memory.sqlite3");
+    let calls = root.path().join("codex.calls");
+    make_repo(&checkout);
+    std::fs::create_dir_all(&stubs).unwrap();
+    approve(&db_path);
+    executable(
+        &stubs.join("codex"),
+        r#"#!/bin/sh
+if [ "$CODEX_EXISTING" = 1 ]; then
+  exec /bin/sleep 30
+fi
+printf '%s\n' "$*" >> "$CODEX_CALLS"
+exit 97
+"#,
+    );
+
+    let issue = IssueRef::new(REPO, 50);
+    let tree = worktree::ensure_worktree(&checkout, &worktrees, &issue, "HEAD").unwrap();
+    let dirty = tree.path.join("unfinished.txt");
+    std::fs::write(&dirty, "active process work\n").unwrap();
+    let registration_before = std::fs::read_to_string(tree.path.join(".git")).unwrap();
+    let branch_before = git(&tree.path, &["rev-parse", "--abbrev-ref", "HEAD"]).stdout;
+    let artifacts = codex_dispatch::prepare_artifacts(&tree.path, &issue).unwrap();
+
+    let child = Command::new(stubs.join("codex"))
+        .args([
+            "exec",
+            "--json",
+            "--output-schema",
+            &artifacts.schema_path,
+            "prompt",
+        ])
+        .env("CODEX_EXISTING", "1")
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let root_pid = child.id();
+    let _child = KillOnDrop(child);
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let identity = serde_json::json!({
+        "version": 1,
+        "root_pid": root_pid,
+        "root_pgid": root_pid,
+        "schema_path": artifacts.schema_path.clone(),
+        "invocation_id": artifacts.invocation_id.clone(),
+        "descendants": [],
+    });
+    std::fs::write(
+        Path::new(&artifacts.schema_path).with_file_name("process.json"),
+        serde_json::to_vec(&identity).unwrap(),
+    )
+    .unwrap();
+
+    let state = DispatchState {
+        implementer: Implementer::Codex,
+        native_session_id: None,
+        codex_artifacts: Some(artifacts.clone()),
+        issue: issue.clone(),
+        worktree_path: tree.path.display().to_string(),
+        ic_session_name: "ic-owner-repo-50".into(),
+        dispatch_class: "unclassified".into(),
+        attempt_n: 0,
+        state: "dispatching".into(),
+        started_at: "2026-10-23T00:00:00Z".into(),
+        session_uuid: "controller-only".into(),
+        turn_n: 0,
+        session_claimed: false,
+    };
+    let db = Database::open(&db_path).unwrap();
+    dispatch_state::upsert_dispatch_state(&db, &state).unwrap();
+    let ledger_before =
+        budget::reserve_unpriced_dispatch(&db, "2026-10-23", &artifacts.invocation_id).unwrap();
+
+    let output = Command::new(bin())
+        .args([
+            "autopilot",
+            "run",
+            REPO,
+            "50",
+            "--title",
+            "resume safely",
+            "--implementer",
+            "codex",
+            "--model",
+            "gpt-test",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--path",
+            checkout.to_str().unwrap(),
+            "--worktree-root",
+            worktrees.to_str().unwrap(),
+            "--json",
+        ])
+        .env("PATH", isolated_path(&stubs))
+        .env("CODEX_CALLS", &calls)
+        .output()
+        .unwrap();
+
+    assert!(
+        dirty.is_file(),
+        "preflight must leave the active checkout's dirty work in place; stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(tree.path.join(".git")).unwrap(),
+        registration_before,
+        "the registered worktree identity must not be replaced"
+    );
+    assert_eq!(
+        git(&tree.path, &["rev-parse", "--abbrev-ref", "HEAD"]).stdout,
+        branch_before,
+        "the active branch must not be detached or replaced"
+    );
+    assert_eq!(
+        dispatch_state::get_dispatch_state(&db, &issue).unwrap(),
+        Some(state)
+    );
+    assert_eq!(
+        budget::get_daily_spend(&db, "2026-10-23").unwrap(),
+        Some(ledger_before)
+    );
+    assert!(
+        !calls.exists(),
+        "preflight must not launch another Codex process"
+    );
+    assert!(
+        !output.status.success(),
+        "an uncertain live invocation must refuse before provisioning: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("cannot provision"), "got: {stderr}");
+}
+
+#[test]
+fn public_run_rejects_wrong_persisted_harness_before_worktree_mutation() {
+    let root = tempfile::tempdir().unwrap();
+    let checkout = root.path().join("checkout");
+    let worktrees = root.path().join("worktrees");
+    let stubs = root.path().join("stubs");
+    let db_path = root.path().join("memory.sqlite3");
+    let calls = root.path().join("claude.calls");
+    make_repo(&checkout);
+    std::fs::create_dir_all(&stubs).unwrap();
+    approve(&db_path);
+    executable(
+        &stubs.join("claude"),
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$CLAUDE_CALLS\"\nexit 97\n",
+    );
+
+    let issue = IssueRef::new(REPO, 51);
+    let tree = worktree::ensure_worktree(&checkout, &worktrees, &issue, "HEAD").unwrap();
+    let dirty = tree.path.join("unfinished.txt");
+    std::fs::write(&dirty, "persist me\n").unwrap();
+    let registration_before = std::fs::read_to_string(tree.path.join(".git")).unwrap();
+    let branch_before = git(&tree.path, &["rev-parse", "--abbrev-ref", "HEAD"]).stdout;
+    let state = DispatchState {
+        implementer: Implementer::Codex,
+        native_session_id: Some("11111111-2222-3333-4444-555555555555".into()),
+        codex_artifacts: None,
+        issue: issue.clone(),
+        worktree_path: tree.path.display().to_string(),
+        ic_session_name: "ic-owner-repo-51".into(),
+        dispatch_class: "unclassified".into(),
+        attempt_n: 0,
+        state: "paused-daily-budget".into(),
+        started_at: "2026-10-23T00:00:00Z".into(),
+        session_uuid: "controller-only".into(),
+        turn_n: 1,
+        session_claimed: true,
+    };
+    let db = Database::open(&db_path).unwrap();
+    dispatch_state::upsert_dispatch_state(&db, &state).unwrap();
+
+    let output = Command::new(bin())
+        .args([
+            "autopilot",
+            "run",
+            REPO,
+            "51",
+            "--title",
+            "wrong harness",
+            "--implementer",
+            "claude",
+            "--model",
+            "claude-test",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--path",
+            checkout.to_str().unwrap(),
+            "--worktree-root",
+            worktrees.to_str().unwrap(),
+        ])
+        .env("PATH", isolated_path(&stubs))
+        .env("CLAUDE_CALLS", &calls)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("harness mismatch"), "got: {stderr}");
+    assert!(dirty.is_file());
+    assert_eq!(
+        std::fs::read_to_string(tree.path.join(".git")).unwrap(),
+        registration_before
+    );
+    assert_eq!(
+        git(&tree.path, &["rev-parse", "--abbrev-ref", "HEAD"]).stdout,
+        branch_before
+    );
+    assert_eq!(
+        dispatch_state::get_dispatch_state(&db, &issue).unwrap(),
+        Some(state)
+    );
+    assert!(!calls.exists(), "wrong-harness preflight must not dispatch");
+}
+
+#[test]
+fn public_lead_rechecks_selected_dispatch_owner_before_worktree_mutation() {
+    let root = tempfile::tempdir().unwrap();
+    let checkout = root.path().join("checkout");
+    let worktrees = root.path().join("worktrees");
+    let stubs = root.path().join("stubs");
+    let db_path = root.path().join("memory.sqlite3");
+    let calls = root.path().join("claude.calls");
+    make_repo(&checkout);
+    std::fs::create_dir_all(&stubs).unwrap();
+    approve(&db_path);
+    executable(
+        &stubs.join("gh"),
+        r#"#!/bin/sh
+case "$*" in
+  *"--label agent:ready"*)
+    printf '%s\n' '[{"number":52,"title":"wrong owner","body":"body","labels":[{"name":"agent:ready"}],"updatedAt":"2026-10-23T00:00:00Z"}]'
+    ;;
+  *) printf '%s\n' '[]' ;;
+esac
+exit 0
+"#,
+    );
+    executable(
+        &stubs.join("claude"),
+        r#"#!/bin/sh
+if [ "$1" = agents ]; then
+  printf '%s\n' '[]'
+  exit 0
+fi
+printf '%s\n' "$*" >> "$CLAUDE_CALLS"
+exit 97
+"#,
+    );
+
+    let issue = IssueRef::new(REPO, 52);
+    let tree = worktree::ensure_worktree(&checkout, &worktrees, &issue, "HEAD").unwrap();
+    let dirty = tree.path.join("unfinished.txt");
+    std::fs::write(&dirty, "persist me\n").unwrap();
+    let registration_before = std::fs::read_to_string(tree.path.join(".git")).unwrap();
+    let state = DispatchState {
+        implementer: Implementer::Codex,
+        native_session_id: Some("11111111-2222-3333-4444-555555555555".into()),
+        codex_artifacts: None,
+        issue: issue.clone(),
+        worktree_path: tree.path.display().to_string(),
+        ic_session_name: "ic-owner-repo-52".into(),
+        dispatch_class: "unclassified".into(),
+        attempt_n: 0,
+        state: "paused-daily-budget".into(),
+        started_at: "2026-10-23T00:00:00Z".into(),
+        session_uuid: "controller-only".into(),
+        turn_n: 1,
+        session_claimed: true,
+    };
+    let db = Database::open(&db_path).unwrap();
+    dispatch_state::upsert_dispatch_state(&db, &state).unwrap();
+
+    let repo_arg = format!("{REPO}={}", checkout.display());
+    let output = Command::new(bin())
+        .args([
+            "autopilot",
+            "lead",
+            "--repo",
+            &repo_arg,
+            "--implementer",
+            "claude",
+            "--model",
+            "claude-test",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--worktree-root",
+            worktrees.to_str().unwrap(),
+            "--json",
+        ])
+        .env("PATH", isolated_path(&stubs))
+        .env("CLAUDE_CALLS", &calls)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "Lead reports per-issue refusal without aborting the tick: {:?}",
+        output
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(report["runs"].as_array().unwrap().is_empty(), "{report}");
+    assert!(
+        report["problems"][0]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("harness mismatch"),
+        "{report}"
+    );
+    assert!(dirty.is_file());
+    assert_eq!(
+        std::fs::read_to_string(tree.path.join(".git")).unwrap(),
+        registration_before
+    );
+    assert_eq!(
+        dispatch_state::get_dispatch_state(&db, &issue).unwrap(),
+        Some(state)
+    );
+    assert!(
+        !calls.exists(),
+        "Lead owner refusal must not dispatch Claude"
+    );
 }
