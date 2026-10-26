@@ -78,8 +78,11 @@
 use serde::Serialize;
 
 use super::gh::IssueListing;
+use super::implementer::Implementer;
 use super::labels::{self, DispatchEligibility};
-use super::registry::{Liveness, RegistrySnapshot};
+#[cfg(test)]
+use super::registry::RegistrySnapshot;
+use super::registry::{Liveness, LivenessSnapshot};
 use super::{
     budget, dispatch_state, gate_config, lineage, merge::serialize_issue, remediate, supervise,
     today_utc, validate_repo, AttemptOutcome, IssueRef,
@@ -202,6 +205,11 @@ pub struct QueueConfig {
     /// rather than dispatched and immediately terminated.
     pub attempt_cap: u32,
     pub max_issues_per_repo: u32,
+    /// The harness the dispatching runner will use. A state persisted by the
+    /// other harness is deferred rather than admitted as a resume, because the
+    /// runner refuses it — and a refused resume sorted to the top would take
+    /// the tick's dispatch every tick. `None` is an unscoped preview.
+    pub implementer: Option<Implementer>,
 }
 
 impl Default for QueueConfig {
@@ -212,6 +220,7 @@ impl Default for QueueConfig {
             max_budget_usd: super::run::DEFAULT_MAX_BUDGET_USD,
             attempt_cap: super::run::DEFAULT_ATTEMPT_CAP,
             max_issues_per_repo: DEFAULT_MAX_ISSUES_PER_REPO,
+            implementer: None,
         }
     }
 }
@@ -328,6 +337,18 @@ pub enum DeferReason {
     /// The day's ledger cannot authorize another dispatch. Global: when this
     /// fires, every candidate carries it.
     DailyBudgetExhausted { spent_usd: f64, budget_usd: f64 },
+    /// The last run refused because the rendered goal condition exceeds its
+    /// limit even after reduction. That refusal repeats until a human
+    /// shortens the issue or its gates, so it is not resumed ahead of the
+    /// backlog every tick; `autopilot clear-dispatch` releases it.
+    ConditionTooLong,
+    /// The issue's dispatch state was written by the other harness, which the
+    /// configured runner refuses to resume. Only that harness, or a human
+    /// clearing the state, moves it.
+    HarnessMismatch {
+        persisted: Implementer,
+        configured: Implementer,
+    },
 }
 
 /// One deferred issue and why.
@@ -383,7 +404,7 @@ impl QueuePlan {
 pub fn plan_queue(
     db: &Database,
     backlogs: &[RepoBacklog],
-    snapshot: &RegistrySnapshot,
+    snapshot: &dyn LivenessSnapshot,
     config: &QueueConfig,
 ) -> Result<QueuePlan, MemoryError> {
     config.validate()?;
@@ -504,7 +525,7 @@ pub fn plan_queue(
 
             let state = in_flight.iter().find(|s| s.issue == issue);
             if let Some(state) = state {
-                match snapshot.liveness(&state.ic_session_name) {
+                match snapshot.liveness(state) {
                     Liveness::Alive => {
                         defer(DeferReason::SessionLive {
                             session_name: state.ic_session_name.clone(),
@@ -513,21 +534,24 @@ pub fn plan_queue(
                     }
                     Liveness::Unknown => {
                         defer(DeferReason::RegistryUnreadable {
-                            detail: match snapshot {
-                                RegistrySnapshot::Unavailable { reason } => reason.clone(),
-                                // Unreachable: `Available` never answers
-                                // `Unknown`. Spelled rather than
-                                // `unreachable!` because a panic in the
-                                // Lead's planning pass would take out every
-                                // other repo's work too.
-                                RegistrySnapshot::Available(_) => {
-                                    "registry liveness was indeterminate".to_string()
-                                }
-                            },
+                            detail: snapshot.state_reason(state),
                         });
                         continue;
                     }
                     Liveness::NotListed => {}
+                }
+                if state.state == "paused-condition-too-long" {
+                    defer(DeferReason::ConditionTooLong);
+                    continue;
+                }
+                if let Some(configured) = config.implementer {
+                    if state.implementer != configured {
+                        defer(DeferReason::HarnessMismatch {
+                            persisted: state.implementer,
+                            configured,
+                        });
+                        continue;
+                    }
                 }
             }
 
@@ -710,6 +734,9 @@ mod tests {
         dispatch_state::upsert_dispatch_state(
             db,
             &DispatchState {
+                implementer: crate::autopilot::implementer::Implementer::Claude,
+                native_session_id: None,
+                codex_artifacts: None,
                 issue: issue.clone(),
                 worktree_path: "/tmp/wt".to_string(),
                 ic_session_name: session_name.to_string(),
@@ -1542,5 +1569,117 @@ mod tests {
         assert!(lineage::get_issue_status(&db, &IssueRef::new(REPO, 1))
             .unwrap()
             .is_none());
+    }
+    #[test]
+    fn codex_queue_routes_by_persisted_harness_and_holds_uncertainty() {
+        use crate::autopilot::codex_process::{testing, CodexProcessSnapshot};
+        use crate::autopilot::registry::HarnessSnapshots;
+        let db = approved(&[REPO]);
+        let issue = IssueRef::new(REPO, 1);
+        put_state(&db, &issue, "ic-test");
+        let mut state = dispatch_state::get_dispatch_state(&db, &issue)
+            .unwrap()
+            .unwrap();
+        state.implementer = crate::autopilot::implementer::Implementer::Codex;
+        let dir = tempfile::tempdir().unwrap();
+        let (a, row) = testing::invocation(dir.path());
+        state.codex_artifacts = Some(a.clone());
+        dispatch_state::upsert_dispatch_state(&db, &state).unwrap();
+        let mut snapshots = HarnessSnapshots {
+            claude: RegistrySnapshot::Available(Vec::new()),
+            codex: CodexProcessSnapshot::Available(vec![row]),
+        };
+        let backlogs = [backlog(REPO, vec![ready(1)])];
+        let plan = plan_queue(&db, &backlogs, &snapshots, &config()).unwrap();
+        assert!(matches!(
+            reason_for(&plan, 1),
+            DeferReason::SessionLive { .. }
+        ));
+        snapshots.codex = CodexProcessSnapshot::Available(Vec::new());
+        let plan = plan_queue(&db, &backlogs, &snapshots, &config()).unwrap();
+        assert!(matches!(
+            reason_for(&plan, 1),
+            DeferReason::RegistryUnreadable { .. }
+        ));
+        testing::complete(&a);
+        snapshots.claude = RegistrySnapshot::Available(vec![AgentEntry {
+            name: "ic-test".into(),
+            status: None,
+        }]);
+        let plan = plan_queue(&db, &backlogs, &snapshots, &config()).unwrap();
+        assert_eq!(
+            plan.dispatch.len(),
+            1,
+            "Claude name must not hold a dead Codex invocation"
+        );
+        assert_eq!(plan.dispatch[0].issue, issue);
+    }
+    #[test]
+    fn a_condition_too_long_refusal_is_deferred_not_resumed_ahead_of_the_backlog() {
+        use crate::autopilot::codex_process::CodexProcessSnapshot;
+        use crate::autopilot::implementer::Implementer;
+        use crate::autopilot::registry::HarnessSnapshots;
+        let snapshots = HarnessSnapshots {
+            claude: RegistrySnapshot::Available(Vec::new()),
+            codex: CodexProcessSnapshot::Available(Vec::new()),
+        };
+        for implementer in [Implementer::Claude, Implementer::Codex] {
+            let db = approved(&[REPO]);
+            let issue = IssueRef::new(REPO, 1);
+            put_state(&db, &issue, "ic-test");
+            let mut state = dispatch_state::get_dispatch_state(&db, &issue)
+                .unwrap()
+                .unwrap();
+            state.implementer = implementer;
+            state.state = "paused-condition-too-long".into();
+            dispatch_state::upsert_dispatch_state(&db, &state).unwrap();
+            // Idle, so liveness alone would resume it first — into the same
+            // refusal, taking the tick's dispatch every tick.
+            assert_eq!(snapshots.liveness(&state), Liveness::NotListed);
+            let backlogs = [backlog(REPO, vec![ready(1), ready(2)])];
+            let cfg = QueueConfig {
+                implementer: Some(implementer),
+                ..config()
+            };
+            let plan = plan_queue(&db, &backlogs, &snapshots, &cfg).unwrap();
+            assert_eq!(reason_for(&plan, 1), DeferReason::ConditionTooLong);
+            assert_eq!(plan.dispatch.len(), 1, "{implementer:?}");
+            assert_eq!(plan.dispatch[0].issue, IssueRef::new(REPO, 2));
+        }
+    }
+    #[test]
+    fn a_state_owned_by_the_other_harness_is_deferred_not_dispatched_ahead_of_the_backlog() {
+        use crate::autopilot::implementer::Implementer;
+        let db = approved(&[REPO]);
+        // A Claude Lead left issue 1 paused; its registry no longer lists the
+        // session, so liveness alone would admit it as a resume and sort it
+        // first — into a dispatch the Codex runner must refuse every tick.
+        put_state(&db, &IssueRef::new(REPO, 1), "ic-stale");
+        let backlogs = [backlog(REPO, vec![ready(1), ready(2)])];
+        let snapshot = RegistrySnapshot::Available(Vec::new());
+        let codex = QueueConfig {
+            implementer: Some(Implementer::Codex),
+            ..config()
+        };
+        let plan = plan_queue(&db, &backlogs, &snapshot, &codex).unwrap();
+        assert_eq!(
+            reason_for(&plan, 1),
+            DeferReason::HarnessMismatch {
+                persisted: Implementer::Claude,
+                configured: Implementer::Codex,
+            }
+        );
+        assert_eq!(plan.dispatch.len(), 1);
+        assert_eq!(plan.dispatch[0].issue, IssueRef::new(REPO, 2));
+
+        // The same harness resumes it, and an unscoped preview filters nothing.
+        for scope in [Some(Implementer::Claude), None] {
+            let cfg = QueueConfig {
+                implementer: scope,
+                ..config()
+            };
+            let plan = plan_queue(&db, &backlogs, &snapshot, &cfg).unwrap();
+            assert_eq!(plan.dispatch[0].issue, IssueRef::new(REPO, 1));
+        }
     }
 }

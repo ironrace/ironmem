@@ -387,9 +387,12 @@ enum AutopilotCmd {
         /// Committish new issue branches are cut from
         #[arg(long, default_value = "HEAD")]
         base: String,
+        /// Implementation harness for the IC dispatch
+        #[arg(long, default_value = "claude")]
+        implementer: ironmem::autopilot::Implementer,
         /// Model for the IC dispatch
-        #[arg(long, default_value = "claude-sonnet-5")]
-        model: String,
+        #[arg(long)]
+        model: Option<String>,
         /// Dispatch-time risk class, recorded for the Reviewer to compare against
         #[arg(long = "class", default_value = ironmem::autopilot::lead::UNCLASSIFIED)]
         dispatch_class: String,
@@ -417,7 +420,7 @@ enum AutopilotCmd {
         #[arg(long)]
         json: bool,
     },
-    /// Review an issue's open PR with a fresh-context Codex reviewer (rung 5)
+    /// Review an issue's open PR with a fresh-context Muse or Codex reviewer (rung 5)
     Review {
         /// Path to the database
         #[arg(long)]
@@ -546,6 +549,21 @@ enum AutopilotCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Clear a held issue's dispatch state once no process could be its work
+    /// — the human recovery for a Codex invocation whose completion Autopilot
+    /// cannot prove. Lineage, attempts and spend stand; artifacts are kept.
+    ClearDispatch {
+        /// Repo identity (e.g. "owner/repo")
+        repo: String,
+        /// GitHub issue number
+        issue: u64,
+        /// Path to the database
+        #[arg(long)]
+        db: Option<String>,
+        /// Emit JSON instead of text
+        #[arg(long)]
+        json: bool,
+    },
     /// Give an issue that hit its attempt cap a fresh budget and put it back
     /// in the queue — the human recovery `agent:exhausted` names
     Retry {
@@ -623,9 +641,12 @@ enum AutopilotCmd {
         /// Directory that per-issue worktrees are created under
         #[arg(long)]
         worktree_root: Option<String>,
+        /// Implementation harness for IC dispatches
+        #[arg(long, default_value = "claude")]
+        implementer: ironmem::autopilot::Implementer,
         /// Model for IC dispatches
-        #[arg(long, default_value = "claude-sonnet-5")]
-        model: String,
+        #[arg(long)]
+        model: Option<String>,
         /// Risk class for issues carrying no `risk:*` label.
         ///
         /// Defaults to `unclassified`, which **fails closed**: rung 5's
@@ -961,6 +982,68 @@ fn parse_reviewer(
     })
 }
 
+const DEFAULT_CLAUDE_IMPLEMENTATION_MODEL: &str = "claude-sonnet-5";
+
+/// Resolve the implementation model while keeping CLI-only compatibility
+/// checks ahead of every database, registry, binary, and worktree action.
+fn resolve_implementation_model(
+    implementer: ironmem::autopilot::Implementer,
+    model: Option<String>,
+    explicit_max_turns: bool,
+    explicit_max_budget_usd: bool,
+) -> Result<String, MemoryError> {
+    if implementer == ironmem::autopilot::Implementer::Codex && explicit_max_budget_usd {
+        return Err(MemoryError::Validation(
+            "the Codex implementer does not support --max-budget-usd: the native Codex CLI has no such flag; use the daily unpriced invocation cap and wall-clock timeout"
+                .into(),
+        ));
+    }
+    if implementer == ironmem::autopilot::Implementer::Codex && explicit_max_turns {
+        return Err(MemoryError::Validation(
+            "the Codex implementer does not support --max-turns: the native Codex CLI has no such flag; --n-turns remains prompt guidance"
+                .into(),
+        ));
+    }
+    let model = match model {
+        Some(model) => model,
+        None if implementer == ironmem::autopilot::Implementer::Claude => {
+            DEFAULT_CLAUDE_IMPLEMENTATION_MODEL.to_string()
+        }
+        None => {
+            return Err(MemoryError::Validation(
+                "--model is required for the Codex implementer; pass an explicit Codex model"
+                    .into(),
+            ))
+        }
+    };
+    ironmem::autopilot::run::validate_implementation_model(implementer, &model)?;
+    Ok(model)
+}
+
+/// The dispatcher for the selected implementation harness.
+fn resolve_dispatcher(
+    implementer: ironmem::autopilot::Implementer,
+) -> Result<Box<dyn ironmem::autopilot::run::Dispatcher>, MemoryError> {
+    Ok(match implementer {
+        ironmem::autopilot::Implementer::Claude => {
+            Box::new(ironmem::autopilot::run::ClaudeDispatcher::resolve()?)
+        }
+        ironmem::autopilot::Implementer::Codex => {
+            Box::new(ironmem::autopilot::run::CodexDispatcher::resolve()?)
+        }
+    })
+}
+
+/// " (floor; N unpriced dispatch(es))" after a known-spend figure, or nothing
+/// when every dispatch was priced.
+fn unpriced_floor_note(unpriced_dispatches: u32) -> String {
+    match unpriced_dispatches {
+        0 => String::new(),
+        1 => " (floor; 1 unpriced dispatch)".to_string(),
+        n => format!(" (floor; {n} unpriced dispatches)"),
+    }
+}
+
 /// The reviewer a dry run is handed.
 ///
 /// Never called: `advance_pass` returns before reviewing when `dry_run` is
@@ -978,6 +1061,23 @@ impl ironmem::autopilot::review::ReviewRunner for DryRunReviewer {
     ) -> Result<ironmem::autopilot::review::ReviewOutcome, MemoryError> {
         Err(MemoryError::NotFound(
             "a dry run does not review: this runner should never be called".into(),
+        ))
+    }
+}
+
+/// Advisor used when `autopilot lead` keeps its default `--advisor`-off
+/// policy. Lead checks the policy before every call; reaching this object is
+/// therefore an internal error, never a fabricated answer.
+struct DisabledAdvisor;
+
+impl ironmem::autopilot::advise::Advisor for DisabledAdvisor {
+    fn advise(
+        &mut self,
+        _cwd: &std::path::Path,
+        _spec: &ironmem::autopilot::advise::AdviceSpec,
+    ) -> Result<ironmem::autopilot::advise::AdviceOutput, MemoryError> {
+        Err(MemoryError::Validation(
+            "the disabled advisor was called despite advisor policy being off".into(),
         ))
     }
 }
@@ -1264,6 +1364,12 @@ fn print_lead_report(report: &ironmem::autopilot::lead::LeadReport) {
             row.verdict
         );
     }
+    for issue in &report.released {
+        println!(
+            "  released {}: finished, its leftover dispatch state no longer holds a slot",
+            issue.canonical()
+        );
+    }
     for row in &report.blocked {
         println!("  blocked {}: {:?}", row.issue.canonical(), row.poll);
     }
@@ -1273,10 +1379,11 @@ fn print_lead_report(report: &ironmem::autopilot::lead::LeadReport) {
     print_queue_plan(&report.plan);
     for run in &report.runs {
         println!(
-            "  ran {} — {} dispatch(es), ${:.4}, terminal {:?}",
+            "  ran {} — {} dispatch(es), known spend ${:.4}{}, terminal {:?}",
             run.issue.canonical(),
             run.dispatches.len(),
             run.total_cost_usd,
+            unpriced_floor_note(run.unpriced_dispatches),
             run.terminal,
         );
     }
@@ -1956,6 +2063,7 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                 path,
                 worktree_root,
                 base,
+                implementer,
                 model,
                 dispatch_class,
                 n_turns,
@@ -1968,6 +2076,12 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
             } => {
                 use ironmem::autopilot::run::RunConfig;
 
+                let model = resolve_implementation_model(
+                    implementer,
+                    model,
+                    max_turns.is_some(),
+                    max_budget_usd.is_some(),
+                )?;
                 let issue_ref = ironmem::autopilot::IssueRef::new(repo, issue);
                 let body = match (body, body_file) {
                     (Some(text), _) => text,
@@ -1978,6 +2092,7 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                 };
 
                 let mut config = RunConfig::new(model, dispatch_class);
+                config.implementer = implementer;
                 if let Some(n) = n_turns {
                     config.n_turns = n;
                     // Keep the documented headroom when only N was supplied,
@@ -2011,6 +2126,16 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                 // the checkout already exists on disk.
                 ironmem::autopilot::run::approved_gate_commands(&database, &issue_ref.repo)?;
 
+                // Resolve the selected harness before provisioning a worktree,
+                // but after the useful unapproved-repo diagnostic above.
+                let mut dispatcher = resolve_dispatcher(implementer)?;
+                ironmem::autopilot::run::preflight_worktree_provisioning(
+                    &database,
+                    &issue_ref,
+                    implementer,
+                    dispatcher.as_mut(),
+                )?;
+
                 let worktree_root = match worktree_root {
                     Some(dir) => std::path::PathBuf::from(dir),
                     None => default_worktree_root()?,
@@ -2021,14 +2146,13 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                     &issue_ref,
                     &base,
                 )?;
-                let mut dispatcher = ironmem::autopilot::run::ClaudeDispatcher::resolve()?;
                 let run = ironmem::autopilot::run::run_issue(
                     &database,
                     &issue_ref,
                     &ironmem::autopilot::run::IssueBrief { title, body },
                     &worktree,
                     &config,
-                    &mut dispatcher,
+                    dispatcher.as_mut(),
                 )?;
 
                 if json {
@@ -2042,18 +2166,25 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                     println!("  dispatches: {}", run.dispatches.len());
                     for (i, dispatch) in run.dispatches.iter().enumerate() {
                         println!(
-                            "    {}. {:?} — {} turns, ${:.4}{}",
+                            "    {}. {:?} — {} turns, {}{}",
                             i + 1,
                             dispatch.classification,
                             dispatch.num_turns,
-                            dispatch.total_cost_usd,
+                            dispatch
+                                .total_cost_usd
+                                .map(|cost| format!("${cost:.4}"))
+                                .unwrap_or_else(|| "unpriced".into()),
                             dispatch
                                 .attempt_n
                                 .map(|n| format!(" (attempt {n})"))
                                 .unwrap_or_default()
                         );
                     }
-                    println!("  spend this run: ${:.4}", run.total_cost_usd);
+                    println!(
+                        "  known spend this run: ${:.4}{}",
+                        run.total_cost_usd,
+                        unpriced_floor_note(run.unpriced_dispatches)
+                    );
                     println!("  cumulative attempts: {}", run.cumulative_attempt_n);
                     println!("  terminal: {:?}", run.terminal);
                 }
@@ -2293,6 +2424,38 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                 }
                 Ok(())
             }
+            AutopilotCmd::ClearDispatch {
+                repo,
+                issue,
+                db,
+                json,
+            } => {
+                let database = open_migrated_db(db)?;
+                let issue_ref = ironmem::autopilot::IssueRef::new(&repo, issue);
+                // Both harnesses' evidence, sampled by `clear_dispatch` only
+                // after it has read the state it will judge.
+                let cleared =
+                    ironmem::autopilot::clear::clear_dispatch(&database, &issue_ref, || {
+                        let mut monitor =
+                            ironmem::autopilot::registry::TwoHarnessMonitor::default();
+                        ironmem::autopilot::registry::HarnessMonitor::snapshot(&mut monitor)
+                    })?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&cleared)?);
+                } else {
+                    println!(
+                        "cleared {} ({:?}, was {:?}); lineage, attempts and spend are unchanged, \
+                         and the next dispatch starts a fresh session",
+                        cleared.issue, cleared.implementer, cleared.state
+                    );
+                    if let Some(a) = &cleared.codex_artifacts {
+                        if let Some(dir) = std::path::Path::new(&a.schema_path).parent() {
+                            println!("  invocation evidence kept at {}", dir.display());
+                        }
+                    }
+                }
+                Ok(())
+            }
             AutopilotCmd::Retry {
                 repo,
                 issue,
@@ -2457,8 +2620,9 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                     return Ok(());
                 }
 
-                let mut registry = ironmem::autopilot::registry::ClaudeAgentRegistry::resolve()?;
-                let snapshot = ironmem::autopilot::registry::snapshot(&mut registry);
+                let mut registry = ironmem::autopilot::registry::TwoHarnessMonitor::default();
+                let snapshot =
+                    ironmem::autopilot::registry::HarnessMonitor::snapshot(&mut registry);
                 let report = ironmem::autopilot::supervise::supervise_issue(
                     &database, &issue_ref, &snapshot, &config,
                 )?;
@@ -2529,8 +2693,9 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
             AutopilotCmd::Reconcile { db, json } => {
                 use ironmem::autopilot::supervise::ReconcileVerdict;
                 let database = open_migrated_db(db)?;
-                let mut registry = ironmem::autopilot::registry::ClaudeAgentRegistry::resolve()?;
-                let snapshot = ironmem::autopilot::registry::snapshot(&mut registry);
+                let mut registry = ironmem::autopilot::registry::TwoHarnessMonitor::default();
+                let snapshot =
+                    ironmem::autopilot::registry::HarnessMonitor::snapshot(&mut registry);
                 let rows = ironmem::autopilot::supervise::reconcile(&database, &snapshot)?;
 
                 if json {
@@ -2576,6 +2741,7 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                 repos,
                 base,
                 worktree_root,
+                implementer,
                 model,
                 fallback_class,
                 advisor,
@@ -2597,6 +2763,12 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                 use ironmem::autopilot::queue::QueueConfig;
                 use ironmem::autopilot::run::RunConfig;
 
+                let model = resolve_implementation_model(
+                    implementer,
+                    model,
+                    max_turns.is_some(),
+                    max_budget_usd.is_some(),
+                )?;
                 let worktree_root = match worktree_root {
                     Some(dir) => std::path::PathBuf::from(dir),
                     None => default_worktree_root()?,
@@ -2608,6 +2780,7 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                 }
 
                 let mut run = RunConfig::new(model, fallback_class);
+                run.implementer = implementer;
                 if let Some(n) = n_turns {
                     run.n_turns = n;
                     run.max_turns =
@@ -2686,16 +2859,21 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                         .map(|t| t.path.clone())
                         .unwrap_or_else(|| std::path::PathBuf::from(".")),
                 )?;
-                let mut registry = ironmem::autopilot::registry::ClaudeAgentRegistry::resolve()?;
-                let mut dispatcher = ironmem::autopilot::run::ClaudeDispatcher::resolve()?;
-                let mut advisor = ironmem::autopilot::advise::ClaudeAdvisor::resolve()?;
+                let mut registry = ironmem::autopilot::registry::TwoHarnessMonitor::default();
+                let mut dispatcher = resolve_dispatcher(implementer)?;
+                let mut advisor: Box<dyn ironmem::autopilot::advise::Advisor> =
+                    if config.advice.enabled {
+                        Box::new(ironmem::autopilot::advise::ClaudeAdvisor::resolve()?)
+                    } else {
+                        Box::new(DisabledAdvisor)
+                    };
 
                 let report = ironmem::autopilot::lead::lead_tick(
                     &database,
                     &mut gh_runner,
                     &mut registry,
-                    &mut dispatcher,
-                    &mut advisor,
+                    dispatcher.as_mut(),
+                    advisor.as_mut(),
                     &config,
                 )?;
 
@@ -2842,8 +3020,9 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                 let database = open_migrated_db(db)?;
                 let mut gh_runner =
                     ironmem::autopilot::gh::GhCli::resolve(std::path::PathBuf::from(&path))?;
-                let mut registry = ironmem::autopilot::registry::ClaudeAgentRegistry::resolve()?;
-                let snapshot = ironmem::autopilot::registry::snapshot(&mut registry);
+                let mut registry = ironmem::autopilot::registry::TwoHarnessMonitor::default();
+                let snapshot =
+                    ironmem::autopilot::registry::HarnessMonitor::snapshot(&mut registry);
 
                 let mut backlogs = Vec::new();
                 for repo in &repos {
@@ -3631,6 +3810,117 @@ mod tests {
                 assert_eq!(dispatch_class, "unclassified");
             }
             _ => panic!("expected Commands::Autopilot(Run), got a different variant"),
+        }
+    }
+
+    #[test]
+    fn autopilot_run_defaults_to_claude_with_an_omitted_model() {
+        let cli = Cli::try_parse_from([
+            "ironmem",
+            "autopilot",
+            "run",
+            "owner/repo",
+            "283",
+            "--title",
+            "Make the gate pass",
+        ])
+        .expect("run arguments should parse");
+
+        match cli.command {
+            Commands::Autopilot {
+                cmd:
+                    AutopilotCmd::Run {
+                        implementer, model, ..
+                    },
+            } => {
+                assert_eq!(implementer, ironmem::autopilot::Implementer::Claude);
+                assert_eq!(model, None);
+            }
+            _ => panic!("expected Commands::Autopilot(Run), got a different variant"),
+        }
+    }
+
+    #[test]
+    fn codex_explicit_native_limit_error_precedes_missing_model_error() {
+        let err =
+            resolve_implementation_model(ironmem::autopilot::Implementer::Codex, None, true, false)
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("--max-turns"), "got: {err}");
+        assert!(!err.contains("--model is required"), "got: {err}");
+    }
+
+    #[test]
+    fn autopilot_run_and_lead_parse_codex_implementation_selection() {
+        let run = Cli::try_parse_from([
+            "ironmem",
+            "autopilot",
+            "run",
+            "owner/repo",
+            "283",
+            "--title",
+            "t",
+            "--implementer",
+            "codex",
+            "--model",
+            "gpt-6.1-sol",
+        ])
+        .expect("run Codex selection should parse");
+        match run.command {
+            Commands::Autopilot {
+                cmd:
+                    AutopilotCmd::Run {
+                        implementer, model, ..
+                    },
+            } => {
+                assert_eq!(implementer, ironmem::autopilot::Implementer::Codex);
+                assert_eq!(model.as_deref(), Some("gpt-6.1-sol"));
+            }
+            _ => panic!("expected autopilot run"),
+        }
+
+        let lead = Cli::try_parse_from([
+            "ironmem",
+            "autopilot",
+            "lead",
+            "--repo",
+            "owner/repo=/tmp/repo",
+            "--implementer",
+            "codex",
+            "--model",
+            "gpt-6.1-sol",
+        ])
+        .expect("lead Codex selection should parse");
+        match lead.command {
+            Commands::Autopilot {
+                cmd:
+                    AutopilotCmd::Lead {
+                        implementer, model, ..
+                    },
+            } => {
+                assert_eq!(implementer, ironmem::autopilot::Implementer::Codex);
+                assert_eq!(model.as_deref(), Some("gpt-6.1-sol"));
+            }
+            _ => panic!("expected autopilot lead"),
+        }
+    }
+
+    #[test]
+    fn autopilot_unknown_implementer_names_the_supported_harnesses() {
+        for subcommand in ["run", "lead"] {
+            let mut args = vec!["ironmem", "autopilot", subcommand];
+            if subcommand == "run" {
+                args.extend(["owner/repo", "283", "--title", "t"]);
+            } else {
+                args.extend(["--repo", "owner/repo=/tmp/repo"]);
+            }
+            args.extend(["--implementer", "gemini"]);
+            let err = Cli::try_parse_from(args)
+                .err()
+                .expect("unknown implementer must be rejected")
+                .to_string();
+            assert!(err.contains("claude"), "got: {err}");
+            assert!(err.contains("codex"), "got: {err}");
         }
     }
 

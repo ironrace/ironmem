@@ -19,6 +19,9 @@ use super::{read_current, write_current};
 /// One date's accumulated spend.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BudgetLedgerEntry {
+    /// Durable invocation identities reserved before launching unpriced implementations.
+    #[serde(default)]
+    pub reserved_unpriced_dispatch_ids: Vec<String>,
     /// `YYYY-MM-DD`.
     pub date: String,
     pub total_cost_usd: f64,
@@ -27,8 +30,8 @@ pub struct BudgetLedgerEntry {
     pub dispatch_count: u32,
     /// IC dispatches (fix/remediation runs included) that happened today
     /// but reported **no price**, so their spend is missing from
-    /// `total_cost_usd`. Only a dispatch killed on the wall-clock bound
-    /// lands here: its result JSON — the only meter — died with it.
+    /// `total_cost_usd`. Codex invocations reserve this counter before launch;
+    /// Claude outcomes with no meter (including wall-clock kills) also land here.
     ///
     /// Non-zero (or any other unpriced counter non-zero — see
     /// [`Self::has_unpriced_spend`]) means
@@ -210,6 +213,62 @@ pub fn record_advice_call(
     })
 }
 
+/// Reserve an unpriced invocation before launch. Repeated recovery of the same
+/// identity cannot bill it twice. Like the existing ledger writers, this
+/// read/write assumes one Lead; it is not a distributed concurrency lock.
+pub fn reserve_unpriced_dispatch(
+    db: &Database,
+    date: &str,
+    invocation_id: &str,
+) -> Result<BudgetLedgerEntry, MemoryError> {
+    validate_date(date)?;
+    if invocation_id.trim().is_empty() || invocation_id.trim() != invocation_id {
+        return Err(MemoryError::Validation(
+            "invocation_id must be nonempty without surrounding whitespace".into(),
+        ));
+    }
+    update_ledger(db, date, |entry| {
+        if !entry
+            .reserved_unpriced_dispatch_ids
+            .iter()
+            .any(|id| id == invocation_id)
+        {
+            entry
+                .reserved_unpriced_dispatch_ids
+                .push(invocation_id.to_string());
+            entry.unpriced_dispatch_count += 1;
+        }
+    })
+}
+
+/// Whether this exact invocation was durably reserved. Check every retained
+/// daily ledger: an invocation may cross midnight or remain held for several
+/// days, and the issue's start date is not its per-invocation reservation date.
+/// This is read-only and never infers spend from prepared artifact files alone.
+pub(crate) fn has_unpriced_dispatch_reservation(
+    db: &Database,
+    invocation_id: &str,
+) -> Result<bool, MemoryError> {
+    let prefix = format!(
+        "{}{}",
+        crate::mcp::tools::LOGICAL_KEY_SOURCE_PREFIX,
+        budget_key("")
+    );
+    let drawers =
+        db.get_drawers_by_source_prefix(super::WING, super::ROOM, &prefix, i64::MAX as usize)?;
+    for drawer in drawers {
+        let entry: BudgetLedgerEntry = serde_json::from_str(&drawer.content)?;
+        if entry
+            .reserved_unpriced_dispatch_ids
+            .iter()
+            .any(|id| id == invocation_id)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Read the day's ledger, apply `mutate`, write it back.
 fn update_ledger(
     db: &Database,
@@ -220,6 +279,7 @@ fn update_ledger(
     let mut entry = match read_current(db, &key)? {
         Some(drawer) => serde_json::from_str::<BudgetLedgerEntry>(&drawer.content)?,
         None => BudgetLedgerEntry {
+            reserved_unpriced_dispatch_ids: Vec::new(),
             date: date.to_string(),
             total_cost_usd: 0.0,
             dispatch_count: 0,
@@ -251,6 +311,20 @@ pub fn get_daily_spend(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reservation_is_idempotent_and_preserves_known_dollars() {
+        let db = Database::open_in_memory().unwrap();
+        accumulate_daily_spend(&db, "2026-09-03", 1.25).unwrap();
+        reserve_unpriced_dispatch(&db, "2026-09-03", "invocation-one").unwrap();
+        let entry = reserve_unpriced_dispatch(&db, "2026-09-03", "invocation-one").unwrap();
+        assert_eq!(entry.unpriced_dispatch_count, 1);
+        assert_eq!(entry.reserved_unpriced_dispatch_ids, vec!["invocation-one"]);
+        assert_eq!(entry.total_cost_usd, 1.25);
+        assert_eq!(entry.dispatch_count, 1);
+        assert!(reserve_unpriced_dispatch(&db, "bad", "id").is_err());
+        assert!(reserve_unpriced_dispatch(&db, "2026-09-03", " ").is_err());
+    }
 
     #[test]
     fn accumulates_across_calls_for_the_same_date() {
@@ -403,6 +477,7 @@ mod tests {
         // Mutation guard for `||`: each counter alone must mark the total
         // a floor. An `&&` (or a dropped advice arm) stays red here.
         let mut entry = BudgetLedgerEntry {
+            reserved_unpriced_dispatch_ids: Vec::new(),
             date: "2026-09-03".to_string(),
             total_cost_usd: 0.0,
             dispatch_count: 0,
@@ -434,6 +509,7 @@ mod tests {
         .unwrap();
         let entry = get_daily_spend(&db, "2026-09-01").unwrap().unwrap();
         assert_eq!(entry.unpriced_review_count, 0);
+        assert!(entry.reserved_unpriced_dispatch_ids.is_empty());
         assert_eq!(entry.unpriced_dispatch_count, 2, "old fields preserved");
         assert_eq!(entry.dispatch_count, 3);
         assert!((entry.total_cost_usd - 1.5).abs() < 1e-9);

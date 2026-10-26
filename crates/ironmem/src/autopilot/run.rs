@@ -87,7 +87,9 @@ use std::path::Path;
 use crate::db::schema::Database;
 use crate::error::MemoryError;
 
+use super::codex_dispatch::{self, CodexArtifacts, CodexRecovery};
 use super::dispatch::{self, DispatchOutcome, DispatchSpec, SessionMode, Verdict};
+use super::implementer::Implementer;
 use super::worktree::Worktree;
 use super::{
     blocked, budget, dispatch_state, gate_config, lineage, remediate, supervise, today_utc,
@@ -200,6 +202,7 @@ pub struct IssueBrief {
 /// Policy knobs for one issue's run.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RunConfig {
+    pub implementer: Implementer,
     /// `--model` for the IC. The spec's *Model routing* table routes this by
     /// risk class (Sonnet, escalating to Opus); performing that routing is a
     /// later rung's job, so this module carries whatever the caller chose —
@@ -220,11 +223,49 @@ pub struct RunConfig {
     pub max_unpriced_dispatches_per_day: u32,
 }
 
+/// Validate a model name against the selected implementation harness.
+///
+/// Model aliases are intentionally unrestricted, but their spelling is
+/// preserved exactly in durable state and subprocess argv. Refusing
+/// surrounding whitespace avoids validating one identity while dispatching
+/// a subtly different one.
+pub fn validate_implementation_model(
+    implementer: Implementer,
+    model: &str,
+) -> Result<(), MemoryError> {
+    let harness = match implementer {
+        Implementer::Claude => "Claude",
+        Implementer::Codex => "Codex",
+    };
+    if model.trim().is_empty() {
+        return Err(MemoryError::Validation(format!(
+            "model must not be empty for the {harness} implementer"
+        )));
+    }
+    if model.trim() != model {
+        return Err(MemoryError::Validation(format!(
+            "model must not contain leading or trailing whitespace for the {harness} implementer"
+        )));
+    }
+    if implementer == Implementer::Codex && model.starts_with("claude-") {
+        return Err(MemoryError::Validation(format!(
+            "model '{model}' is incompatible with the Codex implementer; choose a Codex model"
+        )));
+    }
+    if implementer == Implementer::Claude && model.starts_with("gpt-") {
+        return Err(MemoryError::Validation(format!(
+            "model '{model}' is incompatible with the Claude implementer; choose a Claude model"
+        )));
+    }
+    Ok(())
+}
+
 impl RunConfig {
     /// A config with every documented default, for the two values that have
     /// no sensible default: the model and the dispatch-time risk class.
     pub fn new(model: impl Into<String>, dispatch_class: impl Into<String>) -> Self {
         Self {
+            implementer: Implementer::Claude,
             model: model.into(),
             dispatch_class: dispatch_class.into(),
             n_turns: DEFAULT_N_TURNS,
@@ -247,9 +288,7 @@ impl RunConfig {
     /// stop without ever dispatching — a misconfiguration worth naming at
     /// the point it is made rather than diagnosing from a silent no-op.
     pub fn validate(&self) -> Result<(), MemoryError> {
-        if self.model.trim().is_empty() {
-            return Err(MemoryError::Validation("model must not be empty".into()));
-        }
+        validate_implementation_model(self.implementer, &self.model)?;
         if self.dispatch_class.trim().is_empty() {
             return Err(MemoryError::Validation(
                 "dispatch_class must not be empty".into(),
@@ -296,11 +335,22 @@ impl RunConfig {
             ));
         }
         if self.max_budget_usd > self.daily_budget_usd {
-            return Err(MemoryError::Validation(format!(
-                "max_budget_usd ({}) exceeds daily_budget_usd ({}) — no dispatch could ever be \
-                 authorized",
-                self.max_budget_usd, self.daily_budget_usd
-            )));
+            // Codex has no --max-budget-usd, so naming it would send the
+            // operator after a flag the CLI refuses for this implementer.
+            return Err(MemoryError::Validation(match self.implementer {
+                Implementer::Claude => format!(
+                    "max_budget_usd ({}) exceeds daily_budget_usd ({}) — no dispatch could \
+                     ever be authorized",
+                    self.max_budget_usd, self.daily_budget_usd
+                ),
+                Implementer::Codex => format!(
+                    "daily_budget_usd ({}) is below the ${} every Codex dispatch reserves \
+                     before it starts — Codex reports no cost, so each invocation is \
+                     pre-authorized at that fixed ceiling. Raise --daily-budget-usd to at \
+                     least {}",
+                    self.daily_budget_usd, self.max_budget_usd, self.max_budget_usd
+                ),
+            }));
         }
         Ok(())
     }
@@ -403,7 +453,12 @@ pub fn classify(outcome: &DispatchOutcome) -> DispatchClassification {
     // approach, so it is an operator's fix, and
     // `max_consecutive_infrastructure_failures` is what escalates to them
     // instead of the attempt cap silently retiring the issue.
-    if outcome.verdict.is_none() && outcome.num_turns == 0 && outcome.total_cost_usd == 0.0 {
+    // An absent meter reads like the old `0.0` default here: a result that
+    // reported neither a turn nor a price took nothing up either.
+    if outcome.verdict.is_none()
+        && outcome.num_turns == 0
+        && outcome.cost_usd.is_none_or(|cost| cost == 0.0)
+    {
         return DispatchClassification::InfrastructureFailure;
     }
     DispatchClassification::FailedAttempt
@@ -413,6 +468,8 @@ pub fn classify(outcome: &DispatchOutcome) -> DispatchClassification {
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 #[serde(tag = "terminal", rename_all = "snake_case")]
 pub enum TerminalReason {
+    /// An existing implementation may still be running; no new invocation is authorized.
+    ImplementationInFlight { detail: String },
     /// The gate condition was satisfied. Terminal for the issue: the
     /// dispatch-state drawer is cleared and the branch is ready for the
     /// Reviewer (rung 5).
@@ -467,7 +524,8 @@ impl TerminalReason {
     fn clears_dispatch_state(&self) -> bool {
         !matches!(
             self,
-            TerminalReason::DailyBudgetExhausted { .. }
+            TerminalReason::ImplementationInFlight { .. }
+                | TerminalReason::DailyBudgetExhausted { .. }
                 | TerminalReason::InfrastructureFailure { .. }
                 | TerminalReason::StrategyEscalated { .. }
                 | TerminalReason::UnpricedDispatchesExhausted { .. }
@@ -483,7 +541,7 @@ pub struct DispatchSummary {
     /// lineage attempt at all).
     pub attempt_n: Option<u32>,
     pub classification: DispatchClassification,
-    pub total_cost_usd: f64,
+    pub total_cost_usd: Option<f64>,
     pub num_turns: u32,
     pub verdict: Option<Verdict>,
     pub reason: Option<String>,
@@ -492,21 +550,21 @@ pub struct DispatchSummary {
 /// The result of driving one issue.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct IssueRun {
+    /// Unknown-price outcomes or reservations observed by this run, including
+    /// a held invocation reserved on an earlier day. Observing a reservation
+    /// or recovering an outcome never bills it again.
+    pub unpriced_dispatches: u32,
     #[serde(serialize_with = "serialize_issue")]
     pub issue: IssueRef,
     pub terminal: TerminalReason,
     pub dispatches: Vec<DispatchSummary>,
-    /// Spend this run added to the daily ledger — the sum of every dispatch
-    /// that returned a parseable result, successful or not.
+    /// Known dollars this run added to the ledger. With unknown-price
+    /// invocations this is a floor; see `unpriced_dispatches`.
     pub total_cost_usd: f64,
     /// The issue's cumulative attempt count after the run.
     pub cumulative_attempt_n: u32,
-    /// The repo's per-dispatch wall-clock bound, or `None` if it has none.
-    ///
-    /// Reported rather than merely applied: an unbounded repo is a real
-    /// operational fact (a wedged dispatch there runs forever), and a caller
-    /// that never sees the `None` cannot tell an unbounded repo from a
-    /// bounded one that simply never timed out.
+    /// Effective per-dispatch wall-clock bound. Codex uses the finite backend
+    /// default when the repo has none; Claude retains its optional repo bound.
     pub wall_clock_timeout_secs: Option<u64>,
 }
 
@@ -529,6 +587,18 @@ pub struct IssueRun {
 /// already exists fails. [`dispatch::run_dispatch`] follows this — it returns
 /// `NotFound` only from the `Command::output()` call itself.
 pub trait Dispatcher {
+    fn implementer(&self) -> Implementer {
+        Implementer::Claude
+    }
+
+    fn recover(
+        &mut self,
+        _repo: &Path,
+        _state: &DispatchState,
+    ) -> Result<CodexRecovery, MemoryError> {
+        Ok(CodexRecovery::NoPriorInvocation)
+    }
+
     fn dispatch(
         &mut self,
         repo: &Path,
@@ -558,6 +628,53 @@ impl Dispatcher for ClaudeDispatcher {
         spec: &DispatchSpec,
     ) -> Result<DispatchOutcome, MemoryError> {
         dispatch::run_dispatch(&self.bin, repo, spec)
+    }
+}
+
+/// Codex implementation backend. Process evidence is checked before durable
+/// artifacts; only trusted supervisor cleanup permits completed recovery.
+pub struct CodexDispatcher {
+    bin: std::path::PathBuf,
+}
+
+impl CodexDispatcher {
+    pub fn resolve() -> Result<Self, MemoryError> {
+        Ok(Self {
+            bin: crate::launcher::find_on_path(crate::launcher::Harness::Codex.binary())?,
+        })
+    }
+}
+
+impl Dispatcher for CodexDispatcher {
+    fn implementer(&self) -> Implementer {
+        Implementer::Codex
+    }
+
+    fn recover(
+        &mut self,
+        _repo: &Path,
+        state: &DispatchState,
+    ) -> Result<CodexRecovery, MemoryError> {
+        let snapshot =
+            super::codex_process::snapshot(&mut super::codex_process::UnixCodexProcesses);
+        match super::registry::codex_state_liveness(&snapshot, state) {
+            super::registry::Liveness::Alive => Ok(CodexRecovery::Alive),
+            super::registry::Liveness::NotListed => match state.codex_artifacts.as_ref() {
+                Some(artifacts) => codex_dispatch::recover_artifacts(Some(artifacts)),
+                None => Ok(CodexRecovery::NoPriorInvocation),
+            },
+            super::registry::Liveness::Unknown => Ok(CodexRecovery::Unknown {
+                reason: super::registry::codex_state_reason(&snapshot, state),
+            }),
+        }
+    }
+
+    fn dispatch(
+        &mut self,
+        repo: &Path,
+        spec: &DispatchSpec,
+    ) -> Result<DispatchOutcome, MemoryError> {
+        codex_dispatch::run_codex(&self.bin, repo, spec)
     }
 }
 
@@ -626,7 +743,8 @@ fn approach_text(outcome: &DispatchOutcome, classification: DispatchClassificati
         Some(reason) if !reason.trim().is_empty() => reason.to_string(),
         _ => format!(
             "dispatch returned no verdict reason ({classification:?}); {} turns, session {}",
-            outcome.num_turns, outcome.session_id
+            outcome.num_turns,
+            outcome.native_session_id.as_deref().unwrap_or("unknown")
         ),
     }
 }
@@ -663,8 +781,32 @@ fn record_and_advance(
     db: &Database,
     record: &AttemptRecord,
     prior: Option<&IssueStatus>,
+    recoverable_codex: bool,
 ) -> Result<(), MemoryError> {
-    lineage::record_attempt(db, record)?;
+    // Codex can replay durable artifacts after a crash between the append-only
+    // attempt and current-status writes. Complete that same ordinal instead
+    // of appending it twice. Terminal summaries are markers, not attempts.
+    let existing = if recoverable_codex {
+        lineage::attempts_for_issue(db, &record.issue)?
+            .into_iter()
+            .find(|attempt| {
+                attempt.attempt_n == record.attempt_n && !is_terminal_summary(&attempt.approach)
+            })
+    } else {
+        None
+    };
+    if existing
+        .as_ref()
+        .is_some_and(|attempt| attempt.verdict != record.verdict)
+    {
+        return Err(MemoryError::Validation(
+            "recovered Codex verdict conflicts with the already recorded attempt ordinal".into(),
+        ));
+    }
+    if existing.is_none() {
+        lineage::record_attempt(db, record)?;
+    }
+    let record = existing.as_ref().unwrap_or(record);
 
     let issue = &record.issue;
     let verdict = record.verdict;
@@ -823,6 +965,180 @@ pub fn approved_gate_commands(db: &Database, repo: &str) -> Result<Vec<String>, 
     Ok(gate.gate_commands().to_vec())
 }
 
+/// Validate ownership of any persisted dispatch before a caller provisions
+/// or replaces the issue worktree. Returning the state lets callers perform
+/// harness-specific liveness checks without a second database read.
+pub fn validate_dispatch_owner(
+    db: &Database,
+    issue: &IssueRef,
+    implementer: Implementer,
+) -> Result<Option<DispatchState>, MemoryError> {
+    let state = dispatch_state::get_dispatch_state(db, issue)?;
+    if let Some(state) = &state {
+        if state.implementer != implementer {
+            return Err(MemoryError::Validation(format!(
+                "implementation harness mismatch: persisted {:?}, configured {:?}; resume with \
+                 the persisted harness or clear its state with `ironmem autopilot \
+                 clear-dispatch {} {}`",
+                state.implementer, implementer, issue.repo, issue.number
+            )));
+        }
+    }
+    Ok(state)
+}
+
+/// Refuse unsafe worktree provisioning for a persisted Codex dispatch.
+///
+/// A dirty worktree may belong to a still-running process. Quarantining it
+/// before checking the persisted invocation would move that process's cwd and
+/// detach its branch. Completed or explicitly idle pauses may proceed; live or
+/// uncertain evidence holds without touching the checkout.
+pub fn preflight_worktree_provisioning(
+    db: &Database,
+    issue: &IssueRef,
+    implementer: Implementer,
+    dispatcher: &mut dyn Dispatcher,
+) -> Result<(), MemoryError> {
+    if dispatcher.implementer() != implementer {
+        return Err(MemoryError::Validation(format!(
+            "implementation harness mismatch: configured {:?}, dispatcher {:?}; select the \
+             matching dispatcher",
+            implementer,
+            dispatcher.implementer()
+        )));
+    }
+    let Some(state) = validate_dispatch_owner(db, issue, implementer)? else {
+        return Ok(());
+    };
+    if !implementer.recovers_invocations() {
+        return Ok(());
+    }
+    match dispatcher.recover(Path::new(&state.worktree_path), &state)? {
+        CodexRecovery::Alive => Err(MemoryError::Validation(format!(
+            "cannot provision {} while its Codex implementation is still alive",
+            issue.canonical()
+        ))),
+        CodexRecovery::Unknown { reason } => Err(MemoryError::Validation(format!(
+            "cannot provision {} while Codex process completion is uncertain: {reason}; \
+             once no process remains, `ironmem autopilot clear-dispatch {} {}` releases it",
+            issue.canonical(),
+            issue.repo,
+            issue.number
+        ))),
+        CodexRecovery::Finished(_) => Ok(()),
+        CodexRecovery::NoPriorInvocation if state.codex_artifacts.is_none() => Ok(()),
+        CodexRecovery::NoPriorInvocation => Err(MemoryError::Validation(
+            "Codex recovery returned no invocation for persisted artifacts; process completion \
+             is unproven"
+                .into(),
+        )),
+    }
+}
+
+/// What restart recovery decided before a run dispatches anything.
+enum Recovered {
+    /// The run ends here without dispatching.
+    Done(IssueRun),
+    /// The run continues, first classifying a finished invocation if any.
+    Continue(Option<DispatchOutcome>),
+}
+
+/// Adopt, hold, or finish the invocation a persisted state names, for a
+/// harness that [recovers invocations](Implementer::recovers_invocations).
+#[allow(clippy::too_many_arguments)]
+fn recover_invocation(
+    db: &Database,
+    issue: &IssueRef,
+    worktree: &Worktree,
+    dispatcher: &mut dyn Dispatcher,
+    state: &DispatchState,
+    cumulative_attempt_n: u32,
+    wall_clock_timeout_secs: Option<u64>,
+    native_session_id: &mut Option<String>,
+    codex_artifacts: &mut Option<CodexArtifacts>,
+) -> Result<Recovered, MemoryError> {
+    match dispatcher.recover(&worktree.path, state)? {
+        recovery @ (CodexRecovery::Alive | CodexRecovery::Unknown { .. }) => {
+            let detail = match recovery {
+                CodexRecovery::Unknown { reason } => format!(
+                    "{reason}; once no process remains, `ironmem autopilot \
+                     clear-dispatch {} {}` releases it",
+                    issue.repo, issue.number
+                ),
+                _ => "Codex implementation is still alive".into(),
+            };
+            let unpriced_dispatches = match &state.codex_artifacts {
+                Some(artifacts) => u32::from(budget::has_unpriced_dispatch_reservation(
+                    db,
+                    &artifacts.invocation_id,
+                )?),
+                None => 0,
+            };
+            Ok(Recovered::Done(IssueRun {
+                unpriced_dispatches,
+                issue: issue.clone(),
+                terminal: TerminalReason::ImplementationInFlight { detail },
+                dispatches: Vec::new(),
+                total_cost_usd: 0.0,
+                cumulative_attempt_n,
+                wall_clock_timeout_secs,
+            }))
+        }
+        CodexRecovery::Finished(outcome) => {
+            if state.attempt_n < cumulative_attempt_n {
+                // The lineage/status write completed before the Lead crashed
+                // clearing this artifact. Its terminal Impossible decision
+                // still ends this run, without recording or charging again.
+                // Apply the completion and identity checks before trusting
+                // the verdict; a later manual run is allowed after clearing.
+                if outcome.invocation_started
+                    && outcome.process_success
+                    && !outcome.is_error
+                    && !outcome.timed_out
+                    && outcome.is_impossible()
+                    && outcome.native_session_id.as_ref().is_some_and(|id| {
+                        !id.trim().is_empty()
+                            && native_session_id
+                                .as_ref()
+                                .is_none_or(|expected| expected == id)
+                    })
+                {
+                    dispatch_state::clear_dispatch_state(db, issue)?;
+                    return Ok(Recovered::Done(IssueRun {
+                        unpriced_dispatches: 1,
+                        issue: issue.clone(),
+                        terminal: TerminalReason::Impossible {
+                            reason: outcome.reason,
+                        },
+                        dispatches: Vec::new(),
+                        total_cost_usd: 0.0,
+                        cumulative_attempt_n,
+                        wall_clock_timeout_secs,
+                    }));
+                }
+                // Preserve the proven conversation for a continuing run,
+                // but never classify or charge the same attempt again.
+                if native_session_id.is_none() {
+                    *native_session_id =
+                        outcome.native_session_id.filter(|id| !id.trim().is_empty());
+                }
+                *codex_artifacts = None;
+                Ok(Recovered::Continue(None))
+            } else {
+                Ok(Recovered::Continue(Some(outcome)))
+            }
+        }
+        CodexRecovery::NoPriorInvocation if state.codex_artifacts.is_none() => {
+            Ok(Recovered::Continue(None))
+        }
+        CodexRecovery::NoPriorInvocation => Err(MemoryError::Validation(
+            "Codex recovery returned no invocation for persisted artifacts; process \
+             completion is unproven"
+                .into(),
+        )),
+    }
+}
+
 /// Drive one issue to a terminal state.
 ///
 /// Refuses outright, before writing anything, if the repo has no approved
@@ -838,13 +1154,15 @@ pub fn run_issue(
     super::validate_repo(&issue.repo)?;
     config.validate()?;
 
+    if config.implementer != dispatcher.implementer() {
+        return Err(MemoryError::Validation(format!("implementation harness mismatch: configured {:?}, dispatcher {:?}; select the matching dispatcher", config.implementer, dispatcher.implementer())));
+    }
+    let existing_state = validate_dispatch_owner(db, issue, config.implementer)?;
     let gate_commands = approved_gate_commands(db, &issue.repo)?;
-    // Read *after* the approval check above, which is the gate that refuses
-    // an unapproved repo outright. `None` here means this repo has no
-    // wall-clock bound — legal, and the pre-rung-7 behavior, but it is
-    // surfaced on `IssueRun` rather than passing silently, because "no
-    // timeout" and "a timeout nobody set" look identical from the outside.
-    let wall_clock_timeout_secs = gate_config::wall_clock_timeout(db, &issue.repo)?;
+    // Report the effective bound, including Codex's mandatory finite fallback.
+    // Claude retains the repo's optional bound.
+    let wall_clock_timeout_secs = gate_config::wall_clock_timeout(db, &issue.repo)?
+        .or_else(|| config.implementer.fallback_wall_clock_secs());
     let wall_clock_timeout = wall_clock_timeout_secs.map(std::time::Duration::from_secs);
 
     let mut status = lineage::get_issue_status(db, issue)?;
@@ -856,7 +1174,11 @@ pub fn run_issue(
     let remediation = remediate::active_remediation(db, issue)?;
     if let Some(existing) = &status {
         if existing.best_verdict == Some(AttemptOutcome::Success) && remediation.is_none() {
+            if config.implementer.recovers_invocations() {
+                dispatch_state::clear_dispatch_state(db, issue)?;
+            }
             return Ok(IssueRun {
+                unpriced_dispatches: 0,
                 issue: issue.clone(),
                 terminal: TerminalReason::AlreadySucceeded {
                     commit_sha: existing.best_commit_sha.clone(),
@@ -880,7 +1202,6 @@ pub fn run_issue(
     // a new one. The spec's crash-safe-state section is why the session uuid
     // lives in the drawer rather than in the caller's memory: "any Lead can
     // resume any IC".
-    let existing_state = dispatch_state::get_dispatch_state(db, issue)?;
     let session_uuid = existing_state
         .as_ref()
         .map(|state| state.session_uuid.clone())
@@ -894,6 +1215,32 @@ pub fn run_issue(
     // Mutable because a concluded goal loop rotates it; see the rotation in
     // the dispatch loop below.
     let mut session_uuid = session_uuid;
+    let mut native_session_id = existing_state
+        .as_ref()
+        .and_then(|s| s.native_session_id.clone());
+    let mut codex_artifacts = existing_state
+        .as_ref()
+        .and_then(|s| s.codex_artifacts.clone());
+    let mut recovered_outcome = None;
+    if let Some(state) = existing_state
+        .as_ref()
+        .filter(|_| config.implementer.recovers_invocations())
+    {
+        match recover_invocation(
+            db,
+            issue,
+            worktree,
+            dispatcher,
+            state,
+            cumulative_attempt_n,
+            wall_clock_timeout_secs,
+            &mut native_session_id,
+            &mut codex_artifacts,
+        )? {
+            Recovered::Done(run) => return Ok(run),
+            Recovered::Continue(outcome) => recovered_outcome = outcome,
+        }
+    }
     let mut resuming = existing_state
         .as_ref()
         .is_some_and(|state| state.session_claimed);
@@ -917,10 +1264,18 @@ pub fn run_issue(
                        turn_n: u32,
                        state: &str,
                        session_uuid: &str,
-                       session_claimed: bool| {
+                       session_claimed: bool,
+                       identity: (&Option<String>, &Option<CodexArtifacts>)| {
         dispatch_state::upsert_dispatch_state(
             db,
             &DispatchState {
+                implementer: config.implementer,
+                native_session_id: if config.implementer.assigns_own_session_id() {
+                    identity.0.clone()
+                } else {
+                    Some(session_uuid.to_string())
+                },
+                codex_artifacts: identity.1.clone(),
                 issue: issue.clone(),
                 worktree_path: worktree_path.clone(),
                 ic_session_name: ic_session_name.clone(),
@@ -936,154 +1291,218 @@ pub fn run_issue(
         .map(|_| ())
     };
 
-    write_state(
-        db,
-        cumulative_attempt_n,
-        turn_n,
-        "dispatching",
-        &session_uuid,
-        resuming,
-    )?;
+    // A recovering harness publishes each invocation just before it launches.
+    if !config.implementer.recovers_invocations() {
+        write_state(
+            db,
+            cumulative_attempt_n,
+            turn_n,
+            "dispatching",
+            &session_uuid,
+            resuming,
+            (&native_session_id, &codex_artifacts),
+        )?;
+    }
 
     let mut dispatches = Vec::new();
     let mut total_cost_usd = 0.0;
+    let mut unpriced_dispatches = 0u32;
     let mut consecutive_infrastructure_failures = 0u32;
 
     let terminal = loop {
-        // Rung 7's escalation, enforced rather than merely reported. Checked
-        // inside the loop, not once before it: a supervisor polling
-        // alongside a long run can escalate mid-run, and the next dispatch
-        // must see it.
-        if let Some(signature) = supervise::escalated_signature(db, issue)? {
-            break TerminalReason::StrategyEscalated { signature };
-        }
-        // Read fresh each pass, like the escalation above it: a human who
-        // grants a retry while a run is in flight must be honoured by the
-        // very next dispatch, not the next run.
-        if remediate::attempts_charged(db, issue, cumulative_attempt_n, succeeded)?
-            >= config.attempt_cap
-        {
-            let attempts = prior_attempts(db, issue)?;
-            record_terminal_summary(
-                db,
-                issue,
-                cumulative_attempt_n,
-                config.attempt_cap,
-                &attempts,
-            )?;
-            break TerminalReason::AttemptCapExhausted;
-        }
-
-        let ledger = budget::get_daily_spend(db, &today_utc())?;
-        let spent_today = ledger.as_ref().map(|e| e.total_cost_usd).unwrap_or(0.0);
-        if spent_today + config.max_budget_usd > config.daily_budget_usd {
-            break TerminalReason::DailyBudgetExhausted {
-                spent_usd: spent_today,
-            };
-        }
-        // The second ceiling. Checked only when this repo can actually
-        // produce an unpriced dispatch: without a wall-clock bound no
-        // dispatch here can time out, so unpriced dispatches banked by
-        // *other* work (another repo's timeouts — reviews and advice bank
-        // to their own counters) must not stop a repo that cannot
-        // contribute to the counter.
-        if wall_clock_timeout.is_some() {
-            let unpriced_today = ledger
-                .as_ref()
-                .map(|e| e.unpriced_dispatch_count)
-                .unwrap_or(0);
-            if unpriced_today >= config.max_unpriced_dispatches_per_day {
-                break TerminalReason::UnpricedDispatchesExhausted { unpriced_today };
+        if recovered_outcome.is_none() {
+            // Rung 7's escalation, enforced rather than merely reported. Checked
+            // inside the loop, not once before it: a supervisor polling
+            // alongside a long run can escalate mid-run, and the next dispatch
+            // must see it.
+            if let Some(signature) = supervise::escalated_signature(db, issue)? {
+                break TerminalReason::StrategyEscalated { signature };
             }
-        }
-
-        let attempts = prior_attempts(db, issue)?;
-        // Rung 2 provisioned this slot and hardcoded it to `None`; rung 7's
-        // strategy-health check is what finally fills it. Read fresh on every
-        // pass so a redirect issued by a supervisor running *between*
-        // dispatches (the spec's per-dispatch cadence) reaches the very next
-        // one.
-        let strategy_redirect = supervise::active_redirect(db, issue)?;
-        // Rung 8's other half of the blocked round trip. Read fresh on every
-        // pass for the same reason the redirect is: an answer that arrives
-        // between two dispatches must reach the very next one, and the
-        // resuming session is the one that asked the question.
-        let human_answers: Vec<(String, String)> = blocked::active_answers(db, issue)?
-            .into_iter()
-            .filter_map(|pair| pair.answer.map(|answer| (pair.question, answer)))
-            .collect();
-        // Rung 11's delivery half, and the reason a remediation is more than
-        // a label flip: without it the IC would be re-dispatched onto an
-        // issue it has already finished, told nothing about why, and handed a
-        // goal condition its own last commit already satisfies.
-        let remediation_brief = remediation.as_ref().map(|r| turn_prompt::RemediationBrief {
-            pr_number: r.pr_number,
-            head_sha: &r.head_sha,
-            findings: r.findings.as_deref(),
-        });
-        // A condition the platform rejects is a dispatch that silently does
-        // not happen: no turn, no verdict, nothing written to the issue, and
-        // `agent:ready` still set so the next tick repeats it. Refuse here,
-        // before the attempt is spent — the same posture as `config.validate`
-        // refusing an `--n-turns`/`--max-turns` pair at config time.
-        let condition = match turn_prompt::render(&turn_prompt::TurnPromptInputs {
-            issue,
-            issue_title: &brief.title,
-            issue_body: &brief.body,
-            prior_attempts: &attempts,
-            strategy_redirect: strategy_redirect.as_deref(),
-            human_answers: &human_answers,
-            remediation: remediation_brief,
-            // The worktree's own branch, not `worktree::branch_name(issue)`
-            // re-derived: `ensure_worktree` is the thing that guarantees the
-            // checkout is on that branch, and it is the value it hands back
-            // that the IC will actually be committing onto.
-            branch: &worktree.branch,
-            gate_commands: &gate_commands,
-            n_turns: config.n_turns,
-        }) {
-            Ok(condition) => condition,
-            Err(e) => {
-                // Leave the drawer telling the truth on the way out. The
-                // state written before the loop says "dispatching", and
-                // `queue::plan_queue` reads drawers, not labels: a drawer
-                // left mid-dispatch holds a concurrency slot *and* sorts its
-                // issue ahead of every new one as an in-flight resume. A
-                // refusal that never clears would hold both for ever under a
-                // state that never happened.
-                write_state(
+            // Read fresh each pass, like the escalation above it: a human who
+            // grants a retry while a run is in flight must be honoured by the
+            // very next dispatch, not the next run.
+            if remediate::attempts_charged(db, issue, cumulative_attempt_n, succeeded)?
+                >= config.attempt_cap
+            {
+                let attempts = prior_attempts(db, issue)?;
+                record_terminal_summary(
                     db,
+                    issue,
                     cumulative_attempt_n,
-                    turn_n,
-                    "paused-condition-too-long",
-                    &session_uuid,
-                    resuming,
+                    config.attempt_cap,
+                    &attempts,
                 )?;
-                return Err(MemoryError::Validation(e.to_string()));
+                break TerminalReason::AttemptCapExhausted;
             }
-        };
 
-        let spec = DispatchSpec {
-            session: if resuming {
-                SessionMode::Resume {
-                    session_uuid: session_uuid.clone(),
+            let ledger = budget::get_daily_spend(db, &today_utc())?;
+            let spent_today = ledger.as_ref().map(|e| e.total_cost_usd).unwrap_or(0.0);
+            if spent_today + config.max_budget_usd > config.daily_budget_usd {
+                break TerminalReason::DailyBudgetExhausted {
+                    spent_usd: spent_today,
+                };
+            }
+            // Codex always has a finite bound and reserves unknown spend.
+            // Claude keeps its existing policy: this cap gates only repos
+            // with a wall-clock bound.
+            if wall_clock_timeout.is_some() {
+                let unpriced_today = ledger
+                    .as_ref()
+                    .map(|e| e.unpriced_dispatch_count)
+                    .unwrap_or(0);
+                if unpriced_today >= config.max_unpriced_dispatches_per_day {
+                    break TerminalReason::UnpricedDispatchesExhausted { unpriced_today };
                 }
+            }
+        }
+        let recovered = recovered_outcome.is_some();
+        let outcome_result = if let Some(outcome) = recovered_outcome.take() {
+            Ok(outcome)
+        } else {
+            let attempts = prior_attempts(db, issue)?;
+            // Rung 2 provisioned this slot and hardcoded it to `None`; rung 7's
+            // strategy-health check is what finally fills it. Read fresh on every
+            // pass so a redirect issued by a supervisor running *between*
+            // dispatches (the spec's per-dispatch cadence) reaches the very next
+            // one.
+            let strategy_redirect = supervise::active_redirect(db, issue)?;
+            // Rung 8's other half of the blocked round trip. Read fresh on every
+            // pass for the same reason the redirect is: an answer that arrives
+            // between two dispatches must reach the very next one, and the
+            // resuming session is the one that asked the question.
+            let human_answers: Vec<(String, String)> = blocked::active_answers(db, issue)?
+                .into_iter()
+                .filter_map(|pair| pair.answer.map(|answer| (pair.question, answer)))
+                .collect();
+            // Rung 11's delivery half, and the reason a remediation is more than
+            // a label flip: without it the IC would be re-dispatched onto an
+            // issue it has already finished, told nothing about why, and handed a
+            // goal condition its own last commit already satisfies.
+            let remediation_brief = remediation.as_ref().map(|r| turn_prompt::RemediationBrief {
+                pr_number: r.pr_number,
+                head_sha: &r.head_sha,
+                findings: r.findings.as_deref(),
+            });
+            // A condition the platform rejects is a dispatch that silently does
+            // not happen: no turn, no verdict, nothing written to the issue, and
+            // `agent:ready` still set so the next tick repeats it. Refuse here,
+            // before the attempt is spent — the same posture as `config.validate`
+            // refusing an `--n-turns`/`--max-turns` pair at config time.
+            let condition = match turn_prompt::render(&turn_prompt::TurnPromptInputs {
+                issue,
+                issue_title: &brief.title,
+                issue_body: &brief.body,
+                prior_attempts: &attempts,
+                strategy_redirect: strategy_redirect.as_deref(),
+                human_answers: &human_answers,
+                remediation: remediation_brief,
+                // The worktree's own branch, not `worktree::branch_name(issue)`
+                // re-derived: `ensure_worktree` is the thing that guarantees the
+                // checkout is on that branch, and it is the value it hands back
+                // that the IC will actually be committing onto.
+                branch: &worktree.branch,
+                gate_commands: &gate_commands,
+                n_turns: config.n_turns,
+            }) {
+                Ok(condition) => condition,
+                Err(e) => {
+                    // Leave the drawer telling the truth on the way out. The
+                    // state written before the loop says "dispatching", and
+                    // `queue::plan_queue` reads drawers, not labels: a drawer
+                    // left mid-dispatch holds a concurrency slot *and* sorts its
+                    // issue ahead of every new one as an in-flight resume. A
+                    // refusal that never clears would hold both for ever under a
+                    // state that never happened.
+                    write_state(
+                        db,
+                        cumulative_attempt_n,
+                        turn_n,
+                        "paused-condition-too-long",
+                        &session_uuid,
+                        resuming,
+                        (&native_session_id, &codex_artifacts),
+                    )?;
+                    return Err(MemoryError::Validation(e.to_string()));
+                }
+            };
+
+            let prepared_artifacts = if config.implementer.recovers_invocations() {
+                Some(codex_dispatch::prepare_artifacts(&worktree.path, issue)?)
             } else {
-                SessionMode::New {
-                    session_uuid: session_uuid.clone(),
-                }
-            },
-            name: ic_session_name.clone(),
-            model: config.model.clone(),
-            max_budget_usd: config.max_budget_usd,
-            max_turns: config.max_turns,
-            condition,
-            wall_clock_timeout,
-        };
+                codex_artifacts.clone()
+            };
+            let spec = DispatchSpec {
+                implementer: config.implementer,
+                codex_artifacts: prepared_artifacts,
+                session: if config.implementer.assigns_own_session_id() {
+                    match &native_session_id {
+                        Some(id) => SessionMode::Resume {
+                            session_uuid: id.clone(),
+                        },
+                        None => SessionMode::New {
+                            session_uuid: String::new(),
+                        },
+                    }
+                } else if resuming {
+                    SessionMode::Resume {
+                        session_uuid: session_uuid.clone(),
+                    }
+                } else {
+                    SessionMode::New {
+                        session_uuid: session_uuid.clone(),
+                    }
+                },
+                name: ic_session_name.clone(),
+                model: config.model.clone(),
+                max_budget_usd: config.max_budget_usd,
+                max_turns: config.max_turns,
+                condition,
+                wall_clock_timeout,
+            };
 
-        let outcome = match dispatcher.dispatch(&worktree.path, &spec) {
+            if config.implementer.recovers_invocations() {
+                // Validate the exact backend argv before publishing a new
+                // invocation or charging unknown spend. Definite input errors
+                // prove no process launched and must leave prior state intact.
+                codex_dispatch::build_argv(&worktree.path, &spec)?;
+                if let Some(artifacts) = &spec.codex_artifacts {
+                    codex_artifacts = Some(artifacts.clone());
+                    write_state(
+                        db,
+                        cumulative_attempt_n,
+                        turn_n,
+                        "dispatching",
+                        &session_uuid,
+                        resuming,
+                        (&native_session_id, &codex_artifacts),
+                    )?;
+                    budget::reserve_unpriced_dispatch(db, &today_utc(), &artifacts.invocation_id)?;
+                    unpriced_dispatches += 1;
+                }
+            }
+            dispatcher.dispatch(&worktree.path, &spec)
+        };
+        let mut outcome = match outcome_result {
             Ok(outcome) => outcome,
             Err(err) => {
+                if config.implementer.recovers_invocations() {
+                    dispatches.push(DispatchSummary {
+                        attempt_n: None,
+                        classification: DispatchClassification::InfrastructureFailure,
+                        total_cost_usd: None,
+                        num_turns: 0,
+                        verdict: None,
+                        reason: Some(err.to_string()),
+                    });
+                    // Errors do not prove a child is dead; retain the exact invocation for recovery.
+                    break TerminalReason::ImplementationInFlight {
+                        detail: format!(
+                            "Codex dispatch could not establish completion: {err}; once no \
+                             process remains, `ironmem autopilot clear-dispatch {} {}` releases it",
+                            issue.repo, issue.number
+                        ),
+                    };
+                }
                 // A dispatch that produced no parseable result at all banked
                 // no cost and is an infrastructure failure by definition —
                 // there is no verdict to trust and no meter to read. It never
@@ -1101,7 +1520,7 @@ pub fn run_issue(
                 dispatches.push(DispatchSummary {
                     attempt_n: None,
                     classification: DispatchClassification::InfrastructureFailure,
-                    total_cost_usd: 0.0,
+                    total_cost_usd: None,
                     num_turns: 0,
                     verdict: None,
                     reason: Some(err.to_string()),
@@ -1113,6 +1532,7 @@ pub fn run_issue(
                     "infrastructure-failure",
                     &session_uuid,
                     resuming,
+                    (&native_session_id, &codex_artifacts),
                 )?;
                 if consecutive_infrastructure_failures
                     >= config.max_consecutive_infrastructure_failures
@@ -1129,6 +1549,44 @@ pub fn run_issue(
         // how it lands: `--session-id` may only be used once, so that uuid
         // can only ever be `--resume`d again.
         resuming = true;
+        if config.implementer.recovers_invocations() {
+            // Its unknown spend was reserved by the run that launched it.
+            if recovered {
+                unpriced_dispatches += 1;
+            }
+            codex_artifacts = None;
+        }
+        if config.implementer.assigns_own_session_id() {
+            // An invocation that never launched has no thread to check, and
+            // its own reason (why the spawn failed) is the useful one.
+            if outcome.invocation_started
+                && (outcome
+                    .native_session_id
+                    .as_ref()
+                    .is_none_or(|id| id.trim().is_empty())
+                    || native_session_id
+                        .as_ref()
+                        .is_some_and(|id| outcome.native_session_id.as_ref() != Some(id)))
+            {
+                outcome.native_session_id = None;
+                outcome.verdict = None;
+                outcome.is_error = true;
+                outcome.process_success = false;
+                // Keep the invocation's own diagnosis (stderr, timeout, exit
+                // code): a Codex that failed before `thread.started` — auth,
+                // config, network — is explained only there.
+                let identity =
+                    "missing or mismatched native Codex session ID; persisted identity retained";
+                outcome.reason = Some(match outcome.reason.take() {
+                    Some(original) if !original.trim().is_empty() => {
+                        format!("{identity}; {original}")
+                    }
+                    _ => identity.into(),
+                });
+            } else if native_session_id.is_none() {
+                native_session_id = outcome.native_session_id.clone();
+            }
+        }
 
         // ...but a session whose `/goal` loop has **concluded** cannot be
         // resumed usefully at all, so the next dispatch opens a fresh one.
@@ -1157,7 +1615,7 @@ pub fn run_issue(
         // the next turn prompt carries the prior attempts and their failure
         // reasons, which is the degradation the spec's crash-safe-state
         // section already designed for ("any Lead can resume any IC").
-        if outcome.verdict.is_some() {
+        if config.implementer.rotates_session_after_verdict() && outcome.verdict.is_some() {
             session_uuid = uuid::Uuid::new_v4().to_string();
             resuming = false;
         }
@@ -1166,17 +1624,22 @@ pub fn run_issue(
         // Bank spend before deciding anything else. Every dispatch that
         // returned a result is billed, met or not.
         //
-        // A dispatch killed on the wall-clock bound is the exception, and
-        // the reason rung 5's unpriced counter exists: it really did spend
-        // money, and its result JSON — the only meter there is — died with
-        // it. Banking its synthesized `0.0` as *spend* would record a
-        // measurement that was never taken; banking it as *unpriced* marks
-        // the day's total as a floor, which is the true statement.
-        if outcome.timed_out {
+        // An unknown meter (including a dispatch killed on its wall-clock
+        // bound) belongs in the unpriced counter. No cost measurement
+        // exists to bank; the day's dollar total remains a floor.
+        if config.implementer.recovers_invocations() {
+            // Reserved before launch; recovery and completion never bill it again.
+            outcome.cost_usd = None;
+        } else if outcome.cost_usd.is_none() {
+            unpriced_dispatches += 1;
             budget::record_unpriced_dispatch(db, &today_utc())?;
         } else {
-            budget::accumulate_daily_spend(db, &today_utc(), outcome.total_cost_usd.max(0.0))?;
-            total_cost_usd += outcome.total_cost_usd.max(0.0);
+            budget::accumulate_daily_spend(
+                db,
+                &today_utc(),
+                outcome.cost_usd.unwrap_or(0.0).max(0.0),
+            )?;
+            total_cost_usd += outcome.cost_usd.unwrap_or(0.0).max(0.0);
         }
 
         let classification = classify(&outcome);
@@ -1192,7 +1655,7 @@ pub fn run_issue(
         dispatches.push(DispatchSummary {
             attempt_n,
             classification,
-            total_cost_usd: outcome.total_cost_usd,
+            total_cost_usd: outcome.cost_usd,
             num_turns: outcome.num_turns,
             verdict: outcome.verdict,
             reason: outcome.reason.clone(),
@@ -1212,6 +1675,7 @@ pub fn run_issue(
                         commit_sha: commit_sha.clone(),
                     },
                     status.as_ref(),
+                    config.implementer.recovers_invocations(),
                 )?;
                 break TerminalReason::Met { commit_sha };
             }
@@ -1227,6 +1691,7 @@ pub fn run_issue(
                         commit_sha: None,
                     },
                     status.as_ref(),
+                    config.implementer.recovers_invocations(),
                 )?;
                 break TerminalReason::Impossible {
                     reason: outcome.reason.clone(),
@@ -1244,6 +1709,7 @@ pub fn run_issue(
                         commit_sha: None,
                     },
                     status.as_ref(),
+                    config.implementer.recovers_invocations(),
                 )?;
                 status = lineage::get_issue_status(db, issue)?;
                 write_state(
@@ -1253,6 +1719,7 @@ pub fn run_issue(
                     "dispatching",
                     &session_uuid,
                     resuming,
+                    (&native_session_id, &codex_artifacts),
                 )?;
             }
             DispatchClassification::InfrastructureFailure => {
@@ -1263,6 +1730,7 @@ pub fn run_issue(
                     "infrastructure-failure",
                     &session_uuid,
                     resuming,
+                    (&native_session_id, &codex_artifacts),
                 )?;
                 if consecutive_infrastructure_failures
                     >= config.max_consecutive_infrastructure_failures
@@ -1277,7 +1745,7 @@ pub fn run_issue(
 
     if terminal.clears_dispatch_state() {
         dispatch_state::clear_dispatch_state(db, issue)?;
-    } else {
+    } else if !matches!(terminal, TerminalReason::ImplementationInFlight { .. }) {
         let state_label = match &terminal {
             TerminalReason::DailyBudgetExhausted { .. } => "paused-daily-budget",
             _ => "paused-infrastructure-failure",
@@ -1289,10 +1757,12 @@ pub fn run_issue(
             state_label,
             &session_uuid,
             resuming,
+            (&native_session_id, &codex_artifacts),
         )?;
     }
 
     Ok(IssueRun {
+        unpriced_dispatches,
         issue: issue.clone(),
         terminal,
         dispatches,
@@ -1307,6 +1777,631 @@ mod tests {
     use super::*;
     use crate::autopilot::{retry, worktree};
 
+    #[test]
+    fn invalid_codex_resume_refuses_before_reservation_or_state_overwrite() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        let mut state = pending_codex(&db, &wt, Some("invalid-native-uuid"));
+        state.codex_artifacts = None;
+        state.state = "previous-safe-state".into();
+        dispatch_state::upsert_dispatch_state(&db, &state).unwrap();
+        let ledger =
+            budget::reserve_unpriced_dispatch(&db, &today_utc(), "prior-reservation").unwrap();
+        let mut d = codex_script(vec![met()]);
+        let result = run_issue(&db, &issue(), &brief(), &wt, &codex_config(), &mut d);
+        assert!(
+            result.is_err(),
+            "invalid native ID must refuse before dispatch: {result:?}"
+        );
+        assert!(d.inner.seen.is_empty());
+        assert_eq!(
+            dispatch_state::get_dispatch_state(&db, &issue()).unwrap(),
+            Some(state)
+        );
+        assert_eq!(
+            budget::get_daily_spend(&db, &today_utc()).unwrap(),
+            Some(ledger)
+        );
+    }
+    #[test]
+    fn held_codex_reports_only_its_existing_reservation_including_prior_days() {
+        for recovery in [
+            CodexRecovery::Alive,
+            CodexRecovery::Unknown {
+                reason: "unproven completion".into(),
+            },
+        ] {
+            for reserved_date in [None, Some(today_utc()), Some("2026-01-01".into())] {
+                let db = approved_db();
+                let (_dir, wt) = fixture_worktree();
+                let state = pending_codex(&db, &wt, None);
+                let id = &state.codex_artifacts.as_ref().unwrap().invocation_id;
+                let unrelated =
+                    budget::reserve_unpriced_dispatch(&db, &today_utc(), "unrelated-invocation")
+                        .unwrap();
+                let ledger = reserved_date
+                    .as_ref()
+                    .map(|date| budget::reserve_unpriced_dispatch(&db, date, id).unwrap());
+                let before_today = budget::get_daily_spend(&db, &today_utc()).unwrap();
+                let mut d = codex_script(vec![]);
+                d.recovery = Some(recovery.clone());
+                let run = run_issue(&db, &issue(), &brief(), &wt, &codex_config(), &mut d).unwrap();
+                assert!(matches!(
+                    run.terminal,
+                    TerminalReason::ImplementationInFlight { .. }
+                ));
+                assert_eq!(
+                    run.unpriced_dispatches,
+                    u32::from(reserved_date.is_some()),
+                    "a hold must report only a durable reservation for this invocation"
+                );
+                assert_eq!(run.total_cost_usd, 0.0);
+                assert!(run.dispatches.is_empty());
+                assert!(d.inner.seen.is_empty());
+                assert_eq!(
+                    dispatch_state::get_dispatch_state(&db, &issue()).unwrap(),
+                    Some(state)
+                );
+                assert_eq!(
+                    budget::get_daily_spend(&db, &today_utc()).unwrap(),
+                    before_today
+                );
+                if let Some(date) = &reserved_date {
+                    assert_eq!(budget::get_daily_spend(&db, date).unwrap(), ledger);
+                } else {
+                    assert_eq!(before_today, Some(unrelated));
+                }
+            }
+        }
+    }
+    #[test]
+    fn recovery_finishes_a_partially_recorded_attempt_without_duplicate_lineage() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        pending_codex(&db, &wt, None);
+        lineage::record_attempt(
+            &db,
+            &AttemptRecord {
+                issue: issue(),
+                attempt_n: 1,
+                approach: "already durable".into(),
+                verdict: AttemptOutcome::Failed,
+                why_failed: Some("failed".into()),
+                commit_sha: None,
+            },
+        )
+        .unwrap();
+        let mut c = codex_config();
+        c.attempt_cap = 1;
+        let mut result = not_met();
+        result.cost_usd = None;
+        let mut d = codex_script(vec![]);
+        d.recovery = Some(CodexRecovery::Finished(result));
+        let run = run_issue(&db, &issue(), &brief(), &wt, &c, &mut d).unwrap();
+        let attempts = lineage::attempts_for_issue(&db, &issue()).unwrap();
+        assert_eq!(
+            attempts
+                .iter()
+                .filter(|r| !is_terminal_summary(&r.approach))
+                .count(),
+            1,
+            "the append-only write must not replay after a crash before status"
+        );
+        assert_eq!(
+            lineage::get_issue_status(&db, &issue())
+                .unwrap()
+                .unwrap()
+                .cumulative_attempt_n,
+            1
+        );
+        assert_eq!(run.cumulative_attempt_n, 1);
+        assert!(d.inner.seen.is_empty());
+    }
+    #[test]
+    fn a_reported_zero_price_stays_known_and_missing_codex_id_starts_new() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        let mut zero = met();
+        zero.cost_usd = Some(0.0);
+        let mut claude = ScriptedDispatcher::new(vec![Ok(zero)]);
+        let run = run_issue(&db, &issue(), &brief(), &wt, &config(), &mut claude).unwrap();
+        assert_eq!(run.dispatches[0].total_cost_usd, Some(0.0));
+        assert_eq!(run.unpriced_dispatches, 0);
+        assert_eq!(
+            budget::get_daily_spend(&db, &today_utc())
+                .unwrap()
+                .unwrap()
+                .dispatch_count,
+            1
+        );
+        let db = approved_db();
+        let mut missing = no_verdict_error();
+        missing.native_session_id = None;
+        let mut d = codex_script(vec![missing, met()]);
+        let run = run_issue(&db, &issue(), &brief(), &wt, &codex_config(), &mut d).unwrap();
+        assert_eq!(run.unpriced_dispatches, 2);
+        for spec in &d.inner.seen {
+            assert!(
+                matches!(&spec.session, SessionMode::New { session_uuid } if session_uuid.is_empty())
+            );
+        }
+    }
+    #[test]
+    fn absolute_pending_artifacts_survive_actual_worktree_quarantine() {
+        let db = approved_db();
+        let (repo, _) = fixture_worktree();
+        let roots = tempfile::tempdir().unwrap();
+        let first = worktree::ensure_worktree(repo.path(), roots.path(), &issue(), "HEAD").unwrap();
+        let state = pending_codex(&db, &first, None);
+        std::fs::write(first.path.join("dirty.txt"), "unfinished").unwrap();
+        let fresh = worktree::ensure_worktree(repo.path(), roots.path(), &issue(), "HEAD").unwrap();
+        assert!(fresh.quarantined_from.is_some());
+        let artifacts = state.codex_artifacts.as_ref().unwrap();
+        assert!(Path::new(&artifacts.journal_path).is_file());
+        let mut d = codex_script(vec![]);
+        d.recovery = Some(CodexRecovery::Alive);
+        let run = run_issue(&db, &issue(), &brief(), &fresh, &codex_config(), &mut d).unwrap();
+        assert!(matches!(
+            run.terminal,
+            TerminalReason::ImplementationInFlight { .. }
+        ));
+        assert_eq!(
+            dispatch_state::get_dispatch_state(&db, &issue()).unwrap(),
+            Some(state)
+        );
+        assert!(d.inner.seen.is_empty());
+    }
+    #[test]
+    fn consumed_impossible_recovery_preserves_terminal_without_rebilling_or_sticking() {
+        for native in [None, Some("11111111-2222-3333-4444-555555555555")] {
+            let db = approved_db();
+            let (_dir, wt) = fixture_worktree();
+            let state = pending_codex(&db, &wt, native);
+            let ledger = budget::reserve_unpriced_dispatch(
+                &db,
+                &today_utc(),
+                &state.codex_artifacts.as_ref().unwrap().invocation_id,
+            )
+            .unwrap();
+            let mut result = impossible();
+            result.cost_usd = None;
+            record_and_advance(
+                &db,
+                &AttemptRecord {
+                    issue: issue(),
+                    attempt_n: 1,
+                    approach: approach_text(&result, DispatchClassification::Impossible),
+                    verdict: AttemptOutcome::Failed,
+                    why_failed: Some(why_failed_text(&result, DispatchClassification::Impossible)),
+                    commit_sha: None,
+                },
+                None,
+                true,
+            )
+            .unwrap();
+            let attempts = lineage::attempts_for_issue(&db, &issue()).unwrap();
+            let status = lineage::get_issue_status(&db, &issue()).unwrap();
+            let mut d = codex_script(vec![met()]);
+            d.recovery = Some(CodexRecovery::Finished(result.clone()));
+            let run = run_issue(&db, &issue(), &brief(), &wt, &codex_config(), &mut d).unwrap();
+            assert_eq!(
+                run.terminal,
+                TerminalReason::Impossible {
+                    reason: result.reason,
+                }
+            );
+            assert_eq!(run.cumulative_attempt_n, 1);
+            assert_eq!(run.unpriced_dispatches, 1);
+            assert_eq!(run.total_cost_usd, 0.0);
+            assert!(run.dispatches.is_empty());
+            assert!(d.inner.seen.is_empty());
+            assert_eq!(
+                lineage::attempts_for_issue(&db, &issue()).unwrap(),
+                attempts
+            );
+            assert_eq!(lineage::get_issue_status(&db, &issue()).unwrap(), status);
+            assert_eq!(
+                budget::get_daily_spend(&db, &today_utc()).unwrap(),
+                Some(ledger)
+            );
+            assert!(dispatch_state::get_dispatch_state(&db, &issue())
+                .unwrap()
+                .is_none());
+
+            // A later explicitly requested run is fresh, not globally blocked
+            // by an Impossible whose recovered dispatch state was cleared.
+            let later = run_issue(&db, &issue(), &brief(), &wt, &codex_config(), &mut d).unwrap();
+            assert!(matches!(later.terminal, TerminalReason::Met { .. }));
+            assert_eq!(later.cumulative_attempt_n, 2);
+            assert_eq!(d.inner.seen.len(), 1);
+            assert!(matches!(d.inner.seen[0].session, SessionMode::New { .. }));
+        }
+    }
+    #[test]
+    fn consumed_nonterminal_or_untrusted_recovery_continues_the_shared_loop() {
+        let mut nonzero = impossible();
+        nonzero.process_success = false;
+        let mut errored = impossible();
+        errored.is_error = true;
+        let mut killed = impossible();
+        killed.timed_out = true;
+        let mut unstarted = impossible();
+        unstarted.invocation_started = false;
+        let mut missing = impossible();
+        missing.native_session_id = None;
+        let mut conflicting = impossible();
+        conflicting.native_session_id = Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".into());
+        for mut result in [
+            not_met(),
+            nonzero,
+            errored,
+            killed,
+            unstarted,
+            missing,
+            conflicting,
+        ] {
+            let db = approved_db();
+            let (_dir, wt) = fixture_worktree();
+            let native = "11111111-2222-3333-4444-555555555555";
+            let state = pending_codex(&db, &wt, Some(native));
+            budget::reserve_unpriced_dispatch(
+                &db,
+                &today_utc(),
+                &state.codex_artifacts.as_ref().unwrap().invocation_id,
+            )
+            .unwrap();
+            record_and_advance(
+                &db,
+                &AttemptRecord {
+                    issue: issue(),
+                    attempt_n: 1,
+                    approach: "durable failed attempt".into(),
+                    verdict: AttemptOutcome::Failed,
+                    why_failed: Some("not met".into()),
+                    commit_sha: None,
+                },
+                None,
+                true,
+            )
+            .unwrap();
+            result.cost_usd = None;
+            let mut d = codex_script(vec![met()]);
+            d.recovery = Some(CodexRecovery::Finished(result));
+            let run = run_issue(&db, &issue(), &brief(), &wt, &codex_config(), &mut d).unwrap();
+            assert!(matches!(run.terminal, TerminalReason::Met { .. }));
+            assert_eq!(run.cumulative_attempt_n, 2);
+            assert_eq!(d.inner.seen.len(), 1);
+            assert!(
+                matches!(&d.inner.seen[0].session, SessionMode::Resume { session_uuid } if session_uuid == native)
+            );
+            assert_eq!(lineage::attempts_for_issue(&db, &issue()).unwrap().len(), 2);
+            assert_eq!(
+                budget::get_daily_spend(&db, &today_utc())
+                    .unwrap()
+                    .unwrap()
+                    .unpriced_dispatch_count,
+                2
+            );
+        }
+    }
+    #[test]
+    fn consumed_recovery_is_not_replayed_when_lineage_already_advanced() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        let state = pending_codex(&db, &wt, None);
+        lineage::upsert_issue_status(
+            &db,
+            &IssueStatus {
+                issue: issue(),
+                best_verdict: Some(AttemptOutcome::Failed),
+                best_commit_sha: None,
+                cumulative_attempt_n: 1,
+            },
+        )
+        .unwrap();
+        let mut c = codex_config();
+        c.attempt_cap = 1;
+        let mut result = not_met();
+        result.cost_usd = None;
+        let mut d = codex_script(vec![]);
+        d.recovery = Some(CodexRecovery::Finished(result));
+        let run = run_issue(&db, &issue(), &brief(), &wt, &c, &mut d).unwrap();
+        assert!(matches!(run.terminal, TerminalReason::AttemptCapExhausted));
+        assert_eq!(
+            run.cumulative_attempt_n, 1,
+            "a classified artifact must not spend the attempt twice"
+        );
+        assert!(run.dispatches.is_empty());
+        assert!(d.inner.seen.is_empty());
+        assert!(state.codex_artifacts.unwrap().journal_path.starts_with('/'));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn real_codex_backend_persists_unknown_price_and_conservative_recovery() {
+        use std::os::unix::fs::PermissionsExt;
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        let bin_dir = tempfile::tempdir().unwrap();
+        let bin = bin_dir.path().join("stub-codex");
+        std::fs::write(
+            &bin,
+            r#"#!/bin/sh
+while [ "$#" -gt 0 ]; do
+if [ "$1" = '-o' ]; then shift; final="$1"; fi
+shift
+done
+printf '%s\n' '{"type":"thread.started","thread_id":"11111111-2222-3333-4444-555555555555"}'
+printf '%s\n' '{"type":"turn.completed","usage":{}}'
+printf '%s\n' '{"verdict":"met","reason":"gate"}' > "$final"
+sleep 0.5
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut d = CodexDispatcher { bin };
+        let state = pending_codex(&db, &wt, None);
+        assert!(matches!(
+            d.recover(&wt.path, &state).unwrap(),
+            CodexRecovery::Unknown { .. }
+        ));
+        std::fs::write(
+            &state.codex_artifacts.as_ref().unwrap().exit_path,
+            "not-json",
+        )
+        .unwrap();
+        assert!(matches!(
+            d.recover(&wt.path, &state).unwrap(),
+            CodexRecovery::Unknown { .. }
+        ));
+        dispatch_state::clear_dispatch_state(&db, &issue()).unwrap();
+        let run = run_issue(&db, &issue(), &brief(), &wt, &codex_config(), &mut d).unwrap();
+        assert!(matches!(run.terminal, TerminalReason::Met { .. }));
+        assert_eq!(run.dispatches[0].total_cost_usd, None);
+        assert_eq!(run.unpriced_dispatches, 1);
+        assert_eq!(run.total_cost_usd, 0.0);
+    }
+    struct CodexScript {
+        inner: ScriptedDispatcher,
+        recovery: Option<super::super::codex_dispatch::CodexRecovery>,
+    }
+    impl Dispatcher for CodexScript {
+        fn implementer(&self) -> Implementer {
+            Implementer::Codex
+        }
+        fn recover(
+            &mut self,
+            _repo: &Path,
+            _state: &DispatchState,
+        ) -> Result<CodexRecovery, MemoryError> {
+            Ok(self
+                .recovery
+                .take()
+                .unwrap_or(CodexRecovery::NoPriorInvocation))
+        }
+        fn dispatch(
+            &mut self,
+            repo: &Path,
+            spec: &DispatchSpec,
+        ) -> Result<DispatchOutcome, MemoryError> {
+            self.inner.dispatch(repo, spec)
+        }
+    }
+    fn codex_script(outcomes: Vec<DispatchOutcome>) -> CodexScript {
+        CodexScript {
+            inner: ScriptedDispatcher::new(
+                outcomes
+                    .into_iter()
+                    .map(|mut o| {
+                        o.cost_usd = None;
+                        Ok(o)
+                    })
+                    .collect(),
+            ),
+            recovery: None,
+        }
+    }
+    fn codex_config() -> RunConfig {
+        let mut c = config();
+        c.implementer = Implementer::Codex;
+        c.model = "gpt-6.1-sol".into();
+        c
+    }
+    fn pending_codex(db: &Database, worktree: &Worktree, native: Option<&str>) -> DispatchState {
+        let artifacts =
+            super::super::codex_dispatch::prepare_artifacts(&worktree.path, &issue()).unwrap();
+        let state = DispatchState {
+            implementer: Implementer::Codex,
+            native_session_id: native.map(str::to_string),
+            codex_artifacts: Some(artifacts),
+            issue: issue(),
+            worktree_path: worktree.path.to_string_lossy().into_owned(),
+            ic_session_name: "ic".into(),
+            dispatch_class: "logic".into(),
+            attempt_n: 0,
+            state: "dispatching".into(),
+            started_at: "now".into(),
+            session_uuid: "controller-placeholder".into(),
+            turn_n: 0,
+            session_claimed: false,
+        };
+        dispatch_state::upsert_dispatch_state(db, &state).unwrap();
+        state
+    }
+    #[test]
+    fn codex_retries_resume_native_thread_and_reserve_each_unknown_price_once() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        let mut d = codex_script(vec![not_met(), met()]);
+        let run = run_issue(&db, &issue(), &brief(), &wt, &codex_config(), &mut d).unwrap();
+        assert!(matches!(d.inner.seen[0].session, SessionMode::New { .. }));
+        assert!(
+            matches!(&d.inner.seen[1].session, SessionMode::Resume { session_uuid } if session_uuid == "11111111-2222-3333-4444-555555555555")
+        );
+        assert_ne!(
+            d.inner.seen[0].codex_artifacts,
+            d.inner.seen[1].codex_artifacts
+        );
+        assert_eq!(run.unpriced_dispatches, 2);
+        assert_eq!(run.total_cost_usd, 0.0);
+        assert_eq!(run.dispatches[0].total_cost_usd, None);
+        assert_eq!(run.wall_clock_timeout_secs, Some(1200));
+        let ledger = budget::get_daily_spend(&db, &today_utc()).unwrap().unwrap();
+        assert_eq!(ledger.unpriced_dispatch_count, 2);
+        assert_eq!(ledger.reserved_unpriced_dispatch_ids.len(), 2);
+        assert_eq!(ledger.dispatch_count, 0);
+        assert_eq!(ledger.total_cost_usd, 0.0);
+    }
+    #[test]
+    fn wrong_dispatcher_and_wrong_persisted_harness_refuse_without_overwrite_even_after_success() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        let state = pending_codex(&db, &wt, Some("native"));
+        let mut claude = ScriptedDispatcher::new(vec![]);
+        assert!(run_issue(&db, &issue(), &brief(), &wt, &codex_config(), &mut claude).is_err());
+        assert!(run_issue(&db, &issue(), &brief(), &wt, &config(), &mut claude).is_err());
+        assert!(claude.seen.is_empty());
+        assert_eq!(
+            dispatch_state::get_dispatch_state(&db, &issue()).unwrap(),
+            Some(state.clone())
+        );
+        lineage::upsert_issue_status(
+            &db,
+            &IssueStatus {
+                issue: issue(),
+                best_verdict: Some(AttemptOutcome::Success),
+                best_commit_sha: None,
+                cumulative_attempt_n: 1,
+            },
+        )
+        .unwrap();
+        assert!(run_issue(&db, &issue(), &brief(), &wt, &config(), &mut claude).is_err());
+        assert_eq!(
+            dispatch_state::get_dispatch_state(&db, &issue()).unwrap(),
+            Some(state)
+        );
+    }
+    #[test]
+    fn codex_recovery_hold_preserves_exact_artifacts_and_never_dispatches() {
+        for recovery in [
+            CodexRecovery::Alive,
+            CodexRecovery::Unknown {
+                reason: "not proven dead".into(),
+            },
+        ] {
+            let db = approved_db();
+            let (_dir, wt) = fixture_worktree();
+            let state = pending_codex(&db, &wt, None);
+            let mut d = codex_script(vec![]);
+            d.recovery = Some(recovery);
+            let run = run_issue(&db, &issue(), &brief(), &wt, &codex_config(), &mut d).unwrap();
+            assert!(matches!(
+                run.terminal,
+                TerminalReason::ImplementationInFlight { .. }
+            ));
+            assert!(d.inner.seen.is_empty());
+            assert_eq!(
+                dispatch_state::get_dispatch_state(&db, &issue()).unwrap(),
+                Some(state)
+            );
+            assert!(budget::get_daily_spend(&db, &today_utc())
+                .unwrap()
+                .is_none());
+        }
+    }
+    #[test]
+    fn recovered_success_at_cap_is_consumed_without_new_call_or_billing() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        let state = pending_codex(&db, &wt, None);
+        let c = codex_config();
+        for n in 0..c.max_unpriced_dispatches_per_day {
+            budget::reserve_unpriced_dispatch(&db, &today_utc(), &format!("other-{n}")).unwrap();
+        }
+        let mut result = met();
+        result.cost_usd = None;
+        let mut d = codex_script(vec![]);
+        d.recovery = Some(CodexRecovery::Finished(result));
+        let run = run_issue(&db, &issue(), &brief(), &wt, &c, &mut d).unwrap();
+        assert!(matches!(run.terminal, TerminalReason::Met { .. }));
+        assert!(d.inner.seen.is_empty());
+        assert_eq!(run.unpriced_dispatches, 1);
+        assert_eq!(run.total_cost_usd, 0.0);
+        assert_eq!(
+            budget::get_daily_spend(&db, &today_utc())
+                .unwrap()
+                .unwrap()
+                .unpriced_dispatch_count,
+            c.max_unpriced_dispatches_per_day
+        );
+        assert!(dispatch_state::get_dispatch_state(&db, &issue())
+            .unwrap()
+            .is_none());
+        dispatch_state::upsert_dispatch_state(&db, &state).unwrap();
+        let again = run_issue(&db, &issue(), &brief(), &wt, &c, &mut d).unwrap();
+        assert!(matches!(
+            again.terminal,
+            TerminalReason::AlreadySucceeded { .. }
+        ));
+        assert!(dispatch_state::get_dispatch_state(&db, &issue())
+            .unwrap()
+            .is_none());
+    }
+    #[test]
+    fn codex_cap_applies_without_repo_timeout_and_failed_outputs_are_reserved() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        let mut c = codex_config();
+        c.max_unpriced_dispatches_per_day = 3;
+        let mut malformed = no_verdict_error();
+        malformed.process_success = true;
+        let mut nonzero = met();
+        nonzero.process_success = false;
+        nonzero.verdict = None;
+        let mut d = codex_script(vec![malformed, nonzero, timed_out()]);
+        c.max_consecutive_infrastructure_failures = 4;
+        let run = run_issue(&db, &issue(), &brief(), &wt, &c, &mut d).unwrap();
+        assert!(matches!(
+            run.terminal,
+            TerminalReason::UnpricedDispatchesExhausted { unpriced_today: 3 }
+        ));
+        assert_eq!(d.inner.seen.len(), 3);
+        assert_eq!(run.unpriced_dispatches, 3);
+        assert_eq!(
+            budget::get_daily_spend(&db, &today_utc())
+                .unwrap()
+                .unwrap()
+                .reserved_unpriced_dispatch_ids
+                .len(),
+            3
+        );
+        assert_eq!(run.total_cost_usd, 0.0);
+    }
+    #[test]
+    fn codex_recovered_missing_or_conflicting_identity_cannot_succeed_or_replace_id() {
+        for native in [None, Some("different")] {
+            let db = approved_db();
+            let (_dir, wt) = fixture_worktree();
+            pending_codex(&db, &wt, Some("persisted"));
+            let mut result = met();
+            result.native_session_id = native.map(str::to_string);
+            result.cost_usd = None;
+            let mut d = codex_script(vec![]);
+            d.recovery = Some(CodexRecovery::Finished(result));
+            let mut c = codex_config();
+            c.max_consecutive_infrastructure_failures = 1;
+            let run = run_issue(&db, &issue(), &brief(), &wt, &c, &mut d).unwrap();
+            assert!(matches!(
+                run.terminal,
+                TerminalReason::InfrastructureFailure { .. }
+            ));
+            assert!(d.inner.seen.is_empty());
+            let state = dispatch_state::get_dispatch_state(&db, &issue())
+                .unwrap()
+                .unwrap();
+            assert_eq!(state.native_session_id.as_deref(), Some("persisted"));
+            assert!(state.codex_artifacts.is_none());
+        }
+    }
     /// A dispatcher that replays a scripted list of outcomes, recording the
     /// specs it was handed. This is what makes the loop's *policy* testable:
     /// every branch below is exercised against a real database and real
@@ -1349,11 +2444,12 @@ mod tests {
         cost: f64,
     ) -> DispatchOutcome {
         DispatchOutcome {
-            total_cost_usd: cost,
+            cost_usd: Some(cost),
             num_turns: 3,
             duration_ms: 1_000,
             is_error,
-            session_id: "11111111-2222-3333-4444-555555555555".to_string(),
+            native_session_id: Some("11111111-2222-3333-4444-555555555555".to_string()),
+            invocation_started: true,
             verdict,
             reason: verdict.map(|v| format!("scripted {v:?}")),
             process_success,
@@ -1394,6 +2490,75 @@ mod tests {
         RunConfig::new("claude-sonnet-5", "logic")
     }
 
+    #[test]
+    fn codex_implementer_rejects_a_claude_model_name() {
+        let mut config = config();
+        config.implementer = Implementer::Codex;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("Codex"), "error must name the harness: {err}");
+        assert!(
+            err.contains("claude-sonnet-5"),
+            "error must name the incompatible model: {err}"
+        );
+    }
+
+    #[test]
+    fn claude_implementer_rejects_a_gpt_model_name() {
+        let config = RunConfig::new("gpt-6.1-sol", "logic");
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("Claude"), "error must name the harness: {err}");
+        assert!(
+            err.contains("gpt-6.1-sol"),
+            "error must name the incompatible model: {err}"
+        );
+    }
+
+    #[test]
+    fn empty_model_error_names_the_selected_implementer() {
+        for (implementer, name) in [
+            (Implementer::Claude, "Claude"),
+            (Implementer::Codex, "Codex"),
+        ] {
+            let mut config = RunConfig::new("  ", "logic");
+            config.implementer = implementer;
+            let err = config.validate().unwrap_err().to_string();
+            assert!(err.contains(name), "got: {err}");
+            assert!(err.contains("model"), "got: {err}");
+        }
+    }
+
+    #[test]
+    fn model_surrounding_whitespace_is_rejected_before_prefix_compatibility() {
+        for (implementer, model, name) in [
+            (Implementer::Claude, " gpt-6.1-sol", "Claude"),
+            (Implementer::Claude, "gpt-6.1-sol ", "Claude"),
+            (Implementer::Codex, " claude-sonnet-5", "Codex"),
+            (Implementer::Codex, "claude-sonnet-5 ", "Codex"),
+            (Implementer::Claude, " opus", "Claude"),
+            (Implementer::Codex, "gpt-custom ", "Codex"),
+        ] {
+            let mut config = RunConfig::new(model, "logic");
+            config.implementer = implementer;
+            let err = config.validate().unwrap_err().to_string();
+            assert!(err.contains(name), "got: {err}");
+            assert!(err.contains("whitespace"), "got: {err}");
+        }
+    }
+
+    #[test]
+    fn model_aliases_without_surrounding_whitespace_remain_valid() {
+        for (implementer, model) in [
+            (Implementer::Claude, "opus"),
+            (Implementer::Claude, "custom-model"),
+            (Implementer::Codex, "gpt-6.1-sol"),
+            (Implementer::Codex, "custom-model"),
+        ] {
+            let mut config = RunConfig::new(model, "logic");
+            config.implementer = implementer;
+            config.validate().unwrap();
+        }
+    }
+
     fn approved_db() -> Database {
         let db = Database::open_in_memory().unwrap();
         gate_config::propose_gate_config(
@@ -1409,14 +2574,15 @@ mod tests {
 
     /// Rung 7: a dispatch killed on the repo's wall-clock bound. No result
     /// JSON survives such a process, so every field but `timed_out` is a
-    /// placeholder — `total_cost_usd: 0.0` means *unknown*, not *free*.
+    /// placeholder — `cost_usd: None` means unknown spend.
     fn timed_out() -> DispatchOutcome {
         DispatchOutcome {
-            total_cost_usd: 0.0,
+            cost_usd: None,
             num_turns: 0,
             duration_ms: 600_000,
             is_error: true,
-            session_id: "11111111-2222-3333-4444-555555555555".to_string(),
+            native_session_id: Some("11111111-2222-3333-4444-555555555555".to_string()),
+            invocation_started: true,
             verdict: None,
             reason: Some("dispatch exceeded this repo's wall-clock bound".to_string()),
             process_success: false,
@@ -1433,11 +2599,12 @@ mod tests {
     /// never started.
     fn resume_noop() -> DispatchOutcome {
         DispatchOutcome {
-            total_cost_usd: 0.0,
+            cost_usd: Some(0.0),
             num_turns: 0,
             duration_ms: 6_000,
             is_error: false,
-            session_id: "11111111-2222-3333-4444-555555555555".to_string(),
+            native_session_id: Some("11111111-2222-3333-4444-555555555555".to_string()),
+            invocation_started: true,
             verdict: None,
             reason: None,
             process_success: true,
@@ -1899,7 +3066,19 @@ mod tests {
         let mut config = config();
         config.max_budget_usd = 50.0;
         config.daily_budget_usd = 10.0;
-        assert!(config.validate().is_err());
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("max_budget_usd"), "{err}");
+    }
+
+    #[test]
+    fn a_codex_daily_cap_below_its_reservation_names_the_flag_it_can_set() {
+        let mut config = codex_config();
+        config.daily_budget_usd = 2.0;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("--daily-budget-usd to at least 2.5"), "{err}");
+        assert!(!err.contains("max_budget_usd"), "{err}");
+        config.daily_budget_usd = 2.5;
+        config.validate().unwrap();
     }
 
     #[test]
@@ -1957,7 +3136,7 @@ mod tests {
         // Billed but turnless: it engaged the model, so it is a real, if
         // short, attempt.
         let billed = DispatchOutcome {
-            total_cost_usd: 0.03,
+            cost_usd: Some(0.03),
             ..resume_noop()
         };
         assert_eq!(classify(&billed), DispatchClassification::FailedAttempt);
@@ -1973,10 +3152,10 @@ mod tests {
 
     #[test]
     fn a_killed_dispatch_is_still_read_as_a_timeout_not_as_an_empty_one() {
-        // Ordering: `timed_out` reports `0.0`/`0` too, but there the zeroes
-        // mean *unknown*. Its arm sits above the floor so the diagnostic
+        // Ordering: a timeout reports no meter and zero turns. Its arm
+        // sits above the floor so the diagnostic
         // stays a timeout, and the wall-clock ceiling keeps counting it.
-        assert!(timed_out().num_turns == 0 && timed_out().total_cost_usd == 0.0);
+        assert!(timed_out().num_turns == 0 && timed_out().cost_usd.is_none());
         assert_eq!(
             classify(&timed_out()),
             DispatchClassification::InfrastructureFailure
@@ -3071,6 +4250,7 @@ satisfies it on its own"
                 commit_sha: None,
             },
             Some(&succeeded),
+            false,
         )
         .unwrap();
 
@@ -3078,5 +4258,178 @@ satisfies it on its own"
         assert_eq!(after.best_verdict, Some(AttemptOutcome::Success));
         assert_eq!(after.best_commit_sha, succeeded.best_commit_sha);
         assert_eq!(after.cumulative_attempt_n, 2);
+    }
+    #[test]
+    fn completed_codex_pauses_reenter_queue_and_resume_native_identity_once() {
+        use crate::autopilot::codex_process::CodexProcessSnapshot;
+        use crate::autopilot::gh::IssueListing;
+        use crate::autopilot::queue::{plan_queue, QueueConfig, RepoBacklog};
+        use crate::autopilot::registry::{HarnessSnapshots, RegistrySnapshot};
+        use crate::autopilot::supervise::{reconcile, ReconcileVerdict};
+        struct PausingDispatch<'a> {
+            db: &'a Database,
+            outcome: Option<DispatchOutcome>,
+            spend_after: bool,
+            invocation: Option<String>,
+        }
+        impl Dispatcher for PausingDispatch<'_> {
+            fn implementer(&self) -> Implementer {
+                Implementer::Codex
+            }
+            fn dispatch(
+                &mut self,
+                _repo: &Path,
+                spec: &DispatchSpec,
+            ) -> Result<DispatchOutcome, MemoryError> {
+                let state = dispatch_state::get_dispatch_state(self.db, &issue())?.unwrap();
+                assert_eq!(state.state, "dispatching");
+                assert_eq!(
+                    state.codex_artifacts, spec.codex_artifacts,
+                    "pending invocation is durable before launch"
+                );
+                self.invocation =
+                    Some(spec.codex_artifacts.as_ref().unwrap().invocation_id.clone());
+                if self.spend_after {
+                    budget::accumulate_daily_spend(self.db, &today_utc(), 1.5)?;
+                }
+                let mut outcome = self
+                    .outcome
+                    .take()
+                    .expect("only one invocation before pause");
+                outcome.cost_usd = None;
+                Ok(outcome)
+            }
+        }
+        for (first, daily, infrastructure) in [
+            (not_met(), false, false),
+            (timed_out(), false, false),
+            (not_met(), true, false),
+            (no_verdict_error(), false, true),
+        ] {
+            let db = approved_db();
+            let (_dir, wt) = fixture_worktree();
+            let mut cfg = codex_config();
+            cfg.max_budget_usd = 1.0;
+            cfg.daily_budget_usd = 2.0;
+            cfg.max_unpriced_dispatches_per_day = 1;
+            if infrastructure {
+                cfg.max_consecutive_infrastructure_failures = 1;
+            }
+            let mut dispatcher = PausingDispatch {
+                db: &db,
+                outcome: Some(first),
+                spend_after: daily,
+                invocation: None,
+            };
+            let paused = run_issue(&db, &issue(), &brief(), &wt, &cfg, &mut dispatcher).unwrap();
+            assert_eq!(paused.unpriced_dispatches, 1);
+            if daily {
+                assert!(matches!(
+                    paused.terminal,
+                    TerminalReason::DailyBudgetExhausted { .. }
+                ));
+            } else if infrastructure {
+                assert!(matches!(
+                    paused.terminal,
+                    TerminalReason::InfrastructureFailure { .. }
+                ));
+            } else {
+                assert!(matches!(
+                    paused.terminal,
+                    TerminalReason::UnpricedDispatchesExhausted { .. }
+                ));
+            }
+            let state = dispatch_state::get_dispatch_state(&db, &issue())
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                state.state,
+                if daily {
+                    "paused-daily-budget"
+                } else {
+                    "paused-infrastructure-failure"
+                }
+            );
+            assert!(state.codex_artifacts.is_none());
+            let native = state.native_session_id.clone().unwrap();
+            assert_eq!(native, "11111111-2222-3333-4444-555555555555");
+            let ledger = budget::get_daily_spend(&db, &today_utc()).unwrap().unwrap();
+            assert_eq!(ledger.unpriced_dispatch_count, 1);
+            assert_eq!(
+                ledger.reserved_unpriced_dispatch_ids,
+                vec![dispatcher.invocation.unwrap()]
+            );
+            let snapshots = HarnessSnapshots {
+                claude: RegistrySnapshot::Unavailable {
+                    reason: "Claude unrelated".into(),
+                },
+                codex: CodexProcessSnapshot::Available(Vec::new()),
+            };
+            let backlog = [RepoBacklog {
+                repo: issue().repo,
+                issues: vec![IssueListing {
+                    number: issue().number,
+                    title: brief().title,
+                    body: brief().body,
+                    labels: vec!["agent:ready".into()],
+                    updated_at: "2026-09-02T00:00:00Z".into(),
+                }],
+            }];
+            let queue_cfg = QueueConfig {
+                max_budget_usd: 1.0,
+                daily_budget_usd: 4.0,
+                ..QueueConfig::default()
+            };
+            let plan = plan_queue(&db, &backlog, &snapshots, &queue_cfg).unwrap();
+            assert_eq!(
+                plan.dispatch.len(),
+                1,
+                "a completed paused Codex invocation must be selectable: {:?}",
+                plan.deferred
+            );
+            assert_eq!(plan.dispatch[0].issue, issue());
+            assert!(matches!(
+                reconcile(&db, &snapshots).unwrap()[0].verdict,
+                ReconcileVerdict::RestartFromCheckpoint { .. }
+            ));
+            assert_eq!(
+                budget::get_daily_spend(&db, &today_utc()).unwrap().unwrap(),
+                ledger,
+                "liveness planning does not reserve the old invocation again"
+            );
+            cfg.daily_budget_usd = 4.0;
+            cfg.max_unpriced_dispatches_per_day = 2;
+            let mut resumed = codex_script(vec![met()]);
+            resumed.recovery = Some(CodexRecovery::NoPriorInvocation);
+            let result = run_issue(&db, &issue(), &brief(), &wt, &cfg, &mut resumed).unwrap();
+            assert!(matches!(result.terminal, TerminalReason::Met { .. }));
+            assert_eq!(result.unpriced_dispatches, 1);
+            assert!(
+                matches!(&resumed.inner.seen[0].session, SessionMode::Resume { session_uuid } if session_uuid == &native)
+            );
+            let after = budget::get_daily_spend(&db, &today_utc()).unwrap().unwrap();
+            assert_eq!(after.unpriced_dispatch_count, 2);
+            assert_eq!(after.reserved_unpriced_dispatch_ids.len(), 2);
+            assert_eq!(
+                after.reserved_unpriced_dispatch_ids[1],
+                resumed.inner.seen[0]
+                    .codex_artifacts
+                    .as_ref()
+                    .unwrap()
+                    .invocation_id
+            );
+            assert_eq!(
+                after.reserved_unpriced_dispatch_ids[0],
+                ledger.reserved_unpriced_dispatch_ids[0]
+            );
+            assert_ne!(
+                after.reserved_unpriced_dispatch_ids[0],
+                after.reserved_unpriced_dispatch_ids[1]
+            );
+            assert_eq!(after.total_cost_usd, ledger.total_cost_usd);
+            assert!(dispatch_state::get_dispatch_state(&db, &issue())
+                .unwrap()
+                .is_none());
+        }
     }
 }

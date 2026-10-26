@@ -73,7 +73,8 @@
 //! set rather than a scalar.
 
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
@@ -103,9 +104,15 @@ pub trait AgentRegistry {
     fn list(&mut self) -> Result<RegistryOutput, MemoryError>;
 }
 
+/// How long `claude agents --json` may take. Every controller samples it,
+/// including a Codex-only Lead, so a hung Claude CLI must read as an
+/// unavailable registry rather than stall the whole tick.
+const REGISTRY_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// The real registry: `claude agents --json`.
 pub struct ClaudeAgentRegistry {
     bin: PathBuf,
+    timeout: Duration,
 }
 
 impl ClaudeAgentRegistry {
@@ -116,21 +123,64 @@ impl ClaudeAgentRegistry {
     pub fn resolve() -> Result<Self, MemoryError> {
         Ok(Self {
             bin: super::dispatch::resolve_claude_binary()?,
+            timeout: REGISTRY_TIMEOUT,
         })
     }
 }
 
 impl AgentRegistry for ClaudeAgentRegistry {
     fn list(&mut self) -> Result<RegistryOutput, MemoryError> {
-        let args = build_argv();
-        let output = Command::new(&self.bin)
-            .args(&args)
-            .output()
+        let mut command = Command::new(&self.bin);
+        command
+            .args(build_argv())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        // Its own group, so the bound reaps whatever the CLI started too.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+        let mut child = super::dispatch::retry_on_etxtbsy(|| command.spawn())
             .map_err(|e| MemoryError::NotFound(format!("failed to start claude agents: {e}")))?;
+        // Drained on their own threads so a full pipe cannot read as a hang.
+        let stdout = super::dispatch::drain(child.stdout.take());
+        let stderr = super::dispatch::drain(child.stderr.take());
+        let deadline = Instant::now() + self.timeout;
+        // Reaped only once both pipes close: until then the unreaped child
+        // reserves its group's ID, so the bound can still kill a descendant
+        // that outlived the CLI holding its output open.
+        let status = loop {
+            let waited = if stdout.is_finished() && stderr.is_finished() {
+                child.try_wait()
+            } else {
+                Ok(None)
+            };
+            match waited {
+                Ok(Some(status)) => break status,
+                Ok(None) if Instant::now() >= deadline => {
+                    super::dispatch::kill_process_group(&mut child);
+                    let _ = child.wait();
+                    return Err(MemoryError::Validation(format!(
+                        "claude agents did not answer within {}s",
+                        self.timeout.as_secs()
+                    )));
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+                Err(e) => {
+                    super::dispatch::kill_process_group(&mut child);
+                    let _ = child.wait();
+                    return Err(e.into());
+                }
+            }
+        };
+        let stdout = stdout.join().unwrap_or_default();
+        let stderr = stderr.join().unwrap_or_default();
         Ok(RegistryOutput {
-            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-            success: output.status.success(),
+            stdout: String::from_utf8_lossy(&stdout).to_string(),
+            stderr: String::from_utf8_lossy(&stderr).to_string(),
+            success: status.success(),
         })
     }
 }
@@ -300,9 +350,255 @@ pub fn snapshot(registry: &mut dyn AgentRegistry) -> RegistrySnapshot {
     }
 }
 
+pub use crate::autopilot::codex_process::{parse_codex_processes, CodexProcessSnapshot};
+use crate::autopilot::dispatch_state::DispatchState;
+use crate::autopilot::implementer::Implementer;
+
+/// The decision seam routes exclusively by the persisted dispatch harness.
+pub trait LivenessSnapshot {
+    fn liveness(&self, state: &DispatchState) -> Liveness;
+    fn reason(&self, implementer: Implementer) -> String;
+    fn state_reason(&self, state: &DispatchState) -> String {
+        self.reason(state.implementer)
+    }
+    fn claude_names(&self) -> Vec<&str>;
+    fn codex_markers(&self) -> Vec<&str> {
+        Vec::new()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct HarnessSnapshots {
+    pub claude: RegistrySnapshot,
+    pub codex: CodexProcessSnapshot,
+}
+impl HarnessSnapshots {
+    pub fn is_available(&self, implementer: Implementer) -> bool {
+        match implementer {
+            Implementer::Claude => self.claude.is_available(),
+            Implementer::Codex => self.codex.is_available(),
+        }
+    }
+}
+/// `run_issue` persists dispatching + exact new artifacts atomically before
+/// every Codex spawn, and retains pending artifacts whenever completion is
+/// uncertain. Every label `run_issue` writes with no pending artifacts
+/// therefore establishes an idle invocation, including a pause or refusal
+/// before the first launch and a between-invocation state an early `?` left
+/// behind. An unrecognized label still holds, a fresh source is still
+/// required, and identifiable conflicting work holds.
+fn idle_codex_pause(snapshot: &CodexProcessSnapshot, state: &DispatchState) -> Result<(), String> {
+    let CodexProcessSnapshot::Available(rows) = snapshot else {
+        return Err(snapshot.reason());
+    };
+    if !matches!(
+        state.state.as_str(),
+        "paused-daily-budget"
+            | "paused-infrastructure-failure"
+            | "paused-condition-too-long"
+            | "dispatching"
+            | "infrastructure-failure"
+    ) {
+        return Err(format!(
+            "Codex state {:?} has no pending invocation identity and is not a state autopilot writes without one",
+            state.state
+        ));
+    }
+    if state
+        .native_session_id
+        .as_ref()
+        .is_some_and(|id| uuid::Uuid::parse_str(id).is_err())
+    {
+        return Err("paused Codex state has an invalid native session UUID".into());
+    }
+    if let Some(reason) = rows
+        .iter()
+        .filter(|row| row.active())
+        .find_map(|row| row.marker().err())
+    {
+        return Err(format!("Codex process marker is ambiguous: {reason}"));
+    }
+    let slug = state.issue.slug();
+    if snapshot.orphan_markers().iter().any(|marker| {
+        crate::autopilot::codex_process::marker_issue_slug(marker) == Some(slug.as_str())
+    }) {
+        return Err("an active Codex Autopilot marker matches this issue; paused state has no exact invocation identity to adopt safely".into());
+    }
+    Ok(())
+}
+
+pub(crate) fn codex_state_liveness(
+    snapshot: &CodexProcessSnapshot,
+    state: &DispatchState,
+) -> Liveness {
+    match state.codex_artifacts.as_ref() {
+        Some(artifacts) => snapshot.liveness(Some(artifacts)),
+        None => match idle_codex_pause(snapshot, state) {
+            Ok(()) => Liveness::NotListed,
+            Err(_) => Liveness::Unknown,
+        },
+    }
+}
+
+pub(crate) fn codex_state_reason(snapshot: &CodexProcessSnapshot, state: &DispatchState) -> String {
+    match state.codex_artifacts.as_ref() {
+        Some(artifacts) => snapshot.invocation_reason(Some(artifacts)),
+        None => idle_codex_pause(snapshot, state)
+            .err()
+            .unwrap_or_else(|| "Codex has no pending invocation in a durable paused state".into()),
+    }
+}
+
+impl LivenessSnapshot for HarnessSnapshots {
+    fn liveness(&self, state: &DispatchState) -> Liveness {
+        match state.implementer {
+            Implementer::Claude => self.claude.liveness(&state.ic_session_name),
+            Implementer::Codex => codex_state_liveness(&self.codex, state),
+        }
+    }
+    fn reason(&self, implementer: Implementer) -> String {
+        match implementer {
+            Implementer::Claude => LivenessSnapshot::reason(&self.claude, implementer),
+            Implementer::Codex => self.codex.reason(),
+        }
+    }
+    fn state_reason(&self, state: &DispatchState) -> String {
+        match state.implementer {
+            Implementer::Claude => self.reason(state.implementer),
+            Implementer::Codex => codex_state_reason(&self.codex, state),
+        }
+    }
+    fn claude_names(&self) -> Vec<&str> {
+        self.claude.names()
+    }
+    fn codex_markers(&self) -> Vec<&str> {
+        self.codex.orphan_markers()
+    }
+}
+/// Compatibility for callers providing only Claude evidence: never infer a
+/// Codex death from the absence of a Claude session.
+impl LivenessSnapshot for RegistrySnapshot {
+    fn liveness(&self, state: &DispatchState) -> Liveness {
+        match state.implementer {
+            Implementer::Claude => self.liveness(&state.ic_session_name),
+            Implementer::Codex => Liveness::Unknown,
+        }
+    }
+    fn reason(&self, implementer: Implementer) -> String {
+        if implementer == Implementer::Codex {
+            return "Codex process source was not supplied".into();
+        }
+        match self {
+            Self::Unavailable { reason } => reason.clone(),
+            Self::Available(_) => "session liveness unavailable".into(),
+        }
+    }
+    fn claude_names(&self) -> Vec<&str> {
+        self.names()
+    }
+}
+
+pub trait HarnessMonitor {
+    fn snapshot(&mut self) -> HarnessSnapshots;
+}
+impl<T: AgentRegistry + ?Sized> HarnessMonitor for T {
+    fn snapshot(&mut self) -> HarnessSnapshots {
+        // Keep this adapter Claude-only; real controllers use TwoHarnessMonitor.
+        let claude = match self.list() {
+            Ok(output) if output.success => match parse_agents(&output.stdout) {
+                Ok(rows) => RegistrySnapshot::Available(rows),
+                Err(reason) => RegistrySnapshot::Unavailable { reason },
+            },
+            Ok(output) => RegistrySnapshot::Unavailable {
+                reason: format!(
+                    "session registry exited non-zero: {}",
+                    super::scrub::scrub_and_bound(&output.stderr, 500).text
+                ),
+            },
+            Err(e) => RegistrySnapshot::Unavailable {
+                reason: e.to_string(),
+            },
+        };
+        HarnessSnapshots {
+            claude,
+            codex: CodexProcessSnapshot::Unavailable {
+                reason: "Codex process source was not supplied".into(),
+            },
+        }
+    }
+}
+
+pub struct TwoHarnessMonitor {
+    claude: Result<ClaudeAgentRegistry, String>,
+    codex: super::codex_process::UnixCodexProcesses,
+}
+impl Default for TwoHarnessMonitor {
+    fn default() -> Self {
+        Self {
+            claude: ClaudeAgentRegistry::resolve().map_err(|e| e.to_string()),
+            codex: super::codex_process::UnixCodexProcesses,
+        }
+    }
+}
+impl HarnessMonitor for TwoHarnessMonitor {
+    fn snapshot(&mut self) -> HarnessSnapshots {
+        let claude = match &mut self.claude {
+            Ok(registry) => snapshot(registry),
+            Err(reason) => RegistrySnapshot::Unavailable {
+                reason: reason.clone(),
+            },
+        };
+        HarnessSnapshots {
+            claude,
+            codex: super::codex_process::snapshot(&mut self.codex),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_hung_claude_cli_reads_as_an_unavailable_registry_within_its_bound() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let registry = |name: &str, script: &str| {
+            let bin = dir.path().join(name);
+            std::fs::write(&bin, format!("#!/bin/sh\n{script}\n")).unwrap();
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            ClaudeAgentRegistry {
+                bin,
+                timeout: Duration::from_millis(300),
+            }
+        };
+        // Hung outright, and exited while a child holds its output open.
+        // Either way the bound reaps what the CLI started.
+        for (name, script) in [
+            ("hung", "(sleep 2; touch \"$0.survived\") &\nsleep 5"),
+            ("leaky", "(sleep 2; touch \"$0.survived\") &\necho '[]'"),
+        ] {
+            let started = Instant::now();
+            match snapshot(&mut registry(name, script)) {
+                RegistrySnapshot::Unavailable { reason } => {
+                    assert!(reason.contains("did not answer"), "{name}: {reason}")
+                }
+                other => panic!("{name}: {other:?}"),
+            }
+            // Well inside the descendant's 2s, even on a loaded machine.
+            assert!(started.elapsed() < Duration::from_millis(1500), "{name}");
+            std::thread::sleep(Duration::from_millis(2500).saturating_sub(started.elapsed()));
+            assert!(
+                !dir.path().join(format!("{name}.survived")).exists(),
+                "{name}: the bound left the CLI's descendant running"
+            );
+        }
+        assert_eq!(
+            snapshot(&mut registry("prompt", "echo '[]'")),
+            RegistrySnapshot::Available(Vec::new())
+        );
+    }
 
     /// A registry that replays a canned result.
     pub(crate) struct FakeRegistry {
@@ -558,6 +854,182 @@ mod tests {
         assert!(
             !snap.is_available(),
             "an empty names() must be distinguishable from a genuinely empty registry"
+        );
+    }
+}
+
+#[cfg(test)]
+mod harness_tests {
+    use super::*;
+    use crate::autopilot::implementer::Implementer;
+
+    #[test]
+    fn harness_sources_do_not_cross_contaminate() {
+        let snapshots = HarnessSnapshots {
+            claude: RegistrySnapshot::Available(vec![AgentEntry {
+                name: "ic-test".into(),
+                status: None,
+            }]),
+            codex: CodexProcessSnapshot::Unavailable {
+                reason: "ps unavailable".into(),
+            },
+        };
+        assert!(snapshots.is_available(Implementer::Claude));
+        assert!(!snapshots.is_available(Implementer::Codex));
+        assert_eq!(snapshots.reason(Implementer::Codex), "ps unavailable");
+    }
+
+    #[test]
+    fn codex_parser_uses_executable_and_option_position() {
+        let rows = parse_codex_processes("10 1 10 S /opt/codex exec --output-schema /tmp/.git/ironmem/autopilot/repo/uuid/schema.json prompt\n11 1 11 S /bin/sh -c codex exec --output-schema /tmp/.git/ironmem/autopilot/repo/uuid/schema.json\n12 1 12 S codex exec --json reviewer prompt\n13 1 13 S codex exec resume --output-schema /tmp/.git/ironmem/autopilot/repo/other/schema.json native prompt\n").unwrap();
+        assert_eq!(rows.len(), 4);
+        assert_eq!(
+            rows[0].marker().unwrap(),
+            Some("/tmp/.git/ironmem/autopilot/repo/uuid/schema.json")
+        );
+        assert_eq!(rows[1].marker().unwrap(), None);
+        assert_eq!(rows[2].marker().unwrap(), None);
+        let reviewer =
+            parse_codex_processes("16 1 16 S codex exec --future-review-flag reviewer\n").unwrap();
+        assert_eq!(reviewer[0].marker().unwrap(), None);
+        assert_eq!(
+            rows[3].marker().unwrap(),
+            Some("/tmp/.git/ironmem/autopilot/repo/other/schema.json")
+        );
+        let bad = parse_codex_processes(
+            "14 1 14 S codex exec --output-schema /tmp/.git/ironmem/autopilot/repo/uuid/schema.json --future-flag v p\n",
+        )
+        .unwrap();
+        assert!(bad[0].marker().is_err());
+        let prompt =
+            parse_codex_processes("15 1 15 S codex exec prompt --output-schema /tmp/false\n")
+                .unwrap();
+        assert_eq!(prompt[0].marker().unwrap(), None);
+    }
+    fn paused_codex_state() -> DispatchState {
+        DispatchState {
+            implementer: Implementer::Codex,
+            native_session_id: Some("11111111-2222-3333-4444-555555555555".into()),
+            codex_artifacts: None,
+            issue: crate::autopilot::IssueRef::new("owner/repo", 42),
+            worktree_path: "/tmp/wt".into(),
+            ic_session_name: "ic-owner-repo-42".into(),
+            dispatch_class: "logic".into(),
+            attempt_n: 1,
+            state: "paused-daily-budget".into(),
+            started_at: "2026-09-02T00:00:00Z".into(),
+            session_uuid: "controller-only".into(),
+            turn_n: 3,
+            session_claimed: true,
+        }
+    }
+    fn paused_snapshots() -> HarnessSnapshots {
+        HarnessSnapshots {
+            claude: RegistrySnapshot::Available(vec![AgentEntry {
+                name: "ic-owner-repo-42".into(),
+                status: None,
+            }]),
+            codex: CodexProcessSnapshot::Available(Vec::new()),
+        }
+    }
+    #[test]
+    fn explicit_idle_codex_pauses_require_available_source_and_valid_optional_native_id() {
+        let mut state = paused_codex_state();
+        let snapshots = paused_snapshots();
+        for label in [
+            "paused-daily-budget",
+            "paused-infrastructure-failure",
+            // Written with no pending artifacts by `run_issue`: a refusal
+            // before the first launch, and the between-invocation states a
+            // failed `?` on the next iteration leaves behind.
+            "paused-condition-too-long",
+            "dispatching",
+            "infrastructure-failure",
+        ] {
+            state.state = label.into();
+            assert_eq!(snapshots.liveness(&state), Liveness::NotListed, "{label}");
+            state.native_session_id = None;
+            assert_eq!(
+                snapshots.liveness(&state),
+                Liveness::NotListed,
+                "never-started or unidentified completed pause is also idle"
+            );
+            state.native_session_id = Some("11111111-2222-3333-4444-555555555555".into());
+        }
+        for bad in ["", "invalid", " 11111111-2222-3333-4444-555555555555"] {
+            state.native_session_id = Some(bad.into());
+            assert_eq!(snapshots.liveness(&state), Liveness::Unknown);
+        }
+        let state = paused_codex_state();
+        let mut unavailable = paused_snapshots();
+        unavailable.codex = CodexProcessSnapshot::Unavailable {
+            reason: "ps unavailable".into(),
+        };
+        assert_eq!(unavailable.liveness(&state), Liveness::Unknown);
+        assert_eq!(
+            LivenessSnapshot::liveness(&snapshots.claude, &state),
+            Liveness::Unknown,
+            "legacy Claude evidence never proves a Codex pause idle"
+        );
+    }
+    #[test]
+    fn absent_codex_identity_in_an_unknown_phase_still_holds() {
+        let mut state = paused_codex_state();
+        let snapshots = paused_snapshots();
+        for phase in ["paused-other", "", "Dispatching"] {
+            state.state = phase.into();
+            assert_eq!(snapshots.liveness(&state), Liveness::Unknown);
+        }
+    }
+    #[test]
+    fn a_paused_label_never_bypasses_pending_codex_identity_or_completion() {
+        use crate::autopilot::codex_process::testing;
+        let dir = tempfile::tempdir().unwrap();
+        let (a, _) = testing::invocation(dir.path());
+        let mut state = paused_codex_state();
+        state.codex_artifacts = Some(a.clone());
+        let snapshots = paused_snapshots();
+        assert_eq!(snapshots.liveness(&state), Liveness::Unknown);
+        testing::complete(&a);
+        assert_eq!(snapshots.liveness(&state), Liveness::NotListed);
+        let manifest = std::path::Path::new(&a.schema_path).with_file_name("process.json");
+        let mut invalid: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+        invalid["version"] = serde_json::json!(2);
+        std::fs::write(&manifest, serde_json::to_vec(&invalid).unwrap()).unwrap();
+        assert_eq!(snapshots.liveness(&state), Liveness::Unknown);
+        std::fs::remove_file(manifest).unwrap();
+        assert_eq!(snapshots.liveness(&state), Liveness::Unknown);
+    }
+    #[test]
+    fn fresh_same_issue_or_ambiguous_codex_process_evidence_overrides_idle_pause() {
+        let state = paused_codex_state();
+        let mut snapshots = paused_snapshots();
+        assert_eq!(snapshots.liveness(&state), Liveness::NotListed);
+        snapshots.codex = CodexProcessSnapshot::Available(parse_codex_processes("10 1 10 S codex exec --output-schema /other-clone/.git/ironmem/autopilot/owner-repo-42/11111111-2222-3333-4444-555555555555/schema.json prompt\n").unwrap());
+        assert_eq!(
+            snapshots.liveness(&state),
+            Liveness::Unknown,
+            "without a persisted invocation marker, hold rather than adopt an inferred root"
+        );
+        assert!(snapshots.state_reason(&state).contains("active"));
+        snapshots.codex = CodexProcessSnapshot::Available(
+            parse_codex_processes(
+                "10 1 10 S codex exec --future-flag v --output-schema /x/schema.json p\n",
+            )
+            .unwrap(),
+        );
+        assert_eq!(snapshots.liveness(&state), Liveness::Unknown);
+        // An unparseable row that names no schema.json cannot be ours.
+        snapshots.codex = CodexProcessSnapshot::Available(
+            parse_codex_processes("10 1 10 S codex exec --output-schema\n").unwrap(),
+        );
+        assert_eq!(snapshots.liveness(&state), Liveness::NotListed);
+        snapshots.codex = CodexProcessSnapshot::Available(parse_codex_processes("10 1 10 S codex exec --output-schema /other/.git/ironmem/autopilot/owner-repo-99/11111111-2222-3333-4444-555555555555/schema.json prompt\n11 1 11 S codex exec reviewer prompt\n12 1 12 S /bin/sh -c codex exec --output-schema /other-clone/.git/ironmem/autopilot/owner-repo-42/11111111-2222-3333-4444-555555555555/schema.json\n").unwrap());
+        assert_eq!(
+            snapshots.liveness(&state),
+            Liveness::NotListed,
+            "unrelated issue, reviewer, and shell text do not defeat known idle state"
         );
     }
 }

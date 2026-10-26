@@ -200,10 +200,14 @@ pub mod advise;
 pub mod blocked;
 pub mod budget;
 pub mod ci_evidence;
+pub mod clear;
+pub mod codex_dispatch;
+pub mod codex_process;
 pub mod dispatch;
 pub mod dispatch_state;
 pub mod gate_config;
 pub mod gh;
+pub mod implementer;
 pub mod labels;
 pub mod lead;
 pub mod lineage;
@@ -236,16 +240,21 @@ use crate::mcp::tools::{LOGICAL_KEY_ID_PREFIX, LOGICAL_KEY_SOURCE_PREFIX};
 pub use advise::{Advice, AdviceConfig, AdviceKind, AdviceStatus, Advisor, ClaudeAdvisor};
 pub use blocked::{ask_human, poll_answer, AskOutcome, BlockedPoll, BlockedRecord, QaPair};
 pub use budget::BudgetLedgerEntry;
+pub use codex_dispatch::{CodexArtifacts, CodexRecovery};
 pub use dispatch::{DispatchOutcome, DispatchSpec, SessionMode, Verdict};
 pub use dispatch_state::DispatchState;
 pub use gate_config::{GateConfig, GateConfigState};
+pub use implementer::Implementer;
 pub use lead::{lead_tick, LeadConfig, LeadReport, RepoTarget};
 pub use lineage::{AttemptOutcome, AttemptRecord, IssueStatus, RecordedAttempt};
 pub use onboard::{infer_gate_commands, onboard_repo, InferredGates};
 pub use queue::{
     plan_queue, DeferReason, Deferred, Priority, QueueConfig, QueuePlan, QueuedIssue, RepoBacklog,
 };
-pub use registry::{AgentRegistry, ClaudeAgentRegistry, Liveness, RegistrySnapshot};
+pub use registry::{
+    AgentRegistry, ClaudeAgentRegistry, HarnessMonitor, HarnessSnapshots, Liveness,
+    LivenessSnapshot, RegistrySnapshot, TwoHarnessMonitor,
+};
 pub use review::reviews_for_issue;
 pub use review::{
     decide_merge, record_review, review_pr, run_muse_review, run_review, CodexReviewer, HoldReason,

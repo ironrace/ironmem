@@ -13,6 +13,8 @@ use serde_json::json;
 use crate::db::schema::Database;
 use crate::error::MemoryError;
 
+use super::codex_dispatch::CodexArtifacts;
+use super::implementer::Implementer;
 use super::{read_current, validate_repo, write_current, IssueRef};
 
 /// One in-flight IC dispatch. Field names and the literal-shape fields
@@ -29,6 +31,9 @@ use super::{read_current, validate_repo, write_current, IssueRef};
 /// wire shape differs, to track each kind's literal spec shape faithfully.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DispatchState {
+    pub implementer: Implementer,
+    pub native_session_id: Option<String>,
+    pub codex_artifacts: Option<CodexArtifacts>,
     pub issue: IssueRef,
     pub worktree_path: String,
     pub ic_session_name: String,
@@ -57,6 +62,12 @@ pub struct DispatchState {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DispatchStateBody {
+    #[serde(default)]
+    implementer: Implementer,
+    #[serde(default)]
+    native_session_id: Option<String>,
+    #[serde(default)]
+    codex_artifacts: Option<CodexArtifacts>,
     issue: u64,
     repo: String,
     worktree_path: String,
@@ -87,6 +98,9 @@ fn dispatch_state_key(issue: &IssueRef) -> String {
 pub fn upsert_dispatch_state(db: &Database, state: &DispatchState) -> Result<String, MemoryError> {
     validate_repo(&state.issue.repo)?;
     let body = DispatchStateBody {
+        implementer: state.implementer,
+        native_session_id: state.native_session_id.clone(),
+        codex_artifacts: state.codex_artifacts.clone(),
         issue: state.issue.number,
         repo: state.issue.repo.clone(),
         worktree_path: state.worktree_path.clone(),
@@ -112,8 +126,17 @@ pub fn get_dispatch_state(
     let Some(drawer) = read_current(db, &dispatch_state_key(issue))? else {
         return Ok(None);
     };
-    let body: DispatchStateBody = serde_json::from_str(&drawer.content)?;
-    Ok(Some(DispatchState {
+    state_from_content(&drawer.content).map(Some)
+}
+
+fn state_from_content(content: &str) -> Result<DispatchState, MemoryError> {
+    let body: DispatchStateBody = serde_json::from_str(content)?;
+    Ok(DispatchState {
+        implementer: body.implementer,
+        native_session_id: body.native_session_id.or_else(|| {
+            (body.implementer == Implementer::Claude).then(|| body.session_uuid.clone())
+        }),
+        codex_artifacts: body.codex_artifacts,
         issue: IssueRef::new(body.repo, body.issue),
         worktree_path: body.worktree_path,
         ic_session_name: body.ic_session_name,
@@ -124,7 +147,7 @@ pub fn get_dispatch_state(
         session_uuid: body.session_uuid,
         turn_n: body.turn_n,
         session_claimed: body.session_claimed,
-    }))
+    })
 }
 
 /// Every in-flight issue's dispatch-state drawer.
@@ -153,21 +176,10 @@ pub fn all_dispatch_states(db: &Database, limit: usize) -> Result<Vec<DispatchSt
     let drawers = db.get_drawers_by_source_prefix(super::WING, super::ROOM, &prefix, limit)?;
     let mut states = Vec::new();
     for drawer in drawers {
-        let Ok(body) = serde_json::from_str::<DispatchStateBody>(&drawer.content) else {
+        let Ok(state) = state_from_content(&drawer.content) else {
             continue;
         };
-        states.push(DispatchState {
-            issue: IssueRef::new(body.repo, body.issue),
-            worktree_path: body.worktree_path,
-            ic_session_name: body.ic_session_name,
-            dispatch_class: body.dispatch_class,
-            attempt_n: body.attempt_n,
-            state: body.state,
-            started_at: body.started_at,
-            session_uuid: body.session_uuid,
-            turn_n: body.turn_n,
-            session_claimed: body.session_claimed,
-        });
+        states.push(state);
     }
     Ok(states)
 }
@@ -200,12 +212,51 @@ pub fn clear_dispatch_state(db: &Database, issue: &IssueRef) -> Result<bool, Mem
     })
 }
 
+/// [`clear_dispatch_state`], but only while the drawer still holds
+/// `expected`. Read and delete share one transaction, so a dispatch that
+/// rewrote the state after the caller judged it is never deleted unseen.
+/// Returns `false`, deleting nothing, when the state changed or is gone.
+pub fn clear_dispatch_state_if_unchanged(
+    db: &Database,
+    expected: &DispatchState,
+) -> Result<bool, MemoryError> {
+    use rusqlite::OptionalExtension;
+    let id = super::logical_drawer_id(&dispatch_state_key(&expected.issue));
+    db.with_transaction(|tx| {
+        let content: Option<String> = tx
+            .query_row("SELECT content FROM drawers WHERE id = ?1", [&id], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        let unchanged = match content {
+            Some(content) => state_from_content(&content)? == *expected,
+            None => false,
+        };
+        let deleted = unchanged && Database::delete_drawer_tx(tx, &id)?;
+        Database::wal_log_tx(
+            tx,
+            "autopilot_clear_dispatch_state",
+            &json!({
+                "drawer_id": &id,
+                "issue": expected.issue.canonical(),
+                "deleted": deleted,
+                "conditional": true,
+            }),
+            None,
+        )?;
+        Ok(deleted)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn sample(issue: &IssueRef, turn_n: u32) -> DispatchState {
         DispatchState {
+            implementer: crate::autopilot::implementer::Implementer::Claude,
+            native_session_id: None,
+            codex_artifacts: None,
             issue: issue.clone(),
             worktree_path: "/tmp/worktrees/ironmem-283".into(),
             ic_session_name: "ic-ironmem-283".into(),
@@ -217,6 +268,83 @@ mod tests {
             turn_n,
             session_claimed: true,
         }
+    }
+
+    #[test]
+    fn a_conditional_clear_never_deletes_a_state_rewritten_after_it_was_judged() {
+        let db = Database::open_in_memory().unwrap();
+        let issue = IssueRef::new("ironrace/ironmem", 283);
+        // Callers judge the state as read back, which normalizes legacy fields.
+        upsert_dispatch_state(&db, &sample(&issue, 1)).unwrap();
+        let judged = get_dispatch_state(&db, &issue).unwrap().unwrap();
+        upsert_dispatch_state(&db, &sample(&issue, 2)).unwrap();
+        let rewritten = get_dispatch_state(&db, &issue).unwrap().unwrap();
+        assert!(!clear_dispatch_state_if_unchanged(&db, &judged).unwrap());
+        assert_eq!(
+            get_dispatch_state(&db, &issue).unwrap(),
+            Some(rewritten.clone())
+        );
+        assert!(clear_dispatch_state_if_unchanged(&db, &rewritten).unwrap());
+        assert!(get_dispatch_state(&db, &issue).unwrap().is_none());
+        assert!(!clear_dispatch_state_if_unchanged(&db, &rewritten).unwrap());
+    }
+    #[test]
+    fn codex_wire_roundtrip_keeps_native_identity_and_absolute_artifacts() {
+        let db = Database::open_in_memory().unwrap();
+        let issue = IssueRef::new("ironmem", 283);
+        let mut state = sample(&issue, 7);
+        state.implementer = Implementer::Codex;
+        state.native_session_id = Some("native-id".into());
+        state.codex_artifacts = Some(CodexArtifacts {
+            invocation_id: "invocation".into(),
+            schema_path: "/original/schema".into(),
+            journal_path: "/original/journal".into(),
+            final_path: "/original/final".into(),
+            stderr_path: "/original/stderr".into(),
+            exit_path: "/original/exit".into(),
+        });
+        upsert_dispatch_state(&db, &state).unwrap();
+        assert_eq!(get_dispatch_state(&db, &issue).unwrap(), Some(state));
+        let drawer = read_current(&db, &dispatch_state_key(&issue))
+            .unwrap()
+            .unwrap();
+        let invalid = drawer.content.replace("\"codex\"", "\"unknown-harness\"");
+        write_current(&db, &dispatch_state_key(&issue), &invalid).unwrap();
+        assert!(get_dispatch_state(&db, &issue).is_err());
+    }
+
+    #[test]
+    fn old_wire_defaults_to_claude_and_native_uuid() {
+        let db = Database::open_in_memory().unwrap();
+        let issue = IssueRef::new("ironmem", 283);
+        let mut body = serde_json::to_value(DispatchStateBody {
+            implementer: Implementer::Claude,
+            native_session_id: None,
+            codex_artifacts: None,
+            issue: 283,
+            repo: "ironmem".into(),
+            worktree_path: "/absolute/worktree".into(),
+            ic_session_name: "ic".into(),
+            dispatch_class: "logic".into(),
+            attempt_n: 1,
+            state: "dispatching".into(),
+            started_at: "now".into(),
+            session_uuid: "old-id".into(),
+            turn_n: 3,
+            session_claimed: true,
+        })
+        .unwrap();
+        for key in ["implementer", "native_session_id", "codex_artifacts"] {
+            body.as_object_mut().unwrap().remove(key);
+        }
+        write_current(&db, &dispatch_state_key(&issue), &body.to_string()).unwrap();
+        let state = get_dispatch_state(&db, &issue).unwrap().unwrap();
+        assert_eq!(
+            state.implementer,
+            super::super::implementer::Implementer::Claude
+        );
+        assert_eq!(state.native_session_id.as_deref(), Some("old-id"));
+        assert!(state.session_claimed);
     }
 
     #[test]
