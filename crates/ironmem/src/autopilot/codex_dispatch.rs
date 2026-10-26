@@ -1286,7 +1286,7 @@ exit {code}"#
         let (dir, s) = setup();
         let extra = "i=0; while [ \"$i\" -lt 3000 ]; do printf '%s\\n' '{\"type\":\"item.completed\",\"item\":\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"}'; i=$((i+1)); done";
         let o = run_codex_bounded(
-            &binary(dir.path(), &script(extra, 0)),
+            &binary(dir.path(), &script(&observable(extra), 0)),
             dir.path(),
             &s,
             Duration::from_secs(5),

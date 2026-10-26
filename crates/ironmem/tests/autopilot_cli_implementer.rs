@@ -532,7 +532,8 @@ if [ "$CODEX_MODE" = timeout ]; then
   wait "$child"
   exit 0
 fi
-/bin/sleep 0.15
+# Outlive the supervisor's first process sample, as a real Codex does.
+/bin/sleep 0.5
 printf '%s\n' '{"type":"turn.completed","usage":{}}'
 if [ "$CODEX_MODE" = malformed ]; then
   printf '%s\n' 'not-json' > "$final"
@@ -705,6 +706,8 @@ done
 printf '%s\n' '{"type":"thread.started","thread_id":"33333333-4444-4555-8666-777777777777"}'
 printf '%s\n' '{"type":"turn.completed","usage":{}}'
 printf '%s\n' '{"verdict":"not_met","reason":"not done"}' > "$final"
+# Outlive the supervisor's first process sample, as a real Codex does.
+/bin/sleep 0.5
 "#,
     );
     let output = Command::new(bin())
@@ -769,6 +772,8 @@ done
 printf '%s\n' '{"type":"thread.started","thread_id":"44444444-5555-4666-8777-888888888888"}'
 printf '%s\n' '{"type":"turn.completed","usage":{}}'
 printf '%s\n' '{"verdict":"not_met","reason":"not done"}' > "$final"
+# Outlive the supervisor's first process sample, as a real Codex does.
+/bin/sleep 0.5
 "#,
     );
 
