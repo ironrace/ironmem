@@ -350,6 +350,43 @@ pub(crate) fn read_identity(a: &CodexArtifacts) -> Result<ProcessIdentity, Strin
     Ok(identity)
 }
 
+/// The first active row that could still be this invocation's process tree.
+///
+/// Before a trusted exit record, a recorded PID or the root's process group
+/// is evidence. After one, cleanup has already proven every recorded process
+/// gone by kernel birth identity, so a recorded PID is a reuse and no longer
+/// counts. The group still does: an untracked member keeps it alive, and the
+/// kernel never hands out a live group's ID as a new PID. Only a live process
+/// holding the root's PID shows the ID was freed and reused, making the group
+/// someone else's.
+fn recorded_tree_evidence(
+    rows: &[ProcessRow],
+    identity: &ProcessIdentity,
+    completed: bool,
+) -> Option<String> {
+    let active = || rows.iter().filter(|r| r.active());
+    if !completed {
+        if let Some(r) = active().find(|r| {
+            r.pid == identity.root_pid || identity.descendants.iter().any(|d| d.pid == r.pid)
+        }) {
+            return Some(format!(
+                "process {} has a PID this invocation recorded",
+                r.pid
+            ));
+        }
+    }
+    let group_reused = completed && active().any(|r| r.pid == identity.root_pid);
+    if group_reused {
+        return None;
+    }
+    active().find(|r| r.pgid == identity.root_pgid).map(|r| {
+        format!(
+            "process {} is in this invocation's process group {}",
+            r.pid, r.pgid
+        )
+    })
+}
+
 impl CodexProcessSnapshot {
     pub fn is_available(&self) -> bool {
         matches!(self, Self::Available(_))
@@ -395,15 +432,11 @@ impl CodexProcessSnapshot {
         {
             return "Codex schema marker matched an unexpected or ambiguous process identity; holding for verification".into();
         }
-        if rows.iter().any(|r| {
-            r.active()
-                && (r.pid == identity.root_pid
-                    || r.pgid == identity.root_pgid
-                    || identity.descendants.iter().any(|d| d.pid == r.pid))
-        }) {
-            return "Codex root or tracked descendant is present; process identity/completion requires verification".into();
+        let completed = super::codex_dispatch::has_valid_exit_record(a);
+        if let Some(evidence) = recorded_tree_evidence(rows, &identity, completed) {
+            return format!("{evidence}; process identity/completion requires verification");
         }
-        if !super::codex_dispatch::has_valid_exit_record(a) {
+        if !completed {
             return "Codex invocation has no trusted supervisor cleanup/completion record; historical descendants cannot be ruled out".into();
         }
         "Codex supervisor completion verified".into()
@@ -448,17 +481,11 @@ impl CodexProcessSnapshot {
         {
             return Liveness::Alive;
         }
-        if !matches.is_empty()
-            || rows.iter().any(|r| {
-                r.active()
-                    && (r.pid == identity.root_pid
-                        || r.pgid == identity.root_pgid
-                        || identity.descendants.iter().any(|d| d.pid == r.pid))
-            })
-        {
+        let completed = super::codex_dispatch::has_valid_exit_record(a);
+        if !matches.is_empty() || recorded_tree_evidence(rows, &identity, completed).is_some() {
             return Liveness::Unknown;
         }
-        if super::codex_dispatch::has_valid_exit_record(a) {
+        if completed {
             Liveness::NotListed
         } else {
             Liveness::Unknown
@@ -476,7 +503,6 @@ impl CodexProcessSnapshot {
         let Self::Available(rows) = self else {
             return Some(self.reason());
         };
-        let identity = artifacts.and_then(|a| read_identity(a).ok());
         for r in rows.iter().filter(|r| r.active()) {
             match r.marker() {
                 Err(reason) => {
@@ -499,23 +525,14 @@ impl CodexProcessSnapshot {
                 }
                 _ => {}
             }
-            if let Some(identity) = &identity {
-                if r.pid == identity.root_pid || identity.descendants.iter().any(|d| d.pid == r.pid)
-                {
-                    return Some(format!(
-                        "process {} has a PID this invocation recorded",
-                        r.pid
-                    ));
-                }
-                if r.pgid == identity.root_pgid {
-                    return Some(format!(
-                        "process {} is in this invocation's process group {}",
-                        r.pid, r.pgid
-                    ));
-                }
-            }
         }
-        None
+        let a = artifacts?;
+        let identity = read_identity(a).ok()?;
+        recorded_tree_evidence(
+            rows,
+            &identity,
+            super::codex_dispatch::has_valid_exit_record(a),
+        )
     }
     pub fn orphan_markers(&self) -> Vec<&str> {
         match self {
@@ -1027,11 +1044,13 @@ mod tests {
         assert!(CodexProcessSnapshot::Available(vec![mismatched])
             .invocation_reason(Some(&a))
             .contains("marker"));
+        // The exit record proves the supervisor reaped the root, so its PID
+        // on an unmarked process is a reuse.
         let mut reused = row;
         reused.args = "unrelated".into();
         assert_eq!(
             CodexProcessSnapshot::Available(vec![reused]).liveness(Some(&a)),
-            Liveness::Unknown
+            Liveness::NotListed
         );
         assert!(empty.invocation_reason(Some(&a)).contains("completion"));
         std::fs::write(identity_path(&a), "bad-json").unwrap();
@@ -1093,15 +1112,36 @@ mod tests {
         let mut identity = read_identity(&a).unwrap();
         identity.descendants.push(child.clone());
         persist_identity(&a, &identity).unwrap();
+        let live = |rows: Vec<ProcessRow>| CodexProcessSnapshot::Available(rows).liveness(Some(&a));
+        let row = |pid, pgid| ProcessRow {
+            pid,
+            ppid: 1,
+            pgid,
+            stat: "S".into(),
+            args: "unrelated".into(),
+        };
+        // No trusted completion: any recorded PID or the group could be it.
+        assert_eq!(live(vec![child.clone()]), Liveness::Unknown);
+        assert_eq!(live(vec![]), Liveness::Unknown);
         testing::complete(&a);
+        // Cleanup proved every recorded process gone by birth identity, so a
+        // recorded PID now is a reuse, not this invocation.
+        assert_eq!(live(vec![child]), Liveness::NotListed);
         assert_eq!(
-            CodexProcessSnapshot::Available(vec![child]).liveness(Some(&a)),
-            Liveness::Unknown
+            live(vec![row(identity.root_pid, 4242)]),
+            Liveness::NotListed
         );
-        std::fs::remove_file(&a.exit_path).unwrap();
+        // A member of the root's group keeps the group, and so the
+        // invocation, in question...
+        assert_eq!(live(vec![row(4243, identity.root_pgid)]), Liveness::Unknown);
+        // ...unless the root's PID itself was reused, which proves the old
+        // group was gone first.
         assert_eq!(
-            CodexProcessSnapshot::Available(vec![]).liveness(Some(&a)),
-            Liveness::Unknown
+            live(vec![
+                row(identity.root_pid, identity.root_pgid),
+                row(4244, identity.root_pgid)
+            ]),
+            Liveness::NotListed
         );
     }
     #[test]

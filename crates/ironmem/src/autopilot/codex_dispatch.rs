@@ -21,6 +21,13 @@ const STDERR_LIMIT: u64 = 1024 * 1024;
 const FINAL_LIMIT: u64 = 64 * 1024;
 const EXIT_LIMIT: u64 = 4096;
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
+/// How often supervision rescans the process table. A `ps -axww` scan costs
+/// tens of milliseconds of CPU on a busy machine, so scanning on every exit
+/// poll kept a core busy for a whole dispatch. Exit and artifact limits stay
+/// on [`POLL_INTERVAL`]; descendants enrol at this pace, and cleanup rescans
+/// the frozen tree until it is stable, so the slower scan only widens the
+/// between-scan window the module doc already leaves to double-fork escapes.
+const OBSERVE_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CodexArtifacts {
@@ -379,12 +386,17 @@ pub fn run_codex_bounded(
     }
     let mut timed_out = false;
     let mut limit_exceeded;
+    let mut last_observed: Option<Instant> = None;
     let status = loop {
-        if let Err(e) = tracker.observe() {
-            let cleanup = tracker.cleanup(false);
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(with_cleanup(e, cleanup));
+        // The first pass scans immediately after spawn.
+        if last_observed.is_none_or(|at| at.elapsed() >= OBSERVE_INTERVAL) {
+            if let Err(e) = tracker.observe() {
+                let cleanup = tracker.cleanup(false);
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(with_cleanup(e, cleanup));
+            }
+            last_observed = Some(Instant::now());
         }
         limit_exceeded = limits(a);
         if limit_exceeded.is_some() || started.elapsed() >= timeout {

@@ -13,6 +13,47 @@ pub enum Implementer {
     Codex,
 }
 
+/// What differs between harnesses, named once so `run_issue` asks *why* it
+/// branches instead of *which* harness it has. A new harness answers these.
+impl Implementer {
+    /// The wall-clock bound used when the repo sets none. Codex reserves its
+    /// unknown spend per invocation, so it is never unbounded; Claude keeps
+    /// the repo's optional bound.
+    pub fn fallback_wall_clock_secs(self) -> Option<u64> {
+        match self {
+            Self::Claude => None,
+            Self::Codex => Some(super::codex_dispatch::CODEX_DISPATCH_TIMEOUT_SECS),
+        }
+    }
+
+    /// Each invocation leaves durable artifacts that restart recovery must
+    /// adopt or hold, and a dispatch error does not prove its process dead.
+    /// Claude's sessions are found through its registry instead.
+    pub fn recovers_invocations(self) -> bool {
+        self == Self::Codex
+    }
+
+    /// The harness assigns the session ID (a Codex thread) rather than
+    /// taking the controller's (`claude --session-id`), so it is learned
+    /// from the first outcome and checked on every later one.
+    pub fn assigns_own_session_id(self) -> bool {
+        self == Self::Codex
+    }
+
+    /// The harness reports what a dispatch cost. One that does not has its
+    /// unknown spend reserved before launch instead of banked after.
+    pub fn reports_cost(self) -> bool {
+        self == Self::Claude
+    }
+
+    /// A returned verdict spends the session's goal loop, so the next
+    /// dispatch needs a fresh session. Claude's `/goal` arms no hook on
+    /// `--resume`; a Codex thread continues.
+    pub fn rotates_session_after_verdict(self) -> bool {
+        self == Self::Claude
+    }
+}
+
 impl FromStr for Implementer {
     type Err = MemoryError;
     fn from_str(value: &str) -> Result<Self, Self::Err> {

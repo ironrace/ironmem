@@ -1010,7 +1010,7 @@ pub fn preflight_worktree_provisioning(
     let Some(state) = validate_dispatch_owner(db, issue, implementer)? else {
         return Ok(());
     };
-    if implementer != Implementer::Codex {
+    if !implementer.recovers_invocations() {
         return Ok(());
     }
     match dispatcher.recover(Path::new(&state.worktree_path), &state)? {
@@ -1030,6 +1030,110 @@ pub fn preflight_worktree_provisioning(
         CodexRecovery::NoPriorInvocation => Err(MemoryError::Validation(
             "Codex recovery returned no invocation for persisted artifacts; process completion \
              is unproven"
+                .into(),
+        )),
+    }
+}
+
+/// What restart recovery decided before a run dispatches anything.
+enum Recovered {
+    /// The run ends here without dispatching.
+    Done(IssueRun),
+    /// The run continues, first classifying a finished invocation if any.
+    Continue(Option<DispatchOutcome>),
+}
+
+/// Adopt, hold, or finish the invocation a persisted state names, for a
+/// harness that [recovers invocations](Implementer::recovers_invocations).
+#[allow(clippy::too_many_arguments)]
+fn recover_invocation(
+    db: &Database,
+    issue: &IssueRef,
+    worktree: &Worktree,
+    dispatcher: &mut dyn Dispatcher,
+    state: &DispatchState,
+    cumulative_attempt_n: u32,
+    wall_clock_timeout_secs: Option<u64>,
+    native_session_id: &mut Option<String>,
+    codex_artifacts: &mut Option<CodexArtifacts>,
+) -> Result<Recovered, MemoryError> {
+    match dispatcher.recover(&worktree.path, state)? {
+        recovery @ (CodexRecovery::Alive | CodexRecovery::Unknown { .. }) => {
+            let detail = match recovery {
+                CodexRecovery::Unknown { reason } => format!(
+                    "{reason}; once no process remains, `ironmem autopilot \
+                     clear-dispatch {} {}` releases it",
+                    issue.repo, issue.number
+                ),
+                _ => "Codex implementation is still alive".into(),
+            };
+            let unpriced_dispatches = match &state.codex_artifacts {
+                Some(artifacts) => u32::from(budget::has_unpriced_dispatch_reservation(
+                    db,
+                    &artifacts.invocation_id,
+                )?),
+                None => 0,
+            };
+            Ok(Recovered::Done(IssueRun {
+                unpriced_dispatches,
+                issue: issue.clone(),
+                terminal: TerminalReason::ImplementationInFlight { detail },
+                dispatches: Vec::new(),
+                total_cost_usd: 0.0,
+                cumulative_attempt_n,
+                wall_clock_timeout_secs,
+            }))
+        }
+        CodexRecovery::Finished(outcome) => {
+            if state.attempt_n < cumulative_attempt_n {
+                // The lineage/status write completed before the Lead crashed
+                // clearing this artifact. Its terminal Impossible decision
+                // still ends this run, without recording or charging again.
+                // Apply the completion and identity checks before trusting
+                // the verdict; a later manual run is allowed after clearing.
+                if outcome.invocation_started
+                    && outcome.process_success
+                    && !outcome.is_error
+                    && !outcome.timed_out
+                    && outcome.is_impossible()
+                    && outcome.native_session_id.as_ref().is_some_and(|id| {
+                        !id.trim().is_empty()
+                            && native_session_id
+                                .as_ref()
+                                .is_none_or(|expected| expected == id)
+                    })
+                {
+                    dispatch_state::clear_dispatch_state(db, issue)?;
+                    return Ok(Recovered::Done(IssueRun {
+                        unpriced_dispatches: 1,
+                        issue: issue.clone(),
+                        terminal: TerminalReason::Impossible {
+                            reason: outcome.reason,
+                        },
+                        dispatches: Vec::new(),
+                        total_cost_usd: 0.0,
+                        cumulative_attempt_n,
+                        wall_clock_timeout_secs,
+                    }));
+                }
+                // Preserve the proven conversation for a continuing run,
+                // but never classify or charge the same attempt again.
+                if native_session_id.is_none() {
+                    *native_session_id =
+                        outcome.native_session_id.filter(|id| !id.trim().is_empty());
+                }
+                *codex_artifacts = None;
+                Ok(Recovered::Continue(None))
+            } else {
+                Ok(Recovered::Continue(Some(outcome)))
+            }
+        }
+        CodexRecovery::NoPriorInvocation if state.codex_artifacts.is_none() => {
+            Ok(Recovered::Continue(None))
+        }
+        CodexRecovery::NoPriorInvocation => Err(MemoryError::Validation(
+            "Codex recovery returned no invocation for persisted artifacts; process \
+             completion is unproven"
                 .into(),
         )),
     }
@@ -1057,10 +1161,8 @@ pub fn run_issue(
     let gate_commands = approved_gate_commands(db, &issue.repo)?;
     // Report the effective bound, including Codex's mandatory finite fallback.
     // Claude retains the repo's optional bound.
-    let wall_clock_timeout_secs = gate_config::wall_clock_timeout(db, &issue.repo)?.or_else(|| {
-        (config.implementer == Implementer::Codex)
-            .then_some(codex_dispatch::CODEX_DISPATCH_TIMEOUT_SECS)
-    });
+    let wall_clock_timeout_secs = gate_config::wall_clock_timeout(db, &issue.repo)?
+        .or_else(|| config.implementer.fallback_wall_clock_secs());
     let wall_clock_timeout = wall_clock_timeout_secs.map(std::time::Duration::from_secs);
 
     let mut status = lineage::get_issue_status(db, issue)?;
@@ -1072,7 +1174,7 @@ pub fn run_issue(
     let remediation = remediate::active_remediation(db, issue)?;
     if let Some(existing) = &status {
         if existing.best_verdict == Some(AttemptOutcome::Success) && remediation.is_none() {
-            if config.implementer == Implementer::Codex {
+            if config.implementer.recovers_invocations() {
                 dispatch_state::clear_dispatch_state(db, issue)?;
             }
             return Ok(IssueRun {
@@ -1120,87 +1222,23 @@ pub fn run_issue(
         .as_ref()
         .and_then(|s| s.codex_artifacts.clone());
     let mut recovered_outcome = None;
-    if config.implementer == Implementer::Codex {
-        if let Some(state) = existing_state.as_ref() {
-            match dispatcher.recover(&worktree.path, state)? {
-                recovery @ (CodexRecovery::Alive | CodexRecovery::Unknown { .. }) => {
-                    let detail = match recovery {
-                        CodexRecovery::Unknown { reason } => format!(
-                            "{reason}; once no process remains, `ironmem autopilot \
-                             clear-dispatch {} {}` releases it",
-                            issue.repo, issue.number
-                        ),
-                        _ => "Codex implementation is still alive".into(),
-                    };
-                    let unpriced_dispatches = match &state.codex_artifacts {
-                        Some(artifacts) => u32::from(budget::has_unpriced_dispatch_reservation(
-                            db,
-                            &artifacts.invocation_id,
-                        )?),
-                        None => 0,
-                    };
-                    return Ok(IssueRun {
-                        unpriced_dispatches,
-                        issue: issue.clone(),
-                        terminal: TerminalReason::ImplementationInFlight { detail },
-                        dispatches: Vec::new(),
-                        total_cost_usd: 0.0,
-                        cumulative_attempt_n,
-                        wall_clock_timeout_secs,
-                    });
-                }
-                CodexRecovery::Finished(outcome) => {
-                    if state.attempt_n < cumulative_attempt_n {
-                        // The lineage/status write completed before the Lead crashed
-                        // clearing this artifact. Its terminal Impossible decision
-                        // still ends this run, without recording or charging again.
-                        // Apply the completion and identity checks before trusting
-                        // the verdict; a later manual run is allowed after clearing.
-                        if outcome.invocation_started
-                            && outcome.process_success
-                            && !outcome.is_error
-                            && !outcome.timed_out
-                            && outcome.is_impossible()
-                            && outcome.native_session_id.as_ref().is_some_and(|id| {
-                                !id.trim().is_empty()
-                                    && native_session_id
-                                        .as_ref()
-                                        .is_none_or(|expected| expected == id)
-                            })
-                        {
-                            dispatch_state::clear_dispatch_state(db, issue)?;
-                            return Ok(IssueRun {
-                                unpriced_dispatches: 1,
-                                issue: issue.clone(),
-                                terminal: TerminalReason::Impossible {
-                                    reason: outcome.reason,
-                                },
-                                dispatches: Vec::new(),
-                                total_cost_usd: 0.0,
-                                cumulative_attempt_n,
-                                wall_clock_timeout_secs,
-                            });
-                        }
-                        // Preserve the proven conversation for a continuing run,
-                        // but never classify or charge the same attempt again.
-                        if native_session_id.is_none() {
-                            native_session_id =
-                                outcome.native_session_id.filter(|id| !id.trim().is_empty());
-                        }
-                        codex_artifacts = None;
-                    } else {
-                        recovered_outcome = Some(outcome);
-                    }
-                }
-                CodexRecovery::NoPriorInvocation if state.codex_artifacts.is_none() => {}
-                CodexRecovery::NoPriorInvocation => {
-                    return Err(MemoryError::Validation(
-                        "Codex recovery returned no invocation for persisted artifacts; process \
-                     completion is unproven"
-                            .into(),
-                    ))
-                }
-            }
+    if let Some(state) = existing_state
+        .as_ref()
+        .filter(|_| config.implementer.recovers_invocations())
+    {
+        match recover_invocation(
+            db,
+            issue,
+            worktree,
+            dispatcher,
+            state,
+            cumulative_attempt_n,
+            wall_clock_timeout_secs,
+            &mut native_session_id,
+            &mut codex_artifacts,
+        )? {
+            Recovered::Done(run) => return Ok(run),
+            Recovered::Continue(outcome) => recovered_outcome = outcome,
         }
     }
     let mut resuming = existing_state
@@ -1232,10 +1270,10 @@ pub fn run_issue(
             db,
             &DispatchState {
                 implementer: config.implementer,
-                native_session_id: if config.implementer == Implementer::Claude {
-                    Some(session_uuid.to_string())
-                } else {
+                native_session_id: if config.implementer.assigns_own_session_id() {
                     identity.0.clone()
+                } else {
+                    Some(session_uuid.to_string())
                 },
                 codex_artifacts: identity.1.clone(),
                 issue: issue.clone(),
@@ -1253,7 +1291,8 @@ pub fn run_issue(
         .map(|_| ())
     };
 
-    if config.implementer == Implementer::Claude {
+    // A recovering harness publishes each invocation just before it launches.
+    if !config.implementer.recovers_invocations() {
         write_state(
             db,
             cumulative_attempt_n,
@@ -1387,7 +1426,7 @@ pub fn run_issue(
                 }
             };
 
-            let prepared_artifacts = if config.implementer == Implementer::Codex {
+            let prepared_artifacts = if config.implementer.recovers_invocations() {
                 Some(codex_dispatch::prepare_artifacts(&worktree.path, issue)?)
             } else {
                 codex_artifacts.clone()
@@ -1395,7 +1434,7 @@ pub fn run_issue(
             let spec = DispatchSpec {
                 implementer: config.implementer,
                 codex_artifacts: prepared_artifacts,
-                session: if config.implementer == Implementer::Codex {
+                session: if config.implementer.assigns_own_session_id() {
                     match &native_session_id {
                         Some(id) => SessionMode::Resume {
                             session_uuid: id.clone(),
@@ -1421,7 +1460,7 @@ pub fn run_issue(
                 wall_clock_timeout,
             };
 
-            if config.implementer == Implementer::Codex {
+            if config.implementer.recovers_invocations() {
                 // Validate the exact backend argv before publishing a new
                 // invocation or charging unknown spend. Definite input errors
                 // prove no process launched and must leave prior state intact.
@@ -1446,7 +1485,7 @@ pub fn run_issue(
         let mut outcome = match outcome_result {
             Ok(outcome) => outcome,
             Err(err) => {
-                if config.implementer == Implementer::Codex {
+                if config.implementer.recovers_invocations() {
                     dispatches.push(DispatchSummary {
                         attempt_n: None,
                         classification: DispatchClassification::InfrastructureFailure,
@@ -1510,10 +1549,14 @@ pub fn run_issue(
         // how it lands: `--session-id` may only be used once, so that uuid
         // can only ever be `--resume`d again.
         resuming = true;
-        if config.implementer == Implementer::Codex {
+        if config.implementer.recovers_invocations() {
+            // Its unknown spend was reserved by the run that launched it.
             if recovered {
                 unpriced_dispatches += 1;
             }
+            codex_artifacts = None;
+        }
+        if config.implementer.assigns_own_session_id() {
             // An invocation that never launched has no thread to check, and
             // its own reason (why the spawn failed) is the useful one.
             if outcome.invocation_started
@@ -1543,7 +1586,6 @@ pub fn run_issue(
             } else if native_session_id.is_none() {
                 native_session_id = outcome.native_session_id.clone();
             }
-            codex_artifacts = None;
         }
 
         // ...but a session whose `/goal` loop has **concluded** cannot be
@@ -1573,7 +1615,7 @@ pub fn run_issue(
         // the next turn prompt carries the prior attempts and their failure
         // reasons, which is the degradation the spec's crash-safe-state
         // section already designed for ("any Lead can resume any IC").
-        if config.implementer == Implementer::Claude && outcome.verdict.is_some() {
+        if config.implementer.rotates_session_after_verdict() && outcome.verdict.is_some() {
             session_uuid = uuid::Uuid::new_v4().to_string();
             resuming = false;
         }
@@ -1585,7 +1627,7 @@ pub fn run_issue(
         // An unknown meter (including a dispatch killed on its wall-clock
         // bound) belongs in the unpriced counter. No cost measurement
         // exists to bank; the day's dollar total remains a floor.
-        if config.implementer == Implementer::Codex {
+        if !config.implementer.reports_cost() {
             // Reserved before launch; recovery and completion never bill it again.
             outcome.cost_usd = None;
         } else if outcome.cost_usd.is_none() {
@@ -1633,7 +1675,7 @@ pub fn run_issue(
                         commit_sha: commit_sha.clone(),
                     },
                     status.as_ref(),
-                    config.implementer == Implementer::Codex,
+                    config.implementer.recovers_invocations(),
                 )?;
                 break TerminalReason::Met { commit_sha };
             }
@@ -1649,7 +1691,7 @@ pub fn run_issue(
                         commit_sha: None,
                     },
                     status.as_ref(),
-                    config.implementer == Implementer::Codex,
+                    config.implementer.recovers_invocations(),
                 )?;
                 break TerminalReason::Impossible {
                     reason: outcome.reason.clone(),
@@ -1667,7 +1709,7 @@ pub fn run_issue(
                         commit_sha: None,
                     },
                     status.as_ref(),
-                    config.implementer == Implementer::Codex,
+                    config.implementer.recovers_invocations(),
                 )?;
                 status = lineage::get_issue_status(db, issue)?;
                 write_state(

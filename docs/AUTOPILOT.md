@@ -185,7 +185,9 @@ issue, an ambiguous Codex command, or the recorded root PID, process group,
 or a recorded descendant. A `codex exec` counts as ambiguous only when
 Autopilot cannot parse its options *and* it names a `schema.json` file, which
 is the only shape an Autopilot marker takes; your own `codex exec` runs with
-other schema files never hold a dispatch. Descendants are recorded only once the root exits,
+other schema files never hold a dispatch. Once the supervisor has written its
+completion record, a recorded PID no longer counts: cleanup already proved
+that process gone, so the PID has been reused. Descendants are recorded only once the root exits,
 so after a controller crash the check sees the root, its process group, and
 markers, but not a tool that left the group with `setsid`; that part of the
 confirmation is yours. It also refuses a finished invocation that is only
