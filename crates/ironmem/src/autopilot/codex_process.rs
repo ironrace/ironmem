@@ -308,32 +308,11 @@ pub(crate) fn persist_identity(
     a: &CodexArtifacts,
     identity: &ProcessIdentity,
 ) -> Result<(), MemoryError> {
-    let path = identity_path(a);
-    let tmp = path.with_file_name(format!("process-{}.tmp", uuid::Uuid::new_v4()));
-    let result = (|| {
-        use std::io::Write;
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options.open(&tmp)?;
-        file.write_all(&serde_json::to_vec(identity)?)?;
-        file.sync_all()?;
-        std::fs::rename(&tmp, &path)?;
-        std::fs::File::open(
-            path.parent()
-                .ok_or_else(|| MemoryError::Validation("missing process manifest parent".into()))?,
-        )?
-        .sync_all()?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(tmp);
-    }
-    result
+    super::codex_dispatch::persist_private_atomic(
+        &identity_path(a),
+        "process",
+        &serde_json::to_vec(identity)?,
+    )
 }
 
 pub(crate) fn read_identity(a: &CodexArtifacts) -> Result<ProcessIdentity, String> {

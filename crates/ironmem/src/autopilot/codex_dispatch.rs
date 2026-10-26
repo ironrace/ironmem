@@ -251,17 +251,23 @@ fn limits(a: &CodexArtifacts) -> Option<String> {
     })
 }
 
-fn persist_exit(a: &CodexArtifacts, record: &ExitRecord) -> Result<(), MemoryError> {
-    let path = Path::new(&a.exit_path);
-    let tmp = path.with_file_name(format!("exit-{}.tmp", uuid::Uuid::new_v4()));
+/// Durably replace `path` with `bytes`: a private temp file named
+/// `<tmp_prefix>-<uuid>.tmp`, synced, renamed over it, and the directory
+/// synced, so a reader sees the old record or the new one and never a torn one.
+pub(crate) fn persist_private_atomic(
+    path: &Path,
+    tmp_prefix: &str,
+    bytes: &[u8],
+) -> Result<(), MemoryError> {
+    let tmp = path.with_file_name(format!("{tmp_prefix}-{}.tmp", uuid::Uuid::new_v4()));
     let result = (|| {
         let mut file = create_private(&tmp)?;
-        file.write_all(&serde_json::to_vec(record)?)?;
+        file.write_all(bytes)?;
         file.sync_all()?;
         std::fs::rename(&tmp, path)?;
         File::open(
             path.parent()
-                .ok_or_else(|| validation("exit artifact requires a parent directory"))?,
+                .ok_or_else(|| validation("Codex artifact requires a parent directory"))?,
         )?
         .sync_all()?;
         Ok(())
@@ -270,6 +276,42 @@ fn persist_exit(a: &CodexArtifacts, record: &ExitRecord) -> Result<(), MemoryErr
         let _ = std::fs::remove_file(tmp);
     }
     result
+}
+
+fn persist_exit(a: &CodexArtifacts, record: &ExitRecord) -> Result<(), MemoryError> {
+    persist_private_atomic(
+        Path::new(&a.exit_path),
+        "exit",
+        &serde_json::to_vec(record)?,
+    )
+}
+
+/// The supervisor's terminal record for one invocation.
+fn exit_record(
+    a: &CodexArtifacts,
+    spec: &DispatchSpec,
+    exit_code: Option<i32>,
+    timed_out: bool,
+    limit_exceeded: Option<String>,
+    duration_ms: u64,
+    launch_failure: Option<String>,
+) -> ExitRecord {
+    ExitRecord {
+        completion: Some(CompletionRecord {
+            version: 1,
+            invocation_id: a.invocation_id.clone(),
+            schema_path: a.schema_path.clone(),
+        }),
+        exit_code,
+        timed_out,
+        limit_exceeded,
+        duration_ms,
+        expected_native_id: match &spec.session {
+            SessionMode::Resume { session_uuid } => Some(session_uuid.clone()),
+            SessionMode::New { .. } => None,
+        },
+        launch_failure,
+    }
 }
 
 /// Every invocation has a wall-clock ceiling. stdout/stderr are inherited
@@ -387,22 +429,7 @@ fn never_launched(
     spec: &DispatchSpec,
     reason: &str,
 ) -> Result<DispatchOutcome, MemoryError> {
-    let record = ExitRecord {
-        completion: Some(CompletionRecord {
-            version: 1,
-            invocation_id: a.invocation_id.clone(),
-            schema_path: a.schema_path.clone(),
-        }),
-        exit_code: None,
-        timed_out: false,
-        limit_exceeded: None,
-        duration_ms: 0,
-        expected_native_id: match &spec.session {
-            SessionMode::Resume { session_uuid } => Some(session_uuid.clone()),
-            SessionMode::New { .. } => None,
-        },
-        launch_failure: Some(reason.to_owned()),
-    };
+    let record = exit_record(a, spec, None, false, None, 0, Some(reason.to_owned()));
     persist_exit(a, &record).map_err(|e| {
         MemoryError::NotFound(format!(
             "{reason}; recording that it never launched also failed: {e}"
@@ -451,22 +478,15 @@ fn finish_codex_dispatch(
     // Even a successful root can leave a gate in a separate process group.
     // Unknown cleanup returns Err so run.rs retains the invocation and slot.
     tracker.cleanup(true)?;
-    let record = ExitRecord {
-        completion: Some(CompletionRecord {
-            version: 1,
-            invocation_id: a.invocation_id.clone(),
-            schema_path: a.schema_path.clone(),
-        }),
-        exit_code: status.code(),
+    let record = exit_record(
+        a,
+        spec,
+        status.code(),
         timed_out,
         limit_exceeded,
-        duration_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
-        expected_native_id: match &spec.session {
-            SessionMode::Resume { session_uuid } => Some(session_uuid.clone()),
-            SessionMode::New { .. } => None,
-        },
-        launch_failure: None,
-    };
+        started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+        None,
+    );
     persist_exit(a, &record)?;
     let mut outcome = read_artifacts(a)?;
     outcome.invocation_started = true;

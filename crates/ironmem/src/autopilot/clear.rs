@@ -1,7 +1,7 @@
 //! The operator's way out of a hold Autopilot cannot resolve by itself.
 //!
 //! Restart recovery holds a Codex invocation whose completion it cannot
-//! prove — a controller killed by Ctrl-C, a root that exited before the first
+//! prove — a controller killed by Ctrl-C, a root that failed before the first
 //! `ps` sample, an observation error mid-run. That hold is correct: nothing a
 //! controller can read distinguishes "finished" from "still running somewhere
 //! it cannot see". A human can, and this is how they say so.

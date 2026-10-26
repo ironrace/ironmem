@@ -453,7 +453,12 @@ pub fn classify(outcome: &DispatchOutcome) -> DispatchClassification {
     // approach, so it is an operator's fix, and
     // `max_consecutive_infrastructure_failures` is what escalates to them
     // instead of the attempt cap silently retiring the issue.
-    if outcome.verdict.is_none() && outcome.num_turns == 0 && outcome.cost_usd == Some(0.0) {
+    // An absent meter reads like the old `0.0` default here: a result that
+    // reported neither a turn nor a price took nothing up either.
+    if outcome.verdict.is_none()
+        && outcome.num_turns == 0
+        && outcome.cost_usd.is_none_or(|cost| cost == 0.0)
+    {
         return DispatchClassification::InfrastructureFailure;
     }
     DispatchClassification::FailedAttempt
@@ -1524,10 +1529,17 @@ pub fn run_issue(
                 outcome.verdict = None;
                 outcome.is_error = true;
                 outcome.process_success = false;
-                outcome.reason = Some(
-                    "missing or mismatched native Codex session ID; persisted identity retained"
-                        .into(),
-                );
+                // Keep the invocation's own diagnosis (stderr, timeout, exit
+                // code): a Codex that failed before `thread.started` — auth,
+                // config, network — is explained only there.
+                let identity =
+                    "missing or mismatched native Codex session ID; persisted identity retained";
+                outcome.reason = Some(match outcome.reason.take() {
+                    Some(original) if !original.trim().is_empty() => {
+                        format!("{identity}; {original}")
+                    }
+                    _ => identity.into(),
+                });
             } else if native_session_id.is_none() {
                 native_session_id = outcome.native_session_id.clone();
             }

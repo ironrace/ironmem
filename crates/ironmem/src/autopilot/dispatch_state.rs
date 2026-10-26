@@ -176,26 +176,10 @@ pub fn all_dispatch_states(db: &Database, limit: usize) -> Result<Vec<DispatchSt
     let drawers = db.get_drawers_by_source_prefix(super::WING, super::ROOM, &prefix, limit)?;
     let mut states = Vec::new();
     for drawer in drawers {
-        let Ok(body) = serde_json::from_str::<DispatchStateBody>(&drawer.content) else {
+        let Ok(state) = state_from_content(&drawer.content) else {
             continue;
         };
-        states.push(DispatchState {
-            implementer: body.implementer,
-            native_session_id: body.native_session_id.or_else(|| {
-                (body.implementer == Implementer::Claude).then(|| body.session_uuid.clone())
-            }),
-            codex_artifacts: body.codex_artifacts,
-            issue: IssueRef::new(body.repo, body.issue),
-            worktree_path: body.worktree_path,
-            ic_session_name: body.ic_session_name,
-            dispatch_class: body.dispatch_class,
-            attempt_n: body.attempt_n,
-            state: body.state,
-            started_at: body.started_at,
-            session_uuid: body.session_uuid,
-            turn_n: body.turn_n,
-            session_claimed: body.session_claimed,
-        });
+        states.push(state);
     }
     Ok(states)
 }

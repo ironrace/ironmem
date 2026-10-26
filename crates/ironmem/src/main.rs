@@ -1020,6 +1020,30 @@ fn resolve_implementation_model(
     Ok(model)
 }
 
+/// The dispatcher for the selected implementation harness.
+fn resolve_dispatcher(
+    implementer: ironmem::autopilot::Implementer,
+) -> Result<Box<dyn ironmem::autopilot::run::Dispatcher>, MemoryError> {
+    Ok(match implementer {
+        ironmem::autopilot::Implementer::Claude => {
+            Box::new(ironmem::autopilot::run::ClaudeDispatcher::resolve()?)
+        }
+        ironmem::autopilot::Implementer::Codex => {
+            Box::new(ironmem::autopilot::run::CodexDispatcher::resolve()?)
+        }
+    })
+}
+
+/// " (floor; N unpriced dispatch(es))" after a known-spend figure, or nothing
+/// when every dispatch was priced.
+fn unpriced_floor_note(unpriced_dispatches: u32) -> String {
+    match unpriced_dispatches {
+        0 => String::new(),
+        1 => " (floor; 1 unpriced dispatch)".to_string(),
+        n => format!(" (floor; {n} unpriced dispatches)"),
+    }
+}
+
 /// The reviewer a dry run is handed.
 ///
 /// Never called: `advance_pass` returns before reviewing when `dry_run` is
@@ -1353,19 +1377,7 @@ fn print_lead_report(report: &ironmem::autopilot::lead::LeadReport) {
             run.issue.canonical(),
             run.dispatches.len(),
             run.total_cost_usd,
-            if run.unpriced_dispatches == 0 {
-                String::new()
-            } else {
-                format!(
-                    " (floor; {} unpriced dispatch{})",
-                    run.unpriced_dispatches,
-                    if run.unpriced_dispatches == 1 {
-                        ""
-                    } else {
-                        "es"
-                    }
-                )
-            },
+            unpriced_floor_note(run.unpriced_dispatches),
             run.terminal,
         );
     }
@@ -2110,15 +2122,7 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
 
                 // Resolve the selected harness before provisioning a worktree,
                 // but after the useful unapproved-repo diagnostic above.
-                let mut dispatcher: Box<dyn ironmem::autopilot::run::Dispatcher> = match implementer
-                {
-                    ironmem::autopilot::Implementer::Claude => {
-                        Box::new(ironmem::autopilot::run::ClaudeDispatcher::resolve()?)
-                    }
-                    ironmem::autopilot::Implementer::Codex => {
-                        Box::new(ironmem::autopilot::run::CodexDispatcher::resolve()?)
-                    }
-                };
+                let mut dispatcher = resolve_dispatcher(implementer)?;
                 ironmem::autopilot::run::preflight_worktree_provisioning(
                     &database,
                     &issue_ref,
@@ -2173,19 +2177,7 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                     println!(
                         "  known spend this run: ${:.4}{}",
                         run.total_cost_usd,
-                        if run.unpriced_dispatches == 0 {
-                            String::new()
-                        } else {
-                            format!(
-                                " (floor; {} unpriced dispatch{})",
-                                run.unpriced_dispatches,
-                                if run.unpriced_dispatches == 1 {
-                                    ""
-                                } else {
-                                    "es"
-                                }
-                            )
-                        }
+                        unpriced_floor_note(run.unpriced_dispatches)
                     );
                     println!("  cumulative attempts: {}", run.cumulative_attempt_n);
                     println!("  terminal: {:?}", run.terminal);
@@ -2862,15 +2854,7 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                         .unwrap_or_else(|| std::path::PathBuf::from(".")),
                 )?;
                 let mut registry = ironmem::autopilot::registry::TwoHarnessMonitor::default();
-                let mut dispatcher: Box<dyn ironmem::autopilot::run::Dispatcher> = match implementer
-                {
-                    ironmem::autopilot::Implementer::Claude => {
-                        Box::new(ironmem::autopilot::run::ClaudeDispatcher::resolve()?)
-                    }
-                    ironmem::autopilot::Implementer::Codex => {
-                        Box::new(ironmem::autopilot::run::CodexDispatcher::resolve()?)
-                    }
-                };
+                let mut dispatcher = resolve_dispatcher(implementer)?;
                 let mut advisor: Box<dyn ironmem::autopilot::advise::Advisor> =
                     if config.advice.enabled {
                         Box::new(ironmem::autopilot::advise::ClaudeAdvisor::resolve()?)
