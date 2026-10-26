@@ -1566,12 +1566,18 @@ exit {code}"#
     fn timeout_kills_tool_in_a_separate_process_group() {
         let (dir, s) = setup();
         let python = "/usr/bin/python3";
-        let extra = format!("{python} -c 'import os,time; os.setsid(); open(\"detached-ready\",\"w\").close(); time.sleep(1); open(\"detached-survived\",\"w\").close()' &\nwhile [ ! -f detached-ready ]; do sleep 0.01; done\nsleep 10");
+        // The tool waits for a release the test gives only after the bound
+        // fired, so it can mark survival only if the kill missed it. The
+        // bound is generous because a cold python start on a CI runner can
+        // outlast a short one, leaving nothing to kill; the loop ends on its
+        // own if a red run leaves it behind.
+        let extra = format!("{python} -c 'import os,time; os.setsid(); open(\"detached-ready\",\"w\").close()\nfor _ in range(3000):\n  time.sleep(0.01)\n  if os.path.exists(\"release\"): open(\"detached-survived\",\"w\").close(); break' &\nwhile [ ! -f detached-ready ]; do sleep 0.01; done\nsleep 30");
         let bin = binary(dir.path(), &script(&extra, 0));
-        let o = run_codex_bounded(&bin, dir.path(), &s, Duration::from_millis(400)).unwrap();
+        let o = run_codex_bounded(&bin, dir.path(), &s, Duration::from_secs(5)).unwrap();
         assert!(o.timed_out);
         assert!(dir.path().join("detached-ready").exists());
-        std::thread::sleep(Duration::from_millis(1200));
+        std::fs::write(dir.path().join("release"), "").unwrap();
+        std::thread::sleep(Duration::from_millis(500));
         assert!(
             !dir.path().join("detached-survived").exists(),
             "escaped tool survived timeout"
