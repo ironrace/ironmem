@@ -165,7 +165,7 @@ mod tests {
         assert!(refused(vec![row(
             78,
             78,
-            "codex exec --output-schema relative.json p"
+            "codex exec --output-schema relative/schema.json p"
         )])
         .contains("ambiguous"));
         let sibling = "/r/.git/ironmem/autopilot/owner-repo-42/\

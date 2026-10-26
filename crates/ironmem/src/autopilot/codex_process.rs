@@ -31,7 +31,27 @@ impl ProcessRow {
 
     /// ps does not preserve argv boundaries. Only the verified option prefix
     /// before the first positional prompt can supply an invocation marker.
+    ///
+    /// An unparseable prefix is ambiguous only when the row could carry an
+    /// Autopilot marker at all. Every marker is a whitespace-free absolute
+    /// path to a `schema.json` (artifact paths refuse whitespace), so a row
+    /// with no such word is someone else's `codex exec`, and holding every
+    /// Codex dispatch on it would let any unrelated session stall Autopilot.
     pub fn marker(&self) -> Result<Option<&str>, String> {
+        self.parse_marker().or_else(|reason| {
+            if self.args.split_whitespace().any(|word| {
+                Path::new(word)
+                    .file_name()
+                    .is_some_and(|f| f == "schema.json")
+            }) {
+                Err(reason)
+            } else {
+                Ok(None)
+            }
+        })
+    }
+
+    fn parse_marker(&self) -> Result<Option<&str>, String> {
         let mut args = self.args.split_whitespace();
         if args
             .next()
@@ -712,15 +732,20 @@ impl ProcessTracker {
                     ));
                 }
                 None => {
-                    if rows.iter().any(|row| {
+                    // A shell that ran a tool and exited after the ps sample
+                    // leaves a stale row for a child that is gone too; only a
+                    // child the kernel still has escaped authentication.
+                    for row in rows.iter().filter(|row| {
                         row.active()
                             && row.ppid == old.pid
                             && !self.known.iter().any(|(known, _)| known.pid == row.pid)
                     }) {
-                        return Err(MemoryError::Validation(
-                            "Codex ancestry seed disappeared before descendant authentication"
-                                .into(),
-                        ));
+                        if kernel(row.pid).map_err(MemoryError::Validation)?.is_some() {
+                            return Err(MemoryError::Validation(
+                                "Codex ancestry seed disappeared before descendant authentication"
+                                    .into(),
+                            ));
+                        }
                     }
                 }
             }
@@ -1060,6 +1085,26 @@ mod tests {
         assert!(decode_process_table(b"   \n").is_err());
     }
     #[test]
+    fn an_unparseable_codex_command_is_ambiguous_only_if_it_could_carry_a_marker() {
+        let marker = |args: &str| {
+            parse_codex_processes(&format!("30 1 30 S {args}\n")).unwrap()[0]
+                .marker()
+                .map(|m| m.map(str::to_owned))
+        };
+        // Someone else's codex exec: its own schema file, flags we do not list.
+        assert_eq!(
+            marker("codex exec --output-schema ./out.json --profile work prompt"),
+            Ok(None)
+        );
+        assert_eq!(marker("codex exec --output-schema"), Ok(None));
+        // Anything naming a schema.json could be hiding ours, so it still holds.
+        assert!(marker(
+            "codex exec --profile work --output-schema /r/.git/ironmem/autopilot/o-r-1/u/schema.json p"
+        )
+        .is_err());
+        assert!(marker("codex exec --output-schema=/x/schema.json --profile w p").is_err());
+    }
+    #[test]
     fn unobserved_history_and_live_descendants_cannot_be_restarted() {
         let dir = tempfile::tempdir().unwrap();
         let (a, mut child) = testing::invocation(dir.path());
@@ -1317,6 +1362,26 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("unauthenticated"));
+    }
+
+    #[test]
+    fn a_tool_that_exited_with_its_vanished_parent_does_not_abort_observation() {
+        // A shell ran a short-lived tool and both exited between the ps
+        // sample and the kernel check: the stale child row escaped nothing.
+        let root = kernel_process(10, 1, 10, 1);
+        let mut tracker = ProcessTracker::new(10);
+        tracker.known.push((process_row(20, 10, 20), Birth(2, 0)));
+        tracker
+            .observe_rows(
+                vec![
+                    process_row(10, 1, 10),
+                    process_row(20, 10, 20),
+                    process_row(30, 20, 30),
+                ],
+                |pid| Ok(if pid == 10 { Some(root) } else { None }),
+            )
+            .unwrap();
+        assert!(!tracker.known.iter().any(|(row, _)| row.pid == 30));
     }
 
     #[test]

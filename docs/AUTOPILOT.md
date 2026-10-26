@@ -182,7 +182,10 @@ ironmem autopilot clear-dispatch owner/repo 364
 It refuses while a fresh process table shows anything that could be the
 issue's work: the invocation's marker, another Autopilot marker for the same
 issue, an ambiguous Codex command, or the recorded root PID, process group,
-or a recorded descendant. Descendants are recorded only once the root exits,
+or a recorded descendant. A `codex exec` counts as ambiguous only when
+Autopilot cannot parse its options *and* it names a `schema.json` file, which
+is the only shape an Autopilot marker takes; your own `codex exec` runs with
+other schema files never hold a dispatch. Descendants are recorded only once the root exits,
 so after a controller crash the check sees the root, its process group, and
 markers, but not a tool that left the group with `setsid`; that part of the
 confirmation is yours. It also refuses a finished invocation that is only

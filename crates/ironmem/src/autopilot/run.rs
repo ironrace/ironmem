@@ -335,11 +335,22 @@ impl RunConfig {
             ));
         }
         if self.max_budget_usd > self.daily_budget_usd {
-            return Err(MemoryError::Validation(format!(
-                "max_budget_usd ({}) exceeds daily_budget_usd ({}) — no dispatch could ever be \
-                 authorized",
-                self.max_budget_usd, self.daily_budget_usd
-            )));
+            // Codex has no --max-budget-usd, so naming it would send the
+            // operator after a flag the CLI refuses for this implementer.
+            return Err(MemoryError::Validation(match self.implementer {
+                Implementer::Claude => format!(
+                    "max_budget_usd ({}) exceeds daily_budget_usd ({}) — no dispatch could \
+                     ever be authorized",
+                    self.max_budget_usd, self.daily_budget_usd
+                ),
+                Implementer::Codex => format!(
+                    "daily_budget_usd ({}) is below the ${} every Codex dispatch reserves \
+                     before it starts — Codex reports no cost, so each invocation is \
+                     pre-authorized at that fixed ceiling. Raise --daily-budget-usd to at \
+                     least {}",
+                    self.daily_budget_usd, self.max_budget_usd, self.max_budget_usd
+                ),
+            }));
         }
         Ok(())
     }
@@ -3000,7 +3011,19 @@ printf '%s\n' '{"verdict":"met","reason":"gate"}' > "$final"
         let mut config = config();
         config.max_budget_usd = 50.0;
         config.daily_budget_usd = 10.0;
-        assert!(config.validate().is_err());
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("max_budget_usd"), "{err}");
+    }
+
+    #[test]
+    fn a_codex_daily_cap_below_its_reservation_names_the_flag_it_can_set() {
+        let mut config = codex_config();
+        config.daily_budget_usd = 2.0;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("--daily-budget-usd to at least 2.5"), "{err}");
+        assert!(!err.contains("max_budget_usd"), "{err}");
+        config.daily_budget_usd = 2.5;
+        config.validate().unwrap();
     }
 
     #[test]

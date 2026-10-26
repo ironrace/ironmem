@@ -198,8 +198,10 @@ impl LeadConfig {
                 "max_dispatches_per_tick must be at least 1".into(),
             ));
         }
-        self.queue.validate()?;
+        // The run's budget message knows the implementer; the queue's, which
+        // checks the same numbers, does not.
         self.run.validate()?;
+        self.queue.validate()?;
         self.supervision.validate()?;
         self.advice.validate()?;
         Ok(())

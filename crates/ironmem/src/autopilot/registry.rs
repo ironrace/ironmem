@@ -805,7 +805,10 @@ mod harness_tests {
             rows[3].marker().unwrap(),
             Some("/tmp/.git/ironmem/autopilot/repo/other/schema.json")
         );
-        let bad = parse_codex_processes("14 1 14 S codex exec --output-schema\n").unwrap();
+        let bad = parse_codex_processes(
+            "14 1 14 S codex exec --output-schema /tmp/.git/ironmem/autopilot/repo/uuid/schema.json --future-flag v p\n",
+        )
+        .unwrap();
         assert!(bad[0].marker().is_err());
         let prompt =
             parse_codex_processes("15 1 15 S codex exec prompt --output-schema /tmp/false\n")
@@ -920,9 +923,17 @@ mod harness_tests {
         );
         assert!(snapshots.state_reason(&state).contains("active"));
         snapshots.codex = CodexProcessSnapshot::Available(
-            parse_codex_processes("10 1 10 S codex exec --output-schema\n").unwrap(),
+            parse_codex_processes(
+                "10 1 10 S codex exec --future-flag v --output-schema /x/schema.json p\n",
+            )
+            .unwrap(),
         );
         assert_eq!(snapshots.liveness(&state), Liveness::Unknown);
+        // An unparseable row that names no schema.json cannot be ours.
+        snapshots.codex = CodexProcessSnapshot::Available(
+            parse_codex_processes("10 1 10 S codex exec --output-schema\n").unwrap(),
+        );
+        assert_eq!(snapshots.liveness(&state), Liveness::NotListed);
         snapshots.codex = CodexProcessSnapshot::Available(parse_codex_processes("10 1 10 S codex exec --output-schema /other/.git/ironmem/autopilot/owner-repo-99/11111111-2222-3333-4444-555555555555/schema.json prompt\n11 1 11 S codex exec reviewer prompt\n12 1 12 S /bin/sh -c codex exec --output-schema /other-clone/.git/ironmem/autopilot/owner-repo-42/11111111-2222-3333-4444-555555555555/schema.json\n").unwrap());
         assert_eq!(
             snapshots.liveness(&state),
