@@ -549,6 +549,21 @@ enum AutopilotCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Clear a held issue's dispatch state once no process could be its work
+    /// — the human recovery for a Codex invocation whose completion Autopilot
+    /// cannot prove. Lineage, attempts and spend stand; artifacts are kept.
+    ClearDispatch {
+        /// Repo identity (e.g. "owner/repo")
+        repo: String,
+        /// GitHub issue number
+        issue: u64,
+        /// Path to the database
+        #[arg(long)]
+        db: Option<String>,
+        /// Emit JSON instead of text
+        #[arg(long)]
+        json: bool,
+    },
     /// Give an issue that hit its attempt cap a fresh budget and put it back
     /// in the queue — the human recovery `agent:exhausted` names
     Retry {
@@ -2407,6 +2422,38 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                             "  would exhaust: {attempts_summarized} attempt(s) summarized, labels +{:?} -{:?} — dry run, nothing written",
                             label_plan.add, label_plan.remove
                         ),
+                    }
+                }
+                Ok(())
+            }
+            AutopilotCmd::ClearDispatch {
+                repo,
+                issue,
+                db,
+                json,
+            } => {
+                let database = open_migrated_db(db)?;
+                let issue_ref = ironmem::autopilot::IssueRef::new(&repo, issue);
+                // Both harnesses' evidence, sampled by `clear_dispatch` only
+                // after it has read the state it will judge.
+                let cleared =
+                    ironmem::autopilot::clear::clear_dispatch(&database, &issue_ref, || {
+                        let mut monitor =
+                            ironmem::autopilot::registry::TwoHarnessMonitor::default();
+                        ironmem::autopilot::registry::HarnessMonitor::snapshot(&mut monitor)
+                    })?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&cleared)?);
+                } else {
+                    println!(
+                        "cleared {} ({:?}, was {:?}); lineage, attempts and spend are unchanged, \
+                         and the next dispatch starts a fresh session",
+                        cleared.issue, cleared.implementer, cleared.state
+                    );
+                    if let Some(a) = &cleared.codex_artifacts {
+                        if let Some(dir) = std::path::Path::new(&a.schema_path).parent() {
+                            println!("  invocation evidence kept at {}", dir.display());
+                        }
                     }
                 }
                 Ok(())

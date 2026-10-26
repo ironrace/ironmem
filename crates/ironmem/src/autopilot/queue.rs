@@ -337,6 +337,11 @@ pub enum DeferReason {
     /// The day's ledger cannot authorize another dispatch. Global: when this
     /// fires, every candidate carries it.
     DailyBudgetExhausted { spent_usd: f64, budget_usd: f64 },
+    /// The last run refused because the rendered goal condition exceeds its
+    /// limit even after reduction. That refusal repeats until a human
+    /// shortens the issue or its gates, so it is not resumed ahead of the
+    /// backlog every tick; `autopilot clear-dispatch` releases it.
+    ConditionTooLong,
     /// The issue's dispatch state was written by the other harness, which the
     /// configured runner refuses to resume. Only that harness, or a human
     /// clearing the state, moves it.
@@ -534,6 +539,10 @@ pub fn plan_queue(
                         continue;
                     }
                     Liveness::NotListed => {}
+                }
+                if state.state == "paused-condition-too-long" {
+                    defer(DeferReason::ConditionTooLong);
+                    continue;
                 }
                 if let Some(configured) = config.implementer {
                     if state.implementer != configured {
@@ -1604,6 +1613,39 @@ mod tests {
             "Claude name must not hold a dead Codex invocation"
         );
         assert_eq!(plan.dispatch[0].issue, issue);
+    }
+    #[test]
+    fn a_condition_too_long_refusal_is_deferred_not_resumed_ahead_of_the_backlog() {
+        use crate::autopilot::codex_process::CodexProcessSnapshot;
+        use crate::autopilot::implementer::Implementer;
+        use crate::autopilot::registry::HarnessSnapshots;
+        let snapshots = HarnessSnapshots {
+            claude: RegistrySnapshot::Available(Vec::new()),
+            codex: CodexProcessSnapshot::Available(Vec::new()),
+        };
+        for implementer in [Implementer::Claude, Implementer::Codex] {
+            let db = approved(&[REPO]);
+            let issue = IssueRef::new(REPO, 1);
+            put_state(&db, &issue, "ic-test");
+            let mut state = dispatch_state::get_dispatch_state(&db, &issue)
+                .unwrap()
+                .unwrap();
+            state.implementer = implementer;
+            state.state = "paused-condition-too-long".into();
+            dispatch_state::upsert_dispatch_state(&db, &state).unwrap();
+            // Idle, so liveness alone would resume it first — into the same
+            // refusal, taking the tick's dispatch every tick.
+            assert_eq!(snapshots.liveness(&state), Liveness::NotListed);
+            let backlogs = [backlog(REPO, vec![ready(1), ready(2)])];
+            let cfg = QueueConfig {
+                implementer: Some(implementer),
+                ..config()
+            };
+            let plan = plan_queue(&db, &backlogs, &snapshots, &cfg).unwrap();
+            assert_eq!(reason_for(&plan, 1), DeferReason::ConditionTooLong);
+            assert_eq!(plan.dispatch.len(), 1, "{implementer:?}");
+            assert_eq!(plan.dispatch[0].issue, IssueRef::new(REPO, 2));
+        }
     }
     #[test]
     fn a_state_owned_by_the_other_harness_is_deferred_not_dispatched_ahead_of_the_backlog() {

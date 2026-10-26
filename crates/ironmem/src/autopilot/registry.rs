@@ -370,12 +370,7 @@ fn idle_codex_pause(snapshot: &CodexProcessSnapshot, state: &DispatchState) -> R
     }
     let slug = state.issue.slug();
     if snapshot.orphan_markers().iter().any(|marker| {
-        std::path::Path::new(marker)
-            .parent()
-            .and_then(|invocation| invocation.parent())
-            .and_then(|issue| issue.file_name())
-            .and_then(|name| name.to_str())
-            == Some(slug.as_str())
+        crate::autopilot::codex_process::marker_issue_slug(marker) == Some(slug.as_str())
     }) {
         return Err("an active Codex Autopilot marker matches this issue; paused state has no exact invocation identity to adopt safely".into());
     }

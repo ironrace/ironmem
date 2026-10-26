@@ -1128,7 +1128,10 @@ exit 97
         }),
         "{report}"
     );
-    assert!(report["problems"].as_array().unwrap().is_empty(), "{report}");
+    assert!(
+        report["problems"].as_array().unwrap().is_empty(),
+        "{report}"
+    );
     assert!(dirty.is_file());
     assert_eq!(
         std::fs::read_to_string(tree.path.join(".git")).unwrap(),
@@ -1142,4 +1145,120 @@ exit 97
         !calls.exists(),
         "Lead owner refusal must not dispatch Claude"
     );
+}
+
+#[test]
+fn clear_dispatch_refuses_a_live_invocation_and_releases_an_unprovable_dead_one() {
+    use std::os::unix::process::CommandExt;
+
+    let root = tempfile::tempdir().unwrap();
+    let checkout = root.path().join("checkout");
+    let stubs = root.path().join("stubs");
+    let db_path = root.path().join("memory.sqlite3");
+    make_repo(&checkout);
+    std::fs::create_dir_all(&stubs).unwrap();
+    approve(&db_path);
+    executable(&stubs.join("codex"), "#!/bin/sh\nexec /bin/sleep 30\n");
+
+    let issue = IssueRef::new(REPO, 53);
+    let artifacts = codex_dispatch::prepare_artifacts(&checkout, &issue).unwrap();
+    let child = Command::new(stubs.join("codex"))
+        .args([
+            "exec",
+            "--json",
+            "--output-schema",
+            &artifacts.schema_path,
+            "prompt",
+        ])
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let root_pid = child.id();
+    let mut child = KillOnDrop(child);
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    // Persisted identity and no supervisor exit record: the shape a Ctrl-C'd
+    // controller leaves, which restart recovery can never prove finished.
+    std::fs::write(
+        Path::new(&artifacts.schema_path).with_file_name("process.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "root_pid": root_pid,
+            "root_pgid": root_pid,
+            "schema_path": artifacts.schema_path.clone(),
+            "invocation_id": artifacts.invocation_id.clone(),
+            "descendants": [],
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let state = DispatchState {
+        implementer: Implementer::Codex,
+        native_session_id: None,
+        codex_artifacts: Some(artifacts.clone()),
+        issue: issue.clone(),
+        worktree_path: checkout.display().to_string(),
+        ic_session_name: "ic-owner-repo-53".into(),
+        dispatch_class: "unclassified".into(),
+        attempt_n: 0,
+        state: "dispatching".into(),
+        started_at: "2026-10-26T00:00:00Z".into(),
+        session_uuid: "controller-only".into(),
+        turn_n: 0,
+        session_claimed: false,
+    };
+    let db = Database::open(&db_path).unwrap();
+    dispatch_state::upsert_dispatch_state(&db, &state).unwrap();
+    let ledger =
+        budget::reserve_unpriced_dispatch(&db, "2026-10-26", &artifacts.invocation_id).unwrap();
+
+    let clear = || {
+        Command::new(bin())
+            .args([
+                "autopilot",
+                "clear-dispatch",
+                REPO,
+                "53",
+                "--db",
+                db_path.to_str().unwrap(),
+                "--json",
+            ])
+            .env("PATH", isolated_path(&stubs))
+            .output()
+            .unwrap()
+    };
+
+    let refused = clear();
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(stderr.contains("refusing to clear"), "{stderr}");
+    assert_eq!(
+        dispatch_state::get_dispatch_state(&db, &issue).unwrap(),
+        Some(state)
+    );
+
+    child.0.kill().unwrap();
+    child.0.wait().unwrap();
+    let cleared = clear();
+    assert!(
+        cleared.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cleared.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&cleared.stdout).unwrap();
+    assert_eq!(report["implementer"], "codex");
+    assert_eq!(
+        report["codex_artifacts"]["schema_path"],
+        artifacts.schema_path
+    );
+    assert!(dispatch_state::get_dispatch_state(&db, &issue)
+        .unwrap()
+        .is_none());
+    // Only the state goes: the spend stands and the evidence stays on disk.
+    assert_eq!(
+        budget::get_daily_spend(&db, "2026-10-26").unwrap(),
+        Some(ledger)
+    );
+    assert!(Path::new(&artifacts.schema_path)
+        .with_file_name("process.json")
+        .is_file());
 }

@@ -200,6 +200,10 @@ struct ExitRecord {
     duration_ms: u64,
     #[serde(default)]
     expected_native_id: Option<String>,
+    /// Set only when `spawn` itself failed, so no child ever existed. Omitted
+    /// otherwise, keeping every launched record byte-identical to before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    launch_failure: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -306,8 +310,13 @@ pub fn run_codex_bounded(
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
-    let mut child = super::dispatch::retry_on_etxtbsy(|| command.spawn())
-        .map_err(|e| MemoryError::NotFound(format!("failed to launch Codex dispatch: {e}")))?;
+    let mut child = match super::dispatch::retry_on_etxtbsy(|| command.spawn()) {
+        Ok(child) => child,
+        // A failed spawn proves no child exists. Record that as supervisor
+        // evidence so neither this run nor a replacement controller holds an
+        // invocation that never ran.
+        Err(e) => return never_launched(a, spec, &format!("failed to launch Codex dispatch: {e}")),
+    };
     let started = Instant::now();
     let mut identity = super::codex_process::ProcessIdentity {
         version: 1,
@@ -373,6 +382,45 @@ pub fn run_codex_bounded(
     )
 }
 
+fn never_launched(
+    a: &CodexArtifacts,
+    spec: &DispatchSpec,
+    reason: &str,
+) -> Result<DispatchOutcome, MemoryError> {
+    let record = ExitRecord {
+        completion: Some(CompletionRecord {
+            version: 1,
+            invocation_id: a.invocation_id.clone(),
+            schema_path: a.schema_path.clone(),
+        }),
+        exit_code: None,
+        timed_out: false,
+        limit_exceeded: None,
+        duration_ms: 0,
+        expected_native_id: match &spec.session {
+            SessionMode::Resume { session_uuid } => Some(session_uuid.clone()),
+            SessionMode::New { .. } => None,
+        },
+        launch_failure: Some(reason.to_owned()),
+    };
+    persist_exit(a, &record).map_err(|e| {
+        MemoryError::NotFound(format!(
+            "{reason}; recording that it never launched also failed: {e}"
+        ))
+    })?;
+    read_artifacts(a)
+}
+
+/// A supervisor record proving `spawn` failed, so no process ever ran.
+pub fn has_launch_failure_record(artifacts: &CodexArtifacts) -> bool {
+    read_capped(&artifacts.exit_path, EXIT_LIMIT)
+        .ok()
+        .and_then(|text| serde_json::from_str::<ExitRecord>(&text).ok())
+        .is_some_and(|record| {
+            record.proves_completion(artifacts) && record.launch_failure.is_some()
+        })
+}
+
 /// A dispatch error must not hide a failed cleanup: descendants that may
 /// still be running in the worktree are the operator's next problem.
 fn with_cleanup(err: MemoryError, cleanup: Result<(), MemoryError>) -> MemoryError {
@@ -417,6 +465,7 @@ fn finish_codex_dispatch(
             SessionMode::Resume { session_uuid } => Some(session_uuid.clone()),
             SessionMode::New { .. } => None,
         },
+        launch_failure: None,
     };
     persist_exit(a, &record)?;
     let mut outcome = read_artifacts(a)?;
@@ -467,6 +516,7 @@ pub fn read_artifacts(a: &CodexArtifacts) -> Result<DispatchOutcome, MemoryError
     let mut conflict = false;
     let mut turns = 0u32;
     let mut observed_output = false;
+    let mut never_started = false;
     match read_capped(&a.journal_path, JOURNAL_LIMIT) {
         Ok(journal) => {
             observed_output |= !journal.is_empty();
@@ -525,6 +575,9 @@ pub fn read_artifacts(a: &CodexArtifacts) -> Result<DispatchOutcome, MemoryError
         Ok(record) => {
             if !record.proves_completion(a) {
                 errors.push("untrusted Codex supervisor completion evidence".into());
+            } else if let Some(reason) = &record.launch_failure {
+                never_started = true;
+                errors.push(format!("Codex never launched: {reason}"));
             }
             if record
                 .expected_native_id
@@ -591,7 +644,7 @@ pub fn read_artifacts(a: &CodexArtifacts) -> Result<DispatchOutcome, MemoryError
         reason,
         process_success,
         timed_out,
-        invocation_started: exit.is_ok() || observed_output,
+        invocation_started: (exit.is_ok() || observed_output) && !never_started,
     })
 }
 
@@ -935,6 +988,54 @@ mod contract_tests {
             .to_string();
         assert!(err.contains("U+FFFD"), "{err}");
         assert!(!repo.join(".git/ironmem").exists());
+    }
+    #[test]
+    fn a_spawn_that_never_launched_is_a_durable_infrastructure_failure_not_a_hold() {
+        use crate::autopilot::codex_process::{CodexProcessSnapshot, ProcessRow};
+        use crate::autopilot::registry::Liveness;
+        let (dir, s) = setup();
+        let a = s.codex_artifacts.clone().unwrap();
+        let o = run_codex_bounded(
+            Path::new("/missing-binary"),
+            dir.path(),
+            &s,
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        assert!(!o.invocation_started && !o.process_success && !o.is_met());
+        let reason = o.reason.unwrap();
+        assert!(reason.contains("never launched"), "{reason}");
+        // A replacement controller reads the same supervisor evidence: idle,
+        // and recovered as the same unstarted failure rather than held.
+        assert!(has_valid_exit_record(&a));
+        let recovered = read_artifacts(&a).unwrap();
+        assert!(!recovered.invocation_started && !recovered.is_met());
+        let empty = CodexProcessSnapshot::Available(Vec::new());
+        assert_eq!(empty.liveness(Some(&a)), Liveness::NotListed);
+        // A live process carrying the marker contradicts the record: hold.
+        let live = CodexProcessSnapshot::Available(vec![ProcessRow {
+            pid: 70,
+            ppid: 1,
+            pgid: 70,
+            stat: "S".into(),
+            args: format!("codex exec --output-schema {} prompt", a.schema_path),
+        }]);
+        assert_eq!(live.liveness(Some(&a)), Liveness::Unknown);
+        // So does an identity file: only a spawned child writes one.
+        std::fs::write(
+            Path::new(&a.schema_path).with_file_name("process.json"),
+            b"{}",
+        )
+        .unwrap();
+        assert_eq!(empty.liveness(Some(&a)), Liveness::Unknown);
+        // The record never authorizes reuse of the invocation's artifacts.
+        assert!(run_codex_bounded(
+            Path::new("/missing-binary"),
+            dir.path(),
+            &s,
+            Duration::from_secs(1)
+        )
+        .is_err());
     }
     #[test]
     fn timeout_default_override_and_backend_artifact_pairing() {

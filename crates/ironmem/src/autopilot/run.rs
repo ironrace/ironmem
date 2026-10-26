@@ -962,8 +962,9 @@ pub fn validate_dispatch_owner(
         if state.implementer != implementer {
             return Err(MemoryError::Validation(format!(
                 "implementation harness mismatch: persisted {:?}, configured {:?}; resume with \
-                 the persisted harness or explicitly clear its state",
-                state.implementer, implementer
+                 the persisted harness or clear its state with `ironmem autopilot \
+                 clear-dispatch {} {}`",
+                state.implementer, implementer, issue.repo, issue.number
             )));
         }
     }
@@ -1002,8 +1003,11 @@ pub fn preflight_worktree_provisioning(
             issue.canonical()
         ))),
         CodexRecovery::Unknown { reason } => Err(MemoryError::Validation(format!(
-            "cannot provision {} while Codex process completion is uncertain: {reason}",
-            issue.canonical()
+            "cannot provision {} while Codex process completion is uncertain: {reason}; \
+             once no process remains, `ironmem autopilot clear-dispatch {} {}` releases it",
+            issue.canonical(),
+            issue.repo,
+            issue.number
         ))),
         CodexRecovery::Finished(_) => Ok(()),
         CodexRecovery::NoPriorInvocation if state.codex_artifacts.is_none() => Ok(()),
@@ -1105,7 +1109,11 @@ pub fn run_issue(
             match dispatcher.recover(&worktree.path, state)? {
                 recovery @ (CodexRecovery::Alive | CodexRecovery::Unknown { .. }) => {
                     let detail = match recovery {
-                        CodexRecovery::Unknown { reason } => reason,
+                        CodexRecovery::Unknown { reason } => format!(
+                            "{reason}; once no process remains, `ironmem autopilot \
+                             clear-dispatch {} {}` releases it",
+                            issue.repo, issue.number
+                        ),
                         _ => "Codex implementation is still alive".into(),
                     };
                     let unpriced_dispatches = match &state.codex_artifacts {
@@ -1433,7 +1441,11 @@ pub fn run_issue(
                     });
                     // Errors do not prove a child is dead; retain the exact invocation for recovery.
                     break TerminalReason::ImplementationInFlight {
-                        detail: format!("Codex dispatch could not establish completion: {err}"),
+                        detail: format!(
+                            "Codex dispatch could not establish completion: {err}; once no \
+                             process remains, `ironmem autopilot clear-dispatch {} {}` releases it",
+                            issue.repo, issue.number
+                        ),
                     };
                 }
                 // A dispatch that produced no parseable result at all banked
@@ -1486,13 +1498,16 @@ pub fn run_issue(
             if recovered {
                 unpriced_dispatches += 1;
             }
-            if outcome
-                .native_session_id
-                .as_ref()
-                .is_none_or(|id| id.trim().is_empty())
-                || native_session_id
+            // An invocation that never launched has no thread to check, and
+            // its own reason (why the spawn failed) is the useful one.
+            if outcome.invocation_started
+                && (outcome
+                    .native_session_id
                     .as_ref()
-                    .is_some_and(|id| outcome.native_session_id.as_ref() != Some(id))
+                    .is_none_or(|id| id.trim().is_empty())
+                    || native_session_id
+                        .as_ref()
+                        .is_some_and(|id| outcome.native_session_id.as_ref() != Some(id)))
             {
                 outcome.native_session_id = None;
                 outcome.verdict = None;

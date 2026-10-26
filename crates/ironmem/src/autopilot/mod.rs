@@ -200,6 +200,7 @@ pub mod advise;
 pub mod blocked;
 pub mod budget;
 pub mod ci_evidence;
+pub mod clear;
 pub mod codex_dispatch;
 pub mod codex_process;
 pub mod dispatch;

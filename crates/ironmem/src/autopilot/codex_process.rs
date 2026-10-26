@@ -107,6 +107,15 @@ fn decode_process_table(output: &[u8]) -> Result<Vec<ProcessRow>, String> {
     parse_codex_processes(&text)
 }
 
+/// The issue slug an Autopilot marker names: `.../autopilot/<slug>/<uuid>/schema.json`.
+pub(crate) fn marker_issue_slug(marker: &str) -> Option<&str> {
+    Path::new(marker)
+        .parent()
+        .and_then(|invocation| invocation.parent())
+        .and_then(|issue| issue.file_name())
+        .and_then(|name| name.to_str())
+}
+
 pub fn parse_codex_processes(text: &str) -> Result<Vec<ProcessRow>, String> {
     text.lines()
         .filter(|s| !s.trim().is_empty())
@@ -362,6 +371,9 @@ impl CodexProcessSnapshot {
         let Some(a) = artifacts else {
             return "Codex invocation has no persisted artifacts".into();
         };
+        if super::codex_dispatch::has_launch_failure_record(a) {
+            return "Codex never launched, but an active process carries its marker or an ambiguous one; holding for verification".into();
+        }
         let identity = match read_identity(a) {
             Ok(identity) => identity,
             Err(reason) => return reason,
@@ -404,6 +416,22 @@ impl CodexProcessSnapshot {
         let Some(a) = artifacts else {
             return Liveness::Unknown;
         };
+        // A failed spawn writes no process identity, only the supervisor's
+        // proof that no child existed. An identity file or any active marker
+        // contradicts it.
+        if super::codex_dispatch::has_launch_failure_record(a) {
+            let contradicted = identity_path(a).exists()
+                || rows.iter().any(|r| {
+                    r.active()
+                        && r.marker()
+                            .map_or(true, |m| m == Some(a.schema_path.as_str()))
+                });
+            return if contradicted {
+                Liveness::Unknown
+            } else {
+                Liveness::NotListed
+            };
+        }
         let Ok(identity) = read_identity(a) else {
             return Liveness::Unknown;
         };
@@ -436,6 +464,59 @@ impl CodexProcessSnapshot {
         } else {
             Liveness::Unknown
         }
+    }
+    /// Fresh evidence that an issue's Codex work may still be running, or
+    /// `None` when an available table shows nothing that could be it: its
+    /// marker, another Autopilot marker for the issue, an ambiguous Codex row,
+    /// or the recorded root, process group, or a recorded descendant.
+    pub fn live_evidence(
+        &self,
+        issue_slug: &str,
+        artifacts: Option<&CodexArtifacts>,
+    ) -> Option<String> {
+        let Self::Available(rows) = self else {
+            return Some(self.reason());
+        };
+        let identity = artifacts.and_then(|a| read_identity(a).ok());
+        for r in rows.iter().filter(|r| r.active()) {
+            match r.marker() {
+                Err(reason) => {
+                    return Some(format!(
+                        "process {} is an ambiguous Codex command: {reason}",
+                        r.pid
+                    ))
+                }
+                Ok(Some(marker)) if artifacts.is_some_and(|a| a.schema_path == marker) => {
+                    return Some(format!(
+                        "process {} carries this invocation's marker",
+                        r.pid
+                    ))
+                }
+                Ok(Some(marker)) if marker_issue_slug(marker) == Some(issue_slug) => {
+                    return Some(format!(
+                        "process {} runs an Autopilot invocation for {issue_slug}: {marker}",
+                        r.pid
+                    ))
+                }
+                _ => {}
+            }
+            if let Some(identity) = &identity {
+                if r.pid == identity.root_pid || identity.descendants.iter().any(|d| d.pid == r.pid)
+                {
+                    return Some(format!(
+                        "process {} has a PID this invocation recorded",
+                        r.pid
+                    ));
+                }
+                if r.pgid == identity.root_pgid {
+                    return Some(format!(
+                        "process {} is in this invocation's process group {}",
+                        r.pid, r.pgid
+                    ));
+                }
+            }
+        }
+        None
     }
     pub fn orphan_markers(&self) -> Vec<&str> {
         match self {

@@ -126,8 +126,12 @@ pub fn get_dispatch_state(
     let Some(drawer) = read_current(db, &dispatch_state_key(issue))? else {
         return Ok(None);
     };
-    let body: DispatchStateBody = serde_json::from_str(&drawer.content)?;
-    Ok(Some(DispatchState {
+    state_from_content(&drawer.content).map(Some)
+}
+
+fn state_from_content(content: &str) -> Result<DispatchState, MemoryError> {
+    let body: DispatchStateBody = serde_json::from_str(content)?;
+    Ok(DispatchState {
         implementer: body.implementer,
         native_session_id: body.native_session_id.or_else(|| {
             (body.implementer == Implementer::Claude).then(|| body.session_uuid.clone())
@@ -143,7 +147,7 @@ pub fn get_dispatch_state(
         session_uuid: body.session_uuid,
         turn_n: body.turn_n,
         session_claimed: body.session_claimed,
-    }))
+    })
 }
 
 /// Every in-flight issue's dispatch-state drawer.
@@ -224,6 +228,42 @@ pub fn clear_dispatch_state(db: &Database, issue: &IssueRef) -> Result<bool, Mem
     })
 }
 
+/// [`clear_dispatch_state`], but only while the drawer still holds
+/// `expected`. Read and delete share one transaction, so a dispatch that
+/// rewrote the state after the caller judged it is never deleted unseen.
+/// Returns `false`, deleting nothing, when the state changed or is gone.
+pub fn clear_dispatch_state_if_unchanged(
+    db: &Database,
+    expected: &DispatchState,
+) -> Result<bool, MemoryError> {
+    use rusqlite::OptionalExtension;
+    let id = super::logical_drawer_id(&dispatch_state_key(&expected.issue));
+    db.with_transaction(|tx| {
+        let content: Option<String> = tx
+            .query_row("SELECT content FROM drawers WHERE id = ?1", [&id], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        let unchanged = match content {
+            Some(content) => state_from_content(&content)? == *expected,
+            None => false,
+        };
+        let deleted = unchanged && Database::delete_drawer_tx(tx, &id)?;
+        Database::wal_log_tx(
+            tx,
+            "autopilot_clear_dispatch_state",
+            &json!({
+                "drawer_id": &id,
+                "issue": expected.issue.canonical(),
+                "deleted": deleted,
+                "conditional": true,
+            }),
+            None,
+        )?;
+        Ok(deleted)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -246,6 +286,24 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_conditional_clear_never_deletes_a_state_rewritten_after_it_was_judged() {
+        let db = Database::open_in_memory().unwrap();
+        let issue = IssueRef::new("ironrace/ironmem", 283);
+        // Callers judge the state as read back, which normalizes legacy fields.
+        upsert_dispatch_state(&db, &sample(&issue, 1)).unwrap();
+        let judged = get_dispatch_state(&db, &issue).unwrap().unwrap();
+        upsert_dispatch_state(&db, &sample(&issue, 2)).unwrap();
+        let rewritten = get_dispatch_state(&db, &issue).unwrap().unwrap();
+        assert!(!clear_dispatch_state_if_unchanged(&db, &judged).unwrap());
+        assert_eq!(
+            get_dispatch_state(&db, &issue).unwrap(),
+            Some(rewritten.clone())
+        );
+        assert!(clear_dispatch_state_if_unchanged(&db, &rewritten).unwrap());
+        assert!(get_dispatch_state(&db, &issue).unwrap().is_none());
+        assert!(!clear_dispatch_state_if_unchanged(&db, &rewritten).unwrap());
+    }
     #[test]
     fn codex_wire_roundtrip_keeps_native_identity_and_absolute_artifacts() {
         let db = Database::open_in_memory().unwrap();

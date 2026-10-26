@@ -146,7 +146,10 @@ active checkout.
 A Lead defers an issue whose state the other harness wrote
 (`harness_mismatch`) instead of admitting it as a resume, so a leftover
 state from a Claude Lead never takes a Codex Lead's dispatch slot, or the
-reverse. Run the owning harness to finish it.
+reverse. Run the owning harness to finish it. An issue whose last run refused
+because its goal condition was too long even after reduction is deferred
+(`condition_too_long`) rather than resumed every tick; shorten the issue or
+its gates, then release it with `autopilot clear-dispatch`.
 
 Before spawn, Autopilot creates private schema, journal, final-message,
 stderr, exit, and process-identity artifacts under the repository's absolute
@@ -161,9 +164,34 @@ kernel identity, process evidence, or trusted supervisor completion produces
 `Unknown` and holds the issue for inspection. Fresh authenticated live-process
 evidence wins over a stale completion record. If `ps` is unavailable, only
 Codex liveness becomes unknown; if the Claude registry source is unavailable,
-only Claude liveness does. An operator may need to inspect and resolve an
-invocation whose process evidence remains uncertain rather than forcing a
-retry that could duplicate live work.
+only Claude liveness does.
+
+A spawn that fails outright (for example, `codex` missing from `PATH`) proves
+no child existed, so the supervisor records that, and the invocation is an
+ordinary infrastructure failure rather than a hold. What stays held is
+completion that really is unproven: a controller killed by Ctrl-C while
+Codex kept running in its own process group, a root that exited before the
+first `ps` sample, or an observation error mid-run. Stop any Lead or `run`
+working the repo, confirm nothing is still working on the issue, then release
+it with:
+
+```
+ironmem autopilot clear-dispatch owner/repo 364
+```
+
+It refuses while a fresh process table shows anything that could be the
+issue's work: the invocation's marker, another Autopilot marker for the same
+issue, an ambiguous Codex command, or the recorded root PID, process group,
+or a recorded descendant. Descendants are recorded only once the root exits,
+so after a controller crash the check sees the root, its process group, and
+markers, but not a tool that left the group with `setsid`; that part of the
+confirmation is yours. It also refuses a finished invocation that is only
+waiting to be recorded (`autopilot run` records it), and it deletes nothing if
+the state changes while it checks. It deletes only the dispatch state; lineage,
+attempt counts, and the unpriced reservation stand, the artifacts stay on
+disk for inspection, and the next dispatch starts a fresh Codex thread. A
+Claude state clears only against a readable registry that does not list its
+session.
 
 Direct native `codex` processes are the verified path. A launcher wrapper is
 adopted conservatively after restart: a marker visible only on a different
