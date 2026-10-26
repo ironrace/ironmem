@@ -74,6 +74,17 @@ ironmem autopilot run owner/repo 364 --title "..." --implementer codex --model <
 ironmem autopilot lead --repo owner/repo=/path --implementer codex --model <codex-model>
 ```
 
+A Codex implementer runs unattended with `--dangerously-bypass-approvals-and-sandbox`
+and `--dangerously-bypass-hook-trust`, the same trust model as the Claude
+implementer's `--dangerously-skip-permissions`: it executes as the operator,
+with the operator's environment, on a prompt built from the issue title and
+body. Codex documents both flags for externally sandboxed automation, so run
+the Lead inside such a sandbox whenever `agent:ready` issues can be written or
+edited by anyone you would not hand a shell. The hook-trust bypass also means a
+project hook committed by one dispatch runs at the start of every later
+dispatch or resume on that branch. Only the separate Codex *reviewer* runs
+`-s read-only`.
+
 An empty model is rejected for either harness. A known cross-harness prefix
 is also rejected (`claude-*` with Codex, `gpt-*` with Claude), but Autopilot
 does not impose a model allowlist: provider aliases such as a Claude `opus`
@@ -132,12 +143,18 @@ before provisioning or quarantining an issue worktree. Live or uncertain
 process evidence therefore holds without moving, detaching, or replacing the
 active checkout.
 
+A Lead defers an issue whose state the other harness wrote
+(`harness_mismatch`) instead of admitting it as a resume, so a leftover
+state from a Claude Lead never takes a Codex Lead's dispatch slot, or the
+reverse. Run the owning harness to finish it.
+
 Before spawn, Autopilot creates private schema, journal, final-message,
 stderr, exit, and process-identity artifacts under the repository's absolute
 common Git directory. That location survives worktree quarantine and lets a
 replacement controller inspect the same evidence. Canonical artifact paths
-containing whitespace are currently refused because the `ps` evidence parser
-cannot recover an argv boundary safely from them.
+containing whitespace or U+FFFD are currently refused: the `ps` evidence
+parser cannot recover an argv boundary from whitespace, and it decodes
+undecodable argv bytes from unrelated processes to U+FFFD.
 
 Restart recovery is deliberately conservative. Missing or inconsistent
 kernel identity, process evidence, or trusted supervisor completion produces

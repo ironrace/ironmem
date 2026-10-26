@@ -51,6 +51,11 @@ fn supported_path(path: &Path) -> Result<&str, MemoryError> {
     if !path.is_absolute() || text.chars().any(char::is_whitespace) {
         return Err(validation("unsupported Codex artifact path: move the repository to an absolute path without whitespace; process identity recovery cannot parse whitespace"));
     }
+    // The process table is decoded lossily, so U+FFFD in a marker could match
+    // another process's undecodable argv bytes.
+    if text.contains(char::REPLACEMENT_CHARACTER) {
+        return Err(validation("unsupported Codex artifact path: move the repository to a path without U+FFFD; process identity recovery decodes undecodable argv bytes to it"));
+    }
     Ok(text)
 }
 
@@ -316,19 +321,19 @@ pub fn run_codex_bounded(
     if let Err(e) = super::codex_process::persist_identity(a, &identity) {
         // The root is still our unreaped Child; cleanup is authenticated by
         // kernel birth identity, and cannot authorize a retry on uncertainty.
-        let _ = tracker.cleanup(false);
+        let cleanup = tracker.cleanup(false);
         let _ = child.kill();
         let _ = child.wait();
-        return Err(e);
+        return Err(with_cleanup(e, cleanup));
     }
     let mut timed_out = false;
     let mut limit_exceeded;
     let status = loop {
         if let Err(e) = tracker.observe() {
-            let _ = tracker.cleanup(false);
+            let cleanup = tracker.cleanup(false);
             let _ = child.kill();
             let _ = child.wait();
-            return Err(e);
+            return Err(with_cleanup(e, cleanup));
         }
         limit_exceeded = limits(a);
         if limit_exceeded.is_some() || started.elapsed() >= timeout {
@@ -345,17 +350,17 @@ pub fn run_codex_bounded(
             Ok(Some(status)) => break status,
             Ok(None) => std::thread::sleep(POLL_INTERVAL),
             Err(e) => {
-                let _ = tracker.cleanup(false);
+                let cleanup = tracker.cleanup(false);
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(e.into());
+                return Err(with_cleanup(e.into(), cleanup));
             }
         }
     };
     identity.descendants = tracker.descendants();
     if let Err(e) = super::codex_process::persist_identity(a, &identity) {
-        let _ = tracker.cleanup(true);
-        return Err(e);
+        let cleanup = tracker.cleanup(true);
+        return Err(with_cleanup(e, cleanup));
     }
     finish_codex_dispatch(
         &mut tracker,
@@ -366,6 +371,17 @@ pub fn run_codex_bounded(
         timed_out,
         limit_exceeded,
     )
+}
+
+/// A dispatch error must not hide a failed cleanup: descendants that may
+/// still be running in the worktree are the operator's next problem.
+fn with_cleanup(err: MemoryError, cleanup: Result<(), MemoryError>) -> MemoryError {
+    match cleanup {
+        Ok(()) => err,
+        Err(c) => validation(format!(
+            "{err}; process-tree cleanup also failed, so descendants may still be running: {c}"
+        )),
+    }
 }
 
 /// Complete supervision after the root process has been observed and reaped.
@@ -408,7 +424,7 @@ fn finish_codex_dispatch(
     Ok(outcome)
 }
 
-fn read_capped(path: &str, cap: u64) -> Result<String, MemoryError> {
+fn read_capped_bytes(path: &str, cap: u64) -> Result<Vec<u8>, MemoryError> {
     let file = open_existing(path, false)?;
     let mut data = Vec::new();
     file.take(cap + 1).read_to_end(&mut data)?;
@@ -417,7 +433,12 @@ fn read_capped(path: &str, cap: u64) -> Result<String, MemoryError> {
             "Codex artifact exceeds {cap}-byte limit"
         )));
     }
-    String::from_utf8(data).map_err(|_| validation("Codex artifact is not UTF-8"))
+    Ok(data)
+}
+
+fn read_capped(path: &str, cap: u64) -> Result<String, MemoryError> {
+    String::from_utf8(read_capped_bytes(path, cap)?)
+        .map_err(|_| validation("Codex artifact is not UTF-8"))
 }
 
 #[derive(Deserialize)]
@@ -540,7 +561,12 @@ pub fn read_artifacts(a: &CodexArtifacts) -> Result<DispatchOutcome, MemoryError
     if let Some(limit) = limits(a) {
         errors.push(limit);
     }
-    let stderr = read_capped(&a.stderr_path, STDERR_LIMIT).unwrap_or_default();
+    // Stderr is diagnostic only: it never decides validity, but a failed read
+    // is reported with the other errors rather than silently dropped.
+    let (stderr, stderr_error) = match read_capped_bytes(&a.stderr_path, STDERR_LIMIT) {
+        Ok(bytes) => (String::from_utf8_lossy(&bytes).into_owned(), None),
+        Err(e) => (String::new(), Some(e)),
+    };
     observed_output |= !stderr.is_empty();
     let valid = errors.is_empty();
     let (verdict, reason) = if valid {
@@ -549,6 +575,9 @@ pub fn read_artifacts(a: &CodexArtifacts) -> Result<DispatchOutcome, MemoryError
     } else {
         if !stderr.trim().is_empty() {
             errors.push(format!("stderr: {}", stderr.trim()));
+        }
+        if let Some(e) = stderr_error {
+            errors.push(format!("stderr unreadable: {e}"));
         }
         (None, Some(scrub_and_bound(&errors.join("; "), 500).text))
     };
@@ -804,6 +833,30 @@ mod contract_tests {
         }
     }
     #[test]
+    fn non_utf8_stderr_still_explains_a_failure_and_never_decides_validity() {
+        let (_dir, s) = setup();
+        let a = s.codex_artifacts.as_ref().unwrap();
+        std::fs::write(&a.stderr_path, b"model \xff rejected\n").unwrap();
+        let met = completed(
+            &s,
+            r#"{"verdict":"met","reason":"gate"}"#,
+            &journal(),
+            Some(0),
+        );
+        assert!(met.is_met(), "stderr is diagnostic only");
+        let (_dir, s) = setup();
+        let a = s.codex_artifacts.as_ref().unwrap();
+        std::fs::write(&a.stderr_path, b"model \xff rejected\n").unwrap();
+        let failed = completed(
+            &s,
+            r#"{"verdict":"met","reason":"gate"}"#,
+            &journal(),
+            Some(1),
+        );
+        let reason = failed.reason.unwrap();
+        assert!(reason.contains("model \u{FFFD} rejected"), "{reason}");
+    }
+    #[test]
     fn artifacts_are_private_absolute_and_in_common_git_directory() {
         let (dir, s) = setup();
         let a = s.codex_artifacts.unwrap();
@@ -872,6 +925,16 @@ mod contract_tests {
         .unwrap_err()
         .to_string()
         .contains("whitespace"));
+        // Lossy ps decoding turns undecodable argv bytes into U+FFFD, so a
+        // marker containing it could match a different process's bytes.
+        let repo = dir.path().join("rep\u{FFFD}o");
+        std::fs::create_dir(&repo).unwrap();
+        assert!(git(&repo).args(["init", "-q"]).status().unwrap().success());
+        let err = prepare_artifacts(&repo, &IssueRef::new("o/r", 1))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("U+FFFD"), "{err}");
+        assert!(!repo.join(".git/ironmem").exists());
     }
     #[test]
     fn timeout_default_override_and_backend_artifact_pairing() {

@@ -332,18 +332,27 @@ impl HarnessSnapshots {
 }
 /// `run_issue` persists dispatching + exact new artifacts atomically before
 /// every Codex spawn, and retains pending artifacts whenever completion is
-/// uncertain. These explicit paused labels with no pending artifacts therefore
-/// establish an idle invocation, including a pause before the first launch.
-/// A fresh source is still required, and identifiable conflicting work holds.
+/// uncertain. Every label `run_issue` writes with no pending artifacts
+/// therefore establishes an idle invocation, including a pause or refusal
+/// before the first launch and a between-invocation state an early `?` left
+/// behind. An unrecognized label still holds, a fresh source is still
+/// required, and identifiable conflicting work holds.
 fn idle_codex_pause(snapshot: &CodexProcessSnapshot, state: &DispatchState) -> Result<(), String> {
     let CodexProcessSnapshot::Available(rows) = snapshot else {
         return Err(snapshot.reason());
     };
     if !matches!(
         state.state.as_str(),
-        "paused-daily-budget" | "paused-infrastructure-failure"
+        "paused-daily-budget"
+            | "paused-infrastructure-failure"
+            | "paused-condition-too-long"
+            | "dispatching"
+            | "infrastructure-failure"
     ) {
-        return Err("Codex has no pending invocation identity in a recognized paused state".into());
+        return Err(format!(
+            "Codex state {:?} has no pending invocation identity and is not a state autopilot writes without one",
+            state.state
+        ));
     }
     if state
         .native_session_id
@@ -838,9 +847,18 @@ mod harness_tests {
     fn explicit_idle_codex_pauses_require_available_source_and_valid_optional_native_id() {
         let mut state = paused_codex_state();
         let snapshots = paused_snapshots();
-        for label in ["paused-daily-budget", "paused-infrastructure-failure"] {
+        for label in [
+            "paused-daily-budget",
+            "paused-infrastructure-failure",
+            // Written with no pending artifacts by `run_issue`: a refusal
+            // before the first launch, and the between-invocation states a
+            // failed `?` on the next iteration leaves behind.
+            "paused-condition-too-long",
+            "dispatching",
+            "infrastructure-failure",
+        ] {
             state.state = label.into();
-            assert_eq!(snapshots.liveness(&state), Liveness::NotListed);
+            assert_eq!(snapshots.liveness(&state), Liveness::NotListed, "{label}");
             state.native_session_id = None;
             assert_eq!(
                 snapshots.liveness(&state),
@@ -869,13 +887,7 @@ mod harness_tests {
     fn absent_codex_identity_in_an_unknown_phase_still_holds() {
         let mut state = paused_codex_state();
         let snapshots = paused_snapshots();
-        for phase in [
-            "dispatching",
-            "infrastructure-failure",
-            "paused-condition-too-long",
-            "paused-other",
-            "",
-        ] {
+        for phase in ["paused-other", "", "Dispatching"] {
             state.state = phase.into();
             assert_eq!(snapshots.liveness(&state), Liveness::Unknown);
         }

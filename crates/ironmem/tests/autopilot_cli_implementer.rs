@@ -1115,13 +1115,20 @@ exit 97
     );
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert!(report["runs"].as_array().unwrap().is_empty(), "{report}");
-    assert!(
-        report["problems"][0]["detail"]
-            .as_str()
-            .unwrap()
-            .contains("harness mismatch"),
+    // Deferred by the queue, not refused at dispatch: a refused resume would
+    // sort first and take the tick's only dispatch on every tick.
+    let deferred = report["plan"]["deferred"].as_array().unwrap();
+    assert_eq!(deferred.len(), 1, "{report}");
+    assert_eq!(
+        deferred[0]["reason"],
+        serde_json::json!({
+            "reason": "harness_mismatch",
+            "persisted": "codex",
+            "configured": "claude",
+        }),
         "{report}"
     );
+    assert!(report["problems"].as_array().unwrap().is_empty(), "{report}");
     assert!(dirty.is_file());
     assert_eq!(
         std::fs::read_to_string(tree.path.join(".git")).unwrap(),

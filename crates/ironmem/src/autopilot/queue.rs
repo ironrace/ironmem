@@ -78,6 +78,7 @@
 use serde::Serialize;
 
 use super::gh::IssueListing;
+use super::implementer::Implementer;
 use super::labels::{self, DispatchEligibility};
 #[cfg(test)]
 use super::registry::RegistrySnapshot;
@@ -204,6 +205,11 @@ pub struct QueueConfig {
     /// rather than dispatched and immediately terminated.
     pub attempt_cap: u32,
     pub max_issues_per_repo: u32,
+    /// The harness the dispatching runner will use. A state persisted by the
+    /// other harness is deferred rather than admitted as a resume, because the
+    /// runner refuses it — and a refused resume sorted to the top would take
+    /// the tick's dispatch every tick. `None` is an unscoped preview.
+    pub implementer: Option<Implementer>,
 }
 
 impl Default for QueueConfig {
@@ -214,6 +220,7 @@ impl Default for QueueConfig {
             max_budget_usd: super::run::DEFAULT_MAX_BUDGET_USD,
             attempt_cap: super::run::DEFAULT_ATTEMPT_CAP,
             max_issues_per_repo: DEFAULT_MAX_ISSUES_PER_REPO,
+            implementer: None,
         }
     }
 }
@@ -330,6 +337,13 @@ pub enum DeferReason {
     /// The day's ledger cannot authorize another dispatch. Global: when this
     /// fires, every candidate carries it.
     DailyBudgetExhausted { spent_usd: f64, budget_usd: f64 },
+    /// The issue's dispatch state was written by the other harness, which the
+    /// configured runner refuses to resume. Only that harness, or a human
+    /// clearing the state, moves it.
+    HarnessMismatch {
+        persisted: Implementer,
+        configured: Implementer,
+    },
 }
 
 /// One deferred issue and why.
@@ -520,6 +534,15 @@ pub fn plan_queue(
                         continue;
                     }
                     Liveness::NotListed => {}
+                }
+                if let Some(configured) = config.implementer {
+                    if state.implementer != configured {
+                        defer(DeferReason::HarnessMismatch {
+                            persisted: state.implementer,
+                            configured,
+                        });
+                        continue;
+                    }
                 }
             }
 
@@ -1581,5 +1604,40 @@ mod tests {
             "Claude name must not hold a dead Codex invocation"
         );
         assert_eq!(plan.dispatch[0].issue, issue);
+    }
+    #[test]
+    fn a_state_owned_by_the_other_harness_is_deferred_not_dispatched_ahead_of_the_backlog() {
+        use crate::autopilot::implementer::Implementer;
+        let db = approved(&[REPO]);
+        // A Claude Lead left issue 1 paused; its registry no longer lists the
+        // session, so liveness alone would admit it as a resume and sort it
+        // first — into a dispatch the Codex runner must refuse every tick.
+        put_state(&db, &IssueRef::new(REPO, 1), "ic-stale");
+        let backlogs = [backlog(REPO, vec![ready(1), ready(2)])];
+        let snapshot = RegistrySnapshot::Available(Vec::new());
+        let codex = QueueConfig {
+            implementer: Some(Implementer::Codex),
+            ..config()
+        };
+        let plan = plan_queue(&db, &backlogs, &snapshot, &codex).unwrap();
+        assert_eq!(
+            reason_for(&plan, 1),
+            DeferReason::HarnessMismatch {
+                persisted: Implementer::Claude,
+                configured: Implementer::Codex,
+            }
+        );
+        assert_eq!(plan.dispatch.len(), 1);
+        assert_eq!(plan.dispatch[0].issue, IssueRef::new(REPO, 2));
+
+        // The same harness resumes it, and an unscoped preview filters nothing.
+        for scope in [Some(Implementer::Claude), None] {
+            let cfg = QueueConfig {
+                implementer: scope,
+                ..config()
+            };
+            let plan = plan_queue(&db, &backlogs, &snapshot, &cfg).unwrap();
+            assert_eq!(plan.dispatch[0].issue, IssueRef::new(REPO, 1));
+        }
     }
 }

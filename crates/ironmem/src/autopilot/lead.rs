@@ -349,7 +349,13 @@ pub fn lead_tick(
 
     // ── 4. read every backlog and choose ────────────────────────────────
     let backlogs = fetch_backlogs(gh_runner, config, &mut problems);
-    let plan = queue::plan_queue(db, &backlogs, &snapshot, &config.queue)?;
+    // Scoped to the runner's own harness here, not configured separately, so
+    // the queue can never admit a resume the runner will refuse.
+    let queue_config = QueueConfig {
+        implementer: Some(config.run.implementer),
+        ..config.queue.clone()
+    };
+    let plan = queue::plan_queue(db, &backlogs, &snapshot, &queue_config)?;
 
     // ── 5. dispatch the top of the queue ────────────────────────────────
     let mut runs = Vec::new();

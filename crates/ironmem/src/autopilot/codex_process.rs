@@ -96,6 +96,17 @@ impl ProcessRow {
     }
 }
 
+/// Any same-user process may carry non-UTF-8 argv, and ps prints it raw.
+/// Lossy decoding keeps that row from failing every observation; artifact
+/// paths refuse U+FFFD, so a replaced byte can never forge a marker match.
+fn decode_process_table(output: &[u8]) -> Result<Vec<ProcessRow>, String> {
+    let text = String::from_utf8_lossy(output);
+    if text.trim().is_empty() {
+        return Err("ps returned no process table".into());
+    }
+    parse_codex_processes(&text)
+}
+
 pub fn parse_codex_processes(text: &str) -> Result<Vec<ProcessRow>, String> {
     text.lines()
         .filter(|s| !s.trim().is_empty())
@@ -144,12 +155,7 @@ impl CodexProcessSource for UnixCodexProcesses {
     fn list(&mut self) -> Result<Vec<ProcessRow>, String> {
         #[cfg(unix)]
         {
-            let output = bounded_process_table()?;
-            let text = std::str::from_utf8(&output).map_err(|_| "ps output is not UTF-8")?;
-            if text.trim().is_empty() {
-                return Err("ps returned no process table".into());
-            }
-            parse_codex_processes(text)
+            decode_process_table(&bounded_process_table()?)
         }
         #[cfg(not(unix))]
         {
@@ -958,6 +964,19 @@ mod tests {
         }
         assert_eq!(snapshot(&mut Failed).liveness(Some(&a)), Liveness::Unknown);
         assert!(parse_codex_processes("partial row").is_err());
+    }
+    #[test]
+    fn an_unrelated_non_utf8_argv_neither_hides_nor_fails_the_process_table() {
+        // macOS ps prints argv bytes raw; any same-user process can carry
+        // Latin-1. One such row must not abort a live dispatch's observation.
+        let schema = "/tmp/.git/ironmem/autopilot/owner-repo-42/11111111-2222-3333-4444-555555555555/schema.json";
+        let mut table = b"20 1 20 S perl -e sleep \xff\xfe\n".to_vec();
+        table.extend(format!("21 1 21 S codex exec --output-schema {schema} prompt\n").bytes());
+        let rows = decode_process_table(&table).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].marker().unwrap(), Some(schema));
+        assert_eq!(rows[0].marker().unwrap(), None);
+        assert!(decode_process_table(b"   \n").is_err());
     }
     #[test]
     fn unobserved_history_and_live_descendants_cannot_be_restarted() {
