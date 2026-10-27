@@ -1909,14 +1909,7 @@ mod tests {
             &cfg,
         )
         .unwrap();
-        assert!(
-            matches!(
-                reason_for(&plan, 1),
-                DeferReason::DispatchStateUnreadable { .. }
-            ),
-            "{:?}",
-            reason_for(&plan, 1)
-        );
+        assert_eq!(reason_for(&plan, 1), DeferReason::DispatchStateUnreadable);
         assert!(
             matches!(reason_for(&plan, 2), DeferReason::ConcurrencyCap { .. }),
             "{:?}",
