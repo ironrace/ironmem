@@ -1405,7 +1405,8 @@ impl ProcOwner {
 }
 
 /// Real and effective uid from a Linux `/proc/<pid>/status` text: the first
-/// two fields of its `Uid:` line.
+/// two fields of its `Uid:` line. Linux only, but tested everywhere.
+#[cfg(any(target_os = "linux", test))]
 fn uids_from_status(status: &str) -> Option<(u32, u32)> {
     let mut ids = status
         .lines()
