@@ -852,15 +852,322 @@ fn branch_tip(worktree: &Worktree) -> Option<String> {
     (!sha.is_empty()).then_some(sha)
 }
 
-/// `git`'s own complaint, bounded so it can ride inside a one-line reason.
-fn bounded_stderr(out: &std::process::Output) -> String {
-    let text = String::from_utf8_lossy(&out.stderr);
-    text.trim().chars().take(300).collect()
+/// How much of the model's own reason a `met` the guard refused keeps.
+const MODEL_REASON_CHARS: usize = 500;
+
+/// How many hex digits name a commit in a violation.
+const SHORT_SHA_CHARS: usize = 12;
+
+/// How long one of the signing guard's git commands may run before it is
+/// killed with its process group and the guard fails closed. Generous: a
+/// range of thousands of commits reads in well under a second.
+const SIGNING_GUARD_GIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// How often [`GuardGit::run`] checks on its git process.
+const GUARD_GIT_POLL: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// The first `n` characters of `text`.
+fn prefix(text: &str, n: usize) -> String {
+    text.chars().take(n).collect()
+}
+
+/// What may hold a branch to the signing policy beyond its recorded flags:
+/// the policy as this run read it at its start. Passed as a value rather than
+/// a bare `bool` so each source names itself in the violation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SigningPolicySeen {
+    /// `commit.gpgsign` read `true` when this run started.
+    at_run_start: bool,
+}
+
+impl SigningPolicySeen {
+    /// The source that holds the branch, named for a reason, if any does.
+    fn holder(self) -> Option<&'static str> {
+        self.at_run_start
+            .then_some("the policy, which was on when this run started")
+    }
+}
+
+/// Why a `met` breaks the signing policy: the model's to fix, so the `met`
+/// becomes a failed attempt whose reason reaches the next turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SigningViolation {
+    /// `commit.gpgsign` was turned off while `holder` still holds the branch.
+    PolicyDisabled { holder: String },
+    /// The issue branch is gone, so nothing that ships can be checked.
+    MissingBranch { branch: String },
+    /// Commits on the branch are unsigned or carry a bad signature: short
+    /// shas, newest first, and the remote the recipe pushes to.
+    Unsigned {
+        flagged: Vec<String>,
+        cut: String,
+        branch: String,
+        remote: String,
+    },
+}
+
+impl std::fmt::Display for SigningViolation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SigningViolation::PolicyDisabled { holder } => write!(
+                f,
+                "commit.gpgsign was turned off, but this branch is still held to signing by \
+                 {holder}. Restore it with `git config --unset commit.gpgsign` (or set it back \
+                 to true) and sign every commit. If signing fails in your environment, return \
+                 verdict impossible with the signing error; never bypass."
+            ),
+            SigningViolation::MissingBranch { branch } => write!(
+                f,
+                "commit.gpgsign is on, but the issue branch `{branch}` does not exist, so the \
+                 commits that ship cannot be checked. Recreate it at your work (`git checkout -B \
+                 {branch} <your last commit>`), with every commit signed."
+            ),
+            SigningViolation::Unsigned {
+                flagged,
+                cut,
+                branch,
+                remote,
+            } => f.write_str(&unsigned_violation(flagged, cut, branch, remote)),
+        }
+    }
+}
+
+/// Why the guard could not judge a `met`. Never the model's fault, so never
+/// an attempt; the `met` is still never accepted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GuardFault {
+    /// `commit.gpgsign`, or a flag recording it, cannot be read: an
+    /// operator's config fault that every later `met` would meet too.
+    PolicyUnreadable(String),
+    /// Unsigned commits are on the branch, but none was committed under this
+    /// run's identity: a collaborator's push the model is not to rewrite.
+    ForeignUnsigned {
+        commits: Vec<(String, String)>,
+        identity: String,
+    },
+    /// git could not be run, or could not read the branch.
+    GitUnreadable(String),
+}
+
+impl GuardFault {
+    /// Whether every later dispatch's `met` would meet this fault too, so
+    /// the run stops before paying for another one.
+    fn stops_run(&self) -> bool {
+        !matches!(self, GuardFault::GitUnreadable(_))
+    }
+}
+
+impl std::fmt::Display for GuardFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GuardFault::PolicyUnreadable(why) => f.write_str(why),
+            GuardFault::ForeignUnsigned { commits, identity } => {
+                let named = commits
+                    .iter()
+                    .take(NAMED_UNSIGNED_COMMITS)
+                    .map(|(sha, committer)| format!("{sha} by {committer}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let more = commits.len().saturating_sub(NAMED_UNSIGNED_COMMITS);
+                let more = if more > 0 {
+                    format!(" and {more} more")
+                } else {
+                    String::new()
+                };
+                write!(
+                    f,
+                    "commit.gpgsign is on, but commit(s) {named}{more} on this branch are \
+                     unsigned or carry a bad signature, and none was committed as this run's \
+                     identity ({identity}), so the model is not charged for them. Re-sign or \
+                     drop them and push the branch, or opt it out of signing (see Commit \
+                     signing in docs/AUTOPILOT.md)"
+                )
+            }
+            GuardFault::GitUnreadable(why) => write!(
+                f,
+                "commit.gpgsign is on, but the branch's commit signatures could not be read: \
+                 {why}"
+            ),
+        }
+    }
+}
+
+/// The signing guard's git: every command bounded in time, with the
+/// signature programs pinned to the operator's own.
+///
+/// `%G?` makes git run `gpg.program`, `gpg.ssh.program` or
+/// `gpg.x509.program` here, in the controller, after the invocation's
+/// supervision has ended. The repository's `.git/config` is writable by the
+/// unconfined agent, so a program set there would run outside any bound. Each
+/// is pinned with `-c` to the operator's global or system value (git's
+/// default when neither sets one), and every command, with its process group,
+/// is killed after the timeout, failing the guard closed. Messages are read
+/// in the C locale, because one of them is matched.
+struct GuardGit<'a> {
+    repo: &'a Path,
+    timeout: std::time::Duration,
+    pins: Vec<String>,
+}
+
+impl<'a> GuardGit<'a> {
+    fn new(repo: &'a Path, timeout: std::time::Duration) -> Result<Self, String> {
+        let mut git = Self {
+            repo,
+            timeout,
+            pins: Vec::new(),
+        };
+        let (mut openpgp, mut ssh, mut x509) = ("gpg", "ssh-keygen", "gpgsm");
+        let mut read = Vec::new();
+        // System, then global: the order git reads them, so a later value wins.
+        for scope in ["--system", "--global"] {
+            let out = git.run(
+                &[
+                    "config",
+                    scope,
+                    "--includes",
+                    "--get-regexp",
+                    r"^gpg\..*program$",
+                ],
+                None,
+            )?;
+            match out.status.code() {
+                Some(0) => read.push(String::from_utf8_lossy(&out.stdout).into_owned()),
+                Some(1) => {} // none set in that scope
+                _ => {
+                    return Err(format!(
+                        "the operator's {scope} signature programs could not be read: {}",
+                        worktree::bounded_stderr(&out.stderr)
+                    ))
+                }
+            }
+        }
+        for line in read.iter().flat_map(|text| text.lines()) {
+            let Some((key, value)) = line.split_once(' ') else {
+                continue;
+            };
+            match key {
+                "gpg.program" | "gpg.openpgp.program" => openpgp = value,
+                "gpg.ssh.program" => ssh = value,
+                "gpg.x509.program" => x509 = value,
+                _ => {}
+            }
+        }
+        git.pins = vec![
+            format!("gpg.program={openpgp}"),
+            format!("gpg.openpgp.program={openpgp}"),
+            format!("gpg.ssh.program={ssh}"),
+            format!("gpg.x509.program={x509}"),
+        ];
+        Ok(git)
+    }
+
+    /// Run git with `args`, writing `input` one line each to its stdin.
+    fn run(&self, args: &[&str], input: Option<&[&str]>) -> Result<std::process::Output, String> {
+        use std::process::Stdio;
+        let label = || format!("git {}", args.join(" "));
+        let mut command = std::process::Command::new("git");
+        crate::mcp::tools::scrub_git_environment(&mut command);
+        command.env("LC_ALL", "C").env("LANG", "C");
+        for pin in &self.pins {
+            command.arg("-c").arg(pin);
+        }
+        command
+            .args(args)
+            .current_dir(self.repo)
+            .stdin(if input.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+        let mut child = dispatch::retry_on_etxtbsy(|| command.spawn())
+            .map_err(|e| format!("{} could not run: {e}", label()))?;
+        // Written from another thread: git answers as it reads, so a writer
+        // that filled git's input before reading its output would deadlock on
+        // a long range.
+        let writer = match (input, child.stdin.take()) {
+            (Some(lines), Some(mut stdin)) => {
+                let text: String = lines.iter().map(|line| format!("{line}\n")).collect();
+                Some(std::thread::spawn(move || {
+                    std::io::Write::write_all(&mut stdin, text.as_bytes())
+                }))
+            }
+            _ => None,
+        };
+        let stdout = dispatch::drain(child.stdout.take());
+        let stderr = dispatch::drain(child.stderr.take());
+        let deadline = std::time::Instant::now() + self.timeout;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(GUARD_GIT_POLL)
+                }
+                waited => {
+                    dispatch::kill_process_group(&mut child);
+                    let _ = child.wait();
+                    return Err(match waited {
+                        Err(e) => format!("{} could not be waited on: {e}", label()),
+                        _ => format!(
+                            "{} did not finish within {}s and was killed",
+                            label(),
+                            self.timeout.as_secs_f64()
+                        ),
+                    });
+                }
+            }
+        };
+        // A descendant git left behind can hold a pipe open. The readers get
+        // what is left of the same deadline and are then abandoned.
+        let open = !joins_by(&stdout, deadline)
+            || !joins_by(&stderr, deadline)
+            || writer.as_ref().is_some_and(|w| !joins_by(w, deadline));
+        if open {
+            return Err(format!(
+                "{} exited but left its output open past {}s",
+                label(),
+                self.timeout.as_secs_f64()
+            ));
+        }
+        let output = std::process::Output {
+            status,
+            stdout: stdout.join().unwrap_or_default(),
+            stderr: stderr.join().unwrap_or_default(),
+        };
+        match writer.map(std::thread::JoinHandle::join) {
+            None | Some(Ok(Ok(()))) => Ok(output),
+            // git stopping early (a 128 on a bad signature) cuts the write
+            // short, and its own status says so.
+            Some(Ok(Err(_))) if !output.status.success() => Ok(output),
+            Some(Ok(Err(e))) => Err(format!(
+                "{} succeeded without reading all its input: {e}",
+                label()
+            )),
+            Some(Err(_)) => Err(format!("{} input writer panicked", label())),
+        }
+    }
+}
+
+/// Whether `handle`'s thread finishes by `deadline`.
+fn joins_by<T>(handle: &std::thread::JoinHandle<T>, deadline: std::time::Instant) -> bool {
+    while !handle.is_finished() {
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(GUARD_GIT_POLL);
+    }
+    true
 }
 
 /// Why the issue branch's commits break the repository's signing policy:
 /// `Ok(None)` when they keep it or there is no policy, `Ok(Some(violation))`
-/// for the model to fix, and `Err` when the guard itself could not read git.
+/// for the model to fix, and `Err` when the guard could not judge them.
 ///
 /// Measured 2026-10-26: Muse's sandboxed shell could not sign (`No user
 /// exists for uid 501`), and the model silently retried with
@@ -872,134 +1179,155 @@ fn bounded_stderr(out: &std::process::Output) -> String {
 ///
 /// The commits checked are the ones that ship: everything reachable from the
 /// issue branch (`refs/heads/<branch>`, never `HEAD`, which the IC may have
-/// left elsewhere) and from its own remote-tracking refs (what was pushed and
-/// what the PR is opened from), but not from the cut ([`Worktree::cut`],
-/// recorded once when the branch was made) nor from any other remote-tracking
-/// ref. So upstream commits the agent merges or rebases in are never blamed on
-/// it, an earlier dispatch's bypass stays caught after it is pushed (or after
-/// the local branch is reset), and a moving operator checkout cannot shrink or
-/// widen the range. A missing issue branch is a violation: nothing that ships
-/// can be checked.
+/// left elsewhere) and from its own remote-tracking refs
+/// (`refs/remotes/<remote>/<branch>` for each configured remote: what was
+/// pushed and what the PR is opened from), but not from the cut
+/// ([`Worktree::cut`], recorded once when the branch was made) nor from any
+/// other remote-tracking ref. So upstream commits the agent merges or rebases
+/// in are never blamed on it, an earlier dispatch's bypass stays caught after
+/// it is pushed (or after the local branch is reset), and a moving operator
+/// checkout cannot shrink or widen the range. A missing issue branch is a
+/// violation: nothing that ships can be checked.
 ///
-/// The policy is enforced when it was on at this run's start
-/// (`policy_at_start`), when the branch or the repository recorded it on
-/// ([`worktree::record_signing`], at creation and at each run's start), or
-/// when it is on now; an enforced policy that is now off is a violation of its
-/// own, across runs.
+/// A flagged commit is the model's only when it was committed as this run's
+/// identity (`git var GIT_COMMITTER_IDENT`, or the controller's
+/// `GIT_COMMITTER_EMAIL`). One a collaborator pushed is still never accepted,
+/// but it is [`GuardFault::ForeignUnsigned`], not the model's failed attempt:
+/// fixing it means rewriting their commit. An identity that cannot be read
+/// counts every commit as the model's.
+///
+/// The policy is enforced when it was on at this run's start (`seen`), when
+/// the branch or the repository recorded it on ([`worktree::record_signing`],
+/// at creation and at each run's start), or when it is on now; an enforced
+/// policy that is now off is a violation of its own, across runs.
 ///
 /// The flags survive a deliberate operator change to `commit.gpgsign` too. To
 /// stop enforcing on a branch, run `git config branch.<branch>.ironmemSigning
 /// false` (with the policy off).
 ///
-/// `Err` (git failing to run, an unreadable policy, a cut `git log` cannot
-/// use) is the operator's problem, not the model's: the caller makes it an
-/// infrastructure failure, which never counts as `met` and consumes no attempt.
+/// `Err` is never the model's fault: the caller makes it an infrastructure
+/// failure, which never counts as `met` and consumes no attempt, and stops
+/// the run on one that every later `met` would meet too
+/// ([`GuardFault::stops_run`]).
 ///
 /// This catches a lazy or accidental bypass, not deliberate tampering. An
 /// unconfined agent could just as well opt its branch out, rewrite
 /// `branch.<branch>.ironmemCut` to hide earlier commits, push its commits to
 /// another remote branch (every remote-tracking ref but the issue branch's
-/// own is excluded via `--remotes`), or sign with a throwaway key.
-fn signing_violation(worktree: &Worktree, policy_at_start: bool) -> Result<Option<String>, String> {
-    let git = |args: &[&str]| {
-        let mut command = std::process::Command::new("git");
-        crate::mcp::tools::scrub_git_environment(&mut command);
-        command
-            .args(args)
-            .current_dir(&worktree.path)
-            .output()
-            .map_err(|e| format!("git {} could not run: {e}", args.join(" ")))
-    };
-    let unreadable = |detail: String| {
-        format!(
-            "commit.gpgsign is on, but the branch's commit signatures could not be read: {detail}"
-        )
-    };
+/// own is excluded via `--remotes`), commit under another identity, or sign
+/// with a throwaway key.
+fn signing_violation(
+    worktree: &Worktree,
+    seen: SigningPolicySeen,
+) -> Result<Option<SigningViolation>, GuardFault> {
+    check_signing(worktree, seen, SIGNING_GUARD_GIT_TIMEOUT)
+}
+
+/// [`signing_violation`] with each git command bounded by `timeout`.
+fn check_signing(
+    worktree: &Worktree,
+    seen: SigningPolicySeen,
+    timeout: std::time::Duration,
+) -> Result<Option<SigningViolation>, GuardFault> {
     match worktree::signing_policy(&worktree.path) {
-        Err(why) => return Err(format!("commit.gpgsign could not be read: {why}")),
+        Err(why) => {
+            return Err(GuardFault::PolicyUnreadable(format!(
+                "commit.gpgsign could not be read: {why}"
+            )))
+        }
         Ok(false) => {
-            let holder = worktree::signing_holder(&worktree.path, &worktree.branch).or_else(|| {
-                policy_at_start.then(|| "the policy, which was on when this run started".into())
-            });
-            return Ok(holder.map(|holder| {
-                format!(
-                    "commit.gpgsign was turned off, but this branch is still held to signing by \
-                     {holder}. Restore it with `git config --unset commit.gpgsign` (or set it \
-                     back to true) and sign every commit. If signing fails in your environment, \
-                     return verdict impossible with the signing error; never bypass."
-                )
-            }));
+            let holder = worktree::signing_holder(&worktree.path, &worktree.branch)
+                .map_err(GuardFault::PolicyUnreadable)?
+                .or_else(|| seen.holder().map(str::to_string));
+            return Ok(holder.map(|holder| SigningViolation::PolicyDisabled { holder }));
         }
         Ok(true) => {}
     }
+    let unreadable = GuardFault::GitUnreadable;
+    let git = GuardGit::new(&worktree.path, timeout).map_err(unreadable)?;
     let branch = worktree.branch.as_str();
     let local = format!("refs/heads/{branch}");
-    let probe = git(&[
-        "rev-parse",
-        "--verify",
-        "--quiet",
-        &format!("{local}^{{commit}}"),
-    ])
-    .map_err(unreadable)?;
+    let probe = git
+        .run(
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("{local}^{{commit}}"),
+            ],
+            None,
+        )
+        .map_err(unreadable)?;
     match probe.status.code() {
         Some(0) => {}
         Some(1) => {
-            return Ok(Some(format!(
-                "commit.gpgsign is on, but the issue branch `{branch}` does not exist, so the \
-                 commits that ship cannot be checked. Recreate it at your work (`git checkout -B \
-                 {branch} <your last commit>`), with every commit signed."
-            )))
+            return Ok(Some(SigningViolation::MissingBranch {
+                branch: branch.to_string(),
+            }))
         }
-        _ => return Err(unreadable(bounded_stderr(&probe))),
+        _ => return Err(unreadable(worktree::bounded_stderr(&probe.stderr))),
     }
-    // The issue branch's own remote-tracking refs, matched as `--exclude`
-    // below matches them, so what was pushed is checked and never negated.
-    let remotes =
-        git(&["for-each-ref", "--format=%(refname)", "refs/remotes/"]).map_err(unreadable)?;
-    if !remotes.status.success() {
-        return Err(unreadable(bounded_stderr(&remotes)));
-    }
-    let own_suffix = format!("/{branch}");
-    let remotes = String::from_utf8_lossy(&remotes.stdout).into_owned();
-    let own_remotes: Vec<&str> = remotes
-        .lines()
-        .filter(|r| {
-            r.strip_prefix("refs/remotes/")
-                .is_some_and(|name| name.ends_with(&own_suffix))
+    let read = |args: &[&str]| -> Result<String, GuardFault> {
+        let out = git.run(args, None).map_err(unreadable)?;
+        if !out.status.success() {
+            return Err(unreadable(worktree::bounded_stderr(&out.stderr)));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    };
+    // The issue branch's own remote-tracking refs: exactly
+    // `refs/remotes/<remote>/<branch>` for a configured remote, so a ref
+    // such as `origin/x/<branch>` (another branch) is never taken for it.
+    let configured = read(&["remote"])?;
+    let configured: Vec<&str> = configured.lines().map(str::trim).collect();
+    let refs = read(&["for-each-ref", "--format=%(refname)", "refs/remotes/"])?;
+    let refs: std::collections::HashSet<&str> = refs.lines().collect();
+    let own: Vec<(&str, String)> = configured
+        .iter()
+        .filter_map(|remote| {
+            let refname = format!("refs/remotes/{remote}/{branch}");
+            refs.contains(refname.as_str())
+                .then_some((*remote, refname))
         })
         .collect();
     // `--no-show-signature` on every `git log`: an operator's
     // `log.showSignature=true` prints verification lines ahead of each
-    // signed commit, even under `--format`. Listing by `%H` alone also keeps
+    // signed commit, even under `--format`. Listing without `%G?` also keeps
     // a commit whose signature git cannot parse from failing the whole range
     // (`%G?` exits 128 on it); that commit is judged on its own below.
     let mut args = vec![
-        "log",
-        "--no-show-signature",
-        "--topo-order",
-        "--format=%H",
-        local.as_str(),
+        "log".to_string(),
+        "--no-show-signature".into(),
+        "--topo-order".into(),
+        "--format=%H %ce".into(),
+        local.clone(),
     ];
-    args.extend(own_remotes.iter().copied());
-    let own_remote = format!("--exclude=*/{branch}");
-    args.extend(["--not", worktree.cut.as_str(), &own_remote, "--remotes"]);
-    let out = git(&args).map_err(unreadable)?;
-    if !out.status.success() {
-        return Err(unreadable(bounded_stderr(&out)));
-    }
+    args.extend(own.iter().map(|(_, refname)| refname.clone()));
+    // Every ref ending in the branch is kept out of the negated set, not only
+    // the configured remotes' own: a lookalike can only hide commits there.
+    args.extend([
+        "--not".into(),
+        worktree.cut.clone(),
+        format!("--exclude=*/{branch}"),
+        "--remotes".into(),
+    ]);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
     // Children before parents, so the last one flagged has no flagged ancestor.
-    let listed = String::from_utf8_lossy(&out.stdout).into_owned();
-    let shas: Vec<&str> = listed
+    let listed = read(&args)?;
+    let commits: Vec<(&str, &str)> = listed
         .lines()
-        .map(str::trim)
-        .filter(|line| is_full_object_name(line))
+        .filter_map(|line| {
+            let (sha, committer) = line.trim().split_once(' ').unwrap_or((line.trim(), ""));
+            is_full_object_name(sha).then_some((sha, committer))
+        })
         .collect();
+    let shas: Vec<&str> = commits.iter().map(|(sha, _)| *sha).collect();
     // Every commit object in one read, so a long range costs two git
     // processes rather than two per commit.
-    let headers =
-        git_with_input(&worktree.path, &["cat-file", "--batch"], &shas).map_err(unreadable)?;
+    let headers = git
+        .run(&["cat-file", "--batch"], Some(&shas))
+        .map_err(unreadable)?;
     if !headers.status.success() {
-        return Err(unreadable(bounded_stderr(&headers)));
+        return Err(unreadable(worktree::bounded_stderr(&headers.stderr)));
     }
     let has_header = signature_headers(&headers.stdout, &shas).map_err(unreadable)?;
     let with_header: Vec<&str> = shas
@@ -1012,84 +1340,115 @@ fn signing_violation(worktree: &Worktree, policy_at_start: bool) -> Result<Optio
     // are read one commit at a time, where the failure names its commit.
     let mut statuses = std::collections::HashMap::new();
     if !with_header.is_empty() {
-        let batch = git_with_input(
-            &worktree.path,
-            &[
-                "log",
-                "--no-walk",
-                "--stdin",
-                "--no-show-signature",
-                "--format=%H %G?",
-            ],
-            &with_header,
-        )
-        .map_err(unreadable)?;
+        let batch = git
+            .run(
+                &[
+                    "log",
+                    "--no-walk",
+                    "--stdin",
+                    "--no-show-signature",
+                    "--format=%H %G?",
+                ],
+                Some(&with_header),
+            )
+            .map_err(unreadable)?;
         match batch.status.code() {
             Some(0) => statuses = signature_statuses(&batch.stdout),
             Some(128) => {}
-            _ => return Err(unreadable(bounded_stderr(&batch))),
+            _ => return Err(unreadable(worktree::bounded_stderr(&batch.stderr))),
         }
     }
     let mut flagged = Vec::new();
-    for (sha, has) in shas.iter().zip(has_header) {
+    for ((sha, committer), has) in commits.iter().zip(has_header) {
         let signed = has
             && match statuses.get(*sha) {
                 Some(status) => status != "B",
                 None => {
-                    // A signature git cannot even parse (exit 128) is the
-                    // commit's fault, not the guard's: it is flagged like a
-                    // bad one.
-                    let status = git(&["log", "-1", "--no-show-signature", "--format=%G?", sha])
+                    let one = git
+                        .run(
+                            &["log", "-1", "--no-show-signature", "--format=%G?", sha],
+                            None,
+                        )
                         .map_err(unreadable)?;
-                    status.status.success() && String::from_utf8_lossy(&status.stdout).trim() != "B"
+                    signature_kept(&one).map_err(unreadable)?
                 }
             };
         if !signed {
-            flagged.push(sha.chars().take(12).collect::<String>());
+            flagged.push((prefix(sha, SHORT_SHA_CHARS), *committer));
         }
     }
-    // The recipe pushes to the remote that already tracks the issue branch.
-    let remote = own_remotes
-        .first()
-        .and_then(|r| r.strip_prefix("refs/remotes/"))
-        .and_then(|name| name.strip_suffix(own_suffix.as_str()))
+    if flagged.is_empty() {
+        return Ok(None);
+    }
+    let identity = run_identity(&git);
+    let own_commit = |committer: &str| {
+        identity
+            .as_ref()
+            .is_none_or(|emails| emails.iter().any(|e| e.eq_ignore_ascii_case(committer)))
+    };
+    if !flagged.iter().any(|(_, committer)| own_commit(committer)) {
+        return Err(GuardFault::ForeignUnsigned {
+            commits: flagged
+                .into_iter()
+                .map(|(sha, committer)| (sha, committer.to_string()))
+                .collect(),
+            identity: identity.unwrap_or_default().join(" or "),
+        });
+    }
+    // The recipe pushes to the remote that already tracks the issue branch
+    // (`origin` first when several do), else the only remote, else `origin`.
+    let remote = own
+        .iter()
+        .map(|(remote, _)| *remote)
+        .find(|remote| *remote == "origin")
+        .or_else(|| own.first().map(|(remote, _)| *remote))
+        .or_else(|| (configured.len() == 1).then(|| configured[0]))
         .unwrap_or("origin");
-    Ok((!flagged.is_empty()).then(|| unsigned_violation(&flagged, &worktree.cut, branch, remote)))
+    Ok(Some(SigningViolation::Unsigned {
+        flagged: flagged.into_iter().map(|(sha, _)| sha).collect(),
+        cut: worktree.cut.clone(),
+        branch: branch.to_string(),
+        remote: remote.to_string(),
+    }))
 }
 
-/// Run git in `repo` with one object name per line on its stdin. The input is
-/// written from another thread: git answers as it reads, so a writer that
-/// filled git's input before reading its output would deadlock on a long range.
-fn git_with_input(
-    repo: &Path,
-    args: &[&str],
-    lines: &[&str],
-) -> Result<std::process::Output, String> {
-    let mut command = std::process::Command::new("git");
-    crate::mcp::tools::scrub_git_environment(&mut command);
-    let mut child = command
-        .args(args)
-        .current_dir(repo)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("git {} could not run: {e}", args.join(" ")))?;
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| format!("git {} has no stdin", args.join(" ")))?;
-    let input: String = lines.iter().map(|line| format!("{line}\n")).collect();
-    let writer =
-        std::thread::spawn(move || std::io::Write::write_all(&mut stdin, input.as_bytes()));
-    let output = child
-        .wait_with_output()
-        .map_err(|e| format!("git {} could not be read: {e}", args.join(" ")))?;
-    // A write cut short by git exiting early is reported through git's own
-    // status; only a writer that could not run at all is the guard's.
-    match writer.join() {
-        Ok(_) => Ok(output),
-        Err(_) => Err(format!("git {} input writer panicked", args.join(" "))),
+/// The committer emails this run's commits carry: the worktree's
+/// `git var GIT_COMMITTER_IDENT`, plus the controller's own
+/// `GIT_COMMITTER_EMAIL`, which an implementer that inherits the
+/// controller's environment would commit under. `None` when neither reads.
+fn run_identity(git: &GuardGit<'_>) -> Option<Vec<String>> {
+    let mut emails = Vec::new();
+    if let Ok(out) = git.run(&["var", "GIT_COMMITTER_IDENT"], None) {
+        let ident = String::from_utf8_lossy(&out.stdout);
+        if let Some((_, rest)) = ident.split_once('<') {
+            if let Some((email, _)) = rest.split_once('>') {
+                if out.status.success() && !email.trim().is_empty() {
+                    emails.push(email.trim().to_string());
+                }
+            }
+        }
+    }
+    if let Ok(email) = std::env::var("GIT_COMMITTER_EMAIL") {
+        if !email.trim().is_empty() {
+            emails.push(email.trim().to_string());
+        }
+    }
+    (!emails.is_empty()).then_some(emails)
+}
+
+/// Whether one commit's own `git log -1 --format=%G?` read keeps its
+/// signature: `true` unless it reads `B`, or git refused it as a signature it
+/// cannot parse (the commit's fault, flagged like a bad one). Any other
+/// failure is the guard's, not the commit's.
+fn signature_kept(out: &std::process::Output) -> Result<bool, String> {
+    match out.status.code() {
+        Some(0) => Ok(String::from_utf8_lossy(&out.stdout).trim() != "B"),
+        Some(128)
+            if String::from_utf8_lossy(&out.stderr).contains("bad/incompatible signature") =>
+        {
+            Ok(false)
+        }
+        _ => Err(worktree::bounded_stderr(&out.stderr)),
     }
 }
 
@@ -1109,7 +1468,7 @@ fn signature_headers(mut out: &[u8], shas: &[&str]) -> Result<Vec<bool>, String>
         if name != Some(sha) || kind != Some("commit") {
             return Err(format!(
                 "cat-file answered {:?} for commit {sha}",
-                header.chars().take(120).collect::<String>()
+                prefix(&header, 120)
             ));
         }
         let size: usize = size
@@ -1176,7 +1535,7 @@ fn unsigned_violation(flagged: &[String], cut: &str, branch: &str, remote: &str)
         ));
     }
     let oldest = flagged.last().map(String::as_str).unwrap_or_default();
-    let short_cut: String = cut.chars().take(12).collect();
+    let short_cut = prefix(cut, SHORT_SHA_CHARS);
     format!(
         "commit.gpgsign is on, but commit(s) {list} on this branch since its cut {short_cut} are \
          unsigned or carry a bad signature. Re-sign only these commits, never upstream ones \
@@ -1538,6 +1897,10 @@ fn release_hint(issue: &IssueRef, artifacts: Option<&InvocationArtifacts>) -> St
     }
 }
 
+/// How a run stopped by an unusable signing policy leaves its issue.
+const KEPT_FOR_RECOVERY: &str = "a pending invocation for this issue is kept and will be \
+     recovered once this is fixed; do not clear-dispatch it";
+
 /// What restart recovery decided before a run dispatches anything.
 enum Recovered {
     /// The run ends here without dispatching.
@@ -1750,17 +2113,32 @@ pub fn run_issue(
     //
     // A policy that cannot be read stops the run here, before recovery or
     // any dispatch: the guard would refuse every `met` as an infrastructure
-    // failure, so a dispatch would be paid for and then discarded. Nothing is
+    // failure, so a dispatch would be paid for and then discarded. So does a
+    // flag that holds the branch while the policy is off. Nothing is
     // written, so the next run proceeds once the value is fixed.
     let policy_at_start = worktree::signing_policy(&worktree.path).map_err(|why| {
         MemoryError::Validation(format!(
             "commit.gpgsign cannot be read in {}, so the commit-signing guard could not check \
              any result; fix it (`git config --bool commit.gpgsign` must print true or false) \
-             and run again; a pending invocation for this issue is kept and will be recovered \
-             once this is fixed; do not clear-dispatch it. git said: {why}",
+             and run again; {KEPT_FOR_RECOVERY}. git said: {why}",
             worktree.path.display()
         ))
     })?;
+    if !policy_at_start {
+        worktree::signing_holder(&worktree.path, &worktree.branch).map_err(|why| {
+            MemoryError::Validation(format!(
+                "{why} in {}, so the commit-signing guard could not check any result; fix it \
+                 (it must read true or false) and run again; {KEPT_FOR_RECOVERY}",
+                worktree.path.display()
+            ))
+        })?;
+    }
+    let seen = SigningPolicySeen {
+        at_run_start: policy_at_start,
+    };
+    // Set by a guard fault every later `met` would meet too: the run stops
+    // after recording it, before paying for another dispatch.
+    let mut guard_stop: Option<GuardFault> = None;
     if policy_at_start {
         if let Err(e) = worktree::record_signing(&worktree.path, &worktree.branch, true) {
             tracing::warn!(
@@ -2361,36 +2739,41 @@ pub fn run_issue(
             let model_reason = |reason: String, original: Option<String>| match original {
                 Some(original) if !original.trim().is_empty() => format!(
                     "{reason} (model's reason: {})",
-                    original.chars().take(500).collect::<String>()
+                    prefix(&original, MODEL_REASON_CHARS)
                 ),
                 _ => reason,
             };
-            match signing_violation(worktree, policy_at_start) {
+            match signing_violation(worktree, seen) {
                 Ok(None) => {}
                 Ok(Some(violation)) => {
                     outcome.verdict = Some(Verdict::NotMet);
-                    outcome.reason = Some(model_reason(violation, outcome.reason.take()));
+                    outcome.reason =
+                        Some(model_reason(violation.to_string(), outcome.reason.take()));
                 }
-                // The guard's own read failed, so the met cannot be trusted
-                // but the model is not to blame: an errored outcome with no
-                // verdict is an infrastructure failure, which consumes no
-                // attempt and escalates through the consecutive bound.
-                Err(why) => {
+                // The guard could not accept the met, but the model is not to
+                // blame: an errored outcome with no verdict is an
+                // infrastructure failure, which consumes no attempt and
+                // escalates through the consecutive bound, or stops the run
+                // when every later met would meet the same fault.
+                Err(fault) => {
                     tracing::warn!(
-                        error = %why,
+                        error = %fault,
                         branch = %worktree.branch,
-                        "autopilot's commit-signing guard could not check the branch; \
-                         the met is held as an infrastructure failure"
+                        "autopilot's commit-signing guard did not accept the met; \
+                         it is held as an infrastructure failure"
                     );
                     outcome.verdict = None;
                     outcome.is_error = true;
                     outcome.reason = Some(model_reason(
                         format!(
                             "the commit-signing guard could not check the branch, so the met \
-                             was not accepted: {why}"
+                             was not accepted: {fault}"
                         ),
                         outcome.reason.take(),
                     ));
+                    if fault.stops_run() {
+                        guard_stop = Some(fault);
+                    }
                 }
             }
         }
@@ -2486,6 +2869,29 @@ pub fn run_issue(
                 )?;
             }
             DispatchClassification::InfrastructureFailure => {
+                // A guard fault every later met would meet too: stop like the
+                // run-start check, before another paid dispatch. A supervised
+                // harness's drawer still names this finished invocation, so
+                // the first run after the fix recovers and re-checks it;
+                // Claude's records the session it claimed.
+                if let Some(fault) = guard_stop.take() {
+                    if !config.implementer.recovers_invocations() {
+                        write_state(
+                            db,
+                            cumulative_attempt_n,
+                            turn_n,
+                            "infrastructure-failure",
+                            &session_uuid,
+                            resuming,
+                            (&native_session_id, &invocation_artifacts),
+                            (&session_model, resume_refusals),
+                        )?;
+                    }
+                    return Err(MemoryError::Validation(format!(
+                        "{fault}; the run stops rather than pay for another dispatch whose met \
+                         would be refused the same way; {KEPT_FOR_RECOVERY}"
+                    )));
+                }
                 // Retrying a session still in use can never succeed, so it
                 // spends no more units, in this run or on a later Lead tick.
                 if let Some(detail) = session_in_use {
@@ -4562,6 +4968,13 @@ sleep 0.5
 
     // ── commit signing guard ────────────────────────────────────────────
 
+    /// The guard's verdict on `wt` as text, with nothing held from memory.
+    fn check(wt: &Worktree) -> Result<Option<String>, String> {
+        signing_violation(wt, SigningPolicySeen::default())
+            .map(|violation| violation.map(|v| v.to_string()))
+            .map_err(|fault| fault.to_string())
+    }
+
     fn git_in(repo: &Path, args: &[&str]) -> String {
         let mut c = std::process::Command::new("git");
         crate::mcp::tools::scrub_git_environment(&mut c);
@@ -4603,7 +5016,7 @@ sleep 0.5
         let (_dir, wt) = fixture_worktree(); // commit.gpgsign pinned false
         commit_in(&wt.path, "a", &[]);
         commit_in(&wt.path, "b", &[]);
-        assert_eq!(signing_violation(&wt, false).unwrap(), None);
+        assert_eq!(check(&wt).unwrap(), None);
     }
 
     #[test]
@@ -4612,7 +5025,7 @@ sleep 0.5
         // Turn the policy on *after* the base, as an operator's global config would.
         git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
         let bypass = commit_in(&wt.path, "b", &["-c", "commit.gpgsign=false"]);
-        let violation = signing_violation(&wt, false).unwrap().unwrap();
+        let violation = check(&wt).unwrap().unwrap();
         assert!(violation.contains(&bypass[..12]), "got: {violation}");
         assert!(violation.contains(&wt.cut[..12]), "got: {violation}");
         assert!(violation.contains("impossible"), "got: {violation}");
@@ -4626,7 +5039,7 @@ sleep 0.5
     fn a_policy_that_cannot_be_read_is_the_guards_failure_with_gits_complaint() {
         let (_dir, wt) = fixture_worktree();
         git_in(&wt.path, &["config", "commit.gpgsign", "maybe"]);
-        let why = signing_violation(&wt, false).unwrap_err();
+        let why = check(&wt).unwrap_err();
         assert!(why.contains("could not be read"), "got: {why}");
         assert!(why.contains("maybe"), "got: {why}");
     }
@@ -4637,7 +5050,7 @@ sleep 0.5
         // A pruned cut: a well-formed sha naming no object.
         wt.cut = "a".repeat(40);
         git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
-        let why = signing_violation(&wt, false).unwrap_err();
+        let why = check(&wt).unwrap_err();
         assert!(why.contains("signatures could not be read"), "got: {why}");
         assert!(why.contains("bad object"), "got: {why}");
     }
@@ -4683,24 +5096,287 @@ sleep 0.5
             .is_empty());
     }
 
+    /// A dispatcher for `implementer` that runs `before` in the worktree,
+    /// then returns a met outcome, counting its dispatches.
+    struct HarnessCommitThenMet<F: FnMut(&Path)> {
+        implementer: Implementer,
+        before: F,
+        dispatched: u32,
+    }
+    impl<F: FnMut(&Path)> Dispatcher for HarnessCommitThenMet<F> {
+        fn implementer(&self) -> Implementer {
+            self.implementer
+        }
+        fn dispatch(
+            &mut self,
+            repo: &Path,
+            _spec: &DispatchSpec,
+        ) -> Result<DispatchOutcome, MemoryError> {
+            self.dispatched += 1;
+            (self.before)(repo);
+            let mut met = met();
+            if self.implementer.recovers_invocations() {
+                met.cost_usd = None;
+            }
+            Ok(met)
+        }
+    }
+
     #[test]
-    fn a_guard_that_cannot_read_the_policy_costs_no_attempt_and_is_never_met() {
+    fn a_policy_made_unreadable_mid_run_stops_the_run_after_one_dispatch() {
+        for implementer in [Implementer::Claude, Implementer::Muse] {
+            let db = approved_db();
+            let (_dir, wt) = fixture_worktree();
+            git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
+            // Readable at the run's start; the dispatch leaves a typo behind.
+            let mut dispatcher = HarnessCommitThenMet {
+                implementer,
+                before: |path: &Path| {
+                    git_in(path, &["config", "commit.gpgsign", "maybe"]);
+                },
+                dispatched: 0,
+            };
+            let mut c = if implementer == Implementer::Muse {
+                muse_config()
+            } else {
+                config()
+            };
+            c.max_consecutive_infrastructure_failures = 3;
+            let err = run_issue(&db, &issue(), &brief(), &wt, &c, &mut dispatcher)
+                .unwrap_err()
+                .to_string();
+            assert_eq!(dispatcher.dispatched, 1, "{implementer:?}: {err}");
+            assert!(err.contains("commit.gpgsign could not be read"), "{err}");
+            assert!(err.contains("maybe"), "{err}");
+            assert!(err.contains("do not clear-dispatch it"), "{err}");
+            assert!(lineage::attempts_for_issue(&db, &issue())
+                .unwrap()
+                .is_empty());
+            let state = dispatch_state::get_dispatch_state(&db, &issue())
+                .unwrap()
+                .unwrap();
+            if implementer == Implementer::Muse {
+                // The finished invocation stays named, to be recovered and
+                // checked again once the policy reads.
+                assert!(state.invocation_artifacts.is_some(), "{state:?}");
+            } else {
+                assert_eq!(state.state, "infrastructure-failure", "{state:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_unreadable_signing_flag_is_the_guards_fault_never_the_models() {
+        let (_dir, wt) = fixture_worktree(); // policy off
+        let key = format!("branch.{}.ironmemSigning", wt.branch);
+        git_in(&wt.path, &["config", &key, "maybe"]);
+        let why = check(&wt).unwrap_err();
+        assert!(why.contains(&key), "{why}");
+        assert!(why.contains("maybe"), "{why}");
+        // Unset on the branch, the repository flag decides, and is read too.
+        git_in(&wt.path, &["config", "--unset", &key]);
+        git_in(&wt.path, &["config", "ironmem.autopilotSigning", "maybe"]);
+        let why = check(&wt).unwrap_err();
+        assert!(why.contains("ironmem.autopilotSigning"), "{why}");
+    }
+
+    #[test]
+    fn an_unreadable_signing_flag_at_the_runs_start_stops_before_any_dispatch() {
         let db = approved_db();
+        let (_dir, wt) = fixture_worktree(); // policy off
+        let key = format!("branch.{}.ironmemSigning", wt.branch);
+        git_in(&wt.path, &["config", &key, "maybe"]);
+        let mut dispatched = false;
+        let mut dispatcher = CommitThenMet(|_: &Path| dispatched = true);
+        let err = run_issue(&db, &issue(), &brief(), &wt, &config(), &mut dispatcher)
+            .unwrap_err()
+            .to_string();
+        assert!(!dispatched, "{err}");
+        assert!(err.contains(&key), "{err}");
+        assert!(err.contains("do not clear-dispatch it"), "{err}");
+    }
+
+    #[test]
+    fn an_unsigned_commit_pushed_by_a_collaborator_is_never_met_nor_the_models_attempt() {
         let (_dir, wt) = fixture_worktree();
         git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
-        // Readable at the run's start; the dispatch leaves a typo behind.
-        let mut dispatcher = CommitThenMet(|path: &Path| {
-            git_in(path, &["config", "commit.gpgsign", "maybe"]);
-        });
-        let mut c = config();
-        c.max_consecutive_infrastructure_failures = 1;
-        let run = run_issue(&db, &issue(), &brief(), &wt, &c, &mut dispatcher).unwrap();
-        assert_eq!(
-            run.dispatches[0].classification,
-            DispatchClassification::InfrastructureFailure
+        let theirs = commit_in(
+            &wt.path,
+            "theirs",
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "user.email=human@example.test",
+                "-c",
+                "user.name=Human",
+            ],
         );
-        assert_eq!(run.cumulative_attempt_n, 0);
-        assert!(!matches!(run.terminal, TerminalReason::Met { .. }));
+        let why = check(&wt).unwrap_err();
+        assert!(why.contains(&short(&theirs)), "{why}");
+        assert!(why.contains("human@example.test"), "{why}");
+        assert!(why.contains("autopilot@example.test"), "{why}");
+        // As a run: no attempt, and the run stops rather than pay again.
+        let db = approved_db();
+        let mut dispatcher = HarnessCommitThenMet {
+            implementer: Implementer::Claude,
+            before: |_: &Path| {},
+            dispatched: 0,
+        };
+        let err = run_issue(&db, &issue(), &brief(), &wt, &config(), &mut dispatcher)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(dispatcher.dispatched, 1, "{err}");
+        assert!(err.contains("human@example.test"), "{err}");
+        assert!(lineage::attempts_for_issue(&db, &issue())
+            .unwrap()
+            .is_empty());
+        // One of the run's own beside it is the model's to fix, and both
+        // are named.
+        let ours = commit_in(&wt.path, "ours", &["-c", "commit.gpgsign=false"]);
+        let violation = check(&wt).unwrap().unwrap();
+        assert_eq!(
+            blamed(&violation),
+            [short(&ours), short(&theirs)].into(),
+            "{violation}"
+        );
+    }
+
+    /// An executable `sh` script at `path` that records it ran in `marker`.
+    #[cfg(unix)]
+    fn marker_script(path: &Path, marker: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(
+            path,
+            format!(
+                "#!/bin/sh\ntouch '{}'\nsleep 0.5\nexit 1\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_signature_program_set_in_the_repository_never_runs_in_the_controller() {
+        let (dir, wt) = fixture_worktree();
+        let script = dir.path().join(".git").join("verify");
+        let marker = dir.path().join(".git").join("verify-ran");
+        marker_script(&script, &marker);
+        let allowed = dir.path().join(".git").join("allowed");
+        std::fs::write(&allowed, "").unwrap();
+        for (key, value) in [
+            ("gpg.program", script.to_str().unwrap()),
+            ("gpg.openpgp.program", script.to_str().unwrap()),
+            ("gpg.ssh.program", script.to_str().unwrap()),
+            ("gpg.x509.program", script.to_str().unwrap()),
+            ("gpg.ssh.allowedSignersFile", allowed.to_str().unwrap()),
+            ("commit.gpgsign", "true"),
+        ] {
+            git_in(&wt.path, &["config", key, value]);
+        }
+        for (file, armor) in [
+            ("pgp", "PGP SIGNATURE"),
+            ("ssh", "SSH SIGNATURE"),
+            ("x509", "SIGNED MESSAGE"),
+        ] {
+            let plain = commit_in(&wt.path, file, &["-c", "commit.gpgsign=false"]);
+            forge_signature_header(
+                &wt,
+                &plain,
+                &format!("-----BEGIN {armor}-----\n \n AAAA\n -----END {armor}-----"),
+            );
+        }
+        let _ = check(&wt);
+        assert!(
+            !marker.exists(),
+            "the repository's signature program ran in the controller"
+        );
+    }
+
+    #[test]
+    fn a_guard_git_command_that_hangs_is_killed_and_fails_closed() {
+        let (_dir, wt) = fixture_worktree();
+        let git = GuardGit::new(&wt.path, std::time::Duration::from_millis(500)).unwrap();
+        let started = std::time::Instant::now();
+        let why = git
+            .run(&["-c", "alias.hang=!sleep 30", "hang"], None)
+            .unwrap_err();
+        assert!(why.contains("did not finish within"), "{why}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_guard_git_command_that_succeeds_without_its_input_is_unreadable() {
+        let (_dir, wt) = fixture_worktree();
+        let git = GuardGit::new(&wt.path, SIGNING_GUARD_GIT_TIMEOUT).unwrap();
+        // Far more than a pipe holds, to a command that reads none of it.
+        let lines = vec!["a".repeat(40); 20_000];
+        let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let why = git
+            .run(&["-c", "alias.skip=!sleep 0.5", "skip"], Some(&lines))
+            .unwrap_err();
+        assert!(why.contains("without reading all its input"), "{why}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn one_commits_signature_read_blames_only_a_signature_git_cannot_parse() {
+        use std::os::unix::process::ExitStatusExt;
+        let read = |code: i32, stdout: &str, stderr: &str| {
+            signature_kept(&std::process::Output {
+                status: std::process::ExitStatus::from_raw(code << 8),
+                stdout: stdout.as_bytes().to_vec(),
+                stderr: stderr.as_bytes().to_vec(),
+            })
+        };
+        assert_eq!(read(0, "G\n", ""), Ok(true));
+        assert_eq!(read(0, "U\n", ""), Ok(true));
+        assert_eq!(read(0, "B\n", ""), Ok(false));
+        assert_eq!(
+            read(128, "", "fatal: bad/incompatible signature 'garbage\n'\n"),
+            Ok(false)
+        );
+        // Any other failure is the guard's, with git's complaint.
+        let why = read(128, "", "fatal: bad object deadbeef").unwrap_err();
+        assert!(why.contains("bad object"), "{why}");
+        assert!(read(1, "", "error: something else").is_err());
+    }
+
+    #[test]
+    fn the_recipe_pushes_to_a_configured_remote_never_a_lookalike_ref() {
+        let (_dir, wt) = remote_fixture();
+        git_in(&wt.path, &["remote", "rename", "origin", "fork"]);
+        git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
+        commit_in(&wt.path, "work", &["-c", "commit.gpgsign=false"]);
+        // No remote tracks the branch yet: the only remote is the one to use.
+        let violation = check(&wt).unwrap().unwrap();
+        assert!(
+            violation.contains(&format!("`git push --force-with-lease fork {}`", wt.branch)),
+            "{violation}"
+        );
+        // A ref that merely ends in the branch name, under no configured
+        // remote, sorting first, is not the branch's remote.
+        git_in(&wt.path, &["push", "-q", "fork", &wt.branch]);
+        let tip = git_in(&wt.path, &["rev-parse", "HEAD"]);
+        git_in(
+            &wt.path,
+            &[
+                "update-ref",
+                &format!("refs/remotes/aaa/{}", wt.branch),
+                &tip,
+            ],
+        );
+        let violation = check(&wt).unwrap().unwrap();
+        assert!(
+            violation.contains(&format!("`git push --force-with-lease fork {}`", wt.branch)),
+            "{violation}"
+        );
     }
 
     #[test]
@@ -4755,7 +5431,7 @@ sleep 0.5
         let bypass = commit_in(&wt.path, "b", &["-c", "commit.gpgsign=false"]);
         // The IC compares against the base and leaves HEAD there.
         git_in(&wt.path, &["checkout", "-q", "--detach", &wt.cut]);
-        let violation = signing_violation(&wt, false).unwrap().unwrap();
+        let violation = check(&wt).unwrap().unwrap();
         assert_eq!(blamed(&violation), [short(&bypass)].into(), "{violation}");
     }
 
@@ -4782,7 +5458,7 @@ sleep 0.5
         git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
         git_in(&wt.path, &["checkout", "-q", "--detach"]);
         git_in(&wt.path, &["branch", "-q", "-D", &wt.branch]);
-        let violation = signing_violation(&wt, false).unwrap().unwrap();
+        let violation = check(&wt).unwrap().unwrap();
         assert!(violation.contains(&wt.branch), "got: {violation}");
         assert!(violation.contains("does not exist"), "got: {violation}");
     }
@@ -4797,7 +5473,7 @@ sleep 0.5
         git_in(&wt.path, &["reset", "-q", "--hard", &wt.cut]);
         let upstream = push_upstream_commit(dir.path());
         git_in(&wt.path, &["fetch", "-q", "origin"]);
-        let violation = signing_violation(&wt, false).unwrap().unwrap();
+        let violation = check(&wt).unwrap().unwrap();
         assert_eq!(
             blamed(&violation),
             [short(&pushed)].into(),
@@ -4813,7 +5489,7 @@ sleep 0.5
         let shas: Vec<String> = (0..7)
             .map(|i| commit_in(&wt.path, &format!("c{i}"), &["-c", "commit.gpgsign=false"]))
             .collect();
-        let violation = signing_violation(&wt, false).unwrap().unwrap();
+        let violation = check(&wt).unwrap().unwrap();
         // Newest first: the five newest are named, the rest counted.
         for sha in &shas[2..] {
             assert!(violation.contains(&short(sha)), "{violation}");
@@ -4864,7 +5540,7 @@ sleep 0.5
         git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
         commit_in(&wt.path, "work", &["-c", "commit.gpgsign=false"]);
         git_in(&wt.path, &["push", "-q", "fork", &wt.branch]);
-        let violation = signing_violation(&wt, false).unwrap().unwrap();
+        let violation = check(&wt).unwrap().unwrap();
         assert!(
             violation.contains(&format!("`git push --force-with-lease fork {}`", wt.branch)),
             "{violation}"
@@ -4951,7 +5627,7 @@ sleep 0.5
         git_in(&wt.path, &["config", "log.showSignature", "true"]);
         commit_in(&wt.path, "one", &[]);
         commit_in(&wt.path, "two", &[]);
-        assert_eq!(signing_violation(&wt, false), Ok(None));
+        assert_eq!(check(&wt), Ok(None));
     }
 
     /// Sign in `repo` with `key`, pinned against the operator's global
@@ -5011,7 +5687,7 @@ sleep 0.5
         // `<sha> <status>` lines; the per-commit fallback's
         // `--no-show-signature` is pinned by the mixed-range test below.
         git_in(&wt.path, &["config", "log.showSignature", "true"]);
-        let violation = signing_violation(&wt, false).unwrap().unwrap();
+        let violation = check(&wt).unwrap().unwrap();
         assert_eq!(blamed(&violation), [short(&tampered)].into(), "{violation}");
     }
 
@@ -5041,7 +5717,7 @@ sleep 0.5
         );
         git_in(&wt.path, &["reset", "-q", "--hard", &bad]);
         git_in(&wt.path, &["config", "log.showSignature", "true"]);
-        let batched = signing_violation(&wt, false).unwrap().unwrap();
+        let batched = check(&wt).unwrap().unwrap();
         assert_eq!(
             blamed(&batched),
             [short(&unsigned), short(&bad)].into(),
@@ -5050,7 +5726,7 @@ sleep 0.5
         );
         let plain = commit_in(&wt.path, "garbled", &["-c", "commit.gpgsign=false"]);
         let garbled = forge_signature_header(&wt, &plain, "garbage");
-        let one_by_one = signing_violation(&wt, false).unwrap().unwrap();
+        let one_by_one = check(&wt).unwrap().unwrap();
         assert_eq!(
             blamed(&one_by_one),
             [short(&unsigned), short(&bad), short(&garbled)].into(),
@@ -5092,7 +5768,7 @@ sleep 0.5
         std::io::Write::write_all(child.stdin.as_mut().unwrap(), script.as_bytes()).unwrap();
         drop(child.stdin.take());
         assert!(child.wait().unwrap().success());
-        let violation = signing_violation(&wt, false).unwrap().unwrap();
+        let violation = check(&wt).unwrap().unwrap();
         assert!(
             violation.contains(&format!("and {} more", COMMITS - NAMED_UNSIGNED_COMMITS)),
             "{violation}"
@@ -5139,7 +5815,7 @@ sleep 0.5
             cut,
             quarantined_from: None,
         };
-        assert_eq!(signing_violation(&wt, false).unwrap(), None);
+        assert_eq!(check(&wt).unwrap(), None);
     }
 
     #[test]
@@ -5210,11 +5886,7 @@ sleep 0.5
                 !status.is_empty() && status != "N" && status != "B",
                 "listed={listed}: %G? = {status:?}"
             );
-            assert_eq!(
-                signing_violation(&wt, false).unwrap(),
-                None,
-                "listed={listed}"
-            );
+            assert_eq!(check(&wt).unwrap(), None, "listed={listed}");
         }
     }
 
@@ -5598,7 +6270,7 @@ sleep 0.5
         let merge = git_in(&wt.path, &["rev-parse", "HEAD"]);
         let agent2 = commit_in(&wt.path, "agent2", &[]);
         git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
-        let violation = signing_violation(&wt, false).unwrap().unwrap();
+        let violation = check(&wt).unwrap().unwrap();
         assert_eq!(
             blamed(&violation),
             [short(&agent1), short(&merge), short(&agent2)].into(),
@@ -5619,14 +6291,14 @@ sleep 0.5
         let agent2 = commit_in(&wt.path, "agent2", &[]);
         git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
         // Until the rebase is pushed, the pre-rebase commit still ships.
-        let violation = signing_violation(&wt, false).unwrap().unwrap();
+        let violation = check(&wt).unwrap().unwrap();
         assert_eq!(
             blamed(&violation),
             [short(&agent1), short(&rebased), short(&agent2)].into(),
             "{violation}"
         );
         git_in(&wt.path, &["push", "-q", "--force", "origin", &wt.branch]);
-        let violation = signing_violation(&wt, false).unwrap().unwrap();
+        let violation = check(&wt).unwrap().unwrap();
         assert_eq!(
             blamed(&violation),
             [short(&rebased), short(&agent2)].into(),

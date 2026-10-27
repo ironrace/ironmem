@@ -460,14 +460,16 @@ can quietly pass `-c commit.gpgsign=false`.
   two git processes however long it is (`git cat-file --batch` for the
   headers, then one `git log --no-walk --stdin` for `%G?`). A signature git
   cannot parse fails that second read, so the range is then read one commit
-  at a time and the unparseable one is named. Every read passes
-  `--no-show-signature`, so an operator's `log.showSignature` setting does
-  not change the result.
+  at a time and the unparseable one is named. Only git refusing a commit's
+  signature as bad or incompatible blames that commit; any other failure of
+  that read is the guard's. Every read passes `--no-show-signature`, so an
+  operator's `log.showSignature` setting does not change the result.
 - **Which commits are checked.** The commits that ship: everything on the
   issue branch (`refs/heads/<issue-branch>`, not `HEAD`, which the agent may
-  have left on another checkout) and on its own remote-tracking refs (such as
-  `origin/<issue-branch>`, what was pushed), since the branch was cut,
-  excluding anything already on another remote branch
+  have left on another checkout) and on its own remote-tracking refs
+  (`refs/remotes/<remote>/<issue-branch>` for each configured remote, what
+  was pushed), since the branch was cut, excluding anything already on
+  another remote branch
   (`git log refs/heads/<issue-branch> <its remote refs> --not <cut>
   --exclude='*/<issue-branch>' --remotes`). The *cut* is the commit the issue
   branch was cut from. Commits merged or rebased in from a remote-tracking
@@ -491,7 +493,9 @@ can quietly pass `-c commit.gpgsign=false`.
   on the repository (`ironmem.autopilotSigning true`). An invalid value (a
   typo such as `commit.gpgsign = ture`) holds a newly created branch but never
   sets the repository flag, and a run refuses to start until it is fixed, since
-  every `met` it produced would be discarded. That refusal keeps a pending
+  every `met` it produced would be discarded. So does an invalid
+  `branch.<branch>.ironmemSigning` or `ironmem.autopilotSigning` while the
+  policy is off. That refusal keeps a pending
   invocation for the issue as it is, and the first run after the fix recovers
   it, so do not `clear-dispatch` it. `commit.gpgsign` lives
   in the `.git/config` shared by every worktree, so an agent on one issue can
@@ -502,17 +506,36 @@ can quietly pass `-c commit.gpgsign=false`.
   fails with "commit.gpgsign was turned off, but this branch is still held to
   signing by ...", naming the flag that holds it. Only an operator can end
   enforcement, as described below.
+- **A collaborator's commit is not the agent's fault.** A flagged commit is
+  charged to the agent only when its committer email is this run's identity
+  (`git var GIT_COMMITTER_IDENT` in the worktree, or the controller's
+  `GIT_COMMITTER_EMAIL`). If every flagged commit has another committer, such
+  as a human who pushed an unsigned fix to the PR branch, the `met` is still
+  not accepted, but it costs no attempt and the run stops (see below), naming
+  the commits and their committers. Re-sign or drop them and push, or opt the
+  branch out. If the identity cannot be read, every commit is the agent's.
+- **The repository's own signature programs never run.** `%G?` makes git run
+  `gpg.program`, `gpg.ssh.program` or `gpg.x509.program` in the controller,
+  and the agent can write `.git/config`. The guard pins each one with `-c` to
+  your global or system value (git's default if neither sets it). Each guard
+  git command is also killed, with its process group, after 120 seconds,
+  which fails the guard.
 - **Trust posture.** The guard catches a lazy or accidental bypass. It does
   not stop an unconfined agent that deliberately signs with another key,
-  opts its branch out, clears the cut, or pushes its commits to another
-  branch.
+  opts its branch out, clears the cut, commits under another identity, or
+  pushes its commits to another branch.
 
-If the guard itself cannot read git when it checks a `met` (git fails to run,
-`commit.gpgsign` was given an invalid value during the run, or the recorded
-cut is no longer an object `git log` can use), the `met` is not accepted. It is recorded as an
-infrastructure failure, not an attempt, so it costs the issue no attempt.
-Repeated ones stop the run through `max_consecutive_infrastructure_failures`,
-like any other infrastructure failure.
+If the guard cannot accept a `met` for a reason that is not the agent's
+(git fails to run or times out, `commit.gpgsign` or a signing flag reads as
+an invalid value, a collaborator's unsigned commit, or a recorded cut that is
+no longer an object `git log` can use), the `met` is not accepted. It is
+recorded as an infrastructure failure, not an attempt, so it costs the issue
+no attempt. An invalid policy or flag, or a collaborator's commit, would meet
+every later `met` too, so the run stops there with an error, before paying for
+another dispatch, and keeps a Codex or Muse invocation for recovery once it is
+fixed (do not `clear-dispatch` it). Any other such failure repeats through
+`max_consecutive_infrastructure_failures`, like any other infrastructure
+failure.
 
 ### A signing failure is a failed attempt
 
@@ -537,7 +560,9 @@ commits merged in, as follows:
 - If a merge commit is flagged or lies in that range, redo the merge (signed)
   instead of rebasing over it.
 - Then `git push --force-with-lease <remote> <issue-branch>`, naming the
-  remote that already tracks the issue branch (`origin` if none does).
+  configured remote that already tracks the issue branch (`origin` first if
+  several do). If none does, it names the only configured remote, or `origin`
+  when there are several.
 
 Make sure the signing key or agent is reachable from wherever the Lead runs,
 including inside an external sandbox. Otherwise every attempt fails.

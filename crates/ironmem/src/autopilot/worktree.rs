@@ -178,12 +178,21 @@ fn config_get(cwd: &Path, args: &[&str]) -> Result<Option<String>, String> {
             String::from_utf8_lossy(&out.stdout).trim().to_string(),
         )),
         Some(1) => Ok(None),
-        _ => Err(String::from_utf8_lossy(&out.stderr)
-            .trim()
-            .chars()
-            .take(300)
-            .collect()),
+        _ => Err(bounded_stderr(&out.stderr)),
     }
+}
+
+/// How many characters of a git command's stderr a one-line reason quotes.
+const STDERR_EXCERPT_CHARS: usize = 300;
+
+/// `git`'s own complaint, trimmed and bounded so it can ride inside a
+/// one-line reason.
+pub(crate) fn bounded_stderr(stderr: &[u8]) -> String {
+    String::from_utf8_lossy(stderr)
+        .trim()
+        .chars()
+        .take(STDERR_EXCERPT_CHARS)
+        .collect()
 }
 
 fn cut_key(branch: &str) -> String {
@@ -250,27 +259,30 @@ pub(crate) fn record_signing(dir: &Path, branch: &str, repo_wide: bool) -> Resul
 /// The branch's own `branch.<branch>.ironmemSigning` decides when set: `true`
 /// holds it, and an operator's explicit `false` opts that one branch out.
 /// Unset, the repository's [`REPO_SIGNING_KEY`] decides. A value that cannot
-/// be read holds it too: these flags only ever tighten.
-pub(crate) fn signing_holder(dir: &Path, branch: &str) -> Option<String> {
+/// be read is `Err`, with git's complaint: it is not the model's fault, and
+/// the caller must never read it as "not held".
+pub(crate) fn signing_holder(dir: &Path, branch: &str) -> Result<Option<String>, String> {
     let branch_key = signing_key(branch);
+    let unreadable = |key: &str, why: String| format!("`{key}` could not be read: {why}");
     match config_bool(dir, &branch_key) {
-        Ok(Some(true)) => Some(format!("`{branch_key}`")),
-        Ok(Some(false)) => None,
+        Ok(Some(true)) => Ok(Some(format!("`{branch_key}`"))),
+        Ok(Some(false)) => Ok(None),
         Ok(None) => match config_bool(dir, REPO_SIGNING_KEY) {
-            Ok(Some(true)) => Some(format!(
+            Ok(Some(true)) => Ok(Some(format!(
                 "`{REPO_SIGNING_KEY}` (the repository recorded signing on)"
-            )),
-            Ok(_) => None,
-            Err(_) => Some(format!("an unreadable `{REPO_SIGNING_KEY}`")),
+            ))),
+            Ok(_) => Ok(None),
+            Err(why) => Err(unreadable(REPO_SIGNING_KEY, why)),
         },
-        Err(_) => Some(format!("an unreadable `{branch_key}`")),
+        Err(why) => Err(unreadable(&branch_key, why)),
     }
 }
 
-/// Whether `branch` is held to the signing policy; see [`signing_holder`].
+/// Whether `branch` is held to the signing policy; see [`signing_holder`]. A
+/// flag that cannot be read counts: these flags only ever tighten.
 #[cfg(test)]
 pub(crate) fn signing_recorded(dir: &Path, branch: &str) -> bool {
-    signing_holder(dir, branch).is_some()
+    signing_holder(dir, branch).map_or(true, |holder| holder.is_some())
 }
 
 /// The cut recorded on an existing `branch`, if any, resolved to a full sha.
