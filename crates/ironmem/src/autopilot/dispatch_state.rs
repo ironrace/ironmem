@@ -79,6 +79,28 @@ pub struct DispatchState {
     pub signing_held: bool,
 }
 
+impl DispatchState {
+    /// Refuse a combination no harness writes: a Claude state carrying
+    /// supervised-CLI invocation artifacts, whose artifacts every Claude path
+    /// would silently ignore. Checked where a state is written and where one
+    /// is read, so a hand-edited or corrupt drawer is refused at load
+    /// rather than half-used.
+    ///
+    /// A supervised (Codex or Muse) state without artifacts is valid: it is
+    /// written before the first launch and by several pauses, and liveness
+    /// then judges it on the process table alone.
+    pub fn validate(&self) -> Result<(), MemoryError> {
+        if self.implementer == Implementer::Claude && self.invocation_artifacts.is_some() {
+            return Err(MemoryError::Validation(format!(
+                "the dispatch state for {} is a Claude state carrying supervised-CLI invocation \
+                 artifacts, which no harness writes",
+                self.issue.canonical()
+            )));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DispatchStateBody {
     #[serde(default)]
@@ -114,7 +136,7 @@ struct DispatchStateBody {
 /// visible failure.
 pub(crate) const DISPATCH_STATE_KEY_PREFIX: &str = "dispatch-state:";
 
-fn dispatch_state_key(issue: &IssueRef) -> String {
+pub(crate) fn dispatch_state_key(issue: &IssueRef) -> String {
     format!("{DISPATCH_STATE_KEY_PREFIX}{}", issue.slug())
 }
 
@@ -172,8 +194,10 @@ pub fn dispatch_state_is(
     Ok(get_dispatch_state(db, issue)? == expected)
 }
 
-/// The persisted body of `state`.
+/// The persisted body of `state`, refused when [`DispatchState::validate`]
+/// refuses it.
 fn content_of(state: &DispatchState) -> Result<String, MemoryError> {
+    state.validate()?;
     let body = DispatchStateBody {
         implementer: state.implementer,
         native_session_id: state.native_session_id.clone(),
@@ -210,7 +234,7 @@ pub fn get_dispatch_state(
 
 fn state_from_content(content: &str) -> Result<DispatchState, MemoryError> {
     let body: DispatchStateBody = serde_json::from_str(content)?;
-    Ok(DispatchState {
+    let state = DispatchState {
         implementer: body.implementer,
         native_session_id: body.native_session_id.or_else(|| {
             (body.implementer == Implementer::Claude).then(|| body.session_uuid.clone())
@@ -229,7 +253,9 @@ fn state_from_content(content: &str) -> Result<DispatchState, MemoryError> {
         session_model: body.session_model,
         resume_refusals: body.resume_refusals,
         signing_held: body.signing_held,
-    })
+    };
+    state.validate()?;
+    Ok(state)
 }
 
 /// Every in-flight issue's dispatch-state drawer.
@@ -248,22 +274,49 @@ fn state_from_content(content: &str) -> Result<DispatchState, MemoryError> {
 ///
 /// A drawer whose body no longer deserializes is skipped rather than failing
 /// the whole reconciliation: one unreadable record must not take every other
-/// in-flight issue's supervision offline with it.
+/// in-flight issue's supervision offline with it. The queue, which must not
+/// treat it as a free slot, reads [`scan_dispatch_states`] instead.
 pub fn all_dispatch_states(db: &Database, limit: usize) -> Result<Vec<DispatchState>, MemoryError> {
+    Ok(scan_dispatch_states(db, limit)?.states)
+}
+
+/// Every dispatch-state drawer, read or not.
+#[derive(Debug, Default)]
+pub(crate) struct DispatchStateScan {
+    /// The drawers that read as dispatch states.
+    pub states: Vec<DispatchState>,
+    /// The logical keys ([`dispatch_state_key`]) of the drawers that did not:
+    /// corrupt, refused by [`DispatchState::validate`], or written by a newer
+    /// binary (an implementer this one does not know). Any of them may be a
+    /// live invocation.
+    pub unreadable: Vec<String>,
+}
+
+/// [`all_dispatch_states`], also naming the drawers it could not read.
+pub(crate) fn scan_dispatch_states(
+    db: &Database,
+    limit: usize,
+) -> Result<DispatchStateScan, MemoryError> {
     let prefix = format!(
         "{}{}",
         crate::mcp::tools::LOGICAL_KEY_SOURCE_PREFIX,
         DISPATCH_STATE_KEY_PREFIX
     );
     let drawers = db.get_drawers_by_source_prefix(super::WING, super::ROOM, &prefix, limit)?;
-    let mut states = Vec::new();
+    let mut scan = DispatchStateScan::default();
     for drawer in drawers {
-        let Ok(state) = state_from_content(&drawer.content) else {
-            continue;
-        };
-        states.push(state);
+        match state_from_content(&drawer.content) {
+            Ok(state) => scan.states.push(state),
+            Err(_) => scan.unreadable.push(
+                drawer
+                    .source_file
+                    .strip_prefix(crate::mcp::tools::LOGICAL_KEY_SOURCE_PREFIX)
+                    .unwrap_or(&drawer.source_file)
+                    .to_string(),
+            ),
+        }
     }
-    Ok(states)
+    Ok(scan)
 }
 
 /// Clear an issue's dispatch-state drawer once it's no longer in flight
@@ -655,5 +708,39 @@ mod tests {
             })
             .unwrap();
         assert_eq!(count_after_noop, 2);
+    }
+
+    #[test]
+    fn a_claude_state_carrying_invocation_artifacts_is_refused_at_load() {
+        let db = Database::open_in_memory().unwrap();
+        let issue = IssueRef::new("ironrace/ironmem", 283);
+        let mut body: serde_json::Value =
+            serde_json::from_str(&content_of(&sample(&issue, 1)).unwrap()).unwrap();
+        body["codex_artifacts"] = serde_json::json!({
+            "invocation_id": "i",
+            "schema_path": "/s",
+            "journal_path": "/j",
+            "final_path": "/f",
+            "stderr_path": "/e",
+            "exit_path": "/x",
+        });
+        super::super::write_current(&db, &dispatch_state_key(&issue), &body.to_string()).unwrap();
+        let err = get_dispatch_state(&db, &issue).unwrap_err().to_string();
+        assert!(err.contains("Claude"), "{err}");
+        let scan = scan_dispatch_states(&db, 100).unwrap();
+        assert!(scan.states.is_empty());
+        assert_eq!(scan.unreadable, vec![dispatch_state_key(&issue)]);
+    }
+
+    #[test]
+    fn an_unreadable_dispatch_state_is_reported_by_its_key() {
+        let db = Database::open_in_memory().unwrap();
+        let good = IssueRef::new("ironrace/ironmem", 283);
+        upsert_dispatch_state(&db, &sample(&good, 1)).unwrap();
+        let corrupt = format!("{DISPATCH_STATE_KEY_PREFIX}corrupt-1");
+        super::super::write_current(&db, &corrupt, "not json").unwrap();
+        let scan = scan_dispatch_states(&db, 100).unwrap();
+        assert_eq!(scan.states.len(), 1);
+        assert_eq!(scan.unreadable, vec![corrupt]);
     }
 }
