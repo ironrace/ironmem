@@ -35,7 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   keeps any pending invocation for recovery once the value is fixed; a value
   made invalid during a run stops it after that one dispatch. An unsigned
   commit someone else committed (a collaborator's push) is never accepted
-  but costs the agent no attempt. The guard reads a branch of any length in
+  but costs the agent no attempt, and no run starts while one is there. The guard reads a branch of any length in
   two git processes, falling back to one read per commit only when a
   signature cannot be parsed, never runs a signature program set in the
   repository's own config, and gives each git command 120 seconds.

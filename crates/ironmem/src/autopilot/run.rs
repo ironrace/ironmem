@@ -2160,6 +2160,17 @@ pub fn run_issue(
         at_run_start: policy_at_start,
         by_interrupted_run: existing_state.as_ref().is_some_and(|s| s.signing_held),
     };
+    // A collaborator's unsigned commit already on the branch would turn away
+    // any `met` this run produced: refuse before recovery or any dispatch,
+    // like an unreadable policy, until an operator deals with it. Anything
+    // else the guard finds now is for the dispatch to fix, or to judge again
+    // when its `met` arrives.
+    if let Err(fault @ GuardFault::ForeignUnsigned { .. }) = signing_violation(worktree, seen) {
+        return Err(MemoryError::Validation(format!(
+            "{fault}; the run does not start, since any met it produced would be refused the \
+             same way; {KEPT_FOR_RECOVERY}"
+        )));
+    }
     // Set by a guard fault every later `met` would meet too: the run stops
     // after recording it, before paying for another dispatch.
     let mut guard_stop: Option<GuardFault> = None;
@@ -5282,37 +5293,44 @@ sleep 0.5
     fn an_unsigned_commit_pushed_by_a_collaborator_is_never_met_nor_the_models_attempt() {
         let (_dir, wt) = fixture_worktree();
         git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
-        let theirs = commit_in(
-            &wt.path,
-            "theirs",
-            &[
-                "-c",
-                "commit.gpgsign=false",
-                "-c",
-                "user.email=human@example.test",
-                "-c",
-                "user.name=Human",
-            ],
-        );
-        let why = check(&wt).unwrap_err();
-        assert!(why.contains(&short(&theirs)), "{why}");
-        assert!(why.contains("human@example.test"), "{why}");
-        assert!(why.contains("autopilot@example.test"), "{why}");
-        // As a run: no attempt, and the run stops rather than pay again.
+        let collaborator = [
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "user.email=human@example.test",
+            "-c",
+            "user.name=Human",
+        ];
+        // Pushed while a dispatch runs: no attempt, and the run stops rather
+        // than pay for another dispatch.
         let db = approved_db();
+        let mut theirs = String::new();
         let mut dispatcher = HarnessCommitThenMet {
             implementer: Implementer::Claude,
-            before: |_: &Path| {},
+            before: |path: &Path| theirs = commit_in(path, "theirs", &collaborator),
             dispatched: 0,
         };
         let err = run_issue(&db, &issue(), &brief(), &wt, &config(), &mut dispatcher)
             .unwrap_err()
             .to_string();
         assert_eq!(dispatcher.dispatched, 1, "{err}");
+        assert!(err.contains(&short(&theirs)), "{err}");
         assert!(err.contains("human@example.test"), "{err}");
+        assert!(err.contains("autopilot@example.test"), "{err}");
         assert!(lineage::attempts_for_issue(&db, &issue())
             .unwrap()
             .is_empty());
+        // Still there at the next run's start: it pays for nothing.
+        let mut next = HarnessCommitThenMet {
+            implementer: Implementer::Claude,
+            before: |_: &Path| {},
+            dispatched: 0,
+        };
+        let err = run_issue(&db, &issue(), &brief(), &wt, &config(), &mut next)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(next.dispatched, 0, "{err}");
+        assert!(err.contains("human@example.test"), "{err}");
         // One of the run's own beside it is the model's to fix, and both
         // are named.
         let ours = commit_in(&wt.path, "ours", &["-c", "commit.gpgsign=false"]);

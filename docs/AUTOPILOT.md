@@ -525,8 +525,10 @@ can quietly pass `-c commit.gpgsign=false`.
   `GIT_COMMITTER_EMAIL`). If every flagged commit has another committer, such
   as a human who pushed an unsigned fix to the PR branch, the `met` is still
   not accepted, but it costs no attempt and the run stops (see below), naming
-  the commits and their committers. Re-sign or drop them and push, or opt the
-  branch out. If the identity cannot be read, every commit is the agent's.
+  the commits and their committers. While such a commit is on the branch, a
+  run refuses to start, so nothing is paid for. Re-sign or drop them and push,
+  or opt the branch out. If the identity cannot be read, every commit is the
+  agent's.
 - **The repository's own signature programs never run.** `%G?` makes git run
   `gpg.program`, `gpg.ssh.program` or `gpg.x509.program` in the controller,
   and the agent can write `.git/config`. The guard pins each one with `-c` to
