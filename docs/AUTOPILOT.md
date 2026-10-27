@@ -441,7 +441,9 @@ can quietly pass `-c commit.gpgsign=false`.
   on the repository (`ironmem.autopilotSigning true`). An invalid value (a
   typo such as `commit.gpgsign = ture`) holds a newly created branch but never
   sets the repository flag, and a run refuses to start until it is fixed, since
-  every `met` it produced would be discarded. `commit.gpgsign` lives
+  every `met` it produced would be discarded. That refusal keeps a pending
+  invocation for the issue as it is, and the first run after the fix recovers
+  it, so do not `clear-dispatch` it. `commit.gpgsign` lives
   in the `.git/config` shared by every worktree, so an agent on one issue can
   turn it off for all of them. The repository flag holds every issue branch to
   the policy anyway, including branches created after it was turned off.

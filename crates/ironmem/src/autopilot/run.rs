@@ -1555,7 +1555,8 @@ pub fn run_issue(
         MemoryError::Validation(format!(
             "commit.gpgsign cannot be read in {}, so the commit-signing guard could not check \
              any result; fix it (`git config --bool commit.gpgsign` must print true or false) \
-             and run again: {why}",
+             and run again; a pending invocation for this issue is kept and will be recovered \
+             once this is fixed; do not clear-dispatch it. git said: {why}",
             worktree.path.display()
         ))
     })?;
@@ -3921,6 +3922,15 @@ sleep 0.5
         );
         assert!(err.contains("commit.gpgsign"), "got: {err}");
         assert!(err.contains("maybe"), "got: {err}");
+        // A held invocation is recovered on the next run once the policy
+        // reads; clearing it would discard a run that may still be live.
+        assert!(
+            err.contains(
+                "a pending invocation for this issue is kept and will be recovered once this \
+                 is fixed; do not clear-dispatch it"
+            ),
+            "got: {err}"
+        );
         assert!(lineage::attempts_for_issue(&db, &issue())
             .unwrap()
             .is_empty());
