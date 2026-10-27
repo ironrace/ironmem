@@ -1953,9 +1953,35 @@ fn release_hint(issue: &IssueRef, artifacts: Option<&InvocationArtifacts>) -> St
     }
 }
 
-/// How a run stopped by an unusable signing policy leaves its issue.
-const KEPT_FOR_RECOVERY: &str = "a pending invocation for this issue is kept and will be \
-     recovered once this is fixed; do not clear-dispatch it";
+/// What a run refused at its start (before recovery) leaves behind, said
+/// for the harness and the dispatch state it found: only a supervised
+/// harness's pending invocation is recovered.
+fn kept_at_start(implementer: Implementer, state: Option<&DispatchState>) -> &'static str {
+    match state {
+        Some(state)
+            if implementer.recovers_invocations() && state.invocation_artifacts.is_some() =>
+        {
+            "a pending invocation for this issue is kept and will be recovered once this is \
+             fixed; do not clear-dispatch it"
+        }
+        Some(_) => {
+            "the issue's dispatch state is left as it is, and the next run after the fix \
+             continues from it"
+        }
+        None => "nothing was written, so the next run after the fix starts the issue afresh",
+    }
+}
+
+/// What a run stopped after a dispatch by a guard fault leaves behind.
+fn kept_mid_run(implementer: Implementer) -> &'static str {
+    if implementer.recovers_invocations() {
+        "the finished invocation is kept, and the first run after the fix checks its met \
+         again; do not clear-dispatch it"
+    } else {
+        "the session is kept (state `infrastructure-failure`), and the next run after the fix \
+         resumes it"
+    }
+}
 
 /// What restart recovery decided before a run dispatches anything.
 enum Recovered {
@@ -2027,7 +2053,9 @@ fn recover_invocation(
                                 .is_none_or(|expected| expected == id)
                     })
                 {
-                    dispatch_state::clear_dispatch_state(db, issue)?;
+                    // Only the state recovery judged; one another run wrote
+                    // since is theirs (every write is a compare-and-set).
+                    dispatch_state::clear_dispatch_state_if_unchanged(db, state)?;
                     return Ok(Recovered::Done(IssueRun {
                         unpriced_dispatches: 1,
                         issue: issue.clone(),
@@ -2099,7 +2127,10 @@ pub fn run_issue(
     if let Some(existing) = &status {
         if existing.best_verdict == Some(AttemptOutcome::Success) && remediation.is_none() {
             if config.implementer.recovers_invocations() {
-                dispatch_state::clear_dispatch_state(db, issue)?;
+                // Only the state this run read; see `write_state`.
+                if let Some(state) = &existing_state {
+                    dispatch_state::clear_dispatch_state_if_unchanged(db, state)?;
+                }
             }
             return Ok(IssueRun {
                 unpriced_dispatches: 0,
@@ -2168,16 +2199,18 @@ pub fn run_issue(
         MemoryError::Validation(format!(
             "commit.gpgsign cannot be read in {}, so the commit-signing guard could not check \
              any result; fix it (`git config --bool commit.gpgsign` must print true or false) \
-             and run again; {KEPT_FOR_RECOVERY}. git said: {why}",
-            worktree.path.display()
+             and run again; {}. git said: {why}",
+            worktree.path.display(),
+            kept_at_start(config.implementer, existing_state.as_ref())
         ))
     })?;
     if !policy_at_start {
         worktree::signing_holder(&worktree.path, &worktree.branch).map_err(|why| {
             MemoryError::Validation(format!(
                 "{why} in {}, so the commit-signing guard could not check any result; fix it \
-                 (it must read true or false) and run again; {KEPT_FOR_RECOVERY}",
-                worktree.path.display()
+                 (it must read true or false) and run again; {}",
+                worktree.path.display(),
+                kept_at_start(config.implementer, existing_state.as_ref())
             ))
         })?;
     }
@@ -2195,7 +2228,8 @@ pub fn run_issue(
     {
         return Err(MemoryError::Validation(format!(
             "{fault}; the run does not start, since any met it produced would be refused the \
-             same way; {KEPT_FOR_RECOVERY}"
+             same way; {}",
+            kept_at_start(config.implementer, existing_state.as_ref())
         )));
     }
     // Set by a guard fault every later `met` would meet too: the run stops
@@ -3008,7 +3042,8 @@ pub fn run_issue(
                     }
                     return Err(MemoryError::Validation(format!(
                         "{fault}; the run stops rather than pay for another dispatch whose met \
-                         would be refused the same way; {KEPT_FOR_RECOVERY}"
+                         would be refused the same way; {}",
+                        kept_mid_run(config.implementer)
                     )));
                 }
                 // Retrying a session still in use can never succeed, so it
@@ -5272,7 +5307,22 @@ sleep 0.5
             assert_eq!(dispatcher.dispatched, 1, "{implementer:?}: {err}");
             assert!(err.contains("commit.gpgsign could not be read"), "{err}");
             assert!(err.contains("maybe"), "{err}");
-            assert!(err.contains("do not clear-dispatch it"), "{err}");
+            if implementer == Implementer::Muse {
+                assert!(
+                    err.contains(
+                        "the finished invocation is kept, and the first run after the fix \
+                         checks its met again; do not clear-dispatch it"
+                    ),
+                    "{err}"
+                );
+            } else {
+                // Claude has no invocation to recover: its session is resumed.
+                assert!(!err.contains("invocation"), "{err}");
+                assert!(
+                    err.contains("the next run after the fix resumes it"),
+                    "{err}"
+                );
+            }
             assert!(lineage::attempts_for_issue(&db, &issue())
                 .unwrap()
                 .is_empty());
@@ -5317,7 +5367,7 @@ sleep 0.5
             .to_string();
         assert!(!dispatched, "{err}");
         assert!(err.contains(&key), "{err}");
-        assert!(err.contains("do not clear-dispatch it"), "{err}");
+        assert!(err.contains("nothing was written"), "{err}");
     }
 
     #[test]
@@ -5531,8 +5581,20 @@ sleep 0.5
         );
         assert!(err.contains("commit.gpgsign"), "got: {err}");
         assert!(err.contains("maybe"), "got: {err}");
+        // No invocation and no state: it says so, rather than promise a
+        // recovery that cannot happen.
+        assert!(!err.contains("invocation"), "got: {err}");
+        assert!(err.contains("nothing was written"), "got: {err}");
+        assert!(lineage::attempts_for_issue(&db, &issue())
+            .unwrap()
+            .is_empty());
         // A held invocation is recovered on the next run once the policy
         // reads; clearing it would discard a run that may still be live.
+        let pending = pending_muse(&db, &wt, None);
+        let mut d = muse_script(vec![]);
+        let err = run_issue(&db, &issue(), &brief(), &wt, &muse_config(), &mut d)
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains(
                 "a pending invocation for this issue is kept and will be recovered once this \
@@ -5540,9 +5602,28 @@ sleep 0.5
             ),
             "got: {err}"
         );
-        assert!(lineage::attempts_for_issue(&db, &issue())
-            .unwrap()
-            .is_empty());
+        assert_eq!(
+            dispatch_state::get_dispatch_state(&db, &issue()).unwrap(),
+            Some(pending)
+        );
+        // A state with no invocation is left for the next run to resume.
+        let mut paused = pending_codex(&db, &wt, None);
+        paused.invocation_artifacts = None;
+        dispatch_state::upsert_dispatch_state(&db, &paused).unwrap();
+        let err = run_issue(
+            &db,
+            &issue(),
+            &brief(),
+            &wt,
+            &codex_config(),
+            &mut codex_script(vec![]),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("dispatch state is left as it is"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -6471,6 +6552,7 @@ sleep 0.5
         db: &'a Database,
         theirs: DispatchState,
         dispatched: bool,
+        recovery: Option<InvocationRecovery>,
     }
     impl Dispatcher for TakenOver<'_> {
         fn implementer(&self) -> Implementer {
@@ -6482,7 +6564,10 @@ sleep 0.5
             _state: &DispatchState,
         ) -> Result<InvocationRecovery, MemoryError> {
             dispatch_state::upsert_dispatch_state(self.db, &self.theirs).unwrap();
-            Ok(InvocationRecovery::NoPriorInvocation)
+            Ok(self
+                .recovery
+                .take()
+                .unwrap_or(InvocationRecovery::NoPriorInvocation))
         }
         fn dispatch(
             &mut self,
@@ -6511,6 +6596,7 @@ sleep 0.5
             db: &db,
             theirs: theirs.clone(),
             dispatched: false,
+            recovery: None,
         };
         let err = run_issue(&db, &issue(), &brief(), &wt, &muse_config(), &mut d)
             .unwrap_err()
@@ -6546,6 +6632,7 @@ sleep 0.5
             db: &db,
             theirs: theirs.clone(),
             dispatched: false,
+            recovery: None,
         };
         let err = run_issue(&db, &issue(), &brief(), &wt, &muse_config(), &mut d)
             .unwrap_err()
@@ -6556,6 +6643,42 @@ sleep 0.5
             .unwrap();
         assert_eq!(stored.session_uuid, theirs.session_uuid);
         assert_eq!(stored.state, "dispatching");
+    }
+
+    #[test]
+    fn a_recovered_impossible_never_clears_a_state_another_run_took() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        let ours = pending_muse(&db, &wt, None);
+        // Its attempt was already recorded before the crash.
+        lineage::upsert_issue_status(
+            &db,
+            &IssueStatus {
+                issue: issue(),
+                best_verdict: Some(AttemptOutcome::Failed),
+                best_commit_sha: None,
+                cumulative_attempt_n: 1,
+            },
+        )
+        .unwrap();
+        let mut theirs = ours.clone();
+        theirs.session_uuid = "22222222-3333-4444-5555-666666666666".into();
+        let mut finished = impossible();
+        finished.cost_usd = None;
+        let mut d = TakenOver {
+            db: &db,
+            theirs: theirs.clone(),
+            dispatched: false,
+            recovery: Some(InvocationRecovery::Finished(finished)),
+        };
+        let run = run_issue(&db, &issue(), &brief(), &wt, &muse_config(), &mut d).unwrap();
+        assert!(
+            matches!(run.terminal, TerminalReason::Impossible { .. }),
+            "{:?}",
+            run.terminal
+        );
+        let stored = dispatch_state::get_dispatch_state(&db, &issue()).unwrap();
+        assert_eq!(stored.map(|s| s.session_uuid), Some(theirs.session_uuid));
     }
 
     /// Every file path under `dir`, recursively.
