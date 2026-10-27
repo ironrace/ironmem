@@ -3822,6 +3822,10 @@ mod tests {
                     Err(error) => panic!("vector fixture accept failed: {error}"),
                 }
             };
+            // macOS hands back an accepted socket that inherits the
+            // listener's O_NONBLOCK, so a client slower than this thread (a
+            // loaded machine) made the read below fail with WouldBlock.
+            stream.set_nonblocking(false).unwrap();
             let _ = accepted_tx.send(());
             let mut request = String::new();
             BufReader::new(stream.try_clone().unwrap())
