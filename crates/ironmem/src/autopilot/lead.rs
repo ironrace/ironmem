@@ -993,7 +993,7 @@ fn dispatch_one(
     // Queue liveness admitted this issue under its persisted owner. Re-check
     // the current state through the injected dispatcher before advice or
     // worktree provisioning so a stale selection cannot mutate the checkout
-    // under the wrong harness or while a Codex process became live meanwhile.
+    // under the wrong harness or while a supervised CLI process became live meanwhile.
     run::preflight_worktree_provisioning(db, &queued.issue, config.run.implementer, dispatcher)?;
 
     let mut run_config = config.run.clone();

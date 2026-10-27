@@ -731,10 +731,24 @@ mod tests {
     }
 
     fn put_state(db: &Database, issue: &IssueRef, session_name: &str) {
+        put_state_for(
+            db,
+            issue,
+            session_name,
+            crate::autopilot::implementer::Implementer::Claude,
+        );
+    }
+
+    fn put_state_for(
+        db: &Database,
+        issue: &IssueRef,
+        session_name: &str,
+        implementer: crate::autopilot::implementer::Implementer,
+    ) {
         dispatch_state::upsert_dispatch_state(
             db,
             &DispatchState {
-                implementer: crate::autopilot::implementer::Implementer::Claude,
+                implementer,
                 native_session_id: None,
                 invocation_artifacts: None,
                 issue: issue.clone(),
@@ -1681,5 +1695,39 @@ mod tests {
             let plan = plan_queue(&db, &backlogs, &snapshot, &cfg).unwrap();
             assert_eq!(plan.dispatch[0].issue, IssueRef::new(REPO, 1));
         }
+    }
+    #[test]
+    fn a_muse_state_is_deferred_for_a_codex_runner_not_dispatched_ahead_of_the_backlog() {
+        use crate::autopilot::implementer::Implementer;
+        use crate::autopilot::process_tree::ProcessSnapshot;
+        use crate::autopilot::registry::HarnessSnapshots;
+        let db = approved(&[REPO]);
+        let issue = IssueRef::new(REPO, 1);
+        put_state_for(&db, &issue, "ic-stale", Implementer::Muse);
+        // An idle pause that readable process evidence proves is not running.
+        let mut state = dispatch_state::get_dispatch_state(&db, &issue)
+            .unwrap()
+            .unwrap();
+        state.state = "paused-daily-budget".into();
+        dispatch_state::upsert_dispatch_state(&db, &state).unwrap();
+        let backlogs = [backlog(REPO, vec![ready(1), ready(2)])];
+        let snapshot = HarnessSnapshots {
+            claude: RegistrySnapshot::Available(Vec::new()),
+            processes: ProcessSnapshot::Available(Vec::new()),
+        };
+        let codex = QueueConfig {
+            implementer: Some(Implementer::Codex),
+            ..config()
+        };
+        let plan = plan_queue(&db, &backlogs, &snapshot, &codex).unwrap();
+        assert_eq!(
+            reason_for(&plan, 1),
+            DeferReason::HarnessMismatch {
+                persisted: Implementer::Muse,
+                configured: Implementer::Codex,
+            }
+        );
+        assert_eq!(plan.dispatch.len(), 1);
+        assert_eq!(plan.dispatch[0].issue, IssueRef::new(REPO, 2));
     }
 }

@@ -325,7 +325,7 @@ impl ProcessSource for UnixProcesses {
         }
         #[cfg(not(unix))]
         {
-            Err("Codex process observation is unsupported on this platform".into())
+            Err("process observation is unsupported on this platform".into())
         }
     }
 }
@@ -463,26 +463,26 @@ pub(crate) fn read_identity(a: &InvocationArtifacts) -> Result<ProcessIdentity, 
     }
     let file = options
         .open(identity_path(a))
-        .map_err(|e| format!("missing Codex process identity: {e}"))?;
+        .map_err(|e| format!("missing invocation process identity: {e}"))?;
     if !file.metadata().map_err(|e| e.to_string())?.is_file() {
-        return Err("Codex identity is not a regular file".into());
+        return Err("invocation identity is not a regular file".into());
     }
     let mut data = Vec::new();
     file.take(1024 * 1024 + 1)
         .read_to_end(&mut data)
         .map_err(|e| e.to_string())?;
     if data.len() > 1024 * 1024 {
-        return Err("Codex identity exceeds size limit".into());
+        return Err("invocation identity exceeds size limit".into());
     }
     let identity: ProcessIdentity = serde_json::from_slice(&data)
-        .map_err(|e| format!("invalid Codex process identity: {e}"))?;
+        .map_err(|e| format!("invalid invocation process identity: {e}"))?;
     if identity.version != 1
         || identity.root_pid == 0
         || identity.root_pgid != identity.root_pid
         || identity.schema_path != a.schema_path
         || identity.invocation_id != a.invocation_id
     {
-        return Err("inconsistent Codex process identity".into());
+        return Err("inconsistent invocation process identity".into());
     }
     Ok(identity)
 }
@@ -532,8 +532,7 @@ impl ProcessSnapshot {
         match self {
             Self::Unavailable { reason } => reason.clone(),
             Self::Available(_) => {
-                "Codex invocation identity or completion evidence is unavailable or inconsistent"
-                    .into()
+                "invocation identity or completion evidence is unavailable or inconsistent".into()
             }
         }
     }
@@ -542,10 +541,10 @@ impl ProcessSnapshot {
             return self.reason();
         };
         let Some(a) = artifacts else {
-            return "Codex invocation has no persisted artifacts".into();
+            return "invocation has no persisted artifacts".into();
         };
         if super::invocation::has_launch_failure_record(a) {
-            return "Codex never launched, but an active process carries its marker or an ambiguous one; holding for verification".into();
+            return "invocation never launched, but an active process carries its marker or an ambiguous one; holding for verification".into();
         }
         let identity = match read_identity(a) {
             Ok(identity) => identity,
@@ -567,16 +566,16 @@ impl ProcessSnapshot {
                 || markers[0].pid != identity.root_pid
                 || markers[0].pgid != identity.root_pgid)
         {
-            return "Codex schema marker matched an unexpected or ambiguous process identity; holding for verification".into();
+            return "invocation schema marker matched an unexpected or ambiguous process identity; holding for verification".into();
         }
         let completed = super::invocation::has_valid_exit_record(a);
         if let Some(evidence) = recorded_tree_evidence(rows, &identity, completed) {
             return format!("{evidence}; process identity/completion requires verification");
         }
         if !completed {
-            return "Codex invocation has no trusted supervisor cleanup/completion record; historical descendants cannot be ruled out".into();
+            return "invocation has no trusted supervisor cleanup/completion record; historical descendants cannot be ruled out".into();
         }
-        "Codex supervisor completion verified".into()
+        "supervisor completion verified".into()
     }
     pub fn liveness(&self, artifacts: Option<&InvocationArtifacts>) -> Liveness {
         let Self::Available(rows) = self else {
@@ -832,7 +831,7 @@ impl ProcessTracker {
                 }
                 Some(_) => {
                     return Err(MemoryError::Validation(
-                        "tracked Codex PID was reused; cleanup cannot be authenticated".into(),
+                        "tracked PID was reused; cleanup cannot be authenticated".into(),
                     ));
                 }
                 None => {
@@ -846,7 +845,7 @@ impl ProcessTracker {
                     }) {
                         if kernel(row.pid).map_err(MemoryError::Validation)?.is_some() {
                             return Err(MemoryError::Validation(
-                                "Codex ancestry seed disappeared before descendant authentication"
+                                "invocation ancestry seed disappeared before descendant authentication"
                                     .into(),
                             ));
                         }
@@ -870,7 +869,7 @@ impl ProcessTracker {
                             .is_some_and(|expected| *expected != actual.birth)
                     {
                         return Err(MemoryError::Validation(
-                            "Codex root identity changed during authentication".into(),
+                            "invocation root identity changed during authentication".into(),
                         ));
                     }
                     self.observed_root = true;
@@ -898,7 +897,7 @@ impl ProcessTracker {
                 let parent_before = kernel(row.ppid).map_err(MemoryError::Validation)?;
                 if !parent_before.is_some_and(|p| p.pid == row.ppid && p.birth == expected_parent) {
                     return Err(MemoryError::Validation(
-                        "Codex ancestry seed changed before descendant authentication".into(),
+                        "invocation ancestry seed changed before descendant authentication".into(),
                     ));
                 }
                 let Some(actual) = kernel(row.pid).map_err(MemoryError::Validation)? else {
@@ -911,13 +910,13 @@ impl ProcessTracker {
                 // row's ownership: parent, group and birth are one record.
                 if actual.pid != row.pid || actual.ppid != row.ppid {
                     return Err(MemoryError::Validation(
-                        "Codex descendant ancestry changed during authentication".into(),
+                        "invocation descendant ancestry changed during authentication".into(),
                     ));
                 }
                 let parent_after = kernel(row.ppid).map_err(MemoryError::Validation)?;
                 if !parent_after.is_some_and(|p| p.pid == row.ppid && p.birth == expected_parent) {
                     return Err(MemoryError::Validation(
-                        "Codex ancestry seed changed during descendant authentication".into(),
+                        "invocation ancestry seed changed during descendant authentication".into(),
                     ));
                 }
                 let Some(candidate_after) = kernel(row.pid).map_err(MemoryError::Validation)?
@@ -928,7 +927,8 @@ impl ProcessTracker {
                 };
                 if candidate_after != actual {
                     return Err(MemoryError::Validation(
-                        "Codex descendant kernel identity changed during authentication".into(),
+                        "invocation descendant kernel identity changed during authentication"
+                            .into(),
                     ));
                 }
                 // The same owned parent bracketed a stable kernel capture.
@@ -964,7 +964,7 @@ impl ProcessTracker {
     fn signal(&self, pid: u32, signal: i32) -> Result<(), MemoryError> {
         let Some((_, expected)) = self.known.iter().find(|(r, _)| r.pid == pid) else {
             return Err(MemoryError::Validation(
-                "cannot signal unauthenticated Codex process".into(),
+                "cannot signal unauthenticated invocation process".into(),
             ));
         };
         match birth(pid).map_err(MemoryError::Validation)? {
@@ -985,12 +985,12 @@ impl ProcessTracker {
                 {
                     let _ = signal;
                     Err(MemoryError::Validation(
-                        "Codex process signaling unsupported".into(),
+                        "invocation process signaling unsupported".into(),
                     ))
                 }
             }
             Some(_) => Err(MemoryError::Validation(
-                "Codex PID identity changed; refusing signal".into(),
+                "invocation PID identity changed; refusing signal".into(),
             )),
         }
     }
@@ -1024,7 +1024,7 @@ impl ProcessTracker {
             }
             if !stable {
                 return Err(MemoryError::Validation(
-                    "Codex process tree did not quiesce".into(),
+                    "invocation process tree did not quiesce".into(),
                 ));
             }
             Ok(())
@@ -1054,7 +1054,7 @@ impl ProcessTracker {
                         Some(actual) if actual == *expected => live = true,
                         Some(_) => {
                             return Err(MemoryError::Validation(
-                                "Codex tracked PID changed during cleanup".into(),
+                                "invocation tracked PID changed during cleanup".into(),
                             ))
                         }
                     }
@@ -1066,7 +1066,7 @@ impl ProcessTracker {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         Err(MemoryError::Validation(
-            "Codex descendants remained alive after cleanup".into(),
+            "invocation descendants remained alive after cleanup".into(),
         ))
     }
     /// Once the root is reaped its children reparent, so PPID enrollment can
@@ -1092,7 +1092,7 @@ impl ProcessTracker {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         Err(MemoryError::Validation(format!(
-            "untracked process {} remained in Codex process group {} after cleanup; \
+            "untracked process {} remained in invocation process group {} after cleanup; \
              completion is unproven",
             straggler.unwrap_or_default(),
             self.root_pid
@@ -1194,7 +1194,7 @@ mod tests {
         assert_eq!(empty.liveness(Some(&a)), Liveness::Unknown);
         assert!(empty
             .invocation_reason(Some(&a))
-            .contains("invalid Codex process identity"));
+            .contains("invalid invocation process identity"));
         std::fs::remove_file(identity_path(&a)).unwrap();
         assert_eq!(empty.liveness(Some(&a)), Liveness::Unknown);
         struct Failed;

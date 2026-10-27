@@ -1,6 +1,6 @@
 //! The operator's way out of a hold Autopilot cannot resolve by itself.
 //!
-//! Restart recovery holds a Codex invocation whose completion it cannot
+//! Restart recovery holds a supervised CLI (Codex or Muse) invocation whose completion it cannot
 //! prove — a controller killed by Ctrl-C, a root that exited before the first
 //! `ps` sample, an observation error mid-run. That hold is correct: nothing a
 //! controller can read distinguishes "finished" from "still running somewhere
@@ -81,8 +81,8 @@ fn refusal(
 ) -> Option<String> {
     match (state.implementer, snapshots.liveness(state)) {
         (_, Liveness::Alive) => Some(format!(
-            "its {:?} implementation is alive",
-            state.implementer
+            "its {} implementation is alive",
+            state.implementer.label()
         )),
         // Idle with pending artifacts is a finished invocation `run_issue` has
         // not recorded yet; clearing would drop its attempt from lineage.
@@ -163,9 +163,9 @@ mod tests {
         IssueRef::new("owner/repo", 42)
     }
 
-    fn held_codex_state(artifacts: InvocationArtifacts) -> DispatchState {
+    fn held_state(implementer: Implementer, artifacts: InvocationArtifacts) -> DispatchState {
         DispatchState {
-            implementer: Implementer::Codex,
+            implementer,
             native_session_id: None,
             invocation_artifacts: Some(artifacts),
             issue: issue(),
@@ -204,9 +204,10 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         // Persisted identity, no supervisor exit record: Ctrl-C's shape.
         let (a, live) = testing::invocation(dir.path());
-        dispatch_state::upsert_dispatch_state(&db, &held_codex_state(a.clone())).unwrap();
+        dispatch_state::upsert_dispatch_state(&db, &held_state(Implementer::Codex, a.clone()))
+            .unwrap();
         assert_eq!(
-            snapshots(Vec::new()).liveness(&held_codex_state(a.clone())),
+            snapshots(Vec::new()).liveness(&held_state(Implementer::Codex, a.clone())),
             Liveness::Unknown
         );
 
@@ -279,7 +280,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = Database::open_in_memory().unwrap();
         let (a, _) = testing::invocation(dir.path());
-        let judged = held_codex_state(a.clone());
+        let judged = held_state(Implementer::Codex, a.clone());
         dispatch_state::upsert_dispatch_state(&db, &judged).unwrap();
         // A Lead resumes the issue after the state was read.
         let mut resumed = judged.clone();
@@ -303,7 +304,7 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         let (a, _) = testing::invocation(dir.path());
         testing::complete(&a);
-        dispatch_state::upsert_dispatch_state(&db, &held_codex_state(a)).unwrap();
+        dispatch_state::upsert_dispatch_state(&db, &held_state(Implementer::Codex, a)).unwrap();
         let err = clear_dispatch(&db, &issue(), || snapshots(Vec::new()))
             .unwrap_err()
             .to_string();
@@ -314,12 +315,30 @@ mod tests {
     }
 
     #[test]
+    fn a_live_muse_root_refuses_clearing_and_names_muse() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_in_memory().unwrap();
+        let (a, mut live) = testing::invocation(dir.path());
+        live.args = format!(
+            "/u/muse-bin-1.4.13-R6996.1 exec --json --output-schema {} --prompt-file /p.md",
+            a.schema_path
+        );
+        dispatch_state::upsert_dispatch_state(&db, &held_state(Implementer::Muse, a)).unwrap();
+        let err = clear_dispatch(&db, &issue(), || snapshots(vec![live]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("its Muse implementation is alive"), "{err}");
+        assert!(dispatch_state::get_dispatch_state(&db, &issue())
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
     fn a_muse_hold_is_judged_by_process_evidence_and_names_its_own_harness() {
         let dir = tempfile::tempdir().unwrap();
         let db = Database::open_in_memory().unwrap();
         let (a, _) = testing::invocation(dir.path());
-        let mut state = held_codex_state(a.clone());
-        state.implementer = Implementer::Muse;
+        let state = held_state(Implementer::Muse, a.clone());
         dispatch_state::upsert_dispatch_state(&db, &state).unwrap();
         // Unfinished: a live Muse invocation for the same issue holds it.
         let sibling = "/r/.git/ironmem/autopilot/owner-repo-42/\
@@ -364,7 +383,7 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         let (a, _) = testing::invocation(dir.path());
         testing::complete(&a);
-        dispatch_state::upsert_dispatch_state(&db, &held_codex_state(a)).unwrap();
+        dispatch_state::upsert_dispatch_state(&db, &held_state(Implementer::Codex, a)).unwrap();
         let err = clear_dispatch(&db, &issue(), || snapshots(Vec::new()))
             .unwrap_err()
             .to_string();
@@ -387,7 +406,7 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         let (a, live) = testing::invocation(dir.path());
         testing::complete(&a);
-        dispatch_state::upsert_dispatch_state(&db, &held_codex_state(a)).unwrap();
+        dispatch_state::upsert_dispatch_state(&db, &held_state(Implementer::Codex, a)).unwrap();
         let kept = |rows: Vec<ProcessRow>| {
             assert!(release_settled_dispatches(&db, &snapshots(rows), 3)
                 .unwrap()
@@ -414,8 +433,7 @@ mod tests {
             .is_none());
 
         // A Claude state at its attempt cap, gone from a readable registry.
-        let mut claude = held_codex_state(testing::invocation(dir.path()).0);
-        claude.implementer = Implementer::Claude;
+        let mut claude = held_state(Implementer::Claude, testing::invocation(dir.path()).0);
         claude.invocation_artifacts = None;
         claude.attempt_n = 3;
         dispatch_state::upsert_dispatch_state(&db, &claude).unwrap();
@@ -429,9 +447,10 @@ mod tests {
     #[test]
     fn a_claude_state_clears_only_against_a_readable_registry_that_omits_it() {
         let db = Database::open_in_memory().unwrap();
-        let mut state =
-            held_codex_state(testing::invocation(tempfile::tempdir().unwrap().path()).0);
-        state.implementer = Implementer::Claude;
+        let mut state = held_state(
+            Implementer::Claude,
+            testing::invocation(tempfile::tempdir().unwrap().path()).0,
+        );
         state.invocation_artifacts = None;
         dispatch_state::upsert_dispatch_state(&db, &state).unwrap();
         let mut snaps = snapshots(Vec::new());

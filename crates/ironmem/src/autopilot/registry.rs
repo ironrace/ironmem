@@ -503,7 +503,7 @@ impl LivenessSnapshot for RegistrySnapshot {
     }
     fn reason(&self, implementer: Implementer) -> String {
         if implementer.recovers_invocations() {
-            return format!("{} process source was not supplied", implementer.label());
+            return "invocation process source was not supplied".into();
         }
         match self {
             Self::Unavailable { reason } => reason.clone(),
@@ -922,9 +922,9 @@ mod harness_tests {
             parse_processes("15 1 15 S codex exec prompt --output-schema /tmp/false\n").unwrap();
         assert_eq!(prompt[0].marker().unwrap(), None);
     }
-    fn paused_codex_state() -> DispatchState {
+    fn paused_state(implementer: Implementer) -> DispatchState {
         DispatchState {
-            implementer: Implementer::Codex,
+            implementer,
             native_session_id: Some("11111111-2222-3333-4444-555555555555".into()),
             invocation_artifacts: None,
             issue: crate::autopilot::IssueRef::new("owner/repo", 42),
@@ -947,12 +947,13 @@ mod harness_tests {
             "/u/muse-bin-1.4.13-R6996.1 exec --json --output-schema {} --prompt-file /p.md",
             artifacts.schema_path
         );
-        let mut state = paused_codex_state();
-        state.implementer = Implementer::Muse;
+        let mut state = paused_state(Implementer::Muse);
         state.state = "dispatching".into();
         state.invocation_artifacts = Some(artifacts);
         let alive = HarnessSnapshots {
-            claude: RegistrySnapshot::Available(Vec::new()),
+            claude: RegistrySnapshot::Unavailable {
+                reason: "registry unreadable".into(),
+            },
             processes: ProcessSnapshot::Available(vec![root]),
         };
         assert_eq!(alive.liveness(&state), Liveness::Alive);
@@ -963,14 +964,16 @@ mod harness_tests {
         );
         assert_eq!(
             LivenessSnapshot::reason(&RegistrySnapshot::Available(Vec::new()), Implementer::Muse),
-            "Muse process source was not supplied"
+            "invocation process source was not supplied"
         );
+        // Muse availability follows the process source alone: the Claude
+        // registry above is unavailable and must not matter.
+        assert!(!alive.is_available(Implementer::Claude));
         assert!(alive.is_available(Implementer::Muse));
     }
     #[test]
     fn an_idle_muse_pause_names_muse_when_it_holds() {
-        let mut state = paused_codex_state();
-        state.implementer = Implementer::Muse;
+        let mut state = paused_state(Implementer::Muse);
         let mut snapshots = paused_snapshots();
         assert_eq!(snapshots.liveness(&state), Liveness::NotListed);
         snapshots.processes = ProcessSnapshot::Available(
@@ -1003,7 +1006,7 @@ mod harness_tests {
     }
     #[test]
     fn explicit_idle_codex_pauses_require_available_source_and_valid_optional_native_id() {
-        let mut state = paused_codex_state();
+        let mut state = paused_state(Implementer::Codex);
         let snapshots = paused_snapshots();
         for label in [
             "paused-daily-budget",
@@ -1029,7 +1032,7 @@ mod harness_tests {
             state.native_session_id = Some(bad.into());
             assert_eq!(snapshots.liveness(&state), Liveness::Unknown);
         }
-        let state = paused_codex_state();
+        let state = paused_state(Implementer::Codex);
         let mut unavailable = paused_snapshots();
         unavailable.processes = ProcessSnapshot::Unavailable {
             reason: "ps unavailable".into(),
@@ -1043,7 +1046,7 @@ mod harness_tests {
     }
     #[test]
     fn absent_codex_identity_in_an_unknown_phase_still_holds() {
-        let mut state = paused_codex_state();
+        let mut state = paused_state(Implementer::Codex);
         let snapshots = paused_snapshots();
         for phase in ["paused-other", "", "Dispatching"] {
             state.state = phase.into();
@@ -1055,7 +1058,7 @@ mod harness_tests {
         use crate::autopilot::process_tree::testing;
         let dir = tempfile::tempdir().unwrap();
         let (a, _) = testing::invocation(dir.path());
-        let mut state = paused_codex_state();
+        let mut state = paused_state(Implementer::Codex);
         state.invocation_artifacts = Some(a.clone());
         let snapshots = paused_snapshots();
         assert_eq!(snapshots.liveness(&state), Liveness::Unknown);
@@ -1072,7 +1075,7 @@ mod harness_tests {
     }
     #[test]
     fn fresh_same_issue_or_ambiguous_codex_process_evidence_overrides_idle_pause() {
-        let state = paused_codex_state();
+        let state = paused_state(Implementer::Codex);
         let mut snapshots = paused_snapshots();
         assert_eq!(snapshots.liveness(&state), Liveness::NotListed);
         snapshots.processes = ProcessSnapshot::Available(parse_processes("10 1 10 S codex exec --output-schema /other-clone/.git/ironmem/autopilot/owner-repo-42/11111111-2222-3333-4444-555555555555/schema.json prompt\n").unwrap());

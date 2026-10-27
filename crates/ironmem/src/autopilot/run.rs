@@ -567,8 +567,8 @@ pub struct IssueRun {
     pub total_cost_usd: f64,
     /// The issue's cumulative attempt count after the run.
     pub cumulative_attempt_n: u32,
-    /// Effective per-dispatch wall-clock bound. Codex uses the finite backend
-    /// default when the repo has none; Claude retains its optional repo bound.
+    /// Effective per-dispatch wall-clock bound. Supervised CLI harnesses (Codex,
+    /// Muse) use the finite backend default when the repo has none; Claude retains its optional repo bound.
     pub wall_clock_timeout_secs: Option<u64>,
 }
 
@@ -790,12 +790,12 @@ fn record_and_advance(
     db: &Database,
     record: &AttemptRecord,
     prior: Option<&IssueStatus>,
-    recoverable_codex: bool,
+    recovering_harness: Option<Implementer>,
 ) -> Result<(), MemoryError> {
-    // Codex can replay durable artifacts after a crash between the append-only
+    // A recovering harness (Codex, Muse) can replay durable artifacts after a crash between the append-only
     // attempt and current-status writes. Complete that same ordinal instead
     // of appending it twice. Terminal summaries are markers, not attempts.
-    let existing = if recoverable_codex {
+    let existing = if recovering_harness.is_some() {
         lineage::attempts_for_issue(db, &record.issue)?
             .into_iter()
             .find(|attempt| {
@@ -808,9 +808,10 @@ fn record_and_advance(
         .as_ref()
         .is_some_and(|attempt| attempt.verdict != record.verdict)
     {
-        return Err(MemoryError::Validation(
-            "recovered Codex verdict conflicts with the already recorded attempt ordinal".into(),
-        ));
+        let label = recovering_harness.map_or("", Implementer::label);
+        return Err(MemoryError::Validation(format!(
+            "recovered {label} verdict conflicts with the already recorded attempt ordinal"
+        )));
     }
     if existing.is_none() {
         lineage::record_attempt(db, record)?;
@@ -1173,7 +1174,7 @@ pub fn run_issue(
     }
     let existing_state = validate_dispatch_owner(db, issue, config.implementer)?;
     let gate_commands = approved_gate_commands(db, &issue.repo)?;
-    // Report the effective bound, including Codex's mandatory finite fallback.
+    // Report the effective bound, including a supervised CLI harness's mandatory finite fallback.
     // Claude retains the repo's optional bound.
     let wall_clock_timeout_secs = gate_config::wall_clock_timeout(db, &issue.repo)?
         .or_else(|| config.implementer.fallback_wall_clock_secs());
@@ -1357,7 +1358,8 @@ pub fn run_issue(
                     spent_usd: spent_today,
                 };
             }
-            // Codex always has a finite bound and reserves unknown spend.
+            // Supervised CLI harnesses always have a finite bound and reserve
+            // unknown spend.
             // Claude keeps its existing policy: this cap gates only repos
             // with a wall-clock bound.
             if wall_clock_timeout.is_some() {
@@ -1512,9 +1514,11 @@ pub fn run_issue(
                     // Errors do not prove a child is dead; retain the exact invocation for recovery.
                     break TerminalReason::ImplementationInFlight {
                         detail: format!(
-                            "Codex dispatch could not establish completion: {err}; once no \
+                            "{} dispatch could not establish completion: {err}; once no \
                              process remains, `ironmem autopilot clear-dispatch {} {}` releases it",
-                            issue.repo, issue.number
+                            config.implementer.label(),
+                            issue.repo,
+                            issue.number
                         ),
                     };
                 }
@@ -1588,15 +1592,18 @@ pub fn run_issue(
                 outcome.is_error = true;
                 outcome.process_success = false;
                 // Keep the invocation's own diagnosis (stderr, timeout, exit
-                // code): a Codex that failed before `thread.started` — auth,
-                // config, network — is explained only there.
-                let identity =
-                    "missing or mismatched native Codex session ID; persisted identity retained";
+                // code): a harness that failed before announcing its session
+                // (Codex `thread.started`) — auth, config, network — is
+                // explained only there.
+                let identity = format!(
+                    "missing or mismatched native {} session ID; persisted identity retained",
+                    config.implementer.label()
+                );
                 outcome.reason = Some(match outcome.reason.take() {
                     Some(original) if !original.trim().is_empty() => {
                         format!("{identity}; {original}")
                     }
-                    _ => identity.into(),
+                    _ => identity,
                 });
             } else if native_session_id.is_none() {
                 native_session_id = outcome.native_session_id.clone();
@@ -1690,7 +1697,10 @@ pub fn run_issue(
                         commit_sha: commit_sha.clone(),
                     },
                     status.as_ref(),
-                    config.implementer.recovers_invocations(),
+                    config
+                        .implementer
+                        .recovers_invocations()
+                        .then_some(config.implementer),
                 )?;
                 break TerminalReason::Met { commit_sha };
             }
@@ -1706,7 +1716,10 @@ pub fn run_issue(
                         commit_sha: None,
                     },
                     status.as_ref(),
-                    config.implementer.recovers_invocations(),
+                    config
+                        .implementer
+                        .recovers_invocations()
+                        .then_some(config.implementer),
                 )?;
                 break TerminalReason::Impossible {
                     reason: outcome.reason.clone(),
@@ -1724,7 +1737,10 @@ pub fn run_issue(
                         commit_sha: None,
                     },
                     status.as_ref(),
-                    config.implementer.recovers_invocations(),
+                    config
+                        .implementer
+                        .recovers_invocations()
+                        .then_some(config.implementer),
                 )?;
                 status = lineage::get_issue_status(db, issue)?;
                 write_state(
@@ -1991,7 +2007,7 @@ mod tests {
                     commit_sha: None,
                 },
                 None,
-                true,
+                Some(Implementer::Codex),
             )
             .unwrap();
             let attempts = lineage::attempts_for_issue(&db, &issue()).unwrap();
@@ -2076,7 +2092,7 @@ mod tests {
                     commit_sha: None,
                 },
                 None,
-                true,
+                Some(Implementer::Codex),
             )
             .unwrap();
             result.cost_usd = None;
@@ -2247,13 +2263,14 @@ sleep 0.5
             "{unknown}"
         );
     }
-    struct CodexScript {
+    struct CliScript {
+        implementer: Implementer,
         inner: ScriptedDispatcher,
         recovery: Option<super::super::invocation::InvocationRecovery>,
     }
-    impl Dispatcher for CodexScript {
+    impl Dispatcher for CliScript {
         fn implementer(&self) -> Implementer {
-            Implementer::Codex
+            self.implementer
         }
         fn recover(
             &mut self,
@@ -2273,8 +2290,9 @@ sleep 0.5
             self.inner.dispatch(repo, spec)
         }
     }
-    fn codex_script(outcomes: Vec<DispatchOutcome>) -> CodexScript {
-        CodexScript {
+    fn cli_script(implementer: Implementer, outcomes: Vec<DispatchOutcome>) -> CliScript {
+        CliScript {
+            implementer,
             inner: ScriptedDispatcher::new(
                 outcomes
                     .into_iter()
@@ -2287,6 +2305,18 @@ sleep 0.5
             recovery: None,
         }
     }
+    fn codex_script(outcomes: Vec<DispatchOutcome>) -> CliScript {
+        cli_script(Implementer::Codex, outcomes)
+    }
+    fn muse_script(outcomes: Vec<DispatchOutcome>) -> CliScript {
+        cli_script(Implementer::Muse, outcomes)
+    }
+    fn muse_config() -> RunConfig {
+        let mut c = config();
+        c.implementer = Implementer::Muse;
+        c.model = "muse-wonder-1.0".into();
+        c
+    }
     fn codex_config() -> RunConfig {
         let mut c = config();
         c.implementer = Implementer::Codex;
@@ -2294,10 +2324,21 @@ sleep 0.5
         c
     }
     fn pending_codex(db: &Database, worktree: &Worktree, native: Option<&str>) -> DispatchState {
+        pending_invocation(Implementer::Codex, db, worktree, native)
+    }
+    fn pending_muse(db: &Database, worktree: &Worktree, native: Option<&str>) -> DispatchState {
+        pending_invocation(Implementer::Muse, db, worktree, native)
+    }
+    fn pending_invocation(
+        implementer: Implementer,
+        db: &Database,
+        worktree: &Worktree,
+        native: Option<&str>,
+    ) -> DispatchState {
         let artifacts =
             super::super::invocation::prepare_artifacts(&worktree.path, &issue()).unwrap();
         let state = DispatchState {
-            implementer: Implementer::Codex,
+            implementer,
             native_session_id: native.map(str::to_string),
             invocation_artifacts: Some(artifacts),
             issue: issue(),
@@ -2394,6 +2435,90 @@ sleep 0.5
                 .unwrap()
                 .is_none());
         }
+    }
+    #[test]
+    fn a_live_muse_invocation_is_held_with_a_muse_message_and_never_redispatched() {
+        for (recovery, expected) in [
+            (
+                InvocationRecovery::Alive,
+                "Muse implementation is still alive",
+            ),
+            (
+                InvocationRecovery::Unknown {
+                    reason: "not proven dead".into(),
+                },
+                "not proven dead",
+            ),
+        ] {
+            let db = approved_db();
+            let (_dir, wt) = fixture_worktree();
+            let state = pending_muse(&db, &wt, None);
+            let mut d = muse_script(vec![]);
+            d.recovery = Some(recovery);
+            let run = run_issue(&db, &issue(), &brief(), &wt, &muse_config(), &mut d).unwrap();
+            match run.terminal {
+                TerminalReason::ImplementationInFlight { detail } => {
+                    assert!(detail.contains(expected), "got: {detail}");
+                    assert!(!detail.contains("Codex"), "got: {detail}");
+                }
+                other => panic!("expected a hold, got {other:?}"),
+            }
+            assert!(d.inner.seen.is_empty());
+            assert_eq!(
+                dispatch_state::get_dispatch_state(&db, &issue()).unwrap(),
+                Some(state)
+            );
+        }
+    }
+    #[test]
+    fn a_muse_dispatch_that_cannot_establish_completion_names_muse() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        let mut d = muse_script(vec![]);
+        d.inner = ScriptedDispatcher::new(vec![Err(MemoryError::Validation("boom".into()))]);
+        let run = run_issue(&db, &issue(), &brief(), &wt, &muse_config(), &mut d).unwrap();
+        match run.terminal {
+            TerminalReason::ImplementationInFlight { detail } => {
+                assert!(
+                    detail.starts_with("Muse dispatch could not establish completion"),
+                    "got: {detail}"
+                );
+            }
+            other => panic!("expected a hold, got {other:?}"),
+        }
+    }
+    #[test]
+    fn a_recovered_muse_ordinal_conflict_names_muse() {
+        let record = |verdict| AttemptRecord {
+            issue: issue(),
+            attempt_n: 1,
+            approach: "durable".into(),
+            verdict,
+            why_failed: None,
+            commit_sha: None,
+        };
+        let db = Database::open_in_memory().unwrap();
+        record_and_advance(
+            &db,
+            &record(AttemptOutcome::Failed),
+            None,
+            Some(Implementer::Muse),
+        )
+        .unwrap();
+        let err = record_and_advance(
+            &db,
+            &record(AttemptOutcome::Success),
+            None,
+            Some(Implementer::Muse),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains(
+                "recovered Muse verdict conflicts with the already recorded attempt ordinal"
+            ),
+            "got: {err}"
+        );
     }
     #[test]
     fn recovered_success_at_cap_is_consumed_without_new_call_or_billing() {
@@ -4363,7 +4488,7 @@ satisfies it on its own"
                 commit_sha: None,
             },
             Some(&succeeded),
-            false,
+            None,
         )
         .unwrap();
 

@@ -550,7 +550,7 @@ enum AutopilotCmd {
         json: bool,
     },
     /// Clear a held issue's dispatch state once no process could be its work
-    /// — the human recovery for a Codex invocation whose completion Autopilot
+    /// — the human recovery for a Codex or Muse invocation whose completion Autopilot
     /// cannot prove. Lineage, attempts and spend stand; artifacts are kept.
     ClearDispatch {
         /// Repo identity (e.g. "owner/repo")
