@@ -309,13 +309,12 @@ completion is recorded. Nothing sampled that run, so its verdict is never
 trusted and it never counts as a successful process. What stays held is
 completion that really is unproven: a controller killed by Ctrl-C while
 Codex kept running in its own process group, a root that exited before even
-its kernel birth could be read, an observation error mid-run, a tool still running in
-Codex's process group after Codex exited that no sample caught, or a process
-started during the invocation still running in the worktree after cleanup
-(see the worktree check below; that one finishes by itself once the process
-exits). Stop any Lead or `run`
-working the repo, confirm nothing is still working on the issue, then release
-it with:
+its kernel birth could be read, an observation error mid-run, a tool still
+running in Codex's process group after Codex exited that no sample caught,
+or a process started during the invocation still running in the worktree
+after cleanup (see the worktree check below; that one finishes by itself
+once the process exits). Stop any Lead or `run` working the repo, confirm
+nothing is still working on the issue, then release it with:
 
 ```
 ironmem autopilot clear-dispatch owner/repo 364

@@ -71,7 +71,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cleanup.** A harness's ironmem MCP server can autospawn the daemon as its
   own child; the process tracker now never treats the daemon on the
   operator's configured socket, or its children, as part of an invocation,
-  so it survives and keeps serving.
+  so it survives and keeps serving. A versioned install (`ironmem-0.9`) is
+  recognised too. When the daemon cannot be recognised (a socket path with
+  whitespace, or an unresolvable executable), or cleanup kills a daemon on a
+  socket other than the configured one outside the temp directory, a
+  warning now says so. A daemon caught between its fork and exec is no
+  longer left in the invocation's process record, where it could hold the
+  issue for as long as it ran.
+- **A Codex or Muse run that fails within milliseconds is no longer held
+  for `clear-dispatch`.** A root that exits before the first process sample
+  (a Muse usage error, or "session in use") is recorded once its process
+  group has drained and the worktree is quiet, as an infrastructure failure
+  that is never `met`; a Muse session refusal on its stderr is still read.
+  Muse's launcher phase (`bash …/muse exec …`, before it execs the binary)
+  now counts as the invocation's own process, and a Muse journal may grow
+  to 64 MiB (Codex keeps 16 MiB) before the run is stopped.
 - **`autopilot lead` now closes out an issue at its attempt cap (#345).**
   Before, a tick whose run ended `AttemptCapExhausted` wrote nothing, so
   the issue kept `agent:ready` with no comment. The queue deferred it on

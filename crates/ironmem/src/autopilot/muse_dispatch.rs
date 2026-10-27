@@ -227,7 +227,12 @@ impl SupervisedCli for MuseCli {
     /// rather than treated as a conflict, and a terminal record on any other
     /// stream is never this run's verdict. Measured runs emit exactly one
     /// terminal record per invocation, so more than one trusts nothing.
-    /// Muse writes no final file, so `final_text` is unused.
+    /// Whether a resume after a wall-clock kill replays the interrupted turn
+    /// with a terminal record of its own is unmeasured; if it does, that
+    /// resume is an infrastructure failure (bounded by the run's
+    /// consecutive-failure limit) rather than a guess at which terminal
+    /// answers this invocation's prompt. Muse writes no final file, so
+    /// `final_text` is unused.
     fn parse(
         &self,
         journal: &str,
