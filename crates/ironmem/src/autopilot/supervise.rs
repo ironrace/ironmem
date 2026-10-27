@@ -1371,9 +1371,13 @@ pub fn reconcile(
     let known_markers: std::collections::HashSet<_> = states
         .iter()
         .filter(|s| s.implementer == super::implementer::Implementer::Codex)
-        .filter_map(|s| s.codex_artifacts.as_ref().map(|a| a.schema_path.as_str()))
+        .filter_map(|s| {
+            s.invocation_artifacts
+                .as_ref()
+                .map(|a| a.schema_path.as_str())
+        })
         .collect();
-    for marker in snapshot.codex_markers() {
+    for marker in snapshot.invocation_markers() {
         if !known_markers.contains(marker) {
             out.push(Reconciliation {
                 issue: None,
@@ -1413,7 +1417,7 @@ mod tests {
         DispatchState {
             implementer: crate::autopilot::implementer::Implementer::Claude,
             native_session_id: None,
-            codex_artifacts: None,
+            invocation_artifacts: None,
             issue: issue.clone(),
             worktree_path: "/tmp/wt".into(),
             ic_session_name: super::super::dispatch::ic_name(issue),
@@ -2705,24 +2709,24 @@ mod tests {
     }
     #[test]
     fn codex_reconciliation_adopts_restarts_and_holds_its_own_source() {
-        use crate::autopilot::codex_process::{testing, CodexProcessSnapshot};
+        use crate::autopilot::process_tree::{testing, ProcessSnapshot};
         use crate::autopilot::registry::HarnessSnapshots;
         let db = Database::open_in_memory().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let (a, row) = testing::invocation(dir.path());
         let mut state = state_for(&issue(), true);
         state.implementer = crate::autopilot::implementer::Implementer::Codex;
-        state.codex_artifacts = Some(a.clone());
+        state.invocation_artifacts = Some(a.clone());
         dispatch_state::upsert_dispatch_state(&db, &state).unwrap();
         let mut snapshots = HarnessSnapshots {
             claude: RegistrySnapshot::Available(Vec::new()),
-            codex: CodexProcessSnapshot::Available(vec![row]),
+            processes: ProcessSnapshot::Available(vec![row]),
         };
         assert_eq!(
             reconcile(&db, &snapshots).unwrap()[0].verdict,
             ReconcileVerdict::Adopt
         );
-        snapshots.codex = CodexProcessSnapshot::Available(Vec::new());
+        snapshots.processes = ProcessSnapshot::Available(Vec::new());
         assert!(matches!(
             reconcile(&db, &snapshots).unwrap()[0].verdict,
             ReconcileVerdict::Hold { .. }

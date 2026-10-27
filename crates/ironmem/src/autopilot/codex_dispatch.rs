@@ -31,7 +31,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(25);
 const OBSERVE_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CodexArtifacts {
+pub struct InvocationArtifacts {
     pub invocation_id: String,
     pub schema_path: String,
     pub journal_path: String,
@@ -41,7 +41,7 @@ pub struct CodexArtifacts {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum CodexRecovery {
+pub enum InvocationRecovery {
     NoPriorInvocation,
     Alive,
     Unknown { reason: String },
@@ -80,7 +80,10 @@ fn create_private(path: &Path) -> Result<File, MemoryError> {
 
 /// Allocate once, then persist these exact paths before spawning the dispatch.
 /// Reject unsupported paths before creating any artifact directories or files.
-pub fn prepare_artifacts(worktree: &Path, issue: &IssueRef) -> Result<CodexArtifacts, MemoryError> {
+pub fn prepare_artifacts(
+    worktree: &Path,
+    issue: &IssueRef,
+) -> Result<InvocationArtifacts, MemoryError> {
     let mut git = Command::new("git");
     git.args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
         .current_dir(worktree);
@@ -109,7 +112,7 @@ pub fn prepare_artifacts(worktree: &Path, issue: &IssueRef) -> Result<CodexArtif
         builder.mode(0o700);
     }
     builder.create(&dir)?;
-    let a = CodexArtifacts {
+    let a = InvocationArtifacts {
         invocation_id,
         schema_path: supported_path(&dir.join("schema.json"))?.into(),
         journal_path: supported_path(&dir.join("journal.jsonl"))?.into(),
@@ -126,13 +129,13 @@ pub fn prepare_artifacts(worktree: &Path, issue: &IssueRef) -> Result<CodexArtif
     Ok(a)
 }
 
-fn validate_spec(spec: &DispatchSpec) -> Result<&CodexArtifacts, MemoryError> {
+fn validate_spec(spec: &DispatchSpec) -> Result<&InvocationArtifacts, MemoryError> {
     if spec.implementer != Implementer::Codex {
         return Err(validation(
             "Codex dispatch requires implementer codex and persisted Codex artifacts",
         ));
     }
-    let a = spec.codex_artifacts.as_ref().ok_or_else(|| validation("Codex dispatch requires persisted Codex artifacts; prepare and save them before spawning"))?;
+    let a = spec.invocation_artifacts.as_ref().ok_or_else(|| validation("Codex dispatch requires persisted Codex artifacts; prepare and save them before spawning"))?;
     for path in [
         &a.schema_path,
         &a.journal_path,
@@ -222,7 +225,7 @@ struct CompletionRecord {
     schema_path: String,
 }
 impl ExitRecord {
-    fn proves_completion(&self, a: &CodexArtifacts) -> bool {
+    fn proves_completion(&self, a: &InvocationArtifacts) -> bool {
         self.completion.as_ref().is_some_and(|c| {
             c.version == 1 && c.invocation_id == a.invocation_id && c.schema_path == a.schema_path
         })
@@ -244,7 +247,7 @@ fn open_existing(path: &str, write: bool) -> Result<File, MemoryError> {
     Ok(file)
 }
 
-fn limits(a: &CodexArtifacts) -> Option<String> {
+fn limits(a: &InvocationArtifacts) -> Option<String> {
     [
         (&a.journal_path, JOURNAL_LIMIT, "journal"),
         (&a.stderr_path, STDERR_LIMIT, "stderr"),
@@ -286,7 +289,7 @@ pub(crate) fn persist_private_atomic(
     result
 }
 
-fn persist_exit(a: &CodexArtifacts, record: &ExitRecord) -> Result<(), MemoryError> {
+fn persist_exit(a: &InvocationArtifacts, record: &ExitRecord) -> Result<(), MemoryError> {
     persist_private_atomic(
         Path::new(&a.exit_path),
         "exit",
@@ -296,7 +299,7 @@ fn persist_exit(a: &CodexArtifacts, record: &ExitRecord) -> Result<(), MemoryErr
 
 /// The supervisor's terminal record for one invocation.
 fn exit_record(
-    a: &CodexArtifacts,
+    a: &InvocationArtifacts,
     spec: &DispatchSpec,
     exit_code: Option<i32>,
     timed_out: bool,
@@ -368,7 +371,7 @@ pub fn run_codex_bounded(
         Err(e) => return never_launched(a, spec, &format!("failed to launch Codex dispatch: {e}")),
     };
     let started = Instant::now();
-    let mut identity = super::codex_process::ProcessIdentity {
+    let mut identity = super::process_tree::ProcessIdentity {
         version: 1,
         root_pid: child.id(),
         root_pgid: child.id(),
@@ -376,8 +379,8 @@ pub fn run_codex_bounded(
         invocation_id: a.invocation_id.clone(),
         descendants: Vec::new(),
     };
-    let mut tracker = super::codex_process::ProcessTracker::new(child.id());
-    if let Err(e) = super::codex_process::persist_identity(a, &identity) {
+    let mut tracker = super::process_tree::ProcessTracker::new(child.id());
+    if let Err(e) = super::process_tree::persist_identity(a, &identity) {
         // The root is still our unreaped Child; cleanup is authenticated by
         // kernel birth identity, and cannot authorize a retry on uncertainty.
         let cleanup = tracker.cleanup(false);
@@ -422,7 +425,7 @@ pub fn run_codex_bounded(
         }
     };
     identity.descendants = tracker.descendants();
-    if let Err(e) = super::codex_process::persist_identity(a, &identity) {
+    if let Err(e) = super::process_tree::persist_identity(a, &identity) {
         let cleanup = tracker.cleanup(true);
         return Err(with_cleanup(e, cleanup));
     }
@@ -438,7 +441,7 @@ pub fn run_codex_bounded(
 }
 
 fn never_launched(
-    a: &CodexArtifacts,
+    a: &InvocationArtifacts,
     spec: &DispatchSpec,
     reason: &str,
 ) -> Result<DispatchOutcome, MemoryError> {
@@ -452,7 +455,7 @@ fn never_launched(
 }
 
 /// A supervisor record proving `spawn` failed, so no process ever ran.
-pub fn has_launch_failure_record(artifacts: &CodexArtifacts) -> bool {
+pub fn has_launch_failure_record(artifacts: &InvocationArtifacts) -> bool {
     read_capped(&artifacts.exit_path, EXIT_LIMIT)
         .ok()
         .and_then(|text| serde_json::from_str::<ExitRecord>(&text).ok())
@@ -475,8 +478,8 @@ fn with_cleanup(err: MemoryError, cleanup: Result<(), MemoryError>) -> MemoryErr
 /// Complete supervision after the root process has been observed and reaped.
 /// Descendants may still be running and writing the invocation's artifacts.
 fn finish_codex_dispatch(
-    tracker: &mut super::codex_process::ProcessTracker,
-    a: &CodexArtifacts,
+    tracker: &mut super::process_tree::ProcessTracker,
+    a: &InvocationArtifacts,
     spec: &DispatchSpec,
     status: std::process::ExitStatus,
     started: Instant,
@@ -539,7 +542,7 @@ struct FinalVerdict {
 /// only the supervisor's valid exit-zero record can authorize a met verdict.
 /// A truncated journal invalidates the verdict but retains an earlier unique
 /// native thread ID so a replacement controller can resume it.
-pub fn read_artifacts(a: &CodexArtifacts) -> Result<DispatchOutcome, MemoryError> {
+pub fn read_artifacts(a: &InvocationArtifacts) -> Result<DispatchOutcome, MemoryError> {
     for path in [
         &a.schema_path,
         &a.journal_path,
@@ -688,7 +691,7 @@ pub fn read_artifacts(a: &CodexArtifacts) -> Result<DispatchOutcome, MemoryError
 
 /// A typed supervisor record proves that wait observed process completion.
 /// A missing, truncated or malformed record does not establish liveness.
-pub fn has_valid_exit_record(artifacts: &CodexArtifacts) -> bool {
+pub fn has_valid_exit_record(artifacts: &InvocationArtifacts) -> bool {
     read_capped(&artifacts.exit_path, EXIT_LIMIT)
         .ok()
         .and_then(|text| serde_json::from_str::<ExitRecord>(&text).ok())
@@ -698,10 +701,12 @@ pub fn has_valid_exit_record(artifacts: &CodexArtifacts) -> bool {
 /// The caller MUST first confirm the invocation is dead. This file-only
 /// primitive cannot establish liveness; registry callers supply Alive/Unknown.
 /// Prepared, empty artifacts carry invocation_started=false and no native ID.
-pub fn recover_artifacts(artifacts: Option<&CodexArtifacts>) -> Result<CodexRecovery, MemoryError> {
+pub fn recover_artifacts(
+    artifacts: Option<&InvocationArtifacts>,
+) -> Result<InvocationRecovery, MemoryError> {
     match artifacts {
-        None => Ok(CodexRecovery::NoPriorInvocation),
-        Some(a) => Ok(CodexRecovery::Finished(read_artifacts(a)?)),
+        None => Ok(InvocationRecovery::NoPriorInvocation),
+        Some(a) => Ok(InvocationRecovery::Finished(read_artifacts(a)?)),
     }
 }
 
@@ -710,11 +715,11 @@ mod tests {
     use std::path::Path;
 
     use super::{build_argv, CODEX_VERDICT_JSON_SCHEMA};
-    use crate::autopilot::dispatch::{CodexArtifacts, DispatchSpec, SessionMode};
+    use crate::autopilot::dispatch::{DispatchSpec, InvocationArtifacts, SessionMode};
     use crate::autopilot::implementer::Implementer;
 
-    fn artifacts() -> CodexArtifacts {
-        CodexArtifacts {
+    fn artifacts() -> InvocationArtifacts {
+        InvocationArtifacts {
             invocation_id: "invocation".into(),
             schema_path: "/tmp/schema.json".into(),
             journal_path: "/tmp/journal.jsonl".into(),
@@ -727,7 +732,7 @@ mod tests {
     fn spec(session: SessionMode) -> DispatchSpec {
         DispatchSpec {
             implementer: Implementer::Codex,
-            codex_artifacts: Some(artifacts()),
+            invocation_artifacts: Some(artifacts()),
             session,
             name: "unused-by-codex".into(),
             model: "gpt-test".into(),
@@ -837,7 +842,7 @@ mod contract_tests {
         let artifacts = prepare_artifacts(dir.path(), &IssueRef::new("owner/repo", 42)).unwrap();
         let spec = DispatchSpec {
             implementer: Implementer::Codex,
-            codex_artifacts: Some(artifacts),
+            invocation_artifacts: Some(artifacts),
             session: SessionMode::New {
                 session_uuid: "controller-only".into(),
             },
@@ -856,7 +861,7 @@ mod contract_tests {
         journal: &str,
         exit: Option<i32>,
     ) -> DispatchOutcome {
-        let a = spec.codex_artifacts.as_ref().unwrap();
+        let a = spec.invocation_artifacts.as_ref().unwrap();
         std::fs::write(&a.final_path, final_json).unwrap();
         std::fs::write(&a.journal_path, journal).unwrap();
         if let Some(code) = exit {
@@ -926,7 +931,7 @@ mod contract_tests {
     #[test]
     fn non_utf8_stderr_still_explains_a_failure_and_never_decides_validity() {
         let (_dir, s) = setup();
-        let a = s.codex_artifacts.as_ref().unwrap();
+        let a = s.invocation_artifacts.as_ref().unwrap();
         std::fs::write(&a.stderr_path, b"model \xff rejected\n").unwrap();
         let met = completed(
             &s,
@@ -936,7 +941,7 @@ mod contract_tests {
         );
         assert!(met.is_met(), "stderr is diagnostic only");
         let (_dir, s) = setup();
-        let a = s.codex_artifacts.as_ref().unwrap();
+        let a = s.invocation_artifacts.as_ref().unwrap();
         std::fs::write(&a.stderr_path, b"model \xff rejected\n").unwrap();
         let failed = completed(
             &s,
@@ -950,7 +955,7 @@ mod contract_tests {
     #[test]
     fn artifacts_are_private_absolute_and_in_common_git_directory() {
         let (dir, s) = setup();
-        let a = s.codex_artifacts.unwrap();
+        let a = s.invocation_artifacts.unwrap();
         for p in [
             &a.schema_path,
             &a.journal_path,
@@ -1006,7 +1011,7 @@ mod contract_tests {
         );
         assert!(!repo.join(".git/ironmem").exists());
         let (_d, mut s) = setup();
-        s.codex_artifacts.as_mut().unwrap().final_path = "/tmp/has space/final".into();
+        s.invocation_artifacts.as_mut().unwrap().final_path = "/tmp/has space/final".into();
         assert!(run_codex_bounded(
             Path::new("/missing-binary"),
             dir.path(),
@@ -1029,10 +1034,10 @@ mod contract_tests {
     }
     #[test]
     fn a_spawn_that_never_launched_is_a_durable_infrastructure_failure_not_a_hold() {
-        use crate::autopilot::codex_process::{CodexProcessSnapshot, ProcessRow};
+        use crate::autopilot::process_tree::{ProcessRow, ProcessSnapshot};
         use crate::autopilot::registry::Liveness;
         let (dir, s) = setup();
-        let a = s.codex_artifacts.clone().unwrap();
+        let a = s.invocation_artifacts.clone().unwrap();
         let o = run_codex_bounded(
             Path::new("/missing-binary"),
             dir.path(),
@@ -1048,10 +1053,10 @@ mod contract_tests {
         assert!(has_valid_exit_record(&a));
         let recovered = read_artifacts(&a).unwrap();
         assert!(!recovered.invocation_started && !recovered.is_met());
-        let empty = CodexProcessSnapshot::Available(Vec::new());
+        let empty = ProcessSnapshot::Available(Vec::new());
         assert_eq!(empty.liveness(Some(&a)), Liveness::NotListed);
         // A live process carrying the marker contradicts the record: hold.
-        let live = CodexProcessSnapshot::Available(vec![ProcessRow {
+        let live = ProcessSnapshot::Available(vec![ProcessRow {
             pid: 70,
             ppid: 1,
             pgid: 70,
@@ -1081,7 +1086,7 @@ mod contract_tests {
         assert_eq!(dispatch_timeout(&s), Duration::from_secs(1200));
         s.wall_clock_timeout = Some(Duration::from_millis(15));
         assert_eq!(dispatch_timeout(&s), Duration::from_millis(15));
-        s.codex_artifacts = None;
+        s.invocation_artifacts = None;
         assert!(build_argv(dir.path(), &s).is_err());
         let (_, mut s) = setup();
         s.implementer = Implementer::Claude;
@@ -1136,7 +1141,7 @@ exit {code}"#
         spec: &DispatchSpec,
     ) -> std::process::Child {
         use std::os::unix::process::CommandExt;
-        let a = spec.codex_artifacts.as_ref().unwrap();
+        let a = spec.invocation_artifacts.as_ref().unwrap();
         let mut command = Command::new(bin);
         command
             .args(build_argv(repo, spec).unwrap())
@@ -1147,9 +1152,9 @@ exit {code}"#
             .process_group(0);
         crate::mcp::tools::scrub_git_environment(&mut command);
         let child = super::super::dispatch::retry_on_etxtbsy(|| command.spawn()).unwrap();
-        super::super::codex_process::persist_identity(
+        super::super::process_tree::persist_identity(
             a,
-            &super::super::codex_process::ProcessIdentity {
+            &super::super::process_tree::ProcessIdentity {
                 version: 1,
                 root_pid: child.id(),
                 root_pgid: child.id(),
@@ -1166,7 +1171,7 @@ exit {code}"#
     fn run_observed_fixture(bin: &Path, repo: &Path, spec: &DispatchSpec) -> DispatchOutcome {
         let started = Instant::now();
         let mut child = spawn_fixture_invocation(bin, repo, spec);
-        let mut tracker = super::super::codex_process::ProcessTracker::new(child.id());
+        let mut tracker = super::super::process_tree::ProcessTracker::new(child.id());
         let result = (|| {
             while !repo.join("root-ready").exists() {
                 if child.try_wait()?.is_some() || started.elapsed() >= Duration::from_secs(3) {
@@ -1192,7 +1197,7 @@ exit {code}"#
             };
             finish_codex_dispatch(
                 &mut tracker,
-                spec.codex_artifacts.as_ref().unwrap(),
+                spec.invocation_artifacts.as_ref().unwrap(),
                 spec,
                 status,
                 started,
@@ -1239,7 +1244,7 @@ exit {code}"#
                     .trim(),
                 dir.path().canonicalize().unwrap().to_str().unwrap()
             );
-            let recovered = read_artifacts(s.codex_artifacts.as_ref().unwrap()).unwrap();
+            let recovered = read_artifacts(s.invocation_artifacts.as_ref().unwrap()).unwrap();
             assert_eq!(recovered.is_met(), code == 0);
         }
     }
@@ -1247,11 +1252,11 @@ exit {code}"#
     #[test]
     fn abnormal_exit_before_any_process_observation_holds_even_after_met_output() {
         let (dir, spec) = setup();
-        let a = spec.codex_artifacts.as_ref().unwrap();
+        let a = spec.invocation_artifacts.as_ref().unwrap();
         let bin = binary(dir.path(), &script("", 7));
         let started = Instant::now();
         let mut child = spawn_fixture_invocation(&bin, dir.path(), &spec);
-        let mut tracker = super::super::codex_process::ProcessTracker::new(child.id());
+        let mut tracker = super::super::process_tree::ProcessTracker::new(child.id());
         // Reap first, deliberately making useful root observation impossible.
         // This is the scheduler ordering the old combined fixture assumed away.
         let status = child.wait().unwrap();
@@ -1266,9 +1271,8 @@ exit {code}"#
             .to_string()
             .contains("before process-tree observation"));
         assert!(!has_valid_exit_record(a));
-        let process = super::super::codex_process::snapshot(
-            &mut super::super::codex_process::UnixCodexProcesses,
-        );
+        let process =
+            super::super::process_tree::snapshot(&mut super::super::process_tree::UnixProcesses);
         assert!(process.is_available());
         assert_eq!(
             process.liveness(Some(a)),
@@ -1299,7 +1303,7 @@ exit {code}"#
             ("final", 65 * 1024),
         ] {
             let (dir, s) = setup();
-            let a = s.codex_artifacts.as_ref().unwrap();
+            let a = s.invocation_artifacts.as_ref().unwrap();
             let target = match field {
                 "journal" => a.journal_path.as_str(),
                 "stderr" => a.stderr_path.as_str(),
@@ -1358,7 +1362,7 @@ exit {code}"#
             "an unrequested thread must never replace the caller's native session"
         );
         assert!(o.reason.unwrap().contains("requested"));
-        assert!(!read_artifacts(s.codex_artifacts.as_ref().unwrap())
+        assert!(!read_artifacts(s.invocation_artifacts.as_ref().unwrap())
             .unwrap()
             .is_met());
     }
@@ -1437,7 +1441,7 @@ exit {code}"#
     #[test]
     fn a_tool_started_after_the_last_scan_and_left_running_withholds_completion() {
         let (dir, s) = setup();
-        let a = s.codex_artifacts.as_ref().unwrap();
+        let a = s.invocation_artifacts.as_ref().unwrap();
         let bin = binary(
             dir.path(),
             &script(
@@ -1449,7 +1453,7 @@ exit {code}"#
         );
         let started = Instant::now();
         let mut child = spawn_fixture_invocation(&bin, dir.path(), &s);
-        let mut tracker = super::super::codex_process::ProcessTracker::new(child.id());
+        let mut tracker = super::super::process_tree::ProcessTracker::new(child.id());
         // The supervisor's last scan sees only the root...
         tracker.observe().unwrap();
         std::fs::write(dir.path().join("root-release"), "release").unwrap();
@@ -1479,7 +1483,7 @@ exit {code}"#
         use std::os::unix::process::CommandExt;
 
         let (dir, s) = setup();
-        let a = s.codex_artifacts.as_ref().unwrap();
+        let a = s.invocation_artifacts.as_ref().unwrap();
         let script = format!(
             "(touch descendant-ready; while [ ! -f gate-release ]; do sleep 0.02; done; touch descendant-survived) &\n\
              while [ ! -f root-release ]; do sleep 0.02; done\n\
@@ -1496,7 +1500,7 @@ exit {code}"#
             .process_group(0);
         let mut child = crate::autopilot::dispatch::retry_on_etxtbsy(|| command.spawn()).unwrap();
         let started = Instant::now();
-        let mut tracker = super::super::codex_process::ProcessTracker::new(child.id());
+        let mut tracker = super::super::process_tree::ProcessTracker::new(child.id());
         let ready = dir.path().join("descendant-ready");
         while !ready.exists() && started.elapsed() < Duration::from_secs(3) {
             std::thread::sleep(Duration::from_millis(5));
@@ -1556,7 +1560,7 @@ exit {code}"#
         std::thread::sleep(Duration::from_millis(1200));
         assert!(!dir.path().join("descendant-survived").exists());
         assert!(
-            read_artifacts(s.codex_artifacts.as_ref().unwrap())
+            read_artifacts(s.invocation_artifacts.as_ref().unwrap())
                 .unwrap()
                 .timed_out
         );

@@ -736,7 +736,7 @@ mod tests {
             &DispatchState {
                 implementer: crate::autopilot::implementer::Implementer::Claude,
                 native_session_id: None,
-                codex_artifacts: None,
+                invocation_artifacts: None,
                 issue: issue.clone(),
                 worktree_path: "/tmp/wt".to_string(),
                 ic_session_name: session_name.to_string(),
@@ -1572,7 +1572,7 @@ mod tests {
     }
     #[test]
     fn codex_queue_routes_by_persisted_harness_and_holds_uncertainty() {
-        use crate::autopilot::codex_process::{testing, CodexProcessSnapshot};
+        use crate::autopilot::process_tree::{testing, ProcessSnapshot};
         use crate::autopilot::registry::HarnessSnapshots;
         let db = approved(&[REPO]);
         let issue = IssueRef::new(REPO, 1);
@@ -1583,11 +1583,11 @@ mod tests {
         state.implementer = crate::autopilot::implementer::Implementer::Codex;
         let dir = tempfile::tempdir().unwrap();
         let (a, row) = testing::invocation(dir.path());
-        state.codex_artifacts = Some(a.clone());
+        state.invocation_artifacts = Some(a.clone());
         dispatch_state::upsert_dispatch_state(&db, &state).unwrap();
         let mut snapshots = HarnessSnapshots {
             claude: RegistrySnapshot::Available(Vec::new()),
-            codex: CodexProcessSnapshot::Available(vec![row]),
+            processes: ProcessSnapshot::Available(vec![row]),
         };
         let backlogs = [backlog(REPO, vec![ready(1)])];
         let plan = plan_queue(&db, &backlogs, &snapshots, &config()).unwrap();
@@ -1595,7 +1595,7 @@ mod tests {
             reason_for(&plan, 1),
             DeferReason::SessionLive { .. }
         ));
-        snapshots.codex = CodexProcessSnapshot::Available(Vec::new());
+        snapshots.processes = ProcessSnapshot::Available(Vec::new());
         let plan = plan_queue(&db, &backlogs, &snapshots, &config()).unwrap();
         assert!(matches!(
             reason_for(&plan, 1),
@@ -1616,12 +1616,12 @@ mod tests {
     }
     #[test]
     fn a_condition_too_long_refusal_is_deferred_not_resumed_ahead_of_the_backlog() {
-        use crate::autopilot::codex_process::CodexProcessSnapshot;
         use crate::autopilot::implementer::Implementer;
+        use crate::autopilot::process_tree::ProcessSnapshot;
         use crate::autopilot::registry::HarnessSnapshots;
         let snapshots = HarnessSnapshots {
             claude: RegistrySnapshot::Available(Vec::new()),
-            codex: CodexProcessSnapshot::Available(Vec::new()),
+            processes: ProcessSnapshot::Available(Vec::new()),
         };
         for implementer in [Implementer::Claude, Implementer::Codex] {
             let db = approved(&[REPO]);

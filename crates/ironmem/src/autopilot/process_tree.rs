@@ -11,7 +11,7 @@ use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
-use crate::autopilot::codex_dispatch::CodexArtifacts;
+use crate::autopilot::codex_dispatch::InvocationArtifacts;
 use crate::autopilot::registry::Liveness;
 use crate::error::MemoryError;
 
@@ -124,7 +124,7 @@ fn decode_process_table(output: &[u8]) -> Result<Vec<ProcessRow>, String> {
     if text.trim().is_empty() {
         return Err("ps returned no process table".into());
     }
-    parse_codex_processes(&text)
+    parse_processes(&text)
 }
 
 /// The issue slug an Autopilot marker names: `.../autopilot/<slug>/<uuid>/schema.json`.
@@ -136,7 +136,7 @@ pub(crate) fn marker_issue_slug(marker: &str) -> Option<&str> {
         .and_then(|name| name.to_str())
 }
 
-pub fn parse_codex_processes(text: &str) -> Result<Vec<ProcessRow>, String> {
+pub fn parse_processes(text: &str) -> Result<Vec<ProcessRow>, String> {
     text.lines()
         .filter(|s| !s.trim().is_empty())
         .map(|line| {
@@ -170,17 +170,17 @@ pub fn parse_codex_processes(text: &str) -> Result<Vec<ProcessRow>, String> {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum CodexProcessSnapshot {
+pub enum ProcessSnapshot {
     Available(Vec<ProcessRow>),
     Unavailable { reason: String },
 }
 
-pub trait CodexProcessSource {
+pub trait ProcessSource {
     fn list(&mut self) -> Result<Vec<ProcessRow>, String>;
 }
 
-pub struct UnixCodexProcesses;
-impl CodexProcessSource for UnixCodexProcesses {
+pub struct UnixProcesses;
+impl ProcessSource for UnixProcesses {
     fn list(&mut self) -> Result<Vec<ProcessRow>, String> {
         #[cfg(unix)]
         {
@@ -280,10 +280,10 @@ fn bounded_process_table() -> Result<Vec<u8>, String> {
     result
 }
 
-pub fn snapshot(source: &mut dyn CodexProcessSource) -> CodexProcessSnapshot {
+pub fn snapshot(source: &mut dyn ProcessSource) -> ProcessSnapshot {
     match source.list() {
-        Ok(rows) => CodexProcessSnapshot::Available(rows),
-        Err(reason) => CodexProcessSnapshot::Unavailable { reason },
+        Ok(rows) => ProcessSnapshot::Available(rows),
+        Err(reason) => ProcessSnapshot::Unavailable { reason },
     }
 }
 
@@ -300,12 +300,12 @@ pub(crate) struct ProcessIdentity {
     pub descendants: Vec<ProcessRow>,
 }
 
-fn identity_path(a: &CodexArtifacts) -> std::path::PathBuf {
+fn identity_path(a: &InvocationArtifacts) -> std::path::PathBuf {
     Path::new(&a.schema_path).with_file_name("process.json")
 }
 
 pub(crate) fn persist_identity(
-    a: &CodexArtifacts,
+    a: &InvocationArtifacts,
     identity: &ProcessIdentity,
 ) -> Result<(), MemoryError> {
     super::codex_dispatch::persist_private_atomic(
@@ -315,7 +315,7 @@ pub(crate) fn persist_identity(
     )
 }
 
-pub(crate) fn read_identity(a: &CodexArtifacts) -> Result<ProcessIdentity, String> {
+pub(crate) fn read_identity(a: &InvocationArtifacts) -> Result<ProcessIdentity, String> {
     use std::io::Read;
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
@@ -387,7 +387,7 @@ fn recorded_tree_evidence(
     })
 }
 
-impl CodexProcessSnapshot {
+impl ProcessSnapshot {
     pub fn is_available(&self) -> bool {
         matches!(self, Self::Available(_))
     }
@@ -400,7 +400,7 @@ impl CodexProcessSnapshot {
             }
         }
     }
-    pub fn invocation_reason(&self, artifacts: Option<&CodexArtifacts>) -> String {
+    pub fn invocation_reason(&self, artifacts: Option<&InvocationArtifacts>) -> String {
         let Self::Available(rows) = self else {
             return self.reason();
         };
@@ -441,7 +441,7 @@ impl CodexProcessSnapshot {
         }
         "Codex supervisor completion verified".into()
     }
-    pub fn liveness(&self, artifacts: Option<&CodexArtifacts>) -> Liveness {
+    pub fn liveness(&self, artifacts: Option<&InvocationArtifacts>) -> Liveness {
         let Self::Available(rows) = self else {
             return Liveness::Unknown;
         };
@@ -499,7 +499,7 @@ impl CodexProcessSnapshot {
     pub fn live_evidence(
         &self,
         issue_slug: &str,
-        artifacts: Option<&CodexArtifacts>,
+        artifacts: Option<&InvocationArtifacts>,
     ) -> Option<String> {
         let Self::Available(rows) = self else {
             return Some(self.reason());
@@ -702,7 +702,7 @@ impl ProcessTracker {
         }
     }
     fn rows() -> Result<Vec<ProcessRow>, MemoryError> {
-        UnixCodexProcesses.list().map_err(MemoryError::Validation)
+        UnixProcesses.list().map_err(MemoryError::Validation)
     }
 
     pub(crate) fn observe(&mut self) -> Result<Vec<ProcessRow>, MemoryError> {
@@ -1006,9 +1006,9 @@ impl ProcessTracker {
 #[cfg(test)]
 pub(crate) mod testing {
     use super::*;
-    pub(crate) fn invocation(dir: &Path) -> (CodexArtifacts, ProcessRow) {
+    pub(crate) fn invocation(dir: &Path) -> (InvocationArtifacts, ProcessRow) {
         let path = |name: &str| dir.join(name).to_str().unwrap().to_owned();
-        let a = CodexArtifacts {
+        let a = InvocationArtifacts {
             invocation_id: "invocation".into(),
             schema_path: path("schema.json"),
             journal_path: path("journal.jsonl"),
@@ -1037,7 +1037,7 @@ pub(crate) mod testing {
         };
         (a, row)
     }
-    pub(crate) fn complete(a: &CodexArtifacts) {
+    pub(crate) fn complete(a: &InvocationArtifacts) {
         std::fs::write(&a.exit_path, serde_json::to_vec(&serde_json::json!({"exit_code":0,"timed_out":false,"limit_exceeded":null,"completion":{"version":1,"invocation_id":a.invocation_id,"schema_path":a.schema_path}})).unwrap()).unwrap();
     }
 }
@@ -1049,29 +1049,29 @@ mod tests {
     fn source_failures_malformed_identity_and_absent_completion_hold() {
         let dir = tempfile::tempdir().unwrap();
         let (a, row) = testing::invocation(dir.path());
-        let empty = CodexProcessSnapshot::Available(Vec::new());
+        let empty = ProcessSnapshot::Available(Vec::new());
         assert_eq!(empty.liveness(Some(&a)), Liveness::Unknown);
         assert_eq!(
-            CodexProcessSnapshot::Available(vec![row.clone()]).liveness(Some(&a)),
+            ProcessSnapshot::Available(vec![row.clone()]).liveness(Some(&a)),
             Liveness::Alive
         );
         testing::complete(&a);
         assert_eq!(empty.liveness(Some(&a)), Liveness::NotListed);
         assert_eq!(
-            CodexProcessSnapshot::Available(vec![row.clone()]).liveness(Some(&a)),
+            ProcessSnapshot::Available(vec![row.clone()]).liveness(Some(&a)),
             Liveness::Alive,
             "live process beats an exit record"
         );
         let mut zombie = row.clone();
         zombie.stat = "Z".into();
         assert_eq!(
-            CodexProcessSnapshot::Available(vec![zombie]).liveness(Some(&a)),
+            ProcessSnapshot::Available(vec![zombie]).liveness(Some(&a)),
             Liveness::NotListed
         );
         let mut mismatched = row.clone();
         mismatched.pid += 1;
         mismatched.pgid += 1;
-        assert!(CodexProcessSnapshot::Available(vec![mismatched])
+        assert!(ProcessSnapshot::Available(vec![mismatched])
             .invocation_reason(Some(&a))
             .contains("marker"));
         // The exit record proves the supervisor reaped the root, so its PID
@@ -1079,7 +1079,7 @@ mod tests {
         let mut reused = row;
         reused.args = "unrelated".into();
         assert_eq!(
-            CodexProcessSnapshot::Available(vec![reused]).liveness(Some(&a)),
+            ProcessSnapshot::Available(vec![reused]).liveness(Some(&a)),
             Liveness::NotListed
         );
         assert!(empty.invocation_reason(Some(&a)).contains("completion"));
@@ -1091,13 +1091,13 @@ mod tests {
         std::fs::remove_file(identity_path(&a)).unwrap();
         assert_eq!(empty.liveness(Some(&a)), Liveness::Unknown);
         struct Failed;
-        impl CodexProcessSource for Failed {
+        impl ProcessSource for Failed {
             fn list(&mut self) -> Result<Vec<ProcessRow>, String> {
                 Err("source failed".into())
             }
         }
         assert_eq!(snapshot(&mut Failed).liveness(Some(&a)), Liveness::Unknown);
-        assert!(parse_codex_processes("partial row").is_err());
+        assert!(parse_processes("partial row").is_err());
     }
     #[test]
     fn an_unrelated_non_utf8_argv_neither_hides_nor_fails_the_process_table() {
@@ -1115,7 +1115,7 @@ mod tests {
     #[test]
     fn an_unparseable_codex_command_is_ambiguous_only_if_it_could_carry_a_marker() {
         let marker = |args: &str| {
-            parse_codex_processes(&format!("30 1 30 S {args}\n")).unwrap()[0]
+            parse_processes(&format!("30 1 30 S {args}\n")).unwrap()[0]
                 .marker()
                 .map(|m| m.map(str::to_owned))
         };
@@ -1142,7 +1142,7 @@ mod tests {
         let mut identity = read_identity(&a).unwrap();
         identity.descendants.push(child.clone());
         persist_identity(&a, &identity).unwrap();
-        let live = |rows: Vec<ProcessRow>| CodexProcessSnapshot::Available(rows).liveness(Some(&a));
+        let live = |rows: Vec<ProcessRow>| ProcessSnapshot::Available(rows).liveness(Some(&a));
         let row = |pid, pgid| ProcessRow {
             pid,
             ppid: 1,
@@ -1176,8 +1176,8 @@ mod tests {
     }
     #[test]
     fn orphan_detection_requires_the_autopilot_invocation_layout() {
-        let rows = parse_codex_processes("10 1 10 S codex exec --output-schema /tmp/ironmem/autopilot/schema.json prompt\n11 1 11 S codex exec --output-schema /tmp/reviewer-schema.json prompt\n12 1 12 S codex exec --output-schema /tmp/.git/ironmem/autopilot/owner-repo-42/11111111-2222-3333-4444-555555555555/schema.json prompt\n").unwrap();
-        assert_eq!(CodexProcessSnapshot::Available(rows).orphan_markers(), vec!["/tmp/.git/ironmem/autopilot/owner-repo-42/11111111-2222-3333-4444-555555555555/schema.json"]);
+        let rows = parse_processes("10 1 10 S codex exec --output-schema /tmp/ironmem/autopilot/schema.json prompt\n11 1 11 S codex exec --output-schema /tmp/reviewer-schema.json prompt\n12 1 12 S codex exec --output-schema /tmp/.git/ironmem/autopilot/owner-repo-42/11111111-2222-3333-4444-555555555555/schema.json prompt\n").unwrap();
+        assert_eq!(ProcessSnapshot::Available(rows).orphan_markers(), vec!["/tmp/.git/ironmem/autopilot/owner-repo-42/11111111-2222-3333-4444-555555555555/schema.json"]);
     }
 
     #[test]
@@ -1212,7 +1212,7 @@ mod tests {
         wire.as_object_mut().unwrap().remove("version");
         std::fs::write(identity_path(&a), serde_json::to_vec(&wire).unwrap()).unwrap();
         assert_eq!(
-            CodexProcessSnapshot::Available(Vec::new()).liveness(Some(&a)),
+            ProcessSnapshot::Available(Vec::new()).liveness(Some(&a)),
             Liveness::Unknown
         );
     }
@@ -1246,7 +1246,7 @@ mod tests {
         }
         let cleanup = Cleanup(child_pid, birth(child_pid).unwrap());
         let (a, _) = testing::invocation(dir.path());
-        let rows = UnixCodexProcesses.list().unwrap();
+        let rows = UnixProcesses.list().unwrap();
         let child_row = rows.iter().find(|r| r.pid == child_pid).unwrap().clone();
         assert!(child_row.active());
         assert_ne!(child_row.pgid, root_pid);
@@ -1268,14 +1268,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            CodexProcessSnapshot::Available(rows).liveness(Some(&a)),
+            ProcessSnapshot::Available(rows).liveness(Some(&a)),
             Liveness::Unknown
         );
         drop(cleanup);
         // Even a later empty process view cannot supply missing historical
         // supervisor completion evidence after the controller disappeared.
         assert_eq!(
-            CodexProcessSnapshot::Available(Vec::new()).liveness(Some(&a)),
+            ProcessSnapshot::Available(Vec::new()).liveness(Some(&a)),
             Liveness::Unknown
         );
     }
@@ -1467,7 +1467,7 @@ mod tests {
         const CHILD: &str = "IRONMEM_BOUNDED_PS_TEST_CHILD";
         if std::env::var_os(CHILD).is_some() {
             let started = Instant::now();
-            let error = UnixCodexProcesses.list().unwrap_err();
+            let error = UnixProcesses.list().unwrap_err();
             assert!(error.contains("exceeded"), "{error}");
             assert!(started.elapsed() < Duration::from_secs(5));
             return;
@@ -1484,7 +1484,7 @@ mod tests {
         let mut child = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "autopilot::codex_process::tests::hung_ps_is_bounded_in_an_isolated_environment",
+                "autopilot::process_tree::tests::hung_ps_is_bounded_in_an_isolated_environment",
                 "--nocapture",
             ])
             .env(CHILD, "1")

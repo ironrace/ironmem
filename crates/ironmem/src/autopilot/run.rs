@@ -87,7 +87,7 @@ use std::path::Path;
 use crate::db::schema::Database;
 use crate::error::MemoryError;
 
-use super::codex_dispatch::{self, CodexArtifacts, CodexRecovery};
+use super::codex_dispatch::{self, InvocationArtifacts, InvocationRecovery};
 use super::dispatch::{self, DispatchOutcome, DispatchSpec, SessionMode, Verdict};
 use super::implementer::Implementer;
 use super::worktree::Worktree;
@@ -595,8 +595,8 @@ pub trait Dispatcher {
         &mut self,
         _repo: &Path,
         _state: &DispatchState,
-    ) -> Result<CodexRecovery, MemoryError> {
-        Ok(CodexRecovery::NoPriorInvocation)
+    ) -> Result<InvocationRecovery, MemoryError> {
+        Ok(InvocationRecovery::NoPriorInvocation)
     }
 
     fn dispatch(
@@ -654,17 +654,16 @@ impl Dispatcher for CodexDispatcher {
         &mut self,
         _repo: &Path,
         state: &DispatchState,
-    ) -> Result<CodexRecovery, MemoryError> {
-        let snapshot =
-            super::codex_process::snapshot(&mut super::codex_process::UnixCodexProcesses);
-        match super::registry::codex_state_liveness(&snapshot, state) {
-            super::registry::Liveness::Alive => Ok(CodexRecovery::Alive),
-            super::registry::Liveness::NotListed => match state.codex_artifacts.as_ref() {
+    ) -> Result<InvocationRecovery, MemoryError> {
+        let snapshot = super::process_tree::snapshot(&mut super::process_tree::UnixProcesses);
+        match super::registry::invocation_state_liveness(&snapshot, state) {
+            super::registry::Liveness::Alive => Ok(InvocationRecovery::Alive),
+            super::registry::Liveness::NotListed => match state.invocation_artifacts.as_ref() {
                 Some(artifacts) => codex_dispatch::recover_artifacts(Some(artifacts)),
-                None => Ok(CodexRecovery::NoPriorInvocation),
+                None => Ok(InvocationRecovery::NoPriorInvocation),
             },
-            super::registry::Liveness::Unknown => Ok(CodexRecovery::Unknown {
-                reason: super::registry::codex_state_reason(&snapshot, state),
+            super::registry::Liveness::Unknown => Ok(InvocationRecovery::Unknown {
+                reason: super::registry::invocation_state_reason(&snapshot, state),
             }),
         }
     }
@@ -1014,20 +1013,20 @@ pub fn preflight_worktree_provisioning(
         return Ok(());
     }
     match dispatcher.recover(Path::new(&state.worktree_path), &state)? {
-        CodexRecovery::Alive => Err(MemoryError::Validation(format!(
+        InvocationRecovery::Alive => Err(MemoryError::Validation(format!(
             "cannot provision {} while its Codex implementation is still alive",
             issue.canonical()
         ))),
-        CodexRecovery::Unknown { reason } => Err(MemoryError::Validation(format!(
+        InvocationRecovery::Unknown { reason } => Err(MemoryError::Validation(format!(
             "cannot provision {} while Codex process completion is uncertain: {reason}; \
              once no process remains, `ironmem autopilot clear-dispatch {} {}` releases it",
             issue.canonical(),
             issue.repo,
             issue.number
         ))),
-        CodexRecovery::Finished(_) => Ok(()),
-        CodexRecovery::NoPriorInvocation if state.codex_artifacts.is_none() => Ok(()),
-        CodexRecovery::NoPriorInvocation => Err(MemoryError::Validation(
+        InvocationRecovery::Finished(_) => Ok(()),
+        InvocationRecovery::NoPriorInvocation if state.invocation_artifacts.is_none() => Ok(()),
+        InvocationRecovery::NoPriorInvocation => Err(MemoryError::Validation(
             "Codex recovery returned no invocation for persisted artifacts; process completion \
              is unproven"
                 .into(),
@@ -1055,19 +1054,19 @@ fn recover_invocation(
     cumulative_attempt_n: u32,
     wall_clock_timeout_secs: Option<u64>,
     native_session_id: &mut Option<String>,
-    codex_artifacts: &mut Option<CodexArtifacts>,
+    invocation_artifacts: &mut Option<InvocationArtifacts>,
 ) -> Result<Recovered, MemoryError> {
     match dispatcher.recover(&worktree.path, state)? {
-        recovery @ (CodexRecovery::Alive | CodexRecovery::Unknown { .. }) => {
+        recovery @ (InvocationRecovery::Alive | InvocationRecovery::Unknown { .. }) => {
             let detail = match recovery {
-                CodexRecovery::Unknown { reason } => format!(
+                InvocationRecovery::Unknown { reason } => format!(
                     "{reason}; once no process remains, `ironmem autopilot \
                      clear-dispatch {} {}` releases it",
                     issue.repo, issue.number
                 ),
                 _ => "Codex implementation is still alive".into(),
             };
-            let unpriced_dispatches = match &state.codex_artifacts {
+            let unpriced_dispatches = match &state.invocation_artifacts {
                 Some(artifacts) => u32::from(budget::has_unpriced_dispatch_reservation(
                     db,
                     &artifacts.invocation_id,
@@ -1084,7 +1083,7 @@ fn recover_invocation(
                 wall_clock_timeout_secs,
             }))
         }
-        CodexRecovery::Finished(outcome) => {
+        InvocationRecovery::Finished(outcome) => {
             if state.attempt_n < cumulative_attempt_n {
                 // The lineage/status write completed before the Lead crashed
                 // clearing this artifact. Its terminal Impossible decision
@@ -1122,16 +1121,16 @@ fn recover_invocation(
                     *native_session_id =
                         outcome.native_session_id.filter(|id| !id.trim().is_empty());
                 }
-                *codex_artifacts = None;
+                *invocation_artifacts = None;
                 Ok(Recovered::Continue(None))
             } else {
                 Ok(Recovered::Continue(Some(outcome)))
             }
         }
-        CodexRecovery::NoPriorInvocation if state.codex_artifacts.is_none() => {
+        InvocationRecovery::NoPriorInvocation if state.invocation_artifacts.is_none() => {
             Ok(Recovered::Continue(None))
         }
-        CodexRecovery::NoPriorInvocation => Err(MemoryError::Validation(
+        InvocationRecovery::NoPriorInvocation => Err(MemoryError::Validation(
             "Codex recovery returned no invocation for persisted artifacts; process \
              completion is unproven"
                 .into(),
@@ -1218,9 +1217,9 @@ pub fn run_issue(
     let mut native_session_id = existing_state
         .as_ref()
         .and_then(|s| s.native_session_id.clone());
-    let mut codex_artifacts = existing_state
+    let mut invocation_artifacts = existing_state
         .as_ref()
-        .and_then(|s| s.codex_artifacts.clone());
+        .and_then(|s| s.invocation_artifacts.clone());
     let mut recovered_outcome = None;
     if let Some(state) = existing_state
         .as_ref()
@@ -1235,7 +1234,7 @@ pub fn run_issue(
             cumulative_attempt_n,
             wall_clock_timeout_secs,
             &mut native_session_id,
-            &mut codex_artifacts,
+            &mut invocation_artifacts,
         )? {
             Recovered::Done(run) => return Ok(run),
             Recovered::Continue(outcome) => recovered_outcome = outcome,
@@ -1259,37 +1258,38 @@ pub fn run_issue(
     // is no longer fixed for the life of a run: a dispatch that concludes its
     // goal loop rotates it (see the rotation below), and the drawer must
     // record the uuid the *next* dispatch will use, not the spent one.
-    let write_state = |db: &Database,
-                       attempt_n: u32,
-                       turn_n: u32,
-                       state: &str,
-                       session_uuid: &str,
-                       session_claimed: bool,
-                       identity: (&Option<String>, &Option<CodexArtifacts>)| {
-        dispatch_state::upsert_dispatch_state(
-            db,
-            &DispatchState {
-                implementer: config.implementer,
-                native_session_id: if config.implementer.assigns_own_session_id() {
-                    identity.0.clone()
-                } else {
-                    Some(session_uuid.to_string())
+    let write_state =
+        |db: &Database,
+         attempt_n: u32,
+         turn_n: u32,
+         state: &str,
+         session_uuid: &str,
+         session_claimed: bool,
+         identity: (&Option<String>, &Option<InvocationArtifacts>)| {
+            dispatch_state::upsert_dispatch_state(
+                db,
+                &DispatchState {
+                    implementer: config.implementer,
+                    native_session_id: if config.implementer.assigns_own_session_id() {
+                        identity.0.clone()
+                    } else {
+                        Some(session_uuid.to_string())
+                    },
+                    invocation_artifacts: identity.1.clone(),
+                    issue: issue.clone(),
+                    worktree_path: worktree_path.clone(),
+                    ic_session_name: ic_session_name.clone(),
+                    dispatch_class: config.dispatch_class.clone(),
+                    attempt_n,
+                    state: state.to_string(),
+                    started_at: started_at.clone(),
+                    session_uuid: session_uuid.to_string(),
+                    turn_n,
+                    session_claimed,
                 },
-                codex_artifacts: identity.1.clone(),
-                issue: issue.clone(),
-                worktree_path: worktree_path.clone(),
-                ic_session_name: ic_session_name.clone(),
-                dispatch_class: config.dispatch_class.clone(),
-                attempt_n,
-                state: state.to_string(),
-                started_at: started_at.clone(),
-                session_uuid: session_uuid.to_string(),
-                turn_n,
-                session_claimed,
-            },
-        )
-        .map(|_| ())
-    };
+            )
+            .map(|_| ())
+        };
 
     // A recovering harness publishes each invocation just before it launches.
     if !config.implementer.recovers_invocations() {
@@ -1300,7 +1300,7 @@ pub fn run_issue(
             "dispatching",
             &session_uuid,
             resuming,
-            (&native_session_id, &codex_artifacts),
+            (&native_session_id, &invocation_artifacts),
         )?;
     }
 
@@ -1420,7 +1420,7 @@ pub fn run_issue(
                         "paused-condition-too-long",
                         &session_uuid,
                         resuming,
-                        (&native_session_id, &codex_artifacts),
+                        (&native_session_id, &invocation_artifacts),
                     )?;
                     return Err(MemoryError::Validation(e.to_string()));
                 }
@@ -1429,11 +1429,11 @@ pub fn run_issue(
             let prepared_artifacts = if config.implementer.recovers_invocations() {
                 Some(codex_dispatch::prepare_artifacts(&worktree.path, issue)?)
             } else {
-                codex_artifacts.clone()
+                invocation_artifacts.clone()
             };
             let spec = DispatchSpec {
                 implementer: config.implementer,
-                codex_artifacts: prepared_artifacts,
+                invocation_artifacts: prepared_artifacts,
                 session: if config.implementer.assigns_own_session_id() {
                     match &native_session_id {
                         Some(id) => SessionMode::Resume {
@@ -1465,8 +1465,8 @@ pub fn run_issue(
                 // invocation or charging unknown spend. Definite input errors
                 // prove no process launched and must leave prior state intact.
                 codex_dispatch::build_argv(&worktree.path, &spec)?;
-                if let Some(artifacts) = &spec.codex_artifacts {
-                    codex_artifacts = Some(artifacts.clone());
+                if let Some(artifacts) = &spec.invocation_artifacts {
+                    invocation_artifacts = Some(artifacts.clone());
                     write_state(
                         db,
                         cumulative_attempt_n,
@@ -1474,7 +1474,7 @@ pub fn run_issue(
                         "dispatching",
                         &session_uuid,
                         resuming,
-                        (&native_session_id, &codex_artifacts),
+                        (&native_session_id, &invocation_artifacts),
                     )?;
                     budget::reserve_unpriced_dispatch(db, &today_utc(), &artifacts.invocation_id)?;
                     unpriced_dispatches += 1;
@@ -1532,7 +1532,7 @@ pub fn run_issue(
                     "infrastructure-failure",
                     &session_uuid,
                     resuming,
-                    (&native_session_id, &codex_artifacts),
+                    (&native_session_id, &invocation_artifacts),
                 )?;
                 if consecutive_infrastructure_failures
                     >= config.max_consecutive_infrastructure_failures
@@ -1554,7 +1554,7 @@ pub fn run_issue(
             if recovered {
                 unpriced_dispatches += 1;
             }
-            codex_artifacts = None;
+            invocation_artifacts = None;
         }
         if config.implementer.assigns_own_session_id() {
             // An invocation that never launched has no thread to check, and
@@ -1719,7 +1719,7 @@ pub fn run_issue(
                     "dispatching",
                     &session_uuid,
                     resuming,
-                    (&native_session_id, &codex_artifacts),
+                    (&native_session_id, &invocation_artifacts),
                 )?;
             }
             DispatchClassification::InfrastructureFailure => {
@@ -1730,7 +1730,7 @@ pub fn run_issue(
                     "infrastructure-failure",
                     &session_uuid,
                     resuming,
-                    (&native_session_id, &codex_artifacts),
+                    (&native_session_id, &invocation_artifacts),
                 )?;
                 if consecutive_infrastructure_failures
                     >= config.max_consecutive_infrastructure_failures
@@ -1757,7 +1757,7 @@ pub fn run_issue(
             state_label,
             &session_uuid,
             resuming,
-            (&native_session_id, &codex_artifacts),
+            (&native_session_id, &invocation_artifacts),
         )?;
     }
 
@@ -1782,7 +1782,7 @@ mod tests {
         let db = approved_db();
         let (_dir, wt) = fixture_worktree();
         let mut state = pending_codex(&db, &wt, Some("invalid-native-uuid"));
-        state.codex_artifacts = None;
+        state.invocation_artifacts = None;
         state.state = "previous-safe-state".into();
         dispatch_state::upsert_dispatch_state(&db, &state).unwrap();
         let ledger =
@@ -1806,8 +1806,8 @@ mod tests {
     #[test]
     fn held_codex_reports_only_its_existing_reservation_including_prior_days() {
         for recovery in [
-            CodexRecovery::Alive,
-            CodexRecovery::Unknown {
+            InvocationRecovery::Alive,
+            InvocationRecovery::Unknown {
                 reason: "unproven completion".into(),
             },
         ] {
@@ -1815,7 +1815,7 @@ mod tests {
                 let db = approved_db();
                 let (_dir, wt) = fixture_worktree();
                 let state = pending_codex(&db, &wt, None);
-                let id = &state.codex_artifacts.as_ref().unwrap().invocation_id;
+                let id = &state.invocation_artifacts.as_ref().unwrap().invocation_id;
                 let unrelated =
                     budget::reserve_unpriced_dispatch(&db, &today_utc(), "unrelated-invocation")
                         .unwrap();
@@ -1876,7 +1876,7 @@ mod tests {
         let mut result = not_met();
         result.cost_usd = None;
         let mut d = codex_script(vec![]);
-        d.recovery = Some(CodexRecovery::Finished(result));
+        d.recovery = Some(InvocationRecovery::Finished(result));
         let run = run_issue(&db, &issue(), &brief(), &wt, &c, &mut d).unwrap();
         let attempts = lineage::attempts_for_issue(&db, &issue()).unwrap();
         assert_eq!(
@@ -1936,10 +1936,10 @@ mod tests {
         std::fs::write(first.path.join("dirty.txt"), "unfinished").unwrap();
         let fresh = worktree::ensure_worktree(repo.path(), roots.path(), &issue(), "HEAD").unwrap();
         assert!(fresh.quarantined_from.is_some());
-        let artifacts = state.codex_artifacts.as_ref().unwrap();
+        let artifacts = state.invocation_artifacts.as_ref().unwrap();
         assert!(Path::new(&artifacts.journal_path).is_file());
         let mut d = codex_script(vec![]);
-        d.recovery = Some(CodexRecovery::Alive);
+        d.recovery = Some(InvocationRecovery::Alive);
         let run = run_issue(&db, &issue(), &brief(), &fresh, &codex_config(), &mut d).unwrap();
         assert!(matches!(
             run.terminal,
@@ -1960,7 +1960,7 @@ mod tests {
             let ledger = budget::reserve_unpriced_dispatch(
                 &db,
                 &today_utc(),
-                &state.codex_artifacts.as_ref().unwrap().invocation_id,
+                &state.invocation_artifacts.as_ref().unwrap().invocation_id,
             )
             .unwrap();
             let mut result = impossible();
@@ -1982,7 +1982,7 @@ mod tests {
             let attempts = lineage::attempts_for_issue(&db, &issue()).unwrap();
             let status = lineage::get_issue_status(&db, &issue()).unwrap();
             let mut d = codex_script(vec![met()]);
-            d.recovery = Some(CodexRecovery::Finished(result.clone()));
+            d.recovery = Some(InvocationRecovery::Finished(result.clone()));
             let run = run_issue(&db, &issue(), &brief(), &wt, &codex_config(), &mut d).unwrap();
             assert_eq!(
                 run.terminal,
@@ -2047,7 +2047,7 @@ mod tests {
             budget::reserve_unpriced_dispatch(
                 &db,
                 &today_utc(),
-                &state.codex_artifacts.as_ref().unwrap().invocation_id,
+                &state.invocation_artifacts.as_ref().unwrap().invocation_id,
             )
             .unwrap();
             record_and_advance(
@@ -2066,7 +2066,7 @@ mod tests {
             .unwrap();
             result.cost_usd = None;
             let mut d = codex_script(vec![met()]);
-            d.recovery = Some(CodexRecovery::Finished(result));
+            d.recovery = Some(InvocationRecovery::Finished(result));
             let run = run_issue(&db, &issue(), &brief(), &wt, &codex_config(), &mut d).unwrap();
             assert!(matches!(run.terminal, TerminalReason::Met { .. }));
             assert_eq!(run.cumulative_attempt_n, 2);
@@ -2104,7 +2104,7 @@ mod tests {
         let mut result = not_met();
         result.cost_usd = None;
         let mut d = codex_script(vec![]);
-        d.recovery = Some(CodexRecovery::Finished(result));
+        d.recovery = Some(InvocationRecovery::Finished(result));
         let run = run_issue(&db, &issue(), &brief(), &wt, &c, &mut d).unwrap();
         assert!(matches!(run.terminal, TerminalReason::AttemptCapExhausted));
         assert_eq!(
@@ -2113,7 +2113,11 @@ mod tests {
         );
         assert!(run.dispatches.is_empty());
         assert!(d.inner.seen.is_empty());
-        assert!(state.codex_artifacts.unwrap().journal_path.starts_with('/'));
+        assert!(state
+            .invocation_artifacts
+            .unwrap()
+            .journal_path
+            .starts_with('/'));
     }
     #[cfg(unix)]
     #[test]
@@ -2142,16 +2146,16 @@ sleep 0.5
         let state = pending_codex(&db, &wt, None);
         assert!(matches!(
             d.recover(&wt.path, &state).unwrap(),
-            CodexRecovery::Unknown { .. }
+            InvocationRecovery::Unknown { .. }
         ));
         std::fs::write(
-            &state.codex_artifacts.as_ref().unwrap().exit_path,
+            &state.invocation_artifacts.as_ref().unwrap().exit_path,
             "not-json",
         )
         .unwrap();
         assert!(matches!(
             d.recover(&wt.path, &state).unwrap(),
-            CodexRecovery::Unknown { .. }
+            InvocationRecovery::Unknown { .. }
         ));
         dispatch_state::clear_dispatch_state(&db, &issue()).unwrap();
         let run = run_issue(&db, &issue(), &brief(), &wt, &codex_config(), &mut d).unwrap();
@@ -2162,7 +2166,7 @@ sleep 0.5
     }
     struct CodexScript {
         inner: ScriptedDispatcher,
-        recovery: Option<super::super::codex_dispatch::CodexRecovery>,
+        recovery: Option<super::super::codex_dispatch::InvocationRecovery>,
     }
     impl Dispatcher for CodexScript {
         fn implementer(&self) -> Implementer {
@@ -2172,11 +2176,11 @@ sleep 0.5
             &mut self,
             _repo: &Path,
             _state: &DispatchState,
-        ) -> Result<CodexRecovery, MemoryError> {
+        ) -> Result<InvocationRecovery, MemoryError> {
             Ok(self
                 .recovery
                 .take()
-                .unwrap_or(CodexRecovery::NoPriorInvocation))
+                .unwrap_or(InvocationRecovery::NoPriorInvocation))
         }
         fn dispatch(
             &mut self,
@@ -2212,7 +2216,7 @@ sleep 0.5
         let state = DispatchState {
             implementer: Implementer::Codex,
             native_session_id: native.map(str::to_string),
-            codex_artifacts: Some(artifacts),
+            invocation_artifacts: Some(artifacts),
             issue: issue(),
             worktree_path: worktree.path.to_string_lossy().into_owned(),
             ic_session_name: "ic".into(),
@@ -2238,8 +2242,8 @@ sleep 0.5
             matches!(&d.inner.seen[1].session, SessionMode::Resume { session_uuid } if session_uuid == "11111111-2222-3333-4444-555555555555")
         );
         assert_ne!(
-            d.inner.seen[0].codex_artifacts,
-            d.inner.seen[1].codex_artifacts
+            d.inner.seen[0].invocation_artifacts,
+            d.inner.seen[1].invocation_artifacts
         );
         assert_eq!(run.unpriced_dispatches, 2);
         assert_eq!(run.total_cost_usd, 0.0);
@@ -2283,8 +2287,8 @@ sleep 0.5
     #[test]
     fn codex_recovery_hold_preserves_exact_artifacts_and_never_dispatches() {
         for recovery in [
-            CodexRecovery::Alive,
-            CodexRecovery::Unknown {
+            InvocationRecovery::Alive,
+            InvocationRecovery::Unknown {
                 reason: "not proven dead".into(),
             },
         ] {
@@ -2320,7 +2324,7 @@ sleep 0.5
         let mut result = met();
         result.cost_usd = None;
         let mut d = codex_script(vec![]);
-        d.recovery = Some(CodexRecovery::Finished(result));
+        d.recovery = Some(InvocationRecovery::Finished(result));
         let run = run_issue(&db, &issue(), &brief(), &wt, &c, &mut d).unwrap();
         assert!(matches!(run.terminal, TerminalReason::Met { .. }));
         assert!(d.inner.seen.is_empty());
@@ -2386,7 +2390,7 @@ sleep 0.5
             result.native_session_id = native.map(str::to_string);
             result.cost_usd = None;
             let mut d = codex_script(vec![]);
-            d.recovery = Some(CodexRecovery::Finished(result));
+            d.recovery = Some(InvocationRecovery::Finished(result));
             let mut c = codex_config();
             c.max_consecutive_infrastructure_failures = 1;
             let run = run_issue(&db, &issue(), &brief(), &wt, &c, &mut d).unwrap();
@@ -2399,7 +2403,7 @@ sleep 0.5
                 .unwrap()
                 .unwrap();
             assert_eq!(state.native_session_id.as_deref(), Some("persisted"));
-            assert!(state.codex_artifacts.is_none());
+            assert!(state.invocation_artifacts.is_none());
         }
     }
     /// A dispatcher that replays a scripted list of outcomes, recording the
@@ -4261,8 +4265,8 @@ satisfies it on its own"
     }
     #[test]
     fn completed_codex_pauses_reenter_queue_and_resume_native_identity_once() {
-        use crate::autopilot::codex_process::CodexProcessSnapshot;
         use crate::autopilot::gh::IssueListing;
+        use crate::autopilot::process_tree::ProcessSnapshot;
         use crate::autopilot::queue::{plan_queue, QueueConfig, RepoBacklog};
         use crate::autopilot::registry::{HarnessSnapshots, RegistrySnapshot};
         use crate::autopilot::supervise::{reconcile, ReconcileVerdict};
@@ -4284,11 +4288,16 @@ satisfies it on its own"
                 let state = dispatch_state::get_dispatch_state(self.db, &issue())?.unwrap();
                 assert_eq!(state.state, "dispatching");
                 assert_eq!(
-                    state.codex_artifacts, spec.codex_artifacts,
+                    state.invocation_artifacts, spec.invocation_artifacts,
                     "pending invocation is durable before launch"
                 );
-                self.invocation =
-                    Some(spec.codex_artifacts.as_ref().unwrap().invocation_id.clone());
+                self.invocation = Some(
+                    spec.invocation_artifacts
+                        .as_ref()
+                        .unwrap()
+                        .invocation_id
+                        .clone(),
+                );
                 if self.spend_after {
                     budget::accumulate_daily_spend(self.db, &today_utc(), 1.5)?;
                 }
@@ -4350,7 +4359,7 @@ satisfies it on its own"
                     "paused-infrastructure-failure"
                 }
             );
-            assert!(state.codex_artifacts.is_none());
+            assert!(state.invocation_artifacts.is_none());
             let native = state.native_session_id.clone().unwrap();
             assert_eq!(native, "11111111-2222-3333-4444-555555555555");
             let ledger = budget::get_daily_spend(&db, &today_utc()).unwrap().unwrap();
@@ -4363,7 +4372,7 @@ satisfies it on its own"
                 claude: RegistrySnapshot::Unavailable {
                     reason: "Claude unrelated".into(),
                 },
-                codex: CodexProcessSnapshot::Available(Vec::new()),
+                processes: ProcessSnapshot::Available(Vec::new()),
             };
             let backlog = [RepoBacklog {
                 repo: issue().repo,
@@ -4400,7 +4409,7 @@ satisfies it on its own"
             cfg.daily_budget_usd = 4.0;
             cfg.max_unpriced_dispatches_per_day = 2;
             let mut resumed = codex_script(vec![met()]);
-            resumed.recovery = Some(CodexRecovery::NoPriorInvocation);
+            resumed.recovery = Some(InvocationRecovery::NoPriorInvocation);
             let result = run_issue(&db, &issue(), &brief(), &wt, &cfg, &mut resumed).unwrap();
             assert!(matches!(result.terminal, TerminalReason::Met { .. }));
             assert_eq!(result.unpriced_dispatches, 1);
@@ -4413,7 +4422,7 @@ satisfies it on its own"
             assert_eq!(
                 after.reserved_unpriced_dispatch_ids[1],
                 resumed.inner.seen[0]
-                    .codex_artifacts
+                    .invocation_artifacts
                     .as_ref()
                     .unwrap()
                     .invocation_id

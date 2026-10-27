@@ -35,7 +35,7 @@ use serde::Deserialize;
 
 use crate::error::MemoryError;
 
-pub use super::codex_dispatch::CodexArtifacts;
+pub use super::codex_dispatch::InvocationArtifacts;
 use super::implementer::Implementer;
 use super::IssueRef;
 
@@ -68,7 +68,7 @@ impl SessionMode {
 #[derive(Debug, Clone, PartialEq)]
 pub struct DispatchSpec {
     pub implementer: Implementer,
-    pub codex_artifacts: Option<CodexArtifacts>,
+    pub invocation_artifacts: Option<InvocationArtifacts>,
     pub session: SessionMode,
     /// `--name`, giving the IC a deterministic address for `ListAgents` and
     /// the abort path. See [`ic_name`] for how this is derived from an issue.
@@ -322,7 +322,7 @@ pub fn run_dispatch(
 }
 
 fn validate_claude_spec(spec: &DispatchSpec) -> Result<(), MemoryError> {
-    if spec.implementer != Implementer::Claude || spec.codex_artifacts.is_some() {
+    if spec.implementer != Implementer::Claude || spec.invocation_artifacts.is_some() {
         return Err(MemoryError::Validation(
             "Claude dispatch requires implementer claude and no Codex artifacts".into(),
         ));
@@ -592,7 +592,7 @@ mod tests {
     fn sample_spec(session: SessionMode) -> DispatchSpec {
         DispatchSpec {
             implementer: Implementer::Claude,
-            codex_artifacts: None,
+            invocation_artifacts: None,
             session,
             name: "ic-ironmem-283".to_string(),
             model: "claude-sonnet-5".to_string(),

@@ -873,7 +873,7 @@ exit 97
     let state = DispatchState {
         implementer: Implementer::Codex,
         native_session_id: None,
-        codex_artifacts: Some(artifacts.clone()),
+        invocation_artifacts: Some(artifacts.clone()),
         issue: issue.clone(),
         worktree_path: tree.path.display().to_string(),
         ic_session_name: "ic-owner-repo-50".into(),
@@ -977,7 +977,7 @@ fn public_run_rejects_wrong_persisted_harness_before_worktree_mutation() {
     let state = DispatchState {
         implementer: Implementer::Codex,
         native_session_id: Some("11111111-2222-3333-4444-555555555555".into()),
-        codex_artifacts: None,
+        invocation_artifacts: None,
         issue: issue.clone(),
         worktree_path: tree.path.display().to_string(),
         ic_session_name: "ic-owner-repo-51".into(),
@@ -1078,7 +1078,7 @@ exit 97
     let state = DispatchState {
         implementer: Implementer::Codex,
         native_session_id: Some("11111111-2222-3333-4444-555555555555".into()),
-        codex_artifacts: None,
+        invocation_artifacts: None,
         issue: issue.clone(),
         worktree_path: tree.path.display().to_string(),
         ic_session_name: "ic-owner-repo-52".into(),
@@ -1201,7 +1201,7 @@ fn clear_dispatch_refuses_a_live_invocation_and_releases_an_unprovable_dead_one(
     let state = DispatchState {
         implementer: Implementer::Codex,
         native_session_id: None,
-        codex_artifacts: Some(artifacts.clone()),
+        invocation_artifacts: Some(artifacts.clone()),
         issue: issue.clone(),
         worktree_path: checkout.display().to_string(),
         ic_session_name: "ic-owner-repo-53".into(),

@@ -13,7 +13,7 @@ use serde_json::json;
 use crate::db::schema::Database;
 use crate::error::MemoryError;
 
-use super::codex_dispatch::CodexArtifacts;
+use super::codex_dispatch::InvocationArtifacts;
 use super::implementer::Implementer;
 use super::{read_current, validate_repo, write_current, IssueRef};
 
@@ -33,7 +33,7 @@ use super::{read_current, validate_repo, write_current, IssueRef};
 pub struct DispatchState {
     pub implementer: Implementer,
     pub native_session_id: Option<String>,
-    pub codex_artifacts: Option<CodexArtifacts>,
+    pub invocation_artifacts: Option<InvocationArtifacts>,
     pub issue: IssueRef,
     pub worktree_path: String,
     pub ic_session_name: String,
@@ -66,8 +66,8 @@ struct DispatchStateBody {
     implementer: Implementer,
     #[serde(default)]
     native_session_id: Option<String>,
-    #[serde(default)]
-    codex_artifacts: Option<CodexArtifacts>,
+    #[serde(default, rename = "codex_artifacts")]
+    invocation_artifacts: Option<InvocationArtifacts>,
     issue: u64,
     repo: String,
     worktree_path: String,
@@ -100,7 +100,7 @@ pub fn upsert_dispatch_state(db: &Database, state: &DispatchState) -> Result<Str
     let body = DispatchStateBody {
         implementer: state.implementer,
         native_session_id: state.native_session_id.clone(),
-        codex_artifacts: state.codex_artifacts.clone(),
+        invocation_artifacts: state.invocation_artifacts.clone(),
         issue: state.issue.number,
         repo: state.issue.repo.clone(),
         worktree_path: state.worktree_path.clone(),
@@ -136,7 +136,7 @@ fn state_from_content(content: &str) -> Result<DispatchState, MemoryError> {
         native_session_id: body.native_session_id.or_else(|| {
             (body.implementer == Implementer::Claude).then(|| body.session_uuid.clone())
         }),
-        codex_artifacts: body.codex_artifacts,
+        invocation_artifacts: body.invocation_artifacts,
         issue: IssueRef::new(body.repo, body.issue),
         worktree_path: body.worktree_path,
         ic_session_name: body.ic_session_name,
@@ -256,7 +256,7 @@ mod tests {
         DispatchState {
             implementer: crate::autopilot::implementer::Implementer::Claude,
             native_session_id: None,
-            codex_artifacts: None,
+            invocation_artifacts: None,
             issue: issue.clone(),
             worktree_path: "/tmp/worktrees/ironmem-283".into(),
             ic_session_name: "ic-ironmem-283".into(),
@@ -295,7 +295,7 @@ mod tests {
         let mut state = sample(&issue, 7);
         state.implementer = Implementer::Codex;
         state.native_session_id = Some("native-id".into());
-        state.codex_artifacts = Some(CodexArtifacts {
+        state.invocation_artifacts = Some(InvocationArtifacts {
             invocation_id: "invocation".into(),
             schema_path: "/original/schema".into(),
             journal_path: "/original/journal".into(),
@@ -313,6 +313,49 @@ mod tests {
         assert!(get_dispatch_state(&db, &issue).is_err());
     }
 
+    fn sample_body() -> DispatchStateBody {
+        DispatchStateBody {
+            implementer: Implementer::Claude,
+            native_session_id: None,
+            invocation_artifacts: None,
+            issue: 283,
+            repo: "ironmem".into(),
+            worktree_path: "/absolute/worktree".into(),
+            ic_session_name: "ic".into(),
+            dispatch_class: "logic".into(),
+            attempt_n: 1,
+            state: "dispatching".into(),
+            started_at: "now".into(),
+            session_uuid: "old-id".into(),
+            turn_n: 3,
+            session_claimed: true,
+        }
+    }
+
+    #[test]
+    fn invocation_artifacts_keep_the_codex_artifacts_wire_key() {
+        let artifacts = crate::autopilot::codex_dispatch::InvocationArtifacts {
+            invocation_id: "11111111-2222-3333-4444-555555555555".into(),
+            schema_path: "/r/.git/ironmem/autopilot/o-r-1/i/schema.json".into(),
+            journal_path: "/r/.git/ironmem/autopilot/o-r-1/i/journal.jsonl".into(),
+            final_path: "/r/.git/ironmem/autopilot/o-r-1/i/final.json".into(),
+            stderr_path: "/r/.git/ironmem/autopilot/o-r-1/i/stderr.log".into(),
+            exit_path: "/r/.git/ironmem/autopilot/o-r-1/i/exit.json".into(),
+        };
+        let body = DispatchStateBody {
+            invocation_artifacts: Some(artifacts.clone()),
+            ..sample_body()
+        };
+        let wire = serde_json::to_value(&body).unwrap();
+        assert_eq!(
+            wire["codex_artifacts"]["invocation_id"],
+            artifacts.invocation_id
+        );
+        assert!(wire.get("invocation_artifacts").is_none());
+        let back: DispatchStateBody = serde_json::from_value(wire).unwrap();
+        assert_eq!(back.invocation_artifacts, Some(artifacts));
+    }
+
     #[test]
     fn old_wire_defaults_to_claude_and_native_uuid() {
         let db = Database::open_in_memory().unwrap();
@@ -320,7 +363,7 @@ mod tests {
         let mut body = serde_json::to_value(DispatchStateBody {
             implementer: Implementer::Claude,
             native_session_id: None,
-            codex_artifacts: None,
+            invocation_artifacts: None,
             issue: 283,
             repo: "ironmem".into(),
             worktree_path: "/absolute/worktree".into(),

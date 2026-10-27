@@ -463,7 +463,7 @@ exit 0
         &DispatchState {
             implementer: ironmem::autopilot::implementer::Implementer::Claude,
             native_session_id: None,
-            codex_artifacts: None,
+            invocation_artifacts: None,
             issue: issue(),
             worktree_path: wt.path.to_string_lossy().to_string(),
             ic_session_name: "autopilot-ic-owner-repo-7".into(),

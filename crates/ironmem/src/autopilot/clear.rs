@@ -14,7 +14,7 @@
 
 use serde::Serialize;
 
-use super::dispatch::CodexArtifacts;
+use super::dispatch::InvocationArtifacts;
 use super::dispatch_state::{self, DispatchState};
 use super::implementer::Implementer;
 use super::registry::{HarnessSnapshots, Liveness, LivenessSnapshot};
@@ -28,7 +28,10 @@ pub struct ClearedDispatch {
     pub issue: String,
     pub implementer: Implementer,
     pub state: String,
-    pub codex_artifacts: Option<CodexArtifacts>,
+    /// Serialized as `codex_artifacts` so `clear-dispatch --json` output
+    /// keeps its key for scripts written before Muse existed.
+    #[serde(rename = "codex_artifacts")]
+    pub invocation_artifacts: Option<InvocationArtifacts>,
 }
 
 /// `observe` is called after the state is read, so the evidence is never
@@ -59,7 +62,7 @@ pub fn clear_dispatch(
         issue: issue.canonical(),
         implementer: state.implementer,
         state: state.state,
-        codex_artifacts: state.codex_artifacts,
+        invocation_artifacts: state.invocation_artifacts,
     })
 }
 
@@ -84,7 +87,7 @@ fn refusal(
         // Idle with pending artifacts is a finished invocation `run_issue` has
         // not recorded yet; clearing would drop its attempt from lineage.
         (Implementer::Codex, Liveness::NotListed)
-            if state.codex_artifacts.is_some() && !attempt_recorded =>
+            if state.invocation_artifacts.is_some() && !attempt_recorded =>
         {
             Some(format!(
                 "a finished Codex invocation is waiting to be recorded. A Lead records it \
@@ -98,8 +101,8 @@ fn refusal(
         // Unknown is exactly the hold this exists for — but only once a fresh
         // process table shows nothing that could be the issue's work.
         (Implementer::Codex, Liveness::Unknown) => snapshots
-            .codex
-            .live_evidence(&state.issue.slug(), state.codex_artifacts.as_ref()),
+            .processes
+            .live_evidence(&state.issue.slug(), state.invocation_artifacts.as_ref()),
         // A Claude hold means its registry could not be read; there is no
         // evidence to clear against.
         (Implementer::Claude, Liveness::Unknown) => Some(snapshots.state_reason(state)),
@@ -135,7 +138,8 @@ pub fn release_settled_dispatches(
         let finished = (succeeded && remediate::active_remediation(db, &state.issue)?.is_none())
             || remediate::attempts_charged(db, &state.issue, cumulative_attempt_n, succeeded)?
                 >= attempt_cap;
-        let unrecorded = state.codex_artifacts.is_some() && cumulative_attempt_n <= state.attempt_n;
+        let unrecorded =
+            state.invocation_artifacts.is_some() && cumulative_attempt_n <= state.attempt_n;
         if finished && !unrecorded && dispatch_state::clear_dispatch_state_if_unchanged(db, &state)?
         {
             released.push(state.issue);
@@ -147,18 +151,18 @@ pub fn release_settled_dispatches(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::autopilot::codex_process::{testing, CodexProcessSnapshot, ProcessRow};
+    use crate::autopilot::process_tree::{testing, ProcessRow, ProcessSnapshot};
     use crate::autopilot::registry::{AgentEntry, RegistrySnapshot};
 
     fn issue() -> IssueRef {
         IssueRef::new("owner/repo", 42)
     }
 
-    fn held_codex_state(artifacts: CodexArtifacts) -> DispatchState {
+    fn held_codex_state(artifacts: InvocationArtifacts) -> DispatchState {
         DispatchState {
             implementer: Implementer::Codex,
             native_session_id: None,
-            codex_artifacts: Some(artifacts),
+            invocation_artifacts: Some(artifacts),
             issue: issue(),
             worktree_path: "/tmp/wt".into(),
             ic_session_name: "ic-owner-repo-42".into(),
@@ -175,7 +179,7 @@ mod tests {
     fn snapshots(rows: Vec<ProcessRow>) -> HarnessSnapshots {
         HarnessSnapshots {
             claude: RegistrySnapshot::Available(Vec::new()),
-            codex: CodexProcessSnapshot::Available(rows),
+            processes: ProcessSnapshot::Available(rows),
         }
     }
 
@@ -232,7 +236,7 @@ mod tests {
         .contains("owner-repo-42"));
         let unavailable = HarnessSnapshots {
             claude: RegistrySnapshot::Available(Vec::new()),
-            codex: CodexProcessSnapshot::Unavailable {
+            processes: ProcessSnapshot::Unavailable {
                 reason: "ps timed out".into(),
             },
         };
@@ -251,7 +255,7 @@ mod tests {
             ])
         })
         .unwrap();
-        assert_eq!(cleared.codex_artifacts.as_ref(), Some(&a));
+        assert_eq!(cleared.invocation_artifacts.as_ref(), Some(&a));
         assert_eq!(cleared.state, "dispatching");
         assert!(dispatch_state::get_dispatch_state(&db, &issue())
             .unwrap()
@@ -375,7 +379,7 @@ mod tests {
         // A Claude state at its attempt cap, gone from a readable registry.
         let mut claude = held_codex_state(testing::invocation(dir.path()).0);
         claude.implementer = Implementer::Claude;
-        claude.codex_artifacts = None;
+        claude.invocation_artifacts = None;
         claude.attempt_n = 3;
         dispatch_state::upsert_dispatch_state(&db, &claude).unwrap();
         record_status(&db, Some(AttemptOutcome::Failed), 3);
@@ -391,7 +395,7 @@ mod tests {
         let mut state =
             held_codex_state(testing::invocation(tempfile::tempdir().unwrap().path()).0);
         state.implementer = Implementer::Claude;
-        state.codex_artifacts = None;
+        state.invocation_artifacts = None;
         dispatch_state::upsert_dispatch_state(&db, &state).unwrap();
         let mut snaps = snapshots(Vec::new());
         snaps.claude = RegistrySnapshot::Available(vec![AgentEntry {

@@ -350,9 +350,9 @@ pub fn snapshot(registry: &mut dyn AgentRegistry) -> RegistrySnapshot {
     }
 }
 
-pub use crate::autopilot::codex_process::{parse_codex_processes, CodexProcessSnapshot};
 use crate::autopilot::dispatch_state::DispatchState;
 use crate::autopilot::implementer::Implementer;
+pub use crate::autopilot::process_tree::{parse_processes, ProcessSnapshot};
 
 /// The decision seam routes exclusively by the persisted dispatch harness.
 pub trait LivenessSnapshot {
@@ -362,7 +362,7 @@ pub trait LivenessSnapshot {
         self.reason(state.implementer)
     }
     fn claude_names(&self) -> Vec<&str>;
-    fn codex_markers(&self) -> Vec<&str> {
+    fn invocation_markers(&self) -> Vec<&str> {
         Vec::new()
     }
 }
@@ -370,13 +370,13 @@ pub trait LivenessSnapshot {
 #[derive(Debug, Clone, PartialEq)]
 pub struct HarnessSnapshots {
     pub claude: RegistrySnapshot,
-    pub codex: CodexProcessSnapshot,
+    pub processes: ProcessSnapshot,
 }
 impl HarnessSnapshots {
     pub fn is_available(&self, implementer: Implementer) -> bool {
         match implementer {
             Implementer::Claude => self.claude.is_available(),
-            Implementer::Codex => self.codex.is_available(),
+            Implementer::Codex => self.processes.is_available(),
         }
     }
 }
@@ -387,8 +387,8 @@ impl HarnessSnapshots {
 /// before the first launch and a between-invocation state an early `?` left
 /// behind. An unrecognized label still holds, a fresh source is still
 /// required, and identifiable conflicting work holds.
-fn idle_codex_pause(snapshot: &CodexProcessSnapshot, state: &DispatchState) -> Result<(), String> {
-    let CodexProcessSnapshot::Available(rows) = snapshot else {
+fn idle_invocation_pause(snapshot: &ProcessSnapshot, state: &DispatchState) -> Result<(), String> {
+    let ProcessSnapshot::Available(rows) = snapshot else {
         return Err(snapshot.reason());
     };
     if !matches!(
@@ -420,30 +420,30 @@ fn idle_codex_pause(snapshot: &CodexProcessSnapshot, state: &DispatchState) -> R
     }
     let slug = state.issue.slug();
     if snapshot.orphan_markers().iter().any(|marker| {
-        crate::autopilot::codex_process::marker_issue_slug(marker) == Some(slug.as_str())
+        crate::autopilot::process_tree::marker_issue_slug(marker) == Some(slug.as_str())
     }) {
         return Err("an active Codex Autopilot marker matches this issue; paused state has no exact invocation identity to adopt safely".into());
     }
     Ok(())
 }
 
-pub(crate) fn codex_state_liveness(
-    snapshot: &CodexProcessSnapshot,
+pub(crate) fn invocation_state_liveness(
+    snapshot: &ProcessSnapshot,
     state: &DispatchState,
 ) -> Liveness {
-    match state.codex_artifacts.as_ref() {
+    match state.invocation_artifacts.as_ref() {
         Some(artifacts) => snapshot.liveness(Some(artifacts)),
-        None => match idle_codex_pause(snapshot, state) {
+        None => match idle_invocation_pause(snapshot, state) {
             Ok(()) => Liveness::NotListed,
             Err(_) => Liveness::Unknown,
         },
     }
 }
 
-pub(crate) fn codex_state_reason(snapshot: &CodexProcessSnapshot, state: &DispatchState) -> String {
-    match state.codex_artifacts.as_ref() {
+pub(crate) fn invocation_state_reason(snapshot: &ProcessSnapshot, state: &DispatchState) -> String {
+    match state.invocation_artifacts.as_ref() {
         Some(artifacts) => snapshot.invocation_reason(Some(artifacts)),
-        None => idle_codex_pause(snapshot, state)
+        None => idle_invocation_pause(snapshot, state)
             .err()
             .unwrap_or_else(|| "Codex has no pending invocation in a durable paused state".into()),
     }
@@ -453,26 +453,26 @@ impl LivenessSnapshot for HarnessSnapshots {
     fn liveness(&self, state: &DispatchState) -> Liveness {
         match state.implementer {
             Implementer::Claude => self.claude.liveness(&state.ic_session_name),
-            Implementer::Codex => codex_state_liveness(&self.codex, state),
+            Implementer::Codex => invocation_state_liveness(&self.processes, state),
         }
     }
     fn reason(&self, implementer: Implementer) -> String {
         match implementer {
             Implementer::Claude => LivenessSnapshot::reason(&self.claude, implementer),
-            Implementer::Codex => self.codex.reason(),
+            Implementer::Codex => self.processes.reason(),
         }
     }
     fn state_reason(&self, state: &DispatchState) -> String {
         match state.implementer {
             Implementer::Claude => self.reason(state.implementer),
-            Implementer::Codex => codex_state_reason(&self.codex, state),
+            Implementer::Codex => invocation_state_reason(&self.processes, state),
         }
     }
     fn claude_names(&self) -> Vec<&str> {
         self.claude.names()
     }
-    fn codex_markers(&self) -> Vec<&str> {
-        self.codex.orphan_markers()
+    fn invocation_markers(&self) -> Vec<&str> {
+        self.processes.orphan_markers()
     }
 }
 /// Compatibility for callers providing only Claude evidence: never infer a
@@ -521,7 +521,7 @@ impl<T: AgentRegistry + ?Sized> HarnessMonitor for T {
         };
         HarnessSnapshots {
             claude,
-            codex: CodexProcessSnapshot::Unavailable {
+            processes: ProcessSnapshot::Unavailable {
                 reason: "Codex process source was not supplied".into(),
             },
         }
@@ -530,13 +530,13 @@ impl<T: AgentRegistry + ?Sized> HarnessMonitor for T {
 
 pub struct TwoHarnessMonitor {
     claude: Result<ClaudeAgentRegistry, String>,
-    codex: super::codex_process::UnixCodexProcesses,
+    processes: super::process_tree::UnixProcesses,
 }
 impl Default for TwoHarnessMonitor {
     fn default() -> Self {
         Self {
             claude: ClaudeAgentRegistry::resolve().map_err(|e| e.to_string()),
-            codex: super::codex_process::UnixCodexProcesses,
+            processes: super::process_tree::UnixProcesses,
         }
     }
 }
@@ -550,7 +550,7 @@ impl HarnessMonitor for TwoHarnessMonitor {
         };
         HarnessSnapshots {
             claude,
-            codex: super::codex_process::snapshot(&mut self.codex),
+            processes: super::process_tree::snapshot(&mut self.processes),
         }
     }
 }
@@ -870,7 +870,7 @@ mod harness_tests {
                 name: "ic-test".into(),
                 status: None,
             }]),
-            codex: CodexProcessSnapshot::Unavailable {
+            processes: ProcessSnapshot::Unavailable {
                 reason: "ps unavailable".into(),
             },
         };
@@ -881,7 +881,7 @@ mod harness_tests {
 
     #[test]
     fn codex_parser_uses_executable_and_option_position() {
-        let rows = parse_codex_processes("10 1 10 S /opt/codex exec --output-schema /tmp/.git/ironmem/autopilot/repo/uuid/schema.json prompt\n11 1 11 S /bin/sh -c codex exec --output-schema /tmp/.git/ironmem/autopilot/repo/uuid/schema.json\n12 1 12 S codex exec --json reviewer prompt\n13 1 13 S codex exec resume --output-schema /tmp/.git/ironmem/autopilot/repo/other/schema.json native prompt\n").unwrap();
+        let rows = parse_processes("10 1 10 S /opt/codex exec --output-schema /tmp/.git/ironmem/autopilot/repo/uuid/schema.json prompt\n11 1 11 S /bin/sh -c codex exec --output-schema /tmp/.git/ironmem/autopilot/repo/uuid/schema.json\n12 1 12 S codex exec --json reviewer prompt\n13 1 13 S codex exec resume --output-schema /tmp/.git/ironmem/autopilot/repo/other/schema.json native prompt\n").unwrap();
         assert_eq!(rows.len(), 4);
         assert_eq!(
             rows[0].marker().unwrap(),
@@ -890,27 +890,26 @@ mod harness_tests {
         assert_eq!(rows[1].marker().unwrap(), None);
         assert_eq!(rows[2].marker().unwrap(), None);
         let reviewer =
-            parse_codex_processes("16 1 16 S codex exec --future-review-flag reviewer\n").unwrap();
+            parse_processes("16 1 16 S codex exec --future-review-flag reviewer\n").unwrap();
         assert_eq!(reviewer[0].marker().unwrap(), None);
         assert_eq!(
             rows[3].marker().unwrap(),
             Some("/tmp/.git/ironmem/autopilot/repo/other/schema.json")
         );
-        let bad = parse_codex_processes(
+        let bad = parse_processes(
             "14 1 14 S codex exec --output-schema /tmp/.git/ironmem/autopilot/repo/uuid/schema.json --future-flag v p\n",
         )
         .unwrap();
         assert!(bad[0].marker().is_err());
         let prompt =
-            parse_codex_processes("15 1 15 S codex exec prompt --output-schema /tmp/false\n")
-                .unwrap();
+            parse_processes("15 1 15 S codex exec prompt --output-schema /tmp/false\n").unwrap();
         assert_eq!(prompt[0].marker().unwrap(), None);
     }
     fn paused_codex_state() -> DispatchState {
         DispatchState {
             implementer: Implementer::Codex,
             native_session_id: Some("11111111-2222-3333-4444-555555555555".into()),
-            codex_artifacts: None,
+            invocation_artifacts: None,
             issue: crate::autopilot::IssueRef::new("owner/repo", 42),
             worktree_path: "/tmp/wt".into(),
             ic_session_name: "ic-owner-repo-42".into(),
@@ -929,7 +928,7 @@ mod harness_tests {
                 name: "ic-owner-repo-42".into(),
                 status: None,
             }]),
-            codex: CodexProcessSnapshot::Available(Vec::new()),
+            processes: ProcessSnapshot::Available(Vec::new()),
         }
     }
     #[test]
@@ -962,7 +961,7 @@ mod harness_tests {
         }
         let state = paused_codex_state();
         let mut unavailable = paused_snapshots();
-        unavailable.codex = CodexProcessSnapshot::Unavailable {
+        unavailable.processes = ProcessSnapshot::Unavailable {
             reason: "ps unavailable".into(),
         };
         assert_eq!(unavailable.liveness(&state), Liveness::Unknown);
@@ -983,11 +982,11 @@ mod harness_tests {
     }
     #[test]
     fn a_paused_label_never_bypasses_pending_codex_identity_or_completion() {
-        use crate::autopilot::codex_process::testing;
+        use crate::autopilot::process_tree::testing;
         let dir = tempfile::tempdir().unwrap();
         let (a, _) = testing::invocation(dir.path());
         let mut state = paused_codex_state();
-        state.codex_artifacts = Some(a.clone());
+        state.invocation_artifacts = Some(a.clone());
         let snapshots = paused_snapshots();
         assert_eq!(snapshots.liveness(&state), Liveness::Unknown);
         testing::complete(&a);
@@ -1006,26 +1005,26 @@ mod harness_tests {
         let state = paused_codex_state();
         let mut snapshots = paused_snapshots();
         assert_eq!(snapshots.liveness(&state), Liveness::NotListed);
-        snapshots.codex = CodexProcessSnapshot::Available(parse_codex_processes("10 1 10 S codex exec --output-schema /other-clone/.git/ironmem/autopilot/owner-repo-42/11111111-2222-3333-4444-555555555555/schema.json prompt\n").unwrap());
+        snapshots.processes = ProcessSnapshot::Available(parse_processes("10 1 10 S codex exec --output-schema /other-clone/.git/ironmem/autopilot/owner-repo-42/11111111-2222-3333-4444-555555555555/schema.json prompt\n").unwrap());
         assert_eq!(
             snapshots.liveness(&state),
             Liveness::Unknown,
             "without a persisted invocation marker, hold rather than adopt an inferred root"
         );
         assert!(snapshots.state_reason(&state).contains("active"));
-        snapshots.codex = CodexProcessSnapshot::Available(
-            parse_codex_processes(
+        snapshots.processes = ProcessSnapshot::Available(
+            parse_processes(
                 "10 1 10 S codex exec --future-flag v --output-schema /x/schema.json p\n",
             )
             .unwrap(),
         );
         assert_eq!(snapshots.liveness(&state), Liveness::Unknown);
         // An unparseable row that names no schema.json cannot be ours.
-        snapshots.codex = CodexProcessSnapshot::Available(
-            parse_codex_processes("10 1 10 S codex exec --output-schema\n").unwrap(),
+        snapshots.processes = ProcessSnapshot::Available(
+            parse_processes("10 1 10 S codex exec --output-schema\n").unwrap(),
         );
         assert_eq!(snapshots.liveness(&state), Liveness::NotListed);
-        snapshots.codex = CodexProcessSnapshot::Available(parse_codex_processes("10 1 10 S codex exec --output-schema /other/.git/ironmem/autopilot/owner-repo-99/11111111-2222-3333-4444-555555555555/schema.json prompt\n11 1 11 S codex exec reviewer prompt\n12 1 12 S /bin/sh -c codex exec --output-schema /other-clone/.git/ironmem/autopilot/owner-repo-42/11111111-2222-3333-4444-555555555555/schema.json\n").unwrap());
+        snapshots.processes = ProcessSnapshot::Available(parse_processes("10 1 10 S codex exec --output-schema /other/.git/ironmem/autopilot/owner-repo-99/11111111-2222-3333-4444-555555555555/schema.json prompt\n11 1 11 S codex exec reviewer prompt\n12 1 12 S /bin/sh -c codex exec --output-schema /other-clone/.git/ironmem/autopilot/owner-repo-42/11111111-2222-3333-4444-555555555555/schema.json\n").unwrap());
         assert_eq!(
             snapshots.liveness(&state),
             Liveness::NotListed,

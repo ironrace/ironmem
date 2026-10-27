@@ -2448,7 +2448,7 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                          and the next dispatch starts a fresh session",
                         cleared.issue, cleared.implementer, cleared.state
                     );
-                    if let Some(a) = &cleared.codex_artifacts {
+                    if let Some(a) = &cleared.invocation_artifacts {
                         if let Some(dir) = std::path::Path::new(&a.schema_path).parent() {
                             println!("  invocation evidence kept at {}", dir.display());
                         }

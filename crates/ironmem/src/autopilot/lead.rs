@@ -1551,7 +1551,7 @@ mod tests {
             &DispatchState {
                 implementer: crate::autopilot::implementer::Implementer::Claude,
                 native_session_id: None,
-                codex_artifacts: None,
+                invocation_artifacts: None,
                 issue: IssueRef::new("ironrace/elsewhere", 1),
                 worktree_path: "/tmp/wt".to_string(),
                 ic_session_name: "ic-ironrace-elsewhere-1".to_string(),
@@ -1829,7 +1829,7 @@ mod tests {
             &DispatchState {
                 implementer: crate::autopilot::implementer::Implementer::Claude,
                 native_session_id: None,
-                codex_artifacts: None,
+                invocation_artifacts: None,
                 issue: issue.clone(),
                 worktree_path: f.repo_path.display().to_string(),
                 ic_session_name: crate::autopilot::dispatch::ic_name(&issue),
@@ -2048,7 +2048,7 @@ mod tests {
                 &DispatchState {
                     implementer: crate::autopilot::implementer::Implementer::Claude,
                     native_session_id: None,
-                    codex_artifacts: None,
+                    invocation_artifacts: None,
                     issue: issue.clone(),
                     worktree_path: f.repo_path.display().to_string(),
                     ic_session_name: crate::autopilot::dispatch::ic_name(&issue),
@@ -2113,7 +2113,7 @@ mod tests {
                 &DispatchState {
                     implementer: crate::autopilot::implementer::Implementer::Claude,
                     native_session_id: None,
-                    codex_artifacts: None,
+                    invocation_artifacts: None,
                     issue: issue.clone(),
                     worktree_path: f.repo_path.display().to_string(),
                     ic_session_name: crate::autopilot::dispatch::ic_name(&issue),
@@ -2213,7 +2213,7 @@ mod tests {
             &DispatchState {
                 implementer: crate::autopilot::implementer::Implementer::Claude,
                 native_session_id: None,
-                codex_artifacts: None,
+                invocation_artifacts: None,
                 issue: issue.clone(),
                 worktree_path: f.repo_path.display().to_string(),
                 ic_session_name: crate::autopilot::dispatch::ic_name(issue),
@@ -3037,7 +3037,7 @@ mod tests {
     }
     #[test]
     fn lead_snapshots_harnesses_once_and_reports_selected_availability() {
-        use crate::autopilot::codex_process::CodexProcessSnapshot;
+        use crate::autopilot::process_tree::ProcessSnapshot;
         use crate::autopilot::registry::{HarnessSnapshots, RegistrySnapshot};
         struct Monitor {
             calls: usize,
@@ -3049,7 +3049,7 @@ mod tests {
                     claude: RegistrySnapshot::Unavailable {
                         reason: "no Claude installed".into(),
                     },
-                    codex: CodexProcessSnapshot::Available(Vec::new()),
+                    processes: ProcessSnapshot::Available(Vec::new()),
                 }
             }
         }

@@ -2339,7 +2339,7 @@ mod tests {
             &DispatchState {
                 implementer: crate::autopilot::implementer::Implementer::Claude,
                 native_session_id: None,
-                codex_artifacts: None,
+                invocation_artifacts: None,
                 issue: issue(),
                 worktree_path: worktree::worktree_path(roots.path(), &issue())
                     .to_string_lossy()
