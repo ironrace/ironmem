@@ -555,6 +555,13 @@ pub enum TerminalReason {
     /// `ironmem autopilot supervise --clear-escalation` retries it, exactly
     /// as `agent:exhausted` requires a human re-label.
     StrategyEscalated { signature: String },
+    /// The harness reported its session still in use after an invocation
+    /// finished: something still holds it. A retry can never succeed and a
+    /// fresh session could start a second implementer over the holder, so
+    /// the run stops on the first one and the state is parked as
+    /// `paused-session-in-use`, which the queue defers until an operator
+    /// clears it. `detail` says how.
+    SessionInUse { detail: String },
 }
 
 impl TerminalReason {
@@ -570,6 +577,7 @@ impl TerminalReason {
                 | TerminalReason::InfrastructureFailure { .. }
                 | TerminalReason::StrategyEscalated { .. }
                 | TerminalReason::UnpricedDispatchesExhausted { .. }
+                | TerminalReason::SessionInUse { .. }
         )
     }
 }
@@ -2101,14 +2109,17 @@ pub fn run_issue(
             issue.repo, issue.number
         );
         let label = config.implementer.label();
+        let mut session_in_use = None;
         let refusal_note = match outcome.session_refusal {
             Some(SessionRefusal::InUse) => {
                 resume_refusals = 0;
-                Some(format!(
+                let note = format!(
                     "{label} reports session {session_uuid} still in use; Autopilot won't start \
                      a new session over it; inspect for a leftover {label} process, then \
                      {release}"
-                ))
+                );
+                session_in_use = Some(note.clone());
+                Some(note)
             }
             Some(SessionRefusal::Unresumable) if config.implementer.rotates_refused_session() => {
                 resume_refusals += 1;
@@ -2400,6 +2411,11 @@ pub fn run_issue(
                 )?;
             }
             DispatchClassification::InfrastructureFailure => {
+                // Retrying a session still in use can never succeed, so it
+                // spends no more units, in this run or on a later Lead tick.
+                if let Some(detail) = session_in_use {
+                    break TerminalReason::SessionInUse { detail };
+                }
                 write_state(
                     db,
                     cumulative_attempt_n,
@@ -2426,6 +2442,7 @@ pub fn run_issue(
     } else if !matches!(terminal, TerminalReason::ImplementationInFlight { .. }) {
         let state_label = match &terminal {
             TerminalReason::DailyBudgetExhausted { .. } => "paused-daily-budget",
+            TerminalReason::SessionInUse { .. } => "paused-session-in-use",
             _ => "paused-infrastructure-failure",
         };
         write_state(
@@ -3236,45 +3253,53 @@ sleep 0.5
 
     /// Muse's lock is the one guard against a second implementer that does
     /// not rest on Autopilot's own process evidence. "In use" after a finish
-    /// means something still holds the session, so it is never rotated over.
+    /// means something still holds the session, so it is never rotated over,
+    /// and since a retry can never succeed the run stops on the first one and
+    /// parks the issue for an operator instead of spending more units.
     #[test]
-    fn a_muse_session_still_in_use_is_never_rotated_over() {
+    fn a_muse_session_in_use_stops_the_run_and_parks_the_issue() {
         let db = approved_db();
         let (_dir, wt) = fixture_worktree();
-        let mut d = muse_script(vec![muse_in_use(), muse_in_use(), muse_in_use()]);
+        let mut d = muse_script(vec![muse_in_use(), met()]);
         let run = run_issue(&db, &issue(), &brief(), &wt, &muse_config(), &mut d).unwrap();
-        assert!(
-            matches!(
-                run.terminal,
-                TerminalReason::InfrastructureFailure { consecutive: 3 }
-            ),
-            "{:?}",
-            run.terminal
+        assert_eq!(d.inner.seen.len(), 1, "no second dispatch in this run");
+        let session = session_of(&d.inner.seen[0]);
+        let hint = format!(
+            "Muse reports session {session} still in use; Autopilot won't start a new session \
+             over it; inspect for a leftover Muse process, then `ironmem autopilot \
+             clear-dispatch ironrace/ironmem 283`"
         );
-        let sessions: Vec<_> = d.inner.seen.iter().map(session_of).collect();
-        assert!(sessions.iter().all(|s| *s == sessions[0]), "{sessions:?}");
-        for dispatch in &run.dispatches {
-            assert_eq!(
-                dispatch.classification,
-                DispatchClassification::InfrastructureFailure
-            );
-            let reason = dispatch.reason.as_deref().unwrap();
-            assert!(
-                reason.contains(&format!(
-                    "Muse reports session {} still in use; Autopilot won't start a new session \
-                     over it; inspect for a leftover Muse process, then `ironmem autopilot \
-                     clear-dispatch ironrace/ironmem 283`",
-                    sessions[0]
-                )),
-                "{reason}"
-            );
+        match &run.terminal {
+            TerminalReason::SessionInUse { detail } => {
+                assert!(detail.contains(&hint), "{detail}")
+            }
+            other => panic!("expected SessionInUse, got {other:?}"),
         }
-        // Nor does an "in use" count toward rotating on a later refusal.
-        let db = approved_db();
-        let mut d = muse_script(vec![muse_refusal(), muse_in_use(), muse_refusal(), met()]);
-        run_issue(&db, &issue(), &brief(), &wt, &muse_config(), &mut d).unwrap();
-        let sessions: Vec<_> = d.inner.seen.iter().map(session_of).collect();
-        assert!(sessions.iter().all(|s| *s == sessions[0]), "{sessions:?}");
+        assert_eq!(run.dispatches.len(), 1);
+        assert_eq!(
+            run.dispatches[0].classification,
+            DispatchClassification::InfrastructureFailure
+        );
+        assert!(
+            run.dispatches[0].reason.as_deref().unwrap().contains(&hint),
+            "{:?}",
+            run.dispatches[0].reason
+        );
+        assert_eq!(run.cumulative_attempt_n, 0, "no attempt is charged");
+        let state = dispatch_state::get_dispatch_state(&db, &issue())
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.state, "paused-session-in-use");
+        assert_eq!(state.session_uuid, session, "never rotated over");
+        assert!(state.invocation_artifacts.is_none(), "{state:?}");
+        assert_eq!(state.resume_refusals, 0);
+        // An operator who has dealt with the holder may run it again: the
+        // same session continues, and the in-use left no refusal count.
+        let mut again = muse_script(vec![muse_refusal(), met()]);
+        let rerun = run_issue(&db, &issue(), &brief(), &wt, &muse_config(), &mut again).unwrap();
+        assert!(matches!(rerun.terminal, TerminalReason::Met { .. }));
+        let sessions: Vec<_> = again.inner.seen.iter().map(session_of).collect();
+        assert_eq!(sessions, [session.clone(), session]);
     }
 
     #[test]

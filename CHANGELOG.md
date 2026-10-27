@@ -20,9 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   row: a cross-provider resume, or retained state it cannot read), or one
   last used with a different `--model`, is replaced with a fresh one at the
   next launch rather than failing every invocation until `clear-dispatch`. A
-  session Muse reports still in use is never replaced: the run records an
-  infrastructure failure that says to look for a leftover Muse process and
-  then run `clear-dispatch`.
+  session Muse reports still in use is never replaced: the run stops after
+  that one dispatch, parks the issue as `paused-session-in-use` (deferred by
+  the queue as `session_in_use`), and says to look for a leftover Muse
+  process and then run `clear-dispatch`.
 - **Commit-signing guard for every harness (#366).** With `commit.gpgsign`
   on, a run that reports success but left unsigned commits on the issue
   branch now counts as a failed attempt, with a reason naming the commits.

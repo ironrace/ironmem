@@ -446,6 +446,25 @@ mod tests {
         );
     }
 
+    /// A run parked because Muse reported its session still in use names no
+    /// invocation; once nothing could be it, `clear-dispatch` releases it.
+    #[test]
+    fn a_muse_session_in_use_pause_is_released_by_clear_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_in_memory().unwrap();
+        let mut state = held_state(Implementer::Muse, testing::invocation(dir.path()).0);
+        state.invocation_artifacts = None;
+        state.session_uuid = "0d6c1e2a-5b8f-4c1d-9e3a-7f2b6a1c4d5e".into();
+        state.native_session_id = Some(state.session_uuid.clone());
+        state.state = "paused-session-in-use".into();
+        dispatch_state::upsert_dispatch_state(&db, &state).unwrap();
+        let cleared = clear_dispatch(&db, &issue(), || snapshots(Vec::new())).unwrap();
+        assert_eq!(cleared.state, "paused-session-in-use");
+        assert!(dispatch_state::get_dispatch_state(&db, &issue())
+            .unwrap()
+            .is_none());
+    }
+
     #[test]
     fn a_claude_state_clears_only_against_a_readable_registry_that_omits_it() {
         let db = Database::open_in_memory().unwrap();

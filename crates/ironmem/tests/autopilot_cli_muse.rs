@@ -799,33 +799,42 @@ fn max_turns_reaches_muse_as_max_model_steps() {
     }
 }
 
-/// Muse's "in use" is read from its stderr and never rotated over: every
-/// dispatch reuses the session and says how to release the issue.
+/// Muse's "in use" is read from its stderr, never rotated over, and never
+/// retried: the run stops after that one dispatch and parks the issue with a
+/// reason that says how to release it, and `clear-dispatch` releases it.
 #[test]
-fn a_muse_session_still_in_use_is_never_rotated_over_at_the_cli() {
+fn a_muse_session_still_in_use_parks_the_issue_at_the_cli() {
     let fx = Fixture::new();
     let output = fx.run("inuse", &["--attempt-cap", "1"]);
     let report = report(&output, "inuse");
-    assert_ne!(report["terminal"]["terminal"], "met", "{report}");
-    let calls = fx.calls();
-    let sessions: Vec<&str> = calls
-        .lines()
-        .map(|line| flag_value(line, "--session-id"))
-        .collect();
-    assert_eq!(sessions.len(), 3, "{calls}");
-    assert!(sessions.iter().all(|s| *s == sessions[0]), "{calls}");
-    for dispatch in report["dispatches"].as_array().unwrap() {
-        assert_eq!(
-            dispatch["classification"], "infrastructure_failure",
-            "{report}"
-        );
-        let reason = dispatch["reason"].as_str().unwrap_or_default();
-        assert!(
-            reason.contains("still in use")
-                && reason.contains("ironmem autopilot clear-dispatch owner/repo 7"),
-            "{report}"
-        );
-    }
+    assert_eq!(report["terminal"]["terminal"], "session_in_use", "{report}");
+    let detail = report["terminal"]["detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains("still in use")
+            && detail.contains("ironmem autopilot clear-dispatch owner/repo 7"),
+        "{report}"
+    );
+    assert_eq!(fx.calls().lines().count(), 1, "{}", fx.calls());
+    let dispatches = report["dispatches"].as_array().unwrap();
+    assert_eq!(dispatches.len(), 1, "{report}");
+    assert_eq!(dispatches[0]["classification"], "infrastructure_failure");
+
+    let db = Database::open(&fx.db_path).unwrap();
+    let issue = IssueRef::new(REPO, 7);
+    let parked = dispatch_state::get_dispatch_state(&db, &issue)
+        .unwrap()
+        .unwrap();
+    assert_eq!(parked.state, "paused-session-in-use");
+    let cleared = fx.clear();
+    assert!(
+        cleared.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&cleared.stdout),
+        String::from_utf8_lossy(&cleared.stderr)
+    );
+    assert!(dispatch_state::get_dispatch_state(&db, &issue)
+        .unwrap()
+        .is_none());
 }
 
 /// A session Muse refuses to resume (here, across providers) is replaced

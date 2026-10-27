@@ -396,6 +396,7 @@ fn idle_invocation_pause(snapshot: &ProcessSnapshot, state: &DispatchState) -> R
         "paused-daily-budget"
             | "paused-infrastructure-failure"
             | "paused-condition-too-long"
+            | "paused-session-in-use"
             | "dispatching"
             | "infrastructure-failure"
     ) {
@@ -1084,6 +1085,7 @@ mod harness_tests {
             // before the first launch, and the between-invocation states a
             // failed `?` on the next iteration leaves behind.
             "paused-condition-too-long",
+            "paused-session-in-use",
             "dispatching",
             "infrastructure-failure",
         ] {

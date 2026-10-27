@@ -342,6 +342,12 @@ pub enum DeferReason {
     /// shortens the issue or its gates, so it is not resumed ahead of the
     /// backlog every tick; `autopilot clear-dispatch` releases it.
     ConditionTooLong,
+    /// The last run's harness reported `session_uuid` still in use after an
+    /// invocation finished: something still holds it. Retrying can never
+    /// succeed and a fresh session could start a second implementer, so it
+    /// waits for an operator to find the holder and run
+    /// `autopilot clear-dispatch`.
+    SessionInUse { session_uuid: String },
     /// The issue's dispatch state was written by the other harness, which the
     /// configured runner refuses to resume. Only that harness, or a human
     /// clearing the state, moves it.
@@ -542,6 +548,12 @@ pub fn plan_queue(
                 }
                 if state.state == "paused-condition-too-long" {
                     defer(DeferReason::ConditionTooLong);
+                    continue;
+                }
+                if state.state == "paused-session-in-use" {
+                    defer(DeferReason::SessionInUse {
+                        session_uuid: state.session_uuid.clone(),
+                    });
                     continue;
                 }
                 if let Some(configured) = config.implementer {
@@ -1662,6 +1674,45 @@ mod tests {
             assert_eq!(plan.dispatch.len(), 1, "{implementer:?}");
             assert_eq!(plan.dispatch[0].issue, IssueRef::new(REPO, 2));
         }
+    }
+    /// A run that Muse refused because something still holds its session is
+    /// parked: retrying can never succeed, so a Lead never re-dispatches it
+    /// until an operator clears it.
+    #[test]
+    fn a_session_in_use_refusal_is_deferred_until_an_operator_clears_it() {
+        use crate::autopilot::implementer::Implementer;
+        use crate::autopilot::process_tree::ProcessSnapshot;
+        use crate::autopilot::registry::HarnessSnapshots;
+        let snapshots = HarnessSnapshots {
+            claude: RegistrySnapshot::Available(Vec::new()),
+            processes: ProcessSnapshot::Available(Vec::new()),
+        };
+        let db = approved(&[REPO]);
+        let issue = IssueRef::new(REPO, 1);
+        put_state(&db, &issue, "ic-test");
+        let mut state = dispatch_state::get_dispatch_state(&db, &issue)
+            .unwrap()
+            .unwrap();
+        state.implementer = Implementer::Muse;
+        state.session_uuid = "0d6c1e2a-5b8f-4c1d-9e3a-7f2b6a1c4d5e".into();
+        state.native_session_id = Some(state.session_uuid.clone());
+        state.state = "paused-session-in-use".into();
+        dispatch_state::upsert_dispatch_state(&db, &state).unwrap();
+        assert_eq!(snapshots.liveness(&state), Liveness::NotListed);
+        let backlogs = [backlog(REPO, vec![ready(1), ready(2)])];
+        let cfg = QueueConfig {
+            implementer: Some(Implementer::Muse),
+            ..config()
+        };
+        let plan = plan_queue(&db, &backlogs, &snapshots, &cfg).unwrap();
+        assert_eq!(
+            reason_for(&plan, 1),
+            DeferReason::SessionInUse {
+                session_uuid: "0d6c1e2a-5b8f-4c1d-9e3a-7f2b6a1c4d5e".into()
+            }
+        );
+        assert_eq!(plan.dispatch.len(), 1);
+        assert_eq!(plan.dispatch[0].issue, IssueRef::new(REPO, 2));
     }
     #[test]
     fn a_state_owned_by_the_other_harness_is_deferred_not_dispatched_ahead_of_the_backlog() {

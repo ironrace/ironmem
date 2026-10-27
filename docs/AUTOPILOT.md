@@ -231,7 +231,8 @@ is never rendered as free.
   could start a second Muse in the same worktree. The run records an
   infrastructure failure whose reason reads "Muse reports session <uuid>
   still in use; Autopilot won't start a new session over it; inspect for a
-  leftover Muse process, then `ironmem autopilot clear-dispatch <repo> <n>`".
+  leftover Muse process, then `ironmem autopilot clear-dispatch <repo> <n>`",
+  stops the run there, and parks the issue as `paused-session-in-use`.
 - `clear-dispatch` on a Muse hold deletes the dispatch state, so the next
   dispatch mints a new session UUID and starts a fresh Muse session. Lineage
   and attempt counts stand.
@@ -261,7 +262,10 @@ state from a Claude Lead never takes a Codex Lead's dispatch slot, or the
 reverse. Run the owning harness to finish it. An issue whose last run refused
 because its goal condition was too long even after reduction is deferred
 (`condition_too_long`) rather than resumed every tick; shorten the issue or
-its gates, then release it with `autopilot clear-dispatch`.
+its gates, then release it with `autopilot clear-dispatch`. A Muse run whose
+session Muse reported still in use stops after that one dispatch and is
+deferred (`session_in_use`, state `paused-session-in-use`) until you find
+and stop whatever holds the session, then run `autopilot clear-dispatch`.
 
 Before spawn, Autopilot creates private schema, journal, final-message,
 stderr, exit, and process-identity artifacts under the repository's absolute
