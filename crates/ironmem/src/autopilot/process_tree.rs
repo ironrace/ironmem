@@ -541,15 +541,34 @@ pub(crate) fn identity_path(a: &InvocationArtifacts) -> std::path::PathBuf {
     Path::new(&a.schema_path).with_file_name("process.json")
 }
 
+/// The most bytes an identity file may hold: [`read_identity`] refuses
+/// more, and [`persist_identity`] never writes more.
+const IDENTITY_LIMIT: usize = 1024 * 1024;
+
+/// Write `identity` within [`IDENTITY_LIMIT`]. Past it, each descendant's
+/// command (kept only for an operator) is dropped, and every PID, group,
+/// parent and birth recovery reads is still written; an identity too large
+/// even then is refused, leaving the previous file in place, rather than
+/// written unreadable.
 pub(crate) fn persist_identity(
     a: &InvocationArtifacts,
     identity: &ProcessIdentity,
 ) -> Result<(), MemoryError> {
-    super::invocation::persist_private_atomic(
-        &identity_path(a),
-        "process",
-        &serde_json::to_vec(identity)?,
-    )
+    let mut bytes = serde_json::to_vec(identity)?;
+    if bytes.len() > IDENTITY_LIMIT {
+        let mut bare = identity.clone();
+        for descendant in &mut bare.descendants {
+            descendant.args.clear();
+        }
+        bytes = serde_json::to_vec(&bare)?;
+    }
+    if bytes.len() > IDENTITY_LIMIT {
+        return Err(MemoryError::Validation(format!(
+            "invocation process identity for {} descendants exceeds its {IDENTITY_LIMIT}-byte limit",
+            identity.descendants.len()
+        )));
+    }
+    super::invocation::persist_private_atomic(&identity_path(a), "process", &bytes)
 }
 
 pub(crate) fn read_identity(a: &InvocationArtifacts) -> Result<ProcessIdentity, String> {
@@ -568,10 +587,10 @@ pub(crate) fn read_identity(a: &InvocationArtifacts) -> Result<ProcessIdentity, 
         return Err("invocation identity is not a regular file".into());
     }
     let mut data = Vec::new();
-    file.take(1024 * 1024 + 1)
+    file.take(IDENTITY_LIMIT as u64 + 1)
         .read_to_end(&mut data)
         .map_err(|e| e.to_string())?;
-    if data.len() > 1024 * 1024 {
+    if data.len() > IDENTITY_LIMIT {
         return Err("invocation identity exceeds size limit".into());
     }
     let identity: ProcessIdentity = serde_json::from_slice(&data)
@@ -1084,15 +1103,20 @@ fn scan_cwds(
     Ok(processes)
 }
 
-/// The current user's processes born at or after `spawned`, with their
-/// working directories ([`scan_cwds`]). macOS reads the kernel directly
-/// (`proc_listpids` by user, then `PROC_PIDVNODEPATHINFO`): about 1.5 ms for
-/// ~600 processes, measured. Linux reads `/proc`.
-fn user_processes_with_cwd(spawned: Birth) -> Result<Vec<CwdProcess>, ScanError> {
-    let uid = current_uid().ok_or("process working directories are unreadable here")?;
+/// The PIDs a worktree-quiet scan reads. Production scans every process
+/// the current user owns ([`user_pids`]). A test passes only the processes
+/// its fixture started, so no unrelated process on the machine can decide
+/// it: on macOS `/bin/ps` is setuid root, so another `ps` caught between
+/// the listing and its exec refuses the kernel read with EPERM (measured),
+/// which fails a real scan as the fail-closed rule requires.
+pub(crate) type ScanPids<'a> = &'a dyn Fn() -> Result<Vec<u32>, String>;
+
+/// Every PID the current user owns (macOS: `proc_listpids` by user; Linux:
+/// every `/proc` entry, filtered by owner when read).
+pub(crate) fn user_pids() -> Result<Vec<u32>, String> {
     #[cfg(target_os = "macos")]
     {
-        use std::os::unix::ffi::OsStrExt;
+        let uid = current_uid().ok_or("process ownership is unreadable here")?;
         /// `PROC_UID_ONLY` from `<sys/proc_info.h>`, absent from libc.
         const PROC_UID_ONLY: u32 = 4;
         const MAX_PIDS: usize = 1 << 20;
@@ -1104,9 +1128,10 @@ fn user_processes_with_cwd(spawned: Birth) -> Result<Vec<CwdProcess>, ScanError>
                 libc::proc_listpids(PROC_UID_ONLY, uid, pids.as_mut_ptr().cast(), capacity)
             };
             if bytes < 0 {
-                return Err(
-                    format!("cannot list processes: {}", std::io::Error::last_os_error()).into(),
-                );
+                return Err(format!(
+                    "cannot list processes: {}",
+                    std::io::Error::last_os_error()
+                ));
             }
             let count = bytes as usize / std::mem::size_of::<i32>();
             if count < pids.len() {
@@ -1118,6 +1143,42 @@ fn user_processes_with_cwd(spawned: Birth) -> Result<Vec<CwdProcess>, ScanError>
             }
             pids.resize(pids.len() * 2, 0);
         }
+        Ok(pids
+            .into_iter()
+            .filter(|pid| *pid > 0)
+            .map(|pid| pid as u32)
+            .collect())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let mut pids = Vec::new();
+        for entry in std::fs::read_dir("/proc").map_err(|e| format!("cannot list /proc: {e}"))? {
+            let entry = entry.map_err(|e| format!("cannot list /proc: {e}"))?;
+            if let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<u32>().ok())
+            {
+                pids.push(pid);
+            }
+        }
+        Ok(pids)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        Err("processes cannot be listed on this platform".into())
+    }
+}
+
+/// Of `pids`, the current user's processes born at or after `spawned`,
+/// with their working directories, read from the kernel ([`scan_cwds`]).
+/// macOS reads `PROC_PIDTBSDINFO` and `PROC_PIDVNODEPATHINFO`: about 1.5 ms
+/// for ~600 processes, measured. Linux reads `/proc`.
+fn processes_with_cwd(pids: Vec<u32>, spawned: Birth) -> Result<Vec<CwdProcess>, ScanError> {
+    let uid = current_uid().ok_or("process working directories are unreadable here")?;
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::ffi::OsStrExt;
         let owner_birth = |pid: u32| {
             Ok(bsd_info(pid)?.map(|info| {
                 (
@@ -1159,10 +1220,6 @@ fn user_processes_with_cwd(spawned: Birth) -> Result<Vec<CwdProcess>, ScanError>
                 Path::new(std::ffi::OsStr::from_bytes(path.to_bytes())).to_path_buf(),
             ))
         };
-        let pids = pids
-            .into_iter()
-            .filter(|pid| *pid > 0)
-            .map(|pid| pid as u32);
         scan_cwds(pids, uid, spawned, owner_birth, cwd_of)
     }
     #[cfg(target_os = "linux")]
@@ -1171,17 +1228,6 @@ fn user_processes_with_cwd(spawned: Birth) -> Result<Vec<CwdProcess>, ScanError>
         let gone = |e: &std::io::Error| {
             e.kind() == std::io::ErrorKind::NotFound || e.raw_os_error() == Some(libc::ESRCH)
         };
-        let mut pids = Vec::new();
-        for entry in std::fs::read_dir("/proc").map_err(|e| format!("cannot list /proc: {e}"))? {
-            let entry = entry.map_err(|e| format!("cannot list /proc: {e}"))?;
-            if let Some(pid) = entry
-                .file_name()
-                .to_str()
-                .and_then(|name| name.parse::<u32>().ok())
-            {
-                pids.push(pid);
-            }
-        }
         let owner_birth = |pid: u32| {
             let owner = match std::fs::metadata(format!("/proc/{pid}")) {
                 Ok(meta) => meta.uid(),
@@ -1199,9 +1245,14 @@ fn user_processes_with_cwd(spawned: Birth) -> Result<Vec<CwdProcess>, ScanError>
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
-        let _ = (uid, spawned);
+        let _ = (pids, uid, spawned);
         Err("process working directories are unreadable on this platform".into())
     }
+}
+
+/// [`processes_with_cwd`] of whatever `pids` lists.
+fn scan_with(pids: ScanPids<'_>, spawned: Birth) -> Result<Vec<CwdProcess>, ScanError> {
+    processes_with_cwd(pids()?, spawned)
 }
 
 fn is_shared_daemon(
@@ -1288,9 +1339,10 @@ impl<'a> QuietCheck<'a> {
         spawned: Birth,
         daemon: Option<&'a SharedDaemon>,
         rows: &[ProcessRow],
+        pids: ScanPids<'_>,
     ) -> Result<Quiet, String> {
         let check = Self::new(worktree, spawned, daemon, kernel_executable)?;
-        let scanned = user_processes_with_cwd(spawned).map_err(|e| e.reason)?;
+        let scanned = scan_with(pids, spawned).map_err(|e| e.reason)?;
         let found = check.stragglers(scanned, || Ok(rows.to_vec()))?;
         Ok(check.verdict(found))
     }
@@ -1459,11 +1511,13 @@ impl ProcessTracker {
     ) -> Result<Vec<ProcessRow>, MemoryError> {
         // The shared ironmem daemon is never owned (see
         // `ProcessRow::is_shared_ironmem_daemon`). A sample taken between its
-        // fork and exec showed it with its proxy's argv and enrolled it; it
-        // cannot have had children yet, so releasing it here, before it
-        // seeds anything, keeps its later children unowned too. Only the
-        // same process, by kernel birth, is released: a different birth is a
-        // reused PID, which the seed check below refuses as it would any.
+        // fork and exec showed it with its spawner's argv and enrolled it.
+        // It may have started children since that sample, but none was
+        // enrolled: it had none then. Releasing it here, before this sample
+        // enrols anything, means it is no seed, so those children are never
+        // reached either. Only the same process, by kernel birth, is
+        // released: a different birth is a reused PID, which the seed check
+        // below refuses as it would any.
         //
         // The daemon test reads a kernel path, so it runs once per row here
         // and never per tracked descendant: `known` keeps every exited one.
@@ -1790,8 +1844,14 @@ impl ProcessTracker {
         &self,
         worktree: &Path,
         grace: std::time::Duration,
+        pids: ScanPids<'_>,
     ) -> Result<Quiet, MemoryError> {
-        self.verify_worktree_quiet_with(worktree, user_processes_with_cwd, Self::rows, grace)
+        self.verify_worktree_quiet_with(
+            worktree,
+            |spawned| scan_with(pids, spawned),
+            Self::rows,
+            grace,
+        )
     }
 
     fn verify_worktree_quiet_with(
@@ -2857,13 +2917,18 @@ mod tests {
         assert_eq!((quiet, scans), (Quiet::Yes, 2));
     }
 
-    /// The real enumeration finds this test process in its own working
-    /// directory, cheaply enough to run at every completion.
+    /// The real enumeration lists this test process, and the real kernel
+    /// reads give its working directory, cheaply enough to run at every
+    /// completion. Only this process is read: an unrelated one caught
+    /// mid-exec of a setuid binary (another test's `ps`) refuses the read,
+    /// which would fail a whole-machine scan, as it must.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn the_kernel_lists_this_process_with_its_working_directory() {
         let started = std::time::Instant::now();
-        let processes = user_processes_with_cwd(Birth(0, 0)).unwrap();
+        let pids = user_pids().unwrap();
+        assert!(pids.contains(&std::process::id()), "{} pids", pids.len());
+        let processes = processes_with_cwd(vec![std::process::id()], Birth(0, 0)).unwrap();
         let elapsed = started.elapsed();
         let me = processes
             .iter()
@@ -2874,7 +2939,38 @@ mod tests {
             std::env::current_dir().unwrap().canonicalize().unwrap()
         );
         assert_eq!(Some(me.birth), birth(me.pid).unwrap());
-        eprintln!("{} processes with cwd in {elapsed:?}", processes.len());
+        eprintln!(
+            "{} pids listed and this one read in {elapsed:?}",
+            pids.len()
+        );
+    }
+
+    /// The writer enforces the reader's bound. Past it, the commands (kept
+    /// only for an operator) are dropped and every PID, group, parent and
+    /// birth is still written; an identity too large even then is refused
+    /// rather than written unreadable.
+    #[test]
+    fn an_identity_past_the_read_bound_drops_commands_or_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, _) = testing::invocation(dir.path());
+        let mut identity = read_identity(&a).unwrap();
+        let long = "x".repeat(RECORDED_ARGS_LIMIT);
+        identity.descendants = (2..6000)
+            .map(|pid| RecordedProcess::new(&args_row(pid, 1234, 1234, &long), Birth(7, 0)))
+            .collect();
+        assert!(serde_json::to_vec(&identity).unwrap().len() > IDENTITY_LIMIT);
+        persist_identity(&a, &identity).unwrap();
+        let read = read_identity(&a).unwrap();
+        assert_eq!(read.descendants.len(), identity.descendants.len());
+        assert!(read.descendants.iter().all(|d| d.args.is_empty()));
+        assert_eq!(read.descendants[0].birth, Some(Birth(7, 0)));
+        identity.descendants = (2..40_000)
+            .map(|pid| RecordedProcess::new(&args_row(pid, 1234, 1234, ""), Birth(7, 0)))
+            .collect();
+        let err = persist_identity(&a, &identity).unwrap_err().to_string();
+        assert!(err.contains("identity"), "{err}");
+        // The earlier, readable identity stands.
+        assert_eq!(read_identity(&a).unwrap().descendants.len(), 5998);
     }
 
     /// The identity is rewritten as descendants enrol, and `read_identity`

@@ -456,6 +456,7 @@ fn settle_awaiting_quiet(
     snapshot: &ProcessSnapshot,
     artifacts: &crate::autopilot::invocation::InvocationArtifacts,
     daemon: fn() -> Option<crate::autopilot::process_tree::SharedDaemon>,
+    pids: crate::autopilot::process_tree::ScanPids<'_>,
 ) -> Result<bool, String> {
     if !crate::autopilot::invocation::is_awaiting_quiet(artifacts) {
         return Ok(false);
@@ -465,6 +466,7 @@ fn settle_awaiting_quiet(
         snapshot,
         daemon().as_ref(),
         crate::autopilot::process_tree::kernel_birth,
+        pids,
     )
 }
 
@@ -472,18 +474,27 @@ pub(crate) fn invocation_state_liveness(
     snapshot: &ProcessSnapshot,
     state: &DispatchState,
 ) -> Liveness {
-    invocation_state_liveness_with(snapshot, state, configured_shared_daemon)
+    invocation_state_liveness_with(
+        snapshot,
+        state,
+        configured_shared_daemon,
+        &crate::autopilot::process_tree::user_pids,
+    )
 }
 
-/// [`invocation_state_liveness`] with the shared-daemon exemption injected.
+/// [`invocation_state_liveness`] with the shared-daemon exemption and the
+/// PIDs a worktree scan reads injected.
 pub(crate) fn invocation_state_liveness_with(
     snapshot: &ProcessSnapshot,
     state: &DispatchState,
     daemon: fn() -> Option<crate::autopilot::process_tree::SharedDaemon>,
+    pids: crate::autopilot::process_tree::ScanPids<'_>,
 ) -> Liveness {
     match state.invocation_artifacts.as_ref() {
         Some(artifacts) => match snapshot.liveness(Some(artifacts)) {
-            Liveness::Unknown if settle_awaiting_quiet(snapshot, artifacts, daemon) == Ok(true) => {
+            Liveness::Unknown
+                if settle_awaiting_quiet(snapshot, artifacts, daemon, pids) == Ok(true) =>
+            {
                 snapshot.liveness(Some(artifacts))
             }
             liveness => liveness,
@@ -496,17 +507,24 @@ pub(crate) fn invocation_state_liveness_with(
 }
 
 pub(crate) fn invocation_state_reason(snapshot: &ProcessSnapshot, state: &DispatchState) -> String {
-    invocation_state_reason_with(snapshot, state, configured_shared_daemon)
+    invocation_state_reason_with(
+        snapshot,
+        state,
+        configured_shared_daemon,
+        &crate::autopilot::process_tree::user_pids,
+    )
 }
 
-/// [`invocation_state_reason`] with the shared-daemon exemption injected.
+/// [`invocation_state_reason`] with the shared-daemon exemption and the
+/// PIDs a worktree scan reads injected.
 pub(crate) fn invocation_state_reason_with(
     snapshot: &ProcessSnapshot,
     state: &DispatchState,
     daemon: fn() -> Option<crate::autopilot::process_tree::SharedDaemon>,
+    pids: crate::autopilot::process_tree::ScanPids<'_>,
 ) -> String {
     match state.invocation_artifacts.as_ref() {
-        Some(artifacts) => match settle_awaiting_quiet(snapshot, artifacts, daemon) {
+        Some(artifacts) => match settle_awaiting_quiet(snapshot, artifacts, daemon, pids) {
             Err(held) => format!(
                 "{} invocation finished, but its completion waits until nothing it started \
                  remains: {held}",

@@ -11,7 +11,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::autopilot::dispatch::{DispatchOutcome, DispatchSpec, SessionRefusal, Verdict};
 use crate::autopilot::implementer::Implementer;
-use crate::autopilot::process_tree::{Birth, QuietHold, SharedDaemon};
+use crate::autopilot::process_tree::{
+    user_pids, Birth, ProcessIdentity, ProcessTracker, QuietHold, ScanPids, SharedDaemon,
+    QUIET_GRACE,
+};
 use crate::autopilot::scrub::scrub_and_bound;
 use crate::autopilot::IssueRef;
 use crate::error::MemoryError;
@@ -829,6 +832,7 @@ fn run_supervised_bounded_with(
     finish_supervised(
         cli,
         &mut tracker,
+        &mut identity,
         repo,
         a,
         spec,
@@ -836,8 +840,26 @@ fn run_supervised_bounded_with(
         started,
         timed_out,
         limit_exceeded,
-        super::process_tree::QUIET_GRACE,
+        QuietScan::supervision(),
     )
+}
+
+/// How completion checks that the worktree is quiet: how long it waits for
+/// that, and which PIDs it scans ([`ScanPids`]).
+#[derive(Clone, Copy)]
+struct QuietScan<'a> {
+    grace: Duration,
+    pids: ScanPids<'a>,
+}
+
+impl QuietScan<'static> {
+    /// Supervision's: [`QUIET_GRACE`] over every process the user owns.
+    fn supervision() -> Self {
+        Self {
+            grace: QUIET_GRACE,
+            pids: &user_pids,
+        }
+    }
 }
 
 /// Create each spawn file privately and exactly once, or name the one that
@@ -860,8 +882,8 @@ fn create_spawn_files(files: &[SpawnFile]) -> Result<(), (&Path, std::io::Error)
 /// descendants, only when they changed.
 fn record_identity(
     a: &InvocationArtifacts,
-    identity: &mut super::process_tree::ProcessIdentity,
-    tracker: &super::process_tree::ProcessTracker,
+    identity: &mut ProcessIdentity,
+    tracker: &ProcessTracker,
 ) -> Result<(), MemoryError> {
     let (root_birth, descendants) = tracker.recorded();
     if root_birth == identity.root_birth && descendants == identity.descendants {
@@ -921,7 +943,8 @@ fn with_cleanup(err: MemoryError, cleanup: Result<(), MemoryError>) -> MemoryErr
 #[allow(clippy::too_many_arguments)]
 fn finish_supervised(
     cli: &dyn SupervisedCli,
-    tracker: &mut super::process_tree::ProcessTracker,
+    tracker: &mut ProcessTracker,
+    identity: &mut ProcessIdentity,
     repo: &Path,
     a: &InvocationArtifacts,
     spec: &DispatchSpec,
@@ -929,7 +952,7 @@ fn finish_supervised(
     started: Instant,
     timed_out: bool,
     limit_exceeded: Option<String>,
-    quiet_grace: Duration,
+    quiet: QuietScan<'_>,
 ) -> Result<DispatchOutcome, MemoryError> {
     // Catch an artifact that crossed the limit just before process exit.
     let limit_exceeded = limit_exceeded.or_else(|| limits(cli, a));
@@ -943,9 +966,16 @@ fn finish_supervised(
     }
     // Even a successful root can leave a gate in a separate process group.
     // Unknown cleanup returns Err so run.rs retains the invocation and slot.
-    tracker.cleanup(true)?;
+    let cleaned = tracker.cleanup(true);
+    // Cleanup's own sample releases a shared daemon that an earlier sample
+    // enrolled between its fork and exec. Record that before anything else
+    // can fail: with no exit record, recovery counts every recorded PID as
+    // this invocation's, and the operator's daemon outlives it.
+    let recorded = record_identity(a, identity, tracker);
+    cleaned?;
+    recorded?;
     tracker.verify_group_drained()?;
-    let quiet = tracker.verify_worktree_quiet(repo, quiet_grace)?;
+    let quiet = tracker.verify_worktree_quiet(repo, quiet.grace, quiet.pids)?;
     let mut record = exit_record(
         a,
         cli.expected_native_id(spec),
@@ -1185,7 +1215,8 @@ pub fn is_awaiting_quiet(artifacts: &InvocationArtifacts) -> bool {
 /// - a fresh scan of the recorded worktree is quiet.
 ///
 /// A kernel read that fails holds; only "no such process" or a different
-/// birth under the PID is gone. `kernel` reads a birth (`kernel_birth`).
+/// birth under the PID is gone. `kernel` reads a birth (`kernel_birth`);
+/// `pids` lists what the fresh scan reads (`user_pids`).
 /// `Ok(true)`: upgraded to a trusted completion. `Ok(false)`: not such an
 /// invocation. `Err`: still held, with what holds it.
 pub(crate) fn settle_awaiting_quiet(
@@ -1193,6 +1224,7 @@ pub(crate) fn settle_awaiting_quiet(
     snapshot: &super::process_tree::ProcessSnapshot,
     daemon: Option<&SharedDaemon>,
     mut kernel: impl FnMut(u32) -> Result<Option<Birth>, String>,
+    pids: ScanPids<'_>,
 ) -> Result<bool, String> {
     use super::process_tree::{current_uid, read_identity, ProcessSnapshot, Quiet, QuietCheck};
     let Some(mut record) = read_capped(&a.exit_path, EXIT_LIMIT)
@@ -1264,7 +1296,8 @@ pub(crate) fn settle_awaiting_quiet(
             _ => {}
         }
     }
-    if let Quiet::Held(hold) = QuietCheck::once(&awaiting.worktree, root_birth, daemon, rows)? {
+    if let Quiet::Held(hold) = QuietCheck::once(&awaiting.worktree, root_birth, daemon, rows, pids)?
+    {
         return Err(hold.reason);
     }
     record.completion = record.awaiting_quiet.take().map(|w| w.completion);
@@ -1446,6 +1479,22 @@ pub(crate) mod contract_tests {
             .unwrap();
         }
         read_artifacts(spec.implementer, a).unwrap()
+    }
+    /// The identity the fixture's spawn persisted, as supervision holds it.
+    fn fixture_identity(a: &InvocationArtifacts) -> ProcessIdentity {
+        super::super::process_tree::read_identity(a).unwrap()
+    }
+    fn no_pids() -> Result<Vec<u32>, String> {
+        Ok(Vec::new())
+    }
+    /// A completion that reads no process for the worktree check, for a
+    /// test whose subject is something else: no unrelated process on the
+    /// machine can then decide it.
+    fn no_scan() -> QuietScan<'static> {
+        QuietScan {
+            grace: QUIET_GRACE,
+            pids: &no_pids,
+        }
     }
     pub(crate) fn journal() -> String {
         format!("{{\"type\":\"thread.started\",\"thread_id\":\"{THREAD}\"}}\n{{\"type\":\"turn.completed\",\"usage\":{{}}}}\n")
@@ -1726,6 +1775,7 @@ exit {code}"#
             finish_supervised(
                 &CodexCli,
                 &mut tracker,
+                &mut fixture_identity(spec.invocation_artifacts.as_ref().unwrap()),
                 repo,
                 spec.invocation_artifacts.as_ref().unwrap(),
                 spec,
@@ -1733,7 +1783,7 @@ exit {code}"#
                 started,
                 false,
                 None,
-                super::super::process_tree::QUIET_GRACE,
+                no_scan(),
             )
         })();
         if result.is_err() {
@@ -1801,6 +1851,7 @@ exit {code}"#
         let error = finish_supervised(
             &CodexCli,
             &mut tracker,
+            &mut fixture_identity(a),
             dir.path(),
             a,
             &spec,
@@ -1808,7 +1859,7 @@ exit {code}"#
             started,
             false,
             None,
-            super::super::process_tree::QUIET_GRACE,
+            no_scan(),
         )
         .unwrap_err();
         assert!(error
@@ -2007,6 +2058,7 @@ exit {code}"#
         let result = finish_supervised(
             &CodexCli,
             &mut tracker,
+            &mut fixture_identity(a),
             dir.path(),
             a,
             &s,
@@ -2014,7 +2066,7 @@ exit {code}"#
             started,
             false,
             None,
-            super::super::process_tree::QUIET_GRACE,
+            no_scan(),
         );
         if let Some(pid) = std::fs::read_to_string(dir.path().join("straggler.pid"))
             .ok()
@@ -2036,6 +2088,13 @@ exit {code}"#
     /// finishes the invocation with its verdict, with no `clear-dispatch`.
     /// The only scan happens before the root starts the tool, which makes
     /// the escape deterministic.
+    ///
+    /// The worktree scans read only the fixture's escaped process, through
+    /// the real kernel. A whole-machine scan fails whenever it meets a
+    /// same-user process it listed just before that process exec'd a
+    /// setuid-root binary (another test's `/bin/ps`, on macOS): the kernel
+    /// then refuses to describe it (EPERM), and the scan holds, as the
+    /// fail-closed rule requires. That made this test flake under load.
     #[cfg(unix)]
     #[test]
     fn a_background_child_of_an_exited_session_leader_tool_withholds_completion_until_gone() {
@@ -2056,30 +2115,41 @@ exit {code}"#
         let bin = binary(
             dir.path(),
             &script(
-                r#"while [ ! -f root-release ]; do sleep 0.01; done
-/usr/bin/python3 -c 'import os; os.setsid(); os.execv("/bin/sh", ["sh", "-c", "(sleep 30 & echo $! > escaped.pid) ; exit 0"])'
+                &format!(
+                    r#"while [ ! -f root-release ]; do sleep 0.01; done
+{} -c 'import os; os.setsid(); os.execv("/bin/sh", ["sh", "-c", "(sleep 30 & echo $! > escaped.pid) ; exit 0"])'
 while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
+                    python3()
+                ),
                 0,
             ),
         );
+        let escaped = || {
+            std::fs::read_to_string(dir.path().join("escaped.pid"))
+                .ok()
+                .and_then(|pid| pid.trim().parse::<u32>().ok())
+        };
+        let fixture_pids = || Ok(escaped().into_iter().collect::<Vec<_>>());
         let started = Instant::now();
         let mut child = spawn_fixture_invocation(&bin, dir.path(), &s);
         let mut tracker = super::super::process_tree::ProcessTracker::new(child.id(), None);
         tracker.observe().unwrap();
         // As the supervision loop does after each sample.
-        let mut identity = super::super::process_tree::read_identity(a).unwrap();
+        let mut identity = fixture_identity(a);
         record_identity(a, &mut identity, &tracker).unwrap();
         std::fs::write(dir.path().join("root-release"), "release").unwrap();
+        // Only a hang guard: a cold python start under load is slow.
         let status = loop {
             if let Some(status) = child.try_wait().unwrap() {
                 break status;
             }
-            assert!(started.elapsed() < Duration::from_secs(5), "root hung");
+            assert!(started.elapsed() < Duration::from_secs(30), "root hung");
             std::thread::sleep(Duration::from_millis(5));
         };
         let result = finish_supervised(
             &CodexCli,
             &mut tracker,
+            &mut identity,
             dir.path(),
             a,
             &s,
@@ -2087,15 +2157,15 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
             started,
             false,
             None,
-            Duration::from_millis(500),
+            QuietScan {
+                grace: Duration::from_millis(500),
+                pids: &fixture_pids,
+            },
         );
-        let escaped = std::fs::read_to_string(dir.path().join("escaped.pid"))
-            .ok()
-            .and_then(|pid| pid.trim().parse::<i32>().ok());
-        let mut guard = KillOnDrop(escaped);
+        let mut guard = KillOnDrop(escaped().map(|pid| pid as i32));
         assert!(status.success());
         let err = result.unwrap_err().to_string();
-        let pid = escaped.expect("the tool recorded its background child");
+        let pid = escaped().expect("the tool recorded its background child");
         assert!(
             err.contains(&format!("process {pid}")) && err.contains("worktree"),
             "{err}"
@@ -2110,10 +2180,10 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
             || super::super::process_tree::snapshot(&mut super::super::process_tree::UnixProcesses);
         // Still there: held, naming it.
         assert_eq!(
-            invocation_state_liveness_with(&snapshot(), &state, no_daemon),
+            invocation_state_liveness_with(&snapshot(), &state, no_daemon, &fixture_pids),
             Liveness::Unknown
         );
-        let reason = invocation_state_reason_with(&snapshot(), &state, no_daemon);
+        let reason = invocation_state_reason_with(&snapshot(), &state, no_daemon, &fixture_pids);
         assert!(reason.contains(&format!("process {pid}")), "{reason}");
         assert!(!has_valid_exit_record(a));
         // Gone: recovery upgrades the record and finishes with the verdict.
@@ -2121,16 +2191,37 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
             // SAFETY: the fixture's own escaped sleep.
             unsafe { libc::kill(pid, libc::SIGKILL) };
         }
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(30);
         let mut liveness = Liveness::Unknown;
         while liveness != Liveness::NotListed && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(50));
-            liveness = invocation_state_liveness_with(&snapshot(), &state, no_daemon);
+            liveness =
+                invocation_state_liveness_with(&snapshot(), &state, no_daemon, &fixture_pids);
         }
         assert_eq!(liveness, Liveness::NotListed);
         assert!(has_valid_exit_record(a) && !is_awaiting_quiet(a));
         let outcome = read_artifacts(Implementer::Codex, a).unwrap();
         assert!(outcome.is_met() && outcome.process_success, "{outcome:?}");
+    }
+
+    /// `/usr/bin/python3`, which these real-process tests use to start a
+    /// process in a session of its own (there is no portable `setsid`
+    /// command). A machine without it fails here, saying so, rather than
+    /// with an unrelated panic later or a silent pass.
+    #[cfg(unix)]
+    pub(crate) fn python3() -> &'static str {
+        const PYTHON: &str = "/usr/bin/python3";
+        let ok = std::process::Command::new(PYTHON)
+            .args(["-c", "import os; os.setsid"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        assert!(
+            ok,
+            "{PYTHON} must run to start a test process in its own session; install Python 3 there"
+        );
+        PYTHON
     }
 
     /// The shared-daemon exemption, injected so recovery tests never read
@@ -2228,8 +2319,11 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
         )
         .unwrap();
         let rows = ProcessSnapshot::Available(Vec::new());
+        // The fresh worktree scan reads no process: its worktree is an
+        // empty temp directory, and what is under test is the recorded
+        // evidence, not whatever else runs on the machine.
         let settle = |kernel: &dyn Fn(u32) -> Result<Option<_>, String>| {
-            settle_awaiting_quiet(a, &rows, None, kernel)
+            settle_awaiting_quiet(a, &rows, None, kernel, &no_pids)
         };
         let real = |pid| kernel_birth(pid);
         // A recorded straggler still alive, though no longer in the worktree.
@@ -2322,8 +2416,15 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
             .unwrap();
         let snapshot =
             super::super::process_tree::snapshot(&mut super::super::process_tree::UnixProcesses);
-        let liveness =
-            invocation_state_liveness_with(&snapshot, &held_state(a, elsewhere.path()), no_daemon);
+        // The scan reads only the newcomer, through the real kernel, so no
+        // unrelated process on the machine can decide the outcome.
+        let newcomer_pid = newcomer.id();
+        let liveness = invocation_state_liveness_with(
+            &snapshot,
+            &held_state(a, elsewhere.path()),
+            no_daemon,
+            &|| Ok(vec![newcomer_pid]),
+        );
         let _ = newcomer.kill();
         let _ = newcomer.wait();
         assert_eq!(liveness, Liveness::Unknown);
@@ -2384,6 +2485,15 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
         let outcome = finish_supervised(
             &CodexCli,
             &mut tracker,
+            &mut ProcessIdentity {
+                version: 1,
+                root_pid: child.id(),
+                root_pgid: child.id(),
+                root_birth: None,
+                schema_path: a.schema_path.clone(),
+                invocation_id: a.invocation_id.clone(),
+                descendants: Vec::new(),
+            },
             dir.path(),
             a,
             &s,
@@ -2391,7 +2501,7 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
             started,
             false,
             previous_limit,
-            super::super::process_tree::QUIET_GRACE,
+            no_scan(),
         )
         .unwrap();
         assert!(!outcome.is_met());
@@ -2432,7 +2542,7 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
     #[test]
     fn timeout_kills_tool_in_a_separate_process_group() {
         let (dir, s) = setup();
-        let python = "/usr/bin/python3";
+        let python = python3();
         // The tool waits for a release the test gives only after the bound
         // fired, so it can mark survival only if the kill missed it. The
         // bound is generous because a cold python start on a CI runner can
@@ -2690,10 +2800,11 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
             let bin = binary(
                 dir.path(),
                 &observable(&format!(
-                    "/usr/bin/python3 -c \"import subprocess,time; \
+                    "{} -c \"import subprocess,time; \
                      p=subprocess.Popen(['{}','serve','--listen','{}'],start_new_session=True,cwd='{}'); \
                      open('daemon.pid','w').write(str(p.pid)); time.sleep(1)\" || exit 5\n\
                      echo journal",
+                    python3(),
                     daemon.display(),
                     socket.display(),
                     daemon_dir.display()
@@ -2722,10 +2833,9 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
                 }),
             );
             let pid: i32 = std::fs::read_to_string(dir.path().join("daemon.pid"))
-                .unwrap()
-                .trim()
-                .parse()
-                .unwrap();
+                .ok()
+                .and_then(|pid| pid.trim().parse().ok())
+                .unwrap_or_else(|| panic!("the fixture never started its daemon: {result:?}"));
             let _cleanup = KillGroup(pid);
             let o = result.unwrap();
             assert!(o.process_success && o.is_met(), "{o:?}");
@@ -2740,6 +2850,159 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
                 assert!(!exists(pid), "a daemon on another socket escaped cleanup");
             }
         }
+    }
+
+    /// A sample taken between the shared daemon's fork and its exec sees the
+    /// spawning process's argv, so the tracker enrols it and the identity
+    /// file records it. Cleanup's own sample sees the daemon argv and
+    /// releases it; the identity file must stop naming it there, before
+    /// anything else can fail. With no exit record, recovery counts every
+    /// recorded PID as this invocation's, so the operator's long-lived daemon
+    /// would hold the slot. The daemon is a `/bin/sh` script behind a symlink
+    /// named `ironmem`, as in the cleanup test above; it waits to exec until
+    /// told, which makes the window deterministic.
+    #[cfg(unix)]
+    #[test]
+    fn a_shared_daemon_enrolled_before_its_exec_leaves_the_identity_at_cleanup() {
+        use crate::autopilot::process_tree::ProcessSource;
+        struct KillGroup(Option<i32>);
+        impl Drop for KillGroup {
+            fn drop(&mut self) {
+                if let Some(pid) = self.0 {
+                    // SAFETY: a negative PID signals the fake daemon's own group.
+                    unsafe { libc::kill(-pid, libc::SIGKILL) };
+                }
+            }
+        }
+        let (dir, s) = setup();
+        let a = s.invocation_artifacts.as_ref().unwrap();
+        let daemon_dir = dir.path().join("daemon");
+        std::fs::create_dir(&daemon_dir).unwrap();
+        std::os::unix::fs::symlink("/bin/sh", daemon_dir.join("ironmem")).unwrap();
+        std::fs::write(daemon_dir.join("serve"), "sleep 30\n:\n").unwrap();
+        let daemon = daemon_dir.join("ironmem");
+        let socket = daemon_dir.join("daemon.sock");
+        let shared = SharedDaemon {
+            socket: socket.clone(),
+            exe: Path::new(if cfg!(target_os = "macos") {
+                "/var/select/sh"
+            } else {
+                "/bin/sh"
+            })
+            .canonicalize()
+            .unwrap(),
+        };
+        let bin = binary(
+            dir.path(),
+            &script(
+                &format!(
+                    "{} -c \"\nimport os, time\nos.setsid()\nos.chdir('{}')\n\
+                     open('../pre-exec.pid', 'w').write(str(os.getpid()))\n\
+                     while not os.path.exists('../exec-now'): time.sleep(0.01)\n\
+                     os.execv('{}', ['{}', 'serve', '--listen', '{}'])\n\" &\n\
+                     while [ ! -f root-release ]; do sleep 0.01; done",
+                    python3(),
+                    daemon_dir.display(),
+                    daemon.display(),
+                    daemon.display(),
+                    socket.display()
+                ),
+                0,
+            ),
+        );
+        let read_pid = |name: &str| {
+            std::fs::read_to_string(dir.path().join(name))
+                .ok()
+                .and_then(|pid| pid.trim().parse::<u32>().ok())
+        };
+        let wait = |what: &str, mut done: Box<dyn FnMut() -> bool + '_>| {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !done() {
+                assert!(Instant::now() < deadline, "timed out waiting for {what}");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        let started = Instant::now();
+        let mut child = spawn_fixture_invocation(&bin, dir.path(), &s);
+        let mut killer = KillGroup(None);
+        let mut tracker = ProcessTracker::new(child.id(), Some(&shared));
+        let mut identity = fixture_identity(a);
+        let result = (|| {
+            wait(
+                "the daemon's fork",
+                Box::new(|| read_pid("pre-exec.pid").is_some()),
+            );
+            let pid = read_pid("pre-exec.pid").unwrap();
+            killer.0 = Some(pid as i32);
+            // The supervisor's sample before the exec enrols it, and records it.
+            tracker.observe()?;
+            record_identity(a, &mut identity, &tracker)?;
+            assert!(
+                super::super::process_tree::read_identity(a)
+                    .unwrap()
+                    .descendants
+                    .iter()
+                    .any(|d| d.pid == pid),
+                "the pre-exec daemon was not enrolled"
+            );
+            std::fs::write(dir.path().join("exec-now"), "")?;
+            wait(
+                "the daemon's exec",
+                Box::new(|| {
+                    super::super::process_tree::UnixProcesses
+                        .list()
+                        .is_ok_and(|rows| {
+                            rows.iter()
+                                .any(|r| r.pid == pid && r.args.contains("serve --listen"))
+                        })
+                }),
+            );
+            // The root exits before any further sample.
+            std::fs::write(dir.path().join("root-release"), "")?;
+            let status = loop {
+                if let Some(status) = child.try_wait()? {
+                    break status;
+                }
+                assert!(started.elapsed() < Duration::from_secs(60), "root hung");
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            finish_supervised(
+                &CodexCli,
+                &mut tracker,
+                &mut identity,
+                dir.path(),
+                a,
+                &s,
+                status,
+                started,
+                false,
+                None,
+                QuietScan {
+                    grace: Duration::from_millis(500),
+                    pids: &|| Ok(vec![pid]),
+                },
+            )
+            .map(|outcome| (pid, outcome))
+        })();
+        if result.is_err() {
+            let _ = tracker.cleanup(false);
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let (pid, outcome) = result.unwrap();
+        assert!(outcome.is_met(), "{outcome:?}");
+        let recorded = super::super::process_tree::read_identity(a).unwrap();
+        assert!(
+            recorded.descendants.iter().all(|d| d.pid != pid),
+            "the released shared daemon is still recorded: {:?}",
+            recorded.descendants
+        );
+        // SAFETY: signal 0 only probes that the process exists.
+        assert_eq!(
+            unsafe { libc::kill(pid as i32, 0) },
+            0,
+            "cleanup killed the daemon"
+        );
     }
 
     /// A crashed controller's successor and `clear-dispatch` see only what
