@@ -116,17 +116,89 @@ pub trait SupervisedCli: Sync {
     ) -> ParsedRun;
 }
 
-/// Harness-parsed evidence; [`read_artifacts`] combines it with the exit record.
-#[derive(Debug, Default)]
+/// Harness-parsed evidence; [`read_artifacts`] combines it with the exit
+/// record. It has exactly two shapes, one per constructor: a verdict with its
+/// native session ID and no errors, or a failure with no verdict. A verdict
+/// alongside an error, or without a native ID, cannot be built.
+#[derive(Debug)]
 pub struct ParsedRun {
-    pub native_id: Option<String>,
-    /// The schema-shaped verdict, when the run produced one. Why there is
-    /// none travels in `errors`; the core refuses a run without one either way.
-    pub verdict: Option<FinalVerdict>,
-    pub turns: u32,
-    pub errors: Vec<String>,
-    /// Whether the journal or final file held any bytes at all.
-    pub observed_output: bool,
+    native_id: Option<String>,
+    verdict: Option<FinalVerdict>,
+    turns: u32,
+    errors: Vec<String>,
+    observed_output: bool,
+}
+
+impl ParsedRun {
+    /// A run that produced its schema-shaped verdict on `native_id` and
+    /// nothing wrong. `observed_output`: the journal or final file held
+    /// any bytes at all.
+    pub fn with_verdict(
+        native_id: String,
+        verdict: FinalVerdict,
+        turns: u32,
+        observed_output: bool,
+    ) -> Self {
+        Self {
+            native_id: Some(native_id),
+            verdict: Some(verdict),
+            turns,
+            errors: Vec::new(),
+            observed_output,
+        }
+    }
+
+    /// A run with no trusted verdict. `errors` says why; when it is empty
+    /// the core reports the missing verdict (and native ID) itself.
+    /// `native_id` is kept so a replacement controller can resume it.
+    pub fn failed(
+        errors: Vec<String>,
+        native_id: Option<String>,
+        turns: u32,
+        observed_output: bool,
+    ) -> Self {
+        Self {
+            native_id,
+            verdict: None,
+            turns,
+            errors,
+            observed_output,
+        }
+    }
+
+    /// [`Self::with_verdict`] when `errors` is empty and both the verdict and the
+    /// native ID are present, otherwise [`Self::failed`], dropping the
+    /// verdict. For a parser that gathers evidence as it goes.
+    pub fn from_evidence(
+        errors: Vec<String>,
+        native_id: Option<String>,
+        verdict: Option<FinalVerdict>,
+        turns: u32,
+        observed_output: bool,
+    ) -> Self {
+        match (verdict, native_id) {
+            (Some(verdict), Some(native_id)) if errors.is_empty() => {
+                Self::with_verdict(native_id, verdict, turns, observed_output)
+            }
+            (_, native_id) => Self::failed(errors, native_id, turns, observed_output),
+        }
+    }
+
+    pub fn native_id(&self) -> Option<&str> {
+        self.native_id.as_deref()
+    }
+    pub fn verdict(&self) -> Option<&FinalVerdict> {
+        self.verdict.as_ref()
+    }
+    pub fn turns(&self) -> u32 {
+        self.turns
+    }
+    pub fn errors(&self) -> &[String] {
+        &self.errors
+    }
+    pub fn observed_output(&self) -> bool {
+        self.observed_output
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -793,9 +865,8 @@ fn read_artifacts_with(
         read_capped(&a.final_path, FINAL_LIMIT),
         expected_native_id,
     );
-    // A harness that reports neither an error nor the evidence a met verdict
-    // needs still fails closed, so valid evidence always carries both. Codex
-    // explains each absence itself, so it never reaches these.
+    // Only a `ParsedRun::failed` with no errors reaches these: say what is
+    // missing rather than fail with no reason. Codex and Muse always give one.
     if parsed.errors.is_empty() {
         if parsed.verdict.is_none() {
             errors.push(format!("{} reported no final verdict", cli.label()));
@@ -929,8 +1000,9 @@ pub fn recover_artifacts(
 
 #[cfg(test)]
 mod tests {
+    use super::contract_tests::THREAD;
     use super::*;
-    use crate::autopilot::dispatch::SessionMode;
+    use crate::autopilot::dispatch::{SessionMode, Verdict};
 
     #[test]
     fn claude_has_no_supervised_cli() {
@@ -963,6 +1035,31 @@ mod tests {
             codex.expected_native_id(&spec).as_deref(),
             Some("11111111-2222-3333-4444-555555555555")
         );
+    }
+
+    /// Parsed evidence has two shapes: a verdict with its native session ID
+    /// and nothing wrong, or a failure that carries no verdict. No other
+    /// combination can be built.
+    #[test]
+    fn parsed_evidence_is_a_verdict_or_a_failure_never_both() {
+        let ok = ParsedRun::with_verdict(
+            THREAD.into(),
+            FinalVerdict {
+                verdict: Verdict::Met,
+                reason: "gate".into(),
+            },
+            3,
+            true,
+        );
+        assert!(ok.errors().is_empty());
+        assert_eq!(ok.native_id(), Some(THREAD));
+        assert_eq!(ok.verdict().map(|v| v.verdict), Some(Verdict::Met));
+        assert_eq!((ok.turns(), ok.observed_output()), (3, true));
+        let failed = ParsedRun::failed(vec!["broken".into()], Some(THREAD.into()), 2, false);
+        assert!(failed.verdict().is_none());
+        assert_eq!(failed.errors(), ["broken"]);
+        assert_eq!(failed.native_id(), Some(THREAD));
+        assert_eq!((failed.turns(), failed.observed_output()), (2, false));
     }
 
     #[test]
@@ -1846,15 +1943,19 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
             _final_text: Result<String, MemoryError>,
             _expected_native_id: Option<&str>,
         ) -> ParsedRun {
-            ParsedRun {
-                native_id: self.native_id.then(|| THREAD.to_owned()),
-                verdict: self.verdict.then(|| FinalVerdict {
-                    verdict: Verdict::Met,
-                    reason: "gate".into(),
-                }),
-                turns: 1,
-                errors: Vec::new(),
-                observed_output: !journal.is_empty(),
+            let native_id = self.native_id.then(|| THREAD.to_owned());
+            match (self.verdict, native_id) {
+                (true, Some(native_id)) => ParsedRun::with_verdict(
+                    native_id,
+                    FinalVerdict {
+                        verdict: Verdict::Met,
+                        reason: "gate".into(),
+                    },
+                    1,
+                    !journal.is_empty(),
+                ),
+                // Reported with no reason, so the core names what is missing.
+                (_, native_id) => ParsedRun::failed(Vec::new(), native_id, 1, !journal.is_empty()),
             }
         }
     }

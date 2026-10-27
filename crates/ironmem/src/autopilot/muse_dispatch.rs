@@ -182,16 +182,19 @@ impl SupervisedCli for MuseCli {
         _final_text: Result<String, MemoryError>,
         expected_native_id: Option<&str>,
     ) -> ParsedRun {
-        let mut parsed = ParsedRun {
-            observed_output: !journal.is_empty(),
-            ..ParsedRun::default()
-        };
+        let observed_output = !journal.is_empty();
         let Some(expected) = expected_native_id else {
-            parsed
-                .errors
-                .push("Muse supervisor record names no session; nothing can be trusted".into());
-            return parsed;
+            return ParsedRun::failed(
+                vec!["Muse supervisor record names no session; nothing can be trusted".into()],
+                None,
+                0,
+                observed_output,
+            );
         };
+        let mut errors: Vec<String> = Vec::new();
+        let mut native_id = None;
+        let mut verdict = None;
+        let mut turns = 0;
         let on_stream = |value: &serde_json::Value, kind: &str| {
             value["stream"]["kind"].as_str() == Some(kind)
                 && value["stream"]["id"].as_str() == Some(expected)
@@ -216,54 +219,47 @@ impl SupervisedCli for MuseCli {
                 Some("run_terminal") if ours => terminals.push(value["payload"].clone()),
                 Some("run_usage") if on_stream(&value, "exec.usage") => {
                     if let Some(n) = value["payload"]["completed_calls"].as_u64() {
-                        parsed.turns = u32::try_from(n).unwrap_or(u32::MAX);
+                        turns = u32::try_from(n).unwrap_or(u32::MAX);
                     }
                 }
                 _ => {}
             }
         }
         if malformed > 0 {
-            parsed.errors.push(format!(
+            errors.push(format!(
                 "{malformed} malformed Muse JSONL line(s) (first at line {first_malformed})"
             ));
         }
         if saw_expected {
-            parsed.native_id = Some(expected.to_owned());
+            native_id = Some(expected.to_owned());
         } else {
-            parsed.errors.push(format!(
+            errors.push(format!(
                 "Muse journal never names the requested session {expected}"
             ));
         }
         match terminals.as_slice() {
-            [] => parsed
-                .errors
-                .push("Muse run emitted no terminal record".into()),
+            [] => errors.push("Muse run emitted no terminal record".into()),
             [t] if t["terminal"].as_str() == Some("completed") => match t["text"].as_str() {
-                None => parsed
-                    .errors
-                    .push("Muse completed terminal record carries no text verdict".into()),
+                None => errors.push("Muse completed terminal record carries no text verdict".into()),
                 Some(text) => match serde_json::from_str::<FinalVerdict>(text) {
-                    Ok(verdict) => parsed.verdict = Some(verdict),
-                    Err(e) => parsed.errors.push(format!(
+                    Ok(parsed) => verdict = Some(parsed),
+                    Err(e) => errors.push(format!(
                         "invalid Muse final verdict: {e}; text: {:?}",
                         excerpt(text)
                     )),
                 },
             },
-            [t] => parsed.errors.push(format!(
+            [t] => errors.push(format!(
                 "Muse run ended {}: {}",
                 t["terminal"].as_str().unwrap_or("without a terminal kind"),
                 t["reason"].as_str().unwrap_or("no reason given")
             )),
-            many => parsed.errors.push(format!(
+            many => errors.push(format!(
                 "Muse journal has {} terminal records for the requested session; expected exactly one",
                 many.len()
             )),
         }
-        if !parsed.errors.is_empty() {
-            parsed.verdict = None;
-        }
-        parsed
+        ParsedRun::from_evidence(errors, native_id, verdict, turns, observed_output)
     }
 }
 
@@ -493,13 +489,13 @@ mod tests {
         ]
         .join("\n");
         let parsed = MuseCli.parse(&journal, Ok(String::new()), Some(SID));
-        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
-        assert_eq!(parsed.native_id.as_deref(), Some(SID));
-        assert_eq!(parsed.turns, 9);
-        assert_eq!(parsed.verdict.unwrap().verdict, Verdict::Met);
+        assert!(parsed.errors().is_empty(), "{:?}", parsed.errors());
+        assert_eq!(parsed.native_id(), Some(SID));
+        assert_eq!(parsed.turns(), 9);
+        assert_eq!(parsed.verdict().unwrap().verdict, Verdict::Met);
         // With no expected ID (a corrupt exit record), nothing is trusted.
         let untrusted = MuseCli.parse(&journal, Ok(String::new()), None);
-        assert!(untrusted.verdict.is_none() && !untrusted.errors.is_empty());
+        assert!(untrusted.verdict().is_none() && !untrusted.errors().is_empty());
     }
 
     #[test]
@@ -516,8 +512,8 @@ mod tests {
         ]
         .join("\n");
         let parsed = MuseCli.parse(&journal, Ok(String::new()), Some(SID));
-        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
-        assert_eq!(parsed.turns, 3);
+        assert!(parsed.errors().is_empty(), "{:?}", parsed.errors());
+        assert_eq!(parsed.turns(), 3);
     }
 
     #[test]
@@ -534,8 +530,8 @@ mod tests {
         ]
         .join("\n");
         let parsed = MuseCli.parse(&journal, Ok(String::new()), Some(SID));
-        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
-        assert_eq!(parsed.verdict.unwrap().verdict, Verdict::NotMet);
+        assert!(parsed.errors().is_empty(), "{:?}", parsed.errors());
+        assert_eq!(parsed.verdict().unwrap().verdict, Verdict::NotMet);
     }
 
     #[test]
@@ -588,10 +584,10 @@ mod tests {
         for journal in cases {
             let parsed = MuseCli.parse(&journal, Ok(String::new()), Some(SID));
             assert!(
-                parsed.verdict.is_none(),
+                parsed.verdict().is_none(),
                 "trusted a verdict from: {journal}"
             );
-            assert!(!parsed.errors.is_empty(), "no error for: {journal}");
+            assert!(!parsed.errors().is_empty(), "no error for: {journal}");
         }
     }
 
@@ -601,21 +597,26 @@ mod tests {
         for second in [terminal("failed", ""), met.clone()] {
             let journal = [met.clone(), second].join("\n");
             let parsed = MuseCli.parse(&journal, Ok(String::new()), Some(SID));
-            assert!(parsed.verdict.is_none(), "trusted: {journal}");
+            assert!(parsed.verdict().is_none(), "trusted: {journal}");
             assert!(
-                parsed.errors.contains(
+                parsed.errors().contains(
                     &"Muse journal has 2 terminal records for the requested session; expected exactly one"
                         .to_owned()
                 ),
                 "{:?}",
-                parsed.errors
+                parsed.errors()
             );
         }
     }
 
     #[test]
     fn failure_reasons_are_specific_and_bounded() {
-        let errors = |journal: &str| MuseCli.parse(journal, Ok(String::new()), Some(SID)).errors;
+        let errors = |journal: &str| {
+            MuseCli
+                .parse(journal, Ok(String::new()), Some(SID))
+                .errors()
+                .to_vec()
+        };
         // No terminal record: say so without guessing a cause.
         let none = errors(&usage(1));
         assert!(
@@ -674,8 +675,8 @@ mod tests {
         ]
         .join("\n");
         let parsed = MuseCli.parse(&journal, Ok(String::new()), Some(SID));
-        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
-        assert_eq!(parsed.verdict.unwrap().verdict, Verdict::Met);
+        assert!(parsed.errors().is_empty(), "{:?}", parsed.errors());
+        assert_eq!(parsed.verdict().unwrap().verdict, Verdict::Met);
     }
 
     #[test]
@@ -690,8 +691,8 @@ mod tests {
         ]
         .join("\n");
         let parsed = MuseCli.parse(&journal, Ok(String::new()), Some(SID));
-        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
-        assert_eq!(parsed.native_id.as_deref(), Some(SID));
+        assert!(parsed.errors().is_empty(), "{:?}", parsed.errors());
+        assert_eq!(parsed.native_id(), Some(SID));
     }
 
     #[test]
