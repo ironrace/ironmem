@@ -756,6 +756,14 @@ fn run_supervised_bounded_with(
     // checkout, rather than a controller's inherited repository-selection
     // overrides.
     crate::mcp::tools::scrub_git_environment(&mut command);
+    // Tests only: where the identity file is, so a stub can wait on the
+    // tracker's own signal ([`contract_tests::await_first_sample`]) without
+    // guessing the artifact layout.
+    #[cfg(test)]
+    command.env(
+        contract_tests::IDENTITY_PATH_ENV,
+        super::process_tree::identity_path(a),
+    );
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -1740,6 +1748,10 @@ pub(crate) mod contract_tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         path
     }
+    /// The variable the supervisor sets, in tests only, to its invocation's
+    /// identity file (`process.json`).
+    pub(crate) const IDENTITY_PATH_ENV: &str = "IRONMEM_TEST_IDENTITY_PATH";
+
     /// Shell for a stub that goes on only once the supervisor has sampled
     /// it, as any real harness outlives that sample: it starts a probe
     /// `sleep`, waits until the identity file records the probe as an
@@ -1750,7 +1762,7 @@ pub(crate) mod contract_tests {
         "sleep 30 & probe=$!\n\
          sampled=0\n\
          for _ in $(seq 1 6000); do\n\
-         if grep -q \"\\\"pid\\\":$probe,\" .git/ironmem/autopilot/*/*/process.json 2>/dev/null; \
+         if grep -q \"\\\"pid\\\":$probe,\" \"$IRONMEM_TEST_IDENTITY_PATH\" 2>/dev/null; \
          then sampled=1; break; fi\n\
          sleep 0.01\n\
          done\n\

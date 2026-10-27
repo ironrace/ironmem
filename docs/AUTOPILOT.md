@@ -444,7 +444,15 @@ supervisor records the outcome and holds completion, naming that process
 and its real uid, along with anything under it in the process table, until
 each is gone; recovery then finishes it with no `clear-dispatch`. What such
 a process starts after that check and moves out of its tree is outside the
-guarantee.
+guarantee. The worktree check also counts a process whose real uid is
+yours, so an escaped setuid tool keeps the worktree from reading quiet.
+
+A long-lived process cleanup cannot signal (`sudo -b …`, say) holds the
+issue for as long as it runs, and `clear-dispatch` refuses while it does.
+Kill it as root (`sudo kill <pid>`, the PID the hold names); the next Lead
+tick or `autopilot run` then settles the invocation. One that keeps forking
+while refused stops cleanup with "did not quiesce" and no exit record, so
+after killing it, release that invocation with `clear-dispatch`.
 
 The macOS runtime path is exercised. Linux-specific kernel identity and cleanup
 code is covered by code/tests but has not been run end to end on a Linux host.

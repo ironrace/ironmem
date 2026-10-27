@@ -923,6 +923,11 @@ fn birth(pid: u32) -> Result<Option<Birth>, String> {
     kernel_observation(pid).map(|process| process.map(|p| p.birth))
 }
 
+// `kinfo_proc` is read at its LP64 offsets below; a 32-bit Darwin build
+// would misread every field, so it does not build.
+#[cfg(all(target_os = "macos", not(target_pointer_width = "64")))]
+compile_error!("autopilot reads `kinfo_proc` at its LP64 offsets; 32-bit macOS is not supported");
+
 /// One process's `kinfo_proc`, as `sysctl(KERN_PROC_PID)` reports it.
 #[cfg(target_os = "macos")]
 #[derive(Debug, Clone, Copy)]
@@ -1350,37 +1355,46 @@ pub(crate) fn user_pids() -> Result<Vec<u32>, String> {
     #[cfg(target_os = "macos")]
     {
         let uid = current_uid().ok_or("process ownership is unreadable here")?;
-        /// `PROC_UID_ONLY` from `<sys/proc_info.h>`, absent from libc.
+        /// `PROC_UID_ONLY` and `PROC_RUID_ONLY` from `<sys/proc_info.h>`,
+        /// absent from libc: by effective, then by real user.
         const PROC_UID_ONLY: u32 = 4;
+        const PROC_RUID_ONLY: u32 = 5;
         const MAX_PIDS: usize = 1 << 20;
-        let mut pids = vec![0i32; 4096];
-        loop {
-            let capacity = (pids.len() * std::mem::size_of::<i32>()) as i32;
-            // SAFETY: the kernel writes at most `capacity` bytes of PIDs.
-            let bytes = unsafe {
-                libc::proc_listpids(PROC_UID_ONLY, uid, pids.as_mut_ptr().cast(), capacity)
-            };
-            if bytes < 0 {
-                return Err(format!(
-                    "cannot list processes: {}",
-                    std::io::Error::last_os_error()
-                ));
+        let list = |filter: u32| -> Result<Vec<i32>, String> {
+            let mut pids = vec![0i32; 4096];
+            loop {
+                let capacity = (pids.len() * std::mem::size_of::<i32>()) as i32;
+                // SAFETY: the kernel writes at most `capacity` bytes of PIDs.
+                let bytes =
+                    unsafe { libc::proc_listpids(filter, uid, pids.as_mut_ptr().cast(), capacity) };
+                if bytes < 0 {
+                    return Err(format!(
+                        "cannot list processes: {}",
+                        std::io::Error::last_os_error()
+                    ));
+                }
+                let count = bytes as usize / std::mem::size_of::<i32>();
+                if count < pids.len() {
+                    pids.truncate(count);
+                    return Ok(pids);
+                }
+                if pids.len() >= MAX_PIDS {
+                    return Err("process list exceeded its size bound".into());
+                }
+                pids.resize(pids.len() * 2, 0);
             }
-            let count = bytes as usize / std::mem::size_of::<i32>();
-            if count < pids.len() {
-                pids.truncate(count);
-                break;
-            }
-            if pids.len() >= MAX_PIDS {
-                return Err("process list exceeded its size bound".into());
-            }
-            pids.resize(pids.len() * 2, 0);
-        }
-        Ok(pids
+        };
+        // A setuid tool keeps the user's real uid (cleanup can signal it)
+        // but not the effective one, so it is listed only by real uid.
+        let mut pids: Vec<u32> = list(PROC_UID_ONLY)?
             .into_iter()
+            .chain(list(PROC_RUID_ONLY)?)
             .filter(|pid| *pid > 0)
             .map(|pid| pid as u32)
-            .collect())
+            .collect();
+        pids.sort_unstable();
+        pids.dedup();
+        Ok(pids)
     }
     #[cfg(target_os = "linux")]
     {
@@ -1405,18 +1419,23 @@ pub(crate) fn user_pids() -> Result<Vec<u32>, String> {
 
 /// Of `pids`, the current user's processes born at or after `spawned`,
 /// with their working directories, read from the kernel ([`scan_cwds`]).
-/// macOS reads `sysctl(KERN_PROC_PID)` (owner: the effective user, so a
-/// process listed as the user's that has since exec'd a setuid binary is
-/// another user's and skipped, never a failed read) and
-/// `PROC_PIDVNODEPATHINFO`: about 1.5 ms for ~600 processes, measured.
+/// A process is the user's when its effective *or* real uid is: an escaped
+/// setuid tool keeps the real one, and cleanup can signal it, so it must
+/// keep the worktree from reading quiet (its working directory may then be
+/// unreadable, which holds the scan). macOS reads `sysctl(KERN_PROC_PID)`
+/// and `PROC_PIDVNODEPATHINFO`: about 1.5 ms for ~600 processes, measured.
 /// Linux reads `/proc`.
 fn processes_with_cwd(pids: Vec<u32>, spawned: Birth) -> Result<Vec<CwdProcess>, ScanError> {
     let uid = current_uid().ok_or("process working directories are unreadable here")?;
     #[cfg(target_os = "macos")]
     {
         use std::os::unix::ffi::OsStrExt;
-        let owner_birth =
-            |pid: u32| Ok(kinfo_proc(pid)?.map(|record| (record.euid, record.process.birth)));
+        let owner_birth = |pid: u32| {
+            Ok(kinfo_proc(pid)?.map(|record| {
+                let owner = if record.ruid == uid { uid } else { record.euid };
+                (owner, record.process.birth)
+            }))
+        };
         let cwd_of = |pid: u32| {
             let mut info = std::mem::MaybeUninit::<libc::proc_vnodepathinfo>::zeroed();
             let size = std::mem::size_of::<libc::proc_vnodepathinfo>() as i32;
@@ -1463,6 +1482,11 @@ fn processes_with_cwd(pids: Vec<u32>, spawned: Birth) -> Result<Vec<CwdProcess>,
                 Ok(meta) => meta.uid(),
                 Err(e) if gone(&e) => return Ok(None),
                 Err(e) => return Err(format!("cannot read process {pid}: {e}")),
+            };
+            // A real-uid match is the user's too, as on macOS.
+            let owner = match real_and_effective_uid(pid) {
+                Some((real, _)) if real == uid => uid,
+                _ => owner,
             };
             Ok(kernel_observation(pid)?.map(|process| (owner, process.birth)))
         };
@@ -2066,6 +2090,12 @@ impl ProcessTracker {
                 }
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
+            // Fail closed, by design: a refused process (one cleanup may not
+            // signal) that keeps forking grows `known` on every pass, so the
+            // tree never reads as stable. Cleanup then ends "did not
+            // quiesce", no exit record is written, the invocation stays held,
+            // and only `clear-dispatch`, once that process is gone, releases
+            // it.
             if !stable {
                 return Err(MemoryError::Validation(
                     "invocation process tree did not quiesce".into(),
@@ -3701,16 +3731,18 @@ pub(crate) mod tests {
             .unwrap();
         let started = std::time::Instant::now();
         // Until its exec it is still ours; wait for the setuid image.
-        let read = loop {
+        let (read, setuid) = loop {
             let read = kernel_observation(child.id());
             let setuid = real_and_effective_uid(child.id()).is_some_and(|(_, euid)| euid == 0);
             if setuid || started.elapsed() > std::time::Duration::from_secs(10) {
-                break read;
+                break (read, setuid);
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         };
         let _ = child.kill();
         let _ = child.wait();
+        // Otherwise only our own pre-exec image was read, proving nothing.
+        assert!(setuid, "top never ran with euid 0 within 10s");
         let process = read.unwrap().expect("the live top was read as gone");
         assert_eq!(process.pid, child.id());
         assert_eq!(process.ppid, std::process::id());
@@ -3719,6 +3751,42 @@ pub(crate) mod tests {
             real_and_effective_uid(std::process::id()),
             Some((unsafe { libc::getuid() }, unsafe { libc::geteuid() }))
         );
+    }
+
+    /// A setuid tool that escaped into the worktree keeps the user's real
+    /// uid (cleanup can signal it), so the worktree scan lists it and never
+    /// reads the worktree as quiet while it runs: it is either named or, its
+    /// working directory unreadable, fails the scan for that very process.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_setuid_tool_with_our_real_uid_is_seen_by_the_worktree_scan() {
+        let Some(top) = setuid_top() else { return };
+        let worktree = tempfile::tempdir().unwrap();
+        let mut child = Command::new(top)
+            .args(["-l", "30", "-s", "1"])
+            .current_dir(worktree.path())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let started = std::time::Instant::now();
+        while !real_and_effective_uid(pid).is_some_and(|(_, euid)| euid == 0) {
+            if started.elapsed() > std::time::Duration::from_secs(10) {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("top never ran with euid 0 within 10s");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let listed = user_pids();
+        let scanned = processes_with_cwd(vec![pid], Birth(0, 0));
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(listed.unwrap().contains(&pid), "not listed by real uid");
+        match scanned {
+            Ok(found) => assert!(found.iter().any(|p| p.pid == pid), "{found:?}"),
+            Err(e) => assert_eq!(e.unreadable.map(|(p, _)| p), Some(pid), "{}", e.reason),
+        }
     }
 
     /// `live_evidence` (what `clear-dispatch` refuses on) holds an issue for
