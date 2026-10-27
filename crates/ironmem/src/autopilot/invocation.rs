@@ -321,7 +321,7 @@ pub(crate) fn validate_spec<'a>(
         return Err(validation(format!(
             "{} dispatch requires implementer {} and persisted invocation artifacts",
             cli.label(),
-            cli.label().to_ascii_lowercase()
+            cli.implementer().cli_name()
         )));
     }
     let a = spec.invocation_artifacts.as_ref().ok_or_else(|| {

@@ -560,7 +560,9 @@ impl LivenessSnapshot for RegistrySnapshot {
     fn liveness(&self, state: &DispatchState) -> Liveness {
         match state.implementer {
             Implementer::Claude => self.liveness(&state.ic_session_name),
-            _ => Liveness::Unknown,
+            // A supervised CLI harness is judged on process evidence, which
+            // this Claude-only registry does not hold.
+            Implementer::Codex | Implementer::Muse => Liveness::Unknown,
         }
     }
     fn reason(&self, implementer: Implementer) -> String {

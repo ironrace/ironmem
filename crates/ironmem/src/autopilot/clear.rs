@@ -99,7 +99,7 @@ fn refusal(
                 implementer.label(),
                 state.issue.repo,
                 state.issue.number,
-                implementer.label().to_ascii_lowercase()
+                implementer.cli_name()
             ))
         }
         (_, Liveness::NotListed) => None,

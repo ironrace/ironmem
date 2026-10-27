@@ -17,6 +17,10 @@ pub enum Implementer {
 /// What differs between harnesses, named once so `run_issue` asks *why* it
 /// branches instead of *which* harness it has. A new harness answers these.
 impl Implementer {
+    /// Every harness, once. `tests::every_variant_is_listed` matches
+    /// exhaustively, so a new variant fails to compile until it is added here.
+    pub const ALL: [Self; 3] = [Self::Claude, Self::Codex, Self::Muse];
+
     /// The wall-clock bound used when the repo sets none. A supervised CLI
     /// harness (Codex, Muse) reserves its unknown spend per invocation, so it
     /// is never unbounded; Claude keeps the repo's optional bound.
@@ -34,7 +38,13 @@ impl Implementer {
     /// never banked after. Claude's sessions are found through its registry
     /// instead, and Claude reports its cost.
     pub fn recovers_invocations(self) -> bool {
-        matches!(self, Self::Codex | Self::Muse)
+        // Exhaustive on purpose (no `matches!`, no `_`): a new harness must
+        // answer this, because a wrong `false` skips restart recovery and
+        // lets a crash launch a second implementer over a live one.
+        match self {
+            Self::Claude => false,
+            Self::Codex | Self::Muse => true,
+        }
     }
 
     /// The harness assigns the session ID (a Codex thread) rather than
@@ -42,14 +52,20 @@ impl Implementer {
     /// from the first outcome and checked on every later one. Muse continues
     /// the controller's `--session-id`.
     pub fn assigns_own_session_id(self) -> bool {
-        self == Self::Codex
+        match self {
+            Self::Codex => true,
+            Self::Claude | Self::Muse => false,
+        }
     }
 
     /// A returned verdict spends the session's goal loop, so the next
     /// dispatch needs a fresh session. Claude's `/goal` arms no hook on
     /// `--resume`; a Codex thread and a Muse session continue.
     pub fn rotates_session_after_verdict(self) -> bool {
-        self == Self::Claude
+        match self {
+            Self::Claude => true,
+            Self::Codex | Self::Muse => false,
+        }
     }
 
     /// The harness registry entry whose binary this implementer launches.
@@ -58,6 +74,17 @@ impl Implementer {
             Self::Claude => crate::launcher::Harness::Claude,
             Self::Codex => crate::launcher::Harness::Codex,
             Self::Muse => crate::launcher::Harness::Muse,
+        }
+    }
+
+    /// The `--implementer` spelling, which is also the stored (serde) one.
+    /// [`FromStr`] reads it back, and every hint that tells the operator
+    /// which command to run builds the flag from it.
+    pub fn cli_name(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+            Self::Muse => "muse",
         }
     }
 
@@ -74,14 +101,14 @@ impl Implementer {
 impl FromStr for Implementer {
     type Err = MemoryError;
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value.to_ascii_lowercase().as_str() {
-            "claude" => Ok(Self::Claude),
-            "codex" => Ok(Self::Codex),
-            "muse" => Ok(Self::Muse),
-            _ => Err(MemoryError::Validation(format!(
-                "unknown implementer '{value}'; expected 'claude', 'codex' or 'muse'"
-            ))),
-        }
+        Self::ALL
+            .into_iter()
+            .find(|implementer| implementer.cli_name().eq_ignore_ascii_case(value))
+            .ok_or_else(|| {
+                MemoryError::Validation(format!(
+                    "unknown implementer '{value}'; expected 'claude', 'codex' or 'muse'"
+                ))
+            })
     }
 }
 
@@ -90,6 +117,61 @@ mod tests {
     use std::str::FromStr;
 
     use super::Implementer;
+
+    const ALL: [Implementer; 3] = Implementer::ALL;
+
+    #[test]
+    fn every_variant_is_listed() {
+        for implementer in ALL {
+            // No `_` arm: a new variant stops this compiling, which is the
+            // prompt to add it to `Implementer::ALL`.
+            match implementer {
+                Implementer::Claude | Implementer::Codex | Implementer::Muse => {}
+            }
+        }
+    }
+
+    #[test]
+    fn every_variant_round_trips_through_its_cli_name() {
+        for implementer in ALL {
+            let name = implementer.cli_name();
+            assert_eq!(Implementer::from_str(name).unwrap(), implementer, "{name}");
+            assert_eq!(
+                serde_json::to_string(&implementer).unwrap(),
+                format!("\"{name}\""),
+                "the stored spelling is the CLI spelling"
+            );
+            assert_eq!(name, implementer.label().to_ascii_lowercase());
+        }
+        let names: Vec<&str> = ALL.iter().map(|i| i.cli_name()).collect();
+        let err = Implementer::from_str("gemini").unwrap_err().to_string();
+        for name in names {
+            assert!(err.contains(&format!("'{name}'")), "{err}");
+        }
+    }
+
+    #[test]
+    fn harness_capabilities_are_stated_for_every_variant() {
+        let table: Vec<(Implementer, bool, bool, bool)> = ALL
+            .iter()
+            .map(|&i| {
+                (
+                    i,
+                    i.recovers_invocations(),
+                    i.assigns_own_session_id(),
+                    i.rotates_session_after_verdict(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            table,
+            vec![
+                (Implementer::Claude, false, false, true),
+                (Implementer::Codex, true, true, false),
+                (Implementer::Muse, true, false, false),
+            ]
+        );
+    }
 
     #[test]
     fn implementer_defaults_to_claude_and_round_trips_snake_case() {
