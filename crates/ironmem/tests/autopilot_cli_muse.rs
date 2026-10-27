@@ -5,19 +5,18 @@
 
 #![cfg(unix)]
 
-use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use ironmem::autopilot::budget;
 use ironmem::autopilot::dispatch_state;
-use ironmem::autopilot::gate_config;
 use ironmem::autopilot::{Implementer, IssueRef};
 use ironmem::db::schema::Database;
 
-const REPO: &str = "owner/repo";
+mod autopilot_support;
+use autopilot_support::{approve, executable, git, ironmem, isolated_path, make_repo, REPO};
 
 /// Appends `"$PWD|$*"` to `$MUSE_CALLS`, writes a journal on the requested
 /// session's stream, and behaves per `$MUSE_MODE`. `$MUSE_COUNT` numbers the
@@ -74,82 +73,6 @@ while [ ! -e "$MUSE_RELEASE" ] && [ "$i" -lt 600 ]; do /bin/sleep 0.1; i=$((i+1)
 /bin/sleep 0.5
 exit 143
 "#;
-
-fn bin() -> &'static str {
-    env!("CARGO_BIN_EXE_ironmem")
-}
-
-/// The ironmem binary with every `GIT_*` var stripped, so a `GIT_DIR` set by
-/// an outer context (a git hook running `cargo test`) can never reach ironmem
-/// or the stub it spawns.
-fn ironmem() -> Command {
-    let mut command = Command::new(bin());
-    for (key, _) in std::env::vars_os() {
-        if key
-            .to_string_lossy()
-            .to_ascii_uppercase()
-            .starts_with("GIT_")
-        {
-            command.env_remove(key);
-        }
-    }
-    command
-}
-
-fn git(dir: &Path, args: &[&str]) -> Output {
-    let mut command = Command::new("git");
-    for (key, _) in std::env::vars_os() {
-        if key
-            .to_string_lossy()
-            .to_ascii_uppercase()
-            .starts_with("GIT_")
-        {
-            command.env_remove(key);
-        }
-    }
-    let output = command.args(args).current_dir(dir).output().unwrap();
-    assert!(
-        output.status.success(),
-        "git {args:?} failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    output
-}
-
-fn make_repo(path: &Path) {
-    std::fs::create_dir_all(path).unwrap();
-    git(path, &["init", "-q", "--initial-branch=main"]);
-    git(path, &["config", "user.email", "test@example.com"]);
-    git(path, &["config", "user.name", "Test"]);
-    // Pinned: the global config signs and runs hooks; worktrees share this.
-    git(path, &["config", "commit.gpgsign", "false"]);
-    git(path, &["config", "core.hooksPath", "/dev/null"]);
-    std::fs::write(path.join("README.md"), "seed\n").unwrap();
-    git(path, &["add", "README.md"]);
-    git(path, &["commit", "-qm", "seed"]);
-}
-
-fn approve(db_path: &Path) {
-    let db = Database::open(db_path).unwrap();
-    db.migrate().unwrap();
-    gate_config::propose_gate_config(&db, REPO, vec!["true".into()], Vec::new()).unwrap();
-    gate_config::approve_gate_config(&db, REPO).unwrap();
-}
-
-fn executable(path: &Path, body: &str) {
-    std::fs::write(path, body).unwrap();
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
-}
-
-fn isolated_path(stubs: &Path) -> PathBuf {
-    let mut paths = vec![stubs.to_path_buf()];
-    paths.extend(
-        ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]
-            .into_iter()
-            .map(PathBuf::from),
-    );
-    std::env::join_paths(paths).unwrap().into()
-}
 
 fn today_utc() -> String {
     chrono::Utc::now().format("%Y-%m-%d").to_string()

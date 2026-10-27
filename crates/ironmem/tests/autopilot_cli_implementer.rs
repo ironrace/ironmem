@@ -5,9 +5,8 @@
 
 #![cfg(unix)]
 
-use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output};
+use std::path::Path;
+use std::process::{Child, Command};
 
 use ironmem::autopilot::budget;
 use ironmem::autopilot::dispatch_state;
@@ -18,66 +17,8 @@ use ironmem::autopilot::worktree;
 use ironmem::autopilot::{DispatchState, IssueRef};
 use ironmem::db::schema::Database;
 
-const REPO: &str = "owner/repo";
-
-fn bin() -> &'static str {
-    env!("CARGO_BIN_EXE_ironmem")
-}
-
-fn git(dir: &Path, args: &[&str]) -> Output {
-    let mut command = Command::new("git");
-    for (key, _) in std::env::vars_os() {
-        if key
-            .to_string_lossy()
-            .to_ascii_uppercase()
-            .starts_with("GIT_")
-        {
-            command.env_remove(key);
-        }
-    }
-    let output = command.args(args).current_dir(dir).output().unwrap();
-    assert!(
-        output.status.success(),
-        "git {args:?} failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    output
-}
-
-fn make_repo(path: &Path) {
-    std::fs::create_dir_all(path).unwrap();
-    git(path, &["init", "-q", "--initial-branch=main"]);
-    git(path, &["config", "user.email", "test@example.com"]);
-    git(path, &["config", "user.name", "Test"]);
-    // Pinned: the global config signs and runs hooks; worktrees share this.
-    git(path, &["config", "commit.gpgsign", "false"]);
-    git(path, &["config", "core.hooksPath", "/dev/null"]);
-    std::fs::write(path.join("README.md"), "seed\n").unwrap();
-    git(path, &["add", "README.md"]);
-    git(path, &["commit", "-qm", "seed"]);
-}
-
-fn approve(db_path: &Path) {
-    let db = Database::open(db_path).unwrap();
-    db.migrate().unwrap();
-    gate_config::propose_gate_config(&db, REPO, vec!["true".into()], Vec::new()).unwrap();
-    gate_config::approve_gate_config(&db, REPO).unwrap();
-}
-
-fn executable(path: &Path, body: &str) {
-    std::fs::write(path, body).unwrap();
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
-}
-
-fn isolated_path(stubs: &Path) -> PathBuf {
-    let mut paths = vec![stubs.to_path_buf()];
-    paths.extend(
-        ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]
-            .into_iter()
-            .map(PathBuf::from),
-    );
-    std::env::join_paths(paths).unwrap().into()
-}
+mod autopilot_support;
+use autopilot_support::{approve, executable, git, ironmem, isolated_path, make_repo, REPO};
 
 struct KillOnDrop(Child);
 
@@ -111,7 +52,7 @@ printf '%s\n' '{"total_cost_usd":0.0,"num_turns":1,"duration_ms":5,"is_error":fa
         "the isolated harness directory must not provide Codex"
     );
 
-    let output = Command::new(bin())
+    let output = ironmem()
         .args([
             "autopilot",
             "run",
@@ -194,7 +135,7 @@ fi
 "#,
     );
 
-    let output = Command::new(bin())
+    let output = ironmem()
         .args([
             "autopilot",
             "run",
@@ -297,7 +238,7 @@ fn public_lead_with_codex_and_advisor_off_does_not_require_claude() {
     executable(&stubs.join("gh"), "#!/bin/sh\nprintf '%s\\n' '[]'\n");
 
     let repo_arg = format!("{REPO}={}", checkout.display());
-    let output = Command::new(bin())
+    let output = ironmem()
         .args([
             "autopilot",
             "lead",
@@ -378,7 +319,7 @@ fn codex_native_limit_validation_precedes_model_and_all_persistent_side_effects(
             "--worktree-root".into(),
             worktrees.display().to_string(),
         ]);
-        let output = Command::new(bin())
+        let output = ironmem()
             .args(&args)
             .env("PATH", &empty_path)
             .output()
@@ -405,7 +346,7 @@ fn codex_native_limit_validation_precedes_model_and_all_persistent_side_effects(
 fn codex_requires_an_explicit_model_before_database_creation() {
     let root = tempfile::tempdir().unwrap();
     let db_path = root.path().join("memory.sqlite3");
-    let output = Command::new(bin())
+    let output = ironmem()
         .args([
             "autopilot",
             "run",
@@ -463,7 +404,7 @@ fn invalid_model_spelling_is_rejected_before_all_cli_side_effects() {
         let empty_path = root.path().join("empty-path");
         std::fs::create_dir_all(&empty_path).unwrap();
 
-        let output = Command::new(bin())
+        let output = ironmem()
             .args([
                 "autopilot",
                 "run",
@@ -548,7 +489,7 @@ exit 7
 "#,
         );
 
-        let output = Command::new(bin())
+        let output = ironmem()
             .args([
                 "autopilot",
                 "run",
@@ -622,7 +563,7 @@ fn selected_binary_is_resolved_after_approval_but_before_worktree_provisioning()
     std::fs::create_dir_all(&empty_path).unwrap();
     approve(&db_path);
 
-    let output = Command::new(bin())
+    let output = ironmem()
         .args([
             "autopilot",
             "run",
@@ -661,7 +602,7 @@ fn selected_binary_is_resolved_after_approval_but_before_worktree_provisioning()
 
     let unapproved_db = root.path().join("unapproved.sqlite3");
     Database::open(&unapproved_db).unwrap().migrate().unwrap();
-    let output = Command::new(bin())
+    let output = ironmem()
         .args([
             "autopilot",
             "run",
@@ -714,7 +655,7 @@ printf '%s\n' '{"verdict":"not_met","reason":"not done"}' > "$final"
 /bin/sleep 0.5
 "#,
     );
-    let output = Command::new(bin())
+    let output = ironmem()
         .args([
             "autopilot",
             "run",
@@ -782,7 +723,7 @@ printf '%s\n' '{"verdict":"not_met","reason":"not done"}' > "$final"
     );
 
     let repo_arg = format!("{REPO}={}", checkout.display());
-    let output = Command::new(bin())
+    let output = ironmem()
         .args([
             "autopilot",
             "lead",
@@ -897,7 +838,7 @@ exit 97
     let ledger_before =
         budget::reserve_unpriced_dispatch(&db, "2026-10-23", &artifacts.invocation_id).unwrap();
 
-    let output = Command::new(bin())
+    let output = ironmem()
         .args([
             "autopilot",
             "run",
@@ -1002,7 +943,7 @@ fn public_run_rejects_wrong_persisted_harness_before_worktree_mutation() {
     let db = Database::open(&db_path).unwrap();
     dispatch_state::upsert_dispatch_state(&db, &state).unwrap();
 
-    let output = Command::new(bin())
+    let output = ironmem()
         .args([
             "autopilot",
             "run",
@@ -1107,7 +1048,7 @@ exit 97
     dispatch_state::upsert_dispatch_state(&db, &state).unwrap();
 
     let repo_arg = format!("{REPO}={}", checkout.display());
-    let output = Command::new(bin())
+    let output = ironmem()
         .args([
             "autopilot",
             "lead",
@@ -1235,7 +1176,7 @@ fn clear_dispatch_refuses_a_live_invocation_and_releases_an_unprovable_dead_one(
         budget::reserve_unpriced_dispatch(&db, "2026-10-26", &artifacts.invocation_id).unwrap();
 
     let clear = || {
-        Command::new(bin())
+        ironmem()
             .args([
                 "autopilot",
                 "clear-dispatch",
