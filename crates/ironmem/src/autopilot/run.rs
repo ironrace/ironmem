@@ -1597,6 +1597,22 @@ fn why_failed_text(outcome: &DispatchOutcome, classification: DispatchClassifica
     }
 }
 
+/// The lineage `approach` and `why_failed` for a `met` the signing guard
+/// refused. The violation goes in `why_failed` only, and the model's own
+/// reason, bounded by [`MODEL_REASON_CHARS`], is the approach: written into
+/// both, a long violation made the prior-attempt line too long for the next
+/// turn's prompt, which then dropped it and never said why the `met` failed.
+fn refused_met_record(violation: &str, original: Option<String>) -> (String, String) {
+    let approach = match original {
+        Some(original) if !original.trim().is_empty() => prefix(&original, MODEL_REASON_CHARS),
+        _ => "reported the gate met, giving no reason".to_string(),
+    };
+    (
+        approach,
+        format!("the commit-signing guard refused the met: {violation}"),
+    )
+}
+
 /// Persist one attempt: the append-only lineage record plus the issue's
 /// current-state drawer, whose `cumulative_attempt_n` is the spec's
 /// cross-dispatch stagnation counter. `prior` is the issue's status as read
@@ -2723,6 +2739,9 @@ pub fn run_issue(
         };
         // `Some(commit)` once a recorded success decides the reported commit.
         let mut recorded_commit_sha: Option<Option<String>> = None;
+        // A met the guard refused: its violation and the model's own reason,
+        // which the lineage keeps apart (see `refused_met_record`).
+        let mut refused_met: Option<(String, Option<String>)> = None;
         if let Some(recorded) = recorded {
             if recorded.verdict == AttemptOutcome::Success {
                 recorded_commit_sha = Some(recorded.commit_sha);
@@ -2746,9 +2765,10 @@ pub fn run_issue(
             match signing_violation(worktree, seen) {
                 Ok(None) => {}
                 Ok(Some(violation)) => {
+                    let original = outcome.reason.take();
                     outcome.verdict = Some(Verdict::NotMet);
-                    outcome.reason =
-                        Some(model_reason(violation.to_string(), outcome.reason.take()));
+                    outcome.reason = Some(model_reason(violation.to_string(), original.clone()));
+                    refused_met = Some((violation.to_string(), original));
                 }
                 // The guard could not accept the met, but the model is not to
                 // blame: an errored outcome with no verdict is an
@@ -2840,14 +2860,21 @@ pub fn run_issue(
                 };
             }
             DispatchClassification::FailedAttempt => {
+                let (approach, why_failed) = match refused_met.take() {
+                    Some((violation, original)) => refused_met_record(&violation, original),
+                    None => (
+                        approach_text(&outcome, classification),
+                        why_failed_text(&outcome, classification),
+                    ),
+                };
                 record_and_advance(
                     db,
                     &AttemptRecord {
                         issue: issue.clone(),
                         attempt_n: cumulative_attempt_n,
-                        approach: approach_text(&outcome, classification),
+                        approach,
                         verdict: AttemptOutcome::Failed,
-                        why_failed: Some(why_failed_text(&outcome, classification)),
+                        why_failed: Some(why_failed),
                         commit_sha: None,
                     },
                     status.as_ref(),
@@ -5913,6 +5940,114 @@ sleep 0.5
             "got: {reason}"
         );
         assert!(!matches!(run.terminal, TerminalReason::Met { .. }));
+    }
+
+    /// The longest a violation may be: a third of the turn prompt's budget,
+    /// so its prior-attempt line, beside the model's bounded reason, fits
+    /// with the prompt's fixed text rather than being dropped.
+    const MAX_VIOLATION_CHARS: usize = turn_prompt::MAX_CONDITION_CHARS / 3;
+
+    #[test]
+    fn the_longest_violation_fits_its_share_of_the_turn_prompt() {
+        // GitHub's longest owner (39) and repository (100) names.
+        let branch = worktree::branch_name(&IssueRef::new(
+            format!("{}/{}", "o".repeat(39), "r".repeat(100)),
+            u64::MAX,
+        ));
+        let flagged: Vec<String> = (0..1000).map(|i| format!("{i:012x}")).collect();
+        let violation = SigningViolation::Unsigned {
+            flagged,
+            cut: "c".repeat(64),
+            branch,
+            remote: "r".repeat(40),
+        }
+        .to_string();
+        assert!(
+            violation.chars().count() <= MAX_VIOLATION_CHARS,
+            "{} > {MAX_VIOLATION_CHARS}: {violation}",
+            violation.chars().count()
+        );
+    }
+
+    /// Commits unsigned work, then reports `met` with `reason`; afterwards
+    /// reports `not_met`. Records every dispatch's condition.
+    struct UnsignedMetThenNotMet {
+        reason: Option<String>,
+        commits: usize,
+        conditions: Vec<String>,
+    }
+    impl Dispatcher for UnsignedMetThenNotMet {
+        fn dispatch(
+            &mut self,
+            repo: &Path,
+            spec: &DispatchSpec,
+        ) -> Result<DispatchOutcome, MemoryError> {
+            self.conditions.push(spec.condition.clone());
+            if self.conditions.len() > 1 {
+                return Ok(not_met());
+            }
+            for i in 0..self.commits {
+                commit_in(repo, &format!("w{i}"), &["-c", "commit.gpgsign=false"]);
+            }
+            let mut met = met();
+            met.reason = self.reason.clone();
+            Ok(met)
+        }
+    }
+
+    fn run_unsigned_met(
+        reason: Option<String>,
+        commits: usize,
+    ) -> (Database, IssueRun, UnsignedMetThenNotMet) {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
+        let mut dispatcher = UnsignedMetThenNotMet {
+            reason,
+            commits,
+            conditions: Vec::new(),
+        };
+        let mut c = config();
+        c.attempt_cap = 2;
+        let run = run_issue(&db, &issue(), &brief(), &wt, &c, &mut dispatcher).unwrap();
+        (db, run, dispatcher)
+    }
+
+    #[test]
+    fn a_refused_met_tells_the_next_turn_why_once_and_bounds_the_models_reason() {
+        let long = "m".repeat(2000);
+        let (db, run, dispatcher) = run_unsigned_met(Some(long), 7);
+        assert_eq!(
+            run.dispatches[0].classification,
+            DispatchClassification::FailedAttempt
+        );
+        // The report keeps the model's reason beside the violation, bounded.
+        let reason = run.dispatches[0].reason.as_deref().unwrap();
+        let quoted = format!("(model's reason: {})", "m".repeat(MODEL_REASON_CHARS));
+        assert!(reason.ends_with(&quoted), "{reason}");
+        // The lineage holds the violation once, in why_failed, and the
+        // model's own account, bounded, as the approach.
+        let attempt = &lineage::attempts_for_issue(&db, &issue()).unwrap()[0];
+        assert_eq!(attempt.approach, "m".repeat(MODEL_REASON_CHARS));
+        let why = attempt.why_failed.as_deref().unwrap();
+        assert!(why.contains("Re-sign only these commits"), "{why}");
+        assert!(!why.contains("mmmm"), "{why}");
+        // ...so the next turn is told why its met was refused.
+        let next = &dispatcher.conditions[1];
+        assert!(next.contains("attempt 1:"), "{next}");
+        assert!(next.contains("Re-sign only these commits"), "{next}");
+    }
+
+    #[test]
+    fn a_refused_met_with_no_reason_of_its_own_gets_no_empty_quote() {
+        for reason in [None, Some("  ".to_string())] {
+            let (db, run, _) = run_unsigned_met(reason.clone(), 1);
+            let report = run.dispatches[0].reason.as_deref().unwrap();
+            assert!(!report.contains("model's reason"), "{reason:?}: {report}");
+            let attempt = &lineage::attempts_for_issue(&db, &issue()).unwrap()[0];
+            assert!(!attempt.approach.trim().is_empty(), "{reason:?}");
+            assert!(!attempt.approach.contains("Re-sign"), "{attempt:?}");
+        }
     }
 
     #[test]

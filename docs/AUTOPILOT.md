@@ -539,8 +539,11 @@ failure.
 
 ### A signing failure is a failed attempt
 
-It counts toward the attempt cap and can end in `agent:exhausted`. The reason
-the next turn and the operator see starts:
+It counts toward the attempt cap and can end in `agent:exhausted`. The
+attempt's lineage record keeps the model's own reason (its first 500
+characters) as the approach and the violation once, as why it failed, so the
+next turn's prompt has room to say why its `met` was refused. The violation
+starts:
 
 > commit.gpgsign is on, but commit(s) <shas> on this branch since its cut
 > <sha> are unsigned or carry a bad signature. Re-sign only these commits ...
