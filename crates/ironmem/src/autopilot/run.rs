@@ -985,6 +985,10 @@ enum GuardFault {
         commits: Vec<(String, String)>,
         identity: String,
     },
+    /// The recorded cut is not a full commit name, so it cannot bound the
+    /// range: on the right of `git log --not`, a value such as `--all`
+    /// would empty it and pass every commit. An operator's to fix.
+    CutInvalid(String),
     /// git could not be run, or could not read the branch.
     GitUnreadable(String),
 }
@@ -1025,6 +1029,12 @@ impl std::fmt::Display for GuardFault {
                      signing in docs/AUTOPILOT.md)"
                 )
             }
+            GuardFault::CutInvalid(cut) => write!(
+                f,
+                "commit.gpgsign is on, but the branch's recorded cut {cut:?} is not a full \
+                 commit name, so the commits since it cannot be checked; set \
+                 `branch.<branch>.ironmemCut` to the commit the branch was cut from"
+            ),
             GuardFault::GitUnreadable(why) => write!(
                 f,
                 "commit.gpgsign is on, but the branch's commit signatures could not be read: \
@@ -1389,11 +1399,16 @@ fn check_signing(
         local.clone(),
     ];
     args.extend(own.iter().map(|(_, refname)| refname.clone()));
+    // The cut is checked where it is made; checked again before it reaches
+    // `--not`, where anything but a commit name could empty the range.
+    if !is_full_object_name(worktree.cut.as_str()) {
+        return Err(GuardFault::CutInvalid(prefix(worktree.cut.as_str(), 80)));
+    }
     // Every ref ending in the branch is kept out of the negated set, not only
     // the configured remotes' own: a lookalike can only hide commits there.
     args.extend([
         "--not".into(),
-        worktree.cut.clone(),
+        worktree.cut.to_string(),
         format!("--exclude=*/{branch}"),
         "--remotes".into(),
     ]);
@@ -1493,7 +1508,7 @@ fn check_signing(
         .unwrap_or("origin");
     Ok(Some(SigningViolation::Unsigned {
         flagged: flagged.into_iter().map(|(sha, _)| sha).collect(),
-        cut: worktree.cut.clone(),
+        cut: worktree.cut.to_string(),
         branch: branch.to_string(),
         remote: remote.to_string(),
     }))
@@ -5264,7 +5279,7 @@ sleep 0.5
             path: path.clone(),
             branch,
             created: true,
-            cut: git_in(&path, &["rev-parse", "HEAD"]),
+            cut: worktree::CommitSha::parse(&git_in(&path, &["rev-parse", "HEAD"])).unwrap(),
             quarantined_from: None,
         };
         (dir, wt)
@@ -5349,10 +5364,30 @@ sleep 0.5
     }
 
     #[test]
+    fn a_cut_that_is_not_a_full_commit_name_is_refused() {
+        for bad in ["--all", "HEAD~3", "abc1234", &"g".repeat(40)] {
+            assert!(worktree::CommitSha::parse(bad).is_err(), "{bad:?}");
+        }
+        for good in ["a".repeat(40), "0F".repeat(32)] {
+            assert_eq!(worktree::CommitSha::parse(&good).unwrap(), good);
+        }
+        // Past the type (it is checked where it is made), the guard refuses
+        // one before `git log --not`, where `--all` would empty the range
+        // and pass an unsigned commit.
+        let (_dir, mut wt) = fixture_worktree();
+        git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
+        commit_in(&wt.path, "b", &["-c", "commit.gpgsign=false"]);
+        wt.cut = worktree::CommitSha::unchecked("--all");
+        let fault = signing_violation(&wt, SigningPolicySeen::default()).unwrap_err();
+        assert!(fault.stops_run(), "{fault}");
+        assert!(fault.to_string().contains("--all"), "{fault}");
+    }
+
+    #[test]
     fn an_unreadable_cut_is_the_guards_failure_when_the_policy_is_on() {
         let (_dir, mut wt) = fixture_worktree();
         // A pruned cut: a well-formed sha naming no object.
-        wt.cut = "a".repeat(40);
+        wt.cut = worktree::CommitSha::parse(&"a".repeat(40)).unwrap();
         git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
         let why = check(&wt).unwrap_err();
         assert!(why.contains("signatures could not be read"), "got: {why}");
@@ -5377,7 +5412,9 @@ sleep 0.5
 
     #[test]
     fn a_guard_that_cannot_read_the_cut_costs_no_attempt_and_is_never_met() {
-        let (db, run) = run_a_met_the_guard_cannot_check(|wt| wt.cut = "a".repeat(40));
+        let (db, run) = run_a_met_the_guard_cannot_check(|wt| {
+            wt.cut = worktree::CommitSha::parse(&"a".repeat(40)).unwrap()
+        });
         assert_eq!(
             run.dispatches[0].classification,
             DispatchClassification::InfrastructureFailure
@@ -6281,7 +6318,7 @@ sleep 0.5
             path,
             branch,
             created: true,
-            cut,
+            cut: worktree::CommitSha::parse(&cut).unwrap(),
             quarantined_from: None,
         };
         assert_eq!(check(&wt).unwrap(), None);
@@ -6520,7 +6557,7 @@ sleep 0.5
         let db = approved_db();
         let (_dir, mut wt) = fixture_worktree();
         // The branch is cut after this unsigned commit, so it is the base's.
-        wt.cut = commit_in(&wt.path, "old", &[]);
+        wt.cut = worktree::CommitSha::parse(&commit_in(&wt.path, "old", &[])).unwrap();
         git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
         let mut dispatcher = CommitThenMet(|_: &Path| {});
         let run = run_issue(&db, &issue(), &brief(), &wt, &config(), &mut dispatcher).unwrap();

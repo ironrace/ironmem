@@ -569,13 +569,15 @@ can quietly pass `-c commit.gpgsign=false`.
 
 If the guard cannot accept a `met` for a reason that is not the agent's
 (git fails to run or times out, `commit.gpgsign` or a signing flag reads as
-an invalid value, a collaborator's unsigned commit, or a recorded cut that is
-no longer an object `git log` can use), the `met` is not accepted. It is
-recorded as an infrastructure failure, not an attempt, so it costs the issue
-no attempt. An invalid policy or flag, or a collaborator's commit, would meet
-every later `met` too, so the run stops there with an error, before paying for
-another dispatch, and keeps a Codex or Muse invocation for recovery once it is
-fixed (do not `clear-dispatch` it). Any other such failure repeats through
+an invalid value, a collaborator's unsigned commit, a recorded cut that is
+not a full commit name, or one that is no longer an object `git log` can
+use), the `met` is not accepted. It is recorded as an infrastructure
+failure, not an attempt, so it costs the issue no attempt. An invalid policy
+or flag, a collaborator's commit, or a cut that is not a commit name would
+meet every later `met` too, so the run stops there with an error, before
+paying for another dispatch, and keeps a Codex or Muse invocation for
+recovery once it is fixed (do not `clear-dispatch` it). The error says what
+it keeps: Claude has no invocation to recover, and its session is resumed. Any other such failure repeats through
 `max_consecutive_infrastructure_failures`, like any other infrastructure
 failure.
 

@@ -144,6 +144,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its age. Cut and signing-flag writes run git in the C locale, so a held
   lock is recognised in any locale, and SHA-256 repositories can provision
   issue worktrees.
+- **Library: `Worktree::cut` is a `CommitSha`**, a full commit object name
+  (40 or 64 hex digits) checked where it is made, instead of a `String`. It
+  derefs to `str`.
 - **Library: supervised-CLI types renamed.** `CodexArtifacts` is now
   `InvocationArtifacts`, `CodexRecovery` is `InvocationRecovery`, and the
   `codex_process` module is `process_tree`. `codex_dispatch` no longer exports

@@ -86,6 +86,74 @@ pub fn worktree_path(worktree_root: &Path, issue: &IssueRef) -> PathBuf {
     worktree_root.join(issue.slug())
 }
 
+/// A full commit object name: 40 hex digits, or 64 in a SHA-256 repository.
+///
+/// Checked when it is made, so a value that git would read as an option or a
+/// revision expression (`--all`, `HEAD~3`, an abbreviation) can never stand in
+/// for a commit, for example on the right of a `git log --not`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CommitSha(String);
+
+impl CommitSha {
+    /// `text` as a commit name, or a validation error quoting it (bounded).
+    pub fn parse(text: &str) -> Result<Self, MemoryError> {
+        if matches!(text.len(), 40 | 64) && text.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Ok(Self(text.to_string()));
+        }
+        Err(MemoryError::Validation(format!(
+            "{:?} is not a full commit object name (40 or 64 hex digits)",
+            text.chars().take(80).collect::<String>()
+        )))
+    }
+
+    /// Any text, unchecked, for tests of what refuses a bad one.
+    #[cfg(test)]
+    pub(crate) fn unchecked(text: impl Into<String>) -> Self {
+        Self(text.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for CommitSha {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl AsRef<str> for CommitSha {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl AsRef<std::ffi::OsStr> for CommitSha {
+    fn as_ref(&self) -> &std::ffi::OsStr {
+        self.0.as_ref()
+    }
+}
+
+impl std::fmt::Display for CommitSha {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl PartialEq<String> for CommitSha {
+    fn eq(&self, other: &String) -> bool {
+        &self.0 == other
+    }
+}
+
+impl PartialEq<str> for CommitSha {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other
+    }
+}
+
 /// A provisioned worktree, ready to dispatch an IC into.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Worktree {
@@ -101,7 +169,7 @@ pub struct Worktree {
     /// the operator's checkout once, before the branch is created, and kept
     /// in `branch.<branch>.ironmemCut` so a resume reads it back rather than
     /// re-resolving a `base` (such as `HEAD`) that has since moved.
-    pub cut: String,
+    pub cut: CommitSha,
     /// Set when a dirty pre-existing worktree was moved aside first — the
     /// path it was moved to, kept for a human to inspect. The spec requires
     /// quarantine rather than deletion precisely so the dead IC's work is
@@ -833,6 +901,7 @@ pub fn ensure_worktree(
     } else {
         resolve_base(&root, base)?
     };
+    let cut = CommitSha::parse(&cut)?;
 
     let mut quarantined_from = None;
     if is_registered_worktree(&root, &path)? {
@@ -1114,7 +1183,7 @@ mod tests {
         assert_eq!(reused.cut, created.cut, "the branch's creation point");
         assert_eq!(
             read_config(repo.path(), &issue_cut_key()),
-            Some(created.cut.clone())
+            Some(created.cut.to_string())
         );
         advance_operator_head(repo.path(), "later-still");
         let again = ensure_worktree(repo.path(), roots.path(), &issue(), "HEAD").unwrap();
@@ -1213,7 +1282,7 @@ mod tests {
         assert!(log.contains("WARN"), "{log}");
         assert!(log.contains(&branch_name(&issue())), "{log}");
         assert!(log.contains("reflog"), "{log}");
-        assert!(log.contains(&created.cut), "{log}");
+        assert!(log.contains(created.cut.as_str()), "{log}");
         // A recorded cut is read back silently.
         let (_, quiet) =
             with_captured_log(|| ensure_worktree(repo.path(), roots.path(), &issue(), "HEAD"));
