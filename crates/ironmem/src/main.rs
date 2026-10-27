@@ -387,8 +387,9 @@ enum AutopilotCmd {
         /// Committish new issue branches are cut from
         #[arg(long, default_value = "HEAD")]
         base: String,
-        /// Implementation harness: claude (default), codex or muse. Reviewer
-        /// selection is independent.
+        /// Implementation harness: claude (default), codex or muse. The
+        /// reviewer is chosen separately (`autopilot review` / `advance
+        /// --reviewer`).
         #[arg(long, default_value = "claude")]
         implementer: ironmem::autopilot::Implementer,
         /// Model for the IC dispatch
@@ -405,17 +406,25 @@ enum AutopilotCmd {
         /// passed as --max-model-steps; Codex: unsupported
         #[arg(long)]
         max_turns: Option<u32>,
-        /// Per-dispatch spend ceiling, passed through to --max-budget-usd
+        /// Per-dispatch spend ceiling passed to `claude --max-budget-usd`.
+        /// Claude only: Codex and Muse refuse it, and each of their
+        /// invocations pre-authorizes the default ceiling against the daily
+        /// ledger
         #[arg(long)]
         max_budget_usd: Option<f64>,
         /// Per-issue attempt cap, cumulative across runs; a remediation gets
         /// its own, counted from the issue's first success
         #[arg(long)]
         attempt_cap: Option<u32>,
-        /// Daily ledger ceiling across all dispatches
+        /// Daily ledger ceiling across all dispatches. Codex and Muse cost is
+        /// unpriced, so the ledger records no dollars for them and their
+        /// effective limit is --max-unpriced-dispatches-per-day
         #[arg(long)]
         daily_budget_usd: Option<f64>,
-        /// How many unpriced (timed-out) IC dispatches may run today
+        /// How many unpriced IC dispatches may run today: timed-out Claude
+        /// dispatches and every Codex or Muse invocation (each reserves one
+        /// unit before launch). For Codex and Muse this is the daily dispatch
+        /// cap
         #[arg(long)]
         max_unpriced_dispatches_per_day: Option<u32>,
         /// Emit JSON instead of text
@@ -643,8 +652,9 @@ enum AutopilotCmd {
         /// Directory that per-issue worktrees are created under
         #[arg(long)]
         worktree_root: Option<String>,
-        /// Implementation harness: claude (default), codex or muse. Reviewer
-        /// selection is independent.
+        /// Implementation harness: claude (default), codex or muse. The
+        /// reviewer is chosen separately (`autopilot review` / `advance
+        /// --reviewer`).
         #[arg(long, default_value = "claude")]
         implementer: ironmem::autopilot::Implementer,
         /// Model for IC dispatches
@@ -693,17 +703,25 @@ enum AutopilotCmd {
         /// passed as --max-model-steps; Codex: unsupported
         #[arg(long)]
         max_turns: Option<u32>,
-        /// Per-dispatch spend ceiling
+        /// Per-dispatch spend ceiling passed to `claude --max-budget-usd`.
+        /// Claude only: Codex and Muse refuse it, and each of their
+        /// invocations pre-authorizes the default ceiling against the daily
+        /// ledger
         #[arg(long)]
         max_budget_usd: Option<f64>,
         /// Per-issue attempt cap, cumulative across runs; a remediation gets
         /// its own, counted from the issue's first success
         #[arg(long)]
         attempt_cap: Option<u32>,
-        /// Daily ledger ceiling across all dispatches
+        /// Daily ledger ceiling across all dispatches. Codex and Muse cost is
+        /// unpriced, so the ledger records no dollars for them and their
+        /// effective limit is --max-unpriced-dispatches-per-day
         #[arg(long)]
         daily_budget_usd: Option<f64>,
-        /// How many unpriced (timed-out) IC dispatches may run today
+        /// How many unpriced IC dispatches may run today: timed-out Claude
+        /// dispatches and every Codex or Muse invocation (each reserves one
+        /// unit before launch). For Codex and Muse this is the daily dispatch
+        /// cap
         #[arg(long)]
         max_unpriced_dispatches_per_day: Option<u32>,
         /// Read everything, plan everything, write nothing and spend nothing
@@ -4017,6 +4035,10 @@ mod tests {
                 .to_string();
             assert!(help.contains("codex or muse"), "{subcommand}: {help}");
             assert!(help.contains("--max-model-steps"), "{subcommand}: {help}");
+            assert!(help.contains("Claude only"), "{subcommand}: {help}");
+            assert!(help.contains("daily dispatch"), "{subcommand}: {help}");
+            assert!(help.contains("effective limit is"), "{subcommand}: {help}");
+            assert!(help.contains("advance"), "{subcommand}: {help}");
         }
     }
 

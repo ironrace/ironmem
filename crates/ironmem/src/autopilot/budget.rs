@@ -30,7 +30,7 @@ pub struct BudgetLedgerEntry {
     pub dispatch_count: u32,
     /// IC dispatches (fix/remediation runs included) that happened today
     /// but reported **no price**, so their spend is missing from
-    /// `total_cost_usd`. Codex invocations reserve this counter before launch;
+    /// `total_cost_usd`. Codex and Muse invocations reserve this counter before launch;
     /// Claude outcomes with no meter (including wall-clock kills) also land here.
     ///
     /// Non-zero (or any other unpriced counter non-zero — see
