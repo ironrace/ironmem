@@ -324,7 +324,7 @@ pub fn run_dispatch(
 fn validate_claude_spec(spec: &DispatchSpec) -> Result<(), MemoryError> {
     if spec.implementer != Implementer::Claude || spec.invocation_artifacts.is_some() {
         return Err(MemoryError::Validation(
-            "Claude dispatch requires implementer claude and no Codex artifacts".into(),
+            "Claude dispatch requires implementer claude and no CLI invocation artifacts".into(),
         ));
     }
     Ok(())
