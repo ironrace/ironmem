@@ -424,7 +424,13 @@ fn run_supervised_bounded_with(
     for path in std::iter::once(super::process_tree::identity_path(a)).chain(cli.spawn_files(a)) {
         match std::fs::symlink_metadata(&path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.into()),
+            Err(e) => {
+                return Err(validation(format!(
+                    "cannot prove {} holds no prior {} spawn: {e}",
+                    path.display(),
+                    cli.label()
+                )))
+            }
             Ok(_) => {
                 return Err(validation(format!(
                     "{} invocation already holds {} from a prior spawn; prepare a new invocation before retrying",
