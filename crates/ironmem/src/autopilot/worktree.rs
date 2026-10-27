@@ -245,6 +245,37 @@ fn recorded_cut(root: &Path, branch: &str) -> Result<Option<String>, MemoryError
     })
 }
 
+/// How many times [`write_cut`] tries while `.git/config` is locked, and how
+/// long it waits between tries.
+const CONFIG_LOCK_ATTEMPTS: u32 = 5;
+const CONFIG_LOCK_RETRY: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Record `cut` on `branch`, waiting briefly while another worktree's agent
+/// holds `.git/config`'s lock. A missing cut is backfilled on a later run,
+/// but from `base` as it is then, which may have moved; so a short bounded
+/// wait is worth it. Any other failure, or a lock held past the window, is
+/// returned.
+fn write_cut(root: &Path, branch: &str, cut: &str) -> Result<(), MemoryError> {
+    let key = cut_key(branch);
+    let mut attempt = 1;
+    loop {
+        match git(root, &["config", &key, cut]) {
+            Ok(_) => return Ok(()),
+            Err(e) if attempt < CONFIG_LOCK_ATTEMPTS && config_locked(&e) => {
+                attempt += 1;
+                std::thread::sleep(CONFIG_LOCK_RETRY);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Whether a failed [`git`] config write failed only on the config lock.
+fn config_locked(e: &MemoryError) -> bool {
+    let text = e.to_string();
+    text.contains("could not lock config file") || text.contains("config.lock")
+}
+
 /// Resolve the operator's `base` to a full sha in `root`, or refuse.
 fn resolve_base(root: &Path, base: &str) -> Result<String, MemoryError> {
     resolve_commit(root, base).ok_or_else(|| {
@@ -313,7 +344,7 @@ pub fn status_porcelain(worktree: &Path) -> Result<String, MemoryError> {
 /// a created worktree and a reused one would otherwise be reported under two
 /// different spellings of the same directory and a restart's reconciliation
 /// would fail to match them.
-fn canonical_or_self(path: &Path) -> PathBuf {
+pub(crate) fn canonical_or_self(path: &Path) -> PathBuf {
     if let Ok(resolved) = std::fs::canonicalize(path) {
         return resolved;
     }
@@ -400,7 +431,8 @@ fn quarantine(repo_root: &Path, path: &Path) -> Result<PathBuf, MemoryError> {
 /// branch is created and stored on the branch; an existing branch reads it
 /// back, backfilling it from `base` once if it predates the record. A `base`
 /// that does not resolve is refused before anything on disk changes. At
-/// creation the signing policy is recorded too ([`record_signing`]).
+/// creation the signing policy is recorded too ([`record_signing`]), on a
+/// best-effort basis: a failed write only warns.
 pub fn ensure_worktree(
     repo_root: &Path,
     worktree_root: &Path,
@@ -470,7 +502,7 @@ pub fn ensure_worktree(
                 )));
             }
             if recorded.is_none() {
-                git(&root, &["config", &cut_key(&branch), &cut])?;
+                write_cut(&root, &branch, &cut)?;
             }
             return Ok(Worktree {
                 path: canonical_or_self(&path),
@@ -511,10 +543,19 @@ pub fn ensure_worktree(
         resolve_base(&root, &format!("refs/heads/{branch}"))?
     };
     if recorded.is_none() {
-        git(&root, &["config", &cut_key(&branch), &cut])?;
+        write_cut(&root, &branch, &cut)?;
     }
+    // Warn-only, as at a run's start: another worktree's agent may hold
+    // `.git/config`'s lock, and `run_issue` holds the run to the policy it
+    // reads at start whether or not this write lands.
     if signing_policy(&path).unwrap_or(true) {
-        record_signing(&path, &branch)?;
+        if let Err(e) = record_signing(&path, &branch) {
+            tracing::warn!(
+                error = %e,
+                branch = %branch,
+                "autopilot could not record the signing policy on the new worktree's branch"
+            );
+        }
     }
 
     Ok(Worktree {
@@ -768,6 +809,64 @@ mod tests {
         ensure_worktree(repo.path(), roots.path(), &issue(), "HEAD").unwrap();
         let key = format!("branch.{}.ironmemSigning", branch_name(&issue()));
         assert_eq!(read_config(repo.path(), &key).as_deref(), Some("true"));
+    }
+
+    /// Hold `.git/config`'s lock the way a sibling worktree's agent does
+    /// mid-`git config`; dropped (or released early) by removing the file.
+    fn hold_config_lock(repo: &Path) -> PathBuf {
+        let lock = repo.join(".git/config.lock");
+        std::fs::write(&lock, "").unwrap();
+        lock
+    }
+
+    #[test]
+    fn a_held_config_lock_never_fails_creation_over_the_signing_flag() {
+        let repo = fixture_repo();
+        let roots = tempfile::tempdir().unwrap();
+        // The branch and its cut exist, so recreating the worktree writes
+        // config only for the signing flag.
+        let first = ensure_worktree(repo.path(), roots.path(), &issue(), "HEAD").unwrap();
+        run(
+            repo.path(),
+            &["worktree", "remove", first.path.to_str().unwrap()],
+        );
+        run(repo.path(), &["config", "commit.gpgsign", "true"]);
+        let lock = hold_config_lock(repo.path());
+        let created = ensure_worktree(repo.path(), roots.path(), &issue(), "HEAD");
+        std::fs::remove_file(&lock).unwrap();
+        let created = created.expect("a held lock must not fail creation via record_signing");
+        assert!(created.created);
+        assert_eq!(created.cut, first.cut);
+    }
+
+    #[test]
+    fn the_cut_write_waits_out_a_briefly_held_config_lock() {
+        let repo = fixture_repo();
+        let roots = tempfile::tempdir().unwrap();
+        let lock = hold_config_lock(repo.path());
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            std::fs::remove_file(&lock).unwrap();
+        });
+        let created = ensure_worktree(repo.path(), roots.path(), &issue(), "HEAD");
+        release.join().unwrap();
+        let created = created.expect("a lock released within the retry window must not fail");
+        assert_eq!(
+            read_config(repo.path(), &issue_cut_key()),
+            Some(created.cut)
+        );
+    }
+
+    #[test]
+    fn a_config_lock_held_past_the_retry_window_still_fails_the_cut_write() {
+        let repo = fixture_repo();
+        let roots = tempfile::tempdir().unwrap();
+        let lock = hold_config_lock(repo.path());
+        let err = ensure_worktree(repo.path(), roots.path(), &issue(), "HEAD");
+        std::fs::remove_file(&lock).unwrap();
+        let err = err.unwrap_err().to_string();
+        assert!(err.contains("could not lock config file"), "got: {err}");
+        assert!(err.contains("ironmemCut"), "got: {err}");
     }
 
     #[test]
