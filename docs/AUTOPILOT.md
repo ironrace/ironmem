@@ -512,10 +512,12 @@ can quietly pass `-c commit.gpgsign=false`.
   it on records it on the branch (`branch.<branch>.ironmemSigning true`) and
   on the repository (`ironmem.autopilotSigning true`), once restart recovery
   has found no invocation still running (a run that holds one writes no
-  config). It also records the reading in the issue's dispatch state before
-  each launch, so a controller that recovers the invocation after a crash
-  still enforces it even if another agent held `.git/config`'s lock and
-  neither flag was written. An invalid value (a
+  config). It also records its own reading in the issue's dispatch state
+  before each launch, so a controller that recovers that invocation after a
+  crash still enforces it on the recovered `met`, even if another agent held
+  `.git/config`'s lock and neither flag was written. That recorded reading
+  holds only the recovered invocation's `met`, never a fresh dispatch, and an
+  explicit `branch.<branch>.ironmemSigning false` overrides it. An invalid value (a
   typo such as `commit.gpgsign = ture`) holds a newly created branch but never
   sets the repository flag, and a run refuses to start until it is fixed, since
   every `met` it produced would be discarded. So does an invalid
@@ -606,8 +608,10 @@ issue 364, `autopilot/owner-repo-364`). To stop enforcing on it on purpose:
    issue's worktree, so any config scope that applies there counts: repo,
    global or system.
 2. In the repo, run `git config branch.<branch>.ironmemSigning false`. An
-   explicit `false` opts that branch out of the repository flag. Unsetting
-   the branch flag is not enough while `ironmem.autopilotSigning` is set.
+   explicit `false` opts that branch out of the repository flag, and out of
+   the reading an interrupted run recorded in the issue's dispatch state.
+   Unsetting the branch flag is not enough while `ironmem.autopilotSigning`
+   is set.
 3. Keep it off. Every run start records the flags again whenever the policy is
    on, so turning signing back on re-arms the guard.
 

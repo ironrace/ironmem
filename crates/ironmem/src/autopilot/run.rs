@@ -879,16 +879,22 @@ fn prefix(text: &str, n: usize) -> String {
 struct SigningPolicySeen {
     /// `commit.gpgsign` read `true` when this run started.
     at_run_start: bool,
-    /// The dispatch state this run started from records an earlier run that
-    /// saw it on ([`DispatchState::signing_held`]). That memory survives a
-    /// controller crash, where this run's own does not.
+    /// The dispatch state this run started from records that the run that
+    /// wrote it saw it on ([`DispatchState::signing_held`]). That memory
+    /// survives a controller crash, where the run's own does not, so it
+    /// holds only the `met` of the invocation that run launched, recovered
+    /// as finished: never a fresh dispatch, and never a branch an operator
+    /// opted out.
     by_interrupted_run: bool,
 }
 
 impl SigningPolicySeen {
-    /// Whether either source holds the branch.
-    fn held(self) -> bool {
-        self.at_run_start || self.by_interrupted_run
+    /// What holds a fresh dispatch's `met`: this run's own reading only.
+    fn fresh(self) -> Self {
+        Self {
+            by_interrupted_run: false,
+            ..self
+        }
     }
 
     /// The source that holds the branch, named for a reason, if any does.
@@ -1251,9 +1257,15 @@ fn check_signing(
             )))
         }
         Ok(false) => {
-            let holder = worktree::signing_holder(&worktree.path, &worktree.branch)
+            let holder = match worktree::signing_holder(&worktree.path, &worktree.branch)
                 .map_err(GuardFault::PolicyUnreadable)?
-                .or_else(|| seen.holder().map(str::to_string));
+            {
+                worktree::SigningHold::Held(holder) => Some(holder),
+                // An operator's opt-out releases what an interrupted run
+                // saw, but not a run that is still going and saw it on.
+                worktree::SigningHold::OptedOut => seen.fresh().holder().map(str::to_string),
+                worktree::SigningHold::NotHeld => seen.holder().map(str::to_string),
+            };
             return Ok(holder.map(|holder| SigningViolation::PolicyDisabled { holder }));
         }
         Ok(true) => {}
@@ -2165,7 +2177,9 @@ pub fn run_issue(
     // like an unreadable policy, until an operator deals with it. Anything
     // else the guard finds now is for the dispatch to fix, or to judge again
     // when its `met` arrives.
-    if let Err(fault @ GuardFault::ForeignUnsigned { .. }) = signing_violation(worktree, seen) {
+    if let Err(fault @ GuardFault::ForeignUnsigned { .. }) =
+        signing_violation(worktree, seen.fresh())
+    {
         return Err(MemoryError::Validation(format!(
             "{fault}; the run does not start, since any met it produced would be refused the \
              same way; {KEPT_FOR_RECOVERY}"
@@ -2275,7 +2289,8 @@ pub fn run_issue(
             session_claimed,
             session_model: session.0.clone(),
             resume_refusals: session.1,
-            signing_held: seen.held(),
+            // What this run saw, never a carried-forward older reading.
+            signing_held: policy_at_start,
         };
         if !dispatch_state::upsert_dispatch_state_if_unchanged(db, owned.as_ref(), &next)? {
             return Err(taken_over());
@@ -2823,6 +2838,9 @@ pub fn run_issue(
                 ),
                 _ => reason,
             };
+            // An interrupted run's reading holds only its own recovered
+            // invocation's met.
+            let seen = if recovered { seen } else { seen.fresh() };
             match signing_violation(worktree, seen) {
                 Ok(None) => {}
                 Ok(Some(violation)) => {
@@ -6297,6 +6315,100 @@ sleep 0.5
                 .unwrap();
             assert_eq!(out.status.code(), Some(1), "{key} was written");
         }
+    }
+
+    /// A paused dispatch state for `implementer`, as a run that saw the
+    /// signing policy on left it, with no invocation pending.
+    fn paused_state_that_saw_signing_on(
+        implementer: Implementer,
+        db: &Database,
+        wt: &Worktree,
+    ) -> DispatchState {
+        let mut state = pending_invocation(implementer, db, wt, None);
+        state.invocation_artifacts = None;
+        state.session_uuid = "11111111-2222-3333-4444-555555555555".into();
+        state.state = "paused-infrastructure-failure".into();
+        state.signing_held = true;
+        dispatch_state::upsert_dispatch_state(db, &state).unwrap();
+        state
+    }
+
+    #[test]
+    fn an_earlier_runs_reading_never_holds_a_fresh_dispatch_to_signing() {
+        // Policy off, and either nothing records it on or the operator opted
+        // the branch out; an earlier run on the issue saw it on.
+        for (implementer, opt_out) in [
+            (Implementer::Claude, false),
+            (Implementer::Claude, true),
+            (Implementer::Muse, false),
+            (Implementer::Muse, true),
+        ] {
+            let db = approved_db();
+            let (_dir, wt) = fixture_worktree();
+            if opt_out {
+                let key = format!("branch.{}.ironmemSigning", wt.branch);
+                git_in(&wt.path, &["config", &key, "false"]);
+            }
+            paused_state_that_saw_signing_on(implementer, &db, &wt);
+            let mut d = HarnessCommitThenMet {
+                implementer,
+                before: |path: &Path| {
+                    commit_in(path, "work", &["-c", "commit.gpgsign=false"]);
+                },
+                dispatched: 0,
+            };
+            let mut c = if implementer == Implementer::Muse {
+                muse_config()
+            } else {
+                config()
+            };
+            c.attempt_cap = 1;
+            let run = run_issue(&db, &issue(), &brief(), &wt, &c, &mut d).unwrap();
+            assert!(
+                matches!(run.terminal, TerminalReason::Met { .. }),
+                "{implementer:?} opt_out={opt_out}: {:?}",
+                run.dispatches
+            );
+        }
+    }
+
+    #[test]
+    fn an_explicit_opt_out_also_releases_a_recovered_met() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        let key = format!("branch.{}.ironmemSigning", wt.branch);
+        git_in(&wt.path, &["config", &key, "false"]);
+        let mut state = pending_muse(&db, &wt, None);
+        state.signing_held = true;
+        dispatch_state::upsert_dispatch_state(&db, &state).unwrap();
+        commit_in(&wt.path, "work", &["-c", "commit.gpgsign=false"]);
+        let mut result = met();
+        result.cost_usd = None;
+        let mut d = muse_script(vec![]);
+        d.recovery = Some(InvocationRecovery::Finished(result));
+        let mut c = muse_config();
+        c.attempt_cap = 1;
+        let run = run_issue(&db, &issue(), &brief(), &wt, &c, &mut d).unwrap();
+        assert!(
+            matches!(run.terminal, TerminalReason::Met { .. }),
+            "{:?}",
+            run.dispatches
+        );
+    }
+
+    #[test]
+    fn a_run_records_only_its_own_reading_of_the_signing_policy() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree(); // policy off
+        paused_state_that_saw_signing_on(Implementer::Muse, &db, &wt);
+        let mut d = muse_script(vec![muse_infra_failure("network down")]);
+        let mut c = muse_config();
+        c.max_consecutive_infrastructure_failures = 1;
+        run_issue(&db, &issue(), &brief(), &wt, &c, &mut d).unwrap();
+        let state = dispatch_state::get_dispatch_state(&db, &issue())
+            .unwrap()
+            .unwrap();
+        assert!(!state.signing_held, "{state:?}");
     }
 
     #[test]
