@@ -79,6 +79,11 @@ fn refusal(
     state: &DispatchState,
     attempt_recorded: bool,
 ) -> Option<String> {
+    if state.state == "paused-session-in-use" {
+        if let Some(reason) = session_holder(snapshots, &state.session_uuid) {
+            return Some(reason);
+        }
+    }
     match (state.implementer, snapshots.liveness(state)) {
         (_, Liveness::Alive) => Some(format!(
             "its {} implementation is alive",
@@ -112,6 +117,34 @@ fn refusal(
         // evidence to clear against.
         (_, Liveness::Unknown) => Some(snapshots.state_reason(state)),
     }
+}
+
+/// A parked session's harness reported it still in use, and what holds it
+/// may be a process the tracker never owned. Any active process that names
+/// it with `--session-id` keeps it held; an unreadable process table does
+/// too.
+fn session_holder(snapshots: &HarnessSnapshots, session: &str) -> Option<String> {
+    let super::process_tree::ProcessSnapshot::Available(rows) = &snapshots.processes else {
+        return Some(snapshots.processes.reason());
+    };
+    let names_session = |args: &str| {
+        let words: Vec<&str> = args.split_whitespace().collect();
+        words
+            .windows(2)
+            .any(|w| w[0] == "--session-id" && w[1] == session)
+            || words
+                .iter()
+                .any(|w| w.strip_prefix("--session-id=") == Some(session))
+    };
+    rows.iter()
+        .find(|r| r.active() && names_session(&r.args))
+        .map(|r| {
+            format!(
+                "process {} names its session {session} with --session-id, so the session may \
+                 still be held; stop that process first",
+                r.pid
+            )
+        })
 }
 
 /// Release the dispatch state of every issue the queue will never run again.
@@ -460,6 +493,55 @@ mod tests {
         dispatch_state::upsert_dispatch_state(&db, &state).unwrap();
         let cleared = clear_dispatch(&db, &issue(), || snapshots(Vec::new())).unwrap();
         assert_eq!(cleared.state, "paused-session-in-use");
+        assert!(dispatch_state::get_dispatch_state(&db, &issue())
+            .unwrap()
+            .is_none());
+    }
+
+    /// The parked session may be held by a Muse process the tracker never
+    /// owned. One that names it with `--session-id` holds the release.
+    #[test]
+    fn a_session_in_use_pause_is_not_released_while_a_process_names_its_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_in_memory().unwrap();
+        let session = "0d6c1e2a-5b8f-4c1d-9e3a-7f2b6a1c4d5e";
+        let mut state = held_state(Implementer::Muse, testing::invocation(dir.path()).0);
+        state.invocation_artifacts = None;
+        state.session_uuid = session.into();
+        state.native_session_id = Some(session.into());
+        state.state = "paused-session-in-use".into();
+        dispatch_state::upsert_dispatch_state(&db, &state).unwrap();
+        let holder = |pid, sid: &str| {
+            row(
+                pid,
+                pid,
+                &format!(
+                    "/Users/u/.local/bin/muse-bin-1.4.14-R7309.1 exec --json --session-id {sid} \
+                     --prompt-file /tmp/p.md"
+                ),
+            )
+        };
+        for rows in [
+            vec![holder(4242, session)],
+            vec![row(
+                4243,
+                4243,
+                &format!("muse exec --session-id={session}"),
+            )],
+        ] {
+            let pid = rows[0].pid;
+            let err = clear_dispatch(&db, &issue(), || snapshots(rows))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("refusing to clear") && err.contains(&format!("process {pid}")),
+                "{err}"
+            );
+        }
+        let mut exited = holder(4244, session);
+        exited.stat = "Z".into();
+        let other = holder(4245, "11111111-2222-4333-8444-555555555555");
+        clear_dispatch(&db, &issue(), || snapshots(vec![exited, other])).unwrap();
         assert!(dispatch_state::get_dispatch_state(&db, &issue())
             .unwrap()
             .is_none());

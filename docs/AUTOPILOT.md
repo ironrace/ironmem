@@ -232,7 +232,11 @@ is never rendered as free.
   infrastructure failure whose reason reads "Muse reports session <uuid>
   still in use; Autopilot won't start a new session over it; inspect for a
   leftover Muse process, then `ironmem autopilot clear-dispatch <repo> <n>`",
-  stops the run there, and parks the issue as `paused-session-in-use`.
+  stops the run there, and parks the issue as `paused-session-in-use`. A
+  later run on a parked issue resumes that same session first, even with a
+  different `--model`, so Muse's lock answers before anything replaces it.
+  `clear-dispatch` refuses while any process still names the session with
+  `--session-id`.
 - `clear-dispatch` on a Muse hold deletes the dispatch state, so the next
   dispatch mints a new session UUID and starts a fresh Muse session. Lineage
   and attempt counts stand.

@@ -1673,6 +1673,12 @@ pub fn run_issue(
         .as_ref()
         .map_or_else(|| Some(config.model.clone()), |s| s.session_model.clone());
     let mut resume_refusals = existing_state.as_ref().map_or(0, |s| s.resume_refusals);
+    // A session the harness last reported still in use. Only the first
+    // launch of this run can be on it; that launch probes it before anything
+    // replaces it (see the model rotation below).
+    let parked_in_use = existing_state
+        .as_ref()
+        .is_some_and(|s| s.state == "paused-session-in-use");
     let mut recovered_outcome = None;
     // Record a signing policy that is on before any dispatch or recovery, so
     // an agent that turns it off is still held to it, in this run and every
@@ -1922,7 +1928,15 @@ pub fn run_issue(
             // replaced when the model changes. Here, at a fresh launch, no
             // invocation can be live: recovery has already held or finished
             // any earlier one, and every in-run outcome is a finished one.
+            //
+            // Not a session parked as still in use: something may still hold
+            // it, and a fresh session would start a second implementer over
+            // the holder. It is resumed first so the harness's own lock
+            // answers. Still held, the run parks again; gone, with the
+            // provider really changed, the harness refuses to resume it and
+            // the usual consecutive refusals rotate it.
             if config.implementer.rotates_refused_session()
+                && !parked_in_use
                 && session_model
                     .as_deref()
                     .is_some_and(|model| model != config.model)
@@ -3300,6 +3314,46 @@ sleep 0.5
         assert!(matches!(rerun.terminal, TerminalReason::Met { .. }));
         let sessions: Vec<_> = again.inner.seen.iter().map(session_of).collect();
         assert_eq!(sessions, [session.clone(), session]);
+    }
+
+    /// A parked session may still be held, so even a different `--model`
+    /// resumes it first: Muse's lock answers before any fresh session could
+    /// start a second Muse over the holder. Still held, it parks again. Gone,
+    /// with the provider really changed, Muse refuses to resume it and the
+    /// usual two refusals rotate it.
+    #[test]
+    fn a_model_change_on_a_parked_in_use_session_probes_the_same_session_first() {
+        let mut changed = muse_config();
+        changed.model = "muse-wonder-2.0".into();
+        let park = |db: &Database, wt: &Worktree| {
+            let mut d = muse_script(vec![muse_in_use()]);
+            run_issue(db, &issue(), &brief(), wt, &muse_config(), &mut d).unwrap();
+            session_of(&d.inner.seen[0])
+        };
+
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        let held = park(&db, &wt);
+        let mut d = muse_script(vec![muse_in_use()]);
+        let run = run_issue(&db, &issue(), &brief(), &wt, &changed, &mut d).unwrap();
+        assert_eq!(session_of(&d.inner.seen[0]), held, "probe the held session");
+        assert!(matches!(run.terminal, TerminalReason::SessionInUse { .. }));
+        let state = dispatch_state::get_dispatch_state(&db, &issue())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (state.state.as_str(), state.session_uuid.as_str()),
+            ("paused-session-in-use", held.as_str())
+        );
+
+        let db = approved_db();
+        let held = park(&db, &wt);
+        let mut d = muse_script(vec![muse_refusal(), muse_refusal(), met()]);
+        let run = run_issue(&db, &issue(), &brief(), &wt, &changed, &mut d).unwrap();
+        assert!(matches!(run.terminal, TerminalReason::Met { .. }));
+        let sessions: Vec<_> = d.inner.seen.iter().map(session_of).collect();
+        assert_eq!(sessions[..2], [held.clone(), held.clone()], "{sessions:?}");
+        assert_ne!(sessions[2], held, "{sessions:?}");
     }
 
     #[test]

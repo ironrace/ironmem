@@ -54,6 +54,14 @@ fn marker_safe<'a>(what: &str, word: &'a str) -> Result<&'a str, MemoryError> {
     Ok(word)
 }
 
+/// `line` without a leading `error:` in any case, and the whitespace after it.
+fn strip_error_lead_in(line: &str) -> &str {
+    match line.get(..6) {
+        Some(lead) if lead.eq_ignore_ascii_case("error:") => line[6..].trim_start(),
+        _ => line,
+    }
+}
+
 impl SupervisedCli for MuseCli {
     fn implementer(&self) -> Implementer {
         Implementer::Muse
@@ -180,8 +188,9 @@ impl SupervisedCli for MuseCli {
     ///   session it cannot read back.
     ///
     /// Only a whole line about `expected_native_id` counts (Muse's own
-    /// `muse: ` notice prefix allowed), so another session's refusal, or the
-    /// words quoted in some tool's output, never do. "In use" wins over any
+    /// `muse: ` notice prefix and an `error:` lead-in in any case allowed),
+    /// so another session's refusal, or the words quoted in some tool's
+    /// output, never do. "In use" wins over any
     /// other refusal: it is the one that must never be rotated over.
     fn session_refusal(
         &self,
@@ -196,6 +205,7 @@ impl SupervisedCli for MuseCli {
         for line in stderr.lines() {
             let line = line.trim();
             let line = line.strip_prefix("muse: ").unwrap_or(line);
+            let line = strip_error_lead_in(line);
             if line == in_use {
                 return Some(SessionRefusal::InUse);
             }
@@ -543,6 +553,17 @@ mod tests {
                 Some(SessionRefusal::Unresumable),
             ),
             (unreadable, Some(SessionRefusal::Unresumable)),
+            // An `error:` lead-in, any case and spacing, after an optional
+            // `muse: ` notice prefix.
+            (format!("error: {in_use}"), Some(SessionRefusal::InUse)),
+            (format!("ERROR:{in_use}"), Some(SessionRefusal::InUse)),
+            (
+                format!("muse: Error:   {in_use}"),
+                Some(SessionRefusal::InUse),
+            ),
+            (format!("Error: {cross}"), Some(SessionRefusal::Unresumable)),
+            (format!("error: {}", in_use.replace(SID, other)), None),
+            (format!("warning: {in_use}"), None),
             // Another session's refusal is not this run's.
             (in_use.replace(SID, other), None),
             (cross.replace(SID, other), None),
