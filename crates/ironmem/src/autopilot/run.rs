@@ -1122,6 +1122,10 @@ struct GuardGit<'a> {
     unset_env: &'static [&'static str],
 }
 
+/// A set of config scopes already warned about (see
+/// [`warn_unreadable_scope_once`]).
+type WarnedScopes = std::sync::Mutex<std::collections::BTreeSet<&'static str>>;
+
 impl<'a> GuardGit<'a> {
     fn new(repo: &'a Path, timeout: std::time::Duration) -> Result<Self, String> {
         Self::build(repo, timeout, &[])
@@ -1131,6 +1135,17 @@ impl<'a> GuardGit<'a> {
         repo: &'a Path,
         timeout: std::time::Duration,
         unset_env: &'static [&'static str],
+    ) -> Result<Self, String> {
+        Self::build_warning_into(repo, timeout, unset_env, &UNREADABLE_SCOPES_WARNED)
+    }
+
+    /// [`Self::build`], recording the scopes it warned about in `warned`
+    /// (the process-wide set, but for tests).
+    fn build_warning_into(
+        repo: &'a Path,
+        timeout: std::time::Duration,
+        unset_env: &'static [&'static str],
+        warned: &WarnedScopes,
     ) -> Result<Self, String> {
         #[cfg(test)]
         GUARD_GITS_BUILT.with(|n| n.set(n.get() + 1));
@@ -1161,7 +1176,11 @@ impl<'a> GuardGit<'a> {
                 // Unreadable (`$HOME` unset under launchd exits 128): git's
                 // own defaults stand for that scope, never the repository's.
                 _ => {
-                    warn_unreadable_scope_once(scope, &worktree::bounded_stderr(&out.stderr));
+                    warn_unreadable_scope_once(
+                        warned,
+                        scope,
+                        &worktree::bounded_stderr(&out.stderr),
+                    );
                 }
             }
         }
@@ -1301,15 +1320,15 @@ impl<'a> GuardGit<'a> {
 
 /// The config scopes whose unreadable signature programs were already
 /// reported, in this process.
-static UNREADABLE_SCOPES_WARNED: std::sync::Mutex<std::collections::BTreeSet<&'static str>> =
+static UNREADABLE_SCOPES_WARNED: WarnedScopes =
     std::sync::Mutex::new(std::collections::BTreeSet::new());
 
 /// Warn that `scope`'s signature programs cannot be read, once per scope per
 /// process: a guard is built for every `met` and every run start, and an
 /// unset `$HOME` stays unset for the controller's life. Returns whether it
 /// warned.
-fn warn_unreadable_scope_once(scope: &'static str, error: &str) -> bool {
-    let first = UNREADABLE_SCOPES_WARNED
+fn warn_unreadable_scope_once(warned: &WarnedScopes, scope: &'static str, error: &str) -> bool {
+    let first = warned
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .insert(scope);
@@ -5885,20 +5904,42 @@ sleep 0.5
     }
 
     #[test]
-    fn a_guard_with_no_home_warns_about_it_at_most_once() {
+    fn a_guard_with_no_home_warns_about_it_exactly_once() {
         let (_dir, wt) = fixture_worktree();
-        GuardGit::build(
-            &wt.path,
-            SIGNING_GUARD_TIMEOUT,
-            &["HOME", "XDG_CONFIG_HOME"],
-        )
-        .unwrap();
-        // That scope's warning is spent for the process: no later guard,
-        // built for every met, repeats it.
-        assert!(!warn_unreadable_scope_once(
-            "--global",
-            "fatal: $HOME not set"
-        ));
+        // Only where git cannot read the global config without `$HOME`.
+        let mut probe = std::process::Command::new("git");
+        crate::mcp::tools::scrub_git_environment(&mut probe);
+        let probe = probe
+            .args(["config", "--global", "--get-regexp", "^gpg\\."])
+            .env_remove("HOME")
+            .env_remove("XDG_CONFIG_HOME")
+            .current_dir(&wt.path)
+            .output()
+            .unwrap();
+        if matches!(probe.status.code(), Some(0 | 1)) {
+            eprintln!("skipped: git reads the global config here without $HOME");
+            return;
+        }
+        // A set of its own, so a guard built by another test has not
+        // already spent the process-wide warning.
+        let warned: &'static WarnedScopes = Box::leak(Box::default());
+        let (_, log) = worktree::testing::with_captured_log(|| {
+            // A guard is built for every met and every run start.
+            for _ in 0..3 {
+                GuardGit::build_warning_into(
+                    &wt.path,
+                    SIGNING_GUARD_TIMEOUT,
+                    &["HOME", "XDG_CONFIG_HOME"],
+                    warned,
+                )
+                .unwrap();
+            }
+        });
+        let warnings = log
+            .lines()
+            .filter(|line| line.contains("cannot read the operator's signature programs"))
+            .count();
+        assert_eq!(warnings, 1, "{log}");
     }
 
     #[cfg(unix)]

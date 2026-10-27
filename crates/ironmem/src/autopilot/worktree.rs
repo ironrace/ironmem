@@ -1423,6 +1423,11 @@ pub(crate) mod testing {
 
     /// Run `f` with a thread-local subscriber; returns its result and the log.
     pub(crate) fn with_captured_log<T>(f: impl FnOnce() -> T) -> (T, String) {
+        // A second live dispatcher turns off tracing-core's one-dispatcher
+        // fast path. On it, a callsite first reached on another test's
+        // thread, which has no subscriber, caches "never" for every thread,
+        // and this capture would silently miss that event.
+        let _second = tracing::Dispatch::new(tracing_subscriber::registry());
         let captured = Captured::default();
         let writer = captured.clone();
         let subscriber = tracing_subscriber::fmt()
