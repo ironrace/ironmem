@@ -1877,16 +1877,18 @@ pub fn run_issue(
         // that may have changed since, and a different verdict would make
         // `record_and_advance` refuse the replay and wedge the issue. The
         // recorded verdict is authoritative instead, and so is a recorded
-        // success's commit: HEAD may have moved since.
+        // success's commit, even when it has none: HEAD may have moved since,
+        // and the stored status reports the recorded one.
         let recorded = if recovered && outcome.is_met() {
             recorded_attempt(db, issue, cumulative_attempt_n + 1)?
         } else {
             None
         };
-        let mut recorded_commit_sha = None;
+        // `Some(commit)` once a recorded success decides the reported commit.
+        let mut recorded_commit_sha: Option<Option<String>> = None;
         if let Some(recorded) = recorded {
             if recorded.verdict == AttemptOutcome::Success {
-                recorded_commit_sha = recorded.commit_sha;
+                recorded_commit_sha = Some(recorded.commit_sha);
             } else {
                 outcome.verdict = Some(Verdict::NotMet);
                 outcome.reason = Some(
@@ -1930,7 +1932,7 @@ pub fn run_issue(
 
         match classification {
             DispatchClassification::Met => {
-                let commit_sha = recorded_commit_sha.or_else(|| head_commit(&worktree.path));
+                let commit_sha = recorded_commit_sha.unwrap_or_else(|| head_commit(&worktree.path));
                 record_and_advance(
                     db,
                     &AttemptRecord {
@@ -3904,49 +3906,54 @@ sleep 0.5
 
     #[test]
     fn a_recovered_met_already_recorded_as_success_skips_the_live_signing_guard() {
-        let db = approved_db();
-        let (_dir, wt) = fixture_worktree();
-        pending_codex(&db, &wt, Some("persisted"));
-        let recorded_sha = git_in(&wt.path, &["rev-parse", "HEAD"]);
-        record_attempt_one_before_the_crash(
-            &db,
-            AttemptOutcome::Success,
-            None,
-            Some(&recorded_sha),
-        );
-        // Between the crash and the replay the policy came on and an unsigned
-        // commit moved HEAD; the guard would now call the recorded success a
-        // failure, and HEAD is no longer the commit that succeeded.
-        git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
-        let later = commit_in(&wt.path, "later", &["-c", "commit.gpgsign=false"]);
-        assert_ne!(later, recorded_sha);
-        let mut result = met();
-        result.native_session_id = Some("persisted".into());
-        let mut d = codex_script(vec![]);
-        d.recovery = Some(InvocationRecovery::Finished(result));
-        let mut c = codex_config();
-        c.attempt_cap = 1;
-        let run = run_issue(&db, &issue(), &brief(), &wt, &c, &mut d).unwrap();
-        match &run.terminal {
-            TerminalReason::Met { commit_sha } => {
-                assert_eq!(commit_sha.as_deref(), Some(recorded_sha.as_str()))
+        // The recorded commit is reported even when HEAD has moved since, and
+        // a success recorded without one reports none: never the unchecked
+        // live HEAD, and always what the stored status says.
+        for record_commit in [true, false] {
+            let db = approved_db();
+            let (_dir, wt) = fixture_worktree();
+            pending_codex(&db, &wt, Some("persisted"));
+            let recorded_sha = record_commit.then(|| git_in(&wt.path, &["rev-parse", "HEAD"]));
+            record_attempt_one_before_the_crash(
+                &db,
+                AttemptOutcome::Success,
+                None,
+                recorded_sha.as_deref(),
+            );
+            // Between the crash and the replay the policy came on and an
+            // unsigned commit moved HEAD; the guard would now call the
+            // recorded success a failure, and HEAD is no longer the commit
+            // that succeeded.
+            git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
+            let later = commit_in(&wt.path, "later", &["-c", "commit.gpgsign=false"]);
+            assert_ne!(Some(&later), recorded_sha.as_ref());
+            let mut result = met();
+            result.native_session_id = Some("persisted".into());
+            let mut d = codex_script(vec![]);
+            d.recovery = Some(InvocationRecovery::Finished(result));
+            let mut c = codex_config();
+            c.attempt_cap = 1;
+            let run = run_issue(&db, &issue(), &brief(), &wt, &c, &mut d).unwrap();
+            match &run.terminal {
+                TerminalReason::Met { commit_sha } => {
+                    assert_eq!(commit_sha, &recorded_sha, "record_commit={record_commit}")
+                }
+                other => panic!("expected Met, got {other:?}"),
             }
-            other => panic!("expected Met, got {other:?}"),
+            assert_eq!(
+                run.dispatches[0].classification,
+                DispatchClassification::Met
+            );
+            assert!(d.inner.seen.is_empty());
+            assert_attempt_one_recorded_once(&db, AttemptOutcome::Success);
+            assert_eq!(
+                lineage::get_issue_status(&db, &issue())
+                    .unwrap()
+                    .unwrap()
+                    .best_commit_sha,
+                recorded_sha
+            );
         }
-        assert_eq!(
-            run.dispatches[0].classification,
-            DispatchClassification::Met
-        );
-        assert!(d.inner.seen.is_empty());
-        assert_attempt_one_recorded_once(&db, AttemptOutcome::Success);
-        assert_eq!(
-            lineage::get_issue_status(&db, &issue())
-                .unwrap()
-                .unwrap()
-                .best_commit_sha
-                .as_deref(),
-            Some(recorded_sha.as_str())
-        );
     }
 
     #[test]
