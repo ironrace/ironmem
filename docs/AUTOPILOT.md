@@ -255,19 +255,23 @@ messages name the harness or say "invocation".
 
 ### Codex and Muse identity, restart recovery, and supervision limits
 
-This section is written for Codex. A Muse implementation recovers the same way
-under the Muse markers and records above, and every `clear-dispatch` check
-here applies to a Muse hold too.
+Codex and Muse recover the same way, under each harness's own markers and
+records; where they differ, this section says so. Every `clear-dispatch`
+check here applies to both.
 
-Codex session identity comes only from the native JSONL
-`thread.started.thread_id`. A resume uses that native UUID. Persisted state
-also records its implementation harness; Claude state cannot be resumed as
-Codex, or vice versa.
+Session identity differs by harness. Codex assigns its own thread ID, so a
+Codex session's identity comes only from the native JSONL
+`thread.started.thread_id`, and a resume uses that native UUID. Muse is
+handed the controller's UUID with `--session-id` (see Muse specifics), so a
+Muse session's identity is that UUID: only records on that session's stream
+(`stream.id`) count, and a resume passes the same UUID again. Persisted
+state also records its implementation harness; a state one harness wrote is
+never resumed by another.
 
-Public `run` and `lead` revalidate that persisted owner and Codex liveness
-before provisioning or quarantining an issue worktree. Live or uncertain
-process evidence therefore holds without moving, detaching, or replacing the
-active checkout.
+Public `run` and `lead` revalidate that persisted owner and the invocation's
+liveness before provisioning or quarantining an issue worktree. Live or
+uncertain process evidence therefore holds without moving, detaching, or
+replacing the active checkout.
 
 A Lead defers an issue whose state the other harness wrote
 (`harness_mismatch`) instead of admitting it as a resume, so a leftover
@@ -279,6 +283,16 @@ its gates, then release it with `autopilot clear-dispatch`. A Muse run whose
 session Muse reported still in use stops after that one dispatch and is
 deferred (`session_in_use`, state `paused-session-in-use`) until you find
 and stop whatever holds the session, then run `autopilot clear-dispatch`.
+
+An issue whose dispatch state this binary cannot read (corrupt, or written
+by a newer ironmem for a harness it does not know) is deferred
+(`dispatch_state_unreadable`) and keeps its concurrency slot, since it may
+be a live invocation. Run the ironmem that wrote it to finish or clear it.
+The reverse is not covered: an ironmem from before Muse support cannot read
+a Muse dispatch state and skips it, so its queue does not count that slot
+and its `reconcile` reports the live Muse process as an orphan. Do not
+downgrade below this release while any Muse dispatch state exists; let it
+finish, or `clear-dispatch` it, first.
 
 Before spawn, Autopilot creates private schema, journal, final-message,
 stderr, exit, and process-identity artifacts under the repository's absolute
@@ -292,12 +306,14 @@ Restart recovery is deliberately conservative. Missing or inconsistent
 kernel identity, process evidence, or trusted supervisor completion produces
 `Unknown` and holds the issue for inspection. Fresh authenticated live-process
 evidence wins over a stale completion record. If `ps` is unavailable, only
-Codex liveness becomes unknown; if the Claude registry source is unavailable,
-only Claude liveness does.
+Codex and Muse liveness becomes unknown; if the Claude registry source is
+unavailable, only Claude liveness does.
 
 The `codex` or `muse` binary is looked up on the absolute `PATH` entries only.
 The harness runs in the issue worktree, so a relative entry such as `.` would
-find a file in the repository being worked on.
+find a file in the repository being worked on. The same holds for `claude`
+as the implementer and for the `codex` or `muse` reviewer, which runs in the
+PR's checkout.
 
 A spawn that fails outright (for example, `codex` missing from `PATH`) proves
 no child existed, so the supervisor records that, and the invocation is an
@@ -322,10 +338,11 @@ ironmem autopilot clear-dispatch owner/repo 364
 
 It refuses while a fresh process table shows anything that could be the
 issue's work: the invocation's marker, another Autopilot marker for the same
-issue, an ambiguous Codex command, or the recorded root PID, process group,
-or a recorded descendant. A `codex exec` counts as ambiguous only when
-Autopilot cannot parse its options *and* it names a `schema.json` file, which
-is the only shape an Autopilot marker takes; your own `codex exec` runs with
+issue, an ambiguous `codex exec` or `muse exec`, or the recorded root PID,
+process group, or a recorded descendant. Either counts as ambiguous only when
+Autopilot cannot parse its options *and* one of its words is a `schema.json`
+path in Autopilot's invocation layout, which is the only shape an Autopilot
+marker takes; your own `codex exec` or `muse exec --output-schema` runs with
 other schema files never hold a dispatch. Once the supervisor has written its
 completion record, a recorded PID no longer counts: cleanup already proved
 that process gone, so the PID has been reused. The descendants alive at
@@ -336,12 +353,13 @@ sample before the crash, or one that tool left running; that part of the
 confirmation is yours. A process-identity file that exists but cannot be
 read also refuses. It also refuses a finished invocation that is only
 waiting to be recorded (a Lead resuming the issue records it, as does
-`autopilot run <repo> <issue> --implementer codex --model <model> --title
-<title>`), unless lineage already holds that attempt, and it deletes nothing if
-the state changes while it checks. It deletes only the dispatch state; lineage,
-attempt counts, and the unpriced reservation stand, the artifacts stay on
-disk for inspection, and the next dispatch starts a fresh Codex thread. A
-Claude state clears only against a readable registry that does not list its
+`autopilot run <repo> <issue> --implementer <codex|muse> --model <model>
+--title <title>`, with the harness that owns the state), unless lineage
+already holds that attempt, and it deletes nothing if the state changes while
+it checks. It deletes only the dispatch state; lineage, attempt counts, and
+the unpriced reservation stand, the artifacts stay on disk for inspection,
+and the next dispatch starts a fresh Codex thread or Muse session. A Claude
+state clears only against a readable registry that does not list its
 session.
 
 You rarely need it for finished issues: each Lead tick (except a dry run)
@@ -350,9 +368,11 @@ reached its attempt cap, once nothing of it is running and its last
 invocation is in lineage, so a crash between recording an outcome and
 clearing its state cannot hold a concurrency slot for ever.
 
-Direct native `codex` processes are the verified path. A launcher wrapper is
-adopted conservatively after restart: a marker visible only on a different
-native child is not treated as proof that the recorded root is the invocation.
+Direct native `codex` processes, and Muse's launcher (which `exec`s its
+versioned binary under the same PID), are the verified paths. Any other
+launcher wrapper is adopted conservatively after restart: a marker visible
+only on a different native child is not treated as proof that the recorded
+root is the invocation.
 The process tracker authenticates and cleans ordinary tool descendants,
 including observed `setsid` children, but it is practical supervision rather
 than hostile fork containment; a deliberate double-fork escape between polls
@@ -427,8 +447,9 @@ on a process leading its own group, whose executable, as the kernel reports
 it, is the same ironmem binary the controller runs. An agent-built
 `target/debug/ironmem` with that command line is cleaned up like any tool,
 and so is a daemon whose executable path cannot be read, or one started by
-a different ironmem install than the controller's. It leaves that daemon's children alone
-too, so an autospawned daemon survives the invocation and keeps serving. A
+a different ironmem install than the controller's. It leaves that daemon's
+children alone too, so an autospawned daemon survives the invocation and
+keeps serving. A
 daemon on any other socket, such as one an ironmem test suite starts on a
 temporary socket, is cleaned up like any other tool. So is a shared daemon
 whose socket path contains whitespace, which the process table cannot
@@ -477,9 +498,9 @@ Verification records are intentionally separated:
 ## Commit signing
 
 This applies to every harness, Claude included. If `commit.gpgsign` is on, an
-implementer that reports `met` (its "goal met" verdict) but whose commits are not
-all signed has that run recorded as a failed attempt instead, because a model
-can quietly pass `-c commit.gpgsign=false`.
+implementer that reports `met` (its "goal met" verdict) but whose commits are
+not all signed has that run recorded as a failed attempt instead, because a
+model can quietly pass `-c commit.gpgsign=false`.
 
 - **What counts as unsigned.** A commit with no `gpgsig` header (or, in a
   SHA-256 repository, no `gpgsig-sha256` header). `%G?` is only used to
@@ -515,19 +536,25 @@ can quietly pass `-c commit.gpgsign=false`.
   worktree exists. If `git worktree add` fails after making the branch (for
   example on the upstream write while another git holds the config lock), the
   branch keeps its cut and the next run reuses it; the cut is taken back only
-  when no branch was made. A branch another controller creates at the same
-  moment is never given this run's cut: the run stops and asks you to run
-  again. If `--base` moves between being resolved and the branch being
-  created, the new branch and worktree are removed again (never by force: a
-  worktree someone has started using is kept, with its cut corrected to where
-  the branch really is) and the run asks you to run again. An existing branch
+  when no branch was made, and only while both its value and the run's own
+  token in `branch.<branch>.ironmemCutOwner` still read as that run's, so a
+  take-back never removes the same value another controller recorded after
+  it. Once its add has made the branch, a run reads the cut back and records
+  it again if another controller's take-back removed it meanwhile. A branch
+  another controller creates at the same moment is never given this run's
+  cut: the run stops and asks you to run again. If `--base` moves between
+  being resolved and the branch being created, the new branch and worktree
+  are removed again (never by force: a worktree someone has started using is
+  kept, with its cut corrected to where the branch really is) and the run
+  asks you to run again. An existing branch
   with no recorded cut (an older branch) gets the commit its reflog says it
   was created from, or, without that entry, the merge base of the branch and
   `--base`; never `--base` itself, which may have moved. That run logs a
   warning naming the branch, the source and the sha. A branch that shares no
-  history with `--base`, or one already merged into `--base` while it has
-  commits on no remote (its merge base would leave the guard nothing to
-  check), and that has no creation entry, is refused: record its cut with
+  history with `--base`, or one whose merge base with `--base` is its own tip
+  (merged into it, or empty) while it has commits on no remote (that merge
+  base would leave the guard nothing to check), and that has no creation
+  entry, is refused: record its cut with
   `git config branch.<branch>.ironmemCut <sha>`.
 - **A config lock left behind blocks new branches.** Storing the cut writes
   `.git/config`. While another worktree's git holds its lock, the write is
@@ -547,14 +574,14 @@ can quietly pass `-c commit.gpgsign=false`.
   crash still enforces it on the recovered `met`, even if another agent held
   `.git/config`'s lock and neither flag was written. That recorded reading
   holds only the recovered invocation's `met`, never a fresh dispatch, and an
-  explicit `branch.<branch>.ironmemSigning false` overrides it. An invalid value (a
-  typo such as `commit.gpgsign = ture`) holds a newly created branch but never
-  sets the repository flag, and a run refuses to start until it is fixed, since
-  every `met` it produced would be discarded. So does an invalid
+  explicit `branch.<branch>.ironmemSigning false` overrides it. An invalid
+  value (a typo such as `commit.gpgsign = ture`) holds a newly created branch
+  but never sets the repository flag, and a run refuses to start until it is
+  fixed, since every `met` it produced would be discarded. So does an invalid
   `branch.<branch>.ironmemSigning` or `ironmem.autopilotSigning` while the
-  policy is off. That refusal keeps a pending
-  invocation for the issue as it is, and the first run after the fix recovers
-  it, so do not `clear-dispatch` it. `commit.gpgsign` lives
+  policy is off. That refusal keeps a pending invocation for the issue as it
+  is, and the first run after the fix recovers it, so do not
+  `clear-dispatch` it. `commit.gpgsign` lives
   in the `.git/config` shared by every worktree, so an agent on one issue can
   turn it off for all of them. The repository flag holds every issue branch to
   the policy anyway, including branches created after it was turned off.
@@ -586,12 +613,16 @@ can quietly pass `-c commit.gpgsign=false`.
   `gpg.program`, `gpg.ssh.program` or `gpg.x509.program` in the controller,
   and the agent can write `.git/config`. The guard pins each one with `-c` to
   your global or system value (git's default if neither sets it, or if that
-  config cannot be read, for example with `$HOME` unset under launchd). The
-  whole check gets 120 seconds: the git command still running then is
-  killed with its process group, which fails the guard. The guard's git
-  never fetches (`GIT_NO_LAZY_FETCH=1`, `protocol.allow=never`), so a
-  partial clone's missing object fails the read instead of reaching the
-  network through the repository's own transport config.
+  config cannot be read, for example with `$HOME` unset under launchd, which
+  is logged once per process). The whole check gets 120 seconds, a run
+  start's check included: the git command still running then is killed with
+  its process group, which fails the guard. The guard's git never fetches
+  (`GIT_NO_LAZY_FETCH=1`, `protocol.allow=never`, and `GIT_ALLOW_PROTOCOL`
+  naming no protocol, which the repository's `protocol.<name>.allow` cannot
+  override), so a partial clone's missing object fails the read instead of
+  reaching the network through the repository's own transport config. It
+  reads commits with `GIT_NO_REPLACE_OBJECTS=1`, so a `refs/replace/` ref
+  cannot change what a commit reads as.
 - **Trust posture.** The guard catches a lazy or accidental bypass. It does
   not stop an unconfined agent that deliberately signs with another key,
   opts its branch out, clears the cut, commits under another identity, or
@@ -607,7 +638,9 @@ or flag, a collaborator's commit, or a cut that is not a commit name would
 meet every later `met` too, so the run stops there with an error, before
 paying for another dispatch, and keeps a Codex or Muse invocation for
 recovery once it is fixed (do not `clear-dispatch` it). The error says what
-it keeps: Claude has no invocation to recover, and its session is resumed. Any other such failure repeats through
+it keeps: Claude has no invocation to recover, and its session is resumed.
+Found at a run's start, before any dispatch, the same faults refuse the run.
+Any other such failure repeats through
 `max_consecutive_infrastructure_failures`, like any other infrastructure
 failure.
 

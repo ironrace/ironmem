@@ -25,7 +25,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the queue as `session_in_use`), and says to look for a leftover Muse
   process and then run `clear-dispatch`. A later run, even with a different
   `--model`, probes that same session first, and `clear-dispatch` refuses
-  while a process still names it.
+  while a process still names it. **Downgrade note:** an ironmem from before
+  this release cannot read a Muse dispatch state and skips it, so its queue
+  undercounts the concurrency cap and its `reconcile` reports the live Muse
+  process as an orphan. Do not downgrade while any Muse dispatch state
+  exists; let it finish, or `clear-dispatch` it, first.
 - **Commit-signing guard for every harness (#366).** With `commit.gpgsign`
   on, a run that reports success but left unsigned commits on the issue
   branch now counts as a failed attempt, with a reason naming the commits.
@@ -38,8 +42,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   but costs the agent no attempt, and no run starts while one is there. The
   guard reads a branch of any length in two git processes, falling back to
   one read per commit only when a signature cannot be parsed, never runs a
-  signature program set in the repository's own config, never fetches, and
-  gives the whole check 120 seconds.
+  signature program set in the repository's own config, never fetches (not
+  even through a protocol the repository's config allows), ignores
+  `refs/replace/` refs, and gives the whole check 120 seconds, a run start's
+  check included. A recorded cut that is not a commit name refuses the run at
+  its start.
 - **Codex and Muse supervision waits for a quiet worktree (#366).** A
   short-lived tool's background child, reparented out of the tracked tree,
   no longer gets a trusted completion while it still runs in the worktree.
@@ -67,6 +74,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   nothing and leaves the first's state alone. Before, it overwrote that
   state, and the first invocation, named by no state, lost its slot while
   still running.
+- **A dispatch state the queue cannot read holds its concurrency slot.** One
+  that is corrupt, or that a newer ironmem wrote for a harness this one does
+  not know, was skipped, so a Lead could dispatch past its cap. It now keeps
+  its slot and defers its issue (`dispatch_state_unreadable`). A Claude
+  dispatch state carrying Codex or Muse invocation artifacts is refused where
+  it is written and where it is read.
 - **Codex and Muse implementers no longer kill the shared ironmem daemon at
   cleanup.** A harness's ironmem MCP server can autospawn the daemon as its
   own child; the process tracker now never treats the daemon on the
@@ -149,16 +162,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   identity is refused** instead of spawning a second process into it.
 - **The Codex and Muse implementers skip relative `PATH` entries** (such as
   `.`) when finding their binary. They run in the issue worktree, where a
-  relative entry would find a file in the repository being worked on.
+  relative entry would find a file in the repository being worked on. So do
+  the Claude implementer and the Codex and Muse reviewers.
 - **Resuming an issue branch with no recorded cut now records the commit the
   branch was created from** (from its reflog, or else its merge base with
-  `--base`), and refuses the run if neither can be found or the branch is
-  already merged into `--base` with unpushed commits. A new branch's cut is
-  recorded before the branch is created and is never taken back from a branch
-  that exists, so a branch is not left without one; a held-lock error now
-  names the lock file and its age. Cut and signing-flag writes run git in the C locale, so a held
-  lock is recognised in any locale, and SHA-256 repositories can provision
-  issue worktrees.
+  `--base`), and refuses the run if neither can be found or that merge base
+  is the branch's own tip while it has unpushed commits. A new branch's cut
+  is recorded before the branch is created, with the creating run's own token
+  in `branch.<branch>.ironmemCutOwner`. It is never taken back from a branch
+  that exists, nor when another controller has recorded the same value since,
+  and a run whose cut was taken back while its add made the branch records
+  it again, so a branch is not left without one. A held-lock error now names
+  the lock file and its age. Cut and signing-flag writes run git in the C
+  locale, so a held lock is recognised in any locale, and SHA-256
+  repositories can provision issue worktrees.
 - **Library: `Worktree::cut` is a `CommitSha`**, a full commit object name
   (40 or 64 hex digits) checked where it is made, instead of a `String`. It
   derefs to `str`.
