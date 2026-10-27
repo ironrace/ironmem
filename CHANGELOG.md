@@ -21,8 +21,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on, a `met` whose branch commits since the cut carry no `gpgsig` header (or
   a bad signature) is now a failed attempt. `--base` is resolved once to a
   sha and stored as `branch.<b>.ironmemCut`, and the policy is sticky via
-  `branch.<b>.ironmemSigning`; `git config --unset` on it stops enforcement
-  on that branch.
+  `branch.<b>.ironmemSigning`; `git config --unset` on it, with
+  `commit.gpgsign` off, stops enforcement on that branch.
 
 ### Fixed
 

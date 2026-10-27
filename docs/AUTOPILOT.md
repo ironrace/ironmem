@@ -100,16 +100,18 @@ writes inside the workspace and it broke SSH commit signing. Because
 `--trust-workspace` loads the workspace's rules, hooks and skills and enables
 agent delegation, repository content steers the agent and runs code
 unattended, so run the Lead in an external sandbox as you would for Codex.
-Autopilot also passes `--no-foreign-personal-context`, so your personal Claude
+Autopilot also passes `--disable-request-user-input`, so the agent cannot stop
+to ask you a question, and `--no-foreign-personal-context`, so your personal Claude
 Code and Codex rules do not leak into an unattended run, and sets
 `MUSE_NO_AUTO_UPDATE=1`, so the launcher cannot swap binaries between
 invocations. The prompt goes through a 0600 `prompt.md` (`--prompt-file`), a
 sibling of the invocation's `schema.json`.
 
 An empty model is rejected for every harness. A known cross-harness prefix
-is also rejected (`claude-*` with Codex, `gpt-*` with Claude), but Autopilot
+is also rejected (Claude rejects `gpt-*` and `muse-*`, Codex rejects `claude-*`
+and `muse-*`, Muse rejects `claude-*` and `gpt-*`), but Autopilot
 does not impose a model allowlist: provider aliases such as a Claude `opus`
-alias remain valid. A Codex implementation never resolves or launches
+alias remain valid. A Codex or Muse implementation never resolves or launches
 `claude`; `lead` also does not resolve the Claude advisor unless `--advisor`
 is enabled.
 
@@ -167,8 +169,10 @@ Accounting therefore works as it does for Codex:
 - The ledger records no Codex or Muse dollars. The daily dollar ceiling can
   still stop one: if the day's other priced spend (priced reviews,
   `--advisor` calls, Claude IC runs) plus the $2.50 ceiling exceeds
-  `--daily-budget-usd`, the dispatch is refused, and the message names that
-  flag.
+  `--daily-budget-usd`, the run pauses as `DailyBudgetExhausted` (state
+  `paused-daily-budget`) and the Lead's queue defers the issue. Neither names
+  the flag. Only a `--daily-budget-usd` below $2.50 is refused at startup, with
+  a message that names it.
 - The wall clock is the repo's `autopilot timeout` or the shared 1200-second
   fallback. `--max-turns` becomes `--max-model-steps` (Codex still refuses
   `--max-turns`). Autopilot also passes `--workspace <worktree>`.
@@ -205,7 +209,8 @@ a model can quietly pass `-c commit.gpgsign=false`.
   commits merged or rebased in are not blamed on the agent, and an earlier
   dispatch's bypass stays caught after it is pushed.
 - **The cut is fixed once.** `--base` is resolved to a commit sha in your
-  checkout when the worktree is created, and stored as
+  checkout when the issue branch is created (or once, for an older branch that
+  has no recorded cut), and stored as
   `branch.<branch>.ironmemCut`. A base that does not resolve is refused before
   any worktree exists. A stored cut that is no longer a commit is refused with
   a hint to `git config --unset branch.<branch>.ironmemCut`, which records it
@@ -220,8 +225,8 @@ a model can quietly pass `-c commit.gpgsign=false`.
   not stop an unconfined agent that deliberately signs with another key,
   clears the flag or the cut, or pushes its commits to another branch.
 
-An unreadable policy or an unusable cut fails closed, and it shows up as a
-failed attempt rather than a hold.
+An unreadable policy, or a cut that `git log` cannot use when the `met` is
+checked, fails closed as a failed attempt rather than a hold.
 
 ### Codex identity, restart recovery, and supervision limits
 
