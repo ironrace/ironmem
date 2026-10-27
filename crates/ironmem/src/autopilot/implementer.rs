@@ -16,6 +16,12 @@ pub enum Implementer {
 
 /// What differs between harnesses, named once so `run_issue` asks *why* it
 /// branches instead of *which* harness it has. A new harness answers these.
+/// Consecutive refused invocations on one session before a harness that
+/// [rotates a refused session](Implementer::rotates_refused_session) opens a
+/// fresh one. Two, not one: Muse's "already in use" can be a lock another
+/// `exec` releases moments later, and a fresh session loses the context.
+pub const RESUME_REFUSALS_BEFORE_ROTATION: u32 = 2;
+
 impl Implementer {
     /// Every harness, once. `tests::every_variant_is_listed` matches
     /// exhaustively, so a new variant fails to compile until it is added here.
@@ -65,6 +71,30 @@ impl Implementer {
         match self {
             Self::Claude => true,
             Self::Codex | Self::Muse => false,
+        }
+    }
+
+    /// The harness continues the controller's session (`--session-id`)
+    /// across invocations and can refuse to: Muse will not resume a session
+    /// another `exec` holds, or one opened with another provider. Only the
+    /// controller can replace that session, so it opens a fresh one after
+    /// [`RESUME_REFUSALS_BEFORE_ROTATION`] consecutive refusals, or when the
+    /// run's model differs from the one the session was used with. Claude
+    /// rotates on its own rule (a verdict), and a Codex thread ID is the
+    /// harness's own.
+    pub fn rotates_refused_session(self) -> bool {
+        match self {
+            Self::Muse => true,
+            Self::Claude | Self::Codex => false,
+        }
+    }
+
+    /// Whether a finished `outcome` is this harness refusing to run on the
+    /// requested session at all, as opposed to a run that failed on it.
+    pub fn refused_resume(self, outcome: &super::dispatch::DispatchOutcome) -> bool {
+        match self {
+            Self::Muse => super::muse_dispatch::refused_resume(outcome),
+            Self::Claude | Self::Codex => false,
         }
     }
 
@@ -152,7 +182,7 @@ mod tests {
 
     #[test]
     fn harness_capabilities_are_stated_for_every_variant() {
-        let table: Vec<(Implementer, bool, bool, bool)> = ALL
+        let table: Vec<(Implementer, bool, bool, bool, bool)> = ALL
             .iter()
             .map(|&i| {
                 (
@@ -160,17 +190,25 @@ mod tests {
                     i.recovers_invocations(),
                     i.assigns_own_session_id(),
                     i.rotates_session_after_verdict(),
+                    i.rotates_refused_session(),
                 )
             })
             .collect();
         assert_eq!(
             table,
             vec![
-                (Implementer::Claude, false, false, true),
-                (Implementer::Codex, true, true, false),
-                (Implementer::Muse, true, false, false),
+                (Implementer::Claude, false, false, true, false),
+                (Implementer::Codex, true, true, false, false),
+                (Implementer::Muse, true, false, false, true),
             ]
         );
+        // Only a harness that keeps the controller's session, and recovers
+        // its invocations, may replace it.
+        for i in ALL {
+            if i.rotates_refused_session() {
+                assert!(i.recovers_invocations() && !i.assigns_own_session_id());
+            }
+        }
     }
 
     #[test]

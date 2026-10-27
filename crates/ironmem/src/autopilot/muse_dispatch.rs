@@ -54,6 +54,32 @@ fn marker_safe<'a>(what: &str, word: &'a str) -> Result<&'a str, MemoryError> {
     Ok(word)
 }
 
+/// What Muse prints when it will not run on the requested session at all
+/// (measured on 1.4.13, #366; exit 1, no terminal record): another `exec`
+/// holds the session, a resume across providers, or a retained session it
+/// cannot read back.
+const RESUME_REFUSALS: [&str; 3] = [
+    "already in use",
+    "refusing to resume",
+    "failed to read retained session",
+];
+
+/// Whether a finished Muse outcome is a refusal to run on its session: it
+/// started, exited non-zero without a timeout or verdict, wrote no terminal
+/// record, and its reason (which carries Muse's stderr) names a refusal.
+pub(crate) fn refused_resume(outcome: &crate::autopilot::dispatch::DispatchOutcome) -> bool {
+    let reason = outcome.reason.as_deref().unwrap_or_default();
+    let lower = reason.to_ascii_lowercase();
+    outcome.invocation_started
+        && !outcome.process_success
+        && !outcome.timed_out
+        && outcome.verdict.is_none()
+        && reason.contains("Muse run emitted no terminal record")
+        && RESUME_REFUSALS
+            .iter()
+            .any(|refusal| lower.contains(refusal))
+}
+
 impl SupervisedCli for MuseCli {
     fn implementer(&self) -> Implementer {
         Implementer::Muse
@@ -479,6 +505,49 @@ mod tests {
     #[test]
     fn the_child_never_self_updates_mid_dispatch() {
         assert_eq!(MuseCli.env(), &[("MUSE_NO_AUTO_UPDATE", "1")]);
+    }
+
+    #[test]
+    fn only_a_terminal_less_nonzero_exit_naming_a_refusal_is_a_refused_resume() {
+        use crate::autopilot::dispatch::{DispatchOutcome, Verdict};
+        let refused = |stderr: &str| DispatchOutcome {
+            cost_usd: None,
+            num_turns: 0,
+            duration_ms: 900,
+            is_error: true,
+            native_session_id: None,
+            invocation_started: true,
+            verdict: None,
+            reason: Some(format!(
+                "Muse run emitted no terminal record; Muse process exited with Some(1); \
+                 stderr: {stderr}"
+            )),
+            process_success: false,
+            timed_out: false,
+        };
+        for stderr in [
+            "error: session 0d6c1e2a is already in use",
+            "Error: Refusing to resume session 0d6c1e2a: it was created with provider meta",
+            "error: failed to read retained session 0d6c1e2a",
+        ] {
+            assert!(refused_resume(&refused(stderr)), "{stderr}");
+        }
+        assert!(!refused_resume(&refused(
+            "error: provider request timed out"
+        )));
+        let mut timed_out = refused("already in use");
+        timed_out.timed_out = true;
+        let mut exited_zero = refused("already in use");
+        exited_zero.process_success = true;
+        let mut never_started = refused("already in use");
+        never_started.invocation_started = false;
+        let mut judged = refused("already in use");
+        judged.verdict = Some(Verdict::NotMet);
+        let mut terminal = refused("already in use");
+        terminal.reason = Some("Muse run ended failed: session already in use".into());
+        for outcome in [timed_out, exited_zero, never_started, judged, terminal] {
+            assert!(!refused_resume(&outcome), "{outcome:?}");
+        }
     }
 
     #[test]

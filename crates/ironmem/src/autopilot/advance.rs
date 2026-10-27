@@ -2374,6 +2374,8 @@ mod tests {
                 session_uuid: "11111111-2222-3333-4444-555555555555".into(),
                 turn_n: 1,
                 session_claimed: true,
+                session_model: None,
+                resume_refusals: 0,
             },
         )
         .unwrap();

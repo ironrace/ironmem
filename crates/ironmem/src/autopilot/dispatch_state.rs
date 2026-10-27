@@ -58,6 +58,16 @@ pub struct DispatchState {
     /// next dispatch, whereas a spurious `--resume` on a session that was
     /// never opened wedges the issue.
     pub session_claimed: bool,
+    /// The `--model` that `session_uuid` was last dispatched with. A harness
+    /// that [rotates a refused session](Implementer::rotates_refused_session)
+    /// opens a fresh one when the run's model differs: Muse refuses to
+    /// resume a session across providers. `None` for records written before
+    /// this field existed, which never rotate on it.
+    pub session_model: Option<String>,
+    /// Consecutive finished invocations the harness refused to run on
+    /// `session_uuid` (see [`Implementer::refused_resume`]). Kept across
+    /// runs so a run that stops after one refusal still counts it.
+    pub resume_refusals: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,6 +90,10 @@ struct DispatchStateBody {
     turn_n: u32,
     #[serde(default)]
     session_claimed: bool,
+    #[serde(default)]
+    session_model: Option<String>,
+    #[serde(default)]
+    resume_refusals: u32,
 }
 
 /// Logical-key prefix shared by every dispatch-state drawer. One constant
@@ -112,6 +126,8 @@ pub fn upsert_dispatch_state(db: &Database, state: &DispatchState) -> Result<Str
         session_uuid: state.session_uuid.clone(),
         turn_n: state.turn_n,
         session_claimed: state.session_claimed,
+        session_model: state.session_model.clone(),
+        resume_refusals: state.resume_refusals,
     };
     let content = serde_json::to_string(&body)?;
     write_current(db, &dispatch_state_key(&state.issue), &content)
@@ -147,6 +163,8 @@ fn state_from_content(content: &str) -> Result<DispatchState, MemoryError> {
         session_uuid: body.session_uuid,
         turn_n: body.turn_n,
         session_claimed: body.session_claimed,
+        session_model: body.session_model,
+        resume_refusals: body.resume_refusals,
     })
 }
 
@@ -267,6 +285,8 @@ mod tests {
             session_uuid: "11111111-1111-1111-1111-111111111111".into(),
             turn_n,
             session_claimed: true,
+            session_model: None,
+            resume_refusals: 0,
         }
     }
 
@@ -329,6 +349,8 @@ mod tests {
             session_uuid: "old-id".into(),
             turn_n: 3,
             session_claimed: true,
+            session_model: None,
+            resume_refusals: 0,
         }
     }
 
@@ -375,9 +397,17 @@ mod tests {
             session_uuid: "old-id".into(),
             turn_n: 3,
             session_claimed: true,
+            session_model: None,
+            resume_refusals: 0,
         })
         .unwrap();
-        for key in ["implementer", "native_session_id", "codex_artifacts"] {
+        for key in [
+            "implementer",
+            "native_session_id",
+            "codex_artifacts",
+            "session_model",
+            "resume_refusals",
+        ] {
             body.as_object_mut().unwrap().remove(key);
         }
         write_current(&db, &dispatch_state_key(&issue), &body.to_string()).unwrap();
@@ -388,6 +418,22 @@ mod tests {
         );
         assert_eq!(state.native_session_id.as_deref(), Some("old-id"));
         assert!(state.session_claimed);
+        // An older record names no model, so it never rotates on one.
+        assert_eq!(state.session_model, None);
+        assert_eq!(state.resume_refusals, 0);
+    }
+
+    #[test]
+    fn the_session_model_and_refusal_count_round_trip() {
+        let db = Database::open_in_memory().unwrap();
+        let issue = IssueRef::new("ironrace/ironmem", 283);
+        let mut state = sample(&issue, 1);
+        state.session_model = Some("muse-wonder-1.0".into());
+        state.resume_refusals = 1;
+        upsert_dispatch_state(&db, &state).unwrap();
+        let read = get_dispatch_state(&db, &issue).unwrap().unwrap();
+        assert_eq!(read.session_model.as_deref(), Some("muse-wonder-1.0"));
+        assert_eq!(read.resume_refusals, 1);
     }
 
     #[test]

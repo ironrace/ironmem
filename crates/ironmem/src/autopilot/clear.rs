@@ -178,6 +178,8 @@ mod tests {
             session_uuid: "controller-only".into(),
             turn_n: 1,
             session_claimed: true,
+            session_model: None,
+            resume_refusals: 0,
         }
     }
 

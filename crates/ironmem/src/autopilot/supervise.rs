@@ -1428,6 +1428,8 @@ mod tests {
             session_uuid: "11111111-1111-1111-1111-111111111111".into(),
             turn_n: 3,
             session_claimed: claimed,
+            session_model: None,
+            resume_refusals: 0,
         }
     }
 

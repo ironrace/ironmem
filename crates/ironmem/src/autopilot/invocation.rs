@@ -2092,6 +2092,8 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
             session_uuid: "controller-only".into(),
             turn_n: 1,
             session_claimed: true,
+            session_model: None,
+            resume_refusals: 0,
         }
     }
 

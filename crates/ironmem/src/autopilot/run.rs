@@ -88,7 +88,7 @@ use crate::db::schema::Database;
 use crate::error::MemoryError;
 
 use super::dispatch::{self, DispatchOutcome, DispatchSpec, SessionMode, Verdict};
-use super::implementer::Implementer;
+use super::implementer::{Implementer, RESUME_REFUSALS_BEFORE_ROTATION};
 use super::invocation::{InvocationArtifacts, InvocationRecovery};
 use super::worktree::{self, Worktree};
 use super::{
@@ -1658,6 +1658,13 @@ pub fn run_issue(
     let mut invocation_artifacts = existing_state
         .as_ref()
         .and_then(|s| s.invocation_artifacts.clone());
+    // The model `session_uuid` was last dispatched with, and how many
+    // finished invocations in a row the harness refused to run on it. See
+    // `Implementer::rotates_refused_session` and the rotations below.
+    let mut session_model = existing_state
+        .as_ref()
+        .map_or_else(|| Some(config.model.clone()), |s| s.session_model.clone());
+    let mut resume_refusals = existing_state.as_ref().map_or(0, |s| s.resume_refusals);
     let mut recovered_outcome = None;
     // Record a signing policy that is on before any dispatch or recovery, so
     // an agent that turns it off is still held to it, in this run and every
@@ -1727,38 +1734,40 @@ pub fn run_issue(
     // is no longer fixed for the life of a run: a dispatch that concludes its
     // goal loop rotates it (see the rotation below), and the drawer must
     // record the uuid the *next* dispatch will use, not the spent one.
-    let write_state =
-        |db: &Database,
-         attempt_n: u32,
-         turn_n: u32,
-         state: &str,
-         session_uuid: &str,
-         session_claimed: bool,
-         identity: (&Option<String>, &Option<InvocationArtifacts>)| {
-            dispatch_state::upsert_dispatch_state(
-                db,
-                &DispatchState {
-                    implementer: config.implementer,
-                    native_session_id: if config.implementer.assigns_own_session_id() {
-                        identity.0.clone()
-                    } else {
-                        Some(session_uuid.to_string())
-                    },
-                    invocation_artifacts: identity.1.clone(),
-                    issue: issue.clone(),
-                    worktree_path: worktree_path.clone(),
-                    ic_session_name: ic_session_name.clone(),
-                    dispatch_class: config.dispatch_class.clone(),
-                    attempt_n,
-                    state: state.to_string(),
-                    started_at: started_at.clone(),
-                    session_uuid: session_uuid.to_string(),
-                    turn_n,
-                    session_claimed,
+    let write_state = |db: &Database,
+                       attempt_n: u32,
+                       turn_n: u32,
+                       state: &str,
+                       session_uuid: &str,
+                       session_claimed: bool,
+                       identity: (&Option<String>, &Option<InvocationArtifacts>),
+                       session: (&Option<String>, u32)| {
+        dispatch_state::upsert_dispatch_state(
+            db,
+            &DispatchState {
+                implementer: config.implementer,
+                native_session_id: if config.implementer.assigns_own_session_id() {
+                    identity.0.clone()
+                } else {
+                    Some(session_uuid.to_string())
                 },
-            )
-            .map(|_| ())
-        };
+                invocation_artifacts: identity.1.clone(),
+                issue: issue.clone(),
+                worktree_path: worktree_path.clone(),
+                ic_session_name: ic_session_name.clone(),
+                dispatch_class: config.dispatch_class.clone(),
+                attempt_n,
+                state: state.to_string(),
+                started_at: started_at.clone(),
+                session_uuid: session_uuid.to_string(),
+                turn_n,
+                session_claimed,
+                session_model: session.0.clone(),
+                resume_refusals: session.1,
+            },
+        )
+        .map(|_| ())
+    };
 
     // A recovering harness publishes each invocation just before it launches.
     if !config.implementer.recovers_invocations() {
@@ -1770,6 +1779,7 @@ pub fn run_issue(
             &session_uuid,
             resuming,
             (&native_session_id, &invocation_artifacts),
+            (&session_model, resume_refusals),
         )?;
     }
 
@@ -1892,11 +1902,33 @@ pub fn run_issue(
                         &session_uuid,
                         resuming,
                         (&native_session_id, &invocation_artifacts),
+                        (&session_model, resume_refusals),
                     )?;
                     return Err(MemoryError::Validation(e.to_string()));
                 }
             };
 
+            // A session the harness keeps but refuses across providers is
+            // replaced when the model changes. Here, at a fresh launch, no
+            // invocation can be live: recovery has already held or finished
+            // any earlier one, and every in-run outcome is a finished one.
+            if config.implementer.rotates_refused_session()
+                && session_model
+                    .as_deref()
+                    .is_some_and(|model| model != config.model)
+            {
+                tracing::info!(
+                    issue = %issue.canonical(),
+                    previous_model = session_model.as_deref().unwrap_or_default(),
+                    model = %config.model,
+                    "autopilot opens a fresh {} session for a different model",
+                    config.implementer.label()
+                );
+                session_uuid = uuid::Uuid::new_v4().to_string();
+                resuming = false;
+                resume_refusals = 0;
+            }
+            session_model = Some(config.model.clone());
             // A supervised harness's artifacts are allocated below, once its
             // argv is known to be valid.
             let mut spec = DispatchSpec {
@@ -1970,6 +2002,7 @@ pub fn run_issue(
                         &session_uuid,
                         resuming,
                         (&native_session_id, &invocation_artifacts),
+                        (&session_model, resume_refusals),
                     )?;
                     unpriced_dispatches += 1;
                 }
@@ -2027,6 +2060,7 @@ pub fn run_issue(
                     &session_uuid,
                     resuming,
                     (&native_session_id, &invocation_artifacts),
+                    (&session_model, resume_refusals),
                 )?;
                 if consecutive_infrastructure_failures
                     >= config.max_consecutive_infrastructure_failures
@@ -2049,6 +2083,48 @@ pub fn run_issue(
                 unpriced_dispatches += 1;
             }
             invocation_artifacts = None;
+        }
+        // A harness that refuses to run on the session it is handed fails
+        // every later invocation the same way, at no attempt's cost. After
+        // enough refusals in a row the next dispatch opens a fresh session;
+        // the outcome is finished, so nothing can still be running on it.
+        if config.implementer.rotates_refused_session() {
+            if config.implementer.refused_resume(&outcome) {
+                resume_refusals += 1;
+                let release = format!(
+                    "if a fresh session is refused too, check {}'s provider and configuration; \
+                     `ironmem autopilot clear-dispatch {} {}` releases the issue",
+                    config.implementer.label(),
+                    issue.repo,
+                    issue.number
+                );
+                let note = if resume_refusals >= RESUME_REFUSALS_BEFORE_ROTATION {
+                    let refused =
+                        std::mem::replace(&mut session_uuid, uuid::Uuid::new_v4().to_string());
+                    resuming = false;
+                    resume_refusals = 0;
+                    format!(
+                        "{} refused to run on session {refused} {RESUME_REFUSALS_BEFORE_ROTATION} \
+                         times in a row, so the next dispatch opens a fresh session; {release}",
+                        config.implementer.label()
+                    )
+                } else {
+                    format!(
+                        "{} refused to run on its session ({resume_refusals} of \
+                         {RESUME_REFUSALS_BEFORE_ROTATION} before a fresh session is opened); \
+                         {release}",
+                        config.implementer.label()
+                    )
+                };
+                outcome.reason = Some(match outcome.reason.take() {
+                    Some(original) if !original.trim().is_empty() => {
+                        format!("{note}. {original}")
+                    }
+                    _ => note,
+                });
+            } else {
+                resume_refusals = 0;
+            }
         }
         // Codex-only today: Muse does not assign its own session id, so this
         // identity check never applies to it.
@@ -2301,6 +2377,7 @@ pub fn run_issue(
                     &session_uuid,
                     resuming,
                     (&native_session_id, &invocation_artifacts),
+                    (&session_model, resume_refusals),
                 )?;
             }
             DispatchClassification::InfrastructureFailure => {
@@ -2312,6 +2389,7 @@ pub fn run_issue(
                     &session_uuid,
                     resuming,
                     (&native_session_id, &invocation_artifacts),
+                    (&session_model, resume_refusals),
                 )?;
                 if consecutive_infrastructure_failures
                     >= config.max_consecutive_infrastructure_failures
@@ -2339,6 +2417,7 @@ pub fn run_issue(
             &session_uuid,
             resuming,
             (&native_session_id, &invocation_artifacts),
+            (&session_model, resume_refusals),
         )?;
     }
 
@@ -2821,6 +2900,8 @@ sleep 0.5
                 session_uuid: "11111111-2222-3333-4444-555555555555".into(),
                 turn_n: 1,
                 session_claimed: true,
+                session_model: None,
+                resume_refusals: 0,
             },
         )
         .unwrap();
@@ -2935,6 +3016,8 @@ sleep 0.5
             session_uuid: "controller-placeholder".into(),
             turn_n: 0,
             session_claimed: false,
+            session_model: None,
+            resume_refusals: 0,
         };
         dispatch_state::upsert_dispatch_state(db, &state).unwrap();
         state
@@ -3054,6 +3137,183 @@ sleep 0.5
             );
         }
     }
+    /// A finished Muse invocation that ended with no terminal record and a
+    /// non-zero exit, with `stderr` as Muse's own complaint.
+    fn muse_infra_failure(stderr: &str) -> DispatchOutcome {
+        DispatchOutcome {
+            cost_usd: None,
+            num_turns: 0,
+            duration_ms: 900,
+            is_error: true,
+            native_session_id: None,
+            invocation_started: true,
+            verdict: None,
+            reason: Some(format!(
+                "Muse journal never names the requested session; Muse run emitted no terminal \
+                 record; Muse process exited with Some(1); stderr: {stderr}"
+            )),
+            process_success: false,
+            timed_out: false,
+        }
+    }
+    /// Measured (Muse 1.4.13, #366): a second `exec` on a running session.
+    fn muse_refusal() -> DispatchOutcome {
+        muse_infra_failure("error: session 0d6c1e2a-5b8f-4c1d-9e3a-7f2b6a1c4d5e is already in use")
+    }
+    fn session_of(spec: &DispatchSpec) -> String {
+        spec.session.session_uuid().to_owned()
+    }
+
+    #[test]
+    fn two_muse_resume_refusals_open_a_fresh_session_for_the_next_dispatch() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        let mut d = muse_script(vec![muse_refusal(), muse_refusal(), met()]);
+        let run = run_issue(&db, &issue(), &brief(), &wt, &muse_config(), &mut d).unwrap();
+        assert!(
+            matches!(run.terminal, TerminalReason::Met { .. }),
+            "{:?}",
+            run.terminal
+        );
+        let seen = &d.inner.seen;
+        assert_eq!(
+            session_of(&seen[0]),
+            session_of(&seen[1]),
+            "one refusal keeps it"
+        );
+        assert_ne!(
+            session_of(&seen[1]),
+            session_of(&seen[2]),
+            "two refusals rotate it"
+        );
+        assert!(matches!(seen[2].session, SessionMode::New { .. }));
+        let first = run.dispatches[0].reason.as_deref().unwrap();
+        assert!(first.contains("1 of 2"), "{first}");
+        let second = run.dispatches[1].reason.as_deref().unwrap();
+        assert!(second.contains("fresh session"), "{second}");
+        assert!(
+            second.contains("ironmem autopilot clear-dispatch ironrace/ironmem 283"),
+            "{second}"
+        );
+        assert!(
+            second.contains("already in use"),
+            "Muse's own words stay: {second}"
+        );
+    }
+
+    #[test]
+    fn muse_resume_refusals_are_counted_across_runs() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        let mut c = muse_config();
+        c.max_consecutive_infrastructure_failures = 1;
+        let mut sessions = Vec::new();
+        for outcome in [muse_refusal(), muse_refusal(), met()] {
+            let mut d = muse_script(vec![outcome]);
+            run_issue(&db, &issue(), &brief(), &wt, &c, &mut d).unwrap();
+            sessions.push(session_of(&d.inner.seen[0]));
+        }
+        assert_eq!(sessions[0], sessions[1]);
+        assert_ne!(sessions[1], sessions[2]);
+    }
+
+    #[test]
+    fn an_ordinary_muse_infrastructure_failure_keeps_the_session() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        let plain = || muse_infra_failure("error: provider request timed out after 60s");
+        let mut d = muse_script(vec![plain(), plain(), met()]);
+        let run = run_issue(&db, &issue(), &brief(), &wt, &muse_config(), &mut d).unwrap();
+        assert!(matches!(run.terminal, TerminalReason::Met { .. }));
+        let sessions: Vec<_> = d.inner.seen.iter().map(session_of).collect();
+        assert!(sessions.iter().all(|s| *s == sessions[0]), "{sessions:?}");
+        // A refusal between two ordinary failures restarts the count.
+        let db = approved_db();
+        let mut d = muse_script(vec![muse_refusal(), plain(), muse_refusal(), met()]);
+        run_issue(&db, &issue(), &brief(), &wt, &muse_config(), &mut d).unwrap();
+        let sessions: Vec<_> = d.inner.seen.iter().map(session_of).collect();
+        assert!(sessions.iter().all(|s| *s == sessions[0]), "{sessions:?}");
+    }
+
+    #[test]
+    fn a_codex_or_claude_failure_quoting_refusal_text_never_rotates() {
+        for (mut c, implementer) in [
+            (codex_config(), Implementer::Codex),
+            (config(), Implementer::Claude),
+        ] {
+            let db = approved_db();
+            let (_dir, wt) = fixture_worktree();
+            c.max_consecutive_infrastructure_failures = 3;
+            let mut d = cli_script(implementer, vec![muse_refusal(), muse_refusal(), met()]);
+            run_issue(&db, &issue(), &brief(), &wt, &c, &mut d).unwrap();
+            let seen = &d.inner.seen;
+            assert_eq!(
+                session_of(&seen[1]),
+                session_of(&seen[2]),
+                "{implementer:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_model_change_opens_a_fresh_muse_session_and_the_same_model_keeps_it() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        let mut c = muse_config();
+        c.max_consecutive_infrastructure_failures = 1;
+        let plain = || muse_infra_failure("error: provider request timed out after 60s");
+        let mut first = muse_script(vec![plain()]);
+        run_issue(&db, &issue(), &brief(), &wt, &c, &mut first).unwrap();
+        let mut same = muse_script(vec![plain()]);
+        run_issue(&db, &issue(), &brief(), &wt, &c, &mut same).unwrap();
+        assert_eq!(
+            session_of(&first.inner.seen[0]),
+            session_of(&same.inner.seen[0])
+        );
+        c.model = "muse-wonder-2.0".into();
+        let mut changed = muse_script(vec![plain()]);
+        run_issue(&db, &issue(), &brief(), &wt, &c, &mut changed).unwrap();
+        assert_ne!(
+            session_of(&same.inner.seen[0]),
+            session_of(&changed.inner.seen[0])
+        );
+        assert!(matches!(
+            changed.inner.seen[0].session,
+            SessionMode::New { .. }
+        ));
+        // The new session is now the new model's, so the next run keeps it.
+        let mut again = muse_script(vec![met()]);
+        run_issue(&db, &issue(), &brief(), &wt, &c, &mut again).unwrap();
+        assert_eq!(
+            session_of(&changed.inner.seen[0]),
+            session_of(&again.inner.seen[0])
+        );
+    }
+
+    #[test]
+    fn a_model_change_never_rotates_a_session_whose_invocation_may_be_live() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        let mut c = muse_config();
+        c.max_consecutive_infrastructure_failures = 1;
+        let mut first = muse_script(vec![muse_infra_failure("error: timed out")]);
+        run_issue(&db, &issue(), &brief(), &wt, &c, &mut first).unwrap();
+        let stored = dispatch_state::get_dispatch_state(&db, &issue()).unwrap();
+        c.model = "muse-wonder-2.0".into();
+        let mut live = muse_script(vec![met()]);
+        live.recovery = Some(InvocationRecovery::Alive);
+        let run = run_issue(&db, &issue(), &brief(), &wt, &c, &mut live).unwrap();
+        assert!(matches!(
+            run.terminal,
+            TerminalReason::ImplementationInFlight { .. }
+        ));
+        assert!(live.inner.seen.is_empty());
+        assert_eq!(
+            dispatch_state::get_dispatch_state(&db, &issue()).unwrap(),
+            stored
+        );
+    }
+
     #[test]
     fn a_dispatch_that_cannot_establish_completion_names_its_harness() {
         for (implementer, label) in [(Implementer::Muse, "Muse"), (Implementer::Codex, "Codex")] {

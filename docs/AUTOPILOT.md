@@ -206,6 +206,21 @@ is never rendered as free.
   running.
 - Muse's own lock refuses a second `exec` on a running session, and after a
   SIGKILL the lock is released (measured).
+- **Session rotation.** Muse refuses some sessions outright: one another
+  `exec` holds ("already in use"), one opened with a different provider
+  ("refusing to resume"), or one it cannot read back ("failed to read
+  retained session"). Such a run exits 1 with no terminal record, which is an
+  infrastructure failure, so without rotation every later invocation would
+  fail the same way. After two refused invocations in a row (counted across
+  runs, and reset by any other outcome), the next dispatch opens a fresh
+  session UUID. A run whose `--model` differs from the one the session was
+  last dispatched with also opens a fresh session. Either way the rotation
+  happens only at a new launch, never while an invocation might still be
+  running. Each refusal's reason says so and names `clear-dispatch`, which is
+  the release if a fresh session is refused too (Muse's provider or
+  configuration is then at fault). The fresh session loses Muse's
+  conversation history, not the prior attempts, which every turn prompt
+  carries.
 - `clear-dispatch` on a Muse hold deletes the dispatch state, so the next
   dispatch mints a new session UUID and starts a fresh Muse session. Lineage
   and attempt counts stand.
