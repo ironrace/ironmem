@@ -1876,14 +1876,18 @@ pub fn run_issue(
         // one: `cumulative_attempt_n + 1`). The guard reads live git state
         // that may have changed since, and a different verdict would make
         // `record_and_advance` refuse the replay and wedge the issue. The
-        // recorded verdict is authoritative instead.
+        // recorded verdict is authoritative instead, and so is a recorded
+        // success's commit: HEAD may have moved since.
         let recorded = if recovered && outcome.is_met() {
             recorded_attempt(db, issue, cumulative_attempt_n + 1)?
         } else {
             None
         };
+        let mut recorded_commit_sha = None;
         if let Some(recorded) = recorded {
-            if recorded.verdict == AttemptOutcome::Failed {
+            if recorded.verdict == AttemptOutcome::Success {
+                recorded_commit_sha = recorded.commit_sha;
+            } else {
                 outcome.verdict = Some(Verdict::NotMet);
                 outcome.reason = Some(
                     recorded
@@ -1926,7 +1930,7 @@ pub fn run_issue(
 
         match classification {
             DispatchClassification::Met => {
-                let commit_sha = head_commit(&worktree.path);
+                let commit_sha = recorded_commit_sha.or_else(|| head_commit(&worktree.path));
                 record_and_advance(
                     db,
                     &AttemptRecord {
@@ -3861,6 +3865,7 @@ sleep 0.5
         db: &Database,
         verdict: AttemptOutcome,
         why_failed: Option<&str>,
+        commit_sha: Option<&str>,
     ) {
         lineage::record_attempt(
             db,
@@ -3870,7 +3875,7 @@ sleep 0.5
                 approach: "recorded before the crash".into(),
                 verdict,
                 why_failed: why_failed.map(str::to_string),
-                commit_sha: None,
+                commit_sha: commit_sha.map(str::to_string),
             },
         )
         .unwrap();
@@ -3902,12 +3907,19 @@ sleep 0.5
         let db = approved_db();
         let (_dir, wt) = fixture_worktree();
         pending_codex(&db, &wt, Some("persisted"));
-        record_attempt_one_before_the_crash(&db, AttemptOutcome::Success, None);
+        let recorded_sha = git_in(&wt.path, &["rev-parse", "HEAD"]);
+        record_attempt_one_before_the_crash(
+            &db,
+            AttemptOutcome::Success,
+            None,
+            Some(&recorded_sha),
+        );
         // Between the crash and the replay the policy came on and an unsigned
-        // commit landed; the guard would now call the recorded success a
-        // failure.
+        // commit moved HEAD; the guard would now call the recorded success a
+        // failure, and HEAD is no longer the commit that succeeded.
         git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
-        commit_in(&wt.path, "later", &["-c", "commit.gpgsign=false"]);
+        let later = commit_in(&wt.path, "later", &["-c", "commit.gpgsign=false"]);
+        assert_ne!(later, recorded_sha);
         let mut result = met();
         result.native_session_id = Some("persisted".into());
         let mut d = codex_script(vec![]);
@@ -3915,16 +3927,26 @@ sleep 0.5
         let mut c = codex_config();
         c.attempt_cap = 1;
         let run = run_issue(&db, &issue(), &brief(), &wt, &c, &mut d).unwrap();
-        assert!(
-            matches!(run.terminal, TerminalReason::Met { .. }),
-            "{run:?}"
-        );
+        match &run.terminal {
+            TerminalReason::Met { commit_sha } => {
+                assert_eq!(commit_sha.as_deref(), Some(recorded_sha.as_str()))
+            }
+            other => panic!("expected Met, got {other:?}"),
+        }
         assert_eq!(
             run.dispatches[0].classification,
             DispatchClassification::Met
         );
         assert!(d.inner.seen.is_empty());
         assert_attempt_one_recorded_once(&db, AttemptOutcome::Success);
+        assert_eq!(
+            lineage::get_issue_status(&db, &issue())
+                .unwrap()
+                .unwrap()
+                .best_commit_sha
+                .as_deref(),
+            Some(recorded_sha.as_str())
+        );
     }
 
     #[test]
@@ -3934,7 +3956,7 @@ sleep 0.5
         pending_muse(&db, &wt, None);
         let recorded =
             "gate condition not met: commit.gpgsign is on, but commit(s) abc are unsigned";
-        record_attempt_one_before_the_crash(&db, AttemptOutcome::Failed, Some(recorded));
+        record_attempt_one_before_the_crash(&db, AttemptOutcome::Failed, Some(recorded), None);
         // The fixture's policy is off and no flag was recorded, so the guard
         // would now pass the met the recorded attempt failed.
         let mut d = muse_script(vec![]);
