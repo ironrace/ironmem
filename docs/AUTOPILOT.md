@@ -297,10 +297,18 @@ is outside its guarantee. The macOS runtime path is exercised. Linux-specific
 kernel identity and cleanup code is covered by code/tests but has not been
 run end to end on a Linux host.
 
-A supervised harness's ironmem MCP server never autospawns the shared ironmem
-daemon (Autopilot sets `IRONMEM_NO_DAEMON=1` for every supervised child): it
-connects to a running daemon or serves in-process, so cleanup never kills the
-daemon your other sessions use.
+Cleanup never kills the shared ironmem daemon your other sessions use. A
+harness's `ironmem serve --connect` MCP server may autospawn that daemon as
+its own child, but the process tracker never treats it as part of an
+invocation. It recognises the daemon by its exact
+`ironmem serve --listen <socket> [--db <path>]` command line on a process
+leading its own group, and it leaves that daemon's children alone too.
+Supervised children also get `IRONMEM_NO_DAEMON=1`, so a harness that passes
+its environment on to MCP servers (Muse) never spawns a daemon at all; Codex
+clears that environment, so this part does not reach its MCP servers. The
+trade-off: a tool that disguises itself as the daemon, with the same command
+line in a group of its own, escapes tracking. That is the same class as the
+double-fork escape above.
 
 Verification records are intentionally separated:
 

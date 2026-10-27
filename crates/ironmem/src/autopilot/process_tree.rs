@@ -5,7 +5,9 @@
 //! child conservatively holds until trusted supervisor completion. Process
 //! polling and authenticated tree cleanup cover ordinary harness tools,
 //! including setsid children; they do not contain deliberate double-fork
-//! escapes between polls.
+//! escapes between polls. The operator's shared ironmem daemon, which a
+//! harness's MCP proxy may autospawn, is never owned; a tool disguised as it
+//! escapes tracking the same way.
 use std::path::Path;
 #[cfg(unix)]
 use std::process::Command;
@@ -84,6 +86,33 @@ impl ProcessRow {
         } else {
             parse_muse_options(args)
         }
+    }
+
+    /// Whether this row is the operator's shared ironmem daemon, which a
+    /// harness's `ironmem serve --connect` MCP proxy may autospawn as its
+    /// own child (`mcp::daemon::spawn_daemon_process`). It serves every
+    /// other session, so supervision must never own it. Matches only that
+    /// spawn's exact argv, `<…/ironmem> serve --listen <socket>
+    /// [--db <path>]`, on a process leading its own group (it is spawned
+    /// with `process_group(0)`).
+    ///
+    /// Trade-off: a tool that disguises itself as the daemon, with the same
+    /// argv in a group of its own, escapes tracking. That is the same class
+    /// as the double-fork escape this module already does not contain.
+    pub(crate) fn is_shared_ironmem_daemon(&self) -> bool {
+        if self.pgid != self.pid {
+            return false;
+        }
+        let words: Vec<&str> = self.args.split_whitespace().collect();
+        let exe_is_ironmem = words
+            .first()
+            .and_then(|exe| Path::new(exe).file_name())
+            .is_some_and(|name| name == "ironmem");
+        exe_is_ironmem
+            && matches!(
+                words[1..],
+                ["serve", "--listen", _] | ["serve", "--listen", _, "--db", _]
+            )
     }
 }
 
@@ -820,6 +849,18 @@ impl ProcessTracker {
         rows: Vec<ProcessRow>,
         mut kernel: impl FnMut(u32) -> Result<Option<KernelProcess>, String>,
     ) -> Result<Vec<ProcessRow>, MemoryError> {
+        // The shared ironmem daemon is never owned (see
+        // `ProcessRow::is_shared_ironmem_daemon`). A sample taken between its
+        // fork and exec showed it with its proxy's argv and enrolled it; it
+        // cannot have had children yet, so releasing it here, before it
+        // seeds anything, keeps its later children unowned too.
+        let root_pid = self.root_pid;
+        self.known.retain(|(old, _)| {
+            old.pid == root_pid
+                || !rows
+                    .iter()
+                    .any(|r| r.pid == old.pid && r.active() && r.is_shared_ironmem_daemon())
+        });
         // Existing descendants remain owned only while their kernel birth
         // token matches. Keep those tokens with the ancestry seeds; a bare
         // PID from ps must never authorize enrollment of a new subtree.
@@ -837,9 +878,12 @@ impl ProcessTracker {
                 None => {
                     // A shell that ran a tool and exited after the ps sample
                     // leaves a stale row for a child that is gone too; only a
-                    // child the kernel still has escaped authentication.
+                    // child the kernel still has escaped authentication. The
+                    // shared daemon outlives its proxy by design and was
+                    // never ours to authenticate.
                     for row in rows.iter().filter(|row| {
                         row.active()
+                            && !row.is_shared_ironmem_daemon()
                             && row.ppid == old.pid
                             && !self.known.iter().any(|(known, _)| known.pid == row.pid)
                     }) {
@@ -887,7 +931,12 @@ impl ProcessTracker {
         }
         loop {
             let mut enrolled = false;
-            for row in rows.iter().filter(|r| r.active()) {
+            // The shared daemon is neither enrolled nor a seed, so its own
+            // children are never reached either.
+            for row in rows
+                .iter()
+                .filter(|r| r.active() && !r.is_shared_ironmem_daemon())
+            {
                 if self.known.iter().any(|(old, _)| old.pid == row.pid) {
                     continue;
                 }
@@ -1527,6 +1576,134 @@ mod tests {
             pgid,
             birth: Birth(start, 0),
         }
+    }
+
+    const DAEMON: &str = "/opt/homebrew/bin/ironmem serve --listen /Users/o/.ironmem/daemon.sock";
+    const DAEMON_DB: &str =
+        "/opt/homebrew/bin/ironmem serve --listen /Users/o/.ironmem/daemon.sock \
+        --db /Users/o/.ironmem/memory.db";
+
+    fn args_row(pid: u32, ppid: u32, pgid: u32, args: &str) -> ProcessRow {
+        ProcessRow {
+            args: args.into(),
+            ..process_row(pid, ppid, pgid)
+        }
+    }
+
+    #[test]
+    fn only_the_exact_daemon_argv_in_its_own_group_is_the_shared_daemon() {
+        for args in [DAEMON, DAEMON_DB, "ironmem serve --listen sock"] {
+            assert!(
+                args_row(40, 30, 40, args).is_shared_ironmem_daemon(),
+                "{args}"
+            );
+        }
+        // Not its own group leader.
+        assert!(!args_row(40, 30, 10, DAEMON_DB).is_shared_ironmem_daemon());
+        for args in [
+            // Extra or incomplete arguments.
+            &format!("{DAEMON_DB} --verbose") as &str,
+            &format!("{DAEMON} extra"),
+            "/opt/homebrew/bin/ironmem serve --listen /s.sock --db",
+            "/opt/homebrew/bin/ironmem serve --listen",
+            "/opt/homebrew/bin/ironmem serve --listen /s.sock --other /x",
+            // The proxy, a plain server, other subcommands.
+            "/opt/homebrew/bin/ironmem serve --connect /Users/o/.ironmem/daemon.sock",
+            "/opt/homebrew/bin/ironmem serve",
+            "/opt/homebrew/bin/ironmem serve --db /x --listen /s.sock",
+            "/opt/homebrew/bin/ironmem autopilot lead owner/repo",
+            // A different executable.
+            "/opt/homebrew/bin/ironmem-dev serve --listen /s.sock",
+            "/usr/bin/python3 serve --listen /s.sock",
+        ] {
+            assert!(
+                !args_row(40, 30, 40, args).is_shared_ironmem_daemon(),
+                "{args}"
+            );
+        }
+    }
+
+    /// The proxy a harness's MCP config starts autospawns the shared daemon
+    /// as its own child. The tracker owns the proxy, never the daemon or the
+    /// daemon's own children, even when it first saw the daemon before its
+    /// `exec` (still wearing the proxy's argv).
+    #[test]
+    fn the_shared_daemon_and_its_children_are_never_enrolled_or_signalled() {
+        let proxy_args = "/opt/homebrew/bin/ironmem serve --connect /Users/o/.ironmem/daemon.sock";
+        let kernel = |pid| {
+            Ok(match pid {
+                10 => Some(kernel_process(10, 1, 10, 1)),
+                20 => Some(kernel_process(20, 10, 10, 2)),
+                30 => Some(kernel_process(30, 20, 30, 3)),
+                31 => Some(kernel_process(31, 30, 30, 4)),
+                _ => None,
+            })
+        };
+        let rows = |daemon_args: &str| {
+            vec![
+                process_row(10, 1, 10),
+                args_row(20, 10, 10, proxy_args),
+                args_row(30, 20, 30, daemon_args),
+                args_row(31, 30, 30, "/opt/homebrew/bin/node mcp-helper"),
+            ]
+        };
+        let assert_owns_only_root_and_proxy = |tracker: &ProcessTracker| {
+            let mut owned: Vec<_> = tracker.known.iter().map(|(r, _)| r.pid).collect();
+            owned.sort_unstable();
+            assert_eq!(owned, vec![10, 20]);
+            assert_eq!(tracker.kill_order().collect::<Vec<_>>(), vec![20, 10]);
+            for pid in [30, 31] {
+                assert!(tracker
+                    .signal(pid, STOP_SIGNAL)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("unauthenticated"));
+            }
+        };
+
+        let mut tracker = ProcessTracker::new(10);
+        tracker.observe_rows(rows(DAEMON_DB), kernel).unwrap();
+        assert_owns_only_root_and_proxy(&tracker);
+
+        // Sampled between fork and exec, the daemon wore the proxy's argv (and
+        // had no children yet) and was enrolled; once it shows the daemon
+        // argv it is released before anything is enrolled under it.
+        let mut tracker = ProcessTracker::new(10);
+        let mut before_exec = rows(proxy_args);
+        before_exec.pop();
+        tracker.observe_rows(before_exec, kernel).unwrap();
+        assert!(tracker.known.iter().any(|(r, _)| r.pid == 30));
+        tracker.observe_rows(rows(DAEMON_DB), kernel).unwrap();
+        assert_owns_only_root_and_proxy(&tracker);
+
+        // The proxy exited after ps sampled the daemon as its child: that
+        // stale row is not a descendant that escaped authentication.
+        let mut tracker = ProcessTracker::new(10);
+        tracker.observe_rows(rows(DAEMON_DB), kernel).unwrap();
+        tracker
+            .observe_rows(rows(DAEMON_DB), |pid| {
+                if pid == 20 {
+                    Ok(None)
+                } else {
+                    kernel(pid)
+                }
+            })
+            .unwrap();
+    }
+
+    /// Restart recovery never mistakes the daemon for invocation evidence:
+    /// it is never recorded as a descendant, carries no marker, and leads a
+    /// group of its own.
+    #[test]
+    fn a_daemon_spawned_under_a_finished_invocation_is_not_evidence_of_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, _) = testing::invocation(dir.path());
+        testing::complete(&a);
+        let daemon = args_row(4321, 1234, 4321, DAEMON_DB);
+        let snapshot = ProcessSnapshot::Available(vec![daemon]);
+        assert_eq!(snapshot.liveness(Some(&a)), Liveness::NotListed);
+        assert_eq!(snapshot.live_evidence("owner-repo-42", Some(&a)), None);
+        assert!(snapshot.orphan_markers().is_empty());
     }
 
     #[test]

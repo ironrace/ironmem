@@ -24,8 +24,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Codex and Muse implementers no longer autospawn — and then kill at
-  cleanup — the shared ironmem daemon.**
+- **Codex and Muse implementers no longer kill the shared ironmem daemon at
+  cleanup.** A harness's ironmem MCP server can autospawn the daemon as its
+  own child; the process tracker now never treats that daemon, or its
+  children, as part of an invocation. Muse children also get
+  `IRONMEM_NO_DAEMON=1`, so they connect to a running daemon or serve
+  in-process instead of spawning one.
 - **`autopilot lead` now closes out an issue at its attempt cap (#345).**
   Before, a tick whose run ended `AttemptCapExhausted` wrote nothing, so
   the issue kept `agent:ready` with no comment. The queue deferred it on

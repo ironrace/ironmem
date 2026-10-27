@@ -23,6 +23,11 @@ const DEFAULT_WRITE_READINESS_TIMEOUT_SECS: u64 = 90;
 /// that panic would take down every connected client, not just the caller.
 const MAX_WRITE_READINESS_TIMEOUT_SECS: u64 = 24 * 60 * 60;
 
+/// Turns off `ironmem serve`'s shared-daemon autospawn; read by
+/// [`Config::daemon_autospawn_enabled`] and set by Autopilot for the CLI
+/// harnesses it supervises.
+pub(crate) const NO_DAEMON_ENV: &str = "IRONMEM_NO_DAEMON";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum McpAccessMode {
     Trusted,
@@ -264,7 +269,7 @@ impl Config {
     /// unset / empty / `0` / `false` / `no` keep auto-spawn ON; anything else
     /// (e.g. `1`, `true`, `yes`) turns it OFF.
     pub fn daemon_autospawn_enabled(&self) -> bool {
-        match std::env::var("IRONMEM_NO_DAEMON") {
+        match std::env::var(NO_DAEMON_ENV) {
             Ok(raw) => matches!(
                 raw.trim().to_ascii_lowercase().as_str(),
                 "" | "0" | "false" | "no"

@@ -13,6 +13,7 @@ use crate::autopilot::dispatch::{DispatchOutcome, DispatchSpec, Verdict};
 use crate::autopilot::implementer::Implementer;
 use crate::autopilot::scrub::scrub_and_bound;
 use crate::autopilot::IssueRef;
+use crate::config::NO_DAEMON_ENV;
 use crate::error::MemoryError;
 
 pub const VERDICT_JSON_SCHEMA: &str = super::dispatch::IC_VERDICT_JSON_SCHEMA;
@@ -429,9 +430,6 @@ pub(crate) fn run_supervised_bounded(
     run_supervised_bounded_with(cli_for(spec.implementer)?, bin, repo, spec, timeout)
 }
 
-/// Read by `ironmem serve --connect` (`Config::daemon_autospawn_enabled`).
-const NO_DAEMON_ENV: &str = "IRONMEM_NO_DAEMON";
-
 fn run_supervised_bounded_with(
     cli: &dyn SupervisedCli,
     bin: &Path,
@@ -504,11 +502,15 @@ fn run_supervised_bounded_with(
     // overrides.
     crate::mcp::tools::scrub_git_environment(&mut command);
     // The harness starts the operator's MCP servers, among them
-    // `ironmem serve --connect`. With no daemon listening, that proxy would
-    // autospawn the shared daemon as its own child: a descendant of this
-    // root, which the process tracker enrols and kills at cleanup, taking
-    // every other session's daemon with it. With autospawn off the proxy
-    // still connects to a running daemon, and otherwise serves in-process.
+    // `ironmem serve --connect`. With no daemon listening, that proxy
+    // autospawns the shared daemon as its own child, under this root. The
+    // process tracker never owns that daemon (see
+    // `ProcessRow::is_shared_ironmem_daemon`); that is the guarantee, for
+    // every harness. This variable is only a first line of defence, for a
+    // harness that passes its environment on to MCP servers (Muse, as far
+    // as is known): with it, the proxy connects to a running daemon or
+    // serves in-process and never spawns one. Codex clears its MCP
+    // servers' environment, so its proxies never see it.
     // Set last, after the harness's `env()` and the git scrub (which removes
     // only `GIT_*`), so nothing a harness supplies can turn autospawn back on.
     command.env(NO_DAEMON_ENV, "1");
@@ -1818,12 +1820,11 @@ exit {code}"#
         );
     }
 
-    /// The harness starts the operator's MCP servers, including
-    /// `ironmem serve --connect`. Were that proxy to autospawn the shared
-    /// daemon, the daemon would be a descendant of the harness root and the
-    /// process tracker would kill it at cleanup. The core therefore disables
-    /// autospawn for every supervised child, and a harness's own env cannot
-    /// turn it back on.
+    /// Every supervised child is told not to autospawn the shared daemon,
+    /// which helps a harness that passes its environment on to its MCP
+    /// servers, and a harness's own env cannot turn it back on. (The
+    /// guarantee for every harness is the tracker never owning the daemon:
+    /// see `cleanup_leaves_a_shared_daemon_the_harness_autospawned_running`.)
     #[cfg(unix)]
     #[test]
     fn a_supervised_child_never_autospawns_the_shared_ironmem_daemon() {
@@ -1849,6 +1850,71 @@ exit {code}"#
         let o = run_supervised_bounded_with(&cli, &bin, dir.path(), &s, Duration::from_secs(5))
             .unwrap();
         assert!(o.process_success && o.is_met(), "{o:?}");
+    }
+
+    /// Codex clears its MCP servers' environment, so `IRONMEM_NO_DAEMON`
+    /// never reaches an `ironmem serve --connect` it starts, and that proxy
+    /// can still autospawn the shared daemon under the harness. Cleanup must
+    /// leave it running. The fake daemon is `/bin/sh` behind a symlink named
+    /// `ironmem` (a copied system binary is killed on macOS), running a
+    /// script named `serve` from its own directory, so ps shows the daemon's
+    /// exact argv in a session of its own, with a `sleep` child.
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_leaves_a_shared_daemon_the_harness_autospawned_running() {
+        struct KillGroup(Option<i32>);
+        impl Drop for KillGroup {
+            fn drop(&mut self) {
+                if let Some(pgid) = self.0 {
+                    // SAFETY: a negative PID signals the fake daemon's own group.
+                    unsafe {
+                        libc::kill(-pgid, libc::SIGKILL);
+                    }
+                }
+            }
+        }
+        let (dir, s) = setup();
+        let daemon_dir = dir.path().join("daemon");
+        std::fs::create_dir(&daemon_dir).unwrap();
+        std::os::unix::fs::symlink("/bin/sh", daemon_dir.join("ironmem")).unwrap();
+        std::fs::write(daemon_dir.join("serve"), "sleep 30\n:\n").unwrap();
+        let daemon = daemon_dir.join("ironmem");
+        let socket = daemon_dir.join("daemon.sock");
+        let cli = FakeCli {
+            verdict: true,
+            native_id: true,
+            prepare_fails: false,
+        };
+        // The child that spawned it outlives a few process samples, so the
+        // tracker sees the daemon while its ancestry still leads to the root.
+        let bin = binary(
+            dir.path(),
+            &observable(&format!(
+                "/usr/bin/python3 -c \"import subprocess,time; \
+                 p=subprocess.Popen(['{}','serve','--listen','{}'],start_new_session=True,cwd='{}'); \
+                 open('daemon.pid','w').write(str(p.pid)); time.sleep(1)\" || exit 5\n\
+                 echo journal",
+                daemon.display(),
+                socket.display(),
+                daemon_dir.display()
+            )),
+        );
+        let result =
+            run_supervised_bounded_with(&cli, &bin, dir.path(), &s, Duration::from_secs(10));
+        let pid: i32 = std::fs::read_to_string(dir.path().join("daemon.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let _cleanup = KillGroup(Some(pid));
+        let o = result.unwrap();
+        assert!(o.process_success && o.is_met(), "{o:?}");
+        // SAFETY: signal 0 only probes that the process exists.
+        assert_eq!(
+            unsafe { libc::kill(pid, 0) },
+            0,
+            "supervision cleanup killed the shared daemon"
+        );
     }
 
     #[test]
