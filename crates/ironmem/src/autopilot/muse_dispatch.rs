@@ -162,6 +162,16 @@ impl SupervisedCli for MuseCli {
         }]
     }
 
+    /// Four times the default. Muse's `--json` stream wraps every record,
+    /// tool output included, in envelope metadata (`schema_version`, `id`,
+    /// `stream`, `sequence`, `recorded_at`, `causation_id`, …), and its
+    /// volume over a long gate-running session has not been measured, so a
+    /// cap sized for Codex's leaner JSONL could kill a healthy run mid-way.
+    /// Recovery reads at most this much back into memory.
+    fn journal_limit(&self) -> u64 {
+        4 * crate::autopilot::invocation::JOURNAL_LIMIT
+    }
+
     /// The launcher otherwise replaces the binary between invocations.
     fn env(&self) -> &'static [(&'static str, &'static str)] {
         &[("MUSE_NO_AUTO_UPDATE", "1")]

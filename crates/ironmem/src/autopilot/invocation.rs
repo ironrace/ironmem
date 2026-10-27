@@ -18,7 +18,9 @@ use crate::error::MemoryError;
 
 pub const VERDICT_JSON_SCHEMA: &str = super::dispatch::IC_VERDICT_JSON_SCHEMA;
 pub const SUPERVISED_DISPATCH_TIMEOUT_SECS: u64 = 1200;
-const JOURNAL_LIMIT: u64 = 16 * 1024 * 1024;
+/// The journal cap a harness gets unless it says otherwise
+/// ([`SupervisedCli::journal_limit`]), sized against Codex's JSONL stream.
+pub(crate) const JOURNAL_LIMIT: u64 = 16 * 1024 * 1024;
 const STDERR_LIMIT: u64 = 1024 * 1024;
 const FINAL_LIMIT: u64 = 64 * 1024;
 const EXIT_LIMIT: u64 = 4096;
@@ -80,6 +82,13 @@ pub trait SupervisedCli: Sync {
     /// the check and the creation cannot disagree. Default: none.
     fn spawn_files(&self, _spec: &DispatchSpec, _a: &InvocationArtifacts) -> Vec<SpawnFile> {
         Vec::new()
+    }
+
+    /// The most journal bytes an invocation may write before it is killed
+    /// as over its limit, and the most recovery reads back. Default:
+    /// [`JOURNAL_LIMIT`].
+    fn journal_limit(&self) -> u64 {
+        JOURNAL_LIMIT
     }
 
     /// Extra child environment. Default: none.
@@ -536,9 +545,9 @@ fn open_existing(path: &str, write: bool) -> Result<File, MemoryError> {
     Ok(file)
 }
 
-fn limits(a: &InvocationArtifacts) -> Option<String> {
+fn limits(cli: &dyn SupervisedCli, a: &InvocationArtifacts) -> Option<String> {
     [
-        (&a.journal_path, JOURNAL_LIMIT, "journal"),
+        (&a.journal_path, cli.journal_limit(), "journal"),
         (&a.stderr_path, STDERR_LIMIT, "stderr"),
         (&a.final_path, FINAL_LIMIT, "final"),
     ]
@@ -791,7 +800,7 @@ fn run_supervised_bounded_with(
             }
             last_observed = Some(Instant::now());
         }
-        limit_exceeded = limits(a);
+        limit_exceeded = limits(cli, a);
         if limit_exceeded.is_some() || started.elapsed() >= timeout {
             timed_out = limit_exceeded.is_none();
             let cleanup = tracker.cleanup(false);
@@ -923,7 +932,7 @@ fn finish_supervised(
     quiet_grace: Duration,
 ) -> Result<DispatchOutcome, MemoryError> {
     // Catch an artifact that crossed the limit just before process exit.
-    let limit_exceeded = limit_exceeded.or_else(|| limits(a));
+    let limit_exceeded = limit_exceeded.or_else(|| limits(cli, a));
     // Success included: a root gone before the first sample could have
     // started a tool that left its group, and nothing tracked it.
     if !tracker.observed_root() {
@@ -1015,7 +1024,7 @@ fn read_artifacts_with(
             ))
         })
     });
-    let journal = match read_capped(&a.journal_path, JOURNAL_LIMIT) {
+    let journal = match read_capped(&a.journal_path, cli.journal_limit()) {
         Ok(journal) => journal,
         Err(e) => {
             errors.push(e.to_string());
@@ -1100,7 +1109,7 @@ fn read_artifacts_with(
         }
     };
     // Also enforce caps at recovery, even if an exit record says zero.
-    if let Some(limit) = limits(a) {
+    if let Some(limit) = limits(cli, a) {
         errors.push(limit);
     }
     // Stderr is diagnostic only: it never decides validity, but a failed read
@@ -2356,7 +2365,7 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
         }
         tracker.observe().unwrap();
         // This is the supervisor's pre-try_wait snapshot: still under cap.
-        let previous_limit = limits(a);
+        let previous_limit = limits(&CodexCli, a);
         assert_eq!(previous_limit, None);
         std::fs::write(dir.path().join("root-release"), "release").unwrap();
         let status = loop {
@@ -2371,7 +2380,7 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
             std::thread::sleep(Duration::from_millis(5));
         };
         assert!(status.success());
-        assert!(limits(a).is_some());
+        assert!(limits(&CodexCli, a).is_some());
         let outcome = finish_supervised(
             &CodexCli,
             &mut tracker,
@@ -2816,6 +2825,34 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
             ProcessSnapshot::Available(Vec::new()).liveness(Some(a)),
             Liveness::NotListed
         );
+    }
+
+    /// The journal cap belongs to the harness: Muse's `--json` stream wraps
+    /// every record in envelope metadata, so it gets more room than Codex's
+    /// JSONL, and the cap read at recovery is the one supervision enforced.
+    #[test]
+    fn the_journal_cap_is_the_harnesss_own() {
+        use crate::autopilot::codex_dispatch::CodexCli;
+        use crate::autopilot::muse_dispatch::MuseCli;
+        assert!(MuseCli.journal_limit() > CodexCli.journal_limit());
+        let (_dir, s) = setup();
+        let a = s.invocation_artifacts.as_ref().unwrap();
+        let between = CodexCli.journal_limit() + 1;
+        std::fs::File::options()
+            .write(true)
+            .open(&a.journal_path)
+            .unwrap()
+            .set_len(between)
+            .unwrap();
+        assert!(limits(&CodexCli, a).is_some_and(|e| e.contains("journal")));
+        assert_eq!(limits(&MuseCli, a), None);
+        std::fs::File::options()
+            .write(true)
+            .open(&a.journal_path)
+            .unwrap()
+            .set_len(MuseCli.journal_limit() + 1)
+            .unwrap();
+        assert!(limits(&MuseCli, a).is_some_and(|e| e.contains("journal")));
     }
 
     /// The core writes each spawn file privately, byte for byte, and never
