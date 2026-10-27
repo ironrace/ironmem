@@ -18,11 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   continues headlessly across invocations, and `--max-turns` becomes
   `--max-model-steps`.
 - **Commit-signing guard for every harness (#366).** With `commit.gpgsign`
-  on, a `met` whose branch commits since the cut carry no `gpgsig` header (or
-  a bad signature) is now a failed attempt. `--base` is resolved once to a
-  sha and stored as `branch.<b>.ironmemCut`, and the policy is sticky via
-  `branch.<b>.ironmemSigning`; `git config --unset` on it, with
-  `commit.gpgsign` off, stops enforcement on that branch.
+  on, a run that reports success but left unsigned commits on the issue
+  branch now counts as a failed attempt, with a reason naming the commits.
+  Turning signing off during a run does not get around it.
 
 ### Fixed
 
@@ -73,6 +71,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Existing setups with `commit.gpgsign` on now get a failed attempt when an
+  implementer's commits are unsigned, for Claude as well as Codex and Muse.**
+  Before, such a run could succeed. Make sure the signing key or agent is
+  reachable from wherever the Lead runs. To stop the check on one issue
+  branch, turn `commit.gpgsign` off, then run `git config --unset
+  branch.<branch>.ironmemSigning` in the repo; see "Commit signing" in
+  `docs/AUTOPILOT.md`.
 - **GitHub releases now carry their version's `CHANGELOG.md` section as the
   description.** Until now the release workflow published every release with
   an empty body. `scripts/release_notes.py` extracts the tag's
