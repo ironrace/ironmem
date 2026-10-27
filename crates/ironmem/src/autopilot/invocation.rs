@@ -286,12 +286,23 @@ pub(crate) fn dispatch_timeout(spec: &DispatchSpec) -> Duration {
         .unwrap_or(Duration::from_secs(SUPERVISED_DISPATCH_TIMEOUT_SECS))
 }
 
+/// `shared_daemon_socket` is the operator's configured shared-daemon socket
+/// (`Config::daemon_socket_path`); a daemon a harness's MCP proxy
+/// autospawns there is never treated as part of the invocation.
 pub fn run_supervised(
     bin: &Path,
     repo: &Path,
     spec: &DispatchSpec,
+    shared_daemon_socket: &Path,
 ) -> Result<DispatchOutcome, MemoryError> {
-    run_supervised_bounded(bin, repo, spec, dispatch_timeout(spec))
+    run_supervised_bounded_with(
+        cli_for(spec.implementer)?,
+        bin,
+        repo,
+        spec,
+        dispatch_timeout(spec),
+        Some(shared_daemon_socket),
+    )
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -418,23 +429,26 @@ fn exit_record(
     }
 }
 
-/// Every invocation has a wall-clock ceiling. stdout/stderr are inherited
-/// regular file handles, so no pipe can wedge the child or die with its parent.
+/// Tests' entry point: no shared-daemon socket, so every descendant is owned.
+#[cfg(test)]
 pub(crate) fn run_supervised_bounded(
     bin: &Path,
     repo: &Path,
     spec: &DispatchSpec,
     timeout: Duration,
 ) -> Result<DispatchOutcome, MemoryError> {
-    run_supervised_bounded_with(cli_for(spec.implementer)?, bin, repo, spec, timeout)
+    run_supervised_bounded_with(cli_for(spec.implementer)?, bin, repo, spec, timeout, None)
 }
 
+/// Every invocation has a wall-clock ceiling. stdout/stderr are inherited
+/// regular file handles, so no pipe can wedge the child or die with its parent.
 fn run_supervised_bounded_with(
     cli: &dyn SupervisedCli,
     bin: &Path,
     repo: &Path,
     spec: &DispatchSpec,
     timeout: Duration,
+    shared_daemon_socket: Option<&Path>,
 ) -> Result<DispatchOutcome, MemoryError> {
     let a = validate_spec(cli, spec)?;
     let args = cli.argv(repo, spec, a)?;
@@ -528,7 +542,7 @@ fn run_supervised_bounded_with(
         invocation_id: a.invocation_id.clone(),
         descendants: Vec::new(),
     };
-    let mut tracker = super::process_tree::ProcessTracker::new(child.id());
+    let mut tracker = super::process_tree::ProcessTracker::new(child.id(), shared_daemon_socket);
     if let Err(e) = super::process_tree::persist_identity(a, &identity) {
         // The root is still our unreaped Child; cleanup is authenticated by
         // kernel birth identity, and cannot authorize a retry on uncertainty.
@@ -1235,7 +1249,7 @@ exit {code}"#
     fn run_observed_fixture(bin: &Path, repo: &Path, spec: &DispatchSpec) -> DispatchOutcome {
         let started = Instant::now();
         let mut child = spawn_fixture_invocation(bin, repo, spec);
-        let mut tracker = super::super::process_tree::ProcessTracker::new(child.id());
+        let mut tracker = super::super::process_tree::ProcessTracker::new(child.id(), None);
         let result = (|| {
             while !repo.join("root-ready").exists() {
                 if child.try_wait()?.is_some() || started.elapsed() >= Duration::from_secs(3) {
@@ -1323,7 +1337,7 @@ exit {code}"#
         let bin = binary(dir.path(), &script("", 7));
         let started = Instant::now();
         let mut child = spawn_fixture_invocation(&bin, dir.path(), &spec);
-        let mut tracker = super::super::process_tree::ProcessTracker::new(child.id());
+        let mut tracker = super::super::process_tree::ProcessTracker::new(child.id(), None);
         // Reap first, deliberately making useful root observation impossible.
         // This is the scheduler ordering the old combined fixture assumed away.
         let status = child.wait().unwrap();
@@ -1524,7 +1538,7 @@ exit {code}"#
         );
         let started = Instant::now();
         let mut child = spawn_fixture_invocation(&bin, dir.path(), &s);
-        let mut tracker = super::super::process_tree::ProcessTracker::new(child.id());
+        let mut tracker = super::super::process_tree::ProcessTracker::new(child.id(), None);
         // The supervisor's last scan sees only the root...
         tracker.observe().unwrap();
         std::fs::write(dir.path().join("root-release"), "release").unwrap();
@@ -1572,7 +1586,7 @@ exit {code}"#
             .process_group(0);
         let mut child = crate::autopilot::dispatch::retry_on_etxtbsy(|| command.spawn()).unwrap();
         let started = Instant::now();
-        let mut tracker = super::super::process_tree::ProcessTracker::new(child.id());
+        let mut tracker = super::super::process_tree::ProcessTracker::new(child.id(), None);
         let ready = dir.path().join("descendant-ready");
         while !ready.exists() && started.elapsed() < Duration::from_secs(3) {
             std::thread::sleep(Duration::from_millis(5));
@@ -1792,8 +1806,9 @@ exit {code}"#
                  echo journal",
             ),
         );
-        let o = run_supervised_bounded_with(&cli, &bin, dir.path(), &s, Duration::from_secs(5))
-            .unwrap();
+        let o =
+            run_supervised_bounded_with(&cli, &bin, dir.path(), &s, Duration::from_secs(5), None)
+                .unwrap();
         assert!(o.process_success && o.is_met(), "{o:?}");
         assert_eq!(
             std::fs::read_to_string(dir.path().join("prompt-seen")).unwrap(),
@@ -1827,73 +1842,94 @@ exit {code}"#
                  echo journal",
             ),
         );
-        let o = run_supervised_bounded_with(&cli, &bin, dir.path(), &s, Duration::from_secs(5))
-            .unwrap();
+        let o =
+            run_supervised_bounded_with(&cli, &bin, dir.path(), &s, Duration::from_secs(5), None)
+                .unwrap();
         assert!(o.process_success && o.is_met(), "{o:?}");
     }
 
     /// An `ironmem serve --connect` MCP proxy the harness starts autospawns
     /// the shared daemon under the harness when none is running. Cleanup
-    /// must leave it running. The fake daemon is `/bin/sh` behind a symlink named
-    /// `ironmem` (a copied system binary is killed on macOS), running a
-    /// script named `serve` from its own directory, so ps shows the daemon's
-    /// exact argv in a session of its own, with a `sleep` child.
+    /// must leave a daemon on the operator's configured socket running, and
+    /// still clean up one on any other socket (an ironmem test suite's own
+    /// temp-socket daemon, say). The fake daemon is `/bin/sh` behind a
+    /// symlink named `ironmem` (a copied system binary is killed on macOS),
+    /// running a script named `serve` from its own directory, so ps shows
+    /// the daemon's exact argv in a session of its own, with a `sleep` child.
     #[cfg(unix)]
     #[test]
     fn cleanup_leaves_a_shared_daemon_the_harness_autospawned_running() {
-        struct KillGroup(Option<i32>);
+        struct KillGroup(i32);
         impl Drop for KillGroup {
             fn drop(&mut self) {
-                if let Some(pgid) = self.0 {
-                    // SAFETY: a negative PID signals the fake daemon's own group.
-                    unsafe {
-                        libc::kill(-pgid, libc::SIGKILL);
-                    }
+                // SAFETY: a negative PID signals the fake daemon's own group.
+                unsafe {
+                    libc::kill(-self.0, libc::SIGKILL);
                 }
             }
         }
-        let (dir, s) = setup();
-        let daemon_dir = dir.path().join("daemon");
-        std::fs::create_dir(&daemon_dir).unwrap();
-        std::os::unix::fs::symlink("/bin/sh", daemon_dir.join("ironmem")).unwrap();
-        std::fs::write(daemon_dir.join("serve"), "sleep 30\n:\n").unwrap();
-        let daemon = daemon_dir.join("ironmem");
-        let socket = daemon_dir.join("daemon.sock");
-        let cli = FakeCli {
-            verdict: true,
-            native_id: true,
-            prepare_fails: false,
-        };
-        // The child that spawned it outlives a few process samples, so the
-        // tracker sees the daemon while its ancestry still leads to the root.
-        let bin = binary(
-            dir.path(),
-            &observable(&format!(
-                "/usr/bin/python3 -c \"import subprocess,time; \
-                 p=subprocess.Popen(['{}','serve','--listen','{}'],start_new_session=True,cwd='{}'); \
-                 open('daemon.pid','w').write(str(p.pid)); time.sleep(1)\" || exit 5\n\
-                 echo journal",
-                daemon.display(),
-                socket.display(),
-                daemon_dir.display()
-            )),
-        );
-        let result =
-            run_supervised_bounded_with(&cli, &bin, dir.path(), &s, Duration::from_secs(10));
-        let pid: i32 = std::fs::read_to_string(dir.path().join("daemon.pid"))
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
-        let _cleanup = KillGroup(Some(pid));
-        let o = result.unwrap();
-        assert!(o.process_success && o.is_met(), "{o:?}");
         // SAFETY: signal 0 only probes that the process exists.
-        assert_eq!(
-            unsafe { libc::kill(pid, 0) },
-            0,
-            "supervision cleanup killed the shared daemon"
-        );
+        let exists = |pid: i32| unsafe { libc::kill(pid, 0) } == 0;
+        for on_configured_socket in [true, false] {
+            let (dir, s) = setup();
+            let daemon_dir = dir.path().join("daemon");
+            std::fs::create_dir(&daemon_dir).unwrap();
+            std::os::unix::fs::symlink("/bin/sh", daemon_dir.join("ironmem")).unwrap();
+            std::fs::write(daemon_dir.join("serve"), "sleep 30\n:\n").unwrap();
+            let daemon = daemon_dir.join("ironmem");
+            let configured = daemon_dir.join("daemon.sock");
+            let socket = if on_configured_socket {
+                configured.clone()
+            } else {
+                daemon_dir.join("temp-test.sock")
+            };
+            let cli = FakeCli {
+                verdict: true,
+                native_id: true,
+                prepare_fails: false,
+            };
+            // The child that spawned it outlives a few process samples, so
+            // the tracker sees the daemon while its ancestry still leads to
+            // the root.
+            let bin = binary(
+                dir.path(),
+                &observable(&format!(
+                    "/usr/bin/python3 -c \"import subprocess,time; \
+                     p=subprocess.Popen(['{}','serve','--listen','{}'],start_new_session=True,cwd='{}'); \
+                     open('daemon.pid','w').write(str(p.pid)); time.sleep(1)\" || exit 5\n\
+                     echo journal",
+                    daemon.display(),
+                    socket.display(),
+                    daemon_dir.display()
+                )),
+            );
+            let result = run_supervised_bounded_with(
+                &cli,
+                &bin,
+                dir.path(),
+                &s,
+                Duration::from_secs(10),
+                Some(&configured),
+            );
+            let pid: i32 = std::fs::read_to_string(dir.path().join("daemon.pid"))
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            let _cleanup = KillGroup(pid);
+            let o = result.unwrap();
+            assert!(o.process_success && o.is_met(), "{o:?}");
+            if on_configured_socket {
+                assert!(exists(pid), "supervision cleanup killed the shared daemon");
+            } else {
+                // Killed by cleanup; give its new parent a moment to reap it.
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while exists(pid) && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                assert!(!exists(pid), "a daemon on another socket escaped cleanup");
+            }
+        }
     }
 
     #[test]
@@ -1913,6 +1949,7 @@ exit {code}"#
             dir.path(),
             &s,
             Duration::from_secs(1),
+            None,
         )
         .unwrap();
         assert!(!o.invocation_started && !o.is_met(), "{o:?}");
@@ -1954,6 +1991,7 @@ exit {code}"#
                 dir.path(),
                 &s,
                 Duration::from_secs(1),
+                None,
             )
             .unwrap_err()
             .to_string();

@@ -678,6 +678,10 @@ impl Dispatcher for ClaudeDispatcher {
 pub struct CliDispatcher {
     implementer: Implementer,
     bin: std::path::PathBuf,
+    /// The socket the operator's MCP proxies connect to, and so where one
+    /// autospawns the shared daemon: `harness::proxy_command_args` registers
+    /// `serve --connect` with this same `Config::daemon_socket_path`.
+    shared_daemon_socket: std::path::PathBuf,
 }
 
 impl CliDispatcher {
@@ -686,6 +690,9 @@ impl CliDispatcher {
         Ok(Self {
             implementer,
             bin: crate::launcher::find_on_path(implementer.launcher_harness().binary())?,
+            // The socket derives from the state directory and
+            // `IRONMEM_DAEMON_SOCKET`, never from a `--db` override.
+            shared_daemon_socket: crate::config::Config::load(None)?.daemon_socket_path(),
         })
     }
 }
@@ -720,7 +727,7 @@ impl Dispatcher for CliDispatcher {
         repo: &Path,
         spec: &DispatchSpec,
     ) -> Result<DispatchOutcome, MemoryError> {
-        super::invocation::run_supervised(&self.bin, repo, spec)
+        super::invocation::run_supervised(&self.bin, repo, spec, &self.shared_daemon_socket)
     }
 }
 
@@ -2423,6 +2430,7 @@ sleep 0.5
         let mut d = CliDispatcher {
             implementer: Implementer::Codex,
             bin,
+            shared_daemon_socket: wt.path.join("no-shared-daemon.sock"),
         };
         let state = pending_codex(&db, &wt, None);
         assert!(matches!(

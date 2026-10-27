@@ -301,12 +301,17 @@ Cleanup never kills the shared ironmem daemon your other sessions use. A
 harness's `ironmem serve --connect` MCP server may autospawn that daemon as
 its own child, but the process tracker never treats it as part of an
 invocation. It recognises the daemon by its exact
-`ironmem serve --listen <socket> [--db <path>]` command line on a process
-leading its own group, and it leaves that daemon's children alone too, so an
-autospawned daemon survives the invocation and keeps serving. The
-trade-off: a tool that disguises itself as the daemon, with the same command
-line in a group of its own, escapes tracking. That is the same class as the
-double-fork escape above.
+`ironmem serve --listen <socket> [--db <path>]` command line, listening on
+your configured daemon socket (`<state dir>/daemon.sock`, or
+`IRONMEM_DAEMON_SOCKET`; the socket your registered MCP servers connect to),
+on a process leading its own group. It leaves that daemon's children alone
+too, so an autospawned daemon survives the invocation and keeps serving. A
+daemon on any other socket, such as one an ironmem test suite starts on a
+temporary socket, is cleaned up like any other tool. So is a shared daemon
+whose socket path contains whitespace, which the process table cannot
+parse. The trade-off: a tool that disguises itself as the daemon, with the
+same command line on your socket in a group of its own, escapes tracking.
+That is the same class as the double-fork escape above.
 
 Verification records are intentionally separated:
 
