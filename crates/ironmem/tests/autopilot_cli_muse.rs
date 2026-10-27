@@ -8,6 +8,7 @@
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use ironmem::autopilot::budget;
@@ -154,10 +155,19 @@ fn today_utc() -> String {
     chrono::Utc::now().format("%Y-%m-%d").to_string()
 }
 
+/// The next fixture's issue number. Every fixture works its own issue: the
+/// tests run in parallel, and a stub `muse` (a bash script, as the real
+/// launcher is) shows in `ps` as a Muse root carrying its invocation's
+/// marker. Autopilot rightly holds an issue while any process runs an
+/// invocation for it, so fixtures sharing one would hold each other.
+static NEXT_ISSUE: AtomicU64 = AtomicU64::new(7);
+
 /// One prepared fixture: an approved repo, a stubs dir holding only `muse`,
-/// and the stub's bookkeeping files.
+/// the stub's bookkeeping files, and an issue number no other fixture uses.
 struct Fixture {
     root: tempfile::TempDir,
+    issue: u64,
+    issue_arg: String,
     checkout: PathBuf,
     worktrees: PathBuf,
     stubs: PathBuf,
@@ -180,8 +190,11 @@ impl Fixture {
         approve(&db_path);
         executable(&stubs.join("muse"), MUSE_STUB);
         executable(&stubs.join("exec"), LIVE_MUSE_BODY);
+        let issue = NEXT_ISSUE.fetch_add(1, Ordering::Relaxed);
         Fixture {
             root,
+            issue,
+            issue_arg: issue.to_string(),
             checkout,
             worktrees,
             stubs,
@@ -191,7 +204,7 @@ impl Fixture {
         }
     }
 
-    /// `ironmem autopilot run owner/repo 7 --implementer muse --model
+    /// `ironmem autopilot run owner/repo <issue> --implementer muse --model
     /// muse-wonder-1.0 … --json` plus `extra`, with the stub in `mode`.
     fn run(&self, mode: &str, extra: &[&str]) -> Output {
         self.run_command(mode, extra).output().unwrap()
@@ -202,7 +215,7 @@ impl Fixture {
             "autopilot",
             "run",
             REPO,
-            "7",
+            &self.issue_arg,
             "--title",
             "t",
             "--implementer",
@@ -229,14 +242,14 @@ impl Fixture {
         command
     }
 
-    /// `ironmem autopilot clear-dispatch owner/repo 7 --json`.
+    /// `ironmem autopilot clear-dispatch owner/repo <issue> --json`.
     fn clear(&self) -> Output {
         ironmem()
             .args([
                 "autopilot",
                 "clear-dispatch",
                 REPO,
-                "7",
+                &self.issue_arg,
                 "--db",
                 self.db_path.to_str().unwrap(),
                 "--json",
@@ -294,7 +307,7 @@ impl Fixture {
     }
 
     fn issue_worktree(&self) -> PathBuf {
-        self.worktrees.join("owner-repo-7")
+        self.worktrees.join(format!("owner-repo-{}", self.issue))
     }
 }
 
@@ -744,7 +757,7 @@ fn clear_dispatch_refuses_a_live_muse_invocation_and_releases_it_once_killed() {
     let mut live = fx.start_live(&["--attempt-cap", "1"]);
     live.crash_controller();
     let db = Database::open(&fx.db_path).unwrap();
-    let issue = IssueRef::new(REPO, 7);
+    let issue = IssueRef::new(REPO, fx.issue);
     let held = dispatch_state::get_dispatch_state(&db, &issue)
         .unwrap()
         .expect("the crashed run's state names its invocation");
@@ -811,7 +824,10 @@ fn a_muse_session_still_in_use_parks_the_issue_at_the_cli() {
     let detail = report["terminal"]["detail"].as_str().unwrap_or_default();
     assert!(
         detail.contains("still in use")
-            && detail.contains("ironmem autopilot clear-dispatch owner/repo 7"),
+            && detail.contains(&format!(
+                "ironmem autopilot clear-dispatch owner/repo {}",
+                fx.issue
+            )),
         "{report}"
     );
     assert_eq!(fx.calls().lines().count(), 1, "{}", fx.calls());
@@ -820,7 +836,7 @@ fn a_muse_session_still_in_use_parks_the_issue_at_the_cli() {
     assert_eq!(dispatches[0]["classification"], "infrastructure_failure");
 
     let db = Database::open(&fx.db_path).unwrap();
-    let issue = IssueRef::new(REPO, 7);
+    let issue = IssueRef::new(REPO, fx.issue);
     let parked = dispatch_state::get_dispatch_state(&db, &issue)
         .unwrap()
         .unwrap();
