@@ -7,10 +7,13 @@
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Child, Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 use ironmem::autopilot::budget;
+use ironmem::autopilot::dispatch_state;
 use ironmem::autopilot::gate_config;
+use ironmem::autopilot::{Implementer, IssueRef};
 use ironmem::db::schema::Database;
 
 const REPO: &str = "owner/repo";
@@ -18,8 +21,17 @@ const REPO: &str = "owner/repo";
 /// Appends `"$PWD|$*"` to `$MUSE_CALLS`, writes a journal on the requested
 /// session's stream, and behaves per `$MUSE_MODE`. `$MUSE_COUNT` numbers the
 /// invocations so `met` can answer `not_met` first and `met` on the resume.
-const MUSE_STUB: &str = r#"#!/bin/sh
+///
+/// `hang` replaces itself, under the same PID, with a process `ps` shows as
+/// `<stubs>/muse-bin-1.4.13-test exec <the Muse argv>`, the shape the real
+/// launcher's `exec` of the versioned binary leaves: bash renamed by
+/// `exec -a`, running the script named `exec` it finds on `PATH`
+/// ([`LIVE_MUSE_BODY`]).
+const MUSE_STUB: &str = r#"#!/bin/bash
 printf '%s\n' "$PWD|$*" >> "$MUSE_CALLS"
+if [ "$MUSE_MODE" = hang ]; then
+  exec -a "${0%/*}/muse-bin-1.4.13-test" /bin/bash "$@"
+fi
 sid=""; prompt=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -44,6 +56,15 @@ case "$MUSE_MODE:$n" in
               rec session "$sid" '{"kind":"run_terminal","terminal":"completed","text":"{\"verdict\":\"met\",\"reason\":\"done\"}","reason":null}' ;;
 esac
 /bin/sleep 0.5
+"#;
+
+/// What the live stub runs: it stays up until `$MUSE_RELEASE` exists (or a
+/// minute passes), then exits like a killed run, with no terminal record.
+const LIVE_MUSE_BODY: &str = r#"#!/bin/bash
+i=0
+while [ ! -e "$MUSE_RELEASE" ] && [ "$i" -lt 600 ]; do /bin/sleep 0.1; i=$((i+1)); done
+/bin/sleep 0.5
+exit 143
 "#;
 
 fn bin() -> &'static str {
@@ -151,6 +172,7 @@ impl Fixture {
         std::fs::create_dir_all(&stubs).unwrap();
         approve(&db_path);
         executable(&stubs.join("muse"), MUSE_STUB);
+        executable(&stubs.join("exec"), LIVE_MUSE_BODY);
         Fixture {
             root,
             checkout,
@@ -165,6 +187,10 @@ impl Fixture {
     /// `ironmem autopilot run owner/repo 7 --implementer muse --model
     /// muse-wonder-1.0 … --json` plus `extra`, with the stub in `mode`.
     fn run(&self, mode: &str, extra: &[&str]) -> Output {
+        self.run_command(mode, extra).output().unwrap()
+    }
+
+    fn run_command(&self, mode: &str, extra: &[&str]) -> Command {
         let mut args = vec![
             "autopilot",
             "run",
@@ -185,14 +211,75 @@ impl Fixture {
             "--json",
         ];
         args.extend_from_slice(extra);
-        ironmem()
+        let mut command = ironmem();
+        command
             .args(&args)
             .env("PATH", isolated_path(&self.stubs))
             .env("MUSE_CALLS", &self.calls)
             .env("MUSE_COUNT", &self.count)
             .env("MUSE_MODE", mode)
+            .env("MUSE_RELEASE", self.root.path().join("release"));
+        command
+    }
+
+    /// `ironmem autopilot clear-dispatch owner/repo 7 --json`.
+    fn clear(&self) -> Output {
+        ironmem()
+            .args([
+                "autopilot",
+                "clear-dispatch",
+                REPO,
+                "7",
+                "--db",
+                self.db_path.to_str().unwrap(),
+                "--json",
+            ])
+            .env("PATH", isolated_path(&self.stubs))
             .output()
             .unwrap()
+    }
+
+    /// Every live process `ps` shows as this fixture's versioned Muse root:
+    /// `(pid, args)`.
+    fn live_muse_roots(&self) -> Vec<(u32, String)> {
+        let unique = self.root.path().file_name().unwrap().to_str().unwrap();
+        let ps = Command::new("/bin/ps")
+            .args(["-A", "-o", "pid=,args="])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&ps.stdout)
+            .lines()
+            .filter_map(|line| {
+                let (pid, args) = line.trim().split_once(' ')?;
+                (args.contains("/muse-bin-1.4.13-test exec ") && args.contains(unique))
+                    .then(|| (pid.parse().unwrap(), args.trim().to_string()))
+            })
+            .collect()
+    }
+
+    /// Start `autopilot run` in the background with the stub in `hang` mode,
+    /// and wait until `ps` shows its Muse root.
+    fn start_live(&self, extra: &[&str]) -> LiveMuse<'_> {
+        let controller = self
+            .run_command("hang", extra)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let live = LiveMuse {
+            fx: self,
+            controller: Some(controller),
+        };
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while self.live_muse_roots().is_empty() {
+            assert!(
+                Instant::now() < deadline,
+                "the live Muse root never appeared; calls={}",
+                self.calls()
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        live
     }
 
     fn calls(&self) -> String {
@@ -201,6 +288,63 @@ impl Fixture {
 
     fn issue_worktree(&self) -> PathBuf {
         self.worktrees.join("owner-repo-7")
+    }
+}
+
+/// A background `autopilot run` whose Muse root is live. Dropping it
+/// releases the stub and kills whatever is left, so a failed assertion never
+/// leaks a process.
+struct LiveMuse<'a> {
+    fx: &'a Fixture,
+    controller: Option<Child>,
+}
+
+impl LiveMuse<'_> {
+    /// SIGKILL the controller, as a crash would; the Muse root survives it.
+    fn crash_controller(&mut self) {
+        if let Some(mut controller) = self.controller.take() {
+            controller.kill().unwrap();
+            controller.wait().unwrap();
+        }
+    }
+
+    /// SIGKILL the Muse root's process group and wait until `ps` loses it.
+    fn kill_muse(&self) {
+        for (pid, _) in self.fx.live_muse_roots() {
+            // The group first (the supervisor makes the root its leader),
+            // then the root itself in case it is not; either may be gone.
+            let _ = Command::new("/bin/kill")
+                .args(["-KILL", "--", &format!("-{pid}")])
+                .stderr(Stdio::null())
+                .status();
+            let _ = Command::new("/bin/kill")
+                .args(["-KILL", &pid.to_string()])
+                .stderr(Stdio::null())
+                .status();
+        }
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !self.fx.live_muse_roots().is_empty() {
+            assert!(Instant::now() < deadline, "Muse root survived");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        // Let the body's last `sleep 0.1` child go too.
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+impl Drop for LiveMuse<'_> {
+    fn drop(&mut self) {
+        let _ = std::fs::write(self.fx.root.path().join("release"), "");
+        if let Some(mut controller) = self.controller.take() {
+            let _ = controller.kill();
+            let _ = controller.wait();
+        }
+        for (pid, _) in self.fx.live_muse_roots() {
+            let _ = Command::new("/bin/kill")
+                .args(["-KILL", &pid.to_string()])
+                .stderr(Stdio::null())
+                .status();
+        }
     }
 }
 
@@ -361,11 +505,13 @@ fn muse_failures_are_never_success_and_each_consumes_an_unpriced_slot() {
 #[test]
 fn muse_does_not_require_claude_or_codex_on_path() {
     let fx = Fixture::new();
-    let stub_names: Vec<String> = std::fs::read_dir(&fx.stubs)
+    let mut stub_names: Vec<String> = std::fs::read_dir(&fx.stubs)
         .unwrap()
         .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
-    assert_eq!(stub_names, ["muse"]);
+    stub_names.sort();
+    // `exec` is the live stub's body, which only the `hang` mode runs.
+    assert_eq!(stub_names, ["exec", "muse"]);
     for dir in std::env::split_paths(&isolated_path(&fx.stubs)) {
         for harness in ["claude", "codex"] {
             assert!(
@@ -529,4 +675,119 @@ fn an_unsigned_muse_commit_is_not_met() {
     // turned the met away.
     let subject = git(&fx.issue_worktree(), &["log", "-1", "--format=%s"]).stdout;
     assert_eq!(String::from_utf8_lossy(&subject).trim(), "bypass");
+}
+
+/// The safety invariant behind every hold: a live (or possibly live) Muse
+/// invocation keeps its slot, and no run launches a second Muse over it,
+/// before or after its controller crashes. The root is a real child of the
+/// real supervisor, showing the real argv shape in `ps`.
+#[test]
+fn a_live_muse_invocation_holds_its_slot_and_no_second_muse_is_launched() {
+    let fx = Fixture::new();
+    let mut live = fx.start_live(&["--attempt-cap", "1"]);
+
+    let roots = fx.live_muse_roots();
+    assert_eq!(roots.len(), 1, "{roots:?}");
+    let argv = roots[0].1.split_once("muse-bin-1.4.13-test ").unwrap().1;
+    let words: Vec<&str> = argv.split_whitespace().collect();
+    assert_eq!(words[..3], ["exec", "--json", "--session-id"], "{argv}");
+    assert!(uuid::Uuid::parse_str(words[3]).is_ok(), "{argv}");
+    assert_eq!(words[4], "--output-schema", "{argv}");
+    assert!(
+        words[5].starts_with('/') && words[5].ends_with("/schema.json"),
+        "{argv}"
+    );
+    assert_eq!(words[6], "--prompt-file", "{argv}");
+    assert_eq!(fx.calls().lines().count(), 1, "{}", fx.calls());
+
+    // "still alive", not merely "uncertain": the hold comes from `ps`
+    // matching this invocation's marker on the recorded root, so it pins the
+    // marker grammar to the real argv shape.
+    let second = fx.run("met", &["--attempt-cap", "1"]);
+    let stderr = String::from_utf8_lossy(&second.stderr);
+    assert!(
+        !second.status.success() && stderr.contains("Muse implementation is still alive"),
+        "a second run must hold while the first controller runs:\nstdout={}\nstderr={stderr}",
+        String::from_utf8_lossy(&second.stdout)
+    );
+    assert_eq!(fx.calls().lines().count(), 1, "{}", fx.calls());
+
+    // A controller crash leaves the root running; the slot is still held.
+    live.crash_controller();
+    assert_eq!(
+        fx.live_muse_roots().len(),
+        1,
+        "the root outlives its controller"
+    );
+    let third = fx.run("met", &["--attempt-cap", "1"]);
+    let stderr = String::from_utf8_lossy(&third.stderr);
+    assert!(
+        !third.status.success() && stderr.contains("Muse implementation is still alive"),
+        "a run after the crash must hold:\nstdout={}\nstderr={stderr}",
+        String::from_utf8_lossy(&third.stdout)
+    );
+    assert_eq!(fx.calls().lines().count(), 1, "{}", fx.calls());
+}
+
+/// `clear-dispatch` on a Muse hold: refused while the root lives, and the
+/// release once it is gone, even with no supervisor record to prove it.
+#[test]
+fn clear_dispatch_refuses_a_live_muse_invocation_and_releases_it_once_killed() {
+    let fx = Fixture::new();
+    let mut live = fx.start_live(&["--attempt-cap", "1"]);
+    live.crash_controller();
+    let db = Database::open(&fx.db_path).unwrap();
+    let issue = IssueRef::new(REPO, 7);
+    let held = dispatch_state::get_dispatch_state(&db, &issue)
+        .unwrap()
+        .expect("the crashed run's state names its invocation");
+    assert_eq!(held.implementer, Implementer::Muse);
+    assert!(held.invocation_artifacts.is_some(), "{held:?}");
+
+    let refused = fx.clear();
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        !refused.status.success()
+            && stderr.contains("refusing to clear")
+            && stderr.contains("its Muse implementation is alive"),
+        "stdout={} stderr={stderr}",
+        String::from_utf8_lossy(&refused.stdout)
+    );
+    assert_eq!(
+        dispatch_state::get_dispatch_state(&db, &issue).unwrap(),
+        Some(held.clone())
+    );
+
+    live.kill_muse();
+    let cleared = fx.clear();
+    assert!(
+        cleared.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&cleared.stdout),
+        String::from_utf8_lossy(&cleared.stderr)
+    );
+    let report = report(&cleared, "clear-dispatch");
+    assert_eq!(report["implementer"], "muse", "{report}");
+    assert!(dispatch_state::get_dispatch_state(&db, &issue)
+        .unwrap()
+        .is_none());
+    assert_eq!(fx.calls().lines().count(), 1, "{}", fx.calls());
+}
+
+#[test]
+fn max_turns_reaches_muse_as_max_model_steps() {
+    let fx = Fixture::new();
+    let output = fx.run("met", &["--attempt-cap", "2", "--max-turns", "77"]);
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let calls = fx.calls();
+    assert_eq!(calls.lines().count(), 2, "{calls}");
+    for line in calls.lines() {
+        assert_eq!(flag_value(line, "--max-model-steps"), "77", "{line}");
+        assert!(!line.contains("--max-turns"), "{line}");
+    }
 }
