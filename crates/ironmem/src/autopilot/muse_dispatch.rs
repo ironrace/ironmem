@@ -9,13 +9,12 @@
 //! the `text` of the one `run_terminal` record, shaped by `--output-schema`;
 //! a SIGTERM/SIGINT ends the process with no terminal record at all; and no
 //! record carries a price, so every invocation is unpriced.
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::autopilot::dispatch::{DispatchSpec, SessionRefusal};
 use crate::autopilot::implementer::Implementer;
 use crate::autopilot::invocation::{
-    create_private, validation, FinalVerdict, InvocationArtifacts, ParsedRun, SupervisedCli,
+    validation, FinalVerdict, InvocationArtifacts, ParsedRun, SpawnFile, SupervisedCli,
 };
 use crate::autopilot::scrub::scrub_and_bound;
 use crate::error::MemoryError;
@@ -154,21 +153,13 @@ impl SupervisedCli for MuseCli {
         ])
     }
 
-    fn spawn_files(&self, a: &InvocationArtifacts) -> Vec<PathBuf> {
-        vec![prompt_path(a)]
-    }
-
-    /// The condition, byte for byte, in a private file created exactly once:
-    /// an existing prompt is never overwritten.
-    fn prepare_spawn(
-        &self,
-        spec: &DispatchSpec,
-        a: &InvocationArtifacts,
-    ) -> Result<(), MemoryError> {
-        let mut file = create_private(&prompt_path(a))?;
-        file.write_all(spec.condition.as_bytes())?;
-        file.sync_all()?;
-        Ok(())
+    /// The condition, byte for byte, as the prompt file. The core creates
+    /// it privately exactly once, so an existing prompt is never overwritten.
+    fn spawn_files(&self, spec: &DispatchSpec, a: &InvocationArtifacts) -> Vec<SpawnFile> {
+        vec![SpawnFile {
+            path: prompt_path(a),
+            contents: spec.condition.as_bytes().to_vec(),
+        }]
     }
 
     /// The launcher otherwise replaces the binary between invocations.
@@ -178,11 +169,6 @@ impl SupervisedCli for MuseCli {
 
     fn expected_native_id(&self, spec: &DispatchSpec) -> Option<String> {
         Some(spec.session.session_uuid().to_owned())
-    }
-
-    /// [`MuseCli::parse`] names the requested session it never saw.
-    fn parse_reports_missing_session(&self) -> bool {
-        true
     }
 
     /// Muse's own refusal lines about the requested session, measured on
@@ -321,7 +307,14 @@ impl SupervisedCli for MuseCli {
                 many.len()
             )),
         }
-        ParsedRun::from_evidence("Muse", errors, native_id, verdict, turns, observed_output)
+        let parsed =
+            ParsedRun::from_evidence("Muse", errors, native_id, verdict, turns, observed_output);
+        // The error above already names the session it never saw.
+        if saw_expected {
+            parsed
+        } else {
+            parsed.reported_missing_session()
+        }
     }
 }
 
@@ -914,55 +907,20 @@ mod tests {
         assert_eq!(parsed.native_id(), Some(SID));
     }
 
+    /// Muse reads its prompt from one file: the condition, byte for byte,
+    /// beside the invocation's schema marker. The core creates it.
     #[test]
-    fn prepare_spawn_writes_the_exact_condition_privately_once() {
-        let dir = tempfile::tempdir().unwrap();
-        let (a, _) =
-            crate::autopilot::process_tree::testing::invocation_for(dir.path(), Implementer::Muse);
-        let mut s = spec(SessionMode::New {
+    fn the_only_spawn_file_is_the_exact_condition_as_the_prompt() {
+        let s = spec(SessionMode::New {
             session_uuid: SID.into(),
         });
-        s.invocation_artifacts = Some(a.clone());
-        assert_eq!(MuseCli.spawn_files(&a), vec![prompt_path(&a)]);
-        MuseCli.prepare_spawn(&s, &a).unwrap();
         assert_eq!(
-            std::fs::read_to_string(prompt_path(&a)).unwrap(),
-            "make the gate pass"
+            MuseCli.spawn_files(&s, &artifacts()),
+            vec![SpawnFile {
+                path: prompt_path(&artifacts()),
+                contents: b"make the gate pass".to_vec(),
+            }]
         );
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert_eq!(
-                std::fs::metadata(prompt_path(&a))
-                    .unwrap()
-                    .permissions()
-                    .mode()
-                    & 0o777,
-                0o600
-            );
-        }
-        // A second spawn into the same invocation is refused, never overwritten.
-        assert!(MuseCli.prepare_spawn(&s, &a).is_err());
-    }
-
-    /// The core refuses a spawn when any `spawn_files` entry exists, so the
-    /// list must name exactly what `prepare_spawn` creates.
-    #[test]
-    fn spawn_files_names_exactly_what_prepare_spawn_creates() {
-        let (_repo, mut s) = crate::autopilot::invocation::contract_tests::setup();
-        s.implementer = Implementer::Muse;
-        let a = s.invocation_artifacts.clone().unwrap();
-        let dir = Path::new(&a.schema_path).parent().unwrap();
-        let list = || {
-            std::fs::read_dir(dir)
-                .unwrap()
-                .map(|e| e.unwrap().path())
-                .collect::<std::collections::BTreeSet<_>>()
-        };
-        let before = list();
-        MuseCli.prepare_spawn(&s, &a).unwrap();
-        let created: std::collections::BTreeSet<_> = list().difference(&before).cloned().collect();
-        assert_eq!(created, MuseCli.spawn_files(&a).into_iter().collect());
     }
 
     #[cfg(unix)]

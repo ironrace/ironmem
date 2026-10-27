@@ -73,21 +73,13 @@ pub trait SupervisedCli: Sync {
         a: &InvocationArtifacts,
     ) -> Result<Vec<String>, MemoryError>;
 
-    /// Files [`SupervisedCli::prepare_spawn`] creates. Any of them already
-    /// present proves a prior spawn was attempted into this invocation, so
-    /// the core refuses before writing. The list must name exactly the files
-    /// `prepare_spawn` creates, no more and no fewer. Default: none.
-    fn spawn_files(&self, _a: &InvocationArtifacts) -> Vec<PathBuf> {
+    /// Files the harness reads at spawn (Muse's prompt file), as data. The
+    /// core creates each one privately and exactly once before spawning,
+    /// and the same paths are its proof of a prior spawn: any of them
+    /// already present refuses the spawn before anything is written, so
+    /// the check and the creation cannot disagree. Default: none.
+    fn spawn_files(&self, _spec: &DispatchSpec, _a: &InvocationArtifacts) -> Vec<SpawnFile> {
         Vec::new()
-    }
-
-    /// Files the harness reads at spawn (Muse's prompt file). Default: none.
-    fn prepare_spawn(
-        &self,
-        _spec: &DispatchSpec,
-        _a: &InvocationArtifacts,
-    ) -> Result<(), MemoryError> {
-        Ok(())
     }
 
     /// Extra child environment. Default: none.
@@ -95,16 +87,10 @@ pub trait SupervisedCli: Sync {
         &[]
     }
 
-    /// The native session ID the run must report, when the controller chose it.
+    /// The native session ID the run must report, when the controller chose
+    /// it. `None` for a new session exactly when
+    /// [`Implementer::assigns_own_session_id`].
     fn expected_native_id(&self, spec: &DispatchSpec) -> Option<String>;
-
-    /// Whether [`SupervisedCli::parse`] itself reports a journal that never
-    /// names `expected_native_id`. The core then adds no generic mismatch of
-    /// its own when the parse found no native ID and already reported why.
-    /// Default: no.
-    fn parse_reports_missing_session(&self) -> bool {
-        false
-    }
 
     /// Whether the harness refused to run on `expected_native_id` at all, from
     /// its bounded raw stderr. Asked only of a run with no valid verdict that
@@ -127,6 +113,13 @@ pub trait SupervisedCli: Sync {
     ) -> ParsedRun;
 }
 
+/// One file a harness reads at spawn ([`SupervisedCli::spawn_files`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpawnFile {
+    pub path: PathBuf,
+    pub contents: Vec<u8>,
+}
+
 /// Harness-parsed evidence; [`read_artifacts`] combines it with the exit
 /// record. It has exactly two shapes, one per constructor: a verdict with its
 /// native session ID and no errors, or a failure with no verdict. A verdict
@@ -138,6 +131,9 @@ pub struct ParsedRun {
     turns: u32,
     errors: Vec<String>,
     observed_output: bool,
+    /// The parse itself reported that the journal never names the expected
+    /// session ([`Self::reported_missing_session`]).
+    missing_session_reported: bool,
 }
 
 impl ParsedRun {
@@ -156,6 +152,7 @@ impl ParsedRun {
             turns,
             errors: Vec::new(),
             observed_output,
+            missing_session_reported: false,
         }
     }
 
@@ -174,7 +171,16 @@ impl ParsedRun {
             turns,
             errors,
             observed_output,
+            missing_session_reported: false,
         }
+    }
+
+    /// Mark a failure whose errors already say the journal never names the
+    /// expected session, so the core adds no generic mismatch of its own.
+    /// Ignored on a run that has a native ID, which named a session.
+    pub fn reported_missing_session(mut self) -> Self {
+        self.missing_session_reported = self.native_id.is_none() && !self.errors.is_empty();
+        self
     }
 
     /// [`Self::with_verdict`] when `errors` is empty and both the verdict and the
@@ -644,7 +650,10 @@ fn run_supervised_bounded_with(
     // proves a child ran, and the harness's spawn files prove a spawn was at
     // least attempted. Either way a never-launched record could mask a live
     // invocation, so refuse with an error instead of writing one.
-    for path in std::iter::once(super::process_tree::identity_path(a)).chain(cli.spawn_files(a)) {
+    let spawn_files = cli.spawn_files(spec, a);
+    for path in std::iter::once(super::process_tree::identity_path(a))
+        .chain(spawn_files.iter().map(|f| f.path.clone()))
+    {
         match std::fs::symlink_metadata(&path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => {
@@ -671,13 +680,28 @@ fn run_supervised_bounded_with(
         )));
     }
     // Nothing has spawned yet and the prior-evidence check passed, so a
-    // failed pre-spawn write is recorded as proof that no child existed.
-    if let Err(e) = cli.prepare_spawn(spec, a) {
+    // failed pre-spawn write is recorded as proof that no child existed;
+    // except a file that now exists, which someone else created since the
+    // check (another supervisor handed this invocation may have a child
+    // running), so that holds with no record.
+    if let Err((path, e)) = create_spawn_files(&spawn_files) {
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            return Err(validation(format!(
+                "{} spawn file {} already exists although the prior-spawn check found none; \
+                 another spawn into this invocation may be running, so it is held",
+                cli.label(),
+                path.display()
+            )));
+        }
         return never_launched(
             cli,
             a,
             spec,
-            &format!("failed to prepare {} dispatch: {e}", cli.label()),
+            &format!(
+                "failed to prepare {} dispatch: cannot write {}: {e}",
+                cli.label(),
+                path.display()
+            ),
         );
     }
     // Still before any spawn and after the same check, so a failed open is
@@ -805,6 +829,22 @@ fn run_supervised_bounded_with(
         limit_exceeded,
         super::process_tree::QUIET_GRACE,
     )
+}
+
+/// Create each spawn file privately and exactly once, or name the one that
+/// failed and why.
+fn create_spawn_files(files: &[SpawnFile]) -> Result<(), (&Path, std::io::Error)> {
+    for file in files {
+        let fail = |e| (file.path.as_path(), e);
+        let created = create_private(&file.path).map_err(|e| match e {
+            MemoryError::Io(e) => e,
+            other => std::io::Error::other(other.to_string()),
+        });
+        let mut handle = created.map_err(fail)?;
+        handle.write_all(&file.contents).map_err(fail)?;
+        handle.sync_all().map_err(fail)?;
+    }
+    Ok(())
 }
 
 /// Persist `identity` with the tracker's current root birth and live
@@ -1001,9 +1041,7 @@ fn read_artifacts_with(
             errors.push(format!("{} reported no native session ID", cli.label()));
         }
     }
-    let missing_session_reported = cli.parse_reports_missing_session()
-        && parsed.native_id.is_none()
-        && !parsed.errors.is_empty();
+    let missing_session_reported = parsed.missing_session_reported;
     errors.extend(parsed.errors);
     let mut native_id = parsed.native_id;
     let mut observed_output = parsed.observed_output;
@@ -2406,10 +2444,37 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
 
     /// A harness whose evidence is scripted, so these tests pin what the
     /// shared core does with whatever a harness reports.
+    #[derive(Clone, Copy)]
     struct FakeCli {
         verdict: bool,
         native_id: bool,
-        prepare_fails: bool,
+        spawn: FakeSpawn,
+        /// Fail the parse with an error of its own and no native ID.
+        parse_error: bool,
+        /// Say the parse itself reported the expected session missing.
+        reports_missing_session: bool,
+    }
+
+    /// What [`FakeCli::spawn_files`] asks the core to create.
+    #[derive(Clone, Copy)]
+    enum FakeSpawn {
+        /// The prompt file, once.
+        Prompt,
+        /// A file in a directory that does not exist, so creating it fails.
+        Unwritable,
+        /// The prompt file twice, so the second creation finds it present,
+        /// as it would if another supervisor created it first.
+        Twice,
+    }
+
+    impl FakeCli {
+        const COMPLETE: Self = Self {
+            verdict: true,
+            native_id: true,
+            spawn: FakeSpawn::Prompt,
+            parse_error: false,
+            reports_missing_session: false,
+        };
     }
 
     const FAKE_ENV: &[(&str, &str)] = &[("IRONMEM_FAKE_HARNESS_ENV", "from-env")];
@@ -2433,20 +2498,19 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
         ) -> Result<Vec<String>, MemoryError> {
             Ok(vec![fake_prompt(a).to_str().unwrap().to_owned()])
         }
-        fn prepare_spawn(
-            &self,
-            _spec: &DispatchSpec,
-            a: &InvocationArtifacts,
-        ) -> Result<(), MemoryError> {
-            if self.prepare_fails {
-                return Err(validation("prompt file could not be written"));
+        fn spawn_files(&self, _spec: &DispatchSpec, a: &InvocationArtifacts) -> Vec<SpawnFile> {
+            let prompt = || SpawnFile {
+                path: fake_prompt(a),
+                contents: b"the prompt".to_vec(),
+            };
+            match self.spawn {
+                FakeSpawn::Prompt => vec![prompt()],
+                FakeSpawn::Unwritable => vec![SpawnFile {
+                    path: Path::new(&a.schema_path).with_file_name("missing-dir/prompt.txt"),
+                    contents: b"the prompt".to_vec(),
+                }],
+                FakeSpawn::Twice => vec![prompt(), prompt()],
             }
-            let mut file = create_private(&fake_prompt(a))?;
-            file.write_all(b"the prompt")?;
-            Ok(())
-        }
-        fn spawn_files(&self, a: &InvocationArtifacts) -> Vec<std::path::PathBuf> {
-            vec![fake_prompt(a)]
         }
         fn env(&self) -> &'static [(&'static str, &'static str)] {
             FAKE_ENV
@@ -2460,6 +2524,19 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
             _final_text: Result<String, MemoryError>,
             _expected_native_id: Option<&str>,
         ) -> ParsedRun {
+            if self.parse_error {
+                let parsed = ParsedRun::failed(
+                    vec!["fake parse error".into()],
+                    None,
+                    1,
+                    !journal.is_empty(),
+                );
+                return if self.reports_missing_session {
+                    parsed.reported_missing_session()
+                } else {
+                    parsed
+                };
+            }
             let native_id = self.native_id.then(|| THREAD.to_owned());
             match (self.verdict, native_id) {
                 (true, Some(native_id)) => ParsedRun::with_verdict(
@@ -2479,11 +2556,7 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
 
     #[test]
     fn a_harness_reporting_no_verdict_or_native_id_fails_closed_rather_than_erroring() {
-        let complete = FakeCli {
-            verdict: true,
-            native_id: true,
-            prepare_fails: false,
-        };
+        let complete = FakeCli::COMPLETE;
         let (_dir, s) = setup();
         let a = s.invocation_artifacts.as_ref().unwrap();
         crate::autopilot::process_tree::testing::complete(a);
@@ -2519,11 +2592,7 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
     #[test]
     fn a_supervised_run_gives_the_child_its_harness_env_and_pre_spawn_files() {
         let (dir, s) = setup();
-        let cli = FakeCli {
-            verdict: true,
-            native_id: true,
-            prepare_fails: false,
-        };
+        let cli = FakeCli::COMPLETE;
         let bin = binary(
             dir.path(),
             &observable(
@@ -2556,11 +2625,7 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
             return;
         }
         let (dir, s) = setup();
-        let cli = FakeCli {
-            verdict: true,
-            native_id: true,
-            prepare_fails: false,
-        };
+        let cli = FakeCli::COMPLETE;
         let bin = binary(
             dir.path(),
             &observable(
@@ -2609,11 +2674,7 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
             } else {
                 daemon_dir.join("temp-test.sock")
             };
-            let cli = FakeCli {
-                verdict: true,
-                native_id: true,
-                prepare_fails: false,
-            };
+            let cli = FakeCli::COMPLETE;
             // The child that spawned it outlives a few process samples, so
             // the tracker sees the daemon while its ancestry still leads to
             // the root.
@@ -2680,11 +2741,7 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
     fn an_enrolled_descendant_is_recorded_before_the_root_exits() {
         let (dir, s) = setup();
         let a = s.invocation_artifacts.clone().unwrap();
-        let cli = FakeCli {
-            verdict: true,
-            native_id: true,
-            prepare_fails: false,
-        };
+        let cli = FakeCli::COMPLETE;
         let bin = binary(
             dir.path(),
             &observable(
@@ -2736,9 +2793,8 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
         let (dir, s) = setup();
         let a = s.invocation_artifacts.as_ref().unwrap();
         let cli = FakeCli {
-            verdict: true,
-            native_id: true,
-            prepare_fails: true,
+            spawn: FakeSpawn::Unwritable,
+            ..FakeCli::COMPLETE
         };
         let o = run_supervised_bounded_with(
             &cli,
@@ -2752,7 +2808,7 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
         assert!(!o.invocation_started && !o.is_met(), "{o:?}");
         let reason = o.reason.unwrap();
         assert!(
-            reason.contains("prompt file could not be written"),
+            reason.contains("failed to prepare Fake dispatch: cannot write"),
             "{reason}"
         );
         assert!(has_launch_failure_record(a));
@@ -2762,8 +2818,131 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
         );
     }
 
-    /// Opening the journal or stderr for the child happens after
-    /// `prepare_spawn` and before any spawn, so a failure there is also
+    /// The core writes each spawn file privately, byte for byte, and never
+    /// over one that exists.
+    #[cfg(unix)]
+    #[test]
+    fn spawn_files_are_created_private_exactly_once() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let file = SpawnFile {
+            path: dir.path().join("prompt.md"),
+            contents: b"the exact condition".to_vec(),
+        };
+        create_spawn_files(std::slice::from_ref(&file)).unwrap();
+        assert_eq!(std::fs::read(&file.path).unwrap(), file.contents);
+        assert_eq!(
+            std::fs::metadata(&file.path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let again = SpawnFile {
+            contents: b"another".to_vec(),
+            ..file.clone()
+        };
+        let (path, e) = create_spawn_files(std::slice::from_ref(&again)).unwrap_err();
+        assert_eq!(
+            (path, e.kind()),
+            (file.path.as_path(), std::io::ErrorKind::AlreadyExists)
+        );
+        assert_eq!(std::fs::read(&file.path).unwrap(), file.contents);
+    }
+
+    /// A spawn file that appears between the prior-spawn check and its own
+    /// creation was made by someone else: another supervisor handed the
+    /// same invocation may already have a child running. A never-launched
+    /// record would tell recovery that invocation is idle, so the core
+    /// refuses with an error instead, writing no record. The fake lists one
+    /// file twice, so its second creation meets the first.
+    #[test]
+    fn a_spawn_file_that_appears_after_the_check_holds_without_a_record() {
+        let (dir, s) = setup();
+        let a = s.invocation_artifacts.as_ref().unwrap();
+        let cli = FakeCli {
+            spawn: FakeSpawn::Twice,
+            ..FakeCli::COMPLETE
+        };
+        let err = run_supervised_bounded_with(
+            &cli,
+            Path::new("/missing-binary"),
+            dir.path(),
+            &s,
+            Duration::from_secs(1),
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("prompt.txt") && err.contains("already exists"),
+            "{err}"
+        );
+        assert_eq!(std::fs::metadata(&a.exit_path).unwrap().len(), 0);
+        assert!(!has_launch_failure_record(a));
+    }
+
+    /// The core omits its generic session mismatch only when the parse
+    /// itself says it reported the expected session missing, never on a
+    /// guess from "no native ID and some error".
+    #[test]
+    fn the_generic_session_mismatch_is_dropped_only_when_the_parse_reported_it() {
+        for reports_missing_session in [false, true] {
+            let (_dir, s) = setup();
+            let a = s.invocation_artifacts.as_ref().unwrap();
+            std::fs::write(
+                &a.exit_path,
+                serde_json::to_vec(&exit_record(
+                    a,
+                    Some(THREAD.into()),
+                    Some(0),
+                    false,
+                    None,
+                    1,
+                    None,
+                ))
+                .unwrap(),
+            )
+            .unwrap();
+            let cli = FakeCli {
+                parse_error: true,
+                reports_missing_session,
+                ..FakeCli::COMPLETE
+            };
+            let o = read_artifacts_with(&cli, a).unwrap();
+            assert!(!o.is_met() && o.native_session_id.is_none());
+            let reason = o.reason.unwrap();
+            assert!(reason.contains("fake parse error"), "{reason}");
+            assert_eq!(
+                reason.contains("native session ID did not match the requested session"),
+                !reports_missing_session,
+                "{reason}"
+            );
+        }
+    }
+
+    /// A harness that assigns its own session ID can name none for a new
+    /// session; one that continues the controller's always names it.
+    #[test]
+    fn a_harnesss_expected_native_id_agrees_with_who_assigns_the_session() {
+        let (_dir, mut s) = setup();
+        for implementer in [Implementer::Codex, Implementer::Muse] {
+            s.implementer = implementer;
+            s.session = SessionMode::New {
+                session_uuid: "934331e6-2c8a-4e0f-bcd6-0b6300000000".into(),
+            };
+            let cli = cli_for(implementer).unwrap();
+            assert_eq!(
+                cli.expected_native_id(&s).is_none(),
+                implementer.assigns_own_session_id(),
+                "{implementer:?}"
+            );
+            s.session = SessionMode::Resume {
+                session_uuid: "934331e6-2c8a-4e0f-bcd6-0b6300000000".into(),
+            };
+            assert!(cli.expected_native_id(&s).is_some(), "{implementer:?}");
+        }
+    }
+
+    /// Opening the journal or stderr for the child happens after the spawn
+    /// files are created and before any spawn, so a failure there is also
     /// proof that nothing ran, not an ambiguous hold that only
     /// `clear-dispatch` releases.
     #[cfg(unix)]
@@ -2773,11 +2952,7 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
 
         use crate::autopilot::process_tree::ProcessSnapshot;
         use crate::autopilot::registry::Liveness;
-        let cli = FakeCli {
-            verdict: true,
-            native_id: true,
-            prepare_fails: false,
-        };
+        let cli = FakeCli::COMPLETE;
         let artifacts: [fn(&InvocationArtifacts) -> &str; 2] =
             [|a| &a.journal_path, |a| &a.stderr_path];
         for artifact in artifacts {
@@ -2814,11 +2989,7 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
     /// an error and leaves the directory untouched.
     #[test]
     fn a_prior_identity_or_spawn_file_refuses_the_spawn_without_a_record() {
-        let cli = FakeCli {
-            verdict: true,
-            native_id: true,
-            prepare_fails: false,
-        };
+        let cli = FakeCli::COMPLETE;
         let leftovers: [fn(&InvocationArtifacts) -> std::path::PathBuf; 2] = [
             |a| Path::new(&a.schema_path).with_file_name("process.json"),
             fake_prompt,
