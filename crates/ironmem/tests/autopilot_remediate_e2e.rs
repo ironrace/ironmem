@@ -150,8 +150,8 @@ for a in "$@"; do
 done
 if [ -f "$AP_FIXTURES/ic_should_commit" ]; then
   echo "fix $(date +%s%N)" >> fix.txt
-  git add fix.txt >/dev/null 2>&1
-  git -c user.email=ic@example.com -c user.name=IC commit -qm "address review findings" >/dev/null 2>&1
+  git add fix.txt || exit 1
+  git -c user.email=ic@example.com -c user.name=IC commit -qm "address review findings" || exit 1
 fi
 printf '{"total_cost_usd":0.0,"num_turns":2,"duration_ms":5,"is_error":false,"session_id":"11111111-2222-3333-4444-555555555555","structured_output":{"verdict":"met"}}'
 exit 0
@@ -190,6 +190,9 @@ exit 0
     git(&checkout, &["init", "-q", "--initial-branch=main"]);
     git(&checkout, &["config", "user.email", "t@example.com"]);
     git(&checkout, &["config", "user.name", "T"]);
+    // Pinned: the global config signs and runs hooks; worktrees share this.
+    git(&checkout, &["config", "commit.gpgsign", "false"]);
+    git(&checkout, &["config", "core.hooksPath", "/dev/null"]);
     std::fs::write(checkout.join("README.md"), "seed\n").unwrap();
     git(&checkout, &["add", "README.md"]);
     git(&checkout, &["commit", "-qm", "seed"]);

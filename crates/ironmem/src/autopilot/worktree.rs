@@ -96,6 +96,12 @@ pub struct Worktree {
     /// existing worktree was reused, which is the normal resumed-dispatch
     /// case).
     pub created: bool,
+    /// The committish the branch was cut from, as passed to
+    /// [`ensure_worktree`]. A named ref (`origin/main`) is kept as written so
+    /// the signing guard's merge-base ignores upstream commits merged in
+    /// later. A `HEAD`-relative form (or `@`) would mean the branch itself
+    /// from inside the worktree, so it is pinned to the commit it named here.
+    pub base: String,
     /// Set when a dirty pre-existing worktree was moved aside first — the
     /// path it was moved to, kept for a human to inspect. The spec requires
     /// quarantine rather than deletion precisely so the dead IC's work is
@@ -314,6 +320,11 @@ pub fn ensure_worktree(
     let root = resolve_repo_root(repo_root)?;
     let branch = branch_name(issue);
     let path = worktree_path(worktree_root, issue);
+    let base_commit = if base.contains("HEAD") || base.trim() == "@" {
+        resolve_commit(&root, base).unwrap_or_else(|| base.to_string())
+    } else {
+        base.to_string()
+    };
 
     let mut quarantined_from = None;
     if is_registered_worktree(&root, &path)? {
@@ -350,6 +361,7 @@ pub fn ensure_worktree(
                 path: canonical_or_self(&path),
                 branch,
                 created: false,
+                base: base_commit,
                 quarantined_from: None,
             });
         } else {
@@ -393,6 +405,7 @@ pub fn ensure_worktree(
         path: canonical_or_self(&path),
         branch,
         created: true,
+        base: base_commit,
         quarantined_from,
     })
 }
@@ -522,6 +535,18 @@ mod tests {
 
     fn issue() -> IssueRef {
         IssueRef::new("ironrace/ironmem", 283)
+    }
+
+    #[test]
+    fn the_branch_base_is_recorded_and_head_is_pinned_to_a_commit() {
+        let repo = fixture_repo();
+        let roots = tempfile::tempdir().unwrap();
+        let head = resolve_commit(repo.path(), "HEAD").unwrap();
+        let created = ensure_worktree(repo.path(), roots.path(), &issue(), "HEAD").unwrap();
+        assert_eq!(created.base, head);
+        let reused = ensure_worktree(repo.path(), roots.path(), &issue(), "main").unwrap();
+        assert!(!reused.created);
+        assert_eq!(reused.base, "main");
     }
 
     #[test]

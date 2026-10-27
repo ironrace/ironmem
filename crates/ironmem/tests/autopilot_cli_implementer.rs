@@ -49,6 +49,9 @@ fn make_repo(path: &Path) {
     git(path, &["init", "-q", "--initial-branch=main"]);
     git(path, &["config", "user.email", "test@example.com"]);
     git(path, &["config", "user.name", "Test"]);
+    // Pinned: the global config signs and runs hooks; worktrees share this.
+    git(path, &["config", "commit.gpgsign", "false"]);
+    git(path, &["config", "core.hooksPath", "/dev/null"]);
     std::fs::write(path.join("README.md"), "seed\n").unwrap();
     git(path, &["add", "README.md"]);
     git(path, &["commit", "-qm", "seed"]);

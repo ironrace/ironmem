@@ -728,8 +728,34 @@ fn head_commit(worktree: &Path) -> Option<String> {
     (!sha.is_empty()).then_some(sha)
 }
 
-/// Why a dispatch's commits break the repository's signing policy, or `None`
-/// when they keep it or there is no policy.
+/// `git`'s own complaint, bounded so it can ride inside a one-line reason.
+fn bounded_stderr(out: &std::process::Output) -> String {
+    let text = String::from_utf8_lossy(&out.stderr);
+    text.trim().chars().take(300).collect()
+}
+
+/// The worktree's effective `commit.gpgsign`. `Err` carries git's bounded
+/// stderr when the value cannot be read: git exits 1 for "unset" (off), so any
+/// other failure (an invalid value exits 128) is not a reading at all.
+fn signing_policy(worktree: &Path) -> Result<bool, String> {
+    let mut command = std::process::Command::new("git");
+    crate::mcp::tools::scrub_git_environment(&mut command);
+    let out = command
+        .args(["config", "--bool", "--get", "commit.gpgsign"])
+        .current_dir(worktree)
+        .output()
+        .map_err(|e| e.to_string())?;
+    match out.status.code() {
+        Some(0) => Ok(String::from_utf8_lossy(&out.stdout).trim() == "true"),
+        Some(1) => Ok(false),
+        _ => Err(bounded_stderr(&out)),
+    }
+}
+
+/// Why the branch's commits break the repository's signing policy, or `None`
+/// when they keep it or there is no policy. `base` is the committish the
+/// branch was cut from ([`Worktree::base`]); `policy_at_start` is the policy as
+/// read before the dispatch began.
 ///
 /// Measured 2026-10-26: Muse's sandboxed shell could not sign (`No user
 /// exists for uid 501`), and the model silently retried with
@@ -737,32 +763,64 @@ fn head_commit(worktree: &Path) -> Option<String> {
 /// for every harness. `%G?` is not a reliable signed/unsigned test (it reads
 /// `U` or `N` for a valid SSH signature without `gpg.ssh.allowedSignersFile`),
 /// so presence comes from the commit's `gpgsig` header and `%G?` only flags
-/// `B`, a bad signature. With the policy on, signatures that cannot be read are
-/// a violation: fail closed.
-fn signing_violation(worktree: &Path, since: Option<&str>) -> Option<String> {
+/// `B`, a bad signature.
+///
+/// Everything since the merge-base with `base` is checked, so an earlier
+/// dispatch's bypass stays caught and upstream commits merged in are not
+/// blamed on the model. The policy is enforced if it was on at the start or is
+/// on now; turning it off mid-dispatch is a violation of its own. Anything
+/// unreadable while the policy is on fails closed. This catches a lazy or
+/// accidental bypass, not an unconfined agent deliberately signing with
+/// another key.
+fn signing_violation(worktree: &Path, base: &str, policy_at_start: bool) -> Option<String> {
     let git = |args: &[&str]| {
         let mut command = std::process::Command::new("git");
         crate::mcp::tools::scrub_git_environment(&mut command);
         command.args(args).current_dir(worktree).output()
     };
-    let policy_on = git(&["config", "--bool", "--get", "commit.gpgsign"]).is_ok_and(|out| {
-        out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "true"
-    });
-    if !policy_on {
-        return None;
-    }
-    let range = since.map(|base| format!("{base}..HEAD"));
-    let args: Vec<&str> = match &range {
-        Some(range) => vec!["log", "--format=%H %G?", range.as_str()],
-        None => vec!["log", "-1", "--format=%H %G?", "HEAD"],
-    };
-    let out = match git(&args) {
-        Ok(out) if out.status.success() => out,
-        _ => {
+    match signing_policy(worktree) {
+        Err(why) => {
+            return Some(format!(
+                "commit.gpgsign is on or unreadable, and its value could not be read: {why}"
+            ))
+        }
+        Ok(false) if policy_at_start => {
             return Some(
-                "commit.gpgsign is on, but the dispatch's commit signatures could not be read"
+                "commit.gpgsign was turned off during the dispatch; restore it with \
+                 `git config --unset commit.gpgsign` (or set it back to true) and sign every commit"
                     .into(),
             )
+        }
+        Ok(false) => return None,
+        Ok(true) => {}
+    }
+    let merge_base = match git(&["merge-base", "HEAD", base]) {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        Ok(out) => {
+            return Some(format!(
+                "cannot determine the branch base `{base}` to check commit signatures: {}",
+                bounded_stderr(&out)
+            ))
+        }
+        Err(e) => {
+            return Some(format!(
+                "cannot determine the branch base `{base}` to check commit signatures: {e}"
+            ))
+        }
+    };
+    let range = format!("{merge_base}..HEAD");
+    let out = match git(&["log", "--format=%H %G?", &range]) {
+        Ok(out) if out.status.success() => out,
+        Ok(out) => {
+            return Some(format!(
+                "commit.gpgsign is on, but the branch's commit signatures could not be read: {}",
+                bounded_stderr(&out)
+            ))
+        }
+        Err(e) => {
+            return Some(format!(
+                "commit.gpgsign is on, but the branch's commit signatures could not be read: {e}"
+            ))
         }
     };
     let mut unsigned = Vec::new();
@@ -781,10 +839,15 @@ fn signing_violation(worktree: &Path, since: Option<&str>) -> Option<String> {
             unsigned.push(sha.chars().take(12).collect::<String>());
         }
     }
+    let short_base: String = merge_base.chars().take(12).collect();
     (!unsigned.is_empty()).then(|| {
         format!(
-            "commit.gpgsign is on, but commit(s) {} are unsigned or carry a bad signature; \
-             sign every commit and never pass -c commit.gpgsign=false or --no-gpg-sign",
+            "commit.gpgsign is on, but commit(s) {} on this branch since {short_base} are \
+             unsigned or carry a bad signature. Re-sign them (e.g. `git rebase --exec 'git \
+             commit --amend --no-edit -S' {short_base}` then `git push --force-with-lease`). \
+             If signing fails in your environment, return verdict impossible with the signing \
+             error; never bypass with -c commit.gpgsign=false, --no-gpg-sign, or by changing \
+             git config.",
             unsigned.join(", ")
         )
     })
@@ -1303,13 +1366,11 @@ pub fn run_issue(
         .as_ref()
         .and_then(|s| s.invocation_artifacts.clone());
     let mut recovered_outcome = None;
-    // Read before `recover_invocation` clears the artifacts: the recovered
-    // outcome's commits are checked over the range its invocation started from.
-    let mut recovered_head_before = existing_state
-        .as_ref()
-        .filter(|_| config.implementer.recovers_invocations())
-        .and_then(|s| s.invocation_artifacts.as_ref())
-        .and_then(super::invocation::read_head_before);
+    // The signing policy before any dispatch or recovery, so an agent that
+    // turns it off mid-dispatch is still held to it. For an outcome recovered
+    // after a controller crash this read happens after the crashed dispatch,
+    // so a policy it disabled is not seen: an accepted limitation.
+    let policy_at_start = signing_policy(&worktree.path).unwrap_or(true);
     if let Some(state) = existing_state
         .as_ref()
         .filter(|_| config.implementer.recovers_invocations())
@@ -1446,10 +1507,8 @@ pub fn run_issue(
             }
         }
         let recovered = recovered_outcome.is_some();
-        // The commit the signing check starts after: the persisted head for a
-        // recovered outcome, the pre-dispatch HEAD for a live one.
-        let (outcome_result, signing_base) = if let Some(outcome) = recovered_outcome.take() {
-            (Ok(outcome), recovered_head_before.take())
+        let outcome_result = if let Some(outcome) = recovered_outcome.take() {
+            Ok(outcome)
         } else {
             let attempts = prior_attempts(db, issue)?;
             // Rung 2 provisioned this slot and hardcoded it to `None`; rung 7's
@@ -1552,17 +1611,12 @@ pub fn run_issue(
                 wall_clock_timeout,
             };
 
-            let signing_base = head_commit(&worktree.path);
             if config.implementer.recovers_invocations() {
                 // Validate the exact backend argv before publishing a new
                 // invocation or charging unknown spend. Definite input errors
                 // prove no process launched and must leave prior state intact.
                 super::invocation::validate_argv(&worktree.path, &spec)?;
                 if let Some(artifacts) = &spec.invocation_artifacts {
-                    // Before the state write, so any published invocation has it.
-                    if let Some(sha) = &signing_base {
-                        super::invocation::persist_head_before(artifacts, sha)?;
-                    }
                     invocation_artifacts = Some(artifacts.clone());
                     write_state(
                         db,
@@ -1577,7 +1631,7 @@ pub fn run_issue(
                     unpriced_dispatches += 1;
                 }
             }
-            (dispatcher.dispatch(&worktree.path, &spec), signing_base)
+            dispatcher.dispatch(&worktree.path, &spec)
         };
         let mut outcome = match outcome_result {
             Ok(outcome) => outcome,
@@ -1746,12 +1800,23 @@ pub fn run_issue(
             total_cost_usd += outcome.cost_usd.unwrap_or(0.0).max(0.0);
         }
 
-        // Every harness: a `met` whose commits bypassed the signing policy is
-        // a failed attempt, and the reason reaches the next turn as `why_failed`.
+        // Every harness: a `met` whose branch holds commits that bypassed the
+        // signing policy is a failed attempt, and the reason reaches the next
+        // turn as `why_failed`. The whole branch is checked, not just this
+        // dispatch's commits, so an earlier bypass cannot be waved through by
+        // a later `met` that adds nothing.
         if outcome.is_met() {
-            if let Some(violation) = signing_violation(&worktree.path, signing_base.as_deref()) {
+            if let Some(violation) =
+                signing_violation(&worktree.path, &worktree.base, policy_at_start)
+            {
                 outcome.verdict = Some(Verdict::NotMet);
-                outcome.reason = Some(violation);
+                outcome.reason = Some(match outcome.reason.take() {
+                    Some(original) if !original.trim().is_empty() => format!(
+                        "{violation} (model's reason: {})",
+                        original.chars().take(500).collect::<String>()
+                    ),
+                    _ => violation,
+                });
             }
         }
 
@@ -3324,35 +3389,25 @@ sleep 0.5
     fn fixture_worktree() -> (tempfile::TempDir, Worktree) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().to_path_buf();
+        // The operator's global config signs and runs a pre-commit scanner;
+        // both are pinned off so the fixture depends on neither.
         for args in [
             vec!["init", "--initial-branch=main"],
             vec!["config", "user.email", "autopilot@example.test"],
             vec!["config", "user.name", "Autopilot Test"],
-            // Pinned: the operator's global config signs, and an unpinned
-            // fixture would either try their key or trip the signing guard.
             vec!["config", "commit.gpgsign", "false"],
+            vec!["config", "core.hooksPath", "/dev/null"],
         ] {
-            let ok = std::process::Command::new("git")
-                .args(&args)
-                .current_dir(&path)
-                .output()
-                .unwrap()
-                .status
-                .success();
-            assert!(ok, "git {args:?} failed");
+            git_in(&path, &args);
         }
         std::fs::write(path.join("README.md"), "seed\n").unwrap();
-        for args in [vec!["add", "README.md"], vec!["commit", "-m", "seed"]] {
-            std::process::Command::new("git")
-                .args(&args)
-                .current_dir(&path)
-                .output()
-                .unwrap();
-        }
+        git_in(&path, &["add", "README.md"]);
+        git_in(&path, &["commit", "-m", "seed"]);
         let wt = Worktree {
             path: path.clone(),
             branch: worktree::branch_name(&issue()),
             created: true,
+            base: git_in(&path, &["rev-parse", "HEAD"]),
             quarantined_from: None,
         };
         (dir, wt)
@@ -3399,35 +3454,78 @@ sleep 0.5
     #[test]
     fn no_signing_policy_means_no_violation() {
         let (_dir, wt) = fixture_worktree(); // commit.gpgsign pinned false
-        let base = commit_in(&wt.path, "a", &[]);
+        commit_in(&wt.path, "a", &[]);
         commit_in(&wt.path, "b", &[]);
-        assert_eq!(signing_violation(&wt.path, Some(&base)), None);
+        assert_eq!(signing_violation(&wt.path, &wt.base, false), None);
     }
 
     #[test]
     fn an_unsigned_commit_under_gpgsign_is_a_violation_naming_it() {
         let (_dir, wt) = fixture_worktree();
-        let base = commit_in(&wt.path, "a", &[]);
         // Turn the policy on *after* the base, as an operator's global config would.
         git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
         let bypass = commit_in(&wt.path, "b", &["-c", "commit.gpgsign=false"]);
-        let violation = signing_violation(&wt.path, Some(&base)).unwrap();
+        let violation = signing_violation(&wt.path, &wt.base, true).unwrap();
         assert!(violation.contains(&bypass[..12]), "got: {violation}");
+        assert!(violation.contains(&wt.base[..12]), "got: {violation}");
+        assert!(violation.contains("impossible"), "got: {violation}");
         assert!(
             violation.contains("commit.gpgsign=false"),
             "got: {violation}"
         );
-        // Without a base, HEAD alone is checked.
-        assert!(signing_violation(&wt.path, None).is_some());
-        // The base is exclusive: nothing after the bypass commit is checked.
-        assert_eq!(signing_violation(&wt.path, Some(&bypass)), None);
+    }
+
+    #[test]
+    fn a_policy_that_cannot_be_read_fails_closed_with_gits_complaint() {
+        let (_dir, wt) = fixture_worktree();
+        git_in(&wt.path, &["config", "commit.gpgsign", "maybe"]);
+        let violation = signing_violation(&wt.path, &wt.base, false).unwrap();
+        assert!(violation.contains("could not be read"), "got: {violation}");
+        assert!(violation.contains("maybe"), "got: {violation}");
+    }
+
+    #[test]
+    fn an_unresolvable_branch_base_fails_closed_when_the_policy_is_on() {
+        let (_dir, wt) = fixture_worktree();
+        git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
+        let violation = signing_violation(&wt.path, "no-such-base", true).unwrap();
+        assert!(
+            violation.contains("cannot determine the branch base `no-such-base`"),
+            "got: {violation}"
+        );
+    }
+
+    #[test]
+    fn upstream_commits_merged_into_the_branch_are_not_blamed_on_the_dispatch() {
+        let (_dir, wt) = fixture_worktree();
+        git_in(&wt.path, &["checkout", "-q", "-b", "issue"]);
+        git_in(&wt.path, &["checkout", "-q", "main"]);
+        // An unsigned commit lands upstream, then the issue branch takes it.
+        let upstream = commit_in(&wt.path, "upstream", &[]);
+        git_in(&wt.path, &["checkout", "-q", "issue"]);
+        git_in(&wt.path, &["merge", "-q", "--ff-only", "main"]);
+        git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
+        assert_eq!(signing_violation(&wt.path, "main", true), None);
+        // The dispatch's own unsigned commit is still caught, alone.
+        let own = commit_in(&wt.path, "own", &["-c", "commit.gpgsign=false"]);
+        let violation = signing_violation(&wt.path, "main", true).unwrap();
+        assert!(violation.contains(&own[..12]), "got: {violation}");
+        // The upstream commit is the merge-base, not a blamed commit.
+        assert!(
+            violation.contains(&format!(
+                "commit(s) {} on this branch since {}",
+                &own[..12],
+                &upstream[..12]
+            )),
+            "got: {violation}"
+        );
     }
 
     #[cfg(unix)]
     #[test]
-    fn an_ssh_signed_commit_is_accepted_without_an_allowed_signers_file() {
-        let (dir, wt) = fixture_worktree();
-        let key = dir.path().join("key");
+    fn ssh_signed_commits_are_accepted_whether_or_not_the_signer_is_trusted() {
+        let keys = tempfile::tempdir().unwrap();
+        let key = keys.path().join("key");
         if std::process::Command::new("ssh-keygen")
             .args(["-q", "-t", "ed25519", "-N", "", "-f"])
             .arg(&key)
@@ -3437,18 +3535,35 @@ sleep 0.5
             eprintln!("ssh-keygen unavailable; skipping");
             return;
         }
-        let base = commit_in(&wt.path, "a", &[]);
-        for (k, v) in [("gpg.format", "ssh"), ("commit.gpgsign", "true")] {
-            git_in(&wt.path, &["config", k, v]);
+        let public = std::fs::read_to_string(keys.path().join("key.pub")).unwrap();
+        // `U` is a valid signature from an unlisted key; `G` one from a listed key.
+        for (listed, expected) in [(false, "U"), (true, "G")] {
+            let (_dir, wt) = fixture_worktree();
+            let allowed = keys.path().join(format!("allowed-{listed}"));
+            let line = if listed {
+                format!("autopilot@example.test {public}")
+            } else {
+                String::new()
+            };
+            std::fs::write(&allowed, line).unwrap();
+            for (k, v) in [
+                ("gpg.format", "ssh"),
+                ("gpg.ssh.program", "ssh-keygen"),
+                ("gpg.ssh.allowedSignersFile", allowed.to_str().unwrap()),
+                ("user.signingkey", key.to_str().unwrap()),
+                ("commit.gpgsign", "true"),
+            ] {
+                git_in(&wt.path, &["config", k, v]);
+            }
+            commit_in(&wt.path, "signed", &[]);
+            let status = git_in(&wt.path, &["log", "-1", "--format=%G?"]);
+            assert_eq!(status, expected, "listed={listed}");
+            assert_eq!(
+                signing_violation(&wt.path, &wt.base, true),
+                None,
+                "listed={listed}"
+            );
         }
-        git_in(
-            &wt.path,
-            &["config", "user.signingkey", key.to_str().unwrap()],
-        );
-        // The key files sit in the worktree; keep them out of the commit.
-        std::fs::write(wt.path.join(".git/info/exclude"), "key*\n").unwrap();
-        commit_in(&wt.path, "signed", &[]);
-        assert_eq!(signing_violation(&wt.path, Some(&base)), None);
     }
 
     #[test]
@@ -3466,20 +3581,45 @@ sleep 0.5
             run.dispatches[0].classification,
             DispatchClassification::FailedAttempt
         );
-        assert!(run.dispatches[0]
-            .reason
-            .as_deref()
-            .unwrap()
-            .contains("unsigned"));
+        let reason = run.dispatches[0].reason.as_deref().unwrap();
+        assert!(reason.contains("unsigned"), "got: {reason}");
+        // The model's own account is kept beside the violation.
+        assert!(
+            reason.contains("(model's reason: scripted Met)"),
+            "got: {reason}"
+        );
         assert!(!matches!(run.terminal, TerminalReason::Met { .. }));
     }
 
     #[test]
-    fn a_met_that_made_no_commits_is_not_blamed_for_an_unsigned_head() {
+    fn an_unsigned_commit_from_an_earlier_dispatch_still_fails_a_later_met() {
         let db = approved_db();
         let (_dir, wt) = fixture_worktree();
-        // An unsigned commit that predates the dispatch is not the dispatch's.
-        commit_in(&wt.path, "old", &[]);
+        git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
+        let mut calls = 0;
+        let mut first = String::new();
+        let mut dispatcher = CommitThenMet(|path: &Path| {
+            calls += 1;
+            if calls == 1 {
+                first = commit_in(path, "work", &["-c", "commit.gpgsign=false"]);
+            }
+        });
+        let mut c = config();
+        c.attempt_cap = 2;
+        let run = run_issue(&db, &issue(), &brief(), &wt, &c, &mut dispatcher).unwrap();
+        assert_eq!(run.dispatches.len(), 2);
+        for d in &run.dispatches {
+            assert_eq!(d.classification, DispatchClassification::FailedAttempt);
+            assert!(d.reason.as_deref().unwrap().contains(&first[..12]));
+        }
+    }
+
+    #[test]
+    fn a_commit_already_on_the_base_is_never_blamed() {
+        let db = approved_db();
+        let (_dir, mut wt) = fixture_worktree();
+        // The branch is cut after this unsigned commit, so it is the base's.
+        wt.base = commit_in(&wt.path, "old", &[]);
         git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
         let mut dispatcher = CommitThenMet(|_: &Path| {});
         let run = run_issue(&db, &issue(), &brief(), &wt, &config(), &mut dispatcher).unwrap();
@@ -3487,54 +3627,49 @@ sleep 0.5
     }
 
     #[test]
-    fn a_recovering_harness_persists_the_head_it_started_from() {
+    fn a_dispatch_that_turns_the_policy_off_is_a_failed_attempt() {
         let db = approved_db();
         let (_dir, wt) = fixture_worktree();
-        let seed = git_in(&wt.path, &["rev-parse", "HEAD"]);
-        let mut d = codex_script(vec![met()]);
-        run_issue(&db, &issue(), &brief(), &wt, &codex_config(), &mut d).unwrap();
-        let artifacts = d.inner.seen[0].invocation_artifacts.as_ref().unwrap();
+        git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
+        let mut dispatcher = CommitThenMet(|path: &Path| {
+            git_in(path, &["config", "commit.gpgsign", "false"]);
+            commit_in(path, "work", &[]);
+        });
+        let mut c = config();
+        c.attempt_cap = 1;
+        let run = run_issue(&db, &issue(), &brief(), &wt, &c, &mut dispatcher).unwrap();
         assert_eq!(
-            super::super::invocation::read_head_before(artifacts),
-            Some(seed)
+            run.dispatches[0].classification,
+            DispatchClassification::FailedAttempt
         );
+        let reason = run.dispatches[0].reason.as_deref().unwrap();
+        assert!(
+            reason.contains("turned off during the dispatch"),
+            "got: {reason}"
+        );
+        assert!(reason.contains("--unset commit.gpgsign"), "got: {reason}");
     }
 
     #[test]
-    fn a_recovered_met_is_checked_from_its_persisted_head_not_the_current_one() {
-        for (base_is_head, expect_met) in [(true, true), (false, false)] {
-            let db = approved_db();
-            let (_dir, wt) = fixture_worktree();
-            let seed = git_in(&wt.path, &["rev-parse", "HEAD"]);
-            let state = pending_codex(&db, &wt, Some("persisted"));
-            git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
-            let bypass = commit_in(&wt.path, "work", &["-c", "commit.gpgsign=false"]);
-            super::super::invocation::persist_head_before(
-                state.invocation_artifacts.as_ref().unwrap(),
-                if base_is_head { &bypass } else { &seed },
-            )
-            .unwrap();
-            let mut result = met();
-            result.native_session_id = Some("persisted".into());
-            let mut d = codex_script(vec![]);
-            d.recovery = Some(InvocationRecovery::Finished(result));
-            let mut c = codex_config();
-            c.attempt_cap = 1;
-            let run = run_issue(&db, &issue(), &brief(), &wt, &c, &mut d).unwrap();
-            assert_eq!(
-                matches!(run.terminal, TerminalReason::Met { .. }),
-                expect_met,
-                "base_is_head={base_is_head}: {:?}",
-                run.dispatches
-            );
-            if !expect_met {
-                assert!(run.dispatches[0]
-                    .reason
-                    .as_deref()
-                    .unwrap()
-                    .contains("unsigned"));
-            }
-        }
+    fn a_recovered_met_is_checked_against_the_branch_base() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        pending_codex(&db, &wt, Some("persisted"));
+        git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
+        commit_in(&wt.path, "work", &["-c", "commit.gpgsign=false"]);
+        let mut result = met();
+        result.native_session_id = Some("persisted".into());
+        let mut d = codex_script(vec![]);
+        d.recovery = Some(InvocationRecovery::Finished(result));
+        let mut c = codex_config();
+        c.attempt_cap = 1;
+        let run = run_issue(&db, &issue(), &brief(), &wt, &c, &mut d).unwrap();
+        assert!(!matches!(run.terminal, TerminalReason::Met { .. }));
+        assert!(run.dispatches[0]
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("unsigned"));
     }
 
     // ── config validation ───────────────────────────────────────────────

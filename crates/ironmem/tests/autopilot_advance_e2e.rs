@@ -171,6 +171,9 @@ exit 0
     git(&checkout, &["init", "-q", "--initial-branch=main"]);
     git(&checkout, &["config", "user.email", "t@example.com"]);
     git(&checkout, &["config", "user.name", "T"]);
+    // Pinned: the global config signs and runs hooks; worktrees share this.
+    git(&checkout, &["config", "commit.gpgsign", "false"]);
+    git(&checkout, &["config", "core.hooksPath", "/dev/null"]);
     std::fs::write(checkout.join("README.md"), "seed\n").unwrap();
     git(&checkout, &["add", "README.md"]);
     git(&checkout, &["commit", "-qm", "seed"]);
