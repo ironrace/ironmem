@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::autopilot::dispatch::{DispatchOutcome, DispatchSpec, Verdict};
 use crate::autopilot::implementer::Implementer;
+use crate::autopilot::process_tree::SharedDaemon;
 use crate::autopilot::scrub::scrub_and_bound;
 use crate::autopilot::IssueRef;
 use crate::error::MemoryError;
@@ -286,14 +287,15 @@ pub(crate) fn dispatch_timeout(spec: &DispatchSpec) -> Duration {
         .unwrap_or(Duration::from_secs(SUPERVISED_DISPATCH_TIMEOUT_SECS))
 }
 
-/// `shared_daemon_socket` is the operator's configured shared-daemon socket
-/// (`Config::daemon_socket_path`); a daemon a harness's MCP proxy
-/// autospawns there is never treated as part of the invocation.
+/// `shared_daemon` is the operator's shared ironmem daemon: its configured
+/// socket (`Config::daemon_socket_path`) and executable. A daemon a
+/// harness's MCP proxy autospawns there is never treated as part of the
+/// invocation. `None` owns every descendant.
 pub fn run_supervised(
     bin: &Path,
     repo: &Path,
     spec: &DispatchSpec,
-    shared_daemon_socket: &Path,
+    shared_daemon: Option<&SharedDaemon>,
 ) -> Result<DispatchOutcome, MemoryError> {
     run_supervised_bounded_with(
         cli_for(spec.implementer)?,
@@ -301,7 +303,7 @@ pub fn run_supervised(
         repo,
         spec,
         dispatch_timeout(spec),
-        Some(shared_daemon_socket),
+        shared_daemon,
     )
 }
 
@@ -448,7 +450,7 @@ fn run_supervised_bounded_with(
     repo: &Path,
     spec: &DispatchSpec,
     timeout: Duration,
-    shared_daemon_socket: Option<&Path>,
+    shared_daemon: Option<&SharedDaemon>,
 ) -> Result<DispatchOutcome, MemoryError> {
     let a = validate_spec(cli, spec)?;
     let args = cli.argv(repo, spec, a)?;
@@ -542,7 +544,7 @@ fn run_supervised_bounded_with(
         invocation_id: a.invocation_id.clone(),
         descendants: Vec::new(),
     };
-    let mut tracker = super::process_tree::ProcessTracker::new(child.id(), shared_daemon_socket);
+    let mut tracker = super::process_tree::ProcessTracker::new(child.id(), shared_daemon);
     if let Err(e) = super::process_tree::persist_identity(a, &identity) {
         // The root is still our unreaped Child; cleanup is authenticated by
         // kernel birth identity, and cannot authorize a retry on uncertainty.
@@ -1909,7 +1911,19 @@ exit {code}"#
                 dir.path(),
                 &s,
                 Duration::from_secs(10),
-                Some(&configured),
+                Some(&SharedDaemon {
+                    socket: configured.clone(),
+                    // The fake daemon's real executable, as the kernel
+                    // reports it: macOS `/bin/sh` re-execs `/bin/bash`
+                    // under the same argv (measured).
+                    exe: Path::new(if cfg!(target_os = "macos") {
+                        "/bin/bash"
+                    } else {
+                        "/bin/sh"
+                    })
+                    .canonicalize()
+                    .unwrap(),
+                }),
             );
             let pid: i32 = std::fs::read_to_string(dir.path().join("daemon.pid"))
                 .unwrap()

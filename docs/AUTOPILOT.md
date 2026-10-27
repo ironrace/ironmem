@@ -304,13 +304,18 @@ invocation. It recognises the daemon by its exact
 `ironmem serve --listen <socket> [--db <path>]` command line, listening on
 your configured daemon socket (`<state dir>/daemon.sock`, or
 `IRONMEM_DAEMON_SOCKET`; the socket your registered MCP servers connect to),
-on a process leading its own group. It leaves that daemon's children alone
+on a process leading its own group, whose executable, as the kernel reports
+it, is the same ironmem binary the controller runs. An agent-built
+`target/debug/ironmem` with that command line is cleaned up like any tool,
+and so is a daemon whose executable path cannot be read, or one started by
+a different ironmem install than the controller's. It leaves that daemon's children alone
 too, so an autospawned daemon survives the invocation and keeps serving. A
 daemon on any other socket, such as one an ironmem test suite starts on a
 temporary socket, is cleaned up like any other tool. So is a shared daemon
 whose socket path contains whitespace, which the process table cannot
-parse. The trade-off: a tool that disguises itself as the daemon, with the
-same command line on your socket in a group of its own, escapes tracking.
+parse. The trade-off: a tool that runs your installed ironmem binary as the
+daemon, with the same command line on your socket in a group of its own,
+escapes tracking.
 That is the same class as the double-fork escape above.
 
 Verification records are intentionally separated:
