@@ -1340,7 +1340,7 @@ fn scan_cwds<O: Into<ProcOwner>>(
         let Some((owner, birth)) = owner_birth(pid)? else {
             continue;
         };
-        if !owner.into().is_users(uid, known) || birth < spawned {
+        if !owner.into().is_users(uid, known, spawned) || birth < spawned {
             continue;
         }
         let cwd = match cwd_of(pid) {
@@ -1377,6 +1377,10 @@ struct ProcOwner {
     euid: u32,
     ruid: u32,
     ppid: u32,
+    pgid: u32,
+    /// The parent's kernel birth, read only for a process that is the
+    /// user's by real uid alone; `None` when not read or unreadable.
+    parent_birth: Option<Birth>,
 }
 
 /// An owner known only by its effective uid (a test seam's shorthand).
@@ -1386,6 +1390,8 @@ impl From<u32> for ProcOwner {
             euid: uid,
             ruid: uid,
             ppid: 0,
+            pgid: 0,
+            parent_birth: None,
         }
     }
 }
@@ -1395,12 +1401,26 @@ impl ProcOwner {
     /// decides, as before. One that is `uid`'s only by real uid is a setuid
     /// image (`login` behind every Terminal tab, `sudo`, `top`, `/bin/ps`)
     /// whose working directory is unreadable, so it counts only when tied
-    /// to the invocation: its parent is a process the tracker knows
-    /// (`known`), or it was reparented to init (its birth, checked by the
-    /// caller, is in the window). An unrelated one is skipped and never
-    /// fails the scan.
-    fn is_users(self, uid: u32, known: &[u32]) -> bool {
-        self.euid == uid || (self.ruid == uid && (self.ppid == 1 || known.contains(&self.ppid)))
+    /// to the invocation (its own birth, checked by the caller, is in the
+    /// window):
+    ///
+    /// - its parent is a process the tracker knows (`known`);
+    /// - its process group is led by one (the root's group, say), which an
+    ///   orphan keeps when Linux hands it to a `systemd --user` subreaper;
+    /// - it was reparented to init (`launchd` on macOS);
+    /// - its parent was itself born during the invocation (`spawned` or
+    ///   later): a process that appeared during it, between two samples.
+    ///
+    /// One whose parent and group predate the invocation (the operator's
+    /// shells and terminals: a Terminal tab's `login`, a `sudo` or `top` run
+    /// by hand) is skipped and never fails the scan.
+    fn is_users(self, uid: u32, known: &[u32], spawned: Birth) -> bool {
+        self.euid == uid
+            || (self.ruid == uid
+                && (self.ppid == 1
+                    || known.contains(&self.ppid)
+                    || known.contains(&self.pgid)
+                    || self.parent_birth.is_some_and(|born| born >= spawned)))
     }
 }
 
@@ -1511,11 +1531,18 @@ fn processes_with_cwd(
         use std::os::unix::ffi::OsStrExt;
         let owner_birth = |pid: u32| {
             Ok(kinfo_proc(pid)?.map(|record| {
+                // The parent is read only for a real-uid-only process.
+                let parent_birth = (record.euid != uid && record.ruid == uid)
+                    .then(|| kinfo_proc(record.process.ppid).ok().flatten())
+                    .flatten()
+                    .map(|parent| parent.process.birth);
                 (
                     ProcOwner {
                         euid: record.euid,
                         ruid: record.ruid,
                         ppid: record.process.ppid,
+                        pgid: record.process.pgid,
+                        parent_birth,
                     },
                     record.process.birth,
                 )
@@ -1570,11 +1597,18 @@ fn processes_with_cwd(
             };
             let ruid = real_and_effective_uid(pid).map_or(owner, |(real, _)| real);
             Ok(kernel_observation(pid)?.map(|process| {
+                // The parent is read only for a real-uid-only process.
+                let parent_birth = (owner != uid && ruid == uid)
+                    .then(|| kernel_observation(process.ppid).ok().flatten())
+                    .flatten()
+                    .map(|parent| parent.birth);
                 (
                     ProcOwner {
                         euid: owner,
                         ruid,
                         ppid: process.ppid,
+                        pgid: process.pgid,
+                        parent_birth,
                     },
                     process.birth,
                 )
@@ -3863,10 +3897,13 @@ pub(crate) mod tests {
         let spawned = Birth(100, 0);
         let uid = 501;
         let root = 42;
+        // Parent and group predate the invocation unless stated.
         let setuid = |ppid: u32| ProcOwner {
             euid: 0,
             ruid: uid,
             ppid,
+            pgid: 300,
+            parent_birth: Some(Birth(50, 0)),
         };
         let owner_birth = |pid: u32| -> Result<Option<(ProcOwner, Birth)>, String> {
             Ok(Some(match pid {
@@ -3882,6 +3919,8 @@ pub(crate) mod tests {
                         euid: uid,
                         ruid: uid,
                         ppid: 300,
+                        pgid: 300,
+                        parent_birth: Some(Birth(50, 0)),
                     },
                     Birth(150, 0),
                 ),
@@ -3913,18 +3952,50 @@ pub(crate) mod tests {
         assert_eq!(uids_from_status(status), Some((501, 0)));
         assert_eq!(uids_from_status("Name:\tx\n"), None);
         let (ruid, euid) = uids_from_status(status).unwrap();
-        let owner = |ppid| ProcOwner { euid, ruid, ppid };
+        let spawned = Birth(100, 0);
+        let root = 42;
+        // `systemd --user`, a subreaper started long before the invocation.
+        let subreaper = 900;
         let owner_birth = |pid: u32| -> Result<Option<(ProcOwner, Birth)>, String> {
+            let (ppid, pgid, parent_birth) = match pid {
+                // Under the root.
+                2 => (root, root, Birth(100, 0)),
+                // An orphan of the invocation, reparented to the user's
+                // subreaper rather than init, still in the root's group.
+                3 => (subreaper, root, Birth(10, 0)),
+                // Its parent appeared during the invocation (a tool started
+                // between two samples), in a group of its own.
+                4 => (500, 4, Birth(120, 0)),
+                // The operator's own `sudo` or `top`, under a shell that
+                // predates the invocation; and a Terminal tab's `login`.
+                _ => (300, pid, Birth(50, 0)),
+            };
             Ok(Some((
-                owner(if pid == 1 { 300 } else { 42 }),
+                ProcOwner {
+                    euid,
+                    ruid,
+                    ppid,
+                    pgid,
+                    parent_birth: Some(parent_birth),
+                },
                 Birth(150, 0),
             )))
         };
+        let reads = std::cell::RefCell::new(Vec::new());
         let cwd_of = |pid: u32| -> Result<Option<PathBuf>, String> {
+            reads.borrow_mut().push(pid);
             Ok(Some(PathBuf::from(format!("/w/{pid}"))))
         };
-        let found = scan_cwds([1, 2], 501, Birth(100, 0), &[42], owner_birth, cwd_of).unwrap();
-        assert_eq!(found.iter().map(|p| p.pid).collect::<Vec<_>>(), vec![2]);
+        let found = scan_cwds([1, 2, 3, 4, 5], 501, spawned, &[root], owner_birth, cwd_of).unwrap();
+        assert_eq!(
+            found.iter().map(|p| p.pid).collect::<Vec<_>>(),
+            vec![2, 3, 4]
+        );
+        assert!(
+            !reads.borrow().contains(&1) && !reads.borrow().contains(&5),
+            "the operator's own setuid processes were read: {:?}",
+            reads.borrow()
+        );
     }
 
     /// The same with a real setuid binary: `top` started by this test
@@ -3936,6 +4007,9 @@ pub(crate) mod tests {
     fn a_real_setuid_tool_holds_the_scan_only_under_the_invocation() {
         let Some(top) = setuid_top() else { return };
         let worktree = tempfile::tempdir().unwrap();
+        // The invocation starts now: this test process, top's parent,
+        // predates it, as an operator's shell does.
+        let spawned = birth_at(std::time::SystemTime::now()).unwrap();
         let mut child = Command::new(top)
             .args(["-l", "30", "-s", "1"])
             .current_dir(worktree.path())
@@ -3953,8 +4027,8 @@ pub(crate) mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         let listed = user_pids();
-        let unrelated = processes_with_cwd(vec![pid], Birth(0, 0), &[]);
-        let tied = processes_with_cwd(vec![pid], Birth(0, 0), &[std::process::id()]);
+        let unrelated = processes_with_cwd(vec![pid], spawned, &[]);
+        let tied = processes_with_cwd(vec![pid], spawned, &[std::process::id()]);
         let _ = child.kill();
         let _ = child.wait();
         assert!(listed.unwrap().contains(&pid), "not listed by real uid");

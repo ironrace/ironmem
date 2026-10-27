@@ -103,11 +103,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (EPERM), so the run was killed and held for `clear-dispatch`. It now
   reads `sysctl(KERN_PROC_PID)`, which needs no privilege. A descendant
   cleanup may not signal is held as evidence, recorded, until it is gone.
-  The worktree check also counts a process that is yours only by real uid
-  (a setuid image) when it is tied to the invocation: its parent is a
-  process the tracker knows, or it was reparented to launchd or init during
-  the invocation. So an escaped setuid tool keeps the run held, while a
-  Terminal tab's `login`, or a `sudo` or `top` you run yourself, does not.
+  The worktree check also counts a process that is yours only by real uid (a
+  setuid image) when it was born during the invocation and is tied to it: its
+  parent or its process group is the invocation's, it was reparented to launchd
+  or init (or, on Linux, its group survives a hand-off to a `systemd --user`
+  subreaper), or its parent was itself born during the invocation. So an escaped
+  setuid tool keeps the run held, while a Terminal tab's `login`, or a `sudo` or
+  `top` you run from a shell you already had, does not.
 - **A Codex or Muse run that fails within milliseconds is no longer held
   for `clear-dispatch`.** A root that exits before the first process sample
   (a Muse usage error, or "session in use") is recorded once its process

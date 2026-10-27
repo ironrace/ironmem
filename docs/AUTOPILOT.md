@@ -444,13 +444,17 @@ supervisor records the outcome and holds completion, naming that process
 and its real uid, along with anything under it in the process table, until
 each is gone; recovery then finishes it with no `clear-dispatch`. What such
 a process starts after that check and moves out of its tree is outside the
-guarantee. The worktree check also counts a process that is yours only by
-real uid (a setuid image, whose working directory cannot be read) when it
-is tied to the invocation: its parent is the invocation's root or a process
-the tracker enrolled, or it was reparented to launchd or init, born during
-the invocation. So an escaped setuid tool keeps the worktree from reading
-quiet, while an unrelated one, such as the `login` behind a Terminal tab
-you open, or a `sudo` or `top` you run yourself, is skipped.
+guarantee. The worktree check also counts a process that is yours only by real
+uid (a setuid image, whose working directory cannot be read) when it was born
+during the invocation and is tied to it: its parent is the invocation's root or
+a process the tracker enrolled, its process group is led by one (an orphan keeps
+it when Linux hands it to a `systemd --user` subreaper), it was reparented to
+launchd or init, or its parent was itself born during the invocation. So an
+escaped setuid tool keeps the worktree from reading quiet, while one whose
+parent and group predate the invocation, such as the `login` behind a Terminal
+tab you open, or a `sudo` or `top` you run from a shell you already had, is
+skipped. A `sudo` run from a terminal opened after the run started has a parent
+born during it, so it holds the run until it exits.
 
 A long-lived process cleanup cannot signal (`sudo -b …`, say) holds the
 issue for as long as it runs, and `clear-dispatch` refuses while it does.
@@ -957,15 +961,17 @@ typing the command.
   artifacts, it refuses while the recorded root, process group or a recorded
   descendant runs, or the process-identity file cannot be read; with its
   worktree, while any of your processes started since the invocation began has
-  its working directory there. Before you run it, still check that worktree for
-  leftover processes yourself: a drawer that names neither cannot be checked
-  that way. It also cannot tell whether a finished invocation was still waiting
-  to be recorded, so that last attempt may go uncounted in lineage. The drawer
-  is deleted only if its content is still byte for byte what was checked. The
-  command prints why it could not be read and its raw content (secrets scrubbed,
-  cut at 4000 characters; `--json` gives `reason`, `raw_content` and
-  `raw_content_truncated`), so the evidence is not lost. Lineage, attempt counts
-  and spend stand.
+  its working directory there. That includes a shell of your own opened inside
+  the worktree after the run started: the refusal names its PID, so close it or
+  `cd` out of the worktree and run the command again. Before you run it, still
+  check that worktree for leftover processes yourself: a drawer that names
+  neither cannot be checked that way. It also cannot tell whether a finished
+  invocation was still waiting to be recorded, so that last attempt may go
+  uncounted in lineage. The drawer is deleted only if its content is still byte
+  for byte what was checked. The command prints why it could not be read and its
+  raw content (secrets scrubbed, cut at 4000 characters; `--json` gives
+  `reason`, `raw_content` and `raw_content_truncated`), so the evidence is not
+  lost. Lineage, attempt counts and spend stand.
 - **A stored cut that is no longer a commit** stops the run with this error:
 
   ```
