@@ -257,7 +257,8 @@ Codex kept running in its own process group, a root that exited before the
 first `ps` sample, an observation error mid-run, a tool still running in
 Codex's process group after Codex exited that no sample caught, or a process
 started during the invocation still running in the worktree after cleanup
-(see the worktree check below). Stop any Lead or `run`
+(see the worktree check below; that one finishes by itself once the process
+exits). Stop any Lead or `run`
 working the repo, confirm nothing is still working on the issue, then release
 it with:
 
@@ -273,12 +274,13 @@ Autopilot cannot parse its options *and* it names a `schema.json` file, which
 is the only shape an Autopilot marker takes; your own `codex exec` runs with
 other schema files never hold a dispatch. Once the supervisor has written its
 completion record, a recorded PID no longer counts: cleanup already proved
-that process gone, so the PID has been reused. Descendants are recorded as
-the tracker enrols them, every `ps` sample (250 ms), so after a controller
-crash the check also sees the tools that left the group with `setsid`,
-including Muse's. It cannot see a tool started after the last sample before
-the crash, or one that tool left running; that part of the confirmation is
-yours. It also refuses a finished invocation that is only
+that process gone, so the PID has been reused. The descendants alive at
+each `ps` sample (every 250 ms) are recorded with their kernel birth, so
+after a controller crash the check also sees the tools that left the group
+with `setsid`, including Muse's. It cannot see a tool started after the last
+sample before the crash, or one that tool left running; that part of the
+confirmation is yours. A process-identity file that exists but cannot be
+read also refuses. It also refuses a finished invocation that is only
 waiting to be recorded (a Lead resuming the issue records it, as does
 `autopilot run <repo> <issue> --implementer codex --model <model> --title
 <title>`), unless lineage already holds that attempt, and it deletes nothing if
@@ -306,18 +308,31 @@ A tool that lives less than one sample and leaves a background child running
 (`cmd &` in a short-lived shell) is the ordinary case of that escape: the
 child is reparented to init before any sample can enrol it. Codex's tools
 stay in its process group, so the group check catches it. Muse's do not, so
-before writing the completion record the supervisor also refuses while any
+before writing the completion record the supervisor also waits while any
 process qualifies: its working directory is the worktree or inside it, you
 own it, the kernel started it at or after the invocation's root, and it is
-neither the supervisor nor the shared daemon (or one of its children). The
-error names each one's PID and command, and the invocation holds its slot
-like any other unproven completion. Your own shell or editor in the
-worktree started earlier, so it never counts; one you open there during the
-run does, and holds that run until you leave. macOS reads working
-directories from the kernel (about 1.5 ms per completion for ~600
-processes) and Linux from `/proc/<pid>/cwd`; on any other platform, or if
-the scan fails, completion is refused. A child that `chdir`s out of the
-worktree still escapes, and a deliberate escape is outside the guarantee.
+neither the supervisor nor the shared daemon (or one of its children). It
+rescans every 250 ms for up to 15 seconds, which covers ordinary detached
+helpers such as git's auto-gc. Your own shell or editor in the worktree
+started earlier, so it never counts; one you open there during the run does.
+
+If something still qualifies after 15 seconds, the supervisor records the
+run's outcome without trusting it, names each process's PID and command,
+and holds the slot. You do not need to act: once nothing the invocation
+started remains (the root, every recorded descendant, the root's process
+group, and any new process in the worktree), a later Lead tick or
+`autopilot run` upgrades that record to a trusted completion and finishes
+the invocation with its verdict. While it waits, the hold reason names
+what is still running. `autopilot clear-dispatch` is the manual release if
+you would rather not wait.
+
+macOS reads working directories from the kernel (about 1.5 ms per scan for
+~600 processes) and Linux from `/proc/<pid>/cwd`. A process born before the
+invocation is skipped before its directory is read. A process born during
+it whose directory cannot be read fails the scan, which is retried within
+the 15 seconds and then refused; so is any scan on another platform. A
+child that `chdir`s out of the worktree still escapes, and a deliberate
+escape is outside the guarantee.
 
 The macOS runtime path is exercised. Linux-specific
 kernel identity and cleanup code is covered by code/tests but has not been

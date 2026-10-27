@@ -1161,6 +1161,163 @@ fn user_processes_with_cwd(spawned: Birth) -> Result<Vec<CwdProcess>, String> {
     }
 }
 
+fn is_shared_daemon(
+    daemon: Option<&SharedDaemon>,
+    kernel_exe: fn(u32) -> Option<PathBuf>,
+    row: &ProcessRow,
+) -> bool {
+    daemon.is_some_and(|daemon| {
+        row.is_shared_ironmem_daemon(&daemon.socket)
+            && kernel_exe(row.pid).is_some_and(|exe| exe == daemon.exe)
+    })
+}
+
+/// How long supervision waits for the worktree to go quiet before it
+/// refuses completion. Ordinary detached helpers (git's auto-gc, say) exit
+/// within it; anything longer is held and finished by recovery once gone.
+pub(crate) const QUIET_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Whether the worktree held no process the invocation could have started.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Quiet {
+    Yes,
+    /// What is still there, named for the operator.
+    Stragglers(String),
+}
+
+/// One worktree-quiet test. A process qualifies, and keeps completion
+/// unproven, when its working directory is the worktree or inside it, the
+/// current user owns it, the kernel started it at or after the invocation's
+/// root (which excludes the operator's own older shell or editor there),
+/// and it is neither the checking process nor the shared daemon or one of
+/// its children.
+pub(crate) struct QuietCheck<'a> {
+    worktree: PathBuf,
+    spawned: Birth,
+    uid: u32,
+    daemon: Option<&'a SharedDaemon>,
+    kernel_exe: fn(u32) -> Option<PathBuf>,
+}
+
+impl<'a> QuietCheck<'a> {
+    fn new(
+        worktree: &Path,
+        spawned: Birth,
+        daemon: Option<&'a SharedDaemon>,
+        kernel_exe: fn(u32) -> Option<PathBuf>,
+    ) -> Result<Self, String> {
+        let canonical = worktree.canonicalize().map_err(|e| {
+            format!(
+                "cannot resolve the invocation worktree {}: {e}",
+                worktree.display()
+            )
+        })?;
+        Ok(Self {
+            worktree: canonical,
+            spawned,
+            uid: current_uid().ok_or("process ownership is unreadable on this platform")?,
+            daemon,
+            kernel_exe,
+        })
+    }
+
+    /// A single pass with the real kernel sources, as recovery runs it.
+    pub(crate) fn once(
+        worktree: &Path,
+        spawned: Birth,
+        daemon: Option<&'a SharedDaemon>,
+        rows: &[ProcessRow],
+    ) -> Result<Quiet, String> {
+        let check = Self::new(worktree, spawned, daemon, kernel_executable)?;
+        let stragglers =
+            check.stragglers(user_processes_with_cwd(spawned)?, || Ok(rows.to_vec()))?;
+        Ok(if stragglers.is_empty() {
+            Quiet::Yes
+        } else {
+            Quiet::Stragglers(check.describe(stragglers))
+        })
+    }
+
+    /// The qualifying processes in `scanned`, each named with its command.
+    /// The process table is read only when there is a candidate.
+    fn stragglers(
+        &self,
+        scanned: Vec<CwdProcess>,
+        rows: impl FnOnce() -> Result<Vec<ProcessRow>, String>,
+    ) -> Result<Vec<String>, String> {
+        let me = std::process::id();
+        let candidates: Vec<CwdProcess> = scanned
+            .into_iter()
+            .filter(|p| {
+                p.uid == self.uid
+                    && p.pid != me
+                    && p.birth >= self.spawned
+                    && p.cwd.starts_with(&self.worktree)
+            })
+            .collect();
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = rows()?;
+        Ok(candidates
+            .iter()
+            .filter(|p| !self.in_shared_daemon_tree(p.pid, &rows))
+            .map(|p| {
+                let command = rows
+                    .iter()
+                    .find(|r| r.pid == p.pid)
+                    .map_or("<command unavailable>", |r| r.args.as_str());
+                format!(
+                    "process {} ({})",
+                    p.pid,
+                    crate::autopilot::scrub::scrub_and_bound(command, 120).text
+                )
+            })
+            .collect())
+    }
+
+    fn describe(&self, stragglers: Vec<String>) -> String {
+        const NAMED: usize = 5;
+        let more = stragglers.len().saturating_sub(NAMED);
+        let mut named = stragglers
+            .into_iter()
+            .take(NAMED)
+            .collect::<Vec<_>>()
+            .join(", ");
+        if more > 0 {
+            named.push_str(&format!(" and {more} more"));
+        }
+        format!(
+            "{named} started during the invocation and still runs in its worktree {}",
+            self.worktree.display()
+        )
+    }
+
+    /// Whether `pid` is the shared daemon or, by its process-table ancestry,
+    /// one of the daemon's children, which the tracker never owns either.
+    fn in_shared_daemon_tree(&self, pid: u32, rows: &[ProcessRow]) -> bool {
+        let mut current = pid;
+        for _ in 0..64 {
+            let Some(row) = rows.iter().find(|r| r.pid == current && r.active()) else {
+                return false;
+            };
+            if is_shared_daemon(self.daemon, self.kernel_exe, row) {
+                return true;
+            }
+            if row.ppid <= 1 || row.ppid == current {
+                return false;
+            }
+            current = row.ppid;
+        }
+        false
+    }
+}
+
+/// The kernel birth of `pid`, or `None` once it has exited or cannot be read.
+pub(crate) fn kernel_birth(pid: u32) -> Option<Birth> {
+    birth(pid).ok().flatten()
+}
+
 pub(crate) struct ProcessTracker {
     root_pid: u32,
     known: Vec<(ProcessRow, Birth)>,
@@ -1190,10 +1347,7 @@ impl ProcessTracker {
     /// the configured one: an agent-built `target/debug/ironmem` with the
     /// same argv is owned like any other tool.
     fn is_shared_daemon(&self, row: &ProcessRow) -> bool {
-        self.shared_daemon.as_ref().is_some_and(|daemon| {
-            row.is_shared_ironmem_daemon(&daemon.socket)
-                && (self.kernel_exe)(row.pid).is_some_and(|exe| exe == daemon.exe)
-        })
+        is_shared_daemon(self.shared_daemon.as_ref(), self.kernel_exe, row)
     }
     fn rows() -> Result<Vec<ProcessRow>, MemoryError> {
         UnixProcesses.list().map_err(MemoryError::Validation)
@@ -1529,23 +1683,20 @@ impl ProcessTracker {
     /// (every Muse shell tool; Codex's are in the root's group) and exits
     /// between two samples leaves a background child reparented to init.
     /// Neither PPID enrollment nor [`Self::verify_group_drained`] reaches it,
-    /// but it still runs in the worktree. So completion is refused while any
-    /// process qualifies: its working directory is the worktree or inside
-    /// it, the current user owns it, the kernel started it at or after the
-    /// invocation's root (which excludes the operator's own older shell or
-    /// editor there), and it is neither the supervisor nor the shared daemon
-    /// or one of its children. It gets a second's grace to finish exiting.
+    /// but it still runs in the worktree. So completion waits while any
+    /// process qualifies ([`QuietCheck`]), rescanning every [`QUIET_POLL`]
+    /// for up to `grace`, and then reports what is still there.
     ///
     /// Limit: a child that `chdir`s out of the worktree before the root exits
     /// still escapes; a deliberate escape is outside this guarantee. A
-    /// platform with no working-directory source, or a failed scan, refuses.
-    pub(crate) fn verify_worktree_quiet(&self, worktree: &Path) -> Result<(), MemoryError> {
-        self.verify_worktree_quiet_with(
-            worktree,
-            user_processes_with_cwd,
-            Self::rows,
-            std::time::Duration::from_secs(1),
-        )
+    /// platform with no working-directory source, or a scan that keeps
+    /// failing, is an error.
+    pub(crate) fn verify_worktree_quiet(
+        &self,
+        worktree: &Path,
+        grace: std::time::Duration,
+    ) -> Result<Quiet, MemoryError> {
+        self.verify_worktree_quiet_with(worktree, user_processes_with_cwd, Self::rows, grace)
     }
 
     fn verify_worktree_quiet_with(
@@ -1554,16 +1705,10 @@ impl ProcessTracker {
         mut cwd_source: impl FnMut(Birth) -> Result<Vec<CwdProcess>, String>,
         mut rows: impl FnMut() -> Result<Vec<ProcessRow>, MemoryError>,
         grace: std::time::Duration,
-    ) -> Result<(), MemoryError> {
+    ) -> Result<Quiet, MemoryError> {
         let unproven = |reason: String| {
             MemoryError::Validation(format!("{reason}; invocation completion is unproven"))
         };
-        let worktree = worktree.canonicalize().map_err(|e| {
-            unproven(format!(
-                "cannot resolve the invocation worktree {}: {e}",
-                worktree.display()
-            ))
-        })?;
         let spawned = self
             .known
             .iter()
@@ -1572,96 +1717,34 @@ impl ProcessTracker {
             .ok_or_else(|| {
                 unproven("the invocation root's kernel birth was never observed".into())
             })?;
-        let uid = current_uid()
-            .ok_or_else(|| unproven("process ownership is unreadable on this platform".into()))?;
-        let supervisor = std::process::id();
+        let check = QuietCheck::new(
+            worktree,
+            spawned,
+            self.shared_daemon.as_ref(),
+            self.kernel_exe,
+        )
+        .map_err(unproven)?;
         let deadline = std::time::Instant::now() + grace;
         loop {
             // A failed scan is retried until the grace runs out.
-            let scanned = match cwd_source(spawned) {
-                Ok(scanned) => scanned,
+            let pass = cwd_source(spawned).and_then(|scanned| {
+                check.stragglers(scanned, || rows().map_err(|e| e.to_string()))
+            });
+            match pass {
+                Ok(stragglers) if stragglers.is_empty() => return Ok(Quiet::Yes),
+                Ok(stragglers) if std::time::Instant::now() >= deadline => {
+                    return Ok(Quiet::Stragglers(check.describe(stragglers)))
+                }
                 Err(e) if std::time::Instant::now() >= deadline => {
                     return Err(unproven(format!(
                         "cannot list processes in the invocation worktree: {e}"
                     )))
                 }
-                Err(_) => {
-                    std::thread::sleep(QUIET_POLL.min(grace));
-                    continue;
-                }
-            };
-            let candidates: Vec<CwdProcess> = scanned
-                .into_iter()
-                .filter(|p| {
-                    p.uid == uid
-                        && p.pid != supervisor
-                        && p.birth >= spawned
-                        && p.cwd.starts_with(&worktree)
-                })
-                .collect();
-            if candidates.is_empty() {
-                return Ok(());
+                _ => std::thread::sleep(QUIET_POLL.min(grace)),
             }
-            // Only now is the process table needed: for the daemon test
-            // and to name what is still running.
-            let rows = rows()?;
-            let stragglers: Vec<String> = candidates
-                .iter()
-                .filter(|p| !self.in_shared_daemon_tree(p.pid, &rows))
-                .map(|p| {
-                    let command = rows
-                        .iter()
-                        .find(|r| r.pid == p.pid)
-                        .map_or("<command unavailable>", |r| r.args.as_str());
-                    format!(
-                        "process {} ({})",
-                        p.pid,
-                        crate::autopilot::scrub::scrub_and_bound(command, 120).text
-                    )
-                })
-                .collect();
-            if stragglers.is_empty() {
-                return Ok(());
-            }
-            if std::time::Instant::now() >= deadline {
-                const NAMED: usize = 5;
-                let more = stragglers.len().saturating_sub(NAMED);
-                let mut named = stragglers
-                    .into_iter()
-                    .take(NAMED)
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                if more > 0 {
-                    named.push_str(&format!(" and {more} more"));
-                }
-                return Err(unproven(format!(
-                    "{named} started during the invocation and still runs in its worktree {} \
-                     after cleanup",
-                    worktree.display()
-                )));
-            }
-            std::thread::sleep(QUIET_POLL.min(grace));
         }
     }
 
-    /// Whether `pid` is the shared daemon or, by its process-table ancestry,
-    /// one of the daemon's children, which the tracker never owns either.
-    fn in_shared_daemon_tree(&self, pid: u32, rows: &[ProcessRow]) -> bool {
-        let mut current = pid;
-        for _ in 0..64 {
-            let Some(row) = rows.iter().find(|r| r.pid == current && r.active()) else {
-                return false;
-            };
-            if self.is_shared_daemon(row) {
-                return true;
-            }
-            if row.ppid <= 1 || row.ppid == current {
-                return false;
-            }
-            current = row.ppid;
-        }
-        false
-    }
     pub(crate) fn observed_root(&self) -> bool {
         self.observed_root
     }
@@ -2386,13 +2469,17 @@ mod tests {
             birth: Birth(start, 0),
             cwd: cwd.to_path_buf(),
         };
-        let check = |tracker: &ProcessTracker, found: CwdProcess| {
-            tracker.verify_worktree_quiet_with(
+        let check = |tracker: &ProcessTracker, found: CwdProcess| -> Result<(), String> {
+            match tracker.verify_worktree_quiet_with(
                 &worktree,
                 |_| Ok(vec![found.clone()]),
                 || Ok(rows.clone()),
                 Duration::ZERO,
-            )
+            ) {
+                Ok(Quiet::Yes) => Ok(()),
+                Ok(Quiet::Stragglers(named)) => Err(named),
+                Err(e) => Err(e.to_string()),
+            }
         };
         for started in [100, 150] {
             let err = check(&tracker, process(40, uid, started, &worktree.join("src")))
@@ -2498,7 +2585,7 @@ mod tests {
             })
             .unwrap();
         let mut scans = 0;
-        tracker
+        let quiet = tracker
             .verify_worktree_quiet_with(
                 dir.path(),
                 |_| {
@@ -2513,7 +2600,7 @@ mod tests {
                 std::time::Duration::from_secs(2),
             )
             .unwrap();
-        assert_eq!(scans, 2);
+        assert_eq!((quiet, scans), (Quiet::Yes, 2));
     }
 
     /// The real enumeration finds this test process in its own working

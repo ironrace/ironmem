@@ -412,6 +412,13 @@ struct ExitRecord {
     /// otherwise, keeping every launched record byte-identical to before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     launch_failure: Option<String>,
+    /// Set instead of `completion` when cleanup and the group drain
+    /// succeeded but processes started during the invocation still ran in
+    /// the worktree. Recovery moves it to `completion` once the recorded tree
+    /// is gone and the worktree is quiet ([`settle_awaiting_quiet`]).
+    /// Omitted otherwise, keeping every other record byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    awaiting_quiet: Option<CompletionRecord>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -421,11 +428,19 @@ struct CompletionRecord {
     invocation_id: String,
     schema_path: String,
 }
+impl CompletionRecord {
+    fn names(&self, a: &InvocationArtifacts) -> bool {
+        self.version == 1
+            && self.invocation_id == a.invocation_id
+            && self.schema_path == a.schema_path
+    }
+}
 impl ExitRecord {
     fn proves_completion(&self, a: &InvocationArtifacts) -> bool {
-        self.completion.as_ref().is_some_and(|c| {
-            c.version == 1 && c.invocation_id == a.invocation_id && c.schema_path == a.schema_path
-        })
+        self.completion.as_ref().is_some_and(|c| c.names(a))
+    }
+    fn awaits_quiet(&self, a: &InvocationArtifacts) -> bool {
+        self.completion.is_none() && self.awaiting_quiet.as_ref().is_some_and(|c| c.names(a))
     }
 }
 
@@ -517,6 +532,7 @@ fn exit_record(
         duration_ms,
         expected_native_id,
         launch_failure,
+        awaiting_quiet: None,
     }
 }
 
@@ -716,6 +732,7 @@ fn run_supervised_bounded_with(
         started,
         timed_out,
         limit_exceeded,
+        super::process_tree::QUIET_GRACE,
     )
 }
 
@@ -792,6 +809,7 @@ fn finish_supervised(
     started: Instant,
     timed_out: bool,
     limit_exceeded: Option<String>,
+    quiet_grace: Duration,
 ) -> Result<DispatchOutcome, MemoryError> {
     // Catch an artifact that crossed the limit just before process exit.
     let limit_exceeded = limit_exceeded.or_else(|| limits(a));
@@ -807,8 +825,8 @@ fn finish_supervised(
     // Unknown cleanup returns Err so run.rs retains the invocation and slot.
     tracker.cleanup(true)?;
     tracker.verify_group_drained()?;
-    tracker.verify_worktree_quiet(repo)?;
-    let record = exit_record(
+    let quiet = tracker.verify_worktree_quiet(repo, quiet_grace)?;
+    let mut record = exit_record(
         a,
         cli.expected_native_id(spec),
         status.code(),
@@ -817,6 +835,16 @@ fn finish_supervised(
         started.elapsed().as_millis().min(u64::MAX as u128) as u64,
         None,
     );
+    if let super::process_tree::Quiet::Stragglers(named) = quiet {
+        // Everything else is proven, so record the outcome without trusting
+        // it. The slot stays held; recovery finishes it once they are gone.
+        record.awaiting_quiet = record.completion.take();
+        persist_exit(a, &record)?;
+        return Err(validation(format!(
+            "{named} after cleanup; {} completion waits until it exits",
+            cli.label()
+        )));
+    }
     persist_exit(a, &record)?;
     let mut outcome = read_artifacts_with(cli, a)?;
     outcome.invocation_started = true;
@@ -1008,6 +1036,92 @@ pub fn has_valid_exit_record(artifacts: &InvocationArtifacts) -> bool {
         .ok()
         .and_then(|text| serde_json::from_str::<ExitRecord>(&text).ok())
         .is_some_and(|record| record.proves_completion(artifacts))
+}
+
+/// A supervisor record that proved everything but a quiet worktree.
+pub fn is_awaiting_quiet(artifacts: &InvocationArtifacts) -> bool {
+    read_capped(&artifacts.exit_path, EXIT_LIMIT)
+        .ok()
+        .and_then(|text| serde_json::from_str::<ExitRecord>(&text).ok())
+        .is_some_and(|record| record.awaits_quiet(artifacts))
+}
+
+/// Finish an invocation whose supervisor refused completion only because
+/// processes it started still ran in the worktree. Once the root and every
+/// recorded descendant are gone by kernel birth, nothing remains in the
+/// root's group, no process carries this invocation's marker (or an
+/// ambiguous one), and the worktree is quiet, the recorded outcome becomes a
+/// trusted completion. `Ok(false)`: not such an invocation. `Err`: still held,
+/// with what holds it.
+pub(crate) fn settle_awaiting_quiet(
+    a: &InvocationArtifacts,
+    worktree: &Path,
+    snapshot: &super::process_tree::ProcessSnapshot,
+    daemon: Option<&SharedDaemon>,
+) -> Result<bool, String> {
+    use super::process_tree::{kernel_birth, read_identity, ProcessSnapshot, Quiet, QuietCheck};
+    let Some(mut record) = read_capped(&a.exit_path, EXIT_LIMIT)
+        .ok()
+        .and_then(|text| serde_json::from_str::<ExitRecord>(&text).ok())
+        .filter(|record| record.awaits_quiet(a))
+    else {
+        return Ok(false);
+    };
+    let ProcessSnapshot::Available(rows) = snapshot else {
+        return Err(snapshot.reason());
+    };
+    let identity = read_identity(a)?;
+    let root_birth = identity
+        .root_birth
+        .ok_or("the invocation root's kernel birth was never recorded")?;
+    if kernel_birth(identity.root_pid) == Some(root_birth) {
+        return Err(format!(
+            "the invocation root {} is still running",
+            identity.root_pid
+        ));
+    }
+    let active = || rows.iter().filter(|r| r.active());
+    for d in &identity.descendants {
+        let alive = match d.birth {
+            Some(birth) => kernel_birth(d.pid) == Some(birth),
+            None => active().any(|r| r.pid == d.pid),
+        };
+        if alive {
+            return Err(format!(
+                "recorded process {} ({}) is still running",
+                d.pid, d.args
+            ));
+        }
+    }
+    if let Some(r) = active().find(|r| r.pgid == identity.root_pgid) {
+        return Err(format!(
+            "process {} is in the invocation's process group {}",
+            r.pid, r.pgid
+        ));
+    }
+    for r in active() {
+        match r.marker() {
+            Err(reason) => {
+                return Err(format!(
+                    "process {} is an ambiguous Codex or Muse command: {reason}",
+                    r.pid
+                ))
+            }
+            Ok(Some(marker)) if marker == a.schema_path => {
+                return Err(format!(
+                    "process {} carries this invocation's marker",
+                    r.pid
+                ))
+            }
+            _ => {}
+        }
+    }
+    if let Quiet::Stragglers(named) = QuietCheck::once(worktree, root_birth, daemon, rows)? {
+        return Err(named);
+    }
+    record.completion = record.awaiting_quiet.take();
+    persist_exit(a, &record).map_err(|e| e.to_string())?;
+    Ok(true)
 }
 
 /// The caller MUST first confirm the invocation is dead. This file-only
@@ -1471,6 +1585,7 @@ exit {code}"#
                 started,
                 false,
                 None,
+                super::super::process_tree::QUIET_GRACE,
             )
         })();
         if result.is_err() {
@@ -1545,6 +1660,7 @@ exit {code}"#
             started,
             false,
             None,
+            super::super::process_tree::QUIET_GRACE,
         )
         .unwrap_err();
         assert!(error
@@ -1750,6 +1866,7 @@ exit {code}"#
             started,
             false,
             None,
+            super::super::process_tree::QUIET_GRACE,
         );
         if let Some(pid) = std::fs::read_to_string(dir.path().join("straggler.pid"))
             .ok()
@@ -1766,11 +1883,26 @@ exit {code}"#
     /// child and exits between two samples leaves that child reparented to
     /// init, in a group that is not the root's, so neither ancestry nor the
     /// group drain reaches it. It still runs in the worktree, so completion
-    /// is refused. The only scan happens before the root starts the tool,
-    /// which makes the escape deterministic.
+    /// is refused and the slot held, but the supervisor records that only
+    /// the worktree stood in the way. Once that process is gone, recovery
+    /// finishes the invocation with its verdict, with no `clear-dispatch`.
+    /// The only scan happens before the root starts the tool, which makes
+    /// the escape deterministic.
     #[cfg(unix)]
     #[test]
-    fn a_background_child_of_an_exited_session_leader_tool_withholds_completion() {
+    fn a_background_child_of_an_exited_session_leader_tool_withholds_completion_until_gone() {
+        use crate::autopilot::registry::{
+            invocation_state_liveness, invocation_state_reason, Liveness,
+        };
+        struct KillOnDrop(Option<i32>);
+        impl Drop for KillOnDrop {
+            fn drop(&mut self) {
+                if let Some(pid) = self.0 {
+                    // SAFETY: the fixture's own escaped sleep.
+                    unsafe { libc::kill(pid, libc::SIGKILL) };
+                }
+            }
+        }
         let (dir, s) = setup();
         let a = s.invocation_artifacts.as_ref().unwrap();
         let bin = binary(
@@ -1786,6 +1918,9 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
         let mut child = spawn_fixture_invocation(&bin, dir.path(), &s);
         let mut tracker = super::super::process_tree::ProcessTracker::new(child.id(), None);
         tracker.observe().unwrap();
+        // As the supervision loop does after each sample.
+        let mut identity = super::super::process_tree::read_identity(a).unwrap();
+        record_identity(a, &mut identity, &tracker).unwrap();
         std::fs::write(dir.path().join("root-release"), "release").unwrap();
         let status = loop {
             if let Some(status) = child.try_wait().unwrap() {
@@ -1804,14 +1939,12 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
             started,
             false,
             None,
+            Duration::from_millis(500),
         );
         let escaped = std::fs::read_to_string(dir.path().join("escaped.pid"))
             .ok()
             .and_then(|pid| pid.trim().parse::<i32>().ok());
-        if let Some(pid) = escaped {
-            // SAFETY: the fixture's own escaped sleep, still alive.
-            unsafe { libc::kill(pid, libc::SIGKILL) };
-        }
+        let mut guard = KillOnDrop(escaped);
         assert!(status.success());
         let err = result.unwrap_err().to_string();
         let pid = escaped.expect("the tool recorded its background child");
@@ -1820,6 +1953,95 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
             "{err}"
         );
         assert!(!has_valid_exit_record(a));
+        assert!(is_awaiting_quiet(a));
+        let state = crate::autopilot::dispatch_state::DispatchState {
+            implementer: Implementer::Codex,
+            native_session_id: None,
+            invocation_artifacts: Some(a.clone()),
+            issue: IssueRef::new("owner/repo", 42),
+            worktree_path: dir.path().to_str().unwrap().into(),
+            ic_session_name: "ic-owner-repo-42".into(),
+            dispatch_class: "logic".into(),
+            attempt_n: 1,
+            state: "dispatching".into(),
+            started_at: "2026-10-27T00:00:00Z".into(),
+            session_uuid: "controller-only".into(),
+            turn_n: 1,
+            session_claimed: true,
+        };
+        let snapshot =
+            || super::super::process_tree::snapshot(&mut super::super::process_tree::UnixProcesses);
+        // Still there: held, naming it.
+        assert_eq!(
+            invocation_state_liveness(&snapshot(), &state),
+            Liveness::Unknown
+        );
+        let reason = invocation_state_reason(&snapshot(), &state);
+        assert!(reason.contains(&format!("process {pid}")), "{reason}");
+        assert!(!has_valid_exit_record(a));
+        // Gone: recovery upgrades the record and finishes with the verdict.
+        if let Some(pid) = guard.0.take() {
+            // SAFETY: the fixture's own escaped sleep.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut liveness = Liveness::Unknown;
+        while liveness != Liveness::NotListed && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+            liveness = invocation_state_liveness(&snapshot(), &state);
+        }
+        assert_eq!(liveness, Liveness::NotListed);
+        assert!(has_valid_exit_record(a) && !is_awaiting_quiet(a));
+        let outcome = read_artifacts(Implementer::Codex, a).unwrap();
+        assert!(outcome.is_met() && outcome.process_success, "{outcome:?}");
+    }
+
+    /// The upgrade needs the whole recorded tree gone, not just the
+    /// worktree quiet: a live root or recorded descendant, by kernel birth,
+    /// keeps the invocation held.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn an_awaiting_quiet_invocation_with_a_live_recorded_process_stays_held() {
+        use crate::autopilot::process_tree::{kernel_birth, ProcessSnapshot, RecordedProcess};
+        let (dir, s) = setup();
+        let a = s.invocation_artifacts.as_ref().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        let me = std::process::id();
+        let my_birth = kernel_birth(me).unwrap();
+        let mut record = exit_record(a, None, Some(0), false, None, 1, None);
+        record.awaiting_quiet = record.completion.take();
+        persist_exit(a, &record).unwrap();
+        // Recorded as the root (then as a descendant): this live process.
+        let mut identity = super::super::process_tree::ProcessIdentity {
+            version: 1,
+            root_pid: me,
+            root_pgid: me,
+            root_birth: Some(my_birth),
+            schema_path: a.schema_path.clone(),
+            invocation_id: a.invocation_id.clone(),
+            descendants: Vec::new(),
+        };
+        super::super::process_tree::persist_identity(a, &identity).unwrap();
+        let rows = ProcessSnapshot::Available(Vec::new());
+        let held = settle_awaiting_quiet(a, worktree.path(), &rows, None).unwrap_err();
+        assert!(held.contains("root"), "{held}");
+        // The root has exited (its PID shows no process with its birth).
+        let mut exited = std::process::Command::new("/usr/bin/true").spawn().unwrap();
+        exited.wait().unwrap();
+        identity.root_pid = exited.id();
+        identity.root_pgid = exited.id();
+        identity.descendants = vec![RecordedProcess {
+            pid: me,
+            ppid: 1,
+            pgid: me,
+            args: "tool".into(),
+            birth: Some(my_birth),
+        }];
+        super::super::process_tree::persist_identity(a, &identity).unwrap();
+        let held = settle_awaiting_quiet(a, worktree.path(), &rows, None).unwrap_err();
+        assert!(held.contains(&format!("process {me}")), "{held}");
+        assert!(is_awaiting_quiet(a) && !has_valid_exit_record(a));
+        drop(dir);
     }
 
     #[cfg(unix)]
@@ -1883,6 +2105,7 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
             started,
             false,
             previous_limit,
+            super::super::process_tree::QUIET_GRACE,
         )
         .unwrap();
         assert!(!outcome.is_met());
