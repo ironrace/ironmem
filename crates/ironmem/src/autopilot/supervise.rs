@@ -1110,7 +1110,13 @@ pub fn supervise_issue(
     let now = Utc::now();
     let now_str = now.to_rfc3339();
 
-    let state = dispatch_state::get_dispatch_state(db, issue)?;
+    // A drawer that cannot be read (corrupt, or written by a newer binary)
+    // may name a live invocation: it is held, never treated as no state.
+    let (state, unreadable) = match dispatch_state::read_dispatch_state(db, issue)? {
+        dispatch_state::StateRead::Absent => (None, None),
+        dispatch_state::StateRead::Readable(state) => (Some(state), None),
+        dispatch_state::StateRead::Unreadable(reason) => (None, Some(reason)),
+    };
     let attempts = lineage::attempts_for_issue(db, issue)?;
     let status = lineage::get_issue_status(db, issue)?;
     let fingerprint = progress_fingerprint(state.as_ref(), &attempts, status.as_ref());
@@ -1130,9 +1136,10 @@ pub fn supervise_issue(
     // have a process. An IC exits at the end of every dispatch by design, so
     // an issue with no dispatch-state drawer being absent from the registry is
     // the normal finished state, not a death.
-    let liveness = match &state {
-        Some(state) => snapshot.liveness(state),
-        None => Liveness::Alive,
+    let liveness = match (&state, &unreadable) {
+        (Some(state), _) => snapshot.liveness(state),
+        (None, Some(_)) => Liveness::Unknown,
+        (None, None) => Liveness::Alive,
     };
 
     // The liveness clock's origin. Note the `Unknown` arm: an unreadable
@@ -1151,10 +1158,11 @@ pub fn supervise_issue(
 
     let process = if liveness == Liveness::Unknown {
         ProcessHealth::Unknown {
-            reason: state
-                .as_ref()
-                .map(|s| snapshot.state_reason(s))
-                .unwrap_or_else(|| "no dispatch state".into()),
+            reason: match (&state, &unreadable) {
+                (Some(s), _) => snapshot.state_reason(s),
+                (None, Some(why)) => unreadable_state_reason(why),
+                (None, None) => "no dispatch state".into(),
+            },
         }
     } else if state.is_some() {
         assess_process_health(
@@ -1259,8 +1267,18 @@ pub fn supervise_issue(
         process,
         strategy,
         action,
-        in_flight: state.is_some(),
+        in_flight: state.is_some() || unreadable.is_some(),
     })
+}
+
+/// Why an issue whose dispatch state cannot be read is held.
+fn unreadable_state_reason(why: &str) -> String {
+    format!(
+        "its dispatch state cannot be read ({}); it may name a live invocation, so it is held \
+         until a binary that reads it, or a human who has checked nothing runs for it, \
+         releases it",
+        scrub_and_bound(why, 200).text
+    )
 }
 
 // ── reconciliation on Lead restart ──────────────────────────────────────
@@ -1327,8 +1345,33 @@ pub fn reconcile(
     db: &Database,
     snapshot: &dyn LivenessSnapshot,
 ) -> Result<Vec<Reconciliation>, MemoryError> {
-    let states = dispatch_state::all_dispatch_states(db, MAX_IN_FLIGHT_DISPATCH_STATES)?;
+    // A drawer that cannot be read (corrupt, or written by a newer binary)
+    // may name a live invocation: it is reported as a hold, and while one
+    // cannot be read no live session or marker can be proven an orphan.
+    let dispatch_state::DispatchStateScan { states, unreadable } =
+        dispatch_state::scan_dispatch_states(db, MAX_IN_FLIGHT_DISPATCH_STATES)?;
     let mut out = Vec::new();
+    for key in &unreadable {
+        out.push(Reconciliation {
+            issue: None,
+            session_name: key.clone(),
+            verdict: ReconcileVerdict::Hold {
+                reason: unreadable_state_reason("not a dispatch state this binary understands"),
+            },
+        });
+    }
+    let orphan = || {
+        if unreadable.is_empty() {
+            ReconcileVerdict::Orphan
+        } else {
+            ReconcileVerdict::Hold {
+                reason: format!(
+                    "no readable dispatch state names it, but {} cannot be read and may be its",
+                    unreadable.join(", ")
+                ),
+            }
+        }
+    };
     let mut known_sessions = std::collections::HashSet::new();
 
     for state in &states {
@@ -1362,7 +1405,7 @@ pub fn reconcile(
                 out.push(Reconciliation {
                     issue: None,
                     session_name: name.to_string(),
-                    verdict: ReconcileVerdict::Orphan,
+                    verdict: orphan(),
                 });
             }
         }
@@ -1382,7 +1425,7 @@ pub fn reconcile(
             out.push(Reconciliation {
                 issue: None,
                 session_name: marker.into(),
-                verdict: ReconcileVerdict::Orphan,
+                verdict: orphan(),
             });
         }
     }
@@ -2414,6 +2457,65 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].verdict, ReconcileVerdict::Orphan);
         assert_eq!(rows[0].issue, None);
+    }
+
+    /// A dispatch state written by a newer binary (or corrupt) may name a
+    /// live invocation. It is reported as a hold, never skipped, and while
+    /// one cannot be read no live session or marker is called an orphan:
+    /// it may be that state's.
+    fn write_unreadable_state(db: &Database, issue: &IssueRef) {
+        crate::autopilot::write_current(
+            db,
+            &format!(
+                "{}{}",
+                dispatch_state::DISPATCH_STATE_KEY_PREFIX,
+                issue.slug()
+            ),
+            r#"{"implementer":"some-future-harness"}"#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn an_unreadable_dispatch_state_is_held_and_hides_no_orphan() {
+        let db = Database::open_in_memory().unwrap();
+        db.migrate().unwrap();
+        write_unreadable_state(&db, &issue());
+        let snapshot = RegistrySnapshot::Available(vec![AgentEntry {
+            name: crate::autopilot::dispatch::ic_name(&issue()),
+            status: None,
+        }]);
+        let rows = reconcile(&db, &snapshot).unwrap();
+        assert!(
+            rows.iter()
+                .all(|r| matches!(r.verdict, ReconcileVerdict::Hold { .. })),
+            "{rows:?}"
+        );
+        assert!(
+            rows.iter().any(|r| r.session_name.contains(&issue().slug())
+                && matches!(&r.verdict, ReconcileVerdict::Hold { reason } if reason.contains("cannot be read"))),
+            "{rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|r| r.session_name == crate::autopilot::dispatch::ic_name(&issue())),
+            "{rows:?}"
+        );
+    }
+
+    #[test]
+    fn supervising_an_issue_whose_state_cannot_be_read_holds_it() {
+        let db = Database::open_in_memory().unwrap();
+        db.migrate().unwrap();
+        write_unreadable_state(&db, &issue());
+        let snapshot = RegistrySnapshot::Available(Vec::new());
+        let report =
+            supervise_issue(&db, &issue(), &snapshot, &SupervisionConfig::default()).unwrap();
+        assert!(report.in_flight, "{report:?}");
+        assert!(
+            matches!(&report.process, ProcessHealth::Unknown { reason } if reason.contains("cannot be read")),
+            "{report:?}"
+        );
     }
 
     #[test]

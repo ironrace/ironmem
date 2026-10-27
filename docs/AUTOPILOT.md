@@ -287,7 +287,10 @@ and stop whatever holds the session, then run `autopilot clear-dispatch`.
 An issue whose dispatch state this binary cannot read (corrupt, or written
 by a newer ironmem for a harness it does not know) is deferred
 (`dispatch_state_unreadable`) and keeps its concurrency slot, since it may
-be a live invocation. Run the ironmem that wrote it to finish or clear it.
+be a live invocation. `supervise` reports it as held, and `reconcile`
+reports it as a hold and, while it stays unreadable, holds rather than
+calls an orphan any live session or marker no readable state names. Run
+the ironmem that wrote it to finish or clear it.
 The reverse is not covered: an ironmem from before Muse support cannot read
 a Muse dispatch state and skips it, so its queue does not count that slot
 and its `reconcile` reports the live Muse process as an orphan. Do not

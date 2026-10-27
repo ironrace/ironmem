@@ -232,6 +232,31 @@ pub fn get_dispatch_state(
     state_from_content(&drawer.content).map(Some)
 }
 
+/// What an issue's dispatch-state drawer holds.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum StateRead {
+    Absent,
+    Readable(DispatchState),
+    /// Corrupt, or written by a newer binary for a harness this one does
+    /// not know, with why. It may name a live invocation.
+    Unreadable(String),
+}
+
+/// [`get_dispatch_state`], telling a drawer that cannot be read apart from
+/// a failure to read the database at all.
+pub(crate) fn read_dispatch_state(
+    db: &Database,
+    issue: &IssueRef,
+) -> Result<StateRead, MemoryError> {
+    let Some(drawer) = read_current(db, &dispatch_state_key(issue))? else {
+        return Ok(StateRead::Absent);
+    };
+    Ok(match state_from_content(&drawer.content) {
+        Ok(state) => StateRead::Readable(state),
+        Err(e) => StateRead::Unreadable(e.to_string()),
+    })
+}
+
 fn state_from_content(content: &str) -> Result<DispatchState, MemoryError> {
     let body: DispatchStateBody = serde_json::from_str(content)?;
     let state = DispatchState {
