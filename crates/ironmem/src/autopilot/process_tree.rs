@@ -5,7 +5,9 @@
 //! child conservatively holds until trusted supervisor completion. Process
 //! polling and authenticated tree cleanup cover ordinary harness tools,
 //! including setsid children; they do not contain deliberate double-fork
-//! escapes between polls. The operator's shared ironmem daemon on its
+//! escapes between polls. A short-lived tool's orphaned background child is
+//! caught at completion instead, while its working directory is still in the
+//! worktree (`ProcessTracker::verify_worktree_quiet`). The operator's shared ironmem daemon on its
 //! configured socket, running the controller's own executable, which a
 //! harness's MCP proxy may autospawn, is never owned; a tool disguised as it
 //! escapes tracking the same way.
@@ -737,7 +739,9 @@ const STOP_SIGNAL: i32 = 0;
 const KILL_SIGNAL: i32 = 0;
 
 /// Kernel birth identity prevents a recycled PID from authorizing a signal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Ordered by start time: macOS (seconds, microseconds); Linux (clock ticks
+/// since boot, 0).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct Birth(u64, u64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct KernelProcess {
@@ -750,37 +754,43 @@ fn birth(pid: u32) -> Result<Option<Birth>, String> {
     kernel_observation(pid).map(|process| process.map(|p| p.birth))
 }
 
+/// The kernel's BSD record for `pid`, or `None` once it has exited.
+#[cfg(target_os = "macos")]
+fn bsd_info(pid: u32) -> Result<Option<libc::proc_bsdinfo>, String> {
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    // SAFETY: the kernel writes at most the allocated proc_bsdinfo size.
+    let bytes = unsafe {
+        libc::proc_pidinfo(
+            pid as i32,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            std::mem::size_of::<libc::proc_bsdinfo>() as i32,
+        )
+    };
+    if bytes == 0 {
+        let error = std::io::Error::last_os_error();
+        if matches!(error.raw_os_error(), Some(libc::ESRCH | libc::ENOENT)) {
+            return Ok(None);
+        }
+        return Err(format!("cannot authenticate process {pid}: {error}"));
+    }
+    if bytes as usize != std::mem::size_of::<libc::proc_bsdinfo>() {
+        return Err("incomplete process birth identity".into());
+    }
+    // SAFETY: a full structure was written by proc_pidinfo.
+    let info = unsafe { info.assume_init() };
+    if info.pbi_pid != pid {
+        return Err("kernel process identity mismatch".into());
+    }
+    Ok(Some(info))
+}
+
 /// Ancestry and birth come from the same kernel record, never a stale ps row.
 fn kernel_observation(pid: u32) -> Result<Option<KernelProcess>, String> {
     #[cfg(target_os = "macos")]
     {
-        let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
-        // SAFETY: the kernel writes at most the allocated proc_bsdinfo size.
-        let bytes = unsafe {
-            libc::proc_pidinfo(
-                pid as i32,
-                libc::PROC_PIDTBSDINFO,
-                0,
-                info.as_mut_ptr().cast(),
-                std::mem::size_of::<libc::proc_bsdinfo>() as i32,
-            )
-        };
-        if bytes == 0 {
-            let error = std::io::Error::last_os_error();
-            if matches!(error.raw_os_error(), Some(libc::ESRCH | libc::ENOENT)) {
-                return Ok(None);
-            }
-            return Err(format!("cannot authenticate process {pid}: {error}"));
-        }
-        if bytes as usize != std::mem::size_of::<libc::proc_bsdinfo>() {
-            return Err("incomplete process birth identity".into());
-        }
-        // SAFETY: a full structure was written by proc_pidinfo.
-        let info = unsafe { info.assume_init() };
-        if info.pbi_pid != pid {
-            return Err("kernel process identity mismatch".into());
-        }
-        Ok(Some(KernelProcess {
+        Ok(bsd_info(pid)?.map(|info| KernelProcess {
             pid: info.pbi_pid,
             ppid: info.pbi_ppid,
             pgid: info.pbi_pgid,
@@ -888,6 +898,173 @@ fn kernel_executable(pid: u32) -> Option<PathBuf> {
     {
         let _ = pid;
         None
+    }
+}
+
+/// A process the current user owns, with its working directory, as the
+/// kernel reports them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CwdProcess {
+    pid: u32,
+    uid: u32,
+    birth: Birth,
+    cwd: PathBuf,
+}
+
+/// The effective user ID supervision runs as, which every harness process
+/// it spawns shares.
+fn current_uid() -> Option<u32> {
+    #[cfg(unix)]
+    {
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        Some(unsafe { libc::geteuid() })
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+/// Every process the current user owns, with its working directory. A
+/// process that exits mid-scan is skipped; any other failure to read one
+/// fails the whole scan, since the unread process could be the invocation's.
+/// macOS reads the kernel directly (`proc_listpids` by user, then
+/// `PROC_PIDVNODEPATHINFO`): about 1.5 ms for ~600 processes, measured.
+fn user_processes_with_cwd() -> Result<Vec<CwdProcess>, String> {
+    let uid = current_uid().ok_or("process working directories are unreadable here")?;
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        /// `PROC_UID_ONLY` from `<sys/proc_info.h>`, absent from libc.
+        const PROC_UID_ONLY: u32 = 4;
+        const MAX_PIDS: usize = 1 << 20;
+        let mut pids = vec![0i32; 4096];
+        loop {
+            let capacity = (pids.len() * std::mem::size_of::<i32>()) as i32;
+            // SAFETY: the kernel writes at most `capacity` bytes of PIDs.
+            let bytes = unsafe {
+                libc::proc_listpids(PROC_UID_ONLY, uid, pids.as_mut_ptr().cast(), capacity)
+            };
+            if bytes < 0 {
+                return Err(format!(
+                    "cannot list processes: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            let count = bytes as usize / std::mem::size_of::<i32>();
+            if count < pids.len() {
+                pids.truncate(count);
+                break;
+            }
+            if pids.len() >= MAX_PIDS {
+                return Err("process list exceeded its size bound".into());
+            }
+            pids.resize(pids.len() * 2, 0);
+        }
+        let mut processes = Vec::new();
+        for pid in pids.into_iter().filter(|pid| *pid > 0) {
+            let pid = pid as u32;
+            let Some(before) = bsd_info(pid)? else {
+                continue;
+            };
+            let mut info = std::mem::MaybeUninit::<libc::proc_vnodepathinfo>::zeroed();
+            let size = std::mem::size_of::<libc::proc_vnodepathinfo>() as i32;
+            // SAFETY: the kernel writes at most `size` bytes.
+            let bytes = unsafe {
+                libc::proc_pidinfo(
+                    pid as i32,
+                    libc::PROC_PIDVNODEPATHINFO,
+                    0,
+                    info.as_mut_ptr().cast(),
+                    size,
+                )
+            };
+            if bytes <= 0 {
+                let error = std::io::Error::last_os_error();
+                if matches!(error.raw_os_error(), Some(libc::ESRCH | libc::ENOENT)) {
+                    continue;
+                }
+                return Err(format!(
+                    "cannot read the working directory of process {pid}: {error}"
+                ));
+            }
+            if bytes != size {
+                return Err(format!("incomplete working directory for process {pid}"));
+            }
+            // SAFETY: a full structure was written by proc_pidinfo.
+            let info = unsafe { info.assume_init() };
+            // SAFETY: the kernel NUL-terminates the MAXPATHLEN path buffer.
+            let path = unsafe {
+                std::ffi::CStr::from_ptr(info.pvi_cdir.vip_path.as_ptr().cast::<libc::c_char>())
+            };
+            // The PID must still be the process whose record named the
+            // owner and birth, or the directory may be a successor's.
+            match bsd_info(pid)? {
+                None => continue,
+                Some(after)
+                    if (after.pbi_start_tvsec, after.pbi_start_tvusec)
+                        == (before.pbi_start_tvsec, before.pbi_start_tvusec) => {}
+                Some(_) => return Err(format!("process {pid} was replaced during the scan")),
+            }
+            processes.push(CwdProcess {
+                pid,
+                uid: before.pbi_uid,
+                birth: Birth(before.pbi_start_tvsec, before.pbi_start_tvusec),
+                cwd: Path::new(std::ffi::OsStr::from_bytes(path.to_bytes())).to_path_buf(),
+            });
+        }
+        Ok(processes)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let entries = std::fs::read_dir("/proc").map_err(|e| format!("cannot list /proc: {e}"))?;
+        let mut processes = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("cannot list /proc: {e}"))?;
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            let gone = |e: &std::io::Error| {
+                e.kind() == std::io::ErrorKind::NotFound || e.raw_os_error() == Some(libc::ESRCH)
+            };
+            let owner = match std::fs::metadata(format!("/proc/{pid}")) {
+                Ok(meta) => meta.uid(),
+                Err(e) if gone(&e) => continue,
+                Err(e) => return Err(format!("cannot read process {pid}: {e}")),
+            };
+            if owner != uid {
+                continue;
+            }
+            let cwd = match std::fs::read_link(format!("/proc/{pid}/cwd")) {
+                Ok(cwd) => cwd,
+                Err(e) if gone(&e) => continue,
+                Err(e) => {
+                    return Err(format!(
+                        "cannot read the working directory of process {pid}: {e}"
+                    ))
+                }
+            };
+            let Some(process) = kernel_observation(pid)? else {
+                continue;
+            };
+            processes.push(CwdProcess {
+                pid,
+                uid: owner,
+                birth: process.birth,
+                cwd,
+            });
+        }
+        Ok(processes)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = uid;
+        Err("process working directories are unreadable on this platform".into())
     }
 }
 
@@ -1247,6 +1424,135 @@ impl ProcessTracker {
             straggler.unwrap_or_default(),
             self.root_pid
         )))
+    }
+    /// The last completion check. A harness tool that leads its own session
+    /// (every Muse shell tool; Codex's are in the root's group) and exits
+    /// between two samples leaves a background child reparented to init.
+    /// Neither PPID enrollment nor [`Self::verify_group_drained`] reaches it,
+    /// but it still runs in the worktree. So completion is refused while any
+    /// process qualifies: its working directory is the worktree or inside
+    /// it, the current user owns it, the kernel started it at or after the
+    /// invocation's root (which excludes the operator's own older shell or
+    /// editor there), and it is neither the supervisor nor the shared daemon
+    /// or one of its children. It gets a second's grace to finish exiting.
+    ///
+    /// Limit: a child that `chdir`s out of the worktree before the root exits
+    /// still escapes; a deliberate escape is outside this guarantee. A
+    /// platform with no working-directory source, or a failed scan, refuses.
+    pub(crate) fn verify_worktree_quiet(&self, worktree: &Path) -> Result<(), MemoryError> {
+        self.verify_worktree_quiet_with(
+            worktree,
+            user_processes_with_cwd,
+            Self::rows,
+            std::time::Duration::from_secs(1),
+        )
+    }
+
+    fn verify_worktree_quiet_with(
+        &self,
+        worktree: &Path,
+        mut cwd_source: impl FnMut() -> Result<Vec<CwdProcess>, String>,
+        mut rows: impl FnMut() -> Result<Vec<ProcessRow>, MemoryError>,
+        grace: std::time::Duration,
+    ) -> Result<(), MemoryError> {
+        let unproven = |reason: String| {
+            MemoryError::Validation(format!("{reason}; invocation completion is unproven"))
+        };
+        let worktree = worktree.canonicalize().map_err(|e| {
+            unproven(format!(
+                "cannot resolve the invocation worktree {}: {e}",
+                worktree.display()
+            ))
+        })?;
+        let spawned = self
+            .known
+            .iter()
+            .find(|(r, _)| r.pid == self.root_pid)
+            .map(|(_, birth)| *birth)
+            .ok_or_else(|| {
+                unproven("the invocation root's kernel birth was never observed".into())
+            })?;
+        let uid = current_uid()
+            .ok_or_else(|| unproven("process ownership is unreadable on this platform".into()))?;
+        let supervisor = std::process::id();
+        let deadline = std::time::Instant::now() + grace;
+        loop {
+            let candidates: Vec<CwdProcess> = cwd_source()
+                .map_err(|e| {
+                    unproven(format!(
+                        "cannot list processes in the invocation worktree: {e}"
+                    ))
+                })?
+                .into_iter()
+                .filter(|p| {
+                    p.uid == uid
+                        && p.pid != supervisor
+                        && p.birth >= spawned
+                        && p.cwd.starts_with(&worktree)
+                })
+                .collect();
+            if candidates.is_empty() {
+                return Ok(());
+            }
+            // Only now is the process table needed: for the daemon test
+            // and to name what is still running.
+            let rows = rows()?;
+            let stragglers: Vec<String> = candidates
+                .iter()
+                .filter(|p| !self.in_shared_daemon_tree(p.pid, &rows))
+                .map(|p| {
+                    let command = rows
+                        .iter()
+                        .find(|r| r.pid == p.pid)
+                        .map_or("<command unavailable>", |r| r.args.as_str());
+                    format!(
+                        "process {} ({})",
+                        p.pid,
+                        crate::autopilot::scrub::scrub_and_bound(command, 120).text
+                    )
+                })
+                .collect();
+            if stragglers.is_empty() {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                const NAMED: usize = 5;
+                let more = stragglers.len().saturating_sub(NAMED);
+                let mut named = stragglers
+                    .into_iter()
+                    .take(NAMED)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                if more > 0 {
+                    named.push_str(&format!(" and {more} more"));
+                }
+                return Err(unproven(format!(
+                    "{named} started during the invocation and still runs in its worktree {} \
+                     after cleanup",
+                    worktree.display()
+                )));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// Whether `pid` is the shared daemon or, by its process-table ancestry,
+    /// one of the daemon's children, which the tracker never owns either.
+    fn in_shared_daemon_tree(&self, pid: u32, rows: &[ProcessRow]) -> bool {
+        let mut current = pid;
+        for _ in 0..64 {
+            let Some(row) = rows.iter().find(|r| r.pid == current && r.active()) else {
+                return false;
+            };
+            if self.is_shared_daemon(row) {
+                return true;
+            }
+            if row.ppid <= 1 || row.ppid == current {
+                return false;
+            }
+            current = row.ppid;
+        }
+        false
     }
     pub(crate) fn observed_root(&self) -> bool {
         self.observed_root
@@ -1922,6 +2228,103 @@ mod tests {
             .observe_rows(daemon_rows(DAEMON_DB), daemon_kernel)
             .unwrap();
         assert!(LOOKUPS.load(Ordering::SeqCst) <= 2, "{LOOKUPS:?}");
+    }
+
+    /// A tool shell that exits between samples leaves its background child
+    /// reparented to init, outside every tracked ancestry and the root's
+    /// group. Completion is refused while any process the current user
+    /// started after the invocation's root still has its working directory
+    /// in the worktree. The operator's older shell there, other users'
+    /// processes, the supervisor itself and the shared daemon (with its
+    /// children) are not the invocation's.
+    #[test]
+    fn only_a_new_same_user_process_in_the_worktree_withholds_completion() {
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let worktree = dir.path().canonicalize().unwrap();
+        let sibling = PathBuf::from(format!("{}-other", worktree.display()));
+        let mut tracker = daemon_tracker(installed_exe);
+        tracker
+            .observe_rows(vec![process_row(10, 1, 10)], |pid| {
+                Ok((pid == 10).then(|| kernel_process(10, 1, 10, 100)))
+            })
+            .unwrap();
+        // SAFETY: geteuid has no preconditions.
+        let uid = unsafe { libc::geteuid() };
+        let me = std::process::id();
+        let rows = vec![
+            args_row(40, 1, 40, "sleep 30"),
+            args_row(30, 1, 30, DAEMON_DB),
+            args_row(31, 30, 30, "/opt/homebrew/bin/node mcp-helper"),
+        ];
+        let process = |pid, uid, start, cwd: &Path| CwdProcess {
+            pid,
+            uid,
+            birth: Birth(start, 0),
+            cwd: cwd.to_path_buf(),
+        };
+        let check = |tracker: &ProcessTracker, found: CwdProcess| {
+            tracker.verify_worktree_quiet_with(
+                &worktree,
+                || Ok(vec![found.clone()]),
+                || Ok(rows.clone()),
+                Duration::ZERO,
+            )
+        };
+        for started in [100, 150] {
+            let err = check(&tracker, process(40, uid, started, &worktree.join("src")))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("process 40") && err.contains("sleep 30"),
+                "{err}"
+            );
+        }
+        for ignored in [
+            process(40, uid, 99, &worktree),
+            process(40, uid + 1, 150, &worktree),
+            process(me, uid, 150, &worktree),
+            process(30, uid, 150, &worktree),
+            process(31, uid, 150, &worktree),
+            process(40, uid, 150, Path::new("/elsewhere")),
+            process(40, uid, 150, &sibling),
+        ] {
+            assert!(check(&tracker, ignored.clone()).is_ok(), "{ignored:?}");
+        }
+        // The same daemon argv on another executable is no exemption.
+        tracker.kernel_exe = |_| Some("/w/target/debug/ironmem".into());
+        assert!(check(&tracker, process(30, uid, 150, &worktree)).is_err());
+        // An enumeration that fails proves nothing.
+        let err = tracker
+            .verify_worktree_quiet_with(
+                &worktree,
+                || Err("lookup refused".into()),
+                || Ok(rows.clone()),
+                Duration::ZERO,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("lookup refused"), "{err}");
+    }
+
+    /// The real enumeration finds this test process in its own working
+    /// directory, cheaply enough to run at every completion.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn the_kernel_lists_this_process_with_its_working_directory() {
+        let started = std::time::Instant::now();
+        let processes = user_processes_with_cwd().unwrap();
+        let elapsed = started.elapsed();
+        let me = processes
+            .iter()
+            .find(|p| p.pid == std::process::id())
+            .expect("this process is listed");
+        assert_eq!(
+            me.cwd,
+            std::env::current_dir().unwrap().canonicalize().unwrap()
+        );
+        assert_eq!(Some(me.birth), birth(me.pid).unwrap());
+        eprintln!("{} processes with cwd in {elapsed:?}", processes.len());
     }
 
     /// Release is for the enrolled process itself after its exec. A tracked

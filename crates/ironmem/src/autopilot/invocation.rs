@@ -27,9 +27,13 @@ const POLL_INTERVAL: Duration = Duration::from_millis(25);
 /// tens of milliseconds of CPU on a busy machine, so scanning on every exit
 /// poll kept a core busy for a whole dispatch. Exit and artifact limits stay
 /// on [`POLL_INTERVAL`]; descendants enrol at this pace, and cleanup rescans
-/// the frozen tree until it is stable. A tool the root starts after the last
-/// scan and leaves running at exit is reparented before any scan can enrol
-/// it, so completion also requires the root's process group to drain.
+/// the frozen tree until it is stable. A process that lives less than one
+/// interval is never enrolled, and anything it leaves running is reparented
+/// to init, out of every tracked ancestry. Completion therefore also
+/// requires the root's process group to drain (Codex's tools stay in it) and
+/// the worktree to hold no process started during the invocation (Muse's
+/// tools each lead their own session, so the group check never sees them);
+/// see `ProcessTracker::verify_worktree_quiet` for what that cannot catch.
 const OBSERVE_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -559,7 +563,19 @@ fn run_supervised_bounded_with(
     let status = loop {
         // The first pass scans immediately after spawn.
         if last_observed.is_none_or(|at| at.elapsed() >= OBSERVE_INTERVAL) {
-            if let Err(e) = tracker.observe() {
+            // Record each newly enrolled descendant at once: a successor of a
+            // crashed controller, and `clear-dispatch`, see only what the
+            // identity file holds, and Muse's tools all leave the root's
+            // group. A failed write is handled like the post-spawn one.
+            let observed = tracker.observe().and_then(|_| {
+                let descendants = tracker.descendants();
+                if descendants == identity.descendants {
+                    return Ok(());
+                }
+                identity.descendants = descendants;
+                super::process_tree::persist_identity(a, &identity)
+            });
+            if let Err(e) = observed {
                 let cleanup = tracker.cleanup(false);
                 let _ = child.kill();
                 let _ = child.wait();
@@ -597,6 +613,7 @@ fn run_supervised_bounded_with(
     finish_supervised(
         cli,
         &mut tracker,
+        repo,
         a,
         spec,
         status,
@@ -656,6 +673,7 @@ fn with_cleanup(err: MemoryError, cleanup: Result<(), MemoryError>) -> MemoryErr
 fn finish_supervised(
     cli: &dyn SupervisedCli,
     tracker: &mut super::process_tree::ProcessTracker,
+    repo: &Path,
     a: &InvocationArtifacts,
     spec: &DispatchSpec,
     status: std::process::ExitStatus,
@@ -677,6 +695,7 @@ fn finish_supervised(
     // Unknown cleanup returns Err so run.rs retains the invocation and slot.
     tracker.cleanup(true)?;
     tracker.verify_group_drained()?;
+    tracker.verify_worktree_quiet(repo)?;
     let record = exit_record(
         a,
         cli.expected_native_id(spec),
@@ -1278,6 +1297,7 @@ exit {code}"#
             finish_supervised(
                 &CodexCli,
                 &mut tracker,
+                repo,
                 spec.invocation_artifacts.as_ref().unwrap(),
                 spec,
                 status,
@@ -1351,6 +1371,7 @@ exit {code}"#
         let error = finish_supervised(
             &CodexCli,
             &mut tracker,
+            dir.path(),
             a,
             &spec,
             status,
@@ -1552,8 +1573,17 @@ exit {code}"#
             assert!(started.elapsed() < Duration::from_secs(3), "root hung");
             std::thread::sleep(Duration::from_millis(5));
         };
-        let result =
-            finish_supervised(&CodexCli, &mut tracker, a, &s, status, started, false, None);
+        let result = finish_supervised(
+            &CodexCli,
+            &mut tracker,
+            dir.path(),
+            a,
+            &s,
+            status,
+            started,
+            false,
+            None,
+        );
         if let Some(pid) = std::fs::read_to_string(dir.path().join("straggler.pid"))
             .ok()
             .and_then(|pid| pid.trim().parse::<i32>().ok())
@@ -1565,6 +1595,66 @@ exit {code}"#
         assert!(err.contains("process group"), "{err}");
         assert!(!has_valid_exit_record(a));
     }
+    /// Muse runs each tool as its own session leader. One that backgrounds a
+    /// child and exits between two samples leaves that child reparented to
+    /// init, in a group that is not the root's, so neither ancestry nor the
+    /// group drain reaches it. It still runs in the worktree, so completion
+    /// is refused. The only scan happens before the root starts the tool,
+    /// which makes the escape deterministic.
+    #[cfg(unix)]
+    #[test]
+    fn a_background_child_of_an_exited_session_leader_tool_withholds_completion() {
+        let (dir, s) = setup();
+        let a = s.invocation_artifacts.as_ref().unwrap();
+        let bin = binary(
+            dir.path(),
+            &script(
+                r#"while [ ! -f root-release ]; do sleep 0.01; done
+/usr/bin/python3 -c 'import os; os.setsid(); os.execv("/bin/sh", ["sh", "-c", "(sleep 30 & echo $! > escaped.pid) ; exit 0"])'
+while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
+                0,
+            ),
+        );
+        let started = Instant::now();
+        let mut child = spawn_fixture_invocation(&bin, dir.path(), &s);
+        let mut tracker = super::super::process_tree::ProcessTracker::new(child.id(), None);
+        tracker.observe().unwrap();
+        std::fs::write(dir.path().join("root-release"), "release").unwrap();
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            assert!(started.elapsed() < Duration::from_secs(5), "root hung");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        let result = finish_supervised(
+            &CodexCli,
+            &mut tracker,
+            dir.path(),
+            a,
+            &s,
+            status,
+            started,
+            false,
+            None,
+        );
+        let escaped = std::fs::read_to_string(dir.path().join("escaped.pid"))
+            .ok()
+            .and_then(|pid| pid.trim().parse::<i32>().ok());
+        if let Some(pid) = escaped {
+            // SAFETY: the fixture's own escaped sleep, still alive.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+        assert!(status.success());
+        let err = result.unwrap_err().to_string();
+        let pid = escaped.expect("the tool recorded its background child");
+        assert!(
+            err.contains(&format!("process {pid}")) && err.contains("worktree"),
+            "{err}"
+        );
+        assert!(!has_valid_exit_record(a));
+    }
+
     #[cfg(unix)]
     #[test]
     fn post_exit_artifact_overflow_kills_the_surviving_gate_process() {
@@ -1619,6 +1709,7 @@ exit {code}"#
         let outcome = finish_supervised(
             &CodexCli,
             &mut tracker,
+            dir.path(),
             a,
             &s,
             status,
@@ -1944,6 +2035,63 @@ exit {code}"#
                 assert!(!exists(pid), "a daemon on another socket escaped cleanup");
             }
         }
+    }
+
+    /// A crashed controller's successor and `clear-dispatch` see only what
+    /// the identity file records. A tool the tracker enrols is recorded
+    /// there while the root still runs, not only once it exits.
+    #[cfg(unix)]
+    #[test]
+    fn an_enrolled_descendant_is_recorded_before_the_root_exits() {
+        let (dir, s) = setup();
+        let a = s.invocation_artifacts.clone().unwrap();
+        let cli = FakeCli {
+            verdict: true,
+            native_id: true,
+            prepare_fails: false,
+        };
+        let bin = binary(
+            dir.path(),
+            &observable(
+                "sleep 30 &\n\
+                 echo $! > tool.pid\n\
+                 while [ ! -f root-release ]; do sleep 0.01; done\n\
+                 kill \"$(cat tool.pid)\"\n\
+                 echo journal",
+            ),
+        );
+        std::thread::scope(|scope| {
+            let run = scope.spawn(|| {
+                run_supervised_bounded_with(
+                    &cli,
+                    &bin,
+                    dir.path(),
+                    &s,
+                    Duration::from_secs(10),
+                    None,
+                )
+            });
+            let started = Instant::now();
+            let mut recorded = false;
+            while !recorded && !run.is_finished() && started.elapsed() < Duration::from_secs(5) {
+                let tool = std::fs::read_to_string(dir.path().join("tool.pid"))
+                    .ok()
+                    .and_then(|pid| pid.trim().parse::<u32>().ok());
+                recorded = tool.is_some_and(|tool| {
+                    crate::autopilot::process_tree::read_identity(&a)
+                        .is_ok_and(|identity| identity.descendants.iter().any(|d| d.pid == tool))
+                });
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            // Released either way, so a red run never leaves the root waiting.
+            std::fs::write(dir.path().join("root-release"), "release").unwrap();
+            let outcome = run.join().unwrap().unwrap();
+            assert!(
+                recorded,
+                "the enrolled tool was not recorded while the root ran"
+            );
+            assert!(outcome.is_met(), "{outcome:?}");
+        });
     }
 
     #[test]

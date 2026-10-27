@@ -197,7 +197,10 @@ is never rendered as free.
 - Liveness uses the `ps` marker `--output-schema <.../schema.json>` on the
   `muse-bin-<version>` root (the launcher `exec`s it under the same PID), plus
   the shared process tracker. Each Muse shell tool is its own session leader,
-  which the tracker follows by parent PID.
+  which the tracker follows by parent PID. Because those tools leave the
+  root's process group, the group check below never sees them; the worktree
+  check below is what catches a background child a short-lived tool leaves
+  running.
 - Muse's own lock refuses a second `exec` on a running session, and after a
   SIGKILL the lock is released (measured).
 - `clear-dispatch` on a Muse hold deletes the dispatch state, so the next
@@ -251,8 +254,10 @@ no child existed, so the supervisor records that, and the invocation is an
 ordinary infrastructure failure rather than a hold. What stays held is
 completion that really is unproven: a controller killed by Ctrl-C while
 Codex kept running in its own process group, a root that exited before the
-first `ps` sample, an observation error mid-run, or a tool still running in
-Codex's process group after Codex exited that no sample caught. Stop any Lead or `run`
+first `ps` sample, an observation error mid-run, a tool still running in
+Codex's process group after Codex exited that no sample caught, or a process
+started during the invocation still running in the worktree after cleanup
+(see the worktree check below). Stop any Lead or `run`
 working the repo, confirm nothing is still working on the issue, then release
 it with:
 
@@ -268,10 +273,12 @@ Autopilot cannot parse its options *and* it names a `schema.json` file, which
 is the only shape an Autopilot marker takes; your own `codex exec` runs with
 other schema files never hold a dispatch. Once the supervisor has written its
 completion record, a recorded PID no longer counts: cleanup already proved
-that process gone, so the PID has been reused. Descendants are recorded only once the root exits,
-so after a controller crash the check sees the root, its process group, and
-markers, but not a tool that left the group with `setsid`; that part of the
-confirmation is yours. It also refuses a finished invocation that is only
+that process gone, so the PID has been reused. Descendants are recorded as
+the tracker enrols them, every `ps` sample (250 ms), so after a controller
+crash the check also sees the tools that left the group with `setsid`,
+including Muse's. It cannot see a tool started after the last sample before
+the crash, or one that tool left running; that part of the confirmation is
+yours. It also refuses a finished invocation that is only
 waiting to be recorded (a Lead resuming the issue records it, as does
 `autopilot run <repo> <issue> --implementer codex --model <model> --title
 <title>`), unless lineage already holds that attempt, and it deletes nothing if
@@ -293,7 +300,26 @@ native child is not treated as proof that the recorded root is the invocation.
 The process tracker authenticates and cleans ordinary tool descendants,
 including observed `setsid` children, but it is practical supervision rather
 than hostile fork containment; a deliberate double-fork escape between polls
-is outside its guarantee. The macOS runtime path is exercised. Linux-specific
+is outside its guarantee.
+
+A tool that lives less than one sample and leaves a background child running
+(`cmd &` in a short-lived shell) is the ordinary case of that escape: the
+child is reparented to init before any sample can enrol it. Codex's tools
+stay in its process group, so the group check catches it. Muse's do not, so
+before writing the completion record the supervisor also refuses while any
+process qualifies: its working directory is the worktree or inside it, you
+own it, the kernel started it at or after the invocation's root, and it is
+neither the supervisor nor the shared daemon (or one of its children). The
+error names each one's PID and command, and the invocation holds its slot
+like any other unproven completion. Your own shell or editor in the
+worktree started earlier, so it never counts; one you open there during the
+run does, and holds that run until you leave. macOS reads working
+directories from the kernel (about 1.5 ms per completion for ~600
+processes) and Linux from `/proc/<pid>/cwd`; on any other platform, or if
+the scan fails, completion is refused. A child that `chdir`s out of the
+worktree still escapes, and a deliberate escape is outside the guarantee.
+
+The macOS runtime path is exercised. Linux-specific
 kernel identity and cleanup code is covered by code/tests but has not been
 run end to end on a Linux host.
 
