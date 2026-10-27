@@ -164,6 +164,14 @@ no budget flag. So with either harness:
   last unit, and concurrent ledger writers never lose each other's updates.
   An ambiguous crash in the narrow reservation-before-spawn window can
   conservatively consume a slot even when no child can later be proved.
+- A run writes the issue's dispatch state only while it still holds what
+  that run last wrote (or read at its start): every write is a
+  compare-and-set. If two runs admit the same issue (a Codex Lead and a Muse
+  Lead on one repo, or a Lead and a manual `autopilot run`), the first to
+  publish its invocation wins. The other launches nothing, writes nothing,
+  leaves the winner's state as it is, and fails with "another run took over
+  <issue>". It looks before reserving its unpriced unit, so it rarely spends
+  one; only a takeover between that look and the claim does.
 - The ledger records no Codex or Muse dollars, so `--daily-budget-usd` does
   not bound them by dollars. It can still stop one: if the day's other priced
   spend (priced reviews, `--advisor` calls, Claude IC runs) plus the $2.50

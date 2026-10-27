@@ -122,6 +122,58 @@ fn dispatch_state_key(issue: &IssueRef) -> String {
 /// dispatch time and at every state transition, per the spec.
 pub fn upsert_dispatch_state(db: &Database, state: &DispatchState) -> Result<String, MemoryError> {
     validate_repo(&state.issue.repo)?;
+    write_current(db, &dispatch_state_key(&state.issue), &content_of(state)?)
+}
+
+/// [`upsert_dispatch_state`], but only while the drawer still holds
+/// `expected` (`None`: no drawer at all), compared as read back. Read and
+/// write share one `BEGIN IMMEDIATE` transaction, so of two runs that both
+/// judged the same state, only the first to write it wins. Returns `false`,
+/// writing nothing, when the drawer changed.
+pub fn upsert_dispatch_state_if_unchanged(
+    db: &Database,
+    expected: Option<&DispatchState>,
+    state: &DispatchState,
+) -> Result<bool, MemoryError> {
+    use rusqlite::OptionalExtension;
+    validate_repo(&state.issue.repo)?;
+    let key = dispatch_state_key(&state.issue);
+    let id = super::logical_drawer_id(&key);
+    let expected = expected
+        .map(|expected| content_of(expected).and_then(|c| state_from_content(&c)))
+        .transpose()?;
+    let content = content_of(state)?;
+    db.with_immediate_transaction(|tx| {
+        let current: Option<String> = tx
+            .query_row("SELECT content FROM drawers WHERE id = ?1", [&id], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        let current = current.map(|c| state_from_content(&c)).transpose()?;
+        if current != expected {
+            return Ok(false);
+        }
+        super::write_current_tx(tx, &key, &content)?;
+        Ok(true)
+    })
+}
+
+/// Whether the drawer holds `expected` (`None`: no drawer), compared as read
+/// back. A cheap look before work that [`upsert_dispatch_state_if_unchanged`]
+/// later claims for good.
+pub fn dispatch_state_is(
+    db: &Database,
+    issue: &IssueRef,
+    expected: Option<&DispatchState>,
+) -> Result<bool, MemoryError> {
+    let expected = expected
+        .map(|expected| content_of(expected).and_then(|c| state_from_content(&c)))
+        .transpose()?;
+    Ok(get_dispatch_state(db, issue)? == expected)
+}
+
+/// The persisted body of `state`.
+fn content_of(state: &DispatchState) -> Result<String, MemoryError> {
     let body = DispatchStateBody {
         implementer: state.implementer,
         native_session_id: state.native_session_id.clone(),
@@ -141,8 +193,7 @@ pub fn upsert_dispatch_state(db: &Database, state: &DispatchState) -> Result<Str
         resume_refusals: state.resume_refusals,
         signing_held: state.signing_held,
     };
-    let content = serde_json::to_string(&body)?;
-    write_current(db, &dispatch_state_key(&state.issue), &content)
+    Ok(serde_json::to_string(&body)?)
 }
 
 /// Read the dispatch-state drawer for an issue, if one is currently in
@@ -322,6 +373,26 @@ mod tests {
         assert!(get_dispatch_state(&db, &issue).unwrap().is_none());
         assert!(!clear_dispatch_state_if_unchanged(&db, &rewritten).unwrap());
     }
+    #[test]
+    fn a_conditional_write_never_overwrites_a_state_another_run_wrote() {
+        let db = Database::open_in_memory().unwrap();
+        let issue = IssueRef::new("ironrace/ironmem", 283);
+        let ours = sample(&issue, 1);
+        let theirs = sample(&issue, 2);
+        let turn = |db: &Database| get_dispatch_state(db, &issue).unwrap().map(|s| s.turn_n);
+        // Both judged "no drawer"; the first to write wins.
+        assert!(upsert_dispatch_state_if_unchanged(&db, None, &theirs).unwrap());
+        assert!(!upsert_dispatch_state_if_unchanged(&db, None, &ours).unwrap());
+        assert_eq!(turn(&db), Some(2));
+        // Judged against what is there, the write goes through, compared as
+        // read back (a Claude record's absent native id reads as its uuid).
+        assert!(theirs.native_session_id.is_none());
+        assert!(upsert_dispatch_state_if_unchanged(&db, Some(&theirs), &ours).unwrap());
+        assert_eq!(turn(&db), Some(1));
+        assert!(!upsert_dispatch_state_if_unchanged(&db, Some(&theirs), &theirs).unwrap());
+        assert_eq!(turn(&db), Some(1));
+    }
+
     #[test]
     fn codex_wire_roundtrip_keeps_native_identity_and_absolute_artifacts() {
         let db = Database::open_in_memory().unwrap();

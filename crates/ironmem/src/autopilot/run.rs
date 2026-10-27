@@ -2220,46 +2220,64 @@ pub fn run_issue(
     // is no longer fixed for the life of a run: a dispatch that concludes its
     // goal loop rotates it (see the rotation below), and the drawer must
     // record the uuid the *next* dispatch will use, not the spent one.
-    let write_state = |db: &Database,
+    //
+    // Every write lands only while the drawer still holds `owned`, the state
+    // this run last wrote (at first, the one it read): a compare-and-set, not
+    // a blind upsert. Otherwise another run took the issue over, and the
+    // write fails with `taken_over`. Launching then would put two
+    // implementers in one worktree with one named by no state, and any write
+    // at all would overwrite the state that names the other run's
+    // invocation, releasing its slot while it may still run.
+    let taken_over = || {
+        MemoryError::Validation(format!(
+            "another run took over {} after this one started (its dispatch state changed), so \
+             this run launches and writes nothing more; the other run's state is left as it is",
+            issue.canonical()
+        ))
+    };
+    let write_state = |owned: &mut Option<DispatchState>,
                        attempt_n: u32,
                        turn_n: u32,
                        state: &str,
                        session_uuid: &str,
                        session_claimed: bool,
                        identity: (&Option<String>, &Option<InvocationArtifacts>),
-                       session: (&Option<String>, u32)| {
-        dispatch_state::upsert_dispatch_state(
-            db,
-            &DispatchState {
-                implementer: config.implementer,
-                native_session_id: if config.implementer.assigns_own_session_id() {
-                    identity.0.clone()
-                } else {
-                    Some(session_uuid.to_string())
-                },
-                invocation_artifacts: identity.1.clone(),
-                issue: issue.clone(),
-                worktree_path: worktree_path.clone(),
-                ic_session_name: ic_session_name.clone(),
-                dispatch_class: config.dispatch_class.clone(),
-                attempt_n,
-                state: state.to_string(),
-                started_at: started_at.clone(),
-                session_uuid: session_uuid.to_string(),
-                turn_n,
-                session_claimed,
-                session_model: session.0.clone(),
-                resume_refusals: session.1,
-                signing_held: seen.held(),
+                       session: (&Option<String>, u32)|
+     -> Result<(), MemoryError> {
+        let next = DispatchState {
+            implementer: config.implementer,
+            native_session_id: if config.implementer.assigns_own_session_id() {
+                identity.0.clone()
+            } else {
+                Some(session_uuid.to_string())
             },
-        )
-        .map(|_| ())
+            invocation_artifacts: identity.1.clone(),
+            issue: issue.clone(),
+            worktree_path: worktree_path.clone(),
+            ic_session_name: ic_session_name.clone(),
+            dispatch_class: config.dispatch_class.clone(),
+            attempt_n,
+            state: state.to_string(),
+            started_at: started_at.clone(),
+            session_uuid: session_uuid.to_string(),
+            turn_n,
+            session_claimed,
+            session_model: session.0.clone(),
+            resume_refusals: session.1,
+            signing_held: seen.held(),
+        };
+        if !dispatch_state::upsert_dispatch_state_if_unchanged(db, owned.as_ref(), &next)? {
+            return Err(taken_over());
+        }
+        *owned = Some(next);
+        Ok(())
     };
+    let mut owned = existing_state.clone();
 
     // A recovering harness publishes each invocation just before it launches.
     if !config.implementer.recovers_invocations() {
         write_state(
-            db,
+            &mut owned,
             cumulative_attempt_n,
             turn_n,
             "dispatching",
@@ -2384,7 +2402,7 @@ pub fn run_issue(
                     // refusal that never clears would hold both for ever under a
                     // state that never happened.
                     write_state(
-                        db,
+                        &mut owned,
                         cumulative_attempt_n,
                         turn_n,
                         "paused-condition-too-long",
@@ -2473,6 +2491,12 @@ pub fn run_issue(
                 // prove no process launched and must leave prior state intact.
                 super::invocation::validate_argv(&worktree.path, &spec)?;
                 if let Some(artifacts) = &spec.invocation_artifacts {
+                    // Another run that took the issue over since this one
+                    // last wrote it is seen before a unit is reserved.
+                    if !dispatch_state::dispatch_state_is(db, issue, owned.as_ref())? {
+                        super::invocation::discard_unlaunched(artifacts);
+                        return Err(taken_over());
+                    }
                     // The authority on the day's cap: check and reserve in
                     // one transaction, before this invocation is published,
                     // so two Leads cannot both take the last unit. At the cap
@@ -2496,8 +2520,12 @@ pub fn run_issue(
                         break TerminalReason::UnpricedDispatchesExhausted { unpriced_today };
                     }
                     invocation_artifacts = Some(artifacts.clone());
-                    write_state(
-                        db,
+                    // Claimed only while this run still owns the issue; see
+                    // `write_state`. Nothing has launched yet, so a lost claim
+                    // leaves nothing behind but the reserved unit (the
+                    // look before reserving makes that rare).
+                    if let Err(e) = write_state(
+                        &mut owned,
                         cumulative_attempt_n,
                         turn_n,
                         "dispatching",
@@ -2505,7 +2533,10 @@ pub fn run_issue(
                         resuming,
                         (&native_session_id, &invocation_artifacts),
                         (&session_model, resume_refusals),
-                    )?;
+                    ) {
+                        super::invocation::discard_unlaunched(artifacts);
+                        return Err(e);
+                    }
                     unpriced_dispatches += 1;
                 }
             }
@@ -2555,7 +2586,7 @@ pub fn run_issue(
                     reason: Some(err.to_string()),
                 });
                 write_state(
-                    db,
+                    &mut owned,
                     cumulative_attempt_n,
                     turn_n,
                     "infrastructure-failure",
@@ -2904,7 +2935,7 @@ pub fn run_issue(
                 )?;
                 status = lineage::get_issue_status(db, issue)?;
                 write_state(
-                    db,
+                    &mut owned,
                     cumulative_attempt_n,
                     turn_n,
                     "dispatching",
@@ -2923,7 +2954,7 @@ pub fn run_issue(
                 if let Some(fault) = guard_stop.take() {
                     if !config.implementer.recovers_invocations() {
                         write_state(
-                            db,
+                            &mut owned,
                             cumulative_attempt_n,
                             turn_n,
                             "infrastructure-failure",
@@ -2944,7 +2975,7 @@ pub fn run_issue(
                     break TerminalReason::SessionInUse { detail };
                 }
                 write_state(
-                    db,
+                    &mut owned,
                     cumulative_attempt_n,
                     turn_n,
                     "infrastructure-failure",
@@ -2965,7 +2996,10 @@ pub fn run_issue(
     };
 
     if terminal.clears_dispatch_state() {
-        dispatch_state::clear_dispatch_state(db, issue)?;
+        // Only the state this run owns; one another run wrote is theirs.
+        if let Some(owned) = &owned {
+            dispatch_state::clear_dispatch_state_if_unchanged(db, owned)?;
+        }
     } else if !matches!(terminal, TerminalReason::ImplementationInFlight { .. }) {
         let state_label = match &terminal {
             TerminalReason::DailyBudgetExhausted { .. } => "paused-daily-budget",
@@ -2973,7 +3007,7 @@ pub fn run_issue(
             _ => "paused-infrastructure-failure",
         };
         write_state(
-            db,
+            &mut owned,
             cumulative_attempt_n,
             turn_n,
             state_label,
@@ -6281,6 +6315,113 @@ sleep 0.5
             .unwrap()
             .unwrap();
         assert!(state.signing_held, "{state:?}");
+    }
+
+    /// A dispatcher whose recovery step lets another run take the issue over:
+    /// it writes `theirs` as the dispatch state, as a concurrent Lead would.
+    struct TakenOver<'a> {
+        db: &'a Database,
+        theirs: DispatchState,
+        dispatched: bool,
+    }
+    impl Dispatcher for TakenOver<'_> {
+        fn implementer(&self) -> Implementer {
+            Implementer::Muse
+        }
+        fn recover(
+            &mut self,
+            _repo: &Path,
+            _state: &DispatchState,
+        ) -> Result<InvocationRecovery, MemoryError> {
+            dispatch_state::upsert_dispatch_state(self.db, &self.theirs).unwrap();
+            Ok(InvocationRecovery::NoPriorInvocation)
+        }
+        fn dispatch(
+            &mut self,
+            _repo: &Path,
+            _spec: &DispatchSpec,
+        ) -> Result<DispatchOutcome, MemoryError> {
+            self.dispatched = true;
+            Ok(met())
+        }
+    }
+
+    #[test]
+    fn a_run_whose_issue_another_run_took_over_launches_nothing_and_keeps_theirs() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        let mut ours = pending_muse(&db, &wt, None);
+        ours.invocation_artifacts = None;
+        ours.session_uuid = "11111111-2222-3333-4444-555555555555".into();
+        ours.state = "paused-infrastructure-failure".into();
+        dispatch_state::upsert_dispatch_state(&db, &ours).unwrap();
+        let before = files_under(&wt.path.join(".git/ironmem"));
+        let mut theirs = ours.clone();
+        theirs.session_uuid = "22222222-3333-4444-5555-666666666666".into();
+        theirs.state = "dispatching".into();
+        let mut d = TakenOver {
+            db: &db,
+            theirs: theirs.clone(),
+            dispatched: false,
+        };
+        let err = run_issue(&db, &issue(), &brief(), &wt, &muse_config(), &mut d)
+            .unwrap_err()
+            .to_string();
+        assert!(!d.dispatched, "{err}");
+        assert!(err.contains("another run"), "{err}");
+        let stored = dispatch_state::get_dispatch_state(&db, &issue())
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.session_uuid, theirs.session_uuid);
+        assert_eq!(stored.state, "dispatching");
+        // Nothing reserved for an invocation that never launched.
+        let ledger = budget::get_daily_spend(&db, &today_utc()).unwrap();
+        assert_eq!(ledger.map_or(0, |l| l.unpriced_dispatch_count), 0);
+        // And no invocation directory left behind.
+        assert_eq!(files_under(&wt.path.join(".git/ironmem")), before);
+    }
+
+    #[test]
+    fn a_run_that_stops_before_launching_never_overwrites_the_state_another_run_took() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        let mut ours = pending_muse(&db, &wt, None);
+        ours.invocation_artifacts = None;
+        ours.state = "paused-daily-budget".into();
+        dispatch_state::upsert_dispatch_state(&db, &ours).unwrap();
+        let mut theirs = ours.clone();
+        theirs.state = "dispatching".into();
+        theirs.session_uuid = "22222222-3333-4444-5555-666666666666".into();
+        // The day is spent, so this run pauses without launching.
+        budget::accumulate_daily_spend(&db, &today_utc(), 24.0).unwrap();
+        let mut d = TakenOver {
+            db: &db,
+            theirs: theirs.clone(),
+            dispatched: false,
+        };
+        let err = run_issue(&db, &issue(), &brief(), &wt, &muse_config(), &mut d)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("another run"), "{err}");
+        let stored = dispatch_state::get_dispatch_state(&db, &issue())
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.session_uuid, theirs.session_uuid);
+        assert_eq!(stored.state, "dispatching");
+    }
+
+    /// Every file path under `dir`, recursively.
+    fn files_under(dir: &Path) -> std::collections::BTreeSet<std::path::PathBuf> {
+        let mut found = std::collections::BTreeSet::new();
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                found.extend(files_under(&path));
+            } else {
+                found.insert(path);
+            }
+        }
+        found
     }
 
     /// The crash window [`a_recovered_met_is_checked_against_the_branch_base`]

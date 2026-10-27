@@ -59,6 +59,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and Muse check `--max-unpriced-dispatches-per-day` in the same transaction
   that reserves the invocation, so two Leads racing for the last unit launch
   one invocation, not two.
+- **Two runs that admit the same issue no longer both launch an
+  implementer.** Every dispatch-state write is now a compare-and-set against
+  what the run last wrote, so of a Codex Lead and a Muse Lead (or a Lead and
+  a manual `autopilot run`) racing for one fresh issue, the second launches
+  nothing and leaves the first's state alone. Before, it overwrote that
+  state, and the first invocation, named by no state, lost its slot while
+  still running.
 - **Codex and Muse implementers no longer kill the shared ironmem daemon at
   cleanup.** A harness's ironmem MCP server can autospawn the daemon as its
   own child; the process tracker now never treats the daemon on the
