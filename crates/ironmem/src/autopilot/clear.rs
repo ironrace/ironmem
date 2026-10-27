@@ -218,7 +218,18 @@ fn unreadable_refusal(
             Err(why) => return Some(why),
         }
     }
-    let ic = super::dispatch::ic_name(issue);
+    // A session the drawer names may still be held by a process the tracker
+    // never owned, as the readable clear checks a parked session.
+    if let Some(session) = field("session_uuid").and_then(|v| v.as_str().map(str::to_owned)) {
+        if let Some(reason) = session_holder(snapshots, &session) {
+            return Some(reason);
+        }
+    }
+    // The drawer's own IC name first: it is the one its Claude IC ran under.
+    let ic = field("ic_session_name")
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| super::dispatch::ic_name(issue));
     if snapshots.claude.liveness(&ic) == Liveness::Alive {
         return Some(format!("Claude's registry lists its IC session {ic}"));
     }
@@ -833,7 +844,10 @@ mod tests {
                 snapshots(vec![row(
                     94,
                     94,
-                    "bash /r/my disk/.git/ironmem/autopilot/owner-repo-42/                     11111111-2222-3333-4444-555555555555/schema.json",
+                    &format!(
+                        "bash {}/My Repo/.git/ironmem/autopilot/owner-repo-42/{}/schema.json",
+                        "/Users/someone", "11111111-2222-3333-4444-555555555555"
+                    ),
                 )]),
                 "process 94",
             ),
@@ -985,5 +999,59 @@ mod tests {
             .to_string();
         assert!(err.contains("1234"), "{err}");
         assert!(raw_drawer(&db).is_some());
+    }
+
+    /// What an unreadable drawer says about its session is used too: a
+    /// process still holding its `session_uuid` (as the readable clear checks
+    /// a `paused-session-in-use` state), and its own `ic_session_name` before
+    /// the name a Claude dispatch for the issue would take.
+    #[test]
+    fn an_unreadable_dispatch_state_is_kept_while_its_named_session_is_held() {
+        let db = Database::open_in_memory().unwrap();
+        let session = "0d6c1e2a-5b8f-4c1d-9e3a-7f2b6a1c4d5e";
+        write_raw(
+            &db,
+            &serde_json::json!({
+                "implementer": "some-future-harness",
+                "session_uuid": session,
+                "ic_session_name": "ic-renamed-42",
+            })
+            .to_string(),
+        );
+        let held = |snaps: HarnessSnapshots, why: &str| {
+            let err = clear_dispatch(&db, &issue(), || snaps)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(why), "{err}");
+            assert!(raw_drawer(&db).is_some());
+        };
+        held(
+            snapshots(vec![row(
+                95,
+                95,
+                &format!("muse exec --session-id {session} --json"),
+            )]),
+            "process 95",
+        );
+        held(
+            HarnessSnapshots {
+                claude: RegistrySnapshot::Available(vec![AgentEntry {
+                    name: "ic-renamed-42".into(),
+                    status: None,
+                }]),
+                processes: ProcessSnapshot::Available(Vec::new()),
+            },
+            "ic-renamed-42",
+        );
+        held(
+            snapshots(vec![row(
+                96,
+                96,
+                "claude -p x --name ic-renamed-42 --model m",
+            )]),
+            "process 96",
+        );
+        let cleared = clear_dispatch(&db, &issue(), || snapshots(Vec::new()));
+        assert!(matches!(cleared, Ok(Cleared::Unreadable(_))), "{cleared:?}");
     }
 }
