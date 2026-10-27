@@ -644,6 +644,7 @@ fn run_supervised_bounded_with(
         version: 1,
         root_pid: child.id(),
         root_pgid: child.id(),
+        root_birth: None,
         schema_path: a.schema_path.clone(),
         invocation_id: a.invocation_id.clone(),
         descendants: Vec::new(),
@@ -663,18 +664,14 @@ fn run_supervised_bounded_with(
     let status = loop {
         // The first pass scans immediately after spawn.
         if last_observed.is_none_or(|at| at.elapsed() >= OBSERVE_INTERVAL) {
-            // Record each newly enrolled descendant at once: a successor of a
-            // crashed controller, and `clear-dispatch`, see only what the
-            // identity file holds, and Muse's tools all leave the root's
-            // group. A failed write is handled like the post-spawn one.
-            let observed = tracker.observe().and_then(|_| {
-                let descendants = tracker.descendants();
-                if descendants == identity.descendants {
-                    return Ok(());
-                }
-                identity.descendants = descendants;
-                super::process_tree::persist_identity(a, &identity)
-            });
+            // Record the root's birth and the live descendant set as soon as
+            // either changes: a successor of a crashed controller, and
+            // `clear-dispatch`, see only what the identity file holds, and
+            // Muse's tools all leave the root's group. A failed write is
+            // handled like the post-spawn one.
+            let observed = tracker
+                .observe()
+                .and_then(|_| record_identity(a, &mut identity, &tracker));
             if let Err(e) = observed {
                 let cleanup = tracker.cleanup(false);
                 let _ = child.kill();
@@ -705,8 +702,7 @@ fn run_supervised_bounded_with(
             }
         }
     };
-    identity.descendants = tracker.descendants();
-    if let Err(e) = super::process_tree::persist_identity(a, &identity) {
+    if let Err(e) = record_identity(a, &mut identity, &tracker) {
         let cleanup = tracker.cleanup(true);
         return Err(with_cleanup(e, cleanup));
     }
@@ -721,6 +717,22 @@ fn run_supervised_bounded_with(
         timed_out,
         limit_exceeded,
     )
+}
+
+/// Persist `identity` with the tracker's current root birth and live
+/// descendants, only when they changed.
+fn record_identity(
+    a: &InvocationArtifacts,
+    identity: &mut super::process_tree::ProcessIdentity,
+    tracker: &super::process_tree::ProcessTracker,
+) -> Result<(), MemoryError> {
+    let (root_birth, descendants) = tracker.recorded();
+    if root_birth == identity.root_birth && descendants == identity.descendants {
+        return Ok(());
+    }
+    identity.root_birth = root_birth;
+    identity.descendants = descendants;
+    super::process_tree::persist_identity(a, identity)
 }
 
 fn never_launched(
@@ -1411,6 +1423,7 @@ exit {code}"#
                 version: 1,
                 root_pid: child.id(),
                 root_pgid: child.id(),
+                root_birth: None,
                 schema_path: a.schema_path.clone(),
                 invocation_id: a.invocation_id.clone(),
                 descendants: Vec::new(),

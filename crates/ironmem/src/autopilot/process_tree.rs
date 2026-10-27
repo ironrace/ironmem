@@ -472,17 +472,59 @@ pub fn snapshot(source: &mut dyn ProcessSource) -> ProcessSnapshot {
     }
 }
 
-/// Written immediately after spawn. A terminal record is separate evidence
-/// that the supervising controller finished cleanup, not merely that PID died.
+/// Written immediately after spawn, then again whenever the root's birth is
+/// first observed or the live descendant set changes. A terminal record is
+/// separate evidence that the supervising controller finished cleanup, not
+/// merely that PID died.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ProcessIdentity {
     pub version: u32,
     pub root_pid: u32,
     pub root_pgid: u32,
+    /// The root's kernel birth, once observed; absent from older records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_birth: Option<Birth>,
     pub schema_path: String,
     pub invocation_id: String,
-    pub descendants: Vec<ProcessRow>,
+    /// Descendants alive at the supervisor's last sample.
+    pub descendants: Vec<RecordedProcess>,
+}
+
+/// One recorded descendant. Only its PID, group, parent and birth are read
+/// back; the command is kept, bounded and scrubbed, for an operator reading
+/// the file. Older records (full `ProcessRow`s, no birth) still parse.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RecordedProcess {
+    pub pid: u32,
+    pub ppid: u32,
+    pub pgid: u32,
+    #[serde(default)]
+    pub args: String,
+    #[serde(default)]
+    pub birth: Option<Birth>,
+}
+
+/// The longest command a recorded descendant keeps, in bytes.
+const RECORDED_ARGS_LIMIT: usize = 256;
+
+impl RecordedProcess {
+    fn new(row: &ProcessRow, birth: Birth) -> Self {
+        let mut args =
+            crate::autopilot::scrub::scrub_and_bound(&row.args, RECORDED_ARGS_LIMIT).text;
+        let mut end = args.len().min(RECORDED_ARGS_LIMIT);
+        while !args.is_char_boundary(end) {
+            end -= 1;
+        }
+        args.truncate(end);
+        Self {
+            pid: row.pid,
+            ppid: row.ppid,
+            pgid: row.pgid,
+            args,
+            birth: Some(birth),
+        }
+    }
 }
 
 pub(crate) fn identity_path(a: &InvocationArtifacts) -> std::path::PathBuf {
@@ -713,7 +755,20 @@ impl ProcessSnapshot {
             }
         }
         let a = artifacts?;
-        let identity = read_identity(a).ok()?;
+        // No identity file means nothing was ever spawned into this
+        // invocation. One that exists but cannot be read hides the recorded
+        // tree, so it is evidence, never "nothing running".
+        match std::fs::symlink_metadata(identity_path(a)) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(e) => return Some(format!("cannot stat the invocation process identity: {e}")),
+            Ok(_) => {}
+        }
+        let identity = match read_identity(a) {
+            Ok(identity) => identity,
+            Err(reason) => {
+                return Some(format!("unreadable invocation process identity: {reason}"))
+            }
+        };
         recorded_tree_evidence(rows, &identity, super::invocation::has_valid_exit_record(a))
     }
     pub fn orphan_markers(&self) -> Vec<&str> {
@@ -741,8 +796,8 @@ const KILL_SIGNAL: i32 = 0;
 /// Kernel birth identity prevents a recycled PID from authorizing a signal.
 /// Ordered by start time: macOS (seconds, microseconds); Linux (clock ticks
 /// since boot, 0).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct Birth(u64, u64);
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) struct Birth(u64, u64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct KernelProcess {
     pid: u32,
@@ -1078,6 +1133,8 @@ pub(crate) struct ProcessTracker {
     shared_daemon: Option<SharedDaemon>,
     /// [`kernel_executable`]; a seam so tests need no real daemon binary.
     kernel_exe: fn(u32) -> Option<PathBuf>,
+    /// Descendants whose kernel birth the last observe authenticated.
+    live: std::collections::HashSet<u32>,
 }
 impl ProcessTracker {
     pub(crate) fn new(root_pid: u32, shared_daemon: Option<&SharedDaemon>) -> Self {
@@ -1088,6 +1145,7 @@ impl ProcessTracker {
             root_reaped: false,
             shared_daemon: shared_daemon.cloned(),
             kernel_exe: kernel_executable,
+            live: std::collections::HashSet::new(),
         }
     }
     /// The argv must match, and then the kernel's executable path must be
@@ -1271,6 +1329,10 @@ impl ProcessTracker {
                 break;
             }
         }
+        self.live = seeds
+            .into_keys()
+            .filter(|pid| *pid != self.root_pid)
+            .collect();
         Ok(rows)
     }
 
@@ -1557,12 +1619,22 @@ impl ProcessTracker {
     pub(crate) fn observed_root(&self) -> bool {
         self.observed_root
     }
-    pub(crate) fn descendants(&self) -> Vec<ProcessRow> {
-        self.known
+    /// What the identity file records: the root's kernel birth, once
+    /// observed, and the descendants alive at the last sample. Exited ones
+    /// are left out, so the file stays bounded over a long dispatch.
+    pub(crate) fn recorded(&self) -> (Option<Birth>, Vec<RecordedProcess>) {
+        let root_birth = self
+            .known
             .iter()
-            .filter(|(r, _)| r.pid != self.root_pid)
-            .map(|(r, _)| r.clone())
-            .collect()
+            .find(|(r, _)| r.pid == self.root_pid)
+            .map(|(_, birth)| *birth);
+        let descendants = self
+            .known
+            .iter()
+            .filter(|(r, _)| r.pid != self.root_pid && self.live.contains(&r.pid))
+            .map(|(r, birth)| RecordedProcess::new(r, *birth))
+            .collect();
+        (root_birth, descendants)
     }
 }
 
@@ -1585,6 +1657,7 @@ pub(crate) mod testing {
                 version: 1,
                 root_pid: 1234,
                 root_pgid: 1234,
+                root_birth: None,
                 schema_path: a.schema_path.clone(),
                 invocation_id: a.invocation_id.clone(),
                 descendants: Vec::new(),
@@ -1828,7 +1901,9 @@ mod tests {
         child.pgid = 2345;
         child.args = "python gate".into();
         let mut identity = read_identity(&a).unwrap();
-        identity.descendants.push(child.clone());
+        identity
+            .descendants
+            .push(RecordedProcess::new(&child, Birth(7, 0)));
         persist_identity(&a, &identity).unwrap();
         let live = |rows: Vec<ProcessRow>| ProcessSnapshot::Available(rows).liveness(Some(&a));
         let row = |pid, pgid| ProcessRow {
@@ -1888,6 +1963,7 @@ mod tests {
             root_reaped: false,
             shared_daemon: None,
             kernel_exe: kernel_executable,
+            live: std::collections::HashSet::new(),
         };
         let order = tracker.kill_order().collect::<Vec<_>>();
         assert_eq!(order.last(), Some(&10));
@@ -1946,9 +2022,10 @@ mod tests {
                 version: 1,
                 root_pid,
                 root_pgid: root_pid,
+                root_birth: None,
                 schema_path: a.schema_path.clone(),
                 invocation_id: a.invocation_id.clone(),
-                descendants: vec![child_row],
+                descendants: vec![RecordedProcess::new(&child_row, Birth(7, 0))],
             },
         )
         .unwrap();
@@ -2325,6 +2402,79 @@ mod tests {
         );
         assert_eq!(Some(me.birth), birth(me.pid).unwrap());
         eprintln!("{} processes with cwd in {elapsed:?}", processes.len());
+    }
+
+    /// The identity is rewritten as descendants enrol, and `read_identity`
+    /// refuses anything over 1 MiB. Only descendants alive at the last sample
+    /// are recorded, each with its kernel birth and a bounded command, so a
+    /// build that enrols hundreds of long-argv tools stays well under it.
+    #[test]
+    fn the_recorded_identity_holds_only_live_descendants_and_stays_bounded() {
+        let long = format!("/usr/bin/rustc {}", "--cfg feature=x ".repeat(1000));
+        let mut rows = vec![process_row(10, 1, 10)];
+        rows.extend((100..600).map(|pid| args_row(pid, 10, 10, &long)));
+        let alive = |pid: u32| {
+            Ok(Some(kernel_process(
+                pid,
+                if pid == 10 { 1 } else { 10 },
+                10,
+                u64::from(pid),
+            )))
+        };
+        let mut tracker = ProcessTracker::new(10, None);
+        tracker.observe_rows(rows.clone(), alive).unwrap();
+        let (root_birth, descendants) = tracker.recorded();
+        assert_eq!(root_birth, Some(Birth(10, 0)));
+        assert_eq!(descendants.len(), 500);
+        assert!(descendants
+            .iter()
+            .all(|d| d.args.len() <= 256 && d.birth.is_some()));
+        let identity = ProcessIdentity {
+            version: 1,
+            root_pid: 10,
+            root_pgid: 10,
+            root_birth,
+            schema_path: "/s".into(),
+            invocation_id: "i".into(),
+            descendants,
+        };
+        let bytes = serde_json::to_vec(&identity).unwrap();
+        assert!(bytes.len() < 512 * 1024, "{} bytes", bytes.len());
+        // Three hundred of them exit: only the live ones stay recorded.
+        tracker
+            .observe_rows(rows, |pid| {
+                if (100..400).contains(&pid) {
+                    Ok(None)
+                } else {
+                    alive(pid)
+                }
+            })
+            .unwrap();
+        let (_, descendants) = tracker.recorded();
+        assert_eq!(descendants.len(), 200);
+        assert!(descendants.iter().all(|d| d.pid >= 400));
+    }
+
+    /// `clear-dispatch` asks `live_evidence` whether anything could still be
+    /// the issue's work. An identity it cannot read (corrupt, or over the
+    /// size cap) hides the recorded tree, so that is evidence, not "nothing".
+    #[test]
+    fn an_unreadable_identity_is_live_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, _) = testing::invocation(dir.path());
+        let empty = ProcessSnapshot::Available(Vec::new());
+        assert_eq!(empty.live_evidence("owner-repo-42", Some(&a)), None);
+        for bad in [b"not json".to_vec(), vec![b' '; 1024 * 1024 + 1]] {
+            std::fs::write(identity_path(&a), bad).unwrap();
+            let evidence = empty.live_evidence("owner-repo-42", Some(&a));
+            assert!(
+                evidence.as_deref().is_some_and(|e| e.contains("identity")),
+                "{evidence:?}"
+            );
+        }
+        // No identity at all: nothing was ever spawned to hide.
+        std::fs::remove_file(identity_path(&a)).unwrap();
+        assert_eq!(empty.live_evidence("owner-repo-42", Some(&a)), None);
     }
 
     /// Release is for the enrolled process itself after its exec. A tracked
