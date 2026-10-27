@@ -1430,6 +1430,7 @@ mod tests {
             session_claimed: claimed,
             session_model: None,
             resume_refusals: 0,
+            signing_held: false,
         }
     }
 

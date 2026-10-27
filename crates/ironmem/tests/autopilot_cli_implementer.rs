@@ -890,6 +890,7 @@ exit 97
         session_claimed: false,
         session_model: None,
         resume_refusals: 0,
+        signing_held: false,
     };
     let db = Database::open(&db_path).unwrap();
     dispatch_state::upsert_dispatch_state(&db, &state).unwrap();
@@ -996,6 +997,7 @@ fn public_run_rejects_wrong_persisted_harness_before_worktree_mutation() {
         session_claimed: true,
         session_model: None,
         resume_refusals: 0,
+        signing_held: false,
     };
     let db = Database::open(&db_path).unwrap();
     dispatch_state::upsert_dispatch_state(&db, &state).unwrap();
@@ -1099,6 +1101,7 @@ exit 97
         session_claimed: true,
         session_model: None,
         resume_refusals: 0,
+        signing_held: false,
     };
     let db = Database::open(&db_path).unwrap();
     dispatch_state::upsert_dispatch_state(&db, &state).unwrap();
@@ -1224,6 +1227,7 @@ fn clear_dispatch_refuses_a_live_invocation_and_releases_an_unprovable_dead_one(
         session_claimed: false,
         session_model: None,
         resume_refusals: 0,
+        signing_held: false,
     };
     let db = Database::open(&db_path).unwrap();
     dispatch_state::upsert_dispatch_state(&db, &state).unwrap();

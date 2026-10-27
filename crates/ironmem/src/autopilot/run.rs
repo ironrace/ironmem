@@ -872,19 +872,34 @@ fn prefix(text: &str, n: usize) -> String {
 }
 
 /// What may hold a branch to the signing policy beyond its recorded flags:
-/// the policy as this run read it at its start. Passed as a value rather than
-/// a bare `bool` so each source names itself in the violation.
+/// the policy as this run, or the interrupted run whose dispatch state it
+/// took over, read it at its start. A value rather than a bare `bool`, so each
+/// source names itself in the violation.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct SigningPolicySeen {
     /// `commit.gpgsign` read `true` when this run started.
     at_run_start: bool,
+    /// The dispatch state this run started from records an earlier run that
+    /// saw it on ([`DispatchState::signing_held`]). That memory survives a
+    /// controller crash, where this run's own does not.
+    by_interrupted_run: bool,
 }
 
 impl SigningPolicySeen {
+    /// Whether either source holds the branch.
+    fn held(self) -> bool {
+        self.at_run_start || self.by_interrupted_run
+    }
+
     /// The source that holds the branch, named for a reason, if any does.
     fn holder(self) -> Option<&'static str> {
-        self.at_run_start
-            .then_some("the policy, which was on when this run started")
+        if self.at_run_start {
+            Some("the policy, which was on when this run started")
+        } else if self.by_interrupted_run {
+            Some("the policy, which was on when an interrupted run on this issue started")
+        } else {
+            None
+        }
     }
 }
 
@@ -2119,14 +2134,6 @@ pub fn run_issue(
         .as_ref()
         .is_some_and(|s| s.state == "paused-session-in-use");
     let mut recovered_outcome = None;
-    // Record a signing policy that is on before any dispatch or recovery, so
-    // an agent that turns it off is still held to it, in this run and every
-    // later one. A policy a crashed dispatch disabled before any run or
-    // `ensure_worktree` saw it on is not caught: an accepted limitation.
-    // The reading is also kept in memory, so a failed write (another
-    // worktree's agent holding `.git/config`'s lock) costs only the
-    // cross-run memory, never this run's protection or the run itself.
-    //
     // A policy that cannot be read stops the run here, before recovery or
     // any dispatch: the guard would refuse every `met` as an infrastructure
     // failure, so a dispatch would be paid for and then discarded. So does a
@@ -2151,20 +2158,11 @@ pub fn run_issue(
     }
     let seen = SigningPolicySeen {
         at_run_start: policy_at_start,
+        by_interrupted_run: existing_state.as_ref().is_some_and(|s| s.signing_held),
     };
     // Set by a guard fault every later `met` would meet too: the run stops
     // after recording it, before paying for another dispatch.
     let mut guard_stop: Option<GuardFault> = None;
-    if policy_at_start {
-        if let Err(e) = worktree::record_signing(&worktree.path, &worktree.branch, true) {
-            tracing::warn!(
-                error = %e,
-                branch = %worktree.branch,
-                "autopilot could not record the signing policy on the branch; \
-                 holding this run to it from memory"
-            );
-        }
-    }
     if let Some(state) = existing_state
         .as_ref()
         .filter(|_| config.implementer.recovers_invocations())
@@ -2182,6 +2180,26 @@ pub fn run_issue(
         )? {
             Recovered::Done(run) => return Ok(run),
             Recovered::Continue(outcome) => recovered_outcome = outcome,
+        }
+    }
+    // Record a signing policy that is on before any dispatch, so an agent
+    // that turns it off is still held to it, in this run and every later one.
+    // After recovery, never before: a run that holds a live invocation ends
+    // above, and writing `.git/config` while that agent may be writing it too
+    // would race it for the lock. A policy a crashed dispatch disabled before
+    // any run or `ensure_worktree` saw it on is not caught: an accepted
+    // limitation. A failed write (another worktree's agent holding the lock)
+    // costs only this cross-run memory: the reading is held in memory for
+    // this run and in the dispatch state written before each launch
+    // (`signing_held`), which a replacement controller reads.
+    if policy_at_start {
+        if let Err(e) = worktree::record_signing(&worktree.path, &worktree.branch, true) {
+            tracing::warn!(
+                error = %e,
+                branch = %worktree.branch,
+                "autopilot could not record the signing policy on the branch; \
+                 holding this run to it from memory"
+            );
         }
     }
     let mut resuming = existing_state
@@ -2232,6 +2250,7 @@ pub fn run_issue(
                 session_claimed,
                 session_model: session.0.clone(),
                 resume_refusals: session.1,
+                signing_held: seen.held(),
             },
         )
         .map(|_| ())
@@ -3446,6 +3465,7 @@ sleep 0.5
                 session_claimed: true,
                 session_model: None,
                 resume_refusals: 0,
+                signing_held: false,
             },
         )
         .unwrap();
@@ -3562,6 +3582,7 @@ sleep 0.5
             session_claimed: false,
             session_model: None,
             resume_refusals: 0,
+            signing_held: false,
         };
         dispatch_state::upsert_dispatch_state(db, &state).unwrap();
         state
@@ -6193,6 +6214,73 @@ sleep 0.5
             .as_deref()
             .unwrap()
             .contains("unsigned"));
+    }
+
+    #[test]
+    fn a_run_holding_a_live_invocation_writes_no_signing_config() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        pending_muse(&db, &wt, None);
+        git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
+        let mut d = muse_script(vec![]);
+        d.recovery = Some(InvocationRecovery::Alive);
+        let run = run_issue(&db, &issue(), &brief(), &wt, &muse_config(), &mut d).unwrap();
+        assert!(
+            matches!(run.terminal, TerminalReason::ImplementationInFlight { .. }),
+            "{:?}",
+            run.terminal
+        );
+        // The live agent may be writing `.git/config` itself; the run that
+        // holds it must not race it for the lock.
+        for key in [
+            format!("branch.{}.ironmemSigning", wt.branch),
+            "ironmem.autopilotSigning".to_string(),
+        ] {
+            let mut c = std::process::Command::new("git");
+            crate::mcp::tools::scrub_git_environment(&mut c);
+            let out = c
+                .args(["config", "--get", &key])
+                .current_dir(&wt.path)
+                .output()
+                .unwrap();
+            assert_eq!(out.status.code(), Some(1), "{key} was written");
+        }
+    }
+
+    #[test]
+    fn a_policy_seen_on_by_an_interrupted_run_still_guards_its_recovered_met() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree(); // policy off, no flag recorded
+                                             // The interrupted run saw the policy on, but neither config flag was
+                                             // written (another agent held the lock); only its drawer says so.
+        let mut state = pending_muse(&db, &wt, None);
+        state.signing_held = true;
+        dispatch_state::upsert_dispatch_state(&db, &state).unwrap();
+        let mut result = met();
+        result.cost_usd = None;
+        let mut d = muse_script(vec![]);
+        d.recovery = Some(InvocationRecovery::Finished(result));
+        let mut c = muse_config();
+        c.attempt_cap = 1;
+        let run = run_issue(&db, &issue(), &brief(), &wt, &c, &mut d).unwrap();
+        assert!(!matches!(run.terminal, TerminalReason::Met { .. }));
+        let reason = run.dispatches[0].reason.as_deref().unwrap();
+        assert!(reason.contains("interrupted run"), "{reason}");
+    }
+
+    #[test]
+    fn every_published_invocation_records_whether_signing_was_seen_on() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
+        let mut d = muse_script(vec![muse_infra_failure("network down")]);
+        let mut c = muse_config();
+        c.max_consecutive_infrastructure_failures = 1;
+        run_issue(&db, &issue(), &brief(), &wt, &c, &mut d).unwrap();
+        let state = dispatch_state::get_dispatch_state(&db, &issue())
+            .unwrap()
+            .unwrap();
+        assert!(state.signing_held, "{state:?}");
     }
 
     /// The crash window [`a_recovered_met_is_checked_against_the_branch_base`]

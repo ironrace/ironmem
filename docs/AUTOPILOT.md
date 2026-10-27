@@ -490,7 +490,12 @@ can quietly pass `-c commit.gpgsign=false`.
 - **The policy is sticky.** It is enforced if `commit.gpgsign` was on when the
   issue branch was created or at any run start, or is on now. A run that sees
   it on records it on the branch (`branch.<branch>.ironmemSigning true`) and
-  on the repository (`ironmem.autopilotSigning true`). An invalid value (a
+  on the repository (`ironmem.autopilotSigning true`), once restart recovery
+  has found no invocation still running (a run that holds one writes no
+  config). It also records the reading in the issue's dispatch state before
+  each launch, so a controller that recovers the invocation after a crash
+  still enforces it even if another agent held `.git/config`'s lock and
+  neither flag was written. An invalid value (a
   typo such as `commit.gpgsign = ture`) holds a newly created branch but never
   sets the repository flag, and a run refuses to start until it is fixed, since
   every `met` it produced would be discarded. So does an invalid

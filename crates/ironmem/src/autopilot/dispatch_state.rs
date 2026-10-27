@@ -70,6 +70,13 @@ pub struct DispatchState {
     ///
     /// [`SessionRefusal::Unresumable`]: super::dispatch::SessionRefusal::Unresumable
     pub resume_refusals: u32,
+    /// Whether the run that wrote this record saw the commit-signing policy
+    /// on. Written before every launch, so a replacement controller that
+    /// recovers the invocation still holds its `met` to the policy when the
+    /// branch and repository flags could not be written (another agent held
+    /// `.git/config`'s lock) and the policy has since been turned off.
+    /// Defaulted on read: older records hold nothing beyond those flags.
+    pub signing_held: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,6 +103,8 @@ struct DispatchStateBody {
     session_model: Option<String>,
     #[serde(default)]
     resume_refusals: u32,
+    #[serde(default)]
+    signing_held: bool,
 }
 
 /// Logical-key prefix shared by every dispatch-state drawer. One constant
@@ -130,6 +139,7 @@ pub fn upsert_dispatch_state(db: &Database, state: &DispatchState) -> Result<Str
         session_claimed: state.session_claimed,
         session_model: state.session_model.clone(),
         resume_refusals: state.resume_refusals,
+        signing_held: state.signing_held,
     };
     let content = serde_json::to_string(&body)?;
     write_current(db, &dispatch_state_key(&state.issue), &content)
@@ -167,6 +177,7 @@ fn state_from_content(content: &str) -> Result<DispatchState, MemoryError> {
         session_claimed: body.session_claimed,
         session_model: body.session_model,
         resume_refusals: body.resume_refusals,
+        signing_held: body.signing_held,
     })
 }
 
@@ -289,6 +300,7 @@ mod tests {
             session_claimed: true,
             session_model: None,
             resume_refusals: 0,
+            signing_held: false,
         }
     }
 
@@ -353,6 +365,7 @@ mod tests {
             session_claimed: true,
             session_model: None,
             resume_refusals: 0,
+            signing_held: false,
         }
     }
 
@@ -401,6 +414,7 @@ mod tests {
             session_claimed: true,
             session_model: None,
             resume_refusals: 0,
+            signing_held: false,
         })
         .unwrap();
         for key in [
@@ -409,6 +423,7 @@ mod tests {
             "codex_artifacts",
             "session_model",
             "resume_refusals",
+            "signing_held",
         ] {
             body.as_object_mut().unwrap().remove(key);
         }
@@ -423,6 +438,7 @@ mod tests {
         // An older record names no model, so it never rotates on one.
         assert_eq!(state.session_model, None);
         assert_eq!(state.resume_refusals, 0);
+        assert!(!state.signing_held);
     }
 
     #[test]
@@ -432,10 +448,12 @@ mod tests {
         let mut state = sample(&issue, 1);
         state.session_model = Some("muse-wonder-1.0".into());
         state.resume_refusals = 1;
+        state.signing_held = true;
         upsert_dispatch_state(&db, &state).unwrap();
         let read = get_dispatch_state(&db, &issue).unwrap().unwrap();
         assert_eq!(read.session_model.as_deref(), Some("muse-wonder-1.0"));
         assert_eq!(read.resume_refusals, 1);
+        assert!(read.signing_held);
     }
 
     #[test]

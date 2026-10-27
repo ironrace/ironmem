@@ -213,6 +213,7 @@ mod tests {
             session_claimed: true,
             session_model: None,
             resume_refusals: 0,
+            signing_held: false,
         }
     }
 

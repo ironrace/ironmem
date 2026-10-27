@@ -2112,6 +2112,7 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
             session_claimed: true,
             session_model: None,
             resume_refusals: 0,
+            signing_held: false,
         }
     }
 
