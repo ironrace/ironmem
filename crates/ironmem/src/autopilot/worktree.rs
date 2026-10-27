@@ -202,27 +202,54 @@ pub(crate) fn signing_policy(dir: &Path) -> Result<bool, String> {
         .map(|value| value.is_some_and(|v| v == "true"))
 }
 
-/// Remember on `branch` that the signing policy is on; the caller has read it
-/// as on (an unreadable policy counts as on). The flag is sticky: a later run
-/// that finds the policy off still enforces it, so an agent's `git config
-/// commit.gpgsign false` in the shared `.git/config` outlives neither the
-/// dispatch nor the run.
+/// The repository-wide signing flag, in the common `.git/config`.
 ///
-/// Skipped when the branch already records it. A live agent in another
-/// worktree of the same repo may hold `.git/config`'s lock (`push -u` and
-/// `checkout -b` both write config), and a needless write would race it.
-pub(crate) fn record_signing(dir: &Path, branch: &str) -> Result<(), MemoryError> {
-    if signing_recorded(dir, branch) {
-        return Ok(());
-    }
-    git(dir, &["config", &signing_key(branch), "true"]).map(|_| ())
+/// `commit.gpgsign` is read from that shared config, which an agent in any
+/// sibling worktree can change. A flag kept only per branch would miss every
+/// branch created after such a change: it reads the policy as off and records
+/// nothing. So the first time any run sees the policy on, the repository
+/// remembers it too, and every issue branch in it is held to it.
+const REPO_SIGNING_KEY: &str = "ironmem.autopilotSigning";
+
+/// A `--bool` config value: `None` when unset, `Err` when unreadable.
+fn config_bool(dir: &Path, key: &str) -> Result<Option<bool>, String> {
+    config_get(dir, &["--bool", "--get", key]).map(|value| value.map(|v| v == "true"))
 }
 
-/// Whether `branch` was ever recorded as under the signing policy. A value
-/// that cannot be read counts as recorded: this flag only ever tightens.
+/// Remember on `branch`, and on the repository ([`REPO_SIGNING_KEY`]), that
+/// the signing policy is on; the caller has read it as on (an unreadable
+/// policy counts as on). The flags are sticky: a later run that finds the
+/// policy off still enforces it, so an agent's `git config commit.gpgsign
+/// false` in the shared `.git/config` outlives neither the dispatch nor the
+/// run, and does not unguard branches created after it.
+///
+/// Each flag is skipped when already recorded (or unreadable). A live agent in
+/// another worktree of the same repo may hold `.git/config`'s lock (`push -u`
+/// and `checkout -b` both write config), and a needless write would race it.
+pub(crate) fn record_signing(dir: &Path, branch: &str) -> Result<(), MemoryError> {
+    // The branch first: a held lock on the second write still leaves the
+    // branch held, as before the repository flag existed.
+    for key in [signing_key(branch), REPO_SIGNING_KEY.to_string()] {
+        if matches!(config_bool(dir, &key), Ok(Some(true)) | Err(_)) {
+            continue;
+        }
+        git(dir, &["config", &key, "true"])?;
+    }
+    Ok(())
+}
+
+/// Whether `branch` is held to the signing policy that was once seen on.
+///
+/// The branch's own `branch.<branch>.ironmemSigning` decides when set: `true`
+/// holds it, and an operator's explicit `false` opts that one branch out.
+/// Unset, the repository's [`REPO_SIGNING_KEY`] decides. A value that cannot
+/// be read counts as recorded: these flags only ever tighten.
 pub(crate) fn signing_recorded(dir: &Path, branch: &str) -> bool {
-    config_get(dir, &["--bool", "--get", &signing_key(branch)])
-        .map_or(true, |value| value.is_some_and(|v| v == "true"))
+    match config_bool(dir, &signing_key(branch)) {
+        Ok(Some(on)) => on,
+        Ok(None) => config_bool(dir, REPO_SIGNING_KEY).map_or(true, |on| on == Some(true)),
+        Err(_) => true,
+    }
 }
 
 /// The cut recorded on an existing `branch`, if any, resolved to a full sha.
@@ -268,6 +295,21 @@ fn write_cut(root: &Path, branch: &str, cut: &str) -> Result<(), MemoryError> {
             Err(e) => return Err(e),
         }
     }
+}
+
+/// Record a cut for an existing `branch` that has none, from `base` as it
+/// resolves now. That may not be the commit the branch was cut from (`base`
+/// may have moved since), and a wrong cut widens or narrows the range the
+/// signing guard checks, so the inference is logged rather than silent.
+fn backfill_cut(root: &Path, branch: &str, base: &str, cut: &str) -> Result<(), MemoryError> {
+    tracing::warn!(
+        branch = %branch,
+        base = %base,
+        cut = %cut,
+        "autopilot found no recorded cut for an existing issue branch; recording the base as it \
+         resolves now, which may not be the commit the branch was cut from"
+    );
+    write_cut(root, branch, cut)
 }
 
 /// Whether a failed [`git`] config write failed only on the config lock.
@@ -429,8 +471,10 @@ fn quarantine(repo_root: &Path, path: &Path) -> Result<PathBuf, MemoryError> {
 ///
 /// The cut ([`Worktree::cut`]) is resolved from `base` in `repo_root` when the
 /// branch is created and stored on the branch; an existing branch reads it
-/// back, backfilling it from `base` once if it predates the record. A `base`
-/// that does not resolve is refused before anything on disk changes. At
+/// back, backfilling it from `base` once if it has none (an older branch, or
+/// a creation whose cut write failed), with a warning naming the branch, the
+/// base and the sha recorded. A `base` that does not resolve is refused
+/// before anything on disk changes. At
 /// creation the signing policy is recorded too ([`record_signing`]), on a
 /// best-effort basis: a failed write only warns.
 pub fn ensure_worktree(
@@ -502,7 +546,7 @@ pub fn ensure_worktree(
                 )));
             }
             if recorded.is_none() {
-                write_cut(&root, &branch, &cut)?;
+                backfill_cut(&root, &branch, base, &cut)?;
             }
             return Ok(Worktree {
                 path: canonical_or_self(&path),
@@ -542,8 +586,10 @@ pub fn ensure_worktree(
         git(&root, &["worktree", "add", "-b", &branch, &path_str, base])?;
         resolve_base(&root, &format!("refs/heads/{branch}"))?
     };
-    if recorded.is_none() {
-        write_cut(&root, &branch, &cut)?;
+    match (&recorded, branch_exists) {
+        (Some(_), _) => {}
+        (None, true) => backfill_cut(&root, &branch, base, &cut)?,
+        (None, false) => write_cut(&root, &branch, &cut)?,
     }
     // Warn-only, as at a run's start: another worktree's agent may hold
     // `.git/config`'s lock, and `run_issue` holds the run to the policy it
@@ -749,6 +795,137 @@ mod tests {
         advance_operator_head(repo.path(), "later-still");
         let again = ensure_worktree(repo.path(), roots.path(), &issue(), "HEAD").unwrap();
         assert_eq!(again.cut, now);
+    }
+
+    /// A `tracing` writer that keeps what it is given, for asserting a warning.
+    #[derive(Clone, Default)]
+    struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Run `f` with a thread-local subscriber; returns its result and the log.
+    fn with_captured_log<T>(f: impl FnOnce() -> T) -> (T, String) {
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let out = tracing::subscriber::with_default(subscriber, f);
+        let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        (out, log)
+    }
+
+    #[test]
+    fn a_backfilled_cut_is_logged_as_inferred_from_the_base() {
+        let repo = fixture_repo();
+        let roots = tempfile::tempdir().unwrap();
+        ensure_worktree(repo.path(), roots.path(), &issue(), "HEAD").unwrap();
+        run(repo.path(), &["config", "--unset", &issue_cut_key()]);
+        let now = advance_operator_head(repo.path(), "later");
+        let (reused, log) =
+            with_captured_log(|| ensure_worktree(repo.path(), roots.path(), &issue(), "HEAD"));
+        assert_eq!(reused.unwrap().cut, now);
+        assert!(log.contains("WARN"), "{log}");
+        assert!(log.contains(&branch_name(&issue())), "{log}");
+        assert!(log.contains("base=HEAD"), "{log}");
+        assert!(log.contains(&now), "{log}");
+        // A recorded cut is read back silently.
+        let (_, quiet) =
+            with_captured_log(|| ensure_worktree(repo.path(), roots.path(), &issue(), "HEAD"));
+        assert!(!quiet.contains("WARN"), "{quiet}");
+    }
+
+    #[test]
+    fn a_recorded_cut_that_is_no_longer_a_commit_is_refused_with_the_unset_hint() {
+        let repo = fixture_repo();
+        let roots = tempfile::tempdir().unwrap();
+        let first = ensure_worktree(repo.path(), roots.path(), &issue(), "HEAD").unwrap();
+        run(
+            repo.path(),
+            &["worktree", "remove", first.path.to_str().unwrap()],
+        );
+        let bogus = "a".repeat(40);
+        run(repo.path(), &["config", &issue_cut_key(), &bogus]);
+        let err = ensure_worktree(repo.path(), roots.path(), &issue(), "HEAD")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(&bogus), "got: {err}");
+        assert!(
+            err.contains(&format!("git config --unset {}", issue_cut_key())),
+            "got: {err}"
+        );
+        assert!(!first.path.exists(), "nothing may be created");
+        // The bad record is left for the operator, never silently replaced.
+        assert_eq!(read_config(repo.path(), &issue_cut_key()), Some(bogus));
+    }
+
+    #[test]
+    fn a_cut_record_that_cannot_be_read_is_an_error_not_an_absent_cut() {
+        let missing = tempfile::tempdir().unwrap().path().join("gone");
+        let err = recorded_cut(&missing, &branch_name(&issue()))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(&format!("cannot read {}", issue_cut_key())),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_signing_flag_that_cannot_be_read_counts_as_recorded() {
+        let repo = fixture_repo();
+        let branch = branch_name(&issue());
+        assert!(!signing_recorded(repo.path(), &branch));
+        run(
+            repo.path(),
+            &[
+                "config",
+                &format!("branch.{branch}.ironmemSigning"),
+                "maybe",
+            ],
+        );
+        assert!(signing_recorded(repo.path(), &branch));
+        let missing = tempfile::tempdir().unwrap().path().join("gone");
+        assert!(signing_recorded(&missing, &branch));
+    }
+
+    #[test]
+    fn an_unreadable_signing_policy_at_creation_is_recorded_as_on() {
+        let repo = fixture_repo();
+        let roots = tempfile::tempdir().unwrap();
+        run(repo.path(), &["config", "commit.gpgsign", "maybe"]);
+        ensure_worktree(repo.path(), roots.path(), &issue(), "HEAD").unwrap();
+        let key = format!("branch.{}.ironmemSigning", branch_name(&issue()));
+        assert_eq!(read_config(repo.path(), &key).as_deref(), Some("true"));
+    }
+
+    #[test]
+    fn a_policy_seen_on_once_in_the_repo_holds_every_branch_until_opted_out() {
+        let repo = fixture_repo();
+        let branch = branch_name(&issue());
+        let other = "autopilot/ironrace-ironmem-3";
+        record_signing(repo.path(), &branch).unwrap();
+        assert_eq!(
+            read_config(repo.path(), "ironmem.autopilotSigning").as_deref(),
+            Some("true")
+        );
+        // A branch that never recorded the flag is held by the repo's.
+        assert!(signing_recorded(repo.path(), other));
+        // An operator's explicit `false` opts one branch out.
+        run(
+            repo.path(),
+            &["config", &format!("branch.{other}.ironmemSigning"), "false"],
+        );
+        assert!(!signing_recorded(repo.path(), other));
+        assert!(signing_recorded(repo.path(), &branch));
     }
 
     #[test]

@@ -705,7 +705,7 @@ platform limit, got {}",
     #[test]
     fn the_condition_is_phrased_over_the_commits_made_not_over_a_commit_existing() {
         // An issue that turns out to need no code change is a legitimate
-        // success (`run::head_commit` says so). Phrased as "a commit is
+        // success (`run::branch_tip` says so). Phrased as "a commit is
         // pushed", the condition would be unsatisfiable for it, and the only
         // way to report `met` would be to push an empty commit — which is
         // exactly what the remediation clause tells an IC never to do.

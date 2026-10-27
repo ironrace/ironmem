@@ -373,32 +373,51 @@ implementer that reports `met` (its "goal met" verdict) but whose commits are no
 all signed has that run recorded as a failed attempt instead, because a model
 can quietly pass `-c commit.gpgsign=false`.
 
-- **What counts as unsigned.** A commit with no `gpgsig` or `gpgsig-sha256`
-  header. `%G?` is only used to catch `B`, a bad signature.
-- **Which commits are checked.** The whole issue branch: the agent's commits
-  since the branch was cut, excluding anything already on another remote
-  branch (`HEAD --not <cut> --exclude='*/<issue-branch>' --remotes`). The *cut*
-  is the commit the issue branch was cut from. Commits merged or rebased in
-  from a remote-tracking branch are not blamed on the agent, but local-only
-  commits merged in are checked like the agent's own. An earlier dispatch's
-  bypass stays caught after it is pushed.
+- **What counts as unsigned.** A commit with no `gpgsig` header (or, in a
+  SHA-256 repository, no `gpgsig-sha256` header). `%G?` is only used to
+  catch `B`, a bad signature, such as a signed commit edited afterwards.
+- **Which commits are checked.** The commits that ship: everything on the
+  issue branch (`refs/heads/<issue-branch>`, not `HEAD`, which the agent may
+  have left on another checkout) and on its own remote-tracking refs (such as
+  `origin/<issue-branch>`, what was pushed), since the branch was cut,
+  excluding anything already on another remote branch
+  (`git log refs/heads/<issue-branch> <its remote refs> --not <cut>
+  --exclude='*/<issue-branch>' --remotes`). The *cut* is the commit the issue
+  branch was cut from. Commits merged or rebased in from a remote-tracking
+  branch are not blamed on the agent, but local-only commits merged in are
+  checked like the agent's own. An earlier dispatch's bypass stays caught
+  after it is pushed, and after the local branch is reset, until a re-signed
+  branch is force-pushed over it. If the issue branch no longer exists, the
+  `met` fails: nothing that ships can be checked.
 - **The cut is fixed once.** `--base` is resolved to a commit sha in your
-  checkout when the issue branch is created (or once, for an older branch that
-  has no recorded cut), and stored as `branch.<branch>.ironmemCut`. A base
-  that does not resolve is refused before any worktree exists.
+  checkout when the issue branch is created, and stored as
+  `branch.<branch>.ironmemCut`. A base that does not resolve is refused before
+  any worktree exists. An existing branch with no recorded cut (an older
+  branch, or a creation whose cut write failed) gets one from `--base` as it
+  resolves at that moment, which may not be the commit the branch was cut
+  from. That run logs a warning naming the branch, the base and the sha.
 - **The policy is sticky.** It is enforced if `commit.gpgsign` was on when the
-  issue branch was created or at any run start (recorded as
-  `branch.<branch>.ironmemSigning true`), or is on now.
+  issue branch was created or at any run start, or is on now. A run that sees
+  it on records it on the branch (`branch.<branch>.ironmemSigning true`) and
+  on the repository (`ironmem.autopilotSigning true`). `commit.gpgsign` lives
+  in the `.git/config` shared by every worktree, so an agent on one issue can
+  turn it off for all of them. The repository flag holds every issue branch to
+  the policy anyway, including branches created after it was turned off.
 - **Turning it off does not help.** If the agent, or anyone, turns
-  `commit.gpgsign` off while `ironmemSigning` is set, the next `met` fails
-  with "commit.gpgsign was turned off on this branch". Only an operator who
-  unsets `ironmemSigning` with signing already off ends enforcement.
+  `commit.gpgsign` off while either flag holds the branch, the next `met`
+  fails with "commit.gpgsign was turned off on this branch". Only an operator
+  can end enforcement, as described below.
 - **Trust posture.** The guard catches a lazy or accidental bypass. It does
   not stop an unconfined agent that deliberately signs with another key,
-  clears the flag or the cut, or pushes its commits to another branch.
+  opts its branch out, clears the cut, or pushes its commits to another
+  branch.
 
-An unreadable policy, or a cut that `git log` cannot use when the `met` is
-checked, fails closed as a failed attempt rather than a hold.
+If the guard itself cannot read git when it checks a `met` (git fails to run,
+`commit.gpgsign` holds an invalid value, or the recorded cut is no longer an
+object `git log` can use), the `met` is not accepted. It is recorded as an
+infrastructure failure, not an attempt, so it costs the issue no attempt.
+Repeated ones stop the run through `max_consecutive_infrastructure_failures`,
+like any other infrastructure failure.
 
 ### A signing failure is a failed attempt
 
@@ -406,7 +425,20 @@ It counts toward the attempt cap and can end in `agent:exhausted`. The reason
 the next turn and the operator see starts:
 
 > commit.gpgsign is on, but commit(s) <shas> on this branch since its cut
-> <sha> are unsigned or carry a bad signature. Re-sign them ...
+> <sha> are unsigned or carry a bad signature. Re-sign only these commits ...
+
+It names at most five commits, newest first, and counts the rest ("and 2
+more"). It tells the agent to re-sign only those commits, never the upstream
+commits merged in, as follows:
+
+- If only the tip is flagged, run `git commit --amend --no-edit -S`.
+- Otherwise, run `git rebase --exec 'git commit --amend --no-edit -S'
+  <oldest-flagged>^`. This starts at the oldest flagged commit's parent, never
+  at the cut, because rebasing from the cut would rewrite every upstream
+  commit merged in since.
+- If a merge commit is flagged or lies in that range, redo the merge (signed)
+  instead of rebasing over it.
+- Then `git push --force-with-lease`.
 
 Make sure the signing key or agent is reachable from wherever the Lead runs,
 including inside an external sandbox. Otherwise every attempt fails.
@@ -419,9 +451,15 @@ issue 364, `autopilot/owner-repo-364`). To stop enforcing on it on purpose:
 1. Turn `commit.gpgsign` off. The guard reads the effective value in the
    issue's worktree, so any config scope that applies there counts: repo,
    global or system.
-2. In the repo, run `git config --unset branch.<branch>.ironmemSigning`.
-3. Keep it off. Every run start records the flag again whenever the policy is
+2. In the repo, run `git config branch.<branch>.ironmemSigning false`. An
+   explicit `false` opts that branch out of the repository flag. Unsetting
+   the branch flag is not enough while `ironmem.autopilotSigning` is set.
+3. Keep it off. Every run start records the flags again whenever the policy is
    on, so turning signing back on re-arms the guard.
+
+To stop enforcing on every branch of the repo, do step 1, then run
+`git config --unset ironmem.autopilotSigning` and unset each
+`branch.<branch>.ironmemSigning`.
 
 Do these with no Lead or `run` active on the issue. A running attempt that
 started with signing on still holds the branch to it, so it fails with
