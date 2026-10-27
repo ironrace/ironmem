@@ -206,8 +206,9 @@ is never rendered as free.
   0 with a `completed` terminal record carrying a schema-shaped verdict does
   that verdict count.
 - Liveness uses the `ps` marker `--output-schema <.../schema.json>` on the
-  `muse-bin-<version>` root (the launcher `exec`s it under the same PID), plus
-  the shared process tracker. Each Muse shell tool is its own session leader,
+  `muse-bin-<version>` root (the launcher `exec`s it under the same PID), and
+  on the `bash …/muse exec …` row the root shows before that exec, plus the
+  shared process tracker. Each Muse shell tool is its own session leader,
   which the tracker follows by parent PID. Because those tools leave the
   root's process group, the group check below never sees them; the worktree
   check below is what catches a background child a short-lived tool leaves

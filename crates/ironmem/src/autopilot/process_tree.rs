@@ -63,17 +63,27 @@ impl ProcessRow {
     }
 
     fn parse_marker(&self) -> Result<Option<&str>, String> {
+        fn file_name(word: &str) -> Option<&str> {
+            Path::new(word).file_name().and_then(|a| a.to_str())
+        }
         let mut args = self.args.split_whitespace();
-        let Some(exe) = args
-            .next()
-            .and_then(|a| Path::new(a).file_name())
-            .and_then(|a| a.to_str())
-        else {
+        let Some(mut exe) = args.next().and_then(file_name) else {
             return Ok(None);
         };
+        // `~/.local/bin/muse` is a bash script that `exec`s
+        // `muse-bin-<version>` under the same PID (measured), so until that
+        // exec ps shows the root as `bash …/muse exec …`. That is the root
+        // itself, carrying its own marker.
+        if exe == "bash" || exe == "sh" {
+            let mut script = args.clone();
+            if script.next().and_then(file_name) != Some("muse") {
+                return Ok(None);
+            }
+            args = script;
+            exe = "muse";
+        }
         let codex = exe == "codex";
-        // The `~/.local/bin/muse` launcher `exec`s `muse-bin-<version>` under
-        // the same PID, so ps shows the versioned binary.
+        // After that exec ps shows the versioned binary.
         let muse = exe == "muse" || exe.starts_with("muse-bin-");
         if !(codex || muse) || args.next() != Some("exec") {
             return Ok(None);
@@ -2093,18 +2103,36 @@ mod tests {
         let valued = MUSE_ROOT.replacen("--model muse-wonder-1.0", "--model=muse-wonder-1.0", 1);
         assert!(row(&valued).marker().unwrap().is_some());
     }
+    /// Measured: `~/.local/bin/muse` is a bash script that `exec`s
+    /// `muse-bin-<version>` under the same PID, so until that exec ps shows
+    /// the root as `bash …/muse exec …`. That row is the invocation's root
+    /// and carries its exact marker; reading it as unrelated would hide a
+    /// live invocation from every liveness and same-issue check.
+    #[test]
+    fn the_muse_launcher_phase_yields_the_roots_exact_marker() {
+        let schema =
+            "/r/.git/ironmem/autopilot/o-r-7/0f0e0d0c-0b0a-4908-8706-050403020100/schema.json";
+        let launched = MUSE_ROOT.replacen("muse-bin-1.4.13-R6996.1", "muse", 1);
+        for shell in ["bash", "/bin/bash", "sh", "/bin/sh"] {
+            let r = row(&format!("{shell} {launched}"));
+            assert_eq!(r.marker(), Ok(Some(schema)), "{shell}");
+        }
+        // Its own ambiguity is still ambiguity, as for the binary.
+        assert!(row(&format!("bash {launched} fix the bug"))
+            .marker()
+            .is_err());
+        // A shell running anything else is not a Muse row.
+        for args in [
+            format!("bash {}", launched.replacen("/muse ", "/not-muse ", 1)),
+            format!("bash -c {launched}"),
+            format!("zsh {launched}"),
+            format!("bash {}", launched.replacen(" exec ", " resume ", 1)),
+        ] {
+            assert_eq!(row(&args).marker(), Ok(None), "{args}");
+        }
+    }
     #[test]
     fn non_root_muse_rows_are_not_markers() {
-        // The bash launcher phase: the executable is bash, not Muse.
-        assert_eq!(
-            row(&format!(
-                "bash {}",
-                MUSE_ROOT.replacen("muse-bin-1.4.13-R6996.1", "muse", 1)
-            ))
-            .marker()
-            .unwrap(),
-            None
-        );
         // The Muse reviewer passes no --output-schema.
         assert_eq!(
             row("/u/muse-bin-1.4.13-R6996.1 exec --json --approval-mode never --disable-write --sandbox-network restricted --no-session-log --workspace /r --prompt-file /tmp/p.md")
