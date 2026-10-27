@@ -508,14 +508,29 @@ fn run_supervised_bounded_with(
             &format!("failed to prepare {} dispatch: {e}", cli.label()),
         );
     }
+    // Still before any spawn and after the same check, so a failed open is
+    // recorded the same way rather than held as ambiguous.
+    let outputs = open_existing(&a.journal_path, true)
+        .and_then(|journal| Ok((journal, open_existing(&a.stderr_path, true)?)));
+    let (journal, stderr) = match outputs {
+        Ok(outputs) => outputs,
+        Err(e) => {
+            return never_launched(
+                cli,
+                a,
+                spec,
+                &format!("failed to open {} output artifacts: {e}", cli.label()),
+            )
+        }
+    };
     let mut command = Command::new(bin);
     command
         .args(args)
         .envs(cli.env().iter().copied())
         .current_dir(repo)
         .stdin(Stdio::null())
-        .stdout(Stdio::from(open_existing(&a.journal_path, true)?))
-        .stderr(Stdio::from(open_existing(&a.stderr_path, true)?));
+        .stdout(Stdio::from(journal))
+        .stderr(Stdio::from(stderr));
     // Git subprocesses inside the harness must resolve this invocation's
     // checkout, rather than a controller's inherited repository-selection
     // overrides.
@@ -2125,6 +2140,51 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
             ProcessSnapshot::Available(Vec::new()).liveness(Some(a)),
             Liveness::NotListed
         );
+    }
+
+    /// Opening the journal or stderr for the child happens after
+    /// `prepare_spawn` and before any spawn, so a failure there is also
+    /// proof that nothing ran, not an ambiguous hold that only
+    /// `clear-dispatch` releases.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_artifact_open_before_spawn_is_recorded_as_never_launched() {
+        use std::os::unix::fs::PermissionsExt;
+
+        use crate::autopilot::process_tree::ProcessSnapshot;
+        use crate::autopilot::registry::Liveness;
+        let cli = FakeCli {
+            verdict: true,
+            native_id: true,
+            prepare_fails: false,
+        };
+        let artifacts: [fn(&InvocationArtifacts) -> &str; 2] =
+            [|a| &a.journal_path, |a| &a.stderr_path];
+        for artifact in artifacts {
+            let (dir, s) = setup();
+            let a = s.invocation_artifacts.as_ref().unwrap();
+            // Readable, so the prior-evidence check passes; not writable.
+            std::fs::set_permissions(artifact(a), std::fs::Permissions::from_mode(0o400)).unwrap();
+            let bin = binary(dir.path(), "touch spawned");
+            let o = run_supervised_bounded_with(
+                &cli,
+                &bin,
+                dir.path(),
+                &s,
+                Duration::from_secs(5),
+                None,
+            )
+            .unwrap();
+            assert!(!o.invocation_started && !o.is_met(), "{o:?}");
+            let reason = o.reason.unwrap();
+            assert!(reason.contains("failed to open"), "{reason}");
+            assert!(has_launch_failure_record(a));
+            assert!(!dir.path().join("spawned").exists());
+            assert_eq!(
+                ProcessSnapshot::Available(Vec::new()).liveness(Some(a)),
+                Liveness::NotListed
+            );
+        }
     }
 
     /// A prior spawn into this directory leaves its identity file or the
