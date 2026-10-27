@@ -696,11 +696,41 @@ impl Dispatcher for ClaudeDispatcher {
     }
 }
 
-/// Renamed to [`CliDispatcher`], which serves Muse as well; kept, deprecated,
-/// for one release. Its constructor is now
-/// `CliDispatcher::resolve(Implementer::Codex)`.
-#[deprecated(note = "renamed to `CliDispatcher`; resolve it with `Implementer::Codex`")]
-pub type CodexDispatcher = CliDispatcher;
+/// The pre-Muse Codex dispatcher, kept, deprecated, for one release: a
+/// [`CliDispatcher`] for Codex with the old argument-free `resolve()`.
+#[deprecated(note = "use `CliDispatcher::resolve(Implementer::Codex)`")]
+pub struct CodexDispatcher(CliDispatcher);
+
+#[allow(deprecated)]
+impl CodexDispatcher {
+    /// `CliDispatcher::resolve(Implementer::Codex)`.
+    pub fn resolve() -> Result<Self, MemoryError> {
+        CliDispatcher::resolve(Implementer::Codex).map(Self)
+    }
+}
+
+#[allow(deprecated)]
+impl Dispatcher for CodexDispatcher {
+    fn implementer(&self) -> Implementer {
+        self.0.implementer()
+    }
+
+    fn recover(
+        &mut self,
+        repo: &Path,
+        state: &DispatchState,
+    ) -> Result<InvocationRecovery, MemoryError> {
+        self.0.recover(repo, state)
+    }
+
+    fn dispatch(
+        &mut self,
+        repo: &Path,
+        spec: &DispatchSpec,
+    ) -> Result<DispatchOutcome, MemoryError> {
+        self.0.dispatch(repo, spec)
+    }
+}
 
 /// A supervised CLI implementation backend (Codex, Muse). Process evidence is
 /// checked before durable artifacts; only trusted supervisor cleanup permits
@@ -2441,11 +2471,13 @@ pub fn run_issue(
         at_run_start: policy_at_start,
         by_interrupted_run: existing_state.as_ref().is_some_and(|s| s.signing_held),
     };
-    // A collaborator's unsigned commit already on the branch would turn away
-    // any `met` this run produced: refuse before recovery or any dispatch,
-    // like an unreadable policy, until an operator deals with it. Anything
-    // else the guard finds now is for the dispatch to fix, or to judge again
-    // when its `met` arrives.
+    // A fault every later `met` would meet too (`GuardFault::stops_run`: a
+    // collaborator's unsigned commit, a recorded cut that is not a commit
+    // name, a policy or flag that cannot be read) would turn away any `met`
+    // this run produced: refuse before recovery or any dispatch until an
+    // operator deals with it. A git that cannot be run, and anything the
+    // guard finds that is the model's to fix, are judged again when its
+    // `met` arrives.
     if let Some(fault) = collaborator_check_at_start(worktree, seen.fresh()) {
         return Err(MemoryError::Validation(format!(
             "{fault}; the run does not start, since any met it produced would be refused the \
@@ -4771,6 +4803,21 @@ sleep 0.5
         let err = codex.dispatch(&wt.path, &spec).unwrap_err().to_string();
         assert!(err.contains("harness mismatch"), "{err}");
         assert!(err.contains("Muse") && err.contains("Codex"), "{err}");
+        let state = pending_muse(&approved_db(), &wt, None);
+        let err = codex.recover(&wt.path, &state).unwrap_err().to_string();
+        assert!(err.contains("harness mismatch"), "{err}");
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn the_deprecated_codex_dispatcher_is_a_codex_cli_dispatcher() {
+        let (_dir, wt) = fixture_worktree();
+        let mut codex = CodexDispatcher(CliDispatcher {
+            implementer: Implementer::Codex,
+            bin: wt.path.join("no-such-codex"),
+            shared_daemon: None,
+        });
+        assert_eq!(codex.implementer(), Implementer::Codex);
         let state = pending_muse(&approved_db(), &wt, None);
         let err = codex.recover(&wt.path, &state).unwrap_err().to_string();
         assert!(err.contains("harness mismatch"), "{err}");

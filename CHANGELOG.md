@@ -192,9 +192,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   derefs to `str`.
 - **Library: supervised-CLI types renamed.** `CodexArtifacts` is now
   `InvocationArtifacts`, `CodexRecovery` is `InvocationRecovery`,
-  `CodexDispatcher` is `CliDispatcher` (built with
-  `CliDispatcher::resolve(Implementer::Codex)`), and the `codex_process`
-  module is `process_tree`, where `parse_codex_processes`,
+  `CodexDispatcher` is `CliDispatcher::resolve(Implementer::Codex)` (the old
+  type and its argument-free `resolve()` remain as a deprecated wrapper), and
+  the `codex_process` module is `process_tree`, where `parse_codex_processes`,
   `CodexProcessSnapshot`, `CodexProcessSource` and `UnixCodexProcesses` are
   `parse_processes`, `ProcessSnapshot`, `ProcessSource` and `UnixProcesses`.
   The old names stay, deprecated, for one release. These changes have no

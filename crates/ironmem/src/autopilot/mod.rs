@@ -547,8 +547,10 @@ mod tests {
         fn source(s: &mut dyn codex_process::CodexProcessSource) -> process_tree::ProcessSnapshot {
             process_tree::snapshot(s)
         }
-        fn dispatcher(d: run::CodexDispatcher) -> run::CliDispatcher {
-            d
+        // The old constructor's signature, and a dispatcher like any other.
+        let _: fn() -> Result<run::CodexDispatcher, MemoryError> = run::CodexDispatcher::resolve;
+        fn dispatcher(d: run::CodexDispatcher) -> Box<dyn run::Dispatcher> {
+            Box::new(d)
         }
         let _ = (artifacts, recovery, snapshot, source, dispatcher);
         let _: CodexRecovery = InvocationRecovery::NoPriorInvocation;
