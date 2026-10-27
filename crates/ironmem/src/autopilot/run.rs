@@ -920,23 +920,62 @@ fn signing_violation(worktree: &Worktree, policy_at_start: bool) -> Result<Optio
         return Err(unreadable(bounded_stderr(&out)));
     }
     // Children before parents, so the last one flagged has no flagged ancestor.
-    let mut flagged = Vec::new();
-    for sha in String::from_utf8_lossy(&out.stdout)
+    let listed = String::from_utf8_lossy(&out.stdout).into_owned();
+    let shas: Vec<&str> = listed
         .lines()
         .map(str::trim)
         .filter(|line| is_full_object_name(line))
-    {
-        let obj = git(&["cat-file", "commit", sha]).map_err(unreadable)?;
-        if !obj.status.success() {
-            return Err(unreadable(bounded_stderr(&obj)));
+        .collect();
+    // Every commit object in one read, so a long range costs two git
+    // processes rather than two per commit.
+    let headers =
+        git_with_input(&worktree.path, &["cat-file", "--batch"], &shas).map_err(unreadable)?;
+    if !headers.status.success() {
+        return Err(unreadable(bounded_stderr(&headers)));
+    }
+    let has_header = signature_headers(&headers.stdout, &shas).map_err(unreadable)?;
+    let with_header: Vec<&str> = shas
+        .iter()
+        .zip(&has_header)
+        .filter_map(|(sha, has)| has.then_some(*sha))
+        .collect();
+    // `%G?` for every commit that carries a header, in one read. A signature
+    // git cannot even parse fails that whole read with 128, so those ranges
+    // are read one commit at a time, where the failure names its commit.
+    let mut statuses = std::collections::HashMap::new();
+    if !with_header.is_empty() {
+        let batch = git_with_input(
+            &worktree.path,
+            &[
+                "log",
+                "--no-walk",
+                "--stdin",
+                "--no-show-signature",
+                "--format=%H %G?",
+            ],
+            &with_header,
+        )
+        .map_err(unreadable)?;
+        match batch.status.code() {
+            Some(0) => statuses = signature_statuses(&batch.stdout),
+            Some(128) => {}
+            _ => return Err(unreadable(bounded_stderr(&batch))),
         }
-        let signed = has_signature_header(&String::from_utf8_lossy(&obj.stdout)) && {
-            // A signature git cannot even parse (exit 128) is the commit's
-            // fault, not the guard's: it is flagged like a bad one.
-            let status = git(&["log", "-1", "--no-show-signature", "--format=%G?", sha])
-                .map_err(unreadable)?;
-            status.status.success() && String::from_utf8_lossy(&status.stdout).trim() != "B"
-        };
+    }
+    let mut flagged = Vec::new();
+    for (sha, has) in shas.iter().zip(has_header) {
+        let signed = has
+            && match statuses.get(*sha) {
+                Some(status) => status != "B",
+                None => {
+                    // A signature git cannot even parse (exit 128) is the
+                    // commit's fault, not the guard's: it is flagged like a
+                    // bad one.
+                    let status = git(&["log", "-1", "--no-show-signature", "--format=%G?", sha])
+                        .map_err(unreadable)?;
+                    status.status.success() && String::from_utf8_lossy(&status.stdout).trim() != "B"
+                }
+            };
         if !signed {
             flagged.push(sha.chars().take(12).collect::<String>());
         }
@@ -948,6 +987,87 @@ fn signing_violation(worktree: &Worktree, policy_at_start: bool) -> Result<Optio
         .and_then(|name| name.strip_suffix(own_suffix.as_str()))
         .unwrap_or("origin");
     Ok((!flagged.is_empty()).then(|| unsigned_violation(&flagged, &worktree.cut, branch, remote)))
+}
+
+/// Run git in `repo` with one object name per line on its stdin. The input is
+/// written from another thread: git answers as it reads, so a writer that
+/// filled git's input before reading its output would deadlock on a long range.
+fn git_with_input(
+    repo: &Path,
+    args: &[&str],
+    lines: &[&str],
+) -> Result<std::process::Output, String> {
+    let mut command = std::process::Command::new("git");
+    crate::mcp::tools::scrub_git_environment(&mut command);
+    let mut child = command
+        .args(args)
+        .current_dir(repo)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("git {} could not run: {e}", args.join(" ")))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| format!("git {} has no stdin", args.join(" ")))?;
+    let input: String = lines.iter().map(|line| format!("{line}\n")).collect();
+    let writer =
+        std::thread::spawn(move || std::io::Write::write_all(&mut stdin, input.as_bytes()));
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("git {} could not be read: {e}", args.join(" ")))?;
+    // A write cut short by git exiting early is reported through git's own
+    // status; only a writer that could not run at all is the guard's.
+    match writer.join() {
+        Ok(_) => Ok(output),
+        Err(_) => Err(format!("git {} input writer panicked", args.join(" "))),
+    }
+}
+
+/// From `git cat-file --batch` output for `shas` (in that order), whether
+/// each commit carries a signature header. Anything but one commit object
+/// per requested name, in order, is unreadable rather than guessed at.
+fn signature_headers(mut out: &[u8], shas: &[&str]) -> Result<Vec<bool>, String> {
+    let mut found = Vec::with_capacity(shas.len());
+    for sha in shas {
+        let newline = out
+            .iter()
+            .position(|&b| b == b'\n')
+            .ok_or_else(|| format!("cat-file ended before {sha}"))?;
+        let header = String::from_utf8_lossy(&out[..newline]).into_owned();
+        let mut words = header.split(' ');
+        let (name, kind, size) = (words.next(), words.next(), words.next());
+        if name != Some(sha) || kind != Some("commit") {
+            return Err(format!(
+                "cat-file answered {:?} for commit {sha}",
+                header.chars().take(120).collect::<String>()
+            ));
+        }
+        let size: usize = size
+            .and_then(|size| size.parse().ok())
+            .ok_or_else(|| format!("cat-file gave no size for {sha}"))?;
+        let body = out
+            .get(newline + 1..newline + 1 + size)
+            .ok_or_else(|| format!("cat-file output for {sha} is truncated"))?;
+        found.push(has_signature_header(&String::from_utf8_lossy(body)));
+        out = out.get(newline + 2 + size..).unwrap_or_default();
+    }
+    Ok(found)
+}
+
+/// `%G?` per commit from `git log --format='%H %G?'`. Only lines that are an
+/// object name and one status letter count, so stray verification output can
+/// never be read as a status; a commit missing here is read on its own.
+fn signature_statuses(out: &[u8]) -> std::collections::HashMap<String, String> {
+    String::from_utf8_lossy(out)
+        .lines()
+        .filter_map(|line| {
+            let (sha, status) = line.trim().split_once(' ')?;
+            (is_full_object_name(sha) && status.len() == 1)
+                .then(|| (sha.to_string(), status.to_string()))
+        })
+        .collect()
 }
 
 /// Whether `text` is a full object name: 40 hex digits, or 64 in a SHA-256
@@ -4210,12 +4330,96 @@ sleep 0.5
             "B"
         );
         // Measured (git 2.55): with this set, `%G?` is printed after the
-        // signature's own verification lines, so a check that reads the
-        // whole output never sees a bare `B`. `--no-show-signature` on the
-        // `%G?` read is what keeps it a one-word answer.
+        // signature's own verification lines. The batched read keeps only
+        // `<sha> <status>` lines; the per-commit fallback's
+        // `--no-show-signature` is pinned by the mixed-range test below.
         git_in(&wt.path, &["config", "log.showSignature", "true"]);
         let violation = signing_violation(&wt, false).unwrap().unwrap();
         assert_eq!(blamed(&violation), [short(&tampered)].into(), "{violation}");
+    }
+
+    /// Good, unsigned, bad and unparseable signatures in one range, read
+    /// under `log.showSignature=true`: the batched `%G?` read answers the
+    /// first range, and the unparseable header (which fails that read with
+    /// exit 128) sends the second range to one read per commit. Both blame
+    /// exactly the same commits.
+    #[cfg(unix)]
+    #[test]
+    fn a_mixed_range_is_judged_the_same_batched_or_one_commit_at_a_time() {
+        let keys = tempfile::tempdir().unwrap();
+        let Some(key) = ssh_key(keys.path()) else {
+            return;
+        };
+        let (_dir, wt) = fixture_worktree();
+        sign_with(&wt.path, keys.path(), &key);
+        let good = commit_in(&wt.path, "good", &[]);
+        let unsigned = commit_in(&wt.path, "plain", &["-c", "commit.gpgsign=false"]);
+        let signed = commit_in(&wt.path, "signed", &[]);
+        let object = git_in(&wt.path, &["cat-file", "commit", &signed]);
+        let file = keys.path().join("tampered");
+        std::fs::write(&file, object.replace("\n\nsigned", "\n\ntampered") + "\n").unwrap();
+        let bad = git_in(
+            &wt.path,
+            &["hash-object", "-t", "commit", "-w", file.to_str().unwrap()],
+        );
+        git_in(&wt.path, &["reset", "-q", "--hard", &bad]);
+        git_in(&wt.path, &["config", "log.showSignature", "true"]);
+        let batched = signing_violation(&wt, false).unwrap().unwrap();
+        assert_eq!(
+            blamed(&batched),
+            [short(&unsigned), short(&bad)].into(),
+            "never the good {}: {batched}",
+            short(&good)
+        );
+        let plain = commit_in(&wt.path, "garbled", &["-c", "commit.gpgsign=false"]);
+        let garbled = forge_signature_header(&wt, &plain, "garbage");
+        let one_by_one = signing_violation(&wt, false).unwrap().unwrap();
+        assert_eq!(
+            blamed(&one_by_one),
+            [short(&unsigned), short(&bad), short(&garbled)].into(),
+            "never the good {}: {one_by_one}",
+            short(&good)
+        );
+    }
+
+    /// Thousands of commits are read through pipes in both directions; a
+    /// writer that fills git's input before reading its output would hang.
+    #[test]
+    fn a_range_of_thousands_of_commits_is_checked() {
+        const COMMITS: usize = 3000;
+        let (_dir, wt) = fixture_worktree();
+        git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
+        let mut script = String::new();
+        for i in 0..COMMITS {
+            let message = format!("bulk {i}\n");
+            script.push_str(&format!(
+                "commit refs/heads/{}\ncommitter Autopilot Test <autopilot@example.test> {} +0000\n\
+                 data {}\n{message}",
+                wt.branch,
+                1_700_000_000 + i,
+                message.len()
+            ));
+            if i == 0 {
+                script.push_str(&format!("from {}\n", wt.cut));
+            }
+            script.push('\n');
+        }
+        let mut command = std::process::Command::new("git");
+        crate::mcp::tools::scrub_git_environment(&mut command);
+        let mut child = command
+            .args(["fast-import", "--quiet"])
+            .current_dir(&wt.path)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        std::io::Write::write_all(child.stdin.as_mut().unwrap(), script.as_bytes()).unwrap();
+        drop(child.stdin.take());
+        assert!(child.wait().unwrap().success());
+        let violation = signing_violation(&wt, false).unwrap().unwrap();
+        assert!(
+            violation.contains(&format!("and {} more", COMMITS - NAMED_UNSIGNED_COMMITS)),
+            "{violation}"
+        );
     }
 
     #[cfg(unix)]

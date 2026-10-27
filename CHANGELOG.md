@@ -22,7 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   branch now counts as a failed attempt, with a reason naming the commits.
   Turning signing off during a run, or from another issue's worktree, does
   not get around it. A run whose `commit.gpgsign` holds an invalid value
-  refuses to start rather than paying for a dispatch it would discard.
+  refuses to start rather than paying for a dispatch it would discard, and
+  keeps any pending invocation for recovery once the value is fixed. The
+  guard reads a branch of any length in two git processes, falling back to
+  one read per commit only when a signature cannot be parsed.
 - **Codex and Muse supervision waits for a quiet worktree (#366).** A
   short-lived tool's background child, reparented out of the tracked tree,
   no longer gets a trusted completion while it still runs in the worktree.

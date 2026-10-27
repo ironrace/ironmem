@@ -410,9 +410,13 @@ can quietly pass `-c commit.gpgsign=false`.
 - **What counts as unsigned.** A commit with no `gpgsig` header (or, in a
   SHA-256 repository, no `gpgsig-sha256` header). `%G?` is only used to
   catch `B`, a bad signature, such as a signed commit edited afterwards. A
-  signature git cannot parse at all counts as bad too. Each commit is read on
-  its own with `--no-show-signature`, so an operator's `log.showSignature`
-  setting does not change the result.
+  signature git cannot parse at all counts as bad too. The range is read in
+  two git processes however long it is (`git cat-file --batch` for the
+  headers, then one `git log --no-walk --stdin` for `%G?`). A signature git
+  cannot parse fails that second read, so the range is then read one commit
+  at a time and the unparseable one is named. Every read passes
+  `--no-show-signature`, so an operator's `log.showSignature` setting does
+  not change the result.
 - **Which commits are checked.** The commits that ship: everything on the
   issue branch (`refs/heads/<issue-branch>`, not `HEAD`, which the agent may
   have left on another checkout) and on its own remote-tracking refs (such as
