@@ -6,7 +6,7 @@
 //! 1.4.13-R6996.1 on 2026-10-26 (issue #366 has the measurements):
 //! `--session-id` both creates a session and headlessly continues an existing
 //! one, so new and resumed invocations share one argv; the final verdict is
-//! the `text` of the last `run_terminal` record, shaped by `--output-schema`;
+//! the `text` of the one `run_terminal` record, shaped by `--output-schema`;
 //! a SIGTERM/SIGINT ends the process with no terminal record at all; and no
 //! record carries a price, so every invocation is unpriced.
 use std::io::Write;
@@ -17,7 +17,15 @@ use crate::autopilot::implementer::Implementer;
 use crate::autopilot::invocation::{
     create_private, validation, FinalVerdict, InvocationArtifacts, ParsedRun, SupervisedCli,
 };
+use crate::autopilot::scrub::scrub_and_bound;
 use crate::error::MemoryError;
+
+/// How much of a rejected value or verdict text an error quotes.
+const EXCERPT_CHARS: usize = 120;
+
+fn excerpt(text: &str) -> String {
+    scrub_and_bound(text, EXCERPT_CHARS).text
+}
 
 /// Muse CLI. It continues the controller's `--session-id`, so every
 /// invocation names the native ID its run must report.
@@ -33,7 +41,8 @@ pub fn prompt_path(a: &InvocationArtifacts) -> PathBuf {
 fn marker_safe<'a>(what: &str, word: &'a str) -> Result<&'a str, MemoryError> {
     if word.is_empty() || word.starts_with('-') || word.chars().any(char::is_whitespace) {
         return Err(validation(format!(
-            "Muse {what} must be non-empty, contain no whitespace and not start with '-'; got {word:?}"
+            "Muse {what} must be non-empty, contain no whitespace and not start with '-'; got {:?}",
+            excerpt(word)
         )));
     }
     Ok(word)
@@ -44,10 +53,30 @@ impl SupervisedCli for MuseCli {
         Implementer::Muse
     }
 
-    /// `--disable-sandbox`: Muse's sandbox broke SSH commit signing and did
-    /// not confine writes to the workspace (measured), so it bought nothing
-    /// and cost the commit contract. `--trust-workspace` loads the repo's own
-    /// rules and hooks, as Codex's `--dangerously-bypass-hook-trust` does.
+    /// # Security posture
+    ///
+    /// Three flags combine into an unattended agent with the operator's full
+    /// authority, steered partly by content the repository controls:
+    ///
+    /// - `--approval-mode never`: every tool call runs without a prompt.
+    /// - `--disable-sandbox`: the shell is unconfined and runs as the
+    ///   operator's uid, with network access and the operator's SSH signing
+    ///   keys. Muse's sandbox broke SSH commit signing and did not confine
+    ///   writes to the workspace (measured), so it cost the commit contract
+    ///   and bought no containment.
+    /// - `--trust-workspace`: loads the workspace's rules, hooks *and*
+    ///   skills, and enables agent delegation (`muse exec --help`; the #366
+    ///   measurements). Repository content therefore steers the agent and
+    ///   runs code unattended. Parity with Codex's
+    ///   `--dangerously-bypass-hook-trust` is why it is passed, not a bound
+    ///   on that risk.
+    ///
+    /// Trust boundary: with the sandbox off, the agent can write this
+    /// invocation's journal and exit files itself (their paths are visible
+    /// in `ps`). [`MuseCli::parse`] defends against Muse's framing, not
+    /// tampering by the agent; that is acceptable because a forged record
+    /// buys nothing beyond the agent answering `met` itself.
+    ///
     /// `--no-foreign-personal-context` keeps the operator's Claude Code and
     /// Codex personal rules out of an unattended run. The prompt goes through
     /// `--prompt-file`, so `ps` shows no positional word and the marker
@@ -62,9 +91,10 @@ impl SupervisedCli for MuseCli {
         // UUID, and a `urn:uuid:` or uppercase alias would never match it.
         let session = spec.session.session_uuid();
         if !uuid::Uuid::parse_str(session).is_ok_and(|id| id.hyphenated().to_string() == session) {
-            return Err(validation(
-                "Muse requires the controller's canonical session UUID for --session-id",
-            ));
+            return Err(validation(format!(
+                "Muse requires the controller's canonical session UUID for --session-id; got {:?}",
+                excerpt(session)
+            )));
         }
         if spec.max_turns == 0 {
             return Err(validation("Muse --max-model-steps must be at least 1"));
@@ -130,10 +160,11 @@ impl SupervisedCli for MuseCli {
     }
 
     /// Only the controller's session counts. Records on other session streams
-    /// (delegated agents, if `--trust-workspace` enables delegation) are
-    /// ignored rather than treated as a conflict, and a terminal record on
-    /// any other stream is never this run's verdict. Muse writes no final
-    /// file, so `final_text` is unused.
+    /// (delegated agents, which `--trust-workspace` enables) are ignored
+    /// rather than treated as a conflict, and a terminal record on any other
+    /// stream is never this run's verdict. Measured runs emit exactly one
+    /// terminal record per invocation, so more than one trusts nothing.
+    /// Muse writes no final file, so `final_text` is unused.
     fn parse(
         &self,
         journal: &str,
@@ -150,19 +181,29 @@ impl SupervisedCli for MuseCli {
                 .push("Muse supervisor record names no session; nothing can be trusted".into());
             return parsed;
         };
+        let on_stream = |value: &serde_json::Value, kind: &str| {
+            value["stream"]["kind"].as_str() == Some(kind)
+                && value["stream"]["id"].as_str() == Some(expected)
+        };
         let mut saw_expected = false;
-        let mut last_terminal = None;
-        for line in journal.lines().filter(|l| !l.trim().is_empty()) {
+        let mut terminals = Vec::new();
+        let (mut malformed, mut first_malformed) = (0usize, 0usize);
+        for (index, line) in journal.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
             let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-                parsed.errors.push("malformed Muse JSONL journal".into());
+                malformed += 1;
+                if first_malformed == 0 {
+                    first_malformed = index + 1;
+                }
                 continue;
             };
-            let ours = value["stream"]["kind"].as_str() == Some("session")
-                && value["stream"]["id"].as_str() == Some(expected);
+            let ours = on_stream(&value, "session");
             saw_expected |= ours;
             match value["payload"]["kind"].as_str() {
-                Some("run_terminal") if ours => last_terminal = Some(value["payload"].clone()),
-                Some("run_usage") if value["stream"]["id"].as_str() == Some(expected) => {
+                Some("run_terminal") if ours => terminals.push(value["payload"].clone()),
+                Some("run_usage") if on_stream(&value, "exec.usage") => {
                     if let Some(n) = value["payload"]["completed_calls"].as_u64() {
                         parsed.turns = u32::try_from(n).unwrap_or(u32::MAX);
                     }
@@ -170,29 +211,42 @@ impl SupervisedCli for MuseCli {
                 _ => {}
             }
         }
+        if malformed > 0 {
+            parsed.errors.push(format!(
+                "{malformed} malformed Muse JSONL line(s) (first at line {first_malformed})"
+            ));
+        }
         if saw_expected {
             parsed.native_id = Some(expected.to_owned());
         } else {
-            parsed
-                .errors
-                .push("Muse journal never names the requested session".into());
+            parsed.errors.push(format!(
+                "Muse journal never names the requested session {expected}"
+            ));
         }
-        match last_terminal {
-            None => parsed
+        match terminals.as_slice() {
+            [] => parsed
                 .errors
-                .push("Muse run emitted no terminal record (killed or crashed)".into()),
-            Some(t) if t["terminal"].as_str() == Some("completed") => {
-                match serde_json::from_str::<FinalVerdict>(t["text"].as_str().unwrap_or_default()) {
+                .push("Muse run emitted no terminal record".into()),
+            [t] if t["terminal"].as_str() == Some("completed") => match t["text"].as_str() {
+                None => parsed
+                    .errors
+                    .push("Muse completed terminal record carries no text verdict".into()),
+                Some(text) => match serde_json::from_str::<FinalVerdict>(text) {
                     Ok(verdict) => parsed.verdict = Some(verdict),
-                    Err(e) => parsed
-                        .errors
-                        .push(format!("invalid Muse final verdict: {e}")),
-                }
-            }
-            Some(t) => parsed.errors.push(format!(
+                    Err(e) => parsed.errors.push(format!(
+                        "invalid Muse final verdict: {e}; text: {:?}",
+                        excerpt(text)
+                    )),
+                },
+            },
+            [t] => parsed.errors.push(format!(
                 "Muse run ended {}: {}",
                 t["terminal"].as_str().unwrap_or("without a terminal kind"),
                 t["reason"].as_str().unwrap_or("no reason given")
+            )),
+            many => parsed.errors.push(format!(
+                "Muse journal has {} terminal records for the requested session; expected exactly one",
+                many.len()
             )),
         }
         if !parsed.errors.is_empty() {
@@ -361,14 +415,30 @@ mod tests {
             SID.to_ascii_uppercase(),
             SID.replace('-', ""),
         ] {
-            let bad = spec(SessionMode::Resume {
-                session_uuid: session.clone(),
-            });
-            assert!(
-                MuseCli.argv(Path::new("/w"), &bad, &artifacts()).is_err(),
-                "accepted session {session:?}"
-            );
+            for bad in [
+                spec(SessionMode::New {
+                    session_uuid: session.clone(),
+                }),
+                spec(SessionMode::Resume {
+                    session_uuid: session.clone(),
+                }),
+            ] {
+                let err = MuseCli
+                    .argv(Path::new("/w"), &bad, &artifacts())
+                    .unwrap_err()
+                    .to_string();
+                assert!(err.contains(&session), "{err}");
+            }
         }
+        // The rejected value is quoted, but bounded.
+        let long = spec(SessionMode::New {
+            session_uuid: "x".repeat(500),
+        });
+        let err = MuseCli
+            .argv(Path::new("/w"), &long, &artifacts())
+            .unwrap_err()
+            .to_string();
+        assert!(!err.contains(&"x".repeat(121)), "{err}");
         let mut zero = spec(SessionMode::New {
             session_uuid: SID.into(),
         });
@@ -389,9 +459,14 @@ mod tests {
                 "accepted model {model:?}"
             );
         }
-        assert!(MuseCli
-            .argv(Path::new("/w/my repo"), &ok, &artifacts())
-            .is_err());
+        for workspace in ["/w/my repo", "", "-w"] {
+            assert!(
+                MuseCli
+                    .argv(Path::new(workspace), &ok, &artifacts())
+                    .is_err(),
+                "accepted workspace {workspace:?}"
+            );
+        }
     }
 
     #[test]
@@ -414,6 +489,24 @@ mod tests {
         // With no expected ID (a corrupt exit record), nothing is trusted.
         let untrusted = MuseCli.parse(&journal, Ok(String::new()), None);
         assert!(untrusted.verdict.is_none() && !untrusted.errors.is_empty());
+    }
+
+    #[test]
+    fn usage_counts_only_from_the_usage_stream_of_the_requested_session() {
+        let journal = [
+            usage(3),
+            terminal("completed", r#"{"verdict":"met","reason":"ok"}"#),
+            // A run_usage payload on any other stream kind is not ours.
+            record(
+                "session",
+                SID,
+                serde_json::json!({"kind": "run_usage", "completed_calls": 7}),
+            ),
+        ]
+        .join("\n");
+        let parsed = MuseCli.parse(&journal, Ok(String::new()), Some(SID));
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        assert_eq!(parsed.turns, 3);
     }
 
     #[test]
@@ -449,6 +542,24 @@ mod tests {
                 r#"{"verdict":"success","reason":"wrong enum"}"#,
             ),
             terminal("completed", r#"{"verdict":"met","reason":"x","extra":1}"#),
+            // A completed terminal record carrying no text at all.
+            record(
+                "session",
+                SID,
+                serde_json::json!({
+                    "kind": "run_terminal", "terminal": "completed", "text": null,
+                    "reason": null
+                }),
+            ),
+            // A terminal record on our UUID but not on the session stream.
+            record(
+                "exec.usage",
+                SID,
+                serde_json::json!({
+                    "kind": "run_terminal", "terminal": "completed",
+                    "text": r#"{"verdict":"met","reason":"x"}"#, "reason": null
+                }),
+            ),
             // A terminal record from a different session only.
             record(
                 "session",
@@ -462,12 +573,6 @@ mod tests {
                 "not json\n{}",
                 terminal("completed", r#"{"verdict":"met","reason":"x"}"#)
             ),
-            // A later failure supersedes an earlier completion.
-            [
-                terminal("completed", r#"{"verdict":"met","reason":"x"}"#),
-                terminal("failed", ""),
-            ]
-            .join("\n"),
         ];
         for journal in cases {
             let parsed = MuseCli.parse(&journal, Ok(String::new()), Some(SID));
@@ -477,6 +582,89 @@ mod tests {
             );
             assert!(!parsed.errors.is_empty(), "no error for: {journal}");
         }
+    }
+
+    #[test]
+    fn more_than_one_terminal_record_for_the_requested_session_trusts_nothing() {
+        let met = terminal("completed", r#"{"verdict":"met","reason":"x"}"#);
+        for second in [terminal("failed", ""), met.clone()] {
+            let journal = [met.clone(), second].join("\n");
+            let parsed = MuseCli.parse(&journal, Ok(String::new()), Some(SID));
+            assert!(parsed.verdict.is_none(), "trusted: {journal}");
+            assert!(
+                parsed.errors.contains(
+                    &"Muse journal has 2 terminal records for the requested session; expected exactly one"
+                        .to_owned()
+                ),
+                "{:?}",
+                parsed.errors
+            );
+        }
+    }
+
+    #[test]
+    fn failure_reasons_are_specific_and_bounded() {
+        let errors = |journal: &str| MuseCli.parse(journal, Ok(String::new()), Some(SID)).errors;
+        // No terminal record: say so without guessing a cause.
+        let none = errors(&usage(1));
+        assert!(
+            none.contains(&"Muse run emitted no terminal record".to_owned()),
+            "{none:?}"
+        );
+        // Repeated malformed lines collapse into one error.
+        let ok = terminal("completed", r#"{"verdict":"met","reason":"x"}"#);
+        let malformed = errors(&format!("{ok}\nnot json\n\nalso bad"));
+        assert_eq!(
+            malformed
+                .iter()
+                .filter(|e| e.contains("malformed"))
+                .collect::<Vec<_>>(),
+            ["2 malformed Muse JSONL line(s) (first at line 2)"]
+        );
+        // The session the journal never names is the one it should have.
+        let other = record(
+            "session",
+            "11111111-2222-3333-4444-555555555555",
+            serde_json::json!({"kind": "x"}),
+        );
+        let unnamed = errors(&other);
+        assert!(
+            unnamed
+                .iter()
+                .any(|e| e.contains("never names") && e.contains(SID)),
+            "{unnamed:?}"
+        );
+        // An invalid verdict quotes a bounded excerpt of the text.
+        let invalid = errors(&terminal("completed", "not json at all"));
+        assert!(
+            invalid
+                .iter()
+                .any(|e| e.contains("invalid Muse final verdict") && e.contains("not json at all")),
+            "{invalid:?}"
+        );
+        let long = errors(&terminal("completed", &"y".repeat(500)));
+        assert!(
+            long.iter().all(|e| !e.contains(&"y".repeat(121))),
+            "{long:?}"
+        );
+    }
+
+    #[test]
+    fn another_sessions_terminal_after_ours_leaves_ours_trusted() {
+        let journal = [
+            terminal("completed", r#"{"verdict":"met","reason":"ok"}"#),
+            record(
+                "session",
+                "11111111-2222-3333-4444-555555555555",
+                serde_json::json!({
+                    "kind": "run_terminal", "terminal": "failed", "text": "", "reason": "x"
+                }),
+            ),
+        ]
+        .join("\n");
+        let parsed = MuseCli.parse(&journal, Ok(String::new()), Some(SID));
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        assert_eq!(parsed.verdict.unwrap().verdict, Verdict::Met);
     }
 
     #[test]
@@ -523,6 +711,26 @@ mod tests {
         }
         // A second spawn into the same invocation is refused, never overwritten.
         assert!(MuseCli.prepare_spawn(&s, &a).is_err());
+    }
+
+    /// The core refuses a spawn when any `spawn_files` entry exists, so the
+    /// list must name exactly what `prepare_spawn` creates.
+    #[test]
+    fn spawn_files_names_exactly_what_prepare_spawn_creates() {
+        let (_repo, mut s) = crate::autopilot::invocation::contract_tests::setup();
+        s.implementer = Implementer::Muse;
+        let a = s.invocation_artifacts.clone().unwrap();
+        let dir = Path::new(&a.schema_path).parent().unwrap();
+        let list = || {
+            std::fs::read_dir(dir)
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let before = list();
+        MuseCli.prepare_spawn(&s, &a).unwrap();
+        let created: std::collections::BTreeSet<_> = list().difference(&before).cloned().collect();
+        assert_eq!(created, MuseCli.spawn_files(&a).into_iter().collect());
     }
 
     #[cfg(unix)]

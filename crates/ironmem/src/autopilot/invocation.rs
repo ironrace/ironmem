@@ -69,8 +69,9 @@ pub trait SupervisedCli: Sync {
     ) -> Result<Vec<String>, MemoryError>;
 
     /// Files [`SupervisedCli::prepare_spawn`] creates. Any of them already
-    /// present proves a prior spawn into this invocation, so the core refuses
-    /// before writing. Default: none.
+    /// present proves a prior spawn was attempted into this invocation, so
+    /// the core refuses before writing. The list must name exactly the files
+    /// `prepare_spawn` creates, no more and no fewer. Default: none.
     fn spawn_files(&self, _a: &InvocationArtifacts) -> Vec<PathBuf> {
         Vec::new()
     }
@@ -418,15 +419,16 @@ fn run_supervised_bounded_with(
             )));
         }
     }
-    // A killed child can leave every output empty, but its identity file or
-    // the harness's spawn files still prove it ran. Refuse with an error
-    // rather than record a never-launched failure that could mask it.
+    // A killed child can leave every output empty. Its identity file still
+    // proves a child ran, and the harness's spawn files prove a spawn was at
+    // least attempted. Either way a never-launched record could mask a live
+    // invocation, so refuse with an error instead of writing one.
     for path in std::iter::once(super::process_tree::identity_path(a)).chain(cli.spawn_files(a)) {
         match std::fs::symlink_metadata(&path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => {
                 return Err(validation(format!(
-                    "cannot prove {} holds no prior {} spawn: {e}",
+                    "cannot stat {} to rule out a prior {} spawn: {e}",
                     path.display(),
                     cli.label()
                 )))
