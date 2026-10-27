@@ -85,8 +85,8 @@ project hook committed by one dispatch runs at the start of every later
 dispatch or resume on that branch. Only the separate Codex *reviewer* runs
 `-s read-only`.
 
-Muse Code is explicit too. The model name is yours to choose; `muse-wonder-1.0`
-is only an example:
+Muse Code is explicit too. Pass the model you want, for example
+`muse-wonder-1.0`:
 
 ```
 ironmem autopilot run owner/repo 364 --title "..." --implementer muse --model <muse-model>
@@ -143,8 +143,9 @@ An *invocation* is one launch of the Codex or Muse process.
 
 The native Codex argv was verified against `codex-cli 0.163.0`. It has no
 Autopilot-supplied session name or controller session ID, and it has no native
-`--max-budget-usd` or `--max-turns` flags. Muse has a native step cap but no
-budget flag. So with either harness:
+`--max-budget-usd` or `--max-turns` flags, so Codex refuses `--max-turns` too
+(`--n-turns` still appears as prompt guidance). Muse has a native step cap but
+no budget flag. So with either harness:
 
 - `--max-budget-usd` is an error. Autopilot does not pretend the shared
   `RunConfig` field becomes native enforcement. Instead, each invocation
@@ -171,8 +172,7 @@ budget flag. So with either harness:
 Human output labels known spend and the unpriced dispatch count; JSON keeps
 each Codex or Muse dispatch's `total_cost_usd` as `null`, the run total as the
 known-dollar floor, and reports `unpriced_dispatches` separately. Unknown cost
-is never rendered as free. Codex `--max-turns` is refused too; `--n-turns`
-still appears as prompt guidance.
+is never rendered as free.
 
 ### Muse specifics
 
@@ -369,6 +369,10 @@ issue 364, `autopilot/owner-repo-364`). To stop enforcing on it on purpose:
 2. In the repo, run `git config --unset branch.<branch>.ironmemSigning`.
 3. Keep it off. Every run start records the flag again whenever the policy is
    on, so turning signing back on re-arms the guard.
+
+Do these with no Lead or `run` active on the issue. A running attempt that
+started with signing on still holds the branch to it, so it fails with
+"commit.gpgsign was turned off on this branch".
 
 ## Onboarding a repo
 
@@ -594,8 +598,8 @@ typing the command.
 - **A Codex or Muse hold** (a dispatch that restart recovery could not prove
   finished) is released with `ironmem autopilot clear-dispatch owner/repo
   <issue>`, once you have stopped any Lead or `run` on the repo and confirmed
-  nothing is still working on the issue. *Codex identity, restart recovery,
-  and supervision limits* has the checks it makes.
+  nothing is still working on the issue. *Codex and Muse identity, restart
+  recovery, and supervision limits* has the checks it makes.
 - **A stored cut that is no longer a commit** stops the run with this error:
 
   ```
