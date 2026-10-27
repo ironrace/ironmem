@@ -24,6 +24,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Codex and Muse implementers no longer autospawn — and then kill at
+  cleanup — the shared ironmem daemon.**
 - **`autopilot lead` now closes out an issue at its attempt cap (#345).**
   Before, a tick whose run ended `AttemptCapExhausted` wrote nothing, so
   the issue kept `agent:ready` with no comment. The queue deferred it on

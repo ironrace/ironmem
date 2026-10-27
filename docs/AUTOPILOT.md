@@ -297,6 +297,11 @@ is outside its guarantee. The macOS runtime path is exercised. Linux-specific
 kernel identity and cleanup code is covered by code/tests but has not been
 run end to end on a Linux host.
 
+A supervised harness's ironmem MCP server never autospawns the shared ironmem
+daemon (Autopilot sets `IRONMEM_NO_DAEMON=1` for every supervised child): it
+connects to a running daemon or serves in-process, so cleanup never kills the
+daemon your other sessions use.
+
 Verification records are intentionally separated:
 
 - On 2026-10-22, native `codex-cli 0.163.0` new and resume **no-tools format

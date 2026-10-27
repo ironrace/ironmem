@@ -429,6 +429,9 @@ pub(crate) fn run_supervised_bounded(
     run_supervised_bounded_with(cli_for(spec.implementer)?, bin, repo, spec, timeout)
 }
 
+/// Read by `ironmem serve --connect` (`Config::daemon_autospawn_enabled`).
+const NO_DAEMON_ENV: &str = "IRONMEM_NO_DAEMON";
+
 fn run_supervised_bounded_with(
     cli: &dyn SupervisedCli,
     bin: &Path,
@@ -500,6 +503,15 @@ fn run_supervised_bounded_with(
     // checkout, rather than a controller's inherited repository-selection
     // overrides.
     crate::mcp::tools::scrub_git_environment(&mut command);
+    // The harness starts the operator's MCP servers, among them
+    // `ironmem serve --connect`. With no daemon listening, that proxy would
+    // autospawn the shared daemon as its own child: a descendant of this
+    // root, which the process tracker enrols and kills at cleanup, taking
+    // every other session's daemon with it. With autospawn off the proxy
+    // still connects to a running daemon, and otherwise serves in-process.
+    // Set last, after the harness's `env()` and the git scrub (which removes
+    // only `GIT_*`), so nothing a harness supplies can turn autospawn back on.
+    command.env(NO_DAEMON_ENV, "1");
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -1676,7 +1688,12 @@ exit {code}"#
         prepare_fails: bool,
     }
 
-    const FAKE_ENV: &[(&str, &str)] = &[("IRONMEM_FAKE_HARNESS_ENV", "from-env")];
+    /// The `IRONMEM_NO_DAEMON=0` entry is a harness trying to re-enable the
+    /// daemon autospawn; the core's own setting must win over it.
+    const FAKE_ENV: &[(&str, &str)] = &[
+        ("IRONMEM_FAKE_HARNESS_ENV", "from-env"),
+        (NO_DAEMON_ENV, "0"),
+    ];
 
     fn fake_prompt(a: &InvocationArtifacts) -> std::path::PathBuf {
         Path::new(&a.schema_path).with_file_name("prompt.txt")
@@ -1799,6 +1816,39 @@ exit {code}"#
             std::fs::read_to_string(dir.path().join("prompt-seen")).unwrap(),
             "the prompt"
         );
+    }
+
+    /// The harness starts the operator's MCP servers, including
+    /// `ironmem serve --connect`. Were that proxy to autospawn the shared
+    /// daemon, the daemon would be a descendant of the harness root and the
+    /// process tracker would kill it at cleanup. The core therefore disables
+    /// autospawn for every supervised child, and a harness's own env cannot
+    /// turn it back on.
+    #[cfg(unix)]
+    #[test]
+    fn a_supervised_child_never_autospawns_the_shared_ironmem_daemon() {
+        let (dir, s) = setup();
+        let cli = FakeCli {
+            verdict: true,
+            native_id: true,
+            prepare_fails: false,
+        };
+        assert!(
+            cli.env()
+                .iter()
+                .any(|(k, v)| *k == NO_DAEMON_ENV && *v == "0"),
+            "the fake harness must try to override the core's setting"
+        );
+        let bin = binary(
+            dir.path(),
+            &observable(
+                "[ \"$IRONMEM_NO_DAEMON\" = 1 ] || exit 3\n\
+                 echo journal",
+            ),
+        );
+        let o = run_supervised_bounded_with(&cli, &bin, dir.path(), &s, Duration::from_secs(5))
+            .unwrap();
+        assert!(o.process_success && o.is_met(), "{o:?}");
     }
 
     #[test]
