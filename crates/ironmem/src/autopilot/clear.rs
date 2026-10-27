@@ -73,6 +73,17 @@ pub fn clear_dispatch(
     issue: &IssueRef,
     observe: impl FnOnce() -> HarnessSnapshots,
 ) -> Result<Cleared, MemoryError> {
+    clear_dispatch_with(db, issue, observe, &super::process_tree::user_pids)
+}
+
+/// [`clear_dispatch`], with the PIDs an unreadable state's worktree scan
+/// reads injected ([`super::process_tree::ScanPids`]).
+pub(crate) fn clear_dispatch_with(
+    db: &Database,
+    issue: &IssueRef,
+    observe: impl FnOnce() -> HarnessSnapshots,
+    pids: super::process_tree::ScanPids<'_>,
+) -> Result<Cleared, MemoryError> {
     let refuse = |reason: String| {
         MemoryError::Validation(format!("refusing to clear {}: {reason}", issue.canonical()))
     };
@@ -85,7 +96,7 @@ pub fn clear_dispatch(
     let state = match dispatch_state::parse_dispatch_state(&raw) {
         dispatch_state::Parsed::Readable(state) => *state,
         dispatch_state::Parsed::Unreadable(why) => {
-            if let Some(reason) = unreadable_refusal(&observe(), issue) {
+            if let Some(reason) = unreadable_refusal(&observe(), issue, &raw, pids) {
                 return Err(refuse(format!(
                     "its dispatch state cannot be read ({why}), and {reason}"
                 )));
@@ -134,21 +145,83 @@ pub fn clear_dispatch(
 /// or named with `--name` on a live process. The process table settles a
 /// Claude IC on its own, so an unreadable Claude registry (no `claude`
 /// installed, say) does not keep the drawer for ever.
-fn unreadable_refusal(snapshots: &HarnessSnapshots, issue: &IssueRef) -> Option<String> {
+///
+/// What the drawer still says is used too, read loosely: with its
+/// invocation artifacts (`codex_artifacts`), the recorded tree (root,
+/// group, descendants, identity file) as a readable state's check reads it;
+/// with its `worktree_path`, every same-user process born since the
+/// invocation started whose working directory is in that worktree (the
+/// supervisor's own worktree check). Any marker-shaped path for the issue
+/// is found by substring, so a space in it hides nothing.
+fn unreadable_refusal(
+    snapshots: &HarnessSnapshots,
+    issue: &IssueRef,
+    raw: &str,
+    pids: super::process_tree::ScanPids<'_>,
+) -> Option<String> {
+    let loose: Option<serde_json::Value> = serde_json::from_str(raw).ok();
+    let field = |key: &str| loose.as_ref().and_then(|v| v.get(key)).cloned();
+    let artifacts: Option<InvocationArtifacts> =
+        field("codex_artifacts").and_then(|v| serde_json::from_value(v).ok());
     if let Some(reason) = snapshots.processes.live_evidence_with(
         &issue.slug(),
-        None,
+        artifacts.as_ref(),
         &crate::autopilot::registry::configured_shared_daemon,
     ) {
         return Some(reason);
+    }
+    let super::process_tree::ProcessSnapshot::Available(rows) = &snapshots.processes else {
+        return Some(snapshots.processes.reason());
+    };
+    let layout = format!("/autopilot/{}/", issue.slug());
+    if let Some(r) = rows.iter().find(|r| r.active() && r.args.contains(&layout)) {
+        return Some(format!(
+            "process {} names a path in {}'s Autopilot invocation directory",
+            r.pid,
+            issue.slug()
+        ));
+    }
+    let worktree = field("worktree_path")
+        .and_then(|v| v.as_str().map(std::path::PathBuf::from))
+        .filter(|path| path.is_dir());
+    if let Some(worktree) = worktree {
+        let identity = artifacts
+            .as_ref()
+            .and_then(|a| super::process_tree::read_identity(a).ok());
+        let started = field("started_at")
+            .and_then(|v| v.as_str().map(str::to_owned))
+            .and_then(|at| chrono::DateTime::parse_from_rfc3339(&at).ok())
+            .map(std::time::SystemTime::from)
+            .and_then(super::process_tree::birth_at);
+        let Some(spawned) = identity.as_ref().and_then(|i| i.root_birth).or(started) else {
+            return Some(format!(
+                "when its invocation started cannot be read, so the processes in its worktree \
+                 {} cannot be checked",
+                worktree.display()
+            ));
+        };
+        let known: Vec<u32> = identity
+            .iter()
+            .flat_map(|i| std::iter::once(i.root_pid).chain(i.descendants.iter().map(|d| d.pid)))
+            .collect();
+        let daemon = crate::autopilot::registry::configured_shared_daemon();
+        match super::process_tree::QuietCheck::once(
+            &worktree,
+            spawned,
+            &known,
+            daemon.as_ref(),
+            rows,
+            pids,
+        ) {
+            Ok(super::process_tree::Quiet::Yes) => {}
+            Ok(super::process_tree::Quiet::Held(hold)) => return Some(hold.reason),
+            Err(why) => return Some(why),
+        }
     }
     let ic = super::dispatch::ic_name(issue);
     if snapshots.claude.liveness(&ic) == Liveness::Alive {
         return Some(format!("Claude's registry lists its IC session {ic}"));
     }
-    let super::process_tree::ProcessSnapshot::Available(rows) = &snapshots.processes else {
-        return Some(snapshots.processes.reason());
-    };
     let names_ic = |args: &str| {
         let words: Vec<&str> = args.split_whitespace().collect();
         words.windows(2).any(|w| w[0] == "--name" && w[1] == ic)
@@ -755,6 +828,15 @@ mod tests {
                 snapshots(vec![row(91, 91, &format!("bash -e {ours}"))]),
                 "process 91",
             ),
+            // So does one whose path has a space, which no word split finds.
+            (
+                snapshots(vec![row(
+                    94,
+                    94,
+                    "bash /r/my disk/.git/ironmem/autopilot/owner-repo-42/                     11111111-2222-3333-4444-555555555555/schema.json",
+                )]),
+                "process 94",
+            ),
             (
                 HarnessSnapshots {
                     claude: RegistrySnapshot::Available(Vec::new()),
@@ -836,5 +918,72 @@ mod tests {
             raw_drawer(&db).as_deref(),
             Some("still not json, but different")
         );
+    }
+
+    /// An unreadable drawer that still names its invocation's artifacts and
+    /// worktree is checked against them as a readable one would be: a child
+    /// its recorded root left running in the worktree holds it, and once
+    /// that child is gone the drawer is released.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_dispatch_state_is_kept_while_its_worktree_is_in_use() {
+        let db = Database::open_in_memory().unwrap();
+        let artifacts_dir = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        // The recorded root (PID 1234 in the fixture) has exited.
+        let (a, _) = testing::invocation(artifacts_dir.path());
+        let started = (chrono::Utc::now() - chrono::Duration::seconds(60)).to_rfc3339();
+        write_raw(
+            &db,
+            &serde_json::json!({
+                "implementer": "some-future-harness",
+                "codex_artifacts": a,
+                "worktree_path": worktree.path(),
+                "started_at": started,
+            })
+            .to_string(),
+        );
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .current_dir(worktree.path())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let only_it = move || -> Result<Vec<u32>, String> { Ok(vec![pid]) };
+        let err = clear_dispatch_with(
+            &db,
+            &issue(),
+            || snapshots(vec![row(pid, pid, "sleep 30")]),
+            &only_it,
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+        let err = err.unwrap_err().to_string();
+        assert!(err.contains("refusing to clear"), "{err}");
+        assert!(err.contains(&pid.to_string()), "{err}");
+        assert!(raw_drawer(&db).is_some());
+        // Gone: released.
+        let cleared = clear_dispatch_with(&db, &issue(), || snapshots(Vec::new()), &only_it);
+        assert!(matches!(cleared, Ok(Cleared::Unreadable(_))), "{cleared:?}");
+        assert_eq!(raw_drawer(&db), None);
+    }
+
+    /// Its recorded tree counts too: a recorded descendant still running.
+    #[test]
+    fn an_unreadable_dispatch_state_is_kept_while_its_recorded_tree_runs() {
+        let db = Database::open_in_memory().unwrap();
+        let artifacts_dir = tempfile::tempdir().unwrap();
+        let (a, _) = testing::invocation(artifacts_dir.path());
+        write_raw(
+            &db,
+            &serde_json::json!({"implementer": "some-future-harness", "codex_artifacts": a})
+                .to_string(),
+        );
+        // The fixture's recorded root, 1234, still in the table, unmarked.
+        let err = clear_dispatch(&db, &issue(), || snapshots(vec![row(1234, 1234, "node x")]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("1234"), "{err}");
+        assert!(raw_drawer(&db).is_some());
     }
 }

@@ -945,19 +945,27 @@ typing the command.
   <issue>`, once you have stopped any Lead or `run` on the repo and confirmed
   nothing is still working on the issue. *Codex and Muse identity, restart
   recovery, and supervision limits* has the checks it makes.
-- **An unreadable dispatch state** (deferred as `dispatch_state_unreadable`)
-  is released with the same `ironmem autopilot clear-dispatch owner/repo
-  <issue>`. Its harness is unknown, so it refuses while anything could be
-  the issue's work: a process carrying an Autopilot marker for the issue, an
-  ambiguous `codex exec` or `muse exec`, a process table it cannot read, or
-  the issue's Claude IC (`ic-<owner>-<repo>-<issue>`), either listed in
-  Claude's registry or named with `--name` on a running process. An
-  unreadable Claude registry alone does not refuse, since the process table
-  settles a running `claude`. The drawer is deleted only if its content is
-  still byte for byte what was checked. The command prints why it could not
-  be read and its raw content (secrets scrubbed, cut at 4000 characters;
-  `--json` gives `reason`, `raw_content` and `raw_content_truncated`), so the
-  evidence is not lost. Lineage, attempt counts and spend stand.
+- **An unreadable dispatch state** (deferred as `dispatch_state_unreadable`) is
+  released with the same `ironmem autopilot clear-dispatch owner/repo <issue>`.
+  Its harness is unknown, so it refuses while anything could be the issue's
+  work: a process naming a path in the issue's Autopilot invocation directory,
+  an ambiguous `codex exec` or `muse exec`, a process table it cannot read, or
+  the issue's Claude IC (`ic-<owner>-<repo>-<issue>`), either listed in Claude's
+  registry or named with `--name` on a running process. An unreadable Claude
+  registry alone does not refuse, since the process table settles a running
+  `claude`. What the drawer still says is used too: with its invocation
+  artifacts, it refuses while the recorded root, process group or a recorded
+  descendant runs, or the process-identity file cannot be read; with its
+  worktree, while any of your processes started since the invocation began has
+  its working directory there. Before you run it, still check that worktree for
+  leftover processes yourself: a drawer that names neither cannot be checked
+  that way. It also cannot tell whether a finished invocation was still waiting
+  to be recorded, so that last attempt may go uncounted in lineage. The drawer
+  is deleted only if its content is still byte for byte what was checked. The
+  command prints why it could not be read and its raw content (secrets scrubbed,
+  cut at 4000 characters; `--json` gives `reason`, `raw_content` and
+  `raw_content_truncated`), so the evidence is not lost. Lineage, attempt counts
+  and spend stand.
 - **A stored cut that is no longer a commit** stops the run with this error:
 
   ```

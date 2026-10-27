@@ -79,7 +79,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not know, was skipped, so a Lead could dispatch past its cap. It now keeps
   its slot and defers its issue (`dispatch_state_unreadable`), and
   `clear-dispatch` releases it once a fresh process table shows nothing that
-  could be the issue's work, printing why it could not be read and its raw
+  could be the issue's work (using the artifacts and worktree the drawer
+  still names, if any), printing why it could not be read and its raw
   content (secrets scrubbed, bounded). A Claude dispatch state carrying Codex
   or Muse invocation artifacts is refused where it is written and where it is
   read. **Library:** `clear::clear_dispatch` now returns `clear::Cleared`, an

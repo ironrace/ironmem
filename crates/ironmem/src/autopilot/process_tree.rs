@@ -912,6 +912,40 @@ const KILL_SIGNAL: i32 = 0;
 /// since boot, 0).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct Birth(u64, u64);
+
+/// The kernel birth a process started at wall-clock `at` would carry, for
+/// comparing a recorded start time against process births. macOS births
+/// are wall-clock; Linux births are clock ticks since boot, so its boot time
+/// (`btime` in `/proc/stat`) is subtracted. `None` where that cannot be read.
+pub(crate) fn birth_at(at: std::time::SystemTime) -> Option<Birth> {
+    let since_epoch = at.duration_since(std::time::UNIX_EPOCH).ok()?;
+    #[cfg(target_os = "macos")]
+    {
+        Some(Birth(
+            since_epoch.as_secs(),
+            u64::from(since_epoch.subsec_micros()),
+        ))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let stat = std::fs::read_to_string("/proc/stat").ok()?;
+        let boot: u64 = stat
+            .lines()
+            .find_map(|line| line.strip_prefix("btime "))?
+            .trim()
+            .parse()
+            .ok()?;
+        // SAFETY: sysconf has no preconditions.
+        let ticks = u64::try_from(unsafe { libc::sysconf(libc::_SC_CLK_TCK) }).ok()?;
+        let after_boot = since_epoch.checked_sub(std::time::Duration::from_secs(boot))?;
+        Some(Birth(after_boot.as_secs() * ticks, 0))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = since_epoch;
+        None
+    }
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct KernelProcess {
     pid: u32,
