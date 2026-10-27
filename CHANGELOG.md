@@ -77,9 +77,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **A dispatch state the queue cannot read holds its concurrency slot.** One
   that is corrupt, or that a newer ironmem wrote for a harness this one does
   not know, was skipped, so a Lead could dispatch past its cap. It now keeps
-  its slot and defers its issue (`dispatch_state_unreadable`). A Claude
-  dispatch state carrying Codex or Muse invocation artifacts is refused where
-  it is written and where it is read.
+  its slot and defers its issue (`dispatch_state_unreadable`), and
+  `clear-dispatch` releases it once a fresh process table shows nothing that
+  could be the issue's work, printing why it could not be read and its raw
+  content (secrets scrubbed, bounded). A Claude dispatch state carrying Codex
+  or Muse invocation artifacts is refused where it is written and where it is
+  read. **Library:** `clear::clear_dispatch` now returns `clear::Cleared`, an
+  untagged enum of the existing `ClearedDispatch` and the new
+  `ClearedUnreadable`, so a readable state's `--json` output is unchanged.
 - **Codex and Muse implementers no longer kill the shared ironmem daemon at
   cleanup.** A harness's ironmem MCP server can autospawn the daemon as its
   own child; the process tracker now never treats the daemon on the

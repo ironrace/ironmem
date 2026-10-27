@@ -34,19 +34,79 @@ pub struct ClearedDispatch {
     pub invocation_artifacts: Option<InvocationArtifacts>,
 }
 
+/// A dispatch-state drawer this binary could not read, released: what it
+/// held, so the evidence is not lost with it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ClearedUnreadable {
+    pub issue: String,
+    /// Why it could not be read.
+    pub reason: String,
+    /// Its raw content, secrets scrubbed and bounded to
+    /// [`RAW_CONTENT_CHARS`] characters.
+    pub raw_content: String,
+    /// Whether `raw_content` was cut.
+    pub raw_content_truncated: bool,
+}
+
+/// How many characters of an unreadable drawer's content are reported.
+pub const RAW_CONTENT_CHARS: usize = 4000;
+
+/// What `clear-dispatch` released. Untagged, so a readable state's JSON is
+/// what it always was.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum Cleared {
+    Dispatch(ClearedDispatch),
+    Unreadable(ClearedUnreadable),
+}
+
 /// `observe` is called after the state is read, so the evidence is never
 /// older than the state it judges, and the delete happens only if the state
 /// is still exactly the one judged.
+///
+/// A drawer this binary cannot read (corrupt, refused by
+/// [`DispatchState::validate`], or written by a newer binary for a harness it
+/// does not know) is judged without knowing its harness: see
+/// [`unreadable_refusal`].
 pub fn clear_dispatch(
     db: &Database,
     issue: &IssueRef,
     observe: impl FnOnce() -> HarnessSnapshots,
-) -> Result<ClearedDispatch, MemoryError> {
-    let state = dispatch_state::get_dispatch_state(db, issue)?.ok_or_else(|| {
-        MemoryError::NotFound(format!("{} has no dispatch state", issue.canonical()))
-    })?;
+) -> Result<Cleared, MemoryError> {
     let refuse = |reason: String| {
         MemoryError::Validation(format!("refusing to clear {}: {reason}", issue.canonical()))
+    };
+    let Some(raw) = dispatch_state::raw_dispatch_state(db, issue)? else {
+        return Err(MemoryError::NotFound(format!(
+            "{} has no dispatch state",
+            issue.canonical()
+        )));
+    };
+    let state = match dispatch_state::parse_dispatch_state(&raw) {
+        dispatch_state::StateRead::Readable(state) => *state,
+        dispatch_state::StateRead::Unreadable(why) => {
+            if let Some(reason) = unreadable_refusal(&observe(), issue) {
+                return Err(refuse(format!(
+                    "its dispatch state cannot be read ({why}), and {reason}"
+                )));
+            }
+            if !dispatch_state::clear_raw_dispatch_state_if_unchanged(db, issue, &raw)? {
+                return Err(refuse(
+                    "its dispatch state changed while it was being checked; a dispatch may \
+                     have started — rerun once it settles"
+                        .into(),
+                ));
+            }
+            let reason = super::scrub::scrub_and_bound(&why, RAW_CONTENT_CHARS).text;
+            let content = super::scrub::scrub_and_bound(&raw, RAW_CONTENT_CHARS);
+            return Ok(Cleared::Unreadable(ClearedUnreadable {
+                issue: issue.canonical(),
+                reason,
+                raw_content: content.text,
+                raw_content_truncated: content.truncated,
+            }));
+        }
+        dispatch_state::StateRead::Absent => unreachable!("a raw drawer is never absent"),
     };
     if let Some(reason) = refusal(&observe(), &state, attempt_recorded(db, &state)?) {
         return Err(refuse(reason));
@@ -58,12 +118,46 @@ pub fn clear_dispatch(
                 .into(),
         ));
     }
-    Ok(ClearedDispatch {
+    Ok(Cleared::Dispatch(ClearedDispatch {
         issue: issue.canonical(),
         implementer: state.implementer,
         state: state.state,
         invocation_artifacts: state.invocation_artifacts,
-    })
+    }))
+}
+
+/// Why an issue whose dispatch state cannot be read may still be running,
+/// judged without knowing its harness. Anything that could be its work
+/// refuses: an Autopilot marker for the issue on any process (whatever runs
+/// it), an ambiguous Codex or Muse command, a process table that cannot be
+/// read, or its Claude IC, by the name every Claude dispatch for the issue
+/// takes ([`super::dispatch::ic_name`]), either listed in Claude's registry
+/// or named with `--name` on a live process. The process table settles a
+/// Claude IC on its own, so an unreadable Claude registry (no `claude`
+/// installed, say) does not keep the drawer for ever.
+fn unreadable_refusal(snapshots: &HarnessSnapshots, issue: &IssueRef) -> Option<String> {
+    if let Some(reason) = snapshots.processes.live_evidence_with(
+        &issue.slug(),
+        None,
+        &crate::autopilot::registry::configured_shared_daemon,
+    ) {
+        return Some(reason);
+    }
+    let ic = super::dispatch::ic_name(issue);
+    if snapshots.claude.liveness(&ic) == Liveness::Alive {
+        return Some(format!("Claude's registry lists its IC session {ic}"));
+    }
+    let super::process_tree::ProcessSnapshot::Available(rows) = &snapshots.processes else {
+        return Some(snapshots.processes.reason());
+    };
+    let names_ic = |args: &str| {
+        let words: Vec<&str> = args.split_whitespace().collect();
+        words.windows(2).any(|w| w[0] == "--name" && w[1] == ic)
+            || words.iter().any(|w| w.strip_prefix("--name=") == Some(&ic))
+    };
+    rows.iter()
+        .find(|r| r.active() && names_ic(&r.args))
+        .map(|r| format!("process {} names its IC session {ic} with --name", r.pid))
 }
 
 /// Whether lineage already holds the attempt the state was dispatching: the
@@ -221,6 +315,26 @@ mod tests {
         }
     }
 
+    /// The readable state a clear released, failing on any other outcome.
+    fn readable(cleared: Result<Cleared, MemoryError>) -> ClearedDispatch {
+        match cleared.unwrap() {
+            Cleared::Dispatch(cleared) => cleared,
+            other => panic!("expected a readable state cleared: {other:?}"),
+        }
+    }
+
+    /// Write `content` as the issue's dispatch-state drawer, as is.
+    fn write_raw(db: &Database, content: &str) {
+        crate::autopilot::write_current(db, &dispatch_state::dispatch_state_key(&issue()), content)
+            .unwrap();
+    }
+
+    fn raw_drawer(db: &Database) -> Option<String> {
+        crate::autopilot::read_current(db, &dispatch_state::dispatch_state_key(&issue()))
+            .unwrap()
+            .map(|drawer| drawer.content)
+    }
+
     fn snapshots(rows: Vec<ProcessRow>) -> HarnessSnapshots {
         HarnessSnapshots {
             claude: RegistrySnapshot::Available(Vec::new()),
@@ -294,13 +408,12 @@ mod tests {
         // Nothing that could be it: cleared, artifacts reported, files kept.
         let other = "/r/.git/ironmem/autopilot/owner-repo-7/\
                      11111111-2222-3333-4444-555555555555/schema.json";
-        let cleared = clear_dispatch(&db, &issue(), || {
+        let cleared = readable(clear_dispatch(&db, &issue(), || {
             snapshots(vec![
                 row(80, 80, "sleep 5"),
                 row(81, 81, &format!("codex exec --output-schema {other} p")),
             ])
-        })
-        .unwrap();
+        }));
         assert_eq!(cleared.invocation_artifacts.as_ref(), Some(&a));
         assert_eq!(cleared.state, "dispatching");
         assert!(dispatch_state::get_dispatch_state(&db, &issue())
@@ -496,7 +609,7 @@ mod tests {
         state.native_session_id = Some(state.session_uuid.clone());
         state.state = "paused-session-in-use".into();
         dispatch_state::upsert_dispatch_state(&db, &state).unwrap();
-        let cleared = clear_dispatch(&db, &issue(), || snapshots(Vec::new())).unwrap();
+        let cleared = readable(clear_dispatch(&db, &issue(), || snapshots(Vec::new())));
         assert_eq!(cleared.state, "paused-session-in-use");
         assert!(dispatch_state::get_dispatch_state(&db, &issue())
             .unwrap()
@@ -576,10 +689,153 @@ mod tests {
             .contains("registry unreadable"));
         snaps.claude = RegistrySnapshot::Available(Vec::new());
         assert_eq!(
-            clear_dispatch(&db, &issue(), || snaps.clone())
-                .unwrap()
-                .implementer,
+            readable(clear_dispatch(&db, &issue(), || snaps.clone())).implementer,
             Implementer::Claude
+        );
+    }
+
+    /// A marker path in Autopilot's layout for issue `owner-repo-<n>`.
+    fn marker_for(n: u64) -> String {
+        format!(
+            "/r/.git/ironmem/autopilot/owner-repo-{n}/\
+             11111111-2222-3333-4444-555555555555/schema.json"
+        )
+    }
+
+    #[test]
+    fn an_unreadable_dispatch_state_is_released_with_its_raw_content_reported() {
+        let db = Database::open_in_memory().unwrap();
+        // A credential-shaped value, built so no literal one sits in source.
+        let secret = format!("{} abcdefgh{}", ["Bear", "er"].concat(), "SECRETSECRET");
+        write_raw(
+            &db,
+            &format!(r#"{{"implementer":"some-future-harness","auth":"{secret}"}}"#),
+        );
+        // Another issue's invocation is no reason to hold this one.
+        let other = marker_for(7);
+        let cleared = clear_dispatch(&db, &issue(), || {
+            snapshots(vec![row(
+                81,
+                81,
+                &format!("muse exec --output-schema {other}"),
+            )])
+        })
+        .unwrap();
+        let Cleared::Unreadable(cleared) = cleared else {
+            panic!("expected an unreadable state cleared: {cleared:?}");
+        };
+        assert_eq!(cleared.issue, "owner/repo#42");
+        assert!(
+            cleared.raw_content.contains("some-future-harness"),
+            "{cleared:?}"
+        );
+        assert!(!cleared.raw_content.contains("SECRETSECRET"), "{cleared:?}");
+        assert!(!cleared.reason.is_empty());
+        assert_eq!(raw_drawer(&db), None);
+        // The JSON names it for what it is.
+        let json = serde_json::to_value(Cleared::Unreadable(cleared)).unwrap();
+        assert!(json.get("raw_content").is_some(), "{json}");
+    }
+
+    #[test]
+    fn an_unreadable_dispatch_state_is_kept_while_its_issue_may_be_running() {
+        let db = Database::open_in_memory().unwrap();
+        write_raw(&db, "not json");
+        let ours = marker_for(42);
+        for (evidence, why) in [
+            (
+                snapshots(vec![row(
+                    90,
+                    90,
+                    &format!("muse exec --output-schema {ours}"),
+                )]),
+                "process 90",
+            ),
+            // A launcher shape the grammar cannot parse still names it.
+            (
+                snapshots(vec![row(91, 91, &format!("bash -e {ours}"))]),
+                "process 91",
+            ),
+            (
+                HarnessSnapshots {
+                    claude: RegistrySnapshot::Available(Vec::new()),
+                    processes: ProcessSnapshot::Unavailable {
+                        reason: "ps timed out".into(),
+                    },
+                },
+                "ps timed out",
+            ),
+            // Its Claude IC, by the name every Claude dispatch takes.
+            (
+                HarnessSnapshots {
+                    claude: RegistrySnapshot::Available(vec![AgentEntry {
+                        name: "ic-owner-repo-42".into(),
+                        status: None,
+                    }]),
+                    processes: ProcessSnapshot::Available(Vec::new()),
+                },
+                "ic-owner-repo-42",
+            ),
+            // Or a live `claude` process named for it, with no registry.
+            (
+                HarnessSnapshots {
+                    claude: RegistrySnapshot::Unavailable {
+                        reason: "claude not found".into(),
+                    },
+                    processes: ProcessSnapshot::Available(vec![row(
+                        92,
+                        92,
+                        "claude -p /goal x --name ic-owner-repo-42 --model m",
+                    )]),
+                },
+                "process 92",
+            ),
+        ] {
+            let err = clear_dispatch(&db, &issue(), || evidence)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("refusing to clear"), "{err}");
+            assert!(err.contains(why), "{err}");
+            assert_eq!(raw_drawer(&db).as_deref(), Some("not json"));
+        }
+    }
+
+    #[test]
+    fn an_unreadable_dispatch_state_clears_without_a_readable_claude_registry() {
+        // An operator with no `claude` installed is not left holding it: the
+        // process table alone settles whether a Claude IC runs.
+        let db = Database::open_in_memory().unwrap();
+        write_raw(&db, "not json");
+        let cleared = clear_dispatch(&db, &issue(), || HarnessSnapshots {
+            claude: RegistrySnapshot::Unavailable {
+                reason: "claude not found".into(),
+            },
+            processes: ProcessSnapshot::Available(vec![row(
+                93,
+                93,
+                "claude -p /goal x --name ic-owner-repo-7 --model m",
+            )]),
+        })
+        .unwrap();
+        assert!(matches!(cleared, Cleared::Unreadable(_)), "{cleared:?}");
+        assert_eq!(raw_drawer(&db), None);
+    }
+
+    #[test]
+    fn an_unreadable_dispatch_state_rewritten_while_checked_is_kept() {
+        let db = Database::open_in_memory().unwrap();
+        write_raw(&db, "not json");
+        let err = clear_dispatch(&db, &issue(), || {
+            // Another binary rewrites it after it was read.
+            write_raw(&db, "still not json, but different");
+            snapshots(Vec::new())
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("changed while it was being checked"), "{err}");
+        assert_eq!(
+            raw_drawer(&db).as_deref(),
+            Some("still not json, but different")
         );
     }
 }

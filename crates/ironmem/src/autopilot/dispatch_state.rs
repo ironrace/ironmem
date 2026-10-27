@@ -248,13 +248,27 @@ pub(crate) fn read_dispatch_state(
     db: &Database,
     issue: &IssueRef,
 ) -> Result<StateRead, MemoryError> {
-    let Some(drawer) = read_current(db, &dispatch_state_key(issue))? else {
-        return Ok(StateRead::Absent);
-    };
-    Ok(match state_from_content(&drawer.content) {
+    Ok(match raw_dispatch_state(db, issue)? {
+        None => StateRead::Absent,
+        Some(raw) => parse_dispatch_state(&raw),
+    })
+}
+
+/// An issue's dispatch-state drawer exactly as stored, for a caller that must
+/// act on a drawer it cannot read ([`clear_raw_dispatch_state_if_unchanged`]).
+pub(crate) fn raw_dispatch_state(
+    db: &Database,
+    issue: &IssueRef,
+) -> Result<Option<String>, MemoryError> {
+    Ok(read_current(db, &dispatch_state_key(issue))?.map(|drawer| drawer.content))
+}
+
+/// What a raw dispatch-state drawer holds: never [`StateRead::Absent`].
+pub(crate) fn parse_dispatch_state(raw: &str) -> StateRead {
+    match state_from_content(raw) {
         Ok(state) => StateRead::Readable(Box::new(state)),
         Err(e) => StateRead::Unreadable(e.to_string()),
-    })
+    }
 }
 
 fn state_from_content(content: &str) -> Result<DispatchState, MemoryError> {
@@ -401,6 +415,40 @@ pub fn clear_dispatch_state_if_unchanged(
                 "issue": expected.issue.canonical(),
                 "deleted": deleted,
                 "conditional": true,
+            }),
+            None,
+        )?;
+        Ok(deleted)
+    })
+}
+
+/// [`clear_dispatch_state_if_unchanged`] for a drawer that may not be
+/// readable: deleted only while its raw content is still exactly
+/// `expected_raw`, compared byte for byte in the same transaction.
+pub(crate) fn clear_raw_dispatch_state_if_unchanged(
+    db: &Database,
+    issue: &IssueRef,
+    expected_raw: &str,
+) -> Result<bool, MemoryError> {
+    use rusqlite::OptionalExtension;
+    let id = super::logical_drawer_id(&dispatch_state_key(issue));
+    db.with_transaction(|tx| {
+        let content: Option<String> = tx
+            .query_row("SELECT content FROM drawers WHERE id = ?1", [&id], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        let unchanged = content.as_deref() == Some(expected_raw);
+        let deleted = unchanged && Database::delete_drawer_tx(tx, &id)?;
+        Database::wal_log_tx(
+            tx,
+            "autopilot_clear_dispatch_state",
+            &json!({
+                "drawer_id": &id,
+                "issue": issue.canonical(),
+                "deleted": deleted,
+                "conditional": true,
+                "raw": true,
             }),
             None,
         )?;

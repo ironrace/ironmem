@@ -2467,18 +2467,37 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                             ironmem::autopilot::registry::HarnessProcessMonitor::default();
                         ironmem::autopilot::registry::HarnessMonitor::snapshot(&mut monitor)
                     })?;
+                use ironmem::autopilot::clear::Cleared;
                 if json {
                     println!("{}", serde_json::to_string_pretty(&cleared)?);
-                } else {
-                    println!(
-                        "cleared {} ({:?}, was {:?}); lineage, attempts and spend are unchanged, \
-                         and the next dispatch starts a fresh session",
-                        cleared.issue, cleared.implementer, cleared.state
-                    );
-                    if let Some(a) = &cleared.invocation_artifacts {
-                        if let Some(dir) = std::path::Path::new(&a.schema_path).parent() {
-                            println!("  invocation evidence kept at {}", dir.display());
+                    return Ok(());
+                }
+                match cleared {
+                    Cleared::Dispatch(cleared) => {
+                        println!(
+                            "cleared {} ({:?}, was {:?}); lineage, attempts and spend are \
+                             unchanged, and the next dispatch starts a fresh session",
+                            cleared.issue, cleared.implementer, cleared.state
+                        );
+                        if let Some(a) = &cleared.invocation_artifacts {
+                            if let Some(dir) = std::path::Path::new(&a.schema_path).parent() {
+                                println!("  invocation evidence kept at {}", dir.display());
+                            }
                         }
+                    }
+                    Cleared::Unreadable(cleared) => {
+                        println!(
+                            "cleared {}'s unreadable dispatch state ({}); lineage, attempts and \
+                             spend are unchanged. It held{}:",
+                            cleared.issue,
+                            cleared.reason,
+                            if cleared.raw_content_truncated {
+                                " (cut, secrets scrubbed)"
+                            } else {
+                                " (secrets scrubbed)"
+                            }
+                        );
+                        println!("{}", cleared.raw_content);
                     }
                 }
                 Ok(())

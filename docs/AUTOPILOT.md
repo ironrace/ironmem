@@ -290,8 +290,8 @@ by a newer ironmem for a harness it does not know) is deferred
 be a live invocation. `supervise` reports it as held, and `reconcile`
 reports it as a hold and, while it stays unreadable, holds rather than
 calls an orphan any live session or marker no readable state names. Run
-the ironmem that wrote it to finish or clear it.
-The reverse is not covered: an ironmem from before Muse support cannot read
+the ironmem that wrote it to finish or clear it, or release it with
+`clear-dispatch` (see *Human recovery paths*). The reverse is not covered: an ironmem from before Muse support cannot read
 a Muse dispatch state and skips it, so its queue does not count that slot
 and its `reconcile` reports the live Muse process as an orphan. Do not
 downgrade below this release while any Muse dispatch state exists; let it
@@ -944,6 +944,19 @@ typing the command.
   <issue>`, once you have stopped any Lead or `run` on the repo and confirmed
   nothing is still working on the issue. *Codex and Muse identity, restart
   recovery, and supervision limits* has the checks it makes.
+- **An unreadable dispatch state** (deferred as `dispatch_state_unreadable`)
+  is released with the same `ironmem autopilot clear-dispatch owner/repo
+  <issue>`. Its harness is unknown, so it refuses while anything could be
+  the issue's work: a process carrying an Autopilot marker for the issue, an
+  ambiguous `codex exec` or `muse exec`, a process table it cannot read, or
+  the issue's Claude IC (`ic-<owner>-<repo>-<issue>`), either listed in
+  Claude's registry or named with `--name` on a running process. An
+  unreadable Claude registry alone does not refuse, since the process table
+  settles a running `claude`. The drawer is deleted only if its content is
+  still byte for byte what was checked. The command prints why it could not
+  be read and its raw content (secrets scrubbed, cut at 4000 characters;
+  `--json` gives `reason`, `raw_content` and `raw_content_truncated`), so the
+  evidence is not lost. Lineage, attempt counts and spend stand.
 - **A stored cut that is no longer a commit** stops the run with this error:
 
   ```
