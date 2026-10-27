@@ -50,6 +50,23 @@ fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_ironmem")
 }
 
+/// The ironmem binary with every `GIT_*` var stripped, so a `GIT_DIR` set by
+/// an outer context (a git hook running `cargo test`) can never reach ironmem
+/// or the stub it spawns.
+fn ironmem() -> Command {
+    let mut command = Command::new(bin());
+    for (key, _) in std::env::vars_os() {
+        if key
+            .to_string_lossy()
+            .to_ascii_uppercase()
+            .starts_with("GIT_")
+        {
+            command.env_remove(key);
+        }
+    }
+    command
+}
+
 fn git(dir: &Path, args: &[&str]) -> Output {
     let mut command = Command::new("git");
     for (key, _) in std::env::vars_os() {
@@ -168,7 +185,7 @@ impl Fixture {
             "--json",
         ];
         args.extend_from_slice(extra);
-        Command::new(bin())
+        ironmem()
             .args(&args)
             .env("PATH", isolated_path(&self.stubs))
             .env("MUSE_CALLS", &self.calls)
@@ -379,7 +396,7 @@ fn muse_requires_a_model_before_any_side_effect() {
     let empty_path = root.path().join("empty-path");
     std::fs::create_dir_all(&empty_path).unwrap();
 
-    let output = Command::new(bin())
+    let output = ironmem()
         .args([
             "autopilot",
             "run",
