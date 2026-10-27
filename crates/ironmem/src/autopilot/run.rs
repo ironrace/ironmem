@@ -4209,6 +4209,11 @@ sleep 0.5
             git_in(&wt.path, &["log", "-1", "--format=%G?", &tampered]),
             "B"
         );
+        // Measured (git 2.55): with this set, `%G?` is printed after the
+        // signature's own verification lines, so a check that reads the
+        // whole output never sees a bare `B`. `--no-show-signature` on the
+        // `%G?` read is what keeps it a one-word answer.
+        git_in(&wt.path, &["config", "log.showSignature", "true"]);
         let violation = signing_violation(&wt, false).unwrap().unwrap();
         assert_eq!(blamed(&violation), [short(&tampered)].into(), "{violation}");
     }
