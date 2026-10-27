@@ -540,7 +540,10 @@ can quietly pass `-c commit.gpgsign=false`.
   as a human who pushed an unsigned fix to the PR branch, the `met` is still
   not accepted, but it costs no attempt and the run stops (see below), naming
   the commits and their committers. While such a commit is on the branch, a
-  run refuses to start, so nothing is paid for. Re-sign or drop them and push,
+  run refuses to start, so nothing is paid for. A long-running Lead reads the
+  range again at a run's start only when a ref tip, the remotes, the cut, the
+  policy, the identity or the signature programs changed since it last found
+  it clean. Re-sign or drop them and push,
   or opt the branch out. If the identity cannot be read, every commit is the
   agent's. This relies on the implementer committing as you: two real Muse
   commits carried exactly the worktree's `git var GIT_COMMITTER_IDENT`
@@ -552,9 +555,13 @@ can quietly pass `-c commit.gpgsign=false`.
 - **The repository's own signature programs never run.** `%G?` makes git run
   `gpg.program`, `gpg.ssh.program` or `gpg.x509.program` in the controller,
   and the agent can write `.git/config`. The guard pins each one with `-c` to
-  your global or system value (git's default if neither sets it). Each guard
-  git command is also killed, with its process group, after 120 seconds,
-  which fails the guard.
+  your global or system value (git's default if neither sets it, or if that
+  config cannot be read, for example with `$HOME` unset under launchd). The
+  whole check gets 120 seconds: the git command still running then is
+  killed with its process group, which fails the guard. The guard's git
+  never fetches (`GIT_NO_LAZY_FETCH=1`, `protocol.allow=never`), so a
+  partial clone's missing object fails the read instead of reaching the
+  network through the repository's own transport config.
 - **Trust posture.** The guard catches a lazy or accidental bypass. It does
   not stop an unconfined agent that deliberately signs with another key,
   opts its branch out, clears the cut, commits under another identity, or

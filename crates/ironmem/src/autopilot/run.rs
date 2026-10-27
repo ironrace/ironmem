@@ -858,10 +858,12 @@ const MODEL_REASON_CHARS: usize = 500;
 /// How many hex digits name a commit in a violation.
 const SHORT_SHA_CHARS: usize = 12;
 
-/// How long one of the signing guard's git commands may run before it is
-/// killed with its process group and the guard fails closed. Generous: a
-/// range of thousands of commits reads in well under a second.
-const SIGNING_GUARD_GIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+/// How long one signing-guard check may run, all its git commands together,
+/// before the running one is killed with its process group and the guard
+/// fails closed. One deadline for the whole check, so neither a long range
+/// nor the one-commit-at-a-time fallback can stretch it. Generous: a range of
+/// thousands of commits reads in well under a second.
+const SIGNING_GUARD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// How often [`GuardGit::run`] checks on its git process.
 const GUARD_GIT_POLL: std::time::Duration = std::time::Duration::from_millis(10);
@@ -1029,15 +1031,29 @@ impl std::fmt::Display for GuardFault {
 struct GuardGit<'a> {
     repo: &'a Path,
     timeout: std::time::Duration,
+    /// When the whole check must be done, shared by every command.
+    deadline: std::time::Instant,
     pins: Vec<String>,
+    /// Variables removed from every command's environment (tests only).
+    unset_env: &'static [&'static str],
 }
 
 impl<'a> GuardGit<'a> {
     fn new(repo: &'a Path, timeout: std::time::Duration) -> Result<Self, String> {
+        Self::build(repo, timeout, &[])
+    }
+
+    fn build(
+        repo: &'a Path,
+        timeout: std::time::Duration,
+        unset_env: &'static [&'static str],
+    ) -> Result<Self, String> {
         let mut git = Self {
             repo,
             timeout,
+            deadline: std::time::Instant::now() + timeout,
             pins: Vec::new(),
+            unset_env,
         };
         let (mut openpgp, mut ssh, mut x509) = ("gpg", "ssh-keygen", "gpgsm");
         let mut read = Vec::new();
@@ -1056,12 +1072,14 @@ impl<'a> GuardGit<'a> {
             match out.status.code() {
                 Some(0) => read.push(String::from_utf8_lossy(&out.stdout).into_owned()),
                 Some(1) => {} // none set in that scope
-                _ => {
-                    return Err(format!(
-                        "the operator's {scope} signature programs could not be read: {}",
-                        worktree::bounded_stderr(&out.stderr)
-                    ))
-                }
+                // Unreadable (`$HOME` unset under launchd exits 128): git's
+                // own defaults stand for that scope, never the repository's.
+                _ => tracing::warn!(
+                    scope,
+                    error = %worktree::bounded_stderr(&out.stderr),
+                    "autopilot's commit-signing guard cannot read the operator's signature \
+                     programs in this scope; git's defaults are used for it"
+                ),
             }
         }
         for line in read.iter().flat_map(|text| text.lines()) {
@@ -1090,7 +1108,16 @@ impl<'a> GuardGit<'a> {
         let label = || format!("git {}", args.join(" "));
         let mut command = std::process::Command::new("git");
         crate::mcp::tools::scrub_git_environment(&mut command);
-        command.env("LC_ALL", "C").env("LANG", "C");
+        // No fetch of any kind: a missing object in a partial clone would
+        // otherwise be fetched through the repository's own transport config.
+        command
+            .env("LC_ALL", "C")
+            .env("LANG", "C")
+            .env("GIT_NO_LAZY_FETCH", "1");
+        for key in self.unset_env {
+            command.env_remove(key);
+        }
+        command.args(["-c", "protocol.allow=never"]);
         for pin in &self.pins {
             command.arg("-c").arg(pin);
         }
@@ -1125,7 +1152,7 @@ impl<'a> GuardGit<'a> {
         };
         let stdout = dispatch::drain(child.stdout.take());
         let stderr = dispatch::drain(child.stderr.take());
-        let deadline = std::time::Instant::now() + self.timeout;
+        let deadline = self.deadline;
         let status = loop {
             match child.try_wait() {
                 Ok(Some(status)) => break status,
@@ -1138,7 +1165,7 @@ impl<'a> GuardGit<'a> {
                     return Err(match waited {
                         Err(e) => format!("{} could not be waited on: {e}", label()),
                         _ => format!(
-                            "{} did not finish within {}s and was killed",
+                            "{} did not finish within the guard's {}s and was killed",
                             label(),
                             self.timeout.as_secs_f64()
                         ),
@@ -1152,6 +1179,9 @@ impl<'a> GuardGit<'a> {
             || !joins_by(&stderr, deadline)
             || writer.as_ref().is_some_and(|w| !joins_by(w, deadline));
         if open {
+            // Whatever holds the pipe is still in the group git led: a group
+            // id is not reused while any member lives.
+            dispatch::kill_process_group(&mut child);
             return Err(format!(
                 "{} exited but left its output open past {}s",
                 label(),
@@ -1254,7 +1284,7 @@ fn signing_violation(
     worktree: &Worktree,
     seen: SigningPolicySeen,
 ) -> Result<Option<SigningViolation>, GuardFault> {
-    check_signing(worktree, seen, SIGNING_GUARD_GIT_TIMEOUT)
+    check_signing(worktree, seen, SIGNING_GUARD_TIMEOUT)
 }
 
 /// [`signing_violation`] with each git command bounded by `timeout`.
@@ -1450,6 +1480,78 @@ fn check_signing(
         branch: branch.to_string(),
         remote: remote.to_string(),
     }))
+}
+
+/// Run-start collaborator checks already found clean, by worktree and
+/// branch: the [`range_key`] each was judged on. In this process only, so a
+/// Lead re-checks an unchanged branch once, not on every tick.
+static CLEAN_AT_START: std::sync::Mutex<
+    std::collections::BTreeMap<(std::path::PathBuf, String), String>,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+#[cfg(test)]
+thread_local! {
+    /// How many run-start checks read the range in full, on this thread.
+    static START_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// A collaborator's unsigned commit on the branch at a run's start, which
+/// would turn away any `met` the run produced. The range is read in full only
+/// when something it depends on changed since it was last found clean: every
+/// ref tip, the remotes, the cut, the policy, the identity and the pinned
+/// signature programs ([`range_key`]). Fail closed: a key that cannot be read
+/// is never cached, and a fault is never remembered as clean.
+fn collaborator_check_at_start(worktree: &Worktree, seen: SigningPolicySeen) -> Option<GuardFault> {
+    let slot = (worktree.path.clone(), worktree.branch.clone());
+    let key = range_key(worktree).ok();
+    let cache = || CLEAN_AT_START.lock().unwrap_or_else(|e| e.into_inner());
+    if key.is_some() && cache().get(&slot) == key.as_ref() {
+        return None;
+    }
+    #[cfg(test)]
+    START_CHECKS.with(|n| n.set(n.get() + 1));
+    match signing_violation(worktree, seen) {
+        Err(fault @ GuardFault::ForeignUnsigned { .. }) => {
+            cache().remove(&slot);
+            Some(fault)
+        }
+        Err(_) => None,
+        Ok(_) => {
+            if let Some(key) = key {
+                cache().insert(slot, key);
+            }
+            None
+        }
+    }
+}
+
+/// Everything the collaborator check's answer depends on, as one string.
+fn range_key(worktree: &Worktree) -> Result<String, String> {
+    let git = GuardGit::new(&worktree.path, SIGNING_GUARD_TIMEOUT)?;
+    let read = |args: &[&str]| -> Result<String, String> {
+        let out = git.run(args, None)?;
+        if !out.status.success() {
+            return Err(worktree::bounded_stderr(&out.stderr));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    };
+    let refs = read(&[
+        "for-each-ref",
+        "--format=%(objectname) %(refname)",
+        &format!("refs/heads/{}", worktree.branch),
+        "refs/remotes/",
+    ])?;
+    let remotes = read(&["remote"])?;
+    // The ident without its timestamp, which changes every second.
+    let ident = read(&["var", "GIT_COMMITTER_IDENT"])?;
+    let ident = ident.split_once('>').map_or("", |(who, _)| who);
+    let policy = worktree::signing_policy(&worktree.path)?;
+    Ok(format!(
+        "{refs}\0{remotes}\0{ident}\0{:?}\0{}\0{policy}\0{:?}",
+        std::env::var("GIT_COMMITTER_EMAIL").ok(),
+        worktree.cut,
+        git.pins
+    ))
 }
 
 /// The committer emails this run's commits carry: the worktree's
@@ -2223,9 +2325,7 @@ pub fn run_issue(
     // like an unreadable policy, until an operator deals with it. Anything
     // else the guard finds now is for the dispatch to fix, or to judge again
     // when its `met` arrives.
-    if let Err(fault @ GuardFault::ForeignUnsigned { .. }) =
-        signing_violation(worktree, seen.fresh())
-    {
+    if let Some(fault) = collaborator_check_at_start(worktree, seen.fresh()) {
         return Err(MemoryError::Validation(format!(
             "{fault}; the run does not start, since any met it produced would be refused the \
              same way; {}",
@@ -5482,6 +5582,113 @@ sleep 0.5
     }
 
     #[test]
+    fn a_guard_with_no_home_pins_gits_default_signature_programs() {
+        // Under launchd `$HOME` can be unset, and `git config --global` then
+        // exits 128: never a reason to turn every met into a guard fault,
+        // nor to fall back on the repository's own programs.
+        let (_dir, wt) = fixture_worktree();
+        let git = GuardGit::build(
+            &wt.path,
+            SIGNING_GUARD_TIMEOUT,
+            &["HOME", "XDG_CONFIG_HOME"],
+        )
+        .unwrap();
+        assert!(
+            git.pins.contains(&"gpg.ssh.program=ssh-keygen".to_string()),
+            "{:?}",
+            git.pins
+        );
+        assert!(
+            git.pins.contains(&"gpg.program=gpg".to_string()),
+            "{:?}",
+            git.pins
+        );
+    }
+
+    #[test]
+    fn a_guard_check_shares_one_deadline_across_its_commands() {
+        let (_dir, wt) = fixture_worktree();
+        let git = GuardGit::new(&wt.path, std::time::Duration::from_millis(1500)).unwrap();
+        let nap = ["-c", "alias.nap=!sleep 0.8", "nap"];
+        git.run(&nap, None).unwrap();
+        let why = git.run(&nap, None).unwrap_err();
+        assert!(why.contains("did not finish"), "{why}");
+    }
+
+    #[test]
+    fn a_guard_git_command_never_fetches_and_runs_without_lazy_fetch() {
+        let (_dir, wt) = fixture_worktree();
+        let git = GuardGit::new(&wt.path, SIGNING_GUARD_TIMEOUT).unwrap();
+        let read = |args: &[&str]| {
+            let out = git.run(args, None).unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        assert_eq!(read(&["config", "--get", "protocol.allow"]), "never");
+        assert_eq!(
+            read(&["-c", "alias.lazy=!printenv GIT_NO_LAZY_FETCH", "lazy"]),
+            "1"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_guard_git_command_that_leaves_its_output_open_has_its_group_killed() {
+        let (_dir, wt) = fixture_worktree();
+        let git = GuardGit::new(&wt.path, std::time::Duration::from_millis(1000)).unwrap();
+        // A background child holds stdout open after git exits.
+        let why = git
+            .run(
+                &["-c", "alias.linger=!(sleep 37.13 &); exit 0", "linger"],
+                None,
+            )
+            .unwrap_err();
+        assert!(why.contains("left its output open"), "{why}");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let left = std::process::Command::new("pgrep")
+            .args(["-f", "sleep 37.13"])
+            .output()
+            .unwrap();
+        assert!(
+            left.stdout.is_empty(),
+            "still running: {}",
+            String::from_utf8_lossy(&left.stdout)
+        );
+    }
+
+    #[test]
+    fn a_run_start_check_of_an_unchanged_range_is_not_repeated() {
+        let (_dir, wt) = fixture_worktree();
+        git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
+        commit_in(&wt.path, "work", &[]);
+        let checks = || START_CHECKS.with(std::cell::Cell::get);
+        let seen = SigningPolicySeen::default();
+        assert!(collaborator_check_at_start(&wt, seen).is_none());
+        let first = checks();
+        assert!(collaborator_check_at_start(&wt, seen).is_none());
+        assert_eq!(checks(), first, "an unchanged range is read again");
+        // Anything that moves the range is read again, and a collaborator's
+        // commit is still found.
+        commit_in(
+            &wt.path,
+            "theirs",
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "user.email=human@example.test",
+            ],
+        );
+        assert!(matches!(
+            collaborator_check_at_start(&wt, seen),
+            Some(GuardFault::ForeignUnsigned { .. })
+        ));
+        assert_eq!(checks(), first + 1);
+        // A found fault is never remembered as clean.
+        assert!(collaborator_check_at_start(&wt, seen).is_some());
+        assert_eq!(checks(), first + 2);
+    }
+
+    #[test]
     fn a_guard_git_command_that_hangs_is_killed_and_fails_closed() {
         let (_dir, wt) = fixture_worktree();
         let git = GuardGit::new(&wt.path, std::time::Duration::from_millis(500)).unwrap();
@@ -5500,7 +5707,7 @@ sleep 0.5
     #[test]
     fn a_guard_git_command_that_succeeds_without_its_input_is_unreadable() {
         let (_dir, wt) = fixture_worktree();
-        let git = GuardGit::new(&wt.path, SIGNING_GUARD_GIT_TIMEOUT).unwrap();
+        let git = GuardGit::new(&wt.path, SIGNING_GUARD_TIMEOUT).unwrap();
         // Far more than a pipe holds, to a command that reads none of it.
         let lines = vec!["a".repeat(40); 20_000];
         let lines: Vec<&str> = lines.iter().map(String::as_str).collect();

@@ -38,8 +38,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   but costs the agent no attempt, and no run starts while one is there. The
   guard reads a branch of any length in two git processes, falling back to
   one read per commit only when a signature cannot be parsed, never runs a
-  signature program set in the repository's own config, and gives each git
-  command 120 seconds.
+  signature program set in the repository's own config, never fetches, and
+  gives the whole check 120 seconds.
 - **Codex and Muse supervision waits for a quiet worktree (#366).** A
   short-lived tool's background child, reparented out of the tracked tree,
   no longer gets a trusted completion while it still runs in the worktree.
