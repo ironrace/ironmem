@@ -273,24 +273,25 @@ pub fn validate_implementation_model(
 /// branch and worktree that every dispatch then refuses. The worktree path is
 /// persisted resolved, so the resolved spelling is checked too.
 pub fn validate_worktree_root(implementer: Implementer, root: &Path) -> Result<(), MemoryError> {
-    let cwd = std::env::current_dir()?;
-    validate_worktree_root_from(implementer, root, &cwd)
+    validate_worktree_root_from(implementer, root, std::env::current_dir)
 }
 
-/// [`validate_worktree_root`] with a relative `root` read against `cwd`.
+/// [`validate_worktree_root`] with a relative `root` read against `cwd()`.
 ///
 /// A relative root that does not exist yet resolves to itself, so neither
 /// spelling would carry the working directory's whitespace; the worktree is
-/// still created beneath it. It is made absolute first.
+/// still created beneath it. It is made absolute first. The working
+/// directory is read only for Muse, the only harness this check refuses, so
+/// an unreadable one never fails a Claude or Codex run here.
 fn validate_worktree_root_from(
     implementer: Implementer,
     root: &Path,
-    cwd: &Path,
+    cwd: impl FnOnce() -> std::io::Result<std::path::PathBuf>,
 ) -> Result<(), MemoryError> {
     if implementer != Implementer::Muse {
         return Ok(());
     }
-    let absolute = cwd.join(root);
+    let absolute = cwd()?.join(root);
     for path in [absolute.clone(), worktree::canonical_or_self(&absolute)] {
         let text = path.to_str().ok_or_else(|| {
             MemoryError::Validation(format!(
@@ -747,10 +748,26 @@ fn find_launcher(
     name: &str,
     path_var: &std::ffi::OsStr,
 ) -> Result<std::path::PathBuf, MemoryError> {
-    let absolute = std::env::split_paths(path_var).filter(|dir| dir.is_absolute());
+    let absolute: Vec<_> = std::env::split_paths(path_var)
+        .filter(|dir| dir.is_absolute())
+        .collect();
+    // An empty PATH reads as one empty entry, which would find a bare
+    // relative `name` in the worktree: there must be an absolute entry.
+    let not_found = || {
+        MemoryError::NotFound(format!(
+            "could not find `{name}` on any absolute PATH entry; relative entries are skipped"
+        ))
+    };
+    if absolute.is_empty() {
+        return Err(not_found());
+    }
     let path_var = std::env::join_paths(absolute)
         .map_err(|e| MemoryError::Validation(format!("unusable PATH: {e}")))?;
-    crate::launcher::find_in_paths(name, &path_var)
+    match crate::launcher::find_in_paths(name, &path_var) {
+        Ok(found) if found.is_absolute() => Ok(found),
+        Ok(_) | Err(MemoryError::NotFound(_)) => Err(not_found()),
+        Err(e) => Err(e),
+    }
 }
 
 /// The shared daemon's socket from a loaded config. Loading it parses every
@@ -4564,21 +4581,49 @@ sleep 0.5
     fn a_relative_muse_worktree_root_is_read_against_the_working_directory() {
         // `--worktree-root wt` from a checkout under whitespace: the root
         // does not exist yet, so only the working directory reveals it.
-        let err = validate_worktree_root_from(
-            Implementer::Muse,
-            Path::new("wt"),
-            Path::new("/nonexistent/My Work/repo"),
-        )
+        let err = validate_worktree_root_from(Implementer::Muse, Path::new("wt"), || {
+            Ok("/nonexistent/My Work/repo".into())
+        })
         .unwrap_err()
         .to_string();
         assert!(err.contains("whitespace"), "{err}");
         assert!(err.contains("My Work"), "{err}");
-        validate_worktree_root_from(
-            Implementer::Muse,
-            Path::new("wt"),
-            Path::new("/nonexistent/work/repo"),
-        )
+        validate_worktree_root_from(Implementer::Muse, Path::new("wt"), || {
+            Ok("/nonexistent/work/repo".into())
+        })
         .unwrap();
+    }
+
+    #[test]
+    fn only_muse_needs_a_readable_working_directory_for_its_worktree_root() {
+        let gone = || Err(std::io::Error::other("working directory removed"));
+        for implementer in [Implementer::Claude, Implementer::Codex] {
+            validate_worktree_root_from(implementer, Path::new("wt"), gone).unwrap();
+        }
+        let err = validate_worktree_root_from(Implementer::Muse, Path::new("wt"), gone)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("working directory removed"), "{err}");
+    }
+
+    #[test]
+    fn a_path_of_only_relative_entries_finds_no_launcher() {
+        let planted = tempfile::tempdir().unwrap();
+        let bin = planted.path().join("muse");
+        std::fs::write(&bin, "#!/bin/sh\nsleep 1\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let cwd = std::env::current_dir().unwrap();
+        let up = "../".repeat(cwd.components().count().saturating_sub(1));
+        let relative = Path::new(&up).join(planted.path().strip_prefix("/").unwrap());
+        for path_var in [relative.into_os_string(), std::ffi::OsString::new()] {
+            let err = find_launcher("muse", &path_var).unwrap_err();
+            assert!(matches!(err, MemoryError::NotFound(_)), "{err}");
+            assert!(err.to_string().contains("absolute PATH"), "{err}");
+        }
     }
 
     #[cfg(unix)]
