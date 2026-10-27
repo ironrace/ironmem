@@ -996,7 +996,7 @@ pub fn validate_dispatch_owner(
     Ok(state)
 }
 
-/// Refuse unsafe worktree provisioning for a persisted Codex dispatch.
+/// Refuse unsafe worktree provisioning for a persisted supervised CLI dispatch.
 ///
 /// A dirty worktree may belong to a still-running process. Quarantining it
 /// before checking the persisted invocation would move that process's cwd and
@@ -1024,23 +1024,25 @@ pub fn preflight_worktree_provisioning(
     }
     match dispatcher.recover(Path::new(&state.worktree_path), &state)? {
         InvocationRecovery::Alive => Err(MemoryError::Validation(format!(
-            "cannot provision {} while its Codex implementation is still alive",
-            issue.canonical()
+            "cannot provision {} while its {} implementation is still alive",
+            issue.canonical(),
+            implementer.label()
         ))),
         InvocationRecovery::Unknown { reason } => Err(MemoryError::Validation(format!(
-            "cannot provision {} while Codex process completion is uncertain: {reason}; \
+            "cannot provision {} while {} process completion is uncertain: {reason}; \
              once no process remains, `ironmem autopilot clear-dispatch {} {}` releases it",
             issue.canonical(),
+            implementer.label(),
             issue.repo,
             issue.number
         ))),
         InvocationRecovery::Finished(_) => Ok(()),
         InvocationRecovery::NoPriorInvocation if state.invocation_artifacts.is_none() => Ok(()),
-        InvocationRecovery::NoPriorInvocation => Err(MemoryError::Validation(
-            "Codex recovery returned no invocation for persisted artifacts; process completion \
-             is unproven"
-                .into(),
-        )),
+        InvocationRecovery::NoPriorInvocation => Err(MemoryError::Validation(format!(
+            "{} recovery returned no invocation for persisted artifacts; process completion \
+             is unproven",
+            implementer.label()
+        ))),
     }
 }
 
@@ -1074,7 +1076,10 @@ fn recover_invocation(
                      clear-dispatch {} {}` releases it",
                     issue.repo, issue.number
                 ),
-                _ => "Codex implementation is still alive".into(),
+                _ => format!(
+                    "{} implementation is still alive",
+                    state.implementer.label()
+                ),
             };
             let unpriced_dispatches = match &state.invocation_artifacts {
                 Some(artifacts) => u32::from(budget::has_unpriced_dispatch_reservation(
@@ -1140,11 +1145,11 @@ fn recover_invocation(
         InvocationRecovery::NoPriorInvocation if state.invocation_artifacts.is_none() => {
             Ok(Recovered::Continue(None))
         }
-        InvocationRecovery::NoPriorInvocation => Err(MemoryError::Validation(
-            "Codex recovery returned no invocation for persisted artifacts; process \
-             completion is unproven"
-                .into(),
-        )),
+        InvocationRecovery::NoPriorInvocation => Err(MemoryError::Validation(format!(
+            "{} recovery returned no invocation for persisted artifacts; process \
+             completion is unproven",
+            state.implementer.label()
+        ))),
     }
 }
 
@@ -2176,6 +2181,71 @@ sleep 0.5
         assert_eq!(run.dispatches[0].total_cost_usd, None);
         assert_eq!(run.unpriced_dispatches, 1);
         assert_eq!(run.total_cost_usd, 0.0);
+    }
+    #[test]
+    fn a_held_muse_dispatch_refuses_provisioning_in_its_own_name() {
+        struct MuseHold(Option<InvocationRecovery>);
+        impl Dispatcher for MuseHold {
+            fn implementer(&self) -> Implementer {
+                Implementer::Muse
+            }
+            fn recover(
+                &mut self,
+                _repo: &Path,
+                _state: &DispatchState,
+            ) -> Result<InvocationRecovery, MemoryError> {
+                Ok(self.0.take().unwrap())
+            }
+            fn dispatch(
+                &mut self,
+                _repo: &Path,
+                _spec: &DispatchSpec,
+            ) -> Result<DispatchOutcome, MemoryError> {
+                unreachable!("preflight never dispatches")
+            }
+        }
+        let db = Database::open_in_memory().unwrap();
+        dispatch_state::upsert_dispatch_state(
+            &db,
+            &DispatchState {
+                implementer: Implementer::Muse,
+                native_session_id: Some("11111111-2222-3333-4444-555555555555".into()),
+                invocation_artifacts: None,
+                issue: issue(),
+                worktree_path: "/tmp/wt".into(),
+                ic_session_name: "ic".into(),
+                dispatch_class: "logic".into(),
+                attempt_n: 1,
+                state: "dispatching".into(),
+                started_at: "2026-10-26T00:00:00Z".into(),
+                session_uuid: "11111111-2222-3333-4444-555555555555".into(),
+                turn_n: 1,
+                session_claimed: true,
+            },
+        )
+        .unwrap();
+        let refuse = |recovery| {
+            preflight_worktree_provisioning(
+                &db,
+                &issue(),
+                Implementer::Muse,
+                &mut MuseHold(Some(recovery)),
+            )
+            .unwrap_err()
+            .to_string()
+        };
+        let alive = refuse(InvocationRecovery::Alive);
+        assert!(
+            alive.contains("its Muse implementation is still alive"),
+            "{alive}"
+        );
+        let unknown = refuse(InvocationRecovery::Unknown {
+            reason: "ps timed out".into(),
+        });
+        assert!(
+            unknown.contains("while Muse process completion is uncertain: ps timed out"),
+            "{unknown}"
+        );
     }
     struct CodexScript {
         inner: ScriptedDispatcher,
