@@ -463,6 +463,12 @@ struct ExitRecord {
     /// Omitted otherwise, keeping every other record byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     awaiting_quiet: Option<AwaitingQuiet>,
+    /// Set when the root exited before any process-table sample saw it, so
+    /// nothing supervised the run: its completion is proven (group drained,
+    /// worktree quiet from the root's kernel birth) but its verdict is never
+    /// trusted and its process never counts as a success. Omitted otherwise.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    unobserved_root: bool,
 }
 
 /// The completion an awaiting-quiet record holds back, with what the
@@ -622,6 +628,7 @@ fn exit_record(
         expected_native_id,
         launch_failure,
         awaiting_quiet: None,
+        unobserved_root: false,
     }
 }
 
@@ -773,6 +780,9 @@ fn run_supervised_bounded_with(
         descendants: Vec::new(),
     };
     let mut tracker = super::process_tree::ProcessTracker::new(child.id(), shared_daemon);
+    // Before the first sample, which a root failing fast can beat.
+    tracker.adopt_root();
+    identity.root_birth = tracker.root_birth();
     if let Err(e) = super::process_tree::persist_identity(a, &identity) {
         // The root is still our unreaped Child; cleanup is authenticated by
         // kernel birth identity, and cannot authorize a retry on uncertainty.
@@ -956,11 +966,18 @@ fn finish_supervised(
 ) -> Result<DispatchOutcome, MemoryError> {
     // Catch an artifact that crossed the limit just before process exit.
     let limit_exceeded = limit_exceeded.or_else(|| limits(cli, a));
-    // Success included: a root gone before the first sample could have
-    // started a tool that left its group, and nothing tracked it.
-    if !tracker.observed_root() {
+    // A root gone before the first sample was never seen with children, so
+    // a tool it started that left its group was never tracked. What catches
+    // a short-lived tool's orphan catches that too: the group drain, and the
+    // worktree check from the root's kernel birth, read at spawn. Without
+    // that birth nothing bounds the check, so completion is unproven. With
+    // it, completion can be proven, but nothing supervised the run, so its
+    // record never yields a met verdict (`unobserved_root`).
+    let unobserved_root = !tracker.observed_root();
+    if unobserved_root && tracker.root_birth().is_none() {
         return Err(validation(format!(
-            "{} root exited before process-tree observation; descendant completion is unproven",
+            "{} root exited before process-tree observation, and its kernel birth was never \
+             read; descendant completion is unproven",
             cli.label()
         )));
     }
@@ -985,6 +1002,7 @@ fn finish_supervised(
         started.elapsed().as_millis().min(u64::MAX as u128) as u64,
         None,
     );
+    record.unobserved_root = unobserved_root;
     if let super::process_tree::Quiet::Held(hold) = quiet {
         // Everything else is proven, so record the outcome without trusting
         // it, with what held it. The slot stays held; recovery finishes it
@@ -1111,6 +1129,13 @@ fn read_artifacts_with(
             if let Some(limit) = &record.limit_exceeded {
                 errors.push(limit.clone());
             }
+            if record.unobserved_root {
+                errors.push(format!(
+                    "{} root exited before its process tree was first sampled, so nothing \
+                     supervised the run",
+                    cli.label()
+                ));
+            }
             if record.timed_out {
                 errors.push(format!(
                     "{} dispatch exceeded wall-clock timeout and was killed",
@@ -1128,7 +1153,8 @@ fn read_artifacts_with(
                 record.proves_completion(a)
                     && record.exit_code == Some(0)
                     && !record.timed_out
-                    && record.limit_exceeded.is_none(),
+                    && record.limit_exceeded.is_none()
+                    && !record.unobserved_root,
                 record.timed_out,
                 record.duration_ms,
             )
@@ -1831,23 +1857,82 @@ exit {code}"#
             assert_eq!(recovered.is_met(), code == 0);
         }
     }
+    /// A root that exits before the first process-table sample (Muse's
+    /// usage error exits 2 within tens of milliseconds) was never seen with
+    /// children. Its kernel birth, read straight after spawn, still bounds
+    /// the worktree check, and with the group drained and the worktree quiet
+    /// its completion is recorded, so recovery classifies it rather than
+    /// holding the slot for `clear-dispatch`. Nothing sampled the run, so
+    /// it is never met, whatever it wrote, and its process never counts as
+    /// a success: it is an infrastructure failure.
     #[cfg(unix)]
     #[test]
-    fn abnormal_exit_before_any_process_observation_holds_even_after_met_output() {
+    fn a_root_gone_before_the_first_sample_is_recorded_but_never_met() {
+        for code in [7, 0] {
+            let (dir, spec) = setup();
+            let a = spec.invocation_artifacts.as_ref().unwrap();
+            let bin = binary(dir.path(), &script("", code));
+            let started = Instant::now();
+            let mut child = spawn_fixture_invocation(&bin, dir.path(), &spec);
+            let mut tracker = ProcessTracker::new(child.id(), None);
+            // As supervision does straight after spawn.
+            tracker.adopt_root();
+            // Reap first, deliberately making root observation impossible.
+            let status = child.wait().unwrap();
+            assert_eq!(status.code(), Some(code));
+            assert!(!tracker.observed_root());
+            let final_verdict: FinalVerdict =
+                serde_json::from_str(&std::fs::read_to_string(&a.final_path).unwrap()).unwrap();
+            assert_eq!(final_verdict.verdict, Verdict::Met);
+            let outcome = finish_supervised(
+                &CodexCli,
+                &mut tracker,
+                &mut fixture_identity(a),
+                dir.path(),
+                a,
+                &spec,
+                status,
+                started,
+                false,
+                None,
+                no_scan(),
+            )
+            .unwrap();
+            for outcome in [outcome, read_artifacts(Implementer::Codex, a).unwrap()] {
+                assert!(!outcome.is_met() && !outcome.process_success, "{outcome:?}");
+                assert!(outcome.invocation_started);
+                assert_eq!(outcome.native_session_id.as_deref(), Some(THREAD));
+                let reason = outcome.reason.unwrap();
+                assert!(
+                    reason.contains("before its process tree was first sampled"),
+                    "{reason}"
+                );
+            }
+            assert_eq!(
+                crate::autopilot::run::classify(&read_artifacts(Implementer::Codex, a).unwrap()),
+                crate::autopilot::run::DispatchClassification::InfrastructureFailure
+            );
+            assert!(has_valid_exit_record(a));
+            assert_eq!(
+                super::super::process_tree::ProcessSnapshot::Available(Vec::new())
+                    .liveness(Some(a)),
+                super::super::registry::Liveness::NotListed
+            );
+        }
+    }
+
+    /// Without even the root's kernel birth (the read straight after spawn
+    /// failed), nothing bounds the worktree check: that still holds.
+    #[cfg(unix)]
+    #[test]
+    fn a_root_gone_before_any_kernel_read_holds() {
         let (dir, spec) = setup();
         let a = spec.invocation_artifacts.as_ref().unwrap();
         let bin = binary(dir.path(), &script("", 7));
         let started = Instant::now();
         let mut child = spawn_fixture_invocation(&bin, dir.path(), &spec);
-        let mut tracker = super::super::process_tree::ProcessTracker::new(child.id(), None);
-        // Reap first, deliberately making useful root observation impossible.
-        // This is the scheduler ordering the old combined fixture assumed away.
+        let mut tracker = ProcessTracker::new(child.id(), None);
         let status = child.wait().unwrap();
-        assert_eq!(status.code(), Some(7));
-        assert!(!tracker.observed_root());
-        let final_verdict: FinalVerdict =
-            serde_json::from_str(&std::fs::read_to_string(&a.final_path).unwrap()).unwrap();
-        assert_eq!(final_verdict.verdict, Verdict::Met);
         let error = finish_supervised(
             &CodexCli,
             &mut tracker,
@@ -1862,21 +1947,19 @@ exit {code}"#
             no_scan(),
         )
         .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("before process-tree observation"));
+        assert!(
+            error
+                .to_string()
+                .contains("before process-tree observation"),
+            "{error}"
+        );
         assert!(!has_valid_exit_record(a));
-        let process =
-            super::super::process_tree::snapshot(&mut super::super::process_tree::UnixProcesses);
-        assert!(process.is_available());
         assert_eq!(
-            process.liveness(Some(a)),
+            super::super::process_tree::ProcessSnapshot::Available(Vec::new()).liveness(Some(a)),
             super::super::registry::Liveness::Unknown
         );
         let outcome = read_artifacts(Implementer::Codex, a).unwrap();
-        assert_eq!(outcome.native_session_id.as_deref(), Some(THREAD));
-        assert!(!outcome.is_met());
-        assert!(!outcome.process_success);
+        assert!(!outcome.is_met() && !outcome.process_success);
     }
 
     #[cfg(unix)]

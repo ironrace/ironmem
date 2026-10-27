@@ -1899,8 +1899,37 @@ impl ProcessTracker {
         }
     }
 
+    /// Read the root's kernel record straight after spawn, before any
+    /// process-table sample: our unreaped `Child` reserves its PID, so the
+    /// record is the root's. That gives completion the root's birth even
+    /// when the root exits before the first sample; [`Self::observed_root`]
+    /// stays false until a sample binds its process-table row. A read that
+    /// fails leaves the birth unknown.
+    pub(crate) fn adopt_root(&mut self) {
+        if self.known.iter().any(|(r, _)| r.pid == self.root_pid) {
+            return;
+        }
+        if let Ok(Some(root)) = kernel_observation(self.root_pid) {
+            if root.pid == self.root_pid {
+                let row = ProcessRow {
+                    pid: root.pid,
+                    ppid: root.ppid,
+                    pgid: root.pgid,
+                    stat: String::new(),
+                    args: String::new(),
+                };
+                self.known.push((row, root.birth));
+            }
+        }
+    }
+
     pub(crate) fn observed_root(&self) -> bool {
         self.observed_root
+    }
+
+    /// The root's kernel birth, once read ([`Self::adopt_root`] or a sample).
+    pub(crate) fn root_birth(&self) -> Option<Birth> {
+        self.recorded().0
     }
     /// What the identity file records: the root's kernel birth, once
     /// observed, and the descendants alive at the last sample. Exited ones

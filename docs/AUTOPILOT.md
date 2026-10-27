@@ -301,10 +301,15 @@ find a file in the repository being worked on.
 
 A spawn that fails outright (for example, `codex` missing from `PATH`) proves
 no child existed, so the supervisor records that, and the invocation is an
-ordinary infrastructure failure rather than a hold. What stays held is
+ordinary infrastructure failure rather than a hold. So is a root that exits
+before the first `ps` sample (a Muse usage error exits within tens of
+milliseconds): its kernel birth is read straight after spawn, and once its
+process group has drained and the worktree check below finds nothing, its
+completion is recorded. Nothing sampled that run, so its verdict is never
+trusted and it never counts as a successful process. What stays held is
 completion that really is unproven: a controller killed by Ctrl-C while
-Codex kept running in its own process group, a root that exited before the
-first `ps` sample, an observation error mid-run, a tool still running in
+Codex kept running in its own process group, a root that exited before even
+its kernel birth could be read, an observation error mid-run, a tool still running in
 Codex's process group after Codex exited that no sample caught, or a process
 started during the invocation still running in the worktree after cleanup
 (see the worktree check below; that one finishes by itself once the process
