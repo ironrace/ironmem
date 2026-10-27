@@ -696,6 +696,12 @@ impl Dispatcher for ClaudeDispatcher {
     }
 }
 
+/// Renamed to [`CliDispatcher`], which serves Muse as well; kept, deprecated,
+/// for one release. Its constructor is now
+/// `CliDispatcher::resolve(Implementer::Codex)`.
+#[deprecated(note = "renamed to `CliDispatcher`; resolve it with `Implementer::Codex`")]
+pub type CodexDispatcher = CliDispatcher;
+
 /// A supervised CLI implementation backend (Codex, Muse). Process evidence is
 /// checked before durable artifacts; only trusted supervisor cleanup permits
 /// completed recovery.

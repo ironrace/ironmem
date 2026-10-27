@@ -10,6 +10,15 @@ use crate::autopilot::invocation::{
 };
 use crate::error::MemoryError;
 
+/// Renamed to [`InvocationArtifacts`] and moved to [`super::invocation`];
+/// kept here, deprecated, for one release.
+#[deprecated(note = "renamed to `invocation::InvocationArtifacts`")]
+pub type CodexArtifacts = InvocationArtifacts;
+/// Renamed to [`super::invocation::InvocationRecovery`]; kept here,
+/// deprecated, for one release.
+#[deprecated(note = "renamed to `invocation::InvocationRecovery`")]
+pub type CodexRecovery = crate::autopilot::invocation::InvocationRecovery;
+
 /// Codex CLI. It assigns its own thread ID, reported by `thread.started`, so
 /// only a resume names the native ID the run must report.
 pub struct CodexCli;

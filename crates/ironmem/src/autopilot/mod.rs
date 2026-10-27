@@ -215,6 +215,33 @@ pub mod merge;
 pub mod muse_dispatch;
 pub mod onboard;
 pub mod process_tree;
+/// The old name of [`process_tree`], from before Muse joined Codex as a
+/// supervised harness. Kept, deprecated, for one release.
+#[deprecated(note = "renamed to `process_tree`; it covers every supervised harness")]
+pub mod codex_process {
+    /// Renamed to [`ProcessSource`]. A trait cannot be aliased on stable
+    /// Rust, so this re-export carries no deprecation warning of its own.
+    pub use super::process_tree::ProcessSource as CodexProcessSource;
+    pub use super::process_tree::*;
+
+    /// Renamed to [`ProcessSnapshot`].
+    #[deprecated(note = "renamed to `process_tree::ProcessSnapshot`")]
+    pub type CodexProcessSnapshot = ProcessSnapshot;
+
+    /// Renamed to [`UnixProcesses`]: the type, and (below) the unit value.
+    #[deprecated(note = "renamed to `process_tree::UnixProcesses`")]
+    pub type UnixCodexProcesses = UnixProcesses;
+    /// The unit value of [`UnixCodexProcesses`].
+    #[deprecated(note = "renamed to `process_tree::UnixProcesses`")]
+    #[allow(non_upper_case_globals)]
+    pub const UnixCodexProcesses: UnixProcesses = UnixProcesses;
+
+    /// Renamed to [`parse_processes`]: it reads every supervised harness's rows.
+    #[deprecated(note = "renamed to `process_tree::parse_processes`")]
+    pub fn parse_codex_processes(text: &str) -> Result<Vec<ProcessRow>, String> {
+        parse_processes(text)
+    }
+}
 pub mod queue;
 pub mod registry;
 pub mod remediate;
@@ -247,6 +274,12 @@ pub use dispatch_state::DispatchState;
 pub use gate_config::{GateConfig, GateConfigState};
 pub use implementer::Implementer;
 pub use invocation::{InvocationArtifacts, InvocationRecovery};
+/// Renamed to [`InvocationArtifacts`]; kept, deprecated, for one release.
+#[deprecated(note = "renamed to `InvocationArtifacts`")]
+pub type CodexArtifacts = InvocationArtifacts;
+/// Renamed to [`InvocationRecovery`]; kept, deprecated, for one release.
+#[deprecated(note = "renamed to `InvocationRecovery`")]
+pub type CodexRecovery = InvocationRecovery;
 pub use lead::{lead_tick, LeadConfig, LeadReport, RepoTarget};
 pub use lineage::{AttemptOutcome, AttemptRecord, IssueStatus, RecordedAttempt};
 pub use onboard::{infer_gate_commands, onboard_repo, InferredGates};
@@ -496,6 +529,35 @@ pub(crate) fn read_current(db: &Database, key: &str) -> Result<Option<Drawer>, M
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pre-Muse public names still resolve, deprecated, to the renamed
+    /// items for one release.
+    #[test]
+    #[allow(deprecated)]
+    fn the_renamed_supervised_cli_items_keep_their_old_names() {
+        fn artifacts(a: CodexArtifacts) -> InvocationArtifacts {
+            a
+        }
+        fn recovery(r: codex_dispatch::CodexRecovery) -> InvocationRecovery {
+            r
+        }
+        fn snapshot(s: codex_process::CodexProcessSnapshot) -> process_tree::ProcessSnapshot {
+            s
+        }
+        fn source(s: &mut dyn codex_process::CodexProcessSource) -> process_tree::ProcessSnapshot {
+            process_tree::snapshot(s)
+        }
+        fn dispatcher(d: run::CodexDispatcher) -> run::CliDispatcher {
+            d
+        }
+        let _ = (artifacts, recovery, snapshot, source, dispatcher);
+        let _: CodexRecovery = InvocationRecovery::NoPriorInvocation;
+        let _: codex_process::UnixCodexProcesses = codex_process::UnixCodexProcesses;
+        assert_eq!(
+            codex_process::parse_codex_processes("").ok(),
+            process_tree::parse_processes("").ok()
+        );
+    }
 
     #[test]
     fn repo_slug_replaces_unsafe_characters() {

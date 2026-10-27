@@ -163,9 +163,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (40 or 64 hex digits) checked where it is made, instead of a `String`. It
   derefs to `str`.
 - **Library: supervised-CLI types renamed.** `CodexArtifacts` is now
-  `InvocationArtifacts`, `CodexRecovery` is `InvocationRecovery`, and the
-  `codex_process` module is `process_tree`. `codex_dispatch` no longer exports
-  `CODEX_DISPATCH_TIMEOUT_SECS`, `CODEX_VERDICT_JSON_SCHEMA` or `build_argv`.
+  `InvocationArtifacts`, `CodexRecovery` is `InvocationRecovery`,
+  `CodexDispatcher` is `CliDispatcher` (built with
+  `CliDispatcher::resolve(Implementer::Codex)`), and the `codex_process`
+  module is `process_tree`, where `parse_codex_processes`,
+  `CodexProcessSnapshot`, `CodexProcessSource` and `UnixCodexProcesses` are
+  `parse_processes`, `ProcessSnapshot`, `ProcessSource` and `UnixProcesses`.
+  The old names stay, deprecated, for one release. These changes have no
+  alias and break a caller at compile time: the `codex_artifacts` field of
+  `DispatchSpec`, `DispatchState` and `ClearedDispatch` is
+  `invocation_artifacts` (the stored and `--json` key is still
+  `codex_artifacts`); `HarnessSnapshots::codex` is `processes`; `Worktree`
+  has a new required field, `cut`; `codex_dispatch`'s supervision moved to
+  `invocation`, where `prepare_artifacts`, `has_launch_failure_record`,
+  `has_valid_exit_record` and `recover_artifacts` keep their names, `run_codex`
+  is `run_supervised`, and `run_codex_bounded`, `read_artifacts` and
+  `dispatch_timeout` are no longer public; and `codex_dispatch` no longer
+  exports `CODEX_DISPATCH_TIMEOUT_SECS`, `CODEX_VERDICT_JSON_SCHEMA` or
+  `build_argv`.
 - **GitHub releases now carry their version's `CHANGELOG.md` section as the
   description.** Until now the release workflow published every release with
   an empty body. `scripts/release_notes.py` extracts the tag's
