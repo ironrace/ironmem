@@ -135,8 +135,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **The Codex and Muse implementers skip relative `PATH` entries** (such as
   `.`) when finding their binary. They run in the issue worktree, where a
   relative entry would find a file in the repository being worked on.
-- **Resuming an issue branch with no recorded cut now resolves `--base`**,
-  records it as the cut, and refuses the run if `--base` does not resolve.
+- **Resuming an issue branch with no recorded cut now records the commit the
+  branch was created from** (from its reflog, or else its merge base with
+  `--base`), and refuses the run if neither can be found. A new branch's cut
+  is recorded before the branch is created, so a held `.git/config` lock no
+  longer leaves a branch without one; that error now names the lock file and
+  its age. Cut and signing-flag writes run git in the C locale, so a held
+  lock is recognised in any locale, and SHA-256 repositories can provision
+  issue worktrees.
 - **Library: supervised-CLI types renamed.** `CodexArtifacts` is now
   `InvocationArtifacts`, `CodexRecovery` is `InvocationRecovery`, and the
   `codex_process` module is `process_tree`. `codex_dispatch` no longer exports

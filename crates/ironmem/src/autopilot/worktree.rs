@@ -61,10 +61,11 @@ pub fn resolve_commit(repo_dir: &Path, rev: &str) -> Option<String> {
     )
     .ok()?;
     let sha = sha.trim();
-    // `rev-parse --verify` prints exactly one 40-char object name on success.
-    // Anything else means we are not looking at what we think we are, and a
-    // half-parsed SHA compared against a PR head would silently never match.
-    if sha.len() == 40 && sha.chars().all(|c| c.is_ascii_hexdigit()) {
+    // `rev-parse --verify` prints exactly one full object name on success: 40
+    // hex characters, or 64 in a SHA-256 repository. Anything else means we
+    // are not looking at what we think we are, and a half-parsed SHA compared
+    // against a PR head would silently never match.
+    if matches!(sha.len(), 40 | 64) && sha.chars().all(|c| c.is_ascii_hexdigit()) {
         Some(sha.to_string())
     } else {
         None
@@ -97,8 +98,8 @@ pub struct Worktree {
     /// case).
     pub created: bool,
     /// The full commit sha the branch was cut from. Resolved from `base` in
-    /// the operator's checkout once, when the branch is created, and kept in
-    /// `branch.<branch>.ironmemCut` so a resume reads it back rather than
+    /// the operator's checkout once, before the branch is created, and kept
+    /// in `branch.<branch>.ironmemCut` so a resume reads it back rather than
     /// re-resolving a `base` (such as `HEAD`) that has since moved.
     pub cut: String,
     /// Set when a dirty pre-existing worktree was moved aside first — the
@@ -131,7 +132,28 @@ fn git_command() -> Command {
 /// Run a `git` subcommand in `cwd` through [`git_command`]'s scrubbed
 /// environment, returning trimmed stdout or a descriptive error.
 fn git(cwd: &Path, args: &[&str]) -> Result<String, MemoryError> {
+    run_git(git_command(), cwd, args)
+}
+
+/// [`git_command`] for a `git config` write, in the C locale: [`config_locked`]
+/// recognises a held lock by git's message, which is translated in any other
+/// locale. `LANGUAGE` goes too: GNU gettext prefers it over `LC_ALL` outside
+/// the C locale.
+fn config_write_command() -> Command {
     let mut command = git_command();
+    command
+        .env("LC_ALL", "C")
+        .env("LANG", "C")
+        .env_remove("LANGUAGE");
+    command
+}
+
+/// [`git`] for a `git config` write; see [`config_write_command`].
+fn git_config_write(cwd: &Path, args: &[&str]) -> Result<String, MemoryError> {
+    run_git(config_write_command(), cwd, args)
+}
+
+fn run_git(mut command: Command, cwd: &Path, args: &[&str]) -> Result<String, MemoryError> {
     let output =
         command.args(args).current_dir(cwd).output().map_err(|e| {
             MemoryError::NotFound(format!("failed to run git {}: {e}", args.join(" ")))
@@ -230,13 +252,19 @@ fn config_bool(dir: &Path, key: &str) -> Result<Option<bool>, String> {
 /// read the policy as on; it passes `repo_wide` only for a policy that read
 /// `true`, so an unreadable `commit.gpgsign` (a typo) holds its own branch
 /// but never arms every branch in the repository. The flags are sticky: a
-/// later run that finds the policy off still enforces it, so an agent's `git
-/// config commit.gpgsign false` in the shared `.git/config` outlives neither
-/// the dispatch nor the run, and does not unguard branches created after it.
+/// later run that finds the policy off still enforces it, so an agent that
+/// sets `commit.gpgsign false` in the shared `.git/config` cannot switch
+/// enforcement off for this dispatch or any later run, nor for branches
+/// created after it.
 ///
-/// Each flag is skipped when already recorded (or unreadable). A live agent in
-/// another worktree of the same repo may hold `.git/config`'s lock (`push -u`
-/// and `checkout -b` both write config), and a needless write would race it.
+/// Each flag is skipped when already recorded. A live agent in another
+/// worktree of the same repo may hold `.git/config`'s lock (`push -u` and
+/// `checkout -b` both write config), and a needless write would race it.
+///
+/// A flag that cannot be read is skipped too, with a warning naming it, and
+/// left as it is: it may be an operator's mistyped opt-out, which is theirs
+/// to correct. It still holds the branch ([`signing_holder`] refuses to read
+/// it as "not held"), so nothing is unguarded meanwhile.
 pub(crate) fn record_signing(dir: &Path, branch: &str, repo_wide: bool) -> Result<(), MemoryError> {
     // The branch first: a held lock on the second write still leaves the
     // branch held, as before the repository flag existed.
@@ -245,10 +273,20 @@ pub(crate) fn record_signing(dir: &Path, branch: &str, repo_wide: bool) -> Resul
         keys.push(REPO_SIGNING_KEY.to_string());
     }
     for key in keys {
-        if matches!(config_bool(dir, &key), Ok(Some(true)) | Err(_)) {
-            continue;
+        match config_bool(dir, &key) {
+            Ok(Some(true)) => continue,
+            Err(why) => {
+                tracing::warn!(
+                    key = %key,
+                    error = %why,
+                    "autopilot cannot read a commit-signing flag, so it is left as it is and \
+                     still holds the branch; set it to true or false"
+                );
+                continue;
+            }
+            Ok(_) => {}
         }
-        git(dir, &["config", &key, "true"])?;
+        git_config_write(dir, &["config", &key, "true"])?;
     }
     Ok(())
 }
@@ -298,11 +336,28 @@ fn recorded_cut(root: &Path, branch: &str) -> Result<Option<String>, MemoryError
     };
     resolve_commit(root, &recorded).map(Some).ok_or_else(|| {
         MemoryError::Validation(format!(
-            "{key} is `{recorded}`, which is not a commit in {}; unset it with `git config \
-             --unset {key}` to record the cut again from the base",
+            "{key} is `{}`, which is not a commit in {}; unset it with `git config --unset \
+             {key}` to record the cut again from the branch's history",
+            quoted_value(&recorded),
             root.display()
         ))
     })
+}
+
+/// How many characters of a config value an error quotes.
+const QUOTED_VALUE_CHARS: usize = 80;
+
+/// A config value fit to quote in a one-line error: anyone who can write
+/// `.git/config` (the agent included) chooses it, so control characters are
+/// escaped, secrets scrubbed and the length bounded.
+fn quoted_value(value: &str) -> String {
+    let escaped: String = value.escape_debug().collect();
+    let bounded = super::scrub::scrub_and_bound(&escaped, QUOTED_VALUE_CHARS);
+    if bounded.truncated {
+        format!("{}…", bounded.text)
+    } else {
+        bounded.text
+    }
 }
 
 /// How many times [`write_cut`] tries while `.git/config` is locked, and how
@@ -311,17 +366,32 @@ const CONFIG_LOCK_ATTEMPTS: u32 = 5;
 const CONFIG_LOCK_RETRY: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Record `cut` on `branch`, waiting briefly while another worktree's agent
-/// holds `.git/config`'s lock. A missing cut is backfilled on a later run,
-/// but from `base` as it is then, which may have moved; so a short bounded
-/// wait is worth it. Any other failure, or a lock held past the window, is
-/// returned.
+/// holds `.git/config`'s lock; see [`write_config_waiting`].
 fn write_cut(root: &Path, branch: &str, cut: &str) -> Result<(), MemoryError> {
-    let key = cut_key(branch);
+    write_config_waiting(root, &cut_key(branch), cut, |_| {})
+}
+
+/// Set `key` to `value`, retrying while `.git/config` is locked. A sibling
+/// worktree's agent holds the lock only for a moment (`push -u` and
+/// `checkout -b` write config), so a short bounded wait is worth it. Any
+/// other failure is returned at once; a lock held past the window is returned
+/// naming the lock file ([`lock_held`]). `before_retry` is called with the
+/// failed attempt's number before each retry.
+fn write_config_waiting(
+    root: &Path,
+    key: &str,
+    value: &str,
+    mut before_retry: impl FnMut(u32),
+) -> Result<(), MemoryError> {
     let mut attempt = 1;
     loop {
-        match git(root, &["config", &key, cut]) {
+        match git_config_write(root, &["config", key, value]) {
             Ok(_) => return Ok(()),
-            Err(e) if attempt < CONFIG_LOCK_ATTEMPTS && config_locked(&e) => {
+            Err(e) if config_locked(&e) => {
+                if attempt >= CONFIG_LOCK_ATTEMPTS {
+                    return Err(lock_held(root, e));
+                }
+                before_retry(attempt);
                 attempt += 1;
                 std::thread::sleep(CONFIG_LOCK_RETRY);
             }
@@ -330,19 +400,215 @@ fn write_cut(root: &Path, branch: &str, cut: &str) -> Result<(), MemoryError> {
     }
 }
 
-/// Record a cut for an existing `branch` that has none, from `base` as it
-/// resolves now. That may not be the commit the branch was cut from (`base`
-/// may have moved since), and a wrong cut widens or narrows the range the
-/// signing guard checks, so the inference is logged rather than silent.
-fn backfill_cut(root: &Path, branch: &str, base: &str, cut: &str) -> Result<(), MemoryError> {
+/// A config write's lock error, extended with the lock file's path and age.
+///
+/// A git killed while holding the lock (the supervisor's cleanup SIGKILLs an
+/// agent's `git push -u`, and SIGKILL skips git's lockfile cleanup) leaves it
+/// behind, and every later config write fails until someone removes it. The
+/// lock is never removed here: a live git may still hold it, and only a
+/// person can tell.
+fn lock_held(root: &Path, e: MemoryError) -> MemoryError {
+    let lock = git(
+        root,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+    .map(|dir| canonical_or_self(Path::new(&dir)).join("config.lock"));
+    let Ok(lock) = lock else {
+        return e;
+    };
+    let age = std::fs::metadata(&lock)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .map_or_else(
+            || "a while".to_string(),
+            |age| format!("{}s", age.as_secs()),
+        );
+    let detail = match e {
+        MemoryError::Validation(detail) => detail,
+        other => other.to_string(),
+    };
+    MemoryError::Validation(format!(
+        "{detail}; `{}` has been held for {age}. If no git command is running in any worktree of \
+         {}, a killed git left it behind: remove it and run again",
+        lock.display(),
+        root.display()
+    ))
+}
+
+/// Remove `branch`'s recorded cut only while it still reads `cut`, so a value
+/// another controller wrote meanwhile is kept. Nothing to remove is not an
+/// error (git exits 5).
+fn unset_cut_if(root: &Path, branch: &str, cut: &str) -> Result<(), MemoryError> {
+    let key = cut_key(branch);
+    // A full object name is plain hex, so the anchored pattern matches it alone.
+    let pattern = format!("^{cut}$");
+    let out = config_write_command()
+        .args(["config", "--unset", &key, &pattern])
+        .current_dir(root)
+        .output()
+        .map_err(|e| MemoryError::NotFound(format!("failed to run git config --unset: {e}")))?;
+    match out.status.code() {
+        Some(0) | Some(5) => Ok(()),
+        code => Err(MemoryError::Validation(format!(
+            "git config --unset {key} failed in {} (exit {code:?}): {}",
+            root.display(),
+            bounded_stderr(&out.stderr)
+        ))),
+    }
+}
+
+/// Where an inferred cut came from, named in [`backfill_cut`]'s warning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CutSource {
+    /// The branch reflog's creation entry: the exact commit it was cut from.
+    Reflog,
+    /// The merge base of the branch and the operator's base: an ancestor of
+    /// the branch, so the range it bounds never skips the branch's own work.
+    MergeBase,
+}
+
+impl std::fmt::Display for CutSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            CutSource::Reflog => "the branch's creation entry in its reflog",
+            CutSource::MergeBase => "the merge base of the branch and the base",
+        })
+    }
+}
+
+/// The cut of an existing `branch` that has none recorded.
+///
+/// Its reflog's creation entry (`branch: Created from ...`, which git writes
+/// untranslated) is the commit it was cut from, so that is preferred. Without
+/// one (`core.logAllRefUpdates` off, or the entry expired), the merge base of
+/// the branch and `base`: never `base` itself, which may have moved on since,
+/// or moved to another line of history (an operator's local-only commits
+/// would then count as the agent's). A branch that shares no history with
+/// `base` is refused rather than guessed.
+fn infer_cut(root: &Path, branch: &str, base: &str) -> Result<(String, CutSource), MemoryError> {
+    let local = format!("refs/heads/{branch}");
+    let created = git(root, &["reflog", "show", "--format=%H %gs", &local])
+        .ok()
+        .and_then(|log| {
+            let oldest = log.lines().last()?.to_string();
+            let (sha, subject) = oldest.split_once(' ')?;
+            subject
+                .starts_with("branch: Created from")
+                .then(|| resolve_commit(root, sha))
+                .flatten()
+        });
+    if let Some(sha) = created {
+        return Ok((sha, CutSource::Reflog));
+    }
+    let base_sha = resolve_base(root, base)?;
+    // `merge-base` exits 1 for "no common ancestor"; any other failure is git's.
+    let merge_base = match git(root, &["merge-base", &local, &base_sha]) {
+        Ok(sha) => resolve_commit(root, &sha),
+        Err(MemoryError::Validation(why)) if why.contains("(exit Some(1))") => None,
+        Err(e) => return Err(e),
+    };
+    merge_base
+        .map(|sha| (sha, CutSource::MergeBase))
+        .ok_or_else(|| {
+            MemoryError::Validation(format!(
+                "cannot infer the cut of the issue branch `{branch}` in {}: it records none, its \
+                 reflog has no creation entry, and it shares no history with the base `{base}`; \
+                 record the commit it was cut from with `git config {} <sha>` and run again",
+                root.display(),
+                cut_key(branch)
+            ))
+        })
+}
+
+/// Record a cut [`infer_cut`] found for an existing `branch` that had none.
+/// An inferred cut is logged rather than silent: a wrong one widens or
+/// narrows the range the signing guard checks.
+fn backfill_cut(
+    root: &Path,
+    branch: &str,
+    base: &str,
+    cut: &str,
+    source: CutSource,
+) -> Result<(), MemoryError> {
     tracing::warn!(
         branch = %branch,
         base = %base,
         cut = %cut,
-        "autopilot found no recorded cut for an existing issue branch; recording the base as it \
-         resolves now, which may not be the commit the branch was cut from"
+        source = %source,
+        "autopilot found no recorded cut for an existing issue branch; recording one inferred \
+         from its history"
     );
     write_cut(root, branch, cut)
+}
+
+/// Create `branch` at `cut` (resolved from `base`) with a worktree at `path`,
+/// so the branch never exists without its recorded cut.
+///
+/// The cut is written first: a held config lock then fails before anything
+/// exists. If `git worktree add` fails, the cut is taken back, unless another
+/// controller has since written its own. If the new branch's tip is not `cut`
+/// (`base` moved after it was resolved) or cannot be read, the branch and its
+/// worktree are rolled back, so no branch is left with a cut it was not cut
+/// from. `base` is passed to git as written, so a remote-tracking base still
+/// sets the branch's upstream.
+fn create_branch(
+    root: &Path,
+    branch: &str,
+    path: &Path,
+    base: &str,
+    cut: &str,
+) -> Result<(), MemoryError> {
+    let key = cut_key(branch);
+    if let Ok(Some(stale)) = config_get(root, &["--get", &key]) {
+        if stale != cut {
+            tracing::warn!(
+                branch = %branch,
+                stale = %quoted_value(&stale),
+                cut = %cut,
+                "autopilot is replacing a cut recorded for an issue branch that does not exist"
+            );
+        }
+    }
+    write_cut(root, branch, cut)?;
+    let path_str = path.to_string_lossy().to_string();
+    if let Err(e) = git(root, &["worktree", "add", "-b", branch, &path_str, base]) {
+        if let Err(unset) = unset_cut_if(root, branch, cut) {
+            tracing::warn!(
+                branch = %branch,
+                error = %unset,
+                "autopilot could not take back the cut it recorded for a branch it failed to create"
+            );
+        }
+        return Err(e);
+    }
+    let problem = match resolve_commit(root, &format!("refs/heads/{branch}")) {
+        Some(tip) if tip == cut => return Ok(()),
+        Some(tip) => {
+            format!("it landed on {tip}, not on {cut}, which `{base}` resolved to a moment earlier")
+        }
+        None => "its tip could not be read back".to_string(),
+    };
+    let rolled_back = roll_back_creation(root, branch, &path_str);
+    Err(MemoryError::Validation(format!(
+        "the issue branch `{branch}` was just created in {}, but {problem}; {rolled_back}",
+        root.display()
+    )))
+}
+
+/// Undo [`create_branch`]'s `git worktree add -b`, describing the outcome.
+/// Safe only there: the worktree and branch were made a moment ago and carry
+/// no work. Deleting the branch drops its config section, the cut included.
+fn roll_back_creation(root: &Path, branch: &str, path: &str) -> String {
+    let removed = git(root, &["worktree", "remove", "--force", path])
+        .and_then(|_| git(root, &["branch", "-D", branch]));
+    match removed {
+        Ok(_) => "the branch and its worktree were removed; run again".to_string(),
+        Err(e) => format!(
+            "rolling it back failed ({e}); remove the worktree at {path} and the branch \
+             `{branch}` (`git worktree remove --force` and `git branch -D`) before running again"
+        ),
+    }
 }
 
 /// Whether a failed [`git`] config write failed only on the config lock.
@@ -496,20 +762,23 @@ fn quarantine(repo_root: &Path, path: &Path) -> Result<PathBuf, MemoryError> {
 /// it first if it exists but is dirty.
 ///
 /// `base` is the committish new branches are cut from (e.g. `"origin/main"`
-/// or `"HEAD"`); it is only consulted when the issue's branch does not exist
-/// yet, or to backfill a missing cut. A resumed run whose branch already carries pushed commits reuses that
-/// branch untouched — re-cutting it from `base` would silently discard every
+/// or `"HEAD"`). It is consulted only when the issue's branch does not exist
+/// yet, or, as a fallback, to infer a missing cut.
+///
+/// A resumed run whose branch already carries pushed commits reuses that
+/// branch untouched: re-cutting it from `base` would silently discard every
 /// prior dispatch's work, which is exactly the history the lineage store
 /// exists to keep.
 ///
-/// The cut ([`Worktree::cut`]) is resolved from `base` in `repo_root` when the
-/// branch is created and stored on the branch; an existing branch reads it
-/// back, backfilling it from `base` once if it has none (an older branch, or
-/// a creation whose cut write failed), with a warning naming the branch, the
-/// base and the sha recorded. A `base` that does not resolve is refused
-/// before anything on disk changes. At
-/// creation the signing policy is recorded too ([`record_signing`]), on a
-/// best-effort basis: a failed write only warns.
+/// The cut ([`Worktree::cut`]) is resolved from `base` in `repo_root` and
+/// recorded before the branch is created ([`create_branch`]), so a branch is
+/// never left without one. An existing branch reads it back; one with none
+/// (an older branch) gets one inferred from its own history ([`infer_cut`]),
+/// with a warning naming the branch, the source and the sha recorded. A
+/// `base` that does not resolve, or a cut that cannot be read, inferred or
+/// recorded, is refused before anything on disk changes. At creation the
+/// signing policy is recorded too ([`record_signing`]), on a best-effort
+/// basis: a failed write only warns.
 pub fn ensure_worktree(
     repo_root: &Path,
     worktree_root: &Path,
@@ -535,16 +804,19 @@ pub fn ensure_worktree(
             &format!("refs/heads/{branch}"),
         ],
     )?;
-    // Settled before anything on disk changes, so a bad base leaves nothing
-    // behind. A new branch's cut is re-read from its tip once it exists.
-    let recorded = if branch_exists {
-        recorded_cut(&root, &branch)?
+    // Settled before anything on disk changes, so a bad base or an
+    // unrecordable cut leaves nothing behind.
+    let cut = if branch_exists {
+        match recorded_cut(&root, &branch)? {
+            Some(sha) => sha,
+            None => {
+                let (sha, source) = infer_cut(&root, &branch, base)?;
+                backfill_cut(&root, &branch, base, &sha, source)?;
+                sha
+            }
+        }
     } else {
-        None
-    };
-    let cut = match &recorded {
-        Some(sha) => sha.clone(),
-        None => resolve_base(&root, base)?,
+        resolve_base(&root, base)?
     };
 
     let mut quarantined_from = None;
@@ -578,9 +850,6 @@ pub fn ensure_worktree(
                     path.display()
                 )));
             }
-            if recorded.is_none() {
-                backfill_cut(&root, &branch, base, &cut)?;
-            }
             return Ok(Worktree {
                 path: canonical_or_self(&path),
                 branch,
@@ -609,20 +878,11 @@ pub fn ensure_worktree(
         std::fs::create_dir_all(parent)?;
     }
 
-    let path_str = path.to_string_lossy().to_string();
-    let cut = if branch_exists {
+    if branch_exists {
+        let path_str = path.to_string_lossy().to_string();
         git(&root, &["worktree", "add", &path_str, &branch])?;
-        cut
     } else {
-        // Cut from `base` as written, so a remote-tracking base still sets
-        // the branch's upstream; the tip it landed on is the exact cut.
-        git(&root, &["worktree", "add", "-b", &branch, &path_str, base])?;
-        resolve_base(&root, &format!("refs/heads/{branch}"))?
-    };
-    match (&recorded, branch_exists) {
-        (Some(_), _) => {}
-        (None, true) => backfill_cut(&root, &branch, base, &cut)?,
-        (None, false) => write_cut(&root, &branch, &cut)?,
+        create_branch(&root, &branch, &path, base, &cut)?;
     }
     // Warn-only, as at a run's start: another worktree's agent may hold
     // `.git/config`'s lock, and `run_issue` holds the run to the policy it
@@ -761,9 +1021,21 @@ mod tests {
     /// registration vs. mere directory existence), and a mock would only
     /// assert that we call the commands we already decided to call.
     fn fixture_repo() -> tempfile::TempDir {
+        fixture_repo_of("sha1")
+    }
+
+    /// [`fixture_repo`] with the given `--object-format`.
+    fn fixture_repo_of(object_format: &str) -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path();
-        run(path, &["init", "--initial-branch=main"]);
+        run(
+            path,
+            &[
+                "init",
+                "--initial-branch=main",
+                &format!("--object-format={object_format}"),
+            ],
+        );
         run(path, &["config", "user.email", "autopilot@example.test"]);
         run(path, &["config", "user.name", "Autopilot Test"]);
         // Pinned: the global config signs and runs hooks; worktrees share this.
@@ -818,19 +1090,73 @@ mod tests {
     fn an_absent_cut_is_backfilled_once_on_reuse() {
         let repo = fixture_repo();
         let roots = tempfile::tempdir().unwrap();
-        ensure_worktree(repo.path(), roots.path(), &issue(), "HEAD").unwrap();
+        let created = ensure_worktree(repo.path(), roots.path(), &issue(), "HEAD").unwrap();
         // A worktree created before the cut was recorded.
         run(repo.path(), &["config", "--unset", &issue_cut_key()]);
-        let now = advance_operator_head(repo.path(), "later");
+        // The operator's checkout moves on; the backfill must not follow it.
+        advance_operator_head(repo.path(), "later");
         let reused = ensure_worktree(repo.path(), roots.path(), &issue(), "HEAD").unwrap();
-        assert_eq!(reused.cut, now);
+        assert_eq!(reused.cut, created.cut, "the branch's creation point");
         assert_eq!(
             read_config(repo.path(), &issue_cut_key()),
-            Some(now.clone())
+            Some(created.cut.clone())
         );
         advance_operator_head(repo.path(), "later-still");
         let again = ensure_worktree(repo.path(), roots.path(), &issue(), "HEAD").unwrap();
-        assert_eq!(again.cut, now);
+        assert_eq!(again.cut, created.cut);
+    }
+
+    /// Drop the issue branch's reflog, as `core.logAllRefUpdates=false` or
+    /// an expired reflog leaves it.
+    fn drop_issue_reflog(repo: &Path) {
+        let log = repo
+            .join(".git/logs/refs/heads")
+            .join(branch_name(&issue()));
+        std::fs::remove_file(log).unwrap();
+    }
+
+    #[test]
+    fn without_a_reflog_the_cut_is_backfilled_from_the_merge_base_with_the_base() {
+        let repo = fixture_repo();
+        let roots = tempfile::tempdir().unwrap();
+        let created = ensure_worktree(repo.path(), roots.path(), &issue(), "HEAD").unwrap();
+        commit_in(&created.path, "agent-work");
+        run(repo.path(), &["config", "--unset", &issue_cut_key()]);
+        drop_issue_reflog(repo.path());
+        advance_operator_head(repo.path(), "later");
+        let (reused, log) =
+            with_captured_log(|| ensure_worktree(repo.path(), roots.path(), &issue(), "HEAD"));
+        assert_eq!(reused.unwrap().cut, created.cut);
+        assert!(log.contains("merge base"), "{log}");
+    }
+
+    #[test]
+    fn a_cut_that_cannot_be_inferred_is_refused_not_guessed() {
+        let repo = fixture_repo();
+        let roots = tempfile::tempdir().unwrap();
+        ensure_worktree(repo.path(), roots.path(), &issue(), "HEAD").unwrap();
+        run(repo.path(), &["config", "--unset", &issue_cut_key()]);
+        drop_issue_reflog(repo.path());
+        // A base that shares no history with the branch.
+        let tree = git(repo.path(), &["mktree"]).unwrap();
+        let orphan = git(repo.path(), &["commit-tree", &tree, "-m", "orphan"]).unwrap();
+        let err = ensure_worktree(repo.path(), roots.path(), &issue(), &orphan)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cannot infer the cut"), "got: {err}");
+        assert!(
+            err.contains(&format!("git config {}", issue_cut_key())),
+            "got: {err}"
+        );
+        assert_eq!(read_config(repo.path(), &issue_cut_key()), None);
+    }
+
+    /// Commit a new file in `dir`; returns the commit.
+    fn commit_in(dir: &Path, file: &str) -> String {
+        std::fs::write(dir.join(file), file).unwrap();
+        run(dir, &["add", file]);
+        run(dir, &["commit", "-qm", file]);
+        resolve_commit(dir, "HEAD").unwrap()
     }
 
     /// A `tracing` writer that keeps what it is given, for asserting a warning.
@@ -863,16 +1189,16 @@ mod tests {
     fn a_backfilled_cut_is_logged_as_inferred_from_the_base() {
         let repo = fixture_repo();
         let roots = tempfile::tempdir().unwrap();
-        ensure_worktree(repo.path(), roots.path(), &issue(), "HEAD").unwrap();
+        let created = ensure_worktree(repo.path(), roots.path(), &issue(), "HEAD").unwrap();
         run(repo.path(), &["config", "--unset", &issue_cut_key()]);
-        let now = advance_operator_head(repo.path(), "later");
+        advance_operator_head(repo.path(), "later");
         let (reused, log) =
             with_captured_log(|| ensure_worktree(repo.path(), roots.path(), &issue(), "HEAD"));
-        assert_eq!(reused.unwrap().cut, now);
+        assert_eq!(reused.unwrap().cut, created.cut);
         assert!(log.contains("WARN"), "{log}");
         assert!(log.contains(&branch_name(&issue())), "{log}");
-        assert!(log.contains("base=HEAD"), "{log}");
-        assert!(log.contains(&now), "{log}");
+        assert!(log.contains("reflog"), "{log}");
+        assert!(log.contains(&created.cut), "{log}");
         // A recorded cut is read back silently.
         let (_, quiet) =
             with_captured_log(|| ensure_worktree(repo.path(), roots.path(), &issue(), "HEAD"));
@@ -904,6 +1230,34 @@ mod tests {
     }
 
     #[test]
+    fn a_recorded_cut_is_quoted_escaped_and_bounded_in_the_refusal() {
+        let repo = fixture_repo();
+        let roots = tempfile::tempdir().unwrap();
+        let first = ensure_worktree(repo.path(), roots.path(), &issue(), "HEAD").unwrap();
+        run(
+            repo.path(),
+            &["worktree", "remove", first.path.to_str().unwrap()],
+        );
+        let planted = format!("\u{1b}[31mred\nline two {}", "x".repeat(5000));
+        run(repo.path(), &["config", &issue_cut_key(), &planted]);
+        let err = ensure_worktree(repo.path(), roots.path(), &issue(), "HEAD")
+            .unwrap_err()
+            .to_string();
+        assert!(!err.contains('\u{1b}'), "got: {err}");
+        assert!(!err.contains('\n'), "got: {err}");
+        assert!(!err.contains(&"x".repeat(200)), "got: {err}");
+        assert!(
+            err.chars().count() < 800,
+            "got {} chars",
+            err.chars().count()
+        );
+        assert!(
+            err.contains(&format!("git config --unset {}", issue_cut_key())),
+            "got: {err}"
+        );
+    }
+
+    #[test]
     fn a_cut_record_that_cannot_be_read_is_an_error_not_an_absent_cut() {
         let missing = tempfile::tempdir().unwrap().path().join("gone");
         let err = recorded_cut(&missing, &branch_name(&issue()))
@@ -931,6 +1285,55 @@ mod tests {
         assert!(signing_recorded(repo.path(), &branch));
         let missing = tempfile::tempdir().unwrap().path().join("gone");
         assert!(signing_recorded(&missing, &branch));
+    }
+
+    #[test]
+    fn recording_signing_over_an_unreadable_flag_warns_and_leaves_it() {
+        let repo = fixture_repo();
+        let branch = branch_name(&issue());
+        let key = format!("branch.{branch}.ironmemSigning");
+        run(repo.path(), &["config", &key, "yes-please"]);
+        let (recorded, log) = with_captured_log(|| record_signing(repo.path(), &branch, true));
+        recorded.unwrap();
+        assert!(log.contains("WARN"), "{log}");
+        assert!(log.contains(&key), "{log}");
+        // Left for the operator: it may be a mistyped opt-out.
+        assert_eq!(
+            read_config(repo.path(), &key).as_deref(),
+            Some("yes-please")
+        );
+        // The repository flag is still recorded.
+        assert_eq!(
+            read_config(repo.path(), "ironmem.autopilotSigning").as_deref(),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn a_sha256_repository_provisions_an_issue_worktree() {
+        let repo = fixture_repo_of("sha256");
+        let roots = tempfile::tempdir().unwrap();
+        let head = resolve_commit(repo.path(), "HEAD").expect("a sha256 HEAD resolves");
+        assert_eq!(head.len(), 64);
+        let wt = ensure_worktree(repo.path(), roots.path(), &issue(), "HEAD").unwrap();
+        assert_eq!(wt.cut, head);
+        assert_eq!(read_config(repo.path(), &issue_cut_key()), Some(head));
+    }
+
+    #[test]
+    fn config_writes_run_in_the_c_locale() {
+        use std::ffi::OsStr;
+        let command = config_write_command();
+        let envs: std::collections::HashMap<&OsStr, Option<&OsStr>> = command.get_envs().collect();
+        for var in ["LC_ALL", "LANG"] {
+            assert_eq!(
+                envs.get(OsStr::new(var)),
+                Some(&Some(OsStr::new("C"))),
+                "{var} must be C so config_locked can read git's lock message"
+            );
+        }
+        // GNU gettext prefers LANGUAGE over LC_ALL outside the C locale.
+        assert_eq!(envs.get(OsStr::new("LANGUAGE")), Some(&None));
     }
 
     #[test]
@@ -1055,21 +1458,78 @@ mod tests {
     }
 
     #[test]
-    fn the_cut_write_waits_out_a_briefly_held_config_lock() {
+    fn the_cut_write_retries_once_a_held_config_lock_is_released() {
+        let repo = fixture_repo();
+        let head = resolve_commit(repo.path(), "HEAD").unwrap();
+        let lock = hold_config_lock(repo.path());
+        let mut retries = Vec::new();
+        // Released only after an attempt has failed on it, so the retry is
+        // what succeeds, however slow the machine.
+        write_config_waiting(repo.path(), &issue_cut_key(), &head, |attempt| {
+            retries.push(attempt);
+            let _ = std::fs::remove_file(&lock);
+        })
+        .expect("a lock released within the retry window must not fail");
+        assert_eq!(retries, vec![1]);
+        assert_eq!(read_config(repo.path(), &issue_cut_key()), Some(head));
+    }
+
+    #[test]
+    fn a_failed_worktree_add_takes_back_only_its_own_cut() {
         let repo = fixture_repo();
         let roots = tempfile::tempdir().unwrap();
-        let lock = hold_config_lock(repo.path());
-        let release = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(150));
-            std::fs::remove_file(&lock).unwrap();
-        });
-        let created = ensure_worktree(repo.path(), roots.path(), &issue(), "HEAD");
-        release.join().unwrap();
-        let created = created.expect("a lock released within the retry window must not fail");
+        // A ref below the branch's name makes `git worktree add -b` refuse it.
+        let blocker = format!("{}/blocker", branch_name(&issue()));
+        run(repo.path(), &["branch", &blocker]);
+        let err = ensure_worktree(repo.path(), roots.path(), &issue(), "HEAD");
+        assert!(err.is_err(), "the add must fail: {err:?}");
+        assert_eq!(read_config(repo.path(), &issue_cut_key()), None);
+
+        // A value another controller wrote over ours is not ours to remove.
+        let ours = resolve_commit(repo.path(), "HEAD").unwrap();
+        let theirs = advance_operator_head(repo.path(), "later");
+        run(repo.path(), &["config", &issue_cut_key(), &theirs]);
+        unset_cut_if(repo.path(), &branch_name(&issue()), &ours).unwrap();
         assert_eq!(
             read_config(repo.path(), &issue_cut_key()),
-            Some(created.cut)
+            Some(theirs.clone())
         );
+        unset_cut_if(repo.path(), &branch_name(&issue()), &theirs).unwrap();
+        assert_eq!(read_config(repo.path(), &issue_cut_key()), None);
+    }
+
+    #[test]
+    fn a_base_that_moved_during_creation_rolls_the_creation_back() {
+        let repo = fixture_repo();
+        let roots = tempfile::tempdir().unwrap();
+        let root = resolve_repo_root(repo.path()).unwrap();
+        let resolved = resolve_commit(&root, "HEAD").unwrap();
+        // `HEAD` moves between its resolution and `git worktree add`.
+        let moved = advance_operator_head(&root, "moved");
+        let branch = branch_name(&issue());
+        let path = worktree_path(roots.path(), &issue());
+        let err = create_branch(&root, &branch, &path, "HEAD", &resolved)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(&branch), "got: {err}");
+        assert!(
+            err.contains(&resolved) && err.contains(&moved),
+            "got: {err}"
+        );
+        assert!(err.contains("just created"), "got: {err}");
+        assert!(!err.contains("--base"), "not the operator's base: {err}");
+        assert!(!path.exists(), "the worktree is rolled back");
+        assert!(!git_ok(
+            &root,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{branch}")
+            ]
+        )
+        .unwrap());
+        assert_eq!(read_config(&root, &issue_cut_key()), None);
     }
 
     #[test]
@@ -1082,6 +1542,25 @@ mod tests {
         let err = err.unwrap_err().to_string();
         assert!(err.contains("could not lock config file"), "got: {err}");
         assert!(err.contains("ironmemCut"), "got: {err}");
+        // The stale-lock remedy names the lock file itself.
+        let lock = resolve_repo_root(repo.path())
+            .unwrap()
+            .join(".git/config.lock");
+        assert!(err.contains(&lock.display().to_string()), "got: {err}");
+        assert!(err.contains("remove it"), "got: {err}");
+        assert_eq!(err.matches("Validation error").count(), 1, "got: {err}");
+        // The cut is written first, so a branch never exists without one.
+        assert!(!worktree_path(roots.path(), &issue()).exists());
+        assert!(!git_ok(
+            repo.path(),
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{}", branch_name(&issue()))
+            ]
+        )
+        .unwrap());
     }
 
     #[test]
@@ -1415,7 +1894,7 @@ mod tests {
         // can redirect.
         let source = include_str!("worktree.rs");
         let production = source
-            .split_once("\n#[cfg(test)]")
+            .split_once("\n#[cfg(test)]\nmod tests")
             .map(|(before, _)| before)
             .unwrap_or(source);
         let bare = production

@@ -488,13 +488,25 @@ can quietly pass `-c commit.gpgsign=false`.
   `met` fails: nothing that ships can be checked. For the same reason, the
   commit a success records (and the PR body names as green) is the issue
   branch's tip, not `HEAD`.
-- **The cut is fixed once.** `--base` is resolved to a commit sha in your
-  checkout when the issue branch is created, and stored as
-  `branch.<branch>.ironmemCut`. A base that does not resolve is refused before
-  any worktree exists. An existing branch with no recorded cut (an older
-  branch, or a creation whose cut write failed) gets one from `--base` as it
-  resolves at that moment, which may not be the commit the branch was cut
-  from. That run logs a warning naming the branch, the base and the sha.
+- **The cut is fixed once.** `--base` is resolved to a commit sha (SHA-1 or
+  SHA-256) in your checkout and stored as `branch.<branch>.ironmemCut` before
+  the issue branch is created, so a branch never exists without one. A base
+  that does not resolve, or a cut that cannot be stored, is refused before any
+  worktree exists. If `--base` moves between being resolved and the branch
+  being created, the new branch and worktree are removed again and the run
+  asks you to run again. An existing branch with no recorded cut (an older
+  branch) gets the commit its reflog says it was created from, or, without
+  that entry, the merge base of the branch and `--base`; never `--base`
+  itself, which may have moved. That run logs a warning naming the branch, the
+  source and the sha. A branch that shares no history with `--base` and has
+  no creation entry is refused: record its cut with `git config
+  branch.<branch>.ironmemCut <sha>`.
+- **A config lock left behind blocks new branches.** Storing the cut writes
+  `.git/config`. While another worktree's git holds its lock, the write is
+  retried for about half a second. A lock held longer fails the run with an
+  error naming the lock file and its age. A git killed mid-write (an
+  agent's `git push -u` when its dispatch times out) leaves the lock behind;
+  if no git command is running in any worktree of the repo, remove it.
 - **The policy is sticky.** It is enforced if `commit.gpgsign` was on when the
   issue branch was created or at any run start, or is on now. A run that sees
   it on records it on the branch (`branch.<branch>.ironmemSigning true`) and
@@ -837,11 +849,12 @@ typing the command.
 - **A stored cut that is no longer a commit** stops the run with this error:
 
   ```
-  branch.<branch>.ironmemCut is `<value>`, which is not a commit in <repo>; unset it with `git config --unset branch.<branch>.ironmemCut` to record the cut again from the base
+  branch.<branch>.ironmemCut is `<value>`, which is not a commit in <repo>; unset it with `git config --unset branch.<branch>.ironmemCut` to record the cut again from the branch's history
   ```
 
-  Run that `git config --unset` in the repo. The cut is recorded again from
-  the `--base` of the next run, which may not be the original.
+  The value is quoted escaped and cut to 80 characters. Run that `git config
+  --unset` in the repo. The next run records the cut again from the branch's
+  reflog, or from its merge base with `--base` (see *The cut is fixed once*).
 - **To stop the commit-signing guard on one branch**, follow *Stop the guard on
   one branch* under *Commit signing*.
 - **`ironmem autopilot ask`** is not a manual arm of something `lead` also
