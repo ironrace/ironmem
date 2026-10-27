@@ -1552,7 +1552,9 @@ mod tests {
     fn checkout_with_worktree() -> (tempfile::TempDir, tempfile::TempDir) {
         let repo = tempfile::tempdir().unwrap();
         let run = |args: &[&str]| {
-            let out = std::process::Command::new("git")
+            let mut command = std::process::Command::new("git");
+            crate::mcp::tools::scrub_git_environment(&mut command);
+            let out = command
                 .args(args)
                 .current_dir(repo.path())
                 .output()
@@ -1562,6 +1564,9 @@ mod tests {
         run(&["init", "--initial-branch=main"]);
         run(&["config", "user.email", "t@example.com"]);
         run(&["config", "user.name", "T"]);
+        // Pinned: the global config signs and runs hooks; worktrees share this.
+        run(&["config", "commit.gpgsign", "false"]);
+        run(&["config", "core.hooksPath", "/dev/null"]);
         std::fs::write(repo.path().join("README.md"), "seed\n").unwrap();
         run(&["add", "README.md"]);
         run(&["commit", "-m", "seed"]);

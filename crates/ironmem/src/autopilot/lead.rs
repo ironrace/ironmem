@@ -1188,7 +1188,9 @@ mod tests {
     /// A real git checkout, so `ensure_worktree` has something to cut from.
     fn git_repo(dir: &Path) {
         let run = |args: &[&str]| {
-            let status = std::process::Command::new("git")
+            let mut command = std::process::Command::new("git");
+            crate::mcp::tools::scrub_git_environment(&mut command);
+            let status = command
                 .args(args)
                 .current_dir(dir)
                 .output()
@@ -1202,6 +1204,9 @@ mod tests {
         run(&["init", "--initial-branch=main"]);
         run(&["config", "user.email", "test@example.com"]);
         run(&["config", "user.name", "Test"]);
+        // Pinned: the global config signs and runs hooks; worktrees share this.
+        run(&["config", "commit.gpgsign", "false"]);
+        run(&["config", "core.hooksPath", "/dev/null"]);
         std::fs::write(dir.join("README.md"), "hi").unwrap();
         run(&["add", "."]);
         run(&["commit", "-m", "init"]);
