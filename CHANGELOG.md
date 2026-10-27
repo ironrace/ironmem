@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Muse Code as an Autopilot implementer (#366).** `autopilot run` and
+  `autopilot lead` take `--implementer muse`, alongside `claude` (still the
+  default) and `codex`. Muse runs supervised like Codex: an unpriced
+  reservation per invocation (`--max-unpriced-dispatches-per-day` is its
+  daily dispatch cap), restart recovery that holds rather than re-dispatching
+  while a run might still be alive, and `clear-dispatch` support. Its session
+  continues headlessly across invocations, and `--max-turns` becomes
+  `--max-model-steps`.
+- **Commit-signing guard for every harness (#366).** With `commit.gpgsign`
+  on, a `met` whose branch commits since the cut carry no `gpgsig` header (or
+  a bad signature) is now a failed attempt. `--base` is resolved once to a
+  sha and stored as `branch.<b>.ironmemCut`, and the policy is sticky via
+  `branch.<b>.ironmemSigning`; `git config --unset` on it stops enforcement
+  on that branch.
+
 ### Fixed
 
 - **`autopilot lead` now closes out an issue at its attempt cap (#345).**

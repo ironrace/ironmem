@@ -85,7 +85,28 @@ project hook committed by one dispatch runs at the start of every later
 dispatch or resume on that branch. Only the separate Codex *reviewer* runs
 `-s read-only`.
 
-An empty model is rejected for either harness. A known cross-harness prefix
+Muse Code is explicit too:
+
+```
+ironmem autopilot run owner/repo 366 --title "..." --implementer muse --model muse-wonder-1.0
+ironmem autopilot lead --repo owner/repo=/path --implementer muse --model muse-wonder-1.0
+```
+
+A Muse implementer runs `muse exec` with `--approval-mode never`,
+`--disable-sandbox` and `--trust-workspace`: the same trust model as the Codex
+and Claude implementers, as the operator, with the operator's environment.
+Muse's own sandbox is off deliberately. Measured on 1.4.13, it did not keep
+writes inside the workspace and it broke SSH commit signing. Because
+`--trust-workspace` loads the workspace's rules, hooks and skills and enables
+agent delegation, repository content steers the agent and runs code
+unattended, so run the Lead in an external sandbox as you would for Codex.
+Autopilot also passes `--no-foreign-personal-context`, so your personal Claude
+Code and Codex rules do not leak into an unattended run, and sets
+`MUSE_NO_AUTO_UPDATE=1`, so the launcher cannot swap binaries between
+invocations. The prompt goes through a 0600 `prompt.md` (`--prompt-file`), a
+sibling of the invocation's `schema.json`.
+
+An empty model is rejected for every harness. A known cross-harness prefix
 is also rejected (`claude-*` with Codex, `gpt-*` with Claude), but Autopilot
 does not impose a model allowlist: provider aliases such as a Claude `opus`
 alias remain valid. A Codex implementation never resolves or launches
@@ -100,6 +121,7 @@ accounting remains separate from implementation dispatch accounting:
 |---|---|---|
 | Claude | Fresh Muse review; independent of the Claude implementation session | Fresh Codex review; independent of the Claude implementation session |
 | Codex | Fresh Muse review; the Codex implementation does not replace or suppress it | Fresh Codex review with separate context/session and review accounting; using the same harness does **not** by itself guarantee cross-model independence |
+| Muse | Fresh Muse review with separate context/session and review accounting; the same harness does **not** by itself guarantee cross-model independence | Fresh Codex review; independent of the Muse implementation session |
 
 Different harnesses need not guarantee different underlying model families;
 that depends on their provider configuration. The enforced property is fresh,
@@ -131,7 +153,81 @@ Codex dispatch's `total_cost_usd` as `null`, the run total as the known-dollar
 floor, and reports `unpriced_dispatches` separately. Unknown Codex cost is
 never rendered as free.
 
+### Muse implementation bounds and accounting
+
+Muse reports tokens and subscription `allowance` percentages, but no price.
+Accounting therefore works as it does for Codex:
+
+- `--max-budget-usd` is refused, for Codex and Muse alike. Each invocation
+  pre-authorizes the default per-dispatch ceiling, $2.50, against the daily
+  ledger.
+- Each invocation reserves one unit of `--max-unpriced-dispatches-per-day`
+  (default 5) before launch. For Codex and Muse that flag is the real daily
+  dispatch cap.
+- The ledger records no Codex or Muse dollars. The daily dollar ceiling can
+  still stop one: if the day's other priced spend (priced reviews,
+  `--advisor` calls, Claude IC runs) plus the $2.50 ceiling exceeds
+  `--daily-budget-usd`, the dispatch is refused, and the message names that
+  flag.
+- The wall clock is the repo's `autopilot timeout` or the shared 1200-second
+  fallback. `--max-turns` becomes `--max-model-steps` (Codex still refuses
+  `--max-turns`). Autopilot also passes `--workspace <worktree>`.
+- Every invocation passes the controller's `--session-id`. Muse creates the
+  session the first time and continues it headlessly after that, even after a
+  kill, so a resumed run is the same conversation.
+
+The verdict is the `text` of the one `run_terminal` record on the requested
+session, shaped by `--output-schema`. Records on other session streams (for
+example delegated agents) are ignored. A missing terminal record (the process
+took a SIGTERM or SIGINT) is never success, and neither is more than one
+terminal record on the requested session.
+
+Liveness uses the `ps` marker `--output-schema <.../schema.json>` on the
+`muse-bin-<version>` root (the launcher `exec`s it under the same PID), plus
+the shared process tracker. Each Muse shell tool is its own session leader,
+which the tracker follows by parent PID. Muse's own lock refuses a second
+`exec` on a running session, and after a SIGKILL the lock is released
+(measured). Restart recovery, holds and `clear-dispatch` behave as described
+for Codex below; hold and reason messages name the harness or say
+"invocation".
+
+### Commit signing
+
+This applies to every harness, Claude included. If `commit.gpgsign` is on, a
+`met` whose commits are not all signed is recorded as a failed attempt, because
+a model can quietly pass `-c commit.gpgsign=false`.
+
+- **What counts as unsigned.** A commit with no `gpgsig` or `gpgsig-sha256`
+  header. `%G?` is only used to catch `B`, a bad signature.
+- **Which commits are checked.** The whole issue branch: the agent's commits
+  since the branch was cut, excluding anything already on another remote
+  branch (`HEAD --not <cut> --exclude='*/<issue-branch>' --remotes`). Upstream
+  commits merged or rebased in are not blamed on the agent, and an earlier
+  dispatch's bypass stays caught after it is pushed.
+- **The cut is fixed once.** `--base` is resolved to a commit sha in your
+  checkout when the worktree is created, and stored as
+  `branch.<branch>.ironmemCut`. A base that does not resolve is refused before
+  any worktree exists. A stored cut that is no longer a commit is refused with
+  a hint to `git config --unset branch.<branch>.ironmemCut`, which records it
+  again from the base.
+- **The policy is sticky.** It is enforced if `commit.gpgsign` was on when the
+  worktree was created or at any run start (recorded as
+  `branch.<branch>.ironmemSigning true`), or is on now. Turning it off on the
+  branch is itself a violation. To stop enforcement on a branch on purpose,
+  run `git config --unset branch.<branch>.ironmemSigning` (with
+  `commit.gpgsign` off).
+- **Trust posture.** The guard catches a lazy or accidental bypass. It does
+  not stop an unconfined agent that deliberately signs with another key,
+  clears the flag or the cut, or pushes its commits to another branch.
+
+An unreadable policy or an unusable cut fails closed, and it shows up as a
+failed attempt rather than a hold.
+
 ### Codex identity, restart recovery, and supervision limits
+
+This section is written for Codex. A Muse implementation recovers the same way
+under the Muse markers and records above, and every `clear-dispatch` check
+here applies to a Muse hold too.
 
 Codex session identity comes only from the native JSONL
 `thread.started.thread_id`. A resume uses that native UUID. Persisted state
@@ -411,7 +507,10 @@ typing the command.
   when it's off, refused, or fails.
 - The daily budget ceiling (`--daily-budget-usd`) tracks known-price IC
   dispatches and advisor calls in one shared dollar ledger — but **it does
-  not bound an unpriced reviewer or Codex implementer by dollars**. Muse and
+  not bound an unpriced reviewer, or a Codex or Muse implementer, by
+  dollars**. (A Codex or Muse dispatch can still be refused when other priced
+  spend plus the $2.50 default ceiling exceeds it; see *Muse implementation
+  bounds and accounting*.) Muse and
   Codex reviewers report no `total_cost_usd`, so every reviewer invocation is
   banked as *unpriced* spend (`unpriced_review_count`) rather than added to
   the dollar total; a
@@ -457,6 +556,11 @@ typing the command.
   exclusivity runs the other way: `ask` moves an issue to `agent:blocked`,
   which clears `agent:exhausted`. Forgiving attempts and removing labels are
   separate acts, and only the first is what `retry` promises.
+- **A Codex or Muse hold** (a dispatch that restart recovery could not prove
+  finished) is released with `ironmem autopilot clear-dispatch owner/repo
+  <issue>`, once you have stopped any Lead or `run` on the repo and confirmed
+  nothing is still working on the issue. *Codex identity, restart recovery,
+  and supervision limits* has the checks it makes.
 - **`ironmem autopilot ask`** is not a manual arm of something `lead` also
   does on its own: it is the *only* caller of `ask_human` outside tests.
   Blocking an issue on a question happens when an operator types that
