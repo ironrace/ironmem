@@ -449,7 +449,8 @@ struct AwaitingQuiet {
     worktree: PathBuf,
     /// What it found there, by PID and kernel birth.
     stragglers: Vec<Straggler>,
-    /// Set when the scan itself kept failing; `stragglers` is then empty.
+    /// Set when the scan itself kept failing. `stragglers` then holds only
+    /// the in-window process whose unreadable directory failed it, if one did.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     scan_failed: Option<String>,
 }
@@ -2196,6 +2197,28 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
         write_awaiting(a, uid, worktree.path(), vec![(me, other_birth)]);
         assert_eq!(settle(&real), Ok(true));
         assert!(has_valid_exit_record(a) && !is_awaiting_quiet(a));
+        // A scan that failed on one process's unreadable directory recorded
+        // it: it holds by birth, though a fresh scan of the worktree (here,
+        // empty) would now read it as quiet.
+        let mut record = exit_record(a, None, Some(0), false, None, 1, None);
+        let hold = super::super::process_tree::QuietHold {
+            worktree: worktree.path().canonicalize().unwrap(),
+            uid,
+            stragglers: vec![(me, my_birth)],
+            scan_failed: Some(format!(
+                "process {me}, started during the invocation, has an unreadable working \
+                 directory: Operation not permitted"
+            )),
+            reason: "fixture".into(),
+        };
+        await_quiet(&mut record, &hold);
+        persist_exit(a, &record).unwrap();
+        let held = settle(&real).unwrap_err();
+        assert!(
+            held.contains(&format!("process {me} is still running")),
+            "{held}"
+        );
+        assert!(is_awaiting_quiet(a) && !has_valid_exit_record(a));
     }
 
     /// The worktree the supervisor recorded is the one scanned. A new

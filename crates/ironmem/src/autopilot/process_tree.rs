@@ -989,6 +989,37 @@ pub(crate) fn current_uid() -> Option<u32> {
     }
 }
 
+/// Why a working-directory scan failed. When the cause is one in-window
+/// process whose directory could not be read, `unreadable` names it by PID
+/// and kernel birth: the invocation may have started it, so a hold records
+/// it like a straggler and recovery waits for that very process to go.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ScanError {
+    pub reason: String,
+    pub unreadable: Option<(u32, Birth)>,
+}
+
+impl From<String> for ScanError {
+    fn from(reason: String) -> Self {
+        Self {
+            reason,
+            unreadable: None,
+        }
+    }
+}
+
+impl From<&str> for ScanError {
+    fn from(reason: &str) -> Self {
+        reason.to_string().into()
+    }
+}
+
+impl std::fmt::Display for ScanError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.reason)
+    }
+}
+
 /// The core of a working-directory scan, over injectable kernel reads.
 /// `owner_birth` gives a PID's owner and kernel birth, `cwd_of` its working
 /// directory; either answers `Ok(None)` for a process that has exited.
@@ -1006,7 +1037,7 @@ fn scan_cwds(
     spawned: Birth,
     mut owner_birth: impl FnMut(u32) -> Result<Option<(u32, Birth)>, String>,
     mut cwd_of: impl FnMut(u32) -> Result<Option<PathBuf>, String>,
-) -> Result<Vec<CwdProcess>, String> {
+) -> Result<Vec<CwdProcess>, ScanError> {
     let mut processes = Vec::new();
     for pid in pids {
         let Some((owner, birth)) = owner_birth(pid)? else {
@@ -1019,16 +1050,19 @@ fn scan_cwds(
             Ok(Some(cwd)) => cwd,
             Ok(None) => continue,
             Err(e) => {
-                return Err(format!(
-                    "process {pid}, started during the invocation, has an unreadable \
-                     working directory: {e}"
-                ))
+                return Err(ScanError {
+                    reason: format!(
+                        "process {pid}, started during the invocation, has an unreadable \
+                         working directory: {e}"
+                    ),
+                    unreadable: Some((pid, birth)),
+                })
             }
         };
         match owner_birth(pid)? {
             None => continue,
             Some((_, after)) if after == birth => {}
-            Some(_) => return Err(format!("process {pid} was replaced during the scan")),
+            Some(_) => return Err(format!("process {pid} was replaced during the scan").into()),
         }
         processes.push(CwdProcess {
             pid,
@@ -1044,7 +1078,7 @@ fn scan_cwds(
 /// working directories ([`scan_cwds`]). macOS reads the kernel directly
 /// (`proc_listpids` by user, then `PROC_PIDVNODEPATHINFO`): about 1.5 ms for
 /// ~600 processes, measured. Linux reads `/proc`.
-fn user_processes_with_cwd(spawned: Birth) -> Result<Vec<CwdProcess>, String> {
+fn user_processes_with_cwd(spawned: Birth) -> Result<Vec<CwdProcess>, ScanError> {
     let uid = current_uid().ok_or("process working directories are unreadable here")?;
     #[cfg(target_os = "macos")]
     {
@@ -1060,10 +1094,9 @@ fn user_processes_with_cwd(spawned: Birth) -> Result<Vec<CwdProcess>, String> {
                 libc::proc_listpids(PROC_UID_ONLY, uid, pids.as_mut_ptr().cast(), capacity)
             };
             if bytes < 0 {
-                return Err(format!(
-                    "cannot list processes: {}",
-                    std::io::Error::last_os_error()
-                ));
+                return Err(
+                    format!("cannot list processes: {}", std::io::Error::last_os_error()).into(),
+                );
             }
             let count = bytes as usize / std::mem::size_of::<i32>();
             if count < pids.len() {
@@ -1194,7 +1227,8 @@ pub(crate) struct QuietHold {
     pub uid: u32,
     /// Each qualifying process, by PID and kernel birth.
     pub stragglers: Vec<(u32, Birth)>,
-    /// Set when the scan itself kept failing; `stragglers` is then empty.
+    /// Set when the scan itself kept failing. `stragglers` then holds only
+    /// the in-window process whose unreadable directory failed it, if one did.
     pub scan_failed: Option<String>,
     /// For the operator: each straggler's PID and command, or the failure.
     pub reason: String,
@@ -1246,7 +1280,8 @@ impl<'a> QuietCheck<'a> {
         rows: &[ProcessRow],
     ) -> Result<Quiet, String> {
         let check = Self::new(worktree, spawned, daemon, kernel_executable)?;
-        let found = check.stragglers(user_processes_with_cwd(spawned)?, || Ok(rows.to_vec()))?;
+        let scanned = user_processes_with_cwd(spawned).map_err(|e| e.reason)?;
+        let found = check.stragglers(scanned, || Ok(rows.to_vec()))?;
         Ok(check.verdict(found))
     }
 
@@ -1266,16 +1301,21 @@ impl<'a> QuietCheck<'a> {
         })
     }
 
-    fn scan_failed(&self, error: String) -> Quiet {
+    /// A scan that kept failing. A process that failed it by its unreadable
+    /// directory is recorded as a straggler: it may be the invocation's, and
+    /// it must be seen gone by birth even if it later leaves the worktree.
+    fn scan_failed(&self, error: ScanError) -> Quiet {
         Quiet::Held(QuietHold {
             worktree: self.worktree.clone(),
             uid: self.uid,
-            stragglers: Vec::new(),
+            stragglers: error.unreadable.into_iter().collect(),
             reason: format!(
-                "scan_failed: cannot list processes in the invocation worktree {}: {error}",
-                self.worktree.display()
+                "the processes in the invocation worktree {} could not all be checked, so it \
+                 is not known to be quiet: {}",
+                self.worktree.display(),
+                error.reason
             ),
-            scan_failed: Some(error),
+            scan_failed: Some(error.reason),
         })
     }
 
@@ -1747,7 +1787,7 @@ impl ProcessTracker {
     fn verify_worktree_quiet_with(
         &self,
         worktree: &Path,
-        mut cwd_source: impl FnMut(Birth) -> Result<Vec<CwdProcess>, String>,
+        mut cwd_source: impl FnMut(Birth) -> Result<Vec<CwdProcess>, ScanError>,
         mut rows: impl FnMut() -> Result<Vec<ProcessRow>, MemoryError>,
         grace: std::time::Duration,
     ) -> Result<Quiet, MemoryError> {
@@ -1773,7 +1813,9 @@ impl ProcessTracker {
         loop {
             // A failed scan is retried until the grace runs out.
             let pass = cwd_source(spawned).and_then(|scanned| {
-                check.stragglers(scanned, || rows().map_err(|e| e.to_string()))
+                check
+                    .stragglers(scanned, || rows().map_err(|e| e.to_string()))
+                    .map_err(ScanError::from)
             });
             match pass {
                 Ok(found) if found.is_empty() => return Ok(Quiet::Yes),
@@ -2612,9 +2654,12 @@ mod tests {
         );
         let err = scan_cwds([1, 2, 7], uid, spawned, owner_birth, &mut cwd_of).unwrap_err();
         assert!(
-            err.contains("process 2") && err.contains("not permitted"),
+            err.reason.contains("process 2") && err.reason.contains("not permitted"),
             "{err}"
         );
+        // The process that failed it is named by PID and birth, so a hold
+        // can wait for that very process to go.
+        assert_eq!(err.unreadable, Some((2, Birth(150, 0))), "{err}");
         // Exited between the directory read and the birth re-check: gone.
         let mut reads = 0;
         let vanishing = |_pid: u32| -> Result<Option<(u32, Birth)>, String> {
@@ -2631,7 +2676,67 @@ mod tests {
             reads += 1;
             Ok(Some((uid, Birth(150 + reads, 0))))
         };
-        assert!(scan_cwds([9], uid, spawned, replaced, &mut cwd_of).is_err());
+        let err = scan_cwds([9], uid, spawned, replaced, &mut cwd_of).unwrap_err();
+        assert_eq!(
+            err.unreadable, None,
+            "a replaced PID names no process: {err}"
+        );
+    }
+
+    /// A scan that keeps failing on one in-window process's unreadable
+    /// directory records that process as a straggler, so recovery waits for
+    /// it by birth even if it later becomes readable after leaving the
+    /// worktree. The reason says so in plain words.
+    #[test]
+    fn a_scan_failed_by_one_process_holds_for_that_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tracker = ProcessTracker::new(10, None);
+        tracker
+            .observe_rows(vec![process_row(10, 1, 10)], |pid| {
+                Ok((pid == 10).then(|| kernel_process(10, 1, 10, 100)))
+            })
+            .unwrap();
+        let hold = |error: ScanError| {
+            let Quiet::Held(hold) = tracker
+                .verify_worktree_quiet_with(
+                    dir.path(),
+                    |_| Err(error.clone()),
+                    || Ok(Vec::new()),
+                    std::time::Duration::ZERO,
+                )
+                .unwrap()
+            else {
+                panic!("a failing scan must hold");
+            };
+            hold
+        };
+        let unreadable = hold(ScanError {
+            reason: "process 40, started during the invocation, has an unreadable working \
+                     directory: Operation not permitted"
+                .into(),
+            unreadable: Some((40, Birth(150, 0))),
+        });
+        assert_eq!(unreadable.stragglers, vec![(40, Birth(150, 0))]);
+        assert!(unreadable.scan_failed.is_some(), "{unreadable:?}");
+        assert!(
+            !unreadable.reason.contains("scan_failed"),
+            "{}",
+            unreadable.reason
+        );
+        assert!(
+            unreadable.reason.contains("could not all be checked")
+                && unreadable.reason.contains("process 40"),
+            "{}",
+            unreadable.reason
+        );
+        // A failure that names no process (the listing itself) records none.
+        let listing = hold(ScanError::from("cannot list processes: busy"));
+        assert!(listing.stragglers.is_empty(), "{listing:?}");
+        assert!(
+            !listing.reason.contains("scan_failed"),
+            "{}",
+            listing.reason
+        );
     }
 
     /// A failed scan is retried within the grace before completion is refused.

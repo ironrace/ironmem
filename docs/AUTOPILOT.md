@@ -367,8 +367,13 @@ macOS reads working directories from the kernel (about 1.5 ms per scan for
 ~600 processes) and Linux from `/proc/<pid>/cwd`. A process born before the
 invocation is skipped before its directory is read. A process born during
 it whose directory cannot be read fails the scan, which is retried within
-the 15 seconds and then held as above; any scan on another platform fails
-the same way. A child that `chdir`s out of the worktree before the root
+the 15 seconds and then held as above. The hold records that process by PID
+and kernel birth, like any other straggler, so recovery waits until that
+very process is gone, even if its directory later becomes readable because
+it moved out of the worktree. On a platform other than macOS and Linux no
+working directory can be read at all, so every scan fails: such a hold never
+finishes by itself and always needs `clear-dispatch` once you have confirmed
+nothing is running. A child that `chdir`s out of the worktree before the root
 exits still escapes, and a deliberate escape is outside the guarantee.
 
 The macOS runtime path is exercised. Linux-specific
