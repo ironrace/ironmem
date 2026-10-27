@@ -201,6 +201,7 @@ impl LeadConfig {
         // The run's budget message knows the implementer; the queue's, which
         // checks the same numbers, does not.
         self.run.validate()?;
+        super::run::validate_worktree_root(self.run.implementer, &self.worktree_root)?;
         self.queue.validate()?;
         self.supervision.validate()?;
         self.advice.validate()?;
@@ -1277,6 +1278,20 @@ mod tests {
         let mut cfg = config(&f);
         cfg.max_dispatches_per_tick = 0;
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn a_muse_lead_refuses_a_worktree_root_with_whitespace() {
+        // Every tick would otherwise provision a branch and worktree that
+        // Muse's argv then refuses.
+        let f = fixture();
+        let mut cfg = config(&f);
+        cfg.run.implementer = crate::autopilot::implementer::Implementer::Muse;
+        cfg.run.model = "muse-wonder-1.0".into();
+        cfg.validate().unwrap();
+        cfg.worktree_root = f.worktree_root.join("work trees");
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("whitespace"), "{err}");
     }
 
     // ── risk classification ─────────────────────────────────────────────

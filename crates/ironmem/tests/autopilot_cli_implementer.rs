@@ -454,6 +454,7 @@ fn invalid_model_spelling_is_rejected_before_all_cli_side_effects() {
         ("codex-trailing-alias", "codex", "gpt-custom ", "whitespace"),
         ("claude-empty", "claude", "", "must not be empty"),
         ("codex-empty", "codex", "   ", "must not be empty"),
+        ("muse-interior", "muse", "muse wonder", "whitespace"),
     ] {
         let root = tempfile::tempdir().unwrap();
         let db_path = root.path().join("memory.sqlite3");

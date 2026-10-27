@@ -2143,6 +2143,11 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                 // Validate before provisioning a worktree: a bad config
                 // should not leave a checkout behind.
                 config.validate()?;
+                let worktree_root = match worktree_root {
+                    Some(dir) => std::path::PathBuf::from(dir),
+                    None => default_worktree_root()?,
+                };
+                ironmem::autopilot::run::validate_worktree_root(implementer, &worktree_root)?;
 
                 let database = open_migrated_db(db)?;
                 // Refuse an unapproved repo *before* creating a worktree and
@@ -2160,10 +2165,6 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                     dispatcher.as_mut(),
                 )?;
 
-                let worktree_root = match worktree_root {
-                    Some(dir) => std::path::PathBuf::from(dir),
-                    None => default_worktree_root()?,
-                };
                 let worktree = ironmem::autopilot::worktree::ensure_worktree(
                     std::path::Path::new(&path),
                     &worktree_root,

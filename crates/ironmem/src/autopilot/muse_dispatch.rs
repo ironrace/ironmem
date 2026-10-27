@@ -36,10 +36,16 @@ pub fn prompt_path(a: &InvocationArtifacts) -> PathBuf {
     Path::new(&a.schema_path).with_file_name("prompt.md")
 }
 
-/// ps joins argv with spaces, so a word with whitespace, or a value that
-/// reads as an option, would make the marker grammar misparse this row.
+/// Whether `word` survives as one marker word. ps joins argv with spaces, so
+/// a word with whitespace, or a value that reads as an option, would make the
+/// marker grammar misparse this row. Run validation refuses a model on the
+/// same rule before any side effect.
+pub(crate) fn is_marker_safe(word: &str) -> bool {
+    !word.is_empty() && !word.starts_with('-') && !word.chars().any(char::is_whitespace)
+}
+
 fn marker_safe<'a>(what: &str, word: &'a str) -> Result<&'a str, MemoryError> {
-    if word.is_empty() || word.starts_with('-') || word.chars().any(char::is_whitespace) {
+    if !is_marker_safe(word) {
         return Err(validation(format!(
             "Muse {what} must be non-empty, contain no whitespace and not start with '-'; got {:?}",
             excerpt(word)

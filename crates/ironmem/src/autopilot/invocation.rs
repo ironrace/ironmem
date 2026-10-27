@@ -252,6 +252,27 @@ pub fn validate_argv(repo: &Path, spec: &DispatchSpec) -> Result<Vec<String>, Me
     cli.argv(repo, spec, a)
 }
 
+/// [`validate_argv`] before any artifact exists, so a definite input error
+/// (model, workspace, session, step cap) leaves no invocation directory
+/// behind. Placeholder artifacts stand in for [`prepare_artifacts`]'s; the
+/// caller still validates the exact argv once the real ones exist.
+pub(crate) fn validate_argv_before_artifacts(
+    repo: &Path,
+    spec: &DispatchSpec,
+) -> Result<(), MemoryError> {
+    let dir = "/ironmem-argv-check";
+    let mut probe = spec.clone();
+    probe.invocation_artifacts = Some(InvocationArtifacts {
+        invocation_id: "00000000-0000-4000-8000-000000000000".into(),
+        schema_path: format!("{dir}/schema.json"),
+        journal_path: format!("{dir}/journal.jsonl"),
+        final_path: format!("{dir}/final.json"),
+        stderr_path: format!("{dir}/stderr.log"),
+        exit_path: format!("{dir}/exit.json"),
+    });
+    validate_argv(repo, &probe).map(|_| ())
+}
+
 pub fn dispatch_timeout(spec: &DispatchSpec) -> Duration {
     spec.wall_clock_timeout
         .unwrap_or(Duration::from_secs(SUPERVISED_DISPATCH_TIMEOUT_SECS))

@@ -244,6 +244,14 @@ pub fn validate_implementation_model(
             "model must not contain leading or trailing whitespace for the {harness} implementer"
         )));
     }
+    // Refused here rather than first by `MuseCli::argv`, which keeps the same
+    // check: by then the worktree, branch and invocation directory exist.
+    if implementer == Implementer::Muse && !super::muse_dispatch::is_marker_safe(model) {
+        return Err(MemoryError::Validation(format!(
+            "model {model:?} cannot be passed to the Muse implementer: it must contain no \
+             whitespace and not start with '-'"
+        )));
+    }
     let foreign = match implementer {
         Implementer::Claude => model.starts_with("gpt-") || model.starts_with("muse-"),
         Implementer::Codex => model.starts_with("claude-") || model.starts_with("muse-"),
@@ -253,6 +261,35 @@ pub fn validate_implementation_model(
         return Err(MemoryError::Validation(format!(
             "model '{model}' is incompatible with the {harness} implementer; choose a {harness} model"
         )));
+    }
+    Ok(())
+}
+
+/// Refuse a worktree root the selected harness cannot dispatch under, before
+/// anything is provisioned beneath it.
+///
+/// Muse passes the issue worktree as `--workspace`, one word of the
+/// process-table marker grammar, so a root with whitespace would provision a
+/// branch and worktree that every dispatch then refuses. The worktree path is
+/// persisted resolved, so the resolved spelling is checked too.
+pub fn validate_worktree_root(implementer: Implementer, root: &Path) -> Result<(), MemoryError> {
+    if implementer != Implementer::Muse {
+        return Ok(());
+    }
+    for path in [root.to_path_buf(), worktree::canonical_or_self(root)] {
+        let text = path.to_str().ok_or_else(|| {
+            MemoryError::Validation(format!(
+                "unsupported worktree root for the Muse implementer: {} is not UTF-8",
+                path.display()
+            ))
+        })?;
+        if text.chars().any(char::is_whitespace) {
+            return Err(MemoryError::Validation(format!(
+                "unsupported worktree root for the Muse implementer: {text:?} contains \
+                 whitespace; choose a --worktree-root without whitespace, because Muse's \
+                 --workspace is one word of the argv that process identity recovery parses"
+            )));
+        }
     }
     Ok(())
 }
@@ -1588,14 +1625,15 @@ pub fn run_issue(
                 }
             };
 
-            let prepared_artifacts = if config.implementer.recovers_invocations() {
-                Some(super::invocation::prepare_artifacts(&worktree.path, issue)?)
-            } else {
-                invocation_artifacts.clone()
-            };
-            let spec = DispatchSpec {
+            // A supervised harness's artifacts are allocated below, once its
+            // argv is known to be valid.
+            let mut spec = DispatchSpec {
                 implementer: config.implementer,
-                invocation_artifacts: prepared_artifacts,
+                invocation_artifacts: if config.implementer.recovers_invocations() {
+                    None
+                } else {
+                    invocation_artifacts.clone()
+                },
                 session: if config.implementer.assigns_own_session_id() {
                     match &native_session_id {
                         Some(id) => SessionMode::Resume {
@@ -1623,6 +1661,12 @@ pub fn run_issue(
             };
 
             if config.implementer.recovers_invocations() {
+                // Refuse a definite input error before allocating an
+                // invocation directory: a Lead repeating the refusal every
+                // tick would otherwise leak one per attempt.
+                super::invocation::validate_argv_before_artifacts(&worktree.path, &spec)?;
+                spec.invocation_artifacts =
+                    Some(super::invocation::prepare_artifacts(&worktree.path, issue)?);
                 // Validate the exact backend argv before publishing a new
                 // invocation or charging unknown spend. Definite input errors
                 // prove no process launched and must leave prior state intact.
@@ -2900,6 +2944,66 @@ sleep 0.5
         assert!(
             err.contains("gpt-6.1-sol"),
             "error must name the incompatible model: {err}"
+        );
+    }
+
+    #[test]
+    fn muse_refuses_a_model_its_argv_cannot_carry() {
+        for model in ["muse wonder", "muse\twonder", "-muse", "--yolo"] {
+            let err = validate_implementation_model(Implementer::Muse, model)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("Muse implementer"), "{model:?}: {err}");
+            assert!(
+                err.contains("whitespace") && err.contains("'-'"),
+                "{model:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_muse_worktree_root_with_whitespace_is_refused() {
+        let err = validate_worktree_root(Implementer::Muse, Path::new("/tmp/work trees"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Muse") && err.contains("whitespace"), "{err}");
+        validate_worktree_root(Implementer::Muse, Path::new("/tmp/worktrees")).unwrap();
+        // Only Muse carries the workspace as a marker word.
+        for implementer in [Implementer::Claude, Implementer::Codex] {
+            validate_worktree_root(implementer, Path::new("/tmp/work trees")).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_muse_argv_refusal_creates_no_invocation_artifacts() {
+        let db = approved_db();
+        let (dir, repo) = fixture_worktree();
+        // A linked worktree under whitespace: the common Git directory, where
+        // artifacts live, is clean, but Muse's --workspace is not.
+        let path = dir.path().join("has space").join("wt");
+        git_in(
+            &repo.path,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                &repo.branch,
+                path.to_str().unwrap(),
+            ],
+        );
+        let wt = Worktree {
+            path: path.clone(),
+            ..repo.clone()
+        };
+        let mut d = muse_script(vec![met()]);
+        let err = run_issue(&db, &issue(), &brief(), &wt, &muse_config(), &mut d)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("workspace"), "{err}");
+        assert!(d.inner.seen.is_empty());
+        assert!(
+            !repo.path.join(".git/ironmem").exists(),
+            "an argv refusal must precede artifact allocation"
         );
     }
 

@@ -434,6 +434,71 @@ fn muse_requires_a_model_before_any_side_effect() {
     );
 }
 
+/// Mirrors `invalid_model_spelling_is_rejected_before_all_cli_side_effects`
+/// for the words only Muse's argv refuses. A refusal that came from the argv
+/// inside `run_issue` would already have created the branch and worktree.
+#[test]
+fn a_muse_model_or_worktree_root_its_argv_refuses_is_rejected_before_all_side_effects() {
+    for (case, model, worktree_dir, expected) in [
+        ("interior-space", "muse wonder", "worktrees", "whitespace"),
+        ("leading-dash", "-muse-wonder", "worktrees", "'-'"),
+        ("root-space", "muse-wonder-1.0", "work trees", "whitespace"),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let db_path = root.path().join("memory.sqlite3");
+        let worktrees = root.path().join(worktree_dir);
+        let checkout = root.path().join("checkout");
+        make_repo(&checkout);
+        let empty_path = root.path().join("empty-path");
+        std::fs::create_dir_all(&empty_path).unwrap();
+        let model_arg = format!("--model={model}");
+
+        let output = ironmem()
+            .args([
+                "autopilot",
+                "run",
+                REPO,
+                "7",
+                "--title",
+                "t",
+                "--implementer",
+                "muse",
+                &model_arg,
+                "--db",
+                db_path.to_str().unwrap(),
+                "--path",
+                checkout.to_str().unwrap(),
+                "--worktree-root",
+                worktrees.to_str().unwrap(),
+                "--json",
+            ])
+            .env("PATH", &empty_path)
+            .output()
+            .unwrap();
+
+        assert!(!output.status.success(), "{case} must fail");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("Muse") && stderr.contains(expected),
+            "{case}: got: {stderr}"
+        );
+        assert!(
+            !db_path.exists(),
+            "{case}: validation must precede database creation"
+        );
+        assert!(
+            !worktrees.exists(),
+            "{case}: validation must precede worktree provisioning"
+        );
+        let branches = git(&checkout, &["branch", "--list", "autopilot/*"]).stdout;
+        assert!(
+            branches.is_empty(),
+            "{case}: validation must precede branch creation: {}",
+            String::from_utf8_lossy(&branches)
+        );
+    }
+}
+
 #[test]
 fn an_unsigned_muse_commit_is_not_met() {
     let fx = Fixture::new();
