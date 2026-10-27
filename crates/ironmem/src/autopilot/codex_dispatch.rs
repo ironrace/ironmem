@@ -6,12 +6,9 @@ use std::path::Path;
 use crate::autopilot::dispatch::{DispatchSpec, SessionMode};
 use crate::autopilot::implementer::Implementer;
 use crate::autopilot::invocation::{
-    validate_spec, validation, FinalVerdict, InvocationArtifacts, ParsedRun, SupervisedCli,
+    validation, FinalVerdict, InvocationArtifacts, ParsedRun, SupervisedCli,
 };
 use crate::error::MemoryError;
-
-pub use crate::autopilot::invocation::VERDICT_JSON_SCHEMA as CODEX_VERDICT_JSON_SCHEMA;
-pub const CODEX_DISPATCH_TIMEOUT_SECS: u64 = super::invocation::SUPERVISED_DISPATCH_TIMEOUT_SECS;
 
 /// Codex CLI. It assigns its own thread ID, reported by `thread.started`, so
 /// only a resume names the native ID the run must report.
@@ -138,19 +135,13 @@ impl SupervisedCli for CodexCli {
     }
 }
 
-/// The exact Codex argv for `spec`, refusing a spec for another harness.
-pub fn build_argv(repo: &Path, spec: &DispatchSpec) -> Result<Vec<String>, MemoryError> {
-    let a = validate_spec(&CodexCli, spec)?;
-    CodexCli.argv(repo, spec, a)
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
     use std::path::Path;
 
-    use super::{build_argv, CODEX_VERDICT_JSON_SCHEMA};
     use crate::autopilot::dispatch::{DispatchSpec, InvocationArtifacts, SessionMode};
     use crate::autopilot::implementer::Implementer;
+    use crate::autopilot::invocation::{validate_argv, VERDICT_JSON_SCHEMA};
 
     fn artifacts() -> InvocationArtifacts {
         InvocationArtifacts {
@@ -180,7 +171,7 @@ pub(crate) mod tests {
     #[test]
     fn codex_schema_is_the_exact_strict_verdict_contract() {
         assert_eq!(
-            serde_json::from_str::<serde_json::Value>(CODEX_VERDICT_JSON_SCHEMA).unwrap(),
+            serde_json::from_str::<serde_json::Value>(VERDICT_JSON_SCHEMA).unwrap(),
             serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -195,7 +186,7 @@ pub(crate) mod tests {
 
     #[test]
     fn new_invocation_uses_verified_codex_exec_arguments() {
-        let args = build_argv(
+        let args = validate_argv(
             Path::new("/repo"),
             &spec(SessionMode::New {
                 session_uuid: "ignored-controller-id".into(),
@@ -224,7 +215,7 @@ pub(crate) mod tests {
 
     #[test]
     fn resume_uses_native_thread_id_and_omits_c_and_goal_prefix() {
-        let args = build_argv(
+        let args = validate_argv(
             Path::new("/repo"),
             &spec(SessionMode::Resume {
                 session_uuid: "11111111-2222-3333-4444-555555555555".into(),

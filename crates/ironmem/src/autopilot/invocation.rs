@@ -93,6 +93,14 @@ pub trait SupervisedCli: Sync {
     /// The native session ID the run must report, when the controller chose it.
     fn expected_native_id(&self, spec: &DispatchSpec) -> Option<String>;
 
+    /// Whether [`SupervisedCli::parse`] itself reports a journal that never
+    /// names `expected_native_id`. The core then adds no generic mismatch of
+    /// its own when the parse found no native ID and already reported why.
+    /// Default: no.
+    fn parse_reports_missing_session(&self) -> bool {
+        false
+    }
+
     /// Parse the bounded journal and final-file text into evidence.
     /// `expected_native_id` is the exit record's `expected_native_id`.
     fn parse(
@@ -273,7 +281,7 @@ pub(crate) fn validate_argv_before_artifacts(
     validate_argv(repo, &probe).map(|_| ())
 }
 
-pub fn dispatch_timeout(spec: &DispatchSpec) -> Duration {
+pub(crate) fn dispatch_timeout(spec: &DispatchSpec) -> Duration {
     spec.wall_clock_timeout
         .unwrap_or(Duration::from_secs(SUPERVISED_DISPATCH_TIMEOUT_SECS))
 }
@@ -412,7 +420,7 @@ fn exit_record(
 
 /// Every invocation has a wall-clock ceiling. stdout/stderr are inherited
 /// regular file handles, so no pipe can wedge the child or die with its parent.
-pub fn run_supervised_bounded(
+pub(crate) fn run_supervised_bounded(
     bin: &Path,
     repo: &Path,
     spec: &DispatchSpec,
@@ -689,7 +697,7 @@ fn read_capped(path: &str, cap: u64) -> Result<String, MemoryError> {
 /// only the supervisor's valid exit-zero record can authorize a met verdict.
 /// A truncated journal invalidates the verdict but retains an earlier unique
 /// native session ID so a replacement controller can resume it.
-pub fn read_artifacts(
+pub(crate) fn read_artifacts(
     implementer: Implementer,
     a: &InvocationArtifacts,
 ) -> Result<DispatchOutcome, MemoryError> {
@@ -746,6 +754,9 @@ fn read_artifacts_with(
             errors.push(format!("{} reported no native session ID", cli.label()));
         }
     }
+    let missing_session_reported = cli.parse_reports_missing_session()
+        && parsed.native_id.is_none()
+        && !parsed.errors.is_empty();
     errors.extend(parsed.errors);
     let mut native_id = parsed.native_id;
     let mut observed_output = parsed.observed_output;
@@ -765,10 +776,12 @@ fn read_artifacts_with(
                 .as_ref()
                 .is_some_and(|expected| native_id.as_ref() != Some(expected))
             {
-                errors.push(format!(
-                    "{} native session ID did not match the requested session",
-                    cli.label()
-                ));
+                if !missing_session_reported {
+                    errors.push(format!(
+                        "{} native session ID did not match the requested session",
+                        cli.label()
+                    ));
+                }
                 native_id = None;
             }
             if let Some(limit) = &record.limit_exceeded {
@@ -856,15 +869,12 @@ pub fn has_valid_exit_record(artifacts: &InvocationArtifacts) -> bool {
 /// Prepared, empty artifacts carry invocation_started=false and no native ID.
 pub fn recover_artifacts(
     implementer: Implementer,
-    artifacts: Option<&InvocationArtifacts>,
+    artifacts: &InvocationArtifacts,
 ) -> Result<InvocationRecovery, MemoryError> {
-    match artifacts {
-        None => Ok(InvocationRecovery::NoPriorInvocation),
-        Some(a) => Ok(InvocationRecovery::Finished(read_artifacts(
-            implementer,
-            a,
-        )?)),
-    }
+    Ok(InvocationRecovery::Finished(read_artifacts(
+        implementer,
+        artifacts,
+    )?))
 }
 
 #[cfg(test)]
@@ -1458,11 +1468,11 @@ exit {code}"#
     }
     #[cfg(unix)]
     #[test]
-    fn codex_process_git_commands_are_isolated_from_inherited_git_overrides() {
-        const CHILD_MARKER: &str = "IRONMEM_CODEX_GIT_ISOLATION_CHILD";
+    fn supervised_git_commands_are_isolated_from_inherited_git_overrides() {
+        const CHILD_MARKER: &str = "IRONMEM_SUPERVISED_GIT_ISOLATION_CHILD";
         if std::env::var_os(CHILD_MARKER).is_none() {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "autopilot::invocation::contract_tests::codex_process_git_commands_are_isolated_from_inherited_git_overrides", "--nocapture"])
+                .args(["--exact", "autopilot::invocation::contract_tests::supervised_git_commands_are_isolated_from_inherited_git_overrides", "--nocapture"])
                 .env(CHILD_MARKER, "1")
                 .env("GIT_DIR", "/nonexistent/hostile-git-dir")
                 .env("GIT_WORK_TREE", "/nonexistent/hostile-worktree")

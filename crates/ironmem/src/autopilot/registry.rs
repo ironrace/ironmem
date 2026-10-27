@@ -545,6 +545,9 @@ impl<T: AgentRegistry + ?Sized> HarnessMonitor for T {
     }
 }
 
+/// The real controllers' monitor: Claude's agent registry plus the process
+/// table, which covers every supervised CLI harness (Codex and Muse). The
+/// name predates Muse; "two" counts the evidence sources, not harnesses.
 pub struct TwoHarnessMonitor {
     claude: Result<ClaudeAgentRegistry, String>,
     processes: super::process_tree::UnixProcesses,

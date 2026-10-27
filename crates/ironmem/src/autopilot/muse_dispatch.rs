@@ -165,6 +165,11 @@ impl SupervisedCli for MuseCli {
         Some(spec.session.session_uuid().to_owned())
     }
 
+    /// [`MuseCli::parse`] names the requested session it never saw.
+    fn parse_reports_missing_session(&self) -> bool {
+        true
+    }
+
     /// Only the controller's session counts. Records on other session streams
     /// (delegated agents, which `--trust-workspace` enables) are ignored
     /// rather than treated as a conflict, and a terminal record on any other
@@ -782,5 +787,51 @@ mod tests {
             .unwrap();
             assert_eq!(recovered.is_met(), met, "{recovered:?}");
         }
+    }
+
+    /// The parser already names the missing session; the core's generic
+    /// mismatch would only spend the bounded reason on a repeat.
+    #[cfg(unix)]
+    #[test]
+    fn a_journal_on_another_session_is_reported_once() {
+        use crate::autopilot::invocation::contract_tests::{binary, setup};
+        let (repo, mut s) = setup();
+        s.implementer = Implementer::Muse;
+        s.session = SessionMode::New {
+            session_uuid: SID.into(),
+        };
+        let other = "11111111-2222-3333-4444-555555555555";
+        let bin = binary(
+            repo.path(),
+            &format!(
+                "printf '%s\\n' '{}'\n/bin/sleep 0.5\n",
+                record(
+                    "session",
+                    other,
+                    serde_json::json!({
+                        "kind": "run_terminal", "terminal": "completed",
+                        "text": r#"{"verdict":"met","reason":"x"}"#, "reason": null
+                    })
+                )
+            ),
+        );
+        let outcome = crate::autopilot::invocation::run_supervised_bounded(
+            &bin,
+            repo.path(),
+            &s,
+            std::time::Duration::from_secs(20),
+        )
+        .unwrap();
+        assert!(!outcome.is_met());
+        assert_eq!(outcome.native_session_id, None);
+        let reason = outcome.reason.unwrap_or_default();
+        assert!(
+            reason.contains(&format!("never names the requested session {SID}")),
+            "{reason}"
+        );
+        assert!(
+            !reason.contains("native session ID did not match"),
+            "{reason}"
+        );
     }
 }

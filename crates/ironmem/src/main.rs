@@ -2457,8 +2457,10 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
             } => {
                 let database = open_migrated_db(db)?;
                 let issue_ref = ironmem::autopilot::IssueRef::new(&repo, issue);
-                // Both harnesses' evidence, sampled by `clear_dispatch` only
-                // after it has read the state it will judge.
+                // Every harness's evidence (Claude's registry and the
+                // supervised CLIs' process table), sampled by
+                // `clear_dispatch` only after it has read the state it will
+                // judge.
                 let cleared =
                     ironmem::autopilot::clear::clear_dispatch(&database, &issue_ref, || {
                         let mut monitor =
