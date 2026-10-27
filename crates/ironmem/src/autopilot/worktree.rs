@@ -216,20 +216,26 @@ fn config_bool(dir: &Path, key: &str) -> Result<Option<bool>, String> {
     config_get(dir, &["--bool", "--get", key]).map(|value| value.map(|v| v == "true"))
 }
 
-/// Remember on `branch`, and on the repository ([`REPO_SIGNING_KEY`]), that
-/// the signing policy is on; the caller has read it as on (an unreadable
-/// policy counts as on). The flags are sticky: a later run that finds the
-/// policy off still enforces it, so an agent's `git config commit.gpgsign
-/// false` in the shared `.git/config` outlives neither the dispatch nor the
-/// run, and does not unguard branches created after it.
+/// Remember on `branch` that the signing policy is on, and, when
+/// `repo_wide`, on the repository too ([`REPO_SIGNING_KEY`]). The caller has
+/// read the policy as on; it passes `repo_wide` only for a policy that read
+/// `true`, so an unreadable `commit.gpgsign` (a typo) holds its own branch
+/// but never arms every branch in the repository. The flags are sticky: a
+/// later run that finds the policy off still enforces it, so an agent's `git
+/// config commit.gpgsign false` in the shared `.git/config` outlives neither
+/// the dispatch nor the run, and does not unguard branches created after it.
 ///
 /// Each flag is skipped when already recorded (or unreadable). A live agent in
 /// another worktree of the same repo may hold `.git/config`'s lock (`push -u`
 /// and `checkout -b` both write config), and a needless write would race it.
-pub(crate) fn record_signing(dir: &Path, branch: &str) -> Result<(), MemoryError> {
+pub(crate) fn record_signing(dir: &Path, branch: &str, repo_wide: bool) -> Result<(), MemoryError> {
     // The branch first: a held lock on the second write still leaves the
     // branch held, as before the repository flag existed.
-    for key in [signing_key(branch), REPO_SIGNING_KEY.to_string()] {
+    let mut keys = vec![signing_key(branch)];
+    if repo_wide {
+        keys.push(REPO_SIGNING_KEY.to_string());
+    }
+    for key in keys {
         if matches!(config_bool(dir, &key), Ok(Some(true)) | Err(_)) {
             continue;
         }
@@ -238,18 +244,33 @@ pub(crate) fn record_signing(dir: &Path, branch: &str) -> Result<(), MemoryError
     Ok(())
 }
 
-/// Whether `branch` is held to the signing policy that was once seen on.
+/// What holds `branch` to the signing policy that was once seen on, named for
+/// a reason the model and the operator read, or `None` when nothing does.
 ///
 /// The branch's own `branch.<branch>.ironmemSigning` decides when set: `true`
 /// holds it, and an operator's explicit `false` opts that one branch out.
 /// Unset, the repository's [`REPO_SIGNING_KEY`] decides. A value that cannot
-/// be read counts as recorded: these flags only ever tighten.
-pub(crate) fn signing_recorded(dir: &Path, branch: &str) -> bool {
-    match config_bool(dir, &signing_key(branch)) {
-        Ok(Some(on)) => on,
-        Ok(None) => config_bool(dir, REPO_SIGNING_KEY).map_or(true, |on| on == Some(true)),
-        Err(_) => true,
+/// be read holds it too: these flags only ever tighten.
+pub(crate) fn signing_holder(dir: &Path, branch: &str) -> Option<String> {
+    let branch_key = signing_key(branch);
+    match config_bool(dir, &branch_key) {
+        Ok(Some(true)) => Some(format!("`{branch_key}`")),
+        Ok(Some(false)) => None,
+        Ok(None) => match config_bool(dir, REPO_SIGNING_KEY) {
+            Ok(Some(true)) => Some(format!(
+                "`{REPO_SIGNING_KEY}` (the repository recorded signing on)"
+            )),
+            Ok(_) => None,
+            Err(_) => Some(format!("an unreadable `{REPO_SIGNING_KEY}`")),
+        },
+        Err(_) => Some(format!("an unreadable `{branch_key}`")),
     }
+}
+
+/// Whether `branch` is held to the signing policy; see [`signing_holder`].
+#[cfg(test)]
+pub(crate) fn signing_recorded(dir: &Path, branch: &str) -> bool {
+    signing_holder(dir, branch).is_some()
 }
 
 /// The cut recorded on an existing `branch`, if any, resolved to a full sha.
@@ -594,8 +615,11 @@ pub fn ensure_worktree(
     // Warn-only, as at a run's start: another worktree's agent may hold
     // `.git/config`'s lock, and `run_issue` holds the run to the policy it
     // reads at start whether or not this write lands.
-    if signing_policy(&path).unwrap_or(true) {
-        if let Err(e) = record_signing(&path, &branch) {
+    // An unreadable policy holds the branch (fail closed) but is not a
+    // policy seen on, so it never arms the repository.
+    let policy = signing_policy(&path);
+    if policy.clone().unwrap_or(true) {
+        if let Err(e) = record_signing(&path, &branch, policy == Ok(true)) {
             tracing::warn!(
                 error = %e,
                 branch = %branch,
@@ -898,13 +922,15 @@ mod tests {
     }
 
     #[test]
-    fn an_unreadable_signing_policy_at_creation_is_recorded_as_on() {
+    fn an_unreadable_signing_policy_at_creation_holds_the_branch_but_not_the_repo() {
         let repo = fixture_repo();
         let roots = tempfile::tempdir().unwrap();
         run(repo.path(), &["config", "commit.gpgsign", "maybe"]);
         ensure_worktree(repo.path(), roots.path(), &issue(), "HEAD").unwrap();
         let key = format!("branch.{}.ironmemSigning", branch_name(&issue()));
         assert_eq!(read_config(repo.path(), &key).as_deref(), Some("true"));
+        // A typo is not a policy seen on: it must not arm every branch.
+        assert_eq!(read_config(repo.path(), "ironmem.autopilotSigning"), None);
     }
 
     #[test]
@@ -912,7 +938,7 @@ mod tests {
         let repo = fixture_repo();
         let branch = branch_name(&issue());
         let other = "autopilot/ironrace-ironmem-3";
-        record_signing(repo.path(), &branch).unwrap();
+        record_signing(repo.path(), &branch, true).unwrap();
         assert_eq!(
             read_config(repo.path(), "ironmem.autopilotSigning").as_deref(),
             Some("true")

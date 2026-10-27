@@ -1223,7 +1223,7 @@ const MAX_PR_TITLE_CHARS: usize = 256;
 fn pr_body(candidate: &Candidate, base: &str) -> String {
     let green = match candidate.green_commit_sha.as_deref().map(str::trim) {
         Some(sha) if !sha.is_empty() => format!(
-            "The gate was recorded green at `{sha}` — the commit the IC's worktree was on when it reported the gate met."
+            "The gate was recorded green at `{sha}` — the issue branch's tip when the IC reported the gate met."
         ),
         _ => "No green commit was recorded for this issue.".to_string(),
     };
@@ -1946,6 +1946,23 @@ mod tests {
         let title = pr_title(&candidate);
         assert_eq!(title.chars().count(), MAX_PR_TITLE_CHARS);
         assert!(title.ends_with('…'));
+    }
+
+    #[test]
+    fn the_pr_body_names_the_green_commit_as_the_issue_branchs_tip() {
+        // The run records the issue branch's tip, not whatever the IC's
+        // worktree had checked out (`run::branch_tip`).
+        let candidate = Candidate {
+            issue: issue(),
+            issue_title: "t".into(),
+            repo_path: PathBuf::from("/nowhere"),
+            risk_label: None,
+            green_commit_sha: Some(GREEN.into()),
+        };
+        let body = pr_body(&candidate, "main");
+        assert!(body.contains(GREEN), "{body}");
+        assert!(body.contains("the issue branch's tip"), "{body}");
+        assert!(!body.contains("worktree was on"), "{body}");
     }
 
     #[test]

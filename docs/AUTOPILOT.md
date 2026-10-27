@@ -390,7 +390,10 @@ can quietly pass `-c commit.gpgsign=false`.
 
 - **What counts as unsigned.** A commit with no `gpgsig` header (or, in a
   SHA-256 repository, no `gpgsig-sha256` header). `%G?` is only used to
-  catch `B`, a bad signature, such as a signed commit edited afterwards.
+  catch `B`, a bad signature, such as a signed commit edited afterwards. A
+  signature git cannot parse at all counts as bad too. Each commit is read on
+  its own with `--no-show-signature`, so an operator's `log.showSignature`
+  setting does not change the result.
 - **Which commits are checked.** The commits that ship: everything on the
   issue branch (`refs/heads/<issue-branch>`, not `HEAD`, which the agent may
   have left on another checkout) and on its own remote-tracking refs (such as
@@ -403,7 +406,9 @@ can quietly pass `-c commit.gpgsign=false`.
   checked like the agent's own. An earlier dispatch's bypass stays caught
   after it is pushed, and after the local branch is reset, until a re-signed
   branch is force-pushed over it. If the issue branch no longer exists, the
-  `met` fails: nothing that ships can be checked.
+  `met` fails: nothing that ships can be checked. For the same reason, the
+  commit a success records (and the PR body names as green) is the issue
+  branch's tip, not `HEAD`.
 - **The cut is fixed once.** `--base` is resolved to a commit sha in your
   checkout when the issue branch is created, and stored as
   `branch.<branch>.ironmemCut`. A base that does not resolve is refused before
@@ -414,22 +419,26 @@ can quietly pass `-c commit.gpgsign=false`.
 - **The policy is sticky.** It is enforced if `commit.gpgsign` was on when the
   issue branch was created or at any run start, or is on now. A run that sees
   it on records it on the branch (`branch.<branch>.ironmemSigning true`) and
-  on the repository (`ironmem.autopilotSigning true`). `commit.gpgsign` lives
+  on the repository (`ironmem.autopilotSigning true`). An invalid value (a
+  typo such as `commit.gpgsign = ture`) holds a newly created branch but never
+  sets the repository flag, and a run refuses to start until it is fixed, since
+  every `met` it produced would be discarded. `commit.gpgsign` lives
   in the `.git/config` shared by every worktree, so an agent on one issue can
   turn it off for all of them. The repository flag holds every issue branch to
   the policy anyway, including branches created after it was turned off.
 - **Turning it off does not help.** If the agent, or anyone, turns
   `commit.gpgsign` off while either flag holds the branch, the next `met`
-  fails with "commit.gpgsign was turned off on this branch". Only an operator
-  can end enforcement, as described below.
+  fails with "commit.gpgsign was turned off, but this branch is still held to
+  signing by ...", naming the flag that holds it. Only an operator can end
+  enforcement, as described below.
 - **Trust posture.** The guard catches a lazy or accidental bypass. It does
   not stop an unconfined agent that deliberately signs with another key,
   opts its branch out, clears the cut, or pushes its commits to another
   branch.
 
 If the guard itself cannot read git when it checks a `met` (git fails to run,
-`commit.gpgsign` holds an invalid value, or the recorded cut is no longer an
-object `git log` can use), the `met` is not accepted. It is recorded as an
+`commit.gpgsign` was given an invalid value during the run, or the recorded
+cut is no longer an object `git log` can use), the `met` is not accepted. It is recorded as an
 infrastructure failure, not an attempt, so it costs the issue no attempt.
 Repeated ones stop the run through `max_consecutive_infrastructure_failures`,
 like any other infrastructure failure.
@@ -446,14 +455,18 @@ It names at most five commits, newest first, and counts the rest ("and 2
 more"). It tells the agent to re-sign only those commits, never the upstream
 commits merged in, as follows:
 
+- First `git checkout <issue-branch>`, since `HEAD` may have been left
+  elsewhere.
 - If only the tip is flagged, run `git commit --amend --no-edit -S`.
 - Otherwise, run `git rebase --exec 'git commit --amend --no-edit -S'
   <oldest-flagged>^`. This starts at the oldest flagged commit's parent, never
   at the cut, because rebasing from the cut would rewrite every upstream
-  commit merged in since.
+  commit merged in since. It is not `--rebase-merges`, which would also
+  rewrite the upstream commits on a merged-in side.
 - If a merge commit is flagged or lies in that range, redo the merge (signed)
   instead of rebasing over it.
-- Then `git push --force-with-lease`.
+- Then `git push --force-with-lease <remote> <issue-branch>`, naming the
+  remote that already tracks the issue branch (`origin` if none does).
 
 Make sure the signing key or agent is reachable from wherever the Lead runs,
 including inside an external sandbox. Otherwise every attempt fails.
@@ -478,7 +491,8 @@ To stop enforcing on every branch of the repo, do step 1, then run
 
 Do these with no Lead or `run` active on the issue. A running attempt that
 started with signing on still holds the branch to it, so it fails with
-"commit.gpgsign was turned off on this branch".
+"commit.gpgsign was turned off, but this branch is still held to signing by
+the policy, which was on when this run started".
 
 ## Onboarding a repo
 

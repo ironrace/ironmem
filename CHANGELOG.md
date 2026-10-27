@@ -20,7 +20,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Commit-signing guard for every harness (#366).** With `commit.gpgsign`
   on, a run that reports success but left unsigned commits on the issue
   branch now counts as a failed attempt, with a reason naming the commits.
-  Turning signing off during a run does not get around it.
+  Turning signing off during a run, or from another issue's worktree, does
+  not get around it. A run whose `commit.gpgsign` holds an invalid value
+  refuses to start rather than paying for a dispatch it would discard.
 
 ### Fixed
 
@@ -80,9 +82,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   implementer's commits are unsigned, for Claude as well as Codex and Muse.**
   Before, such a run could succeed. Make sure the signing key or agent is
   reachable from wherever the Lead runs. To stop the check on one issue
-  branch, turn `commit.gpgsign` off, then run `git config --unset
-  branch.<branch>.ironmemSigning` in the repo; see "Commit signing" in
-  `docs/AUTOPILOT.md`.
+  branch, turn `commit.gpgsign` off, then run `git config
+  branch.<branch>.ironmemSigning false` in the repo. To stop it on every
+  branch, turn `commit.gpgsign` off, then unset the repository-wide
+  `ironmem.autopilotSigning` and each branch's `ironmemSigning`. See
+  "Commit signing" in `docs/AUTOPILOT.md`.
 - **An operator's own `codex exec` or `muse exec --output-schema` session no
   longer stalls Autopilot.** A `ps` row now counts as an ambiguous Autopilot
   invocation only when it carries an Autopilot-shaped marker path.
