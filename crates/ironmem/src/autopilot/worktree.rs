@@ -318,6 +318,13 @@ fn cut_key(branch: &str) -> String {
     format!("branch.{branch}.ironmemCut")
 }
 
+/// The token of the controller that recorded `branch`'s cut while creating
+/// it ([`create_branch`]), so a take-back removes only a cut it wrote
+/// itself: two controllers can record the same value.
+fn cut_owner_key(branch: &str) -> String {
+    format!("branch.{branch}.ironmemCutOwner")
+}
+
 fn signing_key(branch: &str) -> String {
     format!("branch.{branch}.ironmemSigning")
 }
@@ -640,9 +647,10 @@ impl std::fmt::Display for CutSource {
 /// the branch and `base`: never `base` itself, which may have moved on since,
 /// or moved to another line of history (an operator's local-only commits
 /// would then count as the agent's). A branch that shares no history with
-/// `base` is refused rather than guessed. So is one already merged into
-/// `base` (the merge base is its tip) while it carries commits on no remote:
-/// that cut would leave the signing guard nothing to check.
+/// `base` is refused rather than guessed. So is one whose merge base with
+/// `base` is its own tip (merged into it, or an empty branch with no reflog)
+/// while it carries commits on no remote: that cut would leave the signing
+/// guard nothing to check.
 fn infer_cut(root: &Path, branch: &str, base: &str) -> Result<(String, CutSource), MemoryError> {
     let local = format!("refs/heads/{branch}");
     let created = git(root, &["reflog", "show", "--format=%H %gs", &local])
@@ -684,8 +692,9 @@ fn infer_cut(root: &Path, branch: &str, base: &str) -> Result<(String, CutSource
         let unpushed = git(root, &["rev-list", "--count", &local, "--not", "--remotes"])?;
         if unpushed != "0" {
             return Err(refuse(&format!(
-                "it is already merged into the base `{base}` with {unpushed} commit(s) on no \
-                 remote, so its merge base would leave the signing guard nothing to check"
+                "its merge base with the base `{base}` is its own tip, with {unpushed} \
+                 commit(s) on no remote, so that merge base would leave the signing guard \
+                 nothing to check"
             )));
         }
     }
@@ -716,15 +725,18 @@ fn backfill_cut(
 /// Create `branch` at `cut` (resolved from `base`) with a worktree at `path`,
 /// so the branch never exists without its recorded cut.
 ///
-/// The cut is written first: a held config lock then fails before anything
-/// exists. A branch that appeared since the caller looked (another controller
-/// created it) is refused, never given this call's cut. `base` is passed to
-/// git as written, so a remote-tracking base still sets the upstream.
+/// The cut is written first, with this call's owner token
+/// ([`cut_owner_key`]): a held config lock then fails before anything exists.
+/// A branch that appeared since the caller looked (another controller created
+/// it) is refused, never given this call's cut. `base` is passed to git as
+/// written, so a remote-tracking base still sets the upstream. Once the add
+/// has made the branch at `cut`, the cut is read back and recorded again if
+/// another controller's take-back removed it meanwhile.
 ///
 /// If `git worktree add` fails, whether the branch exists decides:
 ///
 /// - It does not: the cut is taken back, unless another controller has since
-///   written its own.
+///   written its own, or the same value as its own ([`take_back_cut`]).
 /// - It does, at `cut`: the cut stays. Either this add made the branch and
 ///   then failed (a held lock on the upstream write), or another controller
 ///   made it from the same commit; either way `cut` is its cut, and the next
@@ -769,20 +781,23 @@ fn create_branch_with(
                 branch = %branch,
                 stale = %quoted_value(&stale),
                 cut = %cut,
-                "autopilot is replacing a cut left recorded for an issue branch that no longer \
-                 exists"
+                "autopilot is replacing a recorded cut for an issue branch that does not exist \
+                 yet (another controller may be creating this branch)"
             );
         }
     }
+    let owner = uuid::Uuid::new_v4().to_string();
+    // The owner first: a write that fails then leaves no cut behind.
+    write_config_waiting(root, &cut_owner_key(branch), &owner, |_| {})?;
     write_cut(root, branch, cut)?;
     before_add();
     let path_str = path.to_string_lossy().to_string();
     if let Err(e) = git(root, &["worktree", "add", "-b", branch, &path_str, base]) {
-        return Err(after_failed_add(root, branch, base, cut, e));
+        return Err(after_failed_add(root, branch, base, cut, &owner, e));
     }
     let tip = resolve_commit(root, &format!("refs/heads/{branch}"));
     let problem = match &tip {
-        Some(tip) if tip == cut => return Ok(()),
+        Some(tip) if tip == cut => return record_cut_again_if_taken(root, branch, cut),
         Some(tip) => {
             format!("it landed on {tip}, not on {cut}, which `{base}` resolved to a moment earlier")
         }
@@ -795,13 +810,99 @@ fn create_branch_with(
     )))
 }
 
+/// After this call's add made `branch` at `cut`: record `cut` again if it no
+/// longer reads so. Another controller that recorded the same value and then
+/// failed its own add takes that value back ([`take_back_cut`]), and may do
+/// so after this add; the branch is this call's, made at `cut`, so `cut` is
+/// its cut.
+fn record_cut_again_if_taken(root: &Path, branch: &str, cut: &str) -> Result<(), MemoryError> {
+    if matches!(config_get(root, &["--get", &cut_key(branch)]), Ok(Some(ref current)) if current == cut)
+    {
+        return Ok(());
+    }
+    tracing::warn!(
+        branch = %branch,
+        cut = %cut,
+        "autopilot found the cut of the issue branch it just created changed or taken back by \
+         another controller; recording it again"
+    );
+    write_cut(root, branch, cut).map_err(|e| {
+        MemoryError::Validation(format!(
+            "the issue branch `{branch}` was created at {cut} in {}, but its cut could not be \
+             recorded again after another controller took it back ({e}); set it with `git \
+             config {} {cut}` before running again",
+            root.display(),
+            cut_key(branch)
+        ))
+    })
+}
+
+/// Take back the cut this call recorded for a `branch` its add did not make,
+/// describing the outcome. Only while both the value and the owner token
+/// still read as this call's: another controller that recorded the same
+/// value after it owns it now. Then, if a branch appeared meanwhile (another
+/// controller's add at the same cut), the cut is recorded again for it.
+fn take_back_cut(root: &Path, branch: &str, cut: &str, owner: &str) -> String {
+    let owner_key = cut_owner_key(branch);
+    match config_get(root, &["--get", &owner_key]) {
+        Ok(Some(current)) if current == owner => {}
+        Ok(_) => {
+            return "the branch was not created, and another controller has since recorded its \
+                    own cut, which is kept"
+                .to_string()
+        }
+        Err(why) => {
+            return format!(
+                "the branch was not created, and whose cut is recorded could not be read \
+                 ({why}), so it is kept; it is replaced when the branch is next created"
+            )
+        }
+    }
+    if let Err(unset) = unset_cut_if(root, branch, cut) {
+        return format!(
+            "the branch was not created, and the cut it was given could not be taken back \
+             ({unset}); it is replaced when the branch is next created"
+        );
+    }
+    // Only this call's token: one written since is kept.
+    let _ = config_waiting(
+        root,
+        &["config", "--unset", &owner_key, &format!("^{owner}$")],
+        &[5],
+        |_| {},
+    );
+    match branch_tip(root, branch) {
+        Ok(None) => "the branch was not created and its cut was taken back".to_string(),
+        Ok(Some(tip)) if tip == cut => match record_cut_again_if_taken(root, branch, cut) {
+            Ok(()) => format!(
+                "another controller created the branch `{branch}` at {cut} meanwhile, so its \
+                 cut is kept; run again to reuse it"
+            ),
+            Err(e) => e.to_string(),
+        },
+        // Made elsewhere: its own controller recorded a different value,
+        // which the take-back above, matching this call's value, left alone.
+        Ok(Some(tip)) => format!(
+            "another controller created the branch `{branch}` at {tip} meanwhile, with its own \
+             cut; run again to reuse it"
+        ),
+        Err(read) => format!(
+            "the cut was taken back, but whether the branch `{branch}` exists now could not be \
+             read ({read}); check `{}` before running again",
+            cut_key(branch)
+        ),
+    }
+}
+
 /// Settle the recorded cut after `git worktree add -b` failed with `e`, and
-/// say how in the error returned; see [`create_branch`].
+/// say how in the error returned; see [`create_branch`]. `owner` is the
+/// token this call recorded with its cut.
 fn after_failed_add(
     root: &Path,
     branch: &str,
     base: &str,
     cut: &str,
+    owner: &str,
     e: MemoryError,
 ) -> MemoryError {
     let detail = match e {
@@ -809,13 +910,7 @@ fn after_failed_add(
         other => other.to_string(),
     };
     let settled = match branch_tip(root, branch) {
-        Ok(None) => match unset_cut_if(root, branch, cut) {
-            Ok(()) => "the branch was not created and its cut was taken back".to_string(),
-            Err(unset) => format!(
-                "the branch was not created, and the cut it was given could not be taken back \
-                 ({unset}); it is replaced when the branch is next created"
-            ),
-        },
+        Ok(None) => take_back_cut(root, branch, cut, owner),
         Ok(Some(tip)) if tip == cut => format!(
             "the branch `{branch}` exists at {cut} and its cut is kept; run again to reuse it"
         ),
@@ -1809,6 +1904,73 @@ mod tests {
         resolve_commit(repo, &format!("refs/heads/{}", branch_name(&issue())))
     }
 
+    fn issue_owner_key() -> String {
+        format!("branch.{}.ironmemCutOwner", branch_name(&issue()))
+    }
+
+    #[test]
+    fn a_take_back_keeps_the_same_cut_another_controller_recorded_after_it() {
+        let repo = fixture_repo();
+        let roots = tempfile::tempdir().unwrap();
+        let root = resolve_repo_root(repo.path()).unwrap();
+        let branch = branch_name(&issue());
+        let cut = resolve_commit(&root, "HEAD").unwrap();
+        // A ref below the branch's name makes this controller's add fail
+        // with no branch made.
+        run(&root, &["branch", &format!("{branch}/blocker")]);
+        let path = worktree_path(roots.path(), &issue());
+        // Another controller records the same cut, as its own, between this
+        // one's write and its add, and has not run its own add yet.
+        let err = create_branch_with(&root, &branch, &path, "HEAD", &cut, || {
+            run(&root, &["config", &issue_cut_key(), &cut]);
+            run(
+                &root,
+                &["config", &issue_owner_key(), "the-other-controller"],
+            );
+        });
+        assert!(err.is_err());
+        assert_eq!(read_config(&root, &issue_cut_key()), Some(cut));
+        assert_eq!(
+            read_config(&root, &issue_owner_key()),
+            Some("the-other-controller".into())
+        );
+    }
+
+    #[test]
+    fn a_branch_whose_cut_was_taken_back_under_it_records_it_again() {
+        let repo = fixture_repo();
+        let roots = tempfile::tempdir().unwrap();
+        let root = resolve_repo_root(repo.path()).unwrap();
+        let branch = branch_name(&issue());
+        let cut = resolve_commit(&root, "HEAD").unwrap();
+        let path = worktree_path(roots.path(), &issue());
+        let elsewhere = roots.path().join("elsewhere");
+        // Between this controller's cut write and its add, another records
+        // the same cut as its own, fails its add with no branch made, and
+        // takes its cut back: the value this controller's add relies on.
+        create_branch_with(&root, &branch, &path, "HEAD", &cut, || {
+            let other = create_branch(&root, &branch, &elsewhere, "refs/heads/no-such", &cut);
+            assert!(other.is_err());
+            assert_eq!(read_config(&root, &issue_cut_key()), None);
+        })
+        .unwrap();
+        assert_eq!(branch_tip(&root), Some(cut.clone()));
+        assert_eq!(
+            read_config(&root, &issue_cut_key()),
+            Some(cut),
+            "a branch never exists without its cut"
+        );
+    }
+
+    #[test]
+    fn a_created_branch_records_its_cut_with_this_controllers_owner_token() {
+        let repo = fixture_repo();
+        let roots = tempfile::tempdir().unwrap();
+        ensure_worktree(repo.path(), roots.path(), &issue(), "HEAD").unwrap();
+        let owner = read_config(repo.path(), &issue_owner_key()).expect("an owner token");
+        assert!(uuid::Uuid::parse_str(&owner).is_ok(), "{owner}");
+    }
+
     /// A repo whose `origin/main` is a remote-tracking base, so creating a
     /// branch from it writes the upstream into `.git/config`.
     fn fixture_repo_with_origin() -> (tempfile::TempDir, tempfile::TempDir) {
@@ -1878,7 +2040,7 @@ mod tests {
         run(&root, &["branch", &branch, &cut]);
         let failed =
             MemoryError::Validation("unable to write upstream branch configuration".into());
-        let err = after_failed_add(&root, &branch, "HEAD", &cut, failed).to_string();
+        let err = after_failed_add(&root, &branch, "HEAD", &cut, "owner", failed).to_string();
         assert!(err.contains("kept"), "got: {err}");
         assert_eq!(read_config(&root, &issue_cut_key()), Some(cut));
     }
@@ -1958,7 +2120,30 @@ mod tests {
             err.contains(&format!("git config {}", issue_cut_key())),
             "got: {err}"
         );
+        // Named for what git saw, not a merge it cannot see.
+        assert!(
+            err.contains("its merge base with the base `HEAD` is its own tip"),
+            "got: {err}"
+        );
         assert_eq!(read_config(repo.path(), &issue_cut_key()), None);
+    }
+
+    #[test]
+    fn replacing_a_recorded_cut_allows_that_another_controller_is_creating_the_branch() {
+        let repo = fixture_repo();
+        let roots = tempfile::tempdir().unwrap();
+        let root = resolve_repo_root(repo.path()).unwrap();
+        let earlier = resolve_commit(&root, "HEAD").unwrap();
+        run(&root, &["config", &issue_cut_key(), &earlier]);
+        advance_operator_head(&root, "later");
+        let (created, log) =
+            with_captured_log(|| ensure_worktree(repo.path(), roots.path(), &issue(), "HEAD"));
+        created.unwrap();
+        assert!(
+            log.contains("another controller may be creating this branch"),
+            "{log}"
+        );
+        assert!(!log.contains("no longer exists"), "{log}");
     }
 
     #[test]
