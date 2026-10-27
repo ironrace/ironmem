@@ -96,12 +96,11 @@ pub struct Worktree {
     /// existing worktree was reused, which is the normal resumed-dispatch
     /// case).
     pub created: bool,
-    /// The committish the branch was cut from, as passed to
-    /// [`ensure_worktree`]. A named ref (`origin/main`) is kept as written so
-    /// the signing guard's merge-base ignores upstream commits merged in
-    /// later. A `HEAD`-relative form (or `@`) would mean the branch itself
-    /// from inside the worktree, so it is pinned to the commit it named here.
-    pub base: String,
+    /// The full commit sha the branch was cut from. Resolved from `base` in
+    /// the operator's checkout once, when the branch is created, and kept in
+    /// `branch.<branch>.ironmemCut` so a resume reads it back rather than
+    /// re-resolving a `base` (such as `HEAD`) that has since moved.
+    pub cut: String,
     /// Set when a dirty pre-existing worktree was moved aside first — the
     /// path it was moved to, kept for a human to inspect. The spec requires
     /// quarantine rather than deletion precisely so the dead IC's work is
@@ -163,6 +162,93 @@ fn git_ok(cwd: &Path, args: &[&str]) -> Result<bool, MemoryError> {
         .status()
         .map_err(|e| MemoryError::NotFound(format!("failed to run git {}: {e}", args.join(" "))))?;
     Ok(status.success())
+}
+
+/// `git config --get key` in `cwd`: `None` when the key is unset (git exits
+/// 1), and an error for any other failure, which is not a reading at all.
+fn config_get(cwd: &Path, args: &[&str]) -> Result<Option<String>, String> {
+    let out = git_command()
+        .arg("config")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .map_err(|e| e.to_string())?;
+    match out.status.code() {
+        Some(0) => Ok(Some(
+            String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        )),
+        Some(1) => Ok(None),
+        _ => Err(String::from_utf8_lossy(&out.stderr)
+            .trim()
+            .chars()
+            .take(300)
+            .collect()),
+    }
+}
+
+fn cut_key(branch: &str) -> String {
+    format!("branch.{branch}.ironmemCut")
+}
+
+fn signing_key(branch: &str) -> String {
+    format!("branch.{branch}.ironmemSigning")
+}
+
+/// The effective `commit.gpgsign` in `dir`. `Err` carries git's bounded
+/// stderr when the value cannot be read: git exits 1 for "unset" (off), so any
+/// other failure (an invalid value exits 128) is not a reading at all.
+pub(crate) fn signing_policy(dir: &Path) -> Result<bool, String> {
+    config_get(dir, &["--bool", "--get", "commit.gpgsign"])
+        .map(|value| value.is_some_and(|v| v == "true"))
+}
+
+/// Remember on `branch` that the signing policy is on, when it is on (or
+/// unreadable, which counts as on). The flag is sticky: a later run that finds
+/// the policy off still enforces it, so an agent's `git config commit.gpgsign
+/// false` in the shared `.git/config` outlives neither the dispatch nor the run.
+pub(crate) fn record_signing_policy(dir: &Path, branch: &str) -> Result<(), MemoryError> {
+    if signing_policy(dir).unwrap_or(true) {
+        git(dir, &["config", &signing_key(branch), "true"])?;
+    }
+    Ok(())
+}
+
+/// Whether `branch` was ever recorded as under the signing policy. A value
+/// that cannot be read counts as recorded: this flag only ever tightens.
+pub(crate) fn signing_recorded(dir: &Path, branch: &str) -> bool {
+    config_get(dir, &["--bool", "--get", &signing_key(branch)])
+        .map_or(true, |value| value.is_some_and(|v| v == "true"))
+}
+
+/// The cut recorded on an existing `branch`, if any, resolved to a full sha.
+/// A recorded value that is no longer a commit is an error rather than a
+/// silent re-resolve, which would move the cut.
+fn recorded_cut(root: &Path, branch: &str) -> Result<Option<String>, MemoryError> {
+    let key = cut_key(branch);
+    let recorded = config_get(root, &["--get", &key]).map_err(|why| {
+        MemoryError::Validation(format!("cannot read {key} in {}: {why}", root.display()))
+    })?;
+    let Some(recorded) = recorded else {
+        return Ok(None);
+    };
+    resolve_commit(root, &recorded).map(Some).ok_or_else(|| {
+        MemoryError::Validation(format!(
+            "{key} is `{recorded}`, which is not a commit in {}; unset it with `git config \
+             --unset {key}` to record the cut again from the base",
+            root.display()
+        ))
+    })
+}
+
+/// Resolve the operator's `base` to a full sha in `root`, or refuse.
+fn resolve_base(root: &Path, base: &str) -> Result<String, MemoryError> {
+    resolve_commit(root, base).ok_or_else(|| {
+        MemoryError::Validation(format!(
+            "cannot resolve the base `{base}` to a commit in {}; pass an existing branch, tag \
+             or sha as the base (`--base`)",
+            root.display()
+        ))
+    })
 }
 
 /// Resolve `repo_root` to the top level of its git working tree, erroring if
@@ -300,10 +386,16 @@ fn quarantine(repo_root: &Path, path: &Path) -> Result<PathBuf, MemoryError> {
 ///
 /// `base` is the committish new branches are cut from (e.g. `"origin/main"`
 /// or `"HEAD"`); it is only consulted when the issue's branch does not exist
-/// yet. A resumed run whose branch already carries pushed commits reuses that
+/// yet, or to backfill a missing cut. A resumed run whose branch already carries pushed commits reuses that
 /// branch untouched — re-cutting it from `base` would silently discard every
 /// prior dispatch's work, which is exactly the history the lineage store
 /// exists to keep.
+///
+/// The cut ([`Worktree::cut`]) is resolved from `base` in `repo_root` when the
+/// branch is created and stored on the branch; an existing branch reads it
+/// back, backfilling it from `base` once if it predates the record. A `base`
+/// that does not resolve is refused before anything on disk changes. At
+/// creation the signing policy is recorded too ([`record_signing_policy`]).
 pub fn ensure_worktree(
     repo_root: &Path,
     worktree_root: &Path,
@@ -320,10 +412,25 @@ pub fn ensure_worktree(
     let root = resolve_repo_root(repo_root)?;
     let branch = branch_name(issue);
     let path = worktree_path(worktree_root, issue);
-    let base_commit = if base.contains("HEAD") || base.trim() == "@" {
-        resolve_commit(&root, base).unwrap_or_else(|| base.to_string())
+    let branch_exists = git_ok(
+        &root,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ],
+    )?;
+    // Settled before anything on disk changes, so a bad base leaves nothing
+    // behind. A new branch's cut is re-read from its tip once it exists.
+    let recorded = if branch_exists {
+        recorded_cut(&root, &branch)?
     } else {
-        base.to_string()
+        None
+    };
+    let cut = match &recorded {
+        Some(sha) => sha.clone(),
+        None => resolve_base(&root, base)?,
     };
 
     let mut quarantined_from = None;
@@ -357,11 +464,14 @@ pub fn ensure_worktree(
                     path.display()
                 )));
             }
+            if recorded.is_none() {
+                git(&root, &["config", &cut_key(&branch), &cut])?;
+            }
             return Ok(Worktree {
                 path: canonical_or_self(&path),
                 branch,
                 created: false,
-                base: base_commit,
+                cut,
                 quarantined_from: None,
             });
         } else {
@@ -386,26 +496,25 @@ pub fn ensure_worktree(
     }
 
     let path_str = path.to_string_lossy().to_string();
-    let branch_exists = git_ok(
-        &root,
-        &[
-            "rev-parse",
-            "--verify",
-            "--quiet",
-            &format!("refs/heads/{branch}"),
-        ],
-    )?;
-    if branch_exists {
+    let cut = if branch_exists {
         git(&root, &["worktree", "add", &path_str, &branch])?;
+        cut
     } else {
+        // Cut from `base` as written, so a remote-tracking base still sets
+        // the branch's upstream; the tip it landed on is the exact cut.
         git(&root, &["worktree", "add", "-b", &branch, &path_str, base])?;
+        resolve_base(&root, &format!("refs/heads/{branch}"))?
+    };
+    if recorded.is_none() {
+        git(&root, &["config", &cut_key(&branch), &cut])?;
     }
+    record_signing_policy(&path, &branch)?;
 
     Ok(Worktree {
         path: canonical_or_self(&path),
         branch,
         created: true,
-        base: base_commit,
+        cut,
         quarantined_from,
     })
 }
@@ -503,7 +612,7 @@ mod tests {
     use super::*;
 
     fn run(cwd: &Path, args: &[&str]) {
-        let output = Command::new("git")
+        let output = git_command()
             .args(args)
             .current_dir(cwd)
             .output()
@@ -527,6 +636,9 @@ mod tests {
         run(path, &["init", "--initial-branch=main"]);
         run(path, &["config", "user.email", "autopilot@example.test"]);
         run(path, &["config", "user.name", "Autopilot Test"]);
+        // Pinned: the global config signs and runs hooks; worktrees share this.
+        run(path, &["config", "commit.gpgsign", "false"]);
+        run(path, &["config", "core.hooksPath", "/dev/null"]);
         std::fs::write(path.join("README.md"), "seed\n").unwrap();
         run(path, &["add", "README.md"]);
         run(path, &["commit", "-m", "seed"]);
@@ -537,16 +649,87 @@ mod tests {
         IssueRef::new("ironrace/ironmem", 283)
     }
 
+    fn read_config(repo: &Path, key: &str) -> Option<String> {
+        git(repo, &["config", "--get", key]).ok()
+    }
+
+    fn issue_cut_key() -> String {
+        format!("branch.{}.ironmemCut", branch_name(&issue()))
+    }
+
+    /// Move the operator checkout's `HEAD` on by one commit; returns it.
+    fn advance_operator_head(repo: &Path, file: &str) -> String {
+        std::fs::write(repo.join(file), file).unwrap();
+        run(repo, &["add", file]);
+        run(repo, &["commit", "-qm", file]);
+        resolve_commit(repo, "HEAD").unwrap()
+    }
+
     #[test]
-    fn the_branch_base_is_recorded_and_head_is_pinned_to_a_commit() {
+    fn the_cut_is_recorded_once_and_survives_a_moved_operator_head() {
         let repo = fixture_repo();
         let roots = tempfile::tempdir().unwrap();
         let head = resolve_commit(repo.path(), "HEAD").unwrap();
         let created = ensure_worktree(repo.path(), roots.path(), &issue(), "HEAD").unwrap();
-        assert_eq!(created.base, head);
-        let reused = ensure_worktree(repo.path(), roots.path(), &issue(), "main").unwrap();
-        assert!(!reused.created);
-        assert_eq!(reused.base, "main");
+        assert_eq!(created.cut, head);
+        assert_eq!(
+            read_config(repo.path(), &issue_cut_key()),
+            Some(head.clone())
+        );
+
+        advance_operator_head(repo.path(), "later");
+        let resumed = ensure_worktree(repo.path(), roots.path(), &issue(), "HEAD").unwrap();
+        assert!(!resumed.created);
+        assert_eq!(resumed.cut, head, "a resume never re-resolves the cut");
+        assert_eq!(read_config(repo.path(), &issue_cut_key()), Some(head));
+    }
+
+    #[test]
+    fn an_absent_cut_is_backfilled_once_on_reuse() {
+        let repo = fixture_repo();
+        let roots = tempfile::tempdir().unwrap();
+        ensure_worktree(repo.path(), roots.path(), &issue(), "HEAD").unwrap();
+        // A worktree created before the cut was recorded.
+        run(repo.path(), &["config", "--unset", &issue_cut_key()]);
+        let now = advance_operator_head(repo.path(), "later");
+        let reused = ensure_worktree(repo.path(), roots.path(), &issue(), "HEAD").unwrap();
+        assert_eq!(reused.cut, now);
+        assert_eq!(
+            read_config(repo.path(), &issue_cut_key()),
+            Some(now.clone())
+        );
+        advance_operator_head(repo.path(), "later-still");
+        let again = ensure_worktree(repo.path(), roots.path(), &issue(), "HEAD").unwrap();
+        assert_eq!(again.cut, now);
+    }
+
+    #[test]
+    fn an_unresolvable_base_is_refused_before_any_worktree_exists() {
+        let repo = fixture_repo();
+        let roots = tempfile::tempdir().unwrap();
+        for base in ["no-such-ref", "@{u}"] {
+            let err = ensure_worktree(repo.path(), roots.path(), &issue(), base)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("cannot resolve the base"), "got: {err}");
+            assert!(err.contains(base), "got: {err}");
+            assert!(!worktree_path(roots.path(), &issue()).exists());
+            assert!(!git_ok(
+                repo.path(),
+                &["rev-parse", "--verify", "--quiet", &branch_name(&issue())]
+            )
+            .unwrap());
+        }
+    }
+
+    #[test]
+    fn a_signing_policy_on_at_creation_is_recorded_on_the_branch() {
+        let repo = fixture_repo();
+        let roots = tempfile::tempdir().unwrap();
+        run(repo.path(), &["config", "commit.gpgsign", "true"]);
+        ensure_worktree(repo.path(), roots.path(), &issue(), "HEAD").unwrap();
+        let key = format!("branch.{}.ironmemSigning", branch_name(&issue()));
+        assert_eq!(read_config(repo.path(), &key).as_deref(), Some("true"));
     }
 
     #[test]

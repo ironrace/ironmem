@@ -90,7 +90,7 @@ use crate::error::MemoryError;
 use super::dispatch::{self, DispatchOutcome, DispatchSpec, SessionMode, Verdict};
 use super::implementer::Implementer;
 use super::invocation::{InvocationArtifacts, InvocationRecovery};
-use super::worktree::Worktree;
+use super::worktree::{self, Worktree};
 use super::{
     blocked, budget, dispatch_state, gate_config, lineage, remediate, supervise, today_utc,
     turn_prompt, IssueRef,
@@ -734,28 +734,8 @@ fn bounded_stderr(out: &std::process::Output) -> String {
     text.trim().chars().take(300).collect()
 }
 
-/// The worktree's effective `commit.gpgsign`. `Err` carries git's bounded
-/// stderr when the value cannot be read: git exits 1 for "unset" (off), so any
-/// other failure (an invalid value exits 128) is not a reading at all.
-fn signing_policy(worktree: &Path) -> Result<bool, String> {
-    let mut command = std::process::Command::new("git");
-    crate::mcp::tools::scrub_git_environment(&mut command);
-    let out = command
-        .args(["config", "--bool", "--get", "commit.gpgsign"])
-        .current_dir(worktree)
-        .output()
-        .map_err(|e| e.to_string())?;
-    match out.status.code() {
-        Some(0) => Ok(String::from_utf8_lossy(&out.stdout).trim() == "true"),
-        Some(1) => Ok(false),
-        _ => Err(bounded_stderr(&out)),
-    }
-}
-
 /// Why the branch's commits break the repository's signing policy, or `None`
-/// when they keep it or there is no policy. `base` is the committish the
-/// branch was cut from ([`Worktree::base`]); `policy_at_start` is the policy as
-/// read before the dispatch began.
+/// when they keep it or there is no policy.
 ///
 /// Measured 2026-10-26: Muse's sandboxed shell could not sign (`No user
 /// exists for uid 501`), and the model silently retried with
@@ -765,28 +745,34 @@ fn signing_policy(worktree: &Path) -> Result<bool, String> {
 /// so presence comes from the commit's `gpgsig` header and `%G?` only flags
 /// `B`, a bad signature.
 ///
-/// Everything since the merge-base with `base` is checked, so an earlier
-/// dispatch's bypass stays caught and upstream commits merged in are not
-/// blamed on the model. The policy is enforced if it was on at the start or is
-/// on now; turning it off mid-dispatch is a violation of its own. Anything
-/// unreadable while the policy is on fails closed. This catches a lazy or
-/// accidental bypass, not an unconfined agent deliberately signing with
-/// another key.
-fn signing_violation(worktree: &Path, base: &str, policy_at_start: bool) -> Option<String> {
+/// The commits checked are the agent's own: everything reachable from `HEAD`
+/// but not from the cut ([`Worktree::cut`], recorded once when the branch was
+/// made) nor from any remote-tracking ref other than the issue branch's own.
+/// So upstream commits the agent merges or rebases in are never blamed on it,
+/// an earlier dispatch's bypass stays caught after it is pushed, and a moving
+/// operator checkout cannot shrink or widen the range.
+///
+/// The policy is enforced when it is on now or when the branch recorded it on
+/// ([`worktree::record_signing_policy`], at creation and at each run's start);
+/// a recorded policy that is now off is a violation of its own, across runs.
+/// Anything unreadable fails closed. This catches a lazy or accidental bypass,
+/// not deliberate tampering: an unconfined agent could just as well clear
+/// `branch.<branch>.ironmemSigning` or sign with a throwaway key.
+fn signing_violation(worktree: &Worktree) -> Option<String> {
     let git = |args: &[&str]| {
         let mut command = std::process::Command::new("git");
         crate::mcp::tools::scrub_git_environment(&mut command);
-        command.args(args).current_dir(worktree).output()
+        command.args(args).current_dir(&worktree.path).output()
     };
-    match signing_policy(worktree) {
+    match worktree::signing_policy(&worktree.path) {
         Err(why) => {
             return Some(format!(
-                "commit.gpgsign is on or unreadable, and its value could not be read: {why}"
+                "commit.gpgsign could not be read (treated as on): {why}"
             ))
         }
-        Ok(false) if policy_at_start => {
+        Ok(false) if worktree::signing_recorded(&worktree.path, &worktree.branch) => {
             return Some(
-                "commit.gpgsign was turned off during the dispatch; restore it with \
+                "commit.gpgsign was turned off on this branch; restore it with \
                  `git config --unset commit.gpgsign` (or set it back to true) and sign every commit"
                     .into(),
             )
@@ -794,22 +780,17 @@ fn signing_violation(worktree: &Path, base: &str, policy_at_start: bool) -> Opti
         Ok(false) => return None,
         Ok(true) => {}
     }
-    let merge_base = match git(&["merge-base", "HEAD", base]) {
-        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
-        Ok(out) => {
-            return Some(format!(
-                "cannot determine the branch base `{base}` to check commit signatures: {}",
-                bounded_stderr(&out)
-            ))
-        }
-        Err(e) => {
-            return Some(format!(
-                "cannot determine the branch base `{base}` to check commit signatures: {e}"
-            ))
-        }
-    };
-    let range = format!("{merge_base}..HEAD");
-    let out = match git(&["log", "--format=%H %G?", &range]) {
+    let cut = worktree.cut.as_str();
+    let own_remote = format!("--exclude=*/{}", worktree.branch);
+    let out = match git(&[
+        "log",
+        "--format=%H %G?",
+        "HEAD",
+        "--not",
+        cut,
+        &own_remote,
+        "--remotes",
+    ]) {
         Ok(out) if out.status.success() => out,
         Ok(out) => {
             return Some(format!(
@@ -839,12 +820,12 @@ fn signing_violation(worktree: &Path, base: &str, policy_at_start: bool) -> Opti
             unsigned.push(sha.chars().take(12).collect::<String>());
         }
     }
-    let short_base: String = merge_base.chars().take(12).collect();
+    let short_cut: String = cut.chars().take(12).collect();
     (!unsigned.is_empty()).then(|| {
         format!(
-            "commit.gpgsign is on, but commit(s) {} on this branch since {short_base} are \
-             unsigned or carry a bad signature. Re-sign them (e.g. `git rebase --exec 'git \
-             commit --amend --no-edit -S' {short_base}` then `git push --force-with-lease`). \
+            "commit.gpgsign is on, but commit(s) {} on this branch since its cut {short_cut} \
+             are unsigned or carry a bad signature. Re-sign them (e.g. `git rebase --exec 'git \
+             commit --amend --no-edit -S' {short_cut}` then `git push --force-with-lease`). \
              If signing fails in your environment, return verdict impossible with the signing \
              error; never bypass with -c commit.gpgsign=false, --no-gpg-sign, or by changing \
              git config.",
@@ -1366,11 +1347,11 @@ pub fn run_issue(
         .as_ref()
         .and_then(|s| s.invocation_artifacts.clone());
     let mut recovered_outcome = None;
-    // The signing policy before any dispatch or recovery, so an agent that
-    // turns it off mid-dispatch is still held to it. For an outcome recovered
-    // after a controller crash this read happens after the crashed dispatch,
-    // so a policy it disabled is not seen: an accepted limitation.
-    let policy_at_start = signing_policy(&worktree.path).unwrap_or(true);
+    // Record a signing policy that is on before any dispatch or recovery, so
+    // an agent that turns it off is still held to it, in this run and every
+    // later one. A policy a crashed dispatch disabled before any run or
+    // `ensure_worktree` saw it on is not caught: an accepted limitation.
+    worktree::record_signing_policy(&worktree.path, &worktree.branch)?;
     if let Some(state) = existing_state
         .as_ref()
         .filter(|_| config.implementer.recovers_invocations())
@@ -1802,13 +1783,11 @@ pub fn run_issue(
 
         // Every harness: a `met` whose branch holds commits that bypassed the
         // signing policy is a failed attempt, and the reason reaches the next
-        // turn as `why_failed`. The whole branch is checked, not just this
-        // dispatch's commits, so an earlier bypass cannot be waved through by
-        // a later `met` that adds nothing.
+        // turn as `why_failed`. Every commit the branch added since its cut is
+        // checked, not just this dispatch's, so an earlier bypass cannot be
+        // waved through by a later `met` that adds nothing.
         if outcome.is_met() {
-            if let Some(violation) =
-                signing_violation(&worktree.path, &worktree.base, policy_at_start)
-            {
+            if let Some(violation) = signing_violation(worktree) {
                 outcome.verdict = Some(Verdict::NotMet);
                 outcome.reason = Some(match outcome.reason.take() {
                     Some(original) if !original.trim().is_empty() => format!(
@@ -3407,7 +3386,7 @@ sleep 0.5
             path: path.clone(),
             branch: worktree::branch_name(&issue()),
             created: true,
-            base: git_in(&path, &["rev-parse", "HEAD"]),
+            cut: git_in(&path, &["rev-parse", "HEAD"]),
             quarantined_from: None,
         };
         (dir, wt)
@@ -3456,7 +3435,7 @@ sleep 0.5
         let (_dir, wt) = fixture_worktree(); // commit.gpgsign pinned false
         commit_in(&wt.path, "a", &[]);
         commit_in(&wt.path, "b", &[]);
-        assert_eq!(signing_violation(&wt.path, &wt.base, false), None);
+        assert_eq!(signing_violation(&wt), None);
     }
 
     #[test]
@@ -3465,9 +3444,9 @@ sleep 0.5
         // Turn the policy on *after* the base, as an operator's global config would.
         git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
         let bypass = commit_in(&wt.path, "b", &["-c", "commit.gpgsign=false"]);
-        let violation = signing_violation(&wt.path, &wt.base, true).unwrap();
+        let violation = signing_violation(&wt).unwrap();
         assert!(violation.contains(&bypass[..12]), "got: {violation}");
-        assert!(violation.contains(&wt.base[..12]), "got: {violation}");
+        assert!(violation.contains(&wt.cut[..12]), "got: {violation}");
         assert!(violation.contains("impossible"), "got: {violation}");
         assert!(
             violation.contains("commit.gpgsign=false"),
@@ -3479,44 +3458,19 @@ sleep 0.5
     fn a_policy_that_cannot_be_read_fails_closed_with_gits_complaint() {
         let (_dir, wt) = fixture_worktree();
         git_in(&wt.path, &["config", "commit.gpgsign", "maybe"]);
-        let violation = signing_violation(&wt.path, &wt.base, false).unwrap();
+        let violation = signing_violation(&wt).unwrap();
         assert!(violation.contains("could not be read"), "got: {violation}");
         assert!(violation.contains("maybe"), "got: {violation}");
     }
 
     #[test]
-    fn an_unresolvable_branch_base_fails_closed_when_the_policy_is_on() {
-        let (_dir, wt) = fixture_worktree();
+    fn an_unreadable_cut_fails_closed_when_the_policy_is_on() {
+        let (_dir, mut wt) = fixture_worktree();
+        wt.cut = "0".repeat(40);
         git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
-        let violation = signing_violation(&wt.path, "no-such-base", true).unwrap();
+        let violation = signing_violation(&wt).unwrap();
         assert!(
-            violation.contains("cannot determine the branch base `no-such-base`"),
-            "got: {violation}"
-        );
-    }
-
-    #[test]
-    fn upstream_commits_merged_into_the_branch_are_not_blamed_on_the_dispatch() {
-        let (_dir, wt) = fixture_worktree();
-        git_in(&wt.path, &["checkout", "-q", "-b", "issue"]);
-        git_in(&wt.path, &["checkout", "-q", "main"]);
-        // An unsigned commit lands upstream, then the issue branch takes it.
-        let upstream = commit_in(&wt.path, "upstream", &[]);
-        git_in(&wt.path, &["checkout", "-q", "issue"]);
-        git_in(&wt.path, &["merge", "-q", "--ff-only", "main"]);
-        git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
-        assert_eq!(signing_violation(&wt.path, "main", true), None);
-        // The dispatch's own unsigned commit is still caught, alone.
-        let own = commit_in(&wt.path, "own", &["-c", "commit.gpgsign=false"]);
-        let violation = signing_violation(&wt.path, "main", true).unwrap();
-        assert!(violation.contains(&own[..12]), "got: {violation}");
-        // The upstream commit is the merge-base, not a blamed commit.
-        assert!(
-            violation.contains(&format!(
-                "commit(s) {} on this branch since {}",
-                &own[..12],
-                &upstream[..12]
-            )),
+            violation.contains("signatures could not be read"),
             "got: {violation}"
         );
     }
@@ -3558,11 +3512,7 @@ sleep 0.5
             commit_in(&wt.path, "signed", &[]);
             let status = git_in(&wt.path, &["log", "-1", "--format=%G?"]);
             assert_eq!(status, expected, "listed={listed}");
-            assert_eq!(
-                signing_violation(&wt.path, &wt.base, true),
-                None,
-                "listed={listed}"
-            );
+            assert_eq!(signing_violation(&wt), None, "listed={listed}");
         }
     }
 
@@ -3619,7 +3569,7 @@ sleep 0.5
         let db = approved_db();
         let (_dir, mut wt) = fixture_worktree();
         // The branch is cut after this unsigned commit, so it is the base's.
-        wt.base = commit_in(&wt.path, "old", &[]);
+        wt.cut = commit_in(&wt.path, "old", &[]);
         git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
         let mut dispatcher = CommitThenMet(|_: &Path| {});
         let run = run_issue(&db, &issue(), &brief(), &wt, &config(), &mut dispatcher).unwrap();
@@ -3644,7 +3594,7 @@ sleep 0.5
         );
         let reason = run.dispatches[0].reason.as_deref().unwrap();
         assert!(
-            reason.contains("turned off during the dispatch"),
+            reason.contains("turned off on this branch"),
             "got: {reason}"
         );
         assert!(reason.contains("--unset commit.gpgsign"), "got: {reason}");
@@ -3670,6 +3620,194 @@ sleep 0.5
             .as_deref()
             .unwrap()
             .contains("unsigned"));
+    }
+
+    /// The short shas a violation blames, from its `commit(s) a, b on` list.
+    fn blamed(violation: &str) -> std::collections::BTreeSet<String> {
+        let list = violation
+            .split_once("commit(s) ")
+            .and_then(|(_, rest)| rest.split_once(" on this branch"))
+            .map_or("", |(list, _)| list);
+        list.split(", ").map(str::to_string).collect()
+    }
+
+    fn short(sha: &str) -> String {
+        sha[..12].to_string()
+    }
+
+    /// An operator checkout under `dir`, pinned against the global config,
+    /// with a bare `origin` it has pushed `main` to.
+    fn operator_checkout(dir: &Path) -> std::path::PathBuf {
+        let origin = dir.join("origin.git");
+        let checkout = dir.join("checkout");
+        std::fs::create_dir_all(&origin).unwrap();
+        std::fs::create_dir_all(&checkout).unwrap();
+        git_in(&origin, &["init", "-q", "--bare", "--initial-branch=main"]);
+        for args in [
+            vec!["init", "-q", "--initial-branch=main"],
+            vec!["config", "user.email", "autopilot@example.test"],
+            vec!["config", "user.name", "Autopilot Test"],
+            vec!["config", "commit.gpgsign", "false"],
+            vec!["config", "core.hooksPath", "/dev/null"],
+        ] {
+            git_in(&checkout, &args);
+        }
+        commit_in(&checkout, "seed", &[]);
+        git_in(
+            &checkout,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        git_in(&checkout, &["push", "-q", "-u", "origin", "main"]);
+        checkout
+    }
+
+    /// The issue's real worktree, cut from the operator checkout's `HEAD`.
+    fn remote_fixture() -> (tempfile::TempDir, Worktree) {
+        let dir = tempfile::tempdir().unwrap();
+        let checkout = operator_checkout(dir.path());
+        let wt = worktree::ensure_worktree(&checkout, &dir.path().join("trees"), &issue(), "HEAD")
+            .unwrap();
+        (dir, wt)
+    }
+
+    /// Someone else lands an unsigned commit on `origin/main`; returns it.
+    fn push_upstream_commit(dir: &Path) -> String {
+        let upstream = dir.join("upstream");
+        let origin = dir.join("origin.git");
+        git_in(
+            dir,
+            &[
+                "clone",
+                "-q",
+                origin.to_str().unwrap(),
+                upstream.to_str().unwrap(),
+            ],
+        );
+        for args in [
+            vec!["config", "user.email", "upstream@example.test"],
+            vec!["config", "user.name", "Upstream"],
+            vec!["config", "commit.gpgsign", "false"],
+            vec!["config", "core.hooksPath", "/dev/null"],
+        ] {
+            git_in(&upstream, &args);
+        }
+        let sha = commit_in(&upstream, "upstream", &[]);
+        git_in(&upstream, &["push", "-q", "origin", "main"]);
+        sha
+    }
+
+    #[test]
+    fn upstream_commits_merged_in_from_the_remote_are_not_blamed() {
+        let (dir, wt) = remote_fixture();
+        let agent1 = commit_in(&wt.path, "agent1", &[]);
+        git_in(&wt.path, &["push", "-q", "origin", &wt.branch]);
+        let upstream = push_upstream_commit(dir.path());
+        git_in(&wt.path, &["fetch", "-q", "origin"]);
+        git_in(&wt.path, &["merge", "-q", "--no-edit", "origin/main"]);
+        let merge = git_in(&wt.path, &["rev-parse", "HEAD"]);
+        let agent2 = commit_in(&wt.path, "agent2", &[]);
+        git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
+        let violation = signing_violation(&wt).unwrap();
+        assert_eq!(
+            blamed(&violation),
+            [short(&agent1), short(&merge), short(&agent2)].into(),
+            "only the agent's commits, never upstream {}: {violation}",
+            short(&upstream)
+        );
+    }
+
+    #[test]
+    fn upstream_commits_rebased_onto_from_the_remote_are_not_blamed() {
+        let (dir, wt) = remote_fixture();
+        commit_in(&wt.path, "agent1", &[]);
+        git_in(&wt.path, &["push", "-q", "origin", &wt.branch]);
+        let upstream = push_upstream_commit(dir.path());
+        git_in(&wt.path, &["fetch", "-q", "origin"]);
+        git_in(&wt.path, &["rebase", "-q", "origin/main"]);
+        let rebased = git_in(&wt.path, &["rev-parse", "HEAD"]);
+        let agent2 = commit_in(&wt.path, "agent2", &[]);
+        git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
+        let violation = signing_violation(&wt).unwrap();
+        assert_eq!(
+            blamed(&violation),
+            [short(&rebased), short(&agent2)].into(),
+            "only the agent's commits, never upstream {}: {violation}",
+            short(&upstream)
+        );
+    }
+
+    #[test]
+    fn a_pushed_unsigned_commit_from_an_earlier_dispatch_still_fails_a_later_met() {
+        let db = approved_db();
+        let (_dir, wt) = remote_fixture();
+        git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
+        let branch = wt.branch.clone();
+        let mut calls = 0;
+        let mut first = String::new();
+        let mut dispatcher = CommitThenMet(|path: &Path| {
+            calls += 1;
+            if calls == 1 {
+                first = commit_in(path, "work", &["-c", "commit.gpgsign=false"]);
+                git_in(path, &["push", "-q", "origin", &branch]);
+            }
+        });
+        let mut c = config();
+        c.attempt_cap = 2;
+        let run = run_issue(&db, &issue(), &brief(), &wt, &c, &mut dispatcher).unwrap();
+        assert_eq!(run.dispatches.len(), 2);
+        for d in &run.dispatches {
+            assert_eq!(d.classification, DispatchClassification::FailedAttempt);
+            assert!(d.reason.as_deref().unwrap().contains(&first[..12]));
+        }
+    }
+
+    #[test]
+    fn a_policy_turned_off_in_an_earlier_run_still_fails_a_later_met() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
+        let mut first = CommitThenMet(|path: &Path| {
+            git_in(path, &["config", "commit.gpgsign", "false"]);
+        });
+        let mut c = config();
+        c.attempt_cap = 1;
+        run_issue(&db, &issue(), &brief(), &wt, &c, &mut first).unwrap();
+        // A fresh run reads the policy as off; the branch remembers it was on.
+        let mut second = CommitThenMet(|path: &Path| {
+            commit_in(path, "work", &[]);
+        });
+        c.attempt_cap = 2;
+        let run = run_issue(&db, &issue(), &brief(), &wt, &c, &mut second).unwrap();
+        assert_eq!(run.dispatches.len(), 1);
+        assert_eq!(
+            run.dispatches[0].classification,
+            DispatchClassification::FailedAttempt
+        );
+        let reason = run.dispatches[0].reason.as_deref().unwrap();
+        assert!(
+            reason.contains("turned off on this branch"),
+            "got: {reason}"
+        );
+    }
+
+    #[test]
+    fn a_policy_that_was_never_on_is_not_enforced_and_leaves_no_flag() {
+        let db = approved_db();
+        let (_dir, wt) = remote_fixture(); // commit.gpgsign pinned false
+        let mut dispatcher = CommitThenMet(|path: &Path| {
+            commit_in(path, "work", &[]);
+        });
+        let run = run_issue(&db, &issue(), &brief(), &wt, &config(), &mut dispatcher).unwrap();
+        assert!(matches!(run.terminal, TerminalReason::Met { .. }));
+        let mut c = std::process::Command::new("git");
+        crate::mcp::tools::scrub_git_environment(&mut c);
+        let key = format!("branch.{}.ironmemSigning", wt.branch);
+        let out = c
+            .args(["config", "--get", &key])
+            .current_dir(&wt.path)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1), "no flag may be recorded");
     }
 
     // ── config validation ───────────────────────────────────────────────
