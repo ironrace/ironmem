@@ -741,10 +741,33 @@ impl CliDispatcher {
     }
 }
 
+/// A directory holding an executable `name`, and that directory spelled as a
+/// PATH entry relative to this process's working directory: the repository
+/// file a relative entry would reach.
+#[cfg(test)]
+pub(crate) fn planted_relative_path_entry(
+    name: &str,
+) -> (tempfile::TempDir, std::path::PathBuf) {
+    let planted = tempfile::tempdir().unwrap();
+    let bin = planted.path().join(name);
+    std::fs::write(&bin, "#!/bin/sh\nsleep 1\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let cwd = std::env::current_dir().unwrap();
+    let up = "../".repeat(cwd.components().count().saturating_sub(1));
+    let relative = Path::new(&up).join(planted.path().strip_prefix("/").unwrap());
+    assert!(relative.join(name).exists());
+    (planted, relative)
+}
+
 /// `name` on `path_var`, skipping relative entries. A supervised harness is
 /// spawned in the issue worktree, where a relative entry such as `.` would
-/// resolve to a file in the repository being worked on.
-fn find_launcher(
+/// resolve to a file in the repository being worked on. The Claude
+/// implementer and the reviewers resolve through it for the same reason.
+pub(crate) fn find_launcher(
     name: &str,
     path_var: &std::ffi::OsStr,
 ) -> Result<std::path::PathBuf, MemoryError> {

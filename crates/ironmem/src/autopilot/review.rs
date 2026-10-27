@@ -497,13 +497,29 @@ fn find_total_token_usage(value: &serde_json::Value) -> Option<ReviewTokenUsage>
 /// validation — the spec's *Reuse* section: "this is what makes a Codex
 /// reviewer nearly free".
 pub fn resolve_codex_binary() -> Result<PathBuf, MemoryError> {
-    crate::launcher::find_on_path(crate::launcher::Harness::Codex.binary())
+    reviewer_binary_in(
+        crate::launcher::Harness::Codex,
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )
 }
 
 /// Resolve `muse` on `PATH`, through the harness registry rather than a
 /// literal — the registry is the single place a harness's binary name lives.
 pub fn resolve_muse_binary() -> Result<PathBuf, MemoryError> {
-    crate::launcher::find_on_path(crate::launcher::Harness::Muse.binary())
+    reviewer_binary_in(
+        crate::launcher::Harness::Muse,
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )
+}
+
+/// `harness`'s binary on `path_var`, skipping relative entries: a review
+/// runs in the PR's checkout, where a relative entry such as `.` would reach
+/// a file in the repository under review.
+fn reviewer_binary_in(
+    harness: crate::launcher::Harness,
+    path_var: &std::ffi::OsStr,
+) -> Result<PathBuf, MemoryError> {
+    super::run::find_launcher(harness.binary(), path_var)
 }
 
 /// A scratch directory holding the schema and last-message files for one
@@ -1892,6 +1908,19 @@ pub fn review_pr(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_reviewer_binary_is_never_found_through_a_relative_path_entry() {
+        for harness in [
+            crate::launcher::Harness::Codex,
+            crate::launcher::Harness::Muse,
+        ] {
+            let (_planted, relative) =
+                super::super::run::planted_relative_path_entry(harness.binary());
+            let err = reviewer_binary_in(harness, relative.as_os_str()).unwrap_err();
+            assert!(matches!(err, MemoryError::NotFound(_)), "{err}");
+        }
+    }
 
     // ── risk classes ────────────────────────────────────────────────────
 

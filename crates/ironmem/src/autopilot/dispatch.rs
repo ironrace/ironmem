@@ -313,7 +313,14 @@ pub fn parse_dispatch_output(stdout: &str) -> Result<DispatchOutcome, MemoryErro
 /// validation (the spec's *Reuse* section: "`launcher` validates the
 /// assistant binary ... this is what makes a Codex reviewer nearly free").
 pub fn resolve_claude_binary() -> Result<std::path::PathBuf, MemoryError> {
-    crate::launcher::find_on_path(crate::launcher::Harness::Claude.binary())
+    claude_binary_in(&std::env::var_os("PATH").unwrap_or_default())
+}
+
+/// `claude` on `path_var`, skipping relative entries: a dispatch runs in the
+/// issue worktree, where a relative entry such as `.` would reach a file in
+/// the repository being worked on.
+fn claude_binary_in(path_var: &std::ffi::OsStr) -> Result<std::path::PathBuf, MemoryError> {
+    super::run::find_launcher(crate::launcher::Harness::Claude.binary(), path_var)
 }
 
 /// Run one IC dispatch: spawn `bin` with `spec`'s argv, in `repo`, capturing
@@ -607,6 +614,13 @@ fn finish_dispatch(output: std::process::Output) -> Result<DispatchOutcome, Memo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_claude_binary_is_never_found_through_a_relative_path_entry() {
+        let (_planted, relative) = super::super::run::planted_relative_path_entry("claude");
+        let err = claude_binary_in(relative.as_os_str()).unwrap_err();
+        assert!(matches!(err, MemoryError::NotFound(_)), "{err}");
+    }
 
     fn sample_spec(session: SessionMode) -> DispatchSpec {
         DispatchSpec {
