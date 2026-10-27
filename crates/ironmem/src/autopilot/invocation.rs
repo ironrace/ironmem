@@ -2661,7 +2661,17 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
     fn post_exit_artifact_overflow_kills_the_surviving_gate_process() {
         use std::os::unix::process::CommandExt;
 
+        /// Releases the gate however the test ends: a gate cleanup missed
+        /// then marks its survival and exits by itself, so no fixture leaks
+        /// and no group is ever signalled after its leader is reaped.
+        struct Release(std::path::PathBuf);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                let _ = std::fs::write(&self.0, "release");
+            }
+        }
         let (dir, s) = setup();
+        let _release = Release(dir.path().join("gate-release"));
         let a = s.invocation_artifacts.as_ref().unwrap();
         let script = format!(
             "(touch descendant-ready; while [ ! -f gate-release ]; do sleep 0.02; done; touch descendant-survived) &\n\
@@ -2695,17 +2705,17 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
         let previous_limit = limits(&CodexCli, a);
         assert_eq!(previous_limit, None);
         std::fs::write(dir.path().join("root-release"), "release").unwrap();
-        let status = loop {
-            if let Some(status) = child.try_wait().unwrap() {
-                break status;
-            }
-            if started.elapsed() >= Duration::from_secs(3) {
+        // Detect the exit without reaping, so the group can still be killed
+        // safely if the root hangs; reap only once it has exited.
+        while !crate::autopilot::dispatch::exited_unreaped(&mut child).unwrap() {
+            if started.elapsed() >= Duration::from_secs(30) {
                 crate::autopilot::dispatch::kill_process_group(&mut child);
                 let _ = child.wait();
                 panic!("root did not finish writing the oversized artifact");
             }
             std::thread::sleep(Duration::from_millis(5));
-        };
+        }
+        let status = child.wait().unwrap();
         assert!(status.success());
         assert!(limits(&CodexCli, a).is_some());
         let outcome = finish_supervised(
@@ -2738,8 +2748,6 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
         while !survived.exists() && released.elapsed() < Duration::from_millis(300) {
             std::thread::sleep(Duration::from_millis(5));
         }
-        // Also clean up on red, before asserting, to avoid leaking fixtures.
-        crate::autopilot::dispatch::kill_process_group(&mut child);
         assert!(
             !survived.exists(),
             "post-exit overflow left the gate process alive"
