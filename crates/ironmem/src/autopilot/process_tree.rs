@@ -1,4 +1,4 @@
-//! Local process evidence for Codex invocations. Missing evidence means unknown.
+//! Local process evidence for supervised CLI invocations (Codex, Muse). Missing evidence means unknown.
 //!
 //! Restart adoption verifies the native Codex root's exact invocation marker.
 //! A launcher wrapper whose marker appears only on a different native child
@@ -35,8 +35,9 @@ impl ProcessRow {
     /// An unparseable prefix is ambiguous only when the row could carry an
     /// Autopilot marker at all. Every marker is a whitespace-free absolute
     /// path to a `schema.json` (artifact paths refuse whitespace), so a row
-    /// with no such word is someone else's `codex exec`, and holding every
-    /// Codex dispatch on it would let any unrelated session stall Autopilot.
+    /// with no such word is someone else's `codex exec` or `muse exec`, and
+    /// holding every dispatch on it would let any unrelated session stall
+    /// Autopilot.
     pub fn marker(&self) -> Result<Option<&str>, String> {
         self.parse_marker().or_else(|reason| {
             if self.args.split_whitespace().any(|word| {
@@ -53,13 +54,17 @@ impl ProcessRow {
 
     fn parse_marker(&self) -> Result<Option<&str>, String> {
         let mut args = self.args.split_whitespace();
-        if args
+        let Some(exe) = args
             .next()
             .and_then(|a| Path::new(a).file_name())
             .and_then(|a| a.to_str())
-            != Some("codex")
-            || args.next() != Some("exec")
-        {
+        else {
+            return Ok(None);
+        };
+        let codex = exe == "codex";
+        // The launcher `exec`s `muse-bin-<version>` under the same PID.
+        let muse = exe == "muse" || exe.starts_with("muse-bin-");
+        if !(codex || muse) || args.next() != Some("exec") {
             return Ok(None);
         }
         if !args
@@ -68,52 +73,147 @@ impl ProcessRow {
         {
             return Ok(None);
         }
-        let mut words = args.peekable();
-        if words.peek() == Some(&"resume") {
-            words.next();
+        if codex {
+            parse_codex_options(args)
+        } else {
+            parse_muse_options(args)
         }
-        let mut marker = None;
-        while let Some(word) = words.next() {
-            match word {
-                "--output-schema" => {
-                    let path = words
-                        .next()
-                        .ok_or("Codex output-schema option has no path")?;
-                    if !Path::new(path).is_absolute() || marker.replace(path).is_some() {
-                        return Err("ambiguous Codex output-schema marker".into());
-                    }
-                }
-                "--json"
-                | "--dangerously-bypass-approvals-and-sandbox"
-                | "--dangerously-bypass-hook-trust"
-                | "--skip-git-repo-check"
-                | "--full-auto"
-                | "--ephemeral" => {}
-                "-o"
-                | "--output-last-message"
-                | "-C"
-                | "--cd"
-                | "-m"
-                | "--model"
-                | "-c"
-                | "--config"
-                | "-s"
-                | "--sandbox"
-                | "--color"
-                | "--add-dir"
-                | "--image"
-                | "-i" => {
-                    words.next().ok_or("Codex option has no value")?;
-                }
-                "--" => break,
-                other if other.starts_with('-') => {
-                    return Err("unrecognized Codex option before prompt".into())
-                }
-                _ => break,
-            }
-        }
-        Ok(marker)
     }
+}
+
+fn parse_codex_options<'a>(args: impl Iterator<Item = &'a str>) -> Result<Option<&'a str>, String> {
+    let mut words = args.peekable();
+    if words.peek() == Some(&"resume") {
+        words.next();
+    }
+    let mut marker = None;
+    while let Some(word) = words.next() {
+        match word {
+            "--output-schema" => {
+                let path = words
+                    .next()
+                    .ok_or("Codex output-schema option has no path")?;
+                if !Path::new(path).is_absolute() || marker.replace(path).is_some() {
+                    return Err("ambiguous Codex output-schema marker".into());
+                }
+            }
+            "--json"
+            | "--dangerously-bypass-approvals-and-sandbox"
+            | "--dangerously-bypass-hook-trust"
+            | "--skip-git-repo-check"
+            | "--full-auto"
+            | "--ephemeral" => {}
+            "-o"
+            | "--output-last-message"
+            | "-C"
+            | "--cd"
+            | "-m"
+            | "--model"
+            | "-c"
+            | "--config"
+            | "-s"
+            | "--sandbox"
+            | "--color"
+            | "--add-dir"
+            | "--image"
+            | "-i" => {
+                words.next().ok_or("Codex option has no value")?;
+            }
+            "--" => break,
+            other if other.starts_with('-') => {
+                return Err("unrecognized Codex option before prompt".into())
+            }
+            _ => break,
+        }
+    }
+    Ok(marker)
+}
+
+/// `muse exec` options measured on 1.4.13 (`muse exec --help`). Autopilot
+/// passes the prompt with `--prompt-file`, so its own rows have no positional
+/// word; any positional makes the rest unparseable.
+const MUSE_FLAGS: &[&str] = &[
+    "--json",
+    "--api-key-stdin",
+    "--parallel-tool-calls",
+    "--no-parallel-tool-calls",
+    "--allow-workspace-switch",
+    "--user-input-auto-resolve",
+    "--subagent-worktree-isolation",
+    "--disable-web-tools",
+    "--disable-reminders",
+    "--disable-request-user-input",
+    "--no-foreign-personal-context",
+    "--no-session-log",
+    "--yolo",
+    "--trust-workspace",
+    "--disable-approval",
+    "--disable-sandbox",
+    "--disable-write",
+    "--disable-shell",
+    "--enable-shell-tool",
+];
+const MUSE_VALUED: &[&str] = &[
+    "--prompt-file",
+    "--provider",
+    "--preset",
+    "--permission-profile",
+    "--model",
+    "--contributor-mode",
+    "-c",
+    "--config",
+    "--reasoning-effort",
+    "--effort",
+    "--base-url",
+    "--image",
+    "--workspace",
+    "--worktree-base",
+    "--worktree-existing",
+    "--context-compaction-strategy",
+    "--context-compaction-soft-threshold",
+    "--context-compaction-hard-threshold",
+    "--max-model-steps",
+    "--max-tool-output-bytes",
+    "--session-id",
+    "--approval-mode",
+    "--approval-judge",
+    "--sandbox-network",
+];
+
+fn parse_muse_options<'a>(
+    mut words: impl Iterator<Item = &'a str>,
+) -> Result<Option<&'a str>, String> {
+    let mut marker = None;
+    let mut take_marker = |path: &'a str| -> Result<(), String> {
+        if !Path::new(path).is_absolute() || marker.replace(path).is_some() {
+            return Err("ambiguous Muse output-schema marker".into());
+        }
+        Ok(())
+    };
+    while let Some(word) = words.next() {
+        if word == "--output-schema" {
+            let path = words
+                .next()
+                .ok_or("Muse output-schema option has no path")?;
+            take_marker(path)?;
+        } else if let Some(path) = word.strip_prefix("--output-schema=") {
+            take_marker(path)?;
+        } else if MUSE_FLAGS.contains(&word) {
+        } else if MUSE_VALUED.contains(&word) {
+            words.next().ok_or("Muse option has no value")?;
+        } else if word
+            .split_once('=')
+            .is_some_and(|(name, _)| MUSE_VALUED.contains(&name))
+        {
+        } else if word == "-w" || word == "--worktree" || word.starts_with("--worktree=") {
+            return Err("Muse --worktree takes an optional value; the argv is ambiguous".into());
+        } else if word.starts_with('-') {
+            return Err("unrecognized Muse option".into());
+        } else {
+            return Err("Muse argv carries a positional prompt; its options are ambiguous".into());
+        }
+    }
+    Ok(marker)
 }
 
 /// Any same-user process may carry non-UTF-8 argv, and ps prints it raw.
@@ -1127,6 +1227,101 @@ mod tests {
         )
         .is_err());
         assert!(marker("codex exec --output-schema=/x/schema.json --profile w p").is_err());
+    }
+    fn row(args: &str) -> ProcessRow {
+        ProcessRow {
+            pid: 10,
+            ppid: 1,
+            pgid: 10,
+            stat: "S".into(),
+            args: args.into(),
+        }
+    }
+    /// Measured on Muse Code 1.4.13-R6996.1, scratch paths shortened.
+    const MUSE_ROOT: &str = "/Users/o/.local/bin/muse-bin-1.4.13-R6996.1 exec --json \
+        --session-id 934331e6-2c8a-4e0f-bcd6-0b6300000000 \
+        --output-schema /r/.git/ironmem/autopilot/o-r-7/0f0e0d0c-0b0a-4908-8706-050403020100/schema.json \
+        --prompt-file /r/.git/ironmem/autopilot/o-r-7/0f0e0d0c-0b0a-4908-8706-050403020100/prompt.md \
+        --model muse-wonder-1.0 --max-model-steps 300 --workspace /w/o-r-7 \
+        --approval-mode never --disable-sandbox --trust-workspace \
+        --no-foreign-personal-context --disable-request-user-input";
+    #[test]
+    fn a_muse_root_yields_its_exact_schema_marker() {
+        assert_eq!(
+            row(MUSE_ROOT).marker().unwrap(),
+            Some(
+                "/r/.git/ironmem/autopilot/o-r-7/0f0e0d0c-0b0a-4908-8706-050403020100/schema.json"
+            )
+        );
+        // The launcher name, before it execs the versioned binary, parses the same.
+        let launcher = MUSE_ROOT.replacen(
+            "/Users/o/.local/bin/muse-bin-1.4.13-R6996.1",
+            "/Users/o/.local/bin/muse",
+            1,
+        );
+        assert!(row(&launcher).marker().unwrap().is_some());
+        let equals = MUSE_ROOT.replacen("--output-schema /", "--output-schema=/", 1);
+        assert!(row(&equals).marker().unwrap().is_some());
+    }
+    #[test]
+    fn non_root_muse_rows_are_not_markers() {
+        // The bash launcher phase: the executable is bash, not Muse.
+        assert_eq!(
+            row(&format!(
+                "bash {}",
+                MUSE_ROOT.replacen("muse-bin-1.4.13-R6996.1", "muse", 1)
+            ))
+            .marker()
+            .unwrap(),
+            None
+        );
+        // The Muse reviewer passes no --output-schema.
+        assert_eq!(
+            row("/u/muse-bin-1.4.13-R6996.1 exec --json --approval-mode never --disable-write --sandbox-network restricted --no-session-log --workspace /r --prompt-file /tmp/p.md")
+                .marker()
+                .unwrap(),
+            None
+        );
+        // A tool shell that merely mentions the path.
+        assert_eq!(
+            row("/bin/sh -c cat /r/.git/ironmem/autopilot/o-r-7/x/schema.json")
+                .marker()
+                .unwrap(),
+            None
+        );
+        // Not `exec`.
+        assert_eq!(
+            row("/u/muse-bin-1.4.13-R6996.1 resume --last")
+                .marker()
+                .unwrap(),
+            None
+        );
+    }
+    #[test]
+    fn an_ambiguous_muse_root_with_a_schema_word_is_an_error() {
+        // A positional prompt: later words could be options or prompt text.
+        assert!(row(&format!("{MUSE_ROOT} fix the bug")).marker().is_err());
+        // An option this grammar does not know.
+        assert!(
+            row(&MUSE_ROOT.replacen("--disable-sandbox", "--brand-new-flag", 1))
+                .marker()
+                .is_err()
+        );
+        // `-w` takes an optional value, so the next word's role is unknowable.
+        assert!(row(&MUSE_ROOT.replacen("--disable-sandbox", "-w", 1))
+            .marker()
+            .is_err());
+        // Two markers.
+        assert!(row(&format!("{MUSE_ROOT} --output-schema /x/schema.json"))
+            .marker()
+            .is_err());
+        // The same ambiguity without any schema.json word is someone else's run.
+        assert_eq!(
+            row("/u/muse-bin-1.4.13-R6996.1 exec --output-schema /tmp/other.json hello")
+                .marker()
+                .unwrap(),
+            None
+        );
     }
     #[test]
     fn unobserved_history_and_live_descendants_cannot_be_restarted() {
