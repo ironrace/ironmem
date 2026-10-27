@@ -68,7 +68,10 @@ fn base_env(cmd: &mut Command, home: &Path, db_path: &Path) {
         .env("IRONMEM_DB_PATH", db_path)
         .env("IRONMEM_EMBED_MODE", "noop")
         .env("IRONMEM_MCP_MODE", "trusted")
-        .env("IRONMEM_AUTO_BOOTSTRAP", "0");
+        .env("IRONMEM_AUTO_BOOTSTRAP", "0")
+        // Some steps expect an autospawned successor daemon; an operator's
+        // exported opt-out must not turn autospawn off.
+        .env_remove("IRONMEM_NO_DAEMON");
 }
 
 /// Run one `initialize` request through a piped-stdio child, returning the

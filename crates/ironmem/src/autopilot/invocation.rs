@@ -13,7 +13,6 @@ use crate::autopilot::dispatch::{DispatchOutcome, DispatchSpec, Verdict};
 use crate::autopilot::implementer::Implementer;
 use crate::autopilot::scrub::scrub_and_bound;
 use crate::autopilot::IssueRef;
-use crate::config::NO_DAEMON_ENV;
 use crate::error::MemoryError;
 
 pub const VERDICT_JSON_SCHEMA: &str = super::dispatch::IC_VERDICT_JSON_SCHEMA;
@@ -501,19 +500,6 @@ fn run_supervised_bounded_with(
     // checkout, rather than a controller's inherited repository-selection
     // overrides.
     crate::mcp::tools::scrub_git_environment(&mut command);
-    // The harness starts the operator's MCP servers, among them
-    // `ironmem serve --connect`. With no daemon listening, that proxy
-    // autospawns the shared daemon as its own child, under this root. The
-    // process tracker never owns that daemon (see
-    // `ProcessRow::is_shared_ironmem_daemon`); that is the guarantee, for
-    // every harness. This variable is only a first line of defence, for a
-    // harness that passes its environment on to MCP servers (Muse, as far
-    // as is known): with it, the proxy connects to a running daemon or
-    // serves in-process and never spawns one. Codex clears its MCP
-    // servers' environment, so its proxies never see it.
-    // Set last, after the harness's `env()` and the git scrub (which removes
-    // only `GIT_*`), so nothing a harness supplies can turn autospawn back on.
-    command.env(NO_DAEMON_ENV, "1");
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -1690,12 +1676,7 @@ exit {code}"#
         prepare_fails: bool,
     }
 
-    /// The `IRONMEM_NO_DAEMON=0` entry is a harness trying to re-enable the
-    /// daemon autospawn; the core's own setting must win over it.
-    const FAKE_ENV: &[(&str, &str)] = &[
-        ("IRONMEM_FAKE_HARNESS_ENV", "from-env"),
-        (NO_DAEMON_ENV, "0"),
-    ];
+    const FAKE_ENV: &[(&str, &str)] = &[("IRONMEM_FAKE_HARNESS_ENV", "from-env")];
 
     fn fake_prompt(a: &InvocationArtifacts) -> std::path::PathBuf {
         Path::new(&a.schema_path).with_file_name("prompt.txt")
@@ -1820,30 +1801,29 @@ exit {code}"#
         );
     }
 
-    /// Every supervised child is told not to autospawn the shared daemon,
-    /// which helps a harness that passes its environment on to its MCP
-    /// servers, and a harness's own env cannot turn it back on. (The
-    /// guarantee for every harness is the tracker never owning the daemon:
-    /// see `cleanup_leaves_a_shared_daemon_the_harness_autospawned_running`.)
+    /// The core adds nothing to the agent's environment that changes how
+    /// ironmem itself behaves. An `IRONMEM_NO_DAEMON` there would reach the
+    /// agent's own shell, and an Autopilot run on an ironmem issue would then
+    /// fail the daemon autospawn tests it is asked to keep green. Keeping
+    /// the shared daemon alive is the tracker's job instead (see
+    /// `cleanup_leaves_a_shared_daemon_the_harness_autospawned_running`).
     #[cfg(unix)]
     #[test]
-    fn a_supervised_child_never_autospawns_the_shared_ironmem_daemon() {
+    fn a_supervised_child_gets_no_daemon_autospawn_override() {
+        if std::env::var_os("IRONMEM_NO_DAEMON").is_some() {
+            eprintln!("IRONMEM_NO_DAEMON is exported to the test run; skipping");
+            return;
+        }
         let (dir, s) = setup();
         let cli = FakeCli {
             verdict: true,
             native_id: true,
             prepare_fails: false,
         };
-        assert!(
-            cli.env()
-                .iter()
-                .any(|(k, v)| *k == NO_DAEMON_ENV && *v == "0"),
-            "the fake harness must try to override the core's setting"
-        );
         let bin = binary(
             dir.path(),
             &observable(
-                "[ \"$IRONMEM_NO_DAEMON\" = 1 ] || exit 3\n\
+                "[ -z \"${IRONMEM_NO_DAEMON+set}\" ] || exit 3\n\
                  echo journal",
             ),
         );
@@ -1852,10 +1832,9 @@ exit {code}"#
         assert!(o.process_success && o.is_met(), "{o:?}");
     }
 
-    /// Codex clears its MCP servers' environment, so `IRONMEM_NO_DAEMON`
-    /// never reaches an `ironmem serve --connect` it starts, and that proxy
-    /// can still autospawn the shared daemon under the harness. Cleanup must
-    /// leave it running. The fake daemon is `/bin/sh` behind a symlink named
+    /// An `ironmem serve --connect` MCP proxy the harness starts autospawns
+    /// the shared daemon under the harness when none is running. Cleanup
+    /// must leave it running. The fake daemon is `/bin/sh` behind a symlink named
     /// `ironmem` (a copied system binary is killed on macOS), running a
     /// script named `serve` from its own directory, so ps shows the daemon's
     /// exact argv in a session of its own, with a `sleep` child.
