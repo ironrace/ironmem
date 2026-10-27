@@ -355,6 +355,26 @@ pub(crate) fn persist_private_atomic(
     result
 }
 
+/// Record the worktree HEAD an invocation started from, before it spawns, so a
+/// recovered outcome is checked over the same commit range a live one would be.
+pub fn persist_head_before(a: &InvocationArtifacts, sha: &str) -> Result<(), MemoryError> {
+    persist_private_atomic(
+        &Path::new(&a.schema_path).with_file_name("head-before"),
+        "head-before",
+        sha.as_bytes(),
+    )
+}
+
+/// The HEAD [`persist_head_before`] recorded, or `None` when it was never
+/// written or is not a full hex object id.
+pub fn read_head_before(a: &InvocationArtifacts) -> Option<String> {
+    let raw =
+        std::fs::read_to_string(Path::new(&a.schema_path).with_file_name("head-before")).ok()?;
+    let sha = raw.trim();
+    (matches!(sha.len(), 40 | 64) && sha.bytes().all(|b| b.is_ascii_hexdigit()))
+        .then(|| sha.to_string())
+}
+
 fn persist_exit(a: &InvocationArtifacts, record: &ExitRecord) -> Result<(), MemoryError> {
     persist_private_atomic(
         Path::new(&a.exit_path),
@@ -850,6 +870,27 @@ pub fn recover_artifacts(
 mod tests {
     use super::*;
     use crate::autopilot::dispatch::SessionMode;
+
+    #[test]
+    fn head_before_round_trips_and_rejects_anything_but_a_full_hex_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = InvocationArtifacts {
+            invocation_id: "i".into(),
+            schema_path: dir.path().join("schema.json").to_string_lossy().into(),
+            journal_path: String::new(),
+            final_path: String::new(),
+            stderr_path: String::new(),
+            exit_path: String::new(),
+        };
+        assert_eq!(read_head_before(&a), None);
+        let sha = "a".repeat(40);
+        persist_head_before(&a, &sha).unwrap();
+        assert_eq!(read_head_before(&a), Some(sha));
+        persist_head_before(&a, "not-a-sha").unwrap();
+        assert_eq!(read_head_before(&a), None);
+        persist_head_before(&a, &"b".repeat(64)).unwrap();
+        assert_eq!(read_head_before(&a), Some("b".repeat(64)));
+    }
 
     #[test]
     fn claude_has_no_supervised_cli() {

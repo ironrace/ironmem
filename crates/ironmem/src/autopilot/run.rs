@@ -728,6 +728,68 @@ fn head_commit(worktree: &Path) -> Option<String> {
     (!sha.is_empty()).then_some(sha)
 }
 
+/// Why a dispatch's commits break the repository's signing policy, or `None`
+/// when they keep it or there is no policy.
+///
+/// Measured 2026-10-26: Muse's sandboxed shell could not sign (`No user
+/// exists for uid 501`), and the model silently retried with
+/// `-c commit.gpgsign=false`. Any implementer can do that, so this is checked
+/// for every harness. `%G?` is not a reliable signed/unsigned test (it reads
+/// `U` or `N` for a valid SSH signature without `gpg.ssh.allowedSignersFile`),
+/// so presence comes from the commit's `gpgsig` header and `%G?` only flags
+/// `B`, a bad signature. With the policy on, signatures that cannot be read are
+/// a violation: fail closed.
+fn signing_violation(worktree: &Path, since: Option<&str>) -> Option<String> {
+    let git = |args: &[&str]| {
+        let mut command = std::process::Command::new("git");
+        crate::mcp::tools::scrub_git_environment(&mut command);
+        command.args(args).current_dir(worktree).output()
+    };
+    let policy_on = git(&["config", "--bool", "--get", "commit.gpgsign"]).is_ok_and(|out| {
+        out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "true"
+    });
+    if !policy_on {
+        return None;
+    }
+    let range = since.map(|base| format!("{base}..HEAD"));
+    let args: Vec<&str> = match &range {
+        Some(range) => vec!["log", "--format=%H %G?", range.as_str()],
+        None => vec!["log", "-1", "--format=%H %G?", "HEAD"],
+    };
+    let out = match git(&args) {
+        Ok(out) if out.status.success() => out,
+        _ => {
+            return Some(
+                "commit.gpgsign is on, but the dispatch's commit signatures could not be read"
+                    .into(),
+            )
+        }
+    };
+    let mut unsigned = Vec::new();
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let Some((sha, status)) = line.split_once(' ') else {
+            continue;
+        };
+        let has_signature = match git(&["cat-file", "commit", sha]) {
+            Ok(obj) if obj.status.success() => String::from_utf8_lossy(&obj.stdout)
+                .lines()
+                .take_while(|l| !l.is_empty())
+                .any(|l| l.starts_with("gpgsig ") || l.starts_with("gpgsig-sha256 ")),
+            _ => false,
+        };
+        if !has_signature || status == "B" {
+            unsigned.push(sha.chars().take(12).collect::<String>());
+        }
+    }
+    (!unsigned.is_empty()).then(|| {
+        format!(
+            "commit.gpgsign is on, but commit(s) {} are unsigned or carry a bad signature; \
+             sign every commit and never pass -c commit.gpgsign=false or --no-gpg-sign",
+            unsigned.join(", ")
+        )
+    })
+}
+
 /// The prior-attempt context the turn prompt shows the IC, newest-last, so a
 /// resumed dispatch reads what has already been tried before doing anything.
 fn prior_attempts(db: &Database, issue: &IssueRef) -> Result<Vec<PriorAttempt>, MemoryError> {
@@ -808,7 +870,11 @@ fn record_and_advance(
         .as_ref()
         .is_some_and(|attempt| attempt.verdict != record.verdict)
     {
-        let label = recovering_harness.map_or("", Implementer::label);
+        let Some(harness) = recovering_harness else {
+            unreachable!("only a recovering harness looks up an existing ordinal");
+        };
+        debug_assert!(harness.recovers_invocations());
+        let label = harness.label();
         return Err(MemoryError::Validation(format!(
             "recovered {label} verdict conflicts with the already recorded attempt ordinal"
         )));
@@ -1237,6 +1303,13 @@ pub fn run_issue(
         .as_ref()
         .and_then(|s| s.invocation_artifacts.clone());
     let mut recovered_outcome = None;
+    // Read before `recover_invocation` clears the artifacts: the recovered
+    // outcome's commits are checked over the range its invocation started from.
+    let mut recovered_head_before = existing_state
+        .as_ref()
+        .filter(|_| config.implementer.recovers_invocations())
+        .and_then(|s| s.invocation_artifacts.as_ref())
+        .and_then(super::invocation::read_head_before);
     if let Some(state) = existing_state
         .as_ref()
         .filter(|_| config.implementer.recovers_invocations())
@@ -1373,8 +1446,10 @@ pub fn run_issue(
             }
         }
         let recovered = recovered_outcome.is_some();
-        let outcome_result = if let Some(outcome) = recovered_outcome.take() {
-            Ok(outcome)
+        // The commit the signing check starts after: the persisted head for a
+        // recovered outcome, the pre-dispatch HEAD for a live one.
+        let (outcome_result, signing_base) = if let Some(outcome) = recovered_outcome.take() {
+            (Ok(outcome), recovered_head_before.take())
         } else {
             let attempts = prior_attempts(db, issue)?;
             // Rung 2 provisioned this slot and hardcoded it to `None`; rung 7's
@@ -1477,12 +1552,17 @@ pub fn run_issue(
                 wall_clock_timeout,
             };
 
+            let signing_base = head_commit(&worktree.path);
             if config.implementer.recovers_invocations() {
                 // Validate the exact backend argv before publishing a new
                 // invocation or charging unknown spend. Definite input errors
                 // prove no process launched and must leave prior state intact.
                 super::invocation::validate_argv(&worktree.path, &spec)?;
                 if let Some(artifacts) = &spec.invocation_artifacts {
+                    // Before the state write, so any published invocation has it.
+                    if let Some(sha) = &signing_base {
+                        super::invocation::persist_head_before(artifacts, sha)?;
+                    }
                     invocation_artifacts = Some(artifacts.clone());
                     write_state(
                         db,
@@ -1497,7 +1577,7 @@ pub fn run_issue(
                     unpriced_dispatches += 1;
                 }
             }
-            dispatcher.dispatch(&worktree.path, &spec)
+            (dispatcher.dispatch(&worktree.path, &spec), signing_base)
         };
         let mut outcome = match outcome_result {
             Ok(outcome) => outcome,
@@ -1575,6 +1655,8 @@ pub fn run_issue(
             }
             invocation_artifacts = None;
         }
+        // Codex-only today: Muse does not assign its own session id, so this
+        // identity check never applies to it.
         if config.implementer.assigns_own_session_id() {
             // An invocation that never launched has no thread to check, and
             // its own reason (why the spawn failed) is the useful one.
@@ -1662,6 +1744,15 @@ pub fn run_issue(
                 outcome.cost_usd.unwrap_or(0.0).max(0.0),
             )?;
             total_cost_usd += outcome.cost_usd.unwrap_or(0.0).max(0.0);
+        }
+
+        // Every harness: a `met` whose commits bypassed the signing policy is
+        // a failed attempt, and the reason reaches the next turn as `why_failed`.
+        if outcome.is_met() {
+            if let Some(violation) = signing_violation(&worktree.path, signing_base.as_deref()) {
+                outcome.verdict = Some(Verdict::NotMet);
+                outcome.reason = Some(violation);
+            }
         }
 
         let classification = classify(&outcome);
@@ -2471,24 +2562,36 @@ sleep 0.5
         }
     }
     #[test]
-    fn a_muse_dispatch_that_cannot_establish_completion_names_muse() {
-        let db = approved_db();
-        let (_dir, wt) = fixture_worktree();
-        let mut d = muse_script(vec![]);
-        d.inner = ScriptedDispatcher::new(vec![Err(MemoryError::Validation("boom".into()))]);
-        let run = run_issue(&db, &issue(), &brief(), &wt, &muse_config(), &mut d).unwrap();
-        match run.terminal {
-            TerminalReason::ImplementationInFlight { detail } => {
-                assert!(
-                    detail.starts_with("Muse dispatch could not establish completion"),
-                    "got: {detail}"
-                );
+    fn a_dispatch_that_cannot_establish_completion_names_its_harness() {
+        for (implementer, label) in [(Implementer::Muse, "Muse"), (Implementer::Codex, "Codex")] {
+            let db = approved_db();
+            let (_dir, wt) = fixture_worktree();
+            let mut d = cli_script(implementer, vec![]);
+            d.inner = ScriptedDispatcher::new(vec![Err(MemoryError::Validation("boom".into()))]);
+            let mut c = config();
+            c.implementer = implementer;
+            c.model = if implementer == Implementer::Muse {
+                "muse-wonder-1.0"
+            } else {
+                "gpt-6.1-sol"
             }
-            other => panic!("expected a hold, got {other:?}"),
+            .into();
+            let run = run_issue(&db, &issue(), &brief(), &wt, &c, &mut d).unwrap();
+            match run.terminal {
+                TerminalReason::ImplementationInFlight { detail } => {
+                    assert!(
+                        detail.starts_with(&format!(
+                            "{label} dispatch could not establish completion"
+                        )),
+                        "got: {detail}"
+                    );
+                }
+                other => panic!("expected a hold, got {other:?}"),
+            }
         }
     }
     #[test]
-    fn a_recovered_muse_ordinal_conflict_names_muse() {
+    fn a_recovered_ordinal_conflict_names_its_harness() {
         let record = |verdict| AttemptRecord {
             issue: issue(),
             attempt_n: 1,
@@ -2497,28 +2600,20 @@ sleep 0.5
             why_failed: None,
             commit_sha: None,
         };
-        let db = Database::open_in_memory().unwrap();
-        record_and_advance(
-            &db,
-            &record(AttemptOutcome::Failed),
-            None,
-            Some(Implementer::Muse),
-        )
-        .unwrap();
-        let err = record_and_advance(
-            &db,
-            &record(AttemptOutcome::Success),
-            None,
-            Some(Implementer::Muse),
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(
-            err.contains(
-                "recovered Muse verdict conflicts with the already recorded attempt ordinal"
-            ),
-            "got: {err}"
-        );
+        for (harness, label) in [(Implementer::Muse, "Muse"), (Implementer::Codex, "Codex")] {
+            let db = Database::open_in_memory().unwrap();
+            record_and_advance(&db, &record(AttemptOutcome::Failed), None, Some(harness)).unwrap();
+            let err =
+                record_and_advance(&db, &record(AttemptOutcome::Success), None, Some(harness))
+                    .unwrap_err()
+                    .to_string();
+            assert!(
+                err.contains(&format!(
+                    "recovered {label} verdict conflicts with the already recorded attempt ordinal"
+                )),
+                "got: {err}"
+            );
+        }
     }
     #[test]
     fn recovered_success_at_cap_is_consumed_without_new_call_or_billing() {
@@ -2607,6 +2702,15 @@ sleep 0.5
                 TerminalReason::InfrastructureFailure { .. }
             ));
             assert!(d.inner.seen.is_empty());
+            assert!(
+                run.dispatches[0]
+                    .reason
+                    .as_deref()
+                    .unwrap()
+                    .contains("missing or mismatched native Codex session ID"),
+                "got: {:?}",
+                run.dispatches[0].reason
+            );
             let state = dispatch_state::get_dispatch_state(&db, &issue())
                 .unwrap()
                 .unwrap();
@@ -3224,6 +3328,9 @@ sleep 0.5
             vec!["init", "--initial-branch=main"],
             vec!["config", "user.email", "autopilot@example.test"],
             vec!["config", "user.name", "Autopilot Test"],
+            // Pinned: the operator's global config signs, and an unpinned
+            // fixture would either try their key or trip the signing guard.
+            vec!["config", "commit.gpgsign", "false"],
         ] {
             let ok = std::process::Command::new("git")
                 .args(&args)
@@ -3249,6 +3356,185 @@ sleep 0.5
             quarantined_from: None,
         };
         (dir, wt)
+    }
+
+    // ── commit signing guard ────────────────────────────────────────────
+
+    fn git_in(repo: &Path, args: &[&str]) -> String {
+        let mut c = std::process::Command::new("git");
+        crate::mcp::tools::scrub_git_environment(&mut c);
+        let out = c.args(args).current_dir(repo).output().unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// Commit `file` in `repo` with `extra` leading git args; returns the new HEAD.
+    fn commit_in(repo: &Path, file: &str, extra: &[&str]) -> String {
+        std::fs::write(repo.join(file), file).unwrap();
+        git_in(repo, &["add", file]);
+        let mut args = extra.to_vec();
+        args.extend(["commit", "-qm", file]);
+        git_in(repo, &args);
+        git_in(repo, &["rev-parse", "HEAD"])
+    }
+
+    /// A Claude-harness dispatcher that runs `before` in the worktree, then
+    /// returns a met outcome, enough to drive the signing guard end to end.
+    struct CommitThenMet<F: FnMut(&Path)>(F);
+    impl<F: FnMut(&Path)> Dispatcher for CommitThenMet<F> {
+        fn dispatch(
+            &mut self,
+            repo: &Path,
+            _spec: &DispatchSpec,
+        ) -> Result<DispatchOutcome, MemoryError> {
+            (self.0)(repo);
+            Ok(met())
+        }
+    }
+
+    #[test]
+    fn no_signing_policy_means_no_violation() {
+        let (_dir, wt) = fixture_worktree(); // commit.gpgsign pinned false
+        let base = commit_in(&wt.path, "a", &[]);
+        commit_in(&wt.path, "b", &[]);
+        assert_eq!(signing_violation(&wt.path, Some(&base)), None);
+    }
+
+    #[test]
+    fn an_unsigned_commit_under_gpgsign_is_a_violation_naming_it() {
+        let (_dir, wt) = fixture_worktree();
+        let base = commit_in(&wt.path, "a", &[]);
+        // Turn the policy on *after* the base, as an operator's global config would.
+        git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
+        let bypass = commit_in(&wt.path, "b", &["-c", "commit.gpgsign=false"]);
+        let violation = signing_violation(&wt.path, Some(&base)).unwrap();
+        assert!(violation.contains(&bypass[..12]), "got: {violation}");
+        assert!(
+            violation.contains("commit.gpgsign=false"),
+            "got: {violation}"
+        );
+        // Without a base, HEAD alone is checked.
+        assert!(signing_violation(&wt.path, None).is_some());
+        // The base is exclusive: nothing after the bypass commit is checked.
+        assert_eq!(signing_violation(&wt.path, Some(&bypass)), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_ssh_signed_commit_is_accepted_without_an_allowed_signers_file() {
+        let (dir, wt) = fixture_worktree();
+        let key = dir.path().join("key");
+        if std::process::Command::new("ssh-keygen")
+            .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+            .arg(&key)
+            .status()
+            .map_or(true, |s| !s.success())
+        {
+            eprintln!("ssh-keygen unavailable; skipping");
+            return;
+        }
+        let base = commit_in(&wt.path, "a", &[]);
+        for (k, v) in [("gpg.format", "ssh"), ("commit.gpgsign", "true")] {
+            git_in(&wt.path, &["config", k, v]);
+        }
+        git_in(
+            &wt.path,
+            &["config", "user.signingkey", key.to_str().unwrap()],
+        );
+        // The key files sit in the worktree; keep them out of the commit.
+        std::fs::write(wt.path.join(".git/info/exclude"), "key*\n").unwrap();
+        commit_in(&wt.path, "signed", &[]);
+        assert_eq!(signing_violation(&wt.path, Some(&base)), None);
+    }
+
+    #[test]
+    fn a_met_with_an_unsigned_commit_becomes_a_failed_attempt() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
+        let mut dispatcher = CommitThenMet(|path: &Path| {
+            commit_in(path, "work", &["-c", "commit.gpgsign=false"]);
+        });
+        let mut c = config();
+        c.attempt_cap = 1;
+        let run = run_issue(&db, &issue(), &brief(), &wt, &c, &mut dispatcher).unwrap();
+        assert_eq!(
+            run.dispatches[0].classification,
+            DispatchClassification::FailedAttempt
+        );
+        assert!(run.dispatches[0]
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("unsigned"));
+        assert!(!matches!(run.terminal, TerminalReason::Met { .. }));
+    }
+
+    #[test]
+    fn a_met_that_made_no_commits_is_not_blamed_for_an_unsigned_head() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        // An unsigned commit that predates the dispatch is not the dispatch's.
+        commit_in(&wt.path, "old", &[]);
+        git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
+        let mut dispatcher = CommitThenMet(|_: &Path| {});
+        let run = run_issue(&db, &issue(), &brief(), &wt, &config(), &mut dispatcher).unwrap();
+        assert!(matches!(run.terminal, TerminalReason::Met { .. }));
+    }
+
+    #[test]
+    fn a_recovering_harness_persists_the_head_it_started_from() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        let seed = git_in(&wt.path, &["rev-parse", "HEAD"]);
+        let mut d = codex_script(vec![met()]);
+        run_issue(&db, &issue(), &brief(), &wt, &codex_config(), &mut d).unwrap();
+        let artifacts = d.inner.seen[0].invocation_artifacts.as_ref().unwrap();
+        assert_eq!(
+            super::super::invocation::read_head_before(artifacts),
+            Some(seed)
+        );
+    }
+
+    #[test]
+    fn a_recovered_met_is_checked_from_its_persisted_head_not_the_current_one() {
+        for (base_is_head, expect_met) in [(true, true), (false, false)] {
+            let db = approved_db();
+            let (_dir, wt) = fixture_worktree();
+            let seed = git_in(&wt.path, &["rev-parse", "HEAD"]);
+            let state = pending_codex(&db, &wt, Some("persisted"));
+            git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
+            let bypass = commit_in(&wt.path, "work", &["-c", "commit.gpgsign=false"]);
+            super::super::invocation::persist_head_before(
+                state.invocation_artifacts.as_ref().unwrap(),
+                if base_is_head { &bypass } else { &seed },
+            )
+            .unwrap();
+            let mut result = met();
+            result.native_session_id = Some("persisted".into());
+            let mut d = codex_script(vec![]);
+            d.recovery = Some(InvocationRecovery::Finished(result));
+            let mut c = codex_config();
+            c.attempt_cap = 1;
+            let run = run_issue(&db, &issue(), &brief(), &wt, &c, &mut d).unwrap();
+            assert_eq!(
+                matches!(run.terminal, TerminalReason::Met { .. }),
+                expect_met,
+                "base_is_head={base_is_head}: {:?}",
+                run.dispatches
+            );
+            if !expect_met {
+                assert!(run.dispatches[0]
+                    .reason
+                    .as_deref()
+                    .unwrap()
+                    .contains("unsigned"));
+            }
+        }
     }
 
     // ── config validation ───────────────────────────────────────────────

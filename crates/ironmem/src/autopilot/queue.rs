@@ -1711,8 +1711,12 @@ mod tests {
         state.state = "paused-daily-budget".into();
         dispatch_state::upsert_dispatch_state(&db, &state).unwrap();
         let backlogs = [backlog(REPO, vec![ready(1), ready(2)])];
+        // Claude's registry is unreadable, so a Muse state routed like Claude
+        // would be held rather than deferred as a harness mismatch.
         let snapshot = HarnessSnapshots {
-            claude: RegistrySnapshot::Available(Vec::new()),
+            claude: RegistrySnapshot::Unavailable {
+                reason: "claude agents --json exited 1".to_string(),
+            },
             processes: ProcessSnapshot::Available(Vec::new()),
         };
         let codex = QueueConfig {
