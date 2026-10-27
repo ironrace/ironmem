@@ -202,15 +202,20 @@ pub(crate) fn signing_policy(dir: &Path) -> Result<bool, String> {
         .map(|value| value.is_some_and(|v| v == "true"))
 }
 
-/// Remember on `branch` that the signing policy is on, when it is on (or
-/// unreadable, which counts as on). The flag is sticky: a later run that finds
-/// the policy off still enforces it, so an agent's `git config commit.gpgsign
-/// false` in the shared `.git/config` outlives neither the dispatch nor the run.
-pub(crate) fn record_signing_policy(dir: &Path, branch: &str) -> Result<(), MemoryError> {
-    if signing_policy(dir).unwrap_or(true) {
-        git(dir, &["config", &signing_key(branch), "true"])?;
+/// Remember on `branch` that the signing policy is on; the caller has read it
+/// as on (an unreadable policy counts as on). The flag is sticky: a later run
+/// that finds the policy off still enforces it, so an agent's `git config
+/// commit.gpgsign false` in the shared `.git/config` outlives neither the
+/// dispatch nor the run.
+///
+/// Skipped when the branch already records it. A live agent in another
+/// worktree of the same repo may hold `.git/config`'s lock (`push -u` and
+/// `checkout -b` both write config), and a needless write would race it.
+pub(crate) fn record_signing(dir: &Path, branch: &str) -> Result<(), MemoryError> {
+    if signing_recorded(dir, branch) {
+        return Ok(());
     }
-    Ok(())
+    git(dir, &["config", &signing_key(branch), "true"]).map(|_| ())
 }
 
 /// Whether `branch` was ever recorded as under the signing policy. A value
@@ -395,7 +400,7 @@ fn quarantine(repo_root: &Path, path: &Path) -> Result<PathBuf, MemoryError> {
 /// branch is created and stored on the branch; an existing branch reads it
 /// back, backfilling it from `base` once if it predates the record. A `base`
 /// that does not resolve is refused before anything on disk changes. At
-/// creation the signing policy is recorded too ([`record_signing_policy`]).
+/// creation the signing policy is recorded too ([`record_signing`]).
 pub fn ensure_worktree(
     repo_root: &Path,
     worktree_root: &Path,
@@ -508,7 +513,9 @@ pub fn ensure_worktree(
     if recorded.is_none() {
         git(&root, &["config", &cut_key(&branch), &cut])?;
     }
-    record_signing_policy(&path, &branch)?;
+    if signing_policy(&path).unwrap_or(true) {
+        record_signing(&path, &branch)?;
+    }
 
     Ok(Worktree {
         path: canonical_or_self(&path),
@@ -720,6 +727,37 @@ mod tests {
             )
             .unwrap());
         }
+    }
+
+    #[test]
+    fn a_remote_tracking_base_records_its_sha_and_keeps_the_upstream() {
+        let repo = fixture_repo();
+        let origin = tempfile::tempdir().unwrap();
+        run(
+            origin.path(),
+            &["init", "-q", "--bare", "--initial-branch=main"],
+        );
+        run(
+            repo.path(),
+            &["remote", "add", "origin", origin.path().to_str().unwrap()],
+        );
+        run(repo.path(), &["push", "-q", "origin", "main"]);
+        let remote_main = resolve_commit(repo.path(), "origin/main").unwrap();
+        // The operator's HEAD moves past origin/main; the cut must not follow.
+        advance_operator_head(repo.path(), "local-only");
+        let roots = tempfile::tempdir().unwrap();
+        let wt = ensure_worktree(repo.path(), roots.path(), &issue(), "origin/main").unwrap();
+        assert_eq!(wt.cut, remote_main);
+        assert_eq!(
+            read_config(repo.path(), &issue_cut_key()),
+            Some(remote_main)
+        );
+        let upstream = git(
+            &wt.path,
+            &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+        )
+        .unwrap();
+        assert_eq!(upstream, "origin/main");
     }
 
     #[test]

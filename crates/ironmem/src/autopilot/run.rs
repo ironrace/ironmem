@@ -752,13 +752,26 @@ fn bounded_stderr(out: &std::process::Output) -> String {
 /// an earlier dispatch's bypass stays caught after it is pushed, and a moving
 /// operator checkout cannot shrink or widen the range.
 ///
-/// The policy is enforced when it is on now or when the branch recorded it on
-/// ([`worktree::record_signing_policy`], at creation and at each run's start);
-/// a recorded policy that is now off is a violation of its own, across runs.
-/// Anything unreadable fails closed. This catches a lazy or accidental bypass,
-/// not deliberate tampering: an unconfined agent could just as well clear
-/// `branch.<branch>.ironmemSigning` or sign with a throwaway key.
-fn signing_violation(worktree: &Worktree) -> Option<String> {
+/// The policy is enforced when it was on at this run's start
+/// (`policy_at_start`), when the branch recorded it on
+/// ([`worktree::record_signing`], at creation and at each run's start), or
+/// when it is on now; an enforced policy that is now off is a violation of its
+/// own, across runs. Anything unreadable fails closed.
+///
+/// The flag survives a deliberate operator change to `commit.gpgsign` too. To
+/// stop enforcing on a branch, run `git config --unset
+/// branch.<branch>.ironmemSigning` (with the policy off).
+///
+/// An unreadable policy or an unusable cut is the operator's fault, but it
+/// still surfaces as the model's failed attempt rather than a hold: a known
+/// limitation.
+///
+/// This catches a lazy or accidental bypass, not deliberate tampering. An
+/// unconfined agent could just as well clear `branch.<branch>.ironmemSigning`,
+/// rewrite `branch.<branch>.ironmemCut` to hide earlier commits, push its
+/// commits to another remote branch (every remote-tracking ref but the issue
+/// branch's own is excluded via `--remotes`), or sign with a throwaway key.
+fn signing_violation(worktree: &Worktree, policy_at_start: bool) -> Option<String> {
     let git = |args: &[&str]| {
         let mut command = std::process::Command::new("git");
         crate::mcp::tools::scrub_git_environment(&mut command);
@@ -770,10 +783,14 @@ fn signing_violation(worktree: &Worktree) -> Option<String> {
                 "commit.gpgsign could not be read (treated as on): {why}"
             ))
         }
-        Ok(false) if worktree::signing_recorded(&worktree.path, &worktree.branch) => {
+        Ok(false)
+            if policy_at_start || worktree::signing_recorded(&worktree.path, &worktree.branch) =>
+        {
             return Some(
                 "commit.gpgsign was turned off on this branch; restore it with \
-                 `git config --unset commit.gpgsign` (or set it back to true) and sign every commit"
+                 `git config --unset commit.gpgsign` (or set it back to true) and sign every \
+                 commit. If signing fails in your environment, return verdict impossible with \
+                 the signing error; never bypass."
                     .into(),
             )
         }
@@ -1351,7 +1368,20 @@ pub fn run_issue(
     // an agent that turns it off is still held to it, in this run and every
     // later one. A policy a crashed dispatch disabled before any run or
     // `ensure_worktree` saw it on is not caught: an accepted limitation.
-    worktree::record_signing_policy(&worktree.path, &worktree.branch)?;
+    // The reading is also kept in memory, so a failed write (another
+    // worktree's agent holding `.git/config`'s lock) costs only the
+    // cross-run memory, never this run's protection or the run itself.
+    let policy_at_start = worktree::signing_policy(&worktree.path).unwrap_or(true);
+    if policy_at_start {
+        if let Err(e) = worktree::record_signing(&worktree.path, &worktree.branch) {
+            tracing::warn!(
+                error = %e,
+                branch = %worktree.branch,
+                "autopilot could not record the signing policy on the branch; \
+                 holding this run to it from memory"
+            );
+        }
+    }
     if let Some(state) = existing_state
         .as_ref()
         .filter(|_| config.implementer.recovers_invocations())
@@ -1787,7 +1817,7 @@ pub fn run_issue(
         // checked, not just this dispatch's, so an earlier bypass cannot be
         // waved through by a later `met` that adds nothing.
         if outcome.is_met() {
-            if let Some(violation) = signing_violation(worktree) {
+            if let Some(violation) = signing_violation(worktree, policy_at_start) {
                 outcome.verdict = Some(Verdict::NotMet);
                 outcome.reason = Some(match outcome.reason.take() {
                     Some(original) if !original.trim().is_empty() => format!(
@@ -3435,7 +3465,7 @@ sleep 0.5
         let (_dir, wt) = fixture_worktree(); // commit.gpgsign pinned false
         commit_in(&wt.path, "a", &[]);
         commit_in(&wt.path, "b", &[]);
-        assert_eq!(signing_violation(&wt), None);
+        assert_eq!(signing_violation(&wt, false), None);
     }
 
     #[test]
@@ -3444,7 +3474,7 @@ sleep 0.5
         // Turn the policy on *after* the base, as an operator's global config would.
         git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
         let bypass = commit_in(&wt.path, "b", &["-c", "commit.gpgsign=false"]);
-        let violation = signing_violation(&wt).unwrap();
+        let violation = signing_violation(&wt, false).unwrap();
         assert!(violation.contains(&bypass[..12]), "got: {violation}");
         assert!(violation.contains(&wt.cut[..12]), "got: {violation}");
         assert!(violation.contains("impossible"), "got: {violation}");
@@ -3458,7 +3488,7 @@ sleep 0.5
     fn a_policy_that_cannot_be_read_fails_closed_with_gits_complaint() {
         let (_dir, wt) = fixture_worktree();
         git_in(&wt.path, &["config", "commit.gpgsign", "maybe"]);
-        let violation = signing_violation(&wt).unwrap();
+        let violation = signing_violation(&wt, false).unwrap();
         assert!(violation.contains("could not be read"), "got: {violation}");
         assert!(violation.contains("maybe"), "got: {violation}");
     }
@@ -3468,7 +3498,7 @@ sleep 0.5
         let (_dir, mut wt) = fixture_worktree();
         wt.cut = "0".repeat(40);
         git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
-        let violation = signing_violation(&wt).unwrap();
+        let violation = signing_violation(&wt, false).unwrap();
         assert!(
             violation.contains("signatures could not be read"),
             "got: {violation}"
@@ -3512,7 +3542,7 @@ sleep 0.5
             commit_in(&wt.path, "signed", &[]);
             let status = git_in(&wt.path, &["log", "-1", "--format=%G?"]);
             assert_eq!(status, expected, "listed={listed}");
-            assert_eq!(signing_violation(&wt), None, "listed={listed}");
+            assert_eq!(signing_violation(&wt, false), None, "listed={listed}");
         }
     }
 
@@ -3598,6 +3628,67 @@ sleep 0.5
             "got: {reason}"
         );
         assert!(reason.contains("--unset commit.gpgsign"), "got: {reason}");
+        assert!(
+            reason.contains("return verdict impossible"),
+            "got: {reason}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_run_whose_branch_already_records_the_policy_writes_no_config() {
+        use std::os::unix::fs::MetadataExt;
+        // A live agent in another worktree may be writing `.git/config`
+        // (`push -u`, `checkout -b`); a needless write here races its lock.
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
+        let flag = format!("branch.{}.ironmemSigning", wt.branch);
+        git_in(&wt.path, &["config", &flag, "true"]);
+        let config_file = wt.path.join(".git/config");
+        let before = std::fs::metadata(&config_file).unwrap().ino();
+        let mut dispatcher = CommitThenMet(|path: &Path| {
+            commit_in(path, "work", &["-c", "commit.gpgsign=false"]);
+        });
+        let mut c = config();
+        c.attempt_cap = 1;
+        let run = run_issue(&db, &issue(), &brief(), &wt, &c, &mut dispatcher).unwrap();
+        assert_eq!(
+            std::fs::metadata(&config_file).unwrap().ino(),
+            before,
+            "git config rewrites by rename, so a new inode means a write"
+        );
+        assert_eq!(
+            run.dispatches[0].classification,
+            DispatchClassification::FailedAttempt
+        );
+    }
+
+    #[test]
+    fn a_held_config_lock_does_not_fail_the_run_and_the_policy_is_still_held() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
+        // Another worktree's agent holds the lock as the run starts.
+        let lock = wt.path.join(".git/config.lock");
+        std::fs::write(&lock, "").unwrap();
+        let mut dispatcher = CommitThenMet(|path: &Path| {
+            std::fs::remove_file(path.join(".git/config.lock")).unwrap();
+            git_in(path, &["config", "commit.gpgsign", "false"]);
+            commit_in(path, "work", &[]);
+        });
+        let mut c = config();
+        c.attempt_cap = 1;
+        let run = run_issue(&db, &issue(), &brief(), &wt, &c, &mut dispatcher).unwrap();
+        assert_eq!(
+            run.dispatches[0].classification,
+            DispatchClassification::FailedAttempt
+        );
+        let reason = run.dispatches[0].reason.as_deref().unwrap();
+        assert!(
+            reason.contains("turned off on this branch"),
+            "got: {reason}"
+        );
     }
 
     #[test]
@@ -3707,7 +3798,7 @@ sleep 0.5
         let merge = git_in(&wt.path, &["rev-parse", "HEAD"]);
         let agent2 = commit_in(&wt.path, "agent2", &[]);
         git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
-        let violation = signing_violation(&wt).unwrap();
+        let violation = signing_violation(&wt, false).unwrap();
         assert_eq!(
             blamed(&violation),
             [short(&agent1), short(&merge), short(&agent2)].into(),
@@ -3727,7 +3818,7 @@ sleep 0.5
         let rebased = git_in(&wt.path, &["rev-parse", "HEAD"]);
         let agent2 = commit_in(&wt.path, "agent2", &[]);
         git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
-        let violation = signing_violation(&wt).unwrap();
+        let violation = signing_violation(&wt, false).unwrap();
         assert_eq!(
             blamed(&violation),
             [short(&rebased), short(&agent2)].into(),
