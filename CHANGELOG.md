@@ -102,6 +102,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (EPERM), so the run was killed and held for `clear-dispatch`. It now
   reads `sysctl(KERN_PROC_PID)`, which needs no privilege. A descendant
   cleanup may not signal is held as evidence, recorded, until it is gone.
+  The worktree check counts a process whose real uid is yours, so a setuid
+  tool that escaped into the worktree keeps the run held while it runs.
 - **A Codex or Muse run that fails within milliseconds is no longer held
   for `clear-dispatch`.** A root that exits before the first process sample
   (a Muse usage error, or "session in use") is recorded once its process
