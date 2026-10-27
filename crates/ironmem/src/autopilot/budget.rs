@@ -4,17 +4,18 @@
 //! This module owns the accumulation (read-current, add, overwrite) because
 //! the spec is explicit that the ledger is a running sum across invocations,
 //! not a bag of independent samples a caller would have to total up itself.
-//! It is not fully race-safe under concurrent writers (see
-//! [`accumulate_daily_spend`]'s doc) — acceptable for v1, whose design has
-//! exactly one Lead process at a time (see the spec's *Non-goals*: "No
-//! second peer Lead").
+//! Every writer's read-modify-write runs in one `BEGIN IMMEDIATE`
+//! transaction, so concurrent writers on one database (a Codex Lead and a
+//! Muse Lead sharing the default DB, say) serialize rather than lose each
+//! other's update, and the unpriced cap is checked in the same transaction
+//! that reserves against it.
 
 use serde::{Deserialize, Serialize};
 
 use crate::db::schema::Database;
 use crate::error::MemoryError;
 
-use super::{read_current, write_current};
+use super::{read_current, write_current_tx};
 
 /// One date's accumulated spend.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -123,16 +124,8 @@ fn validate_date(date: &str) -> Result<(), MemoryError> {
 }
 
 /// Add `delta_usd` (one invocation's `total_cost_usd`) to `date`'s ledger and
-/// persist the new total. Returns the ledger entry after the update.
-///
-/// **Not atomic across concurrent callers**: this reads the current entry,
-/// adds in-process, and writes it back as two separate database
-/// round-trips. Two callers racing on the same date could both read the same
-/// starting total and one update would be lost. Fine for a single Lead
-/// process serializing its own dispatch accounting (the only writer v1's
-/// design has); would need to move the read+add+write inside one
-/// `Database::with_transaction` if a second concurrent writer is ever
-/// introduced.
+/// persist the new total. Returns the ledger entry after the update. Atomic
+/// across concurrent callers; see the module doc.
 pub fn accumulate_daily_spend(
     db: &Database,
     date: &str,
@@ -157,8 +150,6 @@ pub fn accumulate_daily_spend(
 /// count the invocation as costing nothing, which is a claim, whereas this
 /// records the truth — an invocation whose price is unknown. See
 /// [`BudgetLedgerEntry::unpriced_dispatch_count`].
-///
-/// Shares [`accumulate_daily_spend`]'s non-atomicity caveat.
 pub fn record_unpriced_dispatch(
     db: &Database,
     date: &str,
@@ -182,10 +173,8 @@ pub fn record_unpriced_review(db: &Database, date: &str) -> Result<BudgetLedgerE
 /// Bill one advisor one-shot call (rung 9) to `date`.
 ///
 /// One ledger write, not two: the call's price and the fact that a call
-/// happened at all are two fields of the same fact, and
-/// [`accumulate_daily_spend`]'s read-modify-write is not atomic, so
-/// recording them separately would give a concurrent writer a window to lose
-/// one of them.
+/// happened at all are two fields of the same fact, so they are recorded in
+/// one transaction rather than two a crash could split.
 ///
 /// `cost_usd` is `None` when the call's price could not be read — the same
 /// distinction [`record_unpriced_dispatch`] draws, and for the same reason:
@@ -213,20 +202,15 @@ pub fn record_advice_call(
     })
 }
 
-/// Reserve an unpriced invocation before launch. Repeated recovery of the same
-/// identity cannot bill it twice. Like the existing ledger writers, this
-/// read/write assumes one Lead; it is not a distributed concurrency lock.
+/// Reserve an unpriced invocation before launch, with no cap. Repeated
+/// recovery of the same identity cannot bill it twice. A dispatch that must
+/// respect the daily cap uses [`reserve_unpriced_dispatch_if_below`].
 pub fn reserve_unpriced_dispatch(
     db: &Database,
     date: &str,
     invocation_id: &str,
 ) -> Result<BudgetLedgerEntry, MemoryError> {
-    validate_date(date)?;
-    if invocation_id.trim().is_empty() || invocation_id.trim() != invocation_id {
-        return Err(MemoryError::Validation(
-            "invocation_id must be nonempty without surrounding whitespace".into(),
-        ));
-    }
+    validate_reservation(date, invocation_id)?;
     update_ledger(db, date, |entry| {
         if !entry
             .reserved_unpriced_dispatch_ids
@@ -239,6 +223,64 @@ pub fn reserve_unpriced_dispatch(
             entry.unpriced_dispatch_count += 1;
         }
     })
+}
+
+/// What [`reserve_unpriced_dispatch_if_below`] decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnpricedReservation {
+    /// A new reservation was written; the invocation may launch.
+    Reserved,
+    /// This invocation was already reserved, so nothing changed. Recovery
+    /// re-reserving what it already paid for is never a new dispatch.
+    AlreadyReserved,
+    /// The day's cap is reached and nothing was written; do not launch.
+    CapReached { unpriced_today: u32 },
+}
+
+/// Reserve an unpriced invocation before launch only while the day has fewer
+/// than `cap` reserved, checking and reserving in one `BEGIN IMMEDIATE`
+/// transaction. Two Leads racing for the last unit therefore admit exactly
+/// one, where a separate check then reserve would admit both.
+pub fn reserve_unpriced_dispatch_if_below(
+    db: &Database,
+    date: &str,
+    invocation_id: &str,
+    cap: u32,
+) -> Result<UnpricedReservation, MemoryError> {
+    validate_reservation(date, invocation_id)?;
+    let (_, decision) = transact_ledger(db, date, |entry| {
+        if entry
+            .reserved_unpriced_dispatch_ids
+            .iter()
+            .any(|id| id == invocation_id)
+        {
+            return (false, UnpricedReservation::AlreadyReserved);
+        }
+        if entry.unpriced_dispatch_count >= cap {
+            return (
+                false,
+                UnpricedReservation::CapReached {
+                    unpriced_today: entry.unpriced_dispatch_count,
+                },
+            );
+        }
+        entry
+            .reserved_unpriced_dispatch_ids
+            .push(invocation_id.to_string());
+        entry.unpriced_dispatch_count += 1;
+        (true, UnpricedReservation::Reserved)
+    })?;
+    Ok(decision)
+}
+
+fn validate_reservation(date: &str, invocation_id: &str) -> Result<(), MemoryError> {
+    validate_date(date)?;
+    if invocation_id.trim().is_empty() || invocation_id.trim() != invocation_id {
+        return Err(MemoryError::Validation(
+            "invocation_id must be nonempty without surrounding whitespace".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Whether this exact invocation was durably reserved. Check every retained
@@ -269,31 +311,53 @@ pub(crate) fn has_unpriced_dispatch_reservation(
     Ok(false)
 }
 
-/// Read the day's ledger, apply `mutate`, write it back.
+/// Read the day's ledger, apply `mutate`, write it back, atomically.
 fn update_ledger(
     db: &Database,
     date: &str,
     mutate: impl FnOnce(&mut BudgetLedgerEntry),
 ) -> Result<BudgetLedgerEntry, MemoryError> {
-    let key = budget_key(date);
-    let mut entry = match read_current(db, &key)? {
-        Some(drawer) => serde_json::from_str::<BudgetLedgerEntry>(&drawer.content)?,
-        None => BudgetLedgerEntry {
-            reserved_unpriced_dispatch_ids: Vec::new(),
-            date: date.to_string(),
-            total_cost_usd: 0.0,
-            dispatch_count: 0,
-            unpriced_dispatch_count: 0,
-            unpriced_review_count: 0,
-            advice_call_count: 0,
-            unpriced_advice_count: 0,
-        },
-    };
-    mutate(&mut entry);
+    transact_ledger(db, date, |entry| {
+        mutate(entry);
+        (true, ())
+    })
+    .map(|(entry, ())| entry)
+}
 
-    let content = serde_json::to_string(&entry)?;
-    write_current(db, &key, &content)?;
-    Ok(entry)
+/// The one read-modify-write every ledger writer goes through: read the
+/// day's entry, let `decide` change it, and write it back only when `decide`
+/// says to, all inside one `BEGIN IMMEDIATE` transaction. Concurrent writers
+/// (two Leads, or a Lead and a reviewer, on one database) therefore
+/// serialize instead of overwriting each other's update. Returns the entry
+/// as it stands after the transaction.
+fn transact_ledger<T>(
+    db: &Database,
+    date: &str,
+    decide: impl FnOnce(&mut BudgetLedgerEntry) -> (bool, T),
+) -> Result<(BudgetLedgerEntry, T), MemoryError> {
+    let key = budget_key(date);
+    db.with_immediate_transaction(|tx| {
+        // `read_current` goes through `db`, the same connection as `tx`, so
+        // it reads inside this transaction.
+        let mut entry = match read_current(db, &key)? {
+            Some(drawer) => serde_json::from_str::<BudgetLedgerEntry>(&drawer.content)?,
+            None => BudgetLedgerEntry {
+                reserved_unpriced_dispatch_ids: Vec::new(),
+                date: date.to_string(),
+                total_cost_usd: 0.0,
+                dispatch_count: 0,
+                unpriced_dispatch_count: 0,
+                unpriced_review_count: 0,
+                advice_call_count: 0,
+                unpriced_advice_count: 0,
+            },
+        };
+        let (write, value) = decide(&mut entry);
+        if write {
+            write_current_tx(tx, &key, &serde_json::to_string(&entry)?)?;
+        }
+        Ok((entry, value))
+    })
 }
 
 /// Read a date's ledger entry, if anything has been billed to it yet.
@@ -310,7 +374,121 @@ pub fn get_daily_spend(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Barrier};
+
     use super::*;
+    use crate::autopilot::write_current;
+
+    /// A migrated database file that each racing thread opens on its own
+    /// connection, as two Lead processes would.
+    fn shared_db() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.sqlite3");
+        Database::open(&path).unwrap().migrate().unwrap();
+        (dir, path)
+    }
+
+    /// Run `work(thread_index, db)` on `threads` connections released at once.
+    fn race<T: Send + 'static>(
+        path: &std::path::Path,
+        threads: usize,
+        work: impl Fn(usize, &Database) -> T + Send + Sync + 'static,
+    ) -> Vec<T> {
+        let barrier = Arc::new(Barrier::new(threads));
+        let work = Arc::new(work);
+        let handles: Vec<_> = (0..threads)
+            .map(|t| {
+                let (path, barrier, work) = (path.to_path_buf(), barrier.clone(), work.clone());
+                std::thread::spawn(move || {
+                    let db = Database::open(&path).unwrap();
+                    barrier.wait();
+                    work(t, &db)
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    }
+
+    #[test]
+    fn concurrent_ledger_writers_lose_no_reservation_and_no_dollar() {
+        const THREADS: usize = 4;
+        const EACH: usize = 25;
+        let (_dir, path) = shared_db();
+        race(&path, THREADS, |t, db| {
+            for i in 0..EACH {
+                reserve_unpriced_dispatch(db, "2026-09-03", &format!("t{t}-{i}")).unwrap();
+                accumulate_daily_spend(db, "2026-09-03", 0.25).unwrap();
+            }
+        });
+        let db = Database::open(&path).unwrap();
+        let entry = get_daily_spend(&db, "2026-09-03").unwrap().unwrap();
+        let ids: std::collections::BTreeSet<_> =
+            entry.reserved_unpriced_dispatch_ids.iter().collect();
+        assert_eq!(ids.len(), THREADS * EACH, "every reservation kept");
+        assert_eq!(entry.unpriced_dispatch_count as usize, THREADS * EACH);
+        assert_eq!(entry.dispatch_count as usize, THREADS * EACH);
+        assert!((entry.total_cost_usd - 0.25 * (THREADS * EACH) as f64).abs() < 1e-9);
+    }
+
+    #[test]
+    fn two_leads_racing_for_the_last_unit_admit_exactly_one() {
+        const CAP: u32 = 3;
+        let (_dir, path) = shared_db();
+        for round in 1..=20u32 {
+            let date = format!("2026-09-{round:02}");
+            {
+                let db = Database::open(&path).unwrap();
+                for n in 0..CAP - 1 {
+                    reserve_unpriced_dispatch(&db, &date, &format!("earlier-{n}")).unwrap();
+                }
+            }
+            let racing_date = date.clone();
+            let results = race(&path, 2, move |t, db| {
+                reserve_unpriced_dispatch_if_below(db, &racing_date, &format!("racer-{t}"), CAP)
+                    .unwrap()
+            });
+            let reserved = results
+                .iter()
+                .filter(|r| **r == UnpricedReservation::Reserved)
+                .count();
+            assert_eq!(reserved, 1, "round {round}: {results:?}");
+            assert!(
+                results.contains(&UnpricedReservation::CapReached {
+                    unpriced_today: CAP
+                }),
+                "round {round}: {results:?}"
+            );
+            let db = Database::open(&path).unwrap();
+            let entry = get_daily_spend(&db, &date).unwrap().unwrap();
+            assert_eq!(entry.unpriced_dispatch_count, CAP, "round {round}");
+            assert_eq!(entry.reserved_unpriced_dispatch_ids.len(), CAP as usize);
+        }
+    }
+
+    #[test]
+    fn a_reservation_at_the_cap_writes_nothing_and_a_known_one_is_never_refused() {
+        let db = Database::open_in_memory().unwrap();
+        accumulate_daily_spend(&db, "2026-09-03", 1.25).unwrap();
+        assert_eq!(
+            reserve_unpriced_dispatch_if_below(&db, "2026-09-03", "first", 1).unwrap(),
+            UnpricedReservation::Reserved
+        );
+        let before = get_daily_spend(&db, "2026-09-03").unwrap();
+        assert_eq!(
+            reserve_unpriced_dispatch_if_below(&db, "2026-09-03", "second", 1).unwrap(),
+            UnpricedReservation::CapReached { unpriced_today: 1 }
+        );
+        assert_eq!(get_daily_spend(&db, "2026-09-03").unwrap(), before);
+        // Recovery re-reserving an invocation it already paid for is not a
+        // new dispatch, so the cap never refuses it.
+        assert_eq!(
+            reserve_unpriced_dispatch_if_below(&db, "2026-09-03", "first", 1).unwrap(),
+            UnpricedReservation::AlreadyReserved
+        );
+        assert_eq!(get_daily_spend(&db, "2026-09-03").unwrap(), before);
+        assert!(reserve_unpriced_dispatch_if_below(&db, "bad", "id", 1).is_err());
+        assert!(reserve_unpriced_dispatch_if_below(&db, "2026-09-03", " ", 1).is_err());
+    }
 
     #[test]
     fn reservation_is_idempotent_and_preserves_known_dollars() {

@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use rusqlite::{Connection, Transaction};
+use rusqlite::{Connection, Transaction, TransactionBehavior};
 
 use crate::db::ReadOnlyDb;
 use crate::error::MemoryError;
@@ -732,6 +732,34 @@ impl Database {
         let result = f(&tx)?;
         tx.commit()?;
         Ok(result)
+    }
+
+    /// Execute a closure inside a `BEGIN IMMEDIATE` transaction and commit on
+    /// success.
+    ///
+    /// For a read-modify-write whose read must not go stale before its write:
+    /// the write lock is taken before the first read, so a concurrent writer
+    /// (another connection, another process) waits on `busy_timeout` rather
+    /// than interleaving. [`Self::with_transaction`] begins deferred, and a
+    /// deferred transaction that reads and then writes is refused with
+    /// `SQLITE_BUSY` at once when another writer got there first; it retries
+    /// only the stale-snapshot case, so its read-modify-writes can fail or
+    /// lose updates under contention.
+    ///
+    /// Reads inside `f` may go through `self` as well as through the
+    /// transaction: both are this one connection, so they see the
+    /// transaction's state. The closure runs once (no replay): with the write
+    /// lock held from the start, no snapshot can go stale under it.
+    pub fn with_immediate_transaction<T>(
+        &self,
+        f: impl FnOnce(&Transaction<'_>) -> Result<T, MemoryError>,
+    ) -> Result<T, MemoryError> {
+        let tx = retry_on_busy(|| {
+            Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)
+        })?;
+        let value = f(&tx)?;
+        tx.commit()?;
+        Ok(value)
     }
 
     /// Borrow the underlying connection for a read-only closure. Unlike

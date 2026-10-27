@@ -264,6 +264,21 @@ pub(crate) fn create_private(path: &Path) -> Result<File, MemoryError> {
 
 /// Allocate once, then persist these exact paths before spawning the dispatch.
 /// Reject unsupported paths before creating any artifact directories or files.
+/// Remove an invocation directory that [`prepare_artifacts`] made but nothing
+/// launched from, and that no stored state names. Best effort: a directory
+/// left behind holds no process and is never read again.
+pub(crate) fn discard_unlaunched(a: &InvocationArtifacts) {
+    if let Some(dir) = Path::new(&a.schema_path).parent() {
+        if let Err(e) = std::fs::remove_dir_all(dir) {
+            tracing::warn!(
+                error = %e,
+                dir = %dir.display(),
+                "autopilot could not remove an unlaunched invocation directory"
+            );
+        }
+    }
+}
+
 pub fn prepare_artifacts(
     worktree: &Path,
     issue: &IssueRef,

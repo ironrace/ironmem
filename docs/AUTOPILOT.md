@@ -158,9 +158,12 @@ no budget flag. So with either harness:
   (default 5) before it launches, including an invocation that later exits
   nonzero, times out, or produces malformed output. For Codex and Muse that
   flag is the real daily dispatch cap. When it is reached the run stops as
-  `UnpricedDispatchesExhausted`, paused rather than finished. An ambiguous
-  crash in the narrow reservation-before-spawn window can conservatively
-  consume a slot even when no child can later be proved.
+  `UnpricedDispatchesExhausted`, paused rather than finished, before
+  anything launches. The cap is checked and the unit reserved in one
+  database transaction, so two Leads sharing a database cannot both take the
+  last unit, and concurrent ledger writers never lose each other's updates.
+  An ambiguous crash in the narrow reservation-before-spawn window can
+  conservatively consume a slot even when no child can later be proved.
 - The ledger records no Codex or Muse dollars, so `--daily-budget-usd` does
   not bound them by dollars. It can still stop one: if the day's other priced
   spend (priced reviews, `--advisor` calls, Claude IC runs) plus the $2.50

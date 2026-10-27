@@ -1811,11 +1811,12 @@ pub fn run_issue(
                     spent_usd: spent_today,
                 };
             }
-            // Supervised CLI harnesses always have a finite bound and reserve
-            // unknown spend.
             // Claude keeps its existing policy: this cap gates only repos
-            // with a wall-clock bound.
-            if wall_clock_timeout.is_some() {
+            // with a wall-clock bound, and a timed-out dispatch is banked
+            // unpriced after it ends. A supervised CLI harness (always
+            // bounded) is checked where it reserves, below, in the same
+            // transaction, so two Leads cannot both take the last unit.
+            if wall_clock_timeout.is_some() && !config.implementer.recovers_invocations() {
                 let unpriced_today = ledger
                     .as_ref()
                     .map(|e| e.unpriced_dispatch_count)
@@ -1943,6 +1944,23 @@ pub fn run_issue(
                 // prove no process launched and must leave prior state intact.
                 super::invocation::validate_argv(&worktree.path, &spec)?;
                 if let Some(artifacts) = &spec.invocation_artifacts {
+                    // Check the day's cap and reserve in one transaction,
+                    // before the invocation is published. At the cap nothing
+                    // is written and nothing launches: the prepared directory
+                    // is removed and the stored state keeps what it had. A
+                    // crash after reserving but before publishing over-counts
+                    // one unit, never under-counts.
+                    if let budget::UnpricedReservation::CapReached { unpriced_today } =
+                        budget::reserve_unpriced_dispatch_if_below(
+                            db,
+                            &today_utc(),
+                            &artifacts.invocation_id,
+                            config.max_unpriced_dispatches_per_day,
+                        )?
+                    {
+                        super::invocation::discard_unlaunched(artifacts);
+                        break TerminalReason::UnpricedDispatchesExhausted { unpriced_today };
+                    }
                     invocation_artifacts = Some(artifacts.clone());
                     write_state(
                         db,
@@ -1953,7 +1971,6 @@ pub fn run_issue(
                         resuming,
                         (&native_session_id, &invocation_artifacts),
                     )?;
-                    budget::reserve_unpriced_dispatch(db, &today_utc(), &artifacts.invocation_id)?;
                     unpriced_dispatches += 1;
                 }
             }
@@ -3128,6 +3145,47 @@ sleep 0.5
         assert!(dispatch_state::get_dispatch_state(&db, &issue())
             .unwrap()
             .is_none());
+    }
+    /// The cap is decided where the invocation is reserved, in the same
+    /// transaction, so a full day launches nothing and leaves nothing behind:
+    /// no prepared invocation directory, no artifacts in the stored state,
+    /// and the ledger exactly as it was.
+    #[test]
+    fn a_supervised_dispatch_at_the_cap_launches_nothing_and_leaves_nothing_half_written() {
+        for c in [codex_config(), muse_config()] {
+            let db = approved_db();
+            let (_dir, wt) = fixture_worktree();
+            for n in 0..c.max_unpriced_dispatches_per_day {
+                budget::reserve_unpriced_dispatch(&db, &today_utc(), &format!("other-{n}"))
+                    .unwrap();
+            }
+            let before = budget::get_daily_spend(&db, &today_utc()).unwrap();
+            let mut d = cli_script(c.implementer, vec![met()]);
+            let run = run_issue(&db, &issue(), &brief(), &wt, &c, &mut d).unwrap();
+            assert_eq!(
+                run.terminal,
+                TerminalReason::UnpricedDispatchesExhausted {
+                    unpriced_today: c.max_unpriced_dispatches_per_day
+                },
+                "{:?}",
+                c.implementer
+            );
+            assert!(d.inner.seen.is_empty(), "nothing may launch at the cap");
+            assert_eq!(run.unpriced_dispatches, 0);
+            assert_eq!(budget::get_daily_spend(&db, &today_utc()).unwrap(), before);
+            let invocations = wt.path.join(".git/ironmem/autopilot").join(issue().slug());
+            let left: Vec<_> = std::fs::read_dir(&invocations)
+                .map(|dir| dir.flatten().map(|e| e.path()).collect())
+                .unwrap_or_default();
+            assert!(left.is_empty(), "prepared and left behind: {left:?}");
+            let state = dispatch_state::get_dispatch_state(&db, &issue()).unwrap();
+            assert!(
+                state
+                    .as_ref()
+                    .is_none_or(|s| s.invocation_artifacts.is_none()),
+                "{state:?}"
+            );
+        }
     }
     #[test]
     fn codex_cap_applies_without_repo_timeout_and_failed_outputs_are_reserved() {

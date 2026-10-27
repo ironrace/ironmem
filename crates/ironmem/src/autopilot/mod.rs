@@ -453,28 +453,35 @@ pub(crate) fn write_current(
     key: &str,
     content: &str,
 ) -> Result<String, MemoryError> {
+    db.with_transaction(|tx| write_current_tx(tx, key, content))
+}
+
+/// [`write_current`] inside a caller's transaction, for a read-modify-write
+/// that must commit as one (see [`Database::with_immediate_transaction`]).
+pub(crate) fn write_current_tx(
+    tx: &rusqlite::Transaction<'_>,
+    key: &str,
+    content: &str,
+) -> Result<String, MemoryError> {
     let id = logical_drawer_id(key);
     let source_file = format!("{LOGICAL_KEY_SOURCE_PREFIX}{key}");
     let embedding = zero_embedding();
-    db.with_transaction(|tx| {
-        Database::insert_drawer_tx(
-            tx,
-            &id,
-            content,
-            &embedding,
-            WING,
-            ROOM,
-            &source_file,
-            ADDED_BY,
-        )?;
-        Database::wal_log_tx(
-            tx,
-            "autopilot_write_current",
-            &serde_json::json!({ "id": &id, "logical_key": key }),
-            None,
-        )?;
-        Ok(())
-    })?;
+    Database::insert_drawer_tx(
+        tx,
+        &id,
+        content,
+        &embedding,
+        WING,
+        ROOM,
+        &source_file,
+        ADDED_BY,
+    )?;
+    Database::wal_log_tx(
+        tx,
+        "autopilot_write_current",
+        &serde_json::json!({ "id": &id, "logical_key": key }),
+        None,
+    )?;
     Ok(id)
 }
 
