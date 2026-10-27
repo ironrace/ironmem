@@ -1098,6 +1098,8 @@ impl<'a> GuardGit<'a> {
         timeout: std::time::Duration,
         unset_env: &'static [&'static str],
     ) -> Result<Self, String> {
+        #[cfg(test)]
+        GUARD_GITS_BUILT.with(|n| n.set(n.get() + 1));
         let mut git = Self {
             repo,
             timeout,
@@ -1124,12 +1126,9 @@ impl<'a> GuardGit<'a> {
                 Some(1) => {} // none set in that scope
                 // Unreadable (`$HOME` unset under launchd exits 128): git's
                 // own defaults stand for that scope, never the repository's.
-                _ => tracing::warn!(
-                    scope,
-                    error = %worktree::bounded_stderr(&out.stderr),
-                    "autopilot's commit-signing guard cannot read the operator's signature \
-                     programs in this scope; git's defaults are used for it"
-                ),
+                _ => {
+                    warn_unreadable_scope_once(scope, &worktree::bounded_stderr(&out.stderr));
+                }
             }
         }
         for line in read.iter().flat_map(|text| text.lines()) {
@@ -1160,10 +1159,18 @@ impl<'a> GuardGit<'a> {
         crate::mcp::tools::scrub_git_environment(&mut command);
         // No fetch of any kind: a missing object in a partial clone would
         // otherwise be fetched through the repository's own transport config.
+        // `protocol.allow=never` alone is not enough, since the repository's
+        // `protocol.<name>.allow` overrides it per protocol;
+        // `GIT_ALLOW_PROTOCOL` overrides every `protocol.*` setting, and it
+        // names no real protocol here. `GIT_NO_REPLACE_OBJECTS` stops a
+        // `refs/replace/` ref (the agent can write one) from changing what a
+        // commit reads as.
         command
             .env("LC_ALL", "C")
             .env("LANG", "C")
-            .env("GIT_NO_LAZY_FETCH", "1");
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .env("GIT_ALLOW_PROTOCOL", "ironmem-guard-allows-none")
+            .env("GIT_NO_REPLACE_OBJECTS", "1");
         for key in self.unset_env {
             command.env_remove(key);
         }
@@ -1203,10 +1210,22 @@ impl<'a> GuardGit<'a> {
         let stdout = dispatch::drain(child.stdout.take());
         let stderr = dispatch::drain(child.stderr.take());
         let deadline = self.deadline;
-        let status = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break status,
-                Ok(None) if std::time::Instant::now() < deadline => {
+        // git is reaped only once it has exited and its pipes are closed.
+        // Until then its pid, and so the id of the group it leads, stays
+        // reserved, so the group can still be killed safely: a descendant
+        // git left behind can hold a pipe open, and a reaped leader's group
+        // id could already name someone else's group.
+        let finished = |handle: Option<&std::thread::JoinHandle<_>>| {
+            handle.is_none_or(std::thread::JoinHandle::is_finished)
+        };
+        loop {
+            let exited = dispatch::exited_unreaped(&mut child);
+            let closed = stdout.is_finished()
+                && stderr.is_finished()
+                && finished(writer.as_ref());
+            match exited {
+                Ok(true) if closed => break,
+                Ok(_) if std::time::Instant::now() < deadline => {
                     std::thread::sleep(GUARD_GIT_POLL)
                 }
                 waited => {
@@ -1214,7 +1233,12 @@ impl<'a> GuardGit<'a> {
                     let _ = child.wait();
                     return Err(match waited {
                         Err(e) => format!("{} could not be waited on: {e}", label()),
-                        _ => format!(
+                        Ok(true) => format!(
+                            "{} exited but left its output open past {}s",
+                            label(),
+                            self.timeout.as_secs_f64()
+                        ),
+                        Ok(false) => format!(
                             "{} did not finish within the guard's {}s and was killed",
                             label(),
                             self.timeout.as_secs_f64()
@@ -1222,22 +1246,10 @@ impl<'a> GuardGit<'a> {
                     });
                 }
             }
-        };
-        // A descendant git left behind can hold a pipe open. The readers get
-        // what is left of the same deadline and are then abandoned.
-        let open = !joins_by(&stdout, deadline)
-            || !joins_by(&stderr, deadline)
-            || writer.as_ref().is_some_and(|w| !joins_by(w, deadline));
-        if open {
-            // Whatever holds the pipe is still in the group git led: a group
-            // id is not reused while any member lives.
-            dispatch::kill_process_group(&mut child);
-            return Err(format!(
-                "{} exited but left its output open past {}s",
-                label(),
-                self.timeout.as_secs_f64()
-            ));
         }
+        let status = child
+            .wait()
+            .map_err(|e| format!("{} could not be waited on: {e}", label()))?;
         let output = std::process::Output {
             status,
             stdout: stdout.join().unwrap_or_default(),
@@ -1257,15 +1269,29 @@ impl<'a> GuardGit<'a> {
     }
 }
 
-/// Whether `handle`'s thread finishes by `deadline`.
-fn joins_by<T>(handle: &std::thread::JoinHandle<T>, deadline: std::time::Instant) -> bool {
-    while !handle.is_finished() {
-        if std::time::Instant::now() >= deadline {
-            return false;
-        }
-        std::thread::sleep(GUARD_GIT_POLL);
+/// The config scopes whose unreadable signature programs were already
+/// reported, in this process.
+static UNREADABLE_SCOPES_WARNED: std::sync::Mutex<std::collections::BTreeSet<&'static str>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// Warn that `scope`'s signature programs cannot be read, once per scope per
+/// process: a guard is built for every `met` and every run start, and an
+/// unset `$HOME` stays unset for the controller's life. Returns whether it
+/// warned.
+fn warn_unreadable_scope_once(scope: &'static str, error: &str) -> bool {
+    let first = UNREADABLE_SCOPES_WARNED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(scope);
+    if first {
+        tracing::warn!(
+            scope,
+            error = %error,
+            "autopilot's commit-signing guard cannot read the operator's signature programs in \
+             this scope; git's defaults are used for it (warned once per process)"
+        );
     }
-    true
+    first
 }
 
 /// Why the issue branch's commits break the repository's signing policy:
@@ -1337,18 +1363,30 @@ fn signing_violation(
     check_signing(worktree, seen, SIGNING_GUARD_TIMEOUT)
 }
 
-/// [`signing_violation`] with each git command bounded by `timeout`.
+/// [`signing_violation`], with all its git commands bounded by `timeout`.
 fn check_signing(
     worktree: &Worktree,
     seen: SigningPolicySeen,
     timeout: std::time::Duration,
 ) -> Result<Option<SigningViolation>, GuardFault> {
+    if let std::ops::ControlFlow::Break(answer) = policy_gate(worktree, seen)? {
+        return Ok(answer);
+    }
+    let git = GuardGit::new(&worktree.path, timeout).map_err(GuardFault::GitUnreadable)?;
+    check_range(worktree, &git)
+}
+
+/// The signing policy's part of [`signing_violation`]: `Break` with the
+/// answer when the policy is off, `Continue` when it is on and the branch's
+/// range is to be read.
+fn policy_gate(
+    worktree: &Worktree,
+    seen: SigningPolicySeen,
+) -> Result<std::ops::ControlFlow<Option<SigningViolation>>, GuardFault> {
     match worktree::signing_policy(&worktree.path) {
-        Err(why) => {
-            return Err(GuardFault::PolicyUnreadable(format!(
-                "commit.gpgsign could not be read: {why}"
-            )))
-        }
+        Err(why) => Err(GuardFault::PolicyUnreadable(format!(
+            "commit.gpgsign could not be read: {why}"
+        ))),
         Ok(false) => {
             let holder = match worktree::signing_holder(&worktree.path, &worktree.branch)
                 .map_err(GuardFault::PolicyUnreadable)?
@@ -1359,12 +1397,21 @@ fn check_signing(
                 worktree::SigningHold::OptedOut => seen.fresh().holder().map(str::to_string),
                 worktree::SigningHold::NotHeld => seen.holder().map(str::to_string),
             };
-            return Ok(holder.map(|holder| SigningViolation::PolicyDisabled { holder }));
+            Ok(std::ops::ControlFlow::Break(
+                holder.map(|holder| SigningViolation::PolicyDisabled { holder }),
+            ))
         }
-        Ok(true) => {}
+        Ok(true) => Ok(std::ops::ControlFlow::Continue(())),
     }
+}
+
+/// The range part of [`signing_violation`], with the policy on: every
+/// command through `git`, so within its one deadline.
+fn check_range(
+    worktree: &Worktree,
+    git: &GuardGit<'_>,
+) -> Result<Option<SigningViolation>, GuardFault> {
     let unreadable = GuardFault::GitUnreadable;
-    let git = GuardGit::new(&worktree.path, timeout).map_err(unreadable)?;
     let branch = worktree.branch.as_str();
     let local = format!("refs/heads/{branch}");
     let probe = git
@@ -1505,7 +1552,7 @@ fn check_signing(
     if flagged.is_empty() {
         return Ok(None);
     }
-    let identity = run_identity(&git);
+    let identity = run_identity(git);
     let own_commit = |committer: &str| {
         identity
             .as_ref()
@@ -1548,29 +1595,48 @@ static CLEAN_AT_START: std::sync::Mutex<
 thread_local! {
     /// How many run-start checks read the range in full, on this thread.
     static START_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// How many [`GuardGit`]s were built, each with its own deadline, on
+    /// this thread.
+    static GUARD_GITS_BUILT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// A collaborator's unsigned commit on the branch at a run's start, which
-/// would turn away any `met` the run produced. The range is read in full only
-/// when something it depends on changed since it was last found clean: every
-/// ref tip, the remotes, the cut, the policy, the identity and the pinned
-/// signature programs ([`range_key`]). Fail closed: a key that cannot be read
-/// is never cached, and a fault is never remembered as clean.
+/// A fault at a run's start that would turn away any `met` the run
+/// produced: a collaborator's unsigned commit on the branch, or a recorded
+/// cut that cannot bound the range (any [`GuardFault::stops_run`]). The range
+/// is read in full only when something it depends on changed since it was
+/// last found clean: every ref tip, the remotes, the cut, the policy, the
+/// identity and the pinned signature programs ([`range_key`]). The key and
+/// the check share one [`GuardGit`], so one deadline. Fail closed: a key
+/// that cannot be read is never cached, and a fault is never remembered as
+/// clean. A git that cannot be run is not a reason to refuse here; the
+/// guard meets it again at the `met`, where it is never accepted.
 fn collaborator_check_at_start(worktree: &Worktree, seen: SigningPolicySeen) -> Option<GuardFault> {
     let slot = (worktree.path.clone(), worktree.branch.clone());
-    let key = range_key(worktree).ok();
     let cache = || CLEAN_AT_START.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(git) = GuardGit::new(&worktree.path, SIGNING_GUARD_TIMEOUT) else {
+        cache().remove(&slot);
+        return None;
+    };
+    let key = range_key(worktree, &git).ok();
     if key.is_some() && cache().get(&slot) == key.as_ref() {
         return None;
     }
     #[cfg(test)]
     START_CHECKS.with(|n| n.set(n.get() + 1));
-    match signing_violation(worktree, seen) {
-        Err(fault @ GuardFault::ForeignUnsigned { .. }) => {
+    let verdict = match policy_gate(worktree, seen) {
+        Ok(std::ops::ControlFlow::Break(answer)) => Ok(answer),
+        Ok(std::ops::ControlFlow::Continue(())) => check_range(worktree, &git),
+        Err(fault) => Err(fault),
+    };
+    match verdict {
+        Err(fault) if fault.stops_run() => {
             cache().remove(&slot);
             Some(fault)
         }
-        Err(_) => None,
+        Err(_) => {
+            cache().remove(&slot);
+            None
+        }
         Ok(_) => {
             if let Some(key) = key {
                 cache().insert(slot, key);
@@ -1580,9 +1646,9 @@ fn collaborator_check_at_start(worktree: &Worktree, seen: SigningPolicySeen) -> 
     }
 }
 
-/// Everything the collaborator check's answer depends on, as one string.
-fn range_key(worktree: &Worktree) -> Result<String, String> {
-    let git = GuardGit::new(&worktree.path, SIGNING_GUARD_TIMEOUT)?;
+/// Everything the collaborator check's answer depends on, as one string,
+/// read through the check's own `git`.
+fn range_key(worktree: &Worktree, git: &GuardGit<'_>) -> Result<String, String> {
     let read = |args: &[&str]| -> Result<String, String> {
         let out = git.run(args, None)?;
         if !out.status.success() {
@@ -5733,6 +5799,94 @@ sleep 0.5
             read(&["-c", "alias.lazy=!printenv GIT_NO_LAZY_FETCH", "lazy"]),
             "1"
         );
+    }
+
+    #[test]
+    fn a_guard_git_command_cannot_fetch_where_the_repository_allows_a_protocol() {
+        let (_dir, wt) = fixture_worktree();
+        let (_other_dir, other) = fixture_worktree();
+        commit_in(&other.path, "theirs", &[]);
+        // Repository config can allow one protocol over `protocol.allow`.
+        git_in(&wt.path, &["config", "protocol.file.allow", "always"]);
+        let git = GuardGit::new(&wt.path, SIGNING_GUARD_TIMEOUT).unwrap();
+        let url = format!("file://{}", other.path.display());
+        let out = git.run(&["fetch", "-q", &url, "HEAD"], None).unwrap();
+        assert!(
+            !out.status.success(),
+            "the guard's git fetched: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("not allowed"),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    fn a_guard_git_command_reads_a_commit_past_its_replacement() {
+        let (_dir, wt) = fixture_worktree();
+        let real = git_in(&wt.path, &["rev-parse", "HEAD"]);
+        let stand_in = commit_in(&wt.path, "stand-in", &[]);
+        // `git replace` makes every reader see `stand_in` for `real`.
+        git_in(&wt.path, &["replace", &real, &stand_in]);
+        let git = GuardGit::new(&wt.path, SIGNING_GUARD_TIMEOUT).unwrap();
+        let out = git
+            .run(&["log", "-1", "--format=%s", &real], None)
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "seed");
+    }
+
+    #[test]
+    fn a_guard_with_no_home_warns_about_it_at_most_once() {
+        let (_dir, wt) = fixture_worktree();
+        GuardGit::build(
+            &wt.path,
+            SIGNING_GUARD_TIMEOUT,
+            &["HOME", "XDG_CONFIG_HOME"],
+        )
+        .unwrap();
+        // That scope's warning is spent for the process: no later guard,
+        // built for every met, repeats it.
+        assert!(!warn_unreadable_scope_once("--global", "fatal: $HOME not set"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_exited_child_is_seen_without_being_reaped() {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let started = std::time::Instant::now();
+        while !dispatch::exited_unreaped(&mut child).unwrap() {
+            assert!(started.elapsed() < std::time::Duration::from_secs(10));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // Still a zombie: its pid, and so its group's id, stays reserved.
+        // SAFETY: signal 0 only checks that the pid exists.
+        assert_eq!(unsafe { libc::kill(child.id() as i32, 0) }, 0);
+        assert!(child.wait().unwrap().success());
+    }
+
+    #[test]
+    fn a_run_start_check_builds_one_guard_git_for_one_deadline() {
+        let (_dir, wt) = fixture_worktree();
+        git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
+        commit_in(&wt.path, "work", &[]);
+        let built = || GUARD_GITS_BUILT.with(std::cell::Cell::get);
+        let before = built();
+        assert!(collaborator_check_at_start(&wt, SigningPolicySeen::default()).is_none());
+        assert_eq!(built() - before, 1);
+    }
+
+    #[test]
+    fn a_cut_that_is_not_a_commit_name_stops_a_run_at_its_start() {
+        let (_dir, mut wt) = fixture_worktree();
+        git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
+        commit_in(&wt.path, "b", &[]);
+        wt.cut = worktree::CommitSha::unchecked("--all");
+        assert!(matches!(
+            collaborator_check_at_start(&wt, SigningPolicySeen::default()),
+            Some(GuardFault::CutInvalid(_))
+        ));
     }
 
     #[cfg(unix)]

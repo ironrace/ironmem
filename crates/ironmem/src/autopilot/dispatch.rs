@@ -574,6 +574,8 @@ pub(crate) fn retry_on_etxtbsy<T>(
 /// On a non-unix target there are no process groups here, so this degrades to
 /// exactly the previous behavior — the direct child only. Stated rather than
 /// silently platform-dependent.
+///
+/// Call it only on a child not yet reaped: see the SAFETY note below.
 pub(super) fn kill_process_group(child: &mut std::process::Child) {
     #[cfg(unix)]
     {
@@ -583,14 +585,60 @@ pub(super) fn kill_process_group(child: &mut std::process::Child) {
         if pid > 0 {
             // SAFETY: `killpg` on a pid we spawned ourselves, with a signal
             // constant. It cannot address a group we did not create: the
-            // child was spawned into its own new group, and its pid is still
-            // reserved because we have not reaped it yet.
+            // child was spawned into its own new group, and the caller has
+            // not reaped it yet (no `wait`, and no `try_wait` that returned a
+            // status), so its pid, and with it the group id, is still
+            // reserved. That is this function's precondition: a caller that
+            // must know whether the child exited first asks
+            // [`exited_unreaped`], which does not reap.
             unsafe {
                 libc::killpg(pid, libc::SIGKILL);
             }
         }
     }
     let _ = child.kill();
+}
+
+/// Whether `child` has exited, without reaping it on unix: an exited but
+/// unreaped child is a zombie whose pid, and so the id of the group it leads,
+/// stays reserved, so [`kill_process_group`] can still kill that group's
+/// remaining members safely. The caller reaps it afterwards (`wait`).
+///
+/// Elsewhere there are no process groups to protect, and this is
+/// `try_wait`, which reaps.
+pub(super) fn exited_unreaped(child: &mut std::process::Child) -> std::io::Result<bool> {
+    #[cfg(unix)]
+    {
+        let pid = libc::id_t::try_from(child.id())
+            .map_err(|_| std::io::Error::other("child pid out of range"))?;
+        loop {
+            // SAFETY: `siginfo_t` is plain data, valid when zeroed, and
+            // `waitid` writes only into it. `WNOWAIT` leaves the child
+            // waitable, so this never reaps it.
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            let rc = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid,
+                    &mut info,
+                    libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+                )
+            };
+            if rc == 0 {
+                // With `WNOHANG` and no state change, `si_pid` stays zero.
+                // SAFETY: reading a field of the struct `waitid` filled.
+                return Ok(unsafe { info.si_pid() } != 0);
+            }
+            let e = std::io::Error::last_os_error();
+            if e.kind() != std::io::ErrorKind::Interrupted {
+                return Err(e);
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        child.try_wait().map(|status| status.is_some())
+    }
 }
 
 /// Turn a completed process's output into an outcome. Shared by the bounded

@@ -1299,8 +1299,39 @@ pub fn remove_worktree(
     Ok(WorktreeRemoval::Removed { path: path_str })
 }
 
+/// Test support other modules' tests share.
+#[cfg(test)]
+pub(crate) mod testing {
+    /// A `tracing` writer that keeps what it is given, for asserting a warning.
+    #[derive(Clone, Default)]
+    struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Run `f` with a thread-local subscriber; returns its result and the log.
+    pub(crate) fn with_captured_log<T>(f: impl FnOnce() -> T) -> (T, String) {
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let out = tracing::subscriber::with_default(subscriber, f);
+        let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        (out, log)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::testing::with_captured_log;
     use super::*;
 
     fn run(cwd: &Path, args: &[&str]) {
@@ -1459,32 +1490,6 @@ mod tests {
         run(dir, &["add", file]);
         run(dir, &["commit", "-qm", file]);
         resolve_commit(dir, "HEAD").unwrap()
-    }
-
-    /// A `tracing` writer that keeps what it is given, for asserting a warning.
-    #[derive(Clone, Default)]
-    struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-    impl std::io::Write for Captured {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    /// Run `f` with a thread-local subscriber; returns its result and the log.
-    fn with_captured_log<T>(f: impl FnOnce() -> T) -> (T, String) {
-        let captured = Captured::default();
-        let writer = captured.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_ansi(false)
-            .with_writer(move || writer.clone())
-            .finish();
-        let out = tracing::subscriber::with_default(subscriber, f);
-        let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
-        (out, log)
     }
 
     #[test]
