@@ -78,6 +78,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   branch, turn `commit.gpgsign` off, then run `git config --unset
   branch.<branch>.ironmemSigning` in the repo; see "Commit signing" in
   `docs/AUTOPILOT.md`.
+- **An operator's own `codex exec` or `muse exec --output-schema` session no
+  longer stalls Autopilot.** A `ps` row now counts as an ambiguous Autopilot
+  invocation only when it carries an Autopilot-shaped marker path.
+- **A dispatch into an invocation directory that already has a process
+  identity is refused** instead of spawning a second process into it.
+- **Resuming an issue branch with no recorded cut now resolves `--base`**,
+  records it as the cut, and refuses the run if `--base` does not resolve.
+- **Library: supervised-CLI types renamed.** `CodexArtifacts` is now
+  `InvocationArtifacts`, `CodexRecovery` is `InvocationRecovery`, and the
+  `codex_process` module is `process_tree`. `codex_dispatch` no longer exports
+  `CODEX_DISPATCH_TIMEOUT_SECS`, `CODEX_VERDICT_JSON_SCHEMA` or `build_argv`.
 - **GitHub releases now carry their version's `CHANGELOG.md` section as the
   description.** Until now the release workflow published every release with
   an empty body. `scripts/release_notes.py` extracts the tag's

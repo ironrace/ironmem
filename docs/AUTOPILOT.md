@@ -189,6 +189,11 @@ is never rendered as free.
   no verdict, so it is an infrastructure failure: it consumes no attempt, and
   repeated ones escalate to you rather than retiring the issue. It is not a
   hold.
+- What Muse does when a run exhausts `--max-model-steps` has not been
+  measured live. By the code, any run without a valid verdict ends the same
+  way: an infrastructure failure that consumes no attempt. Only if Muse exits
+  0 with a `completed` terminal record carrying a schema-shaped verdict does
+  that verdict count.
 - Liveness uses the `ps` marker `--output-schema <.../schema.json>` on the
   `muse-bin-<version>` root (the launcher `exec`s it under the same PID), plus
   the shared process tracker. Each Muse shell tool is its own session leader,
@@ -326,9 +331,10 @@ can quietly pass `-c commit.gpgsign=false`.
 - **Which commits are checked.** The whole issue branch: the agent's commits
   since the branch was cut, excluding anything already on another remote
   branch (`HEAD --not <cut> --exclude='*/<issue-branch>' --remotes`). The *cut*
-  is the commit the issue branch was cut from. Upstream commits merged or
-  rebased in are not blamed on the agent, and an earlier dispatch's bypass
-  stays caught after it is pushed.
+  is the commit the issue branch was cut from. Commits merged or rebased in
+  from a remote-tracking branch are not blamed on the agent, but local-only
+  commits merged in are checked like the agent's own. An earlier dispatch's
+  bypass stays caught after it is pushed.
 - **The cut is fixed once.** `--base` is resolved to a commit sha in your
   checkout when the issue branch is created (or once, for an older branch that
   has no recorded cut), and stored as `branch.<branch>.ironmemCut`. A base
