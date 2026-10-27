@@ -13,8 +13,8 @@ use serde_json::json;
 use crate::db::schema::Database;
 use crate::error::MemoryError;
 
-use super::codex_dispatch::InvocationArtifacts;
 use super::implementer::Implementer;
+use super::invocation::InvocationArtifacts;
 use super::{read_current, validate_repo, write_current, IssueRef};
 
 /// One in-flight IC dispatch. Field names and the literal-shape fields
@@ -334,7 +334,7 @@ mod tests {
 
     #[test]
     fn invocation_artifacts_keep_the_codex_artifacts_wire_key() {
-        let artifacts = crate::autopilot::codex_dispatch::InvocationArtifacts {
+        let artifacts = InvocationArtifacts {
             invocation_id: "11111111-2222-3333-4444-555555555555".into(),
             schema_path: "/r/.git/ironmem/autopilot/o-r-1/i/schema.json".into(),
             journal_path: "/r/.git/ironmem/autopilot/o-r-1/i/journal.jsonl".into(),

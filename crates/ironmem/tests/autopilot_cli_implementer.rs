@@ -10,10 +10,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output};
 
 use ironmem::autopilot::budget;
-use ironmem::autopilot::codex_dispatch;
 use ironmem::autopilot::dispatch_state;
 use ironmem::autopilot::gate_config;
 use ironmem::autopilot::implementer::Implementer;
+use ironmem::autopilot::invocation;
 use ironmem::autopilot::worktree;
 use ironmem::autopilot::{DispatchState, IssueRef};
 use ironmem::db::schema::Database;
@@ -839,7 +839,7 @@ exit 97
     std::fs::write(&dirty, "active process work\n").unwrap();
     let registration_before = std::fs::read_to_string(tree.path.join(".git")).unwrap();
     let branch_before = git(&tree.path, &["rev-parse", "--abbrev-ref", "HEAD"]).stdout;
-    let artifacts = codex_dispatch::prepare_artifacts(&tree.path, &issue).unwrap();
+    let artifacts = invocation::prepare_artifacts(&tree.path, &issue).unwrap();
 
     let child = Command::new(stubs.join("codex"))
         .args([
@@ -1168,7 +1168,7 @@ fn clear_dispatch_refuses_a_live_invocation_and_releases_an_unprovable_dead_one(
     executable(&stubs.join("codex"), "#!/bin/sh\nexec /bin/sleep 30\n");
 
     let issue = IssueRef::new(REPO, 53);
-    let artifacts = codex_dispatch::prepare_artifacts(&checkout, &issue).unwrap();
+    let artifacts = invocation::prepare_artifacts(&checkout, &issue).unwrap();
     let child = Command::new(stubs.join("codex"))
         .args([
             "exec",

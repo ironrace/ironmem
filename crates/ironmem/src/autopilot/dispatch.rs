@@ -35,8 +35,8 @@ use serde::Deserialize;
 
 use crate::error::MemoryError;
 
-pub use super::codex_dispatch::InvocationArtifacts;
 use super::implementer::Implementer;
+pub use super::invocation::InvocationArtifacts;
 use super::IssueRef;
 
 /// The schema forced onto every IC dispatch via `--json-schema`, verbatim

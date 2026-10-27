@@ -11,7 +11,7 @@ use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
-use crate::autopilot::codex_dispatch::InvocationArtifacts;
+use crate::autopilot::invocation::InvocationArtifacts;
 use crate::autopilot::registry::Liveness;
 use crate::error::MemoryError;
 
@@ -308,7 +308,7 @@ pub(crate) fn persist_identity(
     a: &InvocationArtifacts,
     identity: &ProcessIdentity,
 ) -> Result<(), MemoryError> {
-    super::codex_dispatch::persist_private_atomic(
+    super::invocation::persist_private_atomic(
         &identity_path(a),
         "process",
         &serde_json::to_vec(identity)?,
@@ -407,7 +407,7 @@ impl ProcessSnapshot {
         let Some(a) = artifacts else {
             return "Codex invocation has no persisted artifacts".into();
         };
-        if super::codex_dispatch::has_launch_failure_record(a) {
+        if super::invocation::has_launch_failure_record(a) {
             return "Codex never launched, but an active process carries its marker or an ambiguous one; holding for verification".into();
         }
         let identity = match read_identity(a) {
@@ -432,7 +432,7 @@ impl ProcessSnapshot {
         {
             return "Codex schema marker matched an unexpected or ambiguous process identity; holding for verification".into();
         }
-        let completed = super::codex_dispatch::has_valid_exit_record(a);
+        let completed = super::invocation::has_valid_exit_record(a);
         if let Some(evidence) = recorded_tree_evidence(rows, &identity, completed) {
             return format!("{evidence}; process identity/completion requires verification");
         }
@@ -451,7 +451,7 @@ impl ProcessSnapshot {
         // A failed spawn writes no process identity, only the supervisor's
         // proof that no child existed. An identity file or any active marker
         // contradicts it.
-        if super::codex_dispatch::has_launch_failure_record(a) {
+        if super::invocation::has_launch_failure_record(a) {
             let contradicted = identity_path(a).exists()
                 || rows.iter().any(|r| {
                     r.active()
@@ -481,7 +481,7 @@ impl ProcessSnapshot {
         {
             return Liveness::Alive;
         }
-        let completed = super::codex_dispatch::has_valid_exit_record(a);
+        let completed = super::invocation::has_valid_exit_record(a);
         if !matches.is_empty() || recorded_tree_evidence(rows, &identity, completed).is_some() {
             return Liveness::Unknown;
         }
@@ -529,11 +529,7 @@ impl ProcessSnapshot {
         }
         let a = artifacts?;
         let identity = read_identity(a).ok()?;
-        recorded_tree_evidence(
-            rows,
-            &identity,
-            super::codex_dispatch::has_valid_exit_record(a),
-        )
+        recorded_tree_evidence(rows, &identity, super::invocation::has_valid_exit_record(a))
     }
     pub fn orphan_markers(&self) -> Vec<&str> {
         match self {

@@ -87,9 +87,9 @@ use std::path::Path;
 use crate::db::schema::Database;
 use crate::error::MemoryError;
 
-use super::codex_dispatch::{self, InvocationArtifacts, InvocationRecovery};
 use super::dispatch::{self, DispatchOutcome, DispatchSpec, SessionMode, Verdict};
 use super::implementer::Implementer;
+use super::invocation::{InvocationArtifacts, InvocationRecovery};
 use super::worktree::Worktree;
 use super::{
     blocked, budget, dispatch_state, gate_config, lineage, remediate, supervise, today_utc,
@@ -233,10 +233,7 @@ pub fn validate_implementation_model(
     implementer: Implementer,
     model: &str,
 ) -> Result<(), MemoryError> {
-    let harness = match implementer {
-        Implementer::Claude => "Claude",
-        Implementer::Codex => "Codex",
-    };
+    let harness = implementer.label();
     if model.trim().is_empty() {
         return Err(MemoryError::Validation(format!(
             "model must not be empty for the {harness} implementer"
@@ -631,23 +628,27 @@ impl Dispatcher for ClaudeDispatcher {
     }
 }
 
-/// Codex implementation backend. Process evidence is checked before durable
-/// artifacts; only trusted supervisor cleanup permits completed recovery.
-pub struct CodexDispatcher {
+/// A supervised CLI implementation backend (Codex, Muse). Process evidence is
+/// checked before durable artifacts; only trusted supervisor cleanup permits
+/// completed recovery.
+pub struct CliDispatcher {
+    implementer: Implementer,
     bin: std::path::PathBuf,
 }
 
-impl CodexDispatcher {
-    pub fn resolve() -> Result<Self, MemoryError> {
+impl CliDispatcher {
+    pub fn resolve(implementer: Implementer) -> Result<Self, MemoryError> {
+        super::invocation::cli_for(implementer)?;
         Ok(Self {
-            bin: crate::launcher::find_on_path(crate::launcher::Harness::Codex.binary())?,
+            implementer,
+            bin: crate::launcher::find_on_path(implementer.launcher_harness().binary())?,
         })
     }
 }
 
-impl Dispatcher for CodexDispatcher {
+impl Dispatcher for CliDispatcher {
     fn implementer(&self) -> Implementer {
-        Implementer::Codex
+        self.implementer
     }
 
     fn recover(
@@ -659,7 +660,9 @@ impl Dispatcher for CodexDispatcher {
         match super::registry::invocation_state_liveness(&snapshot, state) {
             super::registry::Liveness::Alive => Ok(InvocationRecovery::Alive),
             super::registry::Liveness::NotListed => match state.invocation_artifacts.as_ref() {
-                Some(artifacts) => codex_dispatch::recover_artifacts(Some(artifacts)),
+                Some(artifacts) => {
+                    super::invocation::recover_artifacts(state.implementer, Some(artifacts))
+                }
                 None => Ok(InvocationRecovery::NoPriorInvocation),
             },
             super::registry::Liveness::Unknown => Ok(InvocationRecovery::Unknown {
@@ -673,7 +676,7 @@ impl Dispatcher for CodexDispatcher {
         repo: &Path,
         spec: &DispatchSpec,
     ) -> Result<DispatchOutcome, MemoryError> {
-        codex_dispatch::run_codex(&self.bin, repo, spec)
+        super::invocation::run_supervised(&self.bin, repo, spec)
     }
 }
 
@@ -1427,7 +1430,7 @@ pub fn run_issue(
             };
 
             let prepared_artifacts = if config.implementer.recovers_invocations() {
-                Some(codex_dispatch::prepare_artifacts(&worktree.path, issue)?)
+                Some(super::invocation::prepare_artifacts(&worktree.path, issue)?)
             } else {
                 invocation_artifacts.clone()
             };
@@ -1464,7 +1467,7 @@ pub fn run_issue(
                 // Validate the exact backend argv before publishing a new
                 // invocation or charging unknown spend. Definite input errors
                 // prove no process launched and must leave prior state intact.
-                codex_dispatch::build_argv(&worktree.path, &spec)?;
+                super::invocation::validate_argv(&worktree.path, &spec)?;
                 if let Some(artifacts) = &spec.invocation_artifacts {
                     invocation_artifacts = Some(artifacts.clone());
                     write_state(
@@ -2142,7 +2145,10 @@ sleep 0.5
         )
         .unwrap();
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let mut d = CodexDispatcher { bin };
+        let mut d = CliDispatcher {
+            implementer: Implementer::Codex,
+            bin,
+        };
         let state = pending_codex(&db, &wt, None);
         assert!(matches!(
             d.recover(&wt.path, &state).unwrap(),
@@ -2166,7 +2172,7 @@ sleep 0.5
     }
     struct CodexScript {
         inner: ScriptedDispatcher,
-        recovery: Option<super::super::codex_dispatch::InvocationRecovery>,
+        recovery: Option<super::super::invocation::InvocationRecovery>,
     }
     impl Dispatcher for CodexScript {
         fn implementer(&self) -> Implementer {
@@ -2212,7 +2218,7 @@ sleep 0.5
     }
     fn pending_codex(db: &Database, worktree: &Worktree, native: Option<&str>) -> DispatchState {
         let artifacts =
-            super::super::codex_dispatch::prepare_artifacts(&worktree.path, &issue()).unwrap();
+            super::super::invocation::prepare_artifacts(&worktree.path, &issue()).unwrap();
         let state = DispatchState {
             implementer: Implementer::Codex,
             native_session_id: native.map(str::to_string),

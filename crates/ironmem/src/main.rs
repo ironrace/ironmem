@@ -1028,9 +1028,9 @@ fn resolve_dispatcher(
         ironmem::autopilot::Implementer::Claude => {
             Box::new(ironmem::autopilot::run::ClaudeDispatcher::resolve()?)
         }
-        ironmem::autopilot::Implementer::Codex => {
-            Box::new(ironmem::autopilot::run::CodexDispatcher::resolve()?)
-        }
+        ironmem::autopilot::Implementer::Codex => Box::new(
+            ironmem::autopilot::run::CliDispatcher::resolve(implementer)?,
+        ),
     })
 }
 

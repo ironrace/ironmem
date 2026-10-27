@@ -48,6 +48,22 @@ impl Implementer {
     pub fn rotates_session_after_verdict(self) -> bool {
         self == Self::Claude
     }
+
+    /// The harness registry entry whose binary this implementer launches.
+    pub fn launcher_harness(self) -> crate::launcher::Harness {
+        match self {
+            Self::Claude => crate::launcher::Harness::Claude,
+            Self::Codex => crate::launcher::Harness::Codex,
+        }
+    }
+
+    /// The operator-facing name, for messages.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Claude => "Claude",
+            Self::Codex => "Codex",
+        }
+    }
 }
 
 impl FromStr for Implementer {
