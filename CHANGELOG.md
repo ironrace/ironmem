@@ -91,6 +91,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   warning now says so. A daemon caught between its fork and exec is no
   longer left in the invocation's process record, where it could hold the
   issue for as long as it ran.
+- **An agent's tool that runs a setuid binary no longer tears its run
+  down.** On macOS the tracker read every descendant with
+  `PROC_PIDTBSDINFO`, which refuses a process running `ps`, `top` or `sudo`
+  (EPERM), so the run was killed and held for `clear-dispatch`. It now
+  reads `sysctl(KERN_PROC_PID)`, which needs no privilege. A descendant
+  cleanup may not signal is held as evidence, recorded, until it is gone.
 - **A Codex or Muse run that fails within milliseconds is no longer held
   for `clear-dispatch`.** A root that exits before the first process sample
   (a Muse usage error, or "session in use") is recorded once its process

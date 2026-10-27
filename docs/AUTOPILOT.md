@@ -432,6 +432,19 @@ finishes by itself and always needs `clear-dispatch` once you have confirmed
 nothing is running. A child that `chdir`s out of the worktree before the root
 exits still escapes, and a deliberate escape is outside the guarantee.
 
+A tool that runs a setuid binary (`ps`, `top`, `sudo`) stays tracked: on
+macOS the tracker reads each process's identity with `sysctl(KERN_PROC_PID)`,
+which needs no privilege even for a setuid-root process (`PROC_PIDTBSDINFO`
+refuses one), and Linux reads the world-readable `/proc/<pid>/stat`. Such a
+process still has your real uid, so cleanup can stop and kill it like any
+other. One it is not permitted to signal (for example `sudo` once it has
+switched to root) is never a failure of the run and never ignored: the
+supervisor records the outcome and holds completion, naming that process
+and its real uid, along with anything under it in the process table, until
+each is gone; recovery then finishes it with no `clear-dispatch`. What such
+a process starts after that check and moves out of its tree is outside the
+guarantee.
+
 The macOS runtime path is exercised. Linux-specific
 kernel identity and cleanup code is covered by code/tests but has not been
 run end to end on a Linux host.

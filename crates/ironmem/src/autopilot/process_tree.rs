@@ -923,48 +923,129 @@ fn birth(pid: u32) -> Result<Option<Birth>, String> {
     kernel_observation(pid).map(|process| process.map(|p| p.birth))
 }
 
-/// The kernel's BSD record for `pid`, or `None` once it has exited.
+/// One process's `kinfo_proc`, as `sysctl(KERN_PROC_PID)` reports it.
 #[cfg(target_os = "macos")]
-fn bsd_info(pid: u32) -> Result<Option<libc::proc_bsdinfo>, String> {
-    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
-    // SAFETY: the kernel writes at most the allocated proc_bsdinfo size.
-    let bytes = unsafe {
-        libc::proc_pidinfo(
-            pid as i32,
-            libc::PROC_PIDTBSDINFO,
+#[derive(Debug, Clone, Copy)]
+struct KinfoProc {
+    process: KernelProcess,
+    ruid: u32,
+    euid: u32,
+}
+
+/// The kernel's record for `pid` from `sysctl(CTL_KERN, KERN_PROC,
+/// KERN_PROC_PID)`, or `None` once it has exited (a zombie included).
+///
+/// Unlike `proc_pidinfo(PROC_PIDTBSDINFO)`, which refuses a process running
+/// a setuid binary (an agent's `ps`, `top` or `sudo`) with EPERM, this
+/// reads any process without privilege (measured on macOS 27). `libc` has
+/// no `kinfo_proc`, so its fields are read at their offsets in the 648-byte
+/// LP64 layout of `<sys/sysctl.h>` (`the_sysctl_record_agrees_with_the_bsd_
+/// record` checks them against `PROC_PIDTBSDINFO` for this process).
+#[cfg(target_os = "macos")]
+fn kinfo_proc(pid: u32) -> Result<Option<KinfoProc>, String> {
+    const SIZE: usize = 648;
+    const P_STARTTIME_SEC: usize = 0;
+    const P_STARTTIME_USEC: usize = 8;
+    const P_STAT: usize = 36;
+    const P_PID: usize = 40;
+    const P_RUID: usize = 392;
+    const CR_UID: usize = 420;
+    const E_PPID: usize = 560;
+    const E_PGID: usize = 564;
+    /// `SZOMB` from `<sys/proc.h>`.
+    const SZOMB: u8 = 5;
+    let pid_arg = i32::try_from(pid).map_err(|_| format!("process {pid} is out of range"))?;
+    let mut mib = [
+        libc::CTL_KERN,
+        libc::KERN_PROC,
+        libc::KERN_PROC_PID,
+        pid_arg,
+    ];
+    let mut buffer = [0u8; SIZE];
+    let mut length = SIZE;
+    // SAFETY: the kernel writes at most `length` bytes into `buffer`.
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            4,
+            buffer.as_mut_ptr().cast(),
+            &mut length,
+            std::ptr::null_mut(),
             0,
-            info.as_mut_ptr().cast(),
-            std::mem::size_of::<libc::proc_bsdinfo>() as i32,
         )
     };
-    if bytes == 0 {
+    if rc != 0 {
         let error = std::io::Error::last_os_error();
         if matches!(error.raw_os_error(), Some(libc::ESRCH | libc::ENOENT)) {
             return Ok(None);
         }
         return Err(format!("cannot authenticate process {pid}: {error}"));
     }
-    if bytes as usize != std::mem::size_of::<libc::proc_bsdinfo>() {
+    if length == 0 {
+        return Ok(None);
+    }
+    if length != SIZE {
         return Err("incomplete process birth identity".into());
     }
-    // SAFETY: a full structure was written by proc_pidinfo.
-    let info = unsafe { info.assume_init() };
-    if info.pbi_pid != pid {
+    let bytes4 = |at: usize| -> [u8; 4] { buffer[at..at + 4].try_into().expect("4 bytes") };
+    let seconds = i64::from_ne_bytes(
+        buffer[P_STARTTIME_SEC..P_STARTTIME_SEC + 8]
+            .try_into()
+            .expect("8 bytes"),
+    );
+    let micros = i32::from_ne_bytes(bytes4(P_STARTTIME_USEC));
+    let record_pid = i32::from_ne_bytes(bytes4(P_PID));
+    if record_pid != pid_arg {
         return Err("kernel process identity mismatch".into());
     }
-    Ok(Some(info))
+    if buffer[P_STAT] == SZOMB {
+        return Ok(None);
+    }
+    let (Ok(seconds), Ok(micros)) = (u64::try_from(seconds), u64::try_from(micros)) else {
+        return Err("invalid process birth identity".into());
+    };
+    let ppid = i32::from_ne_bytes(bytes4(E_PPID));
+    let pgid = i32::from_ne_bytes(bytes4(E_PGID));
+    Ok(Some(KinfoProc {
+        process: KernelProcess {
+            pid,
+            ppid: u32::try_from(ppid).map_err(|_| "invalid process parent")?,
+            pgid: u32::try_from(pgid).map_err(|_| "invalid process group")?,
+            birth: Birth(seconds, micros),
+        },
+        ruid: u32::from_ne_bytes(bytes4(P_RUID)),
+        euid: u32::from_ne_bytes(bytes4(CR_UID)),
+    }))
+}
+
+/// `pid`'s real and effective user IDs, or `None` when they cannot be read.
+pub(crate) fn real_and_effective_uid(pid: u32) -> Option<(u32, u32)> {
+    #[cfg(target_os = "macos")]
+    {
+        kinfo_proc(pid).ok().flatten().map(|k| (k.ruid, k.euid))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+        let mut ids = status
+            .lines()
+            .find_map(|line| line.strip_prefix("Uid:"))?
+            .split_whitespace()
+            .map(|id| id.parse::<u32>().ok());
+        Some((ids.next()??, ids.next()??))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = pid;
+        None
+    }
 }
 
 /// Ancestry and birth come from the same kernel record, never a stale ps row.
 fn kernel_observation(pid: u32) -> Result<Option<KernelProcess>, String> {
     #[cfg(target_os = "macos")]
     {
-        Ok(bsd_info(pid)?.map(|info| KernelProcess {
-            pid: info.pbi_pid,
-            ppid: info.pbi_ppid,
-            pgid: info.pbi_pgid,
-            birth: Birth(info.pbi_start_tvsec, info.pbi_start_tvusec),
-        }))
+        Ok(kinfo_proc(pid)?.map(|record| record.process))
     }
     #[cfg(target_os = "linux")]
     {
@@ -1324,21 +1405,18 @@ pub(crate) fn user_pids() -> Result<Vec<u32>, String> {
 
 /// Of `pids`, the current user's processes born at or after `spawned`,
 /// with their working directories, read from the kernel ([`scan_cwds`]).
-/// macOS reads `PROC_PIDTBSDINFO` and `PROC_PIDVNODEPATHINFO`: about 1.5 ms
-/// for ~600 processes, measured. Linux reads `/proc`.
+/// macOS reads `sysctl(KERN_PROC_PID)` (owner: the effective user, so a
+/// process listed as the user's that has since exec'd a setuid binary is
+/// another user's and skipped, never a failed read) and
+/// `PROC_PIDVNODEPATHINFO`: about 1.5 ms for ~600 processes, measured.
+/// Linux reads `/proc`.
 fn processes_with_cwd(pids: Vec<u32>, spawned: Birth) -> Result<Vec<CwdProcess>, ScanError> {
     let uid = current_uid().ok_or("process working directories are unreadable here")?;
     #[cfg(target_os = "macos")]
     {
         use std::os::unix::ffi::OsStrExt;
-        let owner_birth = |pid: u32| {
-            Ok(bsd_info(pid)?.map(|info| {
-                (
-                    info.pbi_uid,
-                    Birth(info.pbi_start_tvsec, info.pbi_start_tvusec),
-                )
-            }))
-        };
+        let owner_birth =
+            |pid: u32| Ok(kinfo_proc(pid)?.map(|record| (record.euid, record.process.birth)));
         let cwd_of = |pid: u32| {
             let mut info = std::mem::MaybeUninit::<libc::proc_vnodepathinfo>::zeroed();
             let size = std::mem::size_of::<libc::proc_vnodepathinfo>() as i32;
@@ -1629,7 +1707,46 @@ pub(crate) struct ProcessTracker {
     kernel_exe: fn(u32) -> Option<PathBuf>,
     /// Descendants whose kernel birth the last observe authenticated.
     live: std::collections::HashSet<u32>,
+    /// [`unix_kill`]; a seam so tests can stand in for a process the
+    /// kernel will not let the operator signal.
+    kill: fn(u32, i32) -> std::io::Result<()>,
+    /// Known processes cleanup was refused permission to signal: they no
+    /// longer have the operator's real uid (an agent's `sudo`). Never a
+    /// failure of the run, and never ignored: completion waits until each
+    /// is gone ([`Self::hold_unsignalable`]).
+    refused: std::collections::HashSet<u32>,
 }
+
+/// What signalling one known process did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Signalled {
+    Sent,
+    Gone,
+    /// The kernel refused it (EPERM): the process is not the operator's to
+    /// signal, by its real uid.
+    Refused,
+}
+
+/// `kill(2)`, as an `io::Result`.
+pub(crate) fn unix_kill(pid: u32, signal: i32) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let pid = i32::try_from(pid).map_err(|_| std::io::Error::other("pid out of range"))?;
+        // SAFETY: a positive PID the caller checked against a kernel birth.
+        if unsafe { libc::kill(pid, signal) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (pid, signal);
+        Err(std::io::Error::other(
+            "invocation process signaling unsupported",
+        ))
+    }
+}
+
 impl ProcessTracker {
     /// A tracker that never owns `daemon`, the operator's shared daemon.
     pub(crate) fn exempting(root_pid: u32, daemon: &SharedDaemon) -> Self {
@@ -1652,7 +1769,15 @@ impl ProcessTracker {
             shared_daemon: shared_daemon.cloned(),
             kernel_exe: kernel_executable,
             live: std::collections::HashSet::new(),
+            kill: unix_kill,
+            refused: std::collections::HashSet::new(),
         }
+    }
+
+    /// Signal through `kill` instead of [`unix_kill`] (tests).
+    #[cfg(test)]
+    pub(crate) fn set_kill(&mut self, kill: fn(u32, i32) -> std::io::Result<()>) {
+        self.kill = kill;
     }
     /// The argv must match, and then the kernel's executable path must be
     /// the configured one: an agent-built `target/debug/ironmem` with the
@@ -1857,37 +1982,46 @@ impl ProcessTracker {
                 "cannot signal unauthenticated invocation process".into(),
             ));
         };
-        self.signal_known(pid, *expected, signal)
+        match self.signal_known(pid, *expected, signal)? {
+            Signalled::Refused => Err(MemoryError::Validation(format!(
+                "not permitted to signal invocation process {pid}"
+            ))),
+            Signalled::Sent | Signalled::Gone => Ok(()),
+        }
     }
 
     /// Signal a known process, by the birth it was enrolled with.
-    fn signal_known(&self, pid: u32, expected: Birth, signal: i32) -> Result<(), MemoryError> {
+    fn signal_known(
+        &self,
+        pid: u32,
+        expected: Birth,
+        signal: i32,
+    ) -> Result<Signalled, MemoryError> {
         match birth(pid).map_err(MemoryError::Validation)? {
-            None => Ok(()),
-            Some(actual) if actual == expected => {
-                #[cfg(unix)]
-                {
-                    // SAFETY: positive PID checked against a kernel birth token.
-                    if unsafe { libc::kill(pid as i32, signal) } != 0 {
-                        let e = std::io::Error::last_os_error();
-                        if e.raw_os_error() != Some(libc::ESRCH) {
-                            return Err(e.into());
-                        }
-                    }
-                    Ok(())
-                }
-                #[cfg(not(unix))]
-                {
-                    let _ = signal;
-                    Err(MemoryError::Validation(
-                        "invocation process signaling unsupported".into(),
-                    ))
-                }
-            }
+            None => Ok(Signalled::Gone),
+            Some(actual) if actual == expected => match (self.kill)(pid, signal) {
+                Ok(()) => Ok(Signalled::Sent),
+                Err(e) if e.raw_os_error() == Some(libc::ESRCH) => Ok(Signalled::Gone),
+                Err(e) if e.raw_os_error() == Some(libc::EPERM) => Ok(Signalled::Refused),
+                Err(e) => Err(e.into()),
+            },
             Some(_) => Err(MemoryError::Validation(
                 "invocation PID identity changed; refusing signal".into(),
             )),
         }
+    }
+
+    /// [`Self::signal_known`], remembering a refusal ([`Self::refused`]).
+    fn signal_or_keep(
+        &mut self,
+        pid: u32,
+        expected: Birth,
+        signal: i32,
+    ) -> Result<(), MemoryError> {
+        if self.signal_known(pid, expected, signal)? == Signalled::Refused {
+            self.refused.insert(pid);
+        }
+        Ok(())
     }
 
     /// Freeze the owned tree before enumerating/killing it. Separate setsid
@@ -1898,7 +2032,11 @@ impl ProcessTracker {
         let result = (|| {
             if !root_reaped {
                 self.observe()?;
-                self.signal(self.root_pid, STOP_SIGNAL)?;
+                if let Some(&(_, birth)) = self.known.iter().find(|(r, _)| r.pid == self.root_pid) {
+                    self.signal_or_keep(self.root_pid, birth, STOP_SIGNAL)?;
+                } else {
+                    self.signal(self.root_pid, STOP_SIGNAL)?;
+                }
             }
             let mut stable = false;
             for _ in 0..32 {
@@ -1908,12 +2046,19 @@ impl ProcessTracker {
                 // still wearing its spawner's argv, is stopped and killed
                 // here like any tool. That is harmless: it never bound the
                 // socket or served anyone, and the next proxy spawns another.
-                for (row, birth) in &self.known {
-                    self.signal_known(row.pid, *birth, STOP_SIGNAL)?;
+                let known: Vec<(u32, Birth)> =
+                    self.known.iter().map(|(r, b)| (r.pid, *b)).collect();
+                for (pid, birth) in known {
+                    self.signal_or_keep(pid, birth, STOP_SIGNAL)?;
                 }
+                // One it may not signal never stops; it is kept as evidence.
                 let stopped = rows
                     .iter()
-                    .filter(|r| self.known.iter().any(|(k, _)| k.pid == r.pid) && r.active())
+                    .filter(|r| {
+                        r.active()
+                            && !self.refused.contains(&r.pid)
+                            && self.known.iter().any(|(k, _)| k.pid == r.pid)
+                    })
                     .all(|r| r.stat.starts_with('T'));
                 if before == self.known.len() && stopped {
                     stable = true;
@@ -1931,6 +2076,7 @@ impl ProcessTracker {
         // Continue best-effort authenticated cleanup after any uncertainty so
         // SIGSTOP cannot strand a known process. Never signal a stale group.
         let mut signal_error = None;
+        let mut refused = Vec::new();
         let temp = std::env::temp_dir();
         for (row, birth) in self.kill_order() {
             let pid = row.pid;
@@ -1944,10 +2090,13 @@ impl ProcessTracker {
                      registration and Autopilot disagree about the daemon socket"
                 );
             }
-            if let Err(e) = self.signal_known(pid, *birth, KILL_SIGNAL) {
-                signal_error = Some(e);
+            match self.signal_known(pid, *birth, KILL_SIGNAL) {
+                Ok(Signalled::Refused) => refused.push(pid),
+                Ok(_) => {}
+                Err(e) => signal_error = Some(e),
             }
         }
+        self.refused.extend(refused);
         result?;
         if let Some(e) = signal_error {
             return Err(e);
@@ -1958,7 +2107,13 @@ impl ProcessTracker {
         for _ in 0..100 {
             let rows = Self::rows()?;
             let mut live = false;
-            for (old, expected) in &self.known {
+            // One cleanup may not signal is evidence, not a failure: it is
+            // waited for by `hold_unsignalable`, after cleanup.
+            for (old, expected) in self
+                .known
+                .iter()
+                .filter(|(r, _)| !self.refused.contains(&r.pid))
+            {
                 if rows.iter().any(|r| r.pid == old.pid && r.active()) {
                     match birth(old.pid).map_err(MemoryError::Validation)? {
                         None => {} // The ps row raced a completed process exit.
@@ -2078,6 +2233,92 @@ impl ProcessTracker {
                 _ => std::thread::sleep(QUIET_POLL.min(grace)),
             }
         }
+    }
+
+    /// `quiet`, also held for every known process cleanup was refused
+    /// permission to signal that still runs, and for every process under
+    /// one in the process table: none of it could be stopped, so completion
+    /// waits, recorded, until each is gone by kernel birth. Anything such a
+    /// process starts after this check and moves out of its tree is beyond
+    /// the guarantee, like a deliberate escape; the hold lasts at least as
+    /// long as the process itself.
+    pub(crate) fn hold_unsignalable(
+        &self,
+        worktree: &Path,
+        quiet: Quiet,
+    ) -> Result<Quiet, MemoryError> {
+        if self.refused.is_empty() {
+            return Ok(quiet);
+        }
+        let rows = Self::rows()?;
+        let mut held: Vec<(u32, Birth)> = Vec::new();
+        for (row, expected) in self
+            .known
+            .iter()
+            .filter(|(r, _)| self.refused.contains(&r.pid))
+        {
+            if birth(row.pid).map_err(MemoryError::Validation)? == Some(*expected) {
+                held.push((row.pid, *expected));
+            }
+        }
+        // Their descendants in the process table, by parent, to any depth.
+        let mut frontier: Vec<u32> = held.iter().map(|(pid, _)| *pid).collect();
+        while let Some(parent) = frontier.pop() {
+            for row in rows.iter().filter(|r| r.active() && r.ppid == parent) {
+                if held.iter().any(|(pid, _)| *pid == row.pid) {
+                    continue;
+                }
+                if let Some(child) = kernel_observation(row.pid).map_err(MemoryError::Validation)? {
+                    if child.ppid == parent {
+                        held.push((row.pid, child.birth));
+                        frontier.push(row.pid);
+                    }
+                }
+            }
+        }
+        if held.is_empty() {
+            return Ok(quiet);
+        }
+        let named = held
+            .iter()
+            .take(5)
+            .map(|(pid, _)| {
+                let ruid = real_and_effective_uid(*pid)
+                    .map_or_else(|| "unknown".to_owned(), |(ruid, _)| ruid.to_string());
+                format!("process {pid} (real uid {ruid})")
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let reason = format!(
+            "cleanup was not permitted to signal {named}{}, started by the invocation; \
+             completion waits until it is gone",
+            if held.len() > 5 { " and more" } else { "" }
+        );
+        Ok(Quiet::Held(match quiet {
+            Quiet::Held(mut hold) => {
+                for straggler in held {
+                    if !hold.stragglers.contains(&straggler) {
+                        hold.stragglers.push(straggler);
+                    }
+                }
+                hold.reason = format!("{reason}; {}", hold.reason);
+                hold
+            }
+            Quiet::Yes => QuietHold {
+                worktree: worktree.canonicalize().map_err(|e| {
+                    MemoryError::Validation(format!(
+                        "cannot resolve the invocation worktree {}: {e}",
+                        worktree.display()
+                    ))
+                })?,
+                uid: current_uid().ok_or_else(|| {
+                    MemoryError::Validation("process ownership is unreadable here".into())
+                })?,
+                stragglers: held,
+                scan_failed: None,
+                reason,
+            },
+        }))
     }
 
     /// Read the root's kernel record straight after spawn, before any
@@ -2202,7 +2443,7 @@ pub(crate) mod testing {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::autopilot::implementer::Implementer;
 
@@ -2543,6 +2784,8 @@ mod tests {
             shared_daemon: None,
             kernel_exe: kernel_executable,
             live: std::collections::HashSet::new(),
+            kill: unix_kill,
+            refused: std::collections::HashSet::new(),
         };
         let order = tracker.kill_order().map(|(r, _)| r.pid).collect::<Vec<_>>();
         assert_eq!(order.last(), Some(&10));
@@ -3396,6 +3639,86 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("tracked PID was reused"), "{err}");
+    }
+
+    /// `/usr/bin/top` when it is setuid (macOS), the setuid binary these
+    /// tests run as a tool; `None` elsewhere, where they skip.
+    #[cfg(unix)]
+    pub(crate) fn setuid_top() -> Option<&'static str> {
+        use std::os::unix::fs::PermissionsExt;
+        let top = "/usr/bin/top";
+        let setuid = std::fs::metadata(top).is_ok_and(|m| m.permissions().mode() & 0o4000 != 0);
+        if !setuid {
+            eprintln!("{top} is not setuid on this platform; skipping");
+        }
+        setuid.then_some(top)
+    }
+
+    /// The `sysctl(KERN_PROC_PID)` record, read at fixed offsets because
+    /// `libc` has no `kinfo_proc`, agrees with `PROC_PIDTBSDINFO` on this
+    /// process: the offsets are right.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_sysctl_record_agrees_with_the_bsd_record() {
+        let me = std::process::id();
+        let record = kinfo_proc(me).unwrap().unwrap();
+        let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+        // SAFETY: the kernel writes at most the allocated size.
+        let bytes = unsafe {
+            libc::proc_pidinfo(
+                me as i32,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                info.as_mut_ptr().cast(),
+                std::mem::size_of::<libc::proc_bsdinfo>() as i32,
+            )
+        };
+        assert_eq!(bytes as usize, std::mem::size_of::<libc::proc_bsdinfo>());
+        // SAFETY: fully written above.
+        let info = unsafe { info.assume_init() };
+        assert_eq!(record.process.pid, info.pbi_pid);
+        assert_eq!(record.process.ppid, info.pbi_ppid);
+        assert_eq!(record.process.pgid, info.pbi_pgid);
+        assert_eq!(
+            record.process.birth,
+            Birth(info.pbi_start_tvsec, info.pbi_start_tvusec)
+        );
+        assert_eq!((record.ruid, record.euid), (info.pbi_ruid, info.pbi_uid));
+    }
+
+    /// An agent's tool that runs a setuid binary (`ps`, `top`) still has a
+    /// kernel identity the tracker can read without privilege, so its run
+    /// is not torn down. Measured: `PROC_PIDTBSDINFO` refuses such a process
+    /// with EPERM, `sysctl(KERN_PROC_PID)` does not.
+    #[cfg(unix)]
+    #[test]
+    fn a_setuid_root_process_is_authenticated_without_privilege() {
+        let Some(top) = setuid_top() else { return };
+        let mut child = Command::new(top)
+            .args(["-l", "30", "-s", "1"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let started = std::time::Instant::now();
+        // Until its exec it is still ours; wait for the setuid image.
+        let read = loop {
+            let read = kernel_observation(child.id());
+            let setuid = real_and_effective_uid(child.id()).is_some_and(|(_, euid)| euid == 0);
+            if setuid || started.elapsed() > std::time::Duration::from_secs(10) {
+                break read;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let _ = child.kill();
+        let _ = child.wait();
+        let process = read.unwrap().expect("the live top was read as gone");
+        assert_eq!(process.pid, child.id());
+        assert_eq!(process.ppid, std::process::id());
+        // SAFETY: getuid has no preconditions.
+        assert_eq!(
+            real_and_effective_uid(std::process::id()),
+            Some((unsafe { libc::getuid() }, unsafe { libc::geteuid() }))
+        );
     }
 
     /// `live_evidence` (what `clear-dispatch` refuses on) holds an issue for

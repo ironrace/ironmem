@@ -1015,6 +1015,8 @@ fn finish_supervised(
     both(cleaned, recorded)?;
     tracker.verify_group_drained()?;
     let quiet = tracker.verify_worktree_quiet(repo, quiet.grace, quiet.pids)?;
+    // A descendant cleanup could not signal still runs: evidence, held.
+    let quiet = tracker.hold_unsignalable(repo, quiet)?;
     let mut record = exit_record(
         a,
         cli.expected_native_id(spec),
@@ -3061,6 +3063,170 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
                 assert!(!exists(pid), "a daemon on another socket escaped cleanup");
             }
         }
+    }
+
+    /// An agent's tool that runs a setuid binary (`top` here; `ps` and
+    /// `sudo` alike) is a descendant whose kernel identity is still read, so
+    /// the run is not torn down and completion is trusted once it exits.
+    #[cfg(unix)]
+    #[test]
+    fn a_setuid_tool_does_not_tear_the_run_down() {
+        let Some(top) = crate::autopilot::process_tree::tests::setuid_top() else {
+            return;
+        };
+        let (dir, s) = setup();
+        let bin = binary(
+            dir.path(),
+            &script(&format!("{top} -l 3 -s 1 > /dev/null || exit 6"), 0),
+        );
+        let o = run_supervised_bounded(&bin, dir.path(), &s, Duration::from_secs(60)).unwrap();
+        assert!(o.is_met() && o.process_success, "{o:?}");
+    }
+
+    /// A setuid child left running in the worktree is enrolled like any
+    /// tool. Its real uid is still the operator's, so cleanup can and does
+    /// kill it (measured), and completion is trusted once it is gone.
+    #[cfg(unix)]
+    #[test]
+    fn a_long_lived_setuid_child_is_cleaned_up_with_the_run() {
+        let Some(top) = crate::autopilot::process_tree::tests::setuid_top() else {
+            return;
+        };
+        let (dir, s) = setup();
+        let bin = binary(
+            dir.path(),
+            &script(
+                &format!("{top} -l 30 -s 1 > /dev/null &\necho $! > top.pid\nsleep 1"),
+                0,
+            ),
+        );
+        let o = run_supervised_bounded(&bin, dir.path(), &s, Duration::from_secs(60));
+        let pid: i32 = std::fs::read_to_string(dir.path().join("top.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // SAFETY: signal 0 only probes that the process exists.
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        if alive {
+            // SAFETY: the fixture's own top, which cleanup missed.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+        let o = o.unwrap();
+        assert!(o.is_met(), "{o:?}");
+        assert!(!alive, "cleanup left the setuid child running");
+    }
+
+    /// The process the kill seam refuses, as the kernel refuses a signal to
+    /// a process that no longer has the operator's real uid (`sudo`).
+    static REFUSED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+    fn refusing_kill(pid: u32, signal: i32) -> std::io::Result<()> {
+        if pid == REFUSED.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(std::io::Error::from_raw_os_error(libc::EPERM));
+        }
+        crate::autopilot::process_tree::unix_kill(pid, signal)
+    }
+
+    /// A descendant cleanup cannot signal is neither a failure of the run
+    /// nor ignored: it is kept as evidence, and completion waits, recorded,
+    /// until it is gone. Then recovery trusts it with no `clear-dispatch`.
+    #[cfg(unix)]
+    #[test]
+    fn a_descendant_cleanup_cannot_signal_holds_completion_until_gone() {
+        struct KillOnDrop(i32);
+        impl Drop for KillOnDrop {
+            fn drop(&mut self) {
+                // SAFETY: the fixture's own tool.
+                unsafe { libc::kill(self.0, libc::SIGKILL) };
+            }
+        }
+        let (dir, s) = setup();
+        let a = s.invocation_artifacts.as_ref().unwrap();
+        let bin = binary(
+            dir.path(),
+            &script(
+                "sleep 30 &\necho $! > tool.pid\n\
+                 while [ ! -f root-release ]; do sleep 0.01; done",
+                0,
+            ),
+        );
+        let started = Instant::now();
+        let mut child = spawn_fixture_invocation(&bin, dir.path(), &s);
+        let mut tracker = ProcessTracker::owning_every_descendant(child.id());
+        tracker.set_kill(refusing_kill);
+        let mut identity = fixture_identity(a);
+        let tool_pid = || {
+            std::fs::read_to_string(dir.path().join("tool.pid"))
+                .ok()
+                .and_then(|pid| pid.trim().parse::<u32>().ok())
+        };
+        // Sample until the tool is enrolled, then refuse it every signal.
+        let tool = loop {
+            assert!(
+                started.elapsed() < Duration::from_secs(30),
+                "the tool never enrolled"
+            );
+            tracker.observe().unwrap();
+            if let Some(tool) =
+                tool_pid().filter(|tool| tracker.recorded().1.iter().any(|d| d.pid == *tool))
+            {
+                break tool;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let _guard = KillOnDrop(tool as i32);
+        REFUSED.store(tool, std::sync::atomic::Ordering::SeqCst);
+        record_identity(a, &mut identity, &tracker).unwrap();
+        std::fs::write(dir.path().join("root-release"), "").unwrap();
+        let status = child.wait().unwrap();
+        let result = finish_supervised(
+            &CodexCli,
+            &mut tracker,
+            &mut identity,
+            dir.path(),
+            a,
+            &s,
+            status,
+            started,
+            false,
+            None,
+            QuietScan {
+                grace: Duration::from_millis(200),
+                pids: &no_pids,
+            },
+        );
+        REFUSED.store(0, std::sync::atomic::Ordering::SeqCst);
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains(&format!("process {tool}")) && err.contains("signal"),
+            "{err}"
+        );
+        assert!(is_awaiting_quiet(a) && !has_valid_exit_record(a));
+        // SAFETY: signal 0 only probes that the process exists.
+        assert_eq!(unsafe { libc::kill(tool as i32, 0) }, 0);
+        let snapshot =
+            || super::super::process_tree::snapshot(&mut super::super::process_tree::UnixProcesses);
+        let settle = || {
+            settle_awaiting_quiet(
+                a,
+                &snapshot(),
+                None,
+                super::super::process_tree::kernel_birth,
+                &no_pids,
+            )
+        };
+        assert!(settle().is_err_and(|e| e.contains(&tool.to_string())));
+        // SAFETY: the fixture's own tool.
+        unsafe { libc::kill(tool as i32, libc::SIGKILL) };
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut settled = settle();
+        while settled != Ok(true) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+            settled = settle();
+        }
+        assert_eq!(settled, Ok(true));
+        assert!(read_artifacts(Implementer::Codex, a).unwrap().is_met());
     }
 
     /// A sample taken between the shared daemon's fork and its exec sees the
