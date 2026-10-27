@@ -121,6 +121,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   invocation only when it carries an Autopilot-shaped marker path.
 - **A dispatch into an invocation directory that already has a process
   identity is refused** instead of spawning a second process into it.
+- **The Codex and Muse implementers skip relative `PATH` entries** (such as
+  `.`) when finding their binary. They run in the issue worktree, where a
+  relative entry would find a file in the repository being worked on.
 - **Resuming an issue branch with no recorded cut now resolves `--base`**,
   records it as the cut, and refuses the run if `--base` does not resolve.
 - **Library: supervised-CLI types renamed.** `CodexArtifacts` is now

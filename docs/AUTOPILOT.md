@@ -286,6 +286,10 @@ evidence wins over a stale completion record. If `ps` is unavailable, only
 Codex liveness becomes unknown; if the Claude registry source is unavailable,
 only Claude liveness does.
 
+The `codex` or `muse` binary is looked up on the absolute `PATH` entries only.
+The harness runs in the issue worktree, so a relative entry such as `.` would
+find a file in the repository being worked on.
+
 A spawn that fails outright (for example, `codex` missing from `PATH`) proves
 no child existed, so the supervisor records that, and the invocation is an
 ordinary infrastructure failure rather than a hold. What stays held is

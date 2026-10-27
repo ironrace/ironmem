@@ -713,16 +713,59 @@ pub struct CliDispatcher {
 impl CliDispatcher {
     pub fn resolve(implementer: Implementer) -> Result<Self, MemoryError> {
         super::invocation::cli_for(implementer)?;
+        let path_var = std::env::var_os("PATH").unwrap_or_default();
         Ok(Self {
             implementer,
-            bin: crate::launcher::find_on_path(implementer.launcher_harness().binary())?,
+            bin: find_launcher(implementer.launcher_harness().binary(), &path_var)?,
             // The socket derives from the state directory and
             // `IRONMEM_DAEMON_SOCKET`, never from a `--db` override.
             shared_daemon: super::process_tree::SharedDaemon::for_current_exe(
-                crate::config::Config::load(None)?.daemon_socket_path(),
+                shared_daemon_socket(crate::config::Config::load(None))?,
             ),
         })
     }
+
+    /// Refuse work for another harness: `bin` is this dispatcher's binary,
+    /// and handing it another harness's argv or artifacts would run one CLI
+    /// as if it were the other.
+    fn check_harness(&self, other: Implementer) -> Result<(), MemoryError> {
+        if other == self.implementer {
+            return Ok(());
+        }
+        Err(MemoryError::Validation(format!(
+            "implementation harness mismatch: the {} dispatcher was handed a {} invocation",
+            self.implementer.label(),
+            other.label()
+        )))
+    }
+}
+
+/// `name` on `path_var`, skipping relative entries. A supervised harness is
+/// spawned in the issue worktree, where a relative entry such as `.` would
+/// resolve to a file in the repository being worked on.
+fn find_launcher(
+    name: &str,
+    path_var: &std::ffi::OsStr,
+) -> Result<std::path::PathBuf, MemoryError> {
+    let absolute = std::env::split_paths(path_var).filter(|dir| dir.is_absolute());
+    let path_var = std::env::join_paths(absolute)
+        .map_err(|e| MemoryError::Validation(format!("unusable PATH: {e}")))?;
+    crate::launcher::find_in_paths(name, &path_var)
+}
+
+/// The shared daemon's socket from a loaded config. Loading it parses every
+/// `IRONMEM_*` setting, so a failure here names what it was loaded for.
+fn shared_daemon_socket(
+    config: Result<crate::config::Config, MemoryError>,
+) -> Result<std::path::PathBuf, MemoryError> {
+    config
+        .map(|config| config.daemon_socket_path())
+        .map_err(|e| {
+            MemoryError::Validation(format!(
+                "cannot resolve the shared ironmem daemon socket, which supervised \
+                 implementer cleanup must spare, because the ironmem config failed to load: {e}"
+            ))
+        })
 }
 
 impl Dispatcher for CliDispatcher {
@@ -735,6 +778,7 @@ impl Dispatcher for CliDispatcher {
         _repo: &Path,
         state: &DispatchState,
     ) -> Result<InvocationRecovery, MemoryError> {
+        self.check_harness(state.implementer)?;
         let snapshot = super::process_tree::snapshot(&mut super::process_tree::UnixProcesses);
         match super::registry::invocation_state_liveness(&snapshot, state) {
             super::registry::Liveness::Alive => Ok(InvocationRecovery::Alive),
@@ -755,6 +799,7 @@ impl Dispatcher for CliDispatcher {
         repo: &Path,
         spec: &DispatchSpec,
     ) -> Result<DispatchOutcome, MemoryError> {
+        self.check_harness(spec.implementer)?;
         super::invocation::run_supervised(&self.bin, repo, spec, self.shared_daemon.as_ref())
     }
 }
@@ -2185,8 +2230,9 @@ pub fn run_issue(
                 _ => note,
             });
         }
-        // Codex-only today: Muse does not assign its own session id, so this
-        // identity check never applies to it.
+        // Only a harness that assigns its own session id (see
+        // `Implementer::assigns_own_session_id`) is checked here: it is the
+        // one whose identity the outcome, not the controller, supplies.
         if config.implementer.assigns_own_session_id() {
             // An invocation that never launched has no thread to check, and
             // its own reason (why the spawn failed) is the useful one.
@@ -2205,8 +2251,8 @@ pub fn run_issue(
                 outcome.process_success = false;
                 // Keep the invocation's own diagnosis (stderr, timeout, exit
                 // code): a harness that failed before announcing its session
-                // (Codex `thread.started`) — auth, config, network — is
-                // explained only there.
+                // (for Codex, its `thread.started` event) — auth, config,
+                // network — is explained only there.
                 let identity = format!(
                     "missing or mismatched native {} session ID; persisted identity retained",
                     config.implementer.label()
@@ -3883,6 +3929,71 @@ sleep 0.5
             .unwrap_err()
             .to_string();
         assert!(err.contains("my disk"), "{err}");
+    }
+
+    #[test]
+    fn a_cli_dispatcher_refuses_a_spec_or_state_for_another_harness() {
+        let (_dir, wt) = fixture_worktree();
+        let mut codex = CliDispatcher {
+            implementer: Implementer::Codex,
+            bin: wt.path.join("no-such-codex"),
+            shared_daemon: None,
+        };
+        let spec = DispatchSpec {
+            implementer: Implementer::Muse,
+            invocation_artifacts: None,
+            session: SessionMode::New {
+                session_uuid: "11111111-2222-3333-4444-555555555555".into(),
+            },
+            name: "ic".into(),
+            model: "muse-wonder-1.0".into(),
+            max_budget_usd: 1.0,
+            max_turns: 10,
+            condition: "do it".into(),
+            wall_clock_timeout: None,
+        };
+        let err = codex.dispatch(&wt.path, &spec).unwrap_err().to_string();
+        assert!(err.contains("harness mismatch"), "{err}");
+        assert!(err.contains("Muse") && err.contains("Codex"), "{err}");
+        let state = pending_muse(&approved_db(), &wt, None);
+        let err = codex.recover(&wt.path, &state).unwrap_err().to_string();
+        assert!(err.contains("harness mismatch"), "{err}");
+    }
+
+    #[test]
+    fn a_supervised_launcher_is_never_found_through_a_relative_path_entry() {
+        let planted = tempfile::tempdir().unwrap();
+        let real = tempfile::tempdir().unwrap();
+        for dir in [planted.path(), real.path()] {
+            let bin = dir.join("muse");
+            std::fs::write(&bin, "#!/bin/sh\nsleep 1\n").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        }
+        // `planted`, spelled relative to this process's directory, comes
+        // first: a repository file a relative PATH entry would reach.
+        let cwd = std::env::current_dir().unwrap();
+        let up = "../".repeat(cwd.components().count().saturating_sub(1));
+        let relative = Path::new(&up).join(planted.path().strip_prefix("/").unwrap());
+        assert!(relative.join("muse").exists());
+        let path_var = std::env::join_paths([relative.as_path(), real.path()]).unwrap();
+        let found = find_launcher("muse", &path_var).unwrap();
+        assert_eq!(found, real.path().join("muse"));
+        assert!(found.is_absolute());
+    }
+
+    #[test]
+    fn an_unloadable_config_names_the_daemon_socket_lookup() {
+        let err = shared_daemon_socket(Err(MemoryError::Validation(
+            "unknown embed mode 'fast'".into(),
+        )))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("shared ironmem daemon socket"), "{err}");
+        assert!(err.contains("unknown embed mode 'fast'"), "{err}");
     }
 
     #[cfg(unix)]
