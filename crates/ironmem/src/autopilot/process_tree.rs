@@ -48,13 +48,7 @@ impl ProcessRow {
     /// session stall Autopilot.
     pub fn marker(&self) -> Result<Option<&str>, String> {
         self.parse_marker().or_else(|reason| {
-            // `--output-schema=<path>` hides the path behind its option name.
-            if self.args.split_whitespace().any(|word| {
-                is_autopilot_marker_path(word)
-                    || word
-                        .split_once('=')
-                        .is_some_and(|(_, value)| is_autopilot_marker_path(value))
-            }) {
+            if marker_words(&self.args).next().is_some() {
                 Err(reason)
             } else {
                 Ok(None)
@@ -153,6 +147,20 @@ impl ProcessRow {
             _ => None,
         }
     }
+}
+
+/// Every word of `args` shaped like an Autopilot marker, including the
+/// value of an `--option=<path>` word, which hides the path behind its name.
+fn marker_words(args: &str) -> impl Iterator<Item = &str> {
+    args.split_whitespace().filter_map(|word| {
+        if is_autopilot_marker_path(word) {
+            Some(word)
+        } else {
+            word.split_once('=')
+                .map(|(_, value)| value)
+                .filter(|value| is_autopilot_marker_path(value))
+        }
+    })
 }
 
 fn parse_codex_options<'a>(args: impl Iterator<Item = &'a str>) -> Result<Option<&'a str>, String> {
@@ -842,6 +850,17 @@ impl ProcessSnapshot {
                     ))
                 }
                 _ => {}
+            }
+            // Whatever runs it: a launcher shape the grammar does not parse
+            // (`bash -e`, `zsh`) still carries the marker. Only this issue
+            // is held by it, and only where clearing is decided.
+            if let Some(marker) =
+                marker_words(&r.args).find(|word| marker_issue_slug(word) == Some(issue_slug))
+            {
+                return Some(format!(
+                    "process {} names an Autopilot invocation marker for {issue_slug}: {marker}",
+                    r.pid
+                ));
             }
         }
         let a = artifacts?;
@@ -3377,6 +3396,47 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("tracked PID was reused"), "{err}");
+    }
+
+    /// `live_evidence` (what `clear-dispatch` refuses on) holds an issue for
+    /// any active row naming one of that issue's Autopilot markers, whatever
+    /// runs it: a launcher shape the grammar does not parse (`bash -e`,
+    /// `zsh`) still carries the marker. Another issue's marker, or a path
+    /// not shaped like one, is not this issue's.
+    #[test]
+    fn any_row_naming_this_issues_marker_is_live_evidence() {
+        let mine =
+            "/r/.git/ironmem/autopilot/o-r-7/0f0e0d0c-0b0a-4908-8706-050403020100/schema.json";
+        let theirs = mine.replace("o-r-7", "o-r-8");
+        let evidence = |args: &str| {
+            ProcessSnapshot::Available(vec![args_row(40, 1, 40, args)]).live_evidence("o-r-7", None)
+        };
+        for args in [
+            format!("bash -e /u/.local/bin/muse exec --json --output-schema {mine}"),
+            format!("zsh /u/.local/bin/muse exec --output-schema={mine}"),
+            format!("/usr/bin/env node /x/codex exec --output-schema {mine} prompt"),
+        ] {
+            let e = evidence(&args).unwrap_or_else(|| panic!("no evidence for {args}"));
+            assert!(e.contains("process 40") && e.contains("o-r-7"), "{e}");
+        }
+        for args in [
+            format!("zsh /u/.local/bin/muse exec --output-schema {theirs}"),
+            "zsh /u/.local/bin/muse exec --output-schema /tmp/o-r-7/schema.json".into(),
+        ] {
+            assert_eq!(evidence(&args), None, "{args}");
+        }
+        // Liveness is unchanged by it: only this issue is held, and only
+        // where clearing is decided.
+        let dir = tempfile::tempdir().unwrap();
+        let (a, _) = testing::invocation(dir.path());
+        testing::complete(&a);
+        let unrelated = ProcessSnapshot::Available(vec![args_row(
+            40,
+            1,
+            40,
+            &format!("zsh /u/muse exec --output-schema {mine}"),
+        )]);
+        assert_eq!(unrelated.liveness(Some(&a)), Liveness::NotListed);
     }
 
     /// If cleanup's own sample failed before its release pass, the identity
