@@ -625,15 +625,22 @@ pub(crate) fn read_identity(a: &InvocationArtifacts) -> Result<ProcessIdentity, 
 /// kernel never hands out a live group's ID as a new PID. Only a live process
 /// holding the root's PID shows the ID was freed and reused, making the group
 /// someone else's.
+///
+/// A recorded descendant's PID now running the operator's shared daemon
+/// (`is_daemon`) is not evidence: a sample before the daemon's exec may
+/// have recorded it, and a cleanup that failed before its release pass
+/// left it there.
 fn recorded_tree_evidence(
     rows: &[ProcessRow],
     identity: &ProcessIdentity,
     completed: bool,
+    is_daemon: &dyn Fn(&ProcessRow) -> bool,
 ) -> Option<String> {
     let active = || rows.iter().filter(|r| r.active());
     if !completed {
         if let Some(r) = active().find(|r| {
-            r.pid == identity.root_pid || identity.descendants.iter().any(|d| d.pid == r.pid)
+            r.pid == identity.root_pid
+                || (identity.descendants.iter().any(|d| d.pid == r.pid) && !is_daemon(r))
         }) {
             return Some(format!(
                 "process {} has a PID this invocation recorded",
@@ -653,6 +660,17 @@ fn recorded_tree_evidence(
     })
 }
 
+/// The operator's shared daemon, read on demand: loading it reads the
+/// configuration, which most liveness checks never need.
+pub(crate) type DaemonSource<'a> = &'a dyn Fn() -> Option<SharedDaemon>;
+
+/// Whether a row is the shared daemon `daemon` names, by argv and the
+/// kernel's executable path; `daemon` is read at most once.
+fn daemon_check(daemon: DaemonSource<'_>) -> impl Fn(&ProcessRow) -> bool + '_ {
+    let loaded = std::cell::OnceCell::new();
+    move |row| is_shared_daemon(loaded.get_or_init(daemon).as_ref(), kernel_executable, row)
+}
+
 impl ProcessSnapshot {
     pub fn is_available(&self) -> bool {
         matches!(self, Self::Available(_))
@@ -666,6 +684,16 @@ impl ProcessSnapshot {
         }
     }
     pub fn invocation_reason(&self, artifacts: Option<&InvocationArtifacts>) -> String {
+        self.invocation_reason_with(artifacts, &|| None)
+    }
+    /// [`Self::invocation_reason`] with the operator's shared daemon
+    /// (`daemon`, read only when a recorded PID is found running), whose
+    /// PID a pre-exec sample may have recorded.
+    pub(crate) fn invocation_reason_with(
+        &self,
+        artifacts: Option<&InvocationArtifacts>,
+        daemon: DaemonSource<'_>,
+    ) -> String {
         let Self::Available(rows) = self else {
             return self.reason();
         };
@@ -698,7 +726,9 @@ impl ProcessSnapshot {
             return "invocation schema marker matched an unexpected or ambiguous process identity; holding for verification".into();
         }
         let completed = super::invocation::has_valid_exit_record(a);
-        if let Some(evidence) = recorded_tree_evidence(rows, &identity, completed) {
+        if let Some(evidence) =
+            recorded_tree_evidence(rows, &identity, completed, &daemon_check(daemon))
+        {
             return format!("{evidence}; process identity/completion requires verification");
         }
         if !completed {
@@ -707,6 +737,15 @@ impl ProcessSnapshot {
         "supervisor completion verified".into()
     }
     pub fn liveness(&self, artifacts: Option<&InvocationArtifacts>) -> Liveness {
+        self.liveness_with(artifacts, &|| None)
+    }
+    /// [`Self::liveness`] with the operator's shared daemon, as
+    /// [`Self::invocation_reason_with`].
+    pub(crate) fn liveness_with(
+        &self,
+        artifacts: Option<&InvocationArtifacts>,
+        daemon: DaemonSource<'_>,
+    ) -> Liveness {
         let Self::Available(rows) = self else {
             return Liveness::Unknown;
         };
@@ -747,7 +786,9 @@ impl ProcessSnapshot {
             return Liveness::Alive;
         }
         let completed = super::invocation::has_valid_exit_record(a);
-        if !matches.is_empty() || recorded_tree_evidence(rows, &identity, completed).is_some() {
+        if !matches.is_empty()
+            || recorded_tree_evidence(rows, &identity, completed, &daemon_check(daemon)).is_some()
+        {
             return Liveness::Unknown;
         }
         if completed {
@@ -766,6 +807,16 @@ impl ProcessSnapshot {
         &self,
         issue_slug: &str,
         artifacts: Option<&InvocationArtifacts>,
+    ) -> Option<String> {
+        self.live_evidence_with(issue_slug, artifacts, &|| None)
+    }
+    /// [`Self::live_evidence`] with the operator's shared daemon, as
+    /// [`Self::invocation_reason_with`].
+    pub(crate) fn live_evidence_with(
+        &self,
+        issue_slug: &str,
+        artifacts: Option<&InvocationArtifacts>,
+        daemon: DaemonSource<'_>,
     ) -> Option<String> {
         let Self::Available(rows) = self else {
             return Some(self.reason());
@@ -808,7 +859,12 @@ impl ProcessSnapshot {
                 return Some(format!("unreadable invocation process identity: {reason}"))
             }
         };
-        recorded_tree_evidence(rows, &identity, super::invocation::has_valid_exit_record(a))
+        recorded_tree_evidence(
+            rows,
+            &identity,
+            super::invocation::has_valid_exit_record(a),
+            &daemon_check(daemon),
+        )
     }
     pub fn orphan_markers(&self) -> Vec<&str> {
         match self {
@@ -1766,18 +1822,14 @@ impl ProcessTracker {
         Ok(rows)
     }
 
-    fn kill_order(&self) -> impl Iterator<Item = u32> + '_ {
+    /// Descendants newest first, then the root, each with its birth.
+    fn kill_order(&self) -> impl Iterator<Item = &(ProcessRow, Birth)> + '_ {
+        let root = self.root_pid;
         self.known
             .iter()
             .rev()
-            .map(|(r, _)| r.pid)
-            .filter(|pid| *pid != self.root_pid)
-            .chain(
-                self.known
-                    .iter()
-                    .map(|(r, _)| r.pid)
-                    .filter(|pid| *pid == self.root_pid),
-            )
+            .filter(move |(r, _)| r.pid != root)
+            .chain(self.known.iter().filter(move |(r, _)| r.pid == root))
     }
 
     fn signal(&self, pid: u32, signal: i32) -> Result<(), MemoryError> {
@@ -1786,9 +1838,14 @@ impl ProcessTracker {
                 "cannot signal unauthenticated invocation process".into(),
             ));
         };
+        self.signal_known(pid, *expected, signal)
+    }
+
+    /// Signal a known process, by the birth it was enrolled with.
+    fn signal_known(&self, pid: u32, expected: Birth, signal: i32) -> Result<(), MemoryError> {
         match birth(pid).map_err(MemoryError::Validation)? {
             None => Ok(()),
-            Some(actual) if actual == *expected => {
+            Some(actual) if actual == expected => {
                 #[cfg(unix)]
                 {
                     // SAFETY: positive PID checked against a kernel birth token.
@@ -1828,8 +1885,12 @@ impl ProcessTracker {
             for _ in 0..32 {
                 let before = self.known.len();
                 let rows = self.observe()?;
-                for (row, _) in &self.known {
-                    self.signal(row.pid, STOP_SIGNAL)?;
+                // A shared daemon a sample caught between its fork and exec,
+                // still wearing its spawner's argv, is stopped and killed
+                // here like any tool. That is harmless: it never bound the
+                // socket or served anyone, and the next proxy spawns another.
+                for (row, birth) in &self.known {
+                    self.signal_known(row.pid, *birth, STOP_SIGNAL)?;
                 }
                 let stopped = rows
                     .iter()
@@ -1852,13 +1913,9 @@ impl ProcessTracker {
         // SIGSTOP cannot strand a known process. Never signal a stale group.
         let mut signal_error = None;
         let temp = std::env::temp_dir();
-        for pid in self.kill_order() {
-            if let Some(socket) = self
-                .known
-                .iter()
-                .find(|(r, _)| r.pid == pid)
-                .and_then(|(row, _)| foreign_daemon_socket(row, self.shared_daemon.as_ref(), &temp))
-            {
+        for (row, birth) in self.kill_order() {
+            let pid = row.pid;
+            if let Some(socket) = foreign_daemon_socket(row, self.shared_daemon.as_ref(), &temp) {
                 tracing::warn!(
                     pid,
                     socket = %socket,
@@ -1868,7 +1925,7 @@ impl ProcessTracker {
                      registration and Autopilot disagree about the daemon socket"
                 );
             }
-            if let Err(e) = self.signal(pid, KILL_SIGNAL) {
+            if let Err(e) = self.signal_known(pid, *birth, KILL_SIGNAL) {
                 signal_error = Some(e);
             }
         }
@@ -2014,8 +2071,8 @@ impl ProcessTracker {
         if self.known.iter().any(|(r, _)| r.pid == self.root_pid) {
             return;
         }
-        if let Ok(Some(root)) = kernel_observation(self.root_pid) {
-            if root.pid == self.root_pid {
+        match kernel_observation(self.root_pid) {
+            Ok(Some(root)) if root.pid == self.root_pid => {
                 let row = ProcessRow {
                     pid: root.pid,
                     ppid: root.ppid,
@@ -2025,6 +2082,13 @@ impl ProcessTracker {
                 };
                 self.known.push((row, root.birth));
             }
+            // Not fatal: the first sample may still bind the root; without
+            // either, completion holds as unproven.
+            outcome => tracing::debug!(
+                pid = self.root_pid,
+                ?outcome,
+                "could not read the invocation root's kernel record at spawn"
+            ),
         }
     }
 
@@ -2461,7 +2525,7 @@ mod tests {
             kernel_exe: kernel_executable,
             live: std::collections::HashSet::new(),
         };
-        let order = tracker.kill_order().collect::<Vec<_>>();
+        let order = tracker.kill_order().map(|(r, _)| r.pid).collect::<Vec<_>>();
         assert_eq!(order.last(), Some(&10));
         assert_eq!(order.len(), 3);
     }
@@ -2791,7 +2855,10 @@ mod tests {
     fn the_shared_daemon_and_its_children_are_never_enrolled_or_signalled() {
         let assert_owns_only_root_and_proxy = |tracker: &ProcessTracker| {
             assert_eq!(owned(tracker), vec![10, 20]);
-            assert_eq!(tracker.kill_order().collect::<Vec<_>>(), vec![20, 10]);
+            assert_eq!(
+                tracker.kill_order().map(|(r, _)| r.pid).collect::<Vec<_>>(),
+                vec![20, 10]
+            );
             for pid in [30, 31] {
                 assert!(tracker
                     .signal(pid, STOP_SIGNAL)
@@ -3310,6 +3377,37 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("tracked PID was reused"), "{err}");
+    }
+
+    /// If cleanup's own sample failed before its release pass, the identity
+    /// still names a shared daemon an earlier sample enrolled before its
+    /// exec. That PID, now the operator's daemon by argv and executable, is
+    /// no evidence of this invocation; any other recorded PID still is.
+    #[test]
+    fn a_recorded_pid_now_running_the_shared_daemon_is_not_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, _) = testing::invocation(dir.path());
+        let mut identity = read_identity(&a).unwrap();
+        identity.descendants = vec![
+            RecordedProcess::new(&process_row(30, 1234, 30), Birth(3, 0)),
+            RecordedProcess::new(&process_row(31, 1234, 31), Birth(4, 0)),
+        ];
+        let is_daemon = |r: &ProcessRow| is_shared_daemon(Some(&daemon()), installed_exe, r);
+        let daemon_only = vec![args_row(30, 1, 30, DAEMON_DB)];
+        assert_eq!(
+            recorded_tree_evidence(&daemon_only, &identity, false, &is_daemon),
+            None
+        );
+        // Without the exemption it is a recorded PID like any other.
+        assert!(recorded_tree_evidence(&daemon_only, &identity, false, &|_| false).is_some());
+        let tool = vec![args_row(30, 1, 30, DAEMON_DB), process_row(31, 1, 31)];
+        assert!(recorded_tree_evidence(&tool, &identity, false, &is_daemon)
+            .is_some_and(|e| e.contains("process 31")));
+        // The root's own PID is never exempt.
+        let mut root = identity.clone();
+        root.root_pid = 30;
+        root.root_pgid = 30;
+        assert!(recorded_tree_evidence(&daemon_only, &root, false, &is_daemon).is_some());
     }
 
     /// Restart recovery never mistakes the daemon for invocation evidence:

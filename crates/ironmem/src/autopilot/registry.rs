@@ -439,7 +439,7 @@ fn idle_invocation_pause(snapshot: &ProcessSnapshot, state: &DispatchState) -> R
 /// The shared daemon a harness's MCP proxy may have autospawned in the
 /// worktree: the operator's configured socket and the controller's own
 /// executable. Without it nothing is exempt, which only holds longer.
-fn configured_shared_daemon() -> Option<crate::autopilot::process_tree::SharedDaemon> {
+pub(crate) fn configured_shared_daemon() -> Option<crate::autopilot::process_tree::SharedDaemon> {
     crate::config::Config::load(None).ok().and_then(|config| {
         crate::autopilot::process_tree::SharedDaemon::for_current_exe(config.daemon_socket_path())
     })
@@ -491,11 +491,11 @@ pub(crate) fn invocation_state_liveness_with(
     pids: crate::autopilot::process_tree::ScanPids<'_>,
 ) -> Liveness {
     match state.invocation_artifacts.as_ref() {
-        Some(artifacts) => match snapshot.liveness(Some(artifacts)) {
+        Some(artifacts) => match snapshot.liveness_with(Some(artifacts), &daemon) {
             Liveness::Unknown
                 if settle_awaiting_quiet(snapshot, artifacts, daemon, pids) == Ok(true) =>
             {
-                snapshot.liveness(Some(artifacts))
+                snapshot.liveness_with(Some(artifacts), &daemon)
             }
             liveness => liveness,
         },
@@ -530,7 +530,7 @@ pub(crate) fn invocation_state_reason_with(
                  remains: {held}",
                 state.implementer.label()
             ),
-            Ok(_) => snapshot.invocation_reason(Some(artifacts)),
+            Ok(_) => snapshot.invocation_reason_with(Some(artifacts), &daemon),
         },
         None => idle_invocation_pause(snapshot, state)
             .err()

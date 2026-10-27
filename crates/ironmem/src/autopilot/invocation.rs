@@ -957,6 +957,20 @@ fn with_cleanup(err: MemoryError, cleanup: Result<(), MemoryError>) -> MemoryErr
     }
 }
 
+/// `first`'s error, or `second`'s, or both together: neither hides the other.
+fn both(
+    first: Result<(), MemoryError>,
+    second: Result<(), MemoryError>,
+) -> Result<(), MemoryError> {
+    match (first, second) {
+        (Ok(()), second) => second,
+        (Err(first), Ok(())) => Err(first),
+        (Err(first), Err(second)) => Err(validation(format!(
+            "{first}; recording the process identity also failed: {second}"
+        ))),
+    }
+}
+
 /// Complete supervision after the root process has been observed and reaped.
 /// Descendants may still be running and writing the invocation's artifacts.
 #[allow(clippy::too_many_arguments)]
@@ -998,8 +1012,7 @@ fn finish_supervised(
     // can fail: with no exit record, recovery counts every recorded PID as
     // this invocation's, and the operator's daemon outlives it.
     let recorded = record_identity(a, identity, tracker);
-    cleaned?;
-    recorded?;
+    both(cleaned, recorded)?;
     tracker.verify_group_drained()?;
     let quiet = tracker.verify_worktree_quiet(repo, quiet.grace, quiet.pids)?;
     let mut record = exit_record(
@@ -3216,6 +3229,24 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
             .set_len(MuseCli.journal_limit() + 1)
             .unwrap();
         assert!(limits(&MuseCli, a).is_some_and(|e| e.contains("journal")));
+    }
+
+    /// Both failures are reported when cleanup and the identity record both
+    /// fail; neither hides the other.
+    #[test]
+    fn a_failed_cleanup_and_a_failed_record_are_both_reported() {
+        let err = |m: &str| -> Result<(), MemoryError> { Err(validation(m)) };
+        assert!(both(Ok(()), Ok(())).is_ok());
+        assert_eq!(
+            both(err("cleanup"), Ok(())).unwrap_err().to_string(),
+            "Validation error: cleanup"
+        );
+        assert_eq!(
+            both(Ok(()), err("record")).unwrap_err().to_string(),
+            "Validation error: record"
+        );
+        let e = both(err("cleanup"), err("record")).unwrap_err().to_string();
+        assert!(e.contains("cleanup") && e.contains("record"), "{e}");
     }
 
     /// The core writes each spawn file privately, byte for byte, and never

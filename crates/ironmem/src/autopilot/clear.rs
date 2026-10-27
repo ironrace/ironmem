@@ -110,9 +110,13 @@ fn refusal(
         (_, Liveness::NotListed) => None,
         // Unknown is exactly the hold this exists for — but only once a fresh
         // process table shows nothing that could be the issue's work.
-        (implementer, Liveness::Unknown) if implementer.recovers_invocations() => snapshots
-            .processes
-            .live_evidence(&state.issue.slug(), state.invocation_artifacts.as_ref()),
+        (implementer, Liveness::Unknown) if implementer.recovers_invocations() => {
+            snapshots.processes.live_evidence_with(
+                &state.issue.slug(),
+                state.invocation_artifacts.as_ref(),
+                &crate::autopilot::registry::configured_shared_daemon,
+            )
+        }
         // A Claude hold means its registry could not be read; there is no
         // evidence to clear against.
         (_, Liveness::Unknown) => Some(snapshots.state_reason(state)),
