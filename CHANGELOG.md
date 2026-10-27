@@ -39,6 +39,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The daily unpriced cap and the budget ledger hold under concurrent
+  Leads.** Every ledger update now reads and writes in one `BEGIN IMMEDIATE`
+  transaction, so two Leads (or a Lead and a reviewer) sharing a database no
+  longer lose each other's update or fail with `database is locked`. Codex
+  and Muse check `--max-unpriced-dispatches-per-day` in the same transaction
+  that reserves the invocation, so two Leads racing for the last unit launch
+  one invocation, not two.
 - **Codex and Muse implementers no longer kill the shared ironmem daemon at
   cleanup.** A harness's ironmem MCP server can autospawn the daemon as its
   own child; the process tracker now never treats the daemon on the
