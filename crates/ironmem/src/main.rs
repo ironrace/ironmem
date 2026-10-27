@@ -387,7 +387,8 @@ enum AutopilotCmd {
         /// Committish new issue branches are cut from
         #[arg(long, default_value = "HEAD")]
         base: String,
-        /// Implementation harness for the IC dispatch
+        /// Implementation harness: claude (default), codex or muse. Reviewer
+        /// selection is independent.
         #[arg(long, default_value = "claude")]
         implementer: ironmem::autopilot::Implementer,
         /// Model for the IC dispatch
@@ -400,7 +401,8 @@ enum AutopilotCmd {
         #[arg(long)]
         n_turns: Option<u32>,
         /// Hard --max-turns ceiling. Counts tool-call turns, not goal turns,
-        /// so it must clear --n-turns times the per-goal-turn floor
+        /// so it must clear --n-turns times the per-goal-turn floor. Muse:
+        /// passed as --max-model-steps; Codex: unsupported
         #[arg(long)]
         max_turns: Option<u32>,
         /// Per-dispatch spend ceiling, passed through to --max-budget-usd
@@ -641,7 +643,8 @@ enum AutopilotCmd {
         /// Directory that per-issue worktrees are created under
         #[arg(long)]
         worktree_root: Option<String>,
-        /// Implementation harness for IC dispatches
+        /// Implementation harness: claude (default), codex or muse. Reviewer
+        /// selection is independent.
         #[arg(long, default_value = "claude")]
         implementer: ironmem::autopilot::Implementer,
         /// Model for IC dispatches
@@ -686,7 +689,8 @@ enum AutopilotCmd {
         #[arg(long)]
         n_turns: Option<u32>,
         /// Hard --max-turns ceiling. Counts tool-call turns, not goal turns,
-        /// so it must clear --n-turns times the per-goal-turn floor
+        /// so it must clear --n-turns times the per-goal-turn floor. Muse:
+        /// passed as --max-model-steps; Codex: unsupported
         #[arg(long)]
         max_turns: Option<u32>,
         /// Per-dispatch spend ceiling
@@ -3941,6 +3945,78 @@ mod tests {
                 assert_eq!(model.as_deref(), Some("gpt-6.1-sol"));
             }
             _ => panic!("expected autopilot lead"),
+        }
+    }
+
+    #[test]
+    fn autopilot_run_and_lead_parse_muse_implementation_selection() {
+        let run = Cli::try_parse_from([
+            "ironmem",
+            "autopilot",
+            "run",
+            "owner/repo",
+            "283",
+            "--title",
+            "t",
+            "--implementer",
+            "muse",
+            "--model",
+            "muse-wonder-1.0",
+        ])
+        .expect("run Muse selection should parse");
+        match run.command {
+            Commands::Autopilot {
+                cmd:
+                    AutopilotCmd::Run {
+                        implementer, model, ..
+                    },
+            } => {
+                assert_eq!(implementer, ironmem::autopilot::Implementer::Muse);
+                assert_eq!(model.as_deref(), Some("muse-wonder-1.0"));
+            }
+            _ => panic!("expected autopilot run"),
+        }
+
+        let lead = Cli::try_parse_from([
+            "ironmem",
+            "autopilot",
+            "lead",
+            "--repo",
+            "owner/repo=/tmp/repo",
+            "--implementer",
+            "muse",
+            "--model",
+            "muse-wonder-1.0",
+        ])
+        .expect("lead Muse selection should parse");
+        match lead.command {
+            Commands::Autopilot {
+                cmd:
+                    AutopilotCmd::Lead {
+                        implementer, model, ..
+                    },
+            } => {
+                assert_eq!(implementer, ironmem::autopilot::Implementer::Muse);
+                assert_eq!(model.as_deref(), Some("muse-wonder-1.0"));
+            }
+            _ => panic!("expected autopilot lead"),
+        }
+    }
+
+    #[test]
+    fn autopilot_implementer_help_lists_muse() {
+        use clap::CommandFactory;
+
+        let mut root = Cli::command();
+        let autopilot = root.find_subcommand_mut("autopilot").unwrap();
+        for subcommand in ["run", "lead"] {
+            let help = autopilot
+                .find_subcommand_mut(subcommand)
+                .unwrap()
+                .render_long_help()
+                .to_string();
+            assert!(help.contains("codex or muse"), "{subcommand}: {help}");
+            assert!(help.contains("--max-model-steps"), "{subcommand}: {help}");
         }
     }
 
