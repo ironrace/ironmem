@@ -168,9 +168,12 @@ impl ParsedRun {
 
     /// [`Self::with_verdict`] when `errors` is empty and both the verdict and the
     /// native ID are present, otherwise [`Self::failed`], dropping the
-    /// verdict. For a parser that gathers evidence as it goes.
+    /// verdict. For a parser that gathers evidence as it goes. When it
+    /// reported nothing wrong, the failure names each missing piece under
+    /// `label` ("Codex", "Muse").
     pub fn from_evidence(
-        errors: Vec<String>,
+        label: &str,
+        mut errors: Vec<String>,
         native_id: Option<String>,
         verdict: Option<FinalVerdict>,
         turns: u32,
@@ -180,7 +183,17 @@ impl ParsedRun {
             (Some(verdict), Some(native_id)) if errors.is_empty() => {
                 Self::with_verdict(native_id, verdict, turns, observed_output)
             }
-            (_, native_id) => Self::failed(errors, native_id, turns, observed_output),
+            (verdict, native_id) => {
+                if errors.is_empty() {
+                    if verdict.is_none() {
+                        errors.push(format!("{label} reported no final verdict"));
+                    }
+                    if native_id.is_none() {
+                        errors.push(format!("{label} reported no native session ID"));
+                    }
+                }
+                Self::failed(errors, native_id, turns, observed_output)
+            }
         }
     }
 
@@ -1060,6 +1073,35 @@ mod tests {
         assert_eq!(failed.errors(), ["broken"]);
         assert_eq!(failed.native_id(), Some(THREAD));
         assert_eq!((failed.turns(), failed.observed_output()), (2, false));
+    }
+
+    /// Evidence gathered with nothing wrong reported but a piece missing
+    /// says which piece, not a generic "no final verdict".
+    #[test]
+    fn evidence_missing_a_piece_names_that_piece() {
+        let met = || FinalVerdict {
+            verdict: Verdict::Met,
+            reason: "gate".into(),
+        };
+        let no_id = ParsedRun::from_evidence("Fake", Vec::new(), None, Some(met()), 1, true);
+        assert!(no_id.verdict().is_none());
+        assert_eq!(no_id.errors(), ["Fake reported no native session ID"]);
+        let no_verdict =
+            ParsedRun::from_evidence("Fake", Vec::new(), Some(THREAD.into()), None, 1, true);
+        assert_eq!(no_verdict.errors(), ["Fake reported no final verdict"]);
+        assert_eq!(no_verdict.native_id(), Some(THREAD));
+        let neither = ParsedRun::from_evidence("Fake", Vec::new(), None, None, 1, true);
+        assert_eq!(
+            neither.errors(),
+            [
+                "Fake reported no final verdict",
+                "Fake reported no native session ID"
+            ]
+        );
+        // Errors the parser already gave are kept as they are.
+        let explained =
+            ParsedRun::from_evidence("Fake", vec!["broken".into()], None, Some(met()), 1, true);
+        assert_eq!(explained.errors(), ["broken"]);
     }
 
     #[test]
@@ -2121,10 +2163,12 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
                 Some(&SharedDaemon {
                     socket: configured.clone(),
                     // The fake daemon's real executable, as the kernel
-                    // reports it: macOS `/bin/sh` re-execs `/bin/bash`
-                    // under the same argv (measured).
+                    // reports it. macOS `/bin/sh` re-execs the shell that
+                    // `/var/select/sh` selects (bash by default) under the
+                    // same argv (measured); elsewhere `/bin/sh` resolves
+                    // to the shell itself.
                     exe: Path::new(if cfg!(target_os = "macos") {
-                        "/bin/bash"
+                        "/var/select/sh"
                     } else {
                         "/bin/sh"
                     })

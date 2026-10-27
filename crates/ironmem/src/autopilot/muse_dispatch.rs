@@ -259,7 +259,7 @@ impl SupervisedCli for MuseCli {
                 many.len()
             )),
         }
-        ParsedRun::from_evidence(errors, native_id, verdict, turns, observed_output)
+        ParsedRun::from_evidence("Muse", errors, native_id, verdict, turns, observed_output)
     }
 }
 

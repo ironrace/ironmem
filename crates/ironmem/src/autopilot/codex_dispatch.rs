@@ -125,7 +125,7 @@ impl SupervisedCli for CodexCli {
                 None
             }
         };
-        ParsedRun::from_evidence(errors, native_id, verdict, turns, observed_output)
+        ParsedRun::from_evidence("Codex", errors, native_id, verdict, turns, observed_output)
     }
 }
 
