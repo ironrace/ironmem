@@ -816,8 +816,8 @@ fn create_branch_with(
 /// so after this add; the branch is this call's, made at `cut`, so `cut` is
 /// its cut.
 fn record_cut_again_if_taken(root: &Path, branch: &str, cut: &str) -> Result<(), MemoryError> {
-    if matches!(config_get(root, &["--get", &cut_key(branch)]), Ok(Some(ref current)) if current == cut)
-    {
+    let current = config_get(root, &["--get", &cut_key(branch)]);
+    if matches!(current, Ok(Some(ref current)) if current == cut) {
         return Ok(());
     }
     tracing::warn!(
@@ -827,12 +827,23 @@ fn record_cut_again_if_taken(root: &Path, branch: &str, cut: &str) -> Result<(),
          another controller; recording it again"
     );
     write_cut(root, branch, cut).map_err(|e| {
+        // With none recorded, the next run backfills it from the branch's
+        // reflog, whose creation entry this add just wrote. Another
+        // controller's value would be reused as it is, so that one is the
+        // operator's to correct.
+        let next = match current {
+            Ok(None) => "the next run records it again from the branch's reflog".to_string(),
+            _ => format!(
+                "`{}` may hold another controller's value: set it with `git config {} {cut}` \
+                 before running again",
+                cut_key(branch),
+                cut_key(branch)
+            ),
+        };
         MemoryError::Validation(format!(
             "the issue branch `{branch}` was created at {cut} in {}, but its cut could not be \
-             recorded again after another controller took it back ({e}); set it with `git \
-             config {} {cut}` before running again",
-            root.display(),
-            cut_key(branch)
+             recorded again after another controller took it back ({e}); {next}",
+            root.display()
         ))
     })
 }
@@ -1837,6 +1848,26 @@ mod tests {
         let lock = repo.join(".git/config.lock");
         std::fs::write(&lock, "").unwrap();
         lock
+    }
+
+    #[test]
+    fn a_cut_that_cannot_be_recorded_again_is_left_to_the_next_runs_reflog_backfill() {
+        let repo = fixture_repo();
+        let roots = tempfile::tempdir().unwrap();
+        let created = ensure_worktree(repo.path(), roots.path(), &issue(), "HEAD").unwrap();
+        let root = resolve_repo_root(repo.path()).unwrap();
+        // Taken back under the branch, and the config lock is held.
+        run(&root, &["config", "--unset", &issue_cut_key()]);
+        let lock = hold_config_lock(&root);
+        let err = record_cut_again_if_taken(&root, &branch_name(&issue()), &created.cut)
+            .unwrap_err()
+            .to_string();
+        std::fs::remove_file(lock).unwrap();
+        assert!(err.contains("reflog"), "{err}");
+        assert!(!err.contains("before running again"), "{err}");
+        // As promised: the next run records it from the branch's reflog.
+        let reused = ensure_worktree(repo.path(), roots.path(), &issue(), "HEAD").unwrap();
+        assert_eq!(reused.cut, created.cut);
     }
 
     #[test]
