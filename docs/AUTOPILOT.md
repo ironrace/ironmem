@@ -453,8 +453,11 @@ launchd or init, or its parent was itself born during the invocation. So an
 escaped setuid tool keeps the worktree from reading quiet, while one whose
 parent and group predate the invocation, such as the `login` behind a Terminal
 tab you open, or a `sudo` or `top` you run from a shell you already had, is
-skipped. A `sudo` run from a terminal opened after the run started has a parent
-born during it, so it holds the run until it exits.
+skipped. The new-parent rule reaches any setuid process whose parent started
+after the run did, and that process holds the run until it exits: a `sudo` from
+a terminal opened since; a `/bin/ps` run by an `ironmem autopilot run` or Claude
+session started since (a short-lived one is absorbed by the 15-second retry); or
+a new tab's `login`, if the terminal app itself was relaunched mid-run.
 
 A long-lived process cleanup cannot signal (`sudo -b …`, say) holds the
 issue for as long as it runs, and `clear-dispatch` refuses while it does.

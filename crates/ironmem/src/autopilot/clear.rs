@@ -225,22 +225,34 @@ fn unreadable_refusal(
             return Some(reason);
         }
     }
-    // The drawer's own IC name first: it is the one its Claude IC ran under.
-    let ic = field("ic_session_name")
+    // Both the drawer's own IC name, the one its Claude IC ran under, and
+    // the name every Claude dispatch for the issue takes: either held refuses.
+    let mut names = vec![super::dispatch::ic_name(issue)];
+    if let Some(own) = field("ic_session_name")
         .and_then(|v| v.as_str().map(str::to_owned))
-        .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| super::dispatch::ic_name(issue));
-    if snapshots.claude.liveness(&ic) == Liveness::Alive {
-        return Some(format!("Claude's registry lists its IC session {ic}"));
+        .filter(|name| !name.is_empty() && !names.contains(name))
+    {
+        names.insert(0, own);
     }
-    let names_ic = |args: &str| {
-        let words: Vec<&str> = args.split_whitespace().collect();
-        words.windows(2).any(|w| w[0] == "--name" && w[1] == ic)
-            || words.iter().any(|w| w.strip_prefix("--name=") == Some(&ic))
-    };
-    rows.iter()
-        .find(|r| r.active() && names_ic(&r.args))
-        .map(|r| format!("process {} names its IC session {ic} with --name", r.pid))
+    for ic in &names {
+        if snapshots.claude.liveness(ic) == Liveness::Alive {
+            return Some(format!("Claude's registry lists its IC session {ic}"));
+        }
+        let names_ic = |args: &str| {
+            let words: Vec<&str> = args.split_whitespace().collect();
+            words.windows(2).any(|w| w[0] == "--name" && w[1] == ic)
+                || words
+                    .iter()
+                    .any(|w| w.strip_prefix("--name=") == Some(ic.as_str()))
+        };
+        if let Some(r) = rows.iter().find(|r| r.active() && names_ic(&r.args)) {
+            return Some(format!(
+                "process {} names its IC session {ic} with --name",
+                r.pid
+            ));
+        }
+    }
+    None
 }
 
 /// Whether lineage already holds the attempt the state was dispatching: the
@@ -1050,6 +1062,25 @@ mod tests {
                 "claude -p x --name ic-renamed-42 --model m",
             )]),
             "process 96",
+        );
+        // The name every Claude dispatch for the issue takes still counts.
+        held(
+            HarnessSnapshots {
+                claude: RegistrySnapshot::Available(vec![AgentEntry {
+                    name: "ic-owner-repo-42".into(),
+                    status: None,
+                }]),
+                processes: ProcessSnapshot::Available(Vec::new()),
+            },
+            "ic-owner-repo-42",
+        );
+        held(
+            snapshots(vec![row(
+                97,
+                97,
+                "claude -p x --name ic-owner-repo-42 --model m",
+            )]),
+            "process 97",
         );
         let cleared = clear_dispatch(&db, &issue(), || snapshots(Vec::new()));
         assert!(matches!(cleared, Ok(Cleared::Unreadable(_))), "{cleared:?}");
