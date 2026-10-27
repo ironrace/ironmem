@@ -986,7 +986,7 @@ impl std::fmt::Display for GuardFault {
                 let named = commits
                     .iter()
                     .take(NAMED_UNSIGNED_COMMITS)
-                    .map(|(sha, committer)| format!("{sha} by {committer}"))
+                    .map(|(sha, committer)| format!("{sha} (committer {committer})"))
                     .collect::<Vec<_>>()
                     .join(", ");
                 let more = commits.len().saturating_sub(NAMED_UNSIGNED_COMMITS);
@@ -999,8 +999,10 @@ impl std::fmt::Display for GuardFault {
                     f,
                     "commit.gpgsign is on, but commit(s) {named}{more} on this branch are \
                      unsigned or carry a bad signature, and none was committed as this run's \
-                     identity ({identity}), so the model is not charged for them. Re-sign or \
-                     drop them and push the branch, or opt it out of signing (see Commit \
+                     identity: the commits name their committers above, and this run commits \
+                     as {identity}. So the model is not charged for them. If those are the \
+                     same person, the implementer committed under another identity. Re-sign \
+                     or drop them and push the branch, or opt it out of signing (see Commit \
                      signing in docs/AUTOPILOT.md)"
                 )
             }
@@ -1215,7 +1217,18 @@ fn joins_by<T>(handle: &std::thread::JoinHandle<T>, deadline: std::time::Instant
 /// `GIT_COMMITTER_EMAIL`). One a collaborator pushed is still never accepted,
 /// but it is [`GuardFault::ForeignUnsigned`], not the model's failed attempt:
 /// fixing it means rewriting their commit. An identity that cannot be read
-/// counts every commit as the model's.
+/// counts every commit as the model's. This assumes an implementer commits
+/// as the operator: measured 2026-10-27 on two real Muse commits, whose
+/// committer was exactly the worktree's `git var GIT_COMMITTER_IDENT`.
+/// Codex is unmeasured; it runs with the same inherited configuration and
+/// the same scrubbed `GIT_*` environment, so it is assumed to match. A
+/// mismatch never lets a `met` through: it only stops the run instead of
+/// charging an attempt, and the stop names both identities.
+///
+/// In a mixed range, where some flagged commits are the model's and some a
+/// collaborator's, the violation names them all, the collaborator's
+/// included, and the `met` is the model's failed attempt: fail closed, since
+/// every one of them would ship unsigned.
 ///
 /// The policy is enforced when it was on at this run's start (`seen`), when
 /// the branch or the repository recorded it on ([`worktree::record_signing`],
@@ -5333,8 +5346,13 @@ sleep 0.5
             .to_string();
         assert_eq!(dispatcher.dispatched, 1, "{err}");
         assert!(err.contains(&short(&theirs)), "{err}");
-        assert!(err.contains("human@example.test"), "{err}");
-        assert!(err.contains("autopilot@example.test"), "{err}");
+        // Both identities, so an operator can spot a harness committing as
+        // someone else.
+        assert!(err.contains("(committer human@example.test)"), "{err}");
+        assert!(
+            err.contains("this run commits as autopilot@example.test"),
+            "{err}"
+        );
         assert!(lineage::attempts_for_issue(&db, &issue())
             .unwrap()
             .is_empty());

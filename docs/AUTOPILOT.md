@@ -542,7 +542,13 @@ can quietly pass `-c commit.gpgsign=false`.
   the commits and their committers. While such a commit is on the branch, a
   run refuses to start, so nothing is paid for. Re-sign or drop them and push,
   or opt the branch out. If the identity cannot be read, every commit is the
-  agent's.
+  agent's. This relies on the implementer committing as you: two real Muse
+  commits carried exactly the worktree's `git var GIT_COMMITTER_IDENT`
+  (measured 2026-10-27), and Codex, unmeasured, inherits the same
+  configuration. The stop names both identities, so a mismatch shows. In a
+  mixed range, where some flagged commits are the agent's and some a
+  collaborator's, the agent's failed attempt names all of them, the
+  collaborator's included, since every one would ship unsigned.
 - **The repository's own signature programs never run.** `%G?` makes git run
   `gpg.program`, `gpg.ssh.program` or `gpg.x509.program` in the controller,
   and the agent can write `.git/config`. The guard pins each one with `-c` to
