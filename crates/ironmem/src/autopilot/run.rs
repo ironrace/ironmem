@@ -956,11 +956,7 @@ fn record_and_advance(
     // attempt and current-status writes. Complete that same ordinal instead
     // of appending it twice. Terminal summaries are markers, not attempts.
     let existing = if recovering_harness.is_some() {
-        lineage::attempts_for_issue(db, &record.issue)?
-            .into_iter()
-            .find(|attempt| {
-                attempt.attempt_n == record.attempt_n && !is_terminal_summary(&attempt.approach)
-            })
+        recorded_attempt(db, &record.issue, record.attempt_n)?
     } else {
         None
     };
@@ -1010,6 +1006,18 @@ fn record_and_advance(
         },
     )?;
     Ok(())
+}
+
+/// The attempt already recorded at ordinal `attempt_n`, if any. Attempt-cap
+/// terminal summaries are markers, not attempts, so they never match.
+fn recorded_attempt(
+    db: &Database,
+    issue: &IssueRef,
+    attempt_n: u32,
+) -> Result<Option<AttemptRecord>, MemoryError> {
+    Ok(lineage::attempts_for_issue(db, issue)?
+        .into_iter()
+        .find(|attempt| attempt.attempt_n == attempt_n && !is_terminal_summary(&attempt.approach)))
 }
 
 /// Opening words of the attempt-cap terminal record's `approach`. A const
@@ -1860,7 +1868,31 @@ pub fn run_issue(
         // turn as `why_failed`. Every commit the branch added since its cut is
         // checked, not just this dispatch's, so an earlier bypass cannot be
         // waved through by a later `met` that adds nothing.
-        if outcome.is_met() {
+        //
+        // A recovered `met` may replay an attempt that is already recorded:
+        // the attempt record and the status write are separate, and a crash
+        // between them leaves `cumulative_attempt_n` behind, so recovery
+        // replays the outcome onto the same ordinal (a met always consumes
+        // one: `cumulative_attempt_n + 1`). The guard reads live git state
+        // that may have changed since, and a different verdict would make
+        // `record_and_advance` refuse the replay and wedge the issue. The
+        // recorded verdict is authoritative instead.
+        let recorded = if recovered && outcome.is_met() {
+            recorded_attempt(db, issue, cumulative_attempt_n + 1)?
+        } else {
+            None
+        };
+        if let Some(recorded) = recorded {
+            if recorded.verdict == AttemptOutcome::Failed {
+                outcome.verdict = Some(Verdict::NotMet);
+                outcome.reason = Some(
+                    recorded
+                        .why_failed
+                        .filter(|why| !why.trim().is_empty())
+                        .unwrap_or_else(|| "recorded attempt failed".into()),
+                );
+            }
+        } else if outcome.is_met() {
             if let Some(violation) = signing_violation(worktree, policy_at_start) {
                 outcome.verdict = Some(Verdict::NotMet);
                 outcome.reason = Some(match outcome.reason.take() {
@@ -3819,6 +3851,108 @@ sleep 0.5
             .as_deref()
             .unwrap()
             .contains("unsigned"));
+    }
+
+    /// The crash window [`a_recovered_met_is_checked_against_the_branch_base`]
+    /// does not cover: the attempt record was written, the status was not, so
+    /// the replay takes the same ordinal while the signing state may have
+    /// changed since.
+    fn record_attempt_one_before_the_crash(
+        db: &Database,
+        verdict: AttemptOutcome,
+        why_failed: Option<&str>,
+    ) {
+        lineage::record_attempt(
+            db,
+            &AttemptRecord {
+                issue: issue(),
+                attempt_n: 1,
+                approach: "recorded before the crash".into(),
+                verdict,
+                why_failed: why_failed.map(str::to_string),
+                commit_sha: None,
+            },
+        )
+        .unwrap();
+        assert!(
+            lineage::get_issue_status(db, &issue()).unwrap().is_none(),
+            "setup: the crash came before the status write"
+        );
+    }
+
+    fn assert_attempt_one_recorded_once(db: &Database, verdict: AttemptOutcome) {
+        let attempts: Vec<_> = lineage::attempts_for_issue(db, &issue())
+            .unwrap()
+            .into_iter()
+            .filter(|r| !is_terminal_summary(&r.approach))
+            .collect();
+        assert_eq!(attempts.len(), 1, "{attempts:?}");
+        assert_eq!(attempts[0].verdict, verdict);
+        assert_eq!(
+            lineage::get_issue_status(db, &issue())
+                .unwrap()
+                .unwrap()
+                .cumulative_attempt_n,
+            1
+        );
+    }
+
+    #[test]
+    fn a_recovered_met_already_recorded_as_success_skips_the_live_signing_guard() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        pending_codex(&db, &wt, Some("persisted"));
+        record_attempt_one_before_the_crash(&db, AttemptOutcome::Success, None);
+        // Between the crash and the replay the policy came on and an unsigned
+        // commit landed; the guard would now call the recorded success a
+        // failure.
+        git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
+        commit_in(&wt.path, "later", &["-c", "commit.gpgsign=false"]);
+        let mut result = met();
+        result.native_session_id = Some("persisted".into());
+        let mut d = codex_script(vec![]);
+        d.recovery = Some(InvocationRecovery::Finished(result));
+        let mut c = codex_config();
+        c.attempt_cap = 1;
+        let run = run_issue(&db, &issue(), &brief(), &wt, &c, &mut d).unwrap();
+        assert!(
+            matches!(run.terminal, TerminalReason::Met { .. }),
+            "{run:?}"
+        );
+        assert_eq!(
+            run.dispatches[0].classification,
+            DispatchClassification::Met
+        );
+        assert!(d.inner.seen.is_empty());
+        assert_attempt_one_recorded_once(&db, AttemptOutcome::Success);
+    }
+
+    #[test]
+    fn a_recovered_met_already_recorded_as_failed_keeps_the_recorded_failure() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        pending_muse(&db, &wt, None);
+        let recorded =
+            "gate condition not met: commit.gpgsign is on, but commit(s) abc are unsigned";
+        record_attempt_one_before_the_crash(&db, AttemptOutcome::Failed, Some(recorded));
+        // The fixture's policy is off and no flag was recorded, so the guard
+        // would now pass the met the recorded attempt failed.
+        let mut d = muse_script(vec![]);
+        d.recovery = Some(InvocationRecovery::Finished(met()));
+        let mut c = muse_config();
+        c.attempt_cap = 1;
+        let run = run_issue(&db, &issue(), &brief(), &wt, &c, &mut d).unwrap();
+        assert!(
+            !matches!(run.terminal, TerminalReason::Met { .. }),
+            "{run:?}"
+        );
+        assert_eq!(
+            run.dispatches[0].classification,
+            DispatchClassification::FailedAttempt
+        );
+        assert_eq!(run.dispatches[0].reason.as_deref(), Some(recorded));
+        assert!(d.inner.seen.is_empty());
+        assert_attempt_one_recorded_once(&db, AttemptOutcome::Failed);
     }
 
     /// The short shas a violation blames, from its `commit(s) a, b on` list.
