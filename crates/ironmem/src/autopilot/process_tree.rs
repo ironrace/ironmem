@@ -1,10 +1,11 @@
 //! Local process evidence for supervised CLI invocations (Codex, Muse). Missing evidence means unknown.
 //!
-//! Restart adoption verifies the native Codex root's exact invocation marker.
-//! A launcher wrapper whose marker appears only on a different native child
-//! conservatively holds until trusted supervisor completion. Process polling
-//! and authenticated tree cleanup cover ordinary Codex tools, including setsid
-//! children; they do not contain deliberate double-fork escapes between polls.
+//! Restart adoption verifies the native harness root's exact invocation
+//! marker. A launcher wrapper whose marker appears only on a different native
+//! child conservatively holds until trusted supervisor completion. Process
+//! polling and authenticated tree cleanup cover ordinary harness tools,
+//! including setsid children; they do not contain deliberate double-fork
+//! escapes between polls.
 use std::path::Path;
 #[cfg(unix)]
 use std::process::Command;
@@ -29,21 +30,25 @@ impl ProcessRow {
         !self.stat.starts_with('Z')
     }
 
-    /// ps does not preserve argv boundaries. Only the verified option prefix
-    /// before the first positional prompt can supply an invocation marker.
+    /// ps does not preserve argv boundaries. Only argv words the harness
+    /// grammar verifies as options can supply an invocation marker: Codex's
+    /// option prefix before its first positional prompt, or Muse's whole
+    /// argv, which Autopilot passes with no positional prompt.
     ///
-    /// An unparseable prefix is ambiguous only when the row could carry an
+    /// An unparseable argv is ambiguous only when the row could carry an
     /// Autopilot marker at all. Every marker is a whitespace-free absolute
-    /// path to a `schema.json` (artifact paths refuse whitespace), so a row
-    /// with no such word is someone else's `codex exec` or `muse exec`, and
-    /// holding every dispatch on it would let any unrelated session stall
-    /// Autopilot.
+    /// path (artifact paths refuse whitespace) of the Autopilot invocation
+    /// layout, so a row with no such word is someone else's `codex exec` or
+    /// `muse exec`, and holding every dispatch on it would let any unrelated
+    /// session stall Autopilot.
     pub fn marker(&self) -> Result<Option<&str>, String> {
         self.parse_marker().or_else(|reason| {
+            // `--output-schema=<path>` hides the path behind its option name.
             if self.args.split_whitespace().any(|word| {
-                Path::new(word)
-                    .file_name()
-                    .is_some_and(|f| f == "schema.json")
+                is_autopilot_marker_path(word)
+                    || word
+                        .split_once('=')
+                        .is_some_and(|(_, value)| is_autopilot_marker_path(value))
             }) {
                 Err(reason)
             } else {
@@ -62,7 +67,8 @@ impl ProcessRow {
             return Ok(None);
         };
         let codex = exe == "codex";
-        // The launcher `exec`s `muse-bin-<version>` under the same PID.
+        // The `~/.local/bin/muse` launcher `exec`s `muse-bin-<version>` under
+        // the same PID, so ps shows the versioned binary.
         let muse = exe == "muse" || exe.starts_with("muse-bin-");
         if !(codex || muse) || args.next() != Some("exec") {
             return Ok(None);
@@ -225,6 +231,37 @@ fn decode_process_table(output: &[u8]) -> Result<Vec<ProcessRow>, String> {
         return Err("ps returned no process table".into());
     }
     parse_processes(&text)
+}
+
+/// Whether `path` has the Autopilot invocation layout:
+/// `/…/ironmem/autopilot/<slug>-<number>/<uuid>/schema.json`.
+fn is_autopilot_marker_path(path: &str) -> bool {
+    let path = Path::new(path);
+    let Some(invocation) = path.parent() else {
+        return false;
+    };
+    let Some(issue) = invocation.parent() else {
+        return false;
+    };
+    let Some(autopilot) = issue.parent() else {
+        return false;
+    };
+    path.is_absolute()
+        && path.file_name().is_some_and(|s| s == "schema.json")
+        && invocation
+            .file_name()
+            .and_then(|s| s.to_str())
+            .is_some_and(|s| uuid::Uuid::parse_str(s).is_ok())
+        && issue
+            .file_name()
+            .and_then(|s| s.to_str())
+            .and_then(|s| s.rsplit_once('-'))
+            .is_some_and(|(_, number)| number.parse::<u64>().is_ok())
+        && autopilot.file_name().is_some_and(|s| s == "autopilot")
+        && autopilot
+            .parent()
+            .and_then(|p| p.file_name())
+            .is_some_and(|s| s == "ironmem")
 }
 
 /// The issue slug an Autopilot marker names: `.../autopilot/<slug>/<uuid>/schema.json`.
@@ -567,7 +604,7 @@ impl ProcessSnapshot {
         let Ok(identity) = read_identity(a) else {
             return Liveness::Unknown;
         };
-        // Any ambiguous actual Codex command can hide our invocation.
+        // Any ambiguous actual Codex or Muse command can hide our invocation.
         if rows.iter().any(|r| r.active() && r.marker().is_err()) {
             return Liveness::Unknown;
         }
@@ -591,11 +628,12 @@ impl ProcessSnapshot {
             Liveness::Unknown
         }
     }
-    /// Fresh evidence that an issue's Codex work may still be running, or
+    /// Fresh evidence that an issue's harness work may still be running, or
     /// `None` when an available table shows nothing that could be it: its
-    /// marker, another Autopilot marker for the issue, an ambiguous Codex row,
-    /// or the recorded tree as [`recorded_tree_evidence`] judges it (recorded
-    /// PIDs count only before a trusted completion record; the group after).
+    /// marker, another Autopilot marker for the issue, an ambiguous Codex or
+    /// Muse row, or the recorded tree as [`recorded_tree_evidence`] judges it
+    /// (recorded PIDs count only before a trusted completion record; the
+    /// group after).
     pub fn live_evidence(
         &self,
         issue_slug: &str,
@@ -608,7 +646,7 @@ impl ProcessSnapshot {
             match r.marker() {
                 Err(reason) => {
                     return Some(format!(
-                        "process {} is an ambiguous Codex command: {reason}",
+                        "process {} is an ambiguous Codex or Muse command: {reason}",
                         r.pid
                     ))
                 }
@@ -638,34 +676,7 @@ impl ProcessSnapshot {
                 .iter()
                 .filter(|r| r.active())
                 .filter_map(|r| r.marker().ok().flatten())
-                .filter(|p| {
-                    let path = Path::new(p);
-                    let Some(invocation) = path.parent() else {
-                        return false;
-                    };
-                    let Some(issue) = invocation.parent() else {
-                        return false;
-                    };
-                    let Some(autopilot) = issue.parent() else {
-                        return false;
-                    };
-                    path.is_absolute()
-                        && path.file_name().is_some_and(|s| s == "schema.json")
-                        && invocation
-                            .file_name()
-                            .and_then(|s| s.to_str())
-                            .is_some_and(|s| uuid::Uuid::parse_str(s).is_ok())
-                        && issue
-                            .file_name()
-                            .and_then(|s| s.to_str())
-                            .and_then(|s| s.rsplit_once('-'))
-                            .is_some_and(|(_, number)| number.parse::<u64>().is_ok())
-                        && autopilot.file_name().is_some_and(|s| s == "autopilot")
-                        && autopilot
-                            .parent()
-                            .and_then(|p| p.file_name())
-                            .is_some_and(|s| s == "ironmem")
-                })
+                .filter(|p| is_autopilot_marker_path(p))
                 .collect(),
         }
     }
@@ -1221,12 +1232,20 @@ mod tests {
             Ok(None)
         );
         assert_eq!(marker("codex exec --output-schema"), Ok(None));
-        // Anything naming a schema.json could be hiding ours, so it still holds.
+        // Anything naming an Autopilot-shaped marker could be hiding ours, so it still holds.
         assert!(marker(
-            "codex exec --profile work --output-schema /r/.git/ironmem/autopilot/o-r-1/u/schema.json p"
+            "codex exec --profile work --output-schema /r/.git/ironmem/autopilot/o-r-1/0f0e0d0c-0b0a-4908-8706-050403020100/schema.json p"
         )
         .is_err());
-        assert!(marker("codex exec --output-schema=/x/schema.json --profile w p").is_err());
+        assert!(marker(
+            "codex exec --output-schema=/r/.git/ironmem/autopilot/o-r-1/0f0e0d0c-0b0a-4908-8706-050403020100/schema.json --profile w p"
+        )
+        .is_err());
+        // A schema.json outside the Autopilot layout is an operator's own run.
+        assert_eq!(
+            marker("codex exec --brand-new-flag --output-schema /tmp/schema.json hi"),
+            Ok(None)
+        );
     }
     fn row(args: &str) -> ProcessRow {
         ProcessRow {
@@ -1253,7 +1272,7 @@ mod tests {
                 "/r/.git/ironmem/autopilot/o-r-7/0f0e0d0c-0b0a-4908-8706-050403020100/schema.json"
             )
         );
-        // The launcher name, before it execs the versioned binary, parses the same.
+        // A bare `muse` executable is accepted too, for forward compatibility.
         let launcher = MUSE_ROOT.replacen(
             "/Users/o/.local/bin/muse-bin-1.4.13-R6996.1",
             "/Users/o/.local/bin/muse",
@@ -1262,6 +1281,9 @@ mod tests {
         assert!(row(&launcher).marker().unwrap().is_some());
         let equals = MUSE_ROOT.replacen("--output-schema /", "--output-schema=/", 1);
         assert!(row(&equals).marker().unwrap().is_some());
+        // A valued option in its `=` form consumes no following word.
+        let valued = MUSE_ROOT.replacen("--model muse-wonder-1.0", "--model=muse-wonder-1.0", 1);
+        assert!(row(&valued).marker().unwrap().is_some());
     }
     #[test]
     fn non_root_muse_rows_are_not_markers() {
@@ -1311,13 +1333,27 @@ mod tests {
         assert!(row(&MUSE_ROOT.replacen("--disable-sandbox", "-w", 1))
             .marker()
             .is_err());
+        assert!(
+            row(&MUSE_ROOT.replacen("--disable-sandbox", "--worktree=create", 1))
+                .marker()
+                .is_err()
+        );
+        // A trailing valued option with no value.
+        assert!(row(&format!("{MUSE_ROOT} --model")).marker().is_err());
         // Two markers.
         assert!(row(&format!("{MUSE_ROOT} --output-schema /x/schema.json"))
             .marker()
             .is_err());
-        // The same ambiguity without any schema.json word is someone else's run.
+        // The same ambiguity without an Autopilot-shaped marker is someone
+        // else's run, even when it names a schema.json of its own.
         assert_eq!(
             row("/u/muse-bin-1.4.13-R6996.1 exec --output-schema /tmp/other.json hello")
+                .marker()
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            row("/u/muse-bin-1.4.13-R6996.1 exec --output-schema /home/me/schema.json summarize")
                 .marker()
                 .unwrap(),
             None

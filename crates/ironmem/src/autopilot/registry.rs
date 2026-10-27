@@ -897,7 +897,7 @@ mod harness_tests {
             Some("/tmp/.git/ironmem/autopilot/repo/other/schema.json")
         );
         let bad = parse_processes(
-            "14 1 14 S codex exec --output-schema /tmp/.git/ironmem/autopilot/repo/uuid/schema.json --future-flag v p\n",
+            "14 1 14 S codex exec --output-schema /tmp/.git/ironmem/autopilot/owner-repo-42/11111111-2222-3333-4444-555555555555/schema.json --future-flag v p\n",
         )
         .unwrap();
         assert!(bad[0].marker().is_err());
@@ -1014,7 +1014,7 @@ mod harness_tests {
         assert!(snapshots.state_reason(&state).contains("active"));
         snapshots.processes = ProcessSnapshot::Available(
             parse_processes(
-                "10 1 10 S codex exec --future-flag v --output-schema /x/schema.json p\n",
+                "10 1 10 S codex exec --future-flag v --output-schema /x/.git/ironmem/autopilot/owner-repo-7/11111111-2222-3333-4444-555555555555/schema.json p\n",
             )
             .unwrap(),
         );
