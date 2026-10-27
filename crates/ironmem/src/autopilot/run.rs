@@ -273,10 +273,25 @@ pub fn validate_implementation_model(
 /// branch and worktree that every dispatch then refuses. The worktree path is
 /// persisted resolved, so the resolved spelling is checked too.
 pub fn validate_worktree_root(implementer: Implementer, root: &Path) -> Result<(), MemoryError> {
+    let cwd = std::env::current_dir()?;
+    validate_worktree_root_from(implementer, root, &cwd)
+}
+
+/// [`validate_worktree_root`] with a relative `root` read against `cwd`.
+///
+/// A relative root that does not exist yet resolves to itself, so neither
+/// spelling would carry the working directory's whitespace; the worktree is
+/// still created beneath it. It is made absolute first.
+fn validate_worktree_root_from(
+    implementer: Implementer,
+    root: &Path,
+    cwd: &Path,
+) -> Result<(), MemoryError> {
     if implementer != Implementer::Muse {
         return Ok(());
     }
-    for path in [root.to_path_buf(), worktree::canonical_or_self(root)] {
+    let absolute = cwd.join(root);
+    for path in [absolute.clone(), worktree::canonical_or_self(&absolute)] {
         let text = path.to_str().ok_or_else(|| {
             MemoryError::Validation(format!(
                 "unsupported worktree root for the Muse implementer: {} is not UTF-8",
@@ -3832,6 +3847,53 @@ sleep 0.5
         for implementer in [Implementer::Claude, Implementer::Codex] {
             validate_worktree_root(implementer, Path::new("/tmp/work trees")).unwrap();
         }
+    }
+
+    #[test]
+    fn a_relative_muse_worktree_root_is_read_against_the_working_directory() {
+        // `--worktree-root wt` from a checkout under whitespace: the root
+        // does not exist yet, so only the working directory reveals it.
+        let err = validate_worktree_root_from(
+            Implementer::Muse,
+            Path::new("wt"),
+            Path::new("/nonexistent/My Work/repo"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("whitespace"), "{err}");
+        assert!(err.contains("My Work"), "{err}");
+        validate_worktree_root_from(
+            Implementer::Muse,
+            Path::new("wt"),
+            Path::new("/nonexistent/work/repo"),
+        )
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_muse_worktree_root_that_resolves_under_whitespace_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("my disk").join("wt");
+        std::fs::create_dir_all(&target).unwrap();
+        let link = dir.path().join("wt-link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(!link.to_str().unwrap().contains(' '));
+        let err = validate_worktree_root(Implementer::Muse, &link)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("my disk"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_muse_worktree_root_is_refused() {
+        use std::os::unix::ffi::OsStrExt;
+        let root = Path::new(std::ffi::OsStr::from_bytes(b"/nonexistent/wt-\xff"));
+        let err = validate_worktree_root(Implementer::Muse, root)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not UTF-8"), "{err}");
     }
 
     #[test]
