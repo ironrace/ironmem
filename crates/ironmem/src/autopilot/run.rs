@@ -661,7 +661,7 @@ impl Dispatcher for CliDispatcher {
             super::registry::Liveness::Alive => Ok(InvocationRecovery::Alive),
             super::registry::Liveness::NotListed => match state.invocation_artifacts.as_ref() {
                 Some(artifacts) => {
-                    super::invocation::recover_artifacts(state.implementer, Some(artifacts))
+                    super::invocation::recover_artifacts(self.implementer, Some(artifacts))
                 }
                 None => Ok(InvocationRecovery::NoPriorInvocation),
             },

@@ -99,7 +99,8 @@ pub trait SupervisedCli: Sync {
 #[derive(Debug, Default)]
 pub struct ParsedRun {
     pub native_id: Option<String>,
-    /// The schema-shaped verdict, or why there is none.
+    /// The schema-shaped verdict, when the run produced one. Why there is
+    /// none travels in `errors`; the core refuses a run without one either way.
     pub verdict: Option<FinalVerdict>,
     pub turns: u32,
     pub errors: Vec<String>,
@@ -143,7 +144,7 @@ fn supported_path(path: &Path) -> Result<&str, MemoryError> {
     Ok(text)
 }
 
-fn create_private(path: &Path) -> Result<File, MemoryError> {
+pub(crate) fn create_private(path: &Path) -> Result<File, MemoryError> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -387,7 +388,16 @@ pub fn run_supervised_bounded(
     spec: &DispatchSpec,
     timeout: Duration,
 ) -> Result<DispatchOutcome, MemoryError> {
-    let cli = cli_for(spec.implementer)?;
+    run_supervised_bounded_with(cli_for(spec.implementer)?, bin, repo, spec, timeout)
+}
+
+fn run_supervised_bounded_with(
+    cli: &dyn SupervisedCli,
+    bin: &Path,
+    repo: &Path,
+    spec: &DispatchSpec,
+    timeout: Duration,
+) -> Result<DispatchOutcome, MemoryError> {
     let a = validate_spec(cli, spec)?;
     let args = cli.argv(repo, spec, a)?;
     // Never overwrite evidence from a prior invocation. A retry must allocate
@@ -407,7 +417,16 @@ pub fn run_supervised_bounded(
             cli.label()
         )));
     }
-    cli.prepare_spawn(spec, a)?;
+    // Nothing has spawned yet and the prior-evidence check passed, so a
+    // failed pre-spawn write is recorded as proof that no child existed.
+    if let Err(e) = cli.prepare_spawn(spec, a) {
+        return never_launched(
+            cli,
+            a,
+            spec,
+            &format!("failed to prepare {} dispatch: {e}", cli.label()),
+        );
+    }
     let mut command = Command::new(bin);
     command
         .args(args)
@@ -499,6 +518,7 @@ pub fn run_supervised_bounded(
         return Err(with_cleanup(e, cleanup));
     }
     finish_supervised(
+        cli,
         &mut tracker,
         a,
         spec,
@@ -529,7 +549,7 @@ fn never_launched(
             "{reason}; recording that it never launched also failed: {e}"
         ))
     })?;
-    read_artifacts(cli.implementer(), a)
+    read_artifacts_with(cli, a)
 }
 
 /// A supervisor record proving `spawn` failed, so no process ever ran.
@@ -555,7 +575,9 @@ fn with_cleanup(err: MemoryError, cleanup: Result<(), MemoryError>) -> MemoryErr
 
 /// Complete supervision after the root process has been observed and reaped.
 /// Descendants may still be running and writing the invocation's artifacts.
+#[allow(clippy::too_many_arguments)]
 fn finish_supervised(
+    cli: &dyn SupervisedCli,
     tracker: &mut super::process_tree::ProcessTracker,
     a: &InvocationArtifacts,
     spec: &DispatchSpec,
@@ -564,8 +586,6 @@ fn finish_supervised(
     timed_out: bool,
     limit_exceeded: Option<String>,
 ) -> Result<DispatchOutcome, MemoryError> {
-    // The spec was validated before spawn, so this cannot refuse here.
-    let cli = cli_for(spec.implementer)?;
     // Catch an artifact that crossed the limit just before process exit.
     let limit_exceeded = limit_exceeded.or_else(|| limits(a));
     // Success included: a root gone before the first sample could have
@@ -590,7 +610,7 @@ fn finish_supervised(
         None,
     );
     persist_exit(a, &record)?;
-    let mut outcome = read_artifacts(cli.implementer(), a)?;
+    let mut outcome = read_artifacts_with(cli, a)?;
     outcome.invocation_started = true;
     Ok(outcome)
 }
@@ -620,7 +640,13 @@ pub fn read_artifacts(
     implementer: Implementer,
     a: &InvocationArtifacts,
 ) -> Result<DispatchOutcome, MemoryError> {
-    let cli = cli_for(implementer)?;
+    read_artifacts_with(cli_for(implementer)?, a)
+}
+
+fn read_artifacts_with(
+    cli: &dyn SupervisedCli,
+    a: &InvocationArtifacts,
+) -> Result<DispatchOutcome, MemoryError> {
     for path in [
         &a.schema_path,
         &a.journal_path,
@@ -656,6 +682,17 @@ pub fn read_artifacts(
         read_capped(&a.final_path, FINAL_LIMIT),
         expected_native_id,
     );
+    // A harness that reports neither an error nor the evidence a met verdict
+    // needs still fails closed, so valid evidence always carries both. Codex
+    // explains each absence itself, so it never reaches these.
+    if parsed.errors.is_empty() {
+        if parsed.verdict.is_none() {
+            errors.push(format!("{} reported no final verdict", cli.label()));
+        }
+        if parsed.native_id.is_none() {
+            errors.push(format!("{} reported no native session ID", cli.label()));
+        }
+    }
     errors.extend(parsed.errors);
     let mut native_id = parsed.native_id;
     let mut observed_output = parsed.observed_output;
@@ -722,20 +759,21 @@ pub fn read_artifacts(
         Err(e) => (String::new(), Some(e)),
     };
     observed_output |= !stderr.is_empty();
-    let valid = errors.is_empty();
-    let (verdict, reason) = if valid {
-        let final_verdict = parsed
-            .verdict
-            .ok_or_else(|| validation(format!("{} reported no final verdict", cli.label())))?;
-        (Some(final_verdict.verdict), Some(final_verdict.reason))
-    } else {
-        if !stderr.trim().is_empty() {
-            errors.push(format!("stderr: {}", stderr.trim()));
+    // No errors implies a verdict (checked above), so this only ever drops a
+    // verdict that the errors already invalidate.
+    let final_verdict = parsed.verdict.filter(|_| errors.is_empty());
+    let valid = final_verdict.is_some();
+    let (verdict, reason) = match final_verdict {
+        Some(final_verdict) => (Some(final_verdict.verdict), Some(final_verdict.reason)),
+        None => {
+            if !stderr.trim().is_empty() {
+                errors.push(format!("stderr: {}", stderr.trim()));
+            }
+            if let Some(e) = stderr_error {
+                errors.push(format!("stderr unreadable: {e}"));
+            }
+            (None, Some(scrub_and_bound(&errors.join("; "), 500).text))
         }
-        if let Some(e) = stderr_error {
-            errors.push(format!("stderr unreadable: {e}"));
-        }
-        (None, Some(scrub_and_bound(&errors.join("; "), 500).text))
     };
     Ok(DispatchOutcome {
         cost_usd: None,
@@ -823,6 +861,7 @@ pub(crate) mod contract_tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::autopilot::codex_dispatch::CodexCli;
     use crate::autopilot::dispatch::{DispatchSpec, SessionMode, Verdict};
     use crate::autopilot::implementer::Implementer;
     use crate::autopilot::IssueRef;
@@ -1147,6 +1186,7 @@ exit {code}"#
                 std::thread::sleep(Duration::from_millis(5));
             };
             finish_supervised(
+                &CodexCli,
                 &mut tracker,
                 spec.invocation_artifacts.as_ref().unwrap(),
                 spec,
@@ -1218,8 +1258,17 @@ exit {code}"#
         let final_verdict: FinalVerdict =
             serde_json::from_str(&std::fs::read_to_string(&a.final_path).unwrap()).unwrap();
         assert_eq!(final_verdict.verdict, Verdict::Met);
-        let error =
-            finish_supervised(&mut tracker, a, &spec, status, started, false, None).unwrap_err();
+        let error = finish_supervised(
+            &CodexCli,
+            &mut tracker,
+            a,
+            &spec,
+            status,
+            started,
+            false,
+            None,
+        )
+        .unwrap_err();
         assert!(error
             .to_string()
             .contains("before process-tree observation"));
@@ -1413,7 +1462,8 @@ exit {code}"#
             assert!(started.elapsed() < Duration::from_secs(3), "root hung");
             std::thread::sleep(Duration::from_millis(5));
         };
-        let result = finish_supervised(&mut tracker, a, &s, status, started, false, None);
+        let result =
+            finish_supervised(&CodexCli, &mut tracker, a, &s, status, started, false, None);
         if let Some(pid) = std::fs::read_to_string(dir.path().join("straggler.pid"))
             .ok()
             .and_then(|pid| pid.trim().parse::<i32>().ok())
@@ -1476,8 +1526,17 @@ exit {code}"#
         };
         assert!(status.success());
         assert!(limits(a).is_some());
-        let outcome =
-            finish_supervised(&mut tracker, a, &s, status, started, false, previous_limit).unwrap();
+        let outcome = finish_supervised(
+            &CodexCli,
+            &mut tracker,
+            a,
+            &s,
+            status,
+            started,
+            false,
+            previous_limit,
+        )
+        .unwrap();
         assert!(!outcome.is_met());
         assert!(outcome.reason.unwrap().contains("limit"));
         std::fs::write(dir.path().join("gate-release"), "release").unwrap();
@@ -1532,6 +1591,168 @@ exit {code}"#
         assert!(
             !dir.path().join("detached-survived").exists(),
             "escaped tool survived timeout"
+        );
+    }
+
+    /// A harness whose evidence is scripted, so these tests pin what the
+    /// shared core does with whatever a harness reports.
+    struct FakeCli {
+        verdict: bool,
+        native_id: bool,
+        prepare_fails: bool,
+    }
+
+    const FAKE_ENV: &[(&str, &str)] = &[("IRONMEM_FAKE_HARNESS_ENV", "from-env")];
+
+    fn fake_prompt(a: &InvocationArtifacts) -> std::path::PathBuf {
+        Path::new(&a.schema_path).with_file_name("prompt.txt")
+    }
+
+    impl SupervisedCli for FakeCli {
+        fn implementer(&self) -> Implementer {
+            Implementer::Codex
+        }
+        fn label(&self) -> &'static str {
+            "Fake"
+        }
+        fn argv(
+            &self,
+            _repo: &Path,
+            _spec: &DispatchSpec,
+            a: &InvocationArtifacts,
+        ) -> Result<Vec<String>, MemoryError> {
+            Ok(vec![fake_prompt(a).to_str().unwrap().to_owned()])
+        }
+        fn prepare_spawn(
+            &self,
+            _spec: &DispatchSpec,
+            a: &InvocationArtifacts,
+        ) -> Result<(), MemoryError> {
+            if self.prepare_fails {
+                return Err(validation("prompt file could not be written"));
+            }
+            let mut file = create_private(&fake_prompt(a))?;
+            file.write_all(b"the prompt")?;
+            Ok(())
+        }
+        fn env(&self) -> &'static [(&'static str, &'static str)] {
+            FAKE_ENV
+        }
+        fn expected_native_id(&self, _spec: &DispatchSpec) -> Option<String> {
+            None
+        }
+        fn parse(
+            &self,
+            journal: &str,
+            _final_text: Result<String, MemoryError>,
+            _expected_native_id: Option<&str>,
+        ) -> ParsedRun {
+            ParsedRun {
+                native_id: self.native_id.then(|| THREAD.to_owned()),
+                verdict: self.verdict.then(|| FinalVerdict {
+                    verdict: Verdict::Met,
+                    reason: "gate".into(),
+                }),
+                turns: 1,
+                errors: Vec::new(),
+                observed_output: !journal.is_empty(),
+            }
+        }
+    }
+
+    #[test]
+    fn a_harness_reporting_no_verdict_or_native_id_fails_closed_rather_than_erroring() {
+        let complete = FakeCli {
+            verdict: true,
+            native_id: true,
+            prepare_fails: false,
+        };
+        let (_dir, s) = setup();
+        let a = s.invocation_artifacts.as_ref().unwrap();
+        crate::autopilot::process_tree::testing::complete(a);
+        assert!(read_artifacts_with(&complete, a).unwrap().is_met());
+        for (cli, missing) in [
+            (
+                FakeCli {
+                    verdict: false,
+                    ..complete
+                },
+                "Fake reported no final verdict",
+            ),
+            (
+                FakeCli {
+                    native_id: false,
+                    ..complete
+                },
+                "Fake reported no native session ID",
+            ),
+        ] {
+            let (_dir, s) = setup();
+            let a = s.invocation_artifacts.as_ref().unwrap();
+            crate::autopilot::process_tree::testing::complete(a);
+            let o = read_artifacts_with(&cli, a).unwrap();
+            assert!(o.is_error && !o.is_met(), "{o:?}");
+            assert_eq!(o.verdict, None);
+            let reason = o.reason.unwrap();
+            assert!(reason.contains(missing), "{reason}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_supervised_run_gives_the_child_its_harness_env_and_pre_spawn_files() {
+        let (dir, s) = setup();
+        let cli = FakeCli {
+            verdict: true,
+            native_id: true,
+            prepare_fails: false,
+        };
+        let bin = binary(
+            dir.path(),
+            &observable(
+                "[ \"$IRONMEM_FAKE_HARNESS_ENV\" = from-env ] || exit 3\n\
+                 cat \"$1\" > prompt-seen || exit 4\n\
+                 echo journal",
+            ),
+        );
+        let o = run_supervised_bounded_with(&cli, &bin, dir.path(), &s, Duration::from_secs(5))
+            .unwrap();
+        assert!(o.process_success && o.is_met(), "{o:?}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("prompt-seen")).unwrap(),
+            "the prompt"
+        );
+    }
+
+    #[test]
+    fn a_failed_pre_spawn_write_is_recorded_as_never_launched() {
+        use crate::autopilot::process_tree::ProcessSnapshot;
+        use crate::autopilot::registry::Liveness;
+        let (dir, s) = setup();
+        let a = s.invocation_artifacts.as_ref().unwrap();
+        let cli = FakeCli {
+            verdict: true,
+            native_id: true,
+            prepare_fails: true,
+        };
+        let o = run_supervised_bounded_with(
+            &cli,
+            Path::new("/missing-binary"),
+            dir.path(),
+            &s,
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        assert!(!o.invocation_started && !o.is_met(), "{o:?}");
+        let reason = o.reason.unwrap();
+        assert!(
+            reason.contains("prompt file could not be written"),
+            "{reason}"
+        );
+        assert!(has_launch_failure_record(a));
+        assert_eq!(
+            ProcessSnapshot::Available(Vec::new()).liveness(Some(a)),
+            Liveness::NotListed
         );
     }
 }
