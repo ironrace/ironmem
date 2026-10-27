@@ -977,7 +977,7 @@ struct CwdProcess {
 
 /// The effective user ID supervision runs as, which every harness process
 /// it spawns shares.
-fn current_uid() -> Option<u32> {
+pub(crate) fn current_uid() -> Option<u32> {
     #[cfg(unix)]
     {
         // SAFETY: geteuid has no preconditions and cannot fail.
@@ -1181,8 +1181,23 @@ pub(crate) const QUIET_GRACE: std::time::Duration = std::time::Duration::from_se
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Quiet {
     Yes,
-    /// What is still there, named for the operator.
-    Stragglers(String),
+    Held(QuietHold),
+}
+
+/// Why the worktree is not quiet, as the supervisor found it: what recovery
+/// must later see gone before it trusts the invocation's completion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct QuietHold {
+    /// The canonical worktree that was scanned.
+    pub worktree: PathBuf,
+    /// The effective user ID the scan ran as, and so could see.
+    pub uid: u32,
+    /// Each qualifying process, by PID and kernel birth.
+    pub stragglers: Vec<(u32, Birth)>,
+    /// Set when the scan itself kept failing; `stragglers` is then empty.
+    pub scan_failed: Option<String>,
+    /// For the operator: each straggler's PID and command, or the failure.
+    pub reason: String,
 }
 
 /// One worktree-quiet test. A process qualifies, and keeps completion
@@ -1221,7 +1236,9 @@ impl<'a> QuietCheck<'a> {
         })
     }
 
-    /// A single pass with the real kernel sources, as recovery runs it.
+    /// A single pass with the real kernel sources, as recovery runs it. A
+    /// scan that fails is an error here: recovery simply holds and retries
+    /// on its next check.
     pub(crate) fn once(
         worktree: &Path,
         spawned: Birth,
@@ -1229,22 +1246,46 @@ impl<'a> QuietCheck<'a> {
         rows: &[ProcessRow],
     ) -> Result<Quiet, String> {
         let check = Self::new(worktree, spawned, daemon, kernel_executable)?;
-        let stragglers =
-            check.stragglers(user_processes_with_cwd(spawned)?, || Ok(rows.to_vec()))?;
-        Ok(if stragglers.is_empty() {
-            Quiet::Yes
-        } else {
-            Quiet::Stragglers(check.describe(stragglers))
+        let found = check.stragglers(user_processes_with_cwd(spawned)?, || Ok(rows.to_vec()))?;
+        Ok(check.verdict(found))
+    }
+
+    fn verdict(&self, found: Vec<(u32, Birth, String)>) -> Quiet {
+        if found.is_empty() {
+            return Quiet::Yes;
+        }
+        Quiet::Held(QuietHold {
+            worktree: self.worktree.clone(),
+            uid: self.uid,
+            reason: self.describe(&found),
+            stragglers: found
+                .into_iter()
+                .map(|(pid, birth, _)| (pid, birth))
+                .collect(),
+            scan_failed: None,
         })
     }
 
-    /// The qualifying processes in `scanned`, each named with its command.
-    /// The process table is read only when there is a candidate.
+    fn scan_failed(&self, error: String) -> Quiet {
+        Quiet::Held(QuietHold {
+            worktree: self.worktree.clone(),
+            uid: self.uid,
+            stragglers: Vec::new(),
+            reason: format!(
+                "scan_failed: cannot list processes in the invocation worktree {}: {error}",
+                self.worktree.display()
+            ),
+            scan_failed: Some(error),
+        })
+    }
+
+    /// The qualifying processes in `scanned`, each with its birth and named
+    /// with its command. The process table is read only for a candidate.
     fn stragglers(
         &self,
         scanned: Vec<CwdProcess>,
         rows: impl FnOnce() -> Result<Vec<ProcessRow>, String>,
-    ) -> Result<Vec<String>, String> {
+    ) -> Result<Vec<(u32, Birth, String)>, String> {
         let me = std::process::id();
         let candidates: Vec<CwdProcess> = scanned
             .into_iter()
@@ -1267,21 +1308,23 @@ impl<'a> QuietCheck<'a> {
                     .iter()
                     .find(|r| r.pid == p.pid)
                     .map_or("<command unavailable>", |r| r.args.as_str());
-                format!(
+                let named = format!(
                     "process {} ({})",
                     p.pid,
                     crate::autopilot::scrub::scrub_and_bound(command, 120).text
-                )
+                );
+                (p.pid, p.birth, named)
             })
             .collect())
     }
 
-    fn describe(&self, stragglers: Vec<String>) -> String {
+    fn describe(&self, found: &[(u32, Birth, String)]) -> String {
         const NAMED: usize = 5;
-        let more = stragglers.len().saturating_sub(NAMED);
-        let mut named = stragglers
-            .into_iter()
+        let more = found.len().saturating_sub(NAMED);
+        let mut named = found
+            .iter()
             .take(NAMED)
+            .map(|(_, _, named)| named.as_str())
             .collect::<Vec<_>>()
             .join(", ");
         if more > 0 {
@@ -1313,9 +1356,11 @@ impl<'a> QuietCheck<'a> {
     }
 }
 
-/// The kernel birth of `pid`, or `None` once it has exited or cannot be read.
-pub(crate) fn kernel_birth(pid: u32) -> Option<Birth> {
-    birth(pid).ok().flatten()
+/// The kernel birth of `pid`, or `None` once it has exited. A read that
+/// fails is an error, never "exited": a caller deciding that a process is
+/// gone must hold on it.
+pub(crate) fn kernel_birth(pid: u32) -> Result<Option<Birth>, String> {
+    birth(pid)
 }
 
 pub(crate) struct ProcessTracker {
@@ -1731,15 +1776,12 @@ impl ProcessTracker {
                 check.stragglers(scanned, || rows().map_err(|e| e.to_string()))
             });
             match pass {
-                Ok(stragglers) if stragglers.is_empty() => return Ok(Quiet::Yes),
-                Ok(stragglers) if std::time::Instant::now() >= deadline => {
-                    return Ok(Quiet::Stragglers(check.describe(stragglers)))
+                Ok(found) if found.is_empty() => return Ok(Quiet::Yes),
+                Ok(found) if std::time::Instant::now() >= deadline => {
+                    return Ok(check.verdict(found))
                 }
-                Err(e) if std::time::Instant::now() >= deadline => {
-                    return Err(unproven(format!(
-                        "cannot list processes in the invocation worktree: {e}"
-                    )))
-                }
+                // Still a hold recovery can retry later, not an error.
+                Err(e) if std::time::Instant::now() >= deadline => return Ok(check.scan_failed(e)),
                 _ => std::thread::sleep(QUIET_POLL.min(grace)),
             }
         }
@@ -2477,7 +2519,11 @@ mod tests {
                 Duration::ZERO,
             ) {
                 Ok(Quiet::Yes) => Ok(()),
-                Ok(Quiet::Stragglers(named)) => Err(named),
+                Ok(Quiet::Held(hold)) => {
+                    // What was found is recorded by PID and birth too.
+                    assert_eq!(hold.stragglers.len(), 1, "{hold:?}");
+                    Err(hold.reason)
+                }
                 Err(e) => Err(e.to_string()),
             }
         };
@@ -2505,16 +2551,30 @@ mod tests {
         tracker.kernel_exe = |_| Some("/w/target/debug/ironmem".into());
         assert!(check(&tracker, process(30, uid, 150, &worktree)).is_err());
         // An enumeration that fails proves nothing.
-        let err = tracker
+        // An enumeration that keeps failing proves nothing either, but it
+        // is a hold recovery can retry, recorded as such, not an error.
+        let Quiet::Held(hold) = tracker
             .verify_worktree_quiet_with(
                 &worktree,
                 |_| Err("lookup refused".into()),
                 || Ok(rows.clone()),
                 Duration::ZERO,
             )
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("lookup refused"), "{err}");
+            .unwrap()
+        else {
+            panic!("a failing scan must hold");
+        };
+        assert!(hold.stragglers.is_empty());
+        assert!(
+            hold.scan_failed
+                .as_deref()
+                .is_some_and(|e| e.contains("lookup refused")),
+            "{hold:?}"
+        );
+        assert_eq!(
+            (hold.worktree.as_path(), hold.uid),
+            (worktree.as_path(), uid)
+        );
     }
 
     /// Only a process the invocation could have started can fail the scan.

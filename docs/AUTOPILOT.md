@@ -316,23 +316,42 @@ rescans every 250 ms for up to 15 seconds, which covers ordinary detached
 helpers such as git's auto-gc. Your own shell or editor in the worktree
 started earlier, so it never counts; one you open there during the run does.
 
-If something still qualifies after 15 seconds, the supervisor records the
-run's outcome without trusting it, names each process's PID and command,
-and holds the slot. You do not need to act: once nothing the invocation
-started remains (the root, every recorded descendant, the root's process
-group, and any new process in the worktree), a later Lead tick or
-`autopilot run` upgrades that record to a trusted completion and finishes
-the invocation with its verdict. While it waits, the hold reason names
-what is still running. `autopilot clear-dispatch` is the manual release if
-you would rather not wait.
+If something still qualifies after 15 seconds, or the scan keeps failing,
+the supervisor records the run's outcome without trusting it, together with
+what it found: each process by PID and kernel birth (or the scan failure),
+the user it scanned as, and the worktree it scanned. It names each
+process's PID and command and holds the slot. You do not need to act. The
+record becomes a trusted completion once all of these hold:
+
+- every recorded process is gone, even one that has since left the
+  worktree;
+- the root and every recorded descendant are gone, and nothing remains in
+  the root's process group;
+- no process carries the invocation's marker;
+- a fresh scan of the recorded worktree finds nothing new.
+
+The check must run as the same user, and a kernel read that fails counts
+as "still running". A later Lead tick or `autopilot run` then records the
+invocation with its verdict. While it waits, the hold reason names what is
+still running.
+
+Any command that decides a supervised invocation's liveness may do that
+upgrade as a side effect: `autopilot lead`, `autopilot queue`,
+`autopilot reconcile`, `autopilot supervise`, `autopilot run`, and
+`clear-dispatch`. So `clear-dispatch` on an
+invocation that has gone quiet upgrades it and then refuses, because the
+finished invocation is now waiting to be recorded; a Lead tick or
+`autopilot run` records it. `clear-dispatch` releases an awaiting
+invocation by hand only while it is still held, once you have confirmed
+nothing it started is still working.
 
 macOS reads working directories from the kernel (about 1.5 ms per scan for
 ~600 processes) and Linux from `/proc/<pid>/cwd`. A process born before the
 invocation is skipped before its directory is read. A process born during
 it whose directory cannot be read fails the scan, which is retried within
-the 15 seconds and then refused; so is any scan on another platform. A
-child that `chdir`s out of the worktree still escapes, and a deliberate
-escape is outside the guarantee.
+the 15 seconds and then held as above; any scan on another platform fails
+the same way. A child that `chdir`s out of the worktree before the root
+exits still escapes, and a deliberate escape is outside the guarantee.
 
 The macOS runtime path is exercised. Linux-specific
 kernel identity and cleanup code is covered by code/tests but has not been

@@ -23,6 +23,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Turning signing off during a run, or from another issue's worktree, does
   not get around it. A run whose `commit.gpgsign` holds an invalid value
   refuses to start rather than paying for a dispatch it would discard.
+- **Codex and Muse supervision waits for a quiet worktree (#366).** A
+  short-lived tool's background child, reparented out of the tracked tree,
+  no longer gets a trusted completion while it still runs in the worktree.
+  The supervisor waits up to 15 seconds, then holds, and a later Lead tick
+  or `autopilot run` finishes the invocation once nothing it started
+  remains, with no `clear-dispatch`. The process-identity file now records
+  live descendants with their kernel birth. **Upgrade note:** do not
+  downgrade the ironmem binary while a Codex or Muse invocation is in
+  flight. An older binary cannot read the new identity format and treats
+  it as "nothing running" in `clear-dispatch`.
 
 ### Fixed
 

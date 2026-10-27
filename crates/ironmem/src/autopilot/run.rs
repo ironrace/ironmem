@@ -1316,12 +1316,10 @@ pub fn preflight_worktree_provisioning(
             implementer.label()
         ))),
         InvocationRecovery::Unknown { reason } => Err(MemoryError::Validation(format!(
-            "cannot provision {} while {} process completion is uncertain: {reason}; \
-             once no process remains, `ironmem autopilot clear-dispatch {} {}` releases it",
+            "cannot provision {} while {} process completion is uncertain: {reason}; {}",
             issue.canonical(),
             implementer.label(),
-            issue.repo,
-            issue.number
+            release_hint(issue, state.invocation_artifacts.as_ref())
         ))),
         InvocationRecovery::Finished(_) => Ok(()),
         InvocationRecovery::NoPriorInvocation if state.invocation_artifacts.is_none() => Ok(()),
@@ -1330,6 +1328,25 @@ pub fn preflight_worktree_provisioning(
              is unproven",
             implementer.label()
         ))),
+    }
+}
+
+/// How a held supervised invocation is released. One held only because its
+/// worktree was not quiet finishes by itself; any other needs the operator
+/// to confirm nothing is running first.
+fn release_hint(issue: &IssueRef, artifacts: Option<&InvocationArtifacts>) -> String {
+    if artifacts.is_some_and(super::invocation::is_awaiting_quiet) {
+        format!(
+            "a later Lead tick or `ironmem autopilot run` finishes it once nothing it started \
+             remains in the worktree; `ironmem autopilot clear-dispatch {} {}` is the manual \
+             release",
+            issue.repo, issue.number
+        )
+    } else {
+        format!(
+            "once no process remains, `ironmem autopilot clear-dispatch {} {}` releases it",
+            issue.repo, issue.number
+        )
     }
 }
 
@@ -1359,9 +1376,8 @@ fn recover_invocation(
         recovery @ (InvocationRecovery::Alive | InvocationRecovery::Unknown { .. }) => {
             let detail = match recovery {
                 InvocationRecovery::Unknown { reason } => format!(
-                    "{reason}; once no process remains, `ironmem autopilot \
-                     clear-dispatch {} {}` releases it",
-                    issue.repo, issue.number
+                    "{reason}; {}",
+                    release_hint(issue, state.invocation_artifacts.as_ref())
                 ),
                 _ => format!(
                     "{} implementation is still alive",
@@ -1837,11 +1853,9 @@ pub fn run_issue(
                     // Errors do not prove a child is dead; retain the exact invocation for recovery.
                     break TerminalReason::ImplementationInFlight {
                         detail: format!(
-                            "{} dispatch could not establish completion: {err}; once no \
-                             process remains, `ironmem autopilot clear-dispatch {} {}` releases it",
+                            "{} dispatch could not establish completion: {err}; {}",
                             config.implementer.label(),
-                            issue.repo,
-                            issue.number
+                            release_hint(issue, invocation_artifacts.as_ref())
                         ),
                     };
                 }
@@ -2205,6 +2219,34 @@ pub fn run_issue(
 mod tests {
     use super::*;
     use crate::autopilot::{retry, worktree};
+
+    /// An invocation held only for a busy worktree finishes by itself; the
+    /// hold message says so, and names `clear-dispatch` as the manual
+    /// release. Any other held invocation still needs the operator.
+    #[test]
+    fn the_release_hint_tells_an_awaiting_quiet_hold_it_finishes_by_itself() {
+        let (_dir, s) = crate::autopilot::invocation::contract_tests::setup();
+        let a = s.invocation_artifacts.as_ref().unwrap();
+        let other = release_hint(&issue(), Some(a));
+        assert!(other.contains("once no process remains") && other.contains("clear-dispatch"));
+        let worktree = tempfile::tempdir().unwrap();
+        // SAFETY: geteuid has no preconditions.
+        let uid = unsafe { libc::geteuid() };
+        crate::autopilot::invocation::contract_tests::write_awaiting(
+            a,
+            uid,
+            worktree.path(),
+            Vec::new(),
+        );
+        let awaiting = release_hint(&issue(), Some(a));
+        assert!(
+            awaiting.contains("later Lead tick")
+                && awaiting.contains("autopilot run")
+                && awaiting.contains("manual release")
+                && awaiting.contains("clear-dispatch ironrace/ironmem 283"),
+            "{awaiting}"
+        );
+    }
 
     #[test]
     fn invalid_codex_resume_refuses_before_reservation_or_state_overwrite() {

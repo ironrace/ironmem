@@ -72,7 +72,7 @@
 //! unmeasured thing fail toward "unknown", never toward a number) applied to a
 //! set rather than a scalar.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -435,30 +435,35 @@ fn idle_invocation_pause(snapshot: &ProcessSnapshot, state: &DispatchState) -> R
     Ok(())
 }
 
-/// An invocation whose supervisor refused completion only because processes
-/// it started still ran in the worktree is upgraded to a trusted completion
-/// here, once they and the recorded tree are gone. Every liveness decision
-/// for a recovering harness (the queue, the supervisor, `clear-dispatch`,
-/// `CliDispatcher::recover`) goes through this, so a Lead finishes it on a
-/// later tick with no `clear-dispatch`.
+/// The shared daemon a harness's MCP proxy may have autospawned in the
+/// worktree: the operator's configured socket and the controller's own
+/// executable. Without it nothing is exempt, which only holds longer.
+fn configured_shared_daemon() -> Option<crate::autopilot::process_tree::SharedDaemon> {
+    crate::config::Config::load(None).ok().and_then(|config| {
+        crate::autopilot::process_tree::SharedDaemon::for_current_exe(config.daemon_socket_path())
+    })
+}
+
+/// An invocation whose supervisor refused completion only because its
+/// worktree was not quiet is upgraded to a trusted completion here once what
+/// the supervisor recorded is resolved
+/// ([`crate::autopilot::invocation::settle_awaiting_quiet`]). Every liveness
+/// decision for a recovering harness (the queue, reconcile, status,
+/// `clear-dispatch`, `CliDispatcher::recover`) goes through this, so any of
+/// them may finish it, and a Lead records it on a later tick.
 fn settle_awaiting_quiet(
     snapshot: &ProcessSnapshot,
-    state: &DispatchState,
     artifacts: &crate::autopilot::invocation::InvocationArtifacts,
+    daemon: fn() -> Option<crate::autopilot::process_tree::SharedDaemon>,
 ) -> Result<bool, String> {
     if !crate::autopilot::invocation::is_awaiting_quiet(artifacts) {
         return Ok(false);
     }
-    // The daemon a harness's MCP proxy autospawned may sit in the worktree;
-    // without its identity nothing is exempt, which only holds longer.
-    let daemon = crate::config::Config::load(None).ok().and_then(|config| {
-        crate::autopilot::process_tree::SharedDaemon::for_current_exe(config.daemon_socket_path())
-    });
     crate::autopilot::invocation::settle_awaiting_quiet(
         artifacts,
-        Path::new(&state.worktree_path),
         snapshot,
-        daemon.as_ref(),
+        daemon().as_ref(),
+        crate::autopilot::process_tree::kernel_birth,
     )
 }
 
@@ -466,9 +471,18 @@ pub(crate) fn invocation_state_liveness(
     snapshot: &ProcessSnapshot,
     state: &DispatchState,
 ) -> Liveness {
+    invocation_state_liveness_with(snapshot, state, configured_shared_daemon)
+}
+
+/// [`invocation_state_liveness`] with the shared-daemon exemption injected.
+pub(crate) fn invocation_state_liveness_with(
+    snapshot: &ProcessSnapshot,
+    state: &DispatchState,
+    daemon: fn() -> Option<crate::autopilot::process_tree::SharedDaemon>,
+) -> Liveness {
     match state.invocation_artifacts.as_ref() {
         Some(artifacts) => match snapshot.liveness(Some(artifacts)) {
-            Liveness::Unknown if settle_awaiting_quiet(snapshot, state, artifacts) == Ok(true) => {
+            Liveness::Unknown if settle_awaiting_quiet(snapshot, artifacts, daemon) == Ok(true) => {
                 snapshot.liveness(Some(artifacts))
             }
             liveness => liveness,
@@ -481,12 +495,20 @@ pub(crate) fn invocation_state_liveness(
 }
 
 pub(crate) fn invocation_state_reason(snapshot: &ProcessSnapshot, state: &DispatchState) -> String {
+    invocation_state_reason_with(snapshot, state, configured_shared_daemon)
+}
+
+/// [`invocation_state_reason`] with the shared-daemon exemption injected.
+pub(crate) fn invocation_state_reason_with(
+    snapshot: &ProcessSnapshot,
+    state: &DispatchState,
+    daemon: fn() -> Option<crate::autopilot::process_tree::SharedDaemon>,
+) -> String {
     match state.invocation_artifacts.as_ref() {
-        Some(artifacts) => match settle_awaiting_quiet(snapshot, state, artifacts) {
+        Some(artifacts) => match settle_awaiting_quiet(snapshot, artifacts, daemon) {
             Err(held) => format!(
-                "{} invocation finished, but its completion waits until nothing it \
-                 started remains: {held}. A later Lead tick or `autopilot run` finishes it \
-                 then; `autopilot clear-dispatch` releases it by hand",
+                "{} invocation finished, but its completion waits until nothing it started \
+                 remains: {held}",
                 state.implementer.label()
             ),
             Ok(_) => snapshot.invocation_reason(Some(artifacts)),
