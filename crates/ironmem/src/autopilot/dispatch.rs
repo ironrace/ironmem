@@ -55,7 +55,7 @@ pub enum SessionMode {
 }
 
 impl SessionMode {
-    fn session_uuid(&self) -> &str {
+    pub(crate) fn session_uuid(&self) -> &str {
         match self {
             SessionMode::New { session_uuid } | SessionMode::Resume { session_uuid } => {
                 session_uuid

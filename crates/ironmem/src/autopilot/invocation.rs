@@ -3,7 +3,7 @@
 //! the checkout disappears. Each harness contributes only a [`SupervisedCli`].
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -68,6 +68,13 @@ pub trait SupervisedCli: Sync {
         a: &InvocationArtifacts,
     ) -> Result<Vec<String>, MemoryError>;
 
+    /// Files [`SupervisedCli::prepare_spawn`] creates. Any of them already
+    /// present proves a prior spawn into this invocation, so the core refuses
+    /// before writing. Default: none.
+    fn spawn_files(&self, _a: &InvocationArtifacts) -> Vec<PathBuf> {
+        Vec::new()
+    }
+
     /// Files the harness reads at spawn (Muse's prompt file). Default: none.
     fn prepare_spawn(
         &self,
@@ -119,7 +126,7 @@ pub struct FinalVerdict {
 pub fn cli_for(implementer: Implementer) -> Result<&'static dyn SupervisedCli, MemoryError> {
     match implementer {
         Implementer::Codex => Ok(&super::codex_dispatch::CodexCli),
-        Implementer::Muse => Err(validation("the Muse implementer is not available yet")),
+        Implementer::Muse => Ok(&super::muse_dispatch::MuseCli),
         Implementer::Claude => Err(validation(
             "the Claude implementer is not a supervised CLI invocation",
         )),
@@ -409,6 +416,22 @@ fn run_supervised_bounded_with(
                 "{} artifacts already contain invocation data; prepare a new invocation before retrying",
                 cli.label()
             )));
+        }
+    }
+    // A killed child can leave every output empty, but its identity file or
+    // the harness's spawn files still prove it ran. Refuse with an error
+    // rather than record a never-launched failure that could mask it.
+    for path in std::iter::once(super::process_tree::identity_path(a)).chain(cli.spawn_files(a)) {
+        match std::fs::symlink_metadata(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+            Ok(_) => {
+                return Err(validation(format!(
+                    "{} invocation already holds {} from a prior spawn; prepare a new invocation before retrying",
+                    cli.label(),
+                    path.display()
+                )))
+            }
         }
     }
     let schema = read_capped(&a.schema_path, FINAL_LIMIT)?;
@@ -831,9 +854,10 @@ mod tests {
     }
 
     #[test]
-    fn muse_has_no_supervised_cli_yet() {
-        let err = cli_for(Implementer::Muse).err().unwrap().to_string();
-        assert!(err.contains("Muse"), "got: {err}");
+    fn muse_has_a_supervised_cli() {
+        let muse = cli_for(Implementer::Muse).unwrap();
+        assert_eq!(muse.implementer(), Implementer::Muse);
+        assert_eq!(muse.label(), "Muse");
     }
 
     #[test]
@@ -1646,6 +1670,9 @@ exit {code}"#
             file.write_all(b"the prompt")?;
             Ok(())
         }
+        fn spawn_files(&self, a: &InvocationArtifacts) -> Vec<std::path::PathBuf> {
+            vec![fake_prompt(a)]
+        }
         fn env(&self) -> &'static [(&'static str, &'static str)] {
             FAKE_ENV
         }
@@ -1765,5 +1792,41 @@ exit {code}"#
             ProcessSnapshot::Available(Vec::new()).liveness(Some(a)),
             Liveness::NotListed
         );
+    }
+
+    /// A prior spawn into this directory leaves its identity file or the
+    /// harness's spawn files behind even when every output artifact is empty
+    /// (the child was killed before writing). Writing a never-launched
+    /// record there could mask a live invocation, so the core refuses with
+    /// an error and leaves the directory untouched.
+    #[test]
+    fn a_prior_identity_or_spawn_file_refuses_the_spawn_without_a_record() {
+        let cli = FakeCli {
+            verdict: true,
+            native_id: true,
+            prepare_fails: false,
+        };
+        let leftovers: [fn(&InvocationArtifacts) -> std::path::PathBuf; 2] = [
+            |a| Path::new(&a.schema_path).with_file_name("process.json"),
+            fake_prompt,
+        ];
+        for leftover in leftovers {
+            let (dir, s) = setup();
+            let a = s.invocation_artifacts.as_ref().unwrap();
+            std::fs::write(leftover(a), b"prior").unwrap();
+            let err = run_supervised_bounded_with(
+                &cli,
+                Path::new("/missing-binary"),
+                dir.path(),
+                &s,
+                Duration::from_secs(1),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("prior spawn"), "{err}");
+            assert_eq!(std::fs::metadata(&a.exit_path).unwrap().len(), 0);
+            assert!(!has_launch_failure_record(a));
+            assert_eq!(std::fs::read(leftover(a)).unwrap(), b"prior");
+        }
     }
 }

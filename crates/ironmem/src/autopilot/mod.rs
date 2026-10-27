@@ -212,6 +212,7 @@ pub mod labels;
 pub mod lead;
 pub mod lineage;
 pub mod merge;
+pub mod muse_dispatch;
 pub mod onboard;
 pub mod process_tree;
 pub mod queue;

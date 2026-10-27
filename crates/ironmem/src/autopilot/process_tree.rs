@@ -437,7 +437,7 @@ pub(crate) struct ProcessIdentity {
     pub descendants: Vec<ProcessRow>,
 }
 
-fn identity_path(a: &InvocationArtifacts) -> std::path::PathBuf {
+pub(crate) fn identity_path(a: &InvocationArtifacts) -> std::path::PathBuf {
     Path::new(&a.schema_path).with_file_name("process.json")
 }
 
