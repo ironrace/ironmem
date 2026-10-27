@@ -941,7 +941,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_stubbed_muse_run_is_met_only_with_its_own_session_and_exit_zero() {
-        use crate::autopilot::invocation::contract_tests::{binary, setup};
+        use crate::autopilot::invocation::contract_tests::{await_first_sample, binary, setup};
+        let wait = await_first_sample();
         for (code, met) in [(0, true), (1, false)] {
             let (repo, mut s) = setup();
             s.implementer = Implementer::Muse;
@@ -955,7 +956,7 @@ mod tests {
                     "[ \"$MUSE_NO_AUTO_UPDATE\" = 1 ] || exit 8\n\
                      prompt=\"$(echo \"$@\" | sed -n 's/.*--prompt-file \\([^ ]*\\).*/\\1/p')\"\n\
                      [ \"$(cat \"$prompt\")\" = 'the exact condition' ] || exit 9\n\
-                     printf '%s\\n' '{}'\nprintf '%s\\n' '{}'\n/bin/sleep 0.5\nexit {code}\n",
+                     printf '%s\\n' '{}'\nprintf '%s\\n' '{}'\n{wait}\nexit {code}\n",
                     usage(2),
                     terminal("completed", r#"{"verdict":"met","reason":"ok"}"#)
                 ),
@@ -990,7 +991,8 @@ mod tests {
     #[test]
     fn a_supervised_muse_refusal_is_classified_from_its_stderr_file() {
         use crate::autopilot::dispatch::SessionRefusal;
-        use crate::autopilot::invocation::contract_tests::{binary, setup};
+        use crate::autopilot::invocation::contract_tests::{await_first_sample, binary, setup};
+        let wait = await_first_sample();
         let preamble = "muse: notice ".repeat(80);
         for (line, code, expected) in [
             (
@@ -1019,7 +1021,7 @@ mod tests {
                 repo.path(),
                 &format!(
                     "printf '%s\\n' '{preamble}' >&2\nprintf '%s\\n' '{line}' >&2\n\
-                     /bin/sleep 0.5\nexit {code}\n"
+                     {wait}\nexit {code}\n"
                 ),
             );
             let outcome = crate::autopilot::invocation::run_supervised_bounded(
@@ -1044,7 +1046,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_journal_on_another_session_is_reported_once() {
-        use crate::autopilot::invocation::contract_tests::{binary, setup};
+        use crate::autopilot::invocation::contract_tests::{await_first_sample, binary, setup};
+        let wait = await_first_sample();
         let (repo, mut s) = setup();
         s.implementer = Implementer::Muse;
         s.session = SessionMode::New {
@@ -1054,7 +1057,7 @@ mod tests {
         let bin = binary(
             repo.path(),
             &format!(
-                "printf '%s\\n' '{}'\n/bin/sleep 0.5\n",
+                "printf '%s\\n' '{}'\n{wait}\n",
                 record(
                     "session",
                     other,

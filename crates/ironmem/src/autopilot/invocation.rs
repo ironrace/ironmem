@@ -1740,11 +1740,28 @@ pub(crate) mod contract_tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         path
     }
+    /// Shell for a stub that goes on only once the supervisor has sampled
+    /// it, as any real harness outlives that sample: it starts a probe
+    /// `sleep`, waits until the identity file records the probe as an
+    /// enrolled descendant (which takes a sample that saw the root), then
+    /// kills it. A signal from the tracker itself, not a guess at how long
+    /// a sample takes under load. Exits 97 if it never comes.
+    pub(crate) fn await_first_sample() -> &'static str {
+        "sleep 30 & probe=$!\n\
+         sampled=0\n\
+         for _ in $(seq 1 6000); do\n\
+         if grep -q \"\\\"pid\\\":$probe,\" .git/ironmem/autopilot/*/*/process.json 2>/dev/null; \
+         then sampled=1; break; fi\n\
+         sleep 0.01\n\
+         done\n\
+         kill $probe 2>/dev/null\n\
+         [ \"$sampled\" = 1 ] || exit 97"
+    }
     #[cfg(unix)]
     /// A stub that outlives the supervisor's first process sample, as any
-    /// real Codex does; one that exits first is held as unobserved.
+    /// real Codex does ([`await_first_sample`]).
     pub(crate) fn observable(extra: &str) -> String {
-        format!("sleep 0.5\n{extra}")
+        format!("{}\n{extra}", await_first_sample())
     }
     pub(crate) fn script(extra: &str, code: i32) -> String {
         format!(
@@ -2730,16 +2747,42 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
     }
     #[cfg(unix)]
     #[test]
+    /// The wall-clock kill takes a tool's background gate process down with
+    /// the root. The gate waits for a release the test gives only after the
+    /// run returns, so it can mark survival only if cleanup missed it, never
+    /// because a sleep ran out. The stub reaches its long sleep only once
+    /// the identity file records the gate as enrolled, so the bound fires on
+    /// a tree the tracker has seen, whatever the load; before, a 100 ms bound
+    /// raced how far the stub had got.
     fn timeout_kills_descendant_gate_process() {
+        struct Release(std::path::PathBuf);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                let _ = std::fs::write(&self.0, "");
+            }
+        }
         let (dir, s) = setup();
+        let _release = Release(dir.path().join("gate-release"));
         let bin = binary(
             dir.path(),
-            &script("(sleep 1; touch descendant-survived) &\nsleep 10", 0),
+            &script(
+                "(while [ ! -f gate-release ]; do sleep 0.02; done; touch descendant-survived) &\n\
+                 gate=$!\n\
+                 until grep -q \"\\\"pid\\\":$gate,\" .git/ironmem/autopilot/*/*/process.json \
+                 2>/dev/null; do sleep 0.01; done\n\
+                 touch gate-enrolled\nsleep 30",
+                0,
+            ),
         );
-        let o = run_supervised_bounded(&bin, dir.path(), &s, Duration::from_millis(100)).unwrap();
+        let o = run_supervised_bounded(&bin, dir.path(), &s, Duration::from_secs(5)).unwrap();
         assert!(o.timed_out);
         assert!(!o.is_met());
-        std::thread::sleep(Duration::from_millis(1200));
+        assert!(
+            dir.path().join("gate-enrolled").exists(),
+            "the bound fired before the tracker enrolled the gate"
+        );
+        std::fs::write(dir.path().join("gate-release"), "").unwrap();
+        std::thread::sleep(Duration::from_millis(500));
         assert!(!dir.path().join("descendant-survived").exists());
         assert!(
             read_artifacts(Implementer::Codex, s.invocation_artifacts.as_ref().unwrap())
