@@ -1114,7 +1114,7 @@ pub fn supervise_issue(
     // may name a live invocation: it is held, never treated as no state.
     let (state, unreadable) = match dispatch_state::read_dispatch_state(db, issue)? {
         dispatch_state::StateRead::Absent => (None, None),
-        dispatch_state::StateRead::Readable(state) => (Some(state), None),
+        dispatch_state::StateRead::Readable(state) => (Some(*state), None),
         dispatch_state::StateRead::Unreadable(reason) => (None, Some(reason)),
     };
     let attempts = lineage::attempts_for_issue(db, issue)?;

@@ -236,7 +236,7 @@ pub fn get_dispatch_state(
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum StateRead {
     Absent,
-    Readable(DispatchState),
+    Readable(Box<DispatchState>),
     /// Corrupt, or written by a newer binary for a harness this one does
     /// not know, with why. It may name a live invocation.
     Unreadable(String),
@@ -252,7 +252,7 @@ pub(crate) fn read_dispatch_state(
         return Ok(StateRead::Absent);
     };
     Ok(match state_from_content(&drawer.content) {
-        Ok(state) => StateRead::Readable(state),
+        Ok(state) => StateRead::Readable(Box::new(state)),
         Err(e) => StateRead::Unreadable(e.to_string()),
     })
 }
