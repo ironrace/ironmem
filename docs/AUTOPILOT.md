@@ -284,18 +284,18 @@ session Muse reported still in use stops after that one dispatch and is
 deferred (`session_in_use`, state `paused-session-in-use`) until you find
 and stop whatever holds the session, then run `autopilot clear-dispatch`.
 
-An issue whose dispatch state this binary cannot read (corrupt, or written
-by a newer ironmem for a harness it does not know) is deferred
-(`dispatch_state_unreadable`) and keeps its concurrency slot, since it may
-be a live invocation. `supervise` reports it as held, and `reconcile`
-reports it as a hold and, while it stays unreadable, holds rather than
-calls an orphan any live session or marker no readable state names. Run
-the ironmem that wrote it to finish or clear it, or release it with
-`clear-dispatch` (see *Human recovery paths*). The reverse is not covered: an ironmem from before Muse support cannot read
-a Muse dispatch state and skips it, so its queue does not count that slot
-and its `reconcile` reports the live Muse process as an orphan. Do not
-downgrade below this release while any Muse dispatch state exists; let it
-finish, or `clear-dispatch` it, first.
+An issue whose dispatch state this binary cannot read (corrupt, or written by a
+newer ironmem for a harness it does not know) is deferred
+(`dispatch_state_unreadable`) and keeps its concurrency slot, since it may be a
+live invocation. `supervise` reports it as held, and `reconcile` reports it as a
+hold and, while it stays unreadable, holds rather than calls an orphan any live
+session or marker no readable state names. Run the ironmem that wrote it to
+finish or clear it, or release it with `clear-dispatch` (see *Human recovery
+paths*). The reverse is not covered: an ironmem from before Muse support cannot
+read a Muse dispatch state and skips it, so its queue does not count that slot
+and its `reconcile` reports the live Muse process as an orphan. Do not downgrade
+below this release while any Muse dispatch state exists; let it finish, or
+`clear-dispatch` it, first.
 
 Before spawn, Autopilot creates private schema, journal, final-message,
 stderr, exit, and process-identity artifacts under the repository's absolute
@@ -372,14 +372,13 @@ invocation is in lineage, so a crash between recording an outcome and
 clearing its state cannot hold a concurrency slot for ever.
 
 Direct native `codex` processes, and Muse's launcher (which `exec`s its
-versioned binary under the same PID), are the verified paths. Any other
-launcher wrapper is adopted conservatively after restart: a marker visible
-only on a different native child is not treated as proof that the recorded
-root is the invocation.
-The process tracker authenticates and cleans ordinary tool descendants,
-including observed `setsid` children, but it is practical supervision rather
-than hostile fork containment; a deliberate double-fork escape between polls
-is outside its guarantee.
+versioned binary under the same PID), are the verified paths. Any other launcher
+wrapper is adopted conservatively after restart: a marker visible only on a
+different native child is not treated as proof that the recorded root is the
+invocation. The process tracker authenticates and cleans ordinary tool
+descendants, including observed `setsid` children, but it is practical
+supervision rather than hostile fork containment; a deliberate double-fork
+escape between polls is outside its guarantee.
 
 A tool that lives less than one sample and leaves a background child running
 (`cmd &` in a short-lived shell) is the ordinary case of that escape: the
@@ -412,15 +411,14 @@ as "still running". A later Lead tick or `autopilot run` then records the
 invocation with its verdict. While it waits, the hold reason names what is
 still running.
 
-Any command that decides a supervised invocation's liveness may do that
-upgrade as a side effect: `autopilot lead`, `autopilot queue`,
-`autopilot reconcile`, `autopilot supervise`, `autopilot run`, and
-`clear-dispatch`. So `clear-dispatch` on an
-invocation that has gone quiet upgrades it and then refuses, because the
-finished invocation is now waiting to be recorded; a Lead tick or
-`autopilot run` records it. `clear-dispatch` releases an awaiting
-invocation by hand only while it is still held, once you have confirmed
-nothing it started is still working.
+Any command that decides a supervised invocation's liveness may do that upgrade
+as a side effect: `autopilot lead`, `autopilot queue`, `autopilot reconcile`,
+`autopilot supervise`, `autopilot run`, and `clear-dispatch`. So
+`clear-dispatch` on an invocation that has gone quiet upgrades it and then
+refuses, because the finished invocation is now waiting to be recorded; a Lead
+tick or `autopilot run` records it. `clear-dispatch` releases an awaiting
+invocation by hand only while it is still held, once you have confirmed nothing
+it started is still working.
 
 macOS reads working directories from the kernel (about 1.5 ms per scan for
 ~600 processes) and Linux from `/proc/<pid>/cwd`. A process born before the
@@ -448,30 +446,26 @@ each is gone; recovery then finishes it with no `clear-dispatch`. What such
 a process starts after that check and moves out of its tree is outside the
 guarantee.
 
-The macOS runtime path is exercised. Linux-specific
-kernel identity and cleanup code is covered by code/tests but has not been
-run end to end on a Linux host.
+The macOS runtime path is exercised. Linux-specific kernel identity and cleanup
+code is covered by code/tests but has not been run end to end on a Linux host.
 
 Cleanup never kills the shared ironmem daemon your other sessions use. A
-harness's `ironmem serve --connect` MCP server may autospawn that daemon as
-its own child, but the process tracker never treats it as part of an
-invocation. It recognises the daemon by its exact
-`ironmem serve --listen <socket> [--db <path>]` command line, listening on
-your configured daemon socket (`<state dir>/daemon.sock`, or
-`IRONMEM_DAEMON_SOCKET`; the socket your registered MCP servers connect to),
-on a process leading its own group, whose executable, as the kernel reports
-it, is the same ironmem binary the controller runs. An agent-built
-`target/debug/ironmem` with that command line is cleaned up like any tool,
-and so is a daemon whose executable path cannot be read, or one started by
+harness's `ironmem serve --connect` MCP server may autospawn that daemon as its
+own child, but the process tracker never treats it as part of an invocation. It
+recognises the daemon by its exact `ironmem serve --listen <socket> [--db
+<path>]` command line, listening on your configured daemon socket (`<state
+dir>/daemon.sock`, or `IRONMEM_DAEMON_SOCKET`; the socket your registered MCP
+servers connect to), on a process leading its own group, whose executable, as
+the kernel reports it, is the same ironmem binary the controller runs. An
+agent-built `target/debug/ironmem` with that command line is cleaned up like any
+tool, and so is a daemon whose executable path cannot be read, or one started by
 a different ironmem install than the controller's. It leaves that daemon's
-children alone too, so an autospawned daemon survives the invocation and
-keeps serving. A
-daemon on any other socket, such as one an ironmem test suite starts on a
-temporary socket, is cleaned up like any other tool. So is a shared daemon
-whose socket path contains whitespace, which the process table cannot
-parse. The trade-off: a tool that runs your installed ironmem binary as the
-daemon, with the same command line on your socket in a group of its own,
-escapes tracking.
+children alone too, so an autospawned daemon survives the invocation and keeps
+serving. A daemon on any other socket, such as one an ironmem test suite starts
+on a temporary socket, is cleaned up like any other tool. So is a shared daemon
+whose socket path contains whitespace, which the process table cannot parse. The
+trade-off: a tool that runs your installed ironmem binary as the daemon, with
+the same command line on your socket in a group of its own, escapes tracking.
 That is the same class as the double-fork escape above.
 
 A daemon autospawned this way outlives the invocation with what it
@@ -529,78 +523,74 @@ model can quietly pass `-c commit.gpgsign=false`.
   signature as bad or incompatible blames that commit; any other failure of
   that read is the guard's. Every read passes `--no-show-signature`, so an
   operator's `log.showSignature` setting does not change the result.
-- **Which commits are checked.** The commits that ship: everything on the
-  issue branch (`refs/heads/<issue-branch>`, not `HEAD`, which the agent may
-  have left on another checkout) and on its own remote-tracking refs
-  (`refs/remotes/<remote>/<issue-branch>` for each configured remote, what
-  was pushed), since the branch was cut, excluding anything already on
-  another remote branch
-  (`git log refs/heads/<issue-branch> <its remote refs> --not <cut>
-  --exclude='*/<issue-branch>' --remotes`). The *cut* is the commit the issue
-  branch was cut from. Commits merged or rebased in from a remote-tracking
+- **Which commits are checked.** The commits that ship: everything on the issue
+  branch (`refs/heads/<issue-branch>`, not `HEAD`, which the agent may have left
+  on another checkout) and on its own remote-tracking refs
+  (`refs/remotes/<remote>/<issue-branch>` for each configured remote, what was
+  pushed), since the branch was cut, excluding anything already on another
+  remote branch (`git log refs/heads/<issue-branch> <its remote refs> --not
+  <cut> --exclude='*/<issue-branch>' --remotes`). The *cut* is the commit the
+  issue branch was cut from. Commits merged or rebased in from a remote-tracking
   branch are not blamed on the agent, but local-only commits merged in are
-  checked like the agent's own. An earlier dispatch's bypass stays caught
-  after it is pushed, and after the local branch is reset, until a re-signed
-  branch is force-pushed over it. If the issue branch no longer exists, the
-  `met` fails: nothing that ships can be checked. For the same reason, the
-  commit a success records (and the PR body names as green) is the issue
-  branch's tip, not `HEAD`.
+  checked like the agent's own. An earlier dispatch's bypass stays caught after
+  it is pushed, and after the local branch is reset, until a re-signed branch is
+  force-pushed over it. If the issue branch no longer exists, the `met` fails:
+  nothing that ships can be checked. For the same reason, the commit a success
+  records (and the PR body names as green) is the issue branch's tip, not
+  `HEAD`.
 - **The cut is fixed once.** `--base` is resolved to a commit sha (SHA-1 or
   SHA-256) in your checkout and stored as `branch.<branch>.ironmemCut` before
-  the issue branch is created, so a branch never exists without one. A base
-  that does not resolve, or a cut that cannot be stored, is refused before any
+  the issue branch is created, so a branch never exists without one. A base that
+  does not resolve, or a cut that cannot be stored, is refused before any
   worktree exists. If `git worktree add` fails after making the branch (for
   example on the upstream write while another git holds the config lock), the
   branch keeps its cut and the next run reuses it; the cut is taken back only
-  when no branch was made, and only while both its value and the run's own
-  token in `branch.<branch>.ironmemCutOwner` still read as that run's, so a
-  take-back never removes the same value another controller recorded after
-  it. Once its add has made the branch, a run reads the cut back and records
-  it again if another controller's take-back removed it meanwhile. A branch
-  another controller creates at the same moment is never given this run's
-  cut: the run stops and asks you to run again. If `--base` moves between
-  being resolved and the branch being created, the new branch and worktree
-  are removed again (never by force: a worktree someone has started using is
-  kept, with its cut corrected to where the branch really is) and the run
-  asks you to run again. An existing branch
-  with no recorded cut (an older branch) gets the commit its reflog says it
-  was created from, or, without that entry, the merge base of the branch and
-  `--base`; never `--base` itself, which may have moved. That run logs a
-  warning naming the branch, the source and the sha. A branch that shares no
-  history with `--base`, or one whose merge base with `--base` is its own tip
-  (merged into it, or empty) while it has commits on no remote (that merge
-  base would leave the guard nothing to check), and that has no creation
-  entry, is refused: record its cut with
-  `git config branch.<branch>.ironmemCut <sha>`.
+  when no branch was made, and only while both its value and the run's own token
+  in `branch.<branch>.ironmemCutOwner` still read as that run's, so a take-back
+  never removes the same value another controller recorded after it. Once its
+  add has made the branch, a run reads the cut back and records it again if
+  another controller's take-back removed it meanwhile. A branch another
+  controller creates at the same moment is never given this run's cut: the run
+  stops and asks you to run again. If `--base` moves between being resolved and
+  the branch being created, the new branch and worktree are removed again (never
+  by force: a worktree someone has started using is kept, with its cut corrected
+  to where the branch really is) and the run asks you to run again. An existing
+  branch with no recorded cut (an older branch) gets the commit its reflog says
+  it was created from, or, without that entry, the merge base of the branch and
+  `--base`; never `--base` itself, which may have moved. That run logs a warning
+  naming the branch, the source and the sha. A branch that shares no history
+  with `--base`, or one whose merge base with `--base` is its own tip (merged
+  into it, or empty) while it has commits on no remote (that merge base would
+  leave the guard nothing to check), and that has no creation entry, is refused:
+  record its cut with `git config branch.<branch>.ironmemCut <sha>`.
 - **A config lock left behind blocks new branches.** Storing the cut writes
   `.git/config`. While another worktree's git holds its lock, the write is
   retried for about half a second. A lock held longer fails the run with an
-  error naming the lock file and its age, or saying it was released just
-  after the retries ran out, in which case simply run again. A git killed
-  mid-write (an
-  agent's `git push -u` when its dispatch times out) leaves the lock behind;
+  error naming the lock file and its age, or saying it was released just after
+  the retries ran out, in which case simply run again. A git killed mid-write
+  (an agent's `git push -u` when its dispatch times out) leaves the lock behind;
   if no git command is running in any worktree of the repo, remove it.
 - **The policy is sticky.** It is enforced if `commit.gpgsign` was on when the
-  issue branch was created or at any run start, or is on now. A run that sees
-  it on records it on the branch (`branch.<branch>.ironmemSigning true`) and
-  on the repository (`ironmem.autopilotSigning true`), once restart recovery
-  has found no invocation still running (a run that holds one writes no
-  config). It also records its own reading in the issue's dispatch state
-  before each launch, so a controller that recovers that invocation after a
-  crash still enforces it on the recovered `met`, even if another agent held
-  `.git/config`'s lock and neither flag was written. That recorded reading
-  holds only the recovered invocation's `met`, never a fresh dispatch, and an
-  explicit `branch.<branch>.ironmemSigning false` overrides it. An invalid
-  value (a typo such as `commit.gpgsign = ture`) holds a newly created branch
-  but never sets the repository flag, and a run refuses to start until it is
-  fixed, since every `met` it produced would be discarded. So does an invalid
+  issue branch was created or at any run start, or is on now. A run that sees it
+  on records it on the branch (`branch.<branch>.ironmemSigning true`) and on the
+  repository (`ironmem.autopilotSigning true`), once restart recovery has found
+  no invocation still running (a run that holds one writes no config). It also
+  records its own reading in the issue's dispatch state before each launch, so a
+  controller that recovers that invocation after a crash still enforces it on
+  the recovered `met`, even if another agent held `.git/config`'s lock and
+  neither flag was written. That recorded reading holds only the recovered
+  invocation's `met`, never a fresh dispatch, and an explicit
+  `branch.<branch>.ironmemSigning false` overrides it. An invalid value (a typo
+  such as `commit.gpgsign = ture`) holds a newly created branch but never sets
+  the repository flag, and a run refuses to start until it is fixed, since every
+  `met` it produced would be discarded. So does an invalid
   `branch.<branch>.ironmemSigning` or `ironmem.autopilotSigning` while the
-  policy is off. That refusal keeps a pending invocation for the issue as it
-  is, and the first run after the fix recovers it, so do not
-  `clear-dispatch` it. `commit.gpgsign` lives
-  in the `.git/config` shared by every worktree, so an agent on one issue can
-  turn it off for all of them. The repository flag holds every issue branch to
-  the policy anyway, including branches created after it was turned off.
+  policy is off. That refusal keeps a pending invocation for the issue as it is,
+  and the first run after the fix recovers it, so do not `clear-dispatch` it.
+  `commit.gpgsign` lives in the `.git/config` shared by every worktree, so an
+  agent on one issue can turn it off for all of them. The repository flag holds
+  every issue branch to the policy anyway, including branches created after it
+  was turned off.
 - **Turning it off does not help.** If the agent, or anyone, turns
   `commit.gpgsign` off while either flag holds the branch, the next `met`
   fails with "commit.gpgsign was turned off, but this branch is still held to
@@ -609,20 +599,19 @@ model can quietly pass `-c commit.gpgsign=false`.
 - **A collaborator's commit is not the agent's fault.** A flagged commit is
   charged to the agent only when its committer email is this run's identity
   (`git var GIT_COMMITTER_IDENT` in the worktree, or the controller's
-  `GIT_COMMITTER_EMAIL`). If every flagged commit has another committer, such
-  as a human who pushed an unsigned fix to the PR branch, the `met` is still
-  not accepted, but it costs no attempt and the run stops (see below), naming
-  the commits and their committers. While such a commit is on the branch, a
-  run refuses to start, so nothing is paid for. A long-running Lead reads the
-  range again at a run's start only when a ref tip, the remotes, the cut, the
-  policy, the identity or the signature programs changed since it last found
-  it clean. Re-sign or drop them and push,
-  or opt the branch out. If the identity cannot be read, every commit is the
-  agent's. This relies on the implementer committing as you: two real Muse
-  commits carried exactly the worktree's `git var GIT_COMMITTER_IDENT`
-  (measured 2026-10-27), and Codex, unmeasured, inherits the same
-  configuration. The stop names both identities, so a mismatch shows. In a
-  mixed range, where some flagged commits are the agent's and some a
+  `GIT_COMMITTER_EMAIL`). If every flagged commit has another committer, such as
+  a human who pushed an unsigned fix to the PR branch, the `met` is still not
+  accepted, but it costs no attempt and the run stops (see below), naming the
+  commits and their committers. While such a commit is on the branch, a run
+  refuses to start, so nothing is paid for. A long-running Lead reads the range
+  again at a run's start only when a ref tip, the remotes, the cut, the policy,
+  the identity or the signature programs changed since it last found it clean.
+  Re-sign or drop them and push, or opt the branch out. If the identity cannot
+  be read, every commit is the agent's. This relies on the implementer
+  committing as you: two real Muse commits carried exactly the worktree's `git
+  var GIT_COMMITTER_IDENT` (measured 2026-10-27), and Codex, unmeasured,
+  inherits the same configuration. The stop names both identities, so a mismatch
+  shows. In a mixed range, where some flagged commits are the agent's and some a
   collaborator's, the agent's failed attempt names all of them, the
   collaborator's included, since every one would ship unsigned.
 - **The repository's own signature programs never run.** `%G?` makes git run
@@ -644,19 +633,18 @@ model can quietly pass `-c commit.gpgsign=false`.
   opts its branch out, clears the cut, commits under another identity, or
   pushes its commits to another branch.
 
-If the guard cannot accept a `met` for a reason that is not the agent's
-(git fails to run or times out, `commit.gpgsign` or a signing flag reads as
-an invalid value, a collaborator's unsigned commit, a recorded cut that is
-not a full commit name, or one that is no longer an object `git log` can
-use), the `met` is not accepted. It is recorded as an infrastructure
-failure, not an attempt, so it costs the issue no attempt. An invalid policy
-or flag, a collaborator's commit, or a cut that is not a commit name would
-meet every later `met` too, so the run stops there with an error, before
-paying for another dispatch, and keeps a Codex or Muse invocation for
-recovery once it is fixed (do not `clear-dispatch` it). The error says what
-it keeps: Claude has no invocation to recover, and its session is resumed.
-Found at a run's start, before any dispatch, the same faults refuse the run.
-Any other such failure repeats through
+If the guard cannot accept a `met` for a reason that is not the agent's (git
+fails to run or times out, `commit.gpgsign` or a signing flag reads as an
+invalid value, a collaborator's unsigned commit, a recorded cut that is not a
+full commit name, or one that is no longer an object `git log` can use), the
+`met` is not accepted. It is recorded as an infrastructure failure, not an
+attempt, so it costs the issue no attempt. An invalid policy or flag, a
+collaborator's commit, or a cut that is not a commit name would meet every later
+`met` too, so the run stops there with an error, before paying for another
+dispatch, and keeps a Codex or Muse invocation for recovery once it is fixed (do
+not `clear-dispatch` it). The error says what it keeps: Claude has no invocation
+to recover, and its session is resumed. Found at a run's start, before any
+dispatch, the same faults refuse the run. Any other such failure repeats through
 `max_consecutive_infrastructure_failures`, like any other infrastructure
 failure.
 
