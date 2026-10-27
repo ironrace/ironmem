@@ -1854,7 +1854,19 @@ impl ProcessTracker {
 #[cfg(test)]
 pub(crate) mod testing {
     use super::*;
+    use crate::autopilot::implementer::Implementer;
+
+    /// [`invocation_for`] a Codex invocation.
     pub(crate) fn invocation(dir: &Path) -> (InvocationArtifacts, ProcessRow) {
+        invocation_for(dir, Implementer::Codex)
+    }
+
+    /// Artifacts and a persisted identity for one `implementer` invocation in
+    /// `dir`, with the root row that harness's own command shows in `ps`.
+    pub(crate) fn invocation_for(
+        dir: &Path,
+        implementer: Implementer,
+    ) -> (InvocationArtifacts, ProcessRow) {
         let path = |name: &str| dir.join(name).to_str().unwrap().to_owned();
         let a = InvocationArtifacts {
             invocation_id: "invocation".into(),
@@ -1882,7 +1894,18 @@ pub(crate) mod testing {
             ppid: 1,
             pgid: 1234,
             stat: "S".into(),
-            args: format!("codex exec --output-schema {} prompt", a.schema_path),
+            args: match implementer {
+                Implementer::Codex => {
+                    format!("codex exec --output-schema {} prompt", a.schema_path)
+                }
+                Implementer::Muse => format!(
+                    "/u/.local/bin/muse-bin-1.4.13-R6996.1 exec --json --output-schema {} \
+                     --prompt-file {}",
+                    a.schema_path,
+                    path("prompt.md")
+                ),
+                Implementer::Claude => panic!("Claude is not a supervised invocation"),
+            },
         };
         (a, row)
     }
@@ -1894,6 +1917,44 @@ pub(crate) mod testing {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::autopilot::implementer::Implementer;
+
+    /// The fixture's root row is the named harness's own command, carrying
+    /// the invocation's marker, so a Muse test never leans on a Codex row.
+    #[test]
+    fn the_fixture_root_row_is_the_named_harnesss_command() {
+        for (implementer, exe) in [
+            (Implementer::Codex, "codex"),
+            (Implementer::Muse, "muse-bin-"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let (a, row) = testing::invocation_for(dir.path(), implementer);
+            let first = row.args.split_whitespace().next().unwrap();
+            assert!(
+                Path::new(first)
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .starts_with(exe),
+                "{implementer:?}: {}",
+                row.args
+            );
+            assert_eq!(row.marker(), Ok(Some(a.schema_path.as_str())));
+            assert_eq!(
+                ProcessSnapshot::Available(vec![row]).liveness(Some(&a)),
+                Liveness::Alive
+            );
+        }
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            testing::invocation(dir.path()).1.args,
+            testing::invocation_for(dir.path(), Implementer::Codex)
+                .1
+                .args
+        );
+    }
+
     #[test]
     fn source_failures_malformed_identity_and_absent_completion_hold() {
         let dir = tempfile::tempdir().unwrap();

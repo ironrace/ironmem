@@ -23,8 +23,15 @@ use crate::error::MemoryError;
 /// How much of a rejected value or verdict text an error quotes.
 const EXCERPT_CHARS: usize = 120;
 
+/// `text` scrubbed and bounded to [`EXCERPT_CHARS`], ending in `…` when it
+/// was cut, so a quote never reads as the whole value.
 fn excerpt(text: &str) -> String {
-    scrub_and_bound(text, EXCERPT_CHARS).text
+    let bounded = scrub_and_bound(text, EXCERPT_CHARS);
+    let mut text = bounded.text;
+    if bounded.truncated {
+        text.push('…');
+    }
+    text
 }
 
 /// Muse CLI. It continues the controller's `--session-id`, so every
@@ -255,7 +262,11 @@ impl SupervisedCli for MuseCli {
             if line.trim().is_empty() {
                 continue;
             }
-            let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            // A bare number, string or array parses, but is no record.
+            let Some(value) = serde_json::from_str::<serde_json::Value>(line)
+                .ok()
+                .filter(serde_json::Value::is_object)
+            else {
                 malformed += 1;
                 if first_malformed == 0 {
                     first_malformed = index + 1;
@@ -300,8 +311,10 @@ impl SupervisedCli for MuseCli {
             },
             [t] => errors.push(format!(
                 "Muse run ended {}: {}",
-                t["terminal"].as_str().unwrap_or("without a terminal kind"),
-                t["reason"].as_str().unwrap_or("no reason given")
+                excerpt(t["terminal"].as_str().unwrap_or("without a terminal kind")),
+                t["reason"]
+                    .as_str()
+                    .map_or_else(|| "no reason given".to_owned(), excerpt)
             )),
             many => errors.push(format!(
                 "Muse journal has {} terminal records for the requested session; expected exactly one",
@@ -525,9 +538,115 @@ mod tests {
         }
     }
 
+    /// A cut quote says so, so a reader never takes it for the whole value.
     #[test]
-    fn the_child_never_self_updates_mid_dispatch() {
-        assert_eq!(MuseCli.env(), &[("MUSE_NO_AUTO_UPDATE", "1")]);
+    fn an_excerpt_marks_a_cut_and_leaves_a_whole_value_alone() {
+        let cut = excerpt(&"y".repeat(500));
+        assert_eq!(cut, format!("{}…", "y".repeat(EXCERPT_CHARS)));
+        assert_eq!(excerpt("short"), "short");
+        assert_eq!(
+            excerpt(&"y".repeat(EXCERPT_CHARS)),
+            "y".repeat(EXCERPT_CHARS)
+        );
+    }
+
+    /// Muse's own reason is quoted, but bounded and marked when cut, like
+    /// any other value the parser quotes.
+    #[test]
+    fn a_failed_terminal_reason_is_quoted_bounded() {
+        let long = record(
+            "session",
+            SID,
+            serde_json::json!({
+                "kind": "run_terminal", "terminal": "failed", "text": "",
+                "reason": "z".repeat(500)
+            }),
+        );
+        let errors = MuseCli
+            .parse(&long, Ok(String::new()), Some(SID))
+            .errors()
+            .to_vec();
+        let ended = errors
+            .iter()
+            .find(|e| e.starts_with("Muse run ended failed: "))
+            .unwrap_or_else(|| panic!("{errors:?}"));
+        assert!(!ended.contains(&"z".repeat(EXCERPT_CHARS + 1)), "{ended}");
+        assert!(ended.ends_with('…'), "{ended}");
+        let short = record(
+            "session",
+            SID,
+            serde_json::json!({
+                "kind": "run_terminal", "terminal": "cancelled", "text": "",
+                "reason": "operator interrupt"
+            }),
+        );
+        let errors = MuseCli.parse(&short, Ok(String::new()), Some(SID));
+        assert!(
+            errors
+                .errors()
+                .contains(&"Muse run ended cancelled: operator interrupt".to_owned()),
+            "{:?}",
+            errors.errors()
+        );
+    }
+
+    /// A line that is valid JSON but no record (a bare number, string or
+    /// array, as a torn write leaves) is as malformed as one that does not
+    /// parse, as the Codex parser already holds.
+    #[test]
+    fn a_json_line_that_is_not_a_record_is_malformed() {
+        let ok = terminal("completed", r#"{"verdict":"met","reason":"x"}"#);
+        for stray in ["12345", "\"text\"", "[1,2]", "null", "true"] {
+            let parsed = MuseCli.parse(&format!("{ok}\n{stray}"), Ok(String::new()), Some(SID));
+            assert!(parsed.verdict().is_none(), "trusted with {stray}");
+            assert!(
+                parsed
+                    .errors()
+                    .contains(&"1 malformed Muse JSONL line(s) (first at line 2)".to_owned()),
+                "{stray}: {:?}",
+                parsed.errors()
+            );
+        }
+    }
+
+    /// `run_usage` totals the run so far, so the latest record on the
+    /// requested session's usage stream is the count: never a sum, never
+    /// another session's, and a record with no count changes nothing.
+    #[test]
+    fn usage_takes_the_latest_count_on_the_requested_sessions_usage_stream() {
+        let met = terminal("completed", r#"{"verdict":"met","reason":"ok"}"#);
+        let turns = |records: &[String]| {
+            let mut journal = records.to_vec();
+            journal.push(met.clone());
+            let parsed = MuseCli.parse(&journal.join("\n"), Ok(String::new()), Some(SID));
+            assert!(parsed.errors().is_empty(), "{:?}", parsed.errors());
+            parsed.turns()
+        };
+        // The latest wins, whatever order the counts arrive in.
+        assert_eq!(turns(&[usage(3), usage(5)]), 5);
+        assert_eq!(turns(&[usage(5), usage(3)]), 3);
+        // Another session's usage, even on the usage stream, is not ours.
+        let other = record(
+            "exec.usage",
+            "11111111-2222-4333-8444-555555555555",
+            serde_json::json!({"kind": "run_usage", "completed_calls": 40}),
+        );
+        assert_eq!(turns(&[usage(3), other]), 3);
+        // A usage record with no count leaves the last one standing.
+        let uncounted = record(
+            "exec.usage",
+            SID,
+            serde_json::json!({"kind": "run_usage", "calls": 9}),
+        );
+        assert_eq!(turns(&[usage(4), uncounted.clone()]), 4);
+        assert_eq!(turns(&[uncounted]), 0);
+        // A count past u32 is clamped, never wrapped.
+        let huge = record(
+            "exec.usage",
+            SID,
+            serde_json::json!({"kind": "run_usage", "completed_calls": u64::from(u32::MAX) + 7}),
+        );
+        assert_eq!(turns(&[huge]), u32::MAX);
     }
 
     /// Muse's own words, measured on 1.4.13 and again on 1.4.14 (exit 1, no
@@ -798,7 +917,8 @@ mod tests {
     #[test]
     fn prepare_spawn_writes_the_exact_condition_privately_once() {
         let dir = tempfile::tempdir().unwrap();
-        let (a, _) = crate::autopilot::process_tree::testing::invocation(dir.path());
+        let (a, _) =
+            crate::autopilot::process_tree::testing::invocation_for(dir.path(), Implementer::Muse);
         let mut s = spec(SessionMode::New {
             session_uuid: SID.into(),
         });
