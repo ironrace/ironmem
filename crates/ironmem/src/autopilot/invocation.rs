@@ -1944,6 +1944,104 @@ exit {code}"#
         }
     }
 
+    /// The riskiest unobserved-root case: the root starts a child in a
+    /// session of its own, which stays in the worktree, and exits before
+    /// any sample. Nothing tracked the child and the group drain cannot see
+    /// it, so only the worktree check, bounded by the root's birth read at
+    /// spawn, stands between it and a trusted completion. It must hold.
+    #[cfg(unix)]
+    #[test]
+    fn an_unobserved_root_whose_escaped_child_stays_in_the_worktree_is_held() {
+        struct KillOnDrop(Option<i32>);
+        impl Drop for KillOnDrop {
+            fn drop(&mut self) {
+                if let Some(pid) = self.0 {
+                    // SAFETY: the fixture's own escaped sleep.
+                    unsafe { libc::kill(pid, libc::SIGKILL) };
+                }
+            }
+        }
+        let (dir, spec) = setup();
+        let a = spec.invocation_artifacts.as_ref().unwrap();
+        let bin = binary(
+            dir.path(),
+            &script(
+                &format!(
+                    "{} -c 'import os, subprocess; \
+                     p = subprocess.Popen([\"/bin/sleep\", \"30\"], start_new_session=True); \
+                     open(\"escaped.pid\", \"w\").write(str(p.pid))'",
+                    python3()
+                ),
+                0,
+            ),
+        );
+        let escaped = || {
+            std::fs::read_to_string(dir.path().join("escaped.pid"))
+                .ok()
+                .and_then(|pid| pid.trim().parse::<u32>().ok())
+        };
+        let started = Instant::now();
+        let mut child = spawn_fixture_invocation(&bin, dir.path(), &spec);
+        let mut tracker = ProcessTracker::owning_every_descendant(child.id());
+        // As supervision does straight after spawn; no sample ever runs.
+        tracker.adopt_root();
+        let status = child.wait().unwrap();
+        let mut guard = KillOnDrop(escaped().map(|pid| pid as i32));
+        assert!(status.success() && !tracker.observed_root());
+        let pid = escaped().expect("the root recorded its escaped child");
+        let result = finish_supervised(
+            &CodexCli,
+            &mut tracker,
+            &mut fixture_identity(a),
+            dir.path(),
+            a,
+            &spec,
+            status,
+            started,
+            false,
+            None,
+            QuietScan {
+                grace: Duration::from_millis(500),
+                pids: &|| Ok(vec![pid]),
+            },
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains(&format!("process {pid}")) && err.contains("worktree"),
+            "{err}"
+        );
+        assert!(is_awaiting_quiet(a) && !has_valid_exit_record(a));
+        // SAFETY: signal 0 only probes that the process exists.
+        assert_eq!(
+            unsafe { libc::kill(pid as i32, 0) },
+            0,
+            "the escaped child was killed"
+        );
+        // Once it is gone, recovery finishes it, still never met.
+        if let Some(pid) = guard.0.take() {
+            // SAFETY: the fixture's own escaped sleep.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut settled = Err(String::new());
+        while settled != Ok(true) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+            let rows = super::super::process_tree::snapshot(
+                &mut super::super::process_tree::UnixProcesses,
+            );
+            settled = settle_awaiting_quiet(
+                a,
+                &rows,
+                None,
+                super::super::process_tree::kernel_birth,
+                &|| Ok(vec![pid]),
+            );
+        }
+        assert_eq!(settled, Ok(true));
+        let outcome = read_artifacts(Implementer::Codex, a).unwrap();
+        assert!(!outcome.is_met() && !outcome.process_success, "{outcome:?}");
+    }
+
     /// Without even the root's kernel birth (the read straight after spawn
     /// failed), nothing bounds the worktree check: that still holds.
     #[cfg(unix)]
