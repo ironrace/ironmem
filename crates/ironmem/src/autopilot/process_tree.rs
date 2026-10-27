@@ -1032,12 +1032,7 @@ pub(crate) fn real_and_effective_uid(pid: u32) -> Option<(u32, u32)> {
     #[cfg(target_os = "linux")]
     {
         let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
-        let mut ids = status
-            .lines()
-            .find_map(|line| line.strip_prefix("Uid:"))?
-            .split_whitespace()
-            .map(|id| id.parse::<u32>().ok());
-        Some((ids.next()??, ids.next()??))
+        uids_from_status(&status)
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
@@ -1298,11 +1293,12 @@ impl std::fmt::Display for ScanError {
 /// directory cannot be read fails it, since that process could be the
 /// invocation's. The birth is read again afterwards: a PID reused in between
 /// may have handed back a newcomer's directory.
-fn scan_cwds(
+fn scan_cwds<O: Into<ProcOwner>>(
     pids: impl IntoIterator<Item = u32>,
     uid: u32,
     spawned: Birth,
-    mut owner_birth: impl FnMut(u32) -> Result<Option<(u32, Birth)>, String>,
+    known: &[u32],
+    mut owner_birth: impl FnMut(u32) -> Result<Option<(O, Birth)>, String>,
     mut cwd_of: impl FnMut(u32) -> Result<Option<PathBuf>, String>,
 ) -> Result<Vec<CwdProcess>, ScanError> {
     let mut processes = Vec::new();
@@ -1310,7 +1306,7 @@ fn scan_cwds(
         let Some((owner, birth)) = owner_birth(pid)? else {
             continue;
         };
-        if owner != uid || birth < spawned {
+        if !owner.into().is_users(uid, known) || birth < spawned {
             continue;
         }
         let cwd = match cwd_of(pid) {
@@ -1333,12 +1329,56 @@ fn scan_cwds(
         }
         processes.push(CwdProcess {
             pid,
-            uid: owner,
+            uid,
             birth,
             cwd,
         });
     }
     Ok(processes)
+}
+
+/// Who a process belongs to, as a worktree scan judges it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProcOwner {
+    euid: u32,
+    ruid: u32,
+    ppid: u32,
+}
+
+/// An owner known only by its effective uid (a test seam's shorthand).
+impl From<u32> for ProcOwner {
+    fn from(uid: u32) -> Self {
+        Self {
+            euid: uid,
+            ruid: uid,
+            ppid: 0,
+        }
+    }
+}
+
+impl ProcOwner {
+    /// Whether the scan counts the process as `uid`'s. Its effective uid
+    /// decides, as before. One that is `uid`'s only by real uid is a setuid
+    /// image (`login` behind every Terminal tab, `sudo`, `top`, `/bin/ps`)
+    /// whose working directory is unreadable, so it counts only when tied
+    /// to the invocation: its parent is a process the tracker knows
+    /// (`known`), or it was reparented to init (its birth, checked by the
+    /// caller, is in the window). An unrelated one is skipped and never
+    /// fails the scan.
+    fn is_users(self, uid: u32, known: &[u32]) -> bool {
+        self.euid == uid || (self.ruid == uid && (self.ppid == 1 || known.contains(&self.ppid)))
+    }
+}
+
+/// Real and effective uid from a Linux `/proc/<pid>/status` text: the first
+/// two fields of its `Uid:` line.
+fn uids_from_status(status: &str) -> Option<(u32, u32)> {
+    let mut ids = status
+        .lines()
+        .find_map(|line| line.strip_prefix("Uid:"))?
+        .split_whitespace()
+        .map(|id| id.parse::<u32>().ok());
+    Some((ids.next()??, ids.next()??))
 }
 
 /// The PIDs a worktree-quiet scan reads. Production scans every process
@@ -1425,15 +1465,25 @@ pub(crate) fn user_pids() -> Result<Vec<u32>, String> {
 /// unreadable, which holds the scan). macOS reads `sysctl(KERN_PROC_PID)`
 /// and `PROC_PIDVNODEPATHINFO`: about 1.5 ms for ~600 processes, measured.
 /// Linux reads `/proc`.
-fn processes_with_cwd(pids: Vec<u32>, spawned: Birth) -> Result<Vec<CwdProcess>, ScanError> {
+fn processes_with_cwd(
+    pids: Vec<u32>,
+    spawned: Birth,
+    known: &[u32],
+) -> Result<Vec<CwdProcess>, ScanError> {
     let uid = current_uid().ok_or("process working directories are unreadable here")?;
     #[cfg(target_os = "macos")]
     {
         use std::os::unix::ffi::OsStrExt;
         let owner_birth = |pid: u32| {
             Ok(kinfo_proc(pid)?.map(|record| {
-                let owner = if record.ruid == uid { uid } else { record.euid };
-                (owner, record.process.birth)
+                (
+                    ProcOwner {
+                        euid: record.euid,
+                        ruid: record.ruid,
+                        ppid: record.process.ppid,
+                    },
+                    record.process.birth,
+                )
             }))
         };
         let cwd_of = |pid: u32| {
@@ -1469,7 +1519,7 @@ fn processes_with_cwd(pids: Vec<u32>, spawned: Birth) -> Result<Vec<CwdProcess>,
                 Path::new(std::ffi::OsStr::from_bytes(path.to_bytes())).to_path_buf(),
             ))
         };
-        scan_cwds(pids, uid, spawned, owner_birth, cwd_of)
+        scan_cwds(pids, uid, spawned, known, owner_birth, cwd_of)
     }
     #[cfg(target_os = "linux")]
     {
@@ -1483,30 +1533,40 @@ fn processes_with_cwd(pids: Vec<u32>, spawned: Birth) -> Result<Vec<CwdProcess>,
                 Err(e) if gone(&e) => return Ok(None),
                 Err(e) => return Err(format!("cannot read process {pid}: {e}")),
             };
-            // A real-uid match is the user's too, as on macOS.
-            let owner = match real_and_effective_uid(pid) {
-                Some((real, _)) if real == uid => uid,
-                _ => owner,
-            };
-            Ok(kernel_observation(pid)?.map(|process| (owner, process.birth)))
+            let ruid = real_and_effective_uid(pid).map_or(owner, |(real, _)| real);
+            Ok(kernel_observation(pid)?.map(|process| {
+                (
+                    ProcOwner {
+                        euid: owner,
+                        ruid,
+                        ppid: process.ppid,
+                    },
+                    process.birth,
+                )
+            }))
         };
         let cwd_of = |pid: u32| match std::fs::read_link(format!("/proc/{pid}/cwd")) {
             Ok(cwd) => Ok(Some(cwd)),
             Err(e) if gone(&e) => Ok(None),
             Err(e) => Err(e.to_string()),
         };
-        scan_cwds(pids, uid, spawned, owner_birth, cwd_of)
+        scan_cwds(pids, uid, spawned, known, owner_birth, cwd_of)
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
-        let _ = (pids, uid, spawned);
+        let _ = (pids, uid, spawned, known);
         Err("process working directories are unreadable on this platform".into())
     }
 }
 
-/// [`processes_with_cwd`] of whatever `pids` lists.
-fn scan_with(pids: ScanPids<'_>, spawned: Birth) -> Result<Vec<CwdProcess>, ScanError> {
-    processes_with_cwd(pids()?, spawned)
+/// [`processes_with_cwd`] of whatever `pids` lists; `known` are the
+/// invocation's processes ([`ProcOwner::is_users`]).
+fn scan_with(
+    pids: ScanPids<'_>,
+    spawned: Birth,
+    known: &[u32],
+) -> Result<Vec<CwdProcess>, ScanError> {
+    processes_with_cwd(pids()?, spawned, known)
 }
 
 fn is_shared_daemon(
@@ -1591,12 +1651,13 @@ impl<'a> QuietCheck<'a> {
     pub(crate) fn once(
         worktree: &Path,
         spawned: Birth,
+        known: &[u32],
         daemon: Option<&'a SharedDaemon>,
         rows: &[ProcessRow],
         pids: ScanPids<'_>,
     ) -> Result<Quiet, String> {
         let check = Self::new(worktree, spawned, daemon, kernel_executable)?;
-        let scanned = scan_with(pids, spawned).map_err(|e| e.reason)?;
+        let scanned = scan_with(pids, spawned, known).map_err(|e| e.reason)?;
         let found = check.stragglers(scanned, || Ok(rows.to_vec()))?;
         Ok(check.verdict(found))
     }
@@ -2212,9 +2273,12 @@ impl ProcessTracker {
         grace: std::time::Duration,
         pids: ScanPids<'_>,
     ) -> Result<Quiet, MemoryError> {
+        let known: Vec<u32> = std::iter::once(self.root_pid)
+            .chain(self.known.iter().map(|(r, _)| r.pid))
+            .collect();
         self.verify_worktree_quiet_with(
             worktree,
-            |spawned| scan_with(pids, spawned),
+            |spawned| scan_with(pids, spawned, &known),
             Self::rows,
             grace,
         )
@@ -3396,14 +3460,15 @@ pub(crate) mod tests {
                 _ => Ok(Some(PathBuf::from(format!("/w/{pid}")))),
             }
         };
-        let found = scan_cwds([1, 3, 4, 6, 7], uid, spawned, owner_birth, &mut cwd_of).unwrap();
+        let found =
+            scan_cwds([1, 3, 4, 6, 7], uid, spawned, &[], owner_birth, &mut cwd_of).unwrap();
         assert_eq!(found.iter().map(|p| p.pid).collect::<Vec<_>>(), vec![7]);
         assert_eq!(
             cwd_reads.borrow().clone(),
             vec![4, 7],
             "old, gone and foreign processes are never read"
         );
-        let err = scan_cwds([1, 2, 7], uid, spawned, owner_birth, &mut cwd_of).unwrap_err();
+        let err = scan_cwds([1, 2, 7], uid, spawned, &[], owner_birth, &mut cwd_of).unwrap_err();
         assert!(
             err.reason.contains("process 2") && err.reason.contains("not permitted"),
             "{err}"
@@ -3417,7 +3482,7 @@ pub(crate) mod tests {
             reads += 1;
             Ok((reads == 1).then_some((uid, Birth(150, 0))))
         };
-        assert!(scan_cwds([8], uid, spawned, vanishing, &mut cwd_of)
+        assert!(scan_cwds([8], uid, spawned, &[], vanishing, &mut cwd_of)
             .unwrap()
             .is_empty());
         // Replaced by a new process under the same PID: the directory may
@@ -3427,7 +3492,7 @@ pub(crate) mod tests {
             reads += 1;
             Ok(Some((uid, Birth(150 + reads, 0))))
         };
-        let err = scan_cwds([9], uid, spawned, replaced, &mut cwd_of).unwrap_err();
+        let err = scan_cwds([9], uid, spawned, &[], replaced, &mut cwd_of).unwrap_err();
         assert_eq!(
             err.unreadable, None,
             "a replaced PID names no process: {err}"
@@ -3530,7 +3595,7 @@ pub(crate) mod tests {
         let started = std::time::Instant::now();
         let pids = user_pids().unwrap();
         assert!(pids.contains(&std::process::id()), "{} pids", pids.len());
-        let processes = processes_with_cwd(vec![std::process::id()], Birth(0, 0)).unwrap();
+        let processes = processes_with_cwd(vec![std::process::id()], Birth(0, 0), &[]).unwrap();
         let elapsed = started.elapsed();
         let me = processes
             .iter()
@@ -3753,13 +3818,87 @@ pub(crate) mod tests {
         );
     }
 
-    /// A setuid tool that escaped into the worktree keeps the user's real
-    /// uid (cleanup can signal it), so the worktree scan lists it and never
-    /// reads the worktree as quiet while it runs: it is either named or, its
-    /// working directory unreadable, fails the scan for that very process.
+    /// A process that is the user's only by real uid (a setuid tool:
+    /// `login` behind every Terminal tab, `sudo`, `top`) counts only when it
+    /// is tied to the invocation: its parent is a process the tracker knows,
+    /// or it was reparented to init. An unrelated one is skipped before its
+    /// (unreadable) working directory is touched, so it never fails the scan.
+    #[test]
+    fn a_process_ours_only_by_real_uid_counts_only_when_tied_to_the_invocation() {
+        let spawned = Birth(100, 0);
+        let uid = 501;
+        let root = 42;
+        let setuid = |ppid: u32| ProcOwner {
+            euid: 0,
+            ruid: uid,
+            ppid,
+        };
+        let owner_birth = |pid: u32| -> Result<Option<(ProcOwner, Birth)>, String> {
+            Ok(Some(match pid {
+                // A Terminal tab's `login`, born in the window.
+                10 => (setuid(300), Birth(150, 0)),
+                // A setuid tool the invocation's root started.
+                11 => (setuid(root), Birth(150, 0)),
+                // One reparented to init after its parent exited.
+                12 => (setuid(1), Birth(150, 0)),
+                // Same effective uid: counted whoever its parent is.
+                _ => (
+                    ProcOwner {
+                        euid: uid,
+                        ruid: uid,
+                        ppid: 300,
+                    },
+                    Birth(150, 0),
+                ),
+            }))
+        };
+        let reads = std::cell::RefCell::new(Vec::new());
+        let cwd_of = |pid: u32| -> Result<Option<PathBuf>, String> {
+            reads.borrow_mut().push(pid);
+            match pid {
+                10 | 11 => Err("Operation not permitted".into()),
+                _ => Ok(Some(PathBuf::from(format!("/w/{pid}")))),
+            }
+        };
+        let found = scan_cwds([10, 12, 13], uid, spawned, &[root], owner_birth, cwd_of).unwrap();
+        assert_eq!(
+            found.iter().map(|p| p.pid).collect::<Vec<_>>(),
+            vec![12, 13]
+        );
+        assert!(!reads.borrow().contains(&10), "an unrelated login was read");
+        let err = scan_cwds([10, 11], uid, spawned, &[root], owner_birth, cwd_of).unwrap_err();
+        assert_eq!(err.unreadable, Some((11, Birth(150, 0))), "{err}");
+    }
+
+    /// The Linux reading of a process's owners, from `/proc/<pid>/status`,
+    /// feeds the same rule.
+    #[test]
+    fn a_linux_status_reads_real_and_effective_uid_for_the_same_rule() {
+        let status = "Name:\tsudo\nPPid:\t300\nUid:\t501\t0\t0\t0\nGid:\t20\t20\t20\t20\n";
+        assert_eq!(uids_from_status(status), Some((501, 0)));
+        assert_eq!(uids_from_status("Name:\tx\n"), None);
+        let (ruid, euid) = uids_from_status(status).unwrap();
+        let owner = |ppid| ProcOwner { euid, ruid, ppid };
+        let owner_birth = |pid: u32| -> Result<Option<(ProcOwner, Birth)>, String> {
+            Ok(Some((
+                owner(if pid == 1 { 300 } else { 42 }),
+                Birth(150, 0),
+            )))
+        };
+        let cwd_of = |pid: u32| -> Result<Option<PathBuf>, String> {
+            Ok(Some(PathBuf::from(format!("/w/{pid}"))))
+        };
+        let found = scan_cwds([1, 2], 501, Birth(100, 0), &[42], owner_birth, cwd_of).unwrap();
+        assert_eq!(found.iter().map(|p| p.pid).collect::<Vec<_>>(), vec![2]);
+    }
+
+    /// The same with a real setuid binary: `top` started by this test
+    /// process (not the invocation) is skipped; with this process as the
+    /// invocation's root, it is listed or, its directory unreadable, fails
+    /// the scan for that very process.
     #[cfg(target_os = "macos")]
     #[test]
-    fn a_setuid_tool_with_our_real_uid_is_seen_by_the_worktree_scan() {
+    fn a_real_setuid_tool_holds_the_scan_only_under_the_invocation() {
         let Some(top) = setuid_top() else { return };
         let worktree = tempfile::tempdir().unwrap();
         let mut child = Command::new(top)
@@ -3779,11 +3918,13 @@ pub(crate) mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         let listed = user_pids();
-        let scanned = processes_with_cwd(vec![pid], Birth(0, 0));
+        let unrelated = processes_with_cwd(vec![pid], Birth(0, 0), &[]);
+        let tied = processes_with_cwd(vec![pid], Birth(0, 0), &[std::process::id()]);
         let _ = child.kill();
         let _ = child.wait();
         assert!(listed.unwrap().contains(&pid), "not listed by real uid");
-        match scanned {
+        assert_eq!(unrelated.unwrap(), Vec::new());
+        match tied {
             Ok(found) => assert!(found.iter().any(|p| p.pid == pid), "{found:?}"),
             Err(e) => assert_eq!(e.unreadable.map(|(p, _)| p), Some(pid), "{}", e.reason),
         }

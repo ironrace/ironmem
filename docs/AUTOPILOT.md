@@ -444,8 +444,13 @@ supervisor records the outcome and holds completion, naming that process
 and its real uid, along with anything under it in the process table, until
 each is gone; recovery then finishes it with no `clear-dispatch`. What such
 a process starts after that check and moves out of its tree is outside the
-guarantee. The worktree check also counts a process whose real uid is
-yours, so an escaped setuid tool keeps the worktree from reading quiet.
+guarantee. The worktree check also counts a process that is yours only by
+real uid (a setuid image, whose working directory cannot be read) when it
+is tied to the invocation: its parent is the invocation's root or a process
+the tracker enrolled, or it was reparented to launchd or init, born during
+the invocation. So an escaped setuid tool keeps the worktree from reading
+quiet, while an unrelated one, such as the `login` behind a Terminal tab
+you open, or a `sudo` or `top` you run yourself, is skipped.
 
 A long-lived process cleanup cannot signal (`sudo -b …`, say) holds the
 issue for as long as it runs, and `clear-dispatch` refuses while it does.

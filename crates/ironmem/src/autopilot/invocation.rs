@@ -1354,7 +1354,11 @@ pub(crate) fn settle_awaiting_quiet(
             _ => {}
         }
     }
-    if let Quiet::Held(hold) = QuietCheck::once(&awaiting.worktree, root_birth, daemon, rows, pids)?
+    let known: Vec<u32> = std::iter::once(identity.root_pid)
+        .chain(identity.descendants.iter().map(|d| d.pid))
+        .collect();
+    if let Quiet::Held(hold) =
+        QuietCheck::once(&awaiting.worktree, root_birth, &known, daemon, rows, pids)?
     {
         return Err(hold.reason);
     }
