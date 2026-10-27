@@ -745,9 +745,7 @@ impl CliDispatcher {
 /// PATH entry relative to this process's working directory: the repository
 /// file a relative entry would reach.
 #[cfg(test)]
-pub(crate) fn planted_relative_path_entry(
-    name: &str,
-) -> (tempfile::TempDir, std::path::PathBuf) {
+pub(crate) fn planted_relative_path_entry(name: &str) -> (tempfile::TempDir, std::path::PathBuf) {
     let planted = tempfile::tempdir().unwrap();
     let bin = planted.path().join(name);
     std::fs::write(&bin, "#!/bin/sh\nsleep 1\n").unwrap();
@@ -1220,14 +1218,10 @@ impl<'a> GuardGit<'a> {
         };
         loop {
             let exited = dispatch::exited_unreaped(&mut child);
-            let closed = stdout.is_finished()
-                && stderr.is_finished()
-                && finished(writer.as_ref());
+            let closed = stdout.is_finished() && stderr.is_finished() && finished(writer.as_ref());
             match exited {
                 Ok(true) if closed => break,
-                Ok(_) if std::time::Instant::now() < deadline => {
-                    std::thread::sleep(GUARD_GIT_POLL)
-                }
+                Ok(_) if std::time::Instant::now() < deadline => std::thread::sleep(GUARD_GIT_POLL),
                 waited => {
                     dispatch::kill_process_group(&mut child);
                     let _ = child.wait();
@@ -5831,9 +5825,7 @@ sleep 0.5
         // `git replace` makes every reader see `stand_in` for `real`.
         git_in(&wt.path, &["replace", &real, &stand_in]);
         let git = GuardGit::new(&wt.path, SIGNING_GUARD_TIMEOUT).unwrap();
-        let out = git
-            .run(&["log", "-1", "--format=%s", &real], None)
-            .unwrap();
+        let out = git.run(&["log", "-1", "--format=%s", &real], None).unwrap();
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "seed");
     }
 
@@ -5848,7 +5840,10 @@ sleep 0.5
         .unwrap();
         // That scope's warning is spent for the process: no later guard,
         // built for every met, repeats it.
-        assert!(!warn_unreadable_scope_once("--global", "fatal: $HOME not set"));
+        assert!(!warn_unreadable_scope_once(
+            "--global",
+            "fatal: $HOME not set"
+        ));
     }
 
     #[cfg(unix)]
