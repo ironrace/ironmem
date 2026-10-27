@@ -2146,7 +2146,7 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
         .unwrap();
         let rows = ProcessSnapshot::Available(Vec::new());
         let settle = |kernel: &dyn Fn(u32) -> Result<Option<_>, String>| {
-            settle_awaiting_quiet(a, &rows, None, |pid| kernel(pid))
+            settle_awaiting_quiet(a, &rows, None, kernel)
         };
         let real = |pid| kernel_birth(pid);
         // A recorded straggler still alive, though no longer in the worktree.
