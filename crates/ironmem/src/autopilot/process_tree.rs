@@ -235,7 +235,7 @@ fn decode_process_table(output: &[u8]) -> Result<Vec<ProcessRow>, String> {
 
 /// Whether `path` has the Autopilot invocation layout:
 /// `/…/ironmem/autopilot/<slug>-<number>/<uuid>/schema.json`.
-fn is_autopilot_marker_path(path: &str) -> bool {
+pub(crate) fn is_autopilot_marker_path(path: &str) -> bool {
     let path = Path::new(path);
     let Some(invocation) = path.parent() else {
         return false;
@@ -1244,6 +1244,11 @@ mod tests {
         // A schema.json outside the Autopilot layout is an operator's own run.
         assert_eq!(
             marker("codex exec --brand-new-flag --output-schema /tmp/schema.json hi"),
+            Ok(None)
+        );
+        // A relative path can never be an Autopilot marker.
+        assert_eq!(
+            marker("codex exec --output-schema relative/schema.json p"),
             Ok(None)
         );
     }

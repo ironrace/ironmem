@@ -119,6 +119,7 @@ pub struct FinalVerdict {
 pub fn cli_for(implementer: Implementer) -> Result<&'static dyn SupervisedCli, MemoryError> {
     match implementer {
         Implementer::Codex => Ok(&super::codex_dispatch::CodexCli),
+        Implementer::Muse => Err(validation("the Muse implementer is not available yet")),
         Implementer::Claude => Err(validation(
             "the Claude implementer is not a supervised CLI invocation",
         )),
@@ -830,6 +831,12 @@ mod tests {
     }
 
     #[test]
+    fn muse_has_no_supervised_cli_yet() {
+        let err = cli_for(Implementer::Muse).err().unwrap().to_string();
+        assert!(err.contains("Muse"), "got: {err}");
+    }
+
+    #[test]
     fn codex_expected_native_id_is_set_only_on_resume() {
         let codex = cli_for(Implementer::Codex).unwrap();
         let mut spec = crate::autopilot::codex_dispatch::tests::spec(SessionMode::New {
@@ -969,6 +976,10 @@ pub(crate) mod contract_tests {
                 );
             }
         }
+        // The producer layout and the liveness helper must not drift apart.
+        assert!(crate::autopilot::process_tree::is_autopilot_marker_path(
+            &a.schema_path
+        ));
         assert_eq!(
             std::fs::read_to_string(&a.schema_path).unwrap(),
             VERDICT_JSON_SCHEMA

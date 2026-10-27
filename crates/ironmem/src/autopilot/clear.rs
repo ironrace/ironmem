@@ -86,26 +86,31 @@ fn refusal(
         )),
         // Idle with pending artifacts is a finished invocation `run_issue` has
         // not recorded yet; clearing would drop its attempt from lineage.
-        (Implementer::Codex, Liveness::NotListed)
-            if state.invocation_artifacts.is_some() && !attempt_recorded =>
+        (implementer, Liveness::NotListed)
+            if implementer.recovers_invocations()
+                && state.invocation_artifacts.is_some()
+                && !attempt_recorded =>
         {
             Some(format!(
-                "a finished Codex invocation is waiting to be recorded. A Lead records it \
+                "a finished {} invocation is waiting to be recorded. A Lead records it \
                  when it next resumes the issue, or run `ironmem autopilot run {} {} \
-                 --implementer codex --model <model> --title <issue title>` from the checkout \
+                 --implementer {} --model <model> --title <issue title>` from the checkout \
                  it was dispatched in (add --path and --db if they are not the defaults)",
-                state.issue.repo, state.issue.number
+                implementer.label(),
+                state.issue.repo,
+                state.issue.number,
+                implementer.label().to_ascii_lowercase()
             ))
         }
         (_, Liveness::NotListed) => None,
         // Unknown is exactly the hold this exists for — but only once a fresh
         // process table shows nothing that could be the issue's work.
-        (Implementer::Codex, Liveness::Unknown) => snapshots
+        (implementer, Liveness::Unknown) if implementer.recovers_invocations() => snapshots
             .processes
             .live_evidence(&state.issue.slug(), state.invocation_artifacts.as_ref()),
         // A Claude hold means its registry could not be read; there is no
         // evidence to clear against.
-        (Implementer::Claude, Liveness::Unknown) => Some(snapshots.state_reason(state)),
+        (_, Liveness::Unknown) => Some(snapshots.state_reason(state)),
     }
 }
 
@@ -306,6 +311,38 @@ mod tests {
         assert!(dispatch_state::get_dispatch_state(&db, &issue())
             .unwrap()
             .is_some());
+    }
+
+    #[test]
+    fn a_muse_hold_is_judged_by_process_evidence_and_names_its_own_harness() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_in_memory().unwrap();
+        let (a, _) = testing::invocation(dir.path());
+        let mut state = held_codex_state(a.clone());
+        state.implementer = Implementer::Muse;
+        dispatch_state::upsert_dispatch_state(&db, &state).unwrap();
+        // Unfinished: a live Muse invocation for the same issue holds it.
+        let sibling = "/r/.git/ironmem/autopilot/owner-repo-42/\
+                       11111111-2222-3333-4444-555555555555/schema.json";
+        let err = clear_dispatch(&db, &issue(), || {
+            snapshots(vec![row(
+                79,
+                79,
+                &format!("/u/muse-bin-1.4.13-R6996.1 exec --output-schema {sibling}"),
+            )])
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("owner-repo-42"), "{err}");
+        testing::complete(&a);
+        let err = clear_dispatch(&db, &issue(), || snapshots(Vec::new()))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("a finished Muse invocation is waiting to be recorded"),
+            "{err}"
+        );
+        assert!(err.contains("--implementer muse --model <model>"), "{err}");
     }
 
     fn record_status(db: &Database, best: Option<AttemptOutcome>, cumulative_attempt_n: u32) {

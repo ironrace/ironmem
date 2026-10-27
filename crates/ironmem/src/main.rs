@@ -992,12 +992,13 @@ fn resolve_implementation_model(
     explicit_max_turns: bool,
     explicit_max_budget_usd: bool,
 ) -> Result<String, MemoryError> {
-    if implementer == ironmem::autopilot::Implementer::Codex && explicit_max_budget_usd {
-        return Err(MemoryError::Validation(
-            "the Codex implementer does not support --max-budget-usd: the native Codex CLI has no such flag; use the daily unpriced invocation cap and wall-clock timeout"
-                .into(),
-        ));
+    if implementer.recovers_invocations() && explicit_max_budget_usd {
+        return Err(MemoryError::Validation(format!(
+            "the {l} implementer does not support --max-budget-usd: the native {l} CLI has no such flag; use the daily unpriced invocation cap and wall-clock timeout",
+            l = implementer.label()
+        )));
     }
+    // Only Codex lacks a native turn cap: Muse has --max-model-steps.
     if implementer == ironmem::autopilot::Implementer::Codex && explicit_max_turns {
         return Err(MemoryError::Validation(
             "the Codex implementer does not support --max-turns: the native Codex CLI has no such flag; --n-turns remains prompt guidance"
@@ -1010,10 +1011,11 @@ fn resolve_implementation_model(
             DEFAULT_CLAUDE_IMPLEMENTATION_MODEL.to_string()
         }
         None => {
-            return Err(MemoryError::Validation(
-                "--model is required for the Codex implementer; pass an explicit Codex model"
-                    .into(),
-            ))
+            return Err(MemoryError::Validation(format!(
+                "--model is required for the {} implementer; pass an explicit {} model",
+                implementer.label(),
+                implementer.label()
+            )))
         }
     };
     ironmem::autopilot::run::validate_implementation_model(implementer, &model)?;
@@ -1028,7 +1030,7 @@ fn resolve_dispatcher(
         ironmem::autopilot::Implementer::Claude => {
             Box::new(ironmem::autopilot::run::ClaudeDispatcher::resolve()?)
         }
-        ironmem::autopilot::Implementer::Codex => Box::new(
+        ironmem::autopilot::Implementer::Codex | ironmem::autopilot::Implementer::Muse => Box::new(
             ironmem::autopilot::run::CliDispatcher::resolve(implementer)?,
         ),
     })
@@ -3851,6 +3853,43 @@ mod tests {
     }
 
     #[test]
+    fn implementation_model_refusals_name_the_selected_recovering_harness() {
+        use ironmem::autopilot::Implementer;
+        let err = |implementer, model: Option<&str>, turns, budget| {
+            resolve_implementation_model(implementer, model.map(str::to_owned), turns, budget)
+                .unwrap_err()
+                .to_string()
+        };
+        assert_eq!(
+            err(Implementer::Codex, None, false, false),
+            "Validation error: --model is required for the Codex implementer; pass an explicit Codex model"
+        );
+        assert_eq!(
+            err(Implementer::Muse, None, false, false),
+            "Validation error: --model is required for the Muse implementer; pass an explicit Muse model"
+        );
+        assert_eq!(
+            err(Implementer::Codex, Some("gpt-6.1-sol"), false, true),
+            "Validation error: the Codex implementer does not support --max-budget-usd: the native Codex CLI has no such flag; use the daily unpriced invocation cap and wall-clock timeout"
+        );
+        assert_eq!(
+            err(Implementer::Muse, Some("muse-wonder-1.0"), false, true),
+            "Validation error: the Muse implementer does not support --max-budget-usd: the native Muse CLI has no such flag; use the daily unpriced invocation cap and wall-clock timeout"
+        );
+        // Muse has a native step cap, so --max-turns stays a valid limit.
+        assert_eq!(
+            resolve_implementation_model(
+                Implementer::Muse,
+                Some("muse-wonder-1.0".into()),
+                true,
+                false
+            )
+            .unwrap(),
+            "muse-wonder-1.0"
+        );
+    }
+
+    #[test]
     fn autopilot_run_and_lead_parse_codex_implementation_selection() {
         let run = Cli::try_parse_from([
             "ironmem",
@@ -3921,6 +3960,7 @@ mod tests {
                 .to_string();
             assert!(err.contains("claude"), "got: {err}");
             assert!(err.contains("codex"), "got: {err}");
+            assert!(err.contains("muse"), "got: {err}");
         }
     }
 

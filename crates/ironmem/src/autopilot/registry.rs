@@ -105,7 +105,7 @@ pub trait AgentRegistry {
 }
 
 /// How long `claude agents --json` may take. Every controller samples it,
-/// including a Codex-only Lead, so a hung Claude CLI must read as an
+/// including a Codex- or Muse-only Lead, so a hung Claude CLI must read as an
 /// unavailable registry rather than stall the whole tick.
 const REGISTRY_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -376,12 +376,12 @@ impl HarnessSnapshots {
     pub fn is_available(&self, implementer: Implementer) -> bool {
         match implementer {
             Implementer::Claude => self.claude.is_available(),
-            Implementer::Codex => self.processes.is_available(),
+            Implementer::Codex | Implementer::Muse => self.processes.is_available(),
         }
     }
 }
 /// `run_issue` persists dispatching + exact new artifacts atomically before
-/// every Codex spawn, and retains pending artifacts whenever completion is
+/// every supervised CLI spawn, and retains pending artifacts whenever completion is
 /// uncertain. Every label `run_issue` writes with no pending artifacts
 /// therefore establishes an idle invocation, including a pause or refusal
 /// before the first launch and a between-invocation state an early `?` left
@@ -400,7 +400,8 @@ fn idle_invocation_pause(snapshot: &ProcessSnapshot, state: &DispatchState) -> R
             | "infrastructure-failure"
     ) {
         return Err(format!(
-            "Codex state {:?} has no pending invocation identity and is not a state autopilot writes without one",
+            "{} state {:?} has no pending invocation identity and is not a state autopilot writes without one",
+            state.implementer.label(),
             state.state
         ));
     }
@@ -409,20 +410,27 @@ fn idle_invocation_pause(snapshot: &ProcessSnapshot, state: &DispatchState) -> R
         .as_ref()
         .is_some_and(|id| uuid::Uuid::parse_str(id).is_err())
     {
-        return Err("paused Codex state has an invalid native session UUID".into());
+        return Err(format!(
+            "paused {} state has an invalid native session UUID",
+            state.implementer.label()
+        ));
     }
+    // The ambiguous or matching row may belong to either supervised harness,
+    // whatever this state's implementer, so these two name none.
     if let Some(reason) = rows
         .iter()
         .filter(|row| row.active())
         .find_map(|row| row.marker().err())
     {
-        return Err(format!("Codex process marker is ambiguous: {reason}"));
+        return Err(format!(
+            "an invocation process marker is ambiguous: {reason}"
+        ));
     }
     let slug = state.issue.slug();
     if snapshot.orphan_markers().iter().any(|marker| {
         crate::autopilot::process_tree::marker_issue_slug(marker) == Some(slug.as_str())
     }) {
-        return Err("an active Codex Autopilot marker matches this issue; paused state has no exact invocation identity to adopt safely".into());
+        return Err("an active Autopilot marker matches this issue; paused state has no exact invocation identity to adopt safely".into());
     }
     Ok(())
 }
@@ -445,7 +453,12 @@ pub(crate) fn invocation_state_reason(snapshot: &ProcessSnapshot, state: &Dispat
         Some(artifacts) => snapshot.invocation_reason(Some(artifacts)),
         None => idle_invocation_pause(snapshot, state)
             .err()
-            .unwrap_or_else(|| "Codex has no pending invocation in a durable paused state".into()),
+            .unwrap_or_else(|| {
+                format!(
+                    "{} has no pending invocation in a durable paused state",
+                    state.implementer.label()
+                )
+            }),
     }
 }
 
@@ -453,19 +466,23 @@ impl LivenessSnapshot for HarnessSnapshots {
     fn liveness(&self, state: &DispatchState) -> Liveness {
         match state.implementer {
             Implementer::Claude => self.claude.liveness(&state.ic_session_name),
-            Implementer::Codex => invocation_state_liveness(&self.processes, state),
+            Implementer::Codex | Implementer::Muse => {
+                invocation_state_liveness(&self.processes, state)
+            }
         }
     }
     fn reason(&self, implementer: Implementer) -> String {
         match implementer {
             Implementer::Claude => LivenessSnapshot::reason(&self.claude, implementer),
-            Implementer::Codex => self.processes.reason(),
+            Implementer::Codex | Implementer::Muse => self.processes.reason(),
         }
     }
     fn state_reason(&self, state: &DispatchState) -> String {
         match state.implementer {
             Implementer::Claude => self.reason(state.implementer),
-            Implementer::Codex => invocation_state_reason(&self.processes, state),
+            Implementer::Codex | Implementer::Muse => {
+                invocation_state_reason(&self.processes, state)
+            }
         }
     }
     fn claude_names(&self) -> Vec<&str> {
@@ -476,17 +493,17 @@ impl LivenessSnapshot for HarnessSnapshots {
     }
 }
 /// Compatibility for callers providing only Claude evidence: never infer a
-/// Codex death from the absence of a Claude session.
+/// supervised CLI invocation's death from the absence of a Claude session.
 impl LivenessSnapshot for RegistrySnapshot {
     fn liveness(&self, state: &DispatchState) -> Liveness {
         match state.implementer {
             Implementer::Claude => self.liveness(&state.ic_session_name),
-            Implementer::Codex => Liveness::Unknown,
+            _ => Liveness::Unknown,
         }
     }
     fn reason(&self, implementer: Implementer) -> String {
-        if implementer == Implementer::Codex {
-            return "Codex process source was not supplied".into();
+        if implementer.recovers_invocations() {
+            return format!("{} process source was not supplied", implementer.label());
         }
         match self {
             Self::Unavailable { reason } => reason.clone(),
@@ -522,7 +539,7 @@ impl<T: AgentRegistry + ?Sized> HarnessMonitor for T {
         HarnessSnapshots {
             claude,
             processes: ProcessSnapshot::Unavailable {
-                reason: "Codex process source was not supplied".into(),
+                reason: "invocation process source was not supplied".into(),
             },
         }
     }
@@ -922,6 +939,59 @@ mod harness_tests {
             session_claimed: true,
         }
     }
+    #[test]
+    fn a_muse_state_is_judged_by_process_evidence_never_by_the_claude_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        let (artifacts, mut root) = crate::autopilot::process_tree::testing::invocation(dir.path());
+        root.args = format!(
+            "/u/muse-bin-1.4.13-R6996.1 exec --json --output-schema {} --prompt-file /p.md",
+            artifacts.schema_path
+        );
+        let mut state = paused_codex_state();
+        state.implementer = Implementer::Muse;
+        state.state = "dispatching".into();
+        state.invocation_artifacts = Some(artifacts);
+        let alive = HarnessSnapshots {
+            claude: RegistrySnapshot::Available(Vec::new()),
+            processes: ProcessSnapshot::Available(vec![root]),
+        };
+        assert_eq!(alive.liveness(&state), Liveness::Alive);
+        // Claude-only evidence can never prove a Muse invocation dead.
+        assert_eq!(
+            LivenessSnapshot::liveness(&RegistrySnapshot::Available(Vec::new()), &state),
+            Liveness::Unknown
+        );
+        assert_eq!(
+            LivenessSnapshot::reason(&RegistrySnapshot::Available(Vec::new()), Implementer::Muse),
+            "Muse process source was not supplied"
+        );
+        assert!(alive.is_available(Implementer::Muse));
+    }
+    #[test]
+    fn an_idle_muse_pause_names_muse_when_it_holds() {
+        let mut state = paused_codex_state();
+        state.implementer = Implementer::Muse;
+        let mut snapshots = paused_snapshots();
+        assert_eq!(snapshots.liveness(&state), Liveness::NotListed);
+        snapshots.processes = ProcessSnapshot::Available(
+            parse_processes(
+                "10 1 10 S /u/muse-bin-1.4.13-R6996.1 exec --output-schema /x/.git/ironmem/autopilot/owner-repo-42/11111111-2222-3333-4444-555555555555/schema.json --brand-new-flag\n",
+            )
+            .unwrap(),
+        );
+        assert_eq!(snapshots.liveness(&state), Liveness::Unknown);
+        // The ambiguous row's own harness, not the state's, is in its reason.
+        assert_eq!(
+            snapshots.state_reason(&state),
+            "an invocation process marker is ambiguous: unrecognized Muse option"
+        );
+        state.state = "paused-other".into();
+        assert!(
+            snapshots.state_reason(&state).starts_with("Muse state "),
+            "got: {}",
+            snapshots.state_reason(&state)
+        );
+    }
     fn paused_snapshots() -> HarnessSnapshots {
         HarnessSnapshots {
             claude: RegistrySnapshot::Available(vec![AgentEntry {
@@ -1019,7 +1089,7 @@ mod harness_tests {
             .unwrap(),
         );
         assert_eq!(snapshots.liveness(&state), Liveness::Unknown);
-        // An unparseable row that names no schema.json cannot be ours.
+        // An unparseable row that names no Autopilot-shaped marker cannot be ours.
         snapshots.processes = ProcessSnapshot::Available(
             parse_processes("10 1 10 S codex exec --output-schema\n").unwrap(),
         );

@@ -1370,7 +1370,7 @@ pub fn reconcile(
 
     let known_markers: std::collections::HashSet<_> = states
         .iter()
-        .filter(|s| s.implementer == super::implementer::Implementer::Codex)
+        .filter(|s| s.implementer.recovers_invocations())
         .filter_map(|s| {
             s.invocation_artifacts
                 .as_ref()
@@ -2746,5 +2746,38 @@ mod tests {
             reconcile(&db, &snapshots).unwrap()[0].verdict,
             ReconcileVerdict::RestartFromCheckpoint { .. }
         ));
+    }
+    #[test]
+    fn a_live_muse_invocation_is_adopted_and_never_reported_as_an_orphan() {
+        use crate::autopilot::process_tree::{testing, ProcessSnapshot};
+        use crate::autopilot::registry::HarnessSnapshots;
+        let db = Database::open_in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        // Orphan detection only sees markers of the Autopilot layout.
+        let invocation = dir
+            .path()
+            .join(".git/ironmem/autopilot/owner-repo-42/0f0e0d0c-0b0a-4908-8706-050403020100");
+        std::fs::create_dir_all(&invocation).unwrap();
+        let (a, mut root) = testing::invocation(&invocation);
+        root.args = format!(
+            "/u/muse-bin-1.4.13-R6996.1 exec --json --output-schema {} --prompt-file /p.md",
+            a.schema_path
+        );
+        let mut state = state_for(&issue(), true);
+        state.implementer = crate::autopilot::implementer::Implementer::Muse;
+        state.invocation_artifacts = Some(a.clone());
+        dispatch_state::upsert_dispatch_state(&db, &state).unwrap();
+        let snapshots = HarnessSnapshots {
+            claude: RegistrySnapshot::Available(Vec::new()),
+            processes: ProcessSnapshot::Available(vec![root]),
+        };
+        let rows = reconcile(&db, &snapshots).unwrap();
+        assert_eq!(rows[0].verdict, ReconcileVerdict::Adopt);
+        assert!(
+            !rows
+                .iter()
+                .any(|r| r.verdict == ReconcileVerdict::Orphan && r.session_name == a.schema_path),
+            "a known Muse marker must not be reported as an orphan: {rows:?}"
+        );
     }
 }

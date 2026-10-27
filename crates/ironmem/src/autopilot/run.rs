@@ -244,14 +244,14 @@ pub fn validate_implementation_model(
             "model must not contain leading or trailing whitespace for the {harness} implementer"
         )));
     }
-    if implementer == Implementer::Codex && model.starts_with("claude-") {
+    let foreign = match implementer {
+        Implementer::Claude => model.starts_with("gpt-") || model.starts_with("muse-"),
+        Implementer::Codex => model.starts_with("claude-") || model.starts_with("muse-"),
+        Implementer::Muse => model.starts_with("claude-") || model.starts_with("gpt-"),
+    };
+    if foreign {
         return Err(MemoryError::Validation(format!(
-            "model '{model}' is incompatible with the Codex implementer; choose a Codex model"
-        )));
-    }
-    if implementer == Implementer::Claude && model.starts_with("gpt-") {
-        return Err(MemoryError::Validation(format!(
-            "model '{model}' is incompatible with the Claude implementer; choose a Claude model"
+            "model '{model}' is incompatible with the {harness} implementer; choose a {harness} model"
         )));
     }
     Ok(())
@@ -332,22 +332,29 @@ impl RunConfig {
             ));
         }
         if self.max_budget_usd > self.daily_budget_usd {
-            // Codex has no --max-budget-usd, so naming it would send the
-            // operator after a flag the CLI refuses for this implementer.
-            return Err(MemoryError::Validation(match self.implementer {
-                Implementer::Claude => format!(
-                    "max_budget_usd ({}) exceeds daily_budget_usd ({}) — no dispatch could \
-                     ever be authorized",
-                    self.max_budget_usd, self.daily_budget_usd
-                ),
-                Implementer::Codex => format!(
-                    "daily_budget_usd ({}) is below the ${} every Codex dispatch reserves \
-                     before it starts — Codex reports no cost, so each invocation is \
+            // A supervised CLI has no --max-budget-usd, so naming it would send
+            // the operator after a flag the CLI refuses for this implementer.
+            return Err(MemoryError::Validation(
+                if self.implementer.recovers_invocations() {
+                    format!(
+                        "daily_budget_usd ({}) is below the ${} every {} dispatch reserves \
+                     before it starts — {} reports no cost, so each invocation is \
                      pre-authorized at that fixed ceiling. Raise --daily-budget-usd to at \
                      least {}",
-                    self.daily_budget_usd, self.max_budget_usd, self.max_budget_usd
-                ),
-            }));
+                        self.daily_budget_usd,
+                        self.max_budget_usd,
+                        self.implementer.label(),
+                        self.implementer.label(),
+                        self.max_budget_usd
+                    )
+                } else {
+                    format!(
+                        "max_budget_usd ({}) exceeds daily_budget_usd ({}) — no dispatch could \
+                     ever be authorized",
+                        self.max_budget_usd, self.daily_budget_usd
+                    )
+                },
+            ));
         }
         Ok(())
     }
@@ -2521,6 +2528,32 @@ sleep 0.5
             err.contains("gpt-6.1-sol"),
             "error must name the incompatible model: {err}"
         );
+    }
+
+    #[test]
+    fn muse_rejects_cross_harness_model_prefixes_and_names_its_budget_flag() {
+        for model in ["claude-sonnet-5", "gpt-6.1-sol"] {
+            let err = validate_implementation_model(Implementer::Muse, model)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("Muse implementer"), "got: {err}");
+        }
+        validate_implementation_model(Implementer::Muse, "muse-wonder-1.0").unwrap();
+        for implementer in [Implementer::Claude, Implementer::Codex] {
+            let err = validate_implementation_model(implementer, "muse-wonder-1.0")
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(&format!("{} implementer", implementer.label())),
+                "got: {err}"
+            );
+        }
+        let mut config = RunConfig::new("muse-wonder-1.0", "routine");
+        config.implementer = Implementer::Muse;
+        config.daily_budget_usd = config.max_budget_usd / 2.0;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("every Muse dispatch reserves"), "got: {err}");
+        assert!(err.contains("--daily-budget-usd"), "got: {err}");
     }
 
     #[test]
