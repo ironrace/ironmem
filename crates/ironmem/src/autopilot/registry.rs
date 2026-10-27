@@ -603,7 +603,7 @@ pub trait HarnessMonitor {
 }
 impl<T: AgentRegistry + ?Sized> HarnessMonitor for T {
     fn snapshot(&mut self) -> HarnessSnapshots {
-        // Keep this adapter Claude-only; real controllers use TwoHarnessMonitor.
+        // Keep this adapter Claude-only; real controllers use HarnessProcessMonitor.
         let claude = match self.list() {
             Ok(output) if output.success => match parse_agents(&output.stdout) {
                 Ok(rows) => RegistrySnapshot::Available(rows),
@@ -629,13 +629,16 @@ impl<T: AgentRegistry + ?Sized> HarnessMonitor for T {
 }
 
 /// The real controllers' monitor: Claude's agent registry plus the process
-/// table, which covers every supervised CLI harness (Codex and Muse). The
-/// name predates Muse; "two" counts the evidence sources, not harnesses.
-pub struct TwoHarnessMonitor {
+/// table, which covers every supervised CLI harness (Codex and Muse).
+pub struct HarnessProcessMonitor {
     claude: Result<ClaudeAgentRegistry, String>,
     processes: super::process_tree::UnixProcesses,
 }
-impl Default for TwoHarnessMonitor {
+/// The monitor's name from when it watched two harnesses.
+#[deprecated(note = "renamed to `HarnessProcessMonitor`; it watches every harness")]
+pub type TwoHarnessMonitor = HarnessProcessMonitor;
+
+impl Default for HarnessProcessMonitor {
     fn default() -> Self {
         Self {
             claude: ClaudeAgentRegistry::resolve().map_err(|e| e.to_string()),
@@ -643,7 +646,7 @@ impl Default for TwoHarnessMonitor {
         }
     }
 }
-impl HarnessMonitor for TwoHarnessMonitor {
+impl HarnessMonitor for HarnessProcessMonitor {
     fn snapshot(&mut self) -> HarnessSnapshots {
         let claude = match &mut self.claude {
             Ok(registry) => snapshot(registry),
@@ -661,6 +664,20 @@ impl HarnessMonitor for TwoHarnessMonitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The monitor's old name, from when it watched two harnesses, still
+    /// names the same type for anyone outside the crate, deprecated.
+    #[test]
+    #[allow(deprecated)]
+    fn the_process_monitor_keeps_its_old_name_as_a_deprecated_alias() {
+        fn same(monitor: TwoHarnessMonitor) -> HarnessProcessMonitor {
+            monitor
+        }
+        fn back(monitor: HarnessProcessMonitor) -> crate::autopilot::TwoHarnessMonitor {
+            monitor
+        }
+        let _ = (same, back);
+    }
 
     #[cfg(unix)]
     #[test]

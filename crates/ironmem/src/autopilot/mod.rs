@@ -253,9 +253,11 @@ pub use onboard::{infer_gate_commands, onboard_repo, InferredGates};
 pub use queue::{
     plan_queue, DeferReason, Deferred, Priority, QueueConfig, QueuePlan, QueuedIssue, RepoBacklog,
 };
+#[allow(deprecated)]
+pub use registry::TwoHarnessMonitor;
 pub use registry::{
-    AgentRegistry, ClaudeAgentRegistry, HarnessMonitor, HarnessSnapshots, Liveness,
-    LivenessSnapshot, RegistrySnapshot, TwoHarnessMonitor,
+    AgentRegistry, ClaudeAgentRegistry, HarnessMonitor, HarnessProcessMonitor, HarnessSnapshots,
+    Liveness, LivenessSnapshot, RegistrySnapshot,
 };
 pub use review::reviews_for_issue;
 pub use review::{

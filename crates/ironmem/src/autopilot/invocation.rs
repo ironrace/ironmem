@@ -2835,16 +2835,15 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
     #[cfg(unix)]
     #[test]
     fn a_supervised_child_gets_no_daemon_autospawn_override() {
-        if std::env::var_os("IRONMEM_NO_DAEMON").is_some() {
-            eprintln!("IRONMEM_NO_DAEMON is exported to the test run; skipping");
-            return;
-        }
+        // Relative to this test's own environment, so it runs (and means the
+        // same) whether or not the developer exports IRONMEM_NO_DAEMON.
+        let inherited = std::env::var("IRONMEM_NO_DAEMON").unwrap_or_else(|_| "<unset>".into());
         let (dir, s) = setup();
         let cli = FakeCli::COMPLETE;
         let bin = binary(
             dir.path(),
             &observable(
-                "[ -z \"${IRONMEM_NO_DAEMON+set}\" ] || exit 3\n\
+                "printf '%s' \"${IRONMEM_NO_DAEMON-<unset>}\" > no-daemon\n\
                  echo journal",
             ),
         );
@@ -2852,6 +2851,11 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
             run_supervised_bounded_with(&cli, &bin, dir.path(), &s, Duration::from_secs(5), None)
                 .unwrap();
         assert!(o.process_success && o.is_met(), "{o:?}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("no-daemon")).unwrap(),
+            inherited,
+            "the core changed the child's IRONMEM_NO_DAEMON"
+        );
     }
 
     /// An `ironmem serve --connect` MCP proxy the harness starts autospawns

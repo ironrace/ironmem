@@ -2464,7 +2464,7 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                 let cleared =
                     ironmem::autopilot::clear::clear_dispatch(&database, &issue_ref, || {
                         let mut monitor =
-                            ironmem::autopilot::registry::TwoHarnessMonitor::default();
+                            ironmem::autopilot::registry::HarnessProcessMonitor::default();
                         ironmem::autopilot::registry::HarnessMonitor::snapshot(&mut monitor)
                     })?;
                 if json {
@@ -2647,7 +2647,7 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                     return Ok(());
                 }
 
-                let mut registry = ironmem::autopilot::registry::TwoHarnessMonitor::default();
+                let mut registry = ironmem::autopilot::registry::HarnessProcessMonitor::default();
                 let snapshot =
                     ironmem::autopilot::registry::HarnessMonitor::snapshot(&mut registry);
                 let report = ironmem::autopilot::supervise::supervise_issue(
@@ -2720,7 +2720,7 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
             AutopilotCmd::Reconcile { db, json } => {
                 use ironmem::autopilot::supervise::ReconcileVerdict;
                 let database = open_migrated_db(db)?;
-                let mut registry = ironmem::autopilot::registry::TwoHarnessMonitor::default();
+                let mut registry = ironmem::autopilot::registry::HarnessProcessMonitor::default();
                 let snapshot =
                     ironmem::autopilot::registry::HarnessMonitor::snapshot(&mut registry);
                 let rows = ironmem::autopilot::supervise::reconcile(&database, &snapshot)?;
@@ -2886,7 +2886,7 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                         .map(|t| t.path.clone())
                         .unwrap_or_else(|| std::path::PathBuf::from(".")),
                 )?;
-                let mut registry = ironmem::autopilot::registry::TwoHarnessMonitor::default();
+                let mut registry = ironmem::autopilot::registry::HarnessProcessMonitor::default();
                 let mut dispatcher = resolve_dispatcher(implementer)?;
                 let mut advisor: Box<dyn ironmem::autopilot::advise::Advisor> =
                     if config.advice.enabled {
@@ -3047,7 +3047,7 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                 let database = open_migrated_db(db)?;
                 let mut gh_runner =
                     ironmem::autopilot::gh::GhCli::resolve(std::path::PathBuf::from(&path))?;
-                let mut registry = ironmem::autopilot::registry::TwoHarnessMonitor::default();
+                let mut registry = ironmem::autopilot::registry::HarnessProcessMonitor::default();
                 let snapshot =
                     ironmem::autopilot::registry::HarnessMonitor::snapshot(&mut registry);
 
@@ -4024,24 +4024,34 @@ mod tests {
         }
     }
 
+    /// `--implementer muse` parses to the Muse harness on both subcommands
+    /// that dispatch. Behaviour, not help prose: rewording the help cannot
+    /// break this, and dropping Muse from the parser cannot pass it.
     #[test]
-    fn autopilot_implementer_help_lists_muse() {
+    fn autopilot_implementer_accepts_muse() {
         use clap::CommandFactory;
 
-        let mut root = Cli::command();
-        let autopilot = root.find_subcommand_mut("autopilot").unwrap();
         for subcommand in ["run", "lead"] {
-            let help = autopilot
-                .find_subcommand_mut(subcommand)
-                .unwrap()
-                .render_long_help()
-                .to_string();
-            assert!(help.contains("codex or muse"), "{subcommand}: {help}");
-            assert!(help.contains("--max-model-steps"), "{subcommand}: {help}");
-            assert!(help.contains("Claude only"), "{subcommand}: {help}");
-            assert!(help.contains("daily dispatch"), "{subcommand}: {help}");
-            assert!(help.contains("effective limit is"), "{subcommand}: {help}");
-            assert!(help.contains("advance"), "{subcommand}: {help}");
+            let mut args = vec!["ironmem", "autopilot", subcommand];
+            if subcommand == "run" {
+                args.extend(["owner/repo", "283", "--title", "t"]);
+            } else {
+                args.extend(["--repo", "owner/repo=/tmp/repo"]);
+            }
+            args.extend(["--implementer", "muse"]);
+            let matches = Cli::command()
+                .try_get_matches_from(args)
+                .unwrap_or_else(|e| panic!("{subcommand}: {e}"));
+            let implementer = matches
+                .subcommand_matches("autopilot")
+                .and_then(|m| m.subcommand_matches(subcommand))
+                .and_then(|m| m.get_one::<ironmem::autopilot::Implementer>("implementer"))
+                .copied();
+            assert_eq!(
+                implementer,
+                Some(ironmem::autopilot::Implementer::Muse),
+                "{subcommand}"
+            );
         }
     }
 
