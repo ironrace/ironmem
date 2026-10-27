@@ -41,13 +41,20 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 [ -r "$prompt" ] || exit 9
+n=$(cat "$MUSE_COUNT" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "$MUSE_COUNT"
+# Muse's measured refusals (1.4.13 and 1.4.14): stderr only, no journal, exit 1.
+case "$MUSE_MODE:$n" in
+  inuse:*) printf 'session %s is already in use\n' "$sid" >&2; /bin/sleep 0.5; exit 1 ;;
+  unresumable:1|unresumable:2)
+    printf 'failed to read retained session %s: session %s was created with provider echo; refusing to resume with provider meta; start a new session to switch providers\n' "$sid" "$sid" >&2
+    /bin/sleep 0.5; exit 1 ;;
+esac
 rec() { printf '{"schema_version":1,"stream":{"kind":"%s","id":"%s"},"payload":%s}\n' "$1" "$2" "$3"; }
 rec session "$sid" '{"kind":"command_accepted"}'
 rec exec.usage "$sid" '{"kind":"run_usage","completed_calls":3}'
-n=$(cat "$MUSE_COUNT" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "$MUSE_COUNT"
 case "$MUSE_MODE:$n" in
   met:1) rec session "$sid" '{"kind":"run_terminal","terminal":"completed","text":"{\"verdict\":\"not_met\",\"reason\":\"keep going\"}","reason":null}' ;;
-  met:*) printf '42\n' > answer.txt
+  met:*|unresumable:*) printf '42\n' > answer.txt
          rec session "$sid" '{"kind":"run_terminal","terminal":"completed","text":"{\"verdict\":\"met\",\"reason\":\"done\"}","reason":null}' ;;
   failed:*) rec session "$sid" '{"kind":"run_terminal","terminal":"failed","text":"","reason":"transport error"}'; /bin/sleep 0.5; exit 1 ;;
   killed:*) /bin/sleep 0.5; exit 143 ;;
@@ -790,4 +797,55 @@ fn max_turns_reaches_muse_as_max_model_steps() {
         assert_eq!(flag_value(line, "--max-model-steps"), "77", "{line}");
         assert!(!line.contains("--max-turns"), "{line}");
     }
+}
+
+/// Muse's "in use" is read from its stderr and never rotated over: every
+/// dispatch reuses the session and says how to release the issue.
+#[test]
+fn a_muse_session_still_in_use_is_never_rotated_over_at_the_cli() {
+    let fx = Fixture::new();
+    let output = fx.run("inuse", &["--attempt-cap", "1"]);
+    let report = report(&output, "inuse");
+    assert_ne!(report["terminal"]["terminal"], "met", "{report}");
+    let calls = fx.calls();
+    let sessions: Vec<&str> = calls
+        .lines()
+        .map(|line| flag_value(line, "--session-id"))
+        .collect();
+    assert_eq!(sessions.len(), 3, "{calls}");
+    assert!(sessions.iter().all(|s| *s == sessions[0]), "{calls}");
+    for dispatch in report["dispatches"].as_array().unwrap() {
+        assert_eq!(
+            dispatch["classification"], "infrastructure_failure",
+            "{report}"
+        );
+        let reason = dispatch["reason"].as_str().unwrap_or_default();
+        assert!(
+            reason.contains("still in use")
+                && reason.contains("ironmem autopilot clear-dispatch owner/repo 7"),
+            "{report}"
+        );
+    }
+}
+
+/// A session Muse refuses to resume (here, across providers) is replaced
+/// after two refusals, from Muse's own stderr, and the run then succeeds.
+#[test]
+fn an_unresumable_muse_session_is_replaced_at_the_cli() {
+    let fx = Fixture::new();
+    let output = fx.run("unresumable", &["--attempt-cap", "1"]);
+    let report = report(&output, "unresumable");
+    assert_eq!(report["terminal"]["terminal"], "met", "{report}");
+    let calls = fx.calls();
+    let sessions: Vec<&str> = calls
+        .lines()
+        .map(|line| flag_value(line, "--session-id"))
+        .collect();
+    assert_eq!(sessions.len(), 3, "{calls}");
+    assert_eq!(sessions[0], sessions[1], "{calls}");
+    assert_ne!(sessions[1], sessions[2], "{calls}");
+    let second = report["dispatches"][1]["reason"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(second.contains("fresh session"), "{report}");
 }

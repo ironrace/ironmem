@@ -87,7 +87,7 @@ use std::path::Path;
 use crate::db::schema::Database;
 use crate::error::MemoryError;
 
-use super::dispatch::{self, DispatchOutcome, DispatchSpec, SessionMode, Verdict};
+use super::dispatch::{self, DispatchOutcome, DispatchSpec, SessionMode, SessionRefusal, Verdict};
 use super::implementer::{Implementer, RESUME_REFUSALS_BEFORE_ROTATION};
 use super::invocation::{InvocationArtifacts, InvocationRecovery};
 use super::worktree::{self, Worktree};
@@ -2091,47 +2091,59 @@ pub fn run_issue(
             }
             invocation_artifacts = None;
         }
-        // A harness that refuses to run on the session it is handed fails
+        // A harness that refuses to resume the session it is handed fails
         // every later invocation the same way, at no attempt's cost. After
         // enough refusals in a row the next dispatch opens a fresh session;
         // the outcome is finished, so nothing can still be running on it.
-        if config.implementer.rotates_refused_session() {
-            if config.implementer.refused_resume(&outcome) {
+        // A session still in use is the exception: never rotated over.
+        let release = format!(
+            "`ironmem autopilot clear-dispatch {} {}`",
+            issue.repo, issue.number
+        );
+        let label = config.implementer.label();
+        let refusal_note = match outcome.session_refusal {
+            Some(SessionRefusal::InUse) => {
+                resume_refusals = 0;
+                Some(format!(
+                    "{label} reports session {session_uuid} still in use; Autopilot won't start \
+                     a new session over it; inspect for a leftover {label} process, then \
+                     {release}"
+                ))
+            }
+            Some(SessionRefusal::Unresumable) if config.implementer.rotates_refused_session() => {
                 resume_refusals += 1;
-                let release = format!(
-                    "if a fresh session is refused too, check {}'s provider and configuration; \
-                     `ironmem autopilot clear-dispatch {} {}` releases the issue",
-                    config.implementer.label(),
-                    issue.repo,
-                    issue.number
+                let fallback = format!(
+                    "if a fresh session is refused too, check {label}'s provider and \
+                     configuration; {release} releases the issue"
                 );
-                let note = if resume_refusals >= RESUME_REFUSALS_BEFORE_ROTATION {
+                Some(if resume_refusals >= RESUME_REFUSALS_BEFORE_ROTATION {
                     let refused =
                         std::mem::replace(&mut session_uuid, uuid::Uuid::new_v4().to_string());
                     resuming = false;
                     resume_refusals = 0;
                     format!(
-                        "{} refused to run on session {refused} {RESUME_REFUSALS_BEFORE_ROTATION} \
-                         times in a row, so the next dispatch opens a fresh session; {release}",
-                        config.implementer.label()
+                        "{label} refused to resume session {refused} \
+                         {RESUME_REFUSALS_BEFORE_ROTATION} times in a row, so the next dispatch \
+                         opens a fresh session; {fallback}"
                     )
                 } else {
                     format!(
-                        "{} refused to run on its session ({resume_refusals} of \
+                        "{label} refused to resume its session ({resume_refusals} of \
                          {RESUME_REFUSALS_BEFORE_ROTATION} before a fresh session is opened); \
-                         {release}",
-                        config.implementer.label()
+                         {fallback}"
                     )
-                };
-                outcome.reason = Some(match outcome.reason.take() {
-                    Some(original) if !original.trim().is_empty() => {
-                        format!("{note}. {original}")
-                    }
-                    _ => note,
-                });
-            } else {
-                resume_refusals = 0;
+                })
             }
+            _ => {
+                resume_refusals = 0;
+                None
+            }
+        };
+        if let Some(note) = refusal_note {
+            outcome.reason = Some(match outcome.reason.take() {
+                Some(original) if !original.trim().is_empty() => format!("{note}. {original}"),
+                _ => note,
+            });
         }
         // Codex-only today: Muse does not assign its own session id, so this
         // identity check never applies to it.
@@ -3161,11 +3173,25 @@ sleep 0.5
             )),
             process_success: false,
             timed_out: false,
+            session_refusal: None,
         }
     }
-    /// Measured (Muse 1.4.13, #366): a second `exec` on a running session.
+    /// Measured (Muse 1.4.13 and 1.4.14): a resume on another provider.
     fn muse_refusal() -> DispatchOutcome {
-        muse_infra_failure("error: session 0d6c1e2a-5b8f-4c1d-9e3a-7f2b6a1c4d5e is already in use")
+        let mut outcome = muse_infra_failure(
+            "failed to read retained session 0d6c1e2a-5b8f-4c1d-9e3a-7f2b6a1c4d5e: session \
+             0d6c1e2a-5b8f-4c1d-9e3a-7f2b6a1c4d5e was created with provider echo; refusing to \
+             resume with provider meta; start a new session to switch providers",
+        );
+        outcome.session_refusal = Some(SessionRefusal::Unresumable);
+        outcome
+    }
+    /// Measured: a second `exec` on a session Muse still holds.
+    fn muse_in_use() -> DispatchOutcome {
+        let mut outcome =
+            muse_infra_failure("session 0d6c1e2a-5b8f-4c1d-9e3a-7f2b6a1c4d5e is already in use");
+        outcome.session_refusal = Some(SessionRefusal::InUse);
+        outcome
     }
     fn session_of(spec: &DispatchSpec) -> String {
         spec.session.session_uuid().to_owned()
@@ -3203,9 +3229,52 @@ sleep 0.5
             "{second}"
         );
         assert!(
-            second.contains("already in use"),
+            second.contains("refusing to resume"),
             "Muse's own words stay: {second}"
         );
+    }
+
+    /// Muse's lock is the one guard against a second implementer that does
+    /// not rest on Autopilot's own process evidence. "In use" after a finish
+    /// means something still holds the session, so it is never rotated over.
+    #[test]
+    fn a_muse_session_still_in_use_is_never_rotated_over() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        let mut d = muse_script(vec![muse_in_use(), muse_in_use(), muse_in_use()]);
+        let run = run_issue(&db, &issue(), &brief(), &wt, &muse_config(), &mut d).unwrap();
+        assert!(
+            matches!(
+                run.terminal,
+                TerminalReason::InfrastructureFailure { consecutive: 3 }
+            ),
+            "{:?}",
+            run.terminal
+        );
+        let sessions: Vec<_> = d.inner.seen.iter().map(session_of).collect();
+        assert!(sessions.iter().all(|s| *s == sessions[0]), "{sessions:?}");
+        for dispatch in &run.dispatches {
+            assert_eq!(
+                dispatch.classification,
+                DispatchClassification::InfrastructureFailure
+            );
+            let reason = dispatch.reason.as_deref().unwrap();
+            assert!(
+                reason.contains(&format!(
+                    "Muse reports session {} still in use; Autopilot won't start a new session \
+                     over it; inspect for a leftover Muse process, then `ironmem autopilot \
+                     clear-dispatch ironrace/ironmem 283`",
+                    sessions[0]
+                )),
+                "{reason}"
+            );
+        }
+        // Nor does an "in use" count toward rotating on a later refusal.
+        let db = approved_db();
+        let mut d = muse_script(vec![muse_refusal(), muse_in_use(), muse_refusal(), met()]);
+        run_issue(&db, &issue(), &brief(), &wt, &muse_config(), &mut d).unwrap();
+        let sessions: Vec<_> = d.inner.seen.iter().map(session_of).collect();
+        assert!(sessions.iter().all(|s| *s == sessions[0]), "{sessions:?}");
     }
 
     #[test]
@@ -3599,6 +3668,7 @@ sleep 0.5
             reason: verdict.map(|v| format!("scripted {v:?}")),
             process_success,
             timed_out: false,
+            session_refusal: None,
         }
     }
 
@@ -3813,6 +3883,7 @@ sleep 0.5
             reason: Some("dispatch exceeded this repo's wall-clock bound".to_string()),
             process_success: false,
             timed_out: true,
+            session_refusal: None,
         }
     }
 
@@ -3835,6 +3906,7 @@ sleep 0.5
             reason: None,
             process_success: true,
             timed_out: false,
+            session_refusal: None,
         }
     }
 

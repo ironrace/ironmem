@@ -14,14 +14,15 @@ pub enum Implementer {
     Muse,
 }
 
-/// What differs between harnesses, named once so `run_issue` asks *why* it
-/// branches instead of *which* harness it has. A new harness answers these.
-/// Consecutive refused invocations on one session before a harness that
+/// Consecutive [unresumable](super::dispatch::SessionRefusal::Unresumable)
+/// refusals of one session before a harness that
 /// [rotates a refused session](Implementer::rotates_refused_session) opens a
-/// fresh one. Two, not one: Muse's "already in use" can be a lock another
-/// `exec` releases moments later, and a fresh session loses the context.
+/// fresh one. Two, not one: a retained session that could not be read once
+/// may read on the next try, and a fresh session loses the conversation.
 pub const RESUME_REFUSALS_BEFORE_ROTATION: u32 = 2;
 
+/// What differs between harnesses, named once so `run_issue` asks *why* it
+/// branches instead of *which* harness it has. A new harness answers these.
 impl Implementer {
     /// Every harness, once. `tests::every_variant_is_listed` matches
     /// exhaustively, so a new variant fails to compile until it is added here.
@@ -75,25 +76,21 @@ impl Implementer {
     }
 
     /// The harness continues the controller's session (`--session-id`)
-    /// across invocations and can refuse to: Muse will not resume a session
-    /// another `exec` holds, or one opened with another provider. Only the
-    /// controller can replace that session, so it opens a fresh one after
-    /// [`RESUME_REFUSALS_BEFORE_ROTATION`] consecutive refusals, or when the
-    /// run's model differs from the one the session was used with. Claude
-    /// rotates on its own rule (a verdict), and a Codex thread ID is the
-    /// harness's own.
+    /// across invocations and can refuse to resume it: Muse will not resume a
+    /// session opened with another provider, or one whose retained state it
+    /// cannot read. Only the controller can replace that session, so it opens
+    /// a fresh one after [`RESUME_REFUSALS_BEFORE_ROTATION`] consecutive
+    /// [unresumable](super::dispatch::SessionRefusal::Unresumable) refusals,
+    /// or when the run's model differs from the one the session was used with.
+    ///
+    /// Never on a session still [in use](super::dispatch::SessionRefusal::InUse):
+    /// Muse's lock is the one guard against a second implementer that does not
+    /// rest on Autopilot's own process evidence, and something still holds
+    /// that session. Claude rotates on its own rule (a verdict), and a Codex
+    /// thread ID is the harness's own.
     pub fn rotates_refused_session(self) -> bool {
         match self {
             Self::Muse => true,
-            Self::Claude | Self::Codex => false,
-        }
-    }
-
-    /// Whether a finished `outcome` is this harness refusing to run on the
-    /// requested session at all, as opposed to a run that failed on it.
-    pub fn refused_resume(self, outcome: &super::dispatch::DispatchOutcome) -> bool {
-        match self {
-            Self::Muse => super::muse_dispatch::refused_resume(outcome),
             Self::Claude | Self::Codex => false,
         }
     }

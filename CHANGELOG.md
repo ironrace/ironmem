@@ -16,10 +16,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   daily dispatch cap), restart recovery that holds rather than re-dispatching
   while a run might still be alive, and `clear-dispatch` support. Its session
   continues headlessly across invocations, and `--max-turns` becomes
-  `--max-model-steps`. A session Muse refuses to run on (two refusals in a
-  row, such as "already in use" or a cross-provider resume), or one last
-  used with a different `--model`, is replaced with a fresh one at the next
-  launch rather than failing every invocation until `clear-dispatch`.
+  `--max-model-steps`. A session Muse refuses to resume (two refusals in a
+  row: a cross-provider resume, or retained state it cannot read), or one
+  last used with a different `--model`, is replaced with a fresh one at the
+  next launch rather than failing every invocation until `clear-dispatch`. A
+  session Muse reports still in use is never replaced: the run records an
+  infrastructure failure that says to look for a leftover Muse process and
+  then run `clear-dispatch`.
 - **Commit-signing guard for every harness (#366).** With `commit.gpgsign`
   on, a run that reports success but left unsigned commits on the issue
   branch now counts as a failed attempt, with a reason naming the commits.

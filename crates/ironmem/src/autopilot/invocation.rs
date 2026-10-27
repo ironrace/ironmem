@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use crate::autopilot::dispatch::{DispatchOutcome, DispatchSpec, Verdict};
+use crate::autopilot::dispatch::{DispatchOutcome, DispatchSpec, SessionRefusal, Verdict};
 use crate::autopilot::implementer::Implementer;
 use crate::autopilot::process_tree::{Birth, QuietHold, SharedDaemon};
 use crate::autopilot::scrub::scrub_and_bound;
@@ -104,6 +104,17 @@ pub trait SupervisedCli: Sync {
     /// Default: no.
     fn parse_reports_missing_session(&self) -> bool {
         false
+    }
+
+    /// Whether the harness refused to run on `expected_native_id` at all, from
+    /// its bounded raw stderr. Asked only of a run with no valid verdict that
+    /// launched, exited non-zero and was not timed out. Default: never.
+    fn session_refusal(
+        &self,
+        _stderr: &str,
+        _expected_native_id: Option<&str>,
+    ) -> Option<SessionRefusal> {
+        None
     }
 
     /// Parse the bounded journal and final-file text into evidence.
@@ -262,8 +273,6 @@ pub(crate) fn create_private(path: &Path) -> Result<File, MemoryError> {
     Ok(options.open(path)?)
 }
 
-/// Allocate once, then persist these exact paths before spawning the dispatch.
-/// Reject unsupported paths before creating any artifact directories or files.
 /// Remove an invocation directory that [`prepare_artifacts`] made but nothing
 /// launched from, and that no stored state names. Best effort: a directory
 /// left behind holds no process and is never read again.
@@ -279,6 +288,8 @@ pub(crate) fn discard_unlaunched(a: &InvocationArtifacts) {
     }
 }
 
+/// Allocate once, then persist these exact paths before spawning the dispatch.
+/// Reject unsupported paths before creating any artifact directories or files.
 pub fn prepare_artifacts(
     worktree: &Path,
     issue: &IssueRef,
@@ -1065,6 +1076,11 @@ fn read_artifacts_with(
     // verdict that the errors already invalidate.
     let final_verdict = parsed.verdict.filter(|_| errors.is_empty());
     let valid = final_verdict.is_some();
+    // From the raw stderr file, not the bounded reason built below: a long
+    // preamble must not push the harness's own refusal out of view.
+    let session_refusal = (!valid && !process_success && !timed_out && !never_started)
+        .then(|| cli.session_refusal(&stderr, expected_native_id))
+        .flatten();
     let (verdict, reason) = match final_verdict {
         Some(final_verdict) => (Some(final_verdict.verdict), Some(final_verdict.reason)),
         None => {
@@ -1088,6 +1104,7 @@ fn read_artifacts_with(
         process_success,
         timed_out,
         invocation_started: (exit.is_ok() || observed_output) && !never_started,
+        session_refusal,
     })
 }
 

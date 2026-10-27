@@ -206,21 +206,32 @@ is never rendered as free.
   running.
 - Muse's own lock refuses a second `exec` on a running session, and after a
   SIGKILL the lock is released (measured).
-- **Session rotation.** Muse refuses some sessions outright: one another
-  `exec` holds ("already in use"), one opened with a different provider
-  ("refusing to resume"), or one it cannot read back ("failed to read
-  retained session"). Such a run exits 1 with no terminal record, which is an
-  infrastructure failure, so without rotation every later invocation would
-  fail the same way. After two refused invocations in a row (counted across
-  runs, and reset by any other outcome), the next dispatch opens a fresh
-  session UUID. A run whose `--model` differs from the one the session was
-  last dispatched with also opens a fresh session. Either way the rotation
-  happens only at a new launch, never while an invocation might still be
-  running. Each refusal's reason says so and names `clear-dispatch`, which is
-  the release if a fresh session is refused too (Muse's provider or
-  configuration is then at fault). The fresh session loses Muse's
-  conversation history, not the prior attempts, which every turn prompt
-  carries.
+- **Session rotation.** Muse refuses to resume some sessions outright: one
+  opened with a different provider (`failed to read retained session <uuid>:
+  session <uuid> was created with provider <a>; refusing to resume with
+  provider <b>; …`), or one whose retained state it cannot read back
+  (`failed to read retained session <uuid>: …`). Such a run exits 1 with no
+  terminal record, which is an infrastructure failure, so without rotation
+  every later invocation would fail the same way. Autopilot reads these
+  lines from the invocation's own stderr file, and only when they name the
+  requested session. After two such refusals in a row (counted across runs,
+  and reset by any other outcome), the next dispatch opens a fresh session
+  UUID. A run whose `--model` differs from the one the session was last
+  dispatched with also opens a fresh session. Either way the rotation happens
+  only at a new launch, never while an invocation might still be running.
+  Each refusal's reason says so and names `clear-dispatch`, which is the
+  release if a fresh session is refused too (Muse's provider or configuration
+  is then at fault). The fresh session loses Muse's conversation history, not
+  the prior attempts, which every turn prompt carries.
+- **A session still in use is never rotated over.** `session <uuid> is
+  already in use` after an invocation has finished means something still
+  holds the session: a stale lock, or a Muse helper the process tracker
+  missed. Muse's lock is the one guard against a second implementer that
+  does not rest on Autopilot's own process evidence, so a fresh session there
+  could start a second Muse in the same worktree. The run records an
+  infrastructure failure whose reason reads "Muse reports session <uuid>
+  still in use; Autopilot won't start a new session over it; inspect for a
+  leftover Muse process, then `ironmem autopilot clear-dispatch <repo> <n>`".
 - `clear-dispatch` on a Muse hold deletes the dispatch state, so the next
   dispatch mints a new session UUID and starts a fresh Muse session. Lineage
   and attempt counts stand.

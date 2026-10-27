@@ -1103,6 +1103,7 @@ mod tests {
                 reason: Some("scripted".to_string()),
                 process_success: true,
                 timed_out: false,
+                session_refusal: None,
             })
         }
     }
@@ -1138,6 +1139,7 @@ mod tests {
                 reason: Some("scripted infrastructure failure".to_string()),
                 process_success: false,
                 timed_out: false,
+                session_refusal: None,
             })
         }
     }
@@ -2512,6 +2514,7 @@ mod tests {
                 reason: Some("scripted failure".to_string()),
                 process_success: true,
                 timed_out: false,
+                session_refusal: None,
             })
         }
     }

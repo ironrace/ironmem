@@ -64,9 +64,11 @@ pub struct DispatchState {
     /// resume a session across providers. `None` for records written before
     /// this field existed, which never rotate on it.
     pub session_model: Option<String>,
-    /// Consecutive finished invocations the harness refused to run on
-    /// `session_uuid` (see [`Implementer::refused_resume`]). Kept across
-    /// runs so a run that stops after one refusal still counts it.
+    /// Consecutive finished invocations the harness refused to resume
+    /// `session_uuid` for ([`SessionRefusal::Unresumable`]). Kept across runs
+    /// so a run that stops after one refusal still counts it.
+    ///
+    /// [`SessionRefusal::Unresumable`]: super::dispatch::SessionRefusal::Unresumable
     pub resume_refusals: u32,
 }
 

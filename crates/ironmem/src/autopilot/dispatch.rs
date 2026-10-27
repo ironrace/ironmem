@@ -217,6 +217,23 @@ pub struct DispatchOutcome {
     /// the ledger's unpriced counter rather than its total; see
     /// [`super::run::run_issue`].
     pub timed_out: bool,
+    /// The harness refused to run on the requested session at all, read
+    /// from its own stderr about that session. `None` for every run that
+    /// was not such a refusal, and always for a harness that never refuses.
+    pub session_refusal: Option<SessionRefusal>,
+}
+
+/// How a harness that keeps the controller's session refused it (Muse; see
+/// `MuseCli::session_refusal` for the measured words).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionRefusal {
+    /// Something still holds the session. The harness's own lock is the one
+    /// guard against a second implementer that does not rest on Autopilot's
+    /// process evidence, so this is never rotated over.
+    InUse,
+    /// The session cannot be resumed: it was created with another provider,
+    /// or its retained state cannot be read. A fresh session is the cure.
+    Unresumable,
 }
 
 impl DispatchOutcome {
@@ -288,6 +305,7 @@ pub fn parse_dispatch_output(stdout: &str) -> Result<DispatchOutcome, MemoryErro
         reason,
         process_success: true,
         timed_out: false,
+        session_refusal: None,
     })
 }
 
@@ -463,6 +481,7 @@ pub fn run_dispatch_bounded(
                 )),
                 process_success: false,
                 timed_out: true,
+                session_refusal: None,
             });
         }
         std::thread::sleep(TIMEOUT_POLL_INTERVAL);

@@ -12,7 +12,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use crate::autopilot::dispatch::DispatchSpec;
+use crate::autopilot::dispatch::{DispatchSpec, SessionRefusal};
 use crate::autopilot::implementer::Implementer;
 use crate::autopilot::invocation::{
     create_private, validation, FinalVerdict, InvocationArtifacts, ParsedRun, SupervisedCli,
@@ -52,32 +52,6 @@ fn marker_safe<'a>(what: &str, word: &'a str) -> Result<&'a str, MemoryError> {
         )));
     }
     Ok(word)
-}
-
-/// What Muse prints when it will not run on the requested session at all
-/// (measured on 1.4.13, #366; exit 1, no terminal record): another `exec`
-/// holds the session, a resume across providers, or a retained session it
-/// cannot read back.
-const RESUME_REFUSALS: [&str; 3] = [
-    "already in use",
-    "refusing to resume",
-    "failed to read retained session",
-];
-
-/// Whether a finished Muse outcome is a refusal to run on its session: it
-/// started, exited non-zero without a timeout or verdict, wrote no terminal
-/// record, and its reason (which carries Muse's stderr) names a refusal.
-pub(crate) fn refused_resume(outcome: &crate::autopilot::dispatch::DispatchOutcome) -> bool {
-    let reason = outcome.reason.as_deref().unwrap_or_default();
-    let lower = reason.to_ascii_lowercase();
-    outcome.invocation_started
-        && !outcome.process_success
-        && !outcome.timed_out
-        && outcome.verdict.is_none()
-        && reason.contains("Muse run emitted no terminal record")
-        && RESUME_REFUSALS
-            .iter()
-            .any(|refusal| lower.contains(refusal))
 }
 
 impl SupervisedCli for MuseCli {
@@ -194,6 +168,45 @@ impl SupervisedCli for MuseCli {
     /// [`MuseCli::parse`] names the requested session it never saw.
     fn parse_reports_missing_session(&self) -> bool {
         true
+    }
+
+    /// Muse's own refusal lines about the requested session, measured on
+    /// 1.4.13 and again on 1.4.14 (exit 1, nothing on the journal):
+    ///
+    /// - `session <uuid> is already in use`: another `exec` holds it;
+    /// - `failed to read retained session <uuid>: session <uuid> was created
+    ///   with provider <a>; refusing to resume with provider <b>; start a new
+    ///   session to switch providers`, and the same prefix for a retained
+    ///   session it cannot read back.
+    ///
+    /// Only a whole line about `expected_native_id` counts (Muse's own
+    /// `muse: ` notice prefix allowed), so another session's refusal, or the
+    /// words quoted in some tool's output, never do. "In use" wins over any
+    /// other refusal: it is the one that must never be rotated over.
+    fn session_refusal(
+        &self,
+        stderr: &str,
+        expected_native_id: Option<&str>,
+    ) -> Option<SessionRefusal> {
+        let session = expected_native_id?;
+        let in_use = format!("session {session} is already in use");
+        let unreadable = format!("failed to read retained session {session}:");
+        let other_provider = format!("session {session} was created with provider ");
+        let mut refusal = None;
+        for line in stderr.lines() {
+            let line = line.trim();
+            let line = line.strip_prefix("muse: ").unwrap_or(line);
+            if line == in_use {
+                return Some(SessionRefusal::InUse);
+            }
+            if line.starts_with(&unreadable)
+                || (line.starts_with(&other_provider)
+                    && line.contains("; refusing to resume with provider "))
+            {
+                refusal = Some(SessionRefusal::Unresumable);
+            }
+        }
+        refusal
     }
 
     /// Only the controller's session counts. Records on other session streams
@@ -507,47 +520,44 @@ mod tests {
         assert_eq!(MuseCli.env(), &[("MUSE_NO_AUTO_UPDATE", "1")]);
     }
 
+    /// Muse's own words, measured on 1.4.13 and again on 1.4.14 (exit 1, no
+    /// journal), anchored to the requested session.
     #[test]
-    fn only_a_terminal_less_nonzero_exit_naming_a_refusal_is_a_refused_resume() {
-        use crate::autopilot::dispatch::{DispatchOutcome, Verdict};
-        let refused = |stderr: &str| DispatchOutcome {
-            cost_usd: None,
-            num_turns: 0,
-            duration_ms: 900,
-            is_error: true,
-            native_session_id: None,
-            invocation_started: true,
-            verdict: None,
-            reason: Some(format!(
-                "Muse run emitted no terminal record; Muse process exited with Some(1); \
-                 stderr: {stderr}"
-            )),
-            process_success: false,
-            timed_out: false,
-        };
-        for stderr in [
-            "error: session 0d6c1e2a is already in use",
-            "Error: Refusing to resume session 0d6c1e2a: it was created with provider meta",
-            "error: failed to read retained session 0d6c1e2a",
+    fn session_refusals_are_read_from_muses_words_about_the_requested_session() {
+        use crate::autopilot::dispatch::SessionRefusal;
+        let other = "11111111-2222-4333-8444-555555555555";
+        let in_use = format!("session {SID} is already in use");
+        let cross = format!(
+            "failed to read retained session {SID}: session {SID} was created with provider \
+             echo; refusing to resume with provider meta; start a new session to switch providers"
+        );
+        let unreadable = format!("failed to read retained session {SID}: unexpected end of file");
+        let notices = "muse: workspace root: /w (explicit)\nmuse: Agent delegation: auto \
+                       unavailable: workspace is untrusted.\n";
+        for (stderr, expected) in [
+            (in_use.clone(), Some(SessionRefusal::InUse)),
+            (format!("{notices}{in_use}\n"), Some(SessionRefusal::InUse)),
+            (cross.clone(), Some(SessionRefusal::Unresumable)),
+            (
+                format!("{notices}{cross}\n"),
+                Some(SessionRefusal::Unresumable),
+            ),
+            (unreadable, Some(SessionRefusal::Unresumable)),
+            // Another session's refusal is not this run's.
+            (in_use.replace(SID, other), None),
+            (cross.replace(SID, other), None),
+            // Quoted mid-line (say, in a tool's output echoed to stderr).
+            (format!("tool said \"{in_use}\" earlier"), None),
+            ("error: provider request timed out".into(), None),
+            (String::new(), None),
         ] {
-            assert!(refused_resume(&refused(stderr)), "{stderr}");
+            assert_eq!(
+                MuseCli.session_refusal(&stderr, Some(SID)),
+                expected,
+                "{stderr}"
+            );
         }
-        assert!(!refused_resume(&refused(
-            "error: provider request timed out"
-        )));
-        let mut timed_out = refused("already in use");
-        timed_out.timed_out = true;
-        let mut exited_zero = refused("already in use");
-        exited_zero.process_success = true;
-        let mut never_started = refused("already in use");
-        never_started.invocation_started = false;
-        let mut judged = refused("already in use");
-        judged.verdict = Some(Verdict::NotMet);
-        let mut terminal = refused("already in use");
-        terminal.reason = Some("Muse run ended failed: session already in use".into());
-        for outcome in [timed_out, exited_zero, never_started, judged, terminal] {
-            assert!(!refused_resume(&outcome), "{outcome:?}");
-        }
+        assert_eq!(MuseCli.session_refusal(&in_use, None), None);
     }
 
     #[test]
@@ -856,6 +866,62 @@ mod tests {
             )
             .unwrap();
             assert_eq!(recovered.is_met(), met, "{recovered:?}");
+        }
+    }
+
+    /// The refusal is read from the raw stderr file, so a long preamble that
+    /// would push it out of the bounded reason does not hide it, and a
+    /// recovering controller reads the same answer from disk.
+    #[cfg(unix)]
+    #[test]
+    fn a_supervised_muse_refusal_is_classified_from_its_stderr_file() {
+        use crate::autopilot::dispatch::SessionRefusal;
+        use crate::autopilot::invocation::contract_tests::{binary, setup};
+        let preamble = "muse: notice ".repeat(80);
+        for (line, code, expected) in [
+            (
+                format!("session {SID} is already in use"),
+                1,
+                Some(SessionRefusal::InUse),
+            ),
+            (
+                format!(
+                    "failed to read retained session {SID}: session {SID} was created with \
+                     provider echo; refusing to resume with provider meta; start a new session \
+                     to switch providers"
+                ),
+                1,
+                Some(SessionRefusal::Unresumable),
+            ),
+            // A run that exits zero refused nothing, whatever it printed.
+            (format!("session {SID} is already in use"), 0, None),
+        ] {
+            let (repo, mut s) = setup();
+            s.implementer = Implementer::Muse;
+            s.session = SessionMode::New {
+                session_uuid: SID.into(),
+            };
+            let bin = binary(
+                repo.path(),
+                &format!(
+                    "printf '%s\\n' '{preamble}' >&2\nprintf '%s\\n' '{line}' >&2\n\
+                     /bin/sleep 0.5\nexit {code}\n"
+                ),
+            );
+            let outcome = crate::autopilot::invocation::run_supervised_bounded(
+                &bin,
+                repo.path(),
+                &s,
+                std::time::Duration::from_secs(20),
+            )
+            .unwrap();
+            assert_eq!(outcome.session_refusal, expected, "{line}: {outcome:?}");
+            let recovered = crate::autopilot::invocation::read_artifacts(
+                Implementer::Muse,
+                s.invocation_artifacts.as_ref().unwrap(),
+            )
+            .unwrap();
+            assert_eq!(recovered.session_refusal, expected, "{line}: {recovered:?}");
         }
     }
 
