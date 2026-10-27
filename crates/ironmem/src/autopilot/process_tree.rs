@@ -105,17 +105,17 @@ impl ProcessRow {
     /// harness's `ironmem serve --connect` MCP proxy may autospawn as its
     /// own child (`mcp::daemon::spawn_daemon_process`). It serves every
     /// other session, so supervision must never own it. Matches only that
-    /// spawn's exact argv, `<…/ironmem> serve --listen <socket>
-    /// [--db <path>]`, listening on `socket`, the operator's configured
-    /// shared socket (`Config::daemon_socket_path`, the path the registered
-    /// MCP proxies connect to), on a process leading its own group (it is
-    /// spawned with `process_group(0)`). A daemon on any other socket, such
-    /// as one an ironmem test suite autospawns on a temp socket, is an
-    /// ordinary tool and is cleaned up.
+    /// spawn's exact argv ([`Self::daemon_listen_socket`]) listening on
+    /// `daemon.socket`, the operator's configured shared socket
+    /// (`Config::daemon_socket_path`, the path the registered MCP proxies
+    /// connect to). A daemon on any other socket, such as one an ironmem
+    /// test suite autospawns on a temp socket, is an ordinary tool and is
+    /// cleaned up.
     ///
     /// ps loses argv boundaries, so a socket or db path containing
     /// whitespace is never recognised: that daemon is tracked and killed as
-    /// before, which fails safe.
+    /// before, which fails safe, and [`SharedDaemon::for_current_exe`]
+    /// warns about such a socket.
     ///
     /// This is only the argv half. The tracker also requires the kernel's
     /// executable path to be the controller's own canonical ironmem binary
@@ -124,24 +124,34 @@ impl ProcessRow {
     /// binary itself, with the same argv on the configured socket in a group
     /// of its own, escapes tracking. That is the same class as the
     /// double-fork escape this module already does not contain.
-    pub(crate) fn is_shared_ironmem_daemon(&self, socket: &Path) -> bool {
-        let Some(socket) = socket.to_str() else {
-            return false;
-        };
-        if self.pgid != self.pid || socket.chars().any(char::is_whitespace) {
-            return false;
+    pub(crate) fn is_shared_ironmem_daemon(&self, daemon: &SharedDaemon) -> bool {
+        daemon.socket.to_str().is_some_and(|socket| {
+            !socket.chars().any(char::is_whitespace)
+                && self.daemon_listen_socket(daemon.exe.file_name()) == Some(socket)
+        })
+    }
+
+    /// The socket this row listens on when it has the shape of an ironmem
+    /// daemon: `<…/exe> serve --listen <socket> [--db <path>]`, exactly, on
+    /// a process leading its own group (the spawn uses `process_group(0)`),
+    /// where `exe` is named `ironmem` or `exe_name` (the controller's own
+    /// executable, which a versioned install names otherwise). Only the
+    /// shape: the kernel's executable path is checked separately.
+    pub(crate) fn daemon_listen_socket(&self, exe_name: Option<&std::ffi::OsStr>) -> Option<&str> {
+        if self.pgid != self.pid {
+            return None;
         }
         let words: Vec<&str> = self.args.split_whitespace().collect();
-        let exe_is_ironmem = words
-            .first()
-            .and_then(|exe| Path::new(exe).file_name())
-            .is_some_and(|name| name == "ironmem");
-        exe_is_ironmem
-            && matches!(
-                words[1..],
-                ["serve", "--listen", listen] | ["serve", "--listen", listen, "--db", _]
-                    if listen == socket
-            )
+        let name = Path::new(words.first()?).file_name()?;
+        if name != "ironmem" && Some(name) != exe_name {
+            return None;
+        }
+        match words[1..] {
+            ["serve", "--listen", listen] | ["serve", "--listen", listen, "--db", _] => {
+                Some(listen)
+            }
+            _ => None,
+        }
     }
 }
 
@@ -951,10 +961,77 @@ impl SharedDaemon {
     /// The daemon on `socket` running the controller's own executable, the
     /// binary its MCP proxies autospawn. `None` when that executable cannot
     /// be resolved: then nothing is exempt and every descendant is owned.
+    /// Either way the shared daemon would die with each invocation, so that,
+    /// or a socket the process table cannot show ([`Self::unrecognisable`]),
+    /// is logged once per process.
     pub fn for_current_exe(socket: PathBuf) -> Option<Self> {
-        let exe = std::env::current_exe().ok()?.canonicalize().ok()?;
-        Some(Self { socket, exe })
+        static UNRECOGNISABLE: std::sync::Once = std::sync::Once::new();
+        static NO_EXE: std::sync::Once = std::sync::Once::new();
+        if let Some(reason) = Self::unrecognisable(&socket) {
+            UNRECOGNISABLE.call_once(|| {
+                tracing::warn!(
+                    socket = %socket.display(),
+                    "{reason}; Autopilot cannot recognise the shared ironmem daemon there, so a \
+                     daemon a harness autospawns on it is cleaned up with each invocation"
+                );
+            });
+        }
+        let exe = std::env::current_exe().and_then(|exe| exe.canonicalize());
+        match exe {
+            Ok(exe) => Some(Self { socket, exe }),
+            Err(e) => {
+                NO_EXE.call_once(|| {
+                    tracing::warn!(
+                        error = %e,
+                        "cannot resolve this ironmem executable, so Autopilot cannot recognise \
+                         the shared ironmem daemon: a daemon a harness autospawns is cleaned up \
+                         with each invocation"
+                    );
+                });
+                None
+            }
+        }
     }
+
+    /// Why a daemon listening on `socket` can never be recognised from the
+    /// process table, if it cannot: ps loses argv boundaries and decodes
+    /// argv lossily.
+    pub(crate) fn unrecognisable(socket: &Path) -> Option<String> {
+        match socket.to_str() {
+            None => Some("the shared ironmem daemon socket path is not UTF-8".into()),
+            Some(text) if text.chars().any(char::is_whitespace) => {
+                Some("the shared ironmem daemon socket path contains whitespace".into())
+            }
+            Some(_) => None,
+        }
+    }
+}
+
+/// The socket `row` listens on, when it has an ironmem daemon's shape on a
+/// socket other than the configured shared one (`daemon`; any socket when
+/// there is none) and outside `temp`, the system temp directory where an
+/// ironmem test suite puts its own. Cleanup names such a daemon as it kills
+/// it: the operator's MCP registration and Autopilot disagree about the
+/// socket, which silently reintroduces the daemon kill.
+fn foreign_daemon_socket(
+    row: &ProcessRow,
+    daemon: Option<&SharedDaemon>,
+    temp: &Path,
+) -> Option<String> {
+    let socket = row.daemon_listen_socket(daemon.and_then(|d| d.exe.file_name()))?;
+    if daemon.is_some_and(|d| d.socket.to_str() == Some(socket)) {
+        return None;
+    }
+    let canonical_temp = temp.canonicalize().ok();
+    let in_temp = |path: &Path| {
+        path.starts_with(temp) || canonical_temp.as_ref().is_some_and(|t| path.starts_with(t))
+    };
+    let path = Path::new(socket);
+    let canonical = path.parent().and_then(|p| p.canonicalize().ok());
+    if in_temp(path) || canonical.as_deref().is_some_and(in_temp) {
+        return None;
+    }
+    Some(socket.to_owned())
 }
 
 /// The executable the kernel says `pid` is running, canonicalized, or `None`
@@ -1261,7 +1338,7 @@ fn is_shared_daemon(
     row: &ProcessRow,
 ) -> bool {
     daemon.is_some_and(|daemon| {
-        row.is_shared_ironmem_daemon(&daemon.socket)
+        row.is_shared_ironmem_daemon(daemon)
             && kernel_exe(row.pid).is_some_and(|exe| exe == daemon.exe)
     })
 }
@@ -1479,7 +1556,19 @@ pub(crate) struct ProcessTracker {
     live: std::collections::HashSet<u32>,
 }
 impl ProcessTracker {
-    pub(crate) fn new(root_pid: u32, shared_daemon: Option<&SharedDaemon>) -> Self {
+    /// A tracker that never owns `daemon`, the operator's shared daemon.
+    pub(crate) fn exempting(root_pid: u32, daemon: &SharedDaemon) -> Self {
+        Self::new(root_pid, Some(daemon))
+    }
+
+    /// A tracker that owns every descendant, the operator's shared daemon
+    /// included: only for when that daemon cannot be identified
+    /// ([`SharedDaemon::for_current_exe`] logs why) or a test needs none.
+    pub(crate) fn owning_every_descendant(root_pid: u32) -> Self {
+        Self::new(root_pid, None)
+    }
+
+    fn new(root_pid: u32, shared_daemon: Option<&SharedDaemon>) -> Self {
         Self {
             root_pid,
             known: Vec::new(),
@@ -1762,7 +1851,23 @@ impl ProcessTracker {
         // Continue best-effort authenticated cleanup after any uncertainty so
         // SIGSTOP cannot strand a known process. Never signal a stale group.
         let mut signal_error = None;
+        let temp = std::env::temp_dir();
         for pid in self.kill_order() {
+            if let Some(socket) = self
+                .known
+                .iter()
+                .find(|(r, _)| r.pid == pid)
+                .and_then(|(row, _)| foreign_daemon_socket(row, self.shared_daemon.as_ref(), &temp))
+            {
+                tracing::warn!(
+                    pid,
+                    socket = %socket,
+                    configured = ?self.shared_daemon.as_ref().map(|d| d.socket.display().to_string()),
+                    "Autopilot cleanup is killing an ironmem daemon on a socket other than the \
+                     configured shared one; if your MCP servers use that socket, their \
+                     registration and Autopilot disagree about the daemon socket"
+                );
+            }
             if let Err(e) = self.signal(pid, KILL_SIGNAL) {
                 signal_error = Some(e);
             }
@@ -2481,7 +2586,7 @@ mod tests {
     }
 
     fn daemon_tracker(kernel_exe: fn(u32) -> Option<PathBuf>) -> ProcessTracker {
-        let mut tracker = ProcessTracker::new(10, Some(&daemon()));
+        let mut tracker = ProcessTracker::exempting(10, &daemon());
         tracker.kernel_exe = kernel_exe;
         tracker
     }
@@ -2495,7 +2600,7 @@ mod tests {
 
     #[test]
     fn only_the_exact_daemon_argv_on_the_configured_socket_is_the_shared_daemon() {
-        let socket = Path::new(SOCKET);
+        let socket = &daemon();
         for args in [
             DAEMON,
             DAEMON_DB,
@@ -2534,7 +2639,10 @@ mod tests {
         }
         // ps loses argv boundaries, so a socket path with whitespace is never
         // recognised: that daemon is tracked and cleaned up, failing safe.
-        let spaced = Path::new("/Users/o/My Files/daemon.sock");
+        let spaced = &SharedDaemon {
+            socket: "/Users/o/My Files/daemon.sock".into(),
+            exe: DAEMON_EXE.into(),
+        };
         assert!(!args_row(
             40,
             30,
@@ -2542,6 +2650,109 @@ mod tests {
             "/b/ironmem serve --listen /Users/o/My Files/daemon.sock"
         )
         .is_shared_ironmem_daemon(spaced));
+    }
+
+    /// A versioned install (`ironmem-0.9`, or a Linux `current_exe` that
+    /// resolves a symlink to one) spawns its daemon under that name. The
+    /// controller's own executable name counts as well as `ironmem`; any
+    /// other name still does not, and the kernel's path still decides.
+    #[test]
+    fn the_controllers_own_executable_name_is_a_daemon_name() {
+        let versioned = SharedDaemon {
+            socket: SOCKET.into(),
+            exe: "/opt/ironmem/bin/ironmem-0.9".into(),
+        };
+        let row = args_row(
+            40,
+            30,
+            40,
+            "/opt/ironmem/bin/ironmem-0.9 serve --listen /Users/o/.ironmem/daemon.sock",
+        );
+        assert!(row.is_shared_ironmem_daemon(&versioned));
+        assert!(!row.is_shared_ironmem_daemon(&daemon()));
+        assert!(args_row(40, 30, 40, DAEMON).is_shared_ironmem_daemon(&versioned));
+        assert!(!args_row(
+            40,
+            30,
+            40,
+            "/opt/ironmem/bin/ironmem-1.0 serve --listen /Users/o/.ironmem/daemon.sock"
+        )
+        .is_shared_ironmem_daemon(&versioned));
+    }
+
+    /// A socket the process table cannot show unambiguously is named, so
+    /// the operator learns why the daemon a harness autospawns there is
+    /// cleaned up with each invocation.
+    #[test]
+    fn a_socket_the_process_table_cannot_show_is_reported() {
+        assert_eq!(SharedDaemon::unrecognisable(Path::new(SOCKET)), None);
+        let spaced =
+            SharedDaemon::unrecognisable(Path::new("/Users/Jane Doe/.ironmem/d.sock")).unwrap();
+        assert!(spaced.contains("whitespace"), "{spaced}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let bytes = std::ffi::OsStr::from_bytes(b"/tmp/\xff/daemon.sock");
+            let raw = SharedDaemon::unrecognisable(Path::new(bytes)).unwrap();
+            assert!(raw.contains("UTF-8"), "{raw}");
+        }
+    }
+
+    /// Cleanup kills a daemon on any socket but the configured one. Off the
+    /// system temp directory (where an ironmem test suite puts its own),
+    /// that means the operator's MCP registration and Autopilot disagree
+    /// about the socket, which silently reintroduces the daemon kill, so it
+    /// is named.
+    #[test]
+    fn a_killed_daemon_on_another_non_temp_socket_is_named() {
+        let temp = Path::new("/var/folders/x/T");
+        let foreign = |args: &str, daemon: Option<&SharedDaemon>| {
+            foreign_daemon_socket(&args_row(40, 30, 40, args), daemon, temp)
+        };
+        let elsewhere = "/opt/homebrew/bin/ironmem serve --listen /Users/o/other/daemon.sock";
+        assert_eq!(
+            foreign(elsewhere, Some(&daemon())).as_deref(),
+            Some("/Users/o/other/daemon.sock")
+        );
+        // With no exemption at all, every daemon killed is named.
+        assert_eq!(
+            foreign(DAEMON, None).as_deref(),
+            Some("/Users/o/.ironmem/daemon.sock")
+        );
+        for quiet in [
+            // The configured one is never killed, so never named.
+            DAEMON_DB,
+            // A test suite's temp socket.
+            "/opt/homebrew/bin/ironmem serve --listen /var/folders/x/T/.tmpA/daemon.sock",
+            // Not a daemon at all.
+            PROXY,
+            "/usr/bin/python3 serve --listen /Users/o/other/daemon.sock",
+        ] {
+            assert_eq!(foreign(quiet, Some(&daemon())), None, "{quiet}");
+        }
+        // Not leading its own group: not the daemon's shape.
+        assert_eq!(
+            foreign_daemon_socket(&args_row(40, 30, 30, elsewhere), Some(&daemon()), temp),
+            None
+        );
+    }
+
+    /// Owning the operator's daemon is never the silent default: a tracker
+    /// says which it does.
+    #[test]
+    fn a_tracker_names_whether_it_exempts_the_shared_daemon() {
+        let mut exempting = ProcessTracker::exempting(10, &daemon());
+        exempting.kernel_exe = installed_exe;
+        exempting
+            .observe_rows(daemon_rows(DAEMON_DB), daemon_kernel)
+            .unwrap();
+        assert_eq!(owned(&exempting), vec![10, 20]);
+        let mut owning = ProcessTracker::owning_every_descendant(10);
+        owning.kernel_exe = installed_exe;
+        owning
+            .observe_rows(daemon_rows(DAEMON_DB), daemon_kernel)
+            .unwrap();
+        assert_eq!(owned(&owning), vec![10, 20, 30, 31]);
     }
 
     fn daemon_kernel(pid: u32) -> Result<Option<KernelProcess>, String> {
@@ -2633,7 +2844,10 @@ mod tests {
     #[test]
     fn a_daemon_on_another_socket_is_enrolled_like_any_tool() {
         for daemon in [Some(daemon()), None] {
-            let mut tracker = ProcessTracker::new(10, daemon.as_ref());
+            let mut tracker = match &daemon {
+                Some(daemon) => ProcessTracker::exempting(10, daemon),
+                None => ProcessTracker::owning_every_descendant(10),
+            };
             tracker.kernel_exe = installed_exe;
             tracker
                 .observe_rows(daemon_rows(OTHER_DAEMON), daemon_kernel)
@@ -2641,7 +2855,7 @@ mod tests {
             assert_eq!(owned(&tracker), vec![10, 20, 30, 31], "{daemon:?}");
         }
         // Without a configured socket nothing is exempt.
-        let mut tracker = ProcessTracker::new(10, None);
+        let mut tracker = ProcessTracker::owning_every_descendant(10);
         tracker
             .observe_rows(daemon_rows(DAEMON_DB), daemon_kernel)
             .unwrap();
@@ -2868,7 +3082,7 @@ mod tests {
     #[test]
     fn a_scan_failed_by_one_process_holds_for_that_process() {
         let dir = tempfile::tempdir().unwrap();
-        let mut tracker = ProcessTracker::new(10, None);
+        let mut tracker = ProcessTracker::owning_every_descendant(10);
         tracker
             .observe_rows(vec![process_row(10, 1, 10)], |pid| {
                 Ok((pid == 10).then(|| kernel_process(10, 1, 10, 100)))
@@ -2921,7 +3135,7 @@ mod tests {
     #[test]
     fn a_failed_scan_is_retried_within_the_grace() {
         let dir = tempfile::tempdir().unwrap();
-        let mut tracker = ProcessTracker::new(10, None);
+        let mut tracker = ProcessTracker::owning_every_descendant(10);
         tracker
             .observe_rows(vec![process_row(10, 1, 10)], |pid| {
                 Ok((pid == 10).then(|| kernel_process(10, 1, 10, 100)))
@@ -3019,7 +3233,7 @@ mod tests {
                 u64::from(pid),
             )))
         };
-        let mut tracker = ProcessTracker::new(10, None);
+        let mut tracker = ProcessTracker::owning_every_descendant(10);
         tracker.observe_rows(rows.clone(), alive).unwrap();
         let (root_birth, descendants) = tracker.recorded();
         assert_eq!(root_birth, Some(Birth(10, 0)));
@@ -3107,7 +3321,7 @@ mod tests {
         let (a, _) = testing::invocation(dir.path());
         testing::complete(&a);
         let daemon = args_row(4321, 1234, 4321, DAEMON_DB);
-        assert!(daemon.is_shared_ironmem_daemon(Path::new(SOCKET)));
+        assert!(daemon.is_shared_ironmem_daemon(&self::daemon()));
         let snapshot = ProcessSnapshot::Available(vec![daemon]);
         assert_eq!(snapshot.liveness(Some(&a)), Liveness::NotListed);
         assert_eq!(snapshot.live_evidence("owner-repo-42", Some(&a)), None);
@@ -3118,7 +3332,7 @@ mod tests {
     fn stale_descendant_row_cannot_enroll_a_reused_unrelated_pid() {
         let root = kernel_process(10, 1, 10, 1);
         for replacement in [Some(kernel_process(20, 999, 999, 2)), None] {
-            let mut tracker = ProcessTracker::new(10, None);
+            let mut tracker = ProcessTracker::owning_every_descendant(10);
             let result = tracker.observe_rows(
                 vec![process_row(10, 1, 10), process_row(20, 10, 20)],
                 |pid| Ok(if pid == 10 { Some(root) } else { replacement }),
@@ -3149,7 +3363,7 @@ mod tests {
         let parent = kernel_process(20, 10, 20, 2);
         let replacement_parent = kernel_process(20, 999, 999, 3);
         let child = kernel_process(30, 20, 30, 4);
-        let mut tracker = ProcessTracker::new(10, None);
+        let mut tracker = ProcessTracker::owning_every_descendant(10);
         tracker.known.push((process_row(20, 10, 20), parent.birth));
         let mut parent_reads = 0;
         let result = tracker.observe_rows(
@@ -3187,7 +3401,7 @@ mod tests {
     fn authenticated_detached_child_is_enrolled_by_its_real_parent() {
         let root = kernel_process(10, 1, 10, 1);
         let child = kernel_process(20, 10, 20, 2);
-        let mut tracker = ProcessTracker::new(10, None);
+        let mut tracker = ProcessTracker::owning_every_descendant(10);
         tracker
             .observe_rows(
                 vec![process_row(10, 1, 10), process_row(20, 10, 10)],
@@ -3201,7 +3415,7 @@ mod tests {
     #[test]
     fn vanished_known_parent_cannot_authorize_a_snapshot_child() {
         let root = kernel_process(10, 1, 10, 1);
-        let mut tracker = ProcessTracker::new(10, None);
+        let mut tracker = ProcessTracker::owning_every_descendant(10);
         tracker.known.push((process_row(20, 10, 20), Birth(2, 0)));
         let result = tracker.observe_rows(
             vec![
@@ -3235,7 +3449,7 @@ mod tests {
         // A shell ran a short-lived tool and both exited between the ps
         // sample and the kernel check: the stale child row escaped nothing.
         let root = kernel_process(10, 1, 10, 1);
-        let mut tracker = ProcessTracker::new(10, None);
+        let mut tracker = ProcessTracker::owning_every_descendant(10);
         tracker.known.push((process_row(20, 10, 20), Birth(2, 0)));
         tracker
             .observe_rows(
@@ -3253,7 +3467,7 @@ mod tests {
     #[test]
     fn kernel_lookup_failure_does_not_authorize_a_descendant_signal() {
         let root = kernel_process(10, 1, 10, 1);
-        let mut tracker = ProcessTracker::new(10, None);
+        let mut tracker = ProcessTracker::owning_every_descendant(10);
         let result = tracker.observe_rows(
             vec![process_row(10, 1, 10), process_row(20, 10, 20)],
             |pid| {
@@ -3363,7 +3577,7 @@ mod tests {
             kernel_process(20, 10, 30, 2),
             kernel_process(20, 999, 20, 2),
         ] {
-            let mut tracker = ProcessTracker::new(10, None);
+            let mut tracker = ProcessTracker::owning_every_descendant(10);
             let mut candidate_reads = 0;
             let result = tracker.observe_rows(
                 vec![process_row(10, 1, 10), process_row(20, 10, 10)],
@@ -3396,7 +3610,7 @@ mod tests {
     fn candidate_gone_before_final_capture_is_neither_enrolled_nor_signaled() {
         let root = kernel_process(10, 1, 10, 1);
         let candidate = kernel_process(20, 10, 20, 2);
-        let mut tracker = ProcessTracker::new(10, None);
+        let mut tracker = ProcessTracker::owning_every_descendant(10);
         let mut reads = 0;
         let result = tracker.observe_rows(
             vec![process_row(10, 1, 10), process_row(20, 10, 10)],

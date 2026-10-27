@@ -421,9 +421,15 @@ pub(crate) fn dispatch_timeout(spec: &DispatchSpec) -> Duration {
 }
 
 /// `shared_daemon` is the operator's shared ironmem daemon: its configured
-/// socket (`Config::daemon_socket_path`) and executable. A daemon a
-/// harness's MCP proxy autospawns there is never treated as part of the
-/// invocation. `None` owns every descendant.
+/// socket (`Config::daemon_socket_path`, the socket
+/// `harness::proxy_command_args` registers every MCP proxy with) and
+/// executable. A daemon a harness's MCP proxy autospawns there is never
+/// treated as part of the invocation, so it outlives it, keeping the
+/// environment and working directory it inherited from the invocation's
+/// tree (the controller's environment plus whatever the harness or its MCP
+/// server entry adds). `None`, when that executable cannot be resolved
+/// (`SharedDaemon::for_current_exe` logs why), owns every descendant, that
+/// daemon included.
 pub fn run_supervised(
     bin: &Path,
     repo: &Path,
@@ -779,7 +785,10 @@ fn run_supervised_bounded_with(
         invocation_id: a.invocation_id.clone(),
         descendants: Vec::new(),
     };
-    let mut tracker = super::process_tree::ProcessTracker::new(child.id(), shared_daemon);
+    let mut tracker = match shared_daemon {
+        Some(daemon) => ProcessTracker::exempting(child.id(), daemon),
+        None => ProcessTracker::owning_every_descendant(child.id()),
+    };
     // Before the first sample, which a root failing fast can beat.
     tracker.adopt_root();
     identity.root_birth = tracker.root_birth();
@@ -1774,7 +1783,8 @@ exit {code}"#
     fn run_observed_fixture(bin: &Path, repo: &Path, spec: &DispatchSpec) -> DispatchOutcome {
         let started = Instant::now();
         let mut child = spawn_fixture_invocation(bin, repo, spec);
-        let mut tracker = super::super::process_tree::ProcessTracker::new(child.id(), None);
+        let mut tracker =
+            super::super::process_tree::ProcessTracker::owning_every_descendant(child.id());
         let result = (|| {
             while !repo.join("root-ready").exists() {
                 if child.try_wait()?.is_some() || started.elapsed() >= Duration::from_secs(3) {
@@ -1874,7 +1884,7 @@ exit {code}"#
             let bin = binary(dir.path(), &script("", code));
             let started = Instant::now();
             let mut child = spawn_fixture_invocation(&bin, dir.path(), &spec);
-            let mut tracker = ProcessTracker::new(child.id(), None);
+            let mut tracker = ProcessTracker::owning_every_descendant(child.id());
             // As supervision does straight after spawn.
             tracker.adopt_root();
             // Reap first, deliberately making root observation impossible.
@@ -1931,7 +1941,7 @@ exit {code}"#
         let bin = binary(dir.path(), &script("", 7));
         let started = Instant::now();
         let mut child = spawn_fixture_invocation(&bin, dir.path(), &spec);
-        let mut tracker = ProcessTracker::new(child.id(), None);
+        let mut tracker = ProcessTracker::owning_every_descendant(child.id());
         let status = child.wait().unwrap();
         let error = finish_supervised(
             &CodexCli,
@@ -2126,7 +2136,8 @@ exit {code}"#
         );
         let started = Instant::now();
         let mut child = spawn_fixture_invocation(&bin, dir.path(), &s);
-        let mut tracker = super::super::process_tree::ProcessTracker::new(child.id(), None);
+        let mut tracker =
+            super::super::process_tree::ProcessTracker::owning_every_descendant(child.id());
         // The supervisor's last scan sees only the root...
         tracker.observe().unwrap();
         std::fs::write(dir.path().join("root-release"), "release").unwrap();
@@ -2215,7 +2226,8 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
         let fixture_pids = || Ok(escaped().into_iter().collect::<Vec<_>>());
         let started = Instant::now();
         let mut child = spawn_fixture_invocation(&bin, dir.path(), &s);
-        let mut tracker = super::super::process_tree::ProcessTracker::new(child.id(), None);
+        let mut tracker =
+            super::super::process_tree::ProcessTracker::owning_every_descendant(child.id());
         tracker.observe().unwrap();
         // As the supervision loop does after each sample.
         let mut identity = fixture_identity(a);
@@ -2537,7 +2549,8 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
             .process_group(0);
         let mut child = crate::autopilot::dispatch::retry_on_etxtbsy(|| command.spawn()).unwrap();
         let started = Instant::now();
-        let mut tracker = super::super::process_tree::ProcessTracker::new(child.id(), None);
+        let mut tracker =
+            super::super::process_tree::ProcessTracker::owning_every_descendant(child.id());
         let ready = dir.path().join("descendant-ready");
         while !ready.exists() && started.elapsed() < Duration::from_secs(3) {
             std::thread::sleep(Duration::from_millis(5));
@@ -3008,7 +3021,7 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
         let started = Instant::now();
         let mut child = spawn_fixture_invocation(&bin, dir.path(), &s);
         let mut killer = KillGroup(None);
-        let mut tracker = ProcessTracker::new(child.id(), Some(&shared));
+        let mut tracker = ProcessTracker::exempting(child.id(), &shared);
         let mut identity = fixture_identity(a);
         let result = (|| {
             wait(

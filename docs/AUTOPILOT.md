@@ -438,6 +438,21 @@ daemon, with the same command line on your socket in a group of its own,
 escapes tracking.
 That is the same class as the double-fork escape above.
 
+A daemon autospawned this way outlives the invocation with what it
+inherited from the tree that started it: the controller's environment plus
+anything the harness or its MCP server entry adds (`ironmem` writes
+`IRONMEM_MCP_MODE=trusted` into Codex's MCP config, for example), and the
+worktree as its working directory. Its access mode is read once and holds
+for every session it then serves (see the access-mode note in
+`docs/CODEX.md`). Start the shared daemon from your own shell before an
+unattended run if its settings must not come from that run. If your
+socket path contains whitespace or is not UTF-8, the process table cannot
+show it unambiguously, so the daemon is cleaned up with each invocation;
+Autopilot logs a warning saying so. It also logs one when cleanup kills an
+ironmem daemon on a socket other than your configured one outside the
+system temp directory: that usually means your MCP registration and
+Autopilot disagree about the socket.
+
 Verification records are intentionally separated:
 
 - On 2026-10-22, native `codex-cli 0.163.0` new and resume **no-tools format
