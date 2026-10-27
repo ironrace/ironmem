@@ -152,7 +152,14 @@ pub trait GhRunner {
 /// Locate the `gh` binary on `PATH`, reusing `launcher`'s own binary
 /// validation exactly as [`super::review::resolve_codex_binary`] does.
 pub fn resolve_gh_binary() -> Result<PathBuf, MemoryError> {
-    crate::launcher::find_on_path("gh")
+    gh_binary_in(&std::env::var_os("PATH").unwrap_or_default())
+}
+
+/// `gh` on `path_var`, skipping relative entries: it runs in a checkout or
+/// worktree, where a relative entry such as `.` would reach a file the
+/// repository planted (merging, labelling and commenting as the operator).
+fn gh_binary_in(path_var: &std::ffi::OsStr) -> Result<PathBuf, MemoryError> {
+    super::run::find_launcher("gh", path_var)
 }
 
 /// The real `gh`, run in a working directory.
@@ -1549,6 +1556,17 @@ pub(crate) mod testing {
 mod tests {
     use super::testing::ScriptedGh;
     use super::*;
+
+    /// `gh` runs in a checkout or worktree, where a relative PATH entry such
+    /// as `.` would reach a file the repository planted.
+    #[test]
+    fn gh_is_never_found_through_a_relative_path_entry() {
+        let (planted, relative) = super::super::run::planted_relative_path_entry("gh");
+        let err = gh_binary_in(relative.as_os_str()).unwrap_err();
+        assert!(matches!(err, MemoryError::NotFound(_)), "{err}");
+        let found = gh_binary_in(planted.path().as_os_str()).unwrap();
+        assert_eq!(found, planted.path().join("gh"));
+    }
 
     // ── rung 8: the queue's two reads ───────────────────────────────────
 
