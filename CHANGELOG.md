@@ -138,10 +138,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   relative entry would find a file in the repository being worked on.
 - **Resuming an issue branch with no recorded cut now records the commit the
   branch was created from** (from its reflog, or else its merge base with
-  `--base`), and refuses the run if neither can be found. A new branch's cut
-  is recorded before the branch is created, so a held `.git/config` lock no
-  longer leaves a branch without one; that error now names the lock file and
-  its age. Cut and signing-flag writes run git in the C locale, so a held
+  `--base`), and refuses the run if neither can be found or the branch is
+  already merged into `--base` with unpushed commits. A new branch's cut is
+  recorded before the branch is created and is never taken back from a branch
+  that exists, so a branch is not left without one; a held-lock error now
+  names the lock file and its age. Cut and signing-flag writes run git in the C locale, so a held
   lock is recognised in any locale, and SHA-256 repositories can provision
   issue worktrees.
 - **Library: `Worktree::cut` is a `CommitSha`**, a full commit object name

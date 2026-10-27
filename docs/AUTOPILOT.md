@@ -492,19 +492,29 @@ can quietly pass `-c commit.gpgsign=false`.
   SHA-256) in your checkout and stored as `branch.<branch>.ironmemCut` before
   the issue branch is created, so a branch never exists without one. A base
   that does not resolve, or a cut that cannot be stored, is refused before any
-  worktree exists. If `--base` moves between being resolved and the branch
-  being created, the new branch and worktree are removed again and the run
-  asks you to run again. An existing branch with no recorded cut (an older
-  branch) gets the commit its reflog says it was created from, or, without
-  that entry, the merge base of the branch and `--base`; never `--base`
-  itself, which may have moved. That run logs a warning naming the branch, the
-  source and the sha. A branch that shares no history with `--base` and has
-  no creation entry is refused: record its cut with `git config
-  branch.<branch>.ironmemCut <sha>`.
+  worktree exists. If `git worktree add` fails after making the branch (for
+  example on the upstream write while another git holds the config lock), the
+  branch keeps its cut and the next run reuses it; the cut is taken back only
+  when no branch was made. A branch another controller creates at the same
+  moment is never given this run's cut: the run stops and asks you to run
+  again. If `--base` moves between being resolved and the branch being
+  created, the new branch and worktree are removed again (never by force: a
+  worktree someone has started using is kept, with its cut corrected to where
+  the branch really is) and the run asks you to run again. An existing branch
+  with no recorded cut (an older branch) gets the commit its reflog says it
+  was created from, or, without that entry, the merge base of the branch and
+  `--base`; never `--base` itself, which may have moved. That run logs a
+  warning naming the branch, the source and the sha. A branch that shares no
+  history with `--base`, or one already merged into `--base` while it has
+  commits on no remote (its merge base would leave the guard nothing to
+  check), and that has no creation entry, is refused: record its cut with
+  `git config branch.<branch>.ironmemCut <sha>`.
 - **A config lock left behind blocks new branches.** Storing the cut writes
   `.git/config`. While another worktree's git holds its lock, the write is
   retried for about half a second. A lock held longer fails the run with an
-  error naming the lock file and its age. A git killed mid-write (an
+  error naming the lock file and its age, or saying it was released just
+  after the retries ran out, in which case simply run again. A git killed
+  mid-write (an
   agent's `git push -u` when its dispatch times out) leaves the lock behind;
   if no git command is running in any worktree of the repo, remove it.
 - **The policy is sticky.** It is enforced if `commit.gpgsign` was on when the
