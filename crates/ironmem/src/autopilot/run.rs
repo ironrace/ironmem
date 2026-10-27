@@ -3896,12 +3896,14 @@ sleep 0.5
         worktree: &Worktree,
         native: Option<&str>,
     ) -> DispatchState {
-        let artifacts =
-            super::super::invocation::prepare_artifacts(&worktree.path, &issue()).unwrap();
+        // A Claude state never carries artifacts; its load refuses them.
+        let artifacts = (implementer != Implementer::Claude).then(|| {
+            super::super::invocation::prepare_artifacts(&worktree.path, &issue()).unwrap()
+        });
         let state = DispatchState {
             implementer,
             native_session_id: native.map(str::to_string),
-            invocation_artifacts: Some(artifacts),
+            invocation_artifacts: artifacts,
             issue: issue(),
             worktree_path: worktree.path.to_string_lossy().into_owned(),
             ic_session_name: "ic".into(),
