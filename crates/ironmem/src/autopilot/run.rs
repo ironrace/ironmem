@@ -1823,10 +1823,12 @@ pub fn run_issue(
             }
             // Claude keeps its existing policy: this cap gates only repos
             // with a wall-clock bound, and a timed-out dispatch is banked
-            // unpriced after it ends. A supervised CLI harness (always
-            // bounded) is checked where it reserves, below, in the same
-            // transaction, so two Leads cannot both take the last unit.
-            if wall_clock_timeout.is_some() && !config.implementer.recovers_invocations() {
+            // unpriced after it ends. For a supervised CLI harness (always
+            // bounded) this is only a cheap pre-filter that spares rendering,
+            // argv checks and an invocation directory on a capped day; the
+            // transactional reservation below is the authority, since
+            // another Lead can take the last unit after this read.
+            if wall_clock_timeout.is_some() {
                 let unpriced_today = ledger
                     .as_ref()
                     .map(|e| e.unpriced_dispatch_count)
@@ -1976,12 +1978,17 @@ pub fn run_issue(
                 // prove no process launched and must leave prior state intact.
                 super::invocation::validate_argv(&worktree.path, &spec)?;
                 if let Some(artifacts) = &spec.invocation_artifacts {
-                    // Check the day's cap and reserve in one transaction,
-                    // before the invocation is published. At the cap nothing
-                    // is written and nothing launches: the prepared directory
-                    // is removed and the stored state keeps what it had. A
-                    // crash after reserving but before publishing over-counts
-                    // one unit, never under-counts.
+                    // The authority on the day's cap: check and reserve in
+                    // one transaction, before this invocation is published,
+                    // so two Leads cannot both take the last unit. At the cap
+                    // nothing launches, no unit is reserved, the prepared
+                    // directory is removed, and this invocation is never
+                    // published; the run then stops like any capped run,
+                    // saving `paused-infrastructure-failure` with the
+                    // session it would have used (a model change may have
+                    // rotated it above) and no invocation. A crash after
+                    // reserving but before publishing over-counts one unit,
+                    // never under-counts.
                     if let budget::UnpricedReservation::CapReached { unpriced_today } =
                         budget::reserve_unpriced_dispatch_if_below(
                             db,
@@ -3447,6 +3454,34 @@ sleep 0.5
             );
         }
     }
+    /// The cheap check before anything is rendered or allocated: a run that
+    /// starts at the cap never even creates its issue's invocation directory.
+    #[test]
+    fn a_supervised_run_already_at_the_cap_allocates_nothing() {
+        for c in [codex_config(), muse_config()] {
+            let db = approved_db();
+            let (_dir, wt) = fixture_worktree();
+            for n in 0..c.max_unpriced_dispatches_per_day {
+                budget::reserve_unpriced_dispatch(&db, &today_utc(), &format!("other-{n}"))
+                    .unwrap();
+            }
+            let mut d = cli_script(c.implementer, vec![met()]);
+            let run = run_issue(&db, &issue(), &brief(), &wt, &c, &mut d).unwrap();
+            assert_eq!(
+                run.terminal,
+                TerminalReason::UnpricedDispatchesExhausted {
+                    unpriced_today: c.max_unpriced_dispatches_per_day
+                }
+            );
+            let issue_dir = wt.path.join(".git/ironmem/autopilot").join(issue().slug());
+            assert!(
+                !issue_dir.exists(),
+                "{:?} allocated {issue_dir:?}",
+                c.implementer
+            );
+        }
+    }
+
     #[test]
     fn codex_cap_applies_without_repo_timeout_and_failed_outputs_are_reserved() {
         let db = approved_db();
