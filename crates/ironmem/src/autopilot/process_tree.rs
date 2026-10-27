@@ -856,7 +856,12 @@ fn kernel_observation(pid: u32) -> Result<Option<KernelProcess>, String> {
     {
         let text = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
             Ok(text) => text,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::NotFound
+                    || e.raw_os_error() == Some(libc::ESRCH) =>
+            {
+                return Ok(None)
+            }
             Err(e) => return Err(format!("cannot authenticate process {pid}: {e}")),
         };
         let fields = text
@@ -956,6 +961,10 @@ fn kernel_executable(pid: u32) -> Option<PathBuf> {
     }
 }
 
+/// How often the completion check rescans while it waits for the worktree
+/// to go quiet.
+pub(crate) const QUIET_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// A process the current user owns, with its working directory, as the
 /// kernel reports them.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -980,12 +989,62 @@ fn current_uid() -> Option<u32> {
     }
 }
 
-/// Every process the current user owns, with its working directory. A
-/// process that exits mid-scan is skipped; any other failure to read one
-/// fails the whole scan, since the unread process could be the invocation's.
-/// macOS reads the kernel directly (`proc_listpids` by user, then
-/// `PROC_PIDVNODEPATHINFO`): about 1.5 ms for ~600 processes, measured.
-fn user_processes_with_cwd() -> Result<Vec<CwdProcess>, String> {
+/// The core of a working-directory scan, over injectable kernel reads.
+/// `owner_birth` gives a PID's owner and kernel birth, `cwd_of` its working
+/// directory; either answers `Ok(None)` for a process that has exited.
+///
+/// Owner and birth are read first, so a process another user owns, or one
+/// born before `spawned` (it cannot be the invocation's), is skipped before
+/// its directory is touched: macOS refuses some same-user system processes,
+/// and those must not fail the scan. Only an in-window process whose
+/// directory cannot be read fails it, since that process could be the
+/// invocation's. The birth is read again afterwards: a PID reused in between
+/// may have handed back a newcomer's directory.
+fn scan_cwds(
+    pids: impl IntoIterator<Item = u32>,
+    uid: u32,
+    spawned: Birth,
+    mut owner_birth: impl FnMut(u32) -> Result<Option<(u32, Birth)>, String>,
+    mut cwd_of: impl FnMut(u32) -> Result<Option<PathBuf>, String>,
+) -> Result<Vec<CwdProcess>, String> {
+    let mut processes = Vec::new();
+    for pid in pids {
+        let Some((owner, birth)) = owner_birth(pid)? else {
+            continue;
+        };
+        if owner != uid || birth < spawned {
+            continue;
+        }
+        let cwd = match cwd_of(pid) {
+            Ok(Some(cwd)) => cwd,
+            Ok(None) => continue,
+            Err(e) => {
+                return Err(format!(
+                    "process {pid}, started during the invocation, has an unreadable \
+                     working directory: {e}"
+                ))
+            }
+        };
+        match owner_birth(pid)? {
+            None => continue,
+            Some((_, after)) if after == birth => {}
+            Some(_) => return Err(format!("process {pid} was replaced during the scan")),
+        }
+        processes.push(CwdProcess {
+            pid,
+            uid: owner,
+            birth,
+            cwd,
+        });
+    }
+    Ok(processes)
+}
+
+/// The current user's processes born at or after `spawned`, with their
+/// working directories ([`scan_cwds`]). macOS reads the kernel directly
+/// (`proc_listpids` by user, then `PROC_PIDVNODEPATHINFO`): about 1.5 ms for
+/// ~600 processes, measured. Linux reads `/proc`.
+fn user_processes_with_cwd(spawned: Birth) -> Result<Vec<CwdProcess>, String> {
     let uid = current_uid().ok_or("process working directories are unreadable here")?;
     #[cfg(target_os = "macos")]
     {
@@ -1016,12 +1075,15 @@ fn user_processes_with_cwd() -> Result<Vec<CwdProcess>, String> {
             }
             pids.resize(pids.len() * 2, 0);
         }
-        let mut processes = Vec::new();
-        for pid in pids.into_iter().filter(|pid| *pid > 0) {
-            let pid = pid as u32;
-            let Some(before) = bsd_info(pid)? else {
-                continue;
-            };
+        let owner_birth = |pid: u32| {
+            Ok(bsd_info(pid)?.map(|info| {
+                (
+                    info.pbi_uid,
+                    Birth(info.pbi_start_tvsec, info.pbi_start_tvusec),
+                )
+            }))
+        };
+        let cwd_of = |pid: u32| {
             let mut info = std::mem::MaybeUninit::<libc::proc_vnodepathinfo>::zeroed();
             let size = std::mem::size_of::<libc::proc_vnodepathinfo>() as i32;
             // SAFETY: the kernel writes at most `size` bytes.
@@ -1037,14 +1099,12 @@ fn user_processes_with_cwd() -> Result<Vec<CwdProcess>, String> {
             if bytes <= 0 {
                 let error = std::io::Error::last_os_error();
                 if matches!(error.raw_os_error(), Some(libc::ESRCH | libc::ENOENT)) {
-                    continue;
+                    return Ok(None);
                 }
-                return Err(format!(
-                    "cannot read the working directory of process {pid}: {error}"
-                ));
+                return Err(error.to_string());
             }
             if bytes != size {
-                return Err(format!("incomplete working directory for process {pid}"));
+                return Err("incomplete working directory record".into());
             }
             // SAFETY: a full structure was written by proc_pidinfo.
             let info = unsafe { info.assume_init() };
@@ -1052,73 +1112,51 @@ fn user_processes_with_cwd() -> Result<Vec<CwdProcess>, String> {
             let path = unsafe {
                 std::ffi::CStr::from_ptr(info.pvi_cdir.vip_path.as_ptr().cast::<libc::c_char>())
             };
-            // The PID must still be the process whose record named the
-            // owner and birth, or the directory may be a successor's.
-            match bsd_info(pid)? {
-                None => continue,
-                Some(after)
-                    if (after.pbi_start_tvsec, after.pbi_start_tvusec)
-                        == (before.pbi_start_tvsec, before.pbi_start_tvusec) => {}
-                Some(_) => return Err(format!("process {pid} was replaced during the scan")),
-            }
-            processes.push(CwdProcess {
-                pid,
-                uid: before.pbi_uid,
-                birth: Birth(before.pbi_start_tvsec, before.pbi_start_tvusec),
-                cwd: Path::new(std::ffi::OsStr::from_bytes(path.to_bytes())).to_path_buf(),
-            });
-        }
-        Ok(processes)
+            Ok(Some(
+                Path::new(std::ffi::OsStr::from_bytes(path.to_bytes())).to_path_buf(),
+            ))
+        };
+        let pids = pids
+            .into_iter()
+            .filter(|pid| *pid > 0)
+            .map(|pid| pid as u32);
+        scan_cwds(pids, uid, spawned, owner_birth, cwd_of)
     }
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::fs::MetadataExt;
-        let entries = std::fs::read_dir("/proc").map_err(|e| format!("cannot list /proc: {e}"))?;
-        let mut processes = Vec::new();
-        for entry in entries {
+        let gone = |e: &std::io::Error| {
+            e.kind() == std::io::ErrorKind::NotFound || e.raw_os_error() == Some(libc::ESRCH)
+        };
+        let mut pids = Vec::new();
+        for entry in std::fs::read_dir("/proc").map_err(|e| format!("cannot list /proc: {e}"))? {
             let entry = entry.map_err(|e| format!("cannot list /proc: {e}"))?;
-            let Some(pid) = entry
+            if let Some(pid) = entry
                 .file_name()
                 .to_str()
                 .and_then(|name| name.parse::<u32>().ok())
-            else {
-                continue;
-            };
-            let gone = |e: &std::io::Error| {
-                e.kind() == std::io::ErrorKind::NotFound || e.raw_os_error() == Some(libc::ESRCH)
-            };
+            {
+                pids.push(pid);
+            }
+        }
+        let owner_birth = |pid: u32| {
             let owner = match std::fs::metadata(format!("/proc/{pid}")) {
                 Ok(meta) => meta.uid(),
-                Err(e) if gone(&e) => continue,
+                Err(e) if gone(&e) => return Ok(None),
                 Err(e) => return Err(format!("cannot read process {pid}: {e}")),
             };
-            if owner != uid {
-                continue;
-            }
-            let cwd = match std::fs::read_link(format!("/proc/{pid}/cwd")) {
-                Ok(cwd) => cwd,
-                Err(e) if gone(&e) => continue,
-                Err(e) => {
-                    return Err(format!(
-                        "cannot read the working directory of process {pid}: {e}"
-                    ))
-                }
-            };
-            let Some(process) = kernel_observation(pid)? else {
-                continue;
-            };
-            processes.push(CwdProcess {
-                pid,
-                uid: owner,
-                birth: process.birth,
-                cwd,
-            });
-        }
-        Ok(processes)
+            Ok(kernel_observation(pid)?.map(|process| (owner, process.birth)))
+        };
+        let cwd_of = |pid: u32| match std::fs::read_link(format!("/proc/{pid}/cwd")) {
+            Ok(cwd) => Ok(Some(cwd)),
+            Err(e) if gone(&e) => Ok(None),
+            Err(e) => Err(e.to_string()),
+        };
+        scan_cwds(pids, uid, spawned, owner_birth, cwd_of)
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
-        let _ = uid;
+        let _ = (uid, spawned);
         Err("process working directories are unreadable on this platform".into())
     }
 }
@@ -1513,7 +1551,7 @@ impl ProcessTracker {
     fn verify_worktree_quiet_with(
         &self,
         worktree: &Path,
-        mut cwd_source: impl FnMut() -> Result<Vec<CwdProcess>, String>,
+        mut cwd_source: impl FnMut(Birth) -> Result<Vec<CwdProcess>, String>,
         mut rows: impl FnMut() -> Result<Vec<ProcessRow>, MemoryError>,
         grace: std::time::Duration,
     ) -> Result<(), MemoryError> {
@@ -1539,12 +1577,20 @@ impl ProcessTracker {
         let supervisor = std::process::id();
         let deadline = std::time::Instant::now() + grace;
         loop {
-            let candidates: Vec<CwdProcess> = cwd_source()
-                .map_err(|e| {
-                    unproven(format!(
+            // A failed scan is retried until the grace runs out.
+            let scanned = match cwd_source(spawned) {
+                Ok(scanned) => scanned,
+                Err(e) if std::time::Instant::now() >= deadline => {
+                    return Err(unproven(format!(
                         "cannot list processes in the invocation worktree: {e}"
-                    ))
-                })?
+                    )))
+                }
+                Err(_) => {
+                    std::thread::sleep(QUIET_POLL.min(grace));
+                    continue;
+                }
+            };
+            let candidates: Vec<CwdProcess> = scanned
                 .into_iter()
                 .filter(|p| {
                     p.uid == uid
@@ -1594,7 +1640,7 @@ impl ProcessTracker {
                     worktree.display()
                 )));
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            std::thread::sleep(QUIET_POLL.min(grace));
         }
     }
 
@@ -2343,7 +2389,7 @@ mod tests {
         let check = |tracker: &ProcessTracker, found: CwdProcess| {
             tracker.verify_worktree_quiet_with(
                 &worktree,
-                || Ok(vec![found.clone()]),
+                |_| Ok(vec![found.clone()]),
                 || Ok(rows.clone()),
                 Duration::ZERO,
             )
@@ -2375,7 +2421,7 @@ mod tests {
         let err = tracker
             .verify_worktree_quiet_with(
                 &worktree,
-                || Err("lookup refused".into()),
+                |_| Err("lookup refused".into()),
                 || Ok(rows.clone()),
                 Duration::ZERO,
             )
@@ -2384,13 +2430,99 @@ mod tests {
         assert!(err.contains("lookup refused"), "{err}");
     }
 
+    /// Only a process the invocation could have started can fail the scan.
+    /// Its owner and birth are read first: an older process (the operator's
+    /// protected app, say) is skipped before its working directory is
+    /// touched, so its being unreadable is irrelevant. An in-window one whose
+    /// directory cannot be read holds. One that exits mid-scan is gone.
+    #[test]
+    fn only_an_unreadable_process_started_in_the_window_fails_the_scan() {
+        let spawned = Birth(100, 0);
+        let uid = 501;
+        let owner_birth = |pid: u32| -> Result<Option<(u32, Birth)>, String> {
+            Ok(match pid {
+                1 => Some((uid, Birth(50, 0))),
+                3 => None,
+                6 => Some((uid + 1, Birth(150, 0))),
+                _ => Some((uid, Birth(150, 0))),
+            })
+        };
+        let cwd_reads = std::cell::RefCell::new(Vec::new());
+        let mut cwd_of = |pid: u32| -> Result<Option<PathBuf>, String> {
+            cwd_reads.borrow_mut().push(pid);
+            match pid {
+                1 | 2 => Err("Operation not permitted".into()),
+                4 => Ok(None),
+                _ => Ok(Some(PathBuf::from(format!("/w/{pid}")))),
+            }
+        };
+        let found = scan_cwds([1, 3, 4, 6, 7], uid, spawned, owner_birth, &mut cwd_of).unwrap();
+        assert_eq!(found.iter().map(|p| p.pid).collect::<Vec<_>>(), vec![7]);
+        assert_eq!(
+            cwd_reads.borrow().clone(),
+            vec![4, 7],
+            "old, gone and foreign processes are never read"
+        );
+        let err = scan_cwds([1, 2, 7], uid, spawned, owner_birth, &mut cwd_of).unwrap_err();
+        assert!(
+            err.contains("process 2") && err.contains("not permitted"),
+            "{err}"
+        );
+        // Exited between the directory read and the birth re-check: gone.
+        let mut reads = 0;
+        let vanishing = |_pid: u32| -> Result<Option<(u32, Birth)>, String> {
+            reads += 1;
+            Ok((reads == 1).then_some((uid, Birth(150, 0))))
+        };
+        assert!(scan_cwds([8], uid, spawned, vanishing, &mut cwd_of)
+            .unwrap()
+            .is_empty());
+        // Replaced by a new process under the same PID: the directory may
+        // be the newcomer's, so the scan cannot vouch for it.
+        let mut reads = 0;
+        let replaced = |_pid: u32| -> Result<Option<(u32, Birth)>, String> {
+            reads += 1;
+            Ok(Some((uid, Birth(150 + reads, 0))))
+        };
+        assert!(scan_cwds([9], uid, spawned, replaced, &mut cwd_of).is_err());
+    }
+
+    /// A failed scan is retried within the grace before completion is refused.
+    #[test]
+    fn a_failed_scan_is_retried_within_the_grace() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tracker = ProcessTracker::new(10, None);
+        tracker
+            .observe_rows(vec![process_row(10, 1, 10)], |pid| {
+                Ok((pid == 10).then(|| kernel_process(10, 1, 10, 100)))
+            })
+            .unwrap();
+        let mut scans = 0;
+        tracker
+            .verify_worktree_quiet_with(
+                dir.path(),
+                |_| {
+                    scans += 1;
+                    if scans == 1 {
+                        Err("transient".into())
+                    } else {
+                        Ok(Vec::new())
+                    }
+                },
+                || Ok(Vec::new()),
+                std::time::Duration::from_secs(2),
+            )
+            .unwrap();
+        assert_eq!(scans, 2);
+    }
+
     /// The real enumeration finds this test process in its own working
     /// directory, cheaply enough to run at every completion.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn the_kernel_lists_this_process_with_its_working_directory() {
         let started = std::time::Instant::now();
-        let processes = user_processes_with_cwd().unwrap();
+        let processes = user_processes_with_cwd(Birth(0, 0)).unwrap();
         let elapsed = started.elapsed();
         let me = processes
             .iter()
