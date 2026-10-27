@@ -250,7 +250,10 @@ pub(crate) fn read_dispatch_state(
 ) -> Result<StateRead, MemoryError> {
     Ok(match raw_dispatch_state(db, issue)? {
         None => StateRead::Absent,
-        Some(raw) => parse_dispatch_state(&raw),
+        Some(raw) => match parse_dispatch_state(&raw) {
+            Parsed::Readable(state) => StateRead::Readable(state),
+            Parsed::Unreadable(why) => StateRead::Unreadable(why),
+        },
     })
 }
 
@@ -263,11 +266,19 @@ pub(crate) fn raw_dispatch_state(
     Ok(read_current(db, &dispatch_state_key(issue))?.map(|drawer| drawer.content))
 }
 
-/// What a raw dispatch-state drawer holds: never [`StateRead::Absent`].
-pub(crate) fn parse_dispatch_state(raw: &str) -> StateRead {
+/// What a drawer that exists holds: [`StateRead`] without `Absent`.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Parsed {
+    Readable(Box<DispatchState>),
+    /// Why it could not be read.
+    Unreadable(String),
+}
+
+/// What a raw dispatch-state drawer holds.
+pub(crate) fn parse_dispatch_state(raw: &str) -> Parsed {
     match state_from_content(raw) {
-        Ok(state) => StateRead::Readable(Box::new(state)),
-        Err(e) => StateRead::Unreadable(e.to_string()),
+        Ok(state) => Parsed::Readable(Box::new(state)),
+        Err(e) => Parsed::Unreadable(e.to_string()),
     }
 }
 

@@ -83,8 +83,8 @@ pub fn clear_dispatch(
         )));
     };
     let state = match dispatch_state::parse_dispatch_state(&raw) {
-        dispatch_state::StateRead::Readable(state) => *state,
-        dispatch_state::StateRead::Unreadable(why) => {
+        dispatch_state::Parsed::Readable(state) => *state,
+        dispatch_state::Parsed::Unreadable(why) => {
             if let Some(reason) = unreadable_refusal(&observe(), issue) {
                 return Err(refuse(format!(
                     "its dispatch state cannot be read ({why}), and {reason}"
@@ -106,7 +106,6 @@ pub fn clear_dispatch(
                 raw_content_truncated: content.truncated,
             }));
         }
-        dispatch_state::StateRead::Absent => unreachable!("a raw drawer is never absent"),
     };
     if let Some(reason) = refusal(&observe(), &state, attempt_recorded(db, &state)?) {
         return Err(refuse(reason));
