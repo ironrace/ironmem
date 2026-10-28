@@ -107,8 +107,19 @@ const ENTROPY_THRESHOLD_BITS_PER_CHAR: f64 = 3.6;
 /// can be a token too (`x-access-token:…`, or a token with any password). A
 /// user with no password (`ssh://git@host`) is no credential and is left
 /// alone.
+///
+/// Neither part may hold what RFC 3986 keeps out of userinfo (whitespace,
+/// `/ ? # " < > \ ^ ` { | } [ ]`), so a URL with an unrelated `@` later on
+/// (`"http://localhost:8080","admin":"ops@example.com"`, or `?email=bob@…`)
+/// is not taken for one. The password may hold a raw `@`, and the match runs
+/// to the authority's last one, so `user:p@ss@host` leaks no `ss`. `,` and
+/// `)` stay allowed (a password may hold them), which over-redacts a URL
+/// ending at one before an unrelated `user@host`: the safe direction.
 static URL_PASSWORD_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\b(?P<prefix>[a-z][a-z0-9+.-]*://)[^\s/@:]*:[^\s/@]+@").unwrap()
+    Regex::new(
+        r#"(?i)\b(?P<prefix>[a-z][a-z0-9+.-]*://)[^\s/?#@:"<>\\^`{|}\[\]]*:[^\s/?#"<>\\^`{|}\[\]]+@"#,
+    )
+    .unwrap()
 });
 
 /// Redact every recognizable credential-shaped substring in `input`.
@@ -515,5 +526,71 @@ mod tests {
         let (out, redacted) = scrub_secrets(input);
         assert!(!redacted, "{out}");
         assert_eq!(out, input);
+    }
+
+    /// What a URL's userinfo cannot hold (RFC 3986: no `/ ? # " < > \ ^ `
+    /// { | } [ ]`, nor whitespace) ends the match, so a URL followed by an
+    /// unrelated `@` elsewhere is not taken for `user:password@`.
+    #[test]
+    fn a_url_followed_by_an_unrelated_at_sign_is_untouched() {
+        for input in [
+            r#"{"url":"http://localhost:8080","admin":"ops@example.com"}"#,
+            "GET http://localhost:3000?email=bob@example.com 200",
+            "see http://localhost:3000 or mail me@x.com",
+            "https://github.com/foo:bar@baz",
+            "ssh://git@github.com/o/r",
+        ] {
+            let (out, redacted) = scrub_secrets(input);
+            assert!(!redacted, "{input} became {out}");
+            assert_eq!(out, input);
+        }
+    }
+
+    /// Every `user:password@` form is still redacted, through the last `@`
+    /// of the authority, so a password holding a raw `@` leaks nothing.
+    #[test]
+    fn every_url_password_form_is_redacted_in_full() {
+        for (input, expected) in [
+            ("https://user:p@ss@host/r", "https://[REDACTED]@host/r"),
+            ("https://deploy:hunter2@host/r", "https://[REDACTED]@host/r"),
+            (
+                "postgres://u:p@db:5432/x",
+                "postgres://[REDACTED]@db:5432/x",
+            ),
+            (
+                "redis://:s3cret@cache:6379",
+                "redis://[REDACTED]@cache:6379",
+            ),
+            (
+                "fatal: unable to access 'https://x:tok@github.com/o/r'",
+                "fatal: unable to access 'https://[REDACTED]@github.com/o/r'",
+            ),
+        ] {
+            let (out, redacted) = scrub_secrets(input);
+            assert!(redacted, "{input}");
+            assert_eq!(out, expected, "{input}");
+        }
+    }
+
+    /// Two over-redactions are accepted: `,` and `)` may appear in a
+    /// password (RFC 3986 sub-delims), so excluding them would leak a
+    /// password that holds one. A URL ending at one, followed later by an
+    /// unrelated `user@host`, is redacted up to that `@`: losing some text
+    /// is the safe direction for a scrub.
+    #[test]
+    fn a_url_ended_by_a_comma_or_parenthesis_is_over_redacted_by_design() {
+        for (input, expected) in [
+            (
+                "server=http://127.0.0.1:4000,owner=alice@corp.com",
+                "server=http://[REDACTED]@corp.com",
+            ),
+            (
+                "[link](http://localhost:8000)@bob",
+                "[link](http://[REDACTED]@bob",
+            ),
+        ] {
+            let (out, _) = scrub_secrets(input);
+            assert_eq!(out, expected, "{input}");
+        }
     }
 }
