@@ -1,42 +1,10 @@
 use std::path::Path;
 use std::process::Command;
-use std::sync::{LazyLock, Mutex};
 
 use ironmem::review_diff::{
     build_review_diff, expand_review_diff, ReviewDiffRequest, ReviewDiffSource,
 };
 use tempfile::TempDir;
-
-static GIT_ENV_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-
-struct ScopedEnvVars {
-    previous: Vec<(&'static str, Option<std::ffi::OsString>)>,
-}
-
-impl ScopedEnvVars {
-    fn set(values: &[(&'static str, &str)]) -> Self {
-        let previous = values
-            .iter()
-            .map(|(key, value)| {
-                let previous = std::env::var_os(key);
-                std::env::set_var(key, value);
-                (*key, previous)
-            })
-            .collect();
-        Self { previous }
-    }
-}
-
-impl Drop for ScopedEnvVars {
-    fn drop(&mut self) {
-        for (key, previous) in &self.previous {
-            match previous {
-                Some(value) => std::env::set_var(key, value),
-                None => std::env::remove_var(key),
-            }
-        }
-    }
-}
 
 struct DiffFixture {
     tempdir: TempDir,
@@ -177,7 +145,24 @@ fn git_output(repo: &Path, args: impl IntoIterator<Item = impl AsRef<std::ffi::O
     String::from_utf8(output.stdout).expect("fixture git output should be UTF-8")
 }
 
+/// Remove git's environment from a fixture's command. The redirecting
+/// variables go unconditionally, so one set on the process after this call
+/// is not inherited either; the sweep removes any other `GIT_*` set now.
 fn scrub_git_environment(command: &mut Command) {
+    for key in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_CONFIG",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_SYSTEM",
+        "GIT_CONFIG_NOSYSTEM",
+        "GIT_CONFIG_COUNT",
+    ] {
+        command.env_remove(key);
+    }
     for (key, _) in std::env::vars_os() {
         if key
             .to_string_lossy()
@@ -286,9 +271,13 @@ fn range_rejects_option_like_revisions_before_git_executes() {
     );
 }
 
+/// An inherited `GIT_DIR`, `GIT_WORK_TREE` and `GIT_CONFIG_*` must not
+/// redirect review-diff away from its `--repo`. They are put on the `ironmem`
+/// child process, which inherits them as it would from a hook, and never on
+/// this test process, where they would redirect every other test thread's git
+/// while set.
 #[test]
 fn review_diff_ignores_inherited_git_repository_and_config_overrides() {
-    let _env = GIT_ENV_MUTEX.lock().expect("git env lock");
     let intended = fixture();
     let hostile = tempfile::tempdir().expect("hostile repo");
     git(hostile.path(), ["init"]);
@@ -297,22 +286,29 @@ fn review_diff_ignores_inherited_git_repository_and_config_overrides() {
         ["config", "user.email", "hostile@example.test"],
     );
     git(hostile.path(), ["config", "user.name", "Hostile Git Test"]);
+    git(hostile.path(), ["config", "commit.gpgsign", "false"]);
+    git(hostile.path(), ["config", "core.hooksPath", "/dev/null"]);
     std::fs::write(hostile.path().join("hostile.txt"), "hostile\n").expect("write hostile");
     git(hostile.path(), ["add", "."]);
     git(hostile.path(), ["commit", "-m", "hostile"]);
     let expected = intended.source();
-    let hostile_git_dir = hostile.path().join(".git");
-    let _overrides = ScopedEnvVars::set(&[
-        ("GIT_DIR", hostile_git_dir.to_string_lossy().as_ref()),
-        ("GIT_WORK_TREE", hostile.path().to_string_lossy().as_ref()),
-        ("GIT_CONFIG_COUNT", "1"),
-        ("GIT_CONFIG_KEY_0", "core.quotePath"),
-        ("GIT_CONFIG_VALUE_0", "false"),
-    ]);
-
-    let expanded = expand_review_diff(&intended.request(), "alpha.txt", None)
-        .expect("request repo must win over inherited Git overrides");
-    assert!(expected.contains(&expanded));
+    let output = review_diff_command(&intended)
+        .arg("--expand-file")
+        .arg("alpha.txt")
+        .env("GIT_DIR", hostile.path().join(".git"))
+        .env("GIT_WORK_TREE", hostile.path())
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "core.quotePath")
+        .env("GIT_CONFIG_VALUE_0", "false")
+        .output()
+        .expect("review-diff CLI should start");
+    assert!(
+        output.status.success(),
+        "request repo must win over inherited Git overrides: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let expanded = String::from_utf8(output.stdout).expect("CLI stdout should be UTF-8");
+    assert!(expected.contains(expanded.trim_end()), "{expanded}");
     assert!(expanded.contains("alpha.txt section 1 head changed payload"));
     assert!(!expanded.contains("hostile"));
 }

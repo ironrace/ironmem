@@ -60,6 +60,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **More git lookups ignore an inherited `GIT_DIR` reliably.** The session
+  hooks' workspace branch and repository-name lookup and `ironmem review-diff`
+  now use the shared git scrub, which removes the repository-selecting
+  variables (`GIT_DIR`, `GIT_WORK_TREE`, `GIT_CONFIG_*` and the rest)
+  unconditionally rather than only those set when the command was built. The
+  symbol-graph indexer's worktree check and HEAD read did not scrub git's
+  environment at all, so an inherited `GIT_DIR` could make them index or
+  report another repository; they now scrub too.
 - **Linux: a process whose main thread has exited is no longer missed.** A
   process whose main thread called `pthread_exit` while another thread runs
   shows `Zl` in `ps`, and its `/proc/<pid>/cwd` is gone, yet it still runs.

@@ -419,7 +419,17 @@ fn resolve_transcript_context(
 /// return `None`: hook attribution must remain absent rather than guessing a
 /// session from another branch.
 fn current_workspace_branch(workspace_root: &Path) -> Option<String> {
-    workspace_git_output(workspace_root, &["branch", "--show-current"])
+    current_workspace_branch_with(workspace_root, &[])
+}
+
+/// [`current_workspace_branch`], with `inherited` variables placed on git's
+/// own command before the scrub, where an inherited environment would reach
+/// it: a test's hostile `GIT_DIR`, never the whole process's.
+fn current_workspace_branch_with(
+    workspace_root: &Path,
+    inherited: &[(&str, &std::ffi::OsStr)],
+) -> Option<String> {
+    workspace_git_output(workspace_root, &["branch", "--show-current"], inherited)
 }
 
 /// The repository's name, for a handoff wing: the main worktree's directory,
@@ -429,6 +439,7 @@ fn repository_name(workspace_root: &Path) -> Option<String> {
     let common_dir = workspace_git_output(
         workspace_root,
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        &[],
     )
     .map(PathBuf::from);
     let repo_dir = match common_dir {
@@ -443,22 +454,22 @@ fn repository_name(workspace_root: &Path) -> Option<String> {
 }
 
 /// Run `git -C <workspace_root> <args>` and return its trimmed stdout; `None`
-/// on failure, non-UTF-8 or empty output.
-fn workspace_git_output(workspace_root: &Path, args: &[&str]) -> Option<String> {
-    let mut command = Command::new("git");
+/// on failure, non-UTF-8 or empty output. `inherited` is set on git's command
+/// before the scrub ([`current_workspace_branch_with`]); empty in production.
+fn workspace_git_output(
+    workspace_root: &Path,
+    args: &[&str],
+    inherited: &[(&str, &std::ffi::OsStr)],
+) -> Option<String> {
     // Git treats GIT_* variables as repository-selection and configuration
     // overrides. Retain the normal process environment (especially PATH) but
     // remove every Git override so a hook's inherited environment cannot point
-    // this workspace lookup at another repository.
-    for (key, _) in std::env::vars_os() {
-        if key
-            .to_string_lossy()
-            .to_ascii_uppercase()
-            .starts_with("GIT_")
-        {
-            command.env_remove(key);
-        }
-    }
+    // this workspace lookup at another repository. The shared scrub removes
+    // the redirecting ones unconditionally, so one set after the scrub is not
+    // inherited either.
+    let mut command = Command::new("git");
+    command.envs(inherited.iter().copied());
+    crate::mcp::tools::scrub_git_environment(&mut command);
     let output = command
         .arg("-C")
         .arg(workspace_root)
@@ -2768,20 +2779,11 @@ mod tests {
     }
 
     fn git_test_repo(root: &Path, args: &[&str]) {
+        // Scrubbed unconditionally: a `GIT_DIR` set anywhere in this process
+        // (by any test thread) would otherwise make this `git init`/`commit`
+        // operate on the wrong repository despite the explicit `-C` target.
         let mut command = std::process::Command::new("git");
-        // Tests that exercise inherited Git overrides mutate `GIT_DIR` for
-        // their subprocess assertion. A parallel temporary-repo setup must
-        // not inherit that override, or its `git init`/`commit` operates on
-        // the wrong repository despite the explicit `-C` target.
-        for (key, _) in std::env::vars_os() {
-            if key
-                .to_string_lossy()
-                .to_ascii_uppercase()
-                .starts_with("GIT_")
-            {
-                command.env_remove(key);
-            }
-        }
+        crate::mcp::tools::scrub_git_environment(&mut command);
         let output = command.arg("-C").arg(root).args(args).output().unwrap();
         assert!(
             output.status.success(),
@@ -2898,9 +2900,12 @@ mod tests {
         assert!(collab_line(&app, &root).is_none());
     }
 
+    /// An inherited `GIT_DIR` reaches git's command the way one placed on
+    /// that command does, and the production scrub must remove it. It is put
+    /// on the child, never on the process: a process-wide `GIT_DIR` would
+    /// redirect every other test thread's git while it is set.
     #[test]
     fn current_workspace_branch_ignores_inherited_git_dir() {
-        let _env = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let temp = tempfile::tempdir().unwrap();
         let intended = temp.path().join("intended");
         let injected = temp.path().join("injected");
@@ -2908,9 +2913,10 @@ mod tests {
         init_git_test_repo(&injected);
         git_test_repo(&injected, &["checkout", "-b", "injected-branch"]);
 
-        let _git_dir = ScopedEnvVar::set("GIT_DIR", injected.join(".git"));
+        let injected_git_dir = injected.join(".git");
         assert_eq!(
-            current_workspace_branch(&intended).as_deref(),
+            current_workspace_branch_with(&intended, &[("GIT_DIR", injected_git_dir.as_os_str())])
+                .as_deref(),
             Some("main"),
             "the workspace branch must never be selected from inherited GIT_DIR"
         );

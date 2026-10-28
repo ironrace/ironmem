@@ -1624,24 +1624,22 @@ fn require_checkpoint_proof(
 /// must call it before `.output()`.
 ///
 /// Widened from `pub(super)` because the two `code_maps` spawns were the
-/// remaining exposure, and it was not theoretical: this module's own test
-/// fixtures set `GIT_DIR`/`GIT_WORK_TREE` process-wide (see `ScopedGitEnv`),
-/// and `cargo test` runs the lib binary's tests on parallel threads — so an
-/// unscrubbed `git rev-parse --show-toplevel` beside them intermittently
-/// resolved to the fixture's repo instead of its own `current_dir`, failing
-/// two `code_maps` tests at random. The mutex `ScopedGitEnv` holds cannot help
-/// there: it serializes the tests that *set* the variables, not the unrelated
-/// ones that merely inherit them.
+/// remaining exposure, and it was not theoretical: this module's test
+/// fixtures once set `GIT_DIR`/`GIT_WORK_TREE` process-wide, and `cargo test`
+/// runs the lib binary's tests on parallel threads — so an unscrubbed
+/// `git rev-parse --show-toplevel` beside them intermittently resolved to the
+/// fixture's repo instead of its own `current_dir`, failing two `code_maps`
+/// tests at random. No test sets a `GIT_*` variable on the process any more
+/// (`git_env_scan` fails if one does); the hostile-environment tests put it
+/// on the child ([`scrubbed_git`]).
 ///
 /// The removal is recorded in two passes, and the first one is what makes the
 /// guarantee unconditional. `Command` applies recorded removals against the
 /// environment as it exists at *spawn* time, so a sweep of `vars_os()` alone
 /// only strips what happened to be set at scrub time — a `GIT_DIR` that
-/// appears between the sweep and `.output()` is inherited, which is exactly
-/// the race this module's own `ScopedGitEnv` fixtures run: they set `GIT_*`
-/// process-wide while `cargo test` runs other threads' git calls beside them.
-/// `env_remove` records the removal whether or not the variable is currently
-/// set, so naming the redirecting variables outright ([`REDIRECTING_GIT_VARS`])
+/// appears between the sweep and `.output()` is inherited. `env_remove`
+/// records the removal whether or not the variable is currently set, so
+/// naming the redirecting variables outright ([`REDIRECTING_GIT_VARS`])
 /// closes that window. The sweep still runs afterward, for anything outside
 /// that list that is already set.
 pub(crate) fn scrub_git_environment(command: &mut Command) {
@@ -1684,6 +1682,19 @@ const REDIRECTING_GIT_VARS: [&str; 15] = [
     "GIT_CONFIG_COUNT",
 ];
 
+/// The git command this module's head checks run: `inherited` variables set
+/// on it first, where an inherited environment would reach the child (a
+/// test's hostile `GIT_DIR`; empty in production), then
+/// [`scrub_git_environment`]. So a test proves the production scrub removes
+/// what an inherited environment carries without ever setting a variable on
+/// the whole process, which would redirect every other test thread's git.
+fn scrubbed_git(inherited: &[(&str, &std::ffi::OsStr)]) -> Command {
+    let mut command = Command::new("git");
+    command.envs(inherited.iter().copied());
+    scrub_git_environment(&mut command);
+    command
+}
+
 /// Refuse a reported head that is not a real, git-verified descendant of the
 /// session's last recorded head.
 ///
@@ -1714,6 +1725,18 @@ fn validate_global_review_head_advance(
     repo_path: &str,
     last_head_sha: &str,
     head_sha: &str,
+) -> Result<(), MemoryError> {
+    validate_global_review_head_advance_with(repo_path, last_head_sha, head_sha, &[])
+}
+
+/// [`validate_global_review_head_advance`], its git commands built by
+/// [`scrubbed_git`] with `inherited` (a test's hostile environment; empty in
+/// production).
+fn validate_global_review_head_advance_with(
+    repo_path: &str,
+    last_head_sha: &str,
+    head_sha: &str,
+    inherited: &[(&str, &std::ffi::OsStr)],
 ) -> Result<(), MemoryError> {
     // Both revisions must *look like* object names before git is allowed to
     // resolve them. `git merge-base --is-ancestor` accepts any revision
@@ -1824,12 +1847,10 @@ fn validate_global_review_head_advance(
              comparison skipped, existence check only (session seeded before \
              the #284 seed-site shape checks)"
         );
-        return validate_head_sha_exists(repo_path, head_sha);
+        return validate_head_sha_exists(repo_path, head_sha, inherited);
     }
 
-    let mut command = Command::new("git");
-    scrub_git_environment(&mut command);
-    let output = command
+    let output = scrubbed_git(inherited)
         .args([
             "-C",
             repo_path,
@@ -1911,11 +1932,13 @@ fn validate_global_review_head_advance(
 /// separator (there `--` guards a leading `-`; here it would make git read the
 /// argument as a pathspec and report every sha as unresolvable) and why
 /// `^{commit}` cannot be caller-supplied syntax.
-fn validate_head_sha_exists(repo_path: &str, head_sha: &str) -> Result<(), MemoryError> {
+fn validate_head_sha_exists(
+    repo_path: &str,
+    head_sha: &str,
+    inherited: &[(&str, &std::ffi::OsStr)],
+) -> Result<(), MemoryError> {
     let revision = format!("{head_sha}^{{commit}}");
-    let mut command = Command::new("git");
-    scrub_git_environment(&mut command);
-    let output = command
+    let output = scrubbed_git(inherited)
         .args([
             "-C",
             repo_path,
@@ -1972,9 +1995,16 @@ fn validate_head_sha_exists(repo_path: &str, head_sha: &str) -> Result<(), Memor
 /// check" into one answer and report `diverged: false` for an unreadable repo.
 /// See [`HeadCheck`].
 pub(super) fn git_head_sha(repo_path: &str) -> Result<String, MemoryError> {
-    let mut command = Command::new("git");
-    scrub_git_environment(&mut command);
-    let output = command
+    git_head_sha_with(repo_path, &[])
+}
+
+/// [`git_head_sha`], its git command built by [`scrubbed_git`] with
+/// `inherited` (a test's hostile environment; empty in production).
+fn git_head_sha_with(
+    repo_path: &str,
+    inherited: &[(&str, &std::ffi::OsStr)],
+) -> Result<String, MemoryError> {
+    let output = scrubbed_git(inherited)
         .args(["-C", repo_path, "rev-parse", "HEAD"])
         .output()
         .map_err(|err| {
@@ -10521,51 +10551,6 @@ mod tests {
         crate::collab::CollabCheckpoint::from_json(&payload).unwrap()
     }
 
-    /// Serializes the tests below that mutate `GIT_*` process-wide. Separate
-    /// from `METRICS_ENV_LOCK` because it guards a different variable family;
-    /// sharing one lock would couple two unrelated suites.
-    static GIT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Sets `GIT_*` overrides for the duration of a test and restores them on
-    /// drop, holding [`GIT_ENV_LOCK`] throughout — `std::env::set_var` is
-    /// process-global, so an unsynchronized test would leak into whatever runs
-    /// beside it.
-    struct ScopedGitEnv {
-        previous: Vec<(String, Option<std::ffi::OsString>)>,
-        _guard: std::sync::MutexGuard<'static, ()>,
-    }
-
-    impl ScopedGitEnv {
-        fn set(vars: &[(&str, &str)]) -> Self {
-            let guard = GIT_ENV_LOCK
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            let previous = vars
-                .iter()
-                .map(|(key, value)| {
-                    let old = std::env::var_os(key);
-                    std::env::set_var(key, value);
-                    ((*key).to_string(), old)
-                })
-                .collect();
-            Self {
-                previous,
-                _guard: guard,
-            }
-        }
-    }
-
-    impl Drop for ScopedGitEnv {
-        fn drop(&mut self) {
-            for (key, old) in &self.previous {
-                match old {
-                    Some(value) => std::env::set_var(key, value),
-                    None => std::env::remove_var(key),
-                }
-            }
-        }
-    }
-
     /// A second repo whose history is genuinely disjoint from
     /// [`git_repo_with_two_commits`]'s.
     ///
@@ -10608,16 +10593,16 @@ mod tests {
              redirected read would return the right answer by accident"
         );
 
+        // Put on git's own command, where an inherited environment reaches
+        // it: never on the process, where it would redirect every other test
+        // thread's git while it is set.
         let hostile_git_dir = hostile_dir.path().join(".git");
-        let _overrides = ScopedGitEnv::set(&[
-            ("GIT_DIR", hostile_git_dir.to_string_lossy().as_ref()),
-            (
-                "GIT_WORK_TREE",
-                hostile_dir.path().to_string_lossy().as_ref(),
-            ),
-        ]);
+        let inherited = [
+            ("GIT_DIR", hostile_git_dir.as_os_str()),
+            ("GIT_WORK_TREE", hostile_dir.path().as_os_str()),
+        ];
 
-        let read = git_head_sha(&intended_dir.path().to_string_lossy()).unwrap();
+        let read = git_head_sha_with(&intended_dir.path().to_string_lossy(), &inherited).unwrap();
         assert_eq!(
             read, intended_head,
             "the repo_path argument must win over inherited Git overrides"
@@ -10637,22 +10622,21 @@ mod tests {
             "fixture precondition: the hostile repo must not share history"
         );
 
+        // On git's own command, as in the HEAD-read test above.
         let hostile_git_dir = hostile_dir.path().join(".git");
-        let _overrides = ScopedGitEnv::set(&[
-            ("GIT_DIR", hostile_git_dir.to_string_lossy().as_ref()),
-            (
-                "GIT_WORK_TREE",
-                hostile_dir.path().to_string_lossy().as_ref(),
-            ),
-        ]);
+        let inherited = [
+            ("GIT_DIR", hostile_git_dir.as_os_str()),
+            ("GIT_WORK_TREE", hostile_dir.path().as_os_str()),
+        ];
 
         // `second` descends from `first` in the intended repo. Neither sha
         // exists in the hostile one, so a redirected command cannot answer
         // this correctly — it errors on an unknown revision instead.
-        validate_global_review_head_advance(
+        validate_global_review_head_advance_with(
             &intended_dir.path().to_string_lossy(),
             &first,
             &second,
+            &inherited,
         )
         .expect("the repo_path argument must win over inherited Git overrides");
     }
