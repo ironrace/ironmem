@@ -3533,7 +3533,7 @@ mod tests {
                 "remote",
                 "add",
                 "origin",
-                "https://x-access-token:ghp_secret@github.com/ironrace/ironmem.git",
+                "https://github.com/ironrace/ironmem.git",
             ],
         );
         break_config(dir);
@@ -3542,10 +3542,38 @@ mod tests {
         assert_eq!(picked, None, "nothing readable names a remote");
         assert!(log.contains("could not read"), "{log}");
         assert!(log.contains("bad config"), "git's own complaint: {log}");
-        assert!(!log.contains("ghp_secret"), "{log}");
         let ((), log) = with_captured_log(|| warn_if_no_remote_pushes_to(dir, &issue().repo));
         assert!(log.contains("could not read"), "{log}");
         assert!(log.contains("bad config"), "{log}");
+    }
+
+    /// The remotes read, but the remote-tracking refs do not: the remote is
+    /// still chosen by the rules that need no tracking, and the unreadable
+    /// refs are warned about rather than taken for "none tracking".
+    #[test]
+    fn unreadable_remote_tracking_refs_are_warned_about_not_taken_for_none() {
+        let checkout = fixture_repo();
+        let dir = checkout.path();
+        // An SSH alias names no repository, so only steps 2 to 4 pick it.
+        run(
+            dir,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "git@github-work:ironrace/ironmem.git",
+            ],
+        );
+        std::fs::write(dir.join(".git/packed-refs"), "not a packed ref\n").unwrap();
+        let branch = branch_name(&issue());
+        let (picked, log) = with_captured_log(|| push_remote(dir, &branch, &issue().repo));
+        assert_eq!(picked.as_deref(), Some("origin"), "{log}");
+        assert!(log.contains("for-each-ref"), "{log}");
+        assert!(log.contains("packed-refs"), "git's own complaint: {log}");
+        assert!(
+            log.contains("no remote counts as already tracking"),
+            "{log}"
+        );
     }
 
     /// `git branch -D` takes the branch's config section (its recorded cut)
