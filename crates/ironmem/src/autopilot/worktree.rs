@@ -1928,6 +1928,11 @@ pub enum WorktreeRemoval {
     /// issue takes the create path rather than the "registered but missing"
     /// repair path.
     Absent,
+    /// Removal was not attempted: a controller holds the issue, so its
+    /// worktree may be in use. Left in place for a later pass to retry
+    /// once nothing holds the issue (the `Absent` it used to report hid
+    /// that a worktree remains).
+    Skipped { path: String },
     /// The worktree has uncommitted changes, so it was left alone.
     ///
     /// **Refusing is the point.** Cleanup runs after a merge, and a dirty

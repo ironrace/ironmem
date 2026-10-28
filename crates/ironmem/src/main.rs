@@ -1293,6 +1293,9 @@ fn print_advance_report(report: &ironmem::autopilot::advance::AdvanceReport) {
             match &cleanup.worktree {
                 WorktreeRemoval::Removed { path } => println!("    worktree removed: {path}"),
                 WorktreeRemoval::Absent => println!("    worktree: nothing to remove"),
+                WorktreeRemoval::Skipped { path } => println!(
+                    "    worktree SKIPPED (a controller holds the issue): {path} is left in place"
+                ),
                 WorktreeRemoval::DirtyRefused { path } => println!(
                     "    worktree KEPT (uncommitted changes the merge did not include): {path}"
                 ),

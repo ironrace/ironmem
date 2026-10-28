@@ -1252,21 +1252,32 @@ fn pr_body(candidate: &Candidate, base: &str) -> String {
 /// listing this pass is built from and nothing brings it back. Whatever this
 /// call leaves behind — a refused dirty worktree, a drawer a storage error
 /// kept — is left behind for good, which is why the error is reported on
-/// stdout rather than only stored.
+/// stdout rather than only stored. One exception is named as such: cleanup
+/// skipped because a controller holds the issue frees its dispatch state
+/// later (the Lead's release step) but never removes its worktree, so that
+/// worktree's removal is reported as [`WorktreeRemoval::Skipped`] with the
+/// command that removes it by hand.
 fn clean_up(db: &Database, candidate: &Candidate, config: &AdvanceConfig) -> Cleanup {
     // Not while a controller holds the issue: it may be dispatching into the
     // worktree this would remove. Left for it, and said so.
     let _lock = match super::issue_lock::try_lock_issue(&candidate.repo_path, &candidate.issue) {
         Ok(super::issue_lock::IssueLockAttempt::Acquired(lock)) => lock,
         Ok(super::issue_lock::IssueLockAttempt::Held { path }) => {
+            let worktree = worktree::worktree_path(&config.worktree_root, &candidate.issue);
             return Cleanup {
                 dispatch_state_cleared: false,
-                worktree: WorktreeRemoval::Absent,
+                worktree: WorktreeRemoval::Skipped {
+                    path: worktree.to_string_lossy().into_owned(),
+                },
                 error: Some(format!(
-                    "cleanup skipped: {}",
-                    super::issue_lock::held_reason(&candidate.issue, &path)
+                    "cleanup skipped: {}; the worktree {} is left in place (a later \
+                     pass retries it while the issue is still listed, or remove it \
+                     with `git worktree remove {}` once no controller holds the issue)",
+                    super::issue_lock::held_reason(&candidate.issue, &path),
+                    worktree.display(),
+                    worktree.display()
                 )),
-            }
+            };
         }
         Err(e) => {
             return Cleanup {
@@ -2033,6 +2044,22 @@ mod tests {
                 .error
                 .as_deref()
                 .is_some_and(|e| e.contains("another controller holds issue")),
+            "{:?}",
+            cleanup.error
+        );
+        // R11: skipped is its own outcome, naming the worktree left
+        // behind and how to remove it, so a later pass can retry it.
+        let expected = worktree::worktree_path(roots.path(), &issue());
+        assert!(
+            matches!(&cleanup.worktree, WorktreeRemoval::Skipped { path } if path == &expected.to_string_lossy().to_string()),
+            "{:?}",
+            cleanup.worktree
+        );
+        assert!(
+            cleanup
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("git worktree remove")),
             "{:?}",
             cleanup.error
         );
