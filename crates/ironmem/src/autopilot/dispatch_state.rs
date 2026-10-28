@@ -249,9 +249,12 @@ pub fn upsert_dispatch_state(db: &Database, state: &DispatchState) -> Result<Str
 
 /// [`upsert_dispatch_state`], but only while the drawer still holds
 /// `expected` (`None`: no drawer at all), compared as read back. Read and
-/// write share one `BEGIN IMMEDIATE` transaction, so of two runs that both
-/// judged the same state, only the first to write it wins. Returns `false`,
-/// writing nothing, when the drawer changed.
+/// write share one `BEGIN IMMEDIATE` transaction, so of two writers that
+/// judged the same state and write *different* states, only the first wins.
+/// It compares content only: two writes of the same state both pass, which
+/// is why a run claims through [`claim_if_unchanged`], whose owner token
+/// makes every run's writes its own. Returns `false`, writing nothing, when
+/// the drawer changed.
 pub fn upsert_dispatch_state_if_unchanged(
     db: &Database,
     expected: Option<&DispatchState>,
