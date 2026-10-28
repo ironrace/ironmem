@@ -988,6 +988,15 @@ struct KinfoProc {
 /// record` checks them against `PROC_PIDTBSDINFO` for this process).
 #[cfg(target_os = "macos")]
 fn kinfo_proc(pid: u32) -> Result<Option<KinfoProc>, String> {
+    Ok(kinfo_proc_record(pid)?.and_then(|(record, zombie)| (!zombie).then_some(record)))
+}
+
+/// [`kinfo_proc`], keeping a zombie's record (`SZOMB`), marked `true`: its
+/// start time, parent and group are still its own (macOS `ps` lists a
+/// zombie with its start time), which [`root_observation`] needs for an
+/// invocation root that has exited but is not yet reaped.
+#[cfg(target_os = "macos")]
+fn kinfo_proc_record(pid: u32) -> Result<Option<(KinfoProc, bool)>, String> {
     const SIZE: usize = 648;
     const P_STARTTIME_SEC: usize = 0;
     const P_STARTTIME_USEC: usize = 8;
@@ -1043,15 +1052,13 @@ fn kinfo_proc(pid: u32) -> Result<Option<KinfoProc>, String> {
     if record_pid != pid_arg {
         return Err("kernel process identity mismatch".into());
     }
-    if buffer[P_STAT] == SZOMB {
-        return Ok(None);
-    }
+    let zombie = buffer[P_STAT] == SZOMB;
     let (Ok(seconds), Ok(micros)) = (u64::try_from(seconds), u64::try_from(micros)) else {
         return Err("invalid process birth identity".into());
     };
     let ppid = i32::from_ne_bytes(bytes4(E_PPID));
     let pgid = i32::from_ne_bytes(bytes4(E_PGID));
-    Ok(Some(KinfoProc {
+    let record = KinfoProc {
         process: KernelProcess {
             pid,
             ppid: u32::try_from(ppid).map_err(|_| "invalid process parent")?,
@@ -1060,7 +1067,8 @@ fn kinfo_proc(pid: u32) -> Result<Option<KinfoProc>, String> {
         },
         ruid: u32::from_ne_bytes(bytes4(P_RUID)),
         euid: u32::from_ne_bytes(bytes4(CR_UID)),
-    }))
+    };
+    Ok(Some((record, zombie)))
 }
 
 /// `pid`'s real and effective user IDs, or `None` when they cannot be read.
@@ -1267,27 +1275,25 @@ fn linux_cwd(
 /// after the LAST `)`. Linux only, but tested everywhere.
 #[cfg(any(target_os = "linux", test))]
 fn kernel_process_from_stat(pid: u32, text: &str) -> Result<Option<KernelProcess>, String> {
-    proc_stat_record(pid, text, false)
+    Ok(proc_stat_record(pid, text)?
+        .filter(|record| !record.exited)
+        .map(|record| record.process))
 }
 
 /// [`kernel_process_from_stat`] for the invocation root straight after
-/// spawn ([`ProcessTracker::adopt_root`]): a root that has already exited is
-/// our unreaped child's zombie, whose PID it reserves and whose record
-/// (birth, parent, group) is still its own, so it is read like a running
-/// one. A dead task (`X`) is still gone. Linux only, but tested everywhere.
+/// spawn ([`ProcessTracker::adopt_root`]): a zombie's record is returned,
+/// marked exited, rather than counted gone ([`adoptable`] decides). A dead
+/// task (`X`) is still gone. Linux only, but tested everywhere.
 #[cfg(any(target_os = "linux", test))]
-fn root_process_from_stat(pid: u32, text: &str) -> Result<Option<KernelProcess>, String> {
-    proc_stat_record(pid, text, true)
+fn root_process_from_stat(pid: u32, text: &str) -> Result<Option<RootRecord>, String> {
+    proc_stat_record(pid, text)
 }
 
-/// The parse behind [`kernel_process_from_stat`]; `zombie_is_ours` reads a
-/// zombie's record rather than count it exited.
+/// The parse behind [`kernel_process_from_stat`]: the record, marked
+/// exited for a zombie (`Z` with at most one thread), or `None` for a dead
+/// task (`X`).
 #[cfg(any(target_os = "linux", test))]
-fn proc_stat_record(
-    pid: u32,
-    text: &str,
-    zombie_is_ours: bool,
-) -> Result<Option<KernelProcess>, String> {
+fn proc_stat_record(pid: u32, text: &str) -> Result<Option<RootRecord>, String> {
     let fields = text
         .rsplit_once(')')
         .ok_or("malformed proc stat")?
@@ -1303,20 +1309,18 @@ fn proc_stat_record(
     if record_pid != pid {
         return Err("kernel process identity mismatch".into());
     }
-    match fields.first() {
+    let exited = match fields.first() {
         Some(&"X") => return Ok(None),
-        Some(&"Z") if !zombie_is_ours => {
+        Some(&"Z") => {
             let threads: u64 = fields
                 .get(17)
                 .ok_or("missing proc thread count")?
                 .parse()
                 .map_err(|_| "invalid proc thread count")?;
-            if threads <= 1 {
-                return Ok(None);
-            }
+            threads <= 1
         }
-        _ => {}
-    }
+        _ => false,
+    };
     let start = fields
         .get(19)
         .ok_or("missing proc birth identity")?
@@ -1332,11 +1336,14 @@ fn proc_stat_record(
         .ok_or("missing proc group")?
         .parse()
         .map_err(|_| "invalid proc group")?;
-    Ok(Some(KernelProcess {
-        pid,
-        ppid,
-        pgid,
-        birth: Birth(start, 0),
+    Ok(Some(RootRecord {
+        process: KernelProcess {
+            pid,
+            ppid,
+            pgid,
+            birth: Birth(start, 0),
+        },
+        exited,
     }))
 }
 
@@ -1355,11 +1362,19 @@ fn proc_stat_text(pid: u32) -> Result<Option<String>, String> {
     }
 }
 
+/// A kernel record read for the invocation root, which may already have
+/// exited ([`root_observation`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RootRecord {
+    process: KernelProcess,
+    /// Its zombie: it has exited but is not yet reaped.
+    exited: bool,
+}
+
 /// [`kernel_observation`] for the invocation root straight after spawn,
-/// which on Linux reads an already-exited root's zombie record
-/// ([`root_process_from_stat`]). macOS's `kinfo_proc` counts it gone, as it
-/// always has.
-fn root_observation(pid: u32) -> Result<Option<KernelProcess>, String> {
+/// keeping a zombie's record, marked exited, rather than counting it gone,
+/// on macOS ([`kinfo_proc_record`]) and Linux ([`root_process_from_stat`]).
+fn root_observation(pid: u32) -> Result<Option<RootRecord>, String> {
     #[cfg(target_os = "linux")]
     {
         match proc_stat_text(pid)? {
@@ -1367,10 +1382,31 @@ fn root_observation(pid: u32) -> Result<Option<KernelProcess>, String> {
             None => Ok(None),
         }
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
     {
-        kernel_observation(pid)
+        Ok(kinfo_proc_record(pid)?.map(|(record, zombie)| RootRecord {
+            process: record.process,
+            exited: zombie,
+        }))
     }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        Ok(kernel_observation(pid)?.map(|process| RootRecord {
+            process,
+            exited: false,
+        }))
+    }
+}
+
+/// The root's record to adopt from what [`root_observation`] read, if any.
+/// An exited root is adopted only while it is still our own unreaped child
+/// (its parent is `me`, this process): its zombie then holds the PID, so the
+/// record is the root's. A caller that had already reaped it could
+/// otherwise adopt a reused PID's record.
+fn adoptable(root_pid: u32, me: u32, record: Option<RootRecord>) -> Option<KernelProcess> {
+    let record = record?;
+    (record.process.pid == root_pid && (!record.exited || record.process.ppid == me))
+        .then_some(record.process)
 }
 
 /// The operator's shared ironmem daemon, which supervision never owns (see
@@ -2725,8 +2761,13 @@ impl ProcessTracker {
         if self.known.iter().any(|(r, _)| r.pid == self.root_pid) {
             return;
         }
-        match root_observation(self.root_pid) {
-            Ok(Some(root)) if root.pid == self.root_pid => {
+        let read = root_observation(self.root_pid);
+        match read
+            .as_ref()
+            .ok()
+            .and_then(|record| adoptable(self.root_pid, std::process::id(), *record))
+        {
+            Some(root) => {
                 let row = ProcessRow {
                     pid: root.pid,
                     ppid: root.ppid,
@@ -2738,9 +2779,9 @@ impl ProcessTracker {
             }
             // Not fatal: the first sample may still bind the root; without
             // either, completion holds as unproven.
-            outcome => tracing::debug!(
+            None => tracing::debug!(
                 pid = self.root_pid,
-                ?outcome,
+                outcome = ?read,
                 "could not read the invocation root's kernel record at spawn"
             ),
         }
@@ -4265,6 +4306,59 @@ pub(crate) mod tests {
         drop(child);
     }
 
+    /// An exited root's record is adopted only while it is still our own
+    /// unreaped child (its parent is this process): a caller that had
+    /// already reaped it could otherwise adopt a reused PID's record. A
+    /// running root's record is adopted as before.
+    #[test]
+    fn an_exited_root_is_adopted_only_as_our_own_child() {
+        let me = 4242;
+        let record = |pid, ppid| KernelProcess {
+            pid,
+            ppid,
+            pgid: 42,
+            birth: Birth(7, 0),
+        };
+        let root = |process, exited| Some(RootRecord { process, exited });
+        assert_eq!(
+            adoptable(42, me, root(record(42, me), true)),
+            Some(record(42, me))
+        );
+        assert_eq!(adoptable(42, me, root(record(42, 1), true)), None);
+        assert_eq!(
+            adoptable(42, me, root(record(42, 1), false)),
+            Some(record(42, 1))
+        );
+        assert_eq!(adoptable(42, me, root(record(43, me), false)), None);
+        assert_eq!(adoptable(42, me, None), None);
+    }
+
+    /// A real root that exits before adoption reads straight after spawn
+    /// is still adopted, with the birth it had while running, on macOS as on
+    /// Linux: its zombie is our unreaped child.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn a_root_that_exited_before_adoption_is_adopted_with_its_birth() {
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "read line"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let running = kernel_birth(pid).unwrap().expect("it runs");
+        drop(child.stdin.take());
+        // Exited, not reaped: every ordinary read now counts it gone.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while kernel_birth(pid).unwrap().is_some() {
+            assert!(std::time::Instant::now() < deadline, "it never exited");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let mut tracker = ProcessTracker::owning_every_descendant(pid);
+        tracker.adopt_root();
+        child.wait().unwrap();
+        assert_eq!(tracker.root_birth(), Some(running));
+    }
+
     /// The invocation root, read straight after spawn, is our unreaped
     /// child: if it has already exited, its zombie still holds its PID and
     /// its own record, so adoption reads its birth (as released Linux code
@@ -4273,20 +4367,25 @@ pub(crate) mod tests {
     fn an_exited_root_still_yields_its_record_for_adoption() {
         let zombie = proc_stat_line(42, "sh", 'Z');
         assert_eq!(kernel_process_from_stat(42, &zombie), Ok(None));
+        let record = KernelProcess {
+            pid: 42,
+            ppid: 300,
+            pgid: 42,
+            birth: Birth(12345, 0),
+        };
         assert_eq!(
             root_process_from_stat(42, &zombie),
-            Ok(Some(KernelProcess {
-                pid: 42,
-                ppid: 300,
-                pgid: 42,
-                birth: Birth(12345, 0),
+            Ok(Some(RootRecord {
+                process: record,
+                exited: true
             }))
         );
         assert_eq!(
-            root_process_from_stat(42, &proc_stat_line(42, "sh", 'S'))
-                .unwrap()
-                .map(|p| p.birth),
-            Some(Birth(12345, 0))
+            root_process_from_stat(42, &proc_stat_line(42, "sh", 'S')),
+            Ok(Some(RootRecord {
+                process: record,
+                exited: false
+            }))
         );
         assert_eq!(
             root_process_from_stat(42, &proc_stat_line(42, "sh", 'X')),
