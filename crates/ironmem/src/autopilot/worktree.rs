@@ -236,7 +236,11 @@ pub(crate) fn remotes_pushing_elsewhere<'a>(
 /// then miss the repository its pull request is opened in. It names the
 /// remotes, never their URLs, which may hold a token.
 pub(crate) fn warn_if_no_remote_pushes_to(dir: &Path, repo: &str) {
-    let listed = git(dir, &["remote", "-v"]).unwrap_or_default();
+    let listed = git_or_warn(
+        dir,
+        &["remote", "-v"],
+        "so whether one pushes to the issue's repository is not checked",
+    );
     let remotes = remote_push_urls(&listed);
     let remotes: Vec<(&str, &[&str])> = remotes
         .iter()
@@ -279,22 +283,45 @@ pub(crate) fn remote_push_urls(listing: &str) -> Vec<(&str, Vec<&str>)> {
     remotes
 }
 
+/// The trimmed stdout of git `args` in `dir`, or, when git fails, nothing,
+/// with a warning that names the command, git's complaint (scrubbed and
+/// bounded, [`bounded_stderr`]) and `consequence`. For the remote reads
+/// below, where an answer that cannot be read degrades to none rather than
+/// stopping the run, but must not pass for an empty list unseen.
+fn git_or_warn(dir: &Path, args: &[&str], consequence: &str) -> String {
+    git(dir, args).unwrap_or_else(|e| {
+        tracing::warn!(
+            command = %format!("git {}", args.join(" ")),
+            error = %e,
+            "autopilot could not read the checkout's remotes, {consequence}"
+        );
+        String::new()
+    })
+}
+
 /// [`pick_push_remote`] for `branch` of `repo` in the repository at `dir`,
 /// from each remote's effective push URLs ([`remote_push_urls`]). A remote
-/// list that cannot be read counts as none. The URLs, which may hold a
-/// token, are never logged.
+/// list that cannot be read counts as none, with a warning
+/// ([`git_or_warn`]). The URLs, which may hold a token, are never logged.
 pub(crate) fn push_remote(dir: &Path, branch: &str, repo: &str) -> Option<String> {
-    let listed = git(dir, &["remote", "-v"]).unwrap_or_default();
+    let listed = git_or_warn(
+        dir,
+        &["remote", "-v"],
+        "so the implementer's push names no remote",
+    );
     let remotes = remote_push_urls(&listed);
     let remotes: Vec<(&str, &[&str])> = remotes
         .iter()
         .map(|(name, urls)| (*name, urls.as_slice()))
         .collect();
-    let refs = git(
+    if remotes.is_empty() {
+        return None;
+    }
+    let refs = git_or_warn(
         dir,
         &["for-each-ref", "--format=%(refname)", "refs/remotes/"],
-    )
-    .unwrap_or_default();
+        "so no remote counts as already tracking the issue branch",
+    );
     let refs: std::collections::HashSet<&str> = refs.lines().collect();
     let tracking: Vec<&str> = remotes
         .iter()
@@ -3202,5 +3229,38 @@ mod tests {
             "exactly one `Command::new(\"git\")`, inside `git_command`; \
              every other call site must use it"
         );
+    }
+
+    /// Break `.git/config` so that every git command reading it fails.
+    fn break_config(repo: &Path) {
+        let config = repo.join(".git/config");
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        text.push_str("[unterminated\n");
+        std::fs::write(config, text).unwrap();
+    }
+
+    #[test]
+    fn an_unreadable_remote_list_is_warned_about_not_taken_for_none() {
+        let checkout = fixture_repo();
+        let dir = checkout.path();
+        run(
+            dir,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://x-access-token:ghp_secret@github.com/ironrace/ironmem.git",
+            ],
+        );
+        break_config(dir);
+        let branch = branch_name(&issue());
+        let (picked, log) = with_captured_log(|| push_remote(dir, &branch, &issue().repo));
+        assert_eq!(picked, None, "nothing readable names a remote");
+        assert!(log.contains("could not read"), "{log}");
+        assert!(log.contains("bad config"), "git's own complaint: {log}");
+        assert!(!log.contains("ghp_secret"), "{log}");
+        let ((), log) = with_captured_log(|| warn_if_no_remote_pushes_to(dir, &issue().repo));
+        assert!(log.contains("could not read"), "{log}");
+        assert!(log.contains("bad config"), "{log}");
     }
 }
