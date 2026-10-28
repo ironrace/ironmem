@@ -62,6 +62,81 @@ pub struct InvocationArtifacts {
     pub exit_path: String,
 }
 
+/// The files of one invocation directory, beside its `schema.json` marker:
+/// journal, final, stderr and exit, in [`InvocationArtifacts`] field order.
+const ARTIFACT_FILES: [&str; 4] = ["journal.jsonl", "final.json", "stderr.log", "exit.json"];
+
+// `DispatchState::validate` (layout) and recovery (common directory) call
+// these; until that wiring lands only the tests do.
+#[cfg_attr(not(test), allow(dead_code))]
+impl InvocationArtifacts {
+    /// Whether these paths are the layout [`prepare_artifacts`] makes for
+    /// `issue`: the schema marker is an Autopilot marker path
+    /// (`…/ironmem/autopilot/<slug>/<uuid>/schema.json`) naming `issue`'s
+    /// slug, its directory is named `invocation_id`, and the journal, final,
+    /// stderr and exit paths are that directory's fixed files. The paths are
+    /// stored as independent strings in the dispatch-state drawer, so a
+    /// forged or corrupt drawer could otherwise point recovery's reads (its
+    /// stderr goes into the reason) or settle's rename at any file.
+    pub(crate) fn check_layout(&self, issue: &IssueRef) -> Result<(), String> {
+        let schema = Path::new(&self.schema_path);
+        let slug = issue.slug();
+        if !super::process_tree::is_autopilot_marker_path(&self.schema_path)
+            || super::process_tree::marker_issue_slug(&self.schema_path) != Some(slug.as_str())
+        {
+            return Err(format!(
+                "invocation schema path {} is not an Autopilot invocation of {slug}",
+                self.schema_path
+            ));
+        }
+        let dir = schema
+            .parent()
+            .ok_or("invocation schema path has no directory")?;
+        if dir.file_name().and_then(|n| n.to_str()) != Some(self.invocation_id.as_str()) {
+            return Err(format!(
+                "invocation directory {} is not named for invocation {}",
+                dir.display(),
+                self.invocation_id
+            ));
+        }
+        for (path, name) in [
+            &self.journal_path,
+            &self.final_path,
+            &self.stderr_path,
+            &self.exit_path,
+        ]
+        .into_iter()
+        .zip(ARTIFACT_FILES)
+        {
+            if Path::new(path) != dir.join(name) {
+                return Err(format!(
+                    "invocation artifact {path} is not {name} in its directory {}",
+                    dir.display()
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether the invocation directory is under `worktree`'s common Git
+    /// directory, where [`prepare_artifacts`] puts it, as recovery reads
+    /// it: [`Self::check_layout`] alone accepts the same layout anywhere.
+    pub(crate) fn check_common_dir(&self, worktree: &Path) -> Result<(), String> {
+        let common = common_git_dir(worktree).map_err(|e| e.to_string())?;
+        let root = common.join("ironmem/autopilot");
+        if Path::new(&self.schema_path).starts_with(&root) {
+            Ok(())
+        } else {
+            Err(format!(
+                "invocation schema path {} is not under the common Git directory {} of {}",
+                self.schema_path,
+                common.display(),
+                worktree.display()
+            ))
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum InvocationRecovery {
     NoPriorInvocation,
@@ -317,12 +392,9 @@ pub(crate) fn discard_unlaunched(a: &InvocationArtifacts) {
     }
 }
 
-/// Allocate once, then persist these exact paths before spawning the dispatch.
-/// Reject unsupported paths before creating any artifact directories or files.
-pub fn prepare_artifacts(
-    worktree: &Path,
-    issue: &IssueRef,
-) -> Result<InvocationArtifacts, MemoryError> {
+/// `worktree`'s common Git directory, absolute, where every invocation's
+/// artifacts live (`<common>/ironmem/autopilot/<slug>/<uuid>/`).
+fn common_git_dir(worktree: &Path) -> Result<PathBuf, MemoryError> {
     let mut git = Command::new("git");
     git.args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
         .current_dir(worktree);
@@ -330,15 +402,25 @@ pub fn prepare_artifacts(
     let output = git.output()?;
     if !output.status.success() {
         return Err(validation(format!(
-            "cannot resolve common Git directory for invocation artifacts: {}",
+            "cannot resolve the common Git directory for invocation artifacts: {}",
             scrub_and_bound(&String::from_utf8_lossy(&output.stderr), 500).text
         )));
     }
     let common_dir = std::str::from_utf8(&output.stdout)
         .map_err(|_| validation("common Git directory is not UTF-8"))?
         .trim_end_matches(['\n', '\r']);
+    Ok(PathBuf::from(common_dir))
+}
+
+/// Allocate once, then persist these exact paths before spawning the dispatch.
+/// Reject unsupported paths before creating any artifact directories or files.
+pub fn prepare_artifacts(
+    worktree: &Path,
+    issue: &IssueRef,
+) -> Result<InvocationArtifacts, MemoryError> {
+    let common_dir = common_git_dir(worktree)?;
     let invocation_id = uuid::Uuid::new_v4().to_string();
-    let dir = Path::new(common_dir)
+    let dir = common_dir
         .join("ironmem/autopilot")
         .join(issue.slug())
         .join(&invocation_id);
@@ -354,10 +436,10 @@ pub fn prepare_artifacts(
     let a = InvocationArtifacts {
         invocation_id,
         schema_path: supported_path(&dir.join("schema.json"))?.into(),
-        journal_path: supported_path(&dir.join("journal.jsonl"))?.into(),
-        final_path: supported_path(&dir.join("final.json"))?.into(),
-        stderr_path: supported_path(&dir.join("stderr.log"))?.into(),
-        exit_path: supported_path(&dir.join("exit.json"))?.into(),
+        journal_path: supported_path(&dir.join(ARTIFACT_FILES[0]))?.into(),
+        final_path: supported_path(&dir.join(ARTIFACT_FILES[1]))?.into(),
+        stderr_path: supported_path(&dir.join(ARTIFACT_FILES[2]))?.into(),
+        exit_path: supported_path(&dir.join(ARTIFACT_FILES[3]))?.into(),
     };
     let mut schema = create_private(Path::new(&a.schema_path))?;
     schema.write_all(VERDICT_JSON_SCHEMA.as_bytes())?;
@@ -1605,6 +1687,55 @@ pub(crate) mod contract_tests {
             pids: &no_pids,
         }
     }
+    /// Every artifact path follows from the schema marker: one directory,
+    /// named for the invocation, under the issue's slug, with fixed file
+    /// names. A forged or corrupt dispatch state that names any other path
+    /// (another invocation's exit record, or `/etc/hosts` as its stderr) is
+    /// refused; so is a layout outside the worktree's common Git directory.
+    #[test]
+    fn artifact_paths_must_follow_the_invocation_layout() {
+        let (dir, spec) = setup();
+        let a = spec.invocation_artifacts.unwrap();
+        let issue = IssueRef::new("owner/repo", 42);
+        assert_eq!(a.check_layout(&issue), Ok(()));
+        assert_eq!(a.check_common_dir(dir.path()), Ok(()));
+        let invocation = Path::new(&a.schema_path).parent().unwrap().to_owned();
+        let other = invocation
+            .with_file_name("0f0e0d0c-0b0a-4908-8706-050403020100")
+            .join("exit.json");
+        let forged = [
+            InvocationArtifacts {
+                stderr_path: "/etc/hosts".into(),
+                ..a.clone()
+            },
+            InvocationArtifacts {
+                exit_path: other.to_str().unwrap().into(),
+                ..a.clone()
+            },
+            InvocationArtifacts {
+                journal_path: invocation.join("final.json").to_str().unwrap().into(),
+                ..a.clone()
+            },
+            InvocationArtifacts {
+                invocation_id: "0f0e0d0c-0b0a-4908-8706-050403020100".into(),
+                ..a.clone()
+            },
+            InvocationArtifacts {
+                schema_path: "/tmp/schema.json".into(),
+                ..a.clone()
+            },
+        ];
+        for forged in forged {
+            assert!(forged.check_layout(&issue).is_err(), "{forged:?}");
+        }
+        // Another issue's invocation is not this issue's.
+        assert!(a.check_layout(&IssueRef::new("owner/repo", 43)).is_err());
+        // The same layout in another repository's common directory.
+        let (elsewhere, _) = setup();
+        let err = a.check_common_dir(elsewhere.path()).unwrap_err();
+        assert!(err.contains("common Git directory"), "{err}");
+    }
+
     pub(crate) fn journal() -> String {
         format!("{{\"type\":\"thread.started\",\"thread_id\":\"{THREAD}\"}}\n{{\"type\":\"turn.completed\",\"usage\":{{}}}}\n")
     }
