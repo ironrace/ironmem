@@ -1741,20 +1741,25 @@ pub(crate) fn settle_awaiting_quiet_with(
         .root_birth
         .ok_or("the invocation root's kernel birth was never recorded")?;
     still_running(identity.root_pid, root_birth, "the invocation root")?;
+    for d in &identity.descendants {
+        if let Some(birth) = d.birth {
+            still_running(d.pid, birth, "recorded process")?;
+        }
+    }
     // The caller's snapshot may predate the invocation (a Lead takes it at
     // the start of its tick), so a process that appeared since is in a
-    // fresh table, read now that the kernel checks have passed. Both are
+    // fresh table, read now that every kernel check has passed. Both are
     // judged: the snapshot can only add a hold, never lift one.
     let fresh = fresh().map_err(|e| format!("cannot read the process table: {e}"))?;
     let active = || rows.iter().chain(&fresh).filter(|r| r.active());
-    for d in &identity.descendants {
-        match d.birth {
-            Some(birth) => still_running(d.pid, birth, "recorded process")?,
-            None if active().any(|r| r.pid == d.pid) => {
-                return Err(format!("recorded process {} is still running", d.pid))
-            }
-            None => {}
-        }
+    // A descendant recorded with no birth (an older record) is judged by
+    // its PID in the table.
+    if let Some(d) = identity
+        .descendants
+        .iter()
+        .find(|d| d.birth.is_none() && active().any(|r| r.pid == d.pid))
+    {
+        return Err(format!("recorded process {} is still running", d.pid));
     }
     // The root is gone by birth, so a live process now holding its PID
     // shows the group ID was freed and reused: the group is someone
@@ -3328,6 +3333,25 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
             Ok(true)
         );
         assert!(has_valid_exit_record(a));
+        // Every kernel check comes before the fresh table is read: a
+        // recorded descendant still running by birth holds without it.
+        let mut identity = super::super::process_tree::read_identity(a).unwrap();
+        identity.descendants = vec![serde_json::from_value(serde_json::json!({
+            "pid": 6000, "ppid": root, "pgid": root, "birth": [6, 0]
+        }))
+        .unwrap()];
+        super::super::process_tree::persist_identity(a, &identity).unwrap();
+        write_awaiting(a, uid, worktree.path(), Vec::new());
+        let held = settle_awaiting_quiet_with(
+            a,
+            &stale,
+            None,
+            |pid| Ok((pid == 6000).then(|| fixture_birth(6))),
+            &no_pids,
+            &|| panic!("the fresh table was read before every kernel check"),
+        )
+        .unwrap_err();
+        assert!(held.contains("recorded process 6000"), "{held}");
     }
 
     /// A kernel birth for a fixture process that never ran: the kernel is
