@@ -160,7 +160,9 @@ pub struct LeadConfig {
     pub advice: AdviceConfig,
     pub max_dispatches_per_tick: usize,
     pub worktree_root: PathBuf,
-    /// Read everything, decide everything, write nothing and spend nothing.
+    /// Read everything, decide everything, write nothing and spend
+    /// nothing — with one exception: a dry run may finalise the exit
+    /// record of an invocation that was awaiting a quiet worktree.
     pub dry_run: bool,
 }
 

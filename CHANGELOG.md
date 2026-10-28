@@ -182,6 +182,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   counter is charged afresh from its first success, so once a human
   re-labels it `agent:ready` it may get the rest of that cap without an
   `autopilot retry`.
+- **Every Claude launch needs a readable process table.** A Claude run
+  checks `ps` for a process naming its IC before it launches (and a
+  readable Claude registry only when adopting another run's claim), so
+  a host where `ps` cannot be read holds Claude issues instead of
+  launching. The Codex reviewer now receives its prompt on stdin
+  (`review::build_argv` ends in `-`), as the Codex implementer does.
+  The day's dollar total includes in-flight dispatch reservations, so
+  it can read higher than the settled spend while a dispatch runs.
 
 ### Changed
 
@@ -237,7 +245,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Library: supervised-CLI types renamed.** `CodexArtifacts` is now
   `InvocationArtifacts`, `CodexRecovery` is `InvocationRecovery`,
   `CodexDispatcher` is `CliDispatcher::resolve(Implementer::Codex)` (the old
-  type and its argument-free `resolve()` remain as a deprecated wrapper), and
+  type and its argument-free `resolve()` remain as a deprecated wrapper),
+  `registry::TwoHarnessMonitor` is now `HarnessProcessMonitor`, and
   the `codex_process` module is `process_tree`, where `parse_codex_processes`,
   `CodexProcessSnapshot`, `CodexProcessSource` and `UnixCodexProcesses` are
   `parse_processes`, `ProcessSnapshot`, `ProcessSource` and `UnixProcesses`.
@@ -248,7 +257,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `codex_artifacts`); `HarnessSnapshots::codex` is `processes`; `Worktree` has
   a new required field, `cut`; `TurnPromptInputs` has a new required field,
   `remote` (an `Option<&str>`: the remote the goal condition's push names,
-  `None` for none); `codex_dispatch`'s supervision moved to `invocation`,
+  `None` for none); `DispatchState` has new required fields `session_model`,
+  `resume_refusals` and `signing_held`, and `DispatchOutcome` a new required
+  field `session_refusal`; the new `Implementer::Muse` variant breaks
+  exhaustive matches on `Implementer`; `dispatch_state`'s
+  `upsert_dispatch_state_if_unchanged`, `dispatch_state_is` and
+  `clear_dispatch_state_if_unchanged` are removed (the claim
+  compare-and-set functions replace them); `codex_dispatch`'s supervision moved to `invocation`,
   where `prepare_artifacts`, `has_launch_failure_record`,
   `has_valid_exit_record` and `recover_artifacts` keep their names,
   `run_codex` is `run_supervised`, and `run_codex_bounded`, `read_artifacts`

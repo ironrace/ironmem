@@ -680,6 +680,8 @@ impl LivenessSnapshot for RegistrySnapshot {
     }
 }
 
+/// A snapshot of every harness's liveness evidence: Claude's registry
+/// plus the process table that covers Codex and Muse.
 pub trait HarnessMonitor {
     fn snapshot(&mut self) -> HarnessSnapshots;
 }

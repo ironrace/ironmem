@@ -1,4 +1,4 @@
-//! Autopilot backlog runner (build-ladder rungs 1-9).
+//! Autopilot backlog runner (build-ladder rungs 1-11).
 //!
 //! See `docs/iron/specs/2026-08-21-autonomous-backlog-runner-design.md` for
 //! the full design. Rung 1 built the storage half — the `backlog-lineage`
@@ -45,6 +45,12 @@
 //! close-out rests on the loop not depending on them. Rung 9 also gives the
 //! escalation itself a voice: before it, an escalation stopped the work and
 //! said so only in a drawer.
+//!
+//! The implementer itself is [`implementer`]: Claude directly, or a
+//! supervised CLI (Codex, Muse) whose every launch is an [`invocation`]
+//! tracked in [`process_tree`] and supervised by [`codex_dispatch`] or
+//! [`muse_dispatch`]. The old `codex_process` module stays as a deprecated
+//! shim over `process_tree` for one release.
 //!
 //! # The drawer kinds, one room
 //!

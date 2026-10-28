@@ -913,7 +913,9 @@ typing the command.
   record to the local database (verified by
   `a_dry_run_is_recorded_as_a_dry_run`), tagged `dry_run: true` so it can
   never be read back as an executed merge. Nothing it records is visible
-  outside Autopilot's own storage.
+  outside Autopilot's own storage. A dry run may also finalise the exit
+  record of an invocation that was awaiting a quiet worktree, so that
+  invocation can complete on the next real run.
 - `--advisor` (on `lead`), implementation dispatches, and the reviewer
   invocation `advance` runs
   both spend real money. `--advisor` is off by default; every judgment it
