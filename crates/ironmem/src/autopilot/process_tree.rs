@@ -205,7 +205,8 @@ fn parse_codex_options<'a>(args: impl Iterator<Item = &'a str>) -> Result<Option
             | "-i" => {
                 words.next().ok_or("Codex option has no value")?;
             }
-            "--" => break,
+            // `-`: the prompt is read from stdin (Autopilot's own rows).
+            "--" | "-" => break,
             other if other.starts_with('-') => {
                 return Err("unrecognized Codex option before prompt".into())
             }

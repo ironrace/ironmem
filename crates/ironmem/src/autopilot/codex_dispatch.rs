@@ -1,12 +1,12 @@
 //! The Codex `exec` harness for supervised dispatch: its verified argv and
 //! its JSONL journal and final-verdict parsing. Supervision itself lives in
 //! [`super::invocation`].
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::autopilot::dispatch::{DispatchSpec, SessionMode};
 use crate::autopilot::implementer::Implementer;
 use crate::autopilot::invocation::{
-    validation, FinalVerdict, InvocationArtifacts, ParsedRun, SupervisedCli,
+    validation, FinalVerdict, InvocationArtifacts, ParsedRun, SpawnFile, SupervisedCli,
 };
 use crate::error::MemoryError;
 
@@ -23,6 +23,12 @@ pub type CodexRecovery = crate::autopilot::invocation::InvocationRecovery;
 /// only a resume names the native ID the run must report.
 pub struct CodexCli;
 
+/// The prompt Codex reads as its stdin, a sibling of the invocation's
+/// schema marker.
+fn prompt_path(a: &InvocationArtifacts) -> PathBuf {
+    Path::new(&a.schema_path).with_file_name("prompt.md")
+}
+
 impl SupervisedCli for CodexCli {
     fn implementer(&self) -> Implementer {
         Implementer::Codex
@@ -30,6 +36,11 @@ impl SupervisedCli for CodexCli {
 
     /// argv verified against codex-cli 0.163.0. Resume has no `-C`; cwd is set
     /// by the supervisor. Controller UUIDs and Claude-specific limits stay out.
+    /// The prompt is `-`: Codex reads it from stdin, the private prompt file
+    /// ([`Self::stdin_file`]), so the goal condition (issue body, human
+    /// answers, review findings) is never in argv, where any local user
+    /// reads it with `ps` (measured on 0.163.0 for `exec` and `exec
+    /// resume`).
     fn argv(
         &self,
         repo: &Path,
@@ -66,8 +77,21 @@ impl SupervisedCli for CodexCli {
         if let SessionMode::Resume { session_uuid } = &spec.session {
             args.push(session_uuid.clone());
         }
-        args.push(spec.condition.clone());
+        args.push("-".into());
         Ok(args)
+    }
+
+    /// The condition, byte for byte, as the private prompt file; the core
+    /// creates it exactly once.
+    fn spawn_files(&self, spec: &DispatchSpec, a: &InvocationArtifacts) -> Vec<SpawnFile> {
+        vec![SpawnFile {
+            path: prompt_path(a),
+            contents: spec.condition.as_bytes().to_vec(),
+        }]
+    }
+
+    fn stdin_file(&self, a: &InvocationArtifacts) -> Option<PathBuf> {
+        Some(prompt_path(a))
     }
 
     fn expected_native_id(&self, spec: &DispatchSpec) -> Option<String> {
@@ -211,9 +235,55 @@ pub(crate) mod tests {
                 "/repo",
                 "-m",
                 "gpt-test",
-                "make the gate pass"
+                "-"
             ]
         );
+    }
+
+    /// The goal condition (issue body, human answers, review findings)
+    /// never appears in argv, where any local user reads it with `ps`: it
+    /// is a private prompt file the child reads as its stdin (`-`, measured
+    /// on codex-cli 0.163.0 for `exec` and `exec resume`). The marker
+    /// grammar still recovers the invocation from the argv, `-` included.
+    #[test]
+    fn the_condition_travels_in_a_private_prompt_file_not_argv() {
+        use crate::autopilot::invocation::{SpawnFile, SupervisedCli};
+        use crate::autopilot::process_tree::ProcessRow;
+        for session in [
+            SessionMode::New {
+                session_uuid: "ignored-controller-id".into(),
+            },
+            SessionMode::Resume {
+                session_uuid: "11111111-2222-3333-4444-555555555555".into(),
+            },
+        ] {
+            let mut s = spec(session);
+            s.condition = "SECRET-ISSUE-BODY with words".into();
+            let args = validate_argv(Path::new("/repo"), &s).unwrap();
+            let joined = args.join(" ");
+            assert!(!joined.contains("SECRET-ISSUE-BODY"), "{joined}");
+            assert_eq!(args.last().map(String::as_str), Some("-"));
+            let prompt = Path::new("/tmp/prompt.md");
+            assert_eq!(
+                super::CodexCli.spawn_files(&s, &artifacts()),
+                vec![SpawnFile {
+                    path: prompt.to_path_buf(),
+                    contents: b"SECRET-ISSUE-BODY with words".to_vec(),
+                }]
+            );
+            assert_eq!(
+                super::CodexCli.stdin_file(&artifacts()).as_deref(),
+                Some(prompt)
+            );
+            let row = ProcessRow {
+                pid: 1,
+                ppid: 1,
+                pgid: 1,
+                stat: "S".into(),
+                args: format!("/opt/homebrew/bin/codex {joined}"),
+            };
+            assert_eq!(row.marker(), Ok(Some("/tmp/schema.json")), "{joined}");
+        }
     }
 
     #[test]
@@ -240,7 +310,7 @@ pub(crate) mod tests {
                 "-m",
                 "gpt-test",
                 "11111111-2222-3333-4444-555555555555",
-                "make the gate pass"
+                "-"
             ]
         );
     }
@@ -299,6 +369,37 @@ mod contract_tests {
             assert_eq!(o.native_session_id.as_deref(), Some(THREAD));
         }
     }
+    /// The supervised child reads the exact condition on its stdin, from a
+    /// prompt file only the operator can read.
+    #[cfg(unix)]
+    #[test]
+    fn a_supervised_codex_reads_its_condition_from_a_private_stdin_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        use crate::autopilot::invocation::contract_tests::{binary, observable, script};
+        let (dir, mut s) = setup();
+        s.condition = "the exact condition".into();
+        let bin = binary(
+            dir.path(),
+            &observable(&script(
+                "[ \"$(cat)\" = 'the exact condition' ] || exit 9",
+                0,
+            )),
+        );
+        let o = crate::autopilot::invocation::run_supervised_bounded(
+            &bin,
+            dir.path(),
+            &s,
+            std::time::Duration::from_secs(20),
+        )
+        .unwrap();
+        assert!(o.process_success && o.is_met(), "{o:?}");
+        let a = s.invocation_artifacts.as_ref().unwrap();
+        let prompt = std::path::Path::new(&a.schema_path).with_file_name("prompt.md");
+        let mode = std::fs::metadata(prompt).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
     #[test]
     fn truncated_journal_retains_unique_native_id_without_trusting_verdict() {
         let (_dir, s) = setup();

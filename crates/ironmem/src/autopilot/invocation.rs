@@ -173,6 +173,13 @@ pub trait SupervisedCli: Sync {
         Vec::new()
     }
 
+    /// A file the child reads as its stdin, opened after the spawn files
+    /// are written (so normally one of them: Codex's prompt). Default: none,
+    /// and the child's stdin is empty.
+    fn stdin_file(&self, _a: &InvocationArtifacts) -> Option<PathBuf> {
+        None
+    }
+
     /// The most journal bytes an invocation may write before it is killed
     /// as over its limit, and the most recovery reads back. Default:
     /// [`JOURNAL_LIMIT`].
@@ -964,8 +971,19 @@ fn run_supervised_bounded_with(
     // Still before any spawn and after the same check, so a failed open is
     // recorded the same way rather than held as ambiguous.
     let outputs = open_existing(&a.journal_path, true)
-        .and_then(|journal| Ok((journal, open_existing(&a.stderr_path, true)?)));
-    let (journal, stderr) = match outputs {
+        .and_then(|journal| Ok((journal, open_existing(&a.stderr_path, true)?)))
+        .and_then(|(journal, stderr)| {
+            let stdin = match cli.stdin_file(a) {
+                Some(path) => Stdio::from(open_existing(
+                    path.to_str()
+                        .ok_or_else(|| validation("the stdin file path is not UTF-8"))?,
+                    false,
+                )?),
+                None => Stdio::null(),
+            };
+            Ok((journal, stderr, stdin))
+        });
+    let (journal, stderr, stdin) = match outputs {
         Ok(outputs) => outputs,
         Err(e) => {
             return never_launched(
@@ -981,7 +999,7 @@ fn run_supervised_bounded_with(
         .args(args)
         .envs(cli.env().iter().copied())
         .current_dir(repo)
-        .stdin(Stdio::null())
+        .stdin(stdin)
         .stdout(Stdio::from(journal))
         .stderr(Stdio::from(stderr));
     // Git subprocesses inside the harness must resolve this invocation's
