@@ -33,6 +33,166 @@ fn excerpt(text: &str) -> String {
     text
 }
 
+/// One journal line as [`MuseCli::parse`] reads it: the `stream` and the
+/// head of the `payload`, with every other field, and the rest of the
+/// payload, skipped without being built. Only a line that is not a JSON
+/// object fails to parse; a field of an unexpected type reads as absent,
+/// as indexing a `serde_json::Value` would.
+#[derive(Default)]
+struct Envelope {
+    stream: Head,
+    payload: Head,
+}
+
+/// The fields of a `stream` or `payload` object the parser reads; any of
+/// them absent, or of another type, is `None`, and so is every field of a
+/// value that is not an object.
+#[derive(Default)]
+struct Head {
+    kind: Option<String>,
+    id: Option<String>,
+    completed_calls: Option<u64>,
+}
+
+impl<'de> serde::Deserialize<'de> for Envelope {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = Envelope;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a Muse journal record object")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Envelope, A::Error> {
+                let mut envelope = Envelope::default();
+                while let Some(key) = map.next_key::<std::borrow::Cow<'de, str>>()? {
+                    match key.as_ref() {
+                        "stream" => envelope.stream = map.next_value()?,
+                        "payload" => envelope.payload = map.next_value()?,
+                        _ => {
+                            map.next_value::<serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(envelope)
+            }
+        }
+        deserializer.deserialize_map(Visitor)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Head {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = Head;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("any JSON value")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Head, A::Error> {
+                let mut head = Head::default();
+                while let Some(key) = map.next_key::<std::borrow::Cow<'de, str>>()? {
+                    match key.as_ref() {
+                        "kind" => head.kind = map.next_value::<Leaf>()?.text,
+                        "id" => head.id = map.next_value::<Leaf>()?.text,
+                        "completed_calls" => {
+                            head.completed_calls = map.next_value::<Leaf>()?.count;
+                        }
+                        _ => {
+                            map.next_value::<serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(head)
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Head, A::Error> {
+                while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+                Ok(Head::default())
+            }
+            fn visit_bool<E>(self, _: bool) -> Result<Head, E> {
+                Ok(Head::default())
+            }
+            fn visit_i64<E>(self, _: i64) -> Result<Head, E> {
+                Ok(Head::default())
+            }
+            fn visit_u64<E>(self, _: u64) -> Result<Head, E> {
+                Ok(Head::default())
+            }
+            fn visit_f64<E>(self, _: f64) -> Result<Head, E> {
+                Ok(Head::default())
+            }
+            fn visit_str<E>(self, _: &str) -> Result<Head, E> {
+                Ok(Head::default())
+            }
+            fn visit_unit<E>(self) -> Result<Head, E> {
+                Ok(Head::default())
+            }
+        }
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
+/// A scalar field of a [`Head`]: its text if it is a string, its count if
+/// it is a non-negative integer, and neither for anything else.
+#[derive(Default)]
+struct Leaf {
+    text: Option<String>,
+    count: Option<u64>,
+}
+
+impl<'de> serde::Deserialize<'de> for Leaf {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = Leaf;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("any JSON value")
+            }
+            fn visit_str<E>(self, text: &str) -> Result<Leaf, E> {
+                Ok(Leaf {
+                    text: Some(text.to_owned()),
+                    count: None,
+                })
+            }
+            fn visit_u64<E>(self, count: u64) -> Result<Leaf, E> {
+                Ok(Leaf {
+                    text: None,
+                    count: Some(count),
+                })
+            }
+            fn visit_i64<E>(self, count: i64) -> Result<Leaf, E> {
+                Ok(Leaf {
+                    text: None,
+                    count: u64::try_from(count).ok(),
+                })
+            }
+            fn visit_f64<E>(self, _: f64) -> Result<Leaf, E> {
+                Ok(Leaf::default())
+            }
+            fn visit_bool<E>(self, _: bool) -> Result<Leaf, E> {
+                Ok(Leaf::default())
+            }
+            fn visit_unit<E>(self) -> Result<Leaf, E> {
+                Ok(Leaf::default())
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Leaf, A::Error> {
+                while map
+                    .next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
+                    .is_some()
+                {}
+                Ok(Leaf::default())
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Leaf, A::Error> {
+                while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+                Ok(Leaf::default())
+            }
+        }
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
 /// Muse CLI. It continues the controller's `--session-id`, so every
 /// invocation names the native ID its run must report.
 pub struct MuseCli;
@@ -252,9 +412,9 @@ impl SupervisedCli for MuseCli {
         let mut native_id = None;
         let mut verdict = None;
         let mut turns = 0;
-        let on_stream = |value: &serde_json::Value, kind: &str| {
-            value["stream"]["kind"].as_str() == Some(kind)
-                && value["stream"]["id"].as_str() == Some(expected)
+        let on_stream = |envelope: &Envelope, kind: &str| {
+            envelope.stream.kind.as_deref() == Some(kind)
+                && envelope.stream.id.as_deref() == Some(expected)
         };
         let mut saw_expected = false;
         let mut terminals = Vec::new();
@@ -263,23 +423,28 @@ impl SupervisedCli for MuseCli {
             if line.trim().is_empty() {
                 continue;
             }
-            // A bare number, string or array parses, but is no record.
-            let Some(value) = serde_json::from_str::<serde_json::Value>(line)
-                .ok()
-                .filter(serde_json::Value::is_object)
-            else {
+            // A bare number, string or array parses, but is no record. Only
+            // the envelope is read; a payload (tool output, mostly) is
+            // skipped unbuilt, and parsed whole only for this session's
+            // terminal record.
+            let Ok(envelope) = serde_json::from_str::<Envelope>(line) else {
                 malformed += 1;
                 if first_malformed == 0 {
                     first_malformed = index + 1;
                 }
                 continue;
             };
-            let ours = on_stream(&value, "session");
+            let ours = on_stream(&envelope, "session");
             saw_expected |= ours;
-            match value["payload"]["kind"].as_str() {
-                Some("run_terminal") if ours => terminals.push(value["payload"].clone()),
-                Some("run_usage") if on_stream(&value, "exec.usage") => {
-                    if let Some(n) = value["payload"]["completed_calls"].as_u64() {
+            match envelope.payload.kind.as_deref() {
+                Some("run_terminal") if ours => {
+                    // The envelope parsed, so the line is a JSON object.
+                    let value: serde_json::Value =
+                        serde_json::from_str(line).unwrap_or(serde_json::Value::Null);
+                    terminals.push(value["payload"].clone());
+                }
+                Some("run_usage") if on_stream(&envelope, "exec.usage") => {
+                    if let Some(n) = envelope.payload.completed_calls {
                         turns = u32::try_from(n).unwrap_or(u32::MAX);
                     }
                 }
@@ -614,6 +779,17 @@ mod tests {
                 "{stray}: {:?}",
                 parsed.errors()
             );
+        }
+        // Any object is a record, whatever its fields hold: one of an
+        // unexpected type is simply not ours.
+        for odd in [
+            r#"{"stream":"session","payload":5}"#,
+            r#"{"stream":{"kind":7,"id":[1]},"payload":{"kind":null,"completed_calls":-1}}"#,
+            r#"{"stream":null,"payload":[{"kind":"run_terminal"}],"extra":{"deep":[1,{"a":"b"}]}}"#,
+        ] {
+            let parsed = MuseCli.parse(&format!("{ok}\n{odd}"), Ok(String::new()), Some(SID));
+            assert!(parsed.errors().is_empty(), "{odd}: {:?}", parsed.errors());
+            assert_eq!(parsed.verdict().unwrap().verdict, Verdict::Met, "{odd}");
         }
     }
 
