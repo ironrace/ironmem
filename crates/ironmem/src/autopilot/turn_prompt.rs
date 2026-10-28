@@ -369,6 +369,22 @@ These answers are decisions, not suggestions — follow them:\n",
 /// says why in the IC's own terms. The two halves are composed here rather
 /// than stored joined, so a reviewer that gave no reason still gets a coherent
 /// instruction.
+/// The longest remote name the push clause quotes.
+const MAX_QUOTED_REMOTE_CHARS: usize = 64;
+
+/// Whether `remote` may be quoted in the push clause: short, and only
+/// `[A-Za-z0-9._/-]`. A remote is named in the repository's config, which an
+/// agent can write; one that is very long, or carries a backtick or a
+/// newline, would break or bloat the condition, so the clause names the
+/// branch only instead.
+fn is_quotable_remote(remote: &str) -> bool {
+    !remote.is_empty()
+        && remote.len() <= MAX_QUOTED_REMOTE_CHARS
+        && remote
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'/' | b'-'))
+}
+
 pub fn render(inputs: &TurnPromptInputs) -> Result<String, ConditionTooLong> {
     assert!(
         inputs.n_turns >= 1,
@@ -432,7 +448,7 @@ pub fn render(inputs: &TurnPromptInputs) -> Result<String, ConditionTooLong> {
     // condition".
     // It names the remote too when one is known: the branch has no
     // upstream, so a bare `git push` does not reach it.
-    let push_clause = match inputs.remote {
+    let push_clause = match inputs.remote.filter(|remote| is_quotable_remote(remote)) {
         Some(remote) => format!(
             ", and every commit you have made is pushed to this issue's branch `{branch}` \
              (`git push {remote} {branch}`)",
@@ -750,6 +766,25 @@ platform limit, got {}",
             "{condition}"
         );
         assert!(!condition.contains("git push"), "{condition}");
+    }
+
+    /// A remote name too long, or carrying a character that could break the
+    /// condition, is never quoted: the clause names the branch only.
+    #[test]
+    fn a_remote_that_cannot_be_quoted_safely_leaves_the_branch_only_clause() {
+        let long = "r".repeat(3000);
+        for remote in [long.as_str(), "fo`o", "a b", "x\ny", ""] {
+            let text = ordinary_text_on("autopilot/owner-repo-7", Some(remote));
+            let gate_at = text.find("The gate condition for this repo").unwrap();
+            let condition = &text[gate_at..];
+            assert!(
+                condition.contains("is pushed to this issue's branch `autopilot/owner-repo-7`"),
+                "{remote:?}: {condition}"
+            );
+            assert!(!condition.contains("git push"), "{remote:?}: {condition}");
+        }
+        let text = ordinary_text_on("autopilot/owner-repo-7", Some("my-fork.v2/x_y"));
+        assert!(text.contains("`git push my-fork.v2/x_y autopilot/owner-repo-7`"));
     }
 
     #[test]

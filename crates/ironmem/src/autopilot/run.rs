@@ -2938,6 +2938,25 @@ pub fn run_issue(
             );
         }
     }
+    // A policy an interrupted run saw on, and could not record on the branch
+    // (another agent held the config lock), is recorded now that recovery
+    // has proven nothing of it runs: off at this run's start, it would hold
+    // only the recovered met, and no fresh dispatch's after it. Not over an
+    // operator's opt-out.
+    if !policy_at_start && seen.by_interrupted_run {
+        if let Ok(worktree::SigningHold::NotHeld) =
+            worktree::signing_holder(&worktree.path, &worktree.branch)
+        {
+            if let Err(e) = worktree::record_signing(&worktree.path, &worktree.branch, false) {
+                tracing::warn!(
+                    error = %e,
+                    branch = %worktree.branch,
+                    "autopilot could not record on the branch the signing policy an \
+                     interrupted run saw on; only that run's met is held to it"
+                );
+            }
+        }
+    }
     let mut resuming = existing_state
         .as_ref()
         .is_some_and(|state| state.session_claimed);
@@ -4759,6 +4778,52 @@ sleep 0.5
             held,
             "the held session is probed"
         );
+    }
+
+    /// F25: the condition's push clause names the remote whose URL is the
+    /// issue's repository, never the fork `origin` is; with no remote at
+    /// all it names the branch only.
+    #[test]
+    fn the_dispatched_condition_pushes_to_the_issue_repositorys_remote() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        git_in(
+            &wt.path,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/someone/ironmem.git",
+            ],
+        );
+        git_in(
+            &wt.path,
+            &[
+                "remote",
+                "add",
+                "upstream",
+                "https://github.com/ironrace/ironmem.git",
+            ],
+        );
+        let mut d = ScriptedDispatcher::new(vec![Ok(met())]);
+        run_issue(&db, &issue(), &brief(), &wt, &config(), &mut d).unwrap();
+        let push = format!("`git push upstream {}`", wt.branch);
+        assert!(
+            d.seen[0].condition.contains(&push),
+            "{}",
+            d.seen[0].condition
+        );
+
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        let mut d = ScriptedDispatcher::new(vec![Ok(met())]);
+        run_issue(&db, &issue(), &brief(), &wt, &config(), &mut d).unwrap();
+        let condition = &d.seen[0].condition;
+        assert!(
+            condition.contains(&format!("is pushed to this issue's branch `{}`", wt.branch)),
+            "{condition}"
+        );
+        assert!(!condition.contains("git push"), "{condition}");
     }
 
     #[test]
@@ -7919,17 +7984,29 @@ sleep 0.5
                                              // written (another agent held the lock); only its drawer says so.
         let mut state = pending_muse(&db, &wt, None);
         state.signing_held = true;
+        state.session_uuid = "66666666-7777-8888-9999-000000000000".into();
         dispatch_state::upsert_dispatch_state(&db, &state).unwrap();
         let mut result = met();
         result.cost_usd = None;
-        let mut d = muse_script(vec![]);
+        // F23: and the next fresh dispatch's met is held to it too, which
+        // takes the reading recorded on the branch, not only in memory.
+        let mut d = muse_script(vec![met()]);
         d.recovery = Some(InvocationRecovery::Finished(result));
         let mut c = muse_config();
-        c.attempt_cap = 1;
+        c.attempt_cap = 2;
         let run = run_issue(&db, &issue(), &brief(), &wt, &c, &mut d).unwrap();
         assert!(!matches!(run.terminal, TerminalReason::Met { .. }));
         let reason = run.dispatches[0].reason.as_deref().unwrap();
-        assert!(reason.contains("interrupted run"), "{reason}");
+        // Held by the branch flag recorded from the interrupted run's reading.
+        assert!(reason.contains("still held to signing"), "{reason}");
+        assert_eq!(d.inner.seen.len(), 1);
+        assert_eq!(
+            run.dispatches[1].classification,
+            DispatchClassification::FailedAttempt,
+            "{:?}",
+            run.dispatches
+        );
+        assert!(worktree::signing_recorded(&wt.path, &wt.branch));
     }
 
     #[test]
