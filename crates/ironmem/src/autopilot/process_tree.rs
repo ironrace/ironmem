@@ -1399,14 +1399,16 @@ fn root_observation(pid: u32) -> Result<Option<RootRecord>, String> {
 }
 
 /// The root's record to adopt from what [`root_observation`] read, if any.
-/// An exited root is adopted only while it is still our own unreaped child
-/// (its parent is `me`, this process): its zombie then holds the PID, so the
-/// record is the root's. A caller that had already reaped it could
-/// otherwise adopt a reused PID's record.
+/// A root, running or exited, is adopted only while it is our own child (its
+/// parent is `me`, this process): the unreaped child, or its zombie, then
+/// holds the PID, so the record is the root's. A caller that had already
+/// reaped it could otherwise adopt a reused PID's record, a stranger that
+/// may well be running. A debugger attached to the root at spawn (macOS
+/// reports the tracer as `e_ppid`) fails the check too; that only takes the
+/// existing non-fatal path, where the first sample may still bind the root.
 fn adoptable(root_pid: u32, me: u32, record: Option<RootRecord>) -> Option<KernelProcess> {
     let record = record?;
-    (record.process.pid == root_pid && (!record.exited || record.process.ppid == me))
-        .then_some(record.process)
+    (record.process.pid == root_pid && record.process.ppid == me).then_some(record.process)
 }
 
 /// The operator's shared ironmem daemon, which supervision never owns (see
@@ -4306,12 +4308,12 @@ pub(crate) mod tests {
         drop(child);
     }
 
-    /// An exited root's record is adopted only while it is still our own
-    /// unreaped child (its parent is this process): a caller that had
-    /// already reaped it could otherwise adopt a reused PID's record. A
-    /// running root's record is adopted as before.
+    /// A root's record, running or exited, is adopted only while it is our
+    /// own child (its parent is this process): a caller that had already
+    /// reaped it could otherwise adopt a reused PID's record, whether that
+    /// stranger still runs or has exited too.
     #[test]
-    fn an_exited_root_is_adopted_only_as_our_own_child() {
+    fn a_root_is_adopted_only_as_our_own_child() {
         let me = 4242;
         let record = |pid, ppid| KernelProcess {
             pid,
@@ -4326,9 +4328,10 @@ pub(crate) mod tests {
         );
         assert_eq!(adoptable(42, me, root(record(42, 1), true)), None);
         assert_eq!(
-            adoptable(42, me, root(record(42, 1), false)),
-            Some(record(42, 1))
+            adoptable(42, me, root(record(42, me), false)),
+            Some(record(42, me))
         );
+        assert_eq!(adoptable(42, me, root(record(42, 1), false)), None);
         assert_eq!(adoptable(42, me, root(record(43, me), false)), None);
         assert_eq!(adoptable(42, me, None), None);
     }
