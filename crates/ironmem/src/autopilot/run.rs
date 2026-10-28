@@ -2630,6 +2630,7 @@ fn recover_invocation(
     wall_clock_timeout_secs: Option<u64>,
     native_session_id: &mut Option<String>,
     invocation_artifacts: &mut Option<InvocationArtifacts>,
+    session_used: &mut bool,
 ) -> Result<Recovered, MemoryError> {
     let state = &claim.state;
     match dispatcher.recover(&worktree.path, state)? {
@@ -2699,7 +2700,10 @@ fn recover_invocation(
                     }));
                 }
                 // Preserve the proven conversation for a continuing run,
-                // but never classify or charge the same attempt again.
+                // but never classify or charge the same attempt again. An
+                // invocation that started used the controller's session, so
+                // the next one resumes it rather than opening it again.
+                *session_used = outcome.invocation_started;
                 if native_session_id.is_none() {
                     *native_session_id =
                         outcome.native_session_id.filter(|id| !id.trim().is_empty());
@@ -2899,6 +2903,9 @@ pub fn run_issue(
             return Ok(run);
         }
     }
+    // Whether a recovered invocation this run will not classify again used
+    // the session the state names.
+    let mut recovered_session_used = false;
     if let Some(claim) = existing_claim
         .as_ref()
         .filter(|_| config.implementer.recovers_invocations())
@@ -2913,6 +2920,7 @@ pub fn run_issue(
             wall_clock_timeout_secs,
             &mut native_session_id,
             &mut invocation_artifacts,
+            &mut recovered_session_used,
         )? {
             Recovered::Done(run) => return Ok(run),
             Recovered::Continue(outcome) => recovered_outcome = outcome,
@@ -2957,9 +2965,10 @@ pub fn run_issue(
             }
         }
     }
-    let mut resuming = existing_state
-        .as_ref()
-        .is_some_and(|state| state.session_claimed);
+    let mut resuming = recovered_session_used
+        || existing_state
+            .as_ref()
+            .is_some_and(|state| state.session_claimed);
     let started_at = existing_state
         .as_ref()
         .map(|state| state.started_at.clone())
@@ -4149,19 +4158,35 @@ mod tests {
         missing.native_session_id = None;
         let mut conflicting = impossible();
         conflicting.native_session_id = Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".into());
-        for mut result in [
-            not_met(),
-            nonzero,
-            errored,
-            killed,
-            unstarted,
-            missing,
-            conflicting,
-        ] {
+        for (implementer, mut result) in [Implementer::Codex, Implementer::Muse]
+            .into_iter()
+            .flat_map(|implementer| {
+                [
+                    not_met(),
+                    nonzero.clone(),
+                    errored.clone(),
+                    killed.clone(),
+                    unstarted.clone(),
+                    missing.clone(),
+                    conflicting.clone(),
+                ]
+                .map(|result| (implementer, result))
+            })
+        {
             let db = approved_db();
             let (_dir, wt) = fixture_worktree();
             let native = "11111111-2222-3333-4444-555555555555";
-            let state = pending_codex(&db, &wt, Some(native));
+            let mut state = pending_invocation(implementer, &db, &wt, Some(native));
+            // Muse continues the controller's session, which is its native id.
+            if implementer == Implementer::Muse {
+                state.session_uuid = native.into();
+                dispatch_state::upsert_dispatch_state(&db, &state).unwrap();
+            }
+            let c = if implementer == Implementer::Muse {
+                muse_config()
+            } else {
+                codex_config()
+            };
             budget::reserve_unpriced_dispatch(
                 &db,
                 &today_utc(),
@@ -4178,19 +4203,32 @@ mod tests {
                     why_failed: Some("not met".into()),
                     commit_sha: None,
                 },
-                Some(Implementer::Codex),
+                Some(implementer),
             )
             .unwrap();
             result.cost_usd = None;
-            let mut d = codex_script(vec![met()]);
+            // Muse resumes the controller's session only once an invocation
+            // used it; one that never started leaves it to be opened.
+            let session = if implementer == Implementer::Muse && !result.invocation_started {
+                SessionMode::New {
+                    session_uuid: native.into(),
+                }
+            } else {
+                SessionMode::Resume {
+                    session_uuid: native.into(),
+                }
+            };
+            let mut d = cli_script(implementer, vec![met()]);
             d.recovery = Some(InvocationRecovery::Finished(result));
-            let run = run_issue(&db, &issue(), &brief(), &wt, &codex_config(), &mut d).unwrap();
-            assert!(matches!(run.terminal, TerminalReason::Met { .. }));
+            let run = run_issue(&db, &issue(), &brief(), &wt, &c, &mut d).unwrap();
+            assert!(
+                matches!(run.terminal, TerminalReason::Met { .. }),
+                "{implementer:?}: {:?}",
+                run.terminal
+            );
             assert_eq!(run.cumulative_attempt_n, 2);
             assert_eq!(d.inner.seen.len(), 1);
-            assert!(
-                matches!(&d.inner.seen[0].session, SessionMode::Resume { session_uuid } if session_uuid == native)
-            );
+            assert_eq!(d.inner.seen[0].session, session, "{implementer:?}");
             assert_eq!(lineage::attempts_for_issue(&db, &issue()).unwrap().len(), 2);
             assert_eq!(
                 budget::get_daily_spend(&db, &today_utc())
@@ -4994,19 +5032,32 @@ sleep 0.5
     }
     #[test]
     fn recovered_success_at_cap_is_consumed_without_new_call_or_billing() {
+        for implementer in [Implementer::Codex, Implementer::Muse] {
+            recovered_success_at_cap_for(implementer);
+        }
+    }
+    fn recovered_success_at_cap_for(implementer: Implementer) {
         let db = approved_db();
         let (_dir, wt) = fixture_worktree();
-        let state = pending_codex(&db, &wt, None);
-        let c = codex_config();
+        let state = pending_invocation(implementer, &db, &wt, None);
+        let c = if implementer == Implementer::Muse {
+            muse_config()
+        } else {
+            codex_config()
+        };
         for n in 0..c.max_unpriced_dispatches_per_day {
             budget::reserve_unpriced_dispatch(&db, &today_utc(), &format!("other-{n}")).unwrap();
         }
         let mut result = met();
         result.cost_usd = None;
-        let mut d = codex_script(vec![]);
+        let mut d = cli_script(implementer, vec![]);
         d.recovery = Some(InvocationRecovery::Finished(result));
         let run = run_issue(&db, &issue(), &brief(), &wt, &c, &mut d).unwrap();
-        assert!(matches!(run.terminal, TerminalReason::Met { .. }));
+        assert!(
+            matches!(run.terminal, TerminalReason::Met { .. }),
+            "{implementer:?}: {:?}",
+            run.terminal
+        );
         assert!(d.inner.seen.is_empty());
         assert_eq!(run.unpriced_dispatches, 1);
         assert_eq!(run.total_cost_usd, 0.0);
