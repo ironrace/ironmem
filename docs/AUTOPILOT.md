@@ -409,7 +409,12 @@ record becomes a trusted completion once all of these hold:
 The check must run as the same user, and a kernel read that fails counts
 as "still running". A later Lead tick or `autopilot run` then records the
 invocation with its verdict. While it waits, the hold reason names what is
-still running.
+still running. The record may hold 1 MiB, as the process identity does:
+tens of thousands of processes. One larger than that is never written, since
+nothing could read it back, nor cut short, since recovery waits for every
+process it lists; the hold reason says so, and with no record that
+invocation needs `clear-dispatch` once you have confirmed nothing it
+started is still working.
 
 Any command that decides a supervised invocation's liveness may do that upgrade
 as a side effect: `autopilot lead`, `autopilot queue`, `autopilot reconcile`,

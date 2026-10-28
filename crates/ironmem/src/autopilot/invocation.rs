@@ -26,7 +26,12 @@ pub const SUPERVISED_DISPATCH_TIMEOUT_SECS: u64 = 1200;
 pub(crate) const JOURNAL_LIMIT: u64 = 16 * 1024 * 1024;
 const STDERR_LIMIT: u64 = 1024 * 1024;
 const FINAL_LIMIT: u64 = 64 * 1024;
-const EXIT_LIMIT: u64 = 4096;
+/// The most bytes an exit record may hold: every reader refuses more, and
+/// [`persist_exit`] never writes more. An awaiting-quiet record lists every
+/// process still in the worktree, so it is sized like the identity record
+/// that lists the tree ([`super::process_tree::IDENTITY_LIMIT`]): one
+/// background worker pool outgrew the old 4096 bytes.
+const EXIT_LIMIT: u64 = super::process_tree::IDENTITY_LIMIT as u64;
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 /// How often supervision rescans the process table. A `ps -axww` scan costs
 /// tens of milliseconds of CPU on a busy machine, so scanning on every exit
@@ -602,12 +607,24 @@ pub(crate) fn persist_private_atomic(
     result
 }
 
+/// Write `record` within [`EXIT_LIMIT`]. A record past it is refused, never
+/// written for every reader to reject, nor truncated: settling an
+/// awaiting-quiet record relies on every recorded straggler being gone.
 fn persist_exit(a: &InvocationArtifacts, record: &ExitRecord) -> Result<(), MemoryError> {
-    persist_private_atomic(
-        Path::new(&a.exit_path),
-        "exit",
-        &serde_json::to_vec(record)?,
-    )
+    let bytes = serde_json::to_vec(record)?;
+    if bytes.len() as u64 > EXIT_LIMIT {
+        let stragglers = record
+            .awaiting_quiet
+            .as_ref()
+            .map_or(0, |w| w.stragglers.len());
+        return Err(validation(format!(
+            "the invocation exit record is {} bytes ({stragglers} processes still in the \
+             worktree), over its {EXIT_LIMIT}-byte limit; it was not written, since every \
+             reader would refuse it",
+            bytes.len()
+        )));
+    }
+    persist_private_atomic(Path::new(&a.exit_path), "exit", &bytes)
 }
 
 /// The supervisor's terminal record for one invocation. `expected_native_id`
@@ -1036,21 +1053,36 @@ fn finish_supervised(
     );
     record.unobserved_root = unobserved_root;
     if let super::process_tree::Quiet::Held(hold) = quiet {
-        // Everything else is proven, so record the outcome without trusting
-        // it, with what held it. The slot stays held; recovery finishes it
-        // once that is resolved.
-        await_quiet(&mut record, &hold);
-        persist_exit(a, &record)?;
-        return Err(validation(format!(
-            "{} after cleanup; {} completion waits until the worktree is quiet",
-            hold.reason,
-            cli.label()
-        )));
+        return Err(hold_for_quiet(cli.label(), a, record, &hold));
     }
     persist_exit(a, &record)?;
     let mut outcome = read_artifacts_with(cli, a)?;
     outcome.invocation_started = true;
     Ok(outcome)
+}
+
+/// Everything else is proven, so record the outcome without trusting it,
+/// with what held it (`hold`), and return the error that keeps the slot
+/// held; recovery finishes it once that is resolved.
+fn hold_for_quiet(
+    label: &str,
+    a: &InvocationArtifacts,
+    mut record: ExitRecord,
+    hold: &QuietHold,
+) -> MemoryError {
+    await_quiet(&mut record, hold);
+    if let Err(e) = persist_exit(a, &record) {
+        return validation(format!(
+            "{} after cleanup, and recording that {label} completion waits until the \
+             worktree is quiet failed: {e}; with no exit record the invocation stays held \
+             until `clear-dispatch`",
+            hold.reason
+        ));
+    }
+    validation(format!(
+        "{} after cleanup; {label} completion waits until the worktree is quiet",
+        hold.reason
+    ))
 }
 
 fn read_capped_bytes(path: &str, cap: u64) -> Result<Vec<u8>, MemoryError> {
@@ -2619,6 +2651,104 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
             "{held}"
         );
         assert!(is_awaiting_quiet(a) && !has_valid_exit_record(a));
+    }
+
+    /// A kernel birth for a fixture process that never ran: the kernel is
+    /// stubbed wherever one is read.
+    fn fixture_birth(seconds: u64) -> super::super::process_tree::Birth {
+        serde_json::from_value(serde_json::json!([seconds, 0])).unwrap()
+    }
+
+    /// One background worker pool leaves hundreds of stragglers. Their
+    /// record must stay readable: every reader refusing it read as "not
+    /// awaiting quiet", so the invocation was never finished, even after
+    /// every worker exited.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn an_awaiting_quiet_record_with_hundreds_of_stragglers_round_trips_and_settles() {
+        use crate::autopilot::process_tree::{ProcessIdentity, ProcessSnapshot};
+        let (_dir, s) = setup();
+        let a = s.invocation_artifacts.as_ref().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        // SAFETY: geteuid has no preconditions.
+        let uid = unsafe { libc::geteuid() };
+        let root = 4_000_000;
+        super::super::process_tree::persist_identity(
+            a,
+            &ProcessIdentity {
+                version: 1,
+                root_pid: root,
+                root_pgid: root,
+                root_birth: Some(fixture_birth(1)),
+                schema_path: a.schema_path.clone(),
+                invocation_id: a.invocation_id.clone(),
+                descendants: Vec::new(),
+            },
+        )
+        .unwrap();
+        let stragglers: Vec<_> = (0..500u32)
+            .map(|i| (root + 1 + i, fixture_birth(1_700_000_000 + u64::from(i))))
+            .collect();
+        write_awaiting(a, uid, worktree.path(), stragglers.clone());
+        assert!(
+            std::fs::metadata(&a.exit_path).unwrap().len() > 4096,
+            "the record outgrew the old 4096-byte read limit"
+        );
+        assert!(is_awaiting_quiet(a) && !has_valid_exit_record(a));
+        let rows = ProcessSnapshot::Available(Vec::new());
+        // The last worker still runs: held, by its PID.
+        let (last, last_birth) = *stragglers.last().unwrap();
+        let held = settle_awaiting_quiet(
+            a,
+            &rows,
+            None,
+            |pid| Ok((pid == last).then_some(last_birth)),
+            &no_pids,
+        )
+        .unwrap_err();
+        assert!(
+            held.contains(&format!("process {last} is still running")),
+            "{held}"
+        );
+        assert!(is_awaiting_quiet(a) && !has_valid_exit_record(a));
+        // Every worker gone: a trusted completion.
+        assert_eq!(
+            settle_awaiting_quiet(a, &rows, None, |_| Ok(None), &no_pids),
+            Ok(true)
+        );
+        assert!(has_valid_exit_record(a) && !is_awaiting_quiet(a));
+    }
+
+    /// A record its readers would refuse is never written as if it were
+    /// valid, nor truncated (settling relies on every recorded straggler
+    /// being gone): the write fails, saying why, and the invocation stays
+    /// held with nothing on disk a reader would take for a record.
+    #[cfg(unix)]
+    #[test]
+    fn an_exit_record_over_its_limit_is_refused_and_the_invocation_held() {
+        let (_dir, s) = setup();
+        let a = s.invocation_artifacts.as_ref().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        let stragglers: Vec<_> = (0..40_000u32)
+            .map(|i| (1_000_000 + i, fixture_birth(1_700_000_000 + u64::from(i))))
+            .collect();
+        let record = exit_record(a, None, Some(0), false, None, 1, None);
+        let hold = QuietHold {
+            worktree: worktree.path().canonicalize().unwrap(),
+            uid: 501,
+            stragglers,
+            scan_failed: None,
+            reason: "processes still run in the worktree".into(),
+        };
+        let err = hold_for_quiet("Codex", a, record, &hold).to_string();
+        assert!(
+            err.contains("processes still run in the worktree")
+                && err.contains(&format!("{EXIT_LIMIT}-byte limit"))
+                && err.contains("clear-dispatch"),
+            "{err}"
+        );
+        assert_eq!(std::fs::metadata(&a.exit_path).unwrap().len(), 0);
+        assert!(!is_awaiting_quiet(a) && !has_valid_exit_record(a));
     }
 
     /// The worktree the supervisor recorded is the one scanned. A new

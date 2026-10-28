@@ -560,8 +560,10 @@ pub(crate) fn identity_path(a: &InvocationArtifacts) -> std::path::PathBuf {
 }
 
 /// The most bytes an identity file may hold: [`read_identity`] refuses
-/// more, and [`persist_identity`] never writes more.
-const IDENTITY_LIMIT: usize = 1024 * 1024;
+/// more, and [`persist_identity`] never writes more. An exit record, which
+/// lists the processes still in the worktree, shares it
+/// (`invocation::EXIT_LIMIT`).
+pub(crate) const IDENTITY_LIMIT: usize = 1024 * 1024;
 
 /// Write `identity` within [`IDENTITY_LIMIT`]. Past it, each descendant's
 /// command (kept only for an operator) is dropped, and every PID, group,
