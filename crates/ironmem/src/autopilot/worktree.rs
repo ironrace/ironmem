@@ -1929,9 +1929,10 @@ pub enum WorktreeRemoval {
     /// repair path.
     Absent,
     /// Removal was not attempted: a controller holds the issue, so its
-    /// worktree may be in use. Left in place for a later pass to retry
-    /// once nothing holds the issue (the `Absent` it used to report hid
-    /// that a worktree remains).
+    /// worktree may be in use. Left in place: a later pass retries it
+    /// only while the issue is still listed, and otherwise it is removed
+    /// by the command the cleanup report names (the `Absent` it used to
+    /// report hid that a worktree remains).
     Skipped { path: String },
     /// The worktree has uncommitted changes, so it was left alone.
     ///

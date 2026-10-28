@@ -1254,9 +1254,11 @@ fn pr_body(candidate: &Candidate, base: &str) -> String {
 /// kept — is left behind for good, which is why the error is reported on
 /// stdout rather than only stored. One exception is named as such: cleanup
 /// skipped because a controller holds the issue frees its dispatch state
-/// later (the Lead's release step) but never removes its worktree, so that
-/// worktree's removal is reported as [`WorktreeRemoval::Skipped`] with the
-/// command that removes it by hand.
+/// later (the Lead's release step) but no step of its own removes its
+/// worktree — it goes only if a later pass reaches cleanup again while
+/// the issue is still listed (the label-write-failed path above), and
+/// otherwise by hand. So that worktree's removal is reported as
+/// [`WorktreeRemoval::Skipped`] with the command that removes it.
 fn clean_up(db: &Database, candidate: &Candidate, config: &AdvanceConfig) -> Cleanup {
     // Not while a controller holds the issue: it may be dispatching into the
     // worktree this would remove. Left for it, and said so.

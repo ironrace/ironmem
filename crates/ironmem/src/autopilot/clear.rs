@@ -134,11 +134,11 @@ pub(crate) fn clear_dispatch_with(
     if let Some(claim) = dispatch_state::get_claim(db, issue)? {
         if claim.leased(chrono::Utc::now()) {
             return Err(refuse(format!(
-                "its claim is still within its {}s lease (claimed {}s ago), so its run \
+                "its claim is still within its {}s lease (claimed {}), so its run \
                  may not have launched yet; wait up to {}s, or until that run ends, and \
                  clear again",
                 dispatch_state::CLAIM_LEASE.as_secs(),
-                claim.age(chrono::Utc::now()).unwrap_or_default().as_secs(),
+                claim.age_phrase(chrono::Utc::now()).unwrap_or_default(),
                 dispatch_state::CLAIM_LEASE.as_secs()
             )));
         }
@@ -870,6 +870,32 @@ mod tests {
         // between recording it and clearing the state.
         record_status(&db, Some(AttemptOutcome::Failed), 2);
         clear_dispatch(&db, &issue(), || snapshots(Vec::new())).unwrap();
+        assert!(dispatch_state::get_dispatch_state(&db, &issue())
+            .unwrap()
+            .is_none());
+    }
+
+    /// R7: release judges the claim the scan read, owner token included,
+    /// and gives back a settled owned claim's slot.
+    #[test]
+    fn release_gives_back_a_settled_owned_claim() {
+        let db = Database::open_in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = held_state(Implementer::Claude, testing::invocation(dir.path()).0);
+        state.invocation_artifacts = None;
+        state.attempt_n = 3;
+        let claim = dispatch_state::Claim {
+            state,
+            owner: Some("a-finished-run".into()),
+            claimed_at: Some("2026-10-26T00:00:00Z".into()),
+            common_dir: None,
+        };
+        assert!(dispatch_state::claim_if_unchanged(&db, None, &claim).unwrap());
+        record_status(&db, Some(AttemptOutcome::Failed), 3);
+        assert_eq!(
+            release_settled_dispatches(&db, &snapshots(Vec::new()), 3).unwrap(),
+            vec![issue()]
+        );
         assert!(dispatch_state::get_dispatch_state(&db, &issue())
             .unwrap()
             .is_none());

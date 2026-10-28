@@ -218,6 +218,21 @@ impl Claim {
     pub fn leased(&self, now: chrono::DateTime<chrono::Utc>) -> bool {
         !self.state.is_parked() && self.age(now).is_some_and(|age| age < CLAIM_LEASE)
     }
+
+    /// Its claim time for a message, keeping the direction [`Claim::age`]
+    /// drops: "30s ago", or "30s in the future" for a stamp ahead of this
+    /// host's clock. `None` when it holds no lease.
+    pub fn age_phrase(&self, now: chrono::DateTime<chrono::Utc>) -> Option<String> {
+        let at = chrono::DateTime::parse_from_rfc3339(self.claimed_at.as_deref()?).ok()?;
+        let secs = now
+            .signed_duration_since(at.with_timezone(&chrono::Utc))
+            .num_seconds();
+        Some(if secs >= 0 {
+            format!("{secs}s ago")
+        } else {
+            format!("{}s in the future", -secs)
+        })
+    }
 }
 
 /// Where a dispatch stands, as [`DispatchState::state`] spells it on the
@@ -776,6 +791,17 @@ mod tests {
         assert!(claim.leased(now), "a near future time is within the lease");
         claim.claimed_at = Some((now + chrono::Duration::seconds(3600)).to_rfc3339());
         assert!(!claim.leased(now), "a far-future time is not a fresh lease");
+        // Display keeps the direction: a future stamp is ahead, not ago.
+        claim.claimed_at = Some((now - chrono::Duration::seconds(30)).to_rfc3339());
+        assert_eq!(claim.age_phrase(now).as_deref(), Some("30s ago"));
+        claim.claimed_at = Some((now + chrono::Duration::seconds(30)).to_rfc3339());
+        assert!(
+            claim
+                .age_phrase(now)
+                .is_some_and(|p| p.contains("in the future")),
+            "{:?}",
+            claim.age_phrase(now)
+        );
         claim.state.state = DispatchPhase::PausedDailyBudget.as_str().into();
         assert!(!claim.leased(now), "a parked claim's run has ended");
         // Round-tripped with its common directory.

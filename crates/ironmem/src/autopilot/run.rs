@@ -2598,11 +2598,11 @@ pub fn preflight_worktree_provisioning(
     if !implementer.recovers_invocations() && claim.leased(chrono::Utc::now()) {
         return Err(MemoryError::Validation(format!(
             "cannot provision {} while another run's claim is within its {}s lease \
-             (claimed {}s ago, and a recently ended run reads the same way); it is \
+             (claimed {}, and a recently ended run reads the same way); it is \
              left to that run",
             issue.canonical(),
             dispatch_state::CLAIM_LEASE.as_secs(),
-            claim.age(chrono::Utc::now()).unwrap_or_default().as_secs()
+            claim.age_phrase(chrono::Utc::now()).unwrap_or_default()
         )));
     }
     // A parked Claude state's run has ended; any other may be one still
@@ -3152,12 +3152,12 @@ pub fn run_issue(
                 issue: issue.clone(),
                 terminal: TerminalReason::ImplementationInFlight {
                     detail: format!(
-                        "another run claimed {} {}s ago and may be about to launch (a \
+                        "another run claimed {} {} and may be about to launch (a \
                          recently ended run whose lease has not yet lapsed reads the \
                          same way); it is adopted only once its {}s lease lapses with \
                          its IC idle",
                         issue.canonical(),
-                        claim.age(chrono::Utc::now()).unwrap_or_default().as_secs(),
+                        claim.age_phrase(chrono::Utc::now()).unwrap_or_default(),
                         dispatch_state::CLAIM_LEASE.as_secs()
                     ),
                 },
@@ -10963,6 +10963,33 @@ satisfies it on its own"
         // The met was recorded, not dropped as taken over.
         let status = lineage::get_issue_status(&db, &issue()).unwrap().unwrap();
         assert_eq!(status.cumulative_attempt_n, 1);
+    }
+
+    /// R1, at the renewal itself: an aged claim of this run's is renewed
+    /// in place, and an adopter judging the aged bytes can no longer
+    /// claim over them.
+    #[test]
+    fn a_renewed_lease_keeps_an_adopters_cas_out() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        let state = pending_invocation(Implementer::Claude, &db, &wt, None);
+        let mut aged = leased_claim(state.clone(), "us");
+        aged.claimed_at = Some((chrono::Utc::now() - chrono::Duration::seconds(200)).to_rfc3339());
+        let stored = dispatch_state::get_claim(&db, &issue()).unwrap();
+        assert!(dispatch_state::claim_if_unchanged(&db, stored.as_ref(), &aged).unwrap());
+        let mut owned = Some(aged.clone());
+        assert!(renew_owned(&db, &issue(), &mut owned).unwrap());
+        let now = chrono::Utc::now();
+        let renewed = dispatch_state::get_claim(&db, &issue()).unwrap().unwrap();
+        assert!(renewed.leased(now), "{renewed:?}");
+        assert_eq!(owned.as_ref(), Some(&renewed));
+        // The adopter's claim, judged against the aged bytes it read,
+        // no longer lands.
+        let theirs = leased_claim(state, "them");
+        assert!(
+            !dispatch_state::claim_if_unchanged(&db, Some(&aged), &theirs).unwrap(),
+            "an adopter claimed over a renewed lease"
+        );
     }
 
     /// C-I2: a run whose own claim is near the end of its lease claims again

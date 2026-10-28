@@ -172,10 +172,12 @@ fn mountinfo_fstype(mountinfo: &str, path: &Path) -> Option<String> {
             .replace("\\012", "\n")
             .replace("\\134", "\\");
         let holds = path.strip_prefix(&mount_point).is_ok();
+        // `>=`: at one mount point, the later entry is the mount stacked
+        // on top, and it is the one holding the path's files.
         if holds
             && best
                 .as_ref()
-                .is_none_or(|(len, _)| mount_point.len() > *len)
+                .is_none_or(|(len, _)| mount_point.len() >= *len)
         {
             if let Some(fstype) = types.split_whitespace().next() {
                 best = Some((mount_point.len(), fstype.to_string()));
@@ -329,6 +331,20 @@ mod tests {
         assert_eq!(
             linux_remote_type(0x6573_5546, sshfs, Path::new("/elsewhere/db")),
             None
+        );
+        // Overmounted: the later (top) mount at a mount point is the one
+        // holding its files, in whichever order they stack.
+        let local_over_sshfs = "36 25 0:32 / /mnt/x rw - fuse.sshfs src rw\n\
+                                37 25 0:33 / /mnt/x rw - fuse gvfsd rw\n";
+        assert_eq!(
+            linux_remote_type(0x6573_5546, local_over_sshfs, Path::new("/mnt/x/db")),
+            None
+        );
+        let sshfs_over_local = "36 25 0:33 / /mnt/x rw - fuse gvfsd rw\n\
+                                37 25 0:32 / /mnt/x rw - fuse.sshfs src rw\n";
+        assert_eq!(
+            linux_remote_type(0x6573_5546, sshfs_over_local, Path::new("/mnt/x/db")),
+            Some("fuse.sshfs".to_string())
         );
     }
 
