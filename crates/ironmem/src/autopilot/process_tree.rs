@@ -593,6 +593,16 @@ pub(crate) fn persist_identity(
     a: &InvocationArtifacts,
     identity: &ProcessIdentity,
 ) -> Result<(), MemoryError> {
+    persist_identity_synced(a, identity, true)
+}
+
+/// [`persist_identity`], durable across a power loss only when `full`
+/// (see [`super::invocation::persist_private_atomic_synced`]).
+pub(crate) fn persist_identity_synced(
+    a: &InvocationArtifacts,
+    identity: &ProcessIdentity,
+    full: bool,
+) -> Result<(), MemoryError> {
     let mut bytes = serde_json::to_vec(identity)?;
     if bytes.len() > IDENTITY_LIMIT {
         let mut bare = identity.clone();
@@ -607,7 +617,7 @@ pub(crate) fn persist_identity(
             identity.descendants.len()
         )));
     }
-    super::invocation::persist_private_atomic(&identity_path(a), "process", &bytes)
+    super::invocation::persist_private_atomic_synced(&identity_path(a), "process", &bytes, full)
 }
 
 pub(crate) fn read_identity(a: &InvocationArtifacts) -> Result<ProcessIdentity, String> {
@@ -2443,6 +2453,12 @@ impl ProcessTracker {
         let seq = self.next_seq;
         self.next_seq += 1;
         self.known.insert(row.pid, Tracked { row, birth, seq });
+    }
+
+    /// [`Self::enrol`], for a test that needs a tracker owning `row`.
+    #[cfg(test)]
+    pub(crate) fn enrol_for_test(&mut self, row: ProcessRow, birth: Birth) {
+        self.enrol(row, birth);
     }
 
     /// Signal through `kill` instead of [`signal_pinned`] (tests).

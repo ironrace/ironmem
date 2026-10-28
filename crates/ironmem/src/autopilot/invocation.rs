@@ -699,17 +699,38 @@ pub(crate) fn persist_private_atomic(
     tmp_prefix: &str,
     bytes: &[u8],
 ) -> Result<(), MemoryError> {
+    persist_private_atomic_synced(path, tmp_prefix, bytes, true)
+}
+
+/// [`persist_private_atomic`]; only `full` makes the replacement survive a
+/// power loss. Without it the temp file gets a plain `fsync(2)` (on macOS
+/// that skips `F_FULLFSYNC`, which flushes the whole drive cache) and the
+/// directory none: a reader still never sees a torn record, but a crash of
+/// the machine may bring back the previous one. For the frequent
+/// intermediate writes of a record that a later full write supersedes.
+pub(crate) fn persist_private_atomic_synced(
+    path: &Path,
+    tmp_prefix: &str,
+    bytes: &[u8],
+    full: bool,
+) -> Result<(), MemoryError> {
     let tmp = path.with_file_name(format!("{tmp_prefix}-{}.tmp", uuid::Uuid::new_v4()));
     let result = (|| {
         let mut file = create_private(&tmp)?;
         file.write_all(bytes)?;
-        file.sync_all()?;
+        if full {
+            file.sync_all()?;
+        } else {
+            light_sync(&file)?;
+        }
         std::fs::rename(&tmp, path)?;
-        File::open(
-            path.parent()
-                .ok_or_else(|| validation("invocation artifact requires a parent directory"))?,
-        )?
-        .sync_all()?;
+        if full {
+            File::open(
+                path.parent()
+                    .ok_or_else(|| validation("invocation artifact requires a parent directory"))?,
+            )?
+            .sync_all()?;
+        }
         Ok(())
     })();
     if result.is_err() {
@@ -723,6 +744,24 @@ pub(crate) fn persist_private_atomic(
         }
     }
     result
+}
+
+/// A plain `fsync(2)` of `file`: unlike [`File::sync_all`] on macOS, no
+/// `F_FULLFSYNC` drive-cache flush.
+fn light_sync(file: &File) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: fsync on a descriptor this File owns.
+        if unsafe { libc::fsync(file.as_raw_fd()) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        file.sync_data()
+    }
 }
 
 /// Write `record` within [`EXIT_LIMIT`]. A record past it is refused, never
@@ -947,17 +986,20 @@ fn run_supervised_bounded_with(
     let mut timed_out = false;
     let mut limit_exceeded;
     let mut last_observed: Option<Instant> = None;
+    // The post-spawn write above counts: removals wait from it.
+    let mut identity_written = Some(Instant::now());
     let status = loop {
         // The first pass scans immediately after spawn.
         if last_observed.is_none_or(|at| at.elapsed() >= OBSERVE_INTERVAL) {
-            // Record the root's birth and the live descendant set as soon as
-            // either changes: a successor of a crashed controller, and
-            // `clear-dispatch`, see only what the identity file holds, and
-            // Muse's tools all leave the root's group. A failed write is
-            // handled like the post-spawn one.
-            let observed = tracker
-                .observe()
-                .and_then(|_| record_identity(a, &mut identity, &tracker));
+            // Record the root's birth and every newly enrolled descendant
+            // as soon as either appears (exits follow lazily): a successor
+            // of a crashed controller, and `clear-dispatch`, see only what
+            // the identity file holds, and Muse's tools all leave the
+            // root's group. A failed write is handled like the post-spawn
+            // one.
+            let observed = tracker.observe().and_then(|_| {
+                record_live_identity(a, &mut identity, &tracker, &mut identity_written)
+            });
             if let Err(e) = observed {
                 let cleanup = tracker.cleanup(false);
                 let _ = child.kill();
@@ -1041,8 +1083,45 @@ fn create_spawn_files(files: &[SpawnFile]) -> Result<(), (&Path, std::io::Error)
     Ok(())
 }
 
+/// The longest a supervision sample defers writing descendants that only
+/// exited ([`record_live_identity`]).
+const IDENTITY_REMOVAL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// [`record_identity`] for a supervision sample, which runs every
+/// [`OBSERVE_INTERVAL`]. A new root birth or a newly enrolled descendant
+/// (what a successor or `clear-dispatch` must know about) is written at
+/// once. A set that only lost descendants (build churn ends rustc, cc and
+/// ld on almost every sample) is written with the next enrolment or once
+/// [`IDENTITY_REMOVAL_INTERVAL`] has passed since `written`, the last write:
+/// until then the file over-reports, which only holds longer. These writes
+/// skip the full-device flush ([`persist_private_atomic_synced`]); the
+/// writes after the root is reaped are fully durable.
+fn record_live_identity(
+    a: &InvocationArtifacts,
+    identity: &mut ProcessIdentity,
+    tracker: &ProcessTracker,
+    written: &mut Option<Instant>,
+) -> Result<(), MemoryError> {
+    let (root_birth, descendants) = tracker.recorded();
+    if root_birth == identity.root_birth && descendants == identity.descendants {
+        return Ok(());
+    }
+    let enrolled = root_birth != identity.root_birth
+        || descendants
+            .iter()
+            .any(|d| !identity.descendants.iter().any(|old| old == d));
+    if !enrolled && written.is_some_and(|at| at.elapsed() < IDENTITY_REMOVAL_INTERVAL) {
+        return Ok(());
+    }
+    identity.root_birth = root_birth;
+    identity.descendants = descendants;
+    super::process_tree::persist_identity_synced(a, identity, false)?;
+    *written = Some(Instant::now());
+    Ok(())
+}
+
 /// Persist `identity` with the tracker's current root birth and live
-/// descendants, only when they changed.
+/// descendants, only when they changed, fully durably.
 fn record_identity(
     a: &InvocationArtifacts,
     identity: &mut ProcessIdentity,
@@ -2931,6 +3010,66 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
             "{held}"
         );
         assert!(is_awaiting_quiet(a) && !has_valid_exit_record(a));
+    }
+
+    /// A supervision sample whose live descendant set only lost processes
+    /// (build churn: rustc, cc and ld exit every tick) does not rewrite the
+    /// identity file each time; the removal waits for the next enrolment or
+    /// the removal interval. An enrolment, which recovery must know about,
+    /// is written at once, and so is everything after the root is reaped.
+    #[test]
+    fn an_identity_sample_that_only_loses_descendants_is_written_lazily() {
+        use crate::autopilot::process_tree::{read_identity, ProcessRow};
+        let (_dir, s) = setup();
+        let a = s.invocation_artifacts.as_ref().unwrap();
+        let row = |pid: u32| ProcessRow {
+            pid,
+            ppid: 1234,
+            pgid: 1234,
+            stat: "S".into(),
+            args: "tool".into(),
+        };
+        let tracker_of = |pids: &[u32]| {
+            let mut tracker = ProcessTracker::owning_every_descendant(1234);
+            for &pid in pids {
+                tracker.enrol_for_test(row(pid), fixture_birth(u64::from(pid)));
+            }
+            tracker
+        };
+        let listed = || {
+            read_identity(a)
+                .unwrap()
+                .descendants
+                .iter()
+                .map(|d| d.pid)
+                .collect::<Vec<_>>()
+        };
+        let mut identity = ProcessIdentity {
+            version: 1,
+            root_pid: 1234,
+            root_pgid: 1234,
+            root_birth: None,
+            schema_path: a.schema_path.clone(),
+            invocation_id: a.invocation_id.clone(),
+            descendants: Vec::new(),
+        };
+        let mut written = None;
+        // A and B enrol: written at once.
+        record_live_identity(a, &mut identity, &tracker_of(&[20, 30]), &mut written).unwrap();
+        assert_eq!(listed(), vec![20, 30]);
+        // B exits: the file still lists it for now.
+        record_live_identity(a, &mut identity, &tracker_of(&[20]), &mut written).unwrap();
+        assert_eq!(listed(), vec![20, 30]);
+        // C enrols: written at once, B's exit with it.
+        record_live_identity(a, &mut identity, &tracker_of(&[20, 40]), &mut written).unwrap();
+        assert_eq!(listed(), vec![20, 40]);
+        // A removal past the interval is written.
+        written = Some(Instant::now() - IDENTITY_REMOVAL_INTERVAL);
+        record_live_identity(a, &mut identity, &tracker_of(&[40]), &mut written).unwrap();
+        assert_eq!(listed(), vec![40]);
+        // After the root is reaped, a removal is written at once.
+        record_identity(a, &mut identity, &tracker_of(&[])).unwrap();
+        assert!(listed().is_empty());
     }
 
     /// Settling judges the root's group and the invocation's marker on a
