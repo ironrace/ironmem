@@ -1276,12 +1276,23 @@ fn linux_cwd(
         Err(e) if gone(&e) => return Ok(None),
         Err(e) => return Err(format!("its tasks cannot be listed: {e}")),
     };
+    // The first refusal that does not mean "that thread is gone" says why
+    // the hold cannot be lifted (EACCES, say).
+    let mut refusal = None;
     for tid in tasks.into_iter().filter(|tid| *tid != pid) {
-        if let Ok(cwd) = read_link(Path::new(&format!("/proc/{pid}/task/{tid}/cwd"))) {
-            return Ok(Some(cwd));
+        match read_link(Path::new(&format!("/proc/{pid}/task/{tid}/cwd"))) {
+            Ok(cwd) => return Ok(Some(cwd)),
+            Err(e) if !gone(&e) => {
+                refusal.get_or_insert(e);
+            }
+            Err(_) => {}
         }
     }
-    Err("its main thread has exited and no live thread's working directory can be read".into())
+    let reason = "its main thread has exited and no live thread's working directory can be read";
+    Err(match refusal {
+        Some(e) => format!("{reason}: {e}"),
+        None => reason.into(),
+    })
 }
 
 /// One process's kernel record from the text of its Linux
@@ -4632,6 +4643,20 @@ pub(crate) mod tests {
         assert_eq!(
             linux_cwd(8, links(None, None), |_| Err(enoent()), running),
             Ok(None)
+        );
+        // A live thread whose link is refused says why, so the hold is
+        // diagnosable: the first refusal that does not mean "gone" is kept.
+        let refused_task = |path: &Path| -> std::io::Result<PathBuf> {
+            match path.to_str().unwrap() {
+                "/proc/8/cwd" | "/proc/8/task/8/cwd" => Err(enoent()),
+                "/proc/8/task/10/cwd" => Err(Error::from_raw_os_error(libc::EACCES)),
+                other => panic!("unexpected read {other}"),
+            }
+        };
+        let err = linux_cwd(8, refused_task, tasks, running).unwrap_err();
+        assert!(
+            err.contains("thread") && err.contains("Permission denied"),
+            "{err}"
         );
         // A kernel read that fails is no proof it is gone.
         assert!(linux_cwd(8, links(None, None), tasks, |_| Err("refused".into())).is_err());
