@@ -18,7 +18,7 @@ use crate::{config, ingest, mcp};
 /// runner, in particular — can reuse the same "validate the assistant
 /// binary" step the spec's *Reuse* section calls out, instead of
 /// re-implementing PATH scanning.
-pub(crate) use binary::find_launcher;
+pub(crate) use binary::{cached_launcher, find_launcher};
 
 /// The assistant a launcher targets.
 ///

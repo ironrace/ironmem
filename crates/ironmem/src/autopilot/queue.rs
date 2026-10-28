@@ -1860,8 +1860,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let (a, row) =
-            testing::invocation_in(dir.path(), Implementer::Muse, "ironrace-ironmem-1");
+        let (a, row) = testing::invocation_in(dir.path(), Implementer::Muse, "ironrace-ironmem-1");
         state.invocation_artifacts = Some(a.clone());
         dispatch_state::upsert_dispatch_state(&db, &state).unwrap();
         // Claude's registry lists nothing: only process evidence may hold it.

@@ -559,8 +559,7 @@ pub(crate) fn invocation_state_liveness_with(
     // way, so process evidence still decides; `run`'s recovery, which
     // reads the artifacts, is the strict check.
     if let Some(artifacts) = &state.invocation_artifacts {
-        if let Err(reason) =
-            artifacts.check_common_dir(std::path::Path::new(&state.worktree_path))
+        if let Err(reason) = artifacts.check_common_dir(std::path::Path::new(&state.worktree_path))
         {
             if reason.contains("is not under the common Git directory") {
                 return Liveness::Unknown;

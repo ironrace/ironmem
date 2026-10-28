@@ -448,7 +448,10 @@ pub struct Worktree {
 /// Hooks are left on (git-lfs needs `post-checkout`); every command is
 /// bounded in time instead ([`run_git_output`]).
 fn git_command() -> Command {
-    let mut command = Command::new("git");
+    // Resolved once through `find_launcher`, never through a relative
+    // PATH entry in the worktree; the scan in `git_env_scan` cannot see
+    // a held program name, so the scrub is spelled out here as there.
+    let mut command = Command::new(crate::launcher::cached_launcher("git"));
     crate::mcp::tools::scrub_git_environment(&mut command);
     command.args(["-c", "core.fsmonitor=false"]);
     command
@@ -609,8 +612,8 @@ fn run_git_output_within(
             args.join(" ")
         )))
     })?;
-    let stdout = read_pipe(child.stdout.take());
-    let stderr = read_pipe(child.stderr.take());
+    let stdout = super::dispatch::drain(child.stdout.take());
+    let stderr = super::dispatch::drain(child.stderr.take());
     let deadline = std::time::Instant::now() + timeout;
     let mut poll = std::time::Duration::from_millis(1);
     loop {
@@ -651,7 +654,7 @@ fn run_git_output_within(
             label()
         )))
     })?;
-    let read = |pipe: PipeReader, name: &str| -> Result<String, GitRunFailure> {
+    let read = |pipe: super::dispatch::DrainHandle, name: &str| -> Result<String, GitRunFailure> {
         let bytes = pipe
             .join()
             .map_err(|_| std::io::Error::other("its reader panicked"))
@@ -668,21 +671,6 @@ fn run_git_output_within(
         code: status.code(),
         stdout: read(stdout, "stdout")?,
         stderr: read(stderr, "stderr")?,
-    })
-}
-
-/// A thread reading one of a git command's pipes to its end.
-type PipeReader = std::thread::JoinHandle<std::io::Result<Vec<u8>>>;
-
-/// Read `pipe` to its end on its own thread, so a full pipe cannot stall the
-/// git [`run_git_output_within`] is polling for exit.
-fn read_pipe<R: std::io::Read + Send + 'static>(pipe: Option<R>) -> PipeReader {
-    std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(mut pipe) = pipe {
-            pipe.read_to_end(&mut buf)?;
-        }
-        Ok(buf)
     })
 }
 

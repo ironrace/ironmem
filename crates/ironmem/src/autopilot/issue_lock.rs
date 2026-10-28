@@ -123,7 +123,9 @@ pub(crate) fn lock_path_in(common: &Path, issue: &IssueRef) -> PathBuf {
 /// Refused when the common directory is on a remote filesystem
 /// ([`super::local_fs`]).
 pub fn git_common_dir(repo: &Path) -> Result<Option<PathBuf>, MemoryError> {
-    let mut git = Command::new("git");
+    // Through the cached `find_launcher` resolution, like every git
+    // spawn; scrubbed here as the scan requires of a held program name.
+    let mut git = Command::new(crate::launcher::cached_launcher("git"));
     git.args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
         .current_dir(repo);
     crate::mcp::tools::scrub_git_environment(&mut git);

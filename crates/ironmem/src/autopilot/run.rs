@@ -962,9 +962,7 @@ impl Dispatcher for CliDispatcher {
         // F13: recovery reads only artifacts under the worktree's common
         // directory, where `prepare_artifacts` put them.
         if let Some(artifacts) = &state.invocation_artifacts {
-            if let Err(reason) =
-                artifacts.check_common_dir(Path::new(&state.worktree_path))
-            {
+            if let Err(reason) = artifacts.check_common_dir(Path::new(&state.worktree_path)) {
                 return Ok(InvocationRecovery::Unknown { reason });
             }
         }
@@ -1034,7 +1032,8 @@ fn branch_tip(worktree: &Worktree) -> Option<String> {
 /// exists (`rev-parse --verify --quiet` exits 1), `Err` when git could not
 /// be run or failed any other way.
 fn read_branch_tip(dir: &Path, branch: &str) -> Result<Option<String>, String> {
-    let mut command = std::process::Command::new("git");
+    // Through the cached `find_launcher` resolution, like every git spawn.
+    let mut command = std::process::Command::new(crate::launcher::cached_launcher("git"));
     // An inherited `GIT_DIR` overrides `current_dir`, so without this the
     // commit recorded as an attempt's `commit_sha` could be another
     // repository's — a wrong answer that looks exactly like a right one.
@@ -1361,7 +1360,9 @@ impl<'a> GuardGit<'a> {
     fn run(&self, args: &[&str], input: Option<&[&str]>) -> Result<std::process::Output, String> {
         use std::process::Stdio;
         let label = || format!("git {}", args.join(" "));
-        let mut command = std::process::Command::new("git");
+        // Through the cached `find_launcher` resolution, like every git
+        // spawn; scrubbed here as the scan requires of a held name.
+        let mut command = std::process::Command::new(crate::launcher::cached_launcher("git"));
         crate::mcp::tools::scrub_git_environment(&mut command);
         // No fetch of any kind: a missing object in a partial clone would
         // otherwise be fetched through the repository's own transport config.

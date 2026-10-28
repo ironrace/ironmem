@@ -441,7 +441,8 @@ fn bounded_process_table() -> Result<Vec<u8>, String> {
     use std::time::{Duration, Instant};
     const TIMEOUT: Duration = Duration::from_secs(2);
     const OUTPUT_LIMIT: usize = 16 * 1024 * 1024;
-    let mut command = Command::new("ps");
+    // Through the cached `find_launcher` resolution, like every ps spawn.
+    let mut command = Command::new(crate::launcher::cached_launcher("ps"));
     command
         .args(["-axww", "-o", "pid=,ppid=,pgid=,stat=,args="])
         .stdin(Stdio::null())

@@ -679,6 +679,27 @@ fn finish_dispatch(output: std::process::Output) -> Result<DispatchOutcome, Memo
 mod tests {
     use super::*;
 
+    /// Whether `pid` is a zombie: dead, but unreaped where no init
+    /// reaps it (a Linux container without `--init`), so `kill(pid, 0)`
+    /// still succeeds. Elsewhere, and unreadable, false.
+    fn is_zombie(pid: i32) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+                return false;
+            };
+            // The state is the field after the parenthesised comm.
+            stat.rsplit_once(") ")
+                .and_then(|(_, rest)| rest.chars().next())
+                == Some('Z')
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = pid;
+            false
+        }
+    }
+
     /// F6: a pipe that fails partway is an error, never the bytes read so
     /// far passed off as all of it.
     #[test]
@@ -929,7 +950,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(300));
         // SAFETY: `kill` with signal 0 performs an existence/permission check
         // and delivers no signal.
-        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        let alive = unsafe { libc::kill(pid, 0) } == 0 && !is_zombie(pid);
         if alive {
             // Do not leave a stray `sleep 120` behind if the assertion fails.
             unsafe { libc::kill(pid, libc::SIGKILL) };

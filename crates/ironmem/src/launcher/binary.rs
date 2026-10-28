@@ -8,6 +8,26 @@ use std::path::PathBuf;
 
 use crate::error::MemoryError;
 
+/// `name` resolved once through [`find_launcher`] and cached for the
+/// process, for the spawn sites (git, ps) that run constantly and must
+/// never resolve through a relative PATH entry in a worktree. A failed
+/// resolution falls back to the bare name, whose spawn then fails with
+/// the operating system's own not-found error, as it did before.
+pub(crate) fn cached_launcher(name: &str) -> PathBuf {
+    static GIT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    static PS: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    let cell = match name {
+        "git" => &GIT,
+        "ps" => &PS,
+        _ => return PathBuf::from(name),
+    };
+    cell.get_or_init(|| {
+        let path_var = std::env::var_os("PATH").unwrap_or_default();
+        find_launcher(name, &path_var).unwrap_or_else(|_| PathBuf::from(name))
+    })
+    .clone()
+}
+
 /// Locate `name` using the process PATH.
 pub(crate) fn find_on_path(name: &str) -> Result<PathBuf, MemoryError> {
     let path_var = std::env::var_os("PATH").unwrap_or_default();

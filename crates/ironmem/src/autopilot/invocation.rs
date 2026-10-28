@@ -426,7 +426,9 @@ pub(crate) fn discard_unlaunched(a: &InvocationArtifacts) {
 /// `worktree`'s common Git directory, absolute, where every invocation's
 /// artifacts live (`<common>/ironmem/autopilot/<slug>/<uuid>/`).
 fn common_git_dir(worktree: &Path) -> Result<PathBuf, MemoryError> {
-    let mut git = Command::new("git");
+    // Through the cached `find_launcher` resolution, like every git
+    // spawn; scrubbed here as the scan requires of a held program name.
+    let mut git = Command::new(crate::launcher::cached_launcher("git"));
     git.args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
         .current_dir(worktree);
     crate::mcp::tools::scrub_git_environment(&mut git);
@@ -4040,6 +4042,60 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
         // SAFETY: signal 0 only probes that the process (or, negative, the
         // group) exists.
         let exists = |pid: i32| unsafe { libc::kill(pid, 0) } == 0;
+        // A zombie is gone: dead but unreaped where no init reaps it (a
+        // Linux container without `--init`), though `kill(pid, 0)` and a
+        // group probe still succeed on it.
+        let is_zombie = |pid: i32| {
+            #[cfg(target_os = "linux")]
+            {
+                std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+                    stat.rsplit_once(") ")
+                        .and_then(|(_, rest)| rest.chars().next())
+                        == Some('Z')
+                })
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = pid;
+                false
+            }
+        };
+        let gone = |pid: i32| !exists(pid) || is_zombie(pid);
+        // A group is gone when no member of it is alive (zombies aside).
+        let group_gone = |pgid: i32| {
+            #[cfg(target_os = "linux")]
+            {
+                let mut saw_member = false;
+                if let Ok(entries) = std::fs::read_dir("/proc") {
+                    for entry in entries.flatten() {
+                        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+                            continue;
+                        };
+                        let Some((_, rest)) = stat.rsplit_once(") ") else {
+                            continue;
+                        };
+                        let mut fields = rest.split_whitespace();
+                        let (Some(state), _, Some(group)) =
+                            (fields.next(), fields.next(), fields.next())
+                        else {
+                            continue;
+                        };
+                        if group.parse::<i32>() == Ok(pgid) {
+                            saw_member = true;
+                            if state != "Z" {
+                                return false;
+                            }
+                        }
+                    }
+                    return saw_member || !exists(-pgid);
+                }
+                !exists(-pgid)
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                !exists(-pgid)
+            }
+        };
         for on_configured_socket in [true, false] {
             let (dir, s) = setup();
             let daemon_dir = dir.path().join("daemon");
@@ -4103,13 +4159,15 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
                 assert!(exists(pid), "supervision cleanup killed the shared daemon");
             } else {
                 // Killed by cleanup, its `sleep` child too; give their new
-                // parent a moment to reap them.
+                // parent a moment to reap them. A zombie counts as gone:
+                // without an init reaper it is never collected, and its
+                // group probe keeps succeeding on it.
                 let deadline = Instant::now() + Duration::from_secs(2);
-                while (exists(pid) || exists(-pid)) && Instant::now() < deadline {
+                while !(gone(pid) && group_gone(pid)) && Instant::now() < deadline {
                     std::thread::sleep(Duration::from_millis(20));
                 }
-                assert!(!exists(pid), "a daemon on another socket escaped cleanup");
-                assert!(!exists(-pid), "a process in its group escaped cleanup");
+                assert!(gone(pid), "a daemon on another socket escaped cleanup");
+                assert!(group_gone(pid), "a process in its group escaped cleanup");
                 // Confirmed gone, so its group ID is free for reuse.
                 cleanup.0.take();
             }
