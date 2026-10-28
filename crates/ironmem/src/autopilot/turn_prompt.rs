@@ -103,6 +103,10 @@ pub struct TurnPromptInputs<'a> {
     /// nothing on the branch [`super::advance`] looks at, and the failure is
     /// silent: the issue records a success and stalls with no pull request.
     pub branch: &'a str,
+    /// The remote the push clause names: the issue branch has no upstream
+    /// ([`super::worktree::ensure_worktree`]), so a push must name both.
+    /// [`super::worktree::push_remote`] picks it.
+    pub remote: &'a str,
     /// The repo's approved gate commands, verbatim from
     /// [`super::gate_config::GateConfig::gate_commands`] — never authored
     /// separately from the approved config.
@@ -425,9 +429,13 @@ pub fn render(inputs: &TurnPromptInputs) -> Result<String, ConditionTooLong> {
     // The push half of the condition, which is NOT optional and NOT a
     // remediation-only concern — see [`render`]'s "Why the push is in the
     // condition".
+    // It names the remote too: the branch has no upstream, so a bare
+    // `git push` fails.
     let push_clause = format!(
-        ", and every commit you have made is pushed to this issue's branch `{}`",
-        inputs.branch
+        ", and every commit you have made is pushed to this issue's branch `{branch}` \
+         (`git push {remote} {branch}`)",
+        branch = inputs.branch,
+        remote = inputs.remote,
     );
 
     let gate_line = inputs.gate_commands.join(" && ");
@@ -573,6 +581,7 @@ mod tests {
                 findings,
             }),
             branch: "autopilot/owner-repo-7",
+            remote: "origin",
             gate_commands: &["cargo test".to_string()],
             n_turns: 6,
         })
@@ -611,6 +620,7 @@ mod tests {
                 findings: Some(&findings),
             }),
             branch: "autopilot/owner-repo-7",
+            remote: "origin",
             gate_commands: &["cargo test --workspace".to_string()],
             n_turns: 6,
         })
@@ -649,6 +659,11 @@ platform limit, got {}",
 
     /// An ordinary (non-remediation) dispatch's rendered prompt.
     fn ordinary_text(branch: &str) -> String {
+        ordinary_text_on(branch, "origin")
+    }
+
+    /// [`ordinary_text`] pushing to `remote`.
+    fn ordinary_text_on(branch: &str, remote: &str) -> String {
         let issue = base_issue();
         render(&TurnPromptInputs {
             issue: &issue,
@@ -659,6 +674,7 @@ platform limit, got {}",
             human_answers: &[],
             remediation: None,
             branch,
+            remote,
             gate_commands: &["cargo test".to_string()],
             n_turns: 6,
         })
@@ -699,6 +715,20 @@ platform limit, got {}",
         assert!(
             condition.contains("autopilot/owner-repo-7"),
             "the condition must name the branch, so a dispatch that cut its own cannot satisfy it: {condition}"
+        );
+    }
+
+    /// The issue branch has no upstream, so a bare `git push` fails (or,
+    /// under `push.default=upstream`, would have reached the base): the
+    /// condition names the push with its remote and branch.
+    #[test]
+    fn the_push_clause_names_the_remote_and_the_branch() {
+        let text = ordinary_text_on("autopilot/owner-repo-7", "fork");
+        let gate_at = text.find("The gate condition for this repo").unwrap();
+        let condition = &text[gate_at..];
+        assert!(
+            condition.contains("`git push fork autopilot/owner-repo-7`"),
+            "{condition}"
         );
     }
 
@@ -801,6 +831,7 @@ platform limit, got {}",
                 findings: Some("fix it"),
             }),
             branch: "autopilot/owner-repo-7",
+            remote: "origin",
             gate_commands: &["cargo test".to_string()],
             n_turns: 6,
         })
@@ -830,6 +861,7 @@ platform limit, got {}",
             human_answers: &[],
             remediation: None,
             branch: "autopilot/owner-repo-7",
+            remote: "origin",
             gate_commands: &["cargo test --workspace".to_string()],
             n_turns: 6,
         })
@@ -864,6 +896,7 @@ platform limit, got {}",
             human_answers: &[],
             remediation: None,
             branch: "autopilot/owner-repo-7",
+            remote: "origin",
             gate_commands: &["cargo test".to_string()],
             n_turns: 1,
         })
@@ -892,6 +925,7 @@ platform limit, got {}",
             )],
             remediation: None,
             branch: "autopilot/owner-repo-7",
+            remote: "origin",
             gate_commands: &["cargo test".to_string()],
             n_turns: 3,
         })
@@ -922,6 +956,7 @@ platform limit, got {}",
             human_answers: &[("Q?".to_string(), "A!".to_string())],
             remediation: None,
             branch: "autopilot/owner-repo-7",
+            remote: "origin",
             gate_commands: &["cargo test".to_string()],
             n_turns: 3,
         })
@@ -944,6 +979,7 @@ platform limit, got {}",
             human_answers: &[],
             remediation: None,
             branch: "autopilot/owner-repo-7",
+            remote: "origin",
             gate_commands: &["cargo test".to_string()],
             n_turns: 3,
         })
@@ -965,6 +1001,7 @@ platform limit, got {}",
             human_answers: &[],
             remediation: None,
             branch: "autopilot/owner-repo-7",
+            remote: "origin",
             gate_commands: &["cargo test".to_string()],
             n_turns: 3,
         })
@@ -993,6 +1030,7 @@ platform limit, got {}",
             human_answers: &[],
             remediation: None,
             branch: "autopilot/owner-repo-7",
+            remote: "origin",
             gate_commands: &commands,
             n_turns: 1,
         })
@@ -1015,6 +1053,7 @@ platform limit, got {}",
             human_answers: &[],
             remediation: None,
             branch: "autopilot/owner-repo-7",
+            remote: "origin",
             gate_commands: &["cargo test".to_string()],
             n_turns: 1,
         })
@@ -1035,6 +1074,7 @@ platform limit, got {}",
             human_answers: &[],
             remediation: None,
             branch: "autopilot/owner-repo-7",
+            remote: "origin",
             gate_commands: &["cargo test".to_string()],
             n_turns: 0,
         })
@@ -1056,6 +1096,7 @@ platform limit, got {}",
             human_answers: &[],
             remediation: None,
             branch: "autopilot/owner-repo-7",
+            remote: "origin",
             gate_commands: &[],
             n_turns: 1,
         })
@@ -1088,6 +1129,7 @@ platform limit, got {}",
             human_answers: &[],
             remediation: None,
             branch: "autopilot/owner-repo-7",
+            remote: "origin",
             gate_commands: &["cargo test --workspace".to_string()],
             n_turns: 6,
         })
@@ -1116,6 +1158,7 @@ platform limit, got {}",
             human_answers: &[],
             remediation: None,
             branch: "autopilot/ironrace-ironmem-339",
+            remote: "origin",
             gate_commands: &[
                 "cargo fmt --all -- --check".to_string(),
                 "cargo clippy --workspace --all-targets --all-features -- -D warnings".to_string(),
@@ -1239,6 +1282,7 @@ platform limit, got {}",
             human_answers: &[],
             remediation: None,
             branch: "autopilot/ironrace-ironmem-339",
+            remote: "origin",
             gate_commands: &["cargo test ".to_string() + &"--flag ".repeat(2_000)],
             n_turns: 6,
         })
@@ -1313,6 +1357,7 @@ cannot tell it is missing, nor how to read it",
             human_answers: &answers,
             remediation: None,
             branch: "autopilot/ironrace-ironmem-339",
+            remote: "origin",
             gate_commands: &["cargo test --workspace".to_string()],
             n_turns: 6,
         })
@@ -1341,6 +1386,7 @@ cannot tell it is missing, nor how to read it",
             human_answers: &answers,
             remediation: None,
             branch: "autopilot/ironrace-ironmem-339",
+            remote: "origin",
             gate_commands: &["cargo test --workspace".to_string()],
             n_turns: 6,
         })
@@ -1366,6 +1412,7 @@ cannot tell it is missing, nor how to read it",
             human_answers: &[("q".to_string(), "a".to_string())],
             remediation: None,
             branch: "autopilot/ironrace-ironmem-339",
+            remote: "origin",
             gate_commands: &["cargo test ".to_string() + &"--flag ".repeat(2_000)],
             n_turns: 6,
         })

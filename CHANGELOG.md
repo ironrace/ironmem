@@ -165,6 +165,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **A new Autopilot issue branch has no upstream.** Before, an issue branch
+  cut from a remote-tracking `--base` such as `origin/main` tracked it, so
+  with `push.default=upstream` a bare `git push` from the issue branch went to
+  `main`. Now the branch is created at the resolved sha with `--no-track`, so
+  a bare `git push` can never reach the base. Push an issue branch by naming
+  the remote and the branch (`git push origin <branch>`); the implementer's
+  goal condition now says so, naming the remote that already has the branch,
+  else the only remote, else `origin`. Existing branches keep whatever
+  upstream they have.
 - **Existing setups with `commit.gpgsign` on now get a failed attempt when an
   implementer's commits are unsigned, for Claude as well as Codex and Muse.**
   Before, such a run could succeed. Make sure the signing key or agent is

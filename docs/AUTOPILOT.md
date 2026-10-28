@@ -567,16 +567,16 @@ model can quietly pass `-c commit.gpgsign=false`.
   SHA-256) in your checkout and stored as `branch.<branch>.ironmemCut` before
   the issue branch is created, so a branch never exists without one. A base that
   does not resolve, or a cut that cannot be stored, is refused before any
-  worktree exists. The branch is created at that sha, never at `--base` by
-  name, so a `--base` that moves meanwhile cannot move the branch. A
-  remote-tracking `--base` still becomes its upstream, as `git worktree add -b`
-  sets one by default (not when `branch.autoSetupMerge` is `false` or
-  `inherit`); if that write fails (another git holds the config lock for longer
-  than the retries), the run logs a warning and carries on, since Autopilot
-  never uses the upstream. If `git worktree add` fails after making the branch,
-  the branch keeps its cut and the next run reuses it; the cut is taken back
-  only when no branch was made, and only while both its value and the run's own token
-  in `branch.<branch>.ironmemCutOwner` still read as that run's, so a take-back
+  worktree exists. The branch is created at that sha, never at `--base` by name,
+  so a `--base` that moves meanwhile cannot move the branch. The issue branch
+  has no upstream, even from a remote-tracking `--base`, so a bare `git push`
+  from it can never reach the base (with `push.default=upstream`, an upstream of
+  `origin/main` would send it there); push it by naming the remote and the
+  branch, as the goal condition does (`git push origin <branch>`). If `git
+  worktree add` fails after making the branch, the branch keeps its cut and the
+  next run reuses it; the cut is taken back only when no branch was made, and
+  only while both its value and the run's own token (stored in
+  `branch.<branch>.ironmemCutOwner`) still read as that run's, so a take-back
   never removes the same value another controller recorded after it. Once its
   add has made the branch, a run reads the cut back and records it again if
   another controller's take-back removed it meanwhile. A branch another
@@ -586,13 +586,13 @@ model can quietly pass `-c commit.gpgsign=false`.
   its tip cannot be read back, the run stops, keeps both with their cut, and
   asks you to run again. An existing branch with no recorded cut (an older
   branch) gets the commit its reflog says it was created from, or, without that
-  entry, the merge base of the branch and `--base`; never `--base` itself,
-  which may have moved. That run logs a warning
-  naming the branch, the source and the sha. A branch that shares no history
-  with `--base`, or one whose merge base with `--base` is its own tip (merged
-  into it, or empty) while it has commits on no remote (that merge base would
-  leave the guard nothing to check), and that has no creation entry, is refused:
-  record its cut with `git config branch.<branch>.ironmemCut <sha>`.
+  entry, the merge base of the branch and `--base`; never `--base` itself, which
+  may have moved. That run logs a warning naming the branch, the source and the
+  sha. A branch that shares no history with `--base`, or one whose merge base
+  with `--base` is its own tip (merged into it, or empty) while it has commits
+  on no remote (that merge base would leave the guard nothing to check), and
+  that has no creation entry, is refused: record its cut with `git config
+  branch.<branch>.ironmemCut <sha>`.
 - **A config lock left behind blocks new branches.** Storing the cut writes
   `.git/config`. While another worktree's git holds its lock, the write is
   retried for about half a second. A lock held longer fails the run with an

@@ -81,6 +81,44 @@ pub fn branch_name(issue: &IssueRef) -> String {
     format!("{BRANCH_PREFIX}/{}", issue.slug())
 }
 
+/// The remote a push of an issue branch names, from the `configured`
+/// remotes and those already `tracking` it (having
+/// `refs/remotes/<remote>/<branch>`): a tracking one (`origin` first when
+/// several are), else the only configured remote, else `origin`. The issue
+/// branch has no upstream, so every push names its remote and branch.
+pub(crate) fn pick_push_remote<'a>(configured: &[&'a str], tracking: &[&'a str]) -> &'a str {
+    tracking
+        .iter()
+        .copied()
+        .find(|remote| *remote == "origin")
+        .or_else(|| tracking.first().copied())
+        .or_else(|| (configured.len() == 1).then(|| configured[0]))
+        .unwrap_or("origin")
+}
+
+/// [`pick_push_remote`] for `branch` in the repository at `dir`. A remote
+/// list that cannot be read counts as none, which names `origin`.
+pub(crate) fn push_remote(dir: &Path, branch: &str) -> String {
+    let configured = git(dir, &["remote"]).unwrap_or_default();
+    let configured: Vec<&str> = configured
+        .lines()
+        .map(str::trim)
+        .filter(|remote| !remote.is_empty())
+        .collect();
+    let refs = git(
+        dir,
+        &["for-each-ref", "--format=%(refname)", "refs/remotes/"],
+    )
+    .unwrap_or_default();
+    let refs: std::collections::HashSet<&str> = refs.lines().collect();
+    let tracking: Vec<&str> = configured
+        .iter()
+        .copied()
+        .filter(|remote| refs.contains(format!("refs/remotes/{remote}/{branch}").as_str()))
+        .collect();
+    pick_push_remote(&configured, &tracking).to_string()
+}
+
 /// Where an issue's worktree lives under `worktree_root`.
 pub fn worktree_path(worktree_root: &Path, issue: &IssueRef) -> PathBuf {
     worktree_root.join(issue.slug())
@@ -732,8 +770,13 @@ fn backfill_cut(
 /// never `base`: git would resolve a ref name again, and a `base` that moved
 /// since `cut` was resolved would make the branch somewhere else. So the
 /// branch is made at `cut` by construction, and nothing is ever rolled back
-/// ([`settle_created`]). A remote-tracking `base` still gives the branch
-/// that upstream ([`set_upstream`]).
+/// ([`settle_created`]).
+///
+/// The branch never has an upstream (`--no-track`, and a sha start point
+/// sets none under any `branch.autoSetupMerge`, measured). With
+/// `push.default=upstream`, an upstream of `origin/main` would send a bare
+/// `git push` from the issue branch to the base; without one, a push must
+/// name its remote and branch.
 ///
 /// If `git worktree add` fails, whether the branch exists decides:
 ///
@@ -790,22 +833,33 @@ fn create_branch_with(
     write_cut(root, branch, cut)?;
     before_add();
     let path_str = path.to_string_lossy().to_string();
-    if let Err(e) = git(root, &["worktree", "add", "-b", branch, &path_str, cut]) {
+    if let Err(e) = git(
+        root,
+        &[
+            "worktree",
+            "add",
+            "--no-track",
+            "-b",
+            branch,
+            &path_str,
+            cut,
+        ],
+    ) {
         return Err(after_failed_add(root, branch, base, cut, &owner, e));
     }
-    settle_created(root, branch, base, cut)
+    settle_created(root, branch, cut)
 }
 
-/// Finish a `branch` this call's add just made at `cut`: give it `base`'s
-/// upstream ([`set_upstream`]), and record `cut` again if another
-/// controller's take-back removed it ([`record_cut_again_if_taken`]).
+/// Finish a `branch` this call's add just made at `cut`: record `cut` again
+/// if another controller's take-back removed it
+/// ([`record_cut_again_if_taken`]).
 ///
 /// Nothing here deletes or removes anything. The add named `cut`, so a tip
 /// that is not `cut` is someone's work on the branch (another controller
 /// reusing the fresh worktree), and a tip that cannot be read is no proof of
 /// anything: either way the branch, its worktree and its cut are kept, and
 /// the run stops so that the next one reuses them.
-fn settle_created(root: &Path, branch: &str, base: &str, cut: &str) -> Result<(), MemoryError> {
+fn settle_created(root: &Path, branch: &str, cut: &str) -> Result<(), MemoryError> {
     let kept = "the branch, its worktree and its cut are kept; run again to reuse them";
     match resolve_commit(root, &format!("refs/heads/{branch}")) {
         Some(tip) if tip == cut => {}
@@ -824,56 +878,7 @@ fn settle_created(root: &Path, branch: &str, base: &str, cut: &str) -> Result<()
             )))
         }
     }
-    set_upstream(root, branch, base);
     record_cut_again_if_taken(root, branch, cut)
-}
-
-/// Give a `branch` just made at `base`'s sha the upstream `git worktree add
-/// -b <branch> <path> <base>` would have given it: a remote-tracking `base`
-/// becomes its upstream (`branch.<branch>.remote` and `.merge`, plus
-/// `.rebase` under `branch.autoSetupRebase`, as measured), unless
-/// `branch.autoSetupMerge` is `false` or `inherit` (a remote-tracking ref has
-/// no upstream of its own to inherit), or is `simple` and the upstream's name
-/// is not the branch's. A local `base` gets none, as `-b` gives it by default;
-/// `always`'s upstream on a local base is not reproduced.
-///
-/// A failed write (a config lock held past [`config_waiting`]'s retries)
-/// only warns. Autopilot never reads the upstream: it checks the branch
-/// against its recorded cut and the remote refs, and any push it asks for
-/// names the remote and branch. The branch at its cut is correct without
-/// one, and failing the run would only leave the same branch for the next
-/// run to reuse, still with no upstream.
-fn set_upstream(root: &Path, branch: &str, base: &str) {
-    let Ok(full) = git(root, &["rev-parse", "--symbolic-full-name", base]) else {
-        return;
-    };
-    let Some(tracked) = full.strip_prefix("refs/remotes/") else {
-        return;
-    };
-    let mode = config_get(root, &["--get", "branch.autoSetupMerge"])
-        .ok()
-        .flatten()
-        .map(|mode| mode.to_ascii_lowercase());
-    let wanted = match mode.as_deref() {
-        Some("false" | "no" | "off" | "0" | "inherit") => false,
-        Some("simple") => tracked
-            .split_once('/')
-            .is_some_and(|(_, name)| name == branch),
-        _ => true,
-    };
-    if !wanted {
-        return;
-    }
-    let upstream = format!("--set-upstream-to={full}");
-    if let Err(e) = config_waiting(root, &["branch", "-q", &upstream, branch], &[], |_| {}) {
-        tracing::warn!(
-            branch = %branch,
-            upstream = %full,
-            error = %e,
-            "autopilot created the issue branch at its cut but could not set its upstream; \
-             the branch and its cut are kept, and Autopilot does not need the upstream"
-        );
-    }
 }
 
 /// After this call's add made `branch` at `cut`: record `cut` again if it no
@@ -1526,10 +1531,6 @@ mod tests {
         // Pinned: the global config signs and runs hooks; worktrees share this.
         run(path, &["config", "commit.gpgsign", "false"]);
         run(path, &["config", "core.hooksPath", "/dev/null"]);
-        // And git's defaults for the upstream a new branch gets, which the
-        // operator's global config could otherwise change.
-        run(path, &["config", "branch.autoSetupMerge", "true"]);
-        run(path, &["config", "branch.autoSetupRebase", "never"]);
         std::fs::write(path.join("README.md"), "seed\n").unwrap();
         run(path, &["add", "README.md"]);
         run(path, &["commit", "-m", "seed"]);
@@ -1878,79 +1879,49 @@ mod tests {
     }
 
     #[test]
-    fn a_remote_tracking_base_records_its_sha_and_keeps_the_upstream() {
-        let repo = fixture_repo();
-        let origin = tempfile::tempdir().unwrap();
-        run(
-            origin.path(),
-            &["init", "-q", "--bare", "--initial-branch=main"],
-        );
-        run(
-            repo.path(),
-            &["remote", "add", "origin", origin.path().to_str().unwrap()],
-        );
-        run(repo.path(), &["push", "-q", "origin", "main"]);
-        let remote_main = resolve_commit(repo.path(), "origin/main").unwrap();
-        // The operator's HEAD moves past origin/main; the cut must not follow.
-        advance_operator_head(repo.path(), "local-only");
-        let roots = tempfile::tempdir().unwrap();
-        let wt = ensure_worktree(repo.path(), roots.path(), &issue(), "origin/main").unwrap();
-        assert_eq!(wt.cut, remote_main);
+    fn the_push_remote_is_the_one_tracking_the_branch_else_the_only_one_else_origin() {
         assert_eq!(
-            read_config(repo.path(), &issue_cut_key()),
-            Some(remote_main)
+            pick_push_remote(&["fork", "origin"], &["fork", "origin"]),
+            "origin"
         );
-        let upstream = git(
-            &wt.path,
-            &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
-        )
-        .unwrap();
-        assert_eq!(upstream, "origin/main");
-        // The keys `worktree add -b <branch> <path> origin/main` writes
-        // (measured, git 2.55), and no others.
-        let branch = branch_name(&issue());
-        assert_eq!(
-            git(
-                repo.path(),
-                &[
-                    "config",
-                    "--get-regexp",
-                    &format!("^branch\\.{branch}\\.(remote|merge|rebase)$")
-                ]
-            )
-            .unwrap(),
-            format!("branch.{branch}.remote origin\nbranch.{branch}.merge refs/heads/main")
-        );
-    }
-
-    #[test]
-    fn a_remote_tracking_base_sets_no_upstream_when_auto_setup_merge_is_off() {
+        assert_eq!(pick_push_remote(&["fork", "origin"], &["fork"]), "fork");
+        assert_eq!(pick_push_remote(&["fork"], &[]), "fork");
+        assert_eq!(pick_push_remote(&["fork", "up"], &[]), "origin");
+        assert_eq!(pick_push_remote(&[], &[]), "origin");
         let (repo, _origin) = fixture_repo_with_origin();
-        run(repo.path(), &["config", "branch.autoSetupMerge", "false"]);
-        let roots = tempfile::tempdir().unwrap();
-        let wt = ensure_worktree(repo.path(), roots.path(), &issue(), "origin/main").unwrap();
-        assert_eq!(wt.cut, resolve_commit(repo.path(), "origin/main").unwrap());
-        assert_eq!(
-            read_config(
-                repo.path(),
-                &format!("branch.{}.merge", branch_name(&issue()))
-            ),
-            None
-        );
+        run(repo.path(), &["remote", "rename", "origin", "fork"]);
+        assert_eq!(push_remote(repo.path(), &branch_name(&issue())), "fork");
     }
 
+    /// The issue branch has no upstream, even from a remote-tracking base
+    /// and under `branch.autoSetupMerge=always`: with `push.default=upstream`
+    /// a bare `git push` would otherwise send the agent's work to the base.
     #[test]
-    fn a_local_base_sets_no_upstream() {
-        let repo = fixture_repo();
-        let roots = tempfile::tempdir().unwrap();
-        ensure_worktree(repo.path(), roots.path(), &issue(), "main").unwrap();
-        assert_eq!(
-            read_config(
-                repo.path(),
-                &format!("branch.{}.merge", branch_name(&issue()))
-            ),
-            None
-        );
+    fn a_remote_tracking_base_records_its_sha_and_sets_no_upstream() {
+        for auto_setup_merge in [None, Some("always")] {
+            let (repo, _origin) = fixture_repo_with_origin();
+            if let Some(mode) = auto_setup_merge {
+                run(repo.path(), &["config", "branch.autoSetupMerge", mode]);
+            }
+            let remote_main = resolve_commit(repo.path(), "origin/main").unwrap();
+            // The operator's HEAD moves past origin/main; the cut must not follow.
+            advance_operator_head(repo.path(), "local-only");
+            let roots = tempfile::tempdir().unwrap();
+            let wt = ensure_worktree(repo.path(), roots.path(), &issue(), "origin/main").unwrap();
+            assert_eq!(wt.cut, remote_main);
+            assert_eq!(
+                read_config(repo.path(), &issue_cut_key()),
+                Some(remote_main)
+            );
+            let branch = branch_name(&issue());
+            for key in ["remote", "merge"] {
+                assert_eq!(
+                    read_config(repo.path(), &format!("branch.{branch}.{key}")),
+                    None,
+                    "branch.{branch}.{key} under autoSetupMerge {auto_setup_merge:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -2130,8 +2101,7 @@ mod tests {
         assert!(uuid::Uuid::parse_str(&owner).is_ok(), "{owner}");
     }
 
-    /// A repo whose `origin/main` is a remote-tracking base, so creating a
-    /// branch from it sets the upstream in `.git/config`.
+    /// A repo whose `origin/main` is a remote-tracking base.
     fn fixture_repo_with_origin() -> (tempfile::TempDir, tempfile::TempDir) {
         let repo = fixture_repo();
         let origin = tempfile::tempdir().unwrap();
@@ -2145,41 +2115,6 @@ mod tests {
         );
         run(repo.path(), &["push", "-q", "origin", "main"]);
         (repo, origin)
-    }
-
-    #[test]
-    fn an_upstream_write_a_held_config_lock_refuses_keeps_the_branch_and_its_cut() {
-        // Before, `worktree add -b` from a remote-tracking base wrote the
-        // upstream itself, and a held `.git/config` lock failed the whole add
-        // after it had made the branch. The add now names the cut's sha and
-        // writes no config; the upstream is set after it, and a refusal only
-        // warns: Autopilot never reads it.
-        let (repo, _origin) = fixture_repo_with_origin();
-        let roots = tempfile::tempdir().unwrap();
-        let root = resolve_repo_root(repo.path()).unwrap();
-        let cut = resolve_commit(&root, "origin/main").unwrap();
-        let path = worktree_path(roots.path(), &issue());
-        let branch = branch_name(&issue());
-        let mut lock = None;
-        let (created, log) = with_captured_log(|| {
-            create_branch_with(&root, &branch, &path, "origin/main", &cut, || {
-                lock = Some(hold_config_lock(&root));
-            })
-        });
-        std::fs::remove_file(lock.unwrap()).unwrap();
-        created.unwrap();
-        assert_eq!(branch_tip(&root), Some(cut.clone()));
-        assert!(path.is_dir(), "the worktree is kept");
-        assert_eq!(
-            read_config(&root, &issue_cut_key()),
-            Some(cut.clone()),
-            "a branch never exists without its cut"
-        );
-        assert_eq!(read_config(&root, &format!("branch.{branch}.merge")), None);
-        assert!(log.contains("upstream") && log.contains(&branch), "{log}");
-        // The next run reuses the branch and its cut.
-        let reused = ensure_worktree(repo.path(), roots.path(), &issue(), "origin/main").unwrap();
-        assert_eq!(reused.cut, cut);
     }
 
     #[test]
@@ -2336,7 +2271,7 @@ mod tests {
         let branch = branch_name(&issue());
         let cut = added_at_cut(&root, &path);
         let landed = commit_in(&path, "another-run");
-        let err = settle_created(&root, &branch, "HEAD", &cut)
+        let err = settle_created(&root, &branch, &cut)
             .unwrap_err()
             .to_string();
         assert!(err.contains(&branch) && err.contains(&landed), "got: {err}");
@@ -2360,7 +2295,7 @@ mod tests {
             &root,
             &["update-ref", "-d", &format!("refs/heads/{branch}")],
         );
-        let err = settle_created(&root, &branch, "HEAD", &cut)
+        let err = settle_created(&root, &branch, &cut)
             .unwrap_err()
             .to_string();
         assert!(

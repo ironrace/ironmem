@@ -1617,14 +1617,10 @@ fn check_range(
         });
     }
     // The recipe pushes to the remote that already tracks the issue branch
-    // (`origin` first when several do), else the only remote, else `origin`.
-    let remote = own
-        .iter()
-        .map(|(remote, _)| *remote)
-        .find(|remote| *remote == "origin")
-        .or_else(|| own.first().map(|(remote, _)| *remote))
-        .or_else(|| (configured.len() == 1).then(|| configured[0]))
-        .unwrap_or("origin");
+    // (`origin` first when several do), else the only remote, else `origin`,
+    // as the goal condition's push clause does.
+    let tracking: Vec<&str> = own.iter().map(|(remote, _)| *remote).collect();
+    let remote = worktree::pick_push_remote(&configured, &tracking);
     Ok(Some(SigningViolation::Unsigned {
         flagged: flagged.into_iter().map(|(sha, _)| sha).collect(),
         cut: worktree.cut.to_string(),
@@ -2734,6 +2730,8 @@ pub fn run_issue(
                 // checkout is on that branch, and it is the value it hands back
                 // that the IC will actually be committing onto.
                 branch: &worktree.branch,
+                // No upstream: the push clause names the remote too.
+                remote: &worktree::push_remote(&worktree.path, &worktree.branch),
                 gate_commands: &gate_commands,
                 n_turns: config.n_turns,
             }) {
