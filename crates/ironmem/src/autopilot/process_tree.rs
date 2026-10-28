@@ -2282,6 +2282,15 @@ pub(crate) struct ProcessTracker {
     refused: std::collections::HashSet<u32>,
 }
 
+/// `e`'s message, without the "Validation error" prefix a validation
+/// error displays with, for joining several into one.
+fn detail(e: MemoryError) -> String {
+    match e {
+        MemoryError::Validation(message) => message,
+        other => other.to_string(),
+    }
+}
+
 /// One process the tracker owns.
 #[derive(Debug, Clone)]
 struct Tracked {
@@ -2679,7 +2688,9 @@ impl ProcessTracker {
         })();
         // Continue best-effort authenticated cleanup after any uncertainty so
         // SIGSTOP cannot strand a known process. Never signal a stale group.
-        let mut signal_error = None;
+        // Every process that could not be killed is reported, beside any
+        // failure above: neither hides the other.
+        let mut signal_errors = Vec::new();
         let mut refused = Vec::new();
         let temp = std::env::temp_dir();
         for tracked in self.kill_order() {
@@ -2697,15 +2708,26 @@ impl ProcessTracker {
             match self.signal_known(pid, *birth, KILL_SIGNAL) {
                 Ok(Signalled::Refused) => refused.push(pid),
                 Ok(_) => {}
-                Err(e) => signal_error = Some(e),
+                Err(e) => signal_errors.push(format!("process {pid}: {}", detail(e))),
             }
         }
         self.refused.extend(refused);
-        result?;
-        if let Some(e) = signal_error {
-            return Err(e);
+        let killed = if signal_errors.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "cleanup could not kill {}",
+                signal_errors.join("; ")
+            ))
+        };
+        match (result, killed) {
+            (Ok(()), Ok(())) => self.verify_gone(),
+            (Ok(()), Err(killed)) => Err(MemoryError::Validation(killed)),
+            (Err(e), Ok(())) => Err(e),
+            (Err(e), Err(killed)) => {
+                Err(MemoryError::Validation(format!("{}; {killed}", detail(e))))
+            }
         }
-        self.verify_gone()
     }
     pub(crate) fn verify_gone(&self) -> Result<(), MemoryError> {
         for _ in 0..VERIFY_GONE_ATTEMPTS {
@@ -5428,6 +5450,45 @@ pub(crate) mod tests {
             .unwrap_err()
             .to_string()
             .contains("unauthenticated"));
+    }
+
+    /// A cleanup that fails to quiesce and then fails to kill reports both,
+    /// and every process it could not kill, by PID: neither hides the other.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_quiesce_and_every_failed_kill_are_all_reported() {
+        let mut root = Command::new("sh")
+            .args(["-c", "sleep 30 & wait"])
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut tracker = ProcessTracker::owning_every_descendant(root.id());
+        // Stops are "sent" but never land; every kill fails.
+        tracker.set_kill(|_, signal| {
+            if signal == KILL_SIGNAL {
+                Err(std::io::Error::from_raw_os_error(libc::EIO))
+            } else {
+                Ok(())
+            }
+        });
+        let started = std::time::Instant::now();
+        while tracker.known.len() < 2 {
+            assert!(started.elapsed() < std::time::Duration::from_secs(10));
+            tracker.observe().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let pids: Vec<u32> = tracker.known.keys().copied().collect();
+        let err = tracker.cleanup(false).unwrap_err().to_string();
+        for pid in &pids {
+            // SAFETY: our own child and its child, still reserved by them.
+            unsafe { libc::kill(*pid as i32, libc::SIGKILL) };
+        }
+        let _ = root.wait();
+        assert!(err.contains("did not quiesce"), "{err}");
+        for pid in pids {
+            assert!(err.contains(&format!("process {pid}")), "{pid}: {err}");
+        }
+        assert!(err.contains(&std::io::Error::from_raw_os_error(libc::EIO).to_string()));
     }
 
     /// The same through cleanup, against the real process table and kernel:
