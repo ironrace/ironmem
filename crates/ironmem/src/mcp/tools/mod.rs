@@ -20,6 +20,9 @@ mod symbol_graph;
 #[cfg(test)]
 mod test_support;
 
+/// For `git_env_scan`, which checks the integration tests' copy against it.
+#[cfg(test)]
+pub(crate) use collab_session::REDIRECTING_GIT_VARS;
 /// Re-exported so every `Command::new("git")` in the crate can reach the one
 /// scrub, rather than a module outside `mcp::tools` growing a second spelling
 /// of it. See the function's own doc for why an unscrubbed spawn is a defect.

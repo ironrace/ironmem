@@ -25,21 +25,9 @@ pub fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_ironmem")
 }
 
-/// Remove every `GIT_*` variable from `command`'s environment, so a
-/// `GIT_DIR` set by an outer context (a git hook running `cargo test`) can
-/// never point it at another repository.
-pub fn scrub_git_env(command: &mut Command) -> &mut Command {
-    for (key, _) in std::env::vars_os() {
-        if key
-            .to_string_lossy()
-            .to_ascii_uppercase()
-            .starts_with("GIT_")
-        {
-            command.env_remove(key);
-        }
-    }
-    command
-}
+#[path = "../git_env/mod.rs"]
+mod git_env;
+pub use git_env::{fixture_git_env, scrub_git_env};
 
 /// The ironmem binary with every `GIT_*` variable stripped, so neither it
 /// nor the stub it spawns can reach a repository named by the outer context.
@@ -47,17 +35,6 @@ pub fn ironmem() -> Command {
     let mut command = Command::new(bin());
     scrub_git_env(&mut command);
     command
-}
-
-/// [`scrub_git_env`] for a fixture's own git, which also reads no global or
-/// system config: the operator's may sign commits with their key, run their
-/// hooks, or change a default a fixture relies on. Never for the ironmem
-/// binary under test ([`ironmem`]), whose git behaviour is what the tests
-/// check.
-pub fn fixture_git_env(command: &mut Command) -> &mut Command {
-    scrub_git_env(command)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
 }
 
 /// Run fixture git in `dir` ([`fixture_git_env`]), asserting it succeeds.

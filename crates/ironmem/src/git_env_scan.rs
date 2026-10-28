@@ -219,3 +219,21 @@ fn the_scans_find_what_they_look_for() {
     );
     assert_eq!(unscrubbed, vec![1, 4]);
 }
+
+/// The integration tests cannot import the lib's private
+/// `REDIRECTING_GIT_VARS`, so `tests/git_env/mod.rs` keeps a copy every
+/// integration git helper scrubs with. It must name exactly the same
+/// variables, or a helper would leave one of them to be inherited.
+#[test]
+fn the_integration_tests_scrub_the_same_redirecting_variables() {
+    let source = std::fs::read_to_string(crate_dir("tests/git_env/mod.rs"))
+        .expect("tests/git_env/mod.rs holds the integration tests' git scrub");
+    let list = source
+        .split_once("REDIRECTING_GIT_VARS")
+        .and_then(|(_, rest)| rest.split_once("= ["))
+        .and_then(|(_, rest)| rest.split_once("];"))
+        .map(|(list, _)| list)
+        .expect("a REDIRECTING_GIT_VARS array");
+    let copied: Vec<&str> = list.split('"').skip(1).step_by(2).collect();
+    assert_eq!(copied, crate::mcp::tools::REDIRECTING_GIT_VARS);
+}

@@ -23,30 +23,21 @@ use ironmem::autopilot::worktree::{self, WorktreeRemoval};
 use ironmem::autopilot::{dispatch_state, gate_config, DispatchState, IssueRef};
 use ironmem::db::schema::Database;
 
+mod git_env;
+
 const REPO: &str = "owner/repo";
 
 /// `current_dir` is **not** a repository selector: git reads `GIT_DIR` first,
 /// so an inherited one aims these calls at whatever repo the environment
-/// names. This suite is threaded and another module's tests set `GIT_DIR`
-/// process-wide, so the variables are stripped here the way
-/// `autopilot::worktree`'s own `git_command` strips them. Fixture git only:
-/// the code under test runs its own.
+/// names, so the variables are stripped here ([`git_env::fixture_git_env`]),
+/// the way `autopilot::worktree`'s own `git_command` strips them. Fixture git
+/// only: the code under test runs its own.
 fn git(dir: &Path, args: &[&str]) {
     let mut command = std::process::Command::new("git");
-    for (key, _) in std::env::vars_os() {
-        if key
-            .to_string_lossy()
-            .to_ascii_uppercase()
-            .starts_with("GIT_")
-        {
-            command.env_remove(key);
-        }
-    }
-    // And no global or system config: the operator's may sign commits with
-    // their key, run their hooks, or change a default this fixture relies on.
-    command
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1");
+    // Scrubbed (every redirecting variable, unconditionally), and no global
+    // or system config: the operator's may sign commits with their key, run
+    // their hooks, or change a default this fixture relies on.
+    git_env::fixture_git_env(&mut command);
     let out = command
         .args(args)
         .current_dir(dir)

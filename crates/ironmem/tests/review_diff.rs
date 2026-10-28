@@ -6,6 +6,9 @@ use ironmem::review_diff::{
 };
 use tempfile::TempDir;
 
+mod git_env;
+use git_env::scrub_git_env as scrub_git_environment;
+
 struct DiffFixture {
     tempdir: TempDir,
     base: String,
@@ -143,35 +146,6 @@ fn git_output(repo: &Path, args: impl IntoIterator<Item = impl AsRef<std::ffi::O
         "git fixture command should succeed"
     );
     String::from_utf8(output.stdout).expect("fixture git output should be UTF-8")
-}
-
-/// Remove git's environment from a fixture's command. The redirecting
-/// variables go unconditionally, so one set on the process after this call
-/// is not inherited either; the sweep removes any other `GIT_*` set now.
-fn scrub_git_environment(command: &mut Command) {
-    for key in [
-        "GIT_DIR",
-        "GIT_WORK_TREE",
-        "GIT_COMMON_DIR",
-        "GIT_INDEX_FILE",
-        "GIT_OBJECT_DIRECTORY",
-        "GIT_CONFIG",
-        "GIT_CONFIG_GLOBAL",
-        "GIT_CONFIG_SYSTEM",
-        "GIT_CONFIG_NOSYSTEM",
-        "GIT_CONFIG_COUNT",
-    ] {
-        command.env_remove(key);
-    }
-    for (key, _) in std::env::vars_os() {
-        if key
-            .to_string_lossy()
-            .to_ascii_uppercase()
-            .starts_with("GIT_")
-        {
-            command.env_remove(key);
-        }
-    }
 }
 
 #[cfg(feature = "headroom-compression")]
