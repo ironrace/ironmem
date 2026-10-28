@@ -1093,48 +1093,66 @@ fn kernel_observation(pid: u32) -> Result<Option<KernelProcess>, String> {
             }
             Err(e) => return Err(format!("cannot authenticate process {pid}: {e}")),
         };
-        let fields = text
-            .rsplit_once(')')
-            .ok_or("malformed proc stat")?
-            .1
-            .split_whitespace()
-            .collect::<Vec<_>>();
-        let start = fields
-            .get(19)
-            .ok_or("missing proc birth identity")?
-            .parse()
-            .map_err(|_| "invalid proc birth identity")?;
-        let record_pid = text
-            .split_once(' ')
-            .ok_or("missing proc pid")?
-            .0
-            .parse::<u32>()
-            .map_err(|_| "invalid proc pid")?;
-        if record_pid != pid {
-            return Err("kernel process identity mismatch".into());
-        }
-        let ppid = fields
-            .get(1)
-            .ok_or("missing proc parent")?
-            .parse()
-            .map_err(|_| "invalid proc parent")?;
-        let pgid = fields
-            .get(2)
-            .ok_or("missing proc group")?
-            .parse()
-            .map_err(|_| "invalid proc group")?;
-        Ok(Some(KernelProcess {
-            pid,
-            ppid,
-            pgid,
-            birth: Birth(start, 0),
-        }))
+        kernel_process_from_stat(pid, &text)
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = pid;
         Err("kernel process identity is unsupported on this platform".into())
     }
+}
+
+/// One process's kernel record from the text of its Linux
+/// `/proc/<pid>/stat`, or `None` once it has exited, a zombie (`Z`) or a
+/// dead process (`X`) included, as macOS's `kinfo_proc` reads `SZOMB`. A
+/// zombie nobody reaps (a container whose PID 1 never waits) would
+/// otherwise hold everything waiting on its birth for ever. Its PID stays
+/// reserved, so nothing reads a reuse under it meanwhile; and a zombie
+/// takes no signal, so calling it gone skips only a no-op. The comm, in
+/// parentheses, is whatever the process named itself, spaces and `)`
+/// included, so every field after it is read after the LAST `)`. Linux
+/// only, but tested everywhere.
+#[cfg(any(target_os = "linux", test))]
+fn kernel_process_from_stat(pid: u32, text: &str) -> Result<Option<KernelProcess>, String> {
+    let fields = text
+        .rsplit_once(')')
+        .ok_or("malformed proc stat")?
+        .1
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    let record_pid = text
+        .split_once(' ')
+        .ok_or("missing proc pid")?
+        .0
+        .parse::<u32>()
+        .map_err(|_| "invalid proc pid")?;
+    if record_pid != pid {
+        return Err("kernel process identity mismatch".into());
+    }
+    if matches!(fields.first(), Some(&("Z" | "X"))) {
+        return Ok(None);
+    }
+    let start = fields
+        .get(19)
+        .ok_or("missing proc birth identity")?
+        .parse()
+        .map_err(|_| "invalid proc birth identity")?;
+    let ppid = fields
+        .get(1)
+        .ok_or("missing proc parent")?
+        .parse()
+        .map_err(|_| "invalid proc parent")?;
+    let pgid = fields
+        .get(2)
+        .ok_or("missing proc group")?
+        .parse()
+        .map_err(|_| "invalid proc group")?;
+    Ok(Some(KernelProcess {
+        pid,
+        ppid,
+        pgid,
+        birth: Birth(start, 0),
+    }))
 }
 
 /// The operator's shared ironmem daemon, which supervision never owns (see
@@ -1842,9 +1860,9 @@ impl<'a> QuietCheck<'a> {
     }
 }
 
-/// The kernel birth of `pid`, or `None` once it has exited. A read that
-/// fails is an error, never "exited": a caller deciding that a process is
-/// gone must hold on it.
+/// The kernel birth of `pid`, or `None` once it has exited (a zombie
+/// included, on every platform). A read that fails is an error, never
+/// "exited": a caller deciding that a process is gone must hold on it.
 pub(crate) fn kernel_birth(pid: u32) -> Result<Option<Birth>, String> {
     birth(pid)
 }
@@ -3942,6 +3960,67 @@ pub(crate) mod tests {
         assert!(!reads.borrow().contains(&10), "an unrelated login was read");
         let err = scan_cwds([10, 11], uid, spawned, &[root], owner_birth, cwd_of).unwrap_err();
         assert_eq!(err.unreadable, Some((11, Birth(150, 0))), "{err}");
+    }
+
+    /// A Linux `/proc/<pid>/stat` line: pid, comm in parentheses, then state
+    /// and the rest, with starttime as field 22 (index 19 after comm).
+    fn proc_stat_line(pid: u32, comm: &str, state: char) -> String {
+        format!(
+            "{pid} ({comm}) {state} 300 {pid} {pid} 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 \
+             12345 1000000 200 18446744073709551615 1 1 0 0 0 0 0 0 0 0 0 0 17 3 0 0 0 0 0"
+        )
+    }
+
+    /// Linux reads, like macOS's `kinfo_proc`, count a zombie or a dead
+    /// process as exited: an unreaped exit never holds anything for ever.
+    #[test]
+    fn a_linux_stat_reads_a_zombie_or_dead_process_as_exited() {
+        let running = kernel_process_from_stat(42, &proc_stat_line(42, "sh", 'S')).unwrap();
+        assert_eq!(
+            running,
+            Some(KernelProcess {
+                pid: 42,
+                ppid: 300,
+                pgid: 42,
+                birth: Birth(12345, 0),
+            })
+        );
+        for state in ['R', 'D', 'T', 't', 'I'] {
+            assert!(
+                kernel_process_from_stat(42, &proc_stat_line(42, "sh", state))
+                    .unwrap()
+                    .is_some(),
+                "state {state} is running"
+            );
+        }
+        assert_eq!(
+            kernel_process_from_stat(42, &proc_stat_line(42, "sh", 'Z')),
+            Ok(None),
+            "a zombie has exited"
+        );
+        assert_eq!(
+            kernel_process_from_stat(42, &proc_stat_line(42, "sh", 'X')),
+            Ok(None),
+            "a dead process has exited"
+        );
+    }
+
+    /// The comm is anything the process names itself, parentheses and
+    /// spaces included, so the state is read after the LAST `)`.
+    #[test]
+    fn a_linux_stat_reads_the_state_after_the_last_parenthesis() {
+        let comm = "a) Z (b c";
+        let running = kernel_process_from_stat(42, &proc_stat_line(42, comm, 'S')).unwrap();
+        assert_eq!(
+            running.map(|p| (p.ppid, p.birth)),
+            Some((300, Birth(12345, 0)))
+        );
+        assert_eq!(
+            kernel_process_from_stat(42, &proc_stat_line(42, ") R (", 'Z')),
+            Ok(None)
+        );
+        assert!(kernel_process_from_stat(43, &proc_stat_line(42, "sh", 'S')).is_err());
+        assert!(kernel_process_from_stat(42, "42 (sh S 1 2 3").is_err());
     }
 
     /// The Linux reading of a process's owners, from `/proc/<pid>/status`,
