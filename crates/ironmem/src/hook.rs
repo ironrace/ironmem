@@ -2,7 +2,6 @@
 
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
@@ -466,11 +465,8 @@ fn workspace_git_output(
     // remove every Git override so a hook's inherited environment cannot point
     // this workspace lookup at another repository. The shared scrub removes
     // the redirecting ones unconditionally, so one set after the scrub is not
-    // inherited either.
-    let mut command = Command::new("git");
-    command.envs(inherited.iter().copied());
-    crate::mcp::tools::scrub_git_environment(&mut command);
-    let output = command
+    // inherited either. `inherited` is a test's; it must be such a variable.
+    let output = crate::mcp::tools::scrubbed_git(inherited)
         .arg("-C")
         .arg(workspace_root)
         .args(args)

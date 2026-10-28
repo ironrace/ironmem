@@ -23,7 +23,7 @@ mod test_support;
 /// Re-exported so every `Command::new("git")` in the crate can reach the one
 /// scrub, rather than a module outside `mcp::tools` growing a second spelling
 /// of it. See the function's own doc for why an unscrubbed spawn is a defect.
-pub(crate) use collab_session::scrub_git_environment;
+pub(crate) use collab_session::{scrub_git_environment, scrubbed_git};
 /// Re-exported so `crate::autopilot`'s logical-key drawers land on the exact
 /// same id/source-file scheme `add_drawer{logical_key}` uses, rather than
 /// duplicating these literals and risking a silent drift between the two

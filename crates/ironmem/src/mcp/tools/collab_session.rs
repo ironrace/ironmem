@@ -1664,7 +1664,7 @@ pub(crate) fn scrub_git_environment(command: &mut Command) {
 /// set. `GIT_CONFIG_COUNT` covers the whole `GIT_CONFIG_KEY_<n>` /
 /// `GIT_CONFIG_VALUE_<n>` family: git ignores those without the count, and the
 /// family is unbounded, so it cannot be enumerated here.
-const REDIRECTING_GIT_VARS: [&str; 15] = [
+pub(crate) const REDIRECTING_GIT_VARS: [&str; 15] = [
     "GIT_DIR",
     "GIT_WORK_TREE",
     "GIT_COMMON_DIR",
@@ -1682,13 +1682,24 @@ const REDIRECTING_GIT_VARS: [&str; 15] = [
     "GIT_CONFIG_COUNT",
 ];
 
-/// The git command this module's head checks run: `inherited` variables set
-/// on it first, where an inherited environment would reach the child (a
-/// test's hostile `GIT_DIR`; empty in production), then
-/// [`scrub_git_environment`]. So a test proves the production scrub removes
-/// what an inherited environment carries without ever setting a variable on
-/// the whole process, which would redirect every other test thread's git.
-fn scrubbed_git(inherited: &[(&str, &std::ffi::OsStr)]) -> Command {
+/// A scrubbed git command, for shell-outs whose tests need to show the scrub
+/// works: `inherited` variables set on it first, where an inherited
+/// environment would reach the child (a test's hostile `GIT_DIR`; empty in
+/// production), then [`scrub_git_environment`]. So a test proves the
+/// production scrub removes what an inherited environment carries without
+/// ever setting a variable on the whole process, which would redirect every
+/// other test thread's git.
+///
+/// Every `inherited` key must be one of [`REDIRECTING_GIT_VARS`], which the
+/// scrub removes; any other panics. The seam can then never put anything on
+/// production git, such as `GIT_SSH_COMMAND`, `GIT_EXEC_PATH` or `PATH`.
+pub(crate) fn scrubbed_git(inherited: &[(&str, &std::ffi::OsStr)]) -> Command {
+    for (key, _) in inherited {
+        assert!(
+            REDIRECTING_GIT_VARS.contains(key),
+            "scrubbed_git only takes the redirecting git variables its scrub removes, not `{key}`"
+        );
+    }
     let mut command = Command::new("git");
     command.envs(inherited.iter().copied());
     scrub_git_environment(&mut command);
@@ -10608,6 +10619,23 @@ mod tests {
             "the repo_path argument must win over inherited Git overrides"
         );
         assert_ne!(read, hostile_head);
+    }
+
+    /// The seam takes only the variables the scrub removes, so it can never
+    /// put anything on production git: a key such as `GIT_SSH_COMMAND`,
+    /// `GIT_EXEC_PATH` or `PATH` is refused outright.
+    #[test]
+    fn the_scrub_seam_takes_only_redirecting_variables() {
+        let value = std::ffi::OsStr::new("/elsewhere");
+        for key in REDIRECTING_GIT_VARS {
+            scrubbed_git(&[(key, value)]);
+        }
+        for key in ["GIT_SSH_COMMAND", "GIT_EXEC_PATH", "PATH"] {
+            let refused = std::panic::catch_unwind(|| {
+                scrubbed_git(&[(key, value)]);
+            });
+            assert!(refused.is_err(), "{key} was accepted");
+        }
     }
 
     /// The same hazard on the ancestry spawn: an inherited `GIT_DIR` would
