@@ -1631,7 +1631,7 @@ fn check_range(
         .filter(|out| out.status.success())
         .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
         .unwrap_or_default();
-    let listed = worktree::remote_urls(&listing);
+    let listed = worktree::remote_push_urls(&listing);
     let remotes: Vec<(&str, &[&str])> = configured
         .iter()
         .map(|remote| {
@@ -6871,6 +6871,50 @@ sleep 0.5
         };
         assert!(
             at(&first) < at("`origin`") && at(&first) < at("`mirror`"),
+            "{violation}"
+        );
+    }
+
+    /// The recipe picks by where a push really goes, as the push clause
+    /// does: `upstream` fetches the issue's repo but pushes to a fork, so it
+    /// is not the remote the recipe force-pushes first.
+    #[test]
+    fn the_recipe_ignores_a_remote_that_only_fetches_the_issue_repo() {
+        let (_dir, wt) = remote_fixture();
+        git_in(
+            &wt.path,
+            &[
+                "remote",
+                "add",
+                "upstream",
+                "git@github.com:ironrace/ironmem.git",
+            ],
+        );
+        git_in(
+            &wt.path,
+            &[
+                "config",
+                "remote.upstream.pushurl",
+                "git@github.com:someone/ironmem.git",
+            ],
+        );
+        git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
+        commit_in(&wt.path, "work", &["-c", "commit.gpgsign=false"]);
+        git_in(&wt.path, &["push", "-q", "origin", &wt.branch]);
+        assert_eq!(
+            worktree::push_remote(&wt.path, &wt.branch, &issue().repo).as_deref(),
+            Some("origin")
+        );
+        let violation = check(&wt).unwrap().unwrap();
+        assert!(
+            violation.contains(&format!(
+                "`git push --force-with-lease origin {}`",
+                wt.branch
+            )),
+            "{violation}"
+        );
+        assert!(
+            !violation.contains("upstream autopilot") && !violation.contains("`upstream`"),
             "{violation}"
         );
     }

@@ -137,12 +137,14 @@ pub(crate) fn url_names_github_repo(url: &str, repo: &str) -> bool {
 }
 
 /// The remote a push of an issue branch names, from the configured
-/// `remotes` (name and fetch URL, when known), those already `tracking` the
-/// branch (having `refs/remotes/<remote>/<branch>`), and the issue's `repo`:
+/// `remotes` (each name with its effective push URLs, [`remote_push_urls`]),
+/// those already `tracking` the branch (having
+/// `refs/remotes/<remote>/<branch>`), and the issue's `repo`:
 ///
-/// 1. the remote whose URL names `repo` ([`url_names_github_repo`]), where
+/// 1. the remote whose effective push URL names `repo`
+///    ([`url_names_github_repo`]), so the push lands where
 ///    `gh pr create --head` looks for the branch (`origin` first when
-///    several do);
+///    several do); a fetch URL naming it is not enough;
 /// 2. else one already tracking the branch (`origin` first);
 /// 3. else `origin`, only when it is configured;
 /// 4. else the only configured remote;
@@ -180,34 +182,38 @@ pub(crate) fn pick_push_remote<'a>(
         .or_else(|| (remotes.len() == 1).then(|| remotes[0].0))
 }
 
-/// Each remote in `git remote -v` output, in order, with every URL listed
-/// for it: its fetch URL and its push URLs.
-pub(crate) fn remote_urls(listing: &str) -> Vec<(&str, Vec<&str>)> {
+/// Each remote in `git remote -v` output, in order, with its effective push
+/// URLs: the URLs `git push <remote>` sends to. Those are its `pushurl`s
+/// when it has any, else its `url`, after any `pushInsteadOf` or
+/// `insteadOf` rewrite; the "(push)" lines show exactly those (measured, git
+/// 2.55). Fetch URLs are ignored: a remote that fetches the issue's repo
+/// but pushes to a fork must not be taken for the issue's repo.
+pub(crate) fn remote_push_urls(listing: &str) -> Vec<(&str, Vec<&str>)> {
     let mut remotes: Vec<(&str, Vec<&str>)> = Vec::new();
     for line in listing.lines() {
         let Some((name, rest)) = line.split_once('\t') else {
             continue;
         };
-        let url = rest
-            .strip_suffix(" (fetch)")
-            .or_else(|| rest.strip_suffix(" (push)"))
-            .unwrap_or(rest);
-        match remotes.iter_mut().find(|(known, _)| *known == name) {
-            Some((_, urls)) => urls.push(url),
-            None => remotes.push((name, vec![url])),
-        }
+        let push = rest.strip_suffix(" (push)");
+        let urls = match remotes.iter_mut().find(|(known, _)| *known == name) {
+            Some((_, urls)) => urls,
+            None => {
+                remotes.push((name, Vec::new()));
+                &mut remotes.last_mut().expect("just pushed").1
+            }
+        };
+        urls.extend(push);
     }
     remotes
 }
 
 /// [`pick_push_remote`] for `branch` of `repo` in the repository at `dir`,
-/// from `git remote -v`: each remote's fetch URL and its push URLs (a
-/// `pushurl` may differ from the fetch URL, and is where a push goes). A
-/// remote list that cannot be read counts as none. The URLs, which may hold
-/// a token, are never logged.
+/// from each remote's effective push URLs ([`remote_push_urls`]). A remote
+/// list that cannot be read counts as none. The URLs, which may hold a
+/// token, are never logged.
 pub(crate) fn push_remote(dir: &Path, branch: &str, repo: &str) -> Option<String> {
     let listed = git(dir, &["remote", "-v"]).unwrap_or_default();
-    let remotes = remote_urls(&listed);
+    let remotes = remote_push_urls(&listed);
     let remotes: Vec<(&str, &[&str])> = remotes
         .iter()
         .map(|(name, urls)| (*name, urls.as_slice()))
@@ -2087,6 +2093,63 @@ mod tests {
             &["remote", "add", "gitlab", "https://gitlab.com/x/y.git"],
         );
         assert_eq!(push_remote(dir, &branch, &issue().repo), None);
+    }
+
+    /// Step 1 goes by where `git push <remote>` really sends the branch:
+    /// a remote's `pushurl`s when it has any, else its `url`, after any
+    /// `pushInsteadOf`/`insteadOf` rewrite, as `git remote -v`'s push lines
+    /// show them (measured). A fetch URL that names the issue's repo, with
+    /// pushes going elsewhere, is no match.
+    #[test]
+    fn the_push_remote_is_chosen_by_where_a_push_really_goes() {
+        let repo = &issue().repo;
+        let branch = branch_name(&issue());
+        let issue_url = "https://github.com/ironrace/ironmem.git";
+        let fork_url = "https://github.com/someone/ironmem.git";
+
+        // Fetches the issue's repo but pushes to a fork: not `origin`.
+        let checkout = fixture_repo();
+        let dir = checkout.path();
+        run(dir, &["remote", "add", "origin", issue_url]);
+        run(dir, &["config", "remote.origin.pushurl", fork_url]);
+        run(dir, &["remote", "add", "upstream", issue_url]);
+        assert_eq!(push_remote(dir, &branch, repo).as_deref(), Some("upstream"));
+
+        // Fetches a fork but pushes to the issue's repo: `origin`.
+        let checkout = fixture_repo();
+        let dir = checkout.path();
+        run(dir, &["remote", "add", "origin", fork_url]);
+        run(dir, &["config", "remote.origin.pushurl", issue_url]);
+        run(dir, &["remote", "add", "other", fork_url]);
+        assert_eq!(push_remote(dir, &branch, repo).as_deref(), Some("origin"));
+
+        // A `pushInsteadOf` rewrite decides as well: `up` fetches a fork and
+        // pushes to the issue's repo; `origin` fetches the issue's repo and
+        // pushes to a fork.
+        let checkout = fixture_repo();
+        let dir = checkout.path();
+        run(dir, &["remote", "add", "origin", issue_url]);
+        run(
+            dir,
+            &["remote", "add", "up", "https://example.invalid/ironmem.git"],
+        );
+        run(
+            dir,
+            &[
+                "config",
+                "url.git@github.com:ironrace/.pushInsteadOf",
+                "https://example.invalid/",
+            ],
+        );
+        run(
+            dir,
+            &[
+                "config",
+                "url.git@github.com:someone/.pushInsteadOf",
+                "https://github.com/ironrace/",
+            ],
+        );
+        assert_eq!(push_remote(dir, &branch, repo).as_deref(), Some("up"));
     }
 
     /// The issue branch has no upstream, even from a remote-tracking base

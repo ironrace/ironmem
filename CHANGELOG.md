@@ -184,8 +184,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `current`, a `remote.<name>.push` refspec) can still push without naming
   anything. Push an issue branch by naming the remote and the branch (`git
   push <remote> <branch>`); the implementer's goal condition now says so,
-  naming the remote whose URL is the issue's GitHub repository, else the one
-  already tracking the branch, else `origin` if configured, else the only
+  naming the remote whose push URL is the issue's GitHub repository, else the
+  one already tracking the branch, else `origin` if configured, else the only
   remote, and no remote when none of those applies. Existing branches keep
   whatever upstream they have; remove it with `git branch --unset-upstream
   <branch>`.

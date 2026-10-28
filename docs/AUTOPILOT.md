@@ -575,10 +575,11 @@ model can quietly pass `-c commit.gpgsign=false`.
   Other push settings (`push.default=matching` or `current`, or a
   `remote.<name>.push` refspec) can still push without naming anything, so push
   it by naming the remote and the branch, as the goal condition does (`git push
-  <remote> <branch>`: the remote whose URL names the issue's GitHub repository,
-  else the one already tracking the branch, else `origin` if you have one, else
-  your only remote; with none of those it names the branch only, and you push to
-  your issue repository's remote). If `git worktree add` fails after making the
+  <remote> <branch>`: the remote whose push URL (its `pushurl`, else its `url`,
+  as `git remote -v` shows it) names the issue's GitHub repository, else the one
+  already tracking the branch, else `origin` if you have one, else your only
+  remote; with none of those it names the branch only, and you push to your
+  issue repository's remote). If `git worktree add` fails after making the
   branch, the branch keeps its cut and the next run reuses it; the cut is taken
   back only when no branch was made, and only while both its value and the run's
   own token (stored in `branch.<branch>.ironmemCutOwner`) still read as that
@@ -709,7 +710,7 @@ commits merged in, as follows:
 - If a merge commit is flagged or lies in that range, redo the merge (signed)
   instead of rebasing over it.
 - Then `git push --force-with-lease <remote> <issue-branch>`, first to the
-  remote the goal condition's push names (the one whose URL is the issue's
+  remote the goal condition's push names (the one whose push URL is the issue's
   GitHub repository, else one already holding the issue branch, `origin` first,
   else `origin` if configured, else the only remote), then to every other remote
   that holds the issue branch, since the guard checks each one and a remote left
