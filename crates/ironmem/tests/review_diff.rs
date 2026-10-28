@@ -122,9 +122,12 @@ fn fixture_contents(file: &str, version: &str) -> String {
         + "\n"
 }
 
+/// Fixture git ([`git_env::fixture_git_env`]): scrubbed, and reading no
+/// global or system config, which may sign commits with the operator's key
+/// or run their hooks. The binary under test keeps the plain scrub.
 fn git(repo: &Path, args: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>) {
     let mut command = Command::new("git");
-    scrub_git_environment(&mut command);
+    git_env::fixture_git_env(&mut command);
     let status = command
         .args(args)
         .current_dir(repo)
@@ -135,7 +138,7 @@ fn git(repo: &Path, args: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>)
 
 fn git_output(repo: &Path, args: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>) -> String {
     let mut command = Command::new("git");
-    scrub_git_environment(&mut command);
+    git_env::fixture_git_env(&mut command);
     let output = command
         .args(args)
         .current_dir(repo)
