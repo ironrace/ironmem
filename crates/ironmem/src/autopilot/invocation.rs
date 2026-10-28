@@ -505,6 +505,43 @@ fn make_invocation_dir(
     populated
 }
 
+/// How long after [`prepare_artifacts`] an invocation with no process
+/// identity and no exit record may still be launching. A run publishes its
+/// artifacts in the dispatch state, then validates, writes its spawn files,
+/// spawns, and persists the identity: milliseconds normally, seconds on a
+/// stalled disk. Until this passes, such an invocation is a launch in
+/// progress, never idle, so a second run cannot spawn another implementer
+/// beside it. Past it nothing is spawning into it: a run that died before
+/// its spawn left it, and the reading without the window stands.
+pub(crate) const LAUNCH_WINDOW: Duration = Duration::from_secs(120);
+
+/// Why `a` may still be launching, if it may: it has no process identity
+/// and no exit record, and its schema marker was written less than
+/// [`LAUNCH_WINDOW`] ago. An exit record that cannot be read, or a schema
+/// whose age cannot be read, counts as pending: nothing proves otherwise.
+pub(crate) fn launch_pending(a: &InvocationArtifacts) -> Option<String> {
+    match std::fs::symlink_metadata(super::process_tree::identity_path(a)) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        _ => return None,
+    }
+    if matches!(read_exit_record(a), Ok(Some(_))) {
+        return None;
+    }
+    let young = std::fs::symlink_metadata(&a.schema_path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|at| at.elapsed().ok())
+        .is_none_or(|age| age < LAUNCH_WINDOW);
+    young.then(|| {
+        format!(
+            "invocation {} was published with no process identity or exit record yet, under \
+             {}s ago; its launch may be in progress",
+            a.invocation_id,
+            LAUNCH_WINDOW.as_secs()
+        )
+    })
+}
+
 /// How long an invocation directory is kept once nothing names it: its
 /// journal records tool output (secrets a gate printed included) and its
 /// prompt the whole condition.

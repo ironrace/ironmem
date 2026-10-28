@@ -743,6 +743,9 @@ impl ProcessSnapshot {
         if super::invocation::has_launch_failure_record(a) {
             return "invocation never launched, but an active process carries its marker or an ambiguous one; holding for verification".into();
         }
+        if let Some(pending) = super::invocation::launch_pending(a) {
+            return pending;
+        }
         let identity = match read_identity(a) {
             Ok(identity) => identity,
             Err(reason) => return reason,
@@ -814,6 +817,8 @@ impl ProcessSnapshot {
                 Liveness::NotListed
             };
         }
+        // No identity (a launch in progress, `invocation::launch_pending`,
+        // or one that never spawned) or an unreadable one: never idle.
         let Ok(identity) = read_identity(a) else {
             return Liveness::Unknown;
         };
@@ -903,8 +908,13 @@ impl ProcessSnapshot {
         }
         let a = artifacts?;
         // No identity file means nothing was ever spawned into this
-        // invocation. One that exists but cannot be read hides the recorded
-        // tree, so it is evidence, never "nothing running".
+        // invocation, unless its launch may still be in progress (the
+        // identity follows the spawn). One that exists but cannot be read
+        // hides the recorded tree, so it is evidence, never "nothing
+        // running".
+        if let Some(pending) = super::invocation::launch_pending(a) {
+            return Some(pending);
+        }
         match std::fs::symlink_metadata(identity_path(a)) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
             Err(e) => return Some(format!("cannot stat the invocation process identity: {e}")),
@@ -4426,9 +4436,49 @@ pub(crate) mod tests {
                 "{evidence:?}"
             );
         }
-        // No identity at all: nothing was ever spawned to hide.
+        // No identity at all, past the launch window: nothing was ever
+        // spawned to hide.
         std::fs::remove_file(identity_path(&a)).unwrap();
+        std::fs::write(&a.schema_path, "{}").unwrap();
+        std::fs::File::open(&a.schema_path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600))
+            .unwrap();
         assert_eq!(empty.live_evidence("owner-repo-42", Some(&a)), None);
+    }
+
+    /// Between a run publishing an invocation's artifacts and persisting its
+    /// identity just after spawn, another run reading the issue must not see
+    /// it idle and spawn a second implementer: freshly published artifacts
+    /// with no identity and no exit record are evidence (and Unknown). Once
+    /// they are older than the launch window, nothing is spawning into
+    /// them, and the existing reading stands.
+    #[test]
+    fn freshly_published_artifacts_with_no_identity_are_a_launch_in_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, _) = testing::invocation(dir.path());
+        std::fs::remove_file(identity_path(&a)).unwrap();
+        std::fs::write(&a.schema_path, "{}").unwrap();
+        std::fs::write(&a.exit_path, "").unwrap();
+        let empty = ProcessSnapshot::Available(Vec::new());
+        let evidence = empty.live_evidence("owner-repo-42", Some(&a));
+        assert!(
+            evidence.as_deref().is_some_and(|e| e.contains("launch")),
+            "{evidence:?}"
+        );
+        assert_eq!(empty.liveness(Some(&a)), Liveness::Unknown);
+        assert!(empty.invocation_reason(Some(&a)).contains("launch"));
+        // Past the launch window: no spawn is coming, as before.
+        std::fs::File::open(&a.schema_path)
+            .unwrap()
+            .set_modified(
+                std::time::SystemTime::now()
+                    - super::super::invocation::LAUNCH_WINDOW
+                    - std::time::Duration::from_secs(1),
+            )
+            .unwrap();
+        assert_eq!(empty.live_evidence("owner-repo-42", Some(&a)), None);
+        assert_eq!(empty.liveness(Some(&a)), Liveness::Unknown);
     }
 
     /// Release is for the enrolled process itself after its exec. A tracked
