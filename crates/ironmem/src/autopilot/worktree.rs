@@ -697,19 +697,7 @@ fn worktree_add(root: &Path, path: &Path, args: &[&str]) -> Result<(), MemoryErr
         .collect();
     let out = run_git_output_within(git_command(), root, &args, checkout_timeout()).map_err(
         |failure| match failure {
-            GitRunFailure::Killed(e) => {
-                let detail = match e {
-                    MemoryError::Validation(detail) => detail,
-                    other => other.to_string(),
-                };
-                let path = path.display();
-                MemoryError::Validation(format!(
-                    "{detail}; the worktree at {path} may be left registered, with a partial \
-                     checkout: run `git worktree unlock '{path}'` (if `git worktree list` shows \
-                     it locked), then `git worktree remove --force '{path}'`, in {}",
-                    root.display()
-                ))
-            }
+            GitRunFailure::Killed(e) => killed_add_error(e, root, path),
             GitRunFailure::Failed(e) => e,
         },
     )?;
@@ -717,6 +705,28 @@ fn worktree_add(root: &Path, path: &Path, args: &[&str]) -> Result<(), MemoryErr
         return Err(out.failure(root, &args));
     }
     Ok(())
+}
+
+/// [`worktree_add`]'s error for an add killed at its deadline with `e`.
+fn killed_add_error(e: MemoryError, root: &Path, path: &Path) -> MemoryError {
+    let detail = match e {
+        MemoryError::Validation(detail) => detail,
+        other => other.to_string(),
+    };
+    let quoted = shell_quoted(&path.to_string_lossy());
+    MemoryError::Validation(format!(
+        "{detail}; the worktree at {} may be left registered, with a partial checkout: run `git \
+         worktree unlock {quoted}` (if `git worktree list` shows it locked), then `git worktree \
+         remove --force {quoted}`, in {}",
+        path.display(),
+        root.display()
+    ))
+}
+
+/// `text` quoted for a POSIX shell, for a command an error tells the operator
+/// to run: in single quotes, each `'` within written as `'\''`.
+fn shell_quoted(text: &str) -> String {
+    format!("'{}'", text.replace('\'', r"'\''"))
 }
 
 /// Like [`git`], but reports whether the command succeeded instead of
@@ -4004,5 +4014,29 @@ mod tests {
             "the renamed branch's old creation was trusted"
         );
         assert_eq!(recorded, Some(seed), "the merge base with the base");
+    }
+
+    /// A path holding `'` is quoted so that a shell reads it back as it is.
+    #[test]
+    #[cfg(unix)]
+    fn a_path_with_an_apostrophe_is_quoted_for_the_shell() {
+        let path = "/tmp/o'brien's worktrees/owner-repo-7";
+        let quoted = shell_quoted(path);
+        let echoed = Command::new("sh")
+            .args(["-c", &format!("printf %s {quoted}")])
+            .output()
+            .unwrap();
+        assert!(echoed.status.success(), "{quoted}: {echoed:?}");
+        assert_eq!(String::from_utf8_lossy(&echoed.stdout), path, "{quoted}");
+        let err = killed_add_error(
+            MemoryError::Validation("git worktree add … was killed".into()),
+            Path::new("/repo"),
+            Path::new(path),
+        )
+        .to_string();
+        assert!(
+            err.contains(&format!("git worktree remove --force {quoted}")),
+            "{err}"
+        );
     }
 }
