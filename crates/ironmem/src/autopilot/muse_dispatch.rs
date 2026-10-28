@@ -418,6 +418,8 @@ impl SupervisedCli for MuseCli {
         };
         let mut saw_expected = false;
         let mut terminals = Vec::new();
+        // Terminal records on this session that could not be parsed whole.
+        let mut unparsed_terminals = 0usize;
         let (mut malformed, mut first_malformed) = (0usize, 0usize);
         for (index, line) in journal.lines().enumerate() {
             if line.trim().is_empty() {
@@ -442,10 +444,13 @@ impl SupervisedCli for MuseCli {
                     // not, nothing about the run is trusted.
                     match serde_json::from_str::<serde_json::Value>(line) {
                         Ok(value) => terminals.push(value["payload"].clone()),
-                        Err(e) => errors.push(format!(
-                            "terminal record could not be parsed: {}",
-                            excerpt(&e.to_string())
-                        )),
+                        Err(e) => {
+                            unparsed_terminals += 1;
+                            errors.push(format!(
+                                "terminal record could not be parsed: {}",
+                                excerpt(&e.to_string())
+                            ));
+                        }
                     }
                 }
                 Some("run_usage") if on_stream(&envelope, "exec.usage") => {
@@ -469,6 +474,8 @@ impl SupervisedCli for MuseCli {
             ));
         }
         match terminals.as_slice() {
+            // One was emitted; its parse error already says why it is unread.
+            [] if unparsed_terminals > 0 => {}
             [] => errors.push("Muse run emitted no terminal record".into()),
             [t] if t["terminal"].as_str() == Some("completed") => match t["text"].as_str() {
                 None => errors.push("Muse completed terminal record carries no text verdict".into()),
@@ -1020,6 +1027,14 @@ mod tests {
                 .errors()
                 .iter()
                 .any(|e| e.starts_with("terminal record could not be parsed: ")),
+            "{:?}",
+            parsed.errors()
+        );
+        // It was emitted, so the parser does not also say none was.
+        assert!(
+            !parsed
+                .errors()
+                .contains(&"Muse run emitted no terminal record".to_owned()),
             "{:?}",
             parsed.errors()
         );
