@@ -2464,23 +2464,29 @@ mod tests {
             .execute_batch("BEGIN IMMEDIATE; INSERT INTO retry_probe (v) VALUES (1);")
             .unwrap();
         let hold = Duration::from_millis(200);
+        // Taken before the spawn: a thread scheduled late would otherwise
+        // start its clock after part of the hold had passed.
+        let started = std::time::Instant::now();
         let waiter = std::thread::spawn(move || {
-            let started = std::time::Instant::now();
             let seen = db.with_immediate_transaction(|tx| {
                 tx.query_row("SELECT COUNT(*) FROM retry_probe", [], |row| {
                     row.get::<_, i64>(0)
                 })
                 .map_err(MemoryError::from)
             });
-            (seen, started.elapsed())
+            (seen, std::time::Instant::now())
         });
         std::thread::sleep(hold);
+        assert!(
+            !waiter.is_finished(),
+            "the transaction finished while the lock was still held"
+        );
         holder.execute_batch("COMMIT").unwrap();
-        let (seen, waited) = waiter.join().unwrap();
+        let (seen, finished) = waiter.join().unwrap();
         assert_eq!(seen.unwrap(), 1, "it read after the holder committed");
         assert!(
-            waited >= hold,
-            "it began before the lock was free: {waited:?}"
+            finished.duration_since(started) >= hold,
+            "it finished before the lock was free"
         );
     }
 
