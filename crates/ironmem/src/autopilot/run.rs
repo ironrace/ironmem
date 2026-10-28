@@ -1622,8 +1622,8 @@ fn check_range(
     // issue repo, and the flagged commits matter where they were pushed. So
     // the remote already tracking the issue branch (`origin` first), else a
     // configured `origin`, else the only remote, else none.
-    let remotes: Vec<(&str, Option<&str>)> =
-        configured.iter().map(|remote| (*remote, None)).collect();
+    let remotes: Vec<(&str, &[&str])> =
+        configured.iter().map(|remote| (*remote, &[][..])).collect();
     let tracking: Vec<&str> = own.iter().map(|(remote, _)| *remote).collect();
     let remote = worktree::pick_push_remote(&remotes, &tracking, None);
     Ok(Some(SigningViolation::Unsigned {

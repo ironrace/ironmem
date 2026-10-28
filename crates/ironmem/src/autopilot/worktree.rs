@@ -82,22 +82,51 @@ pub fn branch_name(issue: &IssueRef) -> String {
 }
 
 /// Whether a remote `url` names the GitHub repository `repo` (`owner/name`),
-/// in one of the forms GitHub hands out: `https://github.com/O/N`,
-/// `git@github.com:O/N` or `ssh://git@github.com/O/N`, each with or
-/// without `.git` (and a trailing `/`), compared without regard to case.
-/// Any other host or form names no repository here.
+/// compared without regard to case. The forms GitHub hands out:
+/// `https://github.com/O/N`, `ssh://git@github.com/O/N` and the scp-like
+/// `git@github.com:O/N`, each with or without `.git` (and a trailing `/`).
+/// Any userinfo (`user@`, or `user:token@`) and any port (`:22`) is not part
+/// of the host. Any other host, scheme or form names no repository here; an
+/// SSH host alias (`git@github-work:O/N`) is one, so it falls through to the
+/// next rule of [`pick_push_remote`].
 pub(crate) fn url_names_github_repo(url: &str, repo: &str) -> bool {
     let url = url.trim().to_ascii_lowercase();
-    let Some(path) = [
-        "https://github.com/",
-        "git@github.com:",
-        "ssh://git@github.com/",
-    ]
-    .iter()
-    .find_map(|prefix| url.strip_prefix(prefix)) else {
-        return false;
+    let without_user = |authority: &str| -> String {
+        authority
+            .rsplit_once('@')
+            .map_or(authority, |(_, host)| host)
+            .to_string()
     };
-    let path = path.strip_suffix('/').unwrap_or(path);
+    let (host, path) = match url.split_once("://") {
+        Some((scheme, rest)) => {
+            if !matches!(scheme, "https" | "ssh") {
+                return false;
+            }
+            let Some((authority, path)) = rest.split_once('/') else {
+                return false;
+            };
+            let host = without_user(authority);
+            let host = host
+                .split_once(':')
+                .map_or(host.as_str(), |(host, _)| host)
+                .to_string();
+            (host, path.to_string())
+        }
+        None => {
+            // scp-like: `[user@]host:path`; a local path has no `host:`.
+            let Some((authority, path)) = url.split_once(':') else {
+                return false;
+            };
+            if authority.contains('/') || path.starts_with('/') {
+                return false;
+            }
+            (without_user(authority), path.to_string())
+        }
+    };
+    if host != "github.com" {
+        return false;
+    }
+    let path = path.strip_suffix('/').unwrap_or(&path);
     let path = path.strip_suffix(".git").unwrap_or(path);
     match path.split_once('/') {
         Some((owner, name)) if !owner.is_empty() && !name.is_empty() && !name.contains('/') => {
@@ -122,7 +151,7 @@ pub(crate) fn url_names_github_repo(url: &str, repo: &str) -> bool {
 /// The issue branch has no upstream, so the goal condition's push names
 /// its remote when one is known.
 pub(crate) fn pick_push_remote<'a>(
-    remotes: &[(&'a str, Option<&str>)],
+    remotes: &[(&'a str, &[&str])],
     tracking: &[&'a str],
     repo: Option<&str>,
 ) -> Option<&'a str> {
@@ -136,7 +165,7 @@ pub(crate) fn pick_push_remote<'a>(
     let naming_repo = repo.map_or_else(Vec::new, |repo| {
         remotes
             .iter()
-            .filter(|(_, url)| url.is_some_and(|url| url_names_github_repo(url, repo)))
+            .filter(|(_, urls)| urls.iter().any(|url| url_names_github_repo(url, repo)))
             .map(|(name, _)| *name)
             .collect()
     });
@@ -152,21 +181,30 @@ pub(crate) fn pick_push_remote<'a>(
 }
 
 /// [`pick_push_remote`] for `branch` of `repo` in the repository at `dir`,
-/// from `git remote -v`'s fetch URLs. A remote list that cannot be read
-/// counts as none.
+/// from `git remote -v`: each remote's fetch URL and its push URLs (a
+/// `pushurl` may differ from the fetch URL, and is where a push goes). A
+/// remote list that cannot be read counts as none. The URLs, which may hold
+/// a token, are never logged.
 pub(crate) fn push_remote(dir: &Path, branch: &str, repo: &str) -> Option<String> {
     let listed = git(dir, &["remote", "-v"]).unwrap_or_default();
-    let mut remotes: Vec<(&str, Option<&str>)> = Vec::new();
+    let mut remotes: Vec<(&str, Vec<&str>)> = Vec::new();
     for line in listed.lines() {
         let Some((name, rest)) = line.split_once('\t') else {
             continue;
         };
-        let url = rest.strip_suffix(" (fetch)");
-        if url.is_some() || !remotes.iter().any(|(known, _)| *known == name) {
-            remotes.retain(|(known, _)| *known != name);
-            remotes.push((name, url));
+        let url = rest
+            .strip_suffix(" (fetch)")
+            .or_else(|| rest.strip_suffix(" (push)"))
+            .unwrap_or(rest);
+        match remotes.iter_mut().find(|(known, _)| *known == name) {
+            Some((_, urls)) => urls.push(url),
+            None => remotes.push((name, vec![url])),
         }
     }
+    let remotes: Vec<(&str, &[&str])> = remotes
+        .iter()
+        .map(|(name, urls)| (*name, urls.as_slice()))
+        .collect();
     let refs = git(
         dir,
         &["for-each-ref", "--format=%(refname)", "refs/remotes/"],
@@ -1911,6 +1949,11 @@ mod tests {
             "git@github.com:OWNER/REPO",
             "ssh://git@github.com/owner/repo.git",
             "ssh://git@github.com/owner/repo",
+            // Userinfo, a token included, and a port are not the host.
+            "https://user@github.com/owner/repo.git",
+            "https://x-access-token:ghp_secret@github.com/owner/repo",
+            "ssh://git@github.com:22/owner/repo.git",
+            "github.com:owner/repo.git",
         ] {
             assert!(url_names_github_repo(url, "owner/repo"), "{url}");
         }
@@ -1922,16 +1965,31 @@ mod tests {
             "https://github.com/owner/repo/extra",
             "https://github.com/owner",
             "/srv/git/owner/repo.git",
+            // A name that only starts with the repo's is another repo.
+            "https://github.com/owner/repo2",
+            "https://github.com/owner/rep",
+            "https://evilgithub.com/owner/repo",
+            "https://github.com.evil.example/owner/repo",
+            "https://owner@evil.example/github.com/owner/repo",
+            "ftp://github.com/owner/repo",
+            // An SSH host alias names no host here: it falls through to the
+            // next rule rather than be guessed at.
+            "git@github-work:owner/repo.git",
         ] {
             assert!(!url_names_github_repo(url, "owner/repo"), "{url}");
         }
+        assert!(!url_names_github_repo(
+            "https://github.com/owner/repo",
+            "owner/repo2"
+        ));
     }
 
     #[test]
     fn the_push_remote_is_the_issue_repos_then_the_tracking_one_then_a_configured_origin() {
         let repo = Some("owner/repo");
-        let fork = Some("https://github.com/someone/repo.git");
-        let upstream = Some("git@github.com:owner/repo.git");
+        let fork: &[&str] = &["https://github.com/someone/repo.git"];
+        let upstream: &[&str] = &["git@github.com:owner/repo.git"];
+        const NONE: &[&str] = &[];
         // A fork `origin` loses to the remote that names the issue's repo,
         // even when the fork already has the branch.
         assert_eq!(
@@ -1940,22 +1998,22 @@ mod tests {
         );
         // No URL names it: the remote already tracking the branch.
         assert_eq!(
-            pick_push_remote(&[("origin", fork), ("mine", None)], &["mine"], repo),
+            pick_push_remote(&[("origin", fork), ("mine", NONE)], &["mine"], repo),
             Some("mine")
         );
         assert_eq!(
-            pick_push_remote(&[("a", None), ("origin", None)], &["a", "origin"], None),
+            pick_push_remote(&[("a", NONE), ("origin", NONE)], &["a", "origin"], None),
             Some("origin")
         );
         // Then `origin`, only when it is configured; then the only remote.
         assert_eq!(
-            pick_push_remote(&[("a", None), ("origin", None)], &[], None),
+            pick_push_remote(&[("a", NONE), ("origin", NONE)], &[], None),
             Some("origin")
         );
-        assert_eq!(pick_push_remote(&[("fork", None)], &[], repo), Some("fork"));
+        assert_eq!(pick_push_remote(&[("fork", NONE)], &[], repo), Some("fork"));
         // Otherwise none: a missing `origin` is never named.
         assert_eq!(
-            pick_push_remote(&[("github", fork), ("gitlab", None)], &[], repo),
+            pick_push_remote(&[("github", fork), ("gitlab", NONE)], &[], repo),
             None
         );
         assert_eq!(pick_push_remote(&[], &[], repo), None);
@@ -1979,6 +2037,36 @@ mod tests {
                 "add",
                 "upstream",
                 "git@github.com:IronRace/IronMem.git",
+            ],
+        );
+        assert_eq!(
+            push_remote(dir, &branch, &issue().repo).as_deref(),
+            Some("upstream")
+        );
+        // The push URL counts as well as the fetch URL: a mirror fetched
+        // from, pushed to the issue's repo.
+        run(
+            dir,
+            &[
+                "remote",
+                "set-url",
+                "upstream",
+                "https://github.com/mirror/ironmem.git",
+            ],
+        );
+        assert_eq!(
+            push_remote(dir, &branch, &issue().repo).as_deref(),
+            Some("origin"),
+            "neither URL names the issue's repo yet"
+        );
+        run(
+            dir,
+            &[
+                "remote",
+                "set-url",
+                "--push",
+                "upstream",
+                "https://user:token@github.com/IronRace/IronMem.git",
             ],
         );
         assert_eq!(
