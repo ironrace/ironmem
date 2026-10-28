@@ -679,7 +679,7 @@ mod tests {
                 format!("{notices}{cross}\n"),
                 Some(SessionRefusal::Unresumable),
             ),
-            (unreadable, Some(SessionRefusal::Unresumable)),
+            (unreadable.clone(), Some(SessionRefusal::Unresumable)),
             // An `error:` lead-in, any case and spacing, after an optional
             // `muse: ` notice prefix.
             (format!("error: {in_use}"), Some(SessionRefusal::InUse)),
@@ -698,6 +698,12 @@ mod tests {
             (format!("tool said \"{in_use}\" earlier"), None),
             ("error: provider request timed out".into(), None),
             (String::new(), None),
+            // "In use" wins over any other refusal, wherever it comes.
+            (format!("{cross}\n{in_use}\n"), Some(SessionRefusal::InUse)),
+            (
+                format!("{in_use}\n{unreadable}\n"),
+                Some(SessionRefusal::InUse),
+            ),
         ] {
             assert_eq!(
                 MuseCli.session_refusal(&stderr, Some(SID)),
@@ -1039,6 +1045,55 @@ mod tests {
             .unwrap();
             assert_eq!(recovered.session_refusal, expected, "{line}: {recovered:?}");
         }
+    }
+
+    /// A run killed at its wall-clock timeout, or one that never launched,
+    /// refused nothing, whatever its stderr says: only a launched run that
+    /// exited non-zero on its own is asked. Otherwise a quoted "in use"
+    /// line would park the issue instead of retrying it.
+    #[cfg(unix)]
+    #[test]
+    fn a_timed_out_or_never_launched_run_is_no_session_refusal() {
+        use crate::autopilot::invocation::contract_tests::{binary, setup};
+        let in_use = format!("session {SID} is already in use");
+        let (repo, mut s) = setup();
+        s.implementer = Implementer::Muse;
+        s.session = SessionMode::New {
+            session_uuid: SID.into(),
+        };
+        let bin = binary(
+            repo.path(),
+            &format!("printf '%s\\n' '{in_use}' >&2\nsleep 30\nexit 1\n"),
+        );
+        let outcome = crate::autopilot::invocation::run_supervised_bounded(
+            &bin,
+            repo.path(),
+            &s,
+            std::time::Duration::from_secs(1),
+        )
+        .unwrap();
+        assert!(outcome.timed_out, "{outcome:?}");
+        assert_eq!(outcome.session_refusal, None, "{outcome:?}");
+        // A supervisor record that the spawn failed, beside the same line.
+        let (_repo, mut s) = setup();
+        s.implementer = Implementer::Muse;
+        let a = s.invocation_artifacts.as_ref().unwrap();
+        std::fs::write(&a.stderr_path, format!("{in_use}\n")).unwrap();
+        std::fs::write(
+            &a.exit_path,
+            serde_json::json!({
+                "completion": {
+                    "version": 1, "invocation_id": a.invocation_id, "schema_path": a.schema_path
+                },
+                "exit_code": null, "timed_out": false, "limit_exceeded": null,
+                "expected_native_id": SID, "launch_failure": "failed to launch Muse dispatch"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let recovered = crate::autopilot::invocation::read_artifacts(Implementer::Muse, a).unwrap();
+        assert!(!recovered.invocation_started, "{recovered:?}");
+        assert_eq!(recovered.session_refusal, None, "{recovered:?}");
     }
 
     /// The parser already names the missing session; the core's generic
