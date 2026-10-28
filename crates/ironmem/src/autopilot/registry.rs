@@ -396,15 +396,9 @@ fn idle_invocation_pause(snapshot: &ProcessSnapshot, state: &DispatchState) -> R
     let ProcessSnapshot::Available(rows) = snapshot else {
         return Err(snapshot.reason());
     };
-    if !matches!(
-        state.state.as_str(),
-        "paused-daily-budget"
-            | "paused-infrastructure-failure"
-            | "paused-condition-too-long"
-            | "paused-session-in-use"
-            | "dispatching"
-            | "infrastructure-failure"
-    ) {
+    // Every phase a run writes is written without pending artifacts at some
+    // point; only a label no run writes is refused.
+    if state.phase().is_none() {
         return Err(format!(
             "{} state {:?} has no pending invocation identity and is not a state autopilot writes without one",
             state.implementer.label(),

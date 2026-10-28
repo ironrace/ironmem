@@ -77,6 +77,7 @@
 
 use serde::Serialize;
 
+use super::dispatch_state::DispatchPhase;
 use super::gh::IssueListing;
 use super::implementer::Implementer;
 use super::labels::{self, DispatchEligibility};
@@ -570,15 +571,26 @@ pub fn plan_queue(
                     }
                     Liveness::NotListed => {}
                 }
-                if state.state == "paused-condition-too-long" {
-                    defer(DeferReason::ConditionTooLong);
-                    continue;
-                }
-                if state.state == "paused-session-in-use" {
-                    defer(DeferReason::SessionInUse {
-                        session_uuid: state.session_uuid.clone(),
-                    });
-                    continue;
+                // Exhaustive: a new phase must say whether it waits for a
+                // human, or the queue would resume it ahead of the backlog.
+                match state.phase() {
+                    Some(DispatchPhase::PausedConditionTooLong) => {
+                        defer(DeferReason::ConditionTooLong);
+                        continue;
+                    }
+                    Some(DispatchPhase::PausedSessionInUse) => {
+                        defer(DeferReason::SessionInUse {
+                            session_uuid: state.session_uuid.clone(),
+                        });
+                        continue;
+                    }
+                    Some(
+                        DispatchPhase::Dispatching
+                        | DispatchPhase::InfrastructureFailure
+                        | DispatchPhase::PausedDailyBudget
+                        | DispatchPhase::PausedInfrastructureFailure,
+                    )
+                    | None => {}
                 }
                 if let Some(configured) = config.implementer {
                     if state.implementer != configured {
@@ -1740,6 +1752,22 @@ mod tests {
         );
         assert_eq!(plan.dispatch.len(), 1);
         assert_eq!(plan.dispatch[0].issue, IssueRef::new(REPO, 2));
+        // The parked issue still holds its slot.
+        assert_eq!(plan.occupied_slots, 1);
+        // A Claude Lead sees the parked Muse session the same way: it waits
+        // for an operator, ahead of the harness mismatch.
+        let claude = QueueConfig {
+            implementer: Some(Implementer::Claude),
+            ..config()
+        };
+        let plan = plan_queue(&db, &backlogs, &snapshots, &claude).unwrap();
+        assert_eq!(
+            reason_for(&plan, 1),
+            DeferReason::SessionInUse {
+                session_uuid: "0d6c1e2a-5b8f-4c1d-9e3a-7f2b6a1c4d5e".into()
+            }
+        );
+        assert_eq!(plan.occupied_slots, 1);
     }
     #[test]
     fn a_state_owned_by_the_other_harness_is_deferred_not_dispatched_ahead_of_the_backlog() {

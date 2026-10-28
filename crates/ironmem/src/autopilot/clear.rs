@@ -353,7 +353,7 @@ fn refusal(
     state: &DispatchState,
     attempt_recorded: bool,
 ) -> Option<String> {
-    if state.state == "paused-session-in-use" {
+    if state.phase() == Some(dispatch_state::DispatchPhase::PausedSessionInUse) {
         if let Some(reason) = session_holder(snapshots, &state.session_uuid) {
             return Some(reason);
         }
