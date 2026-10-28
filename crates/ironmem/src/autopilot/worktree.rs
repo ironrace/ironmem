@@ -1101,19 +1101,35 @@ impl std::fmt::Display for CutSource {
     }
 }
 
+/// How far [`infer_cut`] trusts a branch's reflog creation entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CreationEntry {
+    /// Only while it is on the base: the branch may have been deleted and
+    /// made again since it was cut. For a branch found existing, whose
+    /// history this run did not see made.
+    OnBaseOnly,
+    /// As it is: another controller made the branch moments ago, from a base
+    /// that may not be this run's, so the entry is its creation.
+    Fresh,
+}
+
 /// The cut of an existing `branch` that has none recorded.
 ///
 /// Its reflog's creation entry (`branch: Created from ...`, which git writes
-/// untranslated) is the commit it was cut from, so that is preferred, but
-/// only while that commit is on `base` (an ancestor of it, or `base` itself).
-/// `git branch -D` takes the branch's reflog and its recorded cut with it, so
-/// a branch made again (`git checkout -B <branch> <its last commit>`, as the
-/// signing guard's own missing-branch advice says) has a creation entry at
-/// the agent's own work. Taken as the cut, that would move the signing
-/// guard's range past every commit before it.
+/// untranslated) is the commit it was cut from, so that is preferred. With
+/// [`CreationEntry::OnBaseOnly`], only while that commit is on `base` (an
+/// ancestor of it, or `base` itself): `git branch -D` takes the branch's
+/// reflog and its recorded cut with it, so a branch made again (`git checkout
+/// -B <branch> <its last commit>`, as the signing guard's own missing-branch
+/// advice says) has a creation entry at the agent's own work. Taken as the
+/// cut, that would move the signing guard's range past every commit before
+/// it. An entry off the base can also mean only that the base moved (`--base
+/// HEAD` now on another line, or a reset base), so the warning names it and
+/// how to restore it: the merge base is the wider range, which may hold base
+/// commits the guard then refuses.
 ///
 /// Otherwise (no reflog, as with `core.logAllRefUpdates` off or an expired
-/// entry, or a creation entry off the base), the merge base of the branch and
+/// entry, or a creation entry set aside), the merge base of the branch and
 /// `base`: never `base` itself, which may have moved on since, or moved to
 /// another line of history (an operator's local-only commits would then count
 /// as the agent's). A branch that shares no history with `base` is refused
@@ -1125,7 +1141,12 @@ impl std::fmt::Display for CutSource {
 /// A reflog that git cannot read is an error, never "no creation entry": the
 /// merge base, recorded for good, would replace the exact cut for a
 /// transient failure.
-fn infer_cut(root: &Path, branch: &str, base: &str) -> Result<(String, CutSource), MemoryError> {
+fn infer_cut(
+    root: &Path,
+    branch: &str,
+    base: &str,
+    entry: CreationEntry,
+) -> Result<(String, CutSource), MemoryError> {
     let local = format!("refs/heads/{branch}");
     let base_sha = resolve_base(root, base)?;
     let log = git(root, &["reflog", "show", "--format=%H %gs", &local]).map_err(|e| {
@@ -1147,15 +1168,19 @@ fn infer_cut(root: &Path, branch: &str, base: &str) -> Result<(String, CutSource
             .flatten()
     });
     if let Some(sha) = created {
-        if is_ancestor(root, &sha, &base_sha)? {
+        if entry == CreationEntry::Fresh || is_ancestor(root, &sha, &base_sha)? {
             return Ok((sha, CutSource::Reflog));
         }
         tracing::warn!(
             branch = %branch,
             created = %sha,
             base = %base,
-            "the issue branch's reflog creation entry is not on the base, so the branch was made \
-             again since it was cut; autopilot infers its cut from the merge base instead"
+            restore = %format!("git config {} {sha}", cut_key(branch)),
+            "the issue branch's reflog creation entry is not on the base: either the branch was \
+             made again since it was cut (deleted and recreated), or the base moved off the \
+             cut's line (`--base HEAD` now on another branch, or a reset base). Autopilot infers \
+             its cut from the merge base instead, which may count base commits as the branch's; \
+             if the branch was not made again, restore the entry's cut with the `restore` command"
         );
     }
     let refuse = |why: &str| {
@@ -1482,7 +1507,9 @@ fn keep_the_branchs_own_cut(root: &Path, branch: &str, base: &str, cut: &str, ti
             )
         }
     }
-    match infer_cut(root, branch, base)
+    // The other controller's add made the branch just now: its creation
+    // entry is fresh, whatever base that controller used.
+    match infer_cut(root, branch, base, CreationEntry::Fresh)
         .and_then(|(own, source)| backfill_cut(root, branch, base, &own, source).map(|()| own))
     {
         Ok(own) => format!(
@@ -1713,7 +1740,7 @@ pub fn ensure_worktree(
         match recorded_cut(&root, &branch)? {
             Some(sha) => sha,
             None => {
-                let (sha, source) = infer_cut(&root, &branch, base)?;
+                let (sha, source) = infer_cut(&root, &branch, base, CreationEntry::OnBaseOnly)?;
                 backfill_cut(&root, &branch, base, &sha, source)?;
                 sha
             }
@@ -3814,5 +3841,52 @@ mod tests {
         run(repo.path(), &["config", "core.hooksPath", "/dev/null"]);
         let reused = ensure_worktree(repo.path(), roots.path(), &issue(), "HEAD").unwrap();
         assert!(reused.created, "after the steps, the worktree is made again");
+    }
+
+    /// A creation entry off the base is not proof the branch was made again:
+    /// `--base HEAD` may now be on another line, or the base was reset. The
+    /// merge base is used, and the warning names both causes, the entry it
+    /// set aside and how to restore it.
+    #[test]
+    fn a_creation_entry_off_a_moved_base_is_set_aside_with_how_to_restore_it() {
+        let repo = fixture_repo();
+        let roots = tempfile::tempdir().unwrap();
+        let seed = resolve_commit(repo.path(), "HEAD").unwrap();
+        let cut = advance_operator_head(repo.path(), "later");
+        let created = ensure_worktree(repo.path(), roots.path(), &issue(), "HEAD").unwrap();
+        assert_eq!(created.cut, cut);
+        run(repo.path(), &["config", "--unset", &issue_cut_key()]);
+        // The operator's base no longer contains the cut.
+        run(repo.path(), &["reset", "-q", "--hard", &seed]);
+        let (reused, log) =
+            with_captured_log(|| ensure_worktree(repo.path(), roots.path(), &issue(), "HEAD"));
+        assert_eq!(reused.unwrap().cut, seed, "the merge base with the base");
+        let restore = format!("git config {} {cut}", issue_cut_key());
+        assert!(log.contains(&restore), "{restore} missing: {log}");
+        assert!(
+            log.contains("made again") && log.contains("moved"),
+            "both causes: {log}"
+        );
+    }
+
+    /// Another controller's branch, made a moment ago from a base other than
+    /// this run's, has a fresh creation entry: its own cut, even off this
+    /// run's base.
+    #[test]
+    fn a_losing_controller_keeps_the_winners_fresh_creation_entry_off_its_base() {
+        let repo = fixture_repo();
+        let roots = tempfile::tempdir().unwrap();
+        let root = resolve_repo_root(repo.path()).unwrap();
+        let branch = branch_name(&issue());
+        run(&root, &["checkout", "-q", "-b", "side"]);
+        let theirs = advance_operator_head(&root, "side-work");
+        run(&root, &["checkout", "-q", "main"]);
+        let ours = advance_operator_head(&root, "later");
+        let path = worktree_path(roots.path(), &issue());
+        let err = create_branch_with(&root, &branch, &path, "HEAD", &ours, || {
+            run(&root, &["branch", &branch, &theirs]);
+        });
+        assert!(err.is_err());
+        assert_eq!(read_config(&root, &issue_cut_key()), Some(theirs));
     }
 }
