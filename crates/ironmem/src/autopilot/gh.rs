@@ -159,7 +159,7 @@ pub fn resolve_gh_binary() -> Result<PathBuf, MemoryError> {
 /// worktree, where a relative entry such as `.` would reach a file the
 /// repository planted (merging, labelling and commenting as the operator).
 fn gh_binary_in(path_var: &std::ffi::OsStr) -> Result<PathBuf, MemoryError> {
-    super::run::find_launcher("gh", path_var)
+    crate::launcher::find_launcher("gh", path_var)
 }
 
 /// The real `gh`, run in a working directory.

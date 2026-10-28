@@ -818,7 +818,10 @@ impl CliDispatcher {
         let path_var = std::env::var_os("PATH").unwrap_or_default();
         Ok(Self {
             implementer,
-            bin: find_launcher(implementer.launcher_harness().binary(), &path_var)?,
+            bin: crate::launcher::find_launcher(
+                implementer.launcher_harness().binary(),
+                &path_var,
+            )?,
             // The socket derives from the state directory and
             // `IRONMEM_DAEMON_SOCKET`, never from a `--db` override.
             shared_daemon: super::process_tree::SharedDaemon::for_current_exe(
@@ -860,36 +863,6 @@ pub(crate) fn planted_relative_path_entry(name: &str) -> (tempfile::TempDir, std
     let relative = Path::new(&up).join(planted.path().strip_prefix("/").unwrap());
     assert!(relative.join(name).exists());
     (planted, relative)
-}
-
-/// `name` on `path_var`, skipping relative entries. A supervised harness is
-/// spawned in the issue worktree, where a relative entry such as `.` would
-/// resolve to a file in the repository being worked on. The Claude
-/// implementer and the reviewers resolve through it for the same reason.
-pub(crate) fn find_launcher(
-    name: &str,
-    path_var: &std::ffi::OsStr,
-) -> Result<std::path::PathBuf, MemoryError> {
-    let absolute: Vec<_> = std::env::split_paths(path_var)
-        .filter(|dir| dir.is_absolute())
-        .collect();
-    // An empty PATH reads as one empty entry, which would find a bare
-    // relative `name` in the worktree: there must be an absolute entry.
-    let not_found = || {
-        MemoryError::NotFound(format!(
-            "could not find `{name}` on any absolute PATH entry; relative entries are skipped"
-        ))
-    };
-    if absolute.is_empty() {
-        return Err(not_found());
-    }
-    let path_var = std::env::join_paths(absolute)
-        .map_err(|e| MemoryError::Validation(format!("unusable PATH: {e}")))?;
-    match crate::launcher::find_in_paths(name, &path_var) {
-        Ok(found) if found.is_absolute() => Ok(found),
-        Ok(_) | Err(MemoryError::NotFound(_)) => Err(not_found()),
-        Err(e) => Err(e),
-    }
 }
 
 /// The shared daemon's socket from a loaded config. Loading it parses every
@@ -1383,10 +1356,14 @@ impl<'a> GuardGit<'a> {
         let status = child
             .wait()
             .map_err(|e| format!("{} could not be waited on: {e}", label()))?;
+        let read = |handle| {
+            dispatch::drained(handle)
+                .map_err(|e| format!("{} output could not be read: {e}", label()))
+        };
         let output = std::process::Output {
             status,
-            stdout: stdout.join().unwrap_or_default(),
-            stderr: stderr.join().unwrap_or_default(),
+            stdout: read(stdout)?,
+            stderr: read(stderr)?,
         };
         match writer.map(std::thread::JoinHandle::join) {
             None | Some(Ok(Ok(()))) => Ok(output),
@@ -5438,7 +5415,7 @@ sleep 0.5
         let up = "../".repeat(cwd.components().count().saturating_sub(1));
         let relative = Path::new(&up).join(planted.path().strip_prefix("/").unwrap());
         for path_var in [relative.into_os_string(), std::ffi::OsString::new()] {
-            let err = find_launcher("muse", &path_var).unwrap_err();
+            let err = crate::launcher::find_launcher("muse", &path_var).unwrap_err();
             assert!(matches!(err, MemoryError::NotFound(_)), "{err}");
             assert!(err.to_string().contains("absolute PATH"), "{err}");
         }
@@ -5523,7 +5500,7 @@ sleep 0.5
         let relative = Path::new(&up).join(planted.path().strip_prefix("/").unwrap());
         assert!(relative.join("muse").exists());
         let path_var = std::env::join_paths([relative.as_path(), real.path()]).unwrap();
-        let found = find_launcher("muse", &path_var).unwrap();
+        let found = crate::launcher::find_launcher("muse", &path_var).unwrap();
         assert_eq!(found, real.path().join("muse"));
         assert!(found.is_absolute());
     }

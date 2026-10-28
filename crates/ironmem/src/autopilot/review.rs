@@ -519,7 +519,7 @@ fn reviewer_binary_in(
     harness: crate::launcher::Harness,
     path_var: &std::ffi::OsStr,
 ) -> Result<PathBuf, MemoryError> {
-    super::run::find_launcher(harness.binary(), path_var)
+    crate::launcher::find_launcher(harness.binary(), path_var)
 }
 
 /// A scratch directory holding the schema and last-message files for one

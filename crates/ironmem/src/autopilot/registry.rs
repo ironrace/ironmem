@@ -175,8 +175,13 @@ impl AgentRegistry for ClaudeAgentRegistry {
                 }
             }
         };
-        let stdout = stdout.join().unwrap_or_default();
-        let stderr = stderr.join().unwrap_or_default();
+        let read = |handle, pipe: &str| {
+            super::dispatch::drained(handle).map_err(|e| {
+                MemoryError::Validation(format!("claude agents {pipe} could not be read: {e}"))
+            })
+        };
+        let stdout = read(stdout, "stdout")?;
+        let stderr = read(stderr, "stderr")?;
         Ok(RegistryOutput {
             stdout: String::from_utf8_lossy(&stdout).to_string(),
             stderr: String::from_utf8_lossy(&stderr).to_string(),

@@ -320,7 +320,7 @@ pub fn resolve_claude_binary() -> Result<std::path::PathBuf, MemoryError> {
 /// issue worktree, where a relative entry such as `.` would reach a file in
 /// the repository being worked on.
 fn claude_binary_in(path_var: &std::ffi::OsStr) -> Result<std::path::PathBuf, MemoryError> {
-    super::run::find_launcher(crate::launcher::Harness::Claude.binary(), path_var)
+    crate::launcher::find_launcher(crate::launcher::Harness::Claude.binary(), path_var)
 }
 
 /// Run one IC dispatch: spawn `bin` with `spec`'s argv, in `repo`, capturing
@@ -497,16 +497,21 @@ pub fn run_dispatch_bounded(
     let status = child
         .wait()
         .map_err(|e| MemoryError::Validation(format!("IC dispatch output was lost: {e}")))?;
+    let read = |handle: DrainHandle, pipe: &str| {
+        drained(handle).map_err(|e| {
+            MemoryError::Validation(format!("IC dispatch {pipe} could not be read: {e}"))
+        })
+    };
     let output = std::process::Output {
         status,
-        stdout: stdout_drain.join().unwrap_or_default(),
-        stderr: stderr_drain.join().unwrap_or_default(),
+        stdout: read(stdout_drain, "stdout")?,
+        stderr: read(stderr_drain, "stderr")?,
     };
     finish_dispatch(output)
 }
 
 /// A background reader collecting one of a bounded dispatch's pipes.
-pub(super) type DrainHandle = std::thread::JoinHandle<Vec<u8>>;
+pub(super) type DrainHandle = std::thread::JoinHandle<std::io::Result<Vec<u8>>>;
 
 /// Read `pipe` to its end on its own thread, so a full pipe buffer cannot
 /// stall a child that a bounded caller is polling for exit.
@@ -514,10 +519,21 @@ pub(super) fn drain<R: std::io::Read + Send + 'static>(pipe: Option<R>) -> Drain
     std::thread::spawn(move || {
         let mut buf = Vec::new();
         if let Some(mut pipe) = pipe {
-            let _ = pipe.read_to_end(&mut buf);
+            pipe.read_to_end(&mut buf)?;
         }
-        buf
+        Ok(buf)
     })
+}
+
+/// What a [`drain`] collected, once its pipe closed: `Err` when the pipe
+/// could not be read or the reader panicked. Output that was cut short is
+/// never passed off as all of it.
+pub(super) fn drained(handle: DrainHandle) -> Result<Vec<u8>, String> {
+    match handle.join() {
+        Ok(Ok(buf)) => Ok(buf),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(_) => Err("its reader panicked".into()),
+    }
 }
 
 /// `ETXTBSY`, which Linux and macOS both number 26.
@@ -662,6 +678,31 @@ fn finish_dispatch(output: std::process::Output) -> Result<DispatchOutcome, Memo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F6: a pipe that fails partway is an error, never the bytes read so
+    /// far passed off as all of it.
+    #[test]
+    fn a_pipe_that_fails_partway_is_an_error_not_short_output() {
+        struct FailsAfterTen(usize);
+        impl std::io::Read for FailsAfterTen {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.0 >= 10 {
+                    return Err(std::io::Error::other("pipe broke"));
+                }
+                let n = buf.len().min(10 - self.0);
+                buf[..n].fill(b'x');
+                self.0 += n;
+                Ok(n)
+            }
+        }
+        let err = drained(drain(Some(FailsAfterTen(0)))).unwrap_err();
+        assert!(err.contains("pipe broke"), "{err}");
+        assert_eq!(
+            drained(drain(Some(std::io::Cursor::new(b"all".to_vec())))).unwrap(),
+            b"all"
+        );
+        assert!(drained(drain(None::<std::io::Empty>)).unwrap().is_empty());
+    }
 
     #[test]
     fn the_claude_binary_is_never_found_through_a_relative_path_entry() {

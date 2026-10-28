@@ -45,6 +45,33 @@ pub(crate) fn find_in_paths(name: &str, path_var: &OsStr) -> Result<PathBuf, Mem
     )))
 }
 
+/// `name` on `path_var`, skipping relative entries. A supervised harness is
+/// spawned in the issue worktree, where a relative entry such as `.` would
+/// resolve to a file in the repository being worked on. The Claude
+/// implementer and the reviewers resolve through it for the same reason.
+pub(crate) fn find_launcher(name: &str, path_var: &OsStr) -> Result<PathBuf, MemoryError> {
+    let absolute: Vec<_> = std::env::split_paths(path_var)
+        .filter(|dir| dir.is_absolute())
+        .collect();
+    // An empty PATH reads as one empty entry, which would find a bare
+    // relative `name` in the worktree: there must be an absolute entry.
+    let not_found = || {
+        MemoryError::NotFound(format!(
+            "could not find `{name}` on any absolute PATH entry; relative entries are skipped"
+        ))
+    };
+    if absolute.is_empty() {
+        return Err(not_found());
+    }
+    let path_var = std::env::join_paths(absolute)
+        .map_err(|e| MemoryError::Validation(format!("unusable PATH: {e}")))?;
+    match find_in_paths(name, &path_var) {
+        Ok(found) if found.is_absolute() => Ok(found),
+        Ok(_) | Err(MemoryError::NotFound(_)) => Err(not_found()),
+        Err(e) => Err(e),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
