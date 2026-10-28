@@ -495,14 +495,15 @@ struct GitOutput {
 }
 
 impl GitOutput {
-    /// The error [`git`] reports for this output.
+    /// The error [`git`] reports for this output, quoting its stderr
+    /// scrubbed and bounded ([`bounded_stderr`]).
     fn failure(&self, cwd: &Path, args: &[&str]) -> MemoryError {
         MemoryError::Validation(format!(
             "git {} failed in {} (exit {:?}): {}",
             args.join(" "),
             cwd.display(),
             self.code,
-            self.stderr
+            bounded_stderr(self.stderr.as_bytes())
         ))
     }
 }
@@ -646,14 +647,18 @@ fn config_get(cwd: &Path, args: &[&str]) -> Result<Option<String>, String> {
 /// How many characters of a git command's stderr a one-line reason quotes.
 const STDERR_EXCERPT_CHARS: usize = 300;
 
-/// `git`'s own complaint, trimmed and bounded so it can ride inside a
-/// one-line reason.
+/// `git`'s own complaint, trimmed, scrubbed of secrets and bounded so it can
+/// ride inside a one-line reason. git can echo a remote URL (with its token)
+/// or a config line, and these reasons reach lineage, logs and the model's
+/// next prompt.
 pub(crate) fn bounded_stderr(stderr: &[u8]) -> String {
-    String::from_utf8_lossy(stderr)
-        .trim()
-        .chars()
-        .take(STDERR_EXCERPT_CHARS)
-        .collect()
+    let bounded =
+        super::scrub::scrub_and_bound(String::from_utf8_lossy(stderr).trim(), STDERR_EXCERPT_CHARS);
+    if bounded.truncated {
+        format!("{}…", bounded.text)
+    } else {
+        bounded.text
+    }
 }
 
 fn cut_key(branch: &str) -> String {
@@ -3579,5 +3584,21 @@ mod tests {
         .expect("output held open past the deadline must fail")
         .to_string();
         assert!(err.contains("left its output open"), "{err}");
+    }
+
+    #[test]
+    fn git_stderr_is_scrubbed_and_bounded_wherever_it_is_quoted() {
+        let token = format!("ghp_{}", "a1B2c3D4e5".repeat(4));
+        let stderr = format!("fatal: unable to access 'https://x:{token}@github.com/o/r'");
+        assert!(!bounded_stderr(stderr.as_bytes()).contains(&token));
+        let out = GitOutput {
+            code: Some(128),
+            stdout: String::new(),
+            stderr: format!("{stderr}\n{}", "x".repeat(10 * STDERR_EXCERPT_CHARS)),
+        };
+        let failure = out.failure(Path::new("/repo"), &["fetch"]).to_string();
+        assert!(!failure.contains(&token), "{failure}");
+        assert!(failure.contains("git fetch failed"), "{failure}");
+        assert!(failure.len() < 2 * STDERR_EXCERPT_CHARS, "{failure}");
     }
 }
