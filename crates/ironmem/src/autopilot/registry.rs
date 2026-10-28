@@ -439,9 +439,57 @@ fn idle_invocation_pause(snapshot: &ProcessSnapshot, state: &DispatchState) -> R
 /// worktree: the operator's configured socket and the controller's own
 /// executable. Without it nothing is exempt, which only holds longer.
 pub(crate) fn configured_shared_daemon() -> Option<crate::autopilot::process_tree::SharedDaemon> {
-    crate::config::Config::load(None).ok().and_then(|config| {
-        crate::autopilot::process_tree::SharedDaemon::for_current_exe(config.daemon_socket_path())
-    })
+    configured_shared_daemon_from(crate::config::Config::load(None))
+}
+
+/// Whether [`configured_shared_daemon_from`] has warned about a config that
+/// failed to load, in this process: liveness reads it on every check.
+static CONFIG_FAILURE_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// [`configured_shared_daemon`] from a loaded (or failed) config. A config
+/// that failed to load exempts nothing, which only holds longer, and says
+/// so once per process.
+pub(crate) fn configured_shared_daemon_from(
+    config: Result<crate::config::Config, MemoryError>,
+) -> Option<crate::autopilot::process_tree::SharedDaemon> {
+    match config {
+        Ok(config) => crate::autopilot::process_tree::SharedDaemon::for_current_exe(
+            config.daemon_socket_path(),
+        ),
+        Err(e) => {
+            if !CONFIG_FAILURE_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::warn!(
+                    error = %e,
+                    "autopilot cannot load the ironmem config, so the shared daemon is not \
+                     exempt from the worktree-quiet check"
+                );
+            }
+            None
+        }
+    }
+}
+
+/// A worktree-quiet hold's reason, saying too when the shared daemon could
+/// not be exempted because the config failed to load: a daemon the agent's
+/// MCP proxy autospawned in the worktree then holds it.
+fn awaiting_quiet_reason(
+    implementer: Implementer,
+    held: &str,
+    config: Result<crate::config::Config, MemoryError>,
+) -> String {
+    let mut reason = format!(
+        "{} invocation finished, but its completion waits until nothing it started remains: \
+         {held}",
+        implementer.label()
+    );
+    if let Err(e) = config {
+        reason.push_str(&format!(
+            "; the shared daemon is not exempt: the ironmem config failed to load: {}",
+            super::scrub::scrub_and_bound(&e.to_string(), 300).text
+        ));
+    }
+    reason
 }
 
 /// An invocation whose supervisor refused completion only because its
@@ -524,11 +572,9 @@ pub(crate) fn invocation_state_reason_with(
 ) -> String {
     match state.invocation_artifacts.as_ref() {
         Some(artifacts) => match settle_awaiting_quiet(snapshot, artifacts, daemon, pids) {
-            Err(held) => format!(
-                "{} invocation finished, but its completion waits until nothing it started \
-                 remains: {held}",
-                state.implementer.label()
-            ),
+            Err(held) => {
+                awaiting_quiet_reason(state.implementer, &held, crate::config::Config::load(None))
+            }
             Ok(_) => snapshot.invocation_reason_with(Some(artifacts), &daemon),
         },
         None => idle_invocation_pause(snapshot, state)
@@ -746,6 +792,21 @@ mod tests {
                 Err(e) => Err(MemoryError::Validation(e.to_string())),
             }
         }
+    }
+
+    /// F19: a config that fails to load exempts no daemon, and the hold
+    /// says why.
+    #[test]
+    fn a_config_that_fails_to_load_is_named_in_the_quiet_hold() {
+        let failed = || Err(MemoryError::Validation("IRONMEM_X is not a number".into()));
+        assert!(configured_shared_daemon_from(failed()).is_none());
+        let reason = awaiting_quiet_reason(Implementer::Muse, "process 7 is in it", failed());
+        assert!(reason.contains("process 7 is in it"), "{reason}");
+        assert!(
+            reason.contains("the shared daemon is not exempt: the ironmem config failed to load"),
+            "{reason}"
+        );
+        assert!(reason.contains("IRONMEM_X is not a number"), "{reason}");
     }
 
     #[test]
