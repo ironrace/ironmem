@@ -37,9 +37,11 @@ static BEARER_TOKEN_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{8,}").unwrap());
 
 /// GitHub personal-access/OAuth/server/refresh token prefixes:
-/// `ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_`.
-static GITHUB_TOKEN_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b").unwrap());
+/// `ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_`, and fine-grained personal access
+/// tokens (`github_pat_`, whose body holds `_`).
+static GITHUB_TOKEN_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{22,})\b").unwrap()
+});
 
 /// AWS access key ids (`AKIA...`) and STS session key ids (`ASIA...`).
 static AWS_KEY_RE: LazyLock<Regex> =
@@ -592,5 +594,21 @@ mod tests {
             let (out, _) = scrub_secrets(input);
             assert_eq!(out, expected, "{input}");
         }
+    }
+
+    /// GitHub's fine-grained personal access tokens (`github_pat_…`), in the
+    /// credential-only scrub too, which has no entropy pass to fall back on.
+    #[test]
+    fn redacts_a_fine_grained_github_token() {
+        // Built so no literal token sits in source.
+        let token = format!("{}_pat_{}{}", "github", "11ABCDEFG0", "Xy".repeat(20));
+        let input = format!("remote: Invalid credentials {token} for o/r");
+        let out = scrub_credentials_and_bound(&input, 10_000);
+        assert!(out.redacted, "{out:?}");
+        assert!(!out.text.contains(&token), "{}", out.text);
+        assert!(!out.text.contains("_pat_"), "{}", out.text);
+        assert!(out.text.contains("for o/r"), "{}", out.text);
+        let (full, _) = scrub_secrets(&input);
+        assert!(!full.contains("_pat_"), "{full}");
     }
 }
