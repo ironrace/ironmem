@@ -1471,8 +1471,20 @@ mod tests {
     use super::testing::with_captured_log;
     use super::*;
 
+    /// [`git_command`] for the fixtures' own git: never the operator's
+    /// global or system config (a signing key or hook there would let a
+    /// fixture pass locally that fails in CI). Set after the scrub, which
+    /// removes every inherited `GIT_*` variable.
+    fn fixture_git() -> Command {
+        let mut command = git_command();
+        command
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1");
+        command
+    }
+
     fn run(cwd: &Path, args: &[&str]) {
-        let output = git_command()
+        let output = fixture_git()
             .args(args)
             .current_dir(cwd)
             .output()
@@ -1501,6 +1513,9 @@ mod tests {
         run(
             path,
             &[
+                // Tests hold a ref's lock file under `.git/refs/heads`.
+                "-c",
+                "init.defaultRefFormat=files",
                 "init",
                 "--initial-branch=main",
                 &format!("--object-format={object_format}"),
@@ -1523,6 +1538,32 @@ mod tests {
 
     fn issue() -> IssueRef {
         IssueRef::new("ironrace/ironmem", 283)
+    }
+
+    /// The fixtures' own git never reads the operator's global or system
+    /// config, and their repos use the files ref backend, which tests that
+    /// hold a ref's lock file rely on.
+    #[test]
+    fn fixture_git_never_reads_the_operators_config_and_uses_files_refs() {
+        let command = fixture_git();
+        let envs: Vec<_> = command.get_envs().collect();
+        assert!(
+            envs.contains(&(
+                std::ffi::OsStr::new("GIT_CONFIG_GLOBAL"),
+                Some(std::ffi::OsStr::new("/dev/null"))
+            )),
+            "{envs:?}"
+        );
+        assert!(
+            envs.contains(&(
+                std::ffi::OsStr::new("GIT_CONFIG_NOSYSTEM"),
+                Some(std::ffi::OsStr::new("1"))
+            )),
+            "{envs:?}"
+        );
+        let repo = fixture_repo();
+        assert!(repo.path().join(".git/refs/heads").is_dir());
+        assert!(!repo.path().join(".git/reftable").exists());
     }
 
     fn read_config(repo: &Path, key: &str) -> Option<String> {
