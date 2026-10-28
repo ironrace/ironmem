@@ -1089,17 +1089,10 @@ fn kernel_observation(pid: u32) -> Result<Option<KernelProcess>, String> {
     }
     #[cfg(target_os = "linux")]
     {
-        let text = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
-            Ok(text) => text,
-            Err(e)
-                if e.kind() == std::io::ErrorKind::NotFound
-                    || e.raw_os_error() == Some(libc::ESRCH) =>
-            {
-                return Ok(None)
-            }
-            Err(e) => return Err(format!("cannot authenticate process {pid}: {e}")),
-        };
-        kernel_process_from_stat(pid, &text)
+        match proc_stat_text(pid)? {
+            Some(text) => kernel_process_from_stat(pid, &text),
+            None => Ok(None),
+        }
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
@@ -1229,6 +1222,27 @@ fn linux_cwd(
 /// after the LAST `)`. Linux only, but tested everywhere.
 #[cfg(any(target_os = "linux", test))]
 fn kernel_process_from_stat(pid: u32, text: &str) -> Result<Option<KernelProcess>, String> {
+    proc_stat_record(pid, text, false)
+}
+
+/// [`kernel_process_from_stat`] for the invocation root straight after
+/// spawn ([`ProcessTracker::adopt_root`]): a root that has already exited is
+/// our unreaped child's zombie, whose PID it reserves and whose record
+/// (birth, parent, group) is still its own, so it is read like a running
+/// one. A dead task (`X`) is still gone. Linux only, but tested everywhere.
+#[cfg(any(target_os = "linux", test))]
+fn root_process_from_stat(pid: u32, text: &str) -> Result<Option<KernelProcess>, String> {
+    proc_stat_record(pid, text, true)
+}
+
+/// The parse behind [`kernel_process_from_stat`]; `zombie_is_ours` reads a
+/// zombie's record rather than count it exited.
+#[cfg(any(target_os = "linux", test))]
+fn proc_stat_record(
+    pid: u32,
+    text: &str,
+    zombie_is_ours: bool,
+) -> Result<Option<KernelProcess>, String> {
     let fields = text
         .rsplit_once(')')
         .ok_or("malformed proc stat")?
@@ -1246,7 +1260,7 @@ fn kernel_process_from_stat(pid: u32, text: &str) -> Result<Option<KernelProcess
     }
     match fields.first() {
         Some(&"X") => return Ok(None),
-        Some(&"Z") => {
+        Some(&"Z") if !zombie_is_ours => {
             let threads: u64 = fields
                 .get(17)
                 .ok_or("missing proc thread count")?
@@ -1279,6 +1293,39 @@ fn kernel_process_from_stat(pid: u32, text: &str) -> Result<Option<KernelProcess
         pgid,
         birth: Birth(start, 0),
     }))
+}
+
+/// The text of Linux's `/proc/<pid>/stat`, or `None` once it is gone.
+#[cfg(target_os = "linux")]
+fn proc_stat_text(pid: u32) -> Result<Option<String>, String> {
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(text) => Ok(Some(text)),
+        Err(e)
+            if e.kind() == std::io::ErrorKind::NotFound
+                || e.raw_os_error() == Some(libc::ESRCH) =>
+        {
+            Ok(None)
+        }
+        Err(e) => Err(format!("cannot authenticate process {pid}: {e}")),
+    }
+}
+
+/// [`kernel_observation`] for the invocation root straight after spawn,
+/// which on Linux reads an already-exited root's zombie record
+/// ([`root_process_from_stat`]). macOS's `kinfo_proc` counts it gone, as it
+/// always has.
+fn root_observation(pid: u32) -> Result<Option<KernelProcess>, String> {
+    #[cfg(target_os = "linux")]
+    {
+        match proc_stat_text(pid)? {
+            Some(text) => root_process_from_stat(pid, &text),
+            None => Ok(None),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        kernel_observation(pid)
+    }
 }
 
 /// The operator's shared ironmem daemon, which supervision never owns (see
@@ -2651,7 +2698,7 @@ impl ProcessTracker {
         if self.known.iter().any(|(r, _)| r.pid == self.root_pid) {
             return;
         }
-        match kernel_observation(self.root_pid) {
+        match root_observation(self.root_pid) {
             Ok(Some(root)) if root.pid == self.root_pid => {
                 let row = ProcessRow {
                     pid: root.pid,
@@ -4113,6 +4160,36 @@ pub(crate) mod tests {
             "{pid} ({comm}) {state} 300 {pid} {pid} 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 {threads} 0 \
              12345 1000000 200 18446744073709551615 1 1 0 0 0 0 0 0 0 0 0 0 17 3 0 0 0 0 0"
         )
+    }
+
+    /// The invocation root, read straight after spawn, is our unreaped
+    /// child: if it has already exited, its zombie still holds its PID and
+    /// its own record, so adoption reads its birth (as released Linux code
+    /// did). Every other read counts a zombie as exited.
+    #[test]
+    fn an_exited_root_still_yields_its_record_for_adoption() {
+        let zombie = proc_stat_line(42, "sh", 'Z');
+        assert_eq!(kernel_process_from_stat(42, &zombie), Ok(None));
+        assert_eq!(
+            root_process_from_stat(42, &zombie),
+            Ok(Some(KernelProcess {
+                pid: 42,
+                ppid: 300,
+                pgid: 42,
+                birth: Birth(12345, 0),
+            }))
+        );
+        assert_eq!(
+            root_process_from_stat(42, &proc_stat_line(42, "sh", 'S'))
+                .unwrap()
+                .map(|p| p.birth),
+            Some(Birth(12345, 0))
+        );
+        assert_eq!(
+            root_process_from_stat(42, &proc_stat_line(42, "sh", 'X')),
+            Ok(None)
+        );
+        assert!(root_process_from_stat(43, &zombie).is_err());
     }
 
     /// A process whose main thread called `pthread_exit` while another
