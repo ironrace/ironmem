@@ -613,14 +613,15 @@ pub(crate) fn persist_private_atomic(
 fn persist_exit(a: &InvocationArtifacts, record: &ExitRecord) -> Result<(), MemoryError> {
     let bytes = serde_json::to_vec(record)?;
     if bytes.len() as u64 > EXIT_LIMIT {
-        let stragglers = record
-            .awaiting_quiet
-            .as_ref()
-            .map_or(0, |w| w.stragglers.len());
+        // The processes are what grows; they include ones cleanup could not
+        // signal, wherever they run, so they are not all in the worktree.
+        let listing = match record.awaiting_quiet.as_ref().map(|w| w.stragglers.len()) {
+            Some(count) if count > 0 => format!(" (it lists {count} recorded processes)"),
+            _ => String::new(),
+        };
         return Err(validation(format!(
-            "the invocation exit record is {} bytes ({stragglers} processes still in the \
-             worktree), over its {EXIT_LIMIT}-byte limit; it was not written, since every \
-             reader would refuse it",
+            "the invocation exit record is {} bytes, over its {EXIT_LIMIT}-byte limit{listing}; \
+             it was not written, since every reader would refuse it",
             bytes.len()
         )));
     }
@@ -1072,6 +1073,10 @@ fn hold_for_quiet(
 ) -> MemoryError {
     await_quiet(&mut record, hold);
     if let Err(e) = persist_exit(a, &record) {
+        let e = match e {
+            MemoryError::Validation(detail) => detail,
+            other => other.to_string(),
+        };
         return validation(format!(
             "{} after cleanup, and recording that {label} completion waits until the \
              worktree is quiet failed: {e}; with no exit record the invocation stays held \
@@ -2745,6 +2750,18 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
             err.contains("processes still run in the worktree")
                 && err.contains(&format!("{EXIT_LIMIT}-byte limit"))
                 && err.contains("clear-dispatch"),
+            "{err}"
+        );
+        // Not all of them are in the worktree: `hold_unsignalable` records
+        // processes cleanup could not signal wherever they run.
+        assert!(err.contains("40000 recorded processes"), "{err}");
+        assert!(!err.contains("still in the worktree"), "{err}");
+        // Another field past the limit names no process count at all.
+        let oversized = "x".repeat(EXIT_LIMIT as usize);
+        let record = exit_record(a, None, Some(0), false, Some(oversized), 1, None);
+        let err = persist_exit(a, &record).unwrap_err().to_string();
+        assert!(
+            err.contains(&format!("{EXIT_LIMIT}-byte limit")) && !err.contains("processes"),
             "{err}"
         );
         assert_eq!(std::fs::metadata(&a.exit_path).unwrap().len(), 0);
