@@ -590,9 +590,7 @@ pub(crate) const INVOCATION_RETENTION: Duration = Duration::from_secs(14 * 24 * 
 /// name ending `-<number>`), so nothing else under
 /// `<common_dir>/ironmem/autopilot/`, such as the `locks/` directory, can
 /// ever be pruned.
-// run_issue's clear and release_settled_dispatches call this; until that
-// wiring lands only the tests do.
-#[cfg_attr(not(test), allow(dead_code))]
+// Called from run_issue's clear and release_settled_dispatches.
 pub(crate) fn prune_invocations(
     common_dir: &Path,
     slug: &str,

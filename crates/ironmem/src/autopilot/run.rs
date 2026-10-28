@@ -2645,6 +2645,15 @@ pub fn preflight_worktree_provisioning(
 /// worktree was not quiet finishes by itself; any other needs the operator
 /// to confirm nothing is running first.
 fn release_hint(issue: &IssueRef, artifacts: Option<&InvocationArtifacts>) -> String {
+    // F55: an exit record that exists but cannot be read is said so,
+    // rather than letting the hint call the invocation missing.
+    if let Some(unreadable) = artifacts.and_then(super::invocation::exit_record_unreadable) {
+        return format!(
+            "{unreadable}; once no process remains, `ironmem autopilot clear-dispatch {} {}` \
+             releases it",
+            issue.repo, issue.number
+        );
+    }
     if artifacts.is_some_and(super::invocation::is_awaiting_quiet) {
         format!(
             "a later Lead tick or `ironmem autopilot run` finishes it once nothing it started \
@@ -3014,7 +3023,29 @@ pub fn run_issue(
             if config.implementer.recovers_invocations() {
                 // Only the state this run read; see `write_state`.
                 if let Some(claim) = &existing_claim {
-                    if !dispatch_state::clear_claim_if_unchanged(db, claim)? {
+                    if dispatch_state::clear_claim_if_unchanged(db, claim)? {
+                        // F52: old invocation directories past retention
+                        // go with the state; the cleared one stays.
+                        if let Some(common) = &claim.common_dir {
+                            let keep = claim
+                                .state
+                                .invocation_artifacts
+                                .as_ref()
+                                .map(|a| a.invocation_id.as_str());
+                            if let Err(e) = super::invocation::prune_invocations(
+                                Path::new(common),
+                                &issue.slug(),
+                                keep,
+                                super::invocation::INVOCATION_RETENTION,
+                            ) {
+                                tracing::warn!(
+                                    error = %e,
+                                    issue = %issue.canonical(),
+                                    "autopilot could not prune old invocation directories"
+                                );
+                            }
+                        }
+                    } else {
                         tracing::info!(
                             issue = %issue.canonical(),
                             "autopilot left the dispatch state of an already succeeded issue to \
@@ -3578,8 +3609,14 @@ pub fn run_issue(
                     Some(super::invocation::prepare_artifacts(&worktree.path, issue)?);
                 // Validate the exact backend argv before publishing a new
                 // invocation or charging unknown spend. Definite input errors
-                // prove no process launched and must leave prior state intact.
-                super::invocation::validate_argv(&worktree.path, &spec)?;
+                // prove no process launched and must leave prior state intact;
+                // the directory just prepared is discarded with them (F53).
+                if let Err(e) = super::invocation::validate_argv(&worktree.path, &spec) {
+                    if let Some(artifacts) = &spec.invocation_artifacts {
+                        super::invocation::discard_unlaunched(artifacts);
+                    }
+                    return Err(e);
+                }
                 if let Some(artifacts) = &spec.invocation_artifacts {
                     // Another run that took the issue over since this one
                     // last wrote it is seen before a unit is reserved.
@@ -4277,6 +4314,14 @@ mod tests {
                 && awaiting.contains("manual release")
                 && awaiting.contains("clear-dispatch ironrace/ironmem 283"),
             "{awaiting}"
+        );
+        // F55: an exit record that exists but cannot be read is named.
+        std::fs::write(&a.exit_path, "not json").unwrap();
+        let unreadable = release_hint(&issue(), Some(a));
+        assert!(
+            unreadable.contains("the exit record cannot be read")
+                && unreadable.contains("clear-dispatch"),
+            "{unreadable}"
         );
     }
 

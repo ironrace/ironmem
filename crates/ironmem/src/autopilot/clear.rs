@@ -575,6 +575,26 @@ pub fn release_settled_dispatches(
         };
         if dispatch_state::clear_raw_dispatch_state_if_unchanged(db, &state.issue, raw)? {
             released.push(state.issue.clone());
+            // F52: the released invocation's directory is evidence; older
+            // ones past retention go. Best effort, as in run's clear.
+            if let Some(common) = &claim.common_dir {
+                let keep = state
+                    .invocation_artifacts
+                    .as_ref()
+                    .map(|a| a.invocation_id.as_str());
+                if let Err(e) = super::invocation::prune_invocations(
+                    Path::new(common),
+                    &state.issue.slug(),
+                    keep,
+                    super::invocation::INVOCATION_RETENTION,
+                ) {
+                    tracing::warn!(
+                        error = %e,
+                        issue = %state.issue.canonical(),
+                        "autopilot could not prune old invocation directories"
+                    );
+                }
+            }
         }
     }
     Ok(released)
