@@ -424,7 +424,18 @@ pub fn prepare_artifacts(
         .join("ironmem/autopilot")
         .join(issue.slug())
         .join(&invocation_id);
-    supported_path(&dir)?;
+    make_invocation_dir(&dir, invocation_id)
+}
+
+/// Create the invocation directory `dir` and its artifacts. Any failure
+/// after the directory exists removes it again: nothing names it yet, and a
+/// failure that persists (a full disk) would otherwise leave one behind on
+/// every attempt.
+fn make_invocation_dir(
+    dir: &Path,
+    invocation_id: String,
+) -> Result<InvocationArtifacts, MemoryError> {
+    supported_path(dir)?;
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true);
     #[cfg(unix)]
@@ -432,22 +443,34 @@ pub fn prepare_artifacts(
         use std::os::unix::fs::DirBuilderExt;
         builder.mode(0o700);
     }
-    builder.create(&dir)?;
-    let a = InvocationArtifacts {
-        invocation_id,
-        schema_path: supported_path(&dir.join("schema.json"))?.into(),
-        journal_path: supported_path(&dir.join(ARTIFACT_FILES[0]))?.into(),
-        final_path: supported_path(&dir.join(ARTIFACT_FILES[1]))?.into(),
-        stderr_path: supported_path(&dir.join(ARTIFACT_FILES[2]))?.into(),
-        exit_path: supported_path(&dir.join(ARTIFACT_FILES[3]))?.into(),
-    };
-    let mut schema = create_private(Path::new(&a.schema_path))?;
-    schema.write_all(VERDICT_JSON_SCHEMA.as_bytes())?;
-    schema.sync_all()?;
-    for path in [&a.journal_path, &a.final_path, &a.stderr_path, &a.exit_path] {
-        create_private(Path::new(path))?;
+    builder.create(dir)?;
+    let populated = (|| {
+        let a = InvocationArtifacts {
+            invocation_id,
+            schema_path: supported_path(&dir.join("schema.json"))?.into(),
+            journal_path: supported_path(&dir.join(ARTIFACT_FILES[0]))?.into(),
+            final_path: supported_path(&dir.join(ARTIFACT_FILES[1]))?.into(),
+            stderr_path: supported_path(&dir.join(ARTIFACT_FILES[2]))?.into(),
+            exit_path: supported_path(&dir.join(ARTIFACT_FILES[3]))?.into(),
+        };
+        let mut schema = create_private(Path::new(&a.schema_path))?;
+        schema.write_all(VERDICT_JSON_SCHEMA.as_bytes())?;
+        schema.sync_all()?;
+        for path in [&a.journal_path, &a.final_path, &a.stderr_path, &a.exit_path] {
+            create_private(Path::new(path))?;
+        }
+        Ok(a)
+    })();
+    if populated.is_err() {
+        if let Err(e) = std::fs::remove_dir_all(dir) {
+            tracing::warn!(
+                error = %e,
+                dir = %dir.display(),
+                "autopilot could not remove a half-made invocation directory"
+            );
+        }
     }
-    Ok(a)
+    populated
 }
 
 pub(crate) fn validate_spec<'a>(
@@ -1687,6 +1710,24 @@ pub(crate) mod contract_tests {
             pids: &no_pids,
         }
     }
+    /// A failure after the invocation directory is created (a full disk,
+    /// say) removes it, so a condition that persists does not leave one
+    /// directory behind per Lead tick.
+    #[test]
+    fn a_failed_artifact_write_leaves_no_invocation_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let dir = root.path().join(&id);
+        std::fs::create_dir_all(dir.join("journal.jsonl")).unwrap();
+        assert!(make_invocation_dir(&dir, id).is_err());
+        assert!(!dir.exists(), "the half-made invocation directory was left");
+        // A directory that is made whole is kept.
+        let id = uuid::Uuid::new_v4().to_string();
+        let dir = root.path().join(&id);
+        let a = make_invocation_dir(&dir, id).unwrap();
+        assert!(Path::new(&a.exit_path).is_file());
+    }
+
     /// Every artifact path follows from the schema marker: one directory,
     /// named for the invocation, under the issue's slug, with fixed file
     /// names. A forged or corrupt dispatch state that names any other path
