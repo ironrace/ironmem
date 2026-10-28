@@ -59,7 +59,8 @@ case "$MUSE_MODE:$n" in
   failed:*) rec session "$sid" '{"kind":"run_terminal","terminal":"failed","text":"","reason":"transport error"}'; /bin/sleep 0.5; exit 1 ;;
   killed:*) /bin/sleep 0.5; exit 143 ;;
   wrongsid:*) rec session 11111111-2222-3333-4444-555555555555 '{"kind":"run_terminal","terminal":"completed","text":"{\"verdict\":\"met\",\"reason\":\"x\"}","reason":null}' ;;
-  unsigned:*) git -c commit.gpgsign=false commit -q --allow-empty -m bypass
+  unsigned:*) GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+                git -c commit.gpgsign=false commit -q --allow-empty -m bypass
               rec session "$sid" '{"kind":"run_terminal","terminal":"completed","text":"{\"verdict\":\"met\",\"reason\":\"done\"}","reason":null}' ;;
 esac
 /bin/sleep 0.5

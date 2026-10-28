@@ -148,6 +148,9 @@ exit 0
 # This stub commits, so the same rule applies to it: an inherited GIT_DIR
 # would aim `git commit` at a repository nothing in this test chose.
 unset $(env | grep -o '^GIT_[A-Za-z0-9_]*' || true)
+# Nor the operator's global or system config: it may sign the commit with
+# their key or run their hooks.
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
 echo "claude $*" >> "$AP_LOG"
 prev=""
 for a in "$@"; do
