@@ -892,35 +892,64 @@ impl std::fmt::Display for CutSource {
 /// The cut of an existing `branch` that has none recorded.
 ///
 /// Its reflog's creation entry (`branch: Created from ...`, which git writes
-/// untranslated) is the commit it was cut from, so that is preferred. Without
-/// one (`core.logAllRefUpdates` off, or the entry expired), the merge base of
-/// the branch and `base`: never `base` itself, which may have moved on since,
-/// or moved to another line of history (an operator's local-only commits
-/// would then count as the agent's). A branch that shares no history with
-/// `base` is refused rather than guessed. So is one whose merge base with
-/// `base` is its own tip (merged into it, or an empty branch with no reflog)
-/// while it carries commits on no remote: that cut would leave the signing
-/// guard nothing to check.
+/// untranslated) is the commit it was cut from, so that is preferred, but
+/// only while that commit is on `base` (an ancestor of it, or `base` itself).
+/// `git branch -D` takes the branch's reflog and its recorded cut with it, so
+/// a branch made again (`git checkout -B <branch> <its last commit>`, as the
+/// signing guard's own missing-branch advice says) has a creation entry at
+/// the agent's own work. Taken as the cut, that would move the signing
+/// guard's range past every commit before it.
+///
+/// Otherwise (no reflog, as with `core.logAllRefUpdates` off or an expired
+/// entry, or a creation entry off the base), the merge base of the branch and
+/// `base`: never `base` itself, which may have moved on since, or moved to
+/// another line of history (an operator's local-only commits would then count
+/// as the agent's). A branch that shares no history with `base` is refused
+/// rather than guessed. So is one whose merge base with `base` is its own tip
+/// (merged into it, or an empty branch with no reflog) while it carries
+/// commits on no remote: that cut would leave the signing guard nothing to
+/// check.
+///
+/// A reflog that git cannot read is an error, never "no creation entry": the
+/// merge base, recorded for good, would replace the exact cut for a
+/// transient failure.
 fn infer_cut(root: &Path, branch: &str, base: &str) -> Result<(String, CutSource), MemoryError> {
     let local = format!("refs/heads/{branch}");
-    let created = git(root, &["reflog", "show", "--format=%H %gs", &local])
-        .ok()
-        .and_then(|log| {
-            let oldest = log.lines().last()?.to_string();
-            let (sha, subject) = oldest.split_once(' ')?;
-            subject
-                .starts_with("branch: Created from")
-                .then(|| resolve_commit(root, sha))
-                .flatten()
-        });
-    if let Some(sha) = created {
-        return Ok((sha, CutSource::Reflog));
-    }
     let base_sha = resolve_base(root, base)?;
+    let log = git(root, &["reflog", "show", "--format=%H %gs", &local]).map_err(|e| {
+        let e = match e {
+            MemoryError::Validation(detail) => detail,
+            other => other.to_string(),
+        };
+        MemoryError::Validation(format!(
+            "cannot infer the cut of the issue branch `{branch}`: its reflog could not be read \
+             ({e}); run again, or record the commit it was cut from with `git config {} <sha>`",
+            cut_key(branch)
+        ))
+    })?;
+    let created = log.lines().last().and_then(|oldest| {
+        let (sha, subject) = oldest.split_once(' ')?;
+        subject
+            .starts_with("branch: Created from")
+            .then(|| resolve_commit(root, sha))
+            .flatten()
+    });
+    if let Some(sha) = created {
+        if is_ancestor(root, &sha, &base_sha)? {
+            return Ok((sha, CutSource::Reflog));
+        }
+        tracing::warn!(
+            branch = %branch,
+            created = %sha,
+            base = %base,
+            "the issue branch's reflog creation entry is not on the base, so the branch was made \
+             again since it was cut; autopilot infers its cut from the merge base instead"
+        );
+    }
     let refuse = |why: &str| {
         MemoryError::Validation(format!(
             "cannot infer the cut of the issue branch `{branch}` in {}: it records none, its \
-             reflog has no creation entry, and {why}; record the commit it was cut from with \
+             reflog has no creation entry on the base, and {why}; record the commit it was cut from with \
              `git config {} <sha>` and run again",
             root.display(),
             cut_key(branch)
@@ -949,6 +978,19 @@ fn infer_cut(root: &Path, branch: &str, base: &str) -> Result<(String, CutSource
         }
     }
     Ok((merge_base, CutSource::MergeBase))
+}
+
+/// Whether `ancestor` is `descendant` or one of its ancestors (`git
+/// merge-base --is-ancestor`, which exits 1 for "no"; any other failure is
+/// git's).
+fn is_ancestor(root: &Path, ancestor: &str, descendant: &str) -> Result<bool, MemoryError> {
+    let args = ["merge-base", "--is-ancestor", ancestor, descendant];
+    let out = run_git_output(git_command(), root, &args)?;
+    match out.code {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(out.failure(root, &args)),
+    }
 }
 
 /// Record a cut [`infer_cut`] found for an existing `branch` that had none.
@@ -3262,5 +3304,73 @@ mod tests {
         let ((), log) = with_captured_log(|| warn_if_no_remote_pushes_to(dir, &issue().repo));
         assert!(log.contains("could not read"), "{log}");
         assert!(log.contains("bad config"), "{log}");
+    }
+
+    /// `git branch -D` takes the branch's config section (its recorded cut)
+    /// and its reflog with it, and a branch made again at the agent's last
+    /// commit has a reflog whose creation entry is that commit. Taken as the
+    /// cut, it would move the signing guard's range past the unsigned
+    /// commits before it.
+    #[test]
+    fn a_branch_recreated_at_its_tip_keeps_the_cut_it_was_first_given() {
+        let repo = fixture_repo();
+        let roots = tempfile::tempdir().unwrap();
+        let created = ensure_worktree(repo.path(), roots.path(), &issue(), "HEAD").unwrap();
+        commit_in(&created.path, "one");
+        let tip = commit_in(&created.path, "two");
+        run(&created.path, &["checkout", "-q", "--detach"]);
+        run(&created.path, &["branch", "-D", &created.branch]);
+        run(
+            &created.path,
+            &["checkout", "-q", "-B", &created.branch, &tip],
+        );
+        assert_eq!(
+            read_config(repo.path(), &issue_cut_key()),
+            None,
+            "the delete took the recorded cut with it"
+        );
+        let (reused, log) =
+            with_captured_log(|| ensure_worktree(repo.path(), roots.path(), &issue(), "HEAD"));
+        let reused = reused.unwrap();
+        assert!(!reused.created);
+        assert_eq!(reused.cut, created.cut, "not the recreation point {tip}");
+        assert!(log.contains("merge base"), "{log}");
+    }
+
+    /// A reflog git cannot read is not a reflog without a creation entry: the
+    /// merge-base fallback, recorded for good, would replace the exact cut.
+    #[test]
+    fn a_reflog_that_cannot_be_read_is_refused_not_replaced_by_the_merge_base() {
+        let repo = fixture_repo();
+        let roots = tempfile::tempdir().unwrap();
+        let created = ensure_worktree(repo.path(), roots.path(), &issue(), "HEAD").unwrap();
+        // With work on it, the merge-base fallback would succeed.
+        let tip = commit_in(&created.path, "agent-work");
+        run(repo.path(), &["config", "--unset", &issue_cut_key()]);
+        // The creation entry names a corrupt loose object, which makes
+        // `git reflog show` exit 128; every other read here still works.
+        let corrupt = "1".repeat(40);
+        let objects = repo.path().join(".git/objects").join(&corrupt[..2]);
+        std::fs::create_dir_all(&objects).unwrap();
+        std::fs::write(objects.join(&corrupt[2..]), "garbage").unwrap();
+        let log = repo
+            .path()
+            .join(".git/logs/refs/heads")
+            .join(branch_name(&issue()));
+        std::fs::write(
+            &log,
+            format!(
+                "{zero} {corrupt} A <a@example.test> 1700000000 +0000\tbranch: Created from main\n\
+                 {corrupt} {tip} A <a@example.test> 1700000001 +0000\treset: moving\n",
+                zero = "0".repeat(40),
+            ),
+        )
+        .unwrap();
+        let err = ensure_worktree(repo.path(), roots.path(), &issue(), "HEAD")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("its reflog could not be read"), "{err}");
+        assert!(err.contains("exit Some(128)"), "git's own failure: {err}");
+        assert_eq!(read_config(repo.path(), &issue_cut_key()), None, "{err}");
     }
 }
