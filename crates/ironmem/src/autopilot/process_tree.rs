@@ -1127,21 +1127,21 @@ fn row_stopped(
     })
 }
 
-/// Each task's state letter under Linux's `/proc/<pid>/task`; an error
-/// wherever one cannot be read. No other platform has per-task states here.
+/// Each task's state letter under Linux's `/proc/<pid>/task`
+/// ([`states_of_tasks`]); an error wherever one cannot be read. No other
+/// platform has per-task states here.
 fn task_states(pid: u32) -> Result<Vec<char>, String> {
     #[cfg(target_os = "linux")]
     {
-        let tasks = std::fs::read_dir(format!("/proc/{pid}/task"))
-            .map_err(|e| format!("cannot list process {pid}'s tasks: {e}"))?;
-        let mut states = Vec::new();
-        for task in tasks {
-            let task = task.map_err(|e| e.to_string())?;
-            let stat = std::fs::read_to_string(task.path().join("stat"))
-                .map_err(|e| format!("cannot read a task of process {pid}: {e}"))?;
-            states.push(task_state(&stat).ok_or("malformed task stat")?);
-        }
-        Ok(states)
+        states_of_tasks(
+            pid,
+            |pid| {
+                std::fs::read_dir(format!("/proc/{pid}/task"))?
+                    .map(|task| Ok(task?.path()))
+                    .collect()
+            },
+            |path: &Path| std::fs::read_to_string(path),
+        )
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -1149,6 +1149,30 @@ fn task_states(pid: u32) -> Result<Vec<char>, String> {
             "process {pid}'s task states are unreadable on this platform"
         ))
     }
+}
+
+/// The state letter of each task `list_tasks` gives for `pid`, from its
+/// `stat` through `read`. A listed task whose `stat` then reads as gone
+/// (ENOENT, ESRCH) has just exited and is skipped; any other failure is an
+/// error. Linux only, but tested everywhere.
+#[cfg(any(target_os = "linux", test))]
+fn states_of_tasks(
+    pid: u32,
+    list_tasks: impl FnOnce(u32) -> std::io::Result<Vec<PathBuf>>,
+    read: impl Fn(&Path) -> std::io::Result<String>,
+) -> Result<Vec<char>, String> {
+    let tasks = list_tasks(pid).map_err(|e| format!("cannot list process {pid}'s tasks: {e}"))?;
+    let mut states = Vec::new();
+    for task in tasks {
+        match read(&task.join("stat")) {
+            Ok(stat) => states.push(task_state(&stat).ok_or("malformed task stat")?),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::NotFound
+                    || e.raw_os_error() == Some(libc::ESRCH) => {}
+            Err(e) => return Err(format!("cannot read a task of process {pid}: {e}")),
+        }
+    }
+    Ok(states)
 }
 
 /// The state letter of a Linux task's `stat` text: the first field after
@@ -4172,8 +4196,18 @@ pub(crate) mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn a_real_zombie_led_process_is_running_scanned_and_stopped_by_its_live_thread() {
+        /// Owns the child, so it is killed and reaped however the test ends,
+        /// and never signalled by PID once reaped: `Child::kill` is a no-op
+        /// after `wait` has collected its status.
+        struct Reap(std::process::Child);
+        impl Drop for Reap {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
         let dir = tempfile::tempdir().unwrap();
-        let mut child = std::process::Command::new("/usr/bin/python3")
+        let child = std::process::Command::new("/usr/bin/python3")
             .args([
                 "-c",
                 "import threading, time, ctypes\n\
@@ -4184,15 +4218,8 @@ pub(crate) mod tests {
             .current_dir(dir.path())
             .spawn()
             .expect("python3 is needed for this test");
-        struct Kill(u32);
-        impl Drop for Kill {
-            fn drop(&mut self) {
-                // SAFETY: the test's own child.
-                unsafe { libc::kill(self.0 as i32, libc::SIGKILL) };
-            }
-        }
-        let pid = child.id();
-        let _kill = Kill(pid);
+        let child = Reap(child);
+        let pid = child.0.id();
         let leader_exited = || {
             std::fs::read_to_string(format!("/proc/{pid}/stat"))
                 .ok()
@@ -4234,9 +4261,8 @@ pub(crate) mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        // SAFETY: the test's own child.
-        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
-        child.wait().unwrap();
+        // Killed and reaped by its guard, once.
+        drop(child);
     }
 
     /// The invocation root, read straight after spawn, is our unreaped
@@ -4359,6 +4385,41 @@ pub(crate) mod tests {
         );
         // Every task gone to `Z`/`X`: nothing runs.
         assert!(row_stopped(&row("Zl"), tasks(&['Z', 'X'])));
+    }
+
+    /// A task `read_dir` listed whose `stat` then reads ENOENT has just
+    /// exited: it is skipped, not an error. Any other failure still is.
+    #[test]
+    fn a_task_that_exits_between_its_listing_and_its_read_is_skipped() {
+        use std::io::{Error, ErrorKind};
+        let list = |pid: u32| -> std::io::Result<Vec<PathBuf>> {
+            assert_eq!(pid, 8);
+            Ok(["8", "10", "11"]
+                .iter()
+                .map(|tid| PathBuf::from(format!("/proc/8/task/{tid}")))
+                .collect())
+        };
+        let read = |missing: ErrorKind| {
+            move |path: &Path| -> std::io::Result<String> {
+                match path.to_str().unwrap() {
+                    "/proc/8/task/8/stat" => Ok("8 (python3) Z 1 8 8".into()),
+                    "/proc/8/task/10/stat" => Err(Error::from(missing)),
+                    "/proc/8/task/11/stat" => Ok("11 (python3) T 1 8 8".into()),
+                    other => panic!("unexpected read {other}"),
+                }
+            }
+        };
+        assert_eq!(
+            states_of_tasks(8, list, read(ErrorKind::NotFound)),
+            Ok(vec!['Z', 'T'])
+        );
+        assert!(states_of_tasks(8, list, read(ErrorKind::PermissionDenied)).is_err());
+        assert!(states_of_tasks(
+            8,
+            |_| Err(Error::from(ErrorKind::NotFound)),
+            read(ErrorKind::NotFound)
+        )
+        .is_err());
     }
 
     /// A Linux `/proc/<pid>/task/<tid>/stat` line's state, after the last
