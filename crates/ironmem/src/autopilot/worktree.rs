@@ -2134,8 +2134,8 @@ mod tests {
             push_remote(dir, &branch, &issue().repo).as_deref(),
             Some("upstream")
         );
-        // The push URL counts as well as the fetch URL: a mirror fetched
-        // from, pushed to the issue's repo.
+        // Only the push URL counts: a mirror fetched from, pushed to the
+        // issue's repo.
         run(
             dir,
             &[
