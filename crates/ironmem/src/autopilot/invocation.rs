@@ -1334,7 +1334,7 @@ fn read_exit_record(a: &InvocationArtifacts) -> Result<Option<ExitRecord>, Strin
     let text = match read_capped(&a.exit_path, EXIT_LIMIT) {
         Ok(text) => text,
         Err(MemoryError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e.to_string()),
+        Err(e) => return Err(super::process_tree::detail(e)),
     };
     if text.is_empty() {
         return Ok(None);
@@ -2030,6 +2030,16 @@ pub(crate) mod contract_tests {
         let rows = crate::autopilot::process_tree::ProcessSnapshot::Available(Vec::new());
         let err = settle_awaiting_quiet(&a, &rows, None, |_| Ok(None), &no_pids).unwrap_err();
         assert!(err.contains("the exit record cannot be read"), "{err}");
+        // A record that is no regular file says so plainly, with no
+        // internal error-kind prefix.
+        std::fs::remove_file(&a.exit_path).unwrap();
+        std::fs::create_dir(&a.exit_path).unwrap();
+        let err = settle_awaiting_quiet(&a, &rows, None, |_| Ok(None), &no_pids).unwrap_err();
+        assert!(
+            err.starts_with("the exit record cannot be read: invocation artifacts must be regular"),
+            "{err}"
+        );
+        std::fs::remove_dir(&a.exit_path).unwrap();
         // An exit record not yet written is simply not one.
         std::fs::write(&a.exit_path, "").unwrap();
         assert_eq!(

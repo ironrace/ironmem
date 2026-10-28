@@ -2324,7 +2324,7 @@ pub(crate) struct ProcessTracker {
 
 /// `e`'s message, without the "Validation error" prefix a validation
 /// error displays with, for joining several into one.
-fn detail(e: MemoryError) -> String {
+pub(crate) fn detail(e: MemoryError) -> String {
     match e {
         MemoryError::Validation(message) => message,
         other => other.to_string(),
