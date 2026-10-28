@@ -183,7 +183,6 @@ mod tests {
     use crate::mcp::app::App;
     use crate::mcp::tools::call_tool;
     use serde_json::json;
-    use std::process::Command;
     use std::sync::Arc;
 
     fn test_app() -> Arc<App> {
@@ -199,32 +198,12 @@ mod tests {
     fn make_git_repo(content: &str) -> (tempfile::TempDir, String) {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_path_buf();
-        Command::new("git")
-            .args(["init", "-b", "main"])
-            .current_dir(&root)
-            .output()
-            .unwrap();
-        Command::new("git")
-            .args(["config", "user.email", "t@t.com"])
-            .current_dir(&root)
-            .output()
-            .unwrap();
-        Command::new("git")
-            .args(["config", "user.name", "T"])
-            .current_dir(&root)
-            .output()
-            .unwrap();
+        crate::autopilot::test_git::output(&root, &["init", "-b", "main"]);
+        crate::autopilot::test_git::output(&root, &["config", "user.email", "t@t.com"]);
+        crate::autopilot::test_git::output(&root, &["config", "user.name", "T"]);
         std::fs::write(root.join("lib.rs"), content).unwrap();
-        Command::new("git")
-            .args(["add", "-A"])
-            .current_dir(&root)
-            .output()
-            .unwrap();
-        Command::new("git")
-            .args(["commit", "-m", "init"])
-            .current_dir(&root)
-            .output()
-            .unwrap();
+        crate::autopilot::test_git::output(&root, &["add", "-A"]);
+        crate::autopilot::test_git::output(&root, &["commit", "-m", "init"]);
         let repo_path = dir.path().to_string_lossy().to_string();
         (dir, repo_path)
     }

@@ -444,14 +444,14 @@ mod tests {
 
     /// Run one git command in `root` with the environment scrubbed.
     ///
-    /// The scrub is not decoration. `collab_session`'s test fixtures set
-    /// `GIT_DIR`/`GIT_WORK_TREE` process-wide (see `ScopedGitEnv`), `cargo
-    /// test` runs this binary's tests on parallel threads, and those variables
-    /// override `current_dir` — so an unscrubbed `git init`/`add`/`commit`
-    /// here intermittently built its repository inside the *other* test's
+    /// The scrub is not decoration. `collab_session`'s test fixtures once set
+    /// `GIT_DIR`/`GIT_WORK_TREE` process-wide, `cargo test` runs this
+    /// binary's tests on parallel threads, and those variables override
+    /// `current_dir` — so an unscrubbed `git init`/`add`/`commit` here
+    /// intermittently built its repository inside the *other* test's
     /// fixture, leaving this one with no commits and failing it at random.
-    /// The mutex `ScopedGitEnv` holds serializes the tests that set the
-    /// variables, not the unrelated ones that merely inherit them.
+    /// No test sets them on the process now (`git_env_scan` enforces it);
+    /// the scrub keeps an inherited one out regardless.
     ///
     /// `commit.gpgsign=false` and `core.hooksPath=/dev/null` are pinned for a
     /// second, unrelated reason: a developer whose global git config signs
@@ -566,16 +566,10 @@ mod tests {
 
         // Change the tracked file and commit
         std::fs::write(root.join("src/lib.rs"), "// v2 changed").unwrap();
-        std::process::Command::new("git")
-            .args(["add", "."])
-            .current_dir(&root)
-            .output()
-            .unwrap();
-        std::process::Command::new("git")
-            .args(["commit", "-m", "update lib"])
-            .current_dir(&root)
-            .output()
-            .unwrap();
+        git_in(&root, &["add", "."]);
+        assert!(git_in(&root, &["commit", "-m", "update lib"])
+            .status
+            .success());
 
         let load_result = call_tool(
             &app,

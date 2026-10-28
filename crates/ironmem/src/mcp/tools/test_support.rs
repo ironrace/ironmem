@@ -19,22 +19,18 @@ pub(crate) fn test_app_with_db_path(db_path: PathBuf, root: &Path) -> Arc<crate:
     Arc::new(crate::mcp::app::App::new(config).unwrap())
 }
 
-/// Run `git` in `cwd` with every inherited `GIT_*` environment variable
-/// scrubbed first — an inherited `GIT_DIR`/`GIT_WORK_TREE` would otherwise
-/// make this operate on (or report shas from) a different repo than the one
-/// at `cwd`, silently. Asserts success so a broken fixture fails loudly at
-/// setup rather than producing a confusing downstream git error.
+/// Run `git` in `cwd` with git's environment scrubbed first
+/// ([`super::scrub_git_environment`]) — an inherited `GIT_DIR`/`GIT_WORK_TREE`
+/// would otherwise make this operate on (or report shas from) a different
+/// repo than the one at `cwd`, silently. The scrub removes the redirecting
+/// variables unconditionally: removing only those set when the command is
+/// built let a `GIT_DIR` another test thread set before the spawn through,
+/// which failed `full_recovery_path_through_tool_level_turn_gate_clears_on_delegated_completion`
+/// on Linux CI. Asserts success so a broken fixture fails loudly at setup
+/// rather than producing a confusing downstream git error.
 fn run_git(cwd: &Path, args: &[&str]) -> std::process::Output {
     let mut command = Command::new("git");
-    for (key, _) in std::env::vars_os() {
-        if key
-            .to_string_lossy()
-            .to_ascii_uppercase()
-            .starts_with("GIT_")
-        {
-            command.env_remove(key);
-        }
-    }
+    super::scrub_git_environment(&mut command);
     let output = command
         .args(args)
         .current_dir(cwd)
