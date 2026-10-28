@@ -902,8 +902,29 @@ fn lock_held(root: &Path, e: MemoryError) -> MemoryError {
         MemoryError::Validation(detail) => detail,
         other => other.to_string(),
     };
-    let modified = match std::fs::metadata(&lock).and_then(|meta| meta.modified()) {
-        Ok(modified) => modified,
+    held_lock_error(
+        &detail,
+        &lock,
+        root,
+        std::fs::metadata(&lock).and_then(|meta| meta.modified()),
+    )
+}
+
+/// [`lock_held`]'s error for `lock`, from its modification time as read. A
+/// time that cannot be read is said to be unknown, never taken for "just
+/// now": an operator told the lock is 0s old would wait on one that may be
+/// hours old.
+fn held_lock_error(
+    detail: &str,
+    lock: &Path,
+    root: &Path,
+    modified: std::io::Result<std::time::SystemTime>,
+) -> MemoryError {
+    let held = match modified {
+        Ok(modified) => {
+            let age = modified.elapsed().map_or(0, |age| age.as_secs());
+            format!("has been held for {age}s")
+        }
         // Gone by now: whoever held it let go after the retries ran out.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return MemoryError::Validation(format!(
@@ -912,12 +933,11 @@ fn lock_held(root: &Path, e: MemoryError) -> MemoryError {
                 lock.display()
             ))
         }
-        Err(_) => std::time::SystemTime::now(),
+        Err(e) => format!("is held (its age cannot be read: {e})"),
     };
-    let age = modified.elapsed().map_or(0, |age| age.as_secs());
     MemoryError::Validation(format!(
-        "{detail}; `{}` has been held for {age}s. If no git command is running in any worktree \
-         of {}, a killed git left it behind: remove it and run again",
+        "{detail}; `{}` {held}. If no git command is running in any worktree of {}, a killed \
+         git left it behind: remove it and run again",
         lock.display(),
         root.display()
     ))
@@ -3600,5 +3620,20 @@ mod tests {
         assert!(!failure.contains(&token), "{failure}");
         assert!(failure.contains("git fetch failed"), "{failure}");
         assert!(failure.len() < 2 * STDERR_EXCERPT_CHARS, "{failure}");
+    }
+
+    #[test]
+    fn a_lock_whose_age_cannot_be_read_is_not_reported_as_held_for_0s() {
+        let err = held_lock_error(
+            "could not lock config file",
+            Path::new("/repo/.git/config.lock"),
+            Path::new("/repo"),
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+        )
+        .to_string();
+        assert!(!err.contains("0s"), "{err}");
+        assert!(err.contains("cannot be read"), "{err}");
+        assert!(err.contains("permission denied"), "{err}");
+        assert!(err.contains("config.lock"), "{err}");
     }
 }
