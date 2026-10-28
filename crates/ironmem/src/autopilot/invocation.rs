@@ -3361,11 +3361,14 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
     /// a process that no longer has the operator's real uid (`sudo`).
     static REFUSED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
-    fn refusing_kill(pid: u32, signal: i32) -> std::io::Result<()> {
-        if pid == REFUSED.load(std::sync::atomic::Ordering::SeqCst) {
+    fn refusing_kill(
+        process: &crate::autopilot::process_tree::PinnedProcess,
+        signal: i32,
+    ) -> std::io::Result<()> {
+        if process.pid == REFUSED.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(std::io::Error::from_raw_os_error(libc::EPERM));
         }
-        crate::autopilot::process_tree::unix_kill(pid, signal)
+        crate::autopilot::process_tree::signal_pinned(process, signal)
     }
 
     /// A descendant cleanup cannot signal is neither a failure of the run

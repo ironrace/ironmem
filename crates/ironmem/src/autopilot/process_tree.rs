@@ -2275,9 +2275,9 @@ pub(crate) struct ProcessTracker {
     shared_daemon: Option<SharedDaemon>,
     /// [`kernel_executable`]; a seam so tests need no real daemon binary.
     kernel_exe: fn(u32) -> Option<PathBuf>,
-    /// [`unix_kill`]; a seam so tests can stand in for a process the
+    /// [`signal_pinned`]; a seam so tests can stand in for a process the
     /// kernel will not let the operator signal.
-    kill: fn(u32, i32) -> std::io::Result<()>,
+    kill: fn(&PinnedProcess, i32) -> std::io::Result<()>,
     /// Known processes cleanup was refused permission to signal: they no
     /// longer have the operator's real uid (an agent's `sudo`). Never a
     /// failure of the run, and never ignored: completion waits until each
@@ -2333,6 +2333,73 @@ pub(crate) fn unix_kill(pid: u32, signal: i32) -> std::io::Result<()> {
     }
 }
 
+/// A process held for signalling. On Linux a pidfd refers to the process
+/// itself, not its PID: taken before the birth check, it makes the signal
+/// reach the very process that check authenticated, or nothing once it has
+/// exited, never a newcomer that reused the PID in between. Elsewhere, and
+/// on a Linux kernel without pidfds, only the PID is held (`fd` is `None`).
+pub(crate) struct PinnedProcess {
+    pub pid: u32,
+    #[cfg(target_os = "linux")]
+    fd: Option<std::os::fd::OwnedFd>,
+}
+
+impl PinnedProcess {
+    /// `pid`, pinned; `None` when it has already exited.
+    fn open(pid: u32) -> Result<Option<Self>, MemoryError> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::FromRawFd;
+            let raw = i32::try_from(pid)
+                .map_err(|_| MemoryError::Validation(format!("process {pid} is out of range")))?;
+            // SAFETY: pidfd_open takes a PID and flags, and returns a new
+            // descriptor or -1.
+            let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, raw, 0) };
+            if fd >= 0 {
+                // SAFETY: a descriptor the kernel just opened for us alone.
+                let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd as i32) };
+                return Ok(Some(Self { pid, fd: Some(fd) }));
+            }
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ESRCH) {
+                return Ok(None);
+            }
+            // No pidfds here (ENOSYS before Linux 5.3, or a seccomp filter
+            // that refuses them): hold the PID, as on every other platform.
+            Ok(Some(Self { pid, fd: None }))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Ok(Some(Self { pid }))
+        }
+    }
+}
+
+/// Send `signal` to `pinned`: through its pidfd where there is one
+/// (`pidfd_send_signal`), else [`unix_kill`] on its PID.
+pub(crate) fn signal_pinned(pinned: &PinnedProcess, signal: i32) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    if let Some(fd) = &pinned.fd {
+        use std::os::fd::AsRawFd;
+        // SAFETY: a pidfd we own, a signal number, no siginfo, no flags.
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                fd.as_raw_fd(),
+                signal,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            )
+        };
+        return if rc == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        };
+    }
+    unix_kill(pinned.pid, signal)
+}
+
 impl ProcessTracker {
     /// A tracker that never owns `daemon`, the operator's shared daemon.
     pub(crate) fn exempting(root_pid: u32, daemon: &SharedDaemon) -> Self {
@@ -2358,7 +2425,7 @@ impl ProcessTracker {
             root_reaped: false,
             shared_daemon: shared_daemon.cloned(),
             kernel_exe: kernel_executable,
-            kill: unix_kill,
+            kill: signal_pinned,
             refused: std::collections::HashSet::new(),
         }
     }
@@ -2372,9 +2439,9 @@ impl ProcessTracker {
         self.known.insert(row.pid, Tracked { row, birth, seq });
     }
 
-    /// Signal through `kill` instead of [`unix_kill`] (tests).
+    /// Signal through `kill` instead of [`signal_pinned`] (tests).
     #[cfg(test)]
-    pub(crate) fn set_kill(&mut self, kill: fn(u32, i32) -> std::io::Result<()>) {
+    pub(crate) fn set_kill(&mut self, kill: fn(&PinnedProcess, i32) -> std::io::Result<()>) {
         self.kill = kill;
     }
     /// The argv must match, and then the kernel's executable path must be
@@ -2599,16 +2666,28 @@ impl ProcessTracker {
         }
     }
 
-    /// Signal a known process, by the birth it was enrolled with.
+    /// Signal a known process, by the birth it was enrolled with. It is
+    /// pinned ([`PinnedProcess`]) before that birth is checked, so on Linux
+    /// the signal reaches the process the check authenticated or nothing.
+    ///
+    /// Residual race elsewhere (macOS has no pidfd): between the birth
+    /// check and `kill(2)`, a process that is not stopped yet (the first
+    /// SIGSTOP pass, or one the kernel would not stop) can exit, be reaped
+    /// by init and have its PID reused, and the signal then reaches the
+    /// newcomer. That needs a PID to wrap within microseconds, so it is
+    /// accepted rather than closed.
     fn signal_known(
         &self,
         pid: u32,
         expected: Birth,
         signal: i32,
     ) -> Result<Signalled, MemoryError> {
+        let Some(pinned) = PinnedProcess::open(pid)? else {
+            return Ok(Signalled::Gone);
+        };
         match birth(pid).map_err(MemoryError::Validation)? {
             None => Ok(Signalled::Gone),
-            Some(actual) if actual == expected => match (self.kill)(pid, signal) {
+            Some(actual) if actual == expected => match (self.kill)(&pinned, signal) {
                 Ok(()) => Ok(Signalled::Sent),
                 Err(e) if e.raw_os_error() == Some(libc::ESRCH) => Ok(Signalled::Gone),
                 Err(e) if e.raw_os_error() == Some(libc::EPERM) => Ok(Signalled::Refused),
@@ -5439,7 +5518,7 @@ pub(crate) mod tests {
     fn an_exited_descendants_reused_pid_is_a_stranger_not_an_abort() {
         let root = kernel_process(10, 1, 10, 1);
         let mut tracker = ProcessTracker::owning_every_descendant(10);
-        tracker.set_kill(|pid, _| panic!("signalled {pid}"));
+        tracker.set_kill(|p, _| panic!("signalled {}", p.pid));
         tracker
             .observe_rows(
                 vec![process_row(10, 1, 10), process_row(20, 10, 10)],
@@ -5477,6 +5556,40 @@ pub(crate) mod tests {
             .unwrap_err()
             .to_string()
             .contains("unauthenticated"));
+    }
+
+    /// A known process is pinned before its birth is checked, and the
+    /// signal goes to what was pinned. On Linux that is a pidfd: once its
+    /// process is reaped it signals nothing (ESRCH), never a newcomer on the
+    /// same PID.
+    #[cfg(unix)]
+    #[test]
+    fn a_signal_reaches_only_the_process_pinned_before_its_birth_check() {
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let pinned = PinnedProcess::open(pid).unwrap().expect("the child runs");
+        assert_eq!(pinned.pid, pid);
+        #[cfg(target_os = "linux")]
+        assert!(pinned.fd.is_some(), "no pidfd on Linux");
+        let born = birth(pid).unwrap().unwrap();
+        let mut tracker = ProcessTracker::owning_every_descendant(pid);
+        tracker.enrol(process_row(pid, std::process::id(), pid), born);
+        assert_eq!(
+            tracker.signal_known(pid, born, KILL_SIGNAL).unwrap(),
+            Signalled::Sent
+        );
+        let status = child.wait().unwrap();
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            signal_pinned(&pinned, 0).unwrap_err().raw_os_error(),
+            Some(libc::ESRCH)
+        );
     }
 
     /// A cleanup that fails to quiesce and then fails to kill reports both,
@@ -5536,7 +5649,7 @@ pub(crate) mod tests {
         let (pa, pb) = (a.id(), b.id());
         let me = std::process::id();
         let mut tracker = ProcessTracker::owning_every_descendant(pa);
-        tracker.set_kill(|pid, _| panic!("signalled {pid}"));
+        tracker.set_kill(|p, _| panic!("signalled {}", p.pid));
         // Enrolled under births these real processes never had…
         tracker
             .observe_rows(
