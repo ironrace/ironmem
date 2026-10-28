@@ -113,6 +113,9 @@ const REGISTRY_TIMEOUT: Duration = Duration::from_secs(15);
 pub struct ClaudeAgentRegistry {
     bin: PathBuf,
     timeout: Duration,
+    /// Where `claude agents` runs; the controller's own directory when
+    /// `None`.
+    dir: Option<PathBuf>,
 }
 
 impl ClaudeAgentRegistry {
@@ -124,6 +127,7 @@ impl ClaudeAgentRegistry {
         Ok(Self {
             bin: super::dispatch::resolve_claude_binary()?,
             timeout: REGISTRY_TIMEOUT,
+            dir: None,
         })
     }
 }
@@ -131,6 +135,9 @@ impl ClaudeAgentRegistry {
 impl AgentRegistry for ClaudeAgentRegistry {
     fn list(&mut self) -> Result<RegistryOutput, MemoryError> {
         let mut command = Command::new(&self.bin);
+        if let Some(dir) = &self.dir {
+            command.current_dir(dir);
+        }
         command
             .args(build_argv())
             .stdin(Stdio::null())
@@ -683,6 +690,19 @@ pub struct HarnessProcessMonitor {
 #[deprecated(note = "renamed to `HarnessProcessMonitor`; it watches every harness")]
 pub type TwoHarnessMonitor = HarnessProcessMonitor;
 
+impl HarnessProcessMonitor {
+    /// A monitor whose registry read runs in `dir` (an issue's worktree),
+    /// not in the controller's own directory, which may be a checkout of
+    /// its own that nothing the read starts should touch.
+    pub(crate) fn in_dir(dir: &std::path::Path) -> Self {
+        let mut monitor = Self::default();
+        if let Ok(registry) = &mut monitor.claude {
+            registry.dir = Some(dir.to_path_buf());
+        }
+        monitor
+    }
+}
+
 impl Default for HarnessProcessMonitor {
     fn default() -> Self {
         Self {
@@ -736,6 +756,7 @@ mod tests {
             ClaudeAgentRegistry {
                 bin,
                 timeout: Duration::from_millis(300),
+                dir: None,
             }
         };
         // Hung outright, and exited while a child holds its output open.
@@ -807,6 +828,31 @@ mod tests {
             "{reason}"
         );
         assert!(reason.contains("IRONMEM_X is not a number"), "{reason}");
+    }
+
+    /// A registry read for an issue runs in its worktree, never in the
+    /// controller's own directory: whatever `claude agents` starts or
+    /// writes stays out of the controller's checkout.
+    #[cfg(unix)]
+    #[test]
+    fn a_registry_read_in_a_directory_runs_there() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("claude");
+        std::fs::write(&bin, "#!/bin/sh\npwd -P > \"$0.cwd\"\necho '[]'\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut registry = ClaudeAgentRegistry {
+            bin: bin.clone(),
+            timeout: Duration::from_secs(10),
+            dir: Some(worktree.path().to_path_buf()),
+        };
+        assert!(registry.list().unwrap().success);
+        let ran_in = std::fs::read_to_string(dir.path().join("claude.cwd")).unwrap();
+        assert_eq!(
+            std::path::Path::new(ran_in.trim()),
+            std::fs::canonicalize(worktree.path()).unwrap()
+        );
     }
 
     #[test]

@@ -715,10 +715,10 @@ impl Dispatcher for ClaudeDispatcher {
     /// idle IC is [`InvocationRecovery::NoPriorInvocation`].
     fn recover(
         &mut self,
-        _repo: &Path,
+        repo: &Path,
         state: &DispatchState,
     ) -> Result<InvocationRecovery, MemoryError> {
-        let mut monitor = super::registry::HarnessProcessMonitor::default();
+        let mut monitor = super::registry::HarnessProcessMonitor::in_dir(repo);
         Ok(claude_recovery(
             &super::registry::HarnessMonitor::snapshot(&mut monitor),
             state,
