@@ -7298,14 +7298,14 @@ mod tests {
 
     /// `idle_secs` goes hugely negative for an activity timestamp far in the
     /// future — the symmetric case of the `i64::MIN` corruption
-    /// `crate::collab::idle_secs` documents. The refusal's "{}s remaining"
-    /// arithmetic must not panic or wrap on it.
+    /// `crate::collab::idle_secs` documents.
     ///
     /// `collab_checkpoints.updated_at` is `INTEGER NOT NULL` with no range
     /// CHECK, so this is reachable by the same hand-repair path that doc
-    /// contemplates. Under debug assertions the unfixed subtraction panics
-    /// *inside* the `with_transaction` closure; under release it wraps and
-    /// renders a nonsensical negative.
+    /// contemplates. It cannot overflow the countdown (see
+    /// `crate::collab::remaining_secs_before_dead`), so this is no panic
+    /// guard: it pins the refusal's honest, very long countdown, and that the
+    /// refusal leaves the session unsealed.
     #[test]
     fn abandon_refusal_survives_an_activity_timestamp_from_the_future() {
         let (_temp, repo_path, heads) = git_ancestor_chain(2);
