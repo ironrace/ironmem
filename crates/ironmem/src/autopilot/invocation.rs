@@ -517,9 +517,23 @@ pub(crate) const LAUNCH_WINDOW: Duration = Duration::from_secs(120);
 
 /// Why `a` may still be launching, if it may: it has no process identity
 /// and no exit record, and its schema marker was written less than
-/// [`LAUNCH_WINDOW`] ago. An exit record that cannot be read, or a schema
-/// whose age cannot be read, counts as pending: nothing proves otherwise.
+/// [`LAUNCH_WINDOW`] from now (in either direction, so a future mtime cannot
+/// hold longer). An exit record that cannot be read counts as not written.
+/// A missing schema is no launch. A schema whose age cannot be read is held
+/// with a reason that names it and the fix, never silently.
 pub(crate) fn launch_pending(a: &InvocationArtifacts) -> Option<String> {
+    launch_pending_at(a, std::time::SystemTime::now(), || {
+        std::fs::symlink_metadata(&a.schema_path)?.modified()
+    })
+}
+
+/// [`launch_pending`] at `now`, with the schema's modification time read by
+/// `schema_mtime`.
+fn launch_pending_at(
+    a: &InvocationArtifacts,
+    now: std::time::SystemTime,
+    schema_mtime: impl FnOnce() -> std::io::Result<std::time::SystemTime>,
+) -> Option<String> {
     match std::fs::symlink_metadata(super::process_tree::identity_path(a)) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         _ => return None,
@@ -527,12 +541,29 @@ pub(crate) fn launch_pending(a: &InvocationArtifacts) -> Option<String> {
     if matches!(read_exit_record(a), Ok(Some(_))) {
         return None;
     }
-    let young = std::fs::symlink_metadata(&a.schema_path)
-        .and_then(|meta| meta.modified())
-        .ok()
-        .and_then(|at| at.elapsed().ok())
-        .is_none_or(|age| age < LAUNCH_WINDOW);
-    young.then(|| {
+    let written = match schema_mtime() {
+        Ok(at) => at,
+        // No marker, no launch: `prepare_artifacts` writes it before the
+        // state is published, and a spawn refuses without it.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        // An invocation directory that cannot be read is held, by name: no
+        // recovery read of it (identity, exit record) works either, so
+        // calling it idle would be a guess. Fixing its permissions lifts it.
+        Err(e) => {
+            return Some(format!(
+                "cannot read the schema's age: {}: {e}; whether invocation {} is still \
+                 launching is unknown until its directory is readable again (fix its \
+                 permissions)",
+                a.schema_path, a.invocation_id
+            ))
+        }
+    };
+    // Either way from now: a clock that jumped, or an mtime from another
+    // host, must not hold for longer than the window itself.
+    let distance = now
+        .duration_since(written)
+        .unwrap_or_else(|ahead| ahead.duration());
+    (distance < LAUNCH_WINDOW).then(|| {
         format!(
             "invocation {} was published with no process identity or exit record yet, under \
              {}s ago; its launch may be in progress",
@@ -2020,6 +2051,44 @@ pub(crate) mod contract_tests {
             pids: &no_pids,
         }
     }
+    /// A launch in progress never wedges an issue: with the schema marker
+    /// gone (the invocation directory deleted, or a drawer naming one that
+    /// never existed) nothing can launch, so it resolves at once; an mtime
+    /// far in the future is no younger than one far in the past; and a
+    /// schema whose age cannot be read is a named refusal saying what to
+    /// fix, never a silent hold.
+    #[test]
+    fn a_launch_in_progress_is_bounded_and_never_silent() {
+        let (_dir, spec) = setup();
+        let a = spec.invocation_artifacts.unwrap();
+        let now = std::time::SystemTime::now();
+        let pending =
+            |mtime: std::io::Result<std::time::SystemTime>| launch_pending_at(&a, now, || mtime);
+        // Freshly prepared: in progress.
+        assert!(pending(Ok(now)).is_some_and(|r| r.contains("launch may be in progress")));
+        // Slightly ahead of this clock (another host's skew): still fresh.
+        assert!(pending(Ok(now + Duration::from_secs(5))).is_some());
+        // Far in either direction: not pending.
+        assert_eq!(pending(Ok(now + 2 * LAUNCH_WINDOW)), None);
+        assert_eq!(pending(Ok(now - 2 * LAUNCH_WINDOW)), None);
+        // Gone: nothing can launch into it.
+        assert_eq!(
+            pending(Err(std::io::Error::from(std::io::ErrorKind::NotFound))),
+            None
+        );
+        // Unreadable: a refusal naming the problem and the fix.
+        let refused = pending(Err(std::io::Error::from_raw_os_error(libc::EACCES))).unwrap();
+        assert!(
+            refused.contains("cannot read the schema's age")
+                && refused.contains("Permission denied")
+                && refused.contains(&a.schema_path),
+            "{refused}"
+        );
+        // The real reader: a deleted invocation directory resolves at once.
+        std::fs::remove_dir_all(Path::new(&a.schema_path).parent().unwrap()).unwrap();
+        assert_eq!(launch_pending(&a), None);
+    }
+
     /// An awaiting-quiet check on an exit record it cannot parse says so,
     /// rather than reading it as "not such an invocation".
     #[test]
