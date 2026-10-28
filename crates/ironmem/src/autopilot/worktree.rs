@@ -90,6 +90,13 @@ pub fn branch_name(issue: &IssueRef) -> String {
 /// SSH host alias (`git@github-work:O/N`) is one, so it falls through to the
 /// next rule of [`pick_push_remote`].
 pub(crate) fn url_names_github_repo(url: &str, repo: &str) -> bool {
+    github_repo_of(url).is_some_and(|named| named == repo.to_ascii_lowercase())
+}
+
+/// The `owner/name` (lowercased) a remote `url` names on GitHub, in the
+/// forms [`url_names_github_repo`] reads; `None` for any URL it cannot read
+/// as one (another host, an SSH alias, a local path).
+fn github_repo_of(url: &str) -> Option<String> {
     let url = url.trim().to_ascii_lowercase();
     let without_user = |authority: &str| -> String {
         authority
@@ -100,11 +107,9 @@ pub(crate) fn url_names_github_repo(url: &str, repo: &str) -> bool {
     let (host, path) = match url.split_once("://") {
         Some((scheme, rest)) => {
             if !matches!(scheme, "https" | "ssh") {
-                return false;
+                return None;
             }
-            let Some((authority, path)) = rest.split_once('/') else {
-                return false;
-            };
+            let (authority, path) = rest.split_once('/')?;
             let host = without_user(authority);
             let host = host
                 .split_once(':')
@@ -114,26 +119,35 @@ pub(crate) fn url_names_github_repo(url: &str, repo: &str) -> bool {
         }
         None => {
             // scp-like: `[user@]host:path`; a local path has no `host:`.
-            let Some((authority, path)) = url.split_once(':') else {
-                return false;
-            };
+            let (authority, path) = url.split_once(':')?;
             if authority.contains('/') || path.starts_with('/') {
-                return false;
+                return None;
             }
             (without_user(authority), path.to_string())
         }
     };
     if host != "github.com" {
-        return false;
+        return None;
     }
     let path = path.strip_suffix('/').unwrap_or(&path);
     let path = path.strip_suffix(".git").unwrap_or(path);
     match path.split_once('/') {
         Some((owner, name)) if !owner.is_empty() && !name.is_empty() && !name.contains('/') => {
-            path == repo.to_ascii_lowercase()
+            Some(path.to_string())
         }
-        _ => false,
+        _ => None,
     }
+}
+
+/// Whether every one of `urls` is a GitHub URL for a repository other than
+/// `repo`: a push there provably goes elsewhere. No URLs, or any this cannot
+/// read as GitHub's, is not proof.
+fn pushes_elsewhere(urls: &[&str], repo: &str) -> bool {
+    let repo = repo.to_ascii_lowercase();
+    !urls.is_empty()
+        && urls
+            .iter()
+            .all(|url| github_repo_of(url).is_some_and(|named| named != repo))
 }
 
 /// The remote a push of an issue branch names, from the configured
@@ -147,8 +161,15 @@ pub(crate) fn url_names_github_repo(url: &str, repo: &str) -> bool {
 ///    several do); a fetch URL naming it is not enough;
 /// 2. else one already tracking the branch (`origin` first);
 /// 3. else `origin`, only when it is configured;
-/// 4. else the only configured remote;
+/// 4. else the only remaining one;
 /// 5. else none: no remote is named rather than one that may not exist.
+///
+/// Steps 2 to 4 skip a remote whose every push URL is a GitHub URL for
+/// another repository ([`pushes_elsewhere`]): a push there provably misses
+/// the issue's repo, and `git push` to a fork still creates its
+/// `refs/remotes/<remote>/<branch>`, so tracking proves nothing. A push URL
+/// that cannot be read as GitHub's (an SSH alias, a GitHub Enterprise host,
+/// a local path) keeps its remote eligible. With no `repo`, none is skipped.
 ///
 /// The issue branch has no upstream, so the goal condition's push names
 /// its remote when one is known.
@@ -171,15 +192,66 @@ pub(crate) fn pick_push_remote<'a>(
             .map(|(name, _)| *name)
             .collect()
     });
+    let eligible: Vec<&'a str> = remotes
+        .iter()
+        .filter(|(_, urls)| !repo.is_some_and(|repo| pushes_elsewhere(urls, repo)))
+        .map(|(name, _)| *name)
+        .collect();
     origin_first(naming_repo)
-        .or_else(|| origin_first(tracking.to_vec()))
         .or_else(|| {
-            remotes
-                .iter()
-                .map(|(name, _)| *name)
-                .find(|name| *name == "origin")
+            origin_first(
+                tracking
+                    .iter()
+                    .copied()
+                    .filter(|name| eligible.contains(name))
+                    .collect(),
+            )
         })
-        .or_else(|| (remotes.len() == 1).then(|| remotes[0].0))
+        .or_else(|| eligible.iter().copied().find(|name| *name == "origin"))
+        .or_else(|| (eligible.len() == 1).then(|| eligible[0]))
+}
+
+/// The remotes that push to another GitHub repository
+/// ([`pushes_elsewhere`]), when no remote's push URL names `repo`; empty
+/// otherwise. Names only: the URLs may hold a token.
+pub(crate) fn remotes_pushing_elsewhere<'a>(
+    remotes: &[(&'a str, &[&str])],
+    repo: &str,
+) -> Vec<&'a str> {
+    if remotes
+        .iter()
+        .any(|(_, urls)| urls.iter().any(|url| url_names_github_repo(url, repo)))
+    {
+        return Vec::new();
+    }
+    remotes
+        .iter()
+        .filter(|(_, urls)| pushes_elsewhere(urls, repo))
+        .map(|(name, _)| *name)
+        .collect()
+}
+
+/// Warn, at run start, when no remote of the checkout at `dir` pushes to
+/// `repo` while some push to another GitHub repository: the IC's push may
+/// then miss the repository its pull request is opened in. It names the
+/// remotes, never their URLs, which may hold a token.
+pub(crate) fn warn_if_no_remote_pushes_to(dir: &Path, repo: &str) {
+    let listed = git(dir, &["remote", "-v"]).unwrap_or_default();
+    let remotes = remote_push_urls(&listed);
+    let remotes: Vec<(&str, &[&str])> = remotes
+        .iter()
+        .map(|(name, urls)| (*name, urls.as_slice()))
+        .collect();
+    let elsewhere = remotes_pushing_elsewhere(&remotes, repo);
+    if !elsewhere.is_empty() {
+        tracing::warn!(
+            repo = %repo,
+            remotes = %elsewhere.join(", "),
+            "no git remote's push URL names the issue's repository, and these push to \
+             another GitHub repository; the implementer's push may miss the repository \
+             its pull request is opened in"
+        );
+    }
 }
 
 /// Each remote in `git remote -v` output, in order, with its effective push
@@ -2026,10 +2098,16 @@ mod tests {
         assert_eq!(pick_push_remote(&[("fork", NONE)], &[], repo), Some("fork"));
         // Otherwise none: a missing `origin` is never named.
         assert_eq!(
-            pick_push_remote(&[("github", fork), ("gitlab", NONE)], &[], repo),
+            pick_push_remote(&[("a", NONE), ("b", NONE)], &[], repo),
             None
         );
         assert_eq!(pick_push_remote(&[], &[], repo), None);
+        // A remote that provably pushes to another GitHub repo is never a
+        // fallback, so the only remaining eligible one is.
+        assert_eq!(
+            pick_push_remote(&[("github", fork), ("gitlab", NONE)], &[], repo),
+            Some("gitlab")
+        );
 
         let (checkout, _origin) = fixture_repo_with_origin();
         let dir = checkout.path();
@@ -2069,8 +2147,8 @@ mod tests {
         );
         assert_eq!(
             push_remote(dir, &branch, &issue().repo).as_deref(),
-            Some("origin"),
-            "neither URL names the issue's repo yet"
+            None,
+            "both push to other GitHub repos, so neither is named"
         );
         run(
             dir,
@@ -2092,7 +2170,147 @@ mod tests {
             dir,
             &["remote", "add", "gitlab", "https://gitlab.com/x/y.git"],
         );
-        assert_eq!(push_remote(dir, &branch, &issue().repo), None);
+        // `github` pushes to a fork; `gitlab` is the one left.
+        assert_eq!(
+            push_remote(dir, &branch, &issue().repo).as_deref(),
+            Some("gitlab")
+        );
+    }
+
+    /// Steps 2 to 4 never name a remote whose every push URL is a GitHub
+    /// URL for another repo: `git push origin` to a fork still creates
+    /// `refs/remotes/origin/<branch>` (measured by review), so tracking the
+    /// branch proves nothing. A push URL this cannot read (an SSH alias, a
+    /// GitHub Enterprise host, a local path) stays eligible.
+    #[test]
+    fn a_remote_that_pushes_to_another_github_repo_is_never_a_fallback() {
+        let repo = Some("owner/repo");
+        let fork: &[&str] = &["https://github.com/someone/repo.git"];
+        let alias: &[&str] = &["git@github-work:owner/repo.git"];
+        let local: &[&str] = &["/srv/git/repo.git"];
+        let enterprise: &[&str] = &["https://github.example.com/owner/repo.git"];
+        // `origin` fetches owner/repo but pushes to a fork and tracks the
+        // branch; `upstream` pushes to owner/repo through an alias.
+        assert_eq!(
+            pick_push_remote(&[("origin", fork), ("upstream", alias)], &["origin"], repo),
+            Some("upstream")
+        );
+        // A tracking `origin` that pushes to a fork, alone: none.
+        assert_eq!(
+            pick_push_remote(&[("origin", fork)], &["origin"], repo),
+            None
+        );
+        // Unreadable push URLs stay eligible, by any later step.
+        assert_eq!(
+            pick_push_remote(&[("origin", alias)], &[], repo),
+            Some("origin")
+        );
+        assert_eq!(
+            pick_push_remote(&[("local", local)], &[], repo),
+            Some("local")
+        );
+        assert_eq!(
+            pick_push_remote(&[("ghe", enterprise), ("fork", fork)], &["ghe"], repo),
+            Some("ghe")
+        );
+        // One push URL elsewhere is not all of them.
+        let both: &[&str] = &["https://github.com/someone/repo.git", "/srv/git/repo.git"];
+        assert_eq!(
+            pick_push_remote(&[("origin", both)], &[], repo),
+            Some("origin")
+        );
+
+        // The same with real remotes.
+        let checkout = fixture_repo();
+        let dir = checkout.path();
+        let branch = branch_name(&issue());
+        run(
+            dir,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/ironrace/ironmem.git",
+            ],
+        );
+        run(
+            dir,
+            &[
+                "config",
+                "remote.origin.pushurl",
+                "https://github.com/someone/ironmem.git",
+            ],
+        );
+        run(
+            dir,
+            &[
+                "remote",
+                "add",
+                "upstream",
+                "git@github-work:ironrace/ironmem.git",
+            ],
+        );
+        let head = test_git::run(dir, &["rev-parse", "HEAD"]);
+        run(
+            dir,
+            &[
+                "update-ref",
+                &format!("refs/remotes/origin/{branch}"),
+                &head,
+            ],
+        );
+        assert_eq!(
+            push_remote(dir, &branch, &issue().repo).as_deref(),
+            Some("upstream")
+        );
+    }
+
+    /// Run start warns, naming remotes only, when no remote's push URL names
+    /// the issue's repo and some push to another GitHub repo.
+    #[test]
+    fn remotes_pushing_elsewhere_are_named_only_when_none_pushes_to_the_issue_repo() {
+        let fork: &[&str] = &["https://x-access-token:ghp_secret@github.com/someone/repo.git"];
+        let issue_repo: &[&str] = &["git@github.com:owner/repo.git"];
+        let alias: &[&str] = &["git@github-work:owner/repo.git"];
+        assert_eq!(
+            remotes_pushing_elsewhere(&[("origin", fork), ("up", alias)], "owner/repo"),
+            vec!["origin"]
+        );
+        assert!(
+            remotes_pushing_elsewhere(&[("origin", fork), ("up", issue_repo)], "owner/repo")
+                .is_empty()
+        );
+        assert!(remotes_pushing_elsewhere(&[("up", alias)], "owner/repo").is_empty());
+
+        // At run start: the remote is named, its URL (and token) never.
+        let checkout = fixture_repo();
+        let dir = checkout.path();
+        run(
+            dir,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://x-access-token:ghp_secret@github.com/someone/ironmem.git",
+            ],
+        );
+        let ((), log) = with_captured_log(|| warn_if_no_remote_pushes_to(dir, &issue().repo));
+        assert!(log.contains("origin") && log.contains("push"), "{log}");
+        assert!(
+            !log.contains("ghp_secret") && !log.contains("someone"),
+            "{log}"
+        );
+        run(
+            dir,
+            &[
+                "remote",
+                "add",
+                "upstream",
+                "git@github.com:ironrace/ironmem.git",
+            ],
+        );
+        let ((), log) = with_captured_log(|| warn_if_no_remote_pushes_to(dir, &issue().repo));
+        assert!(log.is_empty(), "{log}");
     }
 
     /// Step 1 goes by where `git push <remote>` really sends the branch:

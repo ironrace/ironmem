@@ -2596,6 +2596,11 @@ pub fn run_issue(
             kept_at_start(config.implementer, existing_state.as_ref())
         )));
     }
+    // The goal condition's push names a remote whose push URL names the
+    // issue's repository when one does. When none does and some push to
+    // another GitHub repository, say so now: the IC's push may miss the
+    // repository the pull request is opened in.
+    worktree::warn_if_no_remote_pushes_to(&worktree.path, &issue.repo);
     // Set by a guard fault every later `met` would meet too: the run stops
     // after recording it, before paying for another dispatch.
     let mut guard_stop: Option<GuardFault> = None;

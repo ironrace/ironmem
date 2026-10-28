@@ -576,28 +576,29 @@ model can quietly pass `-c commit.gpgsign=false`.
   `remote.<name>.push` refspec) can still push without naming anything, so push
   it by naming the remote and the branch, as the goal condition does (`git push
   <remote> <branch>`: the remote whose push URL (its `pushurl`, else its `url`,
-  as `git remote -v` shows it) names the issue's GitHub repository, else the one
-  already tracking the branch, else `origin` if you have one, else your only
-  remote; with none of those it names the branch only, and you push to your
-  issue repository's remote). If `git worktree add` fails after making the
-  branch, the branch keeps its cut and the next run reuses it; the cut is taken
-  back only when no branch was made, and only while both its value and the run's
-  own token (stored in `branch.<branch>.ironmemCutOwner`) still read as that
-  run's, so a take-back never removes the same value another controller recorded
-  after it. Once its add has made the branch, a run reads the cut back and
-  records it again if another controller's take-back removed it meanwhile. A
-  branch another controller creates at the same moment is never given this run's
-  cut: the run stops and asks you to run again. A run never deletes a branch or
-  worktree it has just created: if the new branch already holds someone else's
-  commit, or its tip cannot be read back, the run stops, keeps both with their
-  cut, and asks you to run again. An existing branch with no recorded cut (an
-  older branch) gets the commit its reflog says it was created from, or, without
-  that entry, the merge base of the branch and `--base`; never `--base` itself,
-  which may have moved. That run logs a warning naming the branch, the source
-  and the sha. A branch that shares no history with `--base`, or one whose merge
-  base with `--base` is its own tip (merged into it, or empty) while it has
-  commits on no remote (that merge base would leave the guard nothing to check),
-  and that has no creation entry, is refused: record its cut with `git config
+  as `git remote -v` shows it) names the issue's GitHub repository, else,
+  skipping any remote that pushes only to another GitHub repository, the one
+  already tracking the branch, else `origin` if you have one, else the only one
+  left; with none of those it names the branch only, and you push to your issue
+  repository's remote). If `git worktree add` fails after making the branch, the
+  branch keeps its cut and the next run reuses it; the cut is taken back only
+  when no branch was made, and only while both its value and the run's own token
+  (stored in `branch.<branch>.ironmemCutOwner`) still read as that run's, so a
+  take-back never removes the same value another controller recorded after it.
+  Once its add has made the branch, a run reads the cut back and records it
+  again if another controller's take-back removed it meanwhile. A branch another
+  controller creates at the same moment is never given this run's cut: the run
+  stops and asks you to run again. A run never deletes a branch or worktree it
+  has just created: if the new branch already holds someone else's commit, or
+  its tip cannot be read back, the run stops, keeps both with their cut, and
+  asks you to run again. An existing branch with no recorded cut (an older
+  branch) gets the commit its reflog says it was created from, or, without that
+  entry, the merge base of the branch and `--base`; never `--base` itself, which
+  may have moved. That run logs a warning naming the branch, the source and the
+  sha. A branch that shares no history with `--base`, or one whose merge base
+  with `--base` is its own tip (merged into it, or empty) while it has commits
+  on no remote (that merge base would leave the guard nothing to check), and
+  that has no creation entry, is refused: record its cut with `git config
   branch.<branch>.ironmemCut <sha>`.
 - **A config lock left behind blocks new branches.** Storing the cut writes
   `.git/config`. While another worktree's git holds its lock, the write is
@@ -711,8 +712,9 @@ commits merged in, as follows:
   instead of rebasing over it.
 - Then `git push --force-with-lease <remote> <issue-branch>`, first to the
   remote the goal condition's push names (the one whose push URL is the issue's
-  GitHub repository, else one already holding the issue branch, `origin` first,
-  else `origin` if configured, else the only remote), then to every other remote
+  GitHub repository, else, skipping a remote that pushes only to another GitHub
+  repository, one already holding the issue branch, `origin` first, else
+  `origin` if configured, else the only one left), then to every other remote
   that holds the issue branch, since the guard checks each one and a remote left
   with the old commits keeps failing it. The recipe names up to three and counts
   the rest. With no remote it can name, it says `<remote>` and asks for the
