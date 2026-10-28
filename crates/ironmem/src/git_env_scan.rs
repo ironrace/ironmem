@@ -30,6 +30,12 @@
 //! an earlier binding or a `const` slips past, and it knows only the writers
 //! it names (`set_var`, `remove_var`, `Scoped…`, `EnvGuard`, `with_env`,
 //! `temp_env`, `with_var`), so a helper under another name slips past too.
+//!
+//! The scrub scans look only for the literal `Command::new("git")`. git run
+//! behind a shell (`Command::new("bash")` with `-c "git …"`), or through a
+//! program name held anywhere else (a variable, a path, a helper returning
+//! a `Command`), is invisible to them; such a call site scrubs its own
+//! command and says so in a comment.
 
 use std::path::{Path, PathBuf};
 
@@ -206,6 +212,51 @@ fn every_git_command_is_scrubbed_by_the_one_shared_scrub() {
     );
 }
 
+/// Lines (one-based, with their text) that import or rename something *as*
+/// one of the scrub names: `use x::noop as fixture_git_env;` would satisfy
+/// both scans while scrubbing nothing.
+fn scrub_aliases(source: &str) -> Vec<(usize, String)> {
+    let names = TEST_SCRUBS.join("|");
+    let rename = regex::Regex::new(&format!(r"\bas\s+(?:{names})\b")).unwrap();
+    source
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| !is_comment(line) && rename.is_match(line))
+        .map(|(at, line)| (at + 1, line.to_string()))
+        .collect()
+}
+
+/// The one rename the scans accept: `review_diff.rs` names `tests/git_env`'s
+/// scrub after the lib's.
+const ACCEPTED_ALIAS: (&str, &str) = (
+    "tests/review_diff.rs",
+    "git_env::scrub_git_env as scrub_git_environment",
+);
+
+/// No file renames anything to a scrub's name but [`ACCEPTED_ALIAS`]: the
+/// scans trust the name, so a rename could stand anything in for the scrub.
+#[test]
+fn nothing_is_renamed_to_a_scrubs_name() {
+    let mut found = Vec::new();
+    for dir in ["src", "tests"] {
+        for file in rust_files(&crate_dir(dir)) {
+            let source = std::fs::read_to_string(&file).unwrap();
+            let accepted = file == crate_dir(ACCEPTED_ALIAS.0);
+            for (line, text) in scrub_aliases(&source) {
+                if !(accepted && text.contains(ACCEPTED_ALIAS.1)) {
+                    found.push(format!("{}:{line}: {}", file.display(), text.trim()));
+                }
+            }
+        }
+    }
+    assert!(
+        found.is_empty(),
+        "these rename something to a git scrub's name, which the scrub scans take on \
+         trust:\n{}",
+        found.join("\n")
+    );
+}
+
 /// The integration tests' twin of
 /// [`every_git_command_is_scrubbed_by_the_one_shared_scrub`]: their git goes
 /// through `tests/git_env`, whose scrubs are defined there and nowhere else.
@@ -292,6 +343,18 @@ fn the_scans_find_what_they_look_for() {
          fixture_git_env(&mut a);\n";
     assert_eq!(git_commands_unscrubbed_by(source, TEST_SCRUBS), vec![7]);
     assert_eq!(unscrubbed_git_commands(source), vec![1, 3, 7]);
+    // A rename to a scrub's name is found, however it is written; a name
+    // that only contains one, or a comment, is not.
+    let aliases = scrub_aliases(
+        "use x::noop as fixture_git_env;\n\
+         use git_env::scrub_git_env as scrub_git_environment;\n\
+         use y::{a as scrub_git_env, b};\n\
+         let scrub_git_env_as_well = 1;\n\
+         use z::c as fixture_git_env_too;\n\
+         // use w::d as fixture_git_env;\n",
+    );
+    let lines: Vec<usize> = aliases.iter().map(|(line, _)| *line).collect();
+    assert_eq!(lines, vec![1, 2, 3], "{aliases:?}");
 }
 
 /// The integration tests cannot import the lib's private
