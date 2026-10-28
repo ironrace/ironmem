@@ -36,6 +36,10 @@ const REDACTED: &str = "[REDACTED]";
 static BEARER_TOKEN_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{8,}").unwrap());
 
+/// HTTP Basic credentials, including short user/password base64 encodings.
+static BASIC_TOKEN_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bBasic\s+[A-Za-z0-9+/=]{8,}").unwrap());
+
 /// GitHub personal-access/OAuth/server/refresh token prefixes:
 /// `ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_`, and fine-grained personal access
 /// tokens (`github_pat_`, whose body holds `_`).
@@ -148,6 +152,7 @@ fn redact_credentials(input: &str) -> (String, bool) {
 
     for pattern in [
         &*BEARER_TOKEN_RE,
+        &*BASIC_TOKEN_RE,
         &*GITHUB_TOKEN_RE,
         &*AWS_KEY_RE,
         &*SLACK_TOKEN_RE,
@@ -295,6 +300,20 @@ fn shannon_entropy_bits_per_char(s: &str) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn short_basic_credentials_are_scrubbed() {
+        for scheme in ["Basic", "basic", "BASIC"] {
+            let input = format!("Authorization: {scheme} dTpwYXNz");
+            assert_eq!(
+                scrub_secrets(&input),
+                ("Authorization: [REDACTED]".into(), true)
+            );
+            assert!(!scrub_credentials_and_bound(&input, 500)
+                .text
+                .contains("dTpwYXNz"));
+        }
+    }
 
     #[test]
     fn redacts_bearer_token() {

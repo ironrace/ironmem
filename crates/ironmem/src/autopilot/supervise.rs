@@ -97,7 +97,9 @@ use super::lineage::{self, AttemptOutcome, AttemptRecord, IssueStatus};
 use super::registry::RegistrySnapshot;
 use super::registry::{Liveness, LivenessSnapshot};
 use super::scrub::scrub_and_bound;
-use super::{read_current, validate_repo, write_current, IssueRef};
+#[cfg(test)]
+use super::write_current;
+use super::{read_current, validate_repo, IssueRef};
 
 /// The short timeout: how long a session must be absent from the registry
 /// before absence counts toward death.
@@ -326,6 +328,13 @@ pub fn upsert_supervision(
     db: &Database,
     record: &SupervisionRecord,
 ) -> Result<String, MemoryError> {
+    db.with_immediate_transaction(|tx| upsert_supervision_tx(tx, record))
+}
+
+fn upsert_supervision_tx(
+    tx: &rusqlite::Transaction<'_>,
+    record: &SupervisionRecord,
+) -> Result<String, MemoryError> {
     validate_repo(&record.issue.repo)?;
     let body = SupervisionBody {
         issue: record.issue.number,
@@ -343,7 +352,7 @@ pub fn upsert_supervision(
         escalation_question: record.escalation_question.clone(),
     };
     let content = serde_json::to_string(&body)?;
-    write_current(db, &supervision_key(&record.issue), &content)
+    super::write_current_tx(tx, &supervision_key(&record.issue), &content)
 }
 
 /// Read an issue's supervision record, if it has ever been checked.
@@ -423,22 +432,24 @@ pub fn set_redirect_proposal(
     signature: &str,
     proposal: &str,
 ) -> Result<bool, MemoryError> {
-    let proposal = scrub_and_bound(proposal.trim(), MAX_REDIRECT_PROPOSAL_CHARS).text;
-    if proposal.is_empty() {
-        return Ok(false);
-    }
-    let Some(mut record) = get_supervision(db, issue)? else {
-        return Ok(false);
-    };
-    if record.active_redirect.is_none()
-        || record.redirect_signature.as_deref() != Some(signature)
-        || record.redirect_proposal.is_some()
-    {
-        return Ok(false);
-    }
-    record.redirect_proposal = Some(proposal);
-    upsert_supervision(db, &record)?;
-    Ok(true)
+    db.with_immediate_transaction(|tx| {
+        let proposal = scrub_and_bound(proposal.trim(), MAX_REDIRECT_PROPOSAL_CHARS).text;
+        if proposal.is_empty() {
+            return Ok(false);
+        }
+        let Some(mut record) = get_supervision(db, issue)? else {
+            return Ok(false);
+        };
+        if record.active_redirect.is_none()
+            || record.redirect_signature.as_deref() != Some(signature)
+            || record.redirect_proposal.is_some()
+        {
+            return Ok(false);
+        }
+        record.redirect_proposal = Some(proposal);
+        upsert_supervision_tx(tx, &record)?;
+        Ok(true)
+    })
 }
 
 /// Record that a proposal was *asked for* on `signature` and none came back.
@@ -462,18 +473,20 @@ pub fn mark_redirect_proposal_asked(
     issue: &IssueRef,
     signature: &str,
 ) -> Result<bool, MemoryError> {
-    let Some(mut record) = get_supervision(db, issue)? else {
-        return Ok(false);
-    };
-    if record.active_redirect.is_none()
-        || record.redirect_signature.as_deref() != Some(signature)
-        || record.redirect_proposal.is_some()
-    {
-        return Ok(false);
-    }
-    record.redirect_proposal = Some(String::new());
-    upsert_supervision(db, &record)?;
-    Ok(true)
+    db.with_immediate_transaction(|tx| {
+        let Some(mut record) = get_supervision(db, issue)? else {
+            return Ok(false);
+        };
+        if record.active_redirect.is_none()
+            || record.redirect_signature.as_deref() != Some(signature)
+            || record.redirect_proposal.is_some()
+        {
+            return Ok(false);
+        }
+        record.redirect_proposal = Some(String::new());
+        upsert_supervision_tx(tx, &record)?;
+        Ok(true)
+    })
 }
 
 /// The signature a human has already been told about on the issue itself.
@@ -529,23 +542,25 @@ pub fn cache_escalation_question(
     signature: &str,
     question: Option<&str>,
 ) -> Result<bool, MemoryError> {
-    let Some(mut record) = get_supervision(db, issue)? else {
-        return Ok(false);
-    };
-    if record.escalated_signature.as_deref() != Some(signature) {
-        return Ok(false);
-    }
-    let question = question
-        // Bounded at the advisor's own answer ceiling rather than
-        // `MAX_REDIRECT_PROPOSAL_CHARS`: this text goes into a GitHub comment
-        // a human reads, not into an IC's prompt, so the tighter prompt budget
-        // would truncate a legitimate question for no reason. Already scrubbed
-        // and bounded upstream; re-applied here because this is the write.
-        .map(|q| scrub_and_bound(q.trim(), super::advise::MAX_ADVICE_ANSWER_CHARS).text)
-        .unwrap_or_default();
-    record.escalation_question = Some(question);
-    upsert_supervision(db, &record)?;
-    Ok(true)
+    db.with_immediate_transaction(|tx| {
+        let Some(mut record) = get_supervision(db, issue)? else {
+            return Ok(false);
+        };
+        if record.escalated_signature.as_deref() != Some(signature) {
+            return Ok(false);
+        }
+        let question = question
+            // Bounded at the advisor's own answer ceiling rather than
+            // `MAX_REDIRECT_PROPOSAL_CHARS`: this text goes into a GitHub comment
+            // a human reads, not into an IC's prompt, so the tighter prompt budget
+            // would truncate a legitimate question for no reason. Already scrubbed
+            // and bounded upstream; re-applied here because this is the write.
+            .map(|q| scrub_and_bound(q.trim(), super::advise::MAX_ADVICE_ANSWER_CHARS).text)
+            .unwrap_or_default();
+        record.escalation_question = Some(question);
+        upsert_supervision_tx(tx, &record)?;
+        Ok(true)
+    })
 }
 
 /// Record that a human has been told about `signature`'s escalation.
@@ -560,15 +575,17 @@ pub fn mark_escalation_notified(
     issue: &IssueRef,
     signature: &str,
 ) -> Result<bool, MemoryError> {
-    let Some(mut record) = get_supervision(db, issue)? else {
-        return Ok(false);
-    };
-    if record.escalation_notified_signature.as_deref() == Some(signature) {
-        return Ok(false);
-    }
-    record.escalation_notified_signature = Some(signature.to_string());
-    upsert_supervision(db, &record)?;
-    Ok(true)
+    db.with_immediate_transaction(|tx| {
+        let Some(mut record) = get_supervision(db, issue)? else {
+            return Ok(false);
+        };
+        if record.escalation_notified_signature.as_deref() == Some(signature) {
+            return Ok(false);
+        }
+        record.escalation_notified_signature = Some(signature.to_string());
+        upsert_supervision_tx(tx, &record)?;
+        Ok(true)
+    })
 }
 
 /// The failure signature an issue has been escalated on, if any.
@@ -589,25 +606,27 @@ pub fn escalated_signature(db: &Database, issue: &IssueRef) -> Result<Option<Str
 /// the IC not to repeat a failure it is about to be re-escalated on would
 /// re-escalate on the very next attempt.
 pub fn clear_escalation(db: &Database, issue: &IssueRef) -> Result<bool, MemoryError> {
-    let Some(mut record) = get_supervision(db, issue)? else {
-        return Ok(false);
-    };
-    if record.escalated_signature.is_none() {
-        return Ok(false);
-    }
-    record.escalated_signature = None;
-    record.active_redirect = None;
-    record.redirect_signature = None;
-    record.redirect_issued_after_attempts = None;
-    record.redirect_proposal = None;
-    // So a *later* escalation of the same signature notifies again. A human
-    // who cleared one and saw it come back needs telling twice — and the
-    // second notice drafts its own question, since the first one's was
-    // written for a state the human has since acted on.
-    record.escalation_notified_signature = None;
-    record.escalation_question = None;
-    upsert_supervision(db, &record)?;
-    Ok(true)
+    db.with_immediate_transaction(|tx| {
+        let Some(mut record) = get_supervision(db, issue)? else {
+            return Ok(false);
+        };
+        if record.escalated_signature.is_none() {
+            return Ok(false);
+        }
+        record.escalated_signature = None;
+        record.active_redirect = None;
+        record.redirect_signature = None;
+        record.redirect_issued_after_attempts = None;
+        record.redirect_proposal = None;
+        // So a *later* escalation of the same signature notifies again. A human
+        // who cleared one and saw it come back needs telling twice — and the
+        // second notice drafts its own question, since the first one's was
+        // written for a state the human has since acted on.
+        record.escalation_notified_signature = None;
+        record.escalation_question = None;
+        upsert_supervision_tx(tx, &record)?;
+        Ok(true)
+    })
 }
 
 /// Clear an issue's active redirect once it is no longer relevant — the
@@ -617,18 +636,20 @@ pub fn clear_escalation(db: &Database, issue: &IssueRef) -> Result<bool, MemoryE
 /// touched, so a redirect that has already been escalated on cannot be
 /// silently re-armed by clearing.
 pub fn clear_redirect(db: &Database, issue: &IssueRef) -> Result<bool, MemoryError> {
-    let Some(mut record) = get_supervision(db, issue)? else {
-        return Ok(false);
-    };
-    if record.active_redirect.is_none() {
-        return Ok(false);
-    }
-    record.active_redirect = None;
-    record.redirect_signature = None;
-    record.redirect_issued_after_attempts = None;
-    record.redirect_proposal = None;
-    upsert_supervision(db, &record)?;
-    Ok(true)
+    db.with_immediate_transaction(|tx| {
+        let Some(mut record) = get_supervision(db, issue)? else {
+            return Ok(false);
+        };
+        if record.active_redirect.is_none() {
+            return Ok(false);
+        }
+        record.active_redirect = None;
+        record.redirect_signature = None;
+        record.redirect_issued_after_attempts = None;
+        record.redirect_proposal = None;
+        upsert_supervision_tx(tx, &record)?;
+        Ok(true)
+    })
 }
 
 // ── progress ────────────────────────────────────────────────────────────
@@ -1105,169 +1126,174 @@ pub fn supervise_issue(
     snapshot: &dyn LivenessSnapshot,
     config: &SupervisionConfig,
 ) -> Result<SupervisionReport, MemoryError> {
-    validate_repo(&issue.repo)?;
-    config.validate()?;
-    let now = Utc::now();
-    let now_str = now.to_rfc3339();
+    db.with_immediate_transaction(|tx| {
+        validate_repo(&issue.repo)?;
+        config.validate()?;
+        let now = Utc::now();
+        let now_str = now.to_rfc3339();
 
-    // A drawer that cannot be read (corrupt, or written by a newer binary)
-    // may name a live invocation: it is held, never treated as no state.
-    let (state, unreadable) = match dispatch_state::read_dispatch_state(db, issue)? {
-        dispatch_state::StateRead::Absent => (None, None),
-        dispatch_state::StateRead::Readable(state) => (Some(*state), None),
-        dispatch_state::StateRead::Unreadable(reason) => (None, Some(reason)),
-    };
-    let attempts = lineage::attempts_for_issue(db, issue)?;
-    let status = lineage::get_issue_status(db, issue)?;
-    let fingerprint = progress_fingerprint(state.as_ref(), &attempts, status.as_ref());
+        // A drawer that cannot be read (corrupt, or written by a newer binary)
+        // may name a live invocation: it is held, never treated as no state.
+        let (state, unreadable) = match dispatch_state::read_dispatch_state(db, issue)? {
+            dispatch_state::StateRead::Absent => (None, None),
+            dispatch_state::StateRead::Readable(state) => (Some(*state), None),
+            dispatch_state::StateRead::Unreadable(reason) => (None, Some(reason)),
+        };
+        let attempts = lineage::attempts_for_issue(db, issue)?;
+        let status = lineage::get_issue_status(db, issue)?;
+        let fingerprint = progress_fingerprint(state.as_ref(), &attempts, status.as_ref());
 
-    let prior = get_supervision(db, issue)?;
+        let prior = get_supervision(db, issue)?;
 
-    // The progress clock's origin: unchanged if the fingerprint is unchanged,
-    // otherwise now. A first-ever check has no prior fingerprint to differ
-    // from, so its origin is now — which is what makes "the first check can
-    // never declare an IC dead" true by construction rather than by a guard.
-    let progress_observed_at = match &prior {
-        Some(record) if record.fingerprint == fingerprint => record.progress_observed_at.clone(),
-        _ => now_str.clone(),
-    };
-
-    // Liveness is only a meaningful question for an issue that is supposed to
-    // have a process. An IC exits at the end of every dispatch by design, so
-    // an issue with no dispatch-state drawer being absent from the registry is
-    // the normal finished state, not a death.
-    let liveness = match (&state, &unreadable) {
-        (Some(state), _) => snapshot.liveness(state),
-        (None, Some(_)) => Liveness::Unknown,
-        (None, None) => Liveness::Alive,
-    };
-
-    // The liveness clock's origin. Note the `Unknown` arm: an unreadable
-    // registry neither starts nor clears the absence clock, because it is not
-    // an observation of absence or of presence.
-    let first_absent_at = match liveness {
-        Liveness::Alive => None,
-        Liveness::NotListed => Some(
-            prior
-                .as_ref()
-                .and_then(|r| r.first_absent_at.clone())
-                .unwrap_or_else(|| now_str.clone()),
-        ),
-        Liveness::Unknown => prior.as_ref().and_then(|r| r.first_absent_at.clone()),
-    };
-
-    let process = if liveness == Liveness::Unknown {
-        ProcessHealth::Unknown {
-            reason: match (&state, &unreadable) {
-                (Some(s), _) => snapshot.state_reason(s),
-                (None, Some(why)) => unreadable_state_reason(why),
-                (None, None) => "no dispatch state".into(),
-            },
-        }
-    } else if state.is_some() {
-        assess_process_health(
-            liveness,
-            &progress_observed_at,
-            first_absent_at.as_deref(),
-            now,
-            config,
-        )
-    } else {
-        ProcessHealth::Healthy
-    };
-    let strategy = assess_strategy_health(&attempts, config);
-    let real_attempt_count = real_attempts(&attempts) as u32;
-    let action = plan_supervision(&process, &strategy, prior.as_ref(), real_attempt_count);
-
-    // Persist the interventions. A redirect is armed whenever one is called
-    // for, independently of which action was *reported* — see
-    // `plan_supervision`'s precedence note — so a restarted dispatch still
-    // reads it. Both are recorded per signature, so a poll loop calling this
-    // every minute issues each exactly once.
-    let mut active_redirect = prior.as_ref().and_then(|r| r.active_redirect.clone());
-    let mut redirect_signature = prior.as_ref().and_then(|r| r.redirect_signature.clone());
-    let mut redirect_proposal = prior.as_ref().and_then(|r| r.redirect_proposal.clone());
-    let mut redirect_issued_after_attempts = prior
-        .as_ref()
-        .and_then(|r| r.redirect_issued_after_attempts);
-    let mut escalated_signature = prior.as_ref().and_then(|r| r.escalated_signature.clone());
-    let mut escalation_question = prior.as_ref().and_then(|r| r.escalation_question.clone());
-    match (&action, &strategy) {
-        (SupervisionAction::Escalate { signature, .. }, _) => {
-            // A question drafted for the previous signature asks about a
-            // failure the issue has stopped having. Dropped with the
-            // escalation it belonged to, exactly as `redirect_proposal` is
-            // dropped with its redirect, so the next notice buys its own.
-            if escalated_signature.as_deref() != Some(signature.as_str()) {
-                escalation_question = None;
+        // The progress clock's origin: unchanged if the fingerprint is unchanged,
+        // otherwise now. A first-ever check has no prior fingerprint to differ
+        // from, so its origin is now — which is what makes "the first check can
+        // never declare an IC dead" true by construction rather than by a guard.
+        let progress_observed_at = match &prior {
+            Some(record) if record.fingerprint == fingerprint => {
+                record.progress_observed_at.clone()
             }
-            escalated_signature = Some(signature.clone());
-        }
-        (
-            SupervisionAction::Redirect { .. } | SupervisionAction::RestartFromCheckpoint { .. },
-            StrategyHealth::Thrashing {
-                signature,
-                consecutive,
-            },
-        ) if redirect_signature.as_deref() != Some(signature.as_str()) => {
-            active_redirect = Some(redirect_text(signature, *consecutive));
-            redirect_signature = Some(signature.clone());
-            redirect_issued_after_attempts = Some(real_attempt_count);
-            // A proposal bought for the previous signature answers a failure
-            // the IC has stopped having. Dropped with the redirect it
-            // belonged to, so rung 9 may buy a fresh one for this signature.
-            redirect_proposal = None;
-        }
-        _ => {}
-    }
-    // A redirect whose signature is no longer the one failing has served its
-    // purpose (or been overtaken). Leaving it in force would keep telling the
-    // IC not to repeat a failure it has already stopped repeating.
-    if let StrategyHealth::Ok = strategy {
-        if active_redirect.is_some() && !attempts.is_empty() {
-            let still_relevant = attempts
-                .iter()
-                .rev()
-                .find(|a| !super::run::is_terminal_summary(&a.approach))
-                .and_then(|a| a.why_failed.as_deref())
-                .map(|why| Some(failure_signature(why)) == redirect_signature)
-                .unwrap_or(false);
-            if !still_relevant {
-                active_redirect = None;
-                redirect_signature = None;
-                redirect_issued_after_attempts = None;
+            _ => now_str.clone(),
+        };
+
+        // Liveness is only a meaningful question for an issue that is supposed to
+        // have a process. An IC exits at the end of every dispatch by design, so
+        // an issue with no dispatch-state drawer being absent from the registry is
+        // the normal finished state, not a death.
+        let liveness = match (&state, &unreadable) {
+            (Some(state), _) => snapshot.liveness(state),
+            (None, Some(_)) => Liveness::Unknown,
+            (None, None) => Liveness::Alive,
+        };
+
+        // The liveness clock's origin. Note the `Unknown` arm: an unreadable
+        // registry neither starts nor clears the absence clock, because it is not
+        // an observation of absence or of presence.
+        let first_absent_at = match liveness {
+            Liveness::Alive => None,
+            Liveness::NotListed => Some(
+                prior
+                    .as_ref()
+                    .and_then(|r| r.first_absent_at.clone())
+                    .unwrap_or_else(|| now_str.clone()),
+            ),
+            Liveness::Unknown => prior.as_ref().and_then(|r| r.first_absent_at.clone()),
+        };
+
+        let process = if liveness == Liveness::Unknown {
+            ProcessHealth::Unknown {
+                reason: match (&state, &unreadable) {
+                    (Some(s), _) => snapshot.state_reason(s),
+                    (None, Some(why)) => unreadable_state_reason(why),
+                    (None, None) => "no dispatch state".into(),
+                },
+            }
+        } else if state.is_some() {
+            assess_process_health(
+                liveness,
+                &progress_observed_at,
+                first_absent_at.as_deref(),
+                now,
+                config,
+            )
+        } else {
+            ProcessHealth::Healthy
+        };
+        let strategy = assess_strategy_health(&attempts, config);
+        let real_attempt_count = real_attempts(&attempts) as u32;
+        let action = plan_supervision(&process, &strategy, prior.as_ref(), real_attempt_count);
+
+        // Persist the interventions. A redirect is armed whenever one is called
+        // for, independently of which action was *reported* — see
+        // `plan_supervision`'s precedence note — so a restarted dispatch still
+        // reads it. Both are recorded per signature, so a poll loop calling this
+        // every minute issues each exactly once.
+        let mut active_redirect = prior.as_ref().and_then(|r| r.active_redirect.clone());
+        let mut redirect_signature = prior.as_ref().and_then(|r| r.redirect_signature.clone());
+        let mut redirect_proposal = prior.as_ref().and_then(|r| r.redirect_proposal.clone());
+        let mut redirect_issued_after_attempts = prior
+            .as_ref()
+            .and_then(|r| r.redirect_issued_after_attempts);
+        let mut escalated_signature = prior.as_ref().and_then(|r| r.escalated_signature.clone());
+        let mut escalation_question = prior.as_ref().and_then(|r| r.escalation_question.clone());
+        match (&action, &strategy) {
+            (SupervisionAction::Escalate { signature, .. }, _) => {
+                // A question drafted for the previous signature asks about a
+                // failure the issue has stopped having. Dropped with the
+                // escalation it belonged to, exactly as `redirect_proposal` is
+                // dropped with its redirect, so the next notice buys its own.
+                if escalated_signature.as_deref() != Some(signature.as_str()) {
+                    escalation_question = None;
+                }
+                escalated_signature = Some(signature.clone());
+            }
+            (
+                SupervisionAction::Redirect { .. }
+                | SupervisionAction::RestartFromCheckpoint { .. },
+                StrategyHealth::Thrashing {
+                    signature,
+                    consecutive,
+                },
+            ) if redirect_signature.as_deref() != Some(signature.as_str()) => {
+                active_redirect = Some(redirect_text(signature, *consecutive));
+                redirect_signature = Some(signature.clone());
+                redirect_issued_after_attempts = Some(real_attempt_count);
+                // A proposal bought for the previous signature answers a failure
+                // the IC has stopped having. Dropped with the redirect it
+                // belonged to, so rung 9 may buy a fresh one for this signature.
                 redirect_proposal = None;
             }
+            _ => {}
         }
-    }
+        // A redirect whose signature is no longer the one failing has served its
+        // purpose (or been overtaken). Leaving it in force would keep telling the
+        // IC not to repeat a failure it has already stopped repeating.
+        if let StrategyHealth::Ok = strategy {
+            if active_redirect.is_some() && !attempts.is_empty() {
+                let still_relevant = attempts
+                    .iter()
+                    .rev()
+                    .find(|a| !super::run::is_terminal_summary(&a.approach))
+                    .and_then(|a| a.why_failed.as_deref())
+                    .map(|why| Some(failure_signature(why)) == redirect_signature)
+                    .unwrap_or(false);
+                if !still_relevant {
+                    active_redirect = None;
+                    redirect_signature = None;
+                    redirect_issued_after_attempts = None;
+                    redirect_proposal = None;
+                }
+            }
+        }
 
-    let record = SupervisionRecord {
-        issue: issue.clone(),
-        fingerprint,
-        progress_observed_at,
-        first_absent_at,
-        last_checked_at: now_str,
-        active_redirect,
-        redirect_signature,
-        redirect_issued_after_attempts,
-        escalated_signature,
-        redirect_proposal,
-        // Never set here: supervision writes no comments. The notice is the
-        // Lead's to send (rung 9's `notify_escalation`), and this records
-        // that it landed — so it is written by the code that watched it land.
-        escalation_notified_signature: prior
-            .as_ref()
-            .and_then(|r| r.escalation_notified_signature.clone()),
-        escalation_question,
-    };
-    upsert_supervision(db, &record)?;
+        let record = SupervisionRecord {
+            issue: issue.clone(),
+            fingerprint,
+            progress_observed_at,
+            first_absent_at,
+            last_checked_at: now_str,
+            active_redirect,
+            redirect_signature,
+            redirect_issued_after_attempts,
+            escalated_signature,
+            redirect_proposal,
+            // Never set here: supervision writes no comments. The notice is the
+            // Lead's to send (rung 9's `notify_escalation`), and this records
+            // that it landed — so it is written by the code that watched it land.
+            escalation_notified_signature: prior
+                .as_ref()
+                .and_then(|r| r.escalation_notified_signature.clone()),
+            escalation_question,
+        };
+        upsert_supervision_tx(tx, &record)?;
 
-    Ok(SupervisionReport {
-        issue: issue.clone(),
-        process,
-        strategy,
-        action,
-        in_flight: state.is_some() || unreadable.is_some(),
+        Ok(SupervisionReport {
+            issue: issue.clone(),
+            process,
+            strategy,
+            action,
+            in_flight: state.is_some() || unreadable.is_some(),
+        })
     })
 }
 
@@ -1517,6 +1543,40 @@ mod tests {
     }
 
     // ── config ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn ultrareview_concurrent_supervision_updates_preserve_both_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("memory.db");
+        let db = Database::open(&path).unwrap();
+        db.migrate().unwrap();
+        for _ in 0..24 {
+            let issue = armed(&db, "sig");
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let workers: Vec<_> = (0..2)
+                .map(|n| {
+                    let path = path.clone();
+                    let barrier = barrier.clone();
+                    let issue = issue.clone();
+                    std::thread::spawn(move || {
+                        let db = Database::open(&path).unwrap();
+                        barrier.wait();
+                        if n == 0 {
+                            set_redirect_proposal(&db, &issue, "sig", "proposal").unwrap()
+                        } else {
+                            mark_escalation_notified(&db, &issue, "sig").unwrap()
+                        }
+                    })
+                })
+                .collect();
+            for worker in workers {
+                assert!(worker.join().unwrap());
+            }
+            let record = get_supervision(&db, &issue).unwrap().unwrap();
+            assert_eq!(record.redirect_proposal.as_deref(), Some("proposal"));
+            assert_eq!(record.escalation_notified_signature.as_deref(), Some("sig"));
+        }
+    }
 
     #[test]
     fn default_config_is_valid_and_its_clocks_are_ordered() {
@@ -2917,7 +2977,7 @@ mod tests {
 
     /// A live invocation marker no readable state names, while a drawer
     /// cannot be read, may be that drawer's: held, and an orphan only once
-    /// the drawer is gone (F28).
+    /// the drawer is gone.
     #[test]
     fn a_marker_is_held_while_an_unreadable_state_may_be_its_and_an_orphan_after() {
         use crate::autopilot::process_tree::{testing, ProcessSnapshot};
@@ -2954,8 +3014,8 @@ mod tests {
         assert_eq!(marker_row(&rows).verdict, ReconcileVerdict::Orphan);
     }
 
-    /// An orphan's hold names at most three unreadable drawers (F100), and
-    /// each unreadable drawer's own row says why it cannot be read (F9).
+    /// An orphan's hold names at most three unreadable drawers, and
+    /// each unreadable drawer's own row says why it cannot be read.
     #[test]
     fn an_orphans_hold_names_three_unreadable_states_and_counts_the_rest() {
         let db = Database::open_in_memory().unwrap();

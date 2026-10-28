@@ -2,7 +2,7 @@
 //! common Git directory, so a replacement controller can inspect them after
 //! the checkout disappears. Each harness contributes only a [`SupervisedCli`].
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -41,8 +41,8 @@ const EXIT_LIMIT: u64 = super::process_tree::IDENTITY_LIMIT as u64;
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 /// How often supervision rescans the process table. A `ps -axww` scan costs
 /// tens of milliseconds of CPU on a busy machine, so scanning on every exit
-/// poll kept a core busy for a whole dispatch. Exit and artifact limits stay
-/// on [`POLL_INTERVAL`]; descendants enrol at this pace, and cleanup rescans
+/// poll kept a core busy for a whole dispatch. Exit checks stay on
+/// [`POLL_INTERVAL`]; artifact limits and descendants use the observation cadence, and cleanup rescans
 /// the frozen tree until it is stable. A process that lives less than one
 /// interval is never enrolled, and anything it leaves running is reparented
 /// to init, out of every tracked ancestry. Completion therefore also
@@ -51,6 +51,18 @@ const POLL_INTERVAL: Duration = Duration::from_millis(25);
 /// tools each lead their own session, so the group check never sees them);
 /// see `ProcessTracker::verify_worktree_quiet` for what that cannot catch.
 const OBSERVE_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Fast enrollment during startup, then less process-table traffic for long
+/// runs. Exit detection remains at 25ms and final reads still enforce caps.
+fn observation_interval(elapsed: Duration) -> Duration {
+    if elapsed >= Duration::from_secs(300) {
+        Duration::from_secs(2)
+    } else if elapsed >= Duration::from_secs(60) {
+        Duration::from_secs(1)
+    } else {
+        OBSERVE_INTERVAL
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InvocationArtifacts {
@@ -285,6 +297,10 @@ impl ParsedRun {
         turns: u32,
         observed_output: bool,
     ) -> Self {
+        let verdict = FinalVerdict {
+            verdict: verdict.verdict,
+            reason: scrub_and_bound(&verdict.reason, 500).text,
+        };
         Self {
             native_id: Some(native_id),
             verdict: Some(verdict),
@@ -441,7 +457,7 @@ fn common_git_dir(worktree: &Path) -> Result<PathBuf, MemoryError> {
     let mut git = Command::new(crate::launcher::cached_launcher("git"));
     git.args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
         .current_dir(worktree);
-    crate::mcp::tools::scrub_git_environment(&mut git);
+    crate::git_env::scrub_git_environment(&mut git);
     let output = git.output()?;
     if !output.status.success() {
         return Err(validation(format!(
@@ -609,6 +625,22 @@ pub(crate) fn prune_invocations(
     keep: Option<&str>,
     older_than: Duration,
 ) -> Result<usize, MemoryError> {
+    prune_invocations_at(
+        common_dir,
+        slug,
+        keep,
+        older_than,
+        std::time::SystemTime::now(),
+    )
+}
+
+fn prune_invocations_at(
+    common_dir: &Path,
+    slug: &str,
+    keep: Option<&str>,
+    older_than: Duration,
+    now: std::time::SystemTime,
+) -> Result<usize, MemoryError> {
     let issue_shaped = !slug.contains('/')
         && slug
             .rsplit_once('-')
@@ -624,7 +656,6 @@ pub(crate) fn prune_invocations(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
         Err(e) => return Err(e.into()),
     };
-    let now = std::time::SystemTime::now();
     let mut pruned = 0;
     for entry in entries {
         let entry = entry?;
@@ -638,11 +669,17 @@ pub(crate) fn prune_invocations(
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => return Err(e.into()),
         };
-        let old = meta
-            .modified()
-            .ok()
-            .and_then(|at| now.duration_since(at).ok())
-            .is_some_and(|age| age > older_than);
+        let old = match meta.modified().map_err(|e| e.to_string()).and_then(|at| {
+            now.duration_since(at)
+                .map_err(|e| format!("mtime is in the future: {e}"))
+        }) {
+            Ok(age) => age > older_than,
+            Err(error) => {
+                tracing::warn!(dir = %entry.path().display(), %error,
+                    "autopilot retained an invocation whose age cannot be established");
+                false
+            }
+        };
         if !meta.is_dir() || !old {
             continue;
         }
@@ -659,10 +696,26 @@ pub(crate) fn prune_invocations(
     Ok(pruned)
 }
 
+/// Diagnostic evidence only. Keep both ends when a verbose stderr exceeds
+/// its cap, so a refusal printed at startup or exit remains visible.
+fn read_head_tail(path: &str, limit: u64) -> Result<Vec<u8>, MemoryError> {
+    let mut file = open_existing(path, false)?;
+    let len = file.metadata()?.len();
+    let half = limit / 2;
+    let mut bytes = Vec::new();
+    (&mut file).take(half).read_to_end(&mut bytes)?;
+    if len > half {
+        file.seek(SeekFrom::Start(len.saturating_sub(half).max(half)))?;
+        file.take(half).read_to_end(&mut bytes)?;
+    }
+    Ok(bytes)
+}
+
 pub(crate) fn validate_spec<'a>(
     cli: &dyn SupervisedCli,
     spec: &'a DispatchSpec,
 ) -> Result<&'a InvocationArtifacts, MemoryError> {
+    spec.validate()?;
     if spec.implementer != cli.implementer() {
         return Err(validation(format!(
             "{} dispatch requires implementer {} and persisted invocation artifacts",
@@ -750,6 +803,9 @@ pub fn run_supervised(
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+// Additive fields intentionally fail closed on older binaries. Do not
+// downgrade with pending invocations; finish/clear using the writing version.
+// See docs/AUTOPILOT.md for the upgrade and recovery contract.
 struct ExitRecord {
     #[serde(default)]
     completion: Option<CompletionRecord>,
@@ -1037,6 +1093,43 @@ fn run_supervised_bounded_with(
     // least attempted. Either way a never-launched record could mask a live
     // invocation, so refuse with an error instead of writing one.
     let spawn_files = cli.spawn_files(spec, a);
+    let reserved: std::collections::HashSet<PathBuf> = [
+        &a.schema_path,
+        &a.journal_path,
+        &a.final_path,
+        &a.stderr_path,
+        &a.exit_path,
+    ]
+    .into_iter()
+    .map(PathBuf::from)
+    .chain(std::iter::once(super::process_tree::identity_path(a)))
+    .collect();
+    let parent = Path::new(&a.schema_path).parent();
+    let mut unique = std::collections::HashSet::new();
+    for file in &spawn_files {
+        if !unique.insert(&file.path) {
+            return Err(validation(format!(
+                "duplicate spawn file: {}",
+                file.path.display()
+            )));
+        }
+        if !parent.is_some_and(|dir| file.path.starts_with(dir))
+            || reserved.contains(&file.path)
+            || file.path.file_name().is_none()
+            || file.path.components().any(|c| {
+                matches!(
+                    c,
+                    std::path::Component::ParentDir | std::path::Component::CurDir
+                )
+            })
+        {
+            return Err(validation(format!(
+                "spawn file must be an invocation sibling disjoint from its evidence: {}",
+                file.path.display()
+            )));
+        }
+    }
+
     for path in std::iter::once(super::process_tree::identity_path(a))
         .chain(spawn_files.iter().map(|f| f.path.clone()))
     {
@@ -1127,7 +1220,7 @@ fn run_supervised_bounded_with(
     // Git subprocesses inside the harness must resolve this invocation's
     // checkout, rather than a controller's inherited repository-selection
     // overrides.
-    crate::mcp::tools::scrub_git_environment(&mut command);
+    crate::git_env::scrub_git_environment(&mut command);
     // Tests only: where the identity file is, so a stub can wait on the
     // tracker's own signal ([`contract_tests::await_first_sample`]) without
     // guessing the artifact layout.
@@ -1181,13 +1274,13 @@ fn run_supervised_bounded_with(
         return Err(with_cleanup(e, cleanup));
     }
     let mut timed_out = false;
-    let mut limit_exceeded;
+    let mut limit_exceeded = None;
     let mut last_observed: Option<Instant> = None;
     // The post-spawn write above counts: removals wait from it.
     let mut identity_written = Some(Instant::now());
     let status = loop {
         // The first pass scans immediately after spawn.
-        if last_observed.is_none_or(|at| at.elapsed() >= OBSERVE_INTERVAL) {
+        if last_observed.is_none_or(|at| at.elapsed() >= observation_interval(started.elapsed())) {
             // Record the root's birth and every newly enrolled descendant
             // as soon as either appears (exits follow lazily): a successor
             // of a crashed controller, and `clear-dispatch`, see only what
@@ -1204,8 +1297,8 @@ fn run_supervised_bounded_with(
                 return Err(with_cleanup(e, cleanup));
             }
             last_observed = Some(Instant::now());
+            limit_exceeded = limits(cli, a);
         }
-        limit_exceeded = limits(cli, a);
         if limit_exceeded.is_some() || started.elapsed() >= timeout {
             timed_out = limit_exceeded.is_none();
             let cleanup = tracker.cleanup(false);
@@ -1284,8 +1377,8 @@ fn create_spawn_files(files: &[SpawnFile]) -> Result<(), (&Path, std::io::Error)
 /// exited ([`record_live_identity`]).
 const IDENTITY_REMOVAL_INTERVAL: Duration = Duration::from_secs(5);
 
-/// [`record_identity`] for a supervision sample, which runs every
-/// [`OBSERVE_INTERVAL`]. A new root birth or a newly enrolled descendant
+/// [`record_identity`] for a supervision sample, at the adaptive
+/// [`observation_interval`]. A new root birth or a newly enrolled descendant
 /// (what a successor or `clear-dispatch` must know about) is written at
 /// once. A set that only lost descendants (build churn ends rustc, cc and
 /// ld on almost every sample) is written with the next enrolment or once
@@ -1303,10 +1396,15 @@ fn record_live_identity(
     if root_birth == identity.root_birth && descendants == identity.descendants {
         return Ok(());
     }
+    let old: std::collections::HashSet<_> = identity
+        .descendants
+        .iter()
+        .map(|d| (d.pid, d.ppid, d.pgid, d.birth, d.args.as_str()))
+        .collect();
     let enrolled = root_birth != identity.root_birth
         || descendants
             .iter()
-            .any(|d| !identity.descendants.iter().any(|old| old == d));
+            .any(|d| !old.contains(&(d.pid, d.ppid, d.pgid, d.birth, d.args.as_str())));
     if !enrolled && written.is_some_and(|at| at.elapsed() < IDENTITY_REMOVAL_INTERVAL) {
         return Ok(());
     }
@@ -1665,7 +1763,15 @@ fn read_artifacts_with(
     // is reported with the other errors rather than silently dropped.
     let (stderr, stderr_error) = match read_capped_bytes(&a.stderr_path, STDERR_LIMIT) {
         Ok(bytes) => (String::from_utf8_lossy(&bytes).into_owned(), None),
-        Err(e) => (String::new(), Some(e)),
+        Err(e) => match read_head_tail(&a.stderr_path, STDERR_LIMIT) {
+            Ok(bytes) => (String::from_utf8_lossy(&bytes).into_owned(), Some(e)),
+            Err(tail) => (
+                String::new(),
+                Some(validation(format!(
+                    "{e}; diagnostic excerpt unreadable: {tail}"
+                ))),
+            ),
+        },
     };
     observed_output |= !stderr.is_empty();
     // No errors implies a verdict (checked above), so this only ever drops a
@@ -1858,6 +1964,9 @@ pub(crate) fn settle_awaiting_quiet_with(
     {
         return Err(hold.reason);
     }
+    // This scan and the record rename are not atomic with arbitrary new
+    // processes entering the checkout. See docs/AUTOPILOT.md's bounded
+    // observation contract; this is not hostile fork containment.
     record.completion = record.awaiting_quiet.take().map(|w| w.completion);
     persist_exit(a, &record).map_err(|e| e.to_string())?;
     Ok(true)
@@ -1881,6 +1990,123 @@ mod tests {
     use super::contract_tests::THREAD;
     use super::*;
     use crate::autopilot::dispatch::{SessionMode, Verdict};
+
+    #[test]
+    fn ultrareview_retention_equality_and_future_mtime_are_retained() {
+        let dir = tempfile::tempdir().unwrap();
+        let candidate = dir
+            .path()
+            .join("ironmem/autopilot/o-r-1/11111111-2222-4333-8444-555555555555");
+        std::fs::create_dir_all(&candidate).unwrap();
+        let modified = std::fs::metadata(&candidate).unwrap().modified().unwrap();
+        assert_eq!(
+            prune_invocations_at(
+                dir.path(),
+                "o-r-1",
+                None,
+                INVOCATION_RETENTION,
+                modified + INVOCATION_RETENTION
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            prune_invocations_at(
+                dir.path(),
+                "o-r-1",
+                None,
+                INVOCATION_RETENTION,
+                modified - Duration::from_secs(1)
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            prune_invocations_at(
+                dir.path(),
+                "o-r-1",
+                None,
+                INVOCATION_RETENTION,
+                modified + INVOCATION_RETENTION + Duration::from_secs(1)
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn ultrareview_specs_refuse_invalid_shared_fields_before_spawn() {
+        let (_dir, base) = contract_tests::setup();
+        for invalid in 0..4 {
+            let mut spec = base.clone();
+            match invalid {
+                0 => spec.model.clear(),
+                1 => spec.model = "two words".into(),
+                2 => spec.max_turns = 0,
+                _ => spec.max_budget_usd = f64::NAN,
+            }
+            assert!(
+                validate_spec(&super::super::codex_dispatch::CodexCli, &spec).is_err(),
+                "{spec:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ultrareview_verdict_reasons_are_scrubbed_and_bounded_at_construction() {
+        let parsed = ParsedRun::with_verdict(
+            "session".into(),
+            FinalVerdict {
+                verdict: Verdict::Met,
+                reason: format!("Authorization: Basic dTpwYXNz {}", "x".repeat(10000)),
+            },
+            1,
+            true,
+        );
+        let reason = &parsed.verdict().unwrap().reason;
+        assert!(reason.chars().count() <= 500);
+        assert!(!reason.contains("dTpwYXNz"));
+    }
+
+    #[test]
+    fn ultrareview_overlong_stderr_preserves_session_refusal_tail() {
+        let (_dir, mut spec) = contract_tests::setup();
+        spec.implementer = Implementer::Muse;
+        let a = spec.invocation_artifacts.as_ref().unwrap();
+        let sid = "11111111-2222-4333-8444-555555555555";
+        std::fs::write(
+            &a.exit_path,
+            serde_json::to_vec(&serde_json::json!({
+                "exit_code":1,"timed_out":false,"limit_exceeded":null,"expected_native_id":sid
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            &a.stderr_path,
+            format!(
+                "{}\nsession {sid} is already in use",
+                "x".repeat(STDERR_LIMIT as usize + 1)
+            ),
+        )
+        .unwrap();
+        let outcome = read_artifacts(Implementer::Muse, a).unwrap();
+        assert_eq!(
+            outcome.session_refusal,
+            Some(super::super::dispatch::SessionRefusal::InUse)
+        );
+        assert!(outcome.is_error && !outcome.is_met());
+    }
+
+    #[test]
+    fn ultrareview_launch_window_equality() {
+        let (_dir, spec) = contract_tests::setup();
+        let a = spec.invocation_artifacts.as_ref().unwrap();
+        let now = std::time::SystemTime::now();
+        for offset in [now - LAUNCH_WINDOW, now + LAUNCH_WINDOW] {
+            assert!(launch_pending_at(a, now, || Ok(offset)).is_none());
+        }
+    }
 
     #[test]
     fn claude_has_no_supervised_cli() {
@@ -2538,7 +2764,7 @@ exit {code}"#
             .stdout(Stdio::from(open_existing(&a.journal_path, true).unwrap()))
             .stderr(Stdio::from(open_existing(&a.stderr_path, true).unwrap()))
             .process_group(0);
-        crate::mcp::tools::scrub_git_environment(&mut command);
+        crate::git_env::scrub_git_environment(&mut command);
         let child = super::super::dispatch::retry_on_etxtbsy(|| command.spawn()).unwrap();
         super::super::process_tree::persist_identity(
             a,
@@ -4671,14 +4897,10 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
         assert_eq!(std::fs::read(&file.path).unwrap(), file.contents);
     }
 
-    /// A spawn file that appears between the prior-spawn check and its own
-    /// creation was made by someone else: another supervisor handed the
-    /// same invocation may already have a child running. A never-launched
-    /// record would tell recovery that invocation is idle, so the core
-    /// refuses with an error instead, writing no record. The fake lists one
-    /// file twice, so its second creation meets the first.
+    /// A duplicate harness file set is invalid before any creation, so it
+    /// neither leaves a partial prompt nor publishes a never-launched record.
     #[test]
-    fn a_spawn_file_that_appears_after_the_check_holds_without_a_record() {
+    fn duplicate_spawn_files_are_refused_before_creation_without_a_record() {
         let (dir, s) = setup();
         let a = s.invocation_artifacts.as_ref().unwrap();
         let cli = FakeCli {
@@ -4696,11 +4918,15 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
         .unwrap_err()
         .to_string();
         assert!(
-            err.contains("prompt.txt") && err.contains("already exists"),
+            err.contains("prompt.txt") && err.contains("duplicate spawn file"),
             "{err}"
         );
         assert_eq!(std::fs::metadata(&a.exit_path).unwrap().len(), 0);
         assert!(!has_launch_failure_record(a));
+        assert!(
+            !fake_prompt(a).exists(),
+            "invalid file sets must be rejected before any creation"
+        );
     }
 
     /// The core omits its generic session mismatch only when the parse

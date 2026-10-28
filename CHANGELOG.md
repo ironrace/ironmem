@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking storage requirement:** Autopilot `lead`, `run` and
+  `clear-dispatch` refuse known remote repository common directories and
+  databases. Move both to local disk before upgrading. Linux FUSE whose
+  subtype cannot be read is refused too. See `docs/AUTOPILOT.md` for platform
+  limits and recovery.
+- **Breaking Rust API changes:** `clear_dispatch` returns the untagged
+  `Cleared` enum; Rust `codex_artifacts` fields on `ClearedDispatch`,
+  `DispatchState` and `DispatchSpec` are now `invocation_artifacts` (the
+  serialized `codex_artifacts` key stays stable). `DispatchOutcome` adds
+  `session_refusal`. Snapshot `Available` variants cannot be constructed
+  externally; `HarnessSnapshots` and `SharedDaemon` fields are crate-private.
+  Use the snapshot/daemon collection APIs. Deprecated Codex aliases are
+  scheduled for removal in **0.7.0**.
+- Pending invocation exit records have additive strict fields that older
+  readers reject and hold. Finish or clear pending runs with this version
+  before downgrading. Journals/prompts/stderr retain raw tool output; old,
+  unnamed invocation directories are opportunistically pruned after 14 days,
+  keeping the named/current invocation. This is not a guaranteed deletion time.
+
 ### Added
 
 - **Muse Code as an Autopilot implementer (#366).** `autopilot run` and
@@ -59,6 +80,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it as "nothing running" in `clear-dispatch`.
 
 ### Fixed
+
+- Per-issue kernel locks coordinate Lead/run, review/merge and cleanup within
+  one clone/host. Held locks skip/refuse with their path; kernel exit releases
+  them. Never unlink lock files. Remote/shared-clone and suspension limits are
+  documented in `docs/AUTOPILOT.md`.
+- Dispatch drains have a five-second post-exit bound; executable resolution
+  fails closed and refreshes vanished paths. Budget reservations deduplicate
+  retries and validate stored amounts. Unknown dispatch phases defer.
+- Reviewer scratch/prompts are private; reviewer credentials are removed from
+  the child environment. HTTP Basic credentials are scrubbed from summaries.
+  Muse reviewer OS confinement remains an explicit risk in `docs/AUTOPILOT.md`.
+- Supervision read/update operations are transactional; busy immediate COMMITs
+  retry without replaying mutations. Process enrolment uses a parent index,
+  identity comparisons use sets, long-run observation slows down, and teardown
+  polls back off. Authentication captures remain fresh.
+
 
 - **More git lookups ignore an inherited `GIT_DIR` reliably.** The session
   hooks' workspace branch and repository-name lookup and `ironmem review-diff`
@@ -250,7 +287,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the `codex_process` module is `process_tree`, where `parse_codex_processes`,
   `CodexProcessSnapshot`, `CodexProcessSource` and `UnixCodexProcesses` are
   `parse_processes`, `ProcessSnapshot`, `ProcessSource` and `UnixProcesses`.
-  The old names stay, deprecated, for one release. These changes have no alias
+  The old names stay, deprecated, until 0.7.0. These changes have no alias
   and break a caller at compile time: the `codex_artifacts` field of
   `DispatchSpec`, `DispatchState` and `ClearedDispatch` is
   `invocation_artifacts` (the stored and `--json` key is still

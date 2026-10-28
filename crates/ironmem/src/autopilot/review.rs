@@ -544,6 +544,21 @@ struct ScratchDir {
 impl ScratchDir {
     fn create() -> Result<Self, MemoryError> {
         let path = std::env::temp_dir().join(format!("ironmem-review-{}", uuid::Uuid::new_v4()));
+        // Owner-only: the files inside hold the issue text and the diff.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&path)
+                .map_err(|e| {
+                    MemoryError::Config(format!(
+                        "cannot create reviewer scratch dir {}: {e}",
+                        path.display()
+                    ))
+                })?;
+        }
+        #[cfg(not(unix))]
         std::fs::create_dir_all(&path).map_err(|e| {
             MemoryError::Config(format!(
                 "cannot create reviewer scratch dir {}: {e}",
@@ -635,6 +650,14 @@ fn spawn_bounded(
     stdin: Option<std::fs::File>,
 ) -> Result<BoundedRun, MemoryError> {
     let mut command = std::process::Command::new(bin);
+    // The reviewer judges a local diff; it never needs the controller's
+    // GitHub token or SSH agent, and a prompt-injected reviewer must not
+    // inherit them. Its own harness credentials (config files, API keys)
+    // are untouched.
+    command
+        .env_remove("GH_TOKEN")
+        .env_remove("GITHUB_TOKEN")
+        .env_remove("SSH_AUTH_SOCK");
     command
         .args(args)
         .current_dir(repo_dir)
@@ -1453,7 +1476,9 @@ pub fn run_muse_review_bounded(
 ) -> Result<ReviewOutcome, MemoryError> {
     let scratch = ScratchDir::create()?;
     let prompt_path = scratch.path.join("review-prompt.txt");
-    std::fs::write(&prompt_path, &prompt).map_err(|e| {
+    // Owner-only, as the Codex path's prompt: it holds the issue and the
+    // diff, which may themselves carry secrets.
+    write_private(&prompt_path, prompt.as_bytes()).map_err(|e| {
         MemoryError::Config(format!(
             "cannot write reviewer prompt to {}: {e}",
             prompt_path.display()

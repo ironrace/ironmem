@@ -159,7 +159,12 @@ fn git_commands_unscrubbed_by(source: &str, scrubs: &[&str]) -> Vec<usize> {
     lines
         .iter()
         .enumerate()
-        .filter(|(_, line)| !is_comment(line) && line.contains("Command::new(\"git\")"))
+        .filter(|(_, line)| {
+            !is_comment(line)
+                && (line.contains("Command::new(\"git\")")
+                    || (line.contains("Command::new(")
+                        && line.contains("cached_launcher(\"git\")")))
+        })
         .filter(|(at, line)| {
             let Some(name) = mutable_binding(line) else {
                 return true;
@@ -200,15 +205,13 @@ fn every_git_command_is_scrubbed_by_the_one_shared_scrub() {
         unscrubbed.join("\n")
     );
     // A local function of the same name would satisfy the scan above while
-    // scrubbing less: the one in `mcp::tools` removes the redirecting
+    // scrubbing less: the one in `crate::git_env` removes the redirecting
     // variables unconditionally, which a sweep of what is set at build time
     // does not.
     assert_eq!(
         definitions,
-        vec![crate_dir("src/mcp/tools/collab_session.rs")
-            .display()
-            .to_string()],
-        "`scrub_git_environment` must be defined once, in mcp::tools"
+        vec![crate_dir("src/git_env.rs").display().to_string()],
+        "`scrub_git_environment` must be defined once, in crate::git_env"
     );
 }
 
@@ -329,7 +332,7 @@ fn the_scans_find_what_they_look_for() {
          Command::new(\"git\").arg(\"x\").output();\n\
          scrub_git_environment(&mut b);\n\
          let mut c = std::process::Command::new(\"git\");\n\
-         crate::mcp::tools::scrub_git_environment(&mut c);\n",
+         crate::git_env::scrub_git_environment(&mut c);\n",
     );
     assert_eq!(unscrubbed, vec![1, 4]);
     // The integration tests' scrubs count there, and only there.
@@ -372,5 +375,20 @@ fn the_integration_tests_scrub_the_same_redirecting_variables() {
         .map(|(list, _)| list)
         .expect("a REDIRECTING_GIT_VARS array");
     let copied: Vec<&str> = list.split('"').skip(1).step_by(2).collect();
-    assert_eq!(copied, crate::mcp::tools::REDIRECTING_GIT_VARS);
+    assert_eq!(copied, crate::git_env::REDIRECTING_GIT_VARS);
+}
+
+#[test]
+fn ultrareview_cached_git_constructors_require_the_matching_scrub() {
+    assert_eq!(
+        unscrubbed_git_commands(
+            "let mut git = Command::new(crate::launcher::cached_launcher(\"git\"));\n"
+        ),
+        vec![1]
+    );
+    assert!(unscrubbed_git_commands(
+        "let mut git = Command::new(crate::launcher::cached_launcher(\"git\"));\n\
+         crate::git_env::scrub_git_environment(&mut git);\n"
+    )
+    .is_empty());
 }

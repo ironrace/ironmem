@@ -298,12 +298,11 @@ pub enum Liveness {
 /// One reading of the whole registry.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RegistrySnapshot {
+    #[non_exhaustive]
     Available(Vec<AgentEntry>),
     /// The registry could not be read. Carries why, so a held reconciliation
     /// can say what it is waiting on rather than reporting a bare "unknown".
-    Unavailable {
-        reason: String,
-    },
+    Unavailable { reason: String },
 }
 
 impl RegistrySnapshot {
@@ -389,8 +388,8 @@ pub trait LivenessSnapshot {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct HarnessSnapshots {
-    pub claude: RegistrySnapshot,
-    pub processes: ProcessSnapshot,
+    pub(crate) claude: RegistrySnapshot,
+    pub(crate) processes: ProcessSnapshot,
 }
 impl HarnessSnapshots {
     pub fn is_available(&self, implementer: Implementer) -> bool {
@@ -552,7 +551,7 @@ pub(crate) fn invocation_state_liveness_with(
     daemon: fn() -> Option<crate::autopilot::process_tree::SharedDaemon>,
     pids: crate::autopilot::process_tree::ScanPids<'_>,
 ) -> Liveness {
-    // F13: artifacts proven outside the worktree's common directory are
+    // artifacts proven outside the worktree's common directory are
     // not this issue's invocation to judge, however the process table
     // reads. A common directory that cannot be resolved at all (the
     // worktree is gone, or was never a checkout) proves nothing either
@@ -717,7 +716,9 @@ pub struct HarnessProcessMonitor {
     processes: super::process_tree::UnixProcesses,
 }
 /// The monitor's name from when it watched two harnesses.
-#[deprecated(note = "renamed to `HarnessProcessMonitor`; it watches every harness")]
+#[deprecated(
+    note = "renamed to `HarnessProcessMonitor`; it watches every harness; removal in 0.7.0"
+)]
 pub type TwoHarnessMonitor = HarnessProcessMonitor;
 
 impl HarnessProcessMonitor {
@@ -846,7 +847,7 @@ mod tests {
         }
     }
 
-    /// F19: a config that fails to load exempts no daemon, and the hold
+    /// a config that fails to load exempts no daemon, and the hold
     /// says why.
     #[test]
     fn a_config_that_fails_to_load_is_named_in_the_quiet_hold() {

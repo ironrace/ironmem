@@ -1,3 +1,7 @@
+//! On a harness upgrade, re-measure argv/options, session refusal wording,
+//! and journal/usage/terminal shapes before updating the pinned version. Run
+//! the real-argv marker cross-test and parser fixtures; paid probes require
+//! operator approval. See docs/agent-guides/pr367-ultrareview.md.
 //! Muse Code (`muse exec`) as a supervised implementation harness: its
 //! argv, prompt file, child environment and JSONL journal parsing.
 //! Supervision itself lives in [`super::invocation`].
@@ -590,6 +594,31 @@ mod tests {
         "--workspace",
         "--approval-mode",
     ];
+
+    #[test]
+    fn ultrareview_invalid_usage_counts_leave_the_last_integer_standing() {
+        for count in [
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!("7"),
+        ] {
+            let odd = record(
+                "exec.usage",
+                SID,
+                serde_json::json!({"kind":"run_usage", "completed_calls":count}),
+            );
+            let met = terminal("completed", r#"{"verdict":"met","reason":"ok"}"#);
+            for (prior, expected) in [(String::new(), 0), (usage(3), 3)] {
+                let parsed = MuseCli.parse(
+                    &format!("{prior}\n{odd}\n{met}"),
+                    Ok(String::new()),
+                    Some(SID),
+                );
+                assert_eq!(parsed.turns(), expected);
+                assert!(parsed.errors().is_empty(), "{:?}", parsed.errors());
+            }
+        }
+    }
 
     #[test]
     fn new_and_resumed_invocations_use_the_same_measured_argv() {

@@ -71,3 +71,7 @@ pub mod harness;
 
 /// Canonical crate error type used by CLI, MCP, and storage layers.
 pub use error::MemoryError;
+
+pub(crate) mod git_env;
+#[cfg(test)]
+pub(crate) mod test_git;

@@ -103,6 +103,12 @@ impl DispatchState {
     /// written before the first launch and by several pauses, and liveness
     /// then judges it on the process table alone.
     pub fn validate(&self) -> Result<(), MemoryError> {
+        if self.session_claimed && self.session_uuid.trim().is_empty() {
+            return Err(MemoryError::Validation(format!(
+                "the dispatch state for {} claims a session but names no session uuid",
+                self.issue.canonical()
+            )));
+        }
         if self.implementer == Implementer::Claude && self.invocation_artifacts.is_some() {
             return Err(MemoryError::Validation(format!(
                 "the dispatch state for {} is a Claude state carrying supervised-CLI invocation \
@@ -110,7 +116,7 @@ impl DispatchState {
                 self.issue.canonical()
             )));
         }
-        // F13: artifacts a state names must be the layout
+        // artifacts a state names must be the layout
         // `prepare_artifacts` makes for this issue, or recovery would
         // read and settle whatever files a forged drawer points at.
         if let Some(artifacts) = &self.invocation_artifacts {
@@ -222,9 +228,20 @@ impl Claim {
     }
 
     /// Whether its lease still keeps another run from adopting it: not
-    /// parked, and claimed less than [`CLAIM_LEASE`] ago.
+    /// parked, and claimed less than [`CLAIM_LEASE`] ago. A present but
+    /// unparseable `claimed_at` also holds the lease: malformed input
+    /// fails closed (held), never open (adoptable).
     pub fn leased(&self, now: chrono::DateTime<chrono::Utc>) -> bool {
-        !self.state.is_parked() && self.age(now).is_some_and(|age| age < CLAIM_LEASE)
+        if self.state.is_parked() {
+            return false;
+        }
+        match &self.claimed_at {
+            None => false,
+            Some(raw) => match chrono::DateTime::parse_from_rfc3339(raw) {
+                Ok(_) => self.age(now).is_some_and(|age| age < CLAIM_LEASE),
+                Err(_) => true,
+            },
+        }
     }
 
     /// Its claim time for a message, keeping the direction [`Claim::age`]
@@ -342,6 +359,14 @@ fn content_of(state: &DispatchState) -> Result<String, MemoryError> {
 fn content_of_claim(claim: &Claim) -> Result<String, MemoryError> {
     let state = &claim.state;
     state.validate()?;
+    if let Some(common_dir) = &claim.common_dir {
+        if !std::path::Path::new(common_dir).is_absolute() {
+            return Err(MemoryError::Validation(format!(
+                "the claim for {} names a non-absolute common directory",
+                state.issue.canonical()
+            )));
+        }
+    }
     let body = DispatchStateBody {
         implementer: state.implementer,
         native_session_id: state.native_session_id.clone(),
@@ -793,6 +818,15 @@ mod tests {
         assert!(claim.leased(now));
         claim.claimed_at = Some((now - chrono::Duration::seconds(121)).to_rfc3339());
         assert!(!claim.leased(now), "lapsed");
+        claim.claimed_at = Some((now - chrono::Duration::seconds(119)).to_rfc3339());
+        assert!(claim.leased(now), "one second inside the lease");
+        claim.claimed_at = Some((now - chrono::Duration::seconds(120)).to_rfc3339());
+        assert!(
+            !claim.leased(now),
+            "exactly at the lease boundary it has lapsed"
+        );
+        claim.claimed_at = Some("not-a-time".into());
+        assert!(claim.leased(now), "a malformed stamp holds, never adopts");
         claim.claimed_at = Some((now + chrono::Duration::seconds(30)).to_rfc3339());
         assert!(claim.leased(now), "a near future time is within the lease");
         claim.claimed_at = Some((now + chrono::Duration::seconds(3600)).to_rfc3339());
@@ -820,7 +854,7 @@ mod tests {
         );
     }
 
-    /// F47/F48: a conditional clear waits out another connection's write
+    /// a conditional clear waits out another connection's write
     /// lock instead of failing with `SQLITE_BUSY` on its read-then-delete.
     #[test]
     fn a_conditional_clear_waits_for_a_concurrent_writer() {
@@ -900,7 +934,7 @@ mod tests {
         assert_eq!(DispatchPhase::parse("in_progress"), None);
     }
 
-    /// F13: a supervised state whose artifacts are not the layout
+    /// a supervised state whose artifacts are not the layout
     /// `prepare_artifacts` makes is refused at validate, so it reads as
     /// unreadable rather than pointing recovery at arbitrary files.
     #[test]
@@ -1218,7 +1252,7 @@ mod tests {
         );
     }
 
-    /// R7: a scan keeps each readable drawer's raw bytes with its parsed
+    /// a scan keeps each readable drawer's raw bytes with its parsed
     /// claim, so a caller can clear against exactly what it judged.
     #[test]
     fn a_scan_keeps_the_raw_bytes_of_each_claim_it_reads() {

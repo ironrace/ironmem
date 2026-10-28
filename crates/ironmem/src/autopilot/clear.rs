@@ -129,7 +129,7 @@ pub(crate) fn clear_dispatch_with(
         }
     };
     // A Claude claim still within its lease may be a run between its
-    // claim and its launch, showing no process yet (R8): not cleared,
+    // claim and its launch, showing no process yet: not cleared,
     // lock or no lock. A supervised CLI's invocation is itself the
     // evidence below, so its lease does not refuse.
     if !state.implementer.recovers_invocations() {
@@ -545,7 +545,7 @@ pub fn release_settled_dispatches(
     let mut released = Vec::new();
     // Judged as scanned (raw bytes plus parsed claim), and cleared
     // against those same bytes: a claim rewritten since, identically
-    // but for its owner, is a live run's, not this release's (R7).
+    // but for its owner, is a live run's, not this release's.
     let scan = dispatch_state::scan_dispatch_states(db, super::queue::IN_FLIGHT_SCAN_LIMIT)?;
     for (raw, claim) in &scan.claims {
         let state = &claim.state;
@@ -585,12 +585,25 @@ pub fn release_settled_dispatches(
         // only while no controller holds the issue: one that does may be
         // about to launch.
         let parsed = dispatch_state::Parsed::Readable(Box::new(state.clone()));
-        let Ok(_lock) = controller_lock(&state.issue, &parsed, raw) else {
-            continue;
+        let _lock = match controller_lock(&state.issue, &parsed, raw) {
+            Ok(lock) => lock,
+            Err(why) => {
+                // Held is benign (retry next pass); a lock that cannot
+                // even be checked would silently pin this slot forever,
+                // so it is named.
+                if !why.starts_with("a controller is running this issue") {
+                    tracing::warn!(
+                        issue = %state.issue.canonical(),
+                        reason = %why,
+                        "autopilot cannot check the issue's lock, so its finished dispatch state is not released"
+                    );
+                }
+                continue;
+            }
         };
         if dispatch_state::clear_raw_dispatch_state_if_unchanged(db, &state.issue, raw)? {
             released.push(state.issue.clone());
-            // F52: the released invocation's directory is evidence; older
+            // the released invocation's directory is evidence; older
             // ones past retention go. Best effort, as in run's clear.
             if let Some(common) = &claim.common_dir {
                 let keep = state
@@ -759,7 +772,7 @@ mod tests {
             .contains("no dispatch state"));
     }
 
-    /// R8: a claim still within its lease is not cleared, lock or no
+    /// a claim still within its lease is not cleared, lock or no
     /// lock: its run may be between its claim and its launch.
     #[test]
     fn a_leased_claim_is_not_cleared() {
@@ -910,7 +923,7 @@ mod tests {
             .is_none());
     }
 
-    /// R7: release judges the claim the scan read, owner token included,
+    /// release judges the claim the scan read, owner token included,
     /// and gives back a settled owned claim's slot.
     #[test]
     fn release_gives_back_a_settled_owned_claim() {
@@ -936,7 +949,7 @@ mod tests {
             .is_none());
     }
 
-    /// F52: releasing a settled claim prunes the issue's invocation
+    /// releasing a settled claim prunes the issue's invocation
     /// directories past retention under its common directory, keeping
     /// the released one.
     #[test]
@@ -1532,7 +1545,7 @@ mod tests {
         body.to_string()
     }
 
-    /// F41: the unreadable path's other refusals and releases, each pinned.
+    /// the unreadable path's other refusals and releases, each pinned.
     #[test]
     fn an_unreadable_dispatch_state_is_judged_on_every_field_it_still_names() {
         let nothing = || -> Result<Vec<u32>, String> { Ok(Vec::new()) };
@@ -1603,7 +1616,7 @@ mod tests {
         assert!(err.contains("process 99 names its IC session"), "{err}");
     }
 
-    /// F42: a worktree that cannot be read is no proof it is empty.
+    /// a worktree that cannot be read is no proof it is empty.
     #[cfg(unix)]
     #[test]
     fn an_unreadable_dispatch_state_whose_worktree_cannot_be_read_is_kept() {
@@ -1668,7 +1681,7 @@ mod tests {
         }
     }
 
-    /// C-I1: an adopting run's claim, identical but for its owner, written
+    /// an adopting run's claim, identical but for its owner, written
     /// after clear-dispatch read the state, is never deleted.
     #[test]
     fn clear_dispatch_never_deletes_a_claim_a_run_made_since_it_read() {
@@ -1693,7 +1706,7 @@ mod tests {
         );
     }
 
-    /// C-I1: the claim names the common directory, so the lock is taken even
+    /// the claim names the common directory, so the lock is taken even
     /// once the worktree is gone.
     #[test]
     fn clear_dispatch_takes_the_lock_through_the_claims_common_dir() {
@@ -1709,7 +1722,7 @@ mod tests {
         readable(clear_dispatch(&db, &issue(), || snapshots(Vec::new())));
     }
 
-    /// C-I1, G-M9: release gives a slot back only for the exact claim judged,
+    /// C-I1, release gives a slot back only for the exact claim judged,
     /// never while a controller holds the issue, never while a process names
     /// its Claude IC, and never for a session parked as in use.
     #[test]

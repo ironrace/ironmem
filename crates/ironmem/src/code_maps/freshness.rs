@@ -60,7 +60,7 @@ fn changed_files(repo_root: &Path, build_sha: &str) -> Result<Vec<String>, Strin
     // against the wrong repository would report freshness about work this map
     // was never built from.
     let mut command = std::process::Command::new("git");
-    crate::mcp::tools::scrub_git_environment(&mut command);
+    crate::git_env::scrub_git_environment(&mut command);
     let output = command
         .args(["-c", "core.quotepath=false", "diff", "--name-only", &range])
         .current_dir(repo_root)

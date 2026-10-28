@@ -405,6 +405,8 @@ impl PartialEq<str> for CommitSha {
 }
 
 /// A provisioned worktree, ready to dispatch an IC into.
+/// Library callers must obtain it from `ensure_worktree`: public fields are
+/// a trusted integration seam, not a validated deserialization boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Worktree {
     /// Absolute path to the checkout.
@@ -452,7 +454,7 @@ fn git_command() -> Command {
     // PATH entry in the worktree; the scan in `git_env_scan` cannot see
     // a held program name, so the scrub is spelled out here as there.
     let mut command = Command::new(crate::launcher::cached_launcher("git"));
-    crate::mcp::tools::scrub_git_environment(&mut command);
+    crate::git_env::scrub_git_environment(&mut command);
     command.args(["-c", "core.fsmonitor=false"]);
     command
 }
@@ -1054,10 +1056,10 @@ fn held_lock_error(
     modified: std::io::Result<std::time::SystemTime>,
 ) -> MemoryError {
     let held = match modified {
-        Ok(modified) => {
-            let age = modified.elapsed().map_or(0, |age| age.as_secs());
-            format!("has been held for {age}s")
-        }
+        Ok(modified) => match modified.elapsed() {
+            Ok(age) => format!("has been held for {}s", age.as_secs()),
+            Err(e) => format!("is held (its age cannot be read: {e})"),
+        },
         // Gone by now: whoever held it let go after the retries ran out.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return MemoryError::Validation(format!(
@@ -1491,12 +1493,15 @@ fn take_back_cut(root: &Path, branch: &str, cut: &str, owner: &str) -> String {
         );
     }
     // Only this call's token: one written since is kept.
-    let _ = config_waiting(
+    if let Err(error) = config_waiting(
         root,
         &["config", "--unset", &owner_key, &format!("^{owner}$")],
         &[5],
         |_| {},
-    );
+    ) {
+        tracing::warn!(branch, owner_key, %error, "autopilot could not remove the cut owner record");
+        return format!("the branch was not created and its cut was taken back, but its owner record could not be removed ({error}); it is replaced on the next create");
+    }
     match branch_tip(root, branch) {
         Ok(None) => "the branch was not created and its cut was taken back".to_string(),
         Ok(Some(tip)) if tip == cut => match record_cut_again_if_taken(root, branch, cut) {
@@ -1733,7 +1738,22 @@ fn quarantine(repo_root: &Path, path: &Path) -> Result<PathBuf, MemoryError> {
             path.display()
         ))
     })?;
-    let destination = path.with_file_name(format!("{file_name}.{QUARANTINE_INFIX}-{timestamp}"));
+    let mut destination =
+        path.with_file_name(format!("{file_name}.{QUARANTINE_INFIX}-{timestamp}"));
+    // git worktree move can move *inside* an existing directory. Never let
+    // a second quarantine change an earlier evidence directory's contents.
+    loop {
+        match std::fs::symlink_metadata(&destination) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+            Err(e) => return Err(e.into()),
+            Ok(_) => {
+                destination = path.with_file_name(format!(
+                    "{file_name}.{QUARANTINE_INFIX}-{timestamp}-{}",
+                    uuid::Uuid::new_v4()
+                ))
+            }
+        }
+    }
     let destination_str = destination.to_string_lossy().to_string();
     let path_str = path.to_string_lossy().to_string();
 
@@ -3287,6 +3307,34 @@ mod tests {
     }
 
     #[test]
+    fn ultrareview_quarantine_preserves_an_existing_destination() {
+        let repo = fixture_repo();
+        let roots = tempfile::tempdir().unwrap();
+        let wt = ensure_worktree(repo.path(), roots.path(), &issue(), "HEAD").unwrap();
+        let now = chrono::Utc::now();
+        for offset in -2..=30 {
+            let stamp = (now + chrono::Duration::seconds(offset)).format("%Y%m%dT%H%M%SZ");
+            let dest = wt.path.with_file_name(format!(
+                "{}.quarantine-{stamp}",
+                wt.path.file_name().unwrap().to_str().unwrap()
+            ));
+            std::fs::create_dir(&dest).unwrap();
+            std::fs::write(dest.join("keep"), "prior evidence").unwrap();
+        }
+        let moved = quarantine(repo.path(), &wt.path).unwrap();
+        assert!(moved.is_dir());
+        for entry in std::fs::read_dir(roots.path()).unwrap() {
+            let entry = entry.unwrap();
+            if entry.path().join("keep").exists() {
+                assert_eq!(
+                    std::fs::read_to_string(entry.path().join("keep")).unwrap(),
+                    "prior evidence"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn ensure_worktree_quarantines_a_dirty_checkout_and_provisions_a_clean_one() {
         let repo = fixture_repo();
         let roots = tempfile::tempdir().unwrap();
@@ -3538,7 +3586,7 @@ mod tests {
         let mut command = Command::new("sh");
         command.env("GIT_DIR", "/decoy/.git");
         command.env("GIT_WORK_TREE", "/decoy");
-        crate::mcp::tools::scrub_git_environment(&mut command);
+        crate::git_env::scrub_git_environment(&mut command);
         let out = command
             .args(["-c", "echo \"${GIT_DIR:-unset}/${GIT_WORK_TREE:-unset}\""])
             .output()
@@ -3896,6 +3944,19 @@ mod tests {
         .to_string();
         assert!(failure.contains(&branch_name(&issue())), "{failure}");
         assert!(!failure.contains("hunter2pass"), "{failure}");
+    }
+
+    #[test]
+    fn a_future_lock_age_is_unknown() {
+        let err = held_lock_error(
+            "could not lock config file",
+            Path::new("/repo/.git/config.lock"),
+            Path::new("/repo"),
+            Ok(std::time::SystemTime::now() + std::time::Duration::from_secs(3600)),
+        )
+        .to_string();
+        assert!(err.contains("cannot be read"), "{err}");
+        assert!(!err.contains("held for 0s"), "{err}");
     }
 
     #[test]

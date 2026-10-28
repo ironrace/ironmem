@@ -898,6 +898,32 @@ fn advance_issue(
         } => (*pr_number, head_sha.clone(), *gate_green),
     };
 
+    // Review and merge read and judge the live issue worktree, so they
+    // run under the issue's lock, held from here to the end of the step:
+    // a Lead dispatching into that worktree concurrently would make the
+    // reviewed tree differ from the pinned head the review is recorded
+    // against. Held means another controller owns the issue; this pass
+    // leaves it for the next one.
+    let mut _issue_lock = if config.dry_run {
+        None
+    } else {
+        match super::issue_lock::try_lock_issue(&candidate.repo_path, &candidate.issue) {
+            Ok(super::issue_lock::IssueLockAttempt::Acquired(lock)) => Some(lock),
+            Ok(super::issue_lock::IssueLockAttempt::Held { .. }) => {
+                return Ok(Advanced {
+                    issue: candidate.issue.clone(),
+                    dispatch_class: class,
+                    step,
+                    review: None,
+                    remediation: None,
+                    merge: None,
+                    cleanup: None,
+                });
+            }
+            Err(e) => return Err(e),
+        }
+    };
+
     let mut review = None;
     if let AdvanceStep::Review { base_branch, .. } = &step {
         if config.dry_run {
@@ -1052,6 +1078,9 @@ fn advance_issue(
             dry_run: merge_dry_run,
         },
     )?;
+
+    // Released before cleanup, which takes the same lock itself.
+    drop(_issue_lock.take());
 
     // Only for a PR that has actually landed, and never during a rehearsal.
     let cleanup = if execution.outcome.landed() && !merge_dry_run {
@@ -1284,9 +1313,16 @@ fn clean_up(db: &Database, candidate: &Candidate, config: &AdvanceConfig) -> Cle
         Err(e) => {
             return Cleanup {
                 dispatch_state_cleared: false,
-                worktree: WorktreeRemoval::Absent,
+                // Nothing was inspected, let alone removed: Skipped, the
+                // variant that says a worktree may remain. Absent would
+                // claim the checkout is gone.
+                worktree: WorktreeRemoval::Skipped {
+                    path: worktree::worktree_path(&config.worktree_root, &candidate.issue)
+                        .to_string_lossy()
+                        .into_owned(),
+                },
                 error: Some(format!("cleanup skipped: the issue's lock: {e}")),
-            }
+            };
         }
     };
     let mut error = None;
@@ -2049,7 +2085,7 @@ mod tests {
             "{:?}",
             cleanup.error
         );
-        // R11: skipped is its own outcome, naming the worktree left
+        // skipped is its own outcome, naming the worktree left
         // behind and how to remove it, so a later pass can retry it.
         let expected = worktree::worktree_path(roots.path(), &issue());
         assert!(
@@ -2226,6 +2262,77 @@ mod tests {
             }
             other => panic!("expected a stall, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn ultrareview_review_respects_and_holds_the_issue_lock() {
+        let db = approved_db();
+        let (repo, roots) = checkout_with_worktree();
+        let candidate = Candidate {
+            issue: issue(),
+            issue_title: "test".into(),
+            repo_path: repo.path().into(),
+            risk_label: None,
+            green_commit_sha: Some(GREEN.into()),
+        };
+        let cfg = config(roots.path(), repo.path());
+        let held = super::super::issue_lock::lock_for_run(repo.path(), &issue()).unwrap();
+        let mut gh = ScriptedGh::new(vec![ok(&pr_list_json(322, GREEN))]);
+        let result = advance_issue(&db, &mut gh, &mut ForbiddenReviewer, &candidate, &cfg).unwrap();
+        assert!(result.review.is_none() && result.merge.is_none());
+        drop(held);
+        struct InspectLock(std::path::PathBuf);
+        impl ReviewRunner for InspectLock {
+            fn review(&mut self, _: &Path, _: &str) -> Result<ReviewOutcome, MemoryError> {
+                assert!(matches!(
+                    super::super::issue_lock::try_lock_issue(&self.0, &issue()).unwrap(),
+                    super::super::issue_lock::IssueLockAttempt::Held { .. }
+                ));
+                Ok(ReviewOutcome {
+                    process_success: false,
+                    reason: Some("lock probe ends review".into()),
+                    ..StubReviewer::passing().outcome
+                })
+            }
+        }
+        let mut gh = ScriptedGh::new(vec![
+            ok(&pr_list_json(322, GREEN)),
+            ok(&pr_view_json(GREEN)),
+        ]);
+        let result = advance_issue(
+            &db,
+            &mut gh,
+            &mut InspectLock(repo.path().into()),
+            &candidate,
+            &cfg,
+        )
+        .unwrap();
+        let review = result.review.unwrap();
+        assert!(!review.outcome.process_success);
+        assert!(review.outcome.reason.unwrap().contains("lock probe"));
+        assert!(matches!(
+            result.merge.unwrap().outcome,
+            merge::MergeOutcome::Held(_)
+        ));
+        super::super::issue_lock::lock_for_run(repo.path(), &issue()).unwrap();
+    }
+
+    #[test]
+    fn ultrareview_advance_rehearsal_creates_no_lock_files() {
+        let db = approved_db();
+        let (repo, roots) = checkout_with_worktree();
+        let candidate = Candidate {
+            issue: issue(),
+            issue_title: "test".into(),
+            repo_path: repo.path().into(),
+            risk_label: None,
+            green_commit_sha: Some(GREEN.into()),
+        };
+        let mut cfg = config(roots.path(), repo.path());
+        cfg.dry_run = true;
+        let mut gh = ScriptedGh::new(vec![ok(&pr_list_json(322, GREEN))]);
+        advance_issue(&db, &mut gh, &mut ForbiddenReviewer, &candidate, &cfg).unwrap();
+        assert!(!repo.path().join(".git/ironmem/autopilot/locks").exists());
     }
 
     #[test]

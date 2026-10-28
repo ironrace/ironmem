@@ -1603,6 +1603,104 @@ mod tests {
     }
 
     #[test]
+    fn ultrareview_dry_run_only_finalizes_quiet_evidence() {
+        use crate::autopilot::implementer::Implementer;
+        use crate::autopilot::invocation::{self, contract_tests::write_awaiting};
+        use crate::autopilot::process_tree::{self, ProcessIdentity, ProcessSnapshot};
+        use crate::autopilot::registry::{HarnessSnapshots, RegistrySnapshot};
+        struct Monitor;
+        impl HarnessMonitor for Monitor {
+            fn snapshot(&mut self) -> HarnessSnapshots {
+                HarnessSnapshots {
+                    claude: RegistrySnapshot::Available(Vec::new()),
+                    processes: ProcessSnapshot::Available(Vec::new()),
+                }
+            }
+        }
+        let db = approved_db();
+        let f = fixture();
+        let mut cfg = config(&f);
+        cfg.dry_run = true;
+        let issue = IssueRef::new(REPO, 3);
+        let a = invocation::prepare_artifacts(&f.repo_path, &issue).unwrap();
+        // A real reaped child supplies a birth which cannot still own its
+        // reserved group/PID. No invented kernel observation is needed.
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("0.2")
+            .spawn()
+            .unwrap();
+        let birth = process_tree::kernel_birth(child.id()).unwrap().unwrap();
+        child.wait().unwrap();
+        process_tree::persist_identity(
+            &a,
+            &ProcessIdentity {
+                version: 1,
+                root_pid: child.id(),
+                root_pgid: child.id(),
+                root_birth: Some(birth),
+                schema_path: a.schema_path.clone(),
+                invocation_id: a.invocation_id.clone(),
+                descendants: Vec::new(),
+            },
+        )
+        .unwrap();
+        write_awaiting(
+            &a,
+            process_tree::current_uid().unwrap(),
+            &f.repo_path,
+            Vec::new(),
+        );
+        let state = DispatchState {
+            issue: issue.clone(),
+            implementer: Implementer::Codex,
+            invocation_artifacts: Some(a.clone()),
+            native_session_id: None,
+            worktree_path: f.repo_path.to_str().unwrap().into(),
+            ic_session_name: format!("ic-{}", issue.slug()),
+            dispatch_class: "logic".into(),
+            attempt_n: 1,
+            state: "dispatching".into(),
+            started_at: chrono::Utc::now().to_rfc3339(),
+            session_uuid: "controller-only".into(),
+            turn_n: 1,
+            session_claimed: true,
+            session_model: None,
+            resume_refusals: 0,
+            signing_held: false,
+        };
+        dispatch_state::upsert_dispatch_state(&db, &state).unwrap();
+        let drawers = || {
+            db.with_connection(|conn| {
+                let mut stmt = conn.prepare("SELECT id, content FROM drawers ORDER BY id")?;
+                let rows = stmt.query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?;
+                Ok(rows.collect::<Result<Vec<_>, _>>()?)
+            })
+            .unwrap()
+        };
+        let before = drawers();
+        let mut gh = ScriptedGh::new(vec![Ok(GhOutput::ok("[]")), Ok(GhOutput::ok("[]"))]);
+        let report = lead_tick(
+            &db,
+            &mut gh,
+            &mut Monitor,
+            &mut RefusingDispatcher,
+            &mut no_advisor(),
+            &cfg,
+        )
+        .unwrap();
+        assert!(report.runs.is_empty());
+        assert!(invocation::has_valid_exit_record(&a));
+        assert!(!invocation::is_awaiting_quiet(&a));
+        assert_eq!(
+            drawers(),
+            before,
+            "dry runs must leave all database records byte-identical"
+        );
+    }
+
+    #[test]
     fn a_dry_run_spends_nothing_and_writes_nothing() {
         let db = approved_db();
         let f = fixture();
@@ -1774,7 +1872,7 @@ mod tests {
         assert!(report.supervision.is_empty());
     }
 
-    /// F14: a dispatch-state drawer that cannot be read holds a slot and is
+    /// a dispatch-state drawer that cannot be read holds a slot and is
     /// supervised by no one, so the tick names it, in no backlog or not.
     #[test]
     fn a_tick_names_a_dispatch_state_it_cannot_read() {

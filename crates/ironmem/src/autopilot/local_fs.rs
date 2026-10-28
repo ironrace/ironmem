@@ -219,8 +219,18 @@ fn statfs_kind(path: &Path) -> std::io::Result<FsKind> {
     }
     #[allow(clippy::unnecessary_cast)]
     let magic = st.f_type as u64;
+    // An unreadable mountinfo must not read as "no mounts": for a FUSE
+    // filesystem the subtype that decides local vs network lives only
+    // there, so failing to read it fails closed below.
     let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+    let mountinfo_read = !mountinfo.is_empty();
     let absolute = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    if magic == libc::FUSE_MAGIC as u64 && !mountinfo_read {
+        return Ok(FsKind {
+            local: false,
+            name: "fuse (subtype unreadable)".into(),
+        });
+    }
     Ok(match linux_remote_type(magic, &mountinfo, &absolute) {
         Some(name) => FsKind { local: false, name },
         None => FsKind {
@@ -250,6 +260,21 @@ mod tests {
                 name: name.to_string(),
             })
         }
+    }
+
+    #[test]
+    fn ultrareview_longest_mount_prefix_wins() {
+        for (outer, inner, expected) in [
+            ("fuse.sshfs", "fuse", None),
+            ("fuse", "fuse.sshfs", Some("fuse.sshfs".to_owned())),
+        ] {
+            let mounts = format!("36 25 0:32 / /mnt rw - {outer} src rw\n37 25 0:33 / /mnt/inner rw - {inner} src rw\n");
+            assert_eq!(
+                linux_remote_type(0x6573_5546, &mounts, Path::new("/mnt/inner/db")),
+                expected
+            );
+        }
+        assert_eq!(fuse_network_subtype("fuse.juicefs-local"), None);
     }
 
     #[test]
@@ -320,7 +345,21 @@ mod tests {
             linux_remote_type(0x6573_5546, sshfs, Path::new("/mnt/local/db")),
             None
         );
-        for subtype in ["s3fs", "rclone", "gcsfuse", "glusterfs"] {
+        for subtype in [
+            "sshfs",
+            "s3fs",
+            "rclone",
+            "gcsfuse",
+            "glusterfs",
+            "curlftpfs",
+            "blobfuse",
+            "blobfuse2",
+            "goofys",
+            "juicefs",
+            "davfs2",
+            "ceph",
+            "seaweedfs",
+        ] {
             let info = format!("36 25 0:32 / /mnt/x rw - fuse.{subtype} src rw\n");
             assert!(
                 linux_remote_type(0x6573_5546, &info, Path::new("/mnt/x/db")).is_some(),

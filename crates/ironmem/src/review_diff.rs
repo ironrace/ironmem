@@ -231,7 +231,7 @@ fn read_source(request: &ReviewDiffRequest) -> Result<String, MemoryError> {
     // Git repository and configuration overrides can redirect a command away
     // from `request.repo`. The shared scrub removes the redirecting ones
     // unconditionally, so one set after this line is not inherited either.
-    crate::mcp::tools::scrub_git_environment(&mut command);
+    crate::git_env::scrub_git_environment(&mut command);
     command.current_dir(&request.repo);
     command.args(["diff", "--no-ext-diff", "--no-textconv", "--unified=3"]);
     match &request.source {

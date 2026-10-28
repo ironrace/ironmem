@@ -292,7 +292,11 @@ fn validate_worktree_root_from(
     if implementer != Implementer::Muse {
         return Ok(());
     }
-    let absolute = cwd()?.join(root);
+    let absolute = if root.is_absolute() {
+        root.to_path_buf()
+    } else {
+        cwd()?.join(root)
+    };
     for path in [absolute.clone(), worktree::canonical_or_self(&absolute)] {
         let text = path.to_str().ok_or_else(|| {
             MemoryError::Validation(format!(
@@ -385,30 +389,22 @@ impl RunConfig {
                 "daily_budget_usd must be a finite, positive number".into(),
             ));
         }
+        // Every harness uses the priced-spend-plus-ceiling start gate.
+        // Supervised harnesses reserve an unpriced unit, not these dollars.
+        if self.max_budget_usd > self.daily_budget_usd && self.implementer.recovers_invocations() {
+            return Err(MemoryError::Validation(format!(
+                "the {} priced-spend-plus-ceiling start gate cannot pass: raise \
+                 --daily-budget-usd to at least {} (no dollars are reserved by this harness)",
+                self.implementer.label(),
+                self.max_budget_usd
+            )));
+        }
         if self.max_budget_usd > self.daily_budget_usd {
-            // A supervised CLI has no --max-budget-usd, so naming it would send
-            // the operator after a flag the CLI refuses for this implementer.
-            return Err(MemoryError::Validation(
-                if self.implementer.recovers_invocations() {
-                    format!(
-                        "daily_budget_usd ({}) is below the ${} every {} dispatch reserves \
-                     before it starts — {} reports no cost, so each invocation is \
-                     pre-authorized at that fixed ceiling. Raise --daily-budget-usd to at \
-                     least {}",
-                        self.daily_budget_usd,
-                        self.max_budget_usd,
-                        self.implementer.label(),
-                        self.implementer.label(),
-                        self.max_budget_usd
-                    )
-                } else {
-                    format!(
-                        "max_budget_usd ({}) exceeds daily_budget_usd ({}) — no dispatch could \
-                     ever be authorized",
-                        self.max_budget_usd, self.daily_budget_usd
-                    )
-                },
-            ));
+            return Err(MemoryError::Validation(format!(
+                "max_budget_usd ({}) exceeds daily_budget_usd ({}) — no dispatch could \
+                 ever pass the priced-spend-plus-ceiling start gate; raise --daily-budget-usd",
+                self.max_budget_usd, self.daily_budget_usd
+            )));
         }
         Ok(())
     }
@@ -804,7 +800,7 @@ fn claude_recovery(
 }
 
 /// [`claude_recovery`] for a state this run itself claimed, checked before
-/// its first launch (D4): only the process table decides. A process naming
+/// its first launch: only the process table decides. A process naming
 /// the IC with `--name` is alive; a readable process table naming it
 /// nowhere is idle, whatever the registry says; an unreadable process
 /// table is uncertain.
@@ -829,9 +825,9 @@ fn claude_recovery_own(
     InvocationRecovery::NoPriorInvocation
 }
 
-/// The pre-Muse Codex dispatcher, kept, deprecated, for one release: a
+/// The pre-Muse Codex dispatcher, kept, deprecated, until 0.7.0: a
 /// [`CliDispatcher`] for Codex with the old argument-free `resolve()`.
-#[deprecated(note = "use `CliDispatcher::resolve(Implementer::Codex)`")]
+#[deprecated(note = "use `CliDispatcher::resolve(Implementer::Codex)`; removal in 0.7.0")]
 pub struct CodexDispatcher(CliDispatcher);
 
 #[allow(deprecated)]
@@ -959,7 +955,7 @@ impl Dispatcher for CliDispatcher {
         state: &DispatchState,
     ) -> Result<InvocationRecovery, MemoryError> {
         self.check_harness(state.implementer)?;
-        // F13: recovery reads only artifacts under the worktree's common
+        // recovery reads only artifacts under the worktree's common
         // directory, where `prepare_artifacts` put them.
         if let Some(artifacts) = &state.invocation_artifacts {
             if let Err(reason) = artifacts.check_common_dir(Path::new(&state.worktree_path)) {
@@ -1037,7 +1033,7 @@ fn read_branch_tip(dir: &Path, branch: &str) -> Result<Option<String>, String> {
     // An inherited `GIT_DIR` overrides `current_dir`, so without this the
     // commit recorded as an attempt's `commit_sha` could be another
     // repository's — a wrong answer that looks exactly like a right one.
-    crate::mcp::tools::scrub_git_environment(&mut command);
+    crate::git_env::scrub_git_environment(&mut command);
     let output = command
         .args([
             "rev-parse",
@@ -1363,7 +1359,7 @@ impl<'a> GuardGit<'a> {
         // Through the cached `find_launcher` resolution, like every git
         // spawn; scrubbed here as the scan requires of a held name.
         let mut command = std::process::Command::new(crate::launcher::cached_launcher("git"));
-        crate::mcp::tools::scrub_git_environment(&mut command);
+        crate::git_env::scrub_git_environment(&mut command);
         // No fetch of any kind: a missing object in a partial clone would
         // otherwise be fetched through the repository's own transport config.
         // `protocol.allow=never` alone is not enough, since the repository's
@@ -2630,7 +2626,7 @@ pub fn preflight_worktree_provisioning(
     let state = &claim.state;
     // A leased Claude claim's run may be between its claim and its
     // launch: refuse before provisioning, so `ensure_worktree` never
-    // quarantines its worktree (R3).
+    // quarantines its worktree.
     if !implementer.recovers_invocations() && claim.leased(chrono::Utc::now()) {
         return Err(MemoryError::Validation(format!(
             "cannot provision {} while another run's claim is within its {}s lease \
@@ -2672,7 +2668,7 @@ pub fn preflight_worktree_provisioning(
 /// worktree was not quiet finishes by itself; any other needs the operator
 /// to confirm nothing is running first.
 fn release_hint(issue: &IssueRef, artifacts: Option<&InvocationArtifacts>) -> String {
-    // F55: an exit record that exists but cannot be read is said so,
+    // an exit record that exists but cannot be read is said so,
     // rather than letting the hint call the invocation missing.
     if let Some(unreadable) = artifacts.and_then(super::invocation::exit_record_unreadable) {
         return format!(
@@ -2796,7 +2792,15 @@ fn still_owned(
     issue: &IssueRef,
     owned: &mut Option<dispatch_state::Claim>,
 ) -> Result<bool, MemoryError> {
-    let now = chrono::Utc::now();
+    still_owned_at(db, issue, owned, chrono::Utc::now())
+}
+
+fn still_owned_at(
+    db: &Database,
+    issue: &IssueRef,
+    owned: &mut Option<dispatch_state::Claim>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<bool, MemoryError> {
     let Some(claim) = owned.as_ref() else {
         return dispatch_state::claim_is(db, issue, None);
     };
@@ -2816,7 +2820,7 @@ fn still_owned(
 }
 
 /// Renew this run's lease as soon as a dispatch returns, before any other
-/// work (R1): a dispatch may run far past [`dispatch_state::CLAIM_LEASE`],
+/// work: a dispatch may run far past [`dispatch_state::CLAIM_LEASE`],
 /// and in the post-run window (signing-guard reads, spend settling, then
 /// the record) a lockless run could otherwise adopt the lapsed claim, so
 /// the record failed `taken_over` and the met was dropped. While the
@@ -2929,6 +2933,8 @@ fn recover_invocation(
                 ),
             };
             let unpriced_dispatches = match &state.invocation_artifacts {
+                // A corrupt daily drawer is logged and skipped by this lookup;
+                // the recovered count is a lower bound, never proof of no spend.
                 Some(artifacts) => u32::from(budget::has_unpriced_dispatch_reservation(
                     db,
                     &artifacts.invocation_id,
@@ -3051,7 +3057,7 @@ pub fn run_issue(
                 // Only the state this run read; see `write_state`.
                 if let Some(claim) = &existing_claim {
                     if dispatch_state::clear_claim_if_unchanged(db, claim)? {
-                        // F52: old invocation directories past retention
+                        // old invocation directories past retention
                         // go with the state; the cleared one stays.
                         if let Some(common) = &claim.common_dir {
                             let keep = claim
@@ -3174,7 +3180,7 @@ pub fn run_issue(
     };
     // What this run's own states record: its reading, and an earlier
     // run's — parked or interrupted — carried forward unless an operator
-    // has since opted the branch out (R10).
+    // has since opted the branch out.
     let signing_held = policy_at_start
         || ((seen.by_parked_run || seen.by_interrupted_run)
             && !matches!(
@@ -3328,12 +3334,22 @@ pub fn run_issue(
     let ic_session_name = dispatch::ic_name(issue);
     let worktree_path = worktree.path.to_string_lossy().to_string();
     // Stored in every claim, so the issue's lock is found even once the
-    // worktree is gone. Unresolvable, nothing names it: the lock is then
-    // looked for through the worktree.
-    let common_dir = super::issue_lock::git_common_dir(&worktree.path)
-        .ok()
-        .flatten()
-        .map(|dir| dir.to_string_lossy().into_owned());
+    // worktree is gone. A just-provisioned worktree is known to be in a
+    // repository, so a failure here is real: publishing a claim with no
+    // common directory would leave no durable pointer to the issue's
+    // lock once the worktree is removed, and a later clear could delete
+    // this live run's state. Refuse rather than store that claim.
+    let common_dir = match super::issue_lock::git_common_dir(&worktree.path) {
+        Ok(dir) => dir.map(|dir| dir.to_string_lossy().into_owned()),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                issue = %issue.canonical(),
+                "autopilot cannot resolve the worktree's git common directory; refusing to claim the issue without a lock pointer"
+            );
+            return Err(e);
+        }
+    };
 
     // `session_uuid` is a parameter rather than a capture because the session
     // is no longer fixed for the life of a run: a dispatch that concludes its
@@ -3654,7 +3670,7 @@ pub fn run_issue(
                 // Validate the exact backend argv before publishing a new
                 // invocation or charging unknown spend. Definite input errors
                 // prove no process launched and must leave prior state intact;
-                // the directory just prepared is discarded with them (F53).
+                // the directory just prepared is discarded with them.
                 if let Err(e) = super::invocation::validate_argv(&worktree.path, &spec) {
                     if let Some(artifacts) = &spec.invocation_artifacts {
                         super::invocation::discard_unlaunched(artifacts);
@@ -3712,6 +3728,16 @@ pub fn run_issue(
                     if !signing_recorded {
                         record_signing_reading();
                         signing_recorded = true;
+                    }
+                    // Last, right before the launch: re-check ownership
+                    // (renewing the lease when too little remains), as the
+                    // priced path does. Between publishing this invocation
+                    // and spawning it there is otherwise no check, and a
+                    // controller stalled past the launch window could be
+                    // adopted as dead and then spawn anyway.
+                    if !still_owned(db, issue, &mut owned)? {
+                        super::invocation::discard_unlaunched(artifacts);
+                        return Err(taken_over());
                     }
                 }
             } else {
@@ -3777,7 +3803,7 @@ pub fn run_issue(
                     return Err(taken_over());
                 }
                 // Right before the first launch, as the other harnesses
-                // record it (R9): after this run's claim, and never for a
+                // record it: after this run's claim, and never for a
                 // run held before launching at all.
                 if !signing_recorded {
                     record_signing_reading();
@@ -3789,7 +3815,7 @@ pub fn run_issue(
         };
         // First, before the signing-guard reads, the spend settling or
         // the record below: renew the lease a long dispatch let lapse
-        // (R1), or this run has lost the issue and records nothing.
+        //, or this run has lost the issue and records nothing.
         if !recovered
             && !config.implementer.recovers_invocations()
             && !renew_owned(db, issue, &mut owned)?
@@ -4340,6 +4366,16 @@ mod tests {
     /// hold message says so, and names `clear-dispatch` as the manual
     /// release. Any other held invocation still needs the operator.
     #[test]
+    fn ultrareview_absolute_muse_root_does_not_read_cwd() {
+        let no_cwd = || Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+        validate_worktree_root_from(Implementer::Muse, Path::new("/valid-root"), no_cwd).unwrap();
+        let err = validate_worktree_root_from(Implementer::Muse, Path::new("/bad root"), no_cwd)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("whitespace"), "{err}");
+    }
+
+    #[test]
     fn the_release_hint_tells_an_awaiting_quiet_hold_it_finishes_by_itself() {
         let (_dir, s) = crate::autopilot::invocation::contract_tests::setup();
         let a = s.invocation_artifacts.as_ref().unwrap();
@@ -4362,7 +4398,7 @@ mod tests {
                 && awaiting.contains("clear-dispatch ironrace/ironmem 283"),
             "{awaiting}"
         );
-        // F55: an exit record that exists but cannot be read is named.
+        // an exit record that exists but cannot be read is named.
         std::fs::write(&a.exit_path, "not json").unwrap();
         let unreadable = release_hint(&issue(), Some(a));
         assert!(
@@ -4864,7 +4900,7 @@ sleep 0.5
         );
     }
 
-    /// R3: preflight refuses a leased Claude claim before provisioning,
+    /// preflight refuses a leased Claude claim before provisioning,
     /// so `ensure_worktree` never quarantines a live controller's tree.
     #[test]
     fn preflight_refuses_a_leased_claude_claim_before_any_recovery() {
@@ -5303,7 +5339,7 @@ sleep 0.5
         assert_ne!(sessions[2], held, "{sessions:?}");
     }
 
-    /// F26: a run that stops before it launches (here at the day's unpriced
+    /// a run that stops before it launches (here at the day's unpriced
     /// cap) learned nothing about a parked session's holder, so the park
     /// stands, and a later run on another model still probes that session.
     #[test]
@@ -5346,7 +5382,7 @@ sleep 0.5
         );
     }
 
-    /// F25: the condition's push clause names the remote whose URL is the
+    /// the condition's push clause names the remote whose URL is the
     /// issue's repository, never the fork `origin` is; with no remote at
     /// all it names the branch only.
     #[test]
@@ -6087,7 +6123,10 @@ sleep 0.5
         config.implementer = Implementer::Muse;
         config.daily_budget_usd = config.max_budget_usd / 2.0;
         let err = config.validate().unwrap_err().to_string();
-        assert!(err.contains("every Muse dispatch reserves"), "got: {err}");
+        assert!(
+            err.contains("priced-spend-plus-ceiling start gate"),
+            "got: {err}"
+        );
         assert!(err.contains("--daily-budget-usd"), "got: {err}");
     }
 
@@ -7022,7 +7061,7 @@ sleep 0.5
         assert!(why.contains("did not finish"), "{why}");
     }
 
-    /// F21: a guard git that cannot run is the guard's fault, never "no
+    /// a guard git that cannot run is the guard's fault, never "no
     /// identity", which would blame every flagged commit on the model.
     #[test]
     fn an_identity_git_cannot_read_is_an_error_not_no_identity() {
@@ -7038,7 +7077,7 @@ sleep 0.5
         );
     }
 
-    /// F88: the controller's own committer email is a commit of this run's
+    /// the controller's own committer email is a commit of this run's
     /// only for a harness that inherits the controller's environment.
     #[test]
     fn the_controllers_committer_email_is_ours_only_for_claude() {
@@ -7059,7 +7098,7 @@ sleep 0.5
         }
     }
 
-    /// G-M16: the controller's committer email is read for Claude only.
+    /// the controller's committer email is read for Claude only.
     #[test]
     fn the_controllers_git_email_is_read_only_for_a_harness_that_inherits_it() {
         let env = |key: &str| (key == "GIT_COMMITTER_EMAIL").then(|| "ops@corp.test".to_string());
@@ -7076,7 +7115,7 @@ sleep 0.5
         );
     }
 
-    /// F85: an unreadable remote list names only the holders, never a guess
+    /// an unreadable remote list names only the holders, never a guess
     /// at the push clause's remote.
     #[test]
     fn an_unreadable_remote_list_names_only_the_holders() {
@@ -7102,7 +7141,7 @@ sleep 0.5
         );
     }
 
-    /// F78: a missing branch has no tip; a directory git cannot read is an
+    /// a missing branch has no tip; a directory git cannot read is an
     /// error, never quietly no tip.
     #[test]
     fn a_branch_tip_git_cannot_read_is_an_error_and_a_missing_branch_is_none() {
@@ -7113,7 +7152,7 @@ sleep 0.5
         assert!(read_branch_tip(not_a_repo.path(), "main").is_err());
     }
 
-    /// F89: only a `gpgsig`/`gpgsig-sha256` header in the header block
+    /// only a `gpgsig`/`gpgsig-sha256` header in the header block
     /// counts, and a cat-file reply that is not one commit object per name,
     /// in order, is refused rather than guessed at.
     #[test]
@@ -7205,7 +7244,7 @@ sleep 0.5
         // Not fixture git: this probes the operator's own git, whose global
         // config is the point, and it only reads.
         let mut probe = std::process::Command::new("git");
-        crate::mcp::tools::scrub_git_environment(&mut probe);
+        crate::git_env::scrub_git_environment(&mut probe);
         let probe = probe
             .args(["config", "--global", "--get-regexp", "^gpg\\."])
             .env_remove("HOME")
@@ -8637,7 +8676,7 @@ sleep 0.5
         }
     }
 
-    /// R9: a Claude run records its signing reading only right before
+    /// a Claude run records its signing reading only right before
     /// its first launch: a run held before launching records nothing.
     #[test]
     fn a_claude_run_held_before_its_first_launch_records_no_signing_reading() {
@@ -8656,7 +8695,7 @@ sleep 0.5
         assert!(!worktree::signing_recorded(&wt.path, &wt.branch));
     }
 
-    /// R10: an interrupted (non-parked) run's signing reading is carried
+    /// an interrupted (non-parked) run's signing reading is carried
     /// into this run's states too, unless the branch is opted out.
     #[test]
     fn an_interrupted_runs_signing_reading_is_carried_forward() {
@@ -8694,7 +8733,7 @@ sleep 0.5
         dispatch_state::upsert_dispatch_state(&db, &state).unwrap();
         let mut result = met();
         result.cost_usd = None;
-        // F23: and the next fresh dispatch's met is held to it too, which
+        // and the next fresh dispatch's met is held to it too, which
         // takes the reading recorded on the branch, not only in memory.
         let mut d = muse_script(vec![met()]);
         d.recovery = Some(InvocationRecovery::Finished(result));
@@ -10742,7 +10781,7 @@ satisfies it on its own"
         dispatch_state::get_claim(db, &issue()).unwrap().unwrap()
     }
 
-    /// F4: run B reads run A's fresh `dispatching` state while A's IC is
+    /// run B reads run A's fresh `dispatching` state while A's IC is
     /// live. B adopts nothing, writes nothing and launches nothing.
     #[test]
     fn a_claude_run_never_adopts_a_state_whose_ic_is_live() {
@@ -10917,7 +10956,7 @@ satisfies it on its own"
             ),
             InvocationRecovery::Unknown { reason } if reason.contains("ps timed out")
         ));
-        // D3: a run never adopts on an unreadable registry, whatever the
+        // a run never adopts on an unreadable registry, whatever the
         // process table shows; both readable and silent, it is idle.
         assert!(matches!(
             claude_recovery(
@@ -10936,7 +10975,7 @@ satisfies it on its own"
             ),
             InvocationRecovery::NoPriorInvocation
         );
-        // D4: the check on this run's own claim, before its first launch,
+        // the check on this run's own claim, before its first launch,
         // needs only the process table: an unreadable registry does not
         // hold a fresh launch, and a process naming the IC still does.
         assert_eq!(
@@ -10975,7 +11014,7 @@ satisfies it on its own"
         }
     }
 
-    /// C-I2: within its lease, another run's claim is never adopted, however
+    /// within its lease, another run's claim is never adopted, however
     /// idle its IC looks; once the lease lapses it is.
     #[test]
     fn a_claude_run_never_adopts_a_claim_within_its_lease() {
@@ -11020,7 +11059,7 @@ satisfies it on its own"
         );
     }
 
-    /// D4: a fresh launch is held only by the process table on its own
+    /// a fresh launch is held only by the process table on its own
     /// claim, never by an unreadable registry; adopting another run's
     /// claim (above) still requires the registry.
     #[test]
@@ -11045,7 +11084,7 @@ satisfies it on its own"
         assert_eq!(b.seen.len(), 1);
     }
 
-    /// R1: a dispatch that ran past its lease has it renewed as soon as
+    /// a dispatch that ran past its lease has it renewed as soon as
     /// it returns, before its outcome is recorded: the record still
     /// lands, and the renewed lease keeps an adopter out.
     #[test]
@@ -11093,8 +11132,29 @@ satisfies it on its own"
         );
     }
 
-    /// C-I2: a run whose own claim is near the end of its lease claims again
+    /// a run whose own claim is near the end of its lease claims again
     /// before it launches; one with time left only looks.
+    #[test]
+    fn ultrareview_claim_refresh_margin_boundaries() {
+        for (age, renews) in [(89, false), (90, true), (91, true)] {
+            let db = approved_db();
+            let (_dir, wt) = fixture_worktree();
+            let state = pending_invocation(Implementer::Claude, &db, &wt, None);
+            let now = chrono::Utc::now();
+            let mut claim = leased_claim(state, "us");
+            claim.claimed_at = Some((now - chrono::Duration::seconds(age)).to_rfc3339());
+            let stored = dispatch_state::get_claim(&db, &issue()).unwrap();
+            assert!(dispatch_state::claim_if_unchanged(&db, stored.as_ref(), &claim).unwrap());
+            let mut owned = Some(claim.clone());
+            assert!(still_owned_at(&db, &issue(), &mut owned, now).unwrap());
+            assert_eq!(
+                owned.as_ref().unwrap().claimed_at != claim.claimed_at,
+                renews,
+                "{age}"
+            );
+        }
+    }
+
     #[test]
     fn a_claim_near_the_end_of_its_lease_is_renewed_before_a_launch() {
         let db = approved_db();
@@ -11121,7 +11181,7 @@ satisfies it on its own"
         assert!(!still_owned(&db, &issue(), &mut owned).unwrap());
     }
 
-    /// G-M1: a parked state stays parked when the check before the first
+    /// a parked state stays parked when the check before the first
     /// launch finds an IC for the issue: the run launched nothing.
     #[test]
     fn a_parked_state_stays_parked_when_the_pre_launch_check_holds() {
@@ -11146,7 +11206,7 @@ satisfies it on its own"
         assert!(dispatch_state::get_claim(&db, &issue()).unwrap().is_none());
     }
 
-    /// G-M2: the ownership look comes last before a launch, after the spend
+    /// the ownership look comes last before a launch, after the spend
     /// is reserved, and a lost issue gives the reservation back.
     #[test]
     fn a_takeover_found_before_a_launch_releases_the_reserved_spend() {
@@ -11171,7 +11231,7 @@ satisfies it on its own"
         assert_eq!(spent, 0.0);
     }
 
-    /// G-M14: a reservation dropped unsettled (an early return, a panic) is
+    /// a reservation dropped unsettled (an early return, a panic) is
     /// released.
     #[test]
     fn an_unsettled_spend_reservation_is_released_when_dropped() {
@@ -11183,7 +11243,7 @@ satisfies it on its own"
         assert_eq!(ledger.total_cost_usd, 0.0);
     }
 
-    /// C-M1/C-M2: a run at its cap whose issue another run took over writes
+    /// C-M1/a run at its cap whose issue another run took over writes
     /// no terminal summary and reports no exhaustion.
     #[test]
     fn a_capped_run_that_lost_its_issue_records_no_summary_and_no_exhaustion() {

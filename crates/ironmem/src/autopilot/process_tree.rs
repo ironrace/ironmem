@@ -401,8 +401,11 @@ pub fn parse_processes(text: &str) -> Result<Vec<ProcessRow>, String> {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ProcessSnapshot {
+    #[non_exhaustive]
     Available(Vec<ProcessRow>),
-    Unavailable { reason: String },
+    Unavailable {
+        reason: String,
+    },
 }
 
 /// Where process-table rows come from: the real `ps` ([`UnixProcesses`]) or
@@ -685,11 +688,12 @@ fn recorded_tree_evidence(
     is_daemon: &dyn Fn(&ProcessRow) -> bool,
 ) -> Option<String> {
     let active = || rows.iter().filter(|r| r.active());
+    let descendants: std::collections::HashSet<u32> =
+        identity.descendants.iter().map(|d| d.pid).collect();
     if !completed {
-        if let Some(r) = active().find(|r| {
-            r.pid == identity.root_pid
-                || (identity.descendants.iter().any(|d| d.pid == r.pid) && !is_daemon(r))
-        }) {
+        if let Some(r) = active()
+            .find(|r| r.pid == identity.root_pid || (descendants.contains(&r.pid) && !is_daemon(r)))
+        {
             return Some(format!(
                 "process {} has a PID this invocation recorded",
                 r.pid
@@ -950,7 +954,14 @@ impl ProcessSnapshot {
             Self::Available(rows) => rows
                 .iter()
                 .filter(|r| r.active())
-                .filter_map(|r| r.marker().ok().flatten())
+                .filter_map(|r| match r.marker() {
+                    Ok(marker) => marker,
+                    Err(reason) => {
+                        tracing::warn!(pid = r.pid, reason = %super::scrub::scrub_and_bound(&reason, 500).text,
+                            "autopilot orphan scan found an ambiguous invocation marker; inspect this process");
+                        None
+                    }
+                })
                 .filter(|p| is_autopilot_marker_path(p))
                 .collect(),
         }
@@ -969,7 +980,7 @@ const KILL_SIGNAL: i32 = 0;
 /// Kernel birth identity prevents a recycled PID from authorizing a signal.
 /// Ordered by start time: macOS (seconds, microseconds); Linux (clock ticks
 /// since boot, 0).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub(crate) struct Birth(u64, u64);
 
 /// The kernel birth a process started at wall-clock `at` would carry, for
@@ -1492,9 +1503,9 @@ fn adoptable(root_pid: u32, me: u32, record: Option<RootRecord>) -> Option<Kerne
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SharedDaemon {
     /// The configured shared-daemon socket (`Config::daemon_socket_path`).
-    pub socket: PathBuf,
+    pub(crate) socket: PathBuf,
     /// The canonical ironmem executable the daemon must be running.
-    pub exe: PathBuf,
+    pub(crate) exe: PathBuf,
 }
 
 impl SharedDaemon {
@@ -1609,7 +1620,7 @@ fn kernel_executable(pid: u32) -> Option<PathBuf> {
 
 /// How often the completion check rescans while it waits for the worktree
 /// to go quiet.
-pub(crate) const QUIET_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+pub(crate) const QUIET_POLL: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// A process the current user owns, with its working directory, as the
 /// kernel reports them.
@@ -2094,9 +2105,9 @@ const NAMED_PROCESSES: usize = 5;
 /// climbs looking for the shared daemon before it gives up.
 const DAEMON_ANCESTRY_DEPTH: usize = 64;
 
-/// How many times [`ProcessTracker::verify_gone`] samples, 10 ms apart, for
-/// the killed tree to leave the process table.
-const VERIFY_GONE_ATTEMPTS: usize = 100;
+/// How long [`ProcessTracker::verify_gone`] waits for the killed tree to
+/// leave the process table, with polls backing off from 10ms to 100ms.
+const VERIFY_GONE_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Whether the worktree held no process the invocation could have started.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2226,13 +2237,15 @@ impl<'a> QuietCheck<'a> {
             return Ok(Vec::new());
         }
         let rows = rows()?;
+        let by_pid: std::collections::HashMap<u32, &ProcessRow> =
+            rows.iter().map(|r| (r.pid, r)).collect();
+        let mut daemon = std::collections::HashMap::new();
         Ok(candidates
             .iter()
-            .filter(|p| !self.in_shared_daemon_tree(p.pid, &rows))
+            .filter(|p| !self.in_shared_daemon_tree(p.pid, &by_pid, &mut daemon))
             .map(|p| {
-                let command = rows
-                    .iter()
-                    .find(|r| r.pid == p.pid)
+                let command = by_pid
+                    .get(&p.pid)
                     .map_or("<command unavailable>", |r| r.args.as_str());
                 let named = format!(
                     "process {} ({})",
@@ -2263,13 +2276,21 @@ impl<'a> QuietCheck<'a> {
 
     /// Whether `pid` is the shared daemon or, by its process-table ancestry,
     /// one of the daemon's children, which the tracker never owns either.
-    fn in_shared_daemon_tree(&self, pid: u32, rows: &[ProcessRow]) -> bool {
+    fn in_shared_daemon_tree(
+        &self,
+        pid: u32,
+        rows: &std::collections::HashMap<u32, &ProcessRow>,
+        daemon: &mut std::collections::HashMap<u32, bool>,
+    ) -> bool {
         let mut current = pid;
         for _ in 0..DAEMON_ANCESTRY_DEPTH {
-            let Some(row) = rows.iter().find(|r| r.pid == current && r.active()) else {
+            let Some(row) = rows.get(&current).filter(|r| r.active()) else {
                 return false;
             };
-            if is_shared_daemon(self.daemon, self.kernel_exe, row) {
+            if *daemon
+                .entry(current)
+                .or_insert_with(|| is_shared_daemon(self.daemon, self.kernel_exe, row))
+            {
                 return true;
             }
             if row.ppid <= 1 || row.ppid == current {
@@ -2510,6 +2531,11 @@ impl ProcessTracker {
         rows: Vec<ProcessRow>,
         mut kernel: impl FnMut(u32) -> Result<Option<KernelProcess>, String>,
     ) -> Result<Vec<ProcessRow>, MemoryError> {
+        let mut by_parent: std::collections::HashMap<u32, Vec<&ProcessRow>> =
+            std::collections::HashMap::new();
+        for row in &rows {
+            by_parent.entry(row.ppid).or_default().push(row);
+        }
         // The shared ironmem daemon is never owned (see
         // `ProcessRow::is_shared_ironmem_daemon`). A sample taken between its
         // fork and exec showed it with its spawner's argv and enrolled it.
@@ -2565,12 +2591,17 @@ impl ProcessTracker {
                     // child the kernel still has escaped authentication. The
                     // shared daemon outlives its proxy by design and was
                     // never ours to authenticate.
-                    for row in rows.iter().filter(|row| {
-                        row.ppid == pid
-                            && row.active()
-                            && !shared_daemon.contains(&row.pid)
-                            && !self.known.contains_key(&row.pid)
-                    }) {
+                    for row in by_parent
+                        .get(&pid)
+                        .into_iter()
+                        .flatten()
+                        .copied()
+                        .filter(|row| {
+                            row.active()
+                                && !shared_daemon.contains(&row.pid)
+                                && !self.known.contains_key(&row.pid)
+                        })
+                    {
                         if kernel(row.pid).map_err(MemoryError::Validation)?.is_some() {
                             return Err(MemoryError::Validation(
                                 "invocation ancestry seed disappeared before descendant authentication"
@@ -2619,12 +2650,16 @@ impl ProcessTracker {
                 }
             }
         }
-        loop {
-            let mut enrolled = false;
-            // The shared daemon is neither enrolled nor a seed, so its own
-            // children are never reached either.
-            for row in rows
-                .iter()
+        // One adjacency index and breadth-first traversal per sample. Keep
+        // the before/after kernel captures: memoizing those would erase the
+        // PID-reuse/parent-change checks that authorize ownership.
+        let mut frontier: std::collections::VecDeque<u32> = seeds.keys().copied().collect();
+        while let Some(parent) = frontier.pop_front() {
+            for row in by_parent
+                .get(&parent)
+                .into_iter()
+                .flatten()
+                .copied()
                 .filter(|r| r.active() && !shared_daemon.contains(&r.pid))
             {
                 if self.known.contains_key(&row.pid) {
@@ -2677,10 +2712,7 @@ impl ProcessTracker {
                 authenticated.pgid = actual.pgid;
                 self.enrol(authenticated, actual.birth);
                 seeds.insert(row.pid, actual.birth);
-                enrolled = true;
-            }
-            if !enrolled {
-                break;
+                frontier.push_back(row.pid);
             }
         }
         Ok(rows)
@@ -2868,7 +2900,9 @@ impl ProcessTracker {
         }
     }
     pub(crate) fn verify_gone(&self) -> Result<(), MemoryError> {
-        for _ in 0..VERIFY_GONE_ATTEMPTS {
+        let deadline = std::time::Instant::now() + VERIFY_GONE_GRACE;
+        let mut poll = std::time::Duration::from_millis(10);
+        loop {
             let active: std::collections::HashSet<u32> = Self::rows()?
                 .into_iter()
                 .filter(ProcessRow::active)
@@ -2898,7 +2932,13 @@ impl ProcessTracker {
             if !live {
                 return Ok(());
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(
+                poll.min(deadline.saturating_duration_since(std::time::Instant::now())),
+            );
+            poll = (poll * 2).min(std::time::Duration::from_millis(100));
         }
         Err(MemoryError::Validation(
             "invocation descendants remained alive after cleanup".into(),
@@ -2920,6 +2960,7 @@ impl ProcessTracker {
         grace: std::time::Duration,
     ) -> Result<(), MemoryError> {
         let deadline = std::time::Instant::now() + grace;
+        let mut poll = std::time::Duration::from_millis(10);
         let straggler = loop {
             let rows = rows()?;
             // Once the root is reaped, a live process holding its PID shows
@@ -2936,7 +2977,10 @@ impl ProcessTracker {
             if std::time::Instant::now() >= deadline {
                 break straggler.pid;
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            std::thread::sleep(
+                poll.min(deadline.saturating_duration_since(std::time::Instant::now())),
+            );
+            poll = (poll * 2).min(std::time::Duration::from_millis(100));
         };
         Err(MemoryError::Validation(format!(
             "untracked process {straggler} remained in invocation process group {} after \
@@ -3048,10 +3092,16 @@ impl ProcessTracker {
             }
         }
         // Their descendants in the process table, by parent, to any depth.
+        let mut by_parent: std::collections::HashMap<u32, Vec<&ProcessRow>> =
+            std::collections::HashMap::new();
+        for row in rows.iter().filter(|r| r.active()) {
+            by_parent.entry(row.ppid).or_default().push(row);
+        }
+        let mut seen: std::collections::HashSet<u32> = held.iter().map(|(pid, _)| *pid).collect();
         let mut frontier: Vec<u32> = held.iter().map(|(pid, _)| *pid).collect();
         while let Some(parent) = frontier.pop() {
-            for row in rows.iter().filter(|r| r.active() && r.ppid == parent) {
-                if held.iter().any(|(pid, _)| *pid == row.pid) {
+            for row in by_parent.get(&parent).into_iter().flatten().copied() {
+                if !seen.insert(row.pid) {
                     continue;
                 }
                 if let Some(child) = kernel_observation(row.pid).map_err(MemoryError::Validation)? {
@@ -3214,7 +3264,7 @@ pub(crate) mod testing {
         dir: &Path,
         implementer: Implementer,
     ) -> (InvocationArtifacts, ProcessRow) {
-        // In the layout `prepare_artifacts` makes (F13), for the issue
+        // In the layout `prepare_artifacts` makes, for the issue
         // most callers build a state for; `invocation_in` is the general
         // form.
         invocation_in(dir, implementer, "owner-repo-42")
@@ -3289,6 +3339,55 @@ pub(crate) mod tests {
     /// A scan's [`Known`] PIDs.
     fn pid_set(pids: &[u32]) -> Known {
         pids.iter().copied().collect()
+    }
+
+    #[test]
+    fn ultrareview_group_drain_backs_off_process_table_spawns() {
+        let tracker = ProcessTracker::owning_every_descendant(10);
+        let mut scans = 0;
+        let result = tracker.verify_group_drained_with(
+            || {
+                scans += 1;
+                Ok(vec![row("tool")])
+            },
+            std::time::Duration::from_millis(250),
+        );
+        assert!(result.is_err());
+        assert!(scans <= 8, "{scans} full process-table scans in 250ms");
+    }
+
+    #[test]
+    fn ultrareview_real_harness_argv_is_understood_by_the_marker_parser() {
+        use super::super::dispatch::SessionMode;
+        use super::super::invocation::{cli_for, contract_tests::setup};
+        let (_dir, mut spec) = setup();
+        // ps cannot represent a whitespace path. Use a controlled marker
+        // spelling here; argv itself is always built by the real harness.
+        let a = spec.invocation_artifacts.as_mut().unwrap();
+        let base = "/r/.git/ironmem/autopilot/owner-repo-42/11111111-2222-4333-8444-555555555555";
+        a.schema_path = format!("{base}/schema.json");
+        a.final_path = format!("{base}/final.json");
+        for (implementer, model) in [
+            (Implementer::Codex, "gpt-test"),
+            (Implementer::Muse, "muse-test"),
+        ] {
+            spec.implementer = implementer;
+            spec.model = model.into();
+            spec.session = SessionMode::New {
+                session_uuid: "11111111-2222-4333-8444-555555555555".into(),
+            };
+            let a = spec.invocation_artifacts.as_ref().unwrap();
+            let args = cli_for(implementer)
+                .unwrap()
+                .argv(Path::new("/workspace"), &spec, a)
+                .unwrap();
+            let command = format!("{} {}", implementer.cli_name(), args.join(" "));
+            assert_eq!(
+                row(&command).marker().unwrap(),
+                Some(a.schema_path.as_str()),
+                "{command}"
+            );
+        }
     }
 
     /// The fixture's root row is the named harness's own command, carrying

@@ -758,7 +758,10 @@ impl Database {
             Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)
         })?;
         let value = f(&tx)?;
-        tx.commit()?;
+        // commit() consumes the transaction even on BUSY. Retain it while
+        // retrying COMMIT, never replaying the caller's mutation closure.
+        retry_on_busy(|| tx.execute_batch("COMMIT"))?;
+        tx.finish()?;
         Ok(value)
     }
 
@@ -965,6 +968,42 @@ mod tests {
             rusqlite::params![id, repo_path, branch, task, implementer],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn ultrareview_busy_commit_retries_without_replaying_the_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("commit.db");
+        let db = Database::open(&path).unwrap();
+        db.conn.execute_batch("PRAGMA journal_mode=DELETE; CREATE TABLE commit_probe (value INTEGER); INSERT INTO commit_probe VALUES (0);").unwrap();
+        db.conn.busy_timeout(Duration::from_millis(1)).unwrap();
+        let (start, wait) = std::sync::mpsc::channel();
+        let (ready, held) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let conn = rusqlite::Connection::open(path).unwrap();
+            wait.recv().unwrap();
+            conn.execute_batch("BEGIN; SELECT * FROM commit_probe;")
+                .unwrap();
+            ready.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(150));
+            conn.execute_batch("COMMIT").unwrap();
+        });
+        let mut calls = 0;
+        let result = db.with_immediate_transaction(|tx| {
+            calls += 1;
+            tx.execute("UPDATE commit_probe SET value = value + 1", [])?;
+            start.send(()).unwrap();
+            held.recv().unwrap();
+            Ok(())
+        });
+        reader.join().unwrap();
+        result.unwrap();
+        assert_eq!(calls, 1);
+        let value: i64 = db
+            .conn
+            .query_row("SELECT value FROM commit_probe", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(value, 1);
     }
 
     #[test]

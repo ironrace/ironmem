@@ -1,4 +1,4 @@
-//! Git for Autopilot's unit-test fixtures, and only for them.
+//! Git for the crate's unit-test fixtures, and only for them.
 //!
 //! Every fixture git call goes through [`command`]: it removes every
 //! inherited `GIT_*` variable (an outer `GIT_DIR` would aim it at another
@@ -16,7 +16,7 @@ use std::process::{Command, Output};
 /// A fixture's git: scrubbed, then reading no global or system config.
 pub(crate) fn command() -> Command {
     let mut command = Command::new("git");
-    crate::mcp::tools::scrub_git_environment(&mut command);
+    crate::git_env::scrub_git_environment(&mut command);
     command
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1");

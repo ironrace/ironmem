@@ -1,3 +1,7 @@
+//! On a harness upgrade, re-measure argv/options, session refusal wording,
+//! and journal/usage/terminal shapes before updating the pinned version. Run
+//! the real-argv marker cross-test and parser fixtures; paid probes require
+//! operator approval. See docs/agent-guides/pr367-ultrareview.md.
 //! The Codex `exec` harness for supervised dispatch: its verified argv and
 //! its JSONL journal and final-verdict parsing. Supervision itself lives in
 //! [`super::invocation`].
@@ -11,12 +15,12 @@ use crate::autopilot::invocation::{
 use crate::error::MemoryError;
 
 /// Renamed to [`InvocationArtifacts`] and moved to [`super::invocation`];
-/// kept here, deprecated, for one release.
-#[deprecated(note = "renamed to `invocation::InvocationArtifacts`")]
+/// kept here, deprecated, until 0.7.0.
+#[deprecated(note = "renamed to `invocation::InvocationArtifacts`; removal in 0.7.0")]
 pub type CodexArtifacts = InvocationArtifacts;
 /// Renamed to [`super::invocation::InvocationRecovery`]; kept here,
-/// deprecated, for one release.
-#[deprecated(note = "renamed to `invocation::InvocationRecovery`")]
+/// deprecated, until 0.7.0.
+#[deprecated(note = "renamed to `invocation::InvocationRecovery`; removal in 0.7.0")]
 pub type CodexRecovery = crate::autopilot::invocation::InvocationRecovery;
 
 /// Codex CLI. It assigns its own thread ID, reported by `thread.started`, so

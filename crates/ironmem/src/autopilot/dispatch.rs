@@ -94,6 +94,29 @@ pub struct DispatchSpec {
     pub wall_clock_timeout: Option<std::time::Duration>,
 }
 
+impl DispatchSpec {
+    /// Shared input checks before a harness reserves/publishes an invocation.
+    /// Native session-ID semantics remain the harness adapter's responsibility.
+    pub fn validate(&self) -> Result<(), MemoryError> {
+        if self.model.is_empty() || self.model.chars().any(char::is_whitespace) {
+            return Err(MemoryError::Validation(
+                "dispatch model must be non-empty and contain no whitespace".into(),
+            ));
+        }
+        if !self.max_budget_usd.is_finite() || self.max_budget_usd < 0.0 {
+            return Err(MemoryError::Validation(
+                "dispatch budget must be finite and non-negative".into(),
+            ));
+        }
+        if self.max_turns == 0 {
+            return Err(MemoryError::Validation(
+                "dispatch max_turns must be at least 1".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// `ic-<repo-slug>-<issue-number>`. The spec's own example (`ic-ironmem-283`)
 /// uses a bare repo name; this uses [`IssueRef::slug`]'s full
 /// `owner-repo-number` form instead, so two different repos with the same
@@ -239,7 +262,8 @@ pub enum SessionRefusal {
 impl DispatchOutcome {
     /// The 6a guard, in one place: a dispatch only counts as "met" when the
     /// schema-forced verdict says so, the invocation did not itself error,
-    /// *and* the process exited zero. A dispatch with no verdict (schema not
+    /// the invocation started, did not time out, and the process exited zero.
+    /// A dispatch with no verdict (schema not
     /// honored — e.g. an infrastructure failure mid-turn) or a non-zero exit
     /// (the JSON's own claims are untrustworthy once the process itself
     /// failed) is never treated as met, no matter what the JSON says on its
@@ -256,8 +280,15 @@ impl DispatchOutcome {
     /// *Error handling* table this is "a normal-looking exit" that must be
     /// recorded as a failure, not a completion — callers should route this
     /// to a failed lineage attempt, never treat it as [`Self::is_met`].
+    /// The same trust guards as [`Self::is_met`] apply: an impossible
+    /// verdict from a process that timed out, errored, or exited non-zero
+    /// is not trusted as a judgement.
     pub fn is_impossible(&self) -> bool {
-        self.verdict == Some(Verdict::Impossible)
+        self.invocation_started
+            && self.process_success
+            && !self.timed_out
+            && !self.is_error
+            && self.verdict == Some(Verdict::Impossible)
     }
 }
 
@@ -347,6 +378,7 @@ pub fn run_dispatch(
 }
 
 fn validate_claude_spec(spec: &DispatchSpec) -> Result<(), MemoryError> {
+    spec.validate()?;
     if spec.implementer != Implementer::Claude || spec.invocation_artifacts.is_some() {
         return Err(MemoryError::Validation(
             "Claude dispatch requires implementer claude and no CLI invocation artifacts".into(),
@@ -525,10 +557,28 @@ pub(super) fn drain<R: std::io::Read + Send + 'static>(pipe: Option<R>) -> Drain
     })
 }
 
+/// How long [`drained`] waits for a pipe to close after its process
+/// exited. A descendant that inherited the pipe can hold it open
+/// indefinitely; joining unboundedly would hang the caller past the
+/// wall-clock bound the dispatch was run under.
+pub(super) const DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// What a [`drain`] collected, once its pipe closed: `Err` when the pipe
-/// could not be read or the reader panicked. Output that was cut short is
-/// never passed off as all of it.
+/// could not be read, the reader panicked, or the pipe stayed open past
+/// [`DRAIN_GRACE`] (a descendant is holding it; the reader is detached
+/// and finishes whenever the pipe finally closes). Output that was cut
+/// short is never passed off as all of it.
 pub(super) fn drained(handle: DrainHandle) -> Result<Vec<u8>, String> {
+    let started = std::time::Instant::now();
+    while !handle.is_finished() && started.elapsed() < DRAIN_GRACE {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    if !handle.is_finished() {
+        return Err(format!(
+            "its pipe stayed open more than {}s after the process exited (a descendant is holding it)",
+            DRAIN_GRACE.as_secs()
+        ));
+    }
     match handle.join() {
         Ok(Ok(buf)) => Ok(buf),
         Ok(Err(e)) => Err(e.to_string()),
@@ -700,7 +750,7 @@ mod tests {
         }
     }
 
-    /// F6: a pipe that fails partway is an error, never the bytes read so
+    /// a pipe that fails partway is an error, never the bytes read so
     /// far passed off as all of it.
     #[test]
     fn a_pipe_that_fails_partway_is_an_error_not_short_output() {
@@ -723,6 +773,21 @@ mod tests {
             b"all"
         );
         assert!(drained(drain(None::<std::io::Empty>)).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_pipe_held_open_past_the_grace_is_an_error_not_a_hang() {
+        struct NeverEnds;
+        impl std::io::Read for NeverEnds {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                std::thread::sleep(std::time::Duration::from_secs(60));
+                Ok(0)
+            }
+        }
+        let started = std::time::Instant::now();
+        let err = drained(drain(Some(NeverEnds))).unwrap_err();
+        assert!(err.contains("stayed open"), "{err}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(30));
     }
 
     #[test]

@@ -389,7 +389,9 @@ enum AutopilotCmd {
         base: String,
         /// Implementation harness: claude (default), codex or muse. The
         /// reviewer is chosen separately (`autopilot review` / `advance
-        /// --reviewer`).
+        /// --reviewer`). Codex and Muse run unsandboxed as the operator,
+        /// with the operator's environment and credentials; only choose
+        /// them for repositories trusted at that level.
         #[arg(long, default_value = "claude")]
         implementer: ironmem::autopilot::Implementer,
         /// Model for the IC dispatch
@@ -407,9 +409,9 @@ enum AutopilotCmd {
         #[arg(long)]
         max_turns: Option<u32>,
         /// Per-dispatch spend ceiling passed to `claude --max-budget-usd`.
-        /// Claude only: Codex and Muse refuse it, and each of their
-        /// invocations pre-authorizes the default ceiling against the daily
-        /// ledger
+        /// Claude only: Codex and Muse refuse it; they report no cost, and
+        /// each of their invocations instead reserves one unpriced unit
+        /// against --max-unpriced-dispatches-per-day before it launches
         #[arg(long)]
         max_budget_usd: Option<f64>,
         /// Per-issue attempt cap, cumulative across runs; a remediation gets
@@ -418,7 +420,9 @@ enum AutopilotCmd {
         attempt_cap: Option<u32>,
         /// Daily ledger ceiling across all dispatches. Codex and Muse cost is
         /// unpriced, so the ledger records no dollars for them and their
-        /// effective limit is --max-unpriced-dispatches-per-day
+        /// effective limit is --max-unpriced-dispatches-per-day; the ceiling
+        /// still gates priced (Claude) dispatches, reviews and advisor calls
+        /// on the same day
         #[arg(long)]
         daily_budget_usd: Option<f64>,
         /// How many unpriced IC dispatches may run today: timed-out Claude
@@ -654,7 +658,9 @@ enum AutopilotCmd {
         worktree_root: Option<String>,
         /// Implementation harness: claude (default), codex or muse. The
         /// reviewer is chosen separately (`autopilot review` / `advance
-        /// --reviewer`).
+        /// --reviewer`). Codex and Muse run unsandboxed as the operator,
+        /// with the operator's environment and credentials; only choose
+        /// them for repositories trusted at that level.
         #[arg(long, default_value = "claude")]
         implementer: ironmem::autopilot::Implementer,
         /// Model for IC dispatches
@@ -704,9 +710,9 @@ enum AutopilotCmd {
         #[arg(long)]
         max_turns: Option<u32>,
         /// Per-dispatch spend ceiling passed to `claude --max-budget-usd`.
-        /// Claude only: Codex and Muse refuse it, and each of their
-        /// invocations pre-authorizes the default ceiling against the daily
-        /// ledger
+        /// Claude only: Codex and Muse refuse it; they report no cost, and
+        /// each of their invocations instead reserves one unpriced unit
+        /// against --max-unpriced-dispatches-per-day before it launches
         #[arg(long)]
         max_budget_usd: Option<f64>,
         /// Per-issue attempt cap, cumulative across runs; a remediation gets
@@ -715,7 +721,9 @@ enum AutopilotCmd {
         attempt_cap: Option<u32>,
         /// Daily ledger ceiling across all dispatches. Codex and Muse cost is
         /// unpriced, so the ledger records no dollars for them and their
-        /// effective limit is --max-unpriced-dispatches-per-day
+        /// effective limit is --max-unpriced-dispatches-per-day; the ceiling
+        /// still gates priced (Claude) dispatches, reviews and advisor calls
+        /// on the same day
         #[arg(long)]
         daily_budget_usd: Option<f64>,
         /// How many unpriced IC dispatches may run today: timed-out Claude
@@ -724,14 +732,14 @@ enum AutopilotCmd {
         /// cap
         #[arg(long)]
         max_unpriced_dispatches_per_day: Option<u32>,
-        /// Read everything, plan everything, write nothing and spend nothing
+        /// Plan without dispatching or spending; liveness checks may finalize awaiting-quiet evidence
         #[arg(long)]
         dry_run: bool,
         /// Emit JSON instead of text
         #[arg(long)]
         json: bool,
     },
-    /// Show what the Lead would work on next, without touching anything
+    /// Preview the Lead queue; liveness checks may finalize awaiting-quiet evidence
     /// (build-ladder rung 8)
     Queue {
         /// Path to the database
@@ -750,7 +758,7 @@ enum AutopilotCmd {
         /// its own, counted from the issue's first success
         #[arg(long)]
         attempt_cap: Option<u32>,
-        /// Per-dispatch spend ceiling, used for the same pre-authorization
+        /// Per-dispatch ceiling, used for the same priced-spend-plus-ceiling
         /// check `autopilot run` applies
         #[arg(long)]
         max_budget_usd: Option<f64>,

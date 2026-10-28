@@ -1,3 +1,5 @@
+//! Never unlink lock files, even when they appear idle. A holder may have
+//! opened the old inode just before deletion; replacing it voids exclusivity.
 //! One controller per issue: an advisory lock held for a whole run.
 //!
 //! Two controllers on one repository (two Leads, or a Lead and a manual
@@ -42,7 +44,7 @@
 //!   so between another run's claim and its spawn a second implementer can
 //!   launch;
 //! - and nothing stops two controllers provisioning one worktree, so one may
-//!   quarantine the other's (F2).
+//!   quarantine the other's.
 
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
@@ -128,7 +130,7 @@ pub fn git_common_dir(repo: &Path) -> Result<Option<PathBuf>, MemoryError> {
     let mut git = Command::new(crate::launcher::cached_launcher("git"));
     git.args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
         .current_dir(repo);
-    crate::mcp::tools::scrub_git_environment(&mut git);
+    crate::git_env::scrub_git_environment(&mut git);
     // Its message is matched below, so it must be git's own English.
     git.env("LC_ALL", "C").env_remove("LANGUAGE");
     let output = git.output().map_err(|e| {
@@ -297,6 +299,83 @@ mod tests {
     }
 
     #[test]
+    fn ultrareview_lock_failures_and_replacement_retry() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("locks/issue.lock");
+        let first = std::cell::Cell::new(true);
+        let lock = acquired(
+            try_lock_path_with(&path, &|| {
+                if first.replace(false) {
+                    std::fs::remove_file(&path).unwrap();
+                    std::fs::write(&path, "replacement").unwrap();
+                }
+            })
+            .unwrap(),
+        );
+        assert_eq!(
+            std::fs::metadata(path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        drop(lock);
+        let generation = std::cell::Cell::new(0);
+        let error = try_lock_path_with(&path, &|| {
+            let n = generation.get();
+            generation.set(n + 1);
+            std::fs::rename(&path, dir.path().join(format!("old-inode-{n}"))).unwrap();
+            std::fs::write(&path, "churn").unwrap();
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("kept being replaced"), "{error}");
+        std::fs::remove_file(&path).unwrap();
+        let target = dir.path().join("target");
+        std::fs::write(&target, "untouched").unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert!(try_lock_path(&path).is_err());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "untouched");
+        assert!(try_lock_path(&target.join("child")).is_err());
+    }
+
+    #[test]
+    fn ultrareview_broken_worktree_shapes() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("checkout");
+        let common = dir.path().join("common");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(common.join("worktrees/w")).unwrap();
+        std::fs::write(common.join("HEAD"), "ref: refs/heads/main").unwrap();
+        std::fs::write(repo.join(".git"), "gitdir: ../common/worktrees/w\n").unwrap();
+        let resolved = common_dir_of_broken_worktree(&repo).unwrap();
+        assert_eq!(
+            resolved.canonicalize().unwrap(),
+            common.canonicalize().unwrap()
+        );
+        std::fs::write(common.join("worktrees/w/commondir"), "../..\n").unwrap();
+        assert_eq!(
+            common_dir_of_broken_worktree(&repo)
+                .unwrap()
+                .canonicalize()
+                .unwrap(),
+            common.canonicalize().unwrap()
+        );
+        std::fs::remove_file(common.join("HEAD")).unwrap();
+        assert!(common_dir_of_broken_worktree(&repo).is_none());
+        std::fs::write(repo.join(".git"), "not a gitdir link").unwrap();
+        assert!(common_dir_of_broken_worktree(&repo).is_none());
+        std::fs::write(repo.join(".git"), "gitdir: ../other/admin\n").unwrap();
+        assert!(common_dir_of_broken_worktree(&repo).is_none());
+        assert!(git_common_dir(&dir.path().join("missing"))
+            .unwrap_err()
+            .to_string()
+            .contains("cannot run git"));
+    }
+
+    #[test]
     fn a_second_open_of_a_held_lock_is_refused_until_the_first_is_dropped() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("locks/owner-repo-7.lock");
@@ -349,7 +428,7 @@ mod tests {
         lock_for_run(repo.path(), &issue).unwrap();
     }
 
-    /// C-M3: a lock taken on a file that was replaced since it was opened
+    /// a lock taken on a file that was replaced since it was opened
     /// is taken again on the file now at the path, which another controller
     /// holds.
     #[test]
@@ -386,7 +465,7 @@ mod tests {
             .contains("/ironmem/autopilot/locks/a-b-c-1-"));
     }
 
-    /// C-M4: a worktree whose administrative directory was pruned still
+    /// a worktree whose administrative directory was pruned still
     /// finds its repository's common directory, and so its lock.
     #[test]
     fn a_worktree_with_a_broken_link_finds_its_repositorys_common_dir() {

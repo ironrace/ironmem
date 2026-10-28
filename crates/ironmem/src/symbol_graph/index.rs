@@ -376,7 +376,7 @@ pub fn canonicalize_repo(raw: &str) -> Result<String, MemoryError> {
     // Verify it is a git worktree. Scrubbed: an inherited `GIT_DIR` would
     // answer about another repository than `canonical`.
     let mut command = std::process::Command::new("git");
-    crate::mcp::tools::scrub_git_environment(&mut command);
+    crate::git_env::scrub_git_environment(&mut command);
     let output = command
         .args(["rev-parse", "--show-toplevel"])
         .current_dir(&canonical)
@@ -397,7 +397,7 @@ pub fn canonicalize_repo(raw: &str) -> Result<String, MemoryError> {
 fn resolve_head(repo: &str) -> (String, bool) {
     // Scrubbed: an inherited `GIT_DIR` would report another repository's HEAD.
     let mut command = std::process::Command::new("git");
-    crate::mcp::tools::scrub_git_environment(&mut command);
+    crate::git_env::scrub_git_environment(&mut command);
     let output = command
         .args(["rev-parse", "HEAD"])
         .current_dir(repo)

@@ -355,6 +355,11 @@ pub enum DeferReason {
     /// that reads it (or a human who has checked nothing runs for it)
     /// releases it. `why` says why it cannot be read.
     DispatchStateUnreadable { why: String },
+    /// The issue's dispatch-state phase label is none this binary writes:
+    /// a newer binary's parked phase, or a corrupt label. It is held, not
+    /// resumed — resuming would spend a dispatch attempt only for
+    /// `run_issue` to refuse it, every tick.
+    DispatchPhaseUnknown { label: String },
     /// The issue's dispatch state was written by the other harness, which the
     /// configured runner refuses to resume. Only that harness, or a human
     /// clearing the state, moves it.
@@ -590,8 +595,13 @@ pub fn plan_queue(
                         | DispatchPhase::InfrastructureFailure
                         | DispatchPhase::PausedDailyBudget
                         | DispatchPhase::PausedInfrastructureFailure,
-                    )
-                    | None => {}
+                    ) => {}
+                    None => {
+                        defer(DeferReason::DispatchPhaseUnknown {
+                            label: state.state.clone(),
+                        });
+                        continue;
+                    }
                 }
                 if let Some(configured) = config.implementer {
                     if state.implementer != configured {

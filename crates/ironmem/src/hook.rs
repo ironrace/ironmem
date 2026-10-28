@@ -466,7 +466,7 @@ fn workspace_git_output(
     // this workspace lookup at another repository. The shared scrub removes
     // the redirecting ones unconditionally, so one set after the scrub is not
     // inherited either. `inherited` is a test's; it must be such a variable.
-    let output = crate::mcp::tools::scrubbed_git(inherited)
+    let output = crate::git_env::scrubbed_git(inherited)
         .arg("-C")
         .arg(workspace_root)
         .args(args)
@@ -2779,7 +2779,7 @@ mod tests {
         // (by any test thread) would otherwise make this `git init`/`commit`
         // operate on the wrong repository despite the explicit `-C` target.
         let mut command = std::process::Command::new("git");
-        crate::mcp::tools::scrub_git_environment(&mut command);
+        crate::git_env::scrub_git_environment(&mut command);
         let output = command.arg("-C").arg(root).args(args).output().unwrap();
         assert!(
             output.status.success(),

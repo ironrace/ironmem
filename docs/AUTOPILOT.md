@@ -51,11 +51,42 @@ merge decision. Running `advance` before
 `advance` leaves every successful dispatch sitting as a pushed branch with
 no open PR, forever.
 
-`ironmem autopilot queue --repo owner/repo ...` is a free, read-only
+`ironmem autopilot queue --repo owner/repo ...` is a free
 preview: it shows what the Lead would dispatch next — the same ordering and
-the same budget/concurrency/attempt-cap checks `lead` applies — without
-touching anything. Run it any time to see what a `lead` tick would do before
+the same budget/concurrency/attempt-cap checks `lead` applies. Liveness may
+finalize awaiting-quiet evidence; it buys no calls and changes no database state. Run it any time to see what a `lead` tick would do before
 running one.
+
+## Controller locks and local storage (upgrade requirement)
+
+Before upgrading, move the repository (including its Git common directory)
+and the ironmem database to a local disk. `lead`, `run`, and `clear-dispatch`
+now refuse known remote filesystems: NFS, SMB/CIFS, 9p, Ceph and network FUSE
+subtypes on Linux; non-local mounts (including macFUSE mounts) on macOS.
+Linux also refuses FUSE when `/proc/self/mountinfo` cannot be read. Unknown
+filesystem types are allowed on Linux; platforms other than Linux/macOS do
+not currently detect remote storage. This is a host-local coordination check,
+not a general storage certification. Advance also needs the issue lock for
+review/merge and reports a lock failure rather than proceeding.
+
+Each issue has a kernel `flock` under
+`<git-common-dir>/ironmem/autopilot/locks/<issue-slug>-<hash>.lock`.
+The Lead holds it through provisioning and dispatch; advance holds it through
+review and merge; cleanup and `clear-dispatch` take it before changing state
+or removing a worktree. A held lock makes the Lead leave the issue to its
+owner, manual run and clear refuse, and advance skip the step or cleanup.
+The refusal/report names the issue and lock path. The kernel releases it when
+the holder exits or crashes. **Never delete a lock file**, even if it looks
+idle: a controller may already have opened its inode, and replacing it can
+allow two controllers to hold different files for the same issue.
+
+This excludes controllers using one clone on one host. It does not coordinate
+two clones, older controllers, or hosts sharing a database. Without it,
+state compare-and-set, leases and process evidence still fail closed on
+uncertainty, but a controller suspended past its lease/launch window between
+its last ownership check and spawn can still launch after takeover. Public
+library callers of `run_issue` must hold the issue lock through provisioning
+and the entire run, as the CLI does.
 
 ## Choose the implementation and review harnesses independently
 
@@ -149,8 +180,9 @@ no budget flag. So with either harness:
 
 - `--max-budget-usd` is an error. Autopilot does not pretend the shared
   `RunConfig` field becomes native enforcement. Instead, each invocation
-  pre-authorizes the default per-dispatch ceiling, $2.50, against the daily
-  ledger.
+  checks the day's priced spend plus the default per-dispatch ceiling,
+  $2.50, against the daily budget at run start. This writes no dollar
+  reservation; it reserves the unpriced unit described below.
 - Every invocation has an enforced wall-clock bound: the repo's approved
   `autopilot timeout` value when configured, otherwise a 1200-second backend
   fallback.
@@ -164,7 +196,7 @@ no budget flag. So with either harness:
   last unit, and concurrent ledger writers never lose each other's updates.
   An ambiguous crash in the narrow reservation-before-spawn window can
   conservatively consume a slot even when no child can later be proved.
-- A run writes the issue's dispatch state only while it still holds what
+- Within the issue lock described above, a run writes its dispatch state only while it still holds what
   that run last wrote (or read at its start): every write is a
   compare-and-set. If two runs admit the same issue (a Codex Lead and a Muse
   Lead on one repo, or a Lead and a manual `autopilot run`), the first to
@@ -349,7 +381,8 @@ marker takes; your own `codex exec` or `muse exec --output-schema` runs with
 other schema files never hold a dispatch. Once the supervisor has written its
 completion record, a recorded PID no longer counts: cleanup already proved
 that process gone, so the PID has been reused. The descendants alive at
-each `ps` sample (every 250 ms) are recorded with their kernel birth, so
+each `ps` sample (250 ms for the first minute, 1 second after that,
+and 2 seconds after five minutes) are recorded with their kernel birth, so
 after a controller crash the check also sees the tools that left the group
 with `setsid`, including Muse's. It cannot see a tool started after the last
 sample before the crash, or one that tool left running; that part of the
@@ -360,7 +393,7 @@ waiting to be recorded (a Lead resuming the issue records it, as does
 --title <title>`, with the harness that owns the state), unless lineage
 already holds that attempt, and it deletes nothing if the state changes while
 it checks. It deletes only the dispatch state; lineage, attempt counts, and
-the unpriced reservation stand, the artifacts stay on disk for inspection,
+the unpriced reservation stand, the artifacts stay on disk for inspection until retention pruning,
 and the next dispatch starts a fresh Codex thread or Muse session. A Claude
 state clears only against a readable registry that does not list its
 session.
@@ -388,7 +421,7 @@ before writing the completion record the supervisor also waits while any
 process qualifies: its working directory is the worktree or inside it, you
 own it, the kernel started it at or after the invocation's root, and it is
 neither the supervisor nor the shared daemon (or one of its children). It
-rescans every 250 ms for up to 15 seconds, which covers ordinary detached
+rescans every 1 second for up to 15 seconds, which covers ordinary detached
 helpers such as git's auto-gc. Your own shell or editor in the worktree
 started earlier, so it never counts; one you open there during the run does.
 
@@ -1061,3 +1094,74 @@ needs the manual step: make `agent:ready` its only `agent:*` label. `labels`
 never rewrites an existing label, so a repo whose `agent:blocked` was created
 earlier keeps the old description, which said it resumes on any newer human
 comment.)
+
+## Operational limits and retained evidence
+
+The default Muse reviewer is **not an OS-confined read-only process**.
+`--disable-write` blocks its non-shell write tools; measured shell writes can
+still succeed. The post-review tracked-tree/HEAD check rejects visible checkout
+changes, but cannot detect ignored-file writes or reads/writes outside the
+checkout. Its private prompt and scratch directory are owner-only, and its
+child environment removes `GH_TOKEN`, `GITHUB_TOKEN` and `SSH_AUTH_SOCK`.
+Other inherited variables, operator files and output channels remain exposed.
+This release retains that operator-equivalent trust as an explicit risk:
+use the Codex read-only reviewer or an external OS sandbox when those
+permissions are unacceptable for unattended review or auto-merge. These
+mitigations do not close the missing-confinement finding.
+
+Implementers intentionally retain the operator's authority and credentials
+needed for commits, signing and pushes. Run only trusted issue/repository
+content, or put the entire controller in an external sandbox. Process markers
+are conservative liveness evidence, not authenticated executable/UID identity:
+a local user who copies a marker can cause a denial of service by holding an
+issue. Birth authentication is required for cleanup signals; on non-Linux
+systems the documented birth-check-to-signal PID-reuse window remains.
+
+Invocation `prompt.md`, `journal.jsonl` and `stderr.log` contain **unscrubbed**
+issue/tool output, potentially secrets. They are owner-only, not protected
+from another process running as the operator, and may enter repository
+backups. Archive with care. Old UUID invocation directories for a finished
+issue are pruned only when a later recorded outcome/release runs, once their
+directory mtime is **more than 14 days** old. The currently named/just-recorded
+invocation is kept; clear-dispatch itself does not erase that evidence.
+Exactly 14 days, future mtimes and unreadable ages are retained (an unknown
+age is warned about). This is opportunistic cleanup, not a deletion deadline.
+
+Liveness reads can finalize an `awaiting_quiet` exit record after fresh process
+and worktree checks. Consequently queue/status/reconcile and **Lead dry runs**
+may finalize this evidence, despite buying no calls and writing no dispatch,
+lineage, budget or GitHub state. The quiet check and record rename are not
+atomic with a new process entering the worktree; this supervisor is not hostile
+fork containment. Additive exit-record fields deliberately make old strict
+readers hold; do not downgrade with pending invocations. Finish or clear them
+using the writing version first.
+
+Run one Lead per shared budget/concurrency domain when strict global caps
+matter. The queue concurrency cap is a **plan-time** count, so simultaneous
+Leads admitting different issues can exceed it. Dispatch dollar/unpriced
+reservations are transactional, but review/advice admission still checks the
+daily ledger before launch and records afterward: overlapping callers can
+overshoot their review/advice count or dollar ceiling. Supervision updates
+now serialize in an immediate transaction; external GitHub notification and
+advisor calls are still outside that transaction and are not exactly-once.
+
+Liveness performs repeated state/identity/exit reads and process-table scans
+across reconcile, queue and release. Per-tick memoization and dedicated
+reservation lookup indexes are deferred: a cached answer must not authorize
+cleanup/adoption after state or process evidence changes. Long runs use a
+slower observation cadence; quiet scans poll once per second. Kernel ownership
+and birth are re-read rather than cached across quiet scans because PIDs and
+credentials can change. Budget reservation lookup scans historical daily
+ledgers without a lifetime cutoff so a long-held invocation's reservation is
+not silently forgotten; corrupt drawers are warned and its reported count is
+a lower bound.
+
+The present harness table couples invocation recovery with unpriced budget
+accounting. Adding a priced recovering harness requires separating recovery,
+pricing, native budget enforcement and inherited environment capabilities;
+`recovers_invocations()` alone is not a pricing contract. Public process-source
+and dispatcher traits are trusted library integration seams, not hostile-input
+boundaries. `Worktree` values supplied by a library caller must come from
+`ensure_worktree` (absolute checkout path, valid branch and recorded cut).
+Unknown/legacy dispatch labels remain readable for compatibility but the queue
+defers unknown labels instead of treating them as resumable.
