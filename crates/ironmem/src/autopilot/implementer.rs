@@ -24,8 +24,9 @@ pub const RESUME_REFUSALS_BEFORE_ROTATION: u32 = 2;
 /// What differs between harnesses, named once so `run_issue` asks *why* it
 /// branches instead of *which* harness it has. A new harness answers these.
 impl Implementer {
-    /// Every harness, once. `tests::every_variant_is_listed` matches
-    /// exhaustively, so a new variant fails to compile until it is added here.
+    /// Every harness, once. `tests::every_variant_is_listed` checks it
+    /// against serde's own list of variants, so a new variant fails that test
+    /// until it is added here.
     pub const ALL: [Self; 3] = [Self::Claude, Self::Codex, Self::Muse];
 
     /// The wall-clock bound used when the repo sets none. A supervised CLI
@@ -95,6 +96,18 @@ impl Implementer {
         }
     }
 
+    /// The harness inherits the controller's environment, `GIT_*` included,
+    /// so it may commit under the controller's `GIT_COMMITTER_EMAIL`. Claude
+    /// does; a supervised CLI harness (Codex, Muse) is spawned with every
+    /// `GIT_*` variable scrubbed, and commits under the worktree's identity
+    /// only.
+    pub fn inherits_controller_git_env(self) -> bool {
+        match self {
+            Self::Claude => true,
+            Self::Codex | Self::Muse => false,
+        }
+    }
+
     /// The harness registry entry whose binary this implementer launches.
     pub fn launcher_harness(self) -> crate::launcher::Harness {
         match self {
@@ -147,14 +160,33 @@ mod tests {
 
     const ALL: [Implementer; 3] = Implementer::ALL;
 
+    /// `ALL` against serde's own variant list, which an unknown variant's
+    /// error names: a variant missing from `ALL` fails here.
     #[test]
     fn every_variant_is_listed() {
+        let err = serde_json::from_str::<Implementer>("\"__none__\"")
+            .unwrap_err()
+            .to_string();
+        let (_, listed) = err
+            .split_once("expected one of ")
+            .unwrap_or_else(|| panic!("serde names no variants: {err}"));
+        let listed = listed.split(" at line").next().unwrap_or(listed);
+        let variants: Vec<String> = listed
+            .split(", ")
+            .map(|v| v.trim().trim_matches('`').to_string())
+            .collect();
+        let all: Vec<String> = ALL.iter().map(|i| i.cli_name().to_string()).collect();
+        assert_eq!(variants, all, "serde said: {err}");
+    }
+
+    #[test]
+    fn only_claude_inherits_the_controllers_git_environment() {
         for implementer in ALL {
-            // No `_` arm: a new variant stops this compiling, which is the
-            // prompt to add it to `Implementer::ALL`.
-            match implementer {
-                Implementer::Claude | Implementer::Codex | Implementer::Muse => {}
-            }
+            assert_eq!(
+                implementer.inherits_controller_git_env(),
+                !implementer.recovers_invocations(),
+                "{implementer:?}"
+            );
         }
     }
 

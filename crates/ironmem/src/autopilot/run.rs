@@ -581,21 +581,43 @@ pub enum TerminalReason {
     SessionInUse { detail: String },
 }
 
+/// What a run's end does with the issue's dispatch-state drawer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Disposition {
+    /// Finished for the issue: cleared.
+    Clear,
+    /// "Paused, not finished": the session is kept under this phase, since
+    /// clearing would turn a resumable session into an orphan, which the
+    /// spec's restart table requires be flagged for a human rather than
+    /// silently adopted.
+    Park(DispatchPhase),
+    /// Left exactly as it is: it may name a live invocation.
+    Keep,
+}
+
 impl TerminalReason {
-    /// Whether the issue's dispatch-state drawer should be cleared. False for
-    /// the two "paused, not finished" reasons — clearing those would turn a
-    /// resumable session into an orphan, which the spec's restart table
-    /// requires be flagged for a human rather than silently adopted.
-    fn clears_dispatch_state(&self) -> bool {
-        !matches!(
-            self,
-            TerminalReason::ImplementationInFlight { .. }
-                | TerminalReason::DailyBudgetExhausted { .. }
-                | TerminalReason::InfrastructureFailure { .. }
-                | TerminalReason::StrategyEscalated { .. }
-                | TerminalReason::UnpricedDispatchesExhausted { .. }
-                | TerminalReason::SessionInUse { .. }
-        )
+    /// What the run's end does with the dispatch state. Exhaustive, with no
+    /// wildcard: a new reason must say, since defaulting to a clear would
+    /// release the slot of a session that may still run.
+    fn disposition(&self) -> Disposition {
+        match self {
+            TerminalReason::ImplementationInFlight { .. } => Disposition::Keep,
+            TerminalReason::Met { .. }
+            | TerminalReason::AlreadySucceeded { .. }
+            | TerminalReason::AttemptCapExhausted
+            | TerminalReason::Impossible { .. } => Disposition::Clear,
+            TerminalReason::DailyBudgetExhausted { .. } => {
+                Disposition::Park(DispatchPhase::PausedDailyBudget)
+            }
+            TerminalReason::InfrastructureFailure { .. }
+            | TerminalReason::UnpricedDispatchesExhausted { .. }
+            | TerminalReason::StrategyEscalated { .. } => {
+                Disposition::Park(DispatchPhase::PausedInfrastructureFailure)
+            }
+            TerminalReason::SessionInUse { .. } => {
+                Disposition::Park(DispatchPhase::PausedSessionInUse)
+            }
+        }
     }
 }
 
@@ -947,6 +969,21 @@ fn serialize_issue<S: serde::Serializer>(
 /// legitimate success, so an unreadable branch degrades to `None` rather than
 /// failing a run that otherwise succeeded.
 fn branch_tip(worktree: &Worktree) -> Option<String> {
+    read_branch_tip(&worktree.path, &worktree.branch).unwrap_or_else(|e| {
+        tracing::warn!(
+            error = %e,
+            branch = %worktree.branch,
+            "autopilot could not read the issue branch's tip; the attempt is recorded without \
+             its commit"
+        );
+        None
+    })
+}
+
+/// `refs/heads/<branch>`'s commit in `dir`: `Ok(None)` when no such branch
+/// exists (`rev-parse --verify --quiet` exits 1), `Err` when git could not
+/// be run or failed any other way.
+fn read_branch_tip(dir: &Path, branch: &str) -> Result<Option<String>, String> {
     let mut command = std::process::Command::new("git");
     // An inherited `GIT_DIR` overrides `current_dir`, so without this the
     // commit recorded as an attempt's `commit_sha` could be another
@@ -957,16 +994,19 @@ fn branch_tip(worktree: &Worktree) -> Option<String> {
             "rev-parse",
             "--verify",
             "--quiet",
-            &format!("refs/heads/{}^{{commit}}", worktree.branch),
+            &format!("refs/heads/{branch}^{{commit}}"),
         ])
-        .current_dir(&worktree.path)
+        .current_dir(dir)
         .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
+        .map_err(|e| format!("git could not be run: {e}"))?;
+    match output.status.code() {
+        Some(0) => {
+            let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            Ok((!sha.is_empty()).then_some(sha))
+        }
+        Some(1) => Ok(None),
+        _ => Err(worktree::bounded_stderr(&output.stderr)),
     }
-    let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    (!sha.is_empty()).then_some(sha)
 }
 
 /// How much of the model's own reason a `met` the guard refused keeps.
@@ -1453,8 +1493,18 @@ fn signing_violation(
     worktree: &Worktree,
     seen: SigningPolicySeen,
     repo: &str,
+    implementer: Implementer,
 ) -> Result<Option<SigningViolation>, GuardFault> {
-    check_signing(worktree, seen, repo, SIGNING_GUARD_TIMEOUT)
+    check_signing(worktree, seen, repo, implementer, SIGNING_GUARD_TIMEOUT)
+}
+
+/// The controller's `GIT_COMMITTER_EMAIL`, when `implementer` inherits it
+/// and so may commit under it ([`Implementer::inherits_controller_git_env`]).
+fn controller_git_email(implementer: Implementer) -> Option<String> {
+    implementer
+        .inherits_controller_git_env()
+        .then(|| std::env::var("GIT_COMMITTER_EMAIL").ok())
+        .flatten()
 }
 
 /// [`signing_violation`], with all its git commands bounded by `timeout`.
@@ -1462,13 +1512,19 @@ fn check_signing(
     worktree: &Worktree,
     seen: SigningPolicySeen,
     repo: &str,
+    implementer: Implementer,
     timeout: std::time::Duration,
 ) -> Result<Option<SigningViolation>, GuardFault> {
     if let std::ops::ControlFlow::Break(answer) = policy_gate(worktree, seen)? {
         return Ok(answer);
     }
     let git = GuardGit::new(&worktree.path, timeout).map_err(GuardFault::GitUnreadable)?;
-    check_range(worktree, &git, Some(repo))
+    check_range(
+        worktree,
+        &git,
+        Some(repo),
+        controller_git_email(implementer).as_deref(),
+    )
 }
 
 /// The signing policy's part of [`signing_violation`]: `Break` with the
@@ -1506,6 +1562,7 @@ fn check_range(
     worktree: &Worktree,
     git: &GuardGit<'_>,
     repo: Option<&str>,
+    controller_email: Option<&str>,
 ) -> Result<Option<SigningViolation>, GuardFault> {
     let unreadable = GuardFault::GitUnreadable;
     let branch = worktree.branch.as_str();
@@ -1648,7 +1705,7 @@ fn check_range(
     if flagged.is_empty() {
         return Ok(None);
     }
-    let identity = run_identity(git);
+    let identity = run_identity(git, controller_email).map_err(unreadable)?;
     let own_commit = |committer: &str| {
         identity
             .as_ref()
@@ -1663,44 +1720,70 @@ fn check_range(
             identity: identity.unwrap_or_default().join(" or "),
         });
     }
-    // The recipe force-pushes first where the goal condition's push clause
-    // pushes (`worktree::pick_push_remote`, with the issue's repo), then to
-    // every other remote holding the issue branch: the guard reads each, so
-    // one left with the old commits keeps it failing. A remote list that
-    // cannot be read names only the holders.
-    let listing = git
-        .run(&["remote", "-v"], None)
-        .ok()
-        .filter(|out| out.status.success())
-        .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
-        .unwrap_or_default();
-    let listed = worktree::remote_push_urls(&listing);
-    let remotes: Vec<(&str, &[&str])> = configured
-        .iter()
-        .map(|remote| {
-            let urls = listed
-                .iter()
-                .find(|(name, _)| name == remote)
-                .map_or(&[][..], |(_, urls)| urls.as_slice());
-            (*remote, urls)
-        })
-        .collect();
-    let holding: Vec<&str> = own.iter().map(|(remote, _)| *remote).collect();
-    let mut push_to: Vec<String> = worktree::pick_push_remote(&remotes, &holding, repo)
-        .map(str::to_string)
-        .into_iter()
-        .collect();
-    for remote in holding {
-        if !push_to.iter().any(|named| named == remote) {
-            push_to.push(remote.to_string());
-        }
+    // The recipe force-pushes where `recipe_remotes` says. A remote list
+    // that cannot be read is said so, and the recipe names only the holders.
+    let listing = match git.run(&["remote", "-v"], None) {
+        Ok(out) if out.status.success() => Ok(String::from_utf8_lossy(&out.stdout).into_owned()),
+        Ok(out) => Err(worktree::bounded_stderr(&out.stderr)),
+        Err(e) => Err(e),
+    };
+    if let Err(e) = &listing {
+        tracing::warn!(
+            error = %e,
+            branch = %branch,
+            "autopilot's signing guard could not read `git remote -v`; the recipe names only \
+             the remotes holding the branch"
+        );
     }
+    let holding: Vec<&str> = own.iter().map(|(remote, _)| *remote).collect();
+    let push_to = recipe_remotes(listing.as_deref().ok(), &configured, &holding, repo);
     Ok(Some(SigningViolation::Unsigned {
         flagged: flagged.into_iter().map(|(sha, _)| sha).collect(),
         cut: worktree.cut.to_string(),
         branch: branch.to_string(),
         remotes: push_to,
     }))
+}
+
+/// Where a signing violation's recipe force-pushes the branch: first where
+/// the goal condition's push clause pushes (`worktree::pick_push_remote`,
+/// with the issue's repo), then to every other remote holding the issue
+/// branch, since the guard reads each and one left with the old commits keeps
+/// it failing. `listing` is `git remote -v`; `None` when it could not be
+/// read, when the push clause's remote cannot be told and only the holders
+/// are named.
+fn recipe_remotes(
+    listing: Option<&str>,
+    configured: &[&str],
+    holding: &[&str],
+    repo: Option<&str>,
+) -> Vec<String> {
+    let mut push_to: Vec<String> = match listing {
+        Some(listing) => {
+            let listed = worktree::remote_push_urls(listing);
+            let remotes: Vec<(&str, &[&str])> = configured
+                .iter()
+                .map(|remote| {
+                    let urls = listed
+                        .iter()
+                        .find(|(name, _)| name == remote)
+                        .map_or(&[][..], |(_, urls)| urls.as_slice());
+                    (*remote, urls)
+                })
+                .collect();
+            worktree::pick_push_remote(&remotes, holding, repo)
+                .map(str::to_string)
+                .into_iter()
+                .collect()
+        }
+        None => Vec::new(),
+    };
+    for remote in holding {
+        if !push_to.iter().any(|named| named == remote) {
+            push_to.push(remote.to_string());
+        }
+    }
+    push_to
 }
 
 /// Run-start collaborator checks already found clean, by worktree and
@@ -1729,14 +1812,39 @@ thread_local! {
 /// that cannot be read is never cached, and a fault is never remembered as
 /// clean. A git that cannot be run is not a reason to refuse here; the
 /// guard meets it again at the `met`, where it is never accepted.
-fn collaborator_check_at_start(worktree: &Worktree, seen: SigningPolicySeen) -> Option<GuardFault> {
+fn collaborator_check_at_start(
+    worktree: &Worktree,
+    seen: SigningPolicySeen,
+    implementer: Implementer,
+) -> Option<GuardFault> {
     let slot = (worktree.path.clone(), worktree.branch.clone());
     let cache = || CLEAN_AT_START.lock().unwrap_or_else(|e| e.into_inner());
-    let Ok(git) = GuardGit::new(&worktree.path, SIGNING_GUARD_TIMEOUT) else {
-        cache().remove(&slot);
-        return None;
+    let git = match GuardGit::new(&worktree.path, SIGNING_GUARD_TIMEOUT) {
+        Ok(git) => git,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                branch = %worktree.branch,
+                "autopilot's run-start signing check could not set up git; the met will \
+                 judge the branch again"
+            );
+            cache().remove(&slot);
+            return None;
+        }
     };
-    let key = range_key(worktree, &git).ok();
+    let controller_email = controller_git_email(implementer);
+    let key = match range_key(worktree, &git, controller_email.as_deref()) {
+        Ok(key) => Some(key),
+        Err(e) => {
+            tracing::debug!(
+                error = %e,
+                branch = %worktree.branch,
+                "autopilot could not read what the run-start signing check depends on, so \
+                 it reads the range in full"
+            );
+            None
+        }
+    };
     if key.is_some() && cache().get(&slot) == key.as_ref() {
         return None;
     }
@@ -1745,7 +1853,9 @@ fn collaborator_check_at_start(worktree: &Worktree, seen: SigningPolicySeen) -> 
     let verdict = match policy_gate(worktree, seen) {
         Ok(std::ops::ControlFlow::Break(answer)) => Ok(answer),
         // Only a fault matters here, so the recipe needs no issue repo.
-        Ok(std::ops::ControlFlow::Continue(())) => check_range(worktree, &git, None),
+        Ok(std::ops::ControlFlow::Continue(())) => {
+            check_range(worktree, &git, None, controller_email.as_deref())
+        }
         Err(fault) => Err(fault),
     };
     match verdict {
@@ -1753,7 +1863,13 @@ fn collaborator_check_at_start(worktree: &Worktree, seen: SigningPolicySeen) -> 
             cache().remove(&slot);
             Some(fault)
         }
-        Err(_) => {
+        Err(fault) => {
+            tracing::warn!(
+                error = %fault,
+                branch = %worktree.branch,
+                "autopilot's run-start signing check could not read the branch; the met will \
+                 judge it again"
+            );
             cache().remove(&slot);
             None
         }
@@ -1768,7 +1884,11 @@ fn collaborator_check_at_start(worktree: &Worktree, seen: SigningPolicySeen) -> 
 
 /// Everything the collaborator check's answer depends on, as one string,
 /// read through the check's own `git`.
-fn range_key(worktree: &Worktree, git: &GuardGit<'_>) -> Result<String, String> {
+fn range_key(
+    worktree: &Worktree,
+    git: &GuardGit<'_>,
+    controller_email: Option<&str>,
+) -> Result<String, String> {
     let read = |args: &[&str]| -> Result<String, String> {
         let out = git.run(args, None)?;
         if !out.status.success() {
@@ -1789,34 +1909,44 @@ fn range_key(worktree: &Worktree, git: &GuardGit<'_>) -> Result<String, String> 
     let policy = worktree::signing_policy(&worktree.path)?;
     Ok(format!(
         "{refs}\0{remotes}\0{ident}\0{:?}\0{}\0{policy}\0{:?}",
-        std::env::var("GIT_COMMITTER_EMAIL").ok(),
-        worktree.cut,
-        git.pins
+        controller_email, worktree.cut, git.pins
     ))
 }
 
 /// The committer emails this run's commits carry: the worktree's
-/// `git var GIT_COMMITTER_IDENT`, plus the controller's own
-/// `GIT_COMMITTER_EMAIL`, which an implementer that inherits the
-/// controller's environment would commit under. `None` when neither reads.
-fn run_identity(git: &GuardGit<'_>) -> Option<Vec<String>> {
+/// `git var GIT_COMMITTER_IDENT`, plus `controller_email`, the controller's
+/// own `GIT_COMMITTER_EMAIL` when the implementer inherits it
+/// ([`controller_git_email`]). `Ok(None)` when git ran and named no email
+/// and there is no controller email: every flagged commit then counts as
+/// this run's. `Err` when git could not be run or failed, which is the
+/// guard's fault, never the model's.
+fn run_identity(
+    git: &GuardGit<'_>,
+    controller_email: Option<&str>,
+) -> Result<Option<Vec<String>>, String> {
+    let out = git.run(&["var", "GIT_COMMITTER_IDENT"], None)?;
+    if !out.status.success() {
+        return Err(worktree::bounded_stderr(&out.stderr));
+    }
     let mut emails = Vec::new();
-    if let Ok(out) = git.run(&["var", "GIT_COMMITTER_IDENT"], None) {
-        let ident = String::from_utf8_lossy(&out.stdout);
-        if let Some((_, rest)) = ident.split_once('<') {
-            if let Some((email, _)) = rest.split_once('>') {
-                if out.status.success() && !email.trim().is_empty() {
-                    emails.push(email.trim().to_string());
-                }
+    let ident = String::from_utf8_lossy(&out.stdout);
+    if let Some((_, rest)) = ident.split_once('<') {
+        if let Some((email, _)) = rest.split_once('>') {
+            if !email.trim().is_empty() {
+                emails.push(email.trim().to_string());
             }
         }
     }
-    if let Ok(email) = std::env::var("GIT_COMMITTER_EMAIL") {
-        if !email.trim().is_empty() {
-            emails.push(email.trim().to_string());
-        }
+    if let Some(email) = controller_email.map(str::trim).filter(|e| !e.is_empty()) {
+        emails.push(email.to_string());
     }
-    (!emails.is_empty()).then_some(emails)
+    if emails.is_empty() {
+        tracing::warn!(
+            "autopilot's signing guard read no committer email, so every flagged commit counts \
+             as this run's"
+        );
+    }
+    Ok((!emails.is_empty()).then_some(emails))
 }
 
 /// Whether one commit's own `git log -1 --format=%G?` read keeps its
@@ -2418,14 +2548,20 @@ fn kept_at_start(implementer: Implementer, state: Option<&DispatchState>) -> &'s
     }
 }
 
-/// What a run stopped after a dispatch by a guard fault leaves behind.
+/// What a run stopped after a dispatch by a guard fault leaves behind. The
+/// fault turns a `met` away, so the dispatch returned a verdict: Claude has
+/// already rotated its session by then
+/// ([`Implementer::rotates_session_after_verdict`]).
 fn kept_mid_run(implementer: Implementer) -> &'static str {
-    if implementer.recovers_invocations() {
-        "the finished invocation is kept, and the first run after the fix checks its met \
-         again; do not clear-dispatch it"
-    } else {
-        "the session is kept (state `infrastructure-failure`), and the next run after the fix \
-         resumes it"
+    match implementer {
+        Implementer::Codex | Implementer::Muse => {
+            "the finished invocation is kept, and the first run after the fix checks its met \
+             again; do not clear-dispatch it"
+        }
+        Implementer::Claude => {
+            "the met's commits stay on the branch (state `infrastructure-failure`), and the next \
+             run after the fix opens a fresh session, whose met is checked again"
+        }
     }
 }
 
@@ -2729,7 +2865,7 @@ pub fn run_issue(
     // operator deals with it. A git that cannot be run, and anything the
     // guard finds that is the model's to fix, are judged again when its
     // `met` arrives.
-    if let Some(fault) = collaborator_check_at_start(worktree, seen.fresh()) {
+    if let Some(fault) = collaborator_check_at_start(worktree, seen.fresh(), config.implementer) {
         return Err(MemoryError::Validation(format!(
             "{fault}; the run does not start, since any met it produced would be refused the \
              same way; {}",
@@ -3460,7 +3596,7 @@ pub fn run_issue(
             // An interrupted run's reading holds only its own recovered
             // invocation's met.
             let seen = if recovered { seen } else { seen.fresh() };
-            match signing_violation(worktree, seen, &issue.repo) {
+            match signing_violation(worktree, seen, &issue.repo, config.implementer) {
                 Ok(None) => {}
                 Ok(Some(violation)) => {
                     let original = outcome.reason.take();
@@ -3648,7 +3784,17 @@ pub fn run_issue(
         }
     };
 
-    if terminal.clears_dispatch_state() {
+    // A session parked as still in use stays parked until a launch probes
+    // it: a run that stopped before launching (a budget, a cap, an
+    // escalation) learned nothing about its holder, and the park is what
+    // keeps a later run from rotating over it or the queue from admitting it.
+    let disposition = match terminal.disposition() {
+        Disposition::Clear | Disposition::Park(_) if parked_in_use && !launched => {
+            Disposition::Park(DispatchPhase::PausedSessionInUse)
+        }
+        disposition => disposition,
+    };
+    if disposition == Disposition::Clear {
         // Only the state this run owns; one another run wrote is theirs.
         if let Some(owned) = &owned {
             if !dispatch_state::clear_claim_if_unchanged(db, owned)? {
@@ -3660,12 +3806,7 @@ pub fn run_issue(
                 );
             }
         }
-    } else if !matches!(terminal, TerminalReason::ImplementationInFlight { .. }) {
-        let state_label = match &terminal {
-            TerminalReason::DailyBudgetExhausted { .. } => DispatchPhase::PausedDailyBudget,
-            TerminalReason::SessionInUse { .. } => DispatchPhase::PausedSessionInUse,
-            _ => DispatchPhase::PausedInfrastructureFailure,
-        };
+    } else if let Disposition::Park(state_label) = disposition {
         write_state(
             &mut owned,
             cumulative_attempt_n,
@@ -4575,6 +4716,49 @@ sleep 0.5
         let sessions: Vec<_> = d.inner.seen.iter().map(session_of).collect();
         assert_eq!(sessions[..2], [held.clone(), held.clone()], "{sessions:?}");
         assert_ne!(sessions[2], held, "{sessions:?}");
+    }
+
+    /// F26: a run that stops before it launches (here at the day's unpriced
+    /// cap) learned nothing about a parked session's holder, so the park
+    /// stands, and a later run on another model still probes that session.
+    #[test]
+    fn a_run_that_never_launches_keeps_a_session_parked_as_in_use() {
+        let mut changed = muse_config();
+        changed.model = "muse-wonder-2.0".into();
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        let mut d = muse_script(vec![muse_in_use()]);
+        run_issue(&db, &issue(), &brief(), &wt, &muse_config(), &mut d).unwrap();
+        let held = session_of(&d.inner.seen[0]);
+
+        let mut capped = muse_config();
+        capped.max_unpriced_dispatches_per_day = 1;
+        let mut d = muse_script(Vec::new());
+        let run = run_issue(&db, &issue(), &brief(), &wt, &capped, &mut d).unwrap();
+        assert!(
+            matches!(
+                run.terminal,
+                TerminalReason::UnpricedDispatchesExhausted { .. }
+            ),
+            "{:?}",
+            run.terminal
+        );
+        assert!(d.inner.seen.is_empty());
+        let state = dispatch_state::get_dispatch_state(&db, &issue())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (state.state.as_str(), state.session_uuid.as_str()),
+            ("paused-session-in-use", held.as_str())
+        );
+
+        let mut d = muse_script(vec![met()]);
+        run_issue(&db, &issue(), &brief(), &wt, &changed, &mut d).unwrap();
+        assert_eq!(
+            session_of(&d.inner.seen[0]),
+            held,
+            "the held session is probed"
+        );
     }
 
     #[test]
@@ -5766,9 +5950,14 @@ sleep 0.5
 
     /// The guard's verdict on `wt` as text, with nothing held from memory.
     fn check(wt: &Worktree) -> Result<Option<String>, String> {
-        signing_violation(wt, SigningPolicySeen::default(), &issue().repo)
-            .map(|violation| violation.map(|v| v.to_string()))
-            .map_err(|fault| fault.to_string())
+        signing_violation(
+            wt,
+            SigningPolicySeen::default(),
+            &issue().repo,
+            Implementer::Claude,
+        )
+        .map(|violation| violation.map(|v| v.to_string()))
+        .map_err(|fault| fault.to_string())
     }
 
     /// Fixture git ([`crate::autopilot::test_git`]): no global or system
@@ -5850,8 +6039,13 @@ sleep 0.5
         git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
         commit_in(&wt.path, "b", &["-c", "commit.gpgsign=false"]);
         wt.cut = worktree::CommitSha::unchecked("--all");
-        let fault =
-            signing_violation(&wt, SigningPolicySeen::default(), &issue().repo).unwrap_err();
+        let fault = signing_violation(
+            &wt,
+            SigningPolicySeen::default(),
+            &issue().repo,
+            Implementer::Claude,
+        )
+        .unwrap_err();
         assert!(fault.stops_run(), "{fault}");
         assert!(fault.to_string().contains("--all"), "{fault}");
     }
@@ -5956,6 +6150,17 @@ sleep 0.5
                 config()
             };
             c.max_consecutive_infrastructure_failures = 3;
+            // Claude resumes a session it claimed earlier, and rotates it on
+            // the met's verdict, before the guard turns the met away.
+            let resumed = "55555555-6666-7777-8888-999999999999";
+            if implementer == Implementer::Claude {
+                let mut paused = pending_invocation(Implementer::Claude, &db, &wt, None);
+                paused.state = "paused-infrastructure-failure".into();
+                paused.session_uuid = resumed.into();
+                paused.native_session_id = Some(resumed.into());
+                paused.session_claimed = true;
+                dispatch_state::upsert_dispatch_state(&db, &paused).unwrap();
+            }
             let err = run_issue(&db, &issue(), &brief(), &wt, &c, &mut dispatcher)
                 .unwrap_err()
                 .to_string();
@@ -5971,10 +6176,11 @@ sleep 0.5
                     "{err}"
                 );
             } else {
-                // Claude has no invocation to recover: its session is resumed.
+                // Claude has no invocation to recover, and its session has
+                // rotated: the next run opens a fresh one.
                 assert!(!err.contains("invocation"), "{err}");
                 assert!(
-                    err.contains("the next run after the fix resumes it"),
+                    err.contains("the next run after the fix opens a fresh session"),
                     "{err}"
                 );
             }
@@ -5990,6 +6196,8 @@ sleep 0.5
                 assert!(state.invocation_artifacts.is_some(), "{state:?}");
             } else {
                 assert_eq!(state.state, "infrastructure-failure", "{state:?}");
+                assert!(!state.session_claimed, "{state:?}");
+                assert_ne!(state.session_uuid, resumed, "{state:?}");
             }
         }
     }
@@ -6170,6 +6378,116 @@ sleep 0.5
         assert!(why.contains("did not finish"), "{why}");
     }
 
+    /// F21: a guard git that cannot run is the guard's fault, never "no
+    /// identity", which would blame every flagged commit on the model.
+    #[test]
+    fn an_identity_git_cannot_read_is_an_error_not_no_identity() {
+        let (_dir, wt) = fixture_worktree();
+        let mut git = GuardGit::new(&wt.path, SIGNING_GUARD_TIMEOUT).unwrap();
+        // Its shared deadline already spent, as by a long range before it.
+        git.deadline = std::time::Instant::now();
+        assert!(run_identity(&git, None).is_err());
+        let git = GuardGit::new(&wt.path, SIGNING_GUARD_TIMEOUT).unwrap();
+        assert_eq!(
+            run_identity(&git, None).unwrap(),
+            Some(vec!["autopilot@example.test".to_string()])
+        );
+    }
+
+    /// F88: the controller's own committer email is a commit of this run's
+    /// only for a harness that inherits the controller's environment.
+    #[test]
+    fn the_controllers_committer_email_is_ours_only_for_claude() {
+        let (_dir, wt) = fixture_worktree();
+        let git = GuardGit::new(&wt.path, SIGNING_GUARD_TIMEOUT).unwrap();
+        let emails = run_identity(&git, Some("ops@corp.test")).unwrap().unwrap();
+        assert!(emails.iter().any(|e| e == "ops@corp.test"), "{emails:?}");
+        for implementer in Implementer::ALL {
+            let email = implementer
+                .inherits_controller_git_env()
+                .then_some("ops@corp.test");
+            let emails = run_identity(&git, email).unwrap().unwrap();
+            assert_eq!(
+                emails.iter().any(|e| e == "ops@corp.test"),
+                implementer == Implementer::Claude,
+                "{implementer:?}: {emails:?}"
+            );
+        }
+    }
+
+    /// F85: an unreadable remote list names only the holders, never a guess
+    /// at the push clause's remote.
+    #[test]
+    fn an_unreadable_remote_list_names_only_the_holders() {
+        let listing = "origin\thttps://github.com/fork/repo.git (fetch)\n\
+                       origin\thttps://github.com/fork/repo.git (push)\n\
+                       upstream\thttps://github.com/ironrace/ironmem.git (fetch)\n\
+                       upstream\thttps://github.com/ironrace/ironmem.git (push)\n";
+        let configured = ["origin", "upstream"];
+        let holding = ["origin", "upstream"];
+        assert_eq!(
+            recipe_remotes(None, &configured, &holding, Some("ironrace/ironmem")),
+            vec!["origin".to_string(), "upstream".to_string()]
+        );
+        // Readable, the push clause's remote leads.
+        assert_eq!(
+            recipe_remotes(
+                Some(listing),
+                &configured,
+                &holding,
+                Some("ironrace/ironmem")
+            ),
+            vec!["upstream".to_string(), "origin".to_string()]
+        );
+    }
+
+    /// F78: a missing branch has no tip; a directory git cannot read is an
+    /// error, never quietly no tip.
+    #[test]
+    fn a_branch_tip_git_cannot_read_is_an_error_and_a_missing_branch_is_none() {
+        let (_dir, wt) = fixture_worktree();
+        assert!(read_branch_tip(&wt.path, &wt.branch).unwrap().is_some());
+        assert_eq!(read_branch_tip(&wt.path, "no-such-branch").unwrap(), None);
+        let not_a_repo = tempfile::tempdir().unwrap();
+        assert!(read_branch_tip(not_a_repo.path(), "main").is_err());
+    }
+
+    /// F89: only a `gpgsig`/`gpgsig-sha256` header in the header block
+    /// counts, and a cat-file reply that is not one commit object per name,
+    /// in order, is refused rather than guessed at.
+    #[test]
+    fn signature_headers_read_only_whole_commit_objects_in_order() {
+        let sha = "a".repeat(40);
+        let other = "b".repeat(40);
+        let object = |sha: &str, body: &str| format!("{sha} commit {}\n{body}\n", body.len());
+        let unsigned = "tree t\nauthor a\n\ngpgsig x in the message";
+        let signed = "tree t\ngpgsig -----BEGIN-----\n continued\n\nmessage";
+        let signed256 = "tree t\ngpgsig-sha256 -----BEGIN-----\n\nmessage";
+        assert!(!has_signature_header(unsigned));
+        assert!(has_signature_header(signed));
+        assert!(has_signature_header(signed256));
+        assert!(!has_signature_header("tree t\ngpgsigx y\n\nm"));
+        let both = format!("{}{}", object(&sha, unsigned), object(&other, signed256));
+        assert_eq!(
+            signature_headers(both.as_bytes(), &[&sha, &other]).unwrap(),
+            vec![false, true]
+        );
+        let one = object(&sha, signed);
+        for (reply, why) in [
+            (String::new(), "missing"),
+            (one[..one.len() - 5].to_string(), "truncated"),
+            (object(&other, signed), "wrong name"),
+            (one.replace(" commit ", " tree "), "wrong kind"),
+            (format!("{sha} commit\n{signed}\n"), "no size"),
+            (format!("{sha} missing\n"), "missing object"),
+        ] {
+            assert!(
+                signature_headers(reply.as_bytes(), &[&sha]).is_err(),
+                "{why}: {reply:?}"
+            );
+        }
+    }
+
     #[test]
     fn a_guard_git_command_never_fetches_and_runs_without_lazy_fetch() {
         let (_dir, wt) = fixture_worktree();
@@ -6287,7 +6605,12 @@ sleep 0.5
         commit_in(&wt.path, "work", &[]);
         let built = || GUARD_GITS_BUILT.with(std::cell::Cell::get);
         let before = built();
-        assert!(collaborator_check_at_start(&wt, SigningPolicySeen::default()).is_none());
+        assert!(collaborator_check_at_start(
+            &wt,
+            SigningPolicySeen::default(),
+            Implementer::Claude
+        )
+        .is_none());
         assert_eq!(built() - before, 1);
     }
 
@@ -6298,7 +6621,7 @@ sleep 0.5
         commit_in(&wt.path, "b", &["-c", "commit.gpgsign=false"]);
         wt.cut = worktree::CommitSha::unchecked("--all");
         assert!(matches!(
-            collaborator_check_at_start(&wt, SigningPolicySeen::default()),
+            collaborator_check_at_start(&wt, SigningPolicySeen::default(), Implementer::Claude),
             Some(GuardFault::CutInvalid(_))
         ));
     }
@@ -6340,9 +6663,9 @@ sleep 0.5
         commit_in(&wt.path, "work", &[]);
         let checks = || START_CHECKS.with(std::cell::Cell::get);
         let seen = SigningPolicySeen::default();
-        assert!(collaborator_check_at_start(&wt, seen).is_none());
+        assert!(collaborator_check_at_start(&wt, seen, Implementer::Claude).is_none());
         let first = checks();
-        assert!(collaborator_check_at_start(&wt, seen).is_none());
+        assert!(collaborator_check_at_start(&wt, seen, Implementer::Claude).is_none());
         assert_eq!(checks(), first, "an unchanged range is read again");
         // Anything that moves the range is read again, and a collaborator's
         // commit is still found.
@@ -6357,12 +6680,12 @@ sleep 0.5
             ],
         );
         assert!(matches!(
-            collaborator_check_at_start(&wt, seen),
+            collaborator_check_at_start(&wt, seen, Implementer::Claude),
             Some(GuardFault::ForeignUnsigned { .. })
         ));
         assert_eq!(checks(), first + 1);
         // A found fault is never remembered as clean.
-        assert!(collaborator_check_at_start(&wt, seen).is_some());
+        assert!(collaborator_check_at_start(&wt, seen, Implementer::Claude).is_some());
         assert_eq!(checks(), first + 2);
     }
 
