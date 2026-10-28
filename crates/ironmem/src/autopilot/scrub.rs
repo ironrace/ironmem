@@ -102,9 +102,34 @@ static ENTROPY_CANDIDATE_RE: LazyLock<Regex> =
 /// examples on both sides.
 const ENTROPY_THRESHOLD_BITS_PER_CHAR: f64 = 3.6;
 
+/// A URL's userinfo when it carries a password (`scheme://user:password@`):
+/// the scheme and host are kept, the whole userinfo redacted, since the user
+/// can be a token too (`x-access-token:…`, or a token with any password). A
+/// user with no password (`ssh://git@host`) is no credential and is left
+/// alone.
+static URL_PASSWORD_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(?P<prefix>[a-z][a-z0-9+.-]*://)[^\s/@:]*:[^\s/@]+@").unwrap()
+});
+
 /// Redact every recognizable credential-shaped substring in `input`.
 /// Returns the scrubbed text and whether anything was redacted.
 pub fn scrub_secrets(input: &str) -> (String, bool) {
+    let (text, redacted) = redact_credentials(input);
+    let (text, entropy_redacted) = redact_high_entropy_tokens(&text);
+    (text, redacted || entropy_redacted)
+}
+
+/// [`scrub_and_bound`] with only the credential shapes (layers 1 and 2, and a
+/// URL's password), not the generic high-entropy pass: for git's own stderr,
+/// whose paths and ref names (`autopilot/<owner-repo-n>`, a temp directory)
+/// that pass would take for secrets, leaving an error that names nothing.
+pub fn scrub_credentials_and_bound(input: &str, max_chars: usize) -> ScrubOutcome {
+    let (scrubbed, redacted) = redact_credentials(input);
+    bound(scrubbed, redacted, max_chars)
+}
+
+/// Layers 1 and 2 of the module doc, plus a URL's password.
+fn redact_credentials(input: &str) -> (String, bool) {
     let mut redacted = false;
     let mut text = input.to_string();
 
@@ -121,6 +146,15 @@ pub fn scrub_secrets(input: &str) -> (String, bool) {
         }
     }
 
+    if URL_PASSWORD_RE.is_match(&text) {
+        redacted = true;
+        text = URL_PASSWORD_RE
+            .replace_all(&text, |caps: &Captures<'_>| {
+                format!("{}{REDACTED}@", &caps["prefix"])
+            })
+            .into_owned();
+    }
+
     if ASSIGNMENT_RE.is_match(&text) {
         redacted = true;
         text = ASSIGNMENT_RE
@@ -129,9 +163,6 @@ pub fn scrub_secrets(input: &str) -> (String, bool) {
             })
             .into_owned();
     }
-
-    let (text, entropy_redacted) = redact_high_entropy_tokens(&text);
-    redacted |= entropy_redacted;
 
     (text, redacted)
 }
@@ -153,6 +184,11 @@ pub struct ScrubOutcome {
 /// being sliced first and silently surviving as a fragment.
 pub fn scrub_and_bound(input: &str, max_chars: usize) -> ScrubOutcome {
     let (scrubbed, redacted) = scrub_secrets(input);
+    bound(scrubbed, redacted, max_chars)
+}
+
+/// `scrubbed` cut to `max_chars` characters.
+fn bound(scrubbed: String, redacted: bool, max_chars: usize) -> ScrubOutcome {
     let mut chars = scrubbed.chars();
     let bounded: String = chars.by_ref().take(max_chars).collect();
     let truncated = chars.next().is_some();
@@ -432,6 +468,52 @@ mod tests {
             !redacted,
             "a plain constant/env-var name must not be treated as a secret"
         );
+        assert_eq!(out, input);
+    }
+
+    /// git's stderr names paths and refs, which the entropy pass would take
+    /// for secrets; the credential scrub keeps them and still redacts the
+    /// credential shapes and a URL's `user:password@`.
+    #[test]
+    fn the_credential_scrub_keeps_paths_and_ref_names_but_not_credentials() {
+        let token = format!("ghp_{}", "a1B2c3D4e5".repeat(4));
+        let input = format!(
+            "fatal: a branch named 'autopilot/ironrace-ironmem-283' already exists in \
+             /private/var/folders/lv/sw669d7j7y9cl9x_ynl_qt2c0000gn/T/.tmpEZ6OPq; \
+             token {token}; remote https://deploy:hunter2pass@git.example.com/o/r.git"
+        );
+        let out = scrub_credentials_and_bound(&input, 10_000);
+        assert!(out.redacted, "{out:?}");
+        for kept in [
+            "autopilot/ironrace-ironmem-283",
+            "/private/var/folders/lv/sw669d7j7y9cl9x_ynl_qt2c0000gn/T/.tmpEZ6OPq",
+            "https://",
+            "@git.example.com/o/r.git",
+        ] {
+            assert!(out.text.contains(kept), "{kept} lost: {}", out.text);
+        }
+        for gone in [token.as_str(), "hunter2pass", "deploy:"] {
+            assert!(!out.text.contains(gone), "{gone} kept: {}", out.text);
+        }
+        let bounded = scrub_credentials_and_bound(&input, 10);
+        assert!(bounded.truncated && bounded.text.chars().count() == 10);
+    }
+
+    /// A URL's `user:password@` is a credential wherever it appears.
+    #[test]
+    fn redacts_a_url_password_in_the_full_scrub_too() {
+        let (out, redacted) = scrub_secrets("cloning https://deploy:hunter2@host/r failed");
+        assert!(redacted);
+        assert!(!out.contains("hunter2"), "{out}");
+        assert!(out.contains("https://") && out.contains("@host/r"), "{out}");
+    }
+
+    /// `ssh://git@host` names a user, not a password.
+    #[test]
+    fn keeps_a_url_user_with_no_password() {
+        let input = "ssh://git@github.com/o/r and git@github.com:o/r";
+        let (out, redacted) = scrub_secrets(input);
+        assert!(!redacted, "{out}");
         assert_eq!(out, input);
     }
 }

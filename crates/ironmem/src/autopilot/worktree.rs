@@ -631,14 +631,16 @@ fn run_git_output_within(
                         label()
                     ))));
                 }
-                return Err(GitRunFailure::Killed(MemoryError::Validation(match waited {
-                    Ok(true) => format!(
+                return Err(GitRunFailure::Killed(MemoryError::Validation(
+                    match waited {
+                        Ok(true) => format!(
                         "{} exited but left its output open past {secs}s, held by a process it \
                          started, and was killed with it",
                         label()
                     ),
-                    _ => format!("{} did not finish within {secs}s and was killed", label()),
-                })));
+                        _ => format!("{} did not finish within {secs}s and was killed", label()),
+                    },
+                )));
             }
         }
     }
@@ -743,12 +745,16 @@ fn config_get(cwd: &Path, args: &[&str]) -> Result<Option<String>, String> {
 const STDERR_EXCERPT_CHARS: usize = 300;
 
 /// `git`'s own complaint, trimmed, scrubbed of secrets and bounded so it can
-/// ride inside a one-line reason. git can echo a remote URL (with its token)
-/// or a config line, and these reasons reach lineage, logs and the model's
-/// next prompt.
+/// ride inside a one-line reason. git can echo a remote URL (with its token
+/// or password) or a config line, and these reasons reach lineage, logs and
+/// the model's next prompt. Only credential shapes are scrubbed
+/// ([`super::scrub::scrub_credentials_and_bound`]): the generic entropy pass
+/// would also redact the paths and ref names that make the error useful.
 pub(crate) fn bounded_stderr(stderr: &[u8]) -> String {
-    let bounded =
-        super::scrub::scrub_and_bound(String::from_utf8_lossy(stderr).trim(), STDERR_EXCERPT_CHARS);
+    let bounded = super::scrub::scrub_credentials_and_bound(
+        String::from_utf8_lossy(stderr).trim(),
+        STDERR_EXCERPT_CHARS,
+    );
     if bounded.truncated {
         format!("{}…", bounded.text)
     } else {
@@ -3765,6 +3771,33 @@ mod tests {
         assert!(failure.len() < 2 * STDERR_EXCERPT_CHARS, "{failure}");
     }
 
+    /// git's stderr quotes paths and ref names, which must survive the scrub
+    /// for the error to be any use; credentials still go.
+    #[test]
+    fn git_stderr_keeps_its_ref_names_and_paths_but_not_credentials() {
+        let token = format!("ghp_{}", "a1B2c3D4e5".repeat(4));
+        let stderr = format!(
+            "fatal: a branch named '{}' already exists\n\
+             fatal: unable to access 'https://deploy:hunter2pass@git.example.com/r': {token}",
+            branch_name(&issue())
+        );
+        let quoted = bounded_stderr(stderr.as_bytes());
+        assert!(quoted.contains(&branch_name(&issue())), "{quoted}");
+        assert!(
+            !quoted.contains("hunter2pass") && !quoted.contains(&token),
+            "{quoted}"
+        );
+        let failure = GitOutput {
+            code: Some(128),
+            stdout: String::new(),
+            stderr,
+        }
+        .failure(Path::new("/repo"), &["worktree", "add"])
+        .to_string();
+        assert!(failure.contains(&branch_name(&issue())), "{failure}");
+        assert!(!failure.contains("hunter2pass"), "{failure}");
+    }
+
     #[test]
     fn a_lock_whose_age_cannot_be_read_is_not_reported_as_held_for_0s() {
         let err = held_lock_error(
@@ -3840,7 +3873,10 @@ mod tests {
         }
         run(repo.path(), &["config", "core.hooksPath", "/dev/null"]);
         let reused = ensure_worktree(repo.path(), roots.path(), &issue(), "HEAD").unwrap();
-        assert!(reused.created, "after the steps, the worktree is made again");
+        assert!(
+            reused.created,
+            "after the steps, the worktree is made again"
+        );
     }
 
     /// A creation entry off the base is not proof the branch was made again:
