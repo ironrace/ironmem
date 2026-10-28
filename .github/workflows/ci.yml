@@ -112,9 +112,11 @@ jobs:
       # *non-deterministic across runner images* — `GITHUB_PATH`
       # prepend works on some runs and not others. Two layers of defense:
       #   1. `rustup default stable` makes the rustup config consistent.
-      #   2. The `cargo test` step calls cargo by absolute path
-      #      (`$HOME/.cargo/bin/cargo`) so PATH precedence is
-      #      irrelevant for the immediate invocation.
+      #   2. The cargo steps run `rustup run stable cargo …`, so PATH
+      #      precedence is irrelevant for the immediate invocation.
+      #      Never an absolute `$HOME/.cargo/bin/cargo`: an image whose
+      #      rustup comes from Homebrew skips the `~/.cargo` install, and
+      #      that path then does not exist.
       # We also still prepend `$HOME/.cargo/bin` to GITHUB_PATH so any
       # child processes cargo spawns (rustc -vV, build scripts, etc.)
       # find the real toolchain first when they inherit PATH.
@@ -132,11 +134,11 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
 
       - name: cargo test
-        run: "$HOME/.cargo/bin/cargo test --workspace"
+        run: "rustup run stable cargo test --workspace"
 
       - name: cargo build ironmem binary for smoke/artifact
         if: runner.os == 'Linux'
-        run: "$HOME/.cargo/bin/cargo build -p ironmem --bin ironmem"
+        run: "rustup run stable cargo build -p ironmem --bin ironmem"
 
       - name: Live initialize smoke test
         if: runner.os == 'Linux'
@@ -161,7 +163,7 @@ jobs:
           toolchain: stable
 
       # See the cargo test step in the `test` job for why we call
-      # cargo by absolute path on macOS.
+      # cargo through `rustup run stable` on macOS.
       - name: Force stable toolchain default + prepend cargo bin to PATH (macOS rustup-init shim workaround)
         run: |
           rustup default stable
@@ -176,7 +178,7 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
 
       - name: cargo build
-        run: "$HOME/.cargo/bin/cargo build -p ironmem --bin ironmem"
+        run: "rustup run stable cargo build -p ironmem --bin ironmem"
 
       - name: Upload binary
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
