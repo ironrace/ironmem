@@ -378,7 +378,9 @@ fn public_run_selects_muse_and_continues_the_same_session() {
             "--output-schema ",
             "--prompt-file ",
             "--disable-sandbox",
+            "--trust-workspace",
             "--no-foreign-personal-context",
+            "--disable-request-user-input",
             "--approval-mode never",
         ] {
             assert!(argv.contains(needle), "{needle} missing: {line}");
