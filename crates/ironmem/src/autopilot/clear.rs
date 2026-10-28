@@ -12,6 +12,8 @@
 //! counts and the unpriced reservation stand, and the invocation's artifacts
 //! stay on disk for inspection. The next dispatch starts a fresh session.
 
+use std::path::Path;
+
 use serde::Serialize;
 
 use super::dispatch::InvocationArtifacts;
@@ -160,21 +162,12 @@ fn controller_lock(
             .ok()
             .and_then(|v| v.get("worktree_path")?.as_str().map(str::to_owned)),
     };
-    let Some(worktree) = worktree.map(std::path::PathBuf::from) else {
+    let Some(worktree) = worktree else {
         return Ok(None);
     };
-    match std::fs::metadata(&worktree) {
-        Ok(meta) if meta.is_dir() => {}
-        Ok(_) => return Ok(None),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => {
-            return Err(format!(
-                "its worktree {} cannot be read ({e}), so whether a controller is running \
-                 this issue cannot be checked",
-                worktree.display()
-            ))
-        }
-    }
+    let Some(worktree) = existing_worktree(Path::new(&worktree))? else {
+        return Ok(None);
+    };
     let path = super::issue_lock::lock_path_if_repository(&worktree, issue).map_err(|e| {
         format!("whether a controller is running this issue cannot be checked: {e}")
     })?;
@@ -185,6 +178,21 @@ fn controller_lock(
         super::issue_lock::IssueLockAttempt::Acquired(lock) => Ok(Some(lock)),
         super::issue_lock::IssueLockAttempt::Held { path } => Err(format!(
             "a controller is running this issue (it holds {}); rerun once it finishes",
+            path.display()
+        )),
+    }
+}
+
+/// The worktree a state names, when it is a directory to check; `None` when
+/// nothing can be in it (gone, or not a directory). One that cannot be read
+/// is no proof it is empty, so it is `Err`, with why.
+fn existing_worktree(path: &Path) -> Result<Option<std::path::PathBuf>, String> {
+    match std::fs::metadata(path) {
+        Ok(meta) if meta.is_dir() => Ok(Some(path.to_path_buf())),
+        Ok(_) => Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!(
+            "its worktree {} cannot be read ({e}), so its processes cannot be checked",
             path.display()
         )),
     }
@@ -249,9 +257,10 @@ fn unreadable_refusal(
     }
     let worktree = match field("worktree_path") {
         None | Some(serde_json::Value::Null) => None,
-        Some(serde_json::Value::String(path)) => {
-            Some(std::path::PathBuf::from(path)).filter(|path| path.is_dir())
-        }
+        Some(serde_json::Value::String(path)) => match existing_worktree(Path::new(&path)) {
+            Ok(worktree) => worktree,
+            Err(reason) => return Some(reason),
+        },
         Some(_) => {
             return Some(
                 "its worktree path is not a string, so the processes in its worktree cannot \
@@ -1265,5 +1274,118 @@ mod tests {
         );
         let cleared = clear_dispatch(&db, &issue(), || snapshots(Vec::new()));
         assert!(matches!(cleared, Ok(Cleared::Unreadable(_))), "{cleared:?}");
+    }
+
+    /// An unreadable drawer naming a worktree, started just now.
+    fn unreadable_naming(worktree: serde_json::Value, extra: serde_json::Value) -> String {
+        let mut body = serde_json::json!({
+            "implementer": "some-future-harness",
+            "worktree_path": worktree,
+            "started_at": (chrono::Utc::now() - chrono::Duration::seconds(2)).to_rfc3339(),
+        });
+        if let (Some(body), Some(extra)) = (body.as_object_mut(), extra.as_object()) {
+            for (k, v) in extra {
+                body.insert(k.clone(), v.clone());
+            }
+        }
+        body.to_string()
+    }
+
+    /// F41: the unreadable path's other refusals and releases, each pinned.
+    #[test]
+    fn an_unreadable_dispatch_state_is_judged_on_every_field_it_still_names() {
+        let nothing = || -> Result<Vec<u32>, String> { Ok(Vec::new()) };
+        let clear = |db: &Database, pids: crate::autopilot::process_tree::ScanPids<'_>| {
+            clear_dispatch_with(db, &issue(), || snapshots(Vec::new()), pids)
+        };
+        let refused =
+            |raw: String, pids: crate::autopilot::process_tree::ScanPids<'_>, why: &str| {
+                let db = Database::open_in_memory().unwrap();
+                write_raw(&db, &raw);
+                let err = clear(&db, pids).unwrap_err().to_string();
+                assert!(err.contains(why), "{why}: {err}");
+                assert_eq!(raw_drawer(&db).as_deref(), Some(raw.as_str()));
+            };
+        let worktree = tempfile::tempdir().unwrap();
+        // A worktree path that is a file holds no process: released.
+        let file = worktree.path().join("not-a-dir");
+        std::fs::write(&file, "x").unwrap();
+        let db = Database::open_in_memory().unwrap();
+        write_raw(
+            &db,
+            &unreadable_naming(serde_json::json!(file), serde_json::json!({})),
+        );
+        assert!(matches!(clear(&db, &nothing), Ok(Cleared::Unreadable(_))));
+        // A start that cannot be read, and no identity to fall back on.
+        refused(
+            unreadable_naming(
+                serde_json::json!(worktree.path()),
+                serde_json::json!({"started_at": "yesterday-ish"}),
+            ),
+            &nothing,
+            "when its invocation started cannot be read",
+        );
+        // The worktree scan itself failing.
+        let broken = || -> Result<Vec<u32>, String> { Err("the pid list failed".into()) };
+        refused(
+            unreadable_naming(serde_json::json!(worktree.path()), serde_json::json!({})),
+            &broken,
+            "the pid list failed",
+        );
+        // The auto-fix's two refusals: artifacts that do not parse, and a
+        // worktree path that is not a string.
+        refused(
+            unreadable_naming(
+                serde_json::json!(worktree.path()),
+                serde_json::json!({"codex_artifacts": {"schema_path": 7}}),
+            ),
+            &nothing,
+            "its invocation artifacts cannot be read",
+        );
+        refused(
+            unreadable_naming(serde_json::json!(42), serde_json::json!({})),
+            &nothing,
+            "its worktree path is not a string",
+        );
+        // `--name=<ic>` names its IC as `--name <ic>` does.
+        let db = Database::open_in_memory().unwrap();
+        write_raw(&db, "not json");
+        let err = clear_dispatch(&db, &issue(), || {
+            snapshots(vec![row(
+                99,
+                99,
+                "claude -p x --name=ic-owner-repo-42 --model m",
+            )])
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("process 99 names its IC session"), "{err}");
+    }
+
+    /// F42: a worktree that cannot be read is no proof it is empty.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_dispatch_state_whose_worktree_cannot_be_read_is_kept() {
+        use std::os::unix::fs::PermissionsExt;
+        // Root reads through any mode, so the case cannot be made there.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let parent = tempfile::tempdir().unwrap();
+        let worktree = parent.path().join("wt");
+        std::fs::create_dir(&worktree).unwrap();
+        let db = Database::open_in_memory().unwrap();
+        write_raw(
+            &db,
+            &unreadable_naming(serde_json::json!(worktree), serde_json::json!({})),
+        );
+        std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o000)).unwrap();
+        let nothing = || -> Result<Vec<u32>, String> { Ok(Vec::new()) };
+        let result = clear_dispatch_with(&db, &issue(), || snapshots(Vec::new()), &nothing);
+        std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("cannot be read"), "{err}");
+        assert!(err.contains(&worktree.display().to_string()), "{err}");
+        assert!(raw_drawer(&db).is_some());
     }
 }
