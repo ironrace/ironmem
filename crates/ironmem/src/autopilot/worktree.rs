@@ -530,11 +530,16 @@ fn run_git_output(command: Command, cwd: &Path, args: &[&str]) -> Result<GitOutp
 /// open then (by a process it started), is an error.
 ///
 /// As the signing guard's git does, the command runs in its own process
-/// group, and at the deadline the whole group is killed: a hook's
-/// background job dies with it rather than running on outside any bound.
-/// git is reaped only once it has exited and its pipes are closed, so its
-/// group id cannot name someone else's group when it is killed
+/// group, and at the deadline every process still in that group is killed:
+/// a hook's background job dies with git rather than running on outside any
+/// bound. git is reaped only once it has exited and its pipes are closed, so
+/// its group id cannot name someone else's group when it is killed
 /// ([`super::dispatch::exited_unreaped`]).
+///
+/// A process that left git's group (`setsid`, or a job-controlling shell)
+/// is beyond that kill. If it still holds git's output open, the error is
+/// returned at the deadline all the same, but the thread reading that pipe,
+/// and the pipe itself, stay alive until the process exits.
 fn run_git_output_within(
     mut command: Command,
     cwd: &Path,
@@ -576,7 +581,8 @@ fn run_git_output_within(
                 return Err(MemoryError::Validation(match waited {
                     Err(e) => format!("{} could not be waited on: {e}", label()),
                     Ok(true) => format!(
-                        "{} exited but left its output open past {secs}s, held by a process it                          started, and was killed with it",
+                        "{} exited but left its output open past {secs}s, held by a process it \
+                         started, and was killed with it",
                         label()
                     ),
                     Ok(false) => format!(
