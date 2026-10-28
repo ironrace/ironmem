@@ -168,7 +168,14 @@ impl Fixture {
 
     /// `ironmem autopilot clear-dispatch owner/repo <issue> --json`.
     fn clear(&self) -> Output {
-        ironmem()
+        self.clear_as(true)
+    }
+
+    /// `ironmem autopilot clear-dispatch owner/repo <issue>`, with `--json`
+    /// when `json`.
+    fn clear_as(&self, json: bool) -> Output {
+        let mut command = ironmem();
+        command
             .args([
                 "autopilot",
                 "clear-dispatch",
@@ -176,11 +183,28 @@ impl Fixture {
                 &self.issue_arg,
                 "--db",
                 self.db_path.to_str().unwrap(),
-                "--json",
             ])
-            .env("PATH", isolated_path(&self.stubs))
-            .output()
-            .unwrap()
+            .env("PATH", isolated_path(&self.stubs));
+        if json {
+            command.arg("--json");
+        }
+        command.output().unwrap()
+    }
+
+    /// Replace the content of this fixture's dispatch-state drawer with
+    /// `content`, as a newer binary (or a corruption) would leave it.
+    fn overwrite_dispatch_state(&self, content: &str) {
+        let db = Database::open(&self.db_path).unwrap();
+        let source = format!("%dispatch-state:owner-repo-{}", self.issue);
+        let updated = db
+            .with_connection(|conn| {
+                Ok(conn.execute(
+                    "UPDATE drawers SET content = ?1 WHERE source_file LIKE ?2",
+                    rusqlite::params![content, source],
+                )?)
+            })
+            .unwrap();
+        assert_eq!(updated, 1, "exactly one dispatch-state drawer to overwrite");
     }
 
     /// Every live process `ps` shows as this fixture's versioned Muse root:
@@ -718,6 +742,76 @@ fn clear_dispatch_refuses_a_live_muse_invocation_and_releases_it_once_killed() {
         .unwrap()
         .is_none());
     assert_eq!(fx.calls().lines().count(), 1, "{}", fx.calls());
+}
+
+/// `clear-dispatch` on a dispatch state this binary cannot read (one a
+/// newer binary wrote for a harness it does not know): released, with its
+/// raw content reported scrubbed, both as text and as `--json`, whose
+/// untagged shape scripts read.
+#[test]
+fn clear_dispatch_releases_an_unreadable_state_and_reports_it_scrubbed() {
+    for json in [false, true] {
+        let fx = Fixture::new();
+        // A real state to overwrite: Muse's in-use refusal parks the issue.
+        let parked = fx.run("inuse", &["--attempt-cap", "1"]);
+        let parked = report(&parked, "inuse");
+        assert_eq!(parked["terminal"]["terminal"], "session_in_use", "{parked}");
+        // A credential-shaped value, built so no literal one sits in source.
+        let secret = format!("{} abcdefgh{}", ["Bear", "er"].concat(), "SECRETSECRET");
+        fx.overwrite_dispatch_state(&format!(
+            r#"{{"implementer":"some-future-harness","auth":"{secret}"}}"#
+        ));
+        let db = Database::open(&fx.db_path).unwrap();
+        let issue = IssueRef::new(REPO, fx.issue);
+        assert!(
+            dispatch_state::get_dispatch_state(&db, &issue).is_err(),
+            "the state is unreadable now"
+        );
+
+        let output = fx.clear_as(json);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "json={json}: stdout={stdout} stderr={stderr}"
+        );
+        assert!(
+            !stdout.contains("SECRETSECRET") && !stderr.contains("SECRETSECRET"),
+            "json={json}: the secret was printed: stdout={stdout} stderr={stderr}"
+        );
+        if json {
+            let cleared = report(&output, "clear-dispatch --json");
+            assert_eq!(
+                cleared["issue"],
+                format!("{REPO}#{}", fx.issue),
+                "{cleared}"
+            );
+            let raw = cleared["raw_content"].as_str().unwrap_or_default();
+            assert!(raw.contains("some-future-harness"), "{cleared}");
+            assert_eq!(cleared["raw_content_truncated"], false, "{cleared}");
+            assert!(
+                cleared["reason"].as_str().is_some_and(|r| !r.is_empty()),
+                "{cleared}"
+            );
+            assert!(
+                cleared.get("implementer").is_none(),
+                "not the readable state's shape: {cleared}"
+            );
+        } else {
+            assert!(
+                stdout.contains("unreadable dispatch state")
+                    && stdout.contains("(secrets scrubbed)")
+                    && stdout.contains("some-future-harness"),
+                "{stdout}"
+            );
+        }
+        assert!(
+            dispatch_state::get_dispatch_state(&db, &issue)
+                .unwrap()
+                .is_none(),
+            "json={json}: the drawer is gone"
+        );
+    }
 }
 
 #[test]
