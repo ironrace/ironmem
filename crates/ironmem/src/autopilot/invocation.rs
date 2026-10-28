@@ -1470,8 +1470,24 @@ pub(crate) fn settle_awaiting_quiet(
     a: &InvocationArtifacts,
     snapshot: &super::process_tree::ProcessSnapshot,
     daemon: Option<&SharedDaemon>,
+    kernel: impl FnMut(u32) -> Result<Option<Birth>, String>,
+    pids: ScanPids<'_>,
+) -> Result<bool, String> {
+    use super::process_tree::ProcessSource;
+    settle_awaiting_quiet_with(a, snapshot, daemon, kernel, pids, &|| {
+        super::process_tree::UnixProcesses.list()
+    })
+}
+
+/// [`settle_awaiting_quiet`] with the fresh process table it reads after
+/// the kernel checks (`fresh`) injected.
+pub(crate) fn settle_awaiting_quiet_with(
+    a: &InvocationArtifacts,
+    snapshot: &super::process_tree::ProcessSnapshot,
+    daemon: Option<&SharedDaemon>,
     mut kernel: impl FnMut(u32) -> Result<Option<Birth>, String>,
     pids: ScanPids<'_>,
+    fresh: &dyn Fn() -> Result<Vec<super::process_tree::ProcessRow>, String>,
 ) -> Result<bool, String> {
     use super::process_tree::{current_uid, read_identity, ProcessSnapshot, Quiet, QuietCheck};
     let Some(mut record) = read_exit_record(a)
@@ -1509,7 +1525,12 @@ pub(crate) fn settle_awaiting_quiet(
         .root_birth
         .ok_or("the invocation root's kernel birth was never recorded")?;
     still_running(identity.root_pid, root_birth, "the invocation root")?;
-    let active = || rows.iter().filter(|r| r.active());
+    // The caller's snapshot may predate the invocation (a Lead takes it at
+    // the start of its tick), so a process that appeared since is in a
+    // fresh table, read now that the kernel checks have passed. Both are
+    // judged: the snapshot can only add a hold, never lift one.
+    let fresh = fresh().map_err(|e| format!("cannot read the process table: {e}"))?;
+    let active = || rows.iter().chain(&fresh).filter(|r| r.active());
     for d in &identity.descendants {
         match d.birth {
             Some(birth) => still_running(d.pid, birth, "recorded process")?,
@@ -1519,7 +1540,13 @@ pub(crate) fn settle_awaiting_quiet(
             None => {}
         }
     }
-    if let Some(r) = active().find(|r| r.pgid == identity.root_pgid) {
+    // The root is gone by birth, so a live process now holding its PID
+    // shows the group ID was freed and reused: the group is someone
+    // else's (as `recorded_tree_evidence` reads it).
+    let group_reused = fresh
+        .iter()
+        .any(|r| r.active() && r.pid == identity.root_pid);
+    if let Some(r) = active().find(|r| !group_reused && r.pgid == identity.root_pgid) {
         return Err(format!(
             "process {} is in the invocation's process group {}",
             r.pid, r.pgid
@@ -1546,7 +1573,7 @@ pub(crate) fn settle_awaiting_quiet(
         .chain(identity.descendants.iter().map(|d| d.pid))
         .collect();
     if let Quiet::Held(hold) =
-        QuietCheck::once(&awaiting.worktree, root_birth, &known, daemon, rows, pids)?
+        QuietCheck::once(&awaiting.worktree, root_birth, &known, daemon, &fresh, pids)?
     {
         return Err(hold.reason);
     }
@@ -1736,6 +1763,11 @@ pub(crate) mod contract_tests {
         super::super::process_tree::read_identity(a).unwrap()
     }
     fn no_pids() -> Result<Vec<u32>, String> {
+        Ok(Vec::new())
+    }
+    /// A fresh process table with nothing in it, for a settle whose subject
+    /// is the recorded evidence, not whatever runs on the machine.
+    fn no_rows() -> Result<Vec<crate::autopilot::process_tree::ProcessRow>, String> {
         Ok(Vec::new())
     }
     /// A completion that reads no process for the worktree check, for a
@@ -2844,7 +2876,7 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
         // empty temp directory, and what is under test is the recorded
         // evidence, not whatever else runs on the machine.
         let settle = |kernel: &dyn Fn(u32) -> Result<Option<_>, String>| {
-            settle_awaiting_quiet(a, &rows, None, kernel, &no_pids)
+            settle_awaiting_quiet_with(a, &rows, None, kernel, &no_pids, &no_rows)
         };
         let real = |pid| kernel_birth(pid);
         // A recorded straggler still alive, though no longer in the worktree.
@@ -2901,6 +2933,67 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
         assert!(is_awaiting_quiet(a) && !has_valid_exit_record(a));
     }
 
+    /// Settling judges the root's group and the invocation's marker on a
+    /// fresh process table, not only the caller's snapshot, which a Lead
+    /// takes at the start of its tick and may predate the invocation: a
+    /// group member that appeared since holds. A live process holding the
+    /// root's own PID shows the group ID was freed and reused, so a process
+    /// in that group is someone else's, as `recorded_tree_evidence` reads it.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn settling_reads_a_fresh_process_table_and_knows_a_reused_group() {
+        use crate::autopilot::process_tree::{ProcessIdentity, ProcessRow, ProcessSnapshot};
+        let (_dir, s) = setup();
+        let a = s.invocation_artifacts.as_ref().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        // SAFETY: geteuid has no preconditions.
+        let uid = unsafe { libc::geteuid() };
+        let root = 4242;
+        super::super::process_tree::persist_identity(
+            a,
+            &ProcessIdentity {
+                version: 1,
+                root_pid: root,
+                root_pgid: root,
+                root_birth: Some(fixture_birth(1)),
+                schema_path: a.schema_path.clone(),
+                invocation_id: a.invocation_id.clone(),
+                descendants: Vec::new(),
+            },
+        )
+        .unwrap();
+        let row = |pid: u32, pgid: u32| ProcessRow {
+            pid,
+            ppid: 1,
+            pgid,
+            stat: "S".into(),
+            args: "tool".into(),
+        };
+        // Every recorded process is gone by birth.
+        let gone = |_: u32| Ok(None);
+        let stale = ProcessSnapshot::Available(Vec::new());
+        write_awaiting(a, uid, worktree.path(), Vec::new());
+        let member = vec![row(5000, root)];
+        let held =
+            settle_awaiting_quiet_with(a, &stale, None, gone, &no_pids, &|| Ok(member.clone()))
+                .unwrap_err();
+        assert!(held.contains("process 5000"), "{held}");
+        assert!(is_awaiting_quiet(a));
+        // A fresh table that cannot be read proves nothing.
+        let held = settle_awaiting_quiet_with(a, &stale, None, gone, &no_pids, &|| {
+            Err("ps refused".into())
+        })
+        .unwrap_err();
+        assert!(held.contains("ps refused"), "{held}");
+        // The root's PID now leads the group: a reuse, not the invocation.
+        let reused = vec![row(root, root), row(5000, root)];
+        assert_eq!(
+            settle_awaiting_quiet_with(a, &stale, None, gone, &no_pids, &|| Ok(reused.clone())),
+            Ok(true)
+        );
+        assert!(has_valid_exit_record(a));
+    }
+
     /// A kernel birth for a fixture process that never ran: the kernel is
     /// stubbed wherever one is read.
     fn fixture_birth(seconds: u64) -> super::super::process_tree::Birth {
@@ -2946,12 +3039,13 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
         let rows = ProcessSnapshot::Available(Vec::new());
         // The last worker still runs: held, by its PID.
         let (last, last_birth) = *stragglers.last().unwrap();
-        let held = settle_awaiting_quiet(
+        let held = settle_awaiting_quiet_with(
             a,
             &rows,
             None,
             |pid| Ok((pid == last).then_some(last_birth)),
             &no_pids,
+            &no_rows,
         )
         .unwrap_err();
         assert!(
@@ -2961,7 +3055,7 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
         assert!(is_awaiting_quiet(a) && !has_valid_exit_record(a));
         // Every worker gone: a trusted completion.
         assert_eq!(
-            settle_awaiting_quiet(a, &rows, None, |_| Ok(None), &no_pids),
+            settle_awaiting_quiet_with(a, &rows, None, |_| Ok(None), &no_pids, &no_rows),
             Ok(true)
         );
         assert!(has_valid_exit_record(a) && !is_awaiting_quiet(a));
