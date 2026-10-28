@@ -522,7 +522,7 @@ mod tests {
         (dir, root)
     }
 
-    fn commit_all(root: &PathBuf) {
+    fn commit_all(root: &Path) {
         crate::autopilot::test_git::output(root, &["add", "."]);
         crate::autopilot::test_git::output(root, &["commit", "-m", "commit"]);
     }
