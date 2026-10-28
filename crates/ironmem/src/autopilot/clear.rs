@@ -128,6 +128,21 @@ pub(crate) fn clear_dispatch_with(
             }));
         }
     };
+    // A claim still within its lease may be a run between its claim and
+    // its launch, showing no process yet (R8): not cleared, lock or no
+    // lock.
+    if let Some(claim) = dispatch_state::get_claim(db, issue)? {
+        if claim.leased(chrono::Utc::now()) {
+            return Err(refuse(format!(
+                "its claim is still within its {}s lease (claimed {}s ago), so its run \
+                 may not have launched yet; wait up to {}s, or until that run ends, and \
+                 clear again",
+                dispatch_state::CLAIM_LEASE.as_secs(),
+                claim.age(chrono::Utc::now()).unwrap_or_default().as_secs(),
+                dispatch_state::CLAIM_LEASE.as_secs()
+            )));
+        }
+    }
     if let Some(reason) = refusal(&observe(), &state, attempt_recorded(db, &state)?) {
         return Err(refuse(reason));
     }
@@ -709,6 +724,32 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("no dispatch state"));
+    }
+
+    /// R8: a claim still within its lease is not cleared, lock or no
+    /// lock: its run may be between its claim and its launch.
+    #[test]
+    fn a_leased_claim_is_not_cleared() {
+        let db = Database::open_in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (a, _) = testing::invocation(dir.path());
+        let mut state = held_state(Implementer::Claude, a);
+        state.invocation_artifacts = None;
+        let claim = dispatch_state::Claim {
+            state,
+            owner: Some("a-run".into()),
+            claimed_at: Some(chrono::Utc::now().to_rfc3339()),
+            common_dir: None,
+        };
+        assert!(dispatch_state::claim_if_unchanged(&db, None, &claim).unwrap());
+        let err = clear_dispatch(&db, &issue(), || snapshots(Vec::new()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("refusing to clear"), "{err}");
+        assert!(err.contains("120"), "{err}");
+        assert!(dispatch_state::get_dispatch_state(&db, &issue())
+            .unwrap()
+            .is_some());
     }
 
     #[test]

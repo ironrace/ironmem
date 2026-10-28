@@ -2588,15 +2588,29 @@ pub fn preflight_worktree_provisioning(
             dispatcher.implementer()
         )));
     }
-    let Some(state) = validate_dispatch_owner(db, issue, implementer)? else {
+    let Some(claim) = validate_dispatch_claim(db, issue, implementer)? else {
         return Ok(());
     };
+    let state = &claim.state;
+    // A leased Claude claim's run may be between its claim and its
+    // launch: refuse before provisioning, so `ensure_worktree` never
+    // quarantines its worktree (R3).
+    if !implementer.recovers_invocations() && claim.leased(chrono::Utc::now()) {
+        return Err(MemoryError::Validation(format!(
+            "cannot provision {} while another run's claim is within its {}s lease \
+             (claimed {}s ago, and a recently ended run reads the same way); it is \
+             left to that run",
+            issue.canonical(),
+            dispatch_state::CLAIM_LEASE.as_secs(),
+            claim.age(chrono::Utc::now()).unwrap_or_default().as_secs()
+        )));
+    }
     // A parked Claude state's run has ended; any other may be one still
     // running, whose IC the dispatcher looks for.
     if !implementer.recovers_invocations() && state.is_parked() {
         return Ok(());
     }
-    match dispatcher.recover(Path::new(&state.worktree_path), &state)? {
+    match dispatcher.recover(Path::new(&state.worktree_path), state)? {
         InvocationRecovery::Alive => Err(MemoryError::Validation(format!(
             "cannot provision {} while its {} implementation is still alive",
             issue.canonical(),
@@ -4737,6 +4751,65 @@ sleep 0.5
         assert!(
             unknown.contains("while Muse process completion is uncertain: ps timed out"),
             "{unknown}"
+        );
+    }
+
+    /// R3: preflight refuses a leased Claude claim before provisioning,
+    /// so `ensure_worktree` never quarantines a live controller's tree.
+    #[test]
+    fn preflight_refuses_a_leased_claude_claim_before_any_recovery() {
+        let db = Database::open_in_memory().unwrap();
+        db.migrate().unwrap();
+        let state = DispatchState {
+            implementer: Implementer::Claude,
+            native_session_id: Some("11111111-2222-3333-4444-555555555555".into()),
+            invocation_artifacts: None,
+            issue: issue(),
+            worktree_path: "/tmp/wt".into(),
+            ic_session_name: "ic".into(),
+            dispatch_class: "logic".into(),
+            attempt_n: 1,
+            state: "dispatching".into(),
+            started_at: "2026-10-26T00:00:00Z".into(),
+            session_uuid: "11111111-2222-3333-4444-555555555555".into(),
+            turn_n: 1,
+            session_claimed: true,
+            session_model: None,
+            resume_refusals: 0,
+            signing_held: false,
+        };
+        let claim = dispatch_state::Claim {
+            state,
+            owner: Some("another-run".into()),
+            claimed_at: Some(chrono::Utc::now().to_rfc3339()),
+            common_dir: None,
+        };
+        assert!(dispatch_state::claim_if_unchanged(&db, None, &claim).unwrap());
+        struct LeasedHold(Option<InvocationRecovery>);
+        impl Dispatcher for LeasedHold {
+            fn recover(
+                &mut self,
+                _repo: &Path,
+                _state: &DispatchState,
+            ) -> Result<InvocationRecovery, MemoryError> {
+                Ok(self.0.take().unwrap())
+            }
+            fn dispatch(
+                &mut self,
+                _repo: &Path,
+                _spec: &DispatchSpec,
+            ) -> Result<DispatchOutcome, MemoryError> {
+                unreachable!("preflight never dispatches")
+            }
+        }
+        let mut hold = LeasedHold(Some(InvocationRecovery::NoPriorInvocation));
+        let err = preflight_worktree_provisioning(&db, &issue(), Implementer::Claude, &mut hold)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("lease"), "{err}");
+        assert!(
+            hold.0.is_some(),
+            "recovery was consulted before the lease refusal"
         );
     }
     struct CliScript {
