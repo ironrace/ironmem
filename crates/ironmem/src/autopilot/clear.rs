@@ -161,8 +161,20 @@ fn unreadable_refusal(
 ) -> Option<String> {
     let loose: Option<serde_json::Value> = serde_json::from_str(raw).ok();
     let field = |key: &str| loose.as_ref().and_then(|v| v.get(key)).cloned();
-    let artifacts: Option<InvocationArtifacts> =
-        field("codex_artifacts").and_then(|v| serde_json::from_value(v).ok());
+    // A field that is present but cannot be read refuses rather than
+    // reading as absent: absent skips the check it would have fed.
+    let artifacts: Option<InvocationArtifacts> = match field("codex_artifacts") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(v) => match serde_json::from_value(v) {
+            Ok(artifacts) => Some(artifacts),
+            Err(why) => {
+                return Some(format!(
+                    "its invocation artifacts cannot be read ({why}), so its recorded process \
+                     tree cannot be checked"
+                ))
+            }
+        },
+    };
     if let Some(reason) = snapshots.processes.live_evidence_with(
         &issue.slug(),
         artifacts.as_ref(),
@@ -181,9 +193,19 @@ fn unreadable_refusal(
             issue.slug()
         ));
     }
-    let worktree = field("worktree_path")
-        .and_then(|v| v.as_str().map(std::path::PathBuf::from))
-        .filter(|path| path.is_dir());
+    let worktree = match field("worktree_path") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(path)) => {
+            Some(std::path::PathBuf::from(path)).filter(|path| path.is_dir())
+        }
+        Some(_) => {
+            return Some(
+                "its worktree path is not a string, so the processes in its worktree cannot \
+                 be checked"
+                    .into(),
+            )
+        }
+    };
     if let Some(worktree) = worktree {
         let identity = artifacts
             .as_ref()

@@ -1900,7 +1900,34 @@ fn processes_with_cwd(
                 )
             }))
         };
-        scan_cwds(pids, uid, spawned, known, owner_birth, proc_cwd)
+        // A non-dumpable process (`ssh-agent`, a sandboxed Chromium or
+        // Electron renderer) refuses `/proc/<pid>/cwd` with EACCES even to
+        // its own user, so the operator's own such process, started during
+        // the invocation anywhere on the machine, would hold every scan. A
+        // refused read fails the scan only for a process tied to the
+        // invocation: its parent or process group is one the tracker knows,
+        // or its parent was born during the invocation. A kernel read that
+        // fails here counts it as tied, so the scan still fails closed.
+        let refused = |pid: u32| {
+            std::fs::read_link(format!("/proc/{pid}/cwd"))
+                .is_err_and(|e| matches!(e.raw_os_error(), Some(libc::EACCES | libc::EPERM)))
+        };
+        let tied = |pid: u32| match kernel_observation(pid) {
+            Ok(Some(process)) => {
+                known.contains(&process.ppid)
+                    || known.contains(&process.pgid)
+                    || !matches!(
+                        kernel_observation(process.ppid),
+                        Ok(Some(parent)) if parent.birth < spawned
+                    )
+            }
+            _ => true,
+        };
+        let cwd_of = |pid: u32| match proc_cwd(pid) {
+            Err(_) if refused(pid) && !tied(pid) => Ok(None),
+            read => read,
+        };
+        scan_cwds(pids, uid, spawned, known, owner_birth, cwd_of)
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
