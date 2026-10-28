@@ -169,11 +169,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cut from a remote-tracking `--base` such as `origin/main` tracked it, so
   with `push.default=upstream` a bare `git push` from the issue branch went to
   `main`. Now the branch is created at the resolved sha with `--no-track`, so
-  a bare `git push` can never reach the base. Push an issue branch by naming
-  the remote and the branch (`git push origin <branch>`); the implementer's
-  goal condition now says so, naming the remote that already has the branch,
-  else the only remote, else `origin`. Existing branches keep whatever
-  upstream they have.
+  it no longer tracks the base and a bare `git push` cannot reach the base
+  through an upstream; other push settings (`push.default=matching` or
+  `current`, a `remote.<name>.push` refspec) can still push without naming
+  anything. Push an issue branch by naming the remote and the branch (`git
+  push <remote> <branch>`); the implementer's goal condition now says so,
+  naming the remote whose URL is the issue's GitHub repository, else the one
+  already tracking the branch, else `origin` if configured, else the only
+  remote, and no remote when none of those applies. Existing branches keep
+  whatever upstream they have; remove it with `git branch --unset-upstream
+  <branch>`.
 - **Existing setups with `commit.gpgsign` on now get a failed attempt when an
   implementer's commits are unsigned, for Claude as well as Codex and Muse.**
   Before, such a run could succeed. Make sure the signing key or agent is
@@ -214,16 +219,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the `codex_process` module is `process_tree`, where `parse_codex_processes`,
   `CodexProcessSnapshot`, `CodexProcessSource` and `UnixCodexProcesses` are
   `parse_processes`, `ProcessSnapshot`, `ProcessSource` and `UnixProcesses`.
-  The old names stay, deprecated, for one release. These changes have no
-  alias and break a caller at compile time: the `codex_artifacts` field of
+  The old names stay, deprecated, for one release. These changes have no alias
+  and break a caller at compile time: the `codex_artifacts` field of
   `DispatchSpec`, `DispatchState` and `ClearedDispatch` is
   `invocation_artifacts` (the stored and `--json` key is still
-  `codex_artifacts`); `HarnessSnapshots::codex` is `processes`; `Worktree`
-  has a new required field, `cut`; `codex_dispatch`'s supervision moved to
-  `invocation`, where `prepare_artifacts`, `has_launch_failure_record`,
-  `has_valid_exit_record` and `recover_artifacts` keep their names, `run_codex`
-  is `run_supervised`, and `run_codex_bounded`, `read_artifacts` and
-  `dispatch_timeout` are no longer public; and `codex_dispatch` no longer
+  `codex_artifacts`); `HarnessSnapshots::codex` is `processes`; `Worktree` has
+  a new required field, `cut`; `TurnPromptInputs` has a new required field,
+  `remote` (an `Option<&str>`: the remote the goal condition's push names,
+  `None` for none); `codex_dispatch`'s supervision moved to `invocation`,
+  where `prepare_artifacts`, `has_launch_failure_record`,
+  `has_valid_exit_record` and `recover_artifacts` keep their names,
+  `run_codex` is `run_supervised`, and `run_codex_bounded`, `read_artifacts`
+  and `dispatch_timeout` are no longer public; and `codex_dispatch` no longer
   exports `CODEX_DISPATCH_TIMEOUT_SECS`, `CODEX_VERDICT_JSON_SCHEMA` or
   `build_argv`.
 - **GitHub releases now carry their version's `CHANGELOG.md` section as the

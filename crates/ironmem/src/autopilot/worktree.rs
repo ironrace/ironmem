@@ -119,8 +119,8 @@ pub(crate) fn url_names_github_repo(url: &str, repo: &str) -> bool {
 /// 4. else the only configured remote;
 /// 5. else none: no remote is named rather than one that may not exist.
 ///
-/// The issue branch has no upstream, so a push names its remote when one is
-/// known.
+/// The issue branch has no upstream, so the goal condition's push names
+/// its remote when one is known.
 pub(crate) fn pick_push_remote<'a>(
     remotes: &[(&'a str, Option<&str>)],
     tracking: &[&'a str],
@@ -835,10 +835,13 @@ fn backfill_cut(
 /// ([`settle_created`]).
 ///
 /// The branch never has an upstream (`--no-track`, and a sha start point
-/// sets none under any `branch.autoSetupMerge`, measured). With
-/// `push.default=upstream`, an upstream of `origin/main` would send a bare
-/// `git push` from the issue branch to the base; without one, a push must
-/// name its remote and branch.
+/// sets none under any `branch.autoSetupMerge`, measured), so it no longer
+/// tracks the base: with `push.default=upstream`, an upstream of
+/// `origin/main` would send a bare `git push` from it to the base. Other
+/// push configuration (`push.default=matching` or `current`, a
+/// `remote.<name>.push` refspec) can still push it without naming anything,
+/// so the goal condition names the remote and branch
+/// ([`push_remote`]).
 ///
 /// If `git worktree add` fails, whether the branch exists decides:
 ///

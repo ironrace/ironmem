@@ -569,17 +569,21 @@ model can quietly pass `-c commit.gpgsign=false`.
   does not resolve, or a cut that cannot be stored, is refused before any
   worktree exists. The branch is created at that sha, never at `--base` by name,
   so a `--base` that moves meanwhile cannot move the branch. The issue branch
-  has no upstream, even from a remote-tracking `--base`, so a bare `git push`
-  from it can never reach the base (with `push.default=upstream`, an upstream of
-  `origin/main` would send it there); push it by naming the remote and the
-  branch, as the goal condition does (`git push origin <branch>`). If `git
-  worktree add` fails after making the branch, the branch keeps its cut and the
-  next run reuses it; the cut is taken back only when no branch was made, and
-  only while both its value and the run's own token (stored in
-  `branch.<branch>.ironmemCutOwner`) still read as that run's, so a take-back
-  never removes the same value another controller recorded after it. Once its
-  add has made the branch, a run reads the cut back and records it again if
-  another controller's take-back removed it meanwhile. A branch another
+  has no upstream, even from a remote-tracking `--base`, so it no longer tracks
+  the base and a bare `git push` cannot reach the base through an upstream (with
+  `push.default=upstream`, an upstream of `origin/main` would send it there).
+  Other push settings (`push.default=matching` or `current`, or a
+  `remote.<name>.push` refspec) can still push without naming anything, so push
+  it by naming the remote and the branch, as the goal condition does (`git push
+  <remote> <branch>`: the remote whose URL names the issue's GitHub repository,
+  else the one already tracking the branch, else `origin` if you have one, else
+  your only remote). If `git worktree add` fails after making the branch, the
+  branch keeps its cut and the next run reuses it; the cut is taken back only
+  when no branch was made, and only while both its value and the run's own token
+  (stored in `branch.<branch>.ironmemCutOwner`) still read as that run's, so a
+  take-back never removes the same value another controller recorded after it.
+  Once its add has made the branch, a run reads the cut back and records it
+  again if another controller's take-back removed it meanwhile. A branch another
   controller creates at the same moment is never given this run's cut: the run
   stops and asks you to run again. A run never deletes a branch or worktree it
   has just created: if the new branch already holds someone else's commit, or
