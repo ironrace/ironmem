@@ -715,10 +715,12 @@ impl Dispatcher for ClaudeDispatcher {
     /// idle IC is [`InvocationRecovery::NoPriorInvocation`].
     fn recover(
         &mut self,
-        repo: &Path,
+        _repo: &Path,
         state: &DispatchState,
     ) -> Result<InvocationRecovery, MemoryError> {
-        let mut monitor = super::registry::HarnessProcessMonitor::in_dir(repo);
+        // From a fixed neutral directory: neither the controller's own
+        // checkout nor the worktree, which the model can write.
+        let mut monitor = super::registry::HarnessProcessMonitor::in_dir(&std::env::temp_dir());
         Ok(claude_recovery(
             &super::registry::HarnessMonitor::snapshot(&mut monitor),
             state,
@@ -736,8 +738,15 @@ impl Dispatcher for ClaudeDispatcher {
 
 /// What fresh evidence says of the Claude IC `state` names: alive when the
 /// registry lists it or a process names it with `--name` (a just-launched IC
-/// registers late); uncertain when the process table cannot be read, since
-/// the registry alone never proves an IC gone; otherwise idle.
+/// registers late); idle only when the registry is readable and does not
+/// list it AND the process table is readable and names it nowhere;
+/// otherwise uncertain.
+///
+/// The rule a run applies, which is stricter than clear-dispatch's: a run
+/// never adopts a Claude state on an unreadable registry, whereas
+/// `clear-dispatch`, an operator's action taken once the Leads are
+/// stopped, lets the process table decide when the registry cannot be read
+/// (see `clear::refusal`).
 fn claude_recovery(
     snapshots: &super::registry::HarnessSnapshots,
     state: &DispatchState,
@@ -750,14 +759,19 @@ fn claude_recovery(
             ),
         };
     };
-    match super::clear::claude_ic_holder(
-        snapshots,
-        rows,
-        &state.issue,
-        Some(&state.ic_session_name),
-    ) {
-        Some(_) => InvocationRecovery::Alive,
-        None => InvocationRecovery::NoPriorInvocation,
+    if super::clear::claude_ic_holder(snapshots, rows, &state.issue, Some(&state.ic_session_name))
+        .is_some()
+    {
+        return InvocationRecovery::Alive;
+    }
+    match &snapshots.claude {
+        super::registry::RegistrySnapshot::Available(_) => InvocationRecovery::NoPriorInvocation,
+        super::registry::RegistrySnapshot::Unavailable { reason } => InvocationRecovery::Unknown {
+            reason: format!(
+                "Claude's session registry cannot be read ({reason}), and a run adopts a Claude \
+                 state only once a readable registry does not list its IC"
+            ),
+        },
     }
 }
 
@@ -1011,21 +1025,38 @@ fn prefix(text: &str, n: usize) -> String {
 struct SigningPolicySeen {
     /// `commit.gpgsign` read `true` when this run started.
     at_run_start: bool,
-    /// The dispatch state this run started from records that the run that
-    /// wrote it saw it on ([`DispatchState::signing_held`]). That memory
-    /// survives a controller crash, where the run's own does not, so it
-    /// holds only the `met` of the invocation that run launched, recovered
-    /// as finished: never a fresh dispatch, and never a branch an operator
-    /// opted out.
+    /// The dispatch state this run started from was written mid-dispatch
+    /// (not parked) by a run that saw the policy on
+    /// ([`DispatchState::signing_held`]). That memory survives a controller
+    /// crash, where the run's own does not, so it holds the `met` of the
+    /// invocation that run launched, recovered as finished; a fresh
+    /// dispatch is held by the branch flag recorded from it instead.
     by_interrupted_run: bool,
+    /// The dispatch state this run started from is parked, and the run that
+    /// parked it saw the policy on. Carried forward: it holds this run's
+    /// fresh dispatches too, and this run's own states keep it, so a flag
+    /// that could not be written (another agent held the config lock) loses
+    /// nothing when a run pauses. An operator's opt-out of the branch
+    /// releases it.
+    by_parked_run: bool,
 }
 
 impl SigningPolicySeen {
-    /// What holds a fresh dispatch's `met`: this run's own reading only.
+    /// What holds a fresh dispatch's `met`: everything but an interrupted
+    /// run's reading, which holds only its own recovered invocation.
     fn fresh(self) -> Self {
         Self {
             by_interrupted_run: false,
             ..self
+        }
+    }
+
+    /// What still holds a branch an operator opted out: only this run's
+    /// own reading, since this run is still going and saw it on.
+    fn opted_out(self) -> Self {
+        Self {
+            at_run_start: self.at_run_start,
+            ..Self::default()
         }
     }
 
@@ -1035,6 +1066,8 @@ impl SigningPolicySeen {
             Some("the policy, which was on when this run started")
         } else if self.by_interrupted_run {
             Some("the policy, which was on when an interrupted run on this issue started")
+        } else if self.by_parked_run {
+            Some("the policy, which was on when an earlier run on this issue saw it, before it paused")
         } else {
             None
         }
@@ -1522,7 +1555,7 @@ fn policy_gate(
                 worktree::SigningHold::Held(holder) => Some(holder),
                 // An operator's opt-out releases what an interrupted run
                 // saw, but not a run that is still going and saw it on.
-                worktree::SigningHold::OptedOut => seen.fresh().holder().map(str::to_string),
+                worktree::SigningHold::OptedOut => seen.opted_out().holder().map(str::to_string),
                 worktree::SigningHold::NotHeld => seen.holder().map(str::to_string),
             };
             Ok(std::ops::ControlFlow::Break(
@@ -2311,6 +2344,7 @@ pub fn is_terminal_summary(approach: &str) -> bool {
 /// carried separately only for the message, since `attempt_n` is the lifetime
 /// number and sits above the cap after a retry, a remediation, or a cap
 /// lowered between runs.
+#[cfg(test)]
 pub(super) fn record_terminal_summary(
     db: &Database,
     issue: &IssueRef,
@@ -2318,6 +2352,45 @@ pub(super) fn record_terminal_summary(
     attempt_cap: u32,
     attempts: &[PriorAttempt],
 ) -> Result<(), MemoryError> {
+    if let Some(record) = terminal_summary(issue, attempt_n, attempt_cap, attempts) {
+        lineage::record_attempt(db, &record)?;
+    }
+    Ok(())
+}
+
+/// [`record_terminal_summary`] for a run, only while it still owns the
+/// issue (`owned`; see `record_and_advance`): the lineage it reads and the
+/// summary it appends share one `BEGIN IMMEDIATE` transaction with that
+/// check. `Ok(false)`, writing nothing, when another run took the issue
+/// over.
+fn record_terminal_summary_owned(
+    db: &Database,
+    issue: &IssueRef,
+    attempt_n: u32,
+    attempt_cap: u32,
+    owned: Option<&dispatch_state::Claim>,
+) -> Result<bool, MemoryError> {
+    db.with_immediate_transaction(|tx| {
+        if !dispatch_state::claim_is_tx(tx, issue, owned)? {
+            return Ok(false);
+        }
+        // Read through `db`, the transaction's own connection.
+        let attempts = prior_attempts(db, issue)?;
+        if let Some(record) = terminal_summary(issue, attempt_n, attempt_cap, &attempts) {
+            lineage::record_attempt_tx(tx, &record)?;
+        }
+        Ok(true)
+    })
+}
+
+/// The terminal record to append, or `None` when one already covers
+/// `attempt_n`.
+fn terminal_summary(
+    issue: &IssueRef,
+    attempt_n: u32,
+    attempt_cap: u32,
+    attempts: &[PriorAttempt],
+) -> Option<AttemptRecord> {
     // Written once, not once per invocation. An exhausted issue is a stable
     // state that a polling Lead re-reads every pass, and each terminal
     // record's summary quotes every attempt before it — including earlier
@@ -2335,7 +2408,7 @@ pub(super) fn record_terminal_summary(
         .iter()
         .any(|a| is_terminal_summary(&a.approach) && a.attempt_n >= attempt_n)
     {
-        return Ok(());
+        return None;
     }
     let summary = if attempts.is_empty() {
         "no attempts recorded".to_string()
@@ -2356,21 +2429,17 @@ pub(super) fn record_terminal_summary(
             .join("\n")
     };
 
-    lineage::record_attempt(
-        db,
-        &AttemptRecord {
-            issue: issue.clone(),
-            attempt_n,
-            approach: format!(
-                "{TERMINAL_SUMMARY_PREFIX} ({attempt_cap}) reached; this record summarizes \
-                 every attempt and is a marker, not a further attempt"
-            ),
-            verdict: AttemptOutcome::Failed,
-            why_failed: Some(summary),
-            commit_sha: None,
-        },
-    )?;
-    Ok(())
+    Some(AttemptRecord {
+        issue: issue.clone(),
+        attempt_n,
+        approach: format!(
+            "{TERMINAL_SUMMARY_PREFIX} ({attempt_cap}) reached; this record summarizes \
+             every attempt and is a marker, not a further attempt"
+        ),
+        verdict: AttemptOutcome::Failed,
+        why_failed: Some(summary),
+        commit_sha: None,
+    })
 }
 
 /// The repo's approved gate commands, or an error naming the exact next
@@ -2550,6 +2619,79 @@ fn taken_over(issue: &IssueRef) -> MemoryError {
          this run launches and writes nothing more; the other run's state is left as it is",
         issue.canonical()
     ))
+}
+
+/// A Claude dispatch's dollar ceiling reserved on a date
+/// ([`budget::reserve_spend_if_within`]) until its cost is known. One left
+/// unsettled (a `?` return, a panic) is released when dropped, so an
+/// unwound run never keeps the day's total inflated.
+struct ReservedSpend<'a> {
+    db: &'a Database,
+    date: String,
+    amount_usd: f64,
+    settled: bool,
+}
+
+impl<'a> ReservedSpend<'a> {
+    fn new(db: &'a Database, date: String, amount_usd: f64) -> Self {
+        Self {
+            db,
+            date,
+            amount_usd,
+            settled: false,
+        }
+    }
+
+    /// Replace the reservation with the measured cost, or release it.
+    fn settle(mut self, cost_usd: Option<f64>) -> Result<(), MemoryError> {
+        self.settled = true;
+        budget::settle_reserved_spend(self.db, &self.date, self.amount_usd, cost_usd).map(|_| ())
+    }
+}
+
+impl Drop for ReservedSpend<'_> {
+    fn drop(&mut self) {
+        if self.settled {
+            return;
+        }
+        if let Err(e) = budget::settle_reserved_spend(self.db, &self.date, self.amount_usd, None) {
+            tracing::warn!(
+                error = %e,
+                date = %self.date,
+                "autopilot could not release an unsettled dispatch's reserved spend; the day's \
+                 total stays that much higher"
+            );
+        }
+    }
+}
+
+/// Whether this run still owns the issue right before a Claude launch:
+/// the drawer still holds `owned`. A claim with too little of its lease
+/// left ([`dispatch_state::CLAIM_LEASE`] less
+/// [`dispatch_state::CLAIM_REFRESH_MARGIN`]) is claimed again, with a fresh
+/// time, in the same compare-and-set.
+fn still_owned(
+    db: &Database,
+    issue: &IssueRef,
+    owned: &mut Option<dispatch_state::Claim>,
+) -> Result<bool, MemoryError> {
+    let now = chrono::Utc::now();
+    let Some(claim) = owned.as_ref() else {
+        return dispatch_state::claim_is(db, issue, None);
+    };
+    let fresh = claim.age(now).is_some_and(|age| {
+        age + dispatch_state::CLAIM_REFRESH_MARGIN < dispatch_state::CLAIM_LEASE
+    });
+    if fresh {
+        return dispatch_state::claim_is(db, issue, Some(claim));
+    }
+    let mut renewed = claim.clone();
+    renewed.claimed_at = Some(now.to_rfc3339());
+    if !dispatch_state::claim_if_unchanged(db, Some(claim), &renewed)? {
+        return Ok(false);
+    }
+    *owned = Some(renewed);
+    Ok(true)
 }
 
 /// What restart recovery decided before a run dispatches anything.
@@ -2837,8 +2979,21 @@ pub fn run_issue(
     }
     let seen = SigningPolicySeen {
         at_run_start: policy_at_start,
-        by_interrupted_run: existing_state.as_ref().is_some_and(|s| s.signing_held),
+        by_interrupted_run: existing_state
+            .as_ref()
+            .is_some_and(|s| s.signing_held && !s.is_parked()),
+        by_parked_run: existing_state
+            .as_ref()
+            .is_some_and(|s| s.signing_held && s.is_parked()),
     };
+    // What this run's own states record: its reading, and a parked run's
+    // carried forward unless an operator has since opted the branch out.
+    let signing_held = policy_at_start
+        || (seen.by_parked_run
+            && !matches!(
+                worktree::signing_holder(&worktree.path, &worktree.branch),
+                Ok(worktree::SigningHold::OptedOut)
+            ));
     // A fault every later `met` would meet too (`GuardFault::stops_run`: a
     // collaborator's unsigned commit, a recorded cut that is not a commit
     // name, a policy or flag that cannot be read) would turn away any `met`
@@ -2865,10 +3020,32 @@ pub fn run_issue(
     // write reuses everything this run read, so the compare-and-set alone
     // would let this run launch a second IC on the same session. Adopted
     // only once fresh evidence shows its IC idle, before anything is written.
-    if let Some(state) = existing_state
+    if let Some(claim) = existing_claim
         .as_ref()
-        .filter(|s| !config.implementer.recovers_invocations() && !s.is_parked())
+        .filter(|c| !config.implementer.recovers_invocations() && !c.state.is_parked())
     {
+        // Within its lease, another run's claim is that run's, however idle
+        // its IC looks: it may be between its claim and its launch.
+        if claim.leased(chrono::Utc::now()) {
+            return Ok(IssueRun {
+                unpriced_dispatches: 0,
+                issue: issue.clone(),
+                terminal: TerminalReason::ImplementationInFlight {
+                    detail: format!(
+                        "another run claimed {} {}s ago and may be about to launch; it is \
+                         adopted only once its {}s lease lapses with its IC idle",
+                        issue.canonical(),
+                        claim.age(chrono::Utc::now()).unwrap_or_default().as_secs(),
+                        dispatch_state::CLAIM_LEASE.as_secs()
+                    ),
+                },
+                dispatches: Vec::new(),
+                total_cost_usd: 0.0,
+                cumulative_attempt_n,
+                wall_clock_timeout_secs,
+            });
+        }
+        let state = &claim.state;
         if let Some(run) = claude_in_flight(
             dispatcher,
             worktree,
@@ -2905,48 +3082,47 @@ pub fn run_issue(
     }
     // Record a signing policy that is on before any dispatch, so an agent
     // that turns it off is still held to it, in this run and every later one.
-    // After recovery, never before: a run that holds a live invocation ends
-    // above, and writing `.git/config` while that agent may be writing it too
-    // would race it for the lock. A policy a crashed dispatch disabled before
-    // any run or `ensure_worktree` saw it on is not caught: an accepted
-    // limitation. A failed write (another worktree's agent holding the lock)
-    // costs only this cross-run memory: the reading is held in memory for
-    // this run and in the dispatch state written before each launch
-    // (`signing_held`), which a replacement controller reads.
-    if policy_at_start {
-        if let Err(e) = worktree::record_signing(&worktree.path, &worktree.branch, true) {
-            tracing::warn!(
-                error = %e,
-                branch = %worktree.branch,
-                "autopilot could not record the signing policy on the branch; \
-                 holding this run to it from memory"
-            );
-        }
-    }
+    // Once this run has first claimed the issue, never before: recovery has
+    // then proven no earlier invocation runs, and no other run can have
+    // launched one since, so no agent can be writing `.git/config` beside
+    // it. A policy a crashed dispatch disabled before any run or
+    // `ensure_worktree` saw it on is not caught: an accepted limitation. A
+    // failed write (another worktree's agent holding the lock) costs only
+    // this cross-run memory: the reading is held in memory for this run and
+    // in every dispatch state it writes (`signing_held`), which a
+    // replacement controller, or the next run after a pause, reads.
+    //
     // A policy a run interrupted mid-dispatch saw on, and could not record
-    // on the branch (another agent held the config lock), is recorded now
-    // that recovery has proven nothing of it runs: off at this run's start,
-    // it would hold only the recovered met, and no fresh dispatch's after
-    // it, though its own agent may be what turned it off. Not over an
-    // operator's opt-out, and not for a run that ended (parked) and so was
-    // not interrupted: a policy turned off since then is the operator's.
-    if !policy_at_start
-        && seen.by_interrupted_run
-        && existing_state.as_ref().is_some_and(|s| !s.is_parked())
-    {
-        if let Ok(worktree::SigningHold::NotHeld) =
-            worktree::signing_holder(&worktree.path, &worktree.branch)
-        {
-            if let Err(e) = worktree::record_signing(&worktree.path, &worktree.branch, false) {
+    // on the branch, is recorded the same way: off at this run's start, it
+    // would hold only the recovered met, and no fresh dispatch's after it,
+    // though its own agent may be what turned it off. Not over an
+    // operator's opt-out.
+    let record_signing_reading = || {
+        if policy_at_start {
+            if let Err(e) = worktree::record_signing(&worktree.path, &worktree.branch, true) {
                 tracing::warn!(
                     error = %e,
                     branch = %worktree.branch,
-                    "autopilot could not record on the branch the signing policy an \
-                     interrupted run saw on; only that run's met is held to it"
+                    "autopilot could not record the signing policy on the branch; \
+                     holding this run to it from memory"
                 );
             }
+        } else if seen.by_interrupted_run {
+            if let Ok(worktree::SigningHold::NotHeld) =
+                worktree::signing_holder(&worktree.path, &worktree.branch)
+            {
+                if let Err(e) = worktree::record_signing(&worktree.path, &worktree.branch, false) {
+                    tracing::warn!(
+                        error = %e,
+                        branch = %worktree.branch,
+                        "autopilot could not record on the branch the signing policy an \
+                         interrupted run saw on; only that run's met is held to it"
+                    );
+                }
+            }
         }
-    }
+    };
+    let mut signing_recorded = false;
     let mut resuming = recovered_session_used
         || existing_state
             .as_ref()
@@ -2961,6 +3137,13 @@ pub fn run_issue(
         .unwrap_or(0);
     let ic_session_name = dispatch::ic_name(issue);
     let worktree_path = worktree.path.to_string_lossy().to_string();
+    // Stored in every claim, so the issue's lock is found even once the
+    // worktree is gone. Unresolvable, nothing names it: the lock is then
+    // looked for through the worktree.
+    let common_dir = super::issue_lock::git_common_dir(&worktree.path)
+        .ok()
+        .flatten()
+        .map(|dir| dir.to_string_lossy().into_owned());
 
     // `session_uuid` is a parameter rather than a capture because the session
     // is no longer fixed for the life of a run: a dispatch that concludes its
@@ -3003,12 +3186,14 @@ pub fn run_issue(
             session_claimed,
             session_model: session.0.clone(),
             resume_refusals: session.1,
-            // What this run saw, never a carried-forward older reading.
-            signing_held: policy_at_start,
+            // What this run saw, and a parked run's reading carried forward.
+            signing_held,
         };
         dispatch_state::Claim {
             state,
             owner: Some(owner.clone()),
+            claimed_at: Some(chrono::Utc::now().to_rfc3339()),
+            common_dir: common_dir.clone(),
         }
     };
     let write_state = |owned: &mut Option<dispatch_state::Claim>,
@@ -3049,6 +3234,8 @@ pub fn run_issue(
             (&native_session_id, &invocation_artifacts),
             (&session_model, resume_refusals),
         )?;
+        record_signing_reading();
+        signing_recorded = true;
     }
 
     let mut dispatches = Vec::new();
@@ -3058,7 +3245,7 @@ pub fn run_issue(
     // Whether this run has launched anything yet.
     let mut launched = false;
     // A Claude dispatch's dollar ceiling reserved on a date, until settled.
-    let mut reserved_spend: Option<(String, f64)> = None;
+    let mut reserved_spend: Option<ReservedSpend<'_>> = None;
 
     let terminal = loop {
         if recovered_outcome.is_none() {
@@ -3075,14 +3262,15 @@ pub fn run_issue(
             if remediate::attempts_charged(db, issue, cumulative_attempt_n, succeeded)?
                 >= config.attempt_cap
             {
-                let attempts = prior_attempts(db, issue)?;
-                record_terminal_summary(
+                if !record_terminal_summary_owned(
                     db,
                     issue,
                     cumulative_attempt_n,
                     config.attempt_cap,
-                    &attempts,
-                )?;
+                    owned.as_ref(),
+                )? {
+                    return Err(taken_over());
+                }
                 break TerminalReason::AttemptCapExhausted;
             }
 
@@ -3308,15 +3496,16 @@ pub fn run_issue(
                         return Err(e);
                     }
                     unpriced_dispatches += 1;
+                    if !signing_recorded {
+                        record_signing_reading();
+                        signing_recorded = true;
+                    }
                 }
             } else {
-                // Claude's launch is claimed by no write of its own: look
-                // that no other run took the issue over since this one last
-                // wrote it, and, before this run's first launch, that no IC
-                // for the issue has started meanwhile.
-                if !dispatch_state::claim_is(db, issue, owned.as_ref())? {
-                    return Err(taken_over());
-                }
+                // Before this run's first launch, no IC for the issue may
+                // have started since the run began. One has: the issue is
+                // given back exactly as this run found it (a parked label
+                // included), since this run launched nothing.
                 if !launched {
                     if let Some(claim) = &owned {
                         if let Some(run) = claude_in_flight(
@@ -3327,6 +3516,16 @@ pub fn run_issue(
                             cumulative_attempt_n,
                             wall_clock_timeout_secs,
                         )? {
+                            let restored = match &existing_claim {
+                                Some(found) => {
+                                    dispatch_state::claim_if_unchanged(db, owned.as_ref(), found)?
+                                }
+                                None => dispatch_state::clear_claim_if_unchanged(db, claim)?,
+                            };
+                            if !restored {
+                                return Err(taken_over());
+                            }
+                            owned = existing_claim.clone();
                             break run.terminal;
                         }
                     }
@@ -3344,11 +3543,21 @@ pub fn run_issue(
                     config.daily_budget_usd,
                 )? {
                     budget::SpendReservation::Reserved => {
-                        reserved_spend = Some((date, config.max_budget_usd));
+                        reserved_spend = Some(ReservedSpend::new(db, date, config.max_budget_usd));
                     }
                     budget::SpendReservation::BudgetReached { spent_usd } => {
                         break TerminalReason::DailyBudgetExhausted { spent_usd };
                     }
+                }
+                // Last, right before the launch: Claude's launch is claimed
+                // by no write of its own, so this run looks that no other run
+                // took the issue over since it last wrote it, and renews its
+                // lease when too little of it would remain at the launch.
+                if !still_owned(db, issue, &mut owned)? {
+                    if let Some(reserved) = reserved_spend.take() {
+                        reserved.settle(None)?;
+                    }
+                    return Err(taken_over());
                 }
             }
             launched = true;
@@ -3391,8 +3600,8 @@ pub fn run_issue(
                 if !matches!(err, MemoryError::NotFound(_)) {
                     resuming = true;
                 }
-                if let Some((date, amount)) = &reserved {
-                    budget::settle_reserved_spend(db, date, *amount, None)?;
+                if let Some(reserved) = reserved {
+                    reserved.settle(None)?;
                 }
                 consecutive_infrastructure_failures += 1;
                 dispatches.push(DispatchSummary {
@@ -3574,10 +3783,8 @@ pub fn run_issue(
             outcome.cost_usd = None;
         } else {
             let cost = outcome.cost_usd.map(|cost| cost.max(0.0));
-            match &reserved {
-                Some((date, amount)) => {
-                    budget::settle_reserved_spend(db, date, *amount, cost)?;
-                }
+            match reserved {
+                Some(reserved) => reserved.settle(cost)?,
                 None => {
                     if let Some(cost) = cost {
                         budget::accumulate_daily_spend(db, &today_utc(), cost)?;
@@ -3834,22 +4041,22 @@ pub fn run_issue(
     // it: a run that stopped before launching (a budget, a cap, an
     // escalation) learned nothing about its holder, and the park is what
     // keeps a later run from rotating over it or the queue from admitting it.
-    let disposition = match terminal.disposition() {
-        Disposition::Clear | Disposition::Park(_) if parked_in_use && !launched => {
+    let disposition = match (&terminal, terminal.disposition()) {
+        (TerminalReason::AttemptCapExhausted, _) | (_, Disposition::Park(_))
+            if parked_in_use && !launched =>
+        {
             Disposition::Park(DispatchPhase::PausedSessionInUse)
         }
-        disposition => disposition,
+        (_, disposition) => disposition,
     };
     if disposition == Disposition::Clear {
         // Only the state this run owns; one another run wrote is theirs.
         if let Some(owned) = &owned {
+            // Lost: another run owns the issue now, and this run's ending
+            // (an exhausted cap, say, which the Lead would close out) is not
+            // the issue's.
             if !dispatch_state::clear_claim_if_unchanged(db, owned)? {
-                tracing::warn!(
-                    issue = %issue.canonical(),
-                    terminal = ?terminal,
-                    "autopilot left the issue's dispatch state to the run that changed it \
-                     after this one last wrote it"
-                );
+                return Err(taken_over());
             }
         }
     } else if let Disposition::Park(state_label) = disposition {
@@ -7968,9 +8175,9 @@ sleep 0.5
     }
 
     #[test]
-    fn an_earlier_runs_reading_never_holds_a_fresh_dispatch_to_signing() {
-        // Policy off, and either nothing records it on or the operator opted
-        // the branch out; an earlier run on the issue saw it on.
+    fn a_parked_runs_reading_holds_a_fresh_dispatch_unless_the_branch_is_opted_out() {
+        // D2. Policy off, and either nothing records it on or the operator
+        // opted the branch out; a parked earlier run on the issue saw it on.
         for (implementer, opt_out) in [
             (Implementer::Claude, false),
             (Implementer::Claude, true),
@@ -7998,11 +8205,70 @@ sleep 0.5
             };
             c.attempt_cap = 1;
             let run = run_issue(&db, &issue(), &brief(), &wt, &c, &mut d).unwrap();
-            assert!(
-                matches!(run.terminal, TerminalReason::Met { .. }),
-                "{implementer:?} opt_out={opt_out}: {:?}",
-                run.dispatches
-            );
+            if opt_out {
+                assert!(
+                    matches!(run.terminal, TerminalReason::Met { .. }),
+                    "{implementer:?}: the opt-out wins: {:?}",
+                    run.dispatches
+                );
+            } else {
+                assert_eq!(
+                    run.dispatches[0].classification,
+                    DispatchClassification::FailedAttempt,
+                    "{implementer:?}: {:?}",
+                    run.dispatches
+                );
+                let reason = run.dispatches[0].reason.as_deref().unwrap();
+                assert!(reason.contains("before it paused"), "{reason}");
+            }
+        }
+    }
+
+    /// D2 end to end: run 1 sees signing on but cannot record it (another
+    /// agent holds the config lock) and parks; run 2, with the policy since
+    /// turned off, refuses an unsigned met, unless the branch is opted out.
+    #[test]
+    fn a_signing_reading_survives_a_park_when_it_could_not_be_recorded() {
+        for opt_out in [false, true] {
+            let db = approved_db();
+            let (_dir, wt) = fixture_worktree();
+            git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
+            let lock = wt.path.join(".git/config.lock");
+            std::fs::write(&lock, "").unwrap();
+            let mut d = muse_script(vec![muse_infra_failure("network down")]);
+            let mut c = muse_config();
+            c.max_consecutive_infrastructure_failures = 1;
+            run_issue(&db, &issue(), &brief(), &wt, &c, &mut d).unwrap();
+            let parked = dispatch_state::get_dispatch_state(&db, &issue())
+                .unwrap()
+                .unwrap();
+            assert!(parked.is_parked() && parked.signing_held, "{parked:?}");
+            std::fs::remove_file(&lock).unwrap();
+            assert!(!worktree::signing_recorded(&wt.path, &wt.branch));
+            git_in(&wt.path, &["config", "commit.gpgsign", "false"]);
+            if opt_out {
+                let key = format!("branch.{}.ironmemSigning", wt.branch);
+                git_in(&wt.path, &["config", &key, "false"]);
+            }
+            let mut d = HarnessCommitThenMet {
+                implementer: Implementer::Muse,
+                before: |path: &Path| {
+                    commit_in(path, "work", &["-c", "commit.gpgsign=false"]);
+                },
+                dispatched: 0,
+            };
+            c.attempt_cap = 1;
+            let run = run_issue(&db, &issue(), &brief(), &wt, &c, &mut d).unwrap();
+            let classification = run.dispatches[0].classification;
+            if opt_out {
+                assert_eq!(classification, DispatchClassification::Met, "{run:?}");
+            } else {
+                assert_eq!(
+                    classification,
+                    DispatchClassification::FailedAttempt,
+                    "{run:?}"
+                );
+            }
         }
     }
 
@@ -8031,18 +8297,24 @@ sleep 0.5
     }
 
     #[test]
-    fn a_run_records_only_its_own_reading_of_the_signing_policy() {
-        let db = approved_db();
-        let (_dir, wt) = fixture_worktree(); // policy off
-        paused_state_that_saw_signing_on(Implementer::Muse, &db, &wt);
-        let mut d = muse_script(vec![muse_infra_failure("network down")]);
-        let mut c = muse_config();
-        c.max_consecutive_infrastructure_failures = 1;
-        run_issue(&db, &issue(), &brief(), &wt, &c, &mut d).unwrap();
-        let state = dispatch_state::get_dispatch_state(&db, &issue())
-            .unwrap()
-            .unwrap();
-        assert!(!state.signing_held, "{state:?}");
+    fn a_parked_runs_reading_is_carried_forward_unless_the_branch_is_opted_out() {
+        for opt_out in [false, true] {
+            let db = approved_db();
+            let (_dir, wt) = fixture_worktree(); // policy off
+            if opt_out {
+                let key = format!("branch.{}.ironmemSigning", wt.branch);
+                git_in(&wt.path, &["config", &key, "false"]);
+            }
+            paused_state_that_saw_signing_on(Implementer::Muse, &db, &wt);
+            let mut d = muse_script(vec![muse_infra_failure("network down")]);
+            let mut c = muse_config();
+            c.max_consecutive_infrastructure_failures = 1;
+            run_issue(&db, &issue(), &brief(), &wt, &c, &mut d).unwrap();
+            let state = dispatch_state::get_dispatch_state(&db, &issue())
+                .unwrap()
+                .unwrap();
+            assert_eq!(state.signing_held, !opt_out, "{state:?}");
+        }
     }
 
     #[test]
@@ -9994,6 +10266,8 @@ satisfies it on its own"
         recovered: usize,
         /// A state another run writes while this run's dispatch runs.
         takeover: Option<dispatch_state::Claim>,
+        /// A state another run writes while this run checks its IC.
+        recover_takeover: Option<dispatch_state::Claim>,
         outcomes: std::collections::VecDeque<DispatchOutcome>,
         seen: Vec<DispatchSpec>,
     }
@@ -10005,6 +10279,7 @@ satisfies it on its own"
                 evidence: evidence.into(),
                 recovered: 0,
                 takeover: None,
+                recover_takeover: None,
                 outcomes: std::collections::VecDeque::new(),
                 seen: Vec::new(),
             }
@@ -10018,6 +10293,12 @@ satisfies it on its own"
             _state: &DispatchState,
         ) -> Result<InvocationRecovery, MemoryError> {
             self.recovered += 1;
+            if let Some(theirs) = self.recover_takeover.take() {
+                let current = dispatch_state::get_claim(self.db, &theirs.state.issue).unwrap();
+                assert!(
+                    dispatch_state::claim_if_unchanged(self.db, current.as_ref(), &theirs).unwrap()
+                );
+            }
             Ok(self
                 .evidence
                 .pop_front()
@@ -10054,6 +10335,8 @@ satisfies it on its own"
         let claim = dispatch_state::Claim {
             state,
             owner: Some("run-a".into()),
+            claimed_at: None,
+            common_dir: None,
         };
         assert!(dispatch_state::claim_if_unchanged(
             db,
@@ -10156,6 +10439,8 @@ satisfies it on its own"
             b.takeover = Some(dispatch_state::Claim {
                 state: theirs,
                 owner: Some("run-c".into()),
+                claimed_at: None,
+                common_dir: None,
             });
             b.outcomes.push_back(outcome.clone());
             let err = run_issue(&db, &issue(), &brief(), &wt, &config(), &mut b)
@@ -10237,13 +10522,210 @@ satisfies it on its own"
             ),
             InvocationRecovery::Unknown { reason } if reason.contains("ps timed out")
         ));
-        // The process table settles it even with no registry.
-        assert_eq!(
+        // D3: a run never adopts on an unreadable registry, whatever the
+        // process table shows; both readable and silent, it is idle.
+        assert!(matches!(
             claude_recovery(
                 &snaps(unreadable, ProcessSnapshot::Available(Vec::new())),
                 &state
             ),
+            InvocationRecovery::Unknown { reason } if reason.contains("claude not found")
+        ));
+        assert_eq!(
+            claude_recovery(
+                &snaps(
+                    RegistrySnapshot::Available(Vec::new()),
+                    ProcessSnapshot::Available(Vec::new())
+                ),
+                &state
+            ),
             InvocationRecovery::NoPriorInvocation
         );
+    }
+
+    /// A claim as another run would write it now: leased.
+    fn leased_claim(state: DispatchState, owner: &str) -> dispatch_state::Claim {
+        dispatch_state::Claim {
+            state,
+            owner: Some(owner.into()),
+            claimed_at: Some(chrono::Utc::now().to_rfc3339()),
+            common_dir: None,
+        }
+    }
+
+    /// C-I2: within its lease, another run's claim is never adopted, however
+    /// idle its IC looks; once the lease lapses it is.
+    #[test]
+    fn a_claude_run_never_adopts_a_claim_within_its_lease() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        let mut a = claude_in_flight_state(&db, &wt);
+        a.claimed_at = Some(chrono::Utc::now().to_rfc3339());
+        assert!(dispatch_state::claim_if_unchanged(
+            &db,
+            dispatch_state::get_claim(&db, &issue()).unwrap().as_ref(),
+            &a
+        )
+        .unwrap());
+        let a = dispatch_state::get_claim(&db, &issue()).unwrap().unwrap();
+        let mut b = ClaudeEvidence::new(&db, Vec::new());
+        let run = run_issue(&db, &issue(), &brief(), &wt, &config(), &mut b).unwrap();
+        assert!(
+            matches!(&run.terminal, TerminalReason::ImplementationInFlight { detail }
+                if detail.contains("lease")),
+            "{:?}",
+            run.terminal
+        );
+        assert!(b.seen.is_empty());
+        assert_eq!(b.recovered, 0, "no adoption check is even needed");
+        assert_eq!(
+            dispatch_state::get_claim(&db, &issue()).unwrap(),
+            Some(a.clone())
+        );
+
+        // Lapsed: adopted once its IC shows idle.
+        let mut lapsed = a.clone();
+        lapsed.claimed_at =
+            Some((chrono::Utc::now() - chrono::Duration::seconds(200)).to_rfc3339());
+        assert!(dispatch_state::claim_if_unchanged(&db, Some(&a), &lapsed).unwrap());
+        let mut b = ClaudeEvidence::new(&db, Vec::new());
+        b.outcomes.push_back(met());
+        let run = run_issue(&db, &issue(), &brief(), &wt, &config(), &mut b).unwrap();
+        assert!(
+            matches!(run.terminal, TerminalReason::Met { .. }),
+            "{:?}",
+            run.terminal
+        );
+    }
+
+    /// C-I2: a run whose own claim is near the end of its lease claims again
+    /// before it launches; one with time left only looks.
+    #[test]
+    fn a_claim_near_the_end_of_its_lease_is_renewed_before_a_launch() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        let state = pending_invocation(Implementer::Claude, &db, &wt, None);
+        let mut old = leased_claim(state, "us");
+        old.claimed_at = Some((chrono::Utc::now() - chrono::Duration::seconds(100)).to_rfc3339());
+        let stored = dispatch_state::get_claim(&db, &issue()).unwrap();
+        assert!(dispatch_state::claim_if_unchanged(&db, stored.as_ref(), &old).unwrap());
+        let mut owned = dispatch_state::get_claim(&db, &issue()).unwrap();
+        assert!(still_owned(&db, &issue(), &mut owned).unwrap());
+        let renewed = owned.clone().unwrap();
+        assert_ne!(renewed.claimed_at, old.claimed_at);
+        assert_eq!(
+            dispatch_state::get_claim(&db, &issue()).unwrap(),
+            Some(renewed.clone())
+        );
+        // Fresh: nothing is written.
+        assert!(still_owned(&db, &issue(), &mut owned).unwrap());
+        assert_eq!(owned, Some(renewed.clone()));
+        // Another run's claim since: not ours.
+        let theirs = leased_claim(renewed.state.clone(), "them");
+        assert!(dispatch_state::claim_if_unchanged(&db, Some(&renewed), &theirs).unwrap());
+        assert!(!still_owned(&db, &issue(), &mut owned).unwrap());
+    }
+
+    /// G-M1: a parked state stays parked when the check before the first
+    /// launch finds an IC for the issue: the run launched nothing.
+    #[test]
+    fn a_parked_state_stays_parked_when_the_pre_launch_check_holds() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        let mut parked = pending_invocation(Implementer::Claude, &db, &wt, None);
+        parked.state = DispatchPhase::PausedDailyBudget.as_str().into();
+        dispatch_state::upsert_dispatch_state(&db, &parked).unwrap();
+        let before = dispatch_state::get_claim(&db, &issue()).unwrap();
+        let mut b = ClaudeEvidence::new(&db, vec![InvocationRecovery::Alive]);
+        let run = run_issue(&db, &issue(), &brief(), &wt, &config(), &mut b).unwrap();
+        assert!(matches!(
+            run.terminal,
+            TerminalReason::ImplementationInFlight { .. }
+        ));
+        assert!(b.seen.is_empty());
+        assert_eq!(dispatch_state::get_claim(&db, &issue()).unwrap(), before);
+        // With nothing found at the start, nothing is left behind.
+        let db = approved_db();
+        let mut b = ClaudeEvidence::new(&db, vec![InvocationRecovery::Alive]);
+        run_issue(&db, &issue(), &brief(), &wt, &config(), &mut b).unwrap();
+        assert!(dispatch_state::get_claim(&db, &issue()).unwrap().is_none());
+    }
+
+    /// G-M2: the ownership look comes last before a launch, after the spend
+    /// is reserved, and a lost issue gives the reservation back.
+    #[test]
+    fn a_takeover_found_before_a_launch_releases_the_reserved_spend() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        let mut b = ClaudeEvidence::new(&db, Vec::new());
+        let theirs = pending_invocation(
+            Implementer::Claude,
+            &Database::open_in_memory().unwrap(),
+            &wt,
+            None,
+        );
+        b.recover_takeover = Some(leased_claim(theirs, "them"));
+        let err = run_issue(&db, &issue(), &brief(), &wt, &config(), &mut b)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("another run took over"), "{err}");
+        assert!(b.seen.is_empty());
+        let spent = budget::get_daily_spend(&db, &today_utc())
+            .unwrap()
+            .map_or(0.0, |l| l.total_cost_usd);
+        assert_eq!(spent, 0.0);
+    }
+
+    /// G-M14: a reservation dropped unsettled (an early return, a panic) is
+    /// released.
+    #[test]
+    fn an_unsettled_spend_reservation_is_released_when_dropped() {
+        let db = Database::open_in_memory().unwrap();
+        let date = today_utc();
+        budget::reserve_spend_if_within(&db, &date, 2.5, 25.0).unwrap();
+        drop(ReservedSpend::new(&db, date.clone(), 2.5));
+        let ledger = budget::get_daily_spend(&db, &date).unwrap().unwrap();
+        assert_eq!(ledger.total_cost_usd, 0.0);
+    }
+
+    /// C-M1/C-M2: a run at its cap whose issue another run took over writes
+    /// no terminal summary and reports no exhaustion.
+    #[test]
+    fn a_capped_run_that_lost_its_issue_records_no_summary_and_no_exhaustion() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        let mut ours = pending_muse(&db, &wt, None);
+        ours.invocation_artifacts = None;
+        ours.session_uuid = "11111111-2222-3333-4444-555555555555".into();
+        ours.state = "paused-infrastructure-failure".into();
+        dispatch_state::upsert_dispatch_state(&db, &ours).unwrap();
+        lineage::upsert_issue_status(
+            &db,
+            &IssueStatus {
+                issue: issue(),
+                best_verdict: Some(AttemptOutcome::Failed),
+                best_commit_sha: None,
+                cumulative_attempt_n: 5,
+            },
+        )
+        .unwrap();
+        let mut theirs = ours.clone();
+        theirs.session_uuid = "22222222-3333-4444-5555-666666666666".into();
+        let mut d = TakenOver {
+            db: &db,
+            theirs,
+            dispatched: false,
+            recovery: None,
+        };
+        let mut c = muse_config();
+        c.attempt_cap = 5;
+        let err = run_issue(&db, &issue(), &brief(), &wt, &c, &mut d)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("another run took over"), "{err}");
+        assert!(lineage::attempts_for_issue(&db, &issue())
+            .unwrap()
+            .iter()
+            .all(|a| !is_terminal_summary(&a.approach)));
     }
 }

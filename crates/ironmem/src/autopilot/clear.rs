@@ -131,7 +131,10 @@ pub(crate) fn clear_dispatch_with(
     if let Some(reason) = refusal(&observe(), &state, attempt_recorded(db, &state)?) {
         return Err(refuse(reason));
     }
-    if !dispatch_state::clear_dispatch_state_if_unchanged(db, &state)? {
+    // Byte for byte, owner token and lease included: a run that adopted the
+    // state since it was read rewrites it identically but for its owner,
+    // and that state is the run's, not this clear's.
+    if !dispatch_state::clear_raw_dispatch_state_if_unchanged(db, issue, &raw)? {
         return Err(refuse(
             "its dispatch state changed while it was being checked; a dispatch may have \
              started — rerun once it settles"
@@ -146,33 +149,57 @@ pub(crate) fn clear_dispatch_with(
     }))
 }
 
-/// The issue's lock ([`super::issue_lock`]), taken in the repository of the
-/// worktree the state names, or why clearing must refuse: a controller
-/// holds it, or it cannot be looked for. A state naming no worktree, or one
-/// that no longer exists or is in no repository, has no controller that
-/// could be launching into it, and takes no lock.
+/// The issue's lock ([`super::issue_lock`]), or why clearing (or releasing)
+/// must not go ahead: a controller holds it, or it cannot be looked for.
+///
+/// Found through the git common directory the claim names, which outlives
+/// the worktree; for an older record that names none, through the worktree
+/// it names. A repository that no longer exists, or a record naming
+/// neither, has no controller that could be launching into it, and takes no
+/// lock.
 fn controller_lock(
     issue: &IssueRef,
     parsed: &dispatch_state::Parsed,
     raw: &str,
 ) -> Result<Option<super::issue_lock::IssueLock>, String> {
-    let worktree = match parsed {
-        dispatch_state::Parsed::Readable(state) => Some(state.worktree_path.clone()),
-        dispatch_state::Parsed::Unreadable(_) => serde_json::from_str::<serde_json::Value>(raw)
-            .ok()
-            .and_then(|v| v.get("worktree_path")?.as_str().map(str::to_owned)),
+    let loose: Option<serde_json::Value> = serde_json::from_str(raw).ok();
+    let field = |key: &str| {
+        loose
+            .as_ref()
+            .and_then(|v| v.get(key)?.as_str().map(str::to_owned))
     };
-    let Some(worktree) = worktree else {
-        return Ok(None);
-    };
-    let Some(worktree) = existing_worktree(Path::new(&worktree))? else {
-        return Ok(None);
-    };
-    let path = super::issue_lock::lock_path_if_repository(&worktree, issue).map_err(|e| {
-        format!("whether a controller is running this issue cannot be checked: {e}")
-    })?;
-    let Some(path) = path else {
-        return Ok(None);
+    let path = match field("common_dir") {
+        Some(common) => {
+            let common = std::path::PathBuf::from(common);
+            match existing_worktree(&common)? {
+                Some(common) => {
+                    super::local_fs::require_local(&common, "the git common directory")
+                        .map_err(|e| e.to_string())?;
+                    super::issue_lock::lock_path_in(&common, issue)
+                }
+                None => return Ok(None),
+            }
+        }
+        None => {
+            let worktree = match parsed {
+                dispatch_state::Parsed::Readable(state) => Some(state.worktree_path.clone()),
+                dispatch_state::Parsed::Unreadable(_) => field("worktree_path"),
+            };
+            let Some(worktree) = worktree else {
+                return Ok(None);
+            };
+            let Some(worktree) = existing_worktree(Path::new(&worktree))? else {
+                return Ok(None);
+            };
+            let path =
+                super::issue_lock::lock_path_if_repository(&worktree, issue).map_err(|e| {
+                    format!("whether a controller is running this issue cannot be checked: {e}")
+                })?;
+            let Some(path) = path else {
+                return Ok(None);
+            };
+            path
+        }
     };
     match super::issue_lock::try_lock_path(&path).map_err(|e| e.to_string())? {
         super::issue_lock::IssueLockAttempt::Acquired(lock) => Ok(Some(lock)),
@@ -409,9 +436,21 @@ fn refusal(
                 &crate::autopilot::registry::configured_shared_daemon,
             )
         }
-        // A Claude hold means its registry could not be read; there is no
-        // evidence to clear against.
-        (_, Liveness::Unknown) => Some(snapshots.state_reason(state)),
+        // Claude's registry could not be read. An operator clears only after
+        // stopping the Leads, so the process table decides, as it does for
+        // an unreadable state: no process naming its IC, and it clears.
+        // Stricter than a run, which never adopts a Claude state on an
+        // unreadable registry (`run::claude_recovery`).
+        (_, Liveness::Unknown) => {
+            let super::process_tree::ProcessSnapshot::Available(rows) = &snapshots.processes else {
+                return Some(format!(
+                    "{}, and {}",
+                    snapshots.state_reason(state),
+                    snapshots.processes.reason()
+                ));
+            };
+            claude_ic_holder(snapshots, rows, &state.issue, Some(&state.ic_session_name))
+        }
     }
 }
 
@@ -450,9 +489,11 @@ fn session_holder(snapshots: &HarnessSnapshots, session: &str) -> Option<String>
 /// `run_issue` — the one place that clears a finished state — could see it.
 /// A controller that crashed between recording the outcome and clearing the
 /// state would hold that slot for ever. A state is released only when its
-/// harness shows nothing running, the issue is finished, and any invocation
-/// it names is already in lineage; the delete is conditional, as
-/// [`clear_dispatch`]'s is.
+/// harness shows nothing running (for Claude, its process table too), the
+/// issue is finished, any invocation it names is already in lineage, it is
+/// not parked as in use, and no controller holds the issue's lock; the
+/// delete is conditional on the exact drawer judged, as [`clear_dispatch`]'s
+/// is.
 pub fn release_settled_dispatches(
     db: &Database,
     snapshots: &HarnessSnapshots,
@@ -462,6 +503,21 @@ pub fn release_settled_dispatches(
     for state in dispatch_state::all_dispatch_states(db, super::queue::IN_FLIGHT_SCAN_LIMIT)? {
         if snapshots.liveness(&state) != Liveness::NotListed {
             continue;
+        }
+        // A session parked as still in use waits for an operator, who knows
+        // what holds it; a Claude IC is looked for by name too.
+        if state.phase() == Some(dispatch_state::DispatchPhase::PausedSessionInUse) {
+            continue;
+        }
+        if state.implementer == Implementer::Claude {
+            let super::process_tree::ProcessSnapshot::Available(rows) = &snapshots.processes else {
+                continue;
+            };
+            if claude_ic_holder(snapshots, rows, &state.issue, Some(&state.ic_session_name))
+                .is_some()
+            {
+                continue;
+            }
         }
         let status = lineage::get_issue_status(db, &state.issue)?;
         let cumulative_attempt_n = status.as_ref().map_or(0, |s| s.cumulative_attempt_n);
@@ -474,8 +530,22 @@ pub fn release_settled_dispatches(
                 >= attempt_cap;
         let unrecorded =
             state.invocation_artifacts.is_some() && cumulative_attempt_n <= state.attempt_n;
-        if finished && !unrecorded && dispatch_state::clear_dispatch_state_if_unchanged(db, &state)?
-        {
+        if !finished || unrecorded {
+            continue;
+        }
+        // Exactly the drawer judged, owner token included, and only while no
+        // controller holds the issue: one that does may be about to launch.
+        let Some(raw) = dispatch_state::raw_dispatch_state(db, &state.issue)? else {
+            continue;
+        };
+        let parsed = dispatch_state::parse_dispatch_state(&raw);
+        if !matches!(&parsed, dispatch_state::Parsed::Readable(read) if **read == state) {
+            continue;
+        }
+        let Ok(_lock) = controller_lock(&state.issue, &parsed, &raw) else {
+            continue;
+        };
+        if dispatch_state::clear_raw_dispatch_state_if_unchanged(db, &state.issue, &raw)? {
             released.push(state.issue);
         }
     }
@@ -878,13 +948,34 @@ mod tests {
             status: None,
         }]);
         assert!(clear_dispatch(&db, &issue(), || snaps.clone()).is_err());
+        // An unreadable registry: the process table decides (C-M5, D3), and
+        // one that cannot be read either refuses.
         snaps.claude = RegistrySnapshot::Unavailable {
             reason: "registry unreadable".into(),
         };
-        assert!(clear_dispatch(&db, &issue(), || snaps.clone())
+        let mut no_ps = snaps.clone();
+        no_ps.processes = ProcessSnapshot::Unavailable {
+            reason: "ps timed out".into(),
+        };
+        let err = clear_dispatch(&db, &issue(), || no_ps.clone())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("registry unreadable") && err.contains("ps timed out"),
+            "{err}"
+        );
+        let mut named = snaps.clone();
+        named.processes =
+            ProcessSnapshot::Available(vec![row(98, 98, "claude -p x --name ic-owner-repo-42")]);
+        assert!(clear_dispatch(&db, &issue(), || named.clone())
             .unwrap_err()
             .to_string()
-            .contains("registry unreadable"));
+            .contains("process 98"));
+        assert_eq!(
+            readable(clear_dispatch(&db, &issue(), || snaps.clone())).implementer,
+            Implementer::Claude
+        );
+        dispatch_state::upsert_dispatch_state(&db, &state).unwrap();
         snaps.claude = RegistrySnapshot::Available(Vec::new());
         assert_eq!(
             readable(clear_dispatch(&db, &issue(), || snaps.clone())).implementer,
@@ -1387,5 +1478,112 @@ mod tests {
         assert!(err.contains("cannot be read"), "{err}");
         assert!(err.contains(&worktree.display().to_string()), "{err}");
         assert!(raw_drawer(&db).is_some());
+    }
+
+    /// A Claude state at its cap, finished and idle, in a real repository
+    /// whose common directory its claim names (its worktree long gone).
+    fn finished_claude_claim(db: &Database, repo: &std::path::Path, owner: &str) -> String {
+        let mut claude = held_state(
+            Implementer::Claude,
+            testing::invocation(tempfile::tempdir().unwrap().path()).0,
+        );
+        claude.invocation_artifacts = None;
+        claude.attempt_n = 3;
+        claude.worktree_path = repo.join("gone-worktree").to_string_lossy().into_owned();
+        let common = crate::autopilot::issue_lock::git_common_dir(repo)
+            .unwrap()
+            .unwrap();
+        let claim = dispatch_state::Claim {
+            state: claude,
+            owner: Some(owner.into()),
+            claimed_at: None,
+            common_dir: Some(common.to_string_lossy().into_owned()),
+        };
+        let current = dispatch_state::get_claim(db, &issue()).unwrap();
+        assert!(dispatch_state::claim_if_unchanged(db, current.as_ref(), &claim).unwrap());
+        record_status(db, Some(AttemptOutcome::Failed), 3);
+        raw_drawer(db).unwrap()
+    }
+
+    fn git_repo() -> tempfile::TempDir {
+        let repo = tempfile::tempdir().unwrap();
+        crate::autopilot::test_git::output(repo.path(), &["init", "-q"]);
+        repo
+    }
+
+    fn hold(repo: &std::path::Path) -> crate::autopilot::issue_lock::IssueLock {
+        match crate::autopilot::issue_lock::try_lock_issue(repo, &issue()).unwrap() {
+            crate::autopilot::issue_lock::IssueLockAttempt::Acquired(lock) => lock,
+            crate::autopilot::issue_lock::IssueLockAttempt::Held { .. } => unreachable!(),
+        }
+    }
+
+    /// C-I1: an adopting run's claim, identical but for its owner, written
+    /// after clear-dispatch read the state, is never deleted.
+    #[test]
+    fn clear_dispatch_never_deletes_a_claim_a_run_made_since_it_read() {
+        let repo = git_repo();
+        let db = Database::open_in_memory().unwrap();
+        finished_claude_claim(&db, repo.path(), "crashed");
+        let read = dispatch_state::get_claim(&db, &issue()).unwrap().unwrap();
+        let err = clear_dispatch(&db, &issue(), || {
+            let mut adopted = read.clone();
+            adopted.owner = Some("lead".into());
+            assert!(dispatch_state::claim_if_unchanged(&db, Some(&read), &adopted).unwrap());
+            snapshots(Vec::new())
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("changed while it was being checked"), "{err}");
+        assert_eq!(
+            dispatch_state::get_claim(&db, &issue())
+                .unwrap()
+                .and_then(|c| c.owner),
+            Some("lead".into())
+        );
+    }
+
+    /// C-I1: the claim names the common directory, so the lock is taken even
+    /// once the worktree is gone.
+    #[test]
+    fn clear_dispatch_takes_the_lock_through_the_claims_common_dir() {
+        let repo = git_repo();
+        let db = Database::open_in_memory().unwrap();
+        finished_claude_claim(&db, repo.path(), "crashed");
+        let held = hold(repo.path());
+        let err = clear_dispatch(&db, &issue(), || snapshots(Vec::new()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("a controller is running this issue"), "{err}");
+        drop(held);
+        readable(clear_dispatch(&db, &issue(), || snapshots(Vec::new())));
+    }
+
+    /// C-I1, G-M9: release gives a slot back only for the exact claim judged,
+    /// never while a controller holds the issue, never while a process names
+    /// its Claude IC, and never for a session parked as in use.
+    #[test]
+    fn release_skips_a_held_issue_a_named_ic_and_a_parked_in_use_session() {
+        let repo = git_repo();
+        let db = Database::open_in_memory().unwrap();
+        let raw = finished_claude_claim(&db, repo.path(), "crashed");
+        let released =
+            |rows: Vec<ProcessRow>| release_settled_dispatches(&db, &snapshots(rows), 3).unwrap();
+        let held = hold(repo.path());
+        assert!(released(Vec::new()).is_empty());
+        drop(held);
+        assert!(released(vec![row(98, 98, "claude -p x --name ic-owner-repo-42")]).is_empty());
+        assert_eq!(raw_drawer(&db).as_deref(), Some(raw.as_str()));
+        // Parked as in use: an operator's to release.
+        let mut parked = dispatch_state::get_claim(&db, &issue()).unwrap().unwrap();
+        let before = parked.clone();
+        parked.state.state = dispatch_state::DispatchPhase::PausedSessionInUse
+            .as_str()
+            .into();
+        assert!(dispatch_state::claim_if_unchanged(&db, Some(&before), &parked).unwrap());
+        assert!(released(Vec::new()).is_empty());
+        assert!(dispatch_state::claim_if_unchanged(&db, Some(&parked), &before).unwrap());
+        assert_eq!(released(Vec::new()), vec![issue()]);
+        assert!(raw_drawer(&db).is_none());
     }
 }

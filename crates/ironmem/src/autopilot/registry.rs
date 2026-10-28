@@ -149,8 +149,16 @@ impl AgentRegistry for ClaudeAgentRegistry {
             use std::os::unix::process::CommandExt;
             command.process_group(0);
         }
-        let mut child = super::dispatch::retry_on_etxtbsy(|| command.spawn())
-            .map_err(|e| MemoryError::NotFound(format!("failed to start claude agents: {e}")))?;
+        let mut child = super::dispatch::retry_on_etxtbsy(|| command.spawn()).map_err(|e| {
+            MemoryError::NotFound(match &self.dir {
+                Some(dir) => format!(
+                    "failed to start claude agents in {} (its working directory, or the \
+                     spawn, failed): {e}",
+                    dir.display()
+                ),
+                None => format!("failed to start claude agents: {e}"),
+            })
+        })?;
         // Drained on their own threads so a full pipe cannot read as a hang.
         let stdout = super::dispatch::drain(child.stdout.take());
         let stderr = super::dispatch::drain(child.stderr.take());
@@ -691,9 +699,10 @@ pub struct HarnessProcessMonitor {
 pub type TwoHarnessMonitor = HarnessProcessMonitor;
 
 impl HarnessProcessMonitor {
-    /// A monitor whose registry read runs in `dir` (an issue's worktree),
-    /// not in the controller's own directory, which may be a checkout of
-    /// its own that nothing the read starts should touch.
+    /// A monitor whose registry read runs in `dir`, not in the controller's
+    /// own directory, which may be a checkout that nothing the read starts
+    /// should touch. Callers pass a fixed neutral directory
+    /// ([`std::env::temp_dir`]), never a worktree the model can write.
     pub(crate) fn in_dir(dir: &std::path::Path) -> Self {
         let mut monitor = Self::default();
         if let Ok(registry) = &mut monitor.claude {

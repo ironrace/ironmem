@@ -145,6 +145,12 @@ struct DispatchStateBody {
     /// outside a run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     owner: Option<String>,
+    /// When the run wrote it ([`Claim::claimed_at`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    claimed_at: Option<String>,
+    /// The worktree's git common directory ([`Claim::common_dir`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    common_dir: Option<String>,
 }
 
 /// A dispatch state as stored, with the token of the run that wrote it.
@@ -155,10 +161,60 @@ struct DispatchStateBody {
 /// compare-and-set: what one run wrote is never what another read. Kept
 /// beside [`DispatchState`] rather than in it so the state's public shape is
 /// unchanged; only a run's own writes compare it.
+///
+/// It is also a lease: `claimed_at` says when its run last claimed the
+/// issue, and another run never adopts a claim that is not parked while it
+/// is younger than [`CLAIM_LEASE`] (see `run::run_issue`). And it names the
+/// repository's git common directory, so whoever must take the issue's lock
+/// ([`super::issue_lock`]) finds it even once the worktree is gone.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Claim {
     pub state: DispatchState,
     pub owner: Option<String>,
+    /// RFC 3339, when the owning run last wrote it; `None` for a record
+    /// written outside a run or before the lease existed, which holds no
+    /// lease.
+    pub claimed_at: Option<String>,
+    /// The git common directory of the worktree it names; `None` when
+    /// unknown.
+    pub common_dir: Option<String>,
+}
+
+/// How long a claim that is not parked keeps another run from adopting it.
+///
+/// A run claims the issue and only then launches its implementer, and until
+/// that implementer shows (a process naming its IC, a registry entry, an
+/// identity file) nothing distinguishes it from a crashed run. Spawning and
+/// exec take well under a second and registration a few, even on a loaded
+/// host, so two minutes covers that window many times over; the cost is
+/// that a crashed run's issue waits two minutes before another run adopts
+/// it. A run whose own claim is older than [`CLAIM_LEASE`] less
+/// [`CLAIM_REFRESH_MARGIN`] claims again before it launches, so a long gap
+/// between its claim and its launch never lets the lease lapse first.
+pub(crate) const CLAIM_LEASE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// How much of [`CLAIM_LEASE`] must remain at a launch, or the run claims
+/// again first.
+pub(crate) const CLAIM_REFRESH_MARGIN: std::time::Duration = std::time::Duration::from_secs(30);
+
+impl Claim {
+    /// How long ago its run claimed it, or `None` when it holds no lease
+    /// (no time, or one that does not parse). A time in the future reads as
+    /// just now.
+    pub fn age(&self, now: chrono::DateTime<chrono::Utc>) -> Option<std::time::Duration> {
+        let at = chrono::DateTime::parse_from_rfc3339(self.claimed_at.as_deref()?).ok()?;
+        Some(
+            now.signed_duration_since(at.with_timezone(&chrono::Utc))
+                .to_std()
+                .unwrap_or_default(),
+        )
+    }
+
+    /// Whether its lease still keeps another run from adopting it: not
+    /// parked, and claimed less than [`CLAIM_LEASE`] ago.
+    pub fn leased(&self, now: chrono::DateTime<chrono::Utc>) -> bool {
+        !self.state.is_parked() && self.age(now).is_some_and(|age| age < CLAIM_LEASE)
+    }
 }
 
 /// Where a dispatch stands, as [`DispatchState::state`] spells it on the
@@ -247,64 +303,20 @@ pub fn upsert_dispatch_state(db: &Database, state: &DispatchState) -> Result<Str
     write_current(db, &dispatch_state_key(&state.issue), &content_of(state)?)
 }
 
-/// [`upsert_dispatch_state`], but only while the drawer still holds
-/// `expected` (`None`: no drawer at all), compared as read back. Read and
-/// write share one `BEGIN IMMEDIATE` transaction, so of two writers that
-/// judged the same state and write *different* states, only the first wins.
-/// It compares content only: two writes of the same state both pass, which
-/// is why a run claims through [`claim_if_unchanged`], whose owner token
-/// makes every run's writes its own. Returns `false`, writing nothing, when
-/// the drawer changed.
-pub fn upsert_dispatch_state_if_unchanged(
-    db: &Database,
-    expected: Option<&DispatchState>,
-    state: &DispatchState,
-) -> Result<bool, MemoryError> {
-    use rusqlite::OptionalExtension;
-    validate_repo(&state.issue.repo)?;
-    let key = dispatch_state_key(&state.issue);
-    let id = super::logical_drawer_id(&key);
-    let expected = expected
-        .map(|expected| content_of(expected).and_then(|c| state_from_content(&c)))
-        .transpose()?;
-    let content = content_of(state)?;
-    db.with_immediate_transaction(|tx| {
-        let current: Option<String> = tx
-            .query_row("SELECT content FROM drawers WHERE id = ?1", [&id], |row| {
-                row.get(0)
-            })
-            .optional()?;
-        let current = current.map(|c| state_from_content(&c)).transpose()?;
-        if current != expected {
-            return Ok(false);
-        }
-        super::write_current_tx(tx, &key, &content)?;
-        Ok(true)
-    })
-}
-
-/// Whether the drawer holds `expected` (`None`: no drawer), compared as read
-/// back. A cheap look before work that [`upsert_dispatch_state_if_unchanged`]
-/// later claims for good.
-pub fn dispatch_state_is(
-    db: &Database,
-    issue: &IssueRef,
-    expected: Option<&DispatchState>,
-) -> Result<bool, MemoryError> {
-    let expected = expected
-        .map(|expected| content_of(expected).and_then(|c| state_from_content(&c)))
-        .transpose()?;
-    Ok(get_dispatch_state(db, issue)? == expected)
-}
-
 /// The persisted body of `state`, refused when [`DispatchState::validate`]
 /// refuses it.
 fn content_of(state: &DispatchState) -> Result<String, MemoryError> {
-    content_owned_by(state, None)
+    content_of_claim(&Claim {
+        state: state.clone(),
+        owner: None,
+        claimed_at: None,
+        common_dir: None,
+    })
 }
 
-/// [`content_of`], carrying the token of the run that writes it.
-fn content_owned_by(state: &DispatchState, owner: Option<&str>) -> Result<String, MemoryError> {
+/// [`content_of`], carrying what the claim adds.
+fn content_of_claim(claim: &Claim) -> Result<String, MemoryError> {
+    let state = &claim.state;
     state.validate()?;
     let body = DispatchStateBody {
         implementer: state.implementer,
@@ -324,7 +336,9 @@ fn content_owned_by(state: &DispatchState, owner: Option<&str>) -> Result<String
         session_model: state.session_model.clone(),
         resume_refusals: state.resume_refusals,
         signing_held: state.signing_held,
-        owner: owner.map(str::to_owned),
+        owner: claim.owner.clone(),
+        claimed_at: claim.claimed_at.clone(),
+        common_dir: claim.common_dir.clone(),
     };
     Ok(serde_json::to_string(&body)?)
 }
@@ -332,7 +346,7 @@ fn content_owned_by(state: &DispatchState, owner: Option<&str>) -> Result<String
 /// `claim` as it reads back from the drawer it would be written to, for an
 /// exact comparison with what is stored.
 fn normalized(claim: &Claim) -> Result<Claim, MemoryError> {
-    claim_from_content(&content_owned_by(&claim.state, claim.owner.as_deref())?)
+    claim_from_content(&content_of_claim(claim)?)
 }
 
 /// The issue's dispatch state and its owner token, if a drawer exists.
@@ -368,7 +382,7 @@ pub(crate) fn write_claim_tx(
     claim: &Claim,
 ) -> Result<(), MemoryError> {
     validate_repo(&claim.state.issue.repo)?;
-    let content = content_owned_by(&claim.state, claim.owner.as_deref())?;
+    let content = content_of_claim(claim)?;
     super::write_current_tx(tx, &dispatch_state_key(&claim.state.issue), &content)?;
     Ok(())
 }
@@ -530,6 +544,8 @@ fn claim_from_content(content: &str) -> Result<Claim, MemoryError> {
     Ok(Claim {
         state,
         owner: body.owner,
+        claimed_at: body.claimed_at,
+        common_dir: body.common_dir,
     })
 }
 
@@ -623,48 +639,11 @@ pub fn clear_dispatch_state(db: &Database, issue: &IssueRef) -> Result<bool, Mem
     })
 }
 
-/// [`clear_dispatch_state`], but only while the drawer still holds
-/// `expected`. Read and delete share one `BEGIN IMMEDIATE` transaction, so a
-/// dispatch that rewrote the state after the caller judged it is never
-/// deleted unseen, and a concurrent writer is waited for rather than failing
-/// the read-then-delete with `SQLITE_BUSY`. Returns `false`, deleting
-/// nothing, when the state changed or is gone.
-pub fn clear_dispatch_state_if_unchanged(
-    db: &Database,
-    expected: &DispatchState,
-) -> Result<bool, MemoryError> {
-    use rusqlite::OptionalExtension;
-    let id = super::logical_drawer_id(&dispatch_state_key(&expected.issue));
-    db.with_immediate_transaction(|tx| {
-        let content: Option<String> = tx
-            .query_row("SELECT content FROM drawers WHERE id = ?1", [&id], |row| {
-                row.get(0)
-            })
-            .optional()?;
-        let unchanged = match content {
-            Some(content) => state_from_content(&content)? == *expected,
-            None => false,
-        };
-        let deleted = unchanged && Database::delete_drawer_tx(tx, &id)?;
-        Database::wal_log_tx(
-            tx,
-            "autopilot_clear_dispatch_state",
-            &json!({
-                "drawer_id": &id,
-                "issue": expected.issue.canonical(),
-                "deleted": deleted,
-                "conditional": true,
-            }),
-            None,
-        )?;
-        Ok(deleted)
-    })
-}
-
-/// [`clear_dispatch_state_if_unchanged`] for a drawer that may not be
-/// readable: deleted only while its raw content is still exactly
-/// `expected_raw`, compared byte for byte in the same `BEGIN IMMEDIATE`
-/// transaction.
+/// Delete an issue's dispatch-state drawer only while its raw content is
+/// still exactly `expected_raw`, compared byte for byte (owner token, lease
+/// and all) in the same `BEGIN IMMEDIATE` transaction. For a drawer that may
+/// not be readable; [`clear_claim_if_unchanged`] is the same for one that
+/// is.
 pub(crate) fn clear_raw_dispatch_state_if_unchanged(
     db: &Database,
     issue: &IssueRef,
@@ -721,42 +700,74 @@ mod tests {
         }
     }
 
+    /// A claim with no lease and no common directory, as tests write.
+    fn bare(state: DispatchState, owner: Option<&str>) -> Claim {
+        Claim {
+            state,
+            owner: owner.map(str::to_owned),
+            claimed_at: None,
+            common_dir: None,
+        }
+    }
+
     #[test]
     fn a_conditional_clear_never_deletes_a_state_rewritten_after_it_was_judged() {
         let db = Database::open_in_memory().unwrap();
         let issue = IssueRef::new("ironrace/ironmem", 283);
-        // Callers judge the state as read back, which normalizes legacy fields.
+        // Callers judge the claim as read back, which normalizes legacy fields.
         upsert_dispatch_state(&db, &sample(&issue, 1)).unwrap();
-        let judged = get_dispatch_state(&db, &issue).unwrap().unwrap();
+        let judged = get_claim(&db, &issue).unwrap().unwrap();
         upsert_dispatch_state(&db, &sample(&issue, 2)).unwrap();
-        let rewritten = get_dispatch_state(&db, &issue).unwrap().unwrap();
-        assert!(!clear_dispatch_state_if_unchanged(&db, &judged).unwrap());
-        assert_eq!(
-            get_dispatch_state(&db, &issue).unwrap(),
-            Some(rewritten.clone())
-        );
-        assert!(clear_dispatch_state_if_unchanged(&db, &rewritten).unwrap());
+        let rewritten = get_claim(&db, &issue).unwrap().unwrap();
+        assert!(!clear_claim_if_unchanged(&db, &judged).unwrap());
+        assert_eq!(get_claim(&db, &issue).unwrap(), Some(rewritten.clone()));
+        assert!(clear_claim_if_unchanged(&db, &rewritten).unwrap());
         assert!(get_dispatch_state(&db, &issue).unwrap().is_none());
-        assert!(!clear_dispatch_state_if_unchanged(&db, &rewritten).unwrap());
+        assert!(!clear_claim_if_unchanged(&db, &rewritten).unwrap());
     }
     #[test]
     fn a_conditional_write_never_overwrites_a_state_another_run_wrote() {
         let db = Database::open_in_memory().unwrap();
         let issue = IssueRef::new("ironrace/ironmem", 283);
-        let ours = sample(&issue, 1);
-        let theirs = sample(&issue, 2);
+        let ours = bare(sample(&issue, 1), Some("ours"));
+        let theirs = bare(sample(&issue, 2), Some("theirs"));
         let turn = |db: &Database| get_dispatch_state(db, &issue).unwrap().map(|s| s.turn_n);
         // Both judged "no drawer"; the first to write wins.
-        assert!(upsert_dispatch_state_if_unchanged(&db, None, &theirs).unwrap());
-        assert!(!upsert_dispatch_state_if_unchanged(&db, None, &ours).unwrap());
+        assert!(claim_if_unchanged(&db, None, &theirs).unwrap());
+        assert!(!claim_if_unchanged(&db, None, &ours).unwrap());
         assert_eq!(turn(&db), Some(2));
         // Judged against what is there, the write goes through, compared as
         // read back (a Claude record's absent native id reads as its uuid).
-        assert!(theirs.native_session_id.is_none());
-        assert!(upsert_dispatch_state_if_unchanged(&db, Some(&theirs), &ours).unwrap());
+        assert!(theirs.state.native_session_id.is_none());
+        assert!(claim_if_unchanged(&db, Some(&theirs), &ours).unwrap());
         assert_eq!(turn(&db), Some(1));
-        assert!(!upsert_dispatch_state_if_unchanged(&db, Some(&theirs), &theirs).unwrap());
+        assert!(!claim_if_unchanged(&db, Some(&theirs), &theirs).unwrap());
         assert_eq!(turn(&db), Some(1));
+    }
+
+    #[test]
+    fn a_claim_is_leased_while_young_and_not_parked() {
+        let issue = IssueRef::new("ironrace/ironmem", 283);
+        let now = chrono::Utc::now();
+        let mut claim = bare(sample(&issue, 1), Some("a"));
+        claim.state.state = DispatchPhase::Dispatching.as_str().into();
+        assert!(!claim.leased(now), "no time, no lease");
+        claim.claimed_at = Some((now - chrono::Duration::seconds(10)).to_rfc3339());
+        assert!(claim.leased(now));
+        claim.claimed_at = Some((now - chrono::Duration::seconds(121)).to_rfc3339());
+        assert!(!claim.leased(now), "lapsed");
+        claim.claimed_at = Some((now + chrono::Duration::seconds(30)).to_rfc3339());
+        assert!(claim.leased(now), "a future time reads as just now");
+        claim.state.state = DispatchPhase::PausedDailyBudget.as_str().into();
+        assert!(!claim.leased(now), "a parked claim's run has ended");
+        // Round-tripped with its common directory.
+        let db = Database::open_in_memory().unwrap();
+        claim.common_dir = Some("/r/.git".into());
+        assert!(claim_if_unchanged(&db, None, &claim).unwrap());
+        assert_eq!(
+            get_claim(&db, &issue).unwrap(),
+            Some(normalized(&claim).unwrap())
+        );
     }
 
     /// F47/F48: a conditional clear waits out another connection's write
@@ -769,7 +780,7 @@ mod tests {
         db.migrate().unwrap();
         let issue = IssueRef::new("ironrace/ironmem", 283);
         upsert_dispatch_state(&db, &sample(&issue, 1)).unwrap();
-        let judged = get_dispatch_state(&db, &issue).unwrap().unwrap();
+        let judged = get_claim(&db, &issue).unwrap().unwrap();
         let raw = raw_dispatch_state(&db, &issue).unwrap().unwrap();
         for raw_clear in [false, true] {
             if raw_clear {
@@ -785,7 +796,7 @@ mod tests {
                     if raw_clear {
                         clear_raw_dispatch_state_if_unchanged(&db, &issue, &raw)
                     } else {
-                        clear_dispatch_state_if_unchanged(&db, &judged)
+                        clear_claim_if_unchanged(&db, &judged)
                     }
                 })
             };
@@ -803,14 +814,8 @@ mod tests {
     fn identical_states_written_by_two_runs_never_both_pass_the_compare_and_set() {
         let db = Database::open_in_memory().unwrap();
         let issue = IssueRef::new("ironrace/ironmem", 283);
-        let claim = |owner: &str| Claim {
-            state: sample(&issue, 1),
-            owner: Some(owner.into()),
-        };
-        let read = Claim {
-            state: sample(&issue, 1),
-            owner: None,
-        };
+        let claim = |owner: &str| bare(sample(&issue, 1), Some(owner));
+        let read = bare(sample(&issue, 1), None);
         upsert_dispatch_state(&db, &read.state).unwrap();
         let read = get_claim(&db, &issue).unwrap().unwrap();
         assert_eq!(read.owner, None);
@@ -890,6 +895,8 @@ mod tests {
             resume_refusals: 0,
             signing_held: false,
             owner: None,
+            claimed_at: None,
+            common_dir: None,
         }
     }
 
@@ -940,6 +947,8 @@ mod tests {
             resume_refusals: 0,
             signing_held: false,
             owner: None,
+            claimed_at: None,
+            common_dir: None,
         })
         .unwrap();
         for key in [

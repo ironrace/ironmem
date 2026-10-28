@@ -1254,15 +1254,43 @@ fn pr_body(candidate: &Candidate, base: &str) -> String {
 /// kept — is left behind for good, which is why the error is reported on
 /// stdout rather than only stored.
 fn clean_up(db: &Database, candidate: &Candidate, config: &AdvanceConfig) -> Cleanup {
-    let mut error = None;
-
-    let dispatch_state_cleared = match dispatch_state::clear_dispatch_state(db, &candidate.issue) {
-        Ok(cleared) => cleared,
+    // Not while a controller holds the issue: it may be dispatching into the
+    // worktree this would remove. Left for it, and said so.
+    let _lock = match super::issue_lock::try_lock_issue(&candidate.repo_path, &candidate.issue) {
+        Ok(super::issue_lock::IssueLockAttempt::Acquired(lock)) => lock,
+        Ok(super::issue_lock::IssueLockAttempt::Held { path }) => {
+            return Cleanup {
+                dispatch_state_cleared: false,
+                worktree: WorktreeRemoval::Absent,
+                error: Some(format!(
+                    "cleanup skipped: {}",
+                    super::issue_lock::held_reason(&candidate.issue, &path)
+                )),
+            }
+        }
         Err(e) => {
-            error = Some(format!("could not clear the dispatch state: {e}"));
-            false
+            return Cleanup {
+                dispatch_state_cleared: false,
+                worktree: WorktreeRemoval::Absent,
+                error: Some(format!("cleanup skipped: the issue's lock: {e}")),
+            }
         }
     };
+    let mut error = None;
+
+    // Only the exact drawer read, owner token included: one a run wrote
+    // since is that run's.
+    let dispatch_state_cleared =
+        match dispatch_state::get_claim(db, &candidate.issue).and_then(|claim| match claim {
+            Some(claim) => dispatch_state::clear_claim_if_unchanged(db, &claim),
+            None => Ok(false),
+        }) {
+            Ok(cleared) => cleared,
+            Err(e) => {
+                error = Some(format!("could not clear the dispatch state: {e}"));
+                false
+            }
+        };
 
     let worktree = match worktree::remove_worktree(
         &candidate.repo_path,

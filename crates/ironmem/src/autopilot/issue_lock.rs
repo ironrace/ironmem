@@ -16,9 +16,27 @@
 //! ever left to remove.
 //!
 //! The lock lives in the common directory, which every worktree of a clone
-//! shares, so it covers controllers working one clone. Controllers on two
-//! clones of one repository sharing a database are not covered; the
-//! dispatch state's owner token is their defence.
+//! shares, so it covers controllers working one clone on one host
+//! ([`super::local_fs`] refuses a remote filesystem). The file is named by
+//! the issue's slug and a hash of `owner/repo#n`, and taken again if it was
+//! replaced between its open and its `flock`.
+//!
+//! Without the lock (two clones of one repository sharing a database, a
+//! controller from before the lock existed, or a lock file removed while
+//! held) less holds:
+//!
+//! - the dispatch state's owner token still makes every run's
+//!   compare-and-set its own, so two runs never both record an outcome, and
+//!   a run that lost the issue launches and writes nothing more;
+//! - a Claude run still adopts another run's claim only once its lease
+//!   (`dispatch_state::CLAIM_LEASE`) has lapsed and fresh evidence shows its
+//!   IC idle;
+//! - a Codex or Muse run still adopts a published invocation only on process
+//!   evidence, but an invocation published and not yet spawned shows none,
+//!   so between another run's claim and its spawn a second implementer can
+//!   launch;
+//! - and nothing stops two controllers provisioning one worktree, so one may
+//!   quarantine the other's (F2).
 
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};

@@ -397,21 +397,36 @@ pub fn lead_tick(
     let mut plan = plan;
     if !config.dry_run {
         let mut held = Vec::new();
-        for queued in plan.dispatch.iter().take(config.max_dispatches_per_tick) {
+        // An issue another controller holds takes none of this tick's
+        // dispatches: the next one in the queue gets its turn.
+        let mut attempted = 0;
+        for queued in &plan.dispatch {
+            if attempted >= config.max_dispatches_per_tick {
+                break;
+            }
             match dispatch_one(db, queued, config, dispatcher, advisor, &mut advice) {
-                Ok(Dispatched::Ran(run)) => runs.push(run),
+                Ok(Dispatched::Ran(run)) => {
+                    attempted += 1;
+                    runs.push(run);
+                }
                 // Another controller has it: skipped this tick, said so.
                 Ok(Dispatched::Held { detail }) => held.push(queue::Deferred {
                     issue: queued.issue.clone(),
                     priority: queued.priority,
                     reason: queue::DeferReason::HeldByAnotherController { detail },
                 }),
-                Err(e) => problems.push(TickProblem {
-                    what: format!("dispatch {}", queued.issue.canonical()),
-                    detail: e.to_string(),
-                }),
+                Err(e) => {
+                    attempted += 1;
+                    problems.push(TickProblem {
+                        what: format!("dispatch {}", queued.issue.canonical()),
+                        detail: e.to_string(),
+                    });
+                }
             }
         }
+        // Reported once, as deferred, never also as dispatched.
+        plan.dispatch
+            .retain(|queued| !held.iter().any(|d| d.issue == queued.issue));
         plan.deferred.extend(held);
     }
 
@@ -1473,6 +1488,52 @@ mod tests {
         let report = tick(&db, &mut dispatcher);
         assert_eq!(report.runs.len(), 1);
         assert_eq!(dispatcher.seen.len(), 1);
+    }
+
+    /// C-M6c: a held issue takes none of the tick's dispatches and is
+    /// reported once, as deferred.
+    #[test]
+    fn a_held_issue_takes_no_dispatch_slot_and_is_reported_only_as_deferred() {
+        let db = approved_db();
+        let f = fixture();
+        let held_issue = IssueRef::new(REPO, 7);
+        let _held = match crate::autopilot::issue_lock::try_lock_issue(&f.repo_path, &held_issue)
+            .unwrap()
+        {
+            crate::autopilot::issue_lock::IssueLockAttempt::Acquired(lock) => lock,
+            crate::autopilot::issue_lock::IssueLockAttempt::Held { .. } => unreachable!(),
+        };
+        let mut gh_runner = ScriptedGh::new(vec![
+            Ok(GhOutput::ok("[]")),
+            Ok(GhOutput::ok(&issue_list_json(&[
+                (7, &["agent:ready", "priority:high"]),
+                (3, &["agent:ready"]),
+            ]))),
+        ]);
+        let mut cfg = config(&f);
+        cfg.max_dispatches_per_tick = 1;
+        let mut dispatcher = RecordingDispatcher::new();
+        let report = lead_tick(
+            &db,
+            &mut gh_runner,
+            &mut empty_registry(),
+            &mut dispatcher,
+            &mut no_advisor(),
+            &cfg,
+        )
+        .unwrap();
+        assert_eq!(report.runs.len(), 1, "{:?}", report.problems);
+        assert_eq!(report.runs[0].issue.number, 3);
+        assert!(!report.plan.dispatch.iter().any(|q| q.issue == held_issue));
+        assert_eq!(
+            report
+                .plan
+                .deferred
+                .iter()
+                .filter(|d| d.issue == held_issue)
+                .count(),
+            1
+        );
     }
 
     #[test]
