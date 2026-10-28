@@ -761,6 +761,12 @@ impl ProcessSnapshot {
             return format!("{evidence}; process identity/completion requires verification");
         }
         if !completed {
+            if let Some(unreadable) = super::invocation::exit_record_unreadable(a) {
+                return format!(
+                    "{unreadable}; historical descendants cannot be ruled out until it is \
+                     repaired or the invocation is cleared"
+                );
+            }
             return "invocation has no trusted supervisor cleanup/completion record; historical descendants cannot be ruled out".into();
         }
         "supervisor completion verified".into()
@@ -3291,6 +3297,30 @@ pub(crate) mod tests {
         assert_eq!(snapshot(&mut Failed).liveness(Some(&a)), Liveness::Unknown);
         assert!(parse_processes("partial row").is_err());
     }
+    /// An exit record that exists but cannot be read or parsed is said to
+    /// be so, not reported as missing: the operator looks for a corrupt
+    /// record, not an absent one. It still proves nothing.
+    #[test]
+    fn an_unreadable_exit_record_is_named_as_such() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, _) = testing::invocation(dir.path());
+        let empty = ProcessSnapshot::Available(Vec::new());
+        // Not yet written (the empty file prepare_artifacts makes): missing.
+        std::fs::write(&a.exit_path, "").unwrap();
+        assert!(empty
+            .invocation_reason(Some(&a))
+            .contains("no trusted supervisor"));
+        std::fs::write(&a.exit_path, "{").unwrap();
+        let reason = empty.invocation_reason(Some(&a));
+        assert!(
+            reason.contains("the exit record cannot be read"),
+            "{reason}"
+        );
+        assert_eq!(empty.liveness(Some(&a)), Liveness::Unknown);
+        assert!(super::super::invocation::exit_record_unreadable(&a)
+            .is_some_and(|e| e.contains("cannot be read")));
+    }
+
     #[test]
     fn an_unrelated_non_utf8_argv_neither_hides_nor_fails_the_process_table() {
         // macOS ps prints argv bytes raw; any same-user process can carry

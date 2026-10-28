@@ -1082,12 +1082,39 @@ fn never_launched(
 
 /// A supervisor record proving `spawn` failed, so no process ever ran.
 pub fn has_launch_failure_record(artifacts: &InvocationArtifacts) -> bool {
-    read_capped(&artifacts.exit_path, EXIT_LIMIT)
+    read_exit_record(artifacts)
         .ok()
-        .and_then(|text| serde_json::from_str::<ExitRecord>(&text).ok())
+        .flatten()
         .is_some_and(|record| {
             record.proves_completion(artifacts) && record.launch_failure.is_some()
         })
+}
+
+/// The supervisor's exit record, or `None` when it has not been written:
+/// the file is missing, or still the empty one [`prepare_artifacts`] made.
+/// A record that exists but cannot be read or parsed is an error, so a
+/// corrupt or unreadable record is never mistaken for an absent one.
+fn read_exit_record(a: &InvocationArtifacts) -> Result<Option<ExitRecord>, String> {
+    let text = match read_capped(&a.exit_path, EXIT_LIMIT) {
+        Ok(text) => text,
+        Err(MemoryError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.to_string()),
+    };
+    if text.is_empty() {
+        return Ok(None);
+    }
+    serde_json::from_str(&text)
+        .map(Some)
+        .map_err(|e| e.to_string())
+}
+
+/// Why the exit record exists but cannot be read, if it cannot:
+/// "the exit record cannot be read: …", for a reason or hint that would
+/// otherwise call it missing.
+pub(crate) fn exit_record_unreadable(a: &InvocationArtifacts) -> Option<String> {
+    read_exit_record(a)
+        .err()
+        .map(|e| format!("the exit record cannot be read: {e}"))
 }
 
 /// A dispatch error must not hide a failed cleanup: descendants that may
@@ -1403,18 +1430,21 @@ fn read_artifacts_with(
 
 /// A typed supervisor record proves that wait observed process completion.
 /// A missing, truncated or malformed record does not establish liveness.
+/// An unreadable one proves nothing either ([`exit_record_unreadable`]
+/// says why).
 pub fn has_valid_exit_record(artifacts: &InvocationArtifacts) -> bool {
-    read_capped(&artifacts.exit_path, EXIT_LIMIT)
+    read_exit_record(artifacts)
         .ok()
-        .and_then(|text| serde_json::from_str::<ExitRecord>(&text).ok())
+        .flatten()
         .is_some_and(|record| record.proves_completion(artifacts))
 }
 
-/// A supervisor record that proved everything but a quiet worktree.
+/// A supervisor record that proved everything but a quiet worktree. An
+/// unreadable record is not one ([`exit_record_unreadable`] says why).
 pub fn is_awaiting_quiet(artifacts: &InvocationArtifacts) -> bool {
-    read_capped(&artifacts.exit_path, EXIT_LIMIT)
+    read_exit_record(artifacts)
         .ok()
-        .and_then(|text| serde_json::from_str::<ExitRecord>(&text).ok())
+        .flatten()
         .is_some_and(|record| record.awaits_quiet(artifacts))
 }
 
@@ -1434,7 +1464,8 @@ pub fn is_awaiting_quiet(artifacts: &InvocationArtifacts) -> bool {
 /// birth under the PID is gone. `kernel` reads a birth (`kernel_birth`);
 /// `pids` lists what the fresh scan reads (`user_pids`).
 /// `Ok(true)`: upgraded to a trusted completion. `Ok(false)`: not such an
-/// invocation. `Err`: still held, with what holds it.
+/// invocation. `Err`: still held, with what holds it, an exit record that
+/// cannot be read included.
 pub(crate) fn settle_awaiting_quiet(
     a: &InvocationArtifacts,
     snapshot: &super::process_tree::ProcessSnapshot,
@@ -1443,9 +1474,8 @@ pub(crate) fn settle_awaiting_quiet(
     pids: ScanPids<'_>,
 ) -> Result<bool, String> {
     use super::process_tree::{current_uid, read_identity, ProcessSnapshot, Quiet, QuietCheck};
-    let Some(mut record) = read_capped(&a.exit_path, EXIT_LIMIT)
-        .ok()
-        .and_then(|text| serde_json::from_str::<ExitRecord>(&text).ok())
+    let Some(mut record) = read_exit_record(a)
+        .map_err(|e| format!("the exit record cannot be read: {e}"))?
         .filter(|record| record.awaits_quiet(a))
     else {
         return Ok(false);
@@ -1717,6 +1747,24 @@ pub(crate) mod contract_tests {
             pids: &no_pids,
         }
     }
+    /// An awaiting-quiet check on an exit record it cannot parse says so,
+    /// rather than reading it as "not such an invocation".
+    #[test]
+    fn settling_a_corrupt_exit_record_says_it_cannot_be_read() {
+        let (_dir, spec) = setup();
+        let a = spec.invocation_artifacts.unwrap();
+        std::fs::write(&a.exit_path, "{").unwrap();
+        let rows = crate::autopilot::process_tree::ProcessSnapshot::Available(Vec::new());
+        let err = settle_awaiting_quiet(&a, &rows, None, |_| Ok(None), &no_pids).unwrap_err();
+        assert!(err.contains("the exit record cannot be read"), "{err}");
+        // An exit record not yet written is simply not one.
+        std::fs::write(&a.exit_path, "").unwrap();
+        assert_eq!(
+            settle_awaiting_quiet(&a, &rows, None, |_| Ok(None), &no_pids),
+            Ok(false)
+        );
+    }
+
     /// A failure after the invocation directory is created (a full disk,
     /// say) removes it, so a condition that persists does not leave one
     /// directory behind per Lead tick.
