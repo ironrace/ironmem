@@ -687,6 +687,18 @@ pub trait Dispatcher {
         Ok(InvocationRecovery::NoPriorInvocation)
     }
 
+    /// [`Dispatcher::recover`] for a state this run itself claimed, checked
+    /// again before its first launch: what may still be running needs less
+    /// proof than adopting another run's state does. By default the same
+    /// check; Claude's differs (see `claude_recovery_own`).
+    fn recover_own(
+        &mut self,
+        repo: &Path,
+        state: &DispatchState,
+    ) -> Result<InvocationRecovery, MemoryError> {
+        self.recover(repo, state)
+    }
+
     fn dispatch(
         &mut self,
         repo: &Path,
@@ -727,6 +739,18 @@ impl Dispatcher for ClaudeDispatcher {
         ))
     }
 
+    fn recover_own(
+        &mut self,
+        _repo: &Path,
+        state: &DispatchState,
+    ) -> Result<InvocationRecovery, MemoryError> {
+        let mut monitor = super::registry::HarnessProcessMonitor::in_dir(&std::env::temp_dir());
+        Ok(claude_recovery_own(
+            &super::registry::HarnessMonitor::snapshot(&mut monitor),
+            state,
+        ))
+    }
+
     fn dispatch(
         &mut self,
         repo: &Path,
@@ -736,17 +760,21 @@ impl Dispatcher for ClaudeDispatcher {
     }
 }
 
-/// What fresh evidence says of the Claude IC `state` names: alive when the
-/// registry lists it or a process names it with `--name` (a just-launched IC
-/// registers late); idle only when the registry is readable and does not
-/// list it AND the process table is readable and names it nowhere;
-/// otherwise uncertain.
+/// What fresh evidence says of the Claude IC `state` names, when a run is
+/// adopting another run's claim: alive when the registry lists it or a
+/// process names it with `--name` (a just-launched IC registers late);
+/// idle only when the registry is readable and does not list it AND the
+/// process table is readable and names it nowhere; otherwise uncertain.
 ///
-/// The rule a run applies, which is stricter than clear-dispatch's: a run
+/// The rule for adoption, which is stricter than clear-dispatch's: a run
 /// never adopts a Claude state on an unreadable registry, whereas
 /// `clear-dispatch`, an operator's action taken once the Leads are
 /// stopped, lets the process table decide when the registry cannot be read
-/// (see `clear::refusal`).
+/// (see `clear::refusal`). A fresh launch, or a launch on this run's own
+/// claim, needs only the process table ([`claude_recovery_own`], D4):
+/// `claude agents --json` was measured never to list a running
+/// `claude -p` IC, so requiring it there made a broken or changed
+/// `claude agents` read every Claude issue as in flight for ever.
 fn claude_recovery(
     snapshots: &super::registry::HarnessSnapshots,
     state: &DispatchState,
@@ -773,6 +801,32 @@ fn claude_recovery(
             ),
         },
     }
+}
+
+/// [`claude_recovery`] for a state this run itself claimed, checked before
+/// its first launch (D4): only the process table decides. A process naming
+/// the IC with `--name` is alive; a readable process table naming it
+/// nowhere is idle, whatever the registry says; an unreadable process
+/// table is uncertain.
+fn claude_recovery_own(
+    snapshots: &super::registry::HarnessSnapshots,
+    state: &DispatchState,
+) -> InvocationRecovery {
+    let super::process_tree::ProcessSnapshot::Available(rows) = &snapshots.processes else {
+        return InvocationRecovery::Unknown {
+            reason: format!(
+                "whether its Claude IC runs cannot be checked: {}",
+                snapshots.processes.reason()
+            ),
+        };
+    };
+    // The name every Claude dispatch for the issue takes.
+    let ic_name = super::dispatch::ic_name(&state.issue);
+    let names = [state.ic_session_name.as_str(), ic_name.as_str()];
+    if super::clear::claude_ic_process_holder(rows, names.iter().copied()).is_some() {
+        return InvocationRecovery::Alive;
+    }
+    InvocationRecovery::NoPriorInvocation
 }
 
 /// The pre-Muse Codex dispatcher, kept, deprecated, for one release: a
@@ -2712,7 +2766,9 @@ enum Recovered {
 
 /// The run a Claude `state` that may still be another run's ends in, or
 /// `None` once fresh evidence shows its IC idle and the state may be
-/// adopted. Nothing is written either way.
+/// adopted. Nothing is written either way. `adopting` is false for the
+/// check on this run's own claim before its first launch, which needs
+/// only the process table (D4, [`Dispatcher::recover_own`]).
 fn claude_in_flight(
     dispatcher: &mut dyn Dispatcher,
     worktree: &Worktree,
@@ -2720,8 +2776,14 @@ fn claude_in_flight(
     issue: &IssueRef,
     cumulative_attempt_n: u32,
     wall_clock_timeout_secs: Option<u64>,
+    adopting: bool,
 ) -> Result<Option<IssueRun>, MemoryError> {
-    let detail = match dispatcher.recover(&worktree.path, state)? {
+    let recovery = if adopting {
+        dispatcher.recover(&worktree.path, state)?
+    } else {
+        dispatcher.recover_own(&worktree.path, state)?
+    };
+    let detail = match recovery {
         InvocationRecovery::NoPriorInvocation | InvocationRecovery::Finished(_) => return Ok(None),
         InvocationRecovery::Alive => format!(
             "its Claude IC {} is still running, so this run adopts nothing and launches \
@@ -3061,6 +3123,7 @@ pub fn run_issue(
             issue,
             cumulative_attempt_n,
             wall_clock_timeout_secs,
+            true,
         )? {
             return Ok(run);
         }
@@ -3523,6 +3586,7 @@ pub fn run_issue(
                             issue,
                             cumulative_attempt_n,
                             wall_clock_timeout_secs,
+                            false,
                         )? {
                             let restored = match &existing_claim {
                                 Some(found) => {
@@ -10289,6 +10353,9 @@ satisfies it on its own"
         /// What each `recover` call reports, in order; then idle.
         evidence: std::collections::VecDeque<InvocationRecovery>,
         recovered: usize,
+        /// What `recover_own` reports, in order; empty delegates to
+        /// `recover`.
+        own_evidence: std::collections::VecDeque<InvocationRecovery>,
         /// A state another run writes while this run's dispatch runs.
         takeover: Option<dispatch_state::Claim>,
         /// A state another run writes while this run checks its IC.
@@ -10302,6 +10369,7 @@ satisfies it on its own"
             Self {
                 db,
                 evidence: evidence.into(),
+                own_evidence: std::collections::VecDeque::new(),
                 recovered: 0,
                 takeover: None,
                 recover_takeover: None,
@@ -10328,6 +10396,17 @@ satisfies it on its own"
                 .evidence
                 .pop_front()
                 .unwrap_or(InvocationRecovery::NoPriorInvocation))
+        }
+
+        fn recover_own(
+            &mut self,
+            repo: &Path,
+            state: &DispatchState,
+        ) -> Result<InvocationRecovery, MemoryError> {
+            match self.own_evidence.pop_front() {
+                Some(evidence) => Ok(evidence),
+                None => self.recover(repo, state),
+            }
         }
 
         fn dispatch(
@@ -10566,6 +10645,33 @@ satisfies it on its own"
             ),
             InvocationRecovery::NoPriorInvocation
         );
+        // D4: the check on this run's own claim, before its first launch,
+        // needs only the process table: an unreadable registry does not
+        // hold a fresh launch, and a process naming the IC still does.
+        assert_eq!(
+            claude_recovery_own(
+                &snaps(
+                    RegistrySnapshot::Unavailable {
+                        reason: "claude not found".into()
+                    },
+                    ProcessSnapshot::Available(Vec::new())
+                ),
+                &state
+            ),
+            InvocationRecovery::NoPriorInvocation
+        );
+        assert_eq!(
+            claude_recovery_own(
+                &snaps(
+                    RegistrySnapshot::Unavailable {
+                        reason: "claude not found".into()
+                    },
+                    ProcessSnapshot::Available(vec![row(format!("claude -p x --name {ic}"))])
+                ),
+                &state
+            ),
+            InvocationRecovery::Alive
+        );
     }
 
     /// A claim as another run would write it now: leased.
@@ -10621,6 +10727,31 @@ satisfies it on its own"
             "{:?}",
             run.terminal
         );
+    }
+
+    /// D4: a fresh launch is held only by the process table on its own
+    /// claim, never by an unreadable registry; adopting another run's
+    /// claim (above) still requires the registry.
+    #[test]
+    fn a_fresh_claude_launch_needs_only_the_process_table() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        let mut b = ClaudeEvidence::new(
+            &db,
+            vec![InvocationRecovery::Unknown {
+                reason: "registry unreadable".into(),
+            }],
+        );
+        b.own_evidence
+            .push_back(InvocationRecovery::NoPriorInvocation);
+        b.outcomes.push_back(met());
+        let run = run_issue(&db, &issue(), &brief(), &wt, &config(), &mut b).unwrap();
+        assert!(
+            matches!(run.terminal, TerminalReason::Met { .. }),
+            "{:?}",
+            run.terminal
+        );
+        assert_eq!(b.seen.len(), 1);
     }
 
     /// C-I2: a run whose own claim is near the end of its lease claims again

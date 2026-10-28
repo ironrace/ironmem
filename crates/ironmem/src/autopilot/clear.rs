@@ -359,12 +359,27 @@ pub(crate) fn claude_ic_holder(
         if snapshots.claude.liveness(ic) == Liveness::Alive {
             return Some(format!("Claude's registry lists its IC session {ic}"));
         }
+        if let Some(reason) = claude_ic_process_holder(rows, std::iter::once(ic.as_str())) {
+            return Some(reason);
+        }
+    }
+    None
+}
+
+/// Why a Claude IC for the issue may be running, on the process table
+/// alone: an active process names one of `names` with `--name`. The
+/// registry is not consulted (a fresh launch's check, `run`'s D4 rule).
+pub(crate) fn claude_ic_process_holder<'a>(
+    rows: &[super::process_tree::ProcessRow],
+    names: impl Iterator<Item = &'a str>,
+) -> Option<String> {
+    for ic in names {
         let names_ic = |args: &str| {
             let words: Vec<&str> = args.split_whitespace().collect();
             words.windows(2).any(|w| w[0] == "--name" && w[1] == ic)
                 || words
                     .iter()
-                    .any(|w| w.strip_prefix("--name=") == Some(ic.as_str()))
+                    .any(|w| w.strip_prefix("--name=") == Some(ic))
         };
         if let Some(r) = rows.iter().find(|r| r.active() && names_ic(&r.args)) {
             return Some(format!(
