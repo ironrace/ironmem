@@ -54,6 +54,9 @@ pub mod doctor;
 /// Deterministic review-diff artifacts and source-preserving expansion helpers.
 pub mod review_diff;
 
+#[cfg(test)]
+mod git_env_scan;
+
 /// One-command launchers for `claude` and `codex` (issue #143).
 pub mod launcher;
 
