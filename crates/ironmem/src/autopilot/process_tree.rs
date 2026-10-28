@@ -1163,6 +1163,27 @@ fn task_state(stat: &str) -> Option<char> {
         .next()
 }
 
+/// [`linux_cwd`] on this machine's `/proc`.
+#[cfg(target_os = "linux")]
+fn proc_cwd(pid: u32) -> Result<Option<PathBuf>, String> {
+    linux_cwd(
+        pid,
+        |path: &Path| std::fs::read_link(path),
+        |pid| {
+            std::fs::read_dir(format!("/proc/{pid}/task"))?
+                .map(|task| {
+                    Ok(task?
+                        .file_name()
+                        .to_string_lossy()
+                        .parse::<u32>()
+                        .unwrap_or(0))
+                })
+                .collect()
+        },
+        |pid| kernel_observation(pid).map(|process| process.is_some()),
+    )
+}
+
 /// The working directory of `pid` for the worktree scan on Linux, from
 /// `/proc/<pid>/cwd` through `read_link`. `None` once it is gone.
 ///
@@ -1805,25 +1826,7 @@ fn processes_with_cwd(
                 )
             }))
         };
-        let cwd_of = |pid: u32| {
-            linux_cwd(
-                pid,
-                |path: &Path| std::fs::read_link(path),
-                |pid| {
-                    std::fs::read_dir(format!("/proc/{pid}/task"))?
-                        .map(|task| {
-                            Ok(task?
-                                .file_name()
-                                .to_string_lossy()
-                                .parse::<u32>()
-                                .unwrap_or(0))
-                        })
-                        .collect()
-                },
-                |pid| kernel_observation(pid).map(|process| process.is_some()),
-            )
-        };
-        scan_cwds(pids, uid, spawned, known, owner_birth, cwd_of)
+        scan_cwds(pids, uid, spawned, known, owner_birth, proc_cwd)
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
@@ -4160,6 +4163,80 @@ pub(crate) mod tests {
             "{pid} ({comm}) {state} 300 {pid} {pid} 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 {threads} 0 \
              12345 1000000 200 18446744073709551615 1 1 0 0 0 0 0 0 0 0 0 0 17 3 0 0 0 0 0"
         )
+    }
+
+    /// A real `Zl` process on Linux: its main thread called `pthread_exit`
+    /// while a worker runs. The kernel read counts it running, the scan
+    /// reads its worktree through the live thread, and it reads stopped
+    /// only once SIGSTOP has reached that thread.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_real_zombie_led_process_is_running_scanned_and_stopped_by_its_live_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = std::process::Command::new("/usr/bin/python3")
+            .args([
+                "-c",
+                "import threading, time, ctypes\n\
+                 def worker():\n    while True: time.sleep(0.05)\n\
+                 threading.Thread(target=worker).start()\n\
+                 ctypes.CDLL(None).pthread_exit(None)\n",
+            ])
+            .current_dir(dir.path())
+            .spawn()
+            .expect("python3 is needed for this test");
+        struct Kill(u32);
+        impl Drop for Kill {
+            fn drop(&mut self) {
+                // SAFETY: the test's own child.
+                unsafe { libc::kill(self.0 as i32, libc::SIGKILL) };
+            }
+        }
+        let pid = child.id();
+        let _kill = Kill(pid);
+        let leader_exited = || {
+            std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|stat| task_state(&stat))
+                == Some('Z')
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !leader_exited() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the leader never exited"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(kernel_observation(pid).unwrap().is_some(), "it still runs");
+        assert_eq!(
+            proc_cwd(pid)
+                .unwrap()
+                .map(|cwd| cwd.canonicalize().unwrap()),
+            Some(dir.path().canonicalize().unwrap()),
+            "the scan reads its worktree through the live thread"
+        );
+        let row = ProcessRow {
+            pid,
+            ppid: std::process::id(),
+            pgid: 0,
+            stat: "Zl".into(),
+            args: String::new(),
+        };
+        assert!(row.active());
+        assert!(!row_stopped(&row, task_states), "its worker runs");
+        // SAFETY: the test's own child.
+        unsafe { libc::kill(pid as i32, libc::SIGSTOP) };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !row_stopped(&row, task_states) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the stop never showed"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        // SAFETY: the test's own child.
+        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        child.wait().unwrap();
     }
 
     /// The invocation root, read straight after spawn, is our unreaped
