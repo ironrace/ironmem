@@ -205,8 +205,15 @@ fn parse_codex_options<'a>(args: impl Iterator<Item = &'a str>) -> Result<Option
             | "-i" => {
                 words.next().ok_or("Codex option has no value")?;
             }
-            // `-`: the prompt is read from stdin (Autopilot's own rows).
-            "--" | "-" => break,
+            // `-`: the prompt is read from stdin, and is Autopilot's last
+            // word; anything after it is a shape Autopilot never writes.
+            "-" => {
+                if words.next().is_some() {
+                    return Err("Codex argv continues after its stdin prompt `-`".into());
+                }
+                break;
+            }
+            "--" => break,
             other if other.starts_with('-') => {
                 return Err("unrecognized Codex option before prompt".into())
             }
@@ -886,7 +893,10 @@ impl ProcessSnapshot {
                         r.pid
                     ))
                 }
-                Ok(Some(marker)) if marker_issue_slug(marker) == Some(issue_slug) => {
+                Ok(Some(marker))
+                    if is_autopilot_marker_path(marker)
+                        && marker_issue_slug(marker) == Some(issue_slug) =>
+                {
                     return Some(format!(
                         "process {} runs an Autopilot invocation for {issue_slug}: {marker}",
                         r.pid
@@ -3404,6 +3414,17 @@ pub(crate) mod tests {
             marker("codex exec --output-schema relative/schema.json p"),
             Ok(None)
         );
+        // Autopilot's `-` (prompt on stdin) is the last word; anything after
+        // it makes the row ambiguous.
+        let ours =
+            "/r/.git/ironmem/autopilot/o-r-1/0f0e0d0c-0b0a-4908-8706-050403020100/schema.json";
+        assert_eq!(
+            marker(&format!(
+                "codex exec --json --output-schema {ours} -m gpt -"
+            )),
+            Ok(Some(ours.to_owned()))
+        );
+        assert!(marker(&format!("codex exec --output-schema {ours} -m gpt - extra")).is_err());
     }
     fn row(args: &str) -> ProcessRow {
         ProcessRow {
@@ -5437,6 +5458,9 @@ pub(crate) mod tests {
         for args in [
             format!("zsh /u/.local/bin/muse exec --output-schema {theirs}"),
             "zsh /u/.local/bin/muse exec --output-schema /tmp/o-r-7/schema.json".into(),
+            // A parsed marker naming the issue's slug outside the Autopilot
+            // layout is someone else's run.
+            "codex exec --output-schema /tmp/o-r-7/notes/schema.json prompt".into(),
         ] {
             assert_eq!(evidence(&args), None, "{args}");
         }
