@@ -8,24 +8,43 @@ use std::path::PathBuf;
 
 use crate::error::MemoryError;
 
-/// `name` resolved once through [`find_launcher`] and cached for the
+/// `name` resolved through [`find_launcher`] and cached for the
 /// process, for the spawn sites (git, ps) that run constantly and must
-/// never resolve through a relative PATH entry in a worktree. A failed
-/// resolution falls back to the bare name, whose spawn then fails with
-/// the operating system's own not-found error, as it did before.
+/// never resolve through a relative PATH entry in a worktree. Only a
+/// successful resolution is cached: a failed one falls back to the
+/// bare name (whose spawn then fails with the operating system's own
+/// not-found error, as it did before) and is retried next time, so a
+/// PATH fixed after a first failure is picked up.
 pub(crate) fn cached_launcher(name: &str) -> PathBuf {
-    static GIT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-    static PS: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    static GIT: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+    static PS: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
     let cell = match name {
         "git" => &GIT,
         "ps" => &PS,
         _ => return PathBuf::from(name),
     };
-    cell.get_or_init(|| {
-        let path_var = std::env::var_os("PATH").unwrap_or_default();
-        find_launcher(name, &path_var).unwrap_or_else(|_| PathBuf::from(name))
-    })
-    .clone()
+    let path_var = std::env::var_os("PATH").unwrap_or_default();
+    resolve_cached(cell, name, &path_var)
+}
+
+/// [`cached_launcher`]'s resolution against an explicit PATH, so tests
+/// can drive it without touching the process environment.
+fn resolve_cached(
+    cell: &std::sync::Mutex<Option<PathBuf>>,
+    name: &str,
+    path_var: &OsStr,
+) -> PathBuf {
+    let mut cached = cell.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(found) = &*cached {
+        return found.clone();
+    }
+    match find_launcher(name, path_var) {
+        Ok(found) => {
+            *cached = Some(found.clone());
+            found
+        }
+        Err(_) => PathBuf::from(name),
+    }
 }
 
 /// Locate `name` using the process PATH.
@@ -126,6 +145,34 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("codex"), "error should name the binary: {msg}");
         assert!(msg.contains("PATH"), "error should mention PATH: {msg}");
+    }
+
+    /// F30: the cached resolution skips relative PATH entries (a
+    /// worktree could supply the binary), caches only successes, and
+    /// picks a PATH fixed after a failure up on the next call.
+    #[cfg(unix)]
+    #[test]
+    fn cached_resolution_skips_relative_entries_and_caches_only_successes() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("git");
+        fs::write(&bin, "#!/bin/sh\n").unwrap();
+        let mut perms = fs::metadata(&bin).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&bin, perms).unwrap();
+        let cell = std::sync::Mutex::new(None);
+        // Only a relative entry names it: never resolved through it.
+        let relative = std::ffi::OsString::from("relative-dir");
+        assert_eq!(
+            resolve_cached(&cell, "git", &relative),
+            PathBuf::from("git")
+        );
+        // The failure was not cached: an absolute entry now resolves,
+        // and is then served from the cache.
+        let absolute = std::env::join_paths([dir.path()]).unwrap();
+        assert_eq!(resolve_cached(&cell, "git", &absolute), bin);
+        let empty = std::ffi::OsString::new();
+        assert_eq!(resolve_cached(&cell, "git", &empty), bin);
     }
 
     #[cfg(unix)]

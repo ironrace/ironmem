@@ -182,11 +182,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   counter is charged afresh from its first success, so once a human
   re-labels it `agent:ready` it may get the rest of that cap without an
   `autopilot retry`.
-- **Every Claude launch needs a readable process table.** A Claude run
-  checks `ps` for a process naming its IC before it launches (and a
-  readable Claude registry only when adopting another run's claim), so
-  a host where `ps` cannot be read holds Claude issues instead of
-  launching. The Codex reviewer now receives its prompt on stdin
+- **A Claude run's first launch needs a readable process table.** A
+  Claude run checks `ps` for a process naming its IC before its first
+  launch (and a readable Claude registry only when adopting another
+  run's claim), so a host where `ps` cannot be read holds Claude
+  issues instead of launching. The Codex reviewer now receives its prompt on stdin
   (`review::build_argv` ends in `-`), as the Codex implementer does.
   The day's dollar total includes in-flight dispatch reservations, so
   it can read higher than the settled spend while a dispatch runs.

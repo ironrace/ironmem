@@ -921,6 +921,41 @@ mod tests {
             .is_none());
     }
 
+    /// F52: releasing a settled claim prunes the issue's invocation
+    /// directories past retention under its common directory, keeping
+    /// the released one.
+    #[test]
+    fn release_prunes_old_invocation_directories() {
+        let db = Database::open_in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = held_state(Implementer::Claude, testing::invocation(dir.path()).0);
+        state.invocation_artifacts = None;
+        state.attempt_n = 3;
+        let common = tempfile::tempdir().unwrap();
+        let issue_dir = common.path().join("ironmem/autopilot/owner-repo-42");
+        let old = issue_dir.join("0f0e0d0c-0b0a-4908-8706-050403020100");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::File::open(&old)
+            .unwrap()
+            .set_modified(
+                std::time::SystemTime::now() - std::time::Duration::from_secs(20 * 24 * 60 * 60),
+            )
+            .unwrap();
+        let claim = dispatch_state::Claim {
+            state,
+            owner: Some("a-finished-run".into()),
+            claimed_at: Some("2026-10-26T00:00:00Z".into()),
+            common_dir: Some(common.path().to_string_lossy().into_owned()),
+        };
+        assert!(dispatch_state::claim_if_unchanged(&db, None, &claim).unwrap());
+        record_status(&db, Some(AttemptOutcome::Failed), 3);
+        assert_eq!(
+            release_settled_dispatches(&db, &snapshots(Vec::new()), 3).unwrap(),
+            vec![issue()]
+        );
+        assert!(!old.exists(), "the old invocation directory was pruned");
+    }
+
     #[test]
     fn only_a_finished_recorded_and_idle_dispatch_gives_its_slot_back() {
         let dir = tempfile::tempdir().unwrap();

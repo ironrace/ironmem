@@ -122,6 +122,16 @@ impl InvocationArtifacts {
         Ok(())
     }
 
+    /// Whether the invocation directory is proven outside `worktree`'s
+    /// common Git directory: false when it is under it, and false when
+    /// no common directory can be resolved (which proves nothing).
+    pub(crate) fn outside_common_dir(&self, worktree: &Path) -> bool {
+        let Ok(common) = common_git_dir(worktree) else {
+            return false;
+        };
+        !Path::new(&self.schema_path).starts_with(common.join("ironmem/autopilot"))
+    }
+
     /// Whether the invocation directory is under `worktree`'s common Git
     /// directory, where [`prepare_artifacts`] puts it, as recovery reads
     /// it: [`Self::check_layout`] alone accepts the same layout anywhere.

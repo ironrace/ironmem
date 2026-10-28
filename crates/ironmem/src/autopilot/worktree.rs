@@ -3571,8 +3571,18 @@ mod tests {
             .filter(|line| line.contains("Command::new(\"git\")"))
             .count();
         assert_eq!(
-            bare, 1,
-            "exactly one `Command::new(\"git\")`, inside `git_command`; \
+            bare, 0,
+            "no bare `Command::new(\"git\")`: git is built once, through \
+             the cached launcher, inside `git_command`"
+        );
+        let cached = production
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .filter(|line| line.contains("cached_launcher(\"git\")"))
+            .count();
+        assert_eq!(
+            cached, 1,
+            "exactly one `cached_launcher(\"git\")`, inside `git_command`; \
              every other call site must use it"
         );
     }
