@@ -4433,7 +4433,9 @@ pub(crate) mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn a_real_non_dumpable_process_outside_the_invocation_does_not_fail_the_scan() {
-        let spawned = birth_at(std::time::SystemTime::now()).unwrap();
+        // Births are clock ticks: let one pass, so this process predates
+        // the child even when the test runs alone.
+        std::thread::sleep(std::time::Duration::from_millis(50));
         // SAFETY: the child only makes async-signal-safe calls (chdir,
         // prctl, pause, _exit) before it is killed.
         let child = unsafe { libc::fork() };
@@ -4470,6 +4472,10 @@ pub(crate) mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+        // The invocation starts with the child (a wall-clock start reads
+        // up to a second off on Linux), after this test process.
+        let spawned = birth(child).unwrap().expect("the child runs");
+        assert!(birth(std::process::id()).unwrap().unwrap() < spawned);
         assert_eq!(
             processes_with_cwd(vec![child], spawned, &[]).map(|found| found.len()),
             Ok(0)
