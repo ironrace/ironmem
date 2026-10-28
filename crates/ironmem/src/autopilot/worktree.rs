@@ -860,25 +860,24 @@ fn create_branch_with(
 /// anything: either way the branch, its worktree and its cut are kept, and
 /// the run stops so that the next one reuses them.
 fn settle_created(root: &Path, branch: &str, cut: &str) -> Result<(), MemoryError> {
-    let kept = "the branch, its worktree and its cut are kept; run again to reuse them";
-    match resolve_commit(root, &format!("refs/heads/{branch}")) {
-        Some(tip) if tip == cut => {}
-        Some(tip) => {
-            return Err(MemoryError::Validation(format!(
-                "the issue branch `{branch}` was just created at {cut} in {}, but it already \
-                 reads {tip}, so another controller is working on it; {kept}",
-                root.display()
-            )))
-        }
-        None => {
-            return Err(MemoryError::Validation(format!(
-                "the issue branch `{branch}` was just created at {cut} in {}, but its tip could \
-                 not be read back; {kept}",
-                root.display()
-            )))
-        }
-    }
-    record_cut_again_if_taken(root, branch, cut)
+    // Recorded again first, whatever the tip reads: this add made the
+    // branch at `cut`, so `cut` is its cut, and a take-back racing it must
+    // not leave the kept branch without one. It deletes nothing.
+    let recorded = record_cut_again_if_taken(root, branch, cut);
+    let problem = match resolve_commit(root, &format!("refs/heads/{branch}")) {
+        Some(tip) if tip == cut => return recorded,
+        Some(tip) => format!("it already reads {tip}, so another controller is working on it"),
+        None => "its tip could not be read back".to_string(),
+    };
+    let kept = match recorded {
+        Ok(()) => "the branch, its worktree and its cut are kept; run again to reuse them".into(),
+        Err(MemoryError::Validation(e)) => format!("the branch and its worktree are kept, but {e}"),
+        Err(e) => format!("the branch and its worktree are kept, but {e}"),
+    };
+    Err(MemoryError::Validation(format!(
+        "the issue branch `{branch}` was just created at {cut} in {}, but {problem}; {kept}",
+        root.display()
+    )))
 }
 
 /// After this call's add made `branch` at `cut`: record `cut` again if it no
@@ -2271,6 +2270,9 @@ mod tests {
         let branch = branch_name(&issue());
         let cut = added_at_cut(&root, &path);
         let landed = commit_in(&path, "another-run");
+        // And another controller's take-back removed the cut meanwhile: the
+        // branch is still this add's, made at `cut`, so it is recorded again.
+        run(&root, &["config", "--unset", &issue_cut_key()]);
         let err = settle_created(&root, &branch, &cut)
             .unwrap_err()
             .to_string();
@@ -2295,6 +2297,7 @@ mod tests {
             &root,
             &["update-ref", "-d", &format!("refs/heads/{branch}")],
         );
+        run(&root, &["config", "--unset", &issue_cut_key()]);
         let err = settle_created(&root, &branch, &cut)
             .unwrap_err()
             .to_string();
