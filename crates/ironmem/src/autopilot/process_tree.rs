@@ -1955,32 +1955,12 @@ fn processes_with_cwd(
                 )
             }))
         };
-        // A non-dumpable process (`ssh-agent`, a sandboxed Chromium or
-        // Electron renderer) refuses `/proc/<pid>/cwd` with EACCES even to
-        // its own user, so the operator's own such process, started during
-        // the invocation anywhere on the machine, would hold every scan. A
-        // refused read fails the scan only for a process tied to the
-        // invocation: its parent or process group is one the tracker knows,
-        // or its parent was born during the invocation. A kernel read that
-        // fails here counts it as tied, so the scan still fails closed.
         let refused = |pid: u32| {
             std::fs::read_link(format!("/proc/{pid}/cwd"))
                 .is_err_and(|e| matches!(e.raw_os_error(), Some(libc::EACCES | libc::EPERM)))
         };
-        let tied = |pid: u32| match kernel_observation(pid) {
-            Ok(Some(process)) => {
-                known.contains(&process.ppid)
-                    || known.contains(&process.pgid)
-                    || !matches!(
-                        kernel_observation(process.ppid),
-                        Ok(Some(parent)) if parent.birth < spawned
-                    )
-            }
-            _ => true,
-        };
-        let cwd_of = |pid: u32| match proc_cwd(pid) {
-            Err(_) if refused(pid) && !tied(pid) => Ok(None),
-            read => read,
+        let cwd_of = |pid: u32| {
+            cwd_unless_refused_stranger(pid, known, spawned, proc_cwd, refused, kernel_observation)
         };
         scan_cwds(pids, uid, spawned, known, owner_birth, cwd_of)
     }
@@ -1989,6 +1969,53 @@ fn processes_with_cwd(
         let _ = (pids, uid, spawned, known);
         Err("process working directories are unreadable on this platform".into())
     }
+}
+
+/// `pid`'s working directory through `read` (Linux: [`proc_cwd`]), except
+/// for a same-user process the invocation cannot have started whose
+/// directory is refused, which is skipped (`None`).
+///
+/// A non-dumpable process (`ssh-agent`, a sandboxed Chromium or Electron
+/// renderer) refuses `/proc/<pid>/cwd` with EACCES even to its own user, so
+/// the operator's own such process, started during the invocation anywhere
+/// on the machine, would hold every scan. A failed read for which `refused`
+/// (a re-read) confirms EACCES or EPERM fails the scan only for a process
+/// tied to the invocation, by `kernel` records: its parent or process group
+/// is one the tracker knows (`known`), or its parent was born during the
+/// invocation (`spawned` or later). A kernel read that fails, or a parent
+/// or process already gone, counts it as tied, so the scan still fails
+/// closed. Any other failure fails it as before.
+///
+/// Known gap: a non-dumpable process the invocation detached with `setsid`
+/// and that a subreaper born before the invocation then adopted is skipped.
+/// Linux only, but tested everywhere.
+#[cfg(any(target_os = "linux", test))]
+fn cwd_unless_refused_stranger(
+    pid: u32,
+    known: &[u32],
+    spawned: Birth,
+    read: impl FnOnce(u32) -> Result<Option<PathBuf>, String>,
+    refused: impl FnOnce(u32) -> bool,
+    kernel: impl Fn(u32) -> Result<Option<KernelProcess>, String>,
+) -> Result<Option<PathBuf>, String> {
+    let read = read(pid);
+    if read.is_err() && refused(pid) {
+        let tied = match kernel(pid) {
+            Ok(Some(process)) => {
+                known.contains(&process.ppid)
+                    || known.contains(&process.pgid)
+                    || !matches!(
+                        kernel(process.ppid),
+                        Ok(Some(parent)) if parent.birth < spawned
+                    )
+            }
+            _ => true,
+        };
+        if !tied {
+            return Ok(None);
+        }
+    }
+    read
 }
 
 /// [`processes_with_cwd`] of whatever `pids` lists; `known` are the
@@ -4318,6 +4345,137 @@ pub(crate) mod tests {
         assert!(!reads.borrow().contains(&10), "an unrelated login was read");
         let err = scan_cwds([10, 11], uid, spawned, &[root], owner_birth, cwd_of).unwrap_err();
         assert_eq!(err.unreadable, Some((11, Birth(150, 0))), "{err}");
+    }
+
+    /// Linux: a same-user non-dumpable process (`ssh-agent`, a sandboxed
+    /// renderer) refuses its `/proc/<pid>/cwd` with EACCES. One the
+    /// invocation cannot have started is skipped, so it never holds the
+    /// scan; one tied to the invocation (parent or group known, parent born
+    /// in the window, or a parent or process that cannot be read) still
+    /// fails it. Any other failed read fails it as before.
+    #[test]
+    fn a_refused_cwd_read_skips_only_a_process_not_tied_to_the_invocation() {
+        let spawned = Birth(100, 0);
+        let root = 42;
+        // Process 7, under parent `ppid` in group `pgid`; the parent was
+        // born at `parent` (`None`: gone; `Some(None)`: unreadable).
+        let kernel = |ppid: u32, pgid: u32, parent: Option<Option<u64>>| {
+            move |pid: u32| -> Result<Option<KernelProcess>, String> {
+                match pid {
+                    7 => Ok(Some(kernel_process(7, ppid, pgid, 150))),
+                    _ if pid == ppid => match parent {
+                        None => Ok(None),
+                        Some(None) => Err("refused".into()),
+                        Some(Some(start)) => Ok(Some(kernel_process(ppid, 1, ppid, start))),
+                    },
+                    other => panic!("unexpected kernel read of {other}"),
+                }
+            }
+        };
+        let denied = || Err::<Option<PathBuf>, _>("Permission denied (os error 13)".to_owned());
+        type Kernel<'a> = &'a dyn Fn(u32) -> Result<Option<KernelProcess>, String>;
+        let decide = |refused: bool, kernel: Kernel<'_>| {
+            cwd_unless_refused_stranger(7, &[root], spawned, |_| denied(), |_| refused, kernel)
+        };
+        // The operator's own: an old parent, in an old group of its own.
+        assert_eq!(decide(true, &kernel(300, 300, Some(Some(50)))), Ok(None));
+        for tied in [
+            kernel(root, 300, Some(Some(50))),
+            kernel(300, root, Some(Some(50))),
+            kernel(300, 300, Some(Some(100))),
+            kernel(300, 300, Some(Some(150))),
+            kernel(300, 300, None),
+            kernel(300, 300, Some(None)),
+        ] {
+            assert!(decide(true, &tied).is_err());
+        }
+        // Its own record unreadable, or gone: nothing unties it.
+        let unreadable = |_: u32| -> Result<Option<KernelProcess>, String> { Err("x".into()) };
+        assert!(decide(true, &unreadable).is_err());
+        assert!(decide(true, &|_: u32| Ok(None)).is_err());
+        // A failure that is not a refusal fails the scan, untied or not.
+        assert!(decide(false, &kernel(300, 300, Some(Some(50)))).is_err());
+        // A directory that reads is the answer; nothing else is asked.
+        let read = cwd_unless_refused_stranger(
+            7,
+            &[root],
+            spawned,
+            |_| Ok(Some(PathBuf::from("/w"))),
+            |_| panic!("re-read a readable directory"),
+            |_| panic!("read the kernel for a readable directory"),
+        );
+        assert_eq!(read, Ok(Some(PathBuf::from("/w"))));
+        // Through the scan: the stranger is skipped and the rest listed.
+        let owner_birth =
+            |_: u32| -> Result<Option<(u32, Birth)>, String> { Ok(Some((501, Birth(150, 0)))) };
+        let found = scan_cwds([7, 8], 501, spawned, &[root], owner_birth, |pid| {
+            if pid == 8 {
+                return Ok(Some(PathBuf::from("/w/8")));
+            }
+            cwd_unless_refused_stranger(
+                pid,
+                &[root],
+                spawned,
+                |_| denied(),
+                |_| true,
+                kernel(300, 300, Some(Some(50))),
+            )
+        })
+        .unwrap();
+        assert_eq!(found.iter().map(|p| p.pid).collect::<Vec<_>>(), vec![8]);
+    }
+
+    /// The same on a real Linux machine: a non-dumpable child of this test
+    /// process (which predates the invocation), working outside the
+    /// worktree, is skipped by the real scan; with this process as the
+    /// invocation's, it fails the scan on that very process, which shows
+    /// its directory really is refused.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_real_non_dumpable_process_outside_the_invocation_does_not_fail_the_scan() {
+        let spawned = birth_at(std::time::SystemTime::now()).unwrap();
+        // SAFETY: the child only makes async-signal-safe calls (chdir,
+        // prctl, pause, _exit) before it is killed.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork: {}", std::io::Error::last_os_error());
+        if child == 0 {
+            // SAFETY: the forked child, as above.
+            unsafe {
+                libc::chdir(c"/".as_ptr());
+                libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
+                loop {
+                    libc::pause();
+                }
+            }
+        }
+        let child = child as u32;
+        struct Reap(u32);
+        impl Drop for Reap {
+            fn drop(&mut self) {
+                // SAFETY: our own unreaped child.
+                unsafe {
+                    libc::kill(self.0 as i32, libc::SIGKILL);
+                    libc::waitpid(self.0 as i32, std::ptr::null_mut(), 0);
+                }
+            }
+        }
+        let _reap = Reap(child);
+        let started = std::time::Instant::now();
+        while !std::fs::read_link(format!("/proc/{child}/cwd"))
+            .is_err_and(|e| e.raw_os_error() == Some(libc::EACCES))
+        {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(10),
+                "the child never became non-dumpable"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            processes_with_cwd(vec![child], spawned, &[]).map(|found| found.len()),
+            Ok(0)
+        );
+        let err = processes_with_cwd(vec![child], spawned, &[std::process::id()]).unwrap_err();
+        assert_eq!(err.unreadable.map(|(pid, _)| pid), Some(child), "{err}");
     }
 
     /// A real-uid-only process whose parent cannot be authenticated is tied
