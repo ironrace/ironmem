@@ -307,18 +307,13 @@ pub fn build_argv(spec: &ReviewSpec, repo_dir: &Path) -> Vec<String> {
         args.push("-m".to_string());
         args.push(model.clone());
     }
-    // The prompt is `codex exec`'s single trailing positional, so it is
-    // pushed after every flag and its value.
-    //
-    // Note what this does *not* buy: being last does not protect a prompt
-    // that begins with `-`, because clap dispatches on the leading dash, not
-    // on position — such a prompt would be rejected as an unknown flag, and a
-    // prompt of exactly `-` means "read the instructions from stdin". Neither
-    // is reachable today ([`super::review_prompt::render`] always opens with
-    // "You are a fresh-context..."), and both fail closed if it ever changes,
-    // so no `--` escape is spelled here; the guarantee just isn't the one the
-    // ordering suggests.
-    args.push(spec.prompt.clone());
+    // The prompt is read from stdin (`-`, codex-cli 0.163, measured), never
+    // passed as an argument: an argument is visible to every user in `ps`,
+    // and the prompt quotes the issue, the diff and the gate output.
+    // [`run_review_bounded`] writes `spec.prompt` to a private file and makes
+    // it the reviewer's stdin. `-` is the trailing positional, after every
+    // flag and its value.
+    args.push("-".to_string());
     args
 }
 
@@ -529,6 +524,19 @@ fn reviewer_binary_in(
 /// dev-dependency here (see `Cargo.toml`'s note on keeping it out of release
 /// builds), and pulling it into `[dependencies]` for two files would change
 /// what every release build compiles.
+/// Write `bytes` to a new file at `path` readable by its owner only.
+fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)?.write_all(bytes)
+}
+
 struct ScratchDir {
     path: PathBuf,
 }
@@ -624,18 +632,23 @@ fn spawn_bounded(
     args: &[String],
     repo_dir: &Path,
     timeout: std::time::Duration,
+    stdin: Option<std::fs::File>,
 ) -> Result<BoundedRun, MemoryError> {
     let mut command = std::process::Command::new(bin);
     command
         .args(args)
         .current_dir(repo_dir)
-        // Nulled explicitly. `spawn` inherits all three streams where the
-        // `output` call this replaced nulled stdin for you, and inheriting it
-        // hands the reviewer the caller's stdin — a TTY under an interactive
-        // `autopilot review` — so a reviewer that reads it blocks until the
-        // bound fires. That is the wedge the bound exists to prevent, made
-        // likelier by the bound that prevents it.
-        .stdin(std::process::Stdio::null())
+        // A file, or nulled explicitly. `spawn` inherits all three streams
+        // where the `output` call this replaced nulled stdin for you, and
+        // inheriting it hands the reviewer the caller's stdin — a TTY under
+        // an interactive `autopilot review` — so a reviewer that reads it
+        // blocks until the bound fires. That is the wedge the bound exists to
+        // prevent, made likelier by the bound that prevents it. A file ends,
+        // so it cannot wedge.
+        .stdin(match stdin {
+            Some(file) => std::process::Stdio::from(file),
+            None => std::process::Stdio::null(),
+        })
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     // Its own process group, so the bound reaps what the reviewer *started*.
@@ -760,6 +773,14 @@ pub fn run_review_bounded(
         ))
     })?;
 
+    // Owner-only: it holds the issue and the diff, and stays out of `ps`.
+    let prompt_path = scratch.path.join("review-prompt.txt");
+    write_private(&prompt_path, prompt.as_bytes()).map_err(|e| {
+        MemoryError::Config(format!(
+            "cannot write reviewer prompt to {}: {e}",
+            prompt_path.display()
+        ))
+    })?;
     let spec = ReviewSpec {
         model,
         prompt,
@@ -767,7 +788,13 @@ pub fn run_review_bounded(
         last_message_path: last_message_path.clone(),
     };
     let args = build_argv(&spec, repo_dir);
-    let run = spawn_bounded(bin, &args, repo_dir, timeout)?;
+    let stdin = std::fs::File::open(&prompt_path).map_err(|e| {
+        MemoryError::Config(format!(
+            "cannot open reviewer prompt {}: {e}",
+            prompt_path.display()
+        ))
+    })?;
+    let run = spawn_bounded(bin, &args, repo_dir, timeout, Some(stdin))?;
 
     let stdout = String::from_utf8_lossy(&run.stdout);
     let token_usage = parse_codex_token_usage(&stdout);
@@ -1442,7 +1469,7 @@ pub fn run_muse_review_bounded(
     // failure.
     let before = checkout_snapshot(repo_dir);
 
-    let run = spawn_bounded(bin, &args, repo_dir, timeout)?;
+    let run = spawn_bounded(bin, &args, repo_dir, timeout, None)?;
 
     let stdout = String::from_utf8_lossy(&run.stdout);
     let terminal = parse_muse_terminal(&stdout);
@@ -2061,17 +2088,54 @@ mod tests {
     }
 
     #[test]
-    fn the_prompt_is_the_trailing_positional() {
-        // The prompt lands after every flag *and every flag's value* — a
-        // prompt emitted between `-m` and the model name would be consumed as
-        // the model. Note this says nothing about a prompt that begins with
-        // `-`; see `build_argv`'s note on why that is not a guarantee here.
+    fn the_prompt_is_read_from_stdin_and_never_in_the_argv() {
+        // `-`, after every flag *and every flag's value*: emitted between
+        // `-m` and the model name it would be consumed as the model. The
+        // prompt itself is never an argument, where `ps` would show it.
         let mut spec = sample_spec();
         spec.model = Some("gpt-5-codex".to_string());
-        spec.prompt = "review this".to_string();
+        spec.prompt = "review this secret diff".to_string();
         let args = build_argv(&spec, Path::new("/repo"));
-        assert_eq!(args.last().unwrap(), "review this");
+        assert_eq!(args.last().unwrap(), "-");
+        assert!(
+            !args.iter().any(|a| a.contains("review this secret diff")),
+            "{args:?}"
+        );
         assert_eq!(value_after(&args, "-m"), "gpt-5-codex");
+    }
+
+    /// The bounded run hands the reviewer its prompt on stdin, from a file
+    /// only its owner can read.
+    #[cfg(unix)]
+    #[test]
+    fn the_codex_reviewer_reads_its_prompt_from_a_private_file_on_stdin() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("seen");
+        let bin = dir.path().join("codex");
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\ncat > '{0}.stdin'\nfor a in \"$@\"; do echo \"$a\"; done > '{0}.argv'\nexit 0\n",
+                out.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        run_review_bounded(
+            &bin,
+            repo.path(),
+            None,
+            "the prompt".into(),
+            std::time::Duration::from_secs(10),
+        )
+        .unwrap();
+        let stdin = std::fs::read_to_string(dir.path().join("seen.stdin")).unwrap();
+        assert_eq!(stdin, "the prompt");
+        let argv = std::fs::read_to_string(dir.path().join("seen.argv")).unwrap();
+        assert!(!argv.contains("the prompt"), "{argv}");
+        assert_eq!(argv.lines().last(), Some("-"));
     }
 
     #[test]
