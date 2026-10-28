@@ -3697,13 +3697,14 @@ pub fn run_issue(
         // First, before the signing-guard reads, the spend settling or
         // the record below: renew the lease a long dispatch let lapse
         // (R1), or this run has lost the issue and records nothing.
-        if !recovered && !config.implementer.recovers_invocations() {
-            if !renew_owned(db, issue, &mut owned)? {
-                if let Some(reserved) = reserved_spend.take() {
-                    reserved.settle(None)?;
-                }
-                return Err(taken_over());
+        if !recovered
+            && !config.implementer.recovers_invocations()
+            && !renew_owned(db, issue, &mut owned)?
+        {
+            if let Some(reserved) = reserved_spend.take() {
+                reserved.settle(None)?;
             }
+            return Err(taken_over());
         }
         // Whatever came back, the reservation gives way to what is known:
         // the measured cost below, or, with none, nothing.
