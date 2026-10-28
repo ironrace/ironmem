@@ -676,7 +676,7 @@ fn a_live_muse_invocation_holds_its_slot_and_no_second_muse_is_launched() {
     let second = fx.run("met", &["--attempt-cap", "1"]);
     let stderr = String::from_utf8_lossy(&second.stderr);
     assert!(
-        !second.status.success() && stderr.contains("Muse implementation is still alive"),
+        !second.status.success() && stderr.contains("another controller holds issue"),
         "a second run must hold while the first controller runs:\nstdout={}\nstderr={stderr}",
         String::from_utf8_lossy(&second.stdout)
     );

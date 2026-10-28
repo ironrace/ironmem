@@ -93,6 +93,7 @@ fn public_run_defaults_to_claude_and_passes_the_claude_default_model() {
     executable(
         &stubs.join("claude"),
         r#"#!/bin/sh
+if [ "$1" = "agents" ]; then echo '[]'; exit 0; fi
 printf '%s\n' "$PWD|$*" >> "$CLAUDE_CALLS"
 printf '%s\n' '{"total_cost_usd":0.0,"num_turns":1,"duration_ms":5,"is_error":false,"session_id":"11111111-2222-3333-4444-555555555555","structured_output":{"verdict":"met"}}'
 "#,
@@ -162,6 +163,7 @@ fn public_run_selects_codex_without_resolving_claude() {
         &stubs.join("codex"),
         r#"#!/bin/sh
 printf '%s\n' "$PWD|$*" >> "$CODEX_CALLS"
+printf 'stdin=%s\n' "$(cat)" >> "$CODEX_CALLS"
 args="$*"
 while [ "$#" -gt 0 ]; do
   if [ "$1" = "-o" ]; then shift; final="$1"; fi
@@ -272,7 +274,21 @@ fi
         !calls.contains("--max-budget-usd"),
         "unexpected Claude flag: {calls}"
     );
-    assert!(calls.contains("true, and every commit you have made is pushed"));
+    // The condition reaches Codex on stdin, not in its argv.
+    let stdin = calls
+        .split("stdin=")
+        .nth(1)
+        .expect("the stub recorded what it was fed on stdin");
+    assert!(
+        stdin.contains("true, and every commit you have made is pushed"),
+        "the condition is missing from stdin: {calls}"
+    );
+    for line in calls.lines().filter(|line| line.contains("|exec ")) {
+        assert!(
+            !line.contains("true, and every commit you have made is pushed"),
+            "the condition leaked into argv: {line}"
+        );
+    }
 }
 
 #[test]
