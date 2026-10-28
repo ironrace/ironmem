@@ -1159,10 +1159,14 @@ enum CreationEntry {
     /// history this run did not see made.
     OnBaseOnly,
     /// As it is when it is the reflog's only line: another controller made
-    /// the branch moments ago, from a base that may not be this run's. A
-    /// longer reflog was not made just now (a `git branch -m` onto the name
-    /// brings the old branch's reflog, `checkout -B` adds a line), so it is
-    /// held to the base as [`Self::OnBaseOnly`] is.
+    /// the branch moments ago, from a base that may not be this run's. The
+    /// one-line rule excludes a branch renamed onto the name (`git branch -m`
+    /// brings the old branch's reflog) or moved in any way since it was made;
+    /// such a reflog is held to the base as [`Self::OnBaseOnly`] is. It does
+    /// not exclude a branch made at another commit inside the window (`git
+    /// checkout -B <branch> <tip>` on a branch that does not exist writes one
+    /// line, measured): that entry is accepted, with a warning naming it, an
+    /// accepted trade-off for the window's width.
     Fresh,
 }
 
@@ -1179,7 +1183,10 @@ enum CreationEntry {
 /// it. An entry off the base can also mean only that the base moved (`--base
 /// HEAD` now on another line, or a reset base), so the warning names it and
 /// how to restore it: the merge base is the wider range, which may hold base
-/// commits the guard then refuses.
+/// commits the guard then refuses. With [`CreationEntry::Fresh`], an entry off
+/// the base is still accepted when it is the reflog's only line, with a
+/// warning, so a branch made at another commit inside the window is taken at
+/// its word.
 ///
 /// Otherwise (no reflog, as with `core.logAllRefUpdates` off or an expired
 /// entry, or a creation entry set aside), the merge base of the branch and
@@ -1230,9 +1237,11 @@ fn infer_cut(
                 created = %sha,
                 base = %base,
                 restore = %format!("git config {} {sha}", cut_key(branch)),
-                "the issue branch another controller just made is not on this run's base; its \
-                 creation entry is recorded as its cut. If that controller's base was wrong, set \
-                 the cut with `git config` as `restore` shows, naming the commit it should be"
+                "the issue branch that another controller, or anything else that made the branch \
+                 in this window, just made is not on this run's base; its creation entry is \
+                 recorded as its cut. If that base was wrong, or the branch was made at another \
+                 commit, set the cut with `git config` as `restore` shows, naming the commit it \
+                 should be"
             );
             return Ok((sha, CutSource::Reflog));
         }
