@@ -78,7 +78,12 @@ impl InvocationArtifacts {
     /// stored as independent strings in the dispatch-state drawer, so a
     /// forged or corrupt drawer could otherwise point recovery's reads (its
     /// stderr goes into the reason) or settle's rename at any file.
+    ///
+    /// Path comparisons do not resolve `..` (and drop a `.`), so the schema
+    /// path must be [`plain_absolute`]; the other four must equal their
+    /// expected paths as text, and so inherit that.
     pub(crate) fn check_layout(&self, issue: &IssueRef) -> Result<(), String> {
+        plain_absolute(&self.schema_path)?;
         let schema = Path::new(&self.schema_path);
         let slug = issue.slug();
         if !super::process_tree::is_autopilot_marker_path(&self.schema_path)
@@ -108,7 +113,7 @@ impl InvocationArtifacts {
         .into_iter()
         .zip(ARTIFACT_FILES)
         {
-            if Path::new(path) != dir.join(name) {
+            if dir.join(name).to_str() != Some(path.as_str()) {
                 return Err(format!(
                     "invocation artifact {path} is not {name} in its directory {}",
                     dir.display()
@@ -122,6 +127,7 @@ impl InvocationArtifacts {
     /// directory, where [`prepare_artifacts`] puts it, as recovery reads
     /// it: [`Self::check_layout`] alone accepts the same layout anywhere.
     pub(crate) fn check_common_dir(&self, worktree: &Path) -> Result<(), String> {
+        plain_absolute(&self.schema_path)?;
         let common = common_git_dir(worktree).map_err(|e| e.to_string())?;
         let root = common.join("ironmem/autopilot");
         if Path::new(&self.schema_path).starts_with(&root) {
@@ -134,6 +140,25 @@ impl InvocationArtifacts {
                 worktree.display()
             ))
         }
+    }
+}
+
+/// `path` as an absolute path whose every component is a plain name: no
+/// `.`, `..` or empty component. `Path::starts_with` and component-wise
+/// equality compare `..` unresolved, so `<common>/ironmem/autopilot/../..`
+/// would otherwise pass as inside the layout.
+#[cfg_attr(not(test), allow(dead_code))]
+fn plain_absolute(path: &str) -> Result<(), String> {
+    let plain = path.strip_prefix('/').is_some_and(|rest| {
+        rest.split('/')
+            .all(|c| !c.is_empty() && c != "." && c != "..")
+    });
+    if plain {
+        Ok(())
+    } else {
+        Err(format!(
+            "invocation path {path} is not a plain absolute path (`.`, `..` or an empty component)"
+        ))
     }
 }
 
@@ -2050,6 +2075,26 @@ pub(crate) mod contract_tests {
         for forged in forged {
             assert!(forged.check_layout(&issue).is_err(), "{forged:?}");
         }
+        // A `..` that climbs out of the layout while every component still
+        // names it, and so starts with the common directory, is refused.
+        let climbing =
+            invocation.join("../../../../../../../../tmp/x/ironmem/autopilot/owner-repo-42");
+        let climbing = climbing.join(&a.invocation_id);
+        let forged = InvocationArtifacts {
+            schema_path: climbing.join("schema.json").to_str().unwrap().into(),
+            journal_path: climbing.join("journal.jsonl").to_str().unwrap().into(),
+            final_path: climbing.join("final.json").to_str().unwrap().into(),
+            stderr_path: climbing.join("stderr.log").to_str().unwrap().into(),
+            exit_path: climbing.join("exit.json").to_str().unwrap().into(),
+            ..a.clone()
+        };
+        assert!(forged.check_layout(&issue).is_err(), "{forged:?}");
+        assert!(forged.check_common_dir(dir.path()).is_err(), "{forged:?}");
+        let dotted = InvocationArtifacts {
+            schema_path: invocation.join("./schema.json").to_str().unwrap().into(),
+            ..a.clone()
+        };
+        assert!(dotted.check_layout(&issue).is_err(), "{dotted:?}");
         // Another issue's invocation is not this issue's.
         assert!(a.check_layout(&IssueRef::new("owner/repo", 43)).is_err());
         // The same layout in another repository's common directory.
