@@ -625,8 +625,6 @@ fn spawn_bounded(
     repo_dir: &Path,
     timeout: std::time::Duration,
 ) -> Result<BoundedRun, MemoryError> {
-    use std::io::Read;
-
     let mut command = std::process::Command::new(bin);
     command
         .args(args)
@@ -666,17 +664,8 @@ fn spawn_bounded(
     // would deadlock, and the bound would then kill a healthy review and
     // report it as timed out. Rung 7's finding, carried over rather than
     // rediscovered.
-    fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> std::thread::JoinHandle<Vec<u8>> {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            if let Some(mut pipe) = pipe {
-                let _ = pipe.read_to_end(&mut buf);
-            }
-            buf
-        })
-    }
-    let stdout_drain = drain(child.stdout.take());
-    let stderr_drain = drain(child.stderr.take());
+    let stdout_drain = super::dispatch::drain(child.stdout.take());
+    let stderr_drain = super::dispatch::drain(child.stderr.take());
 
     let started = std::time::Instant::now();
     let timed_out = loop {
@@ -719,11 +708,22 @@ fn spawn_bounded(
     // stream (or, on the Codex path, the last-message file it names). Draining
     // it is not optional even so — an undrained pipe is what deadlocks the
     // process the bound is timing.
+    let mut status = status;
     let stdout = if timed_out {
         Vec::new()
     } else {
         let _ = stderr_drain.join();
-        stdout_drain.join().unwrap_or_default()
+        // Output cut short is never read as the whole review: the run is
+        // reported as one whose exit cannot be trusted, which is no success.
+        match super::dispatch::drained(stdout_drain) {
+            Ok(stdout) => stdout,
+            Err(e) => {
+                status = Err(std::io::Error::other(format!(
+                    "the reviewer's output could not be read: {e}"
+                )));
+                Vec::new()
+            }
+        }
     };
 
     Ok(BoundedRun {
