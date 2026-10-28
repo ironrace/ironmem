@@ -224,13 +224,11 @@ impl Claim {
     /// host's clock. `None` when it holds no lease.
     pub fn age_phrase(&self, now: chrono::DateTime<chrono::Utc>) -> Option<String> {
         let at = chrono::DateTime::parse_from_rfc3339(self.claimed_at.as_deref()?).ok()?;
-        let secs = now
-            .signed_duration_since(at.with_timezone(&chrono::Utc))
-            .num_seconds();
-        Some(if secs >= 0 {
-            format!("{secs}s ago")
+        let delta = now.signed_duration_since(at.with_timezone(&chrono::Utc));
+        Some(if delta >= chrono::Duration::zero() {
+            format!("{}s ago", delta.num_seconds())
         } else {
-            format!("{}s in the future", -secs)
+            format!("{}s in the future", (-delta).num_seconds())
         })
     }
 }
