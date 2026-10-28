@@ -26,7 +26,7 @@ pub fn bin() -> &'static str {
 }
 
 #[path = "../git_env/mod.rs"]
-mod git_env;
+pub mod git_env;
 pub use git_env::{fixture_git_env, scrub_git_env};
 
 /// The ironmem binary with every `GIT_*` variable stripped, so neither it

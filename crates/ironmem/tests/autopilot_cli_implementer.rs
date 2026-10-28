@@ -48,6 +48,37 @@ fn fixture_git_reads_no_global_config_but_the_binary_under_test_does() {
     }
 }
 
+/// `tests/git_env`'s scrubs remove every redirecting variable from the
+/// command whether or not it is set now (`Command` applies removals at
+/// spawn), so one set on the process later is not inherited either; the
+/// fixture's then pins its two config keys. Checked on the command rather
+/// than by setting a `GIT_*` variable on this threaded process.
+#[test]
+fn the_git_env_scrubs_remove_every_redirecting_variable_unconditionally() {
+    use std::ffi::OsStr;
+    let mut scrubbed = Command::new("git");
+    autopilot_support::scrub_git_env(&mut scrubbed);
+    let scrubbed: Vec<_> = scrubbed.get_envs().collect();
+    let mut fixture = Command::new("git");
+    autopilot_support::fixture_git_env(&mut fixture);
+    let fixture: Vec<_> = fixture.get_envs().collect();
+    for key in autopilot_support::git_env::REDIRECTING_GIT_VARS {
+        assert!(
+            scrubbed.contains(&(OsStr::new(key), None)),
+            "scrub_git_env leaves {key}: {scrubbed:?}"
+        );
+        let pinned = match key {
+            "GIT_CONFIG_GLOBAL" => Some(OsStr::new("/dev/null")),
+            "GIT_CONFIG_NOSYSTEM" => Some(OsStr::new("1")),
+            _ => None,
+        };
+        assert!(
+            fixture.contains(&(OsStr::new(key), pinned)),
+            "fixture_git_env leaves {key} as other than {pinned:?}: {fixture:?}"
+        );
+    }
+}
+
 #[test]
 fn public_run_defaults_to_claude_and_passes_the_claude_default_model() {
     let root = tempfile::tempdir().unwrap();
