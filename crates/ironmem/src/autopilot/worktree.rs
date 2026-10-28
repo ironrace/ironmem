@@ -509,19 +509,20 @@ impl GitOutput {
     }
 }
 
-/// How long one git command that checks out no files may run before it is
-/// killed with its process group: a bound on a hook or filter (which the
-/// agent can install in the shared repository) that never returns, so it
-/// cannot stall the Lead for good. Commands that check files out have
-/// [`GIT_CHECKOUT_TIMEOUT`].
+/// How long one git command that checks out or deletes no worktree may run
+/// before it is killed with its process group: a bound on a hook or filter
+/// (which the agent can install in the shared repository) that never
+/// returns, so it cannot stall the Lead for good. Commands that check a
+/// worktree out or delete one have [`GIT_CHECKOUT_TIMEOUT`].
 const GIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// How long a command that checks files out (`git worktree add`, `git
-/// checkout`) may run. A guard against a hang, not a speed limit: a checkout
-/// of a large repository, with its filters and hooks, has never been
-/// measured against it, so it is set far above any checkout expected to
-/// finish. A checkout killed partway leaves a worktree no later run can reuse
-/// ([`worktree_add`]).
+/// checkout`) or deletes a worktree (`git worktree remove`) may run. A guard
+/// against a hang, not a speed limit: a checkout or removal of a large
+/// repository, with its filters and hooks, has never been measured against
+/// it, so it is set far above any expected to finish. One killed partway
+/// leaves a worktree no later run can reuse or remove ([`worktree_add`],
+/// [`worktree_remove`]).
 const GIT_CHECKOUT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
 /// [`GIT_CHECKOUT_TIMEOUT`], or a test's own bound.
@@ -727,6 +728,39 @@ fn killed_add_error(e: MemoryError, root: &Path, path: &Path) -> MemoryError {
 /// to run: in single quotes, each `'` within written as `'\''`.
 fn shell_quoted(text: &str) -> String {
     format!("'{}'", text.replace('\'', r"'\''"))
+}
+
+/// `git worktree remove` of the worktree at `path`, bounded by
+/// [`checkout_timeout`]: deleting a large tree takes as long as checking it
+/// out. Killed partway, it leaves a half-deleted tree that reads as
+/// uncommitted changes from then on ([`WorktreeRemoval::DirtyRefused`] for
+/// ever), so the error says how to finish the removal.
+fn worktree_remove(root: &Path, path: &Path) -> Result<(), MemoryError> {
+    let path_str = path.to_string_lossy();
+    let args = ["worktree", "remove", path_str.as_ref()];
+    let out = run_git_output_within(git_command(), root, &args, checkout_timeout()).map_err(
+        |failure| match failure {
+            GitRunFailure::Killed(e) => {
+                let detail = match e {
+                    MemoryError::Validation(detail) => detail,
+                    other => other.to_string(),
+                };
+                MemoryError::Validation(format!(
+                    "{detail}; the worktree at {} may be left half deleted, which reads as \
+                     uncommitted changes from now on: once nothing is running in it, run `git \
+                     worktree remove --force {}` in {}",
+                    path.display(),
+                    shell_quoted(&path_str),
+                    root.display()
+                ))
+            }
+            GitRunFailure::Failed(e) => e,
+        },
+    )?;
+    if out.code != Some(0) {
+        return Err(out.failure(root, &args));
+    }
+    Ok(())
 }
 
 /// Like [`git`], but reports whether the command succeeded instead of
@@ -1950,7 +1984,7 @@ pub fn remove_worktree(
         return Ok(WorktreeRemoval::DirtyRefused { path: path_str });
     }
 
-    git(&root, &["worktree", "remove", &path_str])?;
+    worktree_remove(&root, &path)?;
     // `remove` unregisters the worktree it removed; the prune is for the
     // administrative files a concurrent `rm -rf` elsewhere may have
     // orphaned. Cheap, and it keeps `git worktree list` honest for the next
@@ -4038,5 +4072,44 @@ mod tests {
             err.contains(&format!("git worktree remove --force {quoted}")),
             "{err}"
         );
+    }
+
+    /// A removal killed at its deadline (here by a clean filter that never
+    /// returns, which `git worktree remove` runs to check the tree is clean)
+    /// can leave a half-deleted tree that reads as uncommitted changes from
+    /// then on, so the error says how to finish it.
+    #[test]
+    #[cfg(unix)]
+    fn a_worktree_removal_killed_at_its_deadline_says_how_to_finish_it() {
+        let repo = fixture_repo();
+        let roots = tempfile::tempdir().unwrap();
+        let created = ensure_worktree(repo.path(), roots.path(), &issue(), "HEAD").unwrap();
+        run(
+            repo.path(),
+            &["config", "filter.slow.clean", "sleep 30; cat"],
+        );
+        std::fs::write(repo.path().join(".git/info/attributes"), "* filter=slow\n").unwrap();
+        // A stat change makes the clean check run the filter.
+        std::fs::File::options()
+            .write(true)
+            .open(created.path.join("README.md"))
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600))
+            .unwrap();
+        let started = std::time::Instant::now();
+        let err = with_checkout_timeout(std::time::Duration::from_secs(2), || {
+            worktree_remove(repo.path(), &created.path)
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "the filter was waited out"
+        );
+        let finish = format!(
+            "git worktree remove --force {}",
+            shell_quoted(&created.path.to_string_lossy())
+        );
+        assert!(err.contains("killed") && err.contains(&finish), "{err}");
     }
 }
