@@ -31,8 +31,20 @@ pub struct ProcessRow {
 }
 
 impl ProcessRow {
+    /// Whether the row is a running process rather than a zombie. Linux's
+    /// `ps` shows `Zl` for a process whose main thread called `pthread_exit`
+    /// while another thread runs (measured): it still runs and still takes
+    /// SIGKILL, so it is active. macOS's `ps` has no `l` flag.
     pub fn active(&self) -> bool {
-        !self.stat.starts_with('Z')
+        !self.stat.starts_with('Z') || self.stat.contains('l')
+    }
+
+    /// Whether cleanup's SIGSTOP shows on the row. An active `Z` row (see
+    /// [`Self::active`]) counts: its dead leader's `Z` stays in `ps` after
+    /// the stop reaches its live threads (measured), as it did when such a
+    /// row counted as inactive and was never waited for.
+    pub(crate) fn stopped(&self) -> bool {
+        self.stat.starts_with('T') || self.stat.starts_with('Z')
     }
 
     /// ps does not preserve argv boundaries. Only argv words the harness
@@ -1105,15 +1117,21 @@ fn kernel_observation(pid: u32) -> Result<Option<KernelProcess>, String> {
 }
 
 /// One process's kernel record from the text of its Linux
-/// `/proc/<pid>/stat`, or `None` once it has exited, a zombie (`Z`) or a
-/// dead process (`X`) included, as macOS's `kinfo_proc` reads `SZOMB`. A
-/// zombie nobody reaps (a container whose PID 1 never waits) would
-/// otherwise hold everything waiting on its birth for ever. Its PID stays
-/// reserved, so nothing reads a reuse under it meanwhile; and a zombie
-/// takes no signal, so calling it gone skips only a no-op. The comm, in
-/// parentheses, is whatever the process named itself, spaces and `)`
-/// included, so every field after it is read after the LAST `)`. Linux
-/// only, but tested everywhere.
+/// `/proc/<pid>/stat`, or `None` once it has exited, a zombie or a dead
+/// process (`X`) included, as macOS's `kinfo_proc` reads `SZOMB`. A zombie
+/// nobody reaps (a container whose PID 1 never waits) would otherwise hold
+/// everything waiting on its birth for ever. Its PID stays reserved, so
+/// nothing reads a reuse under it meanwhile, and it runs nothing, so
+/// skipping its signal changes nothing.
+///
+/// `Z` alone does not make a zombie: a process whose main thread called
+/// `pthread_exit` while another thread runs reads `Z` too, with
+/// `num_threads` (field 20) of 2 or more (measured). It still runs and
+/// still takes SIGKILL, so it is read as running; only a `Z` with at most
+/// one thread is a zombie, and a `Z` whose thread count cannot be read is an
+/// error, never "exited". The comm, in parentheses, is whatever the process
+/// named itself, spaces and `)` included, so every field after it is read
+/// after the LAST `)`. Linux only, but tested everywhere.
 #[cfg(any(target_os = "linux", test))]
 fn kernel_process_from_stat(pid: u32, text: &str) -> Result<Option<KernelProcess>, String> {
     let fields = text
@@ -1131,8 +1149,19 @@ fn kernel_process_from_stat(pid: u32, text: &str) -> Result<Option<KernelProcess
     if record_pid != pid {
         return Err("kernel process identity mismatch".into());
     }
-    if matches!(fields.first(), Some(&("Z" | "X"))) {
-        return Ok(None);
+    match fields.first() {
+        Some(&"X") => return Ok(None),
+        Some(&"Z") => {
+            let threads: u64 = fields
+                .get(17)
+                .ok_or("missing proc thread count")?
+                .parse()
+                .map_err(|_| "invalid proc thread count")?;
+            if threads <= 1 {
+                return Ok(None);
+            }
+        }
+        _ => {}
     }
     let start = fields
         .get(19)
@@ -2233,7 +2262,7 @@ impl ProcessTracker {
                             && !self.refused.contains(&r.pid)
                             && self.known.iter().any(|(k, _)| k.pid == r.pid)
                     })
-                    .all(|r| r.stat.starts_with('T'));
+                    .all(ProcessRow::stopped);
                 if before == self.known.len() && stopped {
                     stable = true;
                     break;
@@ -3967,10 +3996,73 @@ pub(crate) mod tests {
     /// A Linux `/proc/<pid>/stat` line: pid, comm in parentheses, then state
     /// and the rest, with starttime as field 22 (index 19 after comm).
     fn proc_stat_line(pid: u32, comm: &str, state: char) -> String {
+        proc_stat_line_with_threads(pid, comm, state, "1")
+    }
+
+    /// [`proc_stat_line`] with `threads` as `num_threads` (field 20).
+    fn proc_stat_line_with_threads(pid: u32, comm: &str, state: char, threads: &str) -> String {
         format!(
-            "{pid} ({comm}) {state} 300 {pid} {pid} 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 \
+            "{pid} ({comm}) {state} 300 {pid} {pid} 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 {threads} 0 \
              12345 1000000 200 18446744073709551615 1 1 0 0 0 0 0 0 0 0 0 0 17 3 0 0 0 0 0"
         )
+    }
+
+    /// A process whose main thread called `pthread_exit` while another
+    /// thread runs reads `Z` with `num_threads` 2 (measured in a Linux
+    /// container): it still runs and still takes SIGKILL, so it is never
+    /// read as exited. Only a `Z` with one thread or none is a zombie, and a
+    /// thread count that cannot be read on a `Z` line fails closed.
+    #[test]
+    fn a_linux_stat_reads_a_multithreaded_zombie_leader_as_running() {
+        assert_eq!(
+            kernel_process_from_stat(42, &proc_stat_line_with_threads(42, "sh", 'Z', "2")),
+            Ok(Some(KernelProcess {
+                pid: 42,
+                ppid: 300,
+                pgid: 42,
+                birth: Birth(12345, 0),
+            }))
+        );
+        assert_eq!(
+            kernel_process_from_stat(42, &proc_stat_line_with_threads(42, "sh", 'Z', "0")),
+            Ok(None)
+        );
+        assert!(
+            kernel_process_from_stat(42, &proc_stat_line_with_threads(42, "sh", 'Z', "many"))
+                .is_err()
+        );
+        assert!(kernel_process_from_stat(42, "42 (sh) Z 300 42 42").is_err());
+        // A dead task is gone whatever its thread count reads.
+        assert_eq!(
+            kernel_process_from_stat(42, &proc_stat_line_with_threads(42, "sh", 'X', "2")),
+            Ok(None)
+        );
+    }
+
+    /// `ps` shows that same process as `Zl` (measured, procps on Debian):
+    /// a multithreaded zombie leader, still running, so still active. A
+    /// plain `Z` is a zombie.
+    #[test]
+    fn a_ps_row_for_a_multithreaded_zombie_leader_is_active() {
+        let row = |stat: &str| ProcessRow {
+            pid: 42,
+            ppid: 1,
+            pgid: 42,
+            stat: stat.into(),
+            args: "[python3] <defunct>".into(),
+        };
+        assert!(row("Zl").active());
+        assert!(row("Zl+").active());
+        assert!(!row("Z").active());
+        assert!(!row("Z+").active());
+        assert!(!row("Zs").active());
+        assert!(row("Sl").active());
+        // After SIGSTOP its live thread is `T`, but `ps` still shows the
+        // dead leader's `Zl` (measured), so cleanup counts it as stopped
+        // rather than waiting for a `T` that never comes.
+        assert!(row("Zl").stopped());
+        assert!(row("T").stopped() && row("Tl").stopped());
+        assert!(!row("Sl").stopped() && !row("R").stopped());
     }
 
     /// Linux reads, like macOS's `kinfo_proc`, count a zombie or a dead
