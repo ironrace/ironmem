@@ -994,12 +994,13 @@ enum SigningViolation {
     /// The issue branch is gone, so nothing that ships can be checked.
     MissingBranch { branch: String },
     /// Commits on the branch are unsigned or carry a bad signature: short
-    /// shas, newest first, and the remote the recipe pushes to.
+    /// shas, newest first, and the remote the recipe pushes to, if one can
+    /// be named.
     Unsigned {
         flagged: Vec<String>,
         cut: String,
         branch: String,
-        remote: String,
+        remote: Option<String>,
     },
 }
 
@@ -1024,7 +1025,7 @@ impl std::fmt::Display for SigningViolation {
                 cut,
                 branch,
                 remote,
-            } => f.write_str(&unsigned_violation(flagged, cut, branch, remote)),
+            } => f.write_str(&unsigned_violation(flagged, cut, branch, remote.as_deref())),
         }
     }
 }
@@ -1616,16 +1617,20 @@ fn check_range(
             identity: identity.unwrap_or_default().join(" or "),
         });
     }
-    // The recipe pushes to the remote that already tracks the issue branch
-    // (`origin` first when several do), else the only remote, else `origin`,
-    // as the goal condition's push clause does.
+    // The recipe force-pushes where the goal condition's push clause does
+    // (`worktree::pick_push_remote`), less its first step: the guard has no
+    // issue repo, and the flagged commits matter where they were pushed. So
+    // the remote already tracking the issue branch (`origin` first), else a
+    // configured `origin`, else the only remote, else none.
+    let remotes: Vec<(&str, Option<&str>)> =
+        configured.iter().map(|remote| (*remote, None)).collect();
     let tracking: Vec<&str> = own.iter().map(|(remote, _)| *remote).collect();
-    let remote = worktree::pick_push_remote(&configured, &tracking);
+    let remote = worktree::pick_push_remote(&remotes, &tracking, None);
     Ok(Some(SigningViolation::Unsigned {
         flagged: flagged.into_iter().map(|(sha, _)| sha).collect(),
         cut: worktree.cut.to_string(),
         branch: branch.to_string(),
-        remote: remote.to_string(),
+        remote: remote.map(str::to_string),
     }))
 }
 
@@ -1829,7 +1834,7 @@ const NAMED_UNSIGNED_COMMITS: usize = 5;
 /// which the guard deliberately does not blame. It is a plain rebase, not
 /// `--rebase-merges`: that would also re-pick, and so rewrite, the upstream
 /// commits on a merged-in side, so a merge is redone by hand instead.
-fn unsigned_violation(flagged: &[String], cut: &str, branch: &str, remote: &str) -> String {
+fn unsigned_violation(flagged: &[String], cut: &str, branch: &str, remote: Option<&str>) -> String {
     let mut list = flagged
         .iter()
         .take(NAMED_UNSIGNED_COMMITS)
@@ -1844,14 +1849,21 @@ fn unsigned_violation(flagged: &[String], cut: &str, branch: &str, remote: &str)
     }
     let oldest = flagged.last().map(String::as_str).unwrap_or_default();
     let short_cut = prefix(cut, SHORT_SHA_CHARS);
+    let push = match remote {
+        Some(remote) => format!("`git push --force-with-lease {remote} {branch}`"),
+        None => format!(
+            "`git push --force-with-lease <remote> {branch}`, naming the remote of the issue's \
+             repository"
+        ),
+    };
     format!(
         "commit.gpgsign is on, but commit(s) {list} on this branch since its cut {short_cut} are \
          unsigned or carry a bad signature. Re-sign only these commits, never upstream ones \
          merged in. First `git checkout {branch}`. Then, if only the tip is flagged, `git commit \
          --amend --no-edit -S`; otherwise `git rebase --exec 'git commit --amend --no-edit -S' \
          {oldest}^`. If a merge commit is flagged or lies in that rebase's range, redo the merge \
-         (signed) instead of rebasing over it. Then `git push --force-with-lease {remote} \
-         {branch}`. If signing fails in your environment, return \
+         (signed) instead of rebasing over it. Then {push}. If signing fails in your \
+         environment, return \
          verdict impossible with the signing error; never bypass with -c commit.gpgsign=false, \
          --no-gpg-sign, or by changing git config."
     )
@@ -2731,7 +2743,8 @@ pub fn run_issue(
                 // that the IC will actually be committing onto.
                 branch: &worktree.branch,
                 // No upstream: the push clause names the remote too.
-                remote: &worktree::push_remote(&worktree.path, &worktree.branch),
+                remote: worktree::push_remote(&worktree.path, &worktree.branch, &issue.repo)
+                    .as_deref(),
                 gate_commands: &gate_commands,
                 n_turns: config.n_turns,
             }) {
@@ -6298,14 +6311,15 @@ sleep 0.5
         );
         assert!(violation.contains("merge"), "{violation}");
         // It acts on the issue branch, never on wherever HEAD was left, and
-        // pushes it by name (no remote-tracking ref yet: `origin`).
+        // pushes it by name. This checkout has no remote at all, so none is
+        // named: never an `origin` that does not exist.
         assert!(
             violation.contains(&format!("`git checkout {}`", wt.branch)),
             "{violation}"
         );
         assert!(
             violation.contains(&format!(
-                "`git push --force-with-lease origin {}`",
+                "`git push --force-with-lease <remote> {}`",
                 wt.branch
             )),
             "{violation}"
@@ -6697,6 +6711,24 @@ sleep 0.5
     /// with the prompt's fixed text rather than being dropped.
     const MAX_VIOLATION_CHARS: usize = turn_prompt::MAX_CONDITION_CHARS / 3;
 
+    /// With no remote it can name, the recipe says which one to push to
+    /// rather than naming one that may not exist.
+    #[test]
+    fn a_recipe_with_no_remote_names_none() {
+        let violation = SigningViolation::Unsigned {
+            flagged: vec!["abc123".into()],
+            cut: "c".repeat(40),
+            branch: "autopilot/o-r-1".into(),
+            remote: None,
+        }
+        .to_string();
+        assert!(
+            violation.contains("`git push --force-with-lease <remote> autopilot/o-r-1`"),
+            "{violation}"
+        );
+        assert!(violation.contains("the issue's repository"), "{violation}");
+    }
+
     #[test]
     fn the_longest_violation_fits_its_share_of_the_turn_prompt() {
         // GitHub's longest owner (39) and repository (100) names.
@@ -6709,7 +6741,7 @@ sleep 0.5
             flagged,
             cut: "c".repeat(64),
             branch,
-            remote: "r".repeat(40),
+            remote: Some("r".repeat(40)),
         }
         .to_string();
         assert!(

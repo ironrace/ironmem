@@ -81,42 +81,104 @@ pub fn branch_name(issue: &IssueRef) -> String {
     format!("{BRANCH_PREFIX}/{}", issue.slug())
 }
 
-/// The remote a push of an issue branch names, from the `configured`
-/// remotes and those already `tracking` it (having
-/// `refs/remotes/<remote>/<branch>`): a tracking one (`origin` first when
-/// several are), else the only configured remote, else `origin`. The issue
-/// branch has no upstream, so every push names its remote and branch.
-pub(crate) fn pick_push_remote<'a>(configured: &[&'a str], tracking: &[&'a str]) -> &'a str {
-    tracking
-        .iter()
-        .copied()
-        .find(|remote| *remote == "origin")
-        .or_else(|| tracking.first().copied())
-        .or_else(|| (configured.len() == 1).then(|| configured[0]))
-        .unwrap_or("origin")
+/// Whether a remote `url` names the GitHub repository `repo` (`owner/name`),
+/// in one of the forms GitHub hands out: `https://github.com/O/N`,
+/// `git@github.com:O/N` or `ssh://git@github.com/O/N`, each with or
+/// without `.git` (and a trailing `/`), compared without regard to case.
+/// Any other host or form names no repository here.
+pub(crate) fn url_names_github_repo(url: &str, repo: &str) -> bool {
+    let url = url.trim().to_ascii_lowercase();
+    let Some(path) = [
+        "https://github.com/",
+        "git@github.com:",
+        "ssh://git@github.com/",
+    ]
+    .iter()
+    .find_map(|prefix| url.strip_prefix(prefix)) else {
+        return false;
+    };
+    let path = path.strip_suffix('/').unwrap_or(path);
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    match path.split_once('/') {
+        Some((owner, name)) if !owner.is_empty() && !name.is_empty() && !name.contains('/') => {
+            path == repo.to_ascii_lowercase()
+        }
+        _ => false,
+    }
 }
 
-/// [`pick_push_remote`] for `branch` in the repository at `dir`. A remote
-/// list that cannot be read counts as none, which names `origin`.
-pub(crate) fn push_remote(dir: &Path, branch: &str) -> String {
-    let configured = git(dir, &["remote"]).unwrap_or_default();
-    let configured: Vec<&str> = configured
-        .lines()
-        .map(str::trim)
-        .filter(|remote| !remote.is_empty())
-        .collect();
+/// The remote a push of an issue branch names, from the configured
+/// `remotes` (name and fetch URL, when known), those already `tracking` the
+/// branch (having `refs/remotes/<remote>/<branch>`), and the issue's `repo`:
+///
+/// 1. the remote whose URL names `repo` ([`url_names_github_repo`]), where
+///    `gh pr create --head` looks for the branch (`origin` first when
+///    several do);
+/// 2. else one already tracking the branch (`origin` first);
+/// 3. else `origin`, only when it is configured;
+/// 4. else the only configured remote;
+/// 5. else none: no remote is named rather than one that may not exist.
+///
+/// The issue branch has no upstream, so a push names its remote when one is
+/// known.
+pub(crate) fn pick_push_remote<'a>(
+    remotes: &[(&'a str, Option<&str>)],
+    tracking: &[&'a str],
+    repo: Option<&str>,
+) -> Option<&'a str> {
+    let origin_first = |names: Vec<&'a str>| {
+        names
+            .iter()
+            .copied()
+            .find(|name| *name == "origin")
+            .or_else(|| names.first().copied())
+    };
+    let naming_repo = repo.map_or_else(Vec::new, |repo| {
+        remotes
+            .iter()
+            .filter(|(_, url)| url.is_some_and(|url| url_names_github_repo(url, repo)))
+            .map(|(name, _)| *name)
+            .collect()
+    });
+    origin_first(naming_repo)
+        .or_else(|| origin_first(tracking.to_vec()))
+        .or_else(|| {
+            remotes
+                .iter()
+                .map(|(name, _)| *name)
+                .find(|name| *name == "origin")
+        })
+        .or_else(|| (remotes.len() == 1).then(|| remotes[0].0))
+}
+
+/// [`pick_push_remote`] for `branch` of `repo` in the repository at `dir`,
+/// from `git remote -v`'s fetch URLs. A remote list that cannot be read
+/// counts as none.
+pub(crate) fn push_remote(dir: &Path, branch: &str, repo: &str) -> Option<String> {
+    let listed = git(dir, &["remote", "-v"]).unwrap_or_default();
+    let mut remotes: Vec<(&str, Option<&str>)> = Vec::new();
+    for line in listed.lines() {
+        let Some((name, rest)) = line.split_once('\t') else {
+            continue;
+        };
+        let url = rest.strip_suffix(" (fetch)");
+        if url.is_some() || !remotes.iter().any(|(known, _)| *known == name) {
+            remotes.retain(|(known, _)| *known != name);
+            remotes.push((name, url));
+        }
+    }
     let refs = git(
         dir,
         &["for-each-ref", "--format=%(refname)", "refs/remotes/"],
     )
     .unwrap_or_default();
     let refs: std::collections::HashSet<&str> = refs.lines().collect();
-    let tracking: Vec<&str> = configured
+    let tracking: Vec<&str> = remotes
         .iter()
-        .copied()
-        .filter(|remote| refs.contains(format!("refs/remotes/{remote}/{branch}").as_str()))
+        .map(|(name, _)| *name)
+        .filter(|name| refs.contains(format!("refs/remotes/{name}/{branch}").as_str()))
         .collect();
-    pick_push_remote(&configured, &tracking).to_string()
+    pick_push_remote(&remotes, &tracking, Some(repo)).map(str::to_string)
 }
 
 /// Where an issue's worktree lives under `worktree_root`.
@@ -1837,18 +1899,96 @@ mod tests {
     }
 
     #[test]
-    fn the_push_remote_is_the_one_tracking_the_branch_else_the_only_one_else_origin() {
+    fn a_remote_url_names_its_github_repo_in_each_form() {
+        for url in [
+            "https://github.com/Owner/Repo",
+            "https://github.com/owner/repo.git",
+            "https://GitHub.com/owner/repo/",
+            "git@github.com:owner/repo.git",
+            "git@github.com:OWNER/REPO",
+            "ssh://git@github.com/owner/repo.git",
+            "ssh://git@github.com/owner/repo",
+        ] {
+            assert!(url_names_github_repo(url, "owner/repo"), "{url}");
+        }
+        for url in [
+            "https://github.com/owner/other",
+            "https://github.com/fork/repo.git",
+            "https://gitlab.com/owner/repo.git",
+            "git@gitlab.com:owner/repo.git",
+            "https://github.com/owner/repo/extra",
+            "https://github.com/owner",
+            "/srv/git/owner/repo.git",
+        ] {
+            assert!(!url_names_github_repo(url, "owner/repo"), "{url}");
+        }
+    }
+
+    #[test]
+    fn the_push_remote_is_the_issue_repos_then_the_tracking_one_then_a_configured_origin() {
+        let repo = Some("owner/repo");
+        let fork = Some("https://github.com/someone/repo.git");
+        let upstream = Some("git@github.com:owner/repo.git");
+        // A fork `origin` loses to the remote that names the issue's repo,
+        // even when the fork already has the branch.
         assert_eq!(
-            pick_push_remote(&["fork", "origin"], &["fork", "origin"]),
-            "origin"
+            pick_push_remote(&[("origin", fork), ("up", upstream)], &["origin"], repo),
+            Some("up")
         );
-        assert_eq!(pick_push_remote(&["fork", "origin"], &["fork"]), "fork");
-        assert_eq!(pick_push_remote(&["fork"], &[]), "fork");
-        assert_eq!(pick_push_remote(&["fork", "up"], &[]), "origin");
-        assert_eq!(pick_push_remote(&[], &[]), "origin");
-        let (repo, _origin) = fixture_repo_with_origin();
-        run(repo.path(), &["remote", "rename", "origin", "fork"]);
-        assert_eq!(push_remote(repo.path(), &branch_name(&issue())), "fork");
+        // No URL names it: the remote already tracking the branch.
+        assert_eq!(
+            pick_push_remote(&[("origin", fork), ("mine", None)], &["mine"], repo),
+            Some("mine")
+        );
+        assert_eq!(
+            pick_push_remote(&[("a", None), ("origin", None)], &["a", "origin"], None),
+            Some("origin")
+        );
+        // Then `origin`, only when it is configured; then the only remote.
+        assert_eq!(
+            pick_push_remote(&[("a", None), ("origin", None)], &[], None),
+            Some("origin")
+        );
+        assert_eq!(pick_push_remote(&[("fork", None)], &[], repo), Some("fork"));
+        // Otherwise none: a missing `origin` is never named.
+        assert_eq!(
+            pick_push_remote(&[("github", fork), ("gitlab", None)], &[], repo),
+            None
+        );
+        assert_eq!(pick_push_remote(&[], &[], repo), None);
+
+        let (checkout, _origin) = fixture_repo_with_origin();
+        let dir = checkout.path();
+        let branch = branch_name(&issue());
+        run(
+            dir,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://github.com/fork/ironmem.git",
+            ],
+        );
+        run(
+            dir,
+            &[
+                "remote",
+                "add",
+                "upstream",
+                "git@github.com:IronRace/IronMem.git",
+            ],
+        );
+        assert_eq!(
+            push_remote(dir, &branch, &issue().repo).as_deref(),
+            Some("upstream")
+        );
+        run(dir, &["remote", "remove", "upstream"]);
+        run(dir, &["remote", "rename", "origin", "github"]);
+        run(
+            dir,
+            &["remote", "add", "gitlab", "https://gitlab.com/x/y.git"],
+        );
+        assert_eq!(push_remote(dir, &branch, &issue().repo), None);
     }
 
     /// The issue branch has no upstream, even from a remote-tracking base
