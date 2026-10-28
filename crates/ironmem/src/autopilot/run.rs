@@ -1511,9 +1511,17 @@ fn signing_violation(
 /// The controller's `GIT_COMMITTER_EMAIL`, when `implementer` inherits it
 /// and so may commit under it ([`Implementer::inherits_controller_git_env`]).
 fn controller_git_email(implementer: Implementer) -> Option<String> {
+    controller_git_email_from(implementer, &|key| std::env::var(key).ok())
+}
+
+/// [`controller_git_email`], with the environment read through `env`.
+fn controller_git_email_from(
+    implementer: Implementer,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Option<String> {
     implementer
         .inherits_controller_git_env()
-        .then(|| std::env::var("GIT_COMMITTER_EMAIL").ok())
+        .then(|| env("GIT_COMMITTER_EMAIL"))
         .flatten()
 }
 
@@ -6754,6 +6762,23 @@ sleep 0.5
                 "{implementer:?}: {emails:?}"
             );
         }
+    }
+
+    /// G-M16: the controller's committer email is read for Claude only.
+    #[test]
+    fn the_controllers_git_email_is_read_only_for_a_harness_that_inherits_it() {
+        let env = |key: &str| (key == "GIT_COMMITTER_EMAIL").then(|| "ops@corp.test".to_string());
+        assert_eq!(
+            controller_git_email_from(Implementer::Claude, &env).as_deref(),
+            Some("ops@corp.test")
+        );
+        for implementer in [Implementer::Codex, Implementer::Muse] {
+            assert_eq!(controller_git_email_from(implementer, &env), None);
+        }
+        assert_eq!(
+            controller_git_email_from(Implementer::Claude, &|_| None),
+            None
+        );
     }
 
     /// F85: an unreadable remote list names only the holders, never a guess

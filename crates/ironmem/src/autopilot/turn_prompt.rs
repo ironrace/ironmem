@@ -302,6 +302,24 @@ These answers are decisions, not suggestions — follow them:\n",
     section
 }
 
+/// The longest remote name the push clause quotes.
+const MAX_QUOTED_REMOTE_CHARS: usize = 64;
+
+/// Whether `remote` may be quoted in the push clause: short, only
+/// `[A-Za-z0-9._/-]`, and not starting with `-`. A remote is named in the
+/// repository's config, which an agent can write; one that is very long,
+/// carries a backtick or a newline, or reads as an option would break or
+/// bloat the condition, so the clause names the branch only instead.
+fn is_quotable_remote(remote: &str) -> bool {
+    // A leading `-` would read as an option to `git push`.
+    !remote.is_empty()
+        && !remote.starts_with('-')
+        && remote.len() <= MAX_QUOTED_REMOTE_CHARS
+        && remote
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'/' | b'-'))
+}
+
 /// Render the `/goal` condition text for one IC dispatch.
 ///
 /// # Panics
@@ -369,22 +387,6 @@ These answers are decisions, not suggestions — follow them:\n",
 /// says why in the IC's own terms. The two halves are composed here rather
 /// than stored joined, so a reviewer that gave no reason still gets a coherent
 /// instruction.
-/// The longest remote name the push clause quotes.
-const MAX_QUOTED_REMOTE_CHARS: usize = 64;
-
-/// Whether `remote` may be quoted in the push clause: short, and only
-/// `[A-Za-z0-9._/-]`. A remote is named in the repository's config, which an
-/// agent can write; one that is very long, or carries a backtick or a
-/// newline, would break or bloat the condition, so the clause names the
-/// branch only instead.
-fn is_quotable_remote(remote: &str) -> bool {
-    !remote.is_empty()
-        && remote.len() <= MAX_QUOTED_REMOTE_CHARS
-        && remote
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'/' | b'-'))
-}
-
 pub fn render(inputs: &TurnPromptInputs) -> Result<String, ConditionTooLong> {
     assert!(
         inputs.n_turns >= 1,
@@ -773,7 +775,7 @@ platform limit, got {}",
     #[test]
     fn a_remote_that_cannot_be_quoted_safely_leaves_the_branch_only_clause() {
         let long = "r".repeat(3000);
-        for remote in [long.as_str(), "fo`o", "a b", "x\ny", ""] {
+        for remote in [long.as_str(), "fo`o", "a b", "x\ny", "", "--force", "-o"] {
             let text = ordinary_text_on("autopilot/owner-repo-7", Some(remote));
             let gate_at = text.find("The gate condition for this repo").unwrap();
             let condition = &text[gate_at..];

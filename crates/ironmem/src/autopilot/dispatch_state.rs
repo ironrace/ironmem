@@ -583,6 +583,9 @@ pub(crate) struct DispatchStateScan {
     pub unreadable: Vec<(String, String)>,
 }
 
+/// How much of why a drawer cannot be read [`scan_dispatch_states`] keeps.
+const UNREADABLE_REASON_CHARS: usize = 300;
+
 /// [`all_dispatch_states`], also naming the drawers it could not read.
 pub(crate) fn scan_dispatch_states(
     db: &Database,
@@ -598,13 +601,16 @@ pub(crate) fn scan_dispatch_states(
     for drawer in drawers {
         match state_from_content(&drawer.content) {
             Ok(state) => scan.states.push(state),
+            // Scrubbed and bounded once, here: a parse error can quote the
+            // drawer, and every reader (the queue, reconcile, the tick's
+            // problems) reports it.
             Err(why) => scan.unreadable.push((
                 drawer
                     .source_file
                     .strip_prefix(crate::mcp::tools::LOGICAL_KEY_SOURCE_PREFIX)
                     .unwrap_or(&drawer.source_file)
                     .to_string(),
-                why.to_string(),
+                super::scrub::scrub_and_bound(&why.to_string(), UNREADABLE_REASON_CHARS).text,
             )),
         }
     }
@@ -1160,5 +1166,13 @@ mod tests {
         assert_eq!(scan.unreadable.len(), 1);
         assert_eq!(scan.unreadable[0].0, corrupt);
         assert!(!scan.unreadable[0].1.is_empty());
+        // Bounded however long the parse error.
+        let long = format!("{DISPATCH_STATE_KEY_PREFIX}long-1");
+        super::super::write_current(&db, &long, &format!("{{\"x\": {}", "1".repeat(5000))).unwrap();
+        let scan = scan_dispatch_states(&db, 100).unwrap();
+        assert!(scan
+            .unreadable
+            .iter()
+            .all(|(_, why)| why.chars().count() <= UNREADABLE_REASON_CHARS + 1));
     }
 }
