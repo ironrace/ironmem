@@ -19,7 +19,13 @@ use crate::autopilot::scrub::scrub_and_bound;
 use crate::autopilot::IssueRef;
 use crate::error::MemoryError;
 
+/// The strict verdict JSON schema (`verdict` of `met`, `impossible` or
+/// `not_met`, plus a `reason`) written to every invocation's `schema.json`,
+/// whichever harness runs it. Its path is the invocation's process marker.
 pub const VERDICT_JSON_SCHEMA: &str = super::dispatch::IC_VERDICT_JSON_SCHEMA;
+/// The default wall-clock ceiling, in seconds, of every supervised harness
+/// invocation (Codex and Muse) unless `DispatchSpec::wall_clock_timeout`
+/// sets one. Past it the process tree is killed and the run reads timed out.
 pub const SUPERVISED_DISPATCH_TIMEOUT_SECS: u64 = 1200;
 /// The journal cap a harness gets unless it says otherwise
 /// ([`SupervisedCli::journal_limit`]), sized against Codex's JSONL stream.

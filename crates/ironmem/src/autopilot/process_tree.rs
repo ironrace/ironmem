@@ -353,6 +353,11 @@ pub(crate) fn marker_issue_slug(marker: &str) -> Option<&str> {
         .and_then(|name| name.to_str())
 }
 
+/// Rows of `ps -o pid=,ppid=,pgid=,stat=,args=` output, one per non-blank
+/// line. Only splits the columns: the first four are whitespace-separated and
+/// the rest of the line is the command. Reading a supervised harness's
+/// invocation marker out of that command (Codex or Muse alike) is
+/// [`ProcessRow::marker`]'s job, not this one's.
 pub fn parse_processes(text: &str) -> Result<Vec<ProcessRow>, String> {
     text.lines()
         .filter(|s| !s.trim().is_empty())
@@ -392,10 +397,17 @@ pub enum ProcessSnapshot {
     Unavailable { reason: String },
 }
 
+/// Where process-table rows come from: the real `ps` ([`UnixProcesses`]) or
+/// a test's fixture. Every supervised harness (Codex, Muse) is judged from
+/// the same rows.
 pub trait ProcessSource {
+    /// The whole process table, or why it could not be read.
     fn list(&mut self) -> Result<Vec<ProcessRow>, String>;
 }
 
+/// The machine's process table from a bounded `ps -axww` run: two seconds
+/// and 16 MiB at most, so a hung or flooding `ps` cannot stall supervision.
+/// Unsupported off Unix.
 pub struct UnixProcesses;
 impl ProcessSource for UnixProcesses {
     fn list(&mut self) -> Result<Vec<ProcessRow>, String> {
@@ -497,6 +509,9 @@ fn bounded_process_table() -> Result<Vec<u8>, String> {
     result
 }
 
+/// One reading of `source`: the rows, or why they are unavailable. Liveness,
+/// recovery and clearing decisions for every supervised harness take this,
+/// and an unavailable table decides nothing.
 pub fn snapshot(source: &mut dyn ProcessSource) -> ProcessSnapshot {
     match source.list() {
         Ok(rows) => ProcessSnapshot::Available(rows),
@@ -1552,7 +1567,6 @@ pub(crate) const QUIET_POLL: std::time::Duration = std::time::Duration::from_mil
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CwdProcess {
     pid: u32,
-    uid: u32,
     birth: Birth,
     cwd: PathBuf,
 }
@@ -1647,12 +1661,7 @@ fn scan_cwds<O: Into<ProcOwner>>(
             Some((_, after)) if after == birth => {}
             Some(_) => return Err(format!("process {pid} was replaced during the scan").into()),
         }
-        processes.push(CwdProcess {
-            pid,
-            uid,
-            birth,
-            cwd,
-        });
+        processes.push(CwdProcess { pid, birth, cwd });
     }
     Ok(processes)
 }
@@ -1962,6 +1971,18 @@ fn is_shared_daemon(
 /// within it; anything longer is held and finished by recovery once gone.
 pub(crate) const QUIET_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// How many processes an operator-facing hold names before it says how many
+/// more there are.
+const NAMED_PROCESSES: usize = 5;
+
+/// How many process-table parents [`QuietCheck::in_shared_daemon_tree`]
+/// climbs looking for the shared daemon before it gives up.
+const DAEMON_ANCESTRY_DEPTH: usize = 64;
+
+/// How many times [`ProcessTracker::verify_gone`] samples, 10 ms apart, for
+/// the killed tree to leave the process table.
+const VERIFY_GONE_ATTEMPTS: usize = 100;
+
 /// Whether the worktree held no process the invocation could have started.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Quiet {
@@ -2083,12 +2104,7 @@ impl<'a> QuietCheck<'a> {
         let me = std::process::id();
         let candidates: Vec<CwdProcess> = scanned
             .into_iter()
-            .filter(|p| {
-                p.uid == self.uid
-                    && p.pid != me
-                    && p.birth >= self.spawned
-                    && p.cwd.starts_with(&self.worktree)
-            })
+            .filter(|p| p.pid != me && p.birth >= self.spawned && p.cwd.starts_with(&self.worktree))
             .collect();
         if candidates.is_empty() {
             return Ok(Vec::new());
@@ -2113,11 +2129,10 @@ impl<'a> QuietCheck<'a> {
     }
 
     fn describe(&self, found: &[(u32, Birth, String)]) -> String {
-        const NAMED: usize = 5;
-        let more = found.len().saturating_sub(NAMED);
+        let more = found.len().saturating_sub(NAMED_PROCESSES);
         let mut named = found
             .iter()
-            .take(NAMED)
+            .take(NAMED_PROCESSES)
             .map(|(_, _, named)| named.as_str())
             .collect::<Vec<_>>()
             .join(", ");
@@ -2134,7 +2149,7 @@ impl<'a> QuietCheck<'a> {
     /// one of the daemon's children, which the tracker never owns either.
     fn in_shared_daemon_tree(&self, pid: u32, rows: &[ProcessRow]) -> bool {
         let mut current = pid;
-        for _ in 0..64 {
+        for _ in 0..DAEMON_ANCESTRY_DEPTH {
             let Some(row) = rows.iter().find(|r| r.pid == current && r.active()) else {
                 return false;
             };
@@ -2572,7 +2587,7 @@ impl ProcessTracker {
         self.verify_gone()
     }
     pub(crate) fn verify_gone(&self) -> Result<(), MemoryError> {
-        for _ in 0..100 {
+        for _ in 0..VERIFY_GONE_ATTEMPTS {
             let rows = Self::rows()?;
             let mut live = false;
             // One cleanup may not signal is evidence, not a failure: it is
@@ -2752,7 +2767,7 @@ impl ProcessTracker {
         }
         let named = held
             .iter()
-            .take(5)
+            .take(NAMED_PROCESSES)
             .map(|(pid, _)| {
                 let ruid = real_and_effective_uid(*pid)
                     .map_or_else(|| "unknown".to_owned(), |(ruid, _)| ruid.to_string());
@@ -2763,7 +2778,11 @@ impl ProcessTracker {
         let reason = format!(
             "cleanup was not permitted to signal {named}{}, started by the invocation; \
              completion waits until it is gone",
-            if held.len() > 5 { " and more" } else { "" }
+            if held.len() > NAMED_PROCESSES {
+                " and more"
+            } else {
+                ""
+            }
         );
         Ok(Quiet::Held(match quiet {
             Quiet::Held(mut hold) => {
@@ -3744,9 +3763,8 @@ pub(crate) mod tests {
             args_row(30, 1, 30, DAEMON_DB),
             args_row(31, 30, 30, "/opt/homebrew/bin/node mcp-helper"),
         ];
-        let process = |pid, uid, start, cwd: &Path| CwdProcess {
+        let process = |pid, start, cwd: &Path| CwdProcess {
             pid,
-            uid,
             birth: Birth(start, 0),
             cwd: cwd.to_path_buf(),
         };
@@ -3767,7 +3785,7 @@ pub(crate) mod tests {
             }
         };
         for started in [100, 150] {
-            let err = check(&tracker, process(40, uid, started, &worktree.join("src")))
+            let err = check(&tracker, process(40, started, &worktree.join("src")))
                 .unwrap_err()
                 .to_string();
             assert!(
@@ -3776,19 +3794,18 @@ pub(crate) mod tests {
             );
         }
         for ignored in [
-            process(40, uid, 99, &worktree),
-            process(40, uid + 1, 150, &worktree),
-            process(me, uid, 150, &worktree),
-            process(30, uid, 150, &worktree),
-            process(31, uid, 150, &worktree),
-            process(40, uid, 150, Path::new("/elsewhere")),
-            process(40, uid, 150, &sibling),
+            process(40, 99, &worktree),
+            process(me, 150, &worktree),
+            process(30, 150, &worktree),
+            process(31, 150, &worktree),
+            process(40, 150, Path::new("/elsewhere")),
+            process(40, 150, &sibling),
         ] {
             assert!(check(&tracker, ignored.clone()).is_ok(), "{ignored:?}");
         }
         // The same daemon argv on another executable is no exemption.
         tracker.kernel_exe = |_| Some("/w/target/debug/ironmem".into());
-        assert!(check(&tracker, process(30, uid, 150, &worktree)).is_err());
+        assert!(check(&tracker, process(30, 150, &worktree)).is_err());
         // An enumeration that fails proves nothing.
         // An enumeration that keeps failing proves nothing either, but it
         // is a hold recovery can retry, recorded as such, not an error.
