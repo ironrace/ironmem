@@ -12,12 +12,19 @@
 //!
 //! - no test (under `src/` or `tests/`) sets or removes a `GIT_*` variable on
 //!   the process; a test that needs one puts it on the child `Command`;
-//! - every `Command::new("git")` under `src/` is followed, within a few
-//!   lines, by the one shared `scrub_git_environment`, which removes every
-//!   redirecting variable unconditionally.
+//! - every `Command::new("git")` under `src/` is bound with `let mut <name>`
+//!   and followed, within a few lines, by `scrub_git_environment(&mut
+//!   <name>)`, the one shared scrub, which removes every redirecting variable
+//!   unconditionally.
 //!
 //! They read the source rather than spawn anything: a call site that forgot
 //! is invisible at runtime until the day a variable is set beside it.
+//!
+//! The first is a pattern match over statements, with known limits: it sees
+//! a `"GIT_…"` literal only in the statement that writes it, so a key held in
+//! an earlier binding or a `const` slips past, and it knows only the writers
+//! it names (`set_var`, `remove_var`, `Scoped…`, `EnvGuard`, `with_env`,
+//! `temp_env`, `with_var`), so a helper under another name slips past too.
 
 use std::path::{Path, PathBuf};
 
@@ -58,8 +65,8 @@ fn is_comment(line: &str) -> bool {
 /// Statements (split on `;`) that name a `GIT_*` variable as a string
 /// literal and change the process environment: `std::env::set_var`,
 /// `remove_var`, or a scoped-environment helper (`Scoped…`, `EnvGuard`,
-/// `with_env`) called with it. A `Command`'s own `.env(…)`/`.env_remove(…)`
-/// and reading a variable are fine.
+/// `with_env`, `temp_env`, `with_var`) called with it. A `Command`'s own
+/// `.env(…)`/`.env_remove(…)` and reading a variable are fine.
 fn process_git_env_writes(source: &str) -> Vec<String> {
     let code: String = source
         .lines()
@@ -69,9 +76,17 @@ fn process_git_env_writes(source: &str) -> Vec<String> {
     code.split(';')
         .filter(|statement| statement.contains("\"GIT_"))
         .filter(|statement| {
-            ["set_var(", "remove_var(", "Scoped", "EnvGuard", "with_env"]
-                .iter()
-                .any(|writer| statement.contains(writer))
+            [
+                "set_var(",
+                "remove_var(",
+                "Scoped",
+                "EnvGuard",
+                "with_env",
+                "temp_env",
+                "with_var",
+            ]
+            .iter()
+            .any(|writer| statement.contains(writer))
         })
         .map(|statement| {
             statement
@@ -103,18 +118,33 @@ fn no_test_sets_a_git_variable_on_the_whole_process() {
     );
 }
 
-/// `Command::new("git")` sites under `src/` with no shared scrub within
-/// [`SCRUB_WINDOW`] lines after them.
+/// The `<name>` a line binds with `let mut <name> =`, if it does.
+fn mutable_binding(line: &str) -> Option<&str> {
+    let rest = line.split_once("let mut ")?.1;
+    let end = rest
+        .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .unwrap_or(rest.len());
+    (end > 0 && rest[end..].trim_start().starts_with(['=', ':'])).then(|| &rest[..end])
+}
+
+/// `Command::new("git")` sites (one-based lines) under `src/` that are not
+/// bound to a `let mut <name>` scrubbed by `scrub_git_environment(&mut
+/// <name>)` within [`SCRUB_WINDOW`] lines: a scrub of another binding in the
+/// window does not count.
 fn unscrubbed_git_commands(source: &str) -> Vec<usize> {
     let lines: Vec<&str> = source.lines().collect();
     lines
         .iter()
         .enumerate()
         .filter(|(_, line)| !is_comment(line) && line.contains("Command::new(\"git\")"))
-        .filter(|(at, _)| {
+        .filter(|(at, line)| {
+            let Some(name) = mutable_binding(line) else {
+                return true;
+            };
+            let scrub = format!("scrub_git_environment(&mut {name})");
             !lines[*at..lines.len().min(at + SCRUB_WINDOW + 1)]
                 .iter()
-                .any(|line| !is_comment(line) && line.contains("scrub_git_environment("))
+                .any(|line| !is_comment(line) && line.contains(&scrub))
         })
         .map(|(at, _)| at + 1)
         .collect()
@@ -138,8 +168,9 @@ fn every_git_command_is_scrubbed_by_the_one_shared_scrub() {
     }
     assert!(
         unscrubbed.is_empty(),
-        "these git commands are not scrubbed by `scrub_git_environment` within \
-         {SCRUB_WINDOW} lines, so an inherited GIT_DIR can redirect them:\n{}",
+        "these git commands are not bound with `let mut <name>` and scrubbed by \
+         `scrub_git_environment(&mut <name>)` within {SCRUB_WINDOW} lines, so an \
+         inherited GIT_DIR can redirect them:\n{}",
         unscrubbed.join("\n")
     );
     // A local function of the same name would satisfy the scan above while
@@ -163,9 +194,10 @@ fn the_scans_find_what_they_look_for() {
          for key in [\"GIT_DIR\"] { std::env::remove_var(key); }\n\
          command.env(\"GIT_DIR\", z);\n\
          let email = std::env::var(\"GIT_COMMITTER_EMAIL\");\n\
-         // std::env::set_var(\"GIT_DIR\", w);\n",
+         // std::env::set_var(\"GIT_DIR\", w);\n\
+         temp_env::with_var(\"GIT_DIR\", Some(v), || run());\n",
     );
-    assert_eq!(writes.len(), 3, "{writes:?}");
+    assert_eq!(writes.len(), 4, "{writes:?}");
     let unscrubbed = unscrubbed_git_commands(&format!(
         "let a = Command::new(\"git\");\n{}\
          let mut b = Command::new(\"git\");\n\
@@ -174,4 +206,16 @@ fn the_scans_find_what_they_look_for() {
         "a.arg(\"x\");\n".repeat(SCRUB_WINDOW)
     ));
     assert_eq!(unscrubbed, vec![1]);
+    // A scrub in the window counts only for the command it scrubs: `a` is
+    // not scrubbed by `b`'s, nor is a command with no binding to name.
+    let unscrubbed = unscrubbed_git_commands(
+        "let mut a = Command::new(\"git\");\n\
+         let mut b = Command::new(\"git\");\n\
+         scrub_git_environment(&mut b);\n\
+         Command::new(\"git\").arg(\"x\").output();\n\
+         scrub_git_environment(&mut b);\n\
+         let mut c = std::process::Command::new(\"git\");\n\
+         crate::mcp::tools::scrub_git_environment(&mut c);\n",
+    );
+    assert_eq!(unscrubbed, vec![1, 4]);
 }
