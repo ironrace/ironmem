@@ -2946,12 +2946,17 @@ pub fn run_issue(
             );
         }
     }
-    // A policy an interrupted run saw on, and could not record on the branch
-    // (another agent held the config lock), is recorded now that recovery
-    // has proven nothing of it runs: off at this run's start, it would hold
-    // only the recovered met, and no fresh dispatch's after it. Not over an
-    // operator's opt-out.
-    if !policy_at_start && seen.by_interrupted_run {
+    // A policy a run interrupted mid-dispatch saw on, and could not record
+    // on the branch (another agent held the config lock), is recorded now
+    // that recovery has proven nothing of it runs: off at this run's start,
+    // it would hold only the recovered met, and no fresh dispatch's after
+    // it, though its own agent may be what turned it off. Not over an
+    // operator's opt-out, and not for a run that ended (parked) and so was
+    // not interrupted: a policy turned off since then is the operator's.
+    if !policy_at_start
+        && seen.by_interrupted_run
+        && existing_state.as_ref().is_some_and(|s| !s.is_parked())
+    {
         if let Ok(worktree::SigningHold::NotHeld) =
             worktree::signing_holder(&worktree.path, &worktree.branch)
         {
@@ -3075,6 +3080,8 @@ pub fn run_issue(
     let mut consecutive_infrastructure_failures = 0u32;
     // Whether this run has launched anything yet.
     let mut launched = false;
+    // A Claude dispatch's dollar ceiling reserved on a date, until settled.
+    let mut reserved_spend: Option<(String, f64)> = None;
 
     let terminal = loop {
         if recovered_outcome.is_none() {
@@ -3347,10 +3354,32 @@ pub fn run_issue(
                         }
                     }
                 }
+                // The authority on the day's dollar budget: this dispatch's
+                // ceiling is added in the transaction that checks it, so two
+                // Leads cannot both pass it on the same total; the read at
+                // the top of the loop is only a cheap pre-filter. Settled
+                // to the measured cost once the dispatch returns.
+                let date = today_utc();
+                match budget::reserve_spend_if_within(
+                    db,
+                    &date,
+                    config.max_budget_usd,
+                    config.daily_budget_usd,
+                )? {
+                    budget::SpendReservation::Reserved => {
+                        reserved_spend = Some((date, config.max_budget_usd));
+                    }
+                    budget::SpendReservation::BudgetReached { spent_usd } => {
+                        break TerminalReason::DailyBudgetExhausted { spent_usd };
+                    }
+                }
             }
             launched = true;
             dispatcher.dispatch(&worktree.path, &spec)
         };
+        // Whatever came back, the reservation gives way to what is known:
+        // the measured cost below, or, with none, nothing.
+        let reserved = reserved_spend.take();
         let mut outcome = match outcome_result {
             Ok(outcome) => outcome,
             Err(err) => {
@@ -3384,6 +3413,9 @@ pub fn run_issue(
                 // [`Dispatcher`] error contract.
                 if !matches!(err, MemoryError::NotFound(_)) {
                     resuming = true;
+                }
+                if let Some((date, amount)) = &reserved {
+                    budget::settle_reserved_spend(db, date, *amount, None)?;
                 }
                 consecutive_infrastructure_failures += 1;
                 dispatches.push(DispatchSummary {
@@ -3563,16 +3595,25 @@ pub fn run_issue(
         if config.implementer.recovers_invocations() {
             // Reserved before launch; recovery and completion never bill it again.
             outcome.cost_usd = None;
-        } else if outcome.cost_usd.is_none() {
-            unpriced_dispatches += 1;
-            budget::record_unpriced_dispatch(db, &today_utc())?;
         } else {
-            budget::accumulate_daily_spend(
-                db,
-                &today_utc(),
-                outcome.cost_usd.unwrap_or(0.0).max(0.0),
-            )?;
-            total_cost_usd += outcome.cost_usd.unwrap_or(0.0).max(0.0);
+            let cost = outcome.cost_usd.map(|cost| cost.max(0.0));
+            match &reserved {
+                Some((date, amount)) => {
+                    budget::settle_reserved_spend(db, date, *amount, cost)?;
+                }
+                None => {
+                    if let Some(cost) = cost {
+                        budget::accumulate_daily_spend(db, &today_utc(), cost)?;
+                    }
+                }
+            }
+            match cost {
+                Some(cost) => total_cost_usd += cost,
+                None => {
+                    unpriced_dispatches += 1;
+                    budget::record_unpriced_dispatch(db, &today_utc())?;
+                }
+            }
         }
 
         // Every harness: a `met` whose branch holds commits that bypassed the
@@ -9558,11 +9599,13 @@ satisfies it on its own"
         );
         assert_eq!(run.cumulative_attempt_n, 0);
         assert_eq!(run.total_cost_usd, 0.0);
+        // Its reserved ceiling is released, and nothing else is billed.
+        let ledger = budget::get_daily_spend(&db, &today_utc()).unwrap();
         assert!(
-            budget::get_daily_spend(&db, &today_utc())
-                .unwrap()
-                .is_none(),
-            "a dispatch that returned no meter bills nothing"
+            ledger.as_ref().is_none_or(|l| l.total_cost_usd == 0.0
+                && l.dispatch_count == 0
+                && !l.has_unpriced_spend()),
+            "a dispatch that returned no meter bills nothing: {ledger:?}"
         );
     }
 

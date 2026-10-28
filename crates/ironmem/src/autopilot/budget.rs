@@ -203,26 +203,16 @@ pub fn record_advice_call(
 }
 
 /// Reserve an unpriced invocation before launch, with no cap. Repeated
-/// recovery of the same identity cannot bill it twice. A dispatch that must
-/// respect the daily cap uses [`reserve_unpriced_dispatch_if_below`].
+/// recovery of the same identity cannot bill it twice. Every dispatch path
+/// must use [`reserve_unpriced_dispatch_if_below`] instead, which respects
+/// the daily cap; this one is for tests and for recording a reservation
+/// already made.
 pub fn reserve_unpriced_dispatch(
     db: &Database,
     date: &str,
     invocation_id: &str,
 ) -> Result<BudgetLedgerEntry, MemoryError> {
-    validate_reservation(date, invocation_id)?;
-    update_ledger(db, date, |entry| {
-        if !entry
-            .reserved_unpriced_dispatch_ids
-            .iter()
-            .any(|id| id == invocation_id)
-        {
-            entry
-                .reserved_unpriced_dispatch_ids
-                .push(invocation_id.to_string());
-            entry.unpriced_dispatch_count += 1;
-        }
-    })
+    reserve(db, date, invocation_id, None).map(|(entry, _)| entry)
 }
 
 /// What [`reserve_unpriced_dispatch_if_below`] decided.
@@ -247,8 +237,19 @@ pub fn reserve_unpriced_dispatch_if_below(
     invocation_id: &str,
     cap: u32,
 ) -> Result<UnpricedReservation, MemoryError> {
+    reserve(db, date, invocation_id, Some(cap)).map(|(_, decision)| decision)
+}
+
+/// The one reservation both public forms share: `invocation_id` once, and
+/// only below `cap` when there is one.
+fn reserve(
+    db: &Database,
+    date: &str,
+    invocation_id: &str,
+    cap: Option<u32>,
+) -> Result<(BudgetLedgerEntry, UnpricedReservation), MemoryError> {
     validate_reservation(date, invocation_id)?;
-    let (_, decision) = transact_ledger(db, date, |entry| {
+    transact_ledger(db, date, |entry| {
         if entry
             .reserved_unpriced_dispatch_ids
             .iter()
@@ -256,7 +257,7 @@ pub fn reserve_unpriced_dispatch_if_below(
         {
             return (false, UnpricedReservation::AlreadyReserved);
         }
-        if entry.unpriced_dispatch_count >= cap {
+        if cap.is_some_and(|cap| entry.unpriced_dispatch_count >= cap) {
             return (
                 false,
                 UnpricedReservation::CapReached {
@@ -269,8 +270,79 @@ pub fn reserve_unpriced_dispatch_if_below(
             .push(invocation_id.to_string());
         entry.unpriced_dispatch_count += 1;
         (true, UnpricedReservation::Reserved)
+    })
+}
+
+/// What [`reserve_spend_if_within`] decided.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SpendReservation {
+    /// `amount_usd` is added to the day's total; settle it with
+    /// [`settle_reserved_spend`] once the dispatch's cost is known.
+    Reserved,
+    /// The day's total plus `amount_usd` would pass the budget; nothing was
+    /// written, and nothing may launch.
+    BudgetReached { spent_usd: f64 },
+}
+
+/// Reserve a dispatch's dollar ceiling (`amount_usd`) against `date`'s
+/// `budget_usd` before it launches, checking and adding in one
+/// `BEGIN IMMEDIATE` transaction. Two Leads that would together pass the
+/// budget therefore admit only what fits, where reading the total then
+/// adding after the dispatch would admit both.
+pub fn reserve_spend_if_within(
+    db: &Database,
+    date: &str,
+    amount_usd: f64,
+    budget_usd: f64,
+) -> Result<SpendReservation, MemoryError> {
+    validate_date(date)?;
+    validate_amount(amount_usd)?;
+    let (_, decision) = transact_ledger(db, date, |entry| {
+        if entry.total_cost_usd + amount_usd > budget_usd {
+            return (
+                false,
+                SpendReservation::BudgetReached {
+                    spent_usd: entry.total_cost_usd,
+                },
+            );
+        }
+        entry.total_cost_usd += amount_usd;
+        (true, SpendReservation::Reserved)
     })?;
     Ok(decision)
+}
+
+/// Settle a [`reserve_spend_if_within`] reservation of `reserved_usd` on
+/// `date` (the day it was reserved on): the measured `cost_usd` replaces it
+/// and counts as a dispatch, or, with no price, the reservation is only
+/// released (the caller records the unpriced dispatch on its own counter).
+pub fn settle_reserved_spend(
+    db: &Database,
+    date: &str,
+    reserved_usd: f64,
+    cost_usd: Option<f64>,
+) -> Result<BudgetLedgerEntry, MemoryError> {
+    validate_date(date)?;
+    validate_amount(reserved_usd)?;
+    if let Some(cost) = cost_usd {
+        validate_amount(cost)?;
+    }
+    update_ledger(db, date, |entry| {
+        entry.total_cost_usd = (entry.total_cost_usd - reserved_usd).max(0.0);
+        if let Some(cost) = cost_usd {
+            entry.total_cost_usd += cost;
+            entry.dispatch_count += 1;
+        }
+    })
+}
+
+fn validate_amount(amount_usd: f64) -> Result<(), MemoryError> {
+    if !amount_usd.is_finite() || amount_usd < 0.0 {
+        return Err(MemoryError::Validation(
+            "an amount in USD must be a finite, non-negative number".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_reservation(date: &str, invocation_id: &str) -> Result<(), MemoryError> {
@@ -299,7 +371,20 @@ pub(crate) fn has_unpriced_dispatch_reservation(
     let drawers =
         db.get_drawers_by_source_prefix(super::WING, super::ROOM, &prefix, i64::MAX as usize)?;
     for drawer in drawers {
-        let entry: BudgetLedgerEntry = serde_json::from_str(&drawer.content)?;
+        // One corrupt day must not fail every recovery: it is named, and the
+        // other days are still read.
+        let entry: BudgetLedgerEntry = match serde_json::from_str(&drawer.content) {
+            Ok(entry) => entry,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    ledger = %drawer.source_file,
+                    "autopilot skips a budget ledger it cannot read while looking for an \
+                     invocation's reservation"
+                );
+                continue;
+            }
+        };
         if entry
             .reserved_unpriced_dispatch_ids
             .iter()
@@ -502,6 +587,54 @@ mod tests {
         assert_eq!(entry.dispatch_count, 1);
         assert!(reserve_unpriced_dispatch(&db, "bad", "id").is_err());
         assert!(reserve_unpriced_dispatch(&db, "2026-09-03", " ").is_err());
+    }
+
+    /// F95: the dollar ceiling is reserved in the transaction that checks
+    /// it, so two dispatches that together pass the budget admit one.
+    #[test]
+    fn a_spend_reservation_past_the_budget_is_refused_and_settles_to_the_measured_cost() {
+        let db = Database::open_in_memory().unwrap();
+        let date = "2026-09-03";
+        accumulate_daily_spend(&db, date, 22.0).unwrap();
+        assert_eq!(
+            reserve_spend_if_within(&db, date, 2.5, 25.0).unwrap(),
+            SpendReservation::Reserved
+        );
+        assert_eq!(
+            reserve_spend_if_within(&db, date, 2.5, 25.0).unwrap(),
+            SpendReservation::BudgetReached { spent_usd: 24.5 }
+        );
+        let entry = settle_reserved_spend(&db, date, 2.5, Some(1.0)).unwrap();
+        assert!((entry.total_cost_usd - 23.0).abs() < 1e-9, "{entry:?}");
+        assert_eq!(entry.dispatch_count, 2);
+        reserve_spend_if_within(&db, date, 2.0, 25.0).unwrap();
+        let entry = settle_reserved_spend(&db, date, 2.0, None).unwrap();
+        assert!((entry.total_cost_usd - 23.0).abs() < 1e-9, "{entry:?}");
+        assert_eq!(
+            entry.dispatch_count, 2,
+            "an unpriced dispatch is not counted here"
+        );
+    }
+
+    #[test]
+    fn concurrent_spend_reservations_never_pass_the_budget() {
+        let (_dir, path) = shared_db();
+        accumulate_daily_spend(&Database::open(&path).unwrap(), "2026-09-03", 22.0).unwrap();
+        let reserved = race(&path, 4, |_, db| {
+            reserve_spend_if_within(db, "2026-09-03", 2.5, 25.0).unwrap()
+                == SpendReservation::Reserved
+        });
+        assert_eq!(reserved.iter().filter(|r| **r).count(), 1, "{reserved:?}");
+    }
+
+    /// F5: one corrupt day's ledger does not hide a reservation on another.
+    #[test]
+    fn a_corrupt_ledger_does_not_fail_the_reservation_lookup() {
+        let db = Database::open_in_memory().unwrap();
+        write_current(&db, &budget_key("2026-09-03"), "{").unwrap();
+        reserve_unpriced_dispatch(&db, "2026-09-04", "inv").unwrap();
+        assert!(has_unpriced_dispatch_reservation(&db, "inv").unwrap());
+        assert!(!has_unpriced_dispatch_reservation(&db, "other").unwrap());
     }
 
     #[test]
