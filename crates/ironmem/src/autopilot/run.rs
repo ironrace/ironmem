@@ -2756,6 +2756,41 @@ fn still_owned(
     Ok(true)
 }
 
+/// Renew this run's lease as soon as a dispatch returns, before any other
+/// work (R1): a dispatch may run far past [`dispatch_state::CLAIM_LEASE`],
+/// and in the post-run window (signing-guard reads, spend settling, then
+/// the record) a lockless run could otherwise adopt the lapsed claim, so
+/// the record failed `taken_over` and the met was dropped. While the
+/// dispatch ran, its IC was itself the evidence an adopter checks; once
+/// it exits, this renewal is what keeps the window closed — renewed
+/// unconditionally here rather than periodically during the dispatch,
+/// which would need a second writer racing the dispatch it watches. The
+/// stored claim is re-read and renewed from it: only its `claimed_at`
+/// may have aged, and its owner token is still this run's, or the run
+/// has lost the issue and this returns `false`.
+fn renew_owned(
+    db: &Database,
+    issue: &IssueRef,
+    owned: &mut Option<dispatch_state::Claim>,
+) -> Result<bool, MemoryError> {
+    let Some(claim) = owned.as_ref() else {
+        return dispatch_state::claim_is(db, issue, None);
+    };
+    let Some(stored) = dispatch_state::get_claim(db, issue)? else {
+        return Ok(false);
+    };
+    if stored.owner != claim.owner {
+        return Ok(false);
+    }
+    let mut renewed = stored.clone();
+    renewed.claimed_at = Some(chrono::Utc::now().to_rfc3339());
+    if !dispatch_state::claim_if_unchanged(db, Some(&stored), &renewed)? {
+        return Ok(false);
+    }
+    *owned = Some(renewed);
+    Ok(true)
+}
+
 /// What restart recovery decided before a run dispatches anything.
 enum Recovered {
     /// The run ends here without dispatching.
@@ -3102,8 +3137,10 @@ pub fn run_issue(
                 issue: issue.clone(),
                 terminal: TerminalReason::ImplementationInFlight {
                     detail: format!(
-                        "another run claimed {} {}s ago and may be about to launch; it is \
-                         adopted only once its {}s lease lapses with its IC idle",
+                        "another run claimed {} {}s ago and may be about to launch (a \
+                         recently ended run whose lease has not yet lapsed reads the \
+                         same way); it is adopted only once its {}s lease lapses with \
+                         its IC idle",
                         issue.canonical(),
                         claim.age(chrono::Utc::now()).unwrap_or_default().as_secs(),
                         dispatch_state::CLAIM_LEASE.as_secs()
@@ -3635,6 +3672,17 @@ pub fn run_issue(
             launched = true;
             dispatcher.dispatch(&worktree.path, &spec)
         };
+        // First, before the signing-guard reads, the spend settling or
+        // the record below: renew the lease a long dispatch let lapse
+        // (R1), or this run has lost the issue and records nothing.
+        if !recovered && !config.implementer.recovers_invocations() {
+            if !renew_owned(db, issue, &mut owned)? {
+                if let Some(reserved) = reserved_spend.take() {
+                    reserved.settle(None)?;
+                }
+                return Err(taken_over());
+            }
+        }
         // Whatever came back, the reservation gives way to what is known:
         // the measured cost below, or, with none, nothing.
         let reserved = reserved_spend.take();
@@ -10356,6 +10404,9 @@ satisfies it on its own"
         /// What `recover_own` reports, in order; empty delegates to
         /// `recover`.
         own_evidence: std::collections::VecDeque<InvocationRecovery>,
+        /// Rewrite the stored claim's `claimed_at` 200 s into the past
+        /// during `dispatch`: a dispatch that ran past its lease.
+        age_claim_on_dispatch: bool,
         /// A state another run writes while this run's dispatch runs.
         takeover: Option<dispatch_state::Claim>,
         /// A state another run writes while this run checks its IC.
@@ -10370,6 +10421,7 @@ satisfies it on its own"
                 db,
                 evidence: evidence.into(),
                 own_evidence: std::collections::VecDeque::new(),
+                age_claim_on_dispatch: false,
                 recovered: 0,
                 takeover: None,
                 recover_takeover: None,
@@ -10415,6 +10467,20 @@ satisfies it on its own"
             spec: &DispatchSpec,
         ) -> Result<DispatchOutcome, MemoryError> {
             self.seen.push(spec.clone());
+            if self.age_claim_on_dispatch {
+                let current = dispatch_state::get_claim(self.db, &issue())
+                    .unwrap()
+                    .unwrap();
+                let mut aged = current.clone();
+                aged.claimed_at =
+                    Some((chrono::Utc::now() - chrono::Duration::seconds(200)).to_rfc3339());
+                assert!(dispatch_state::claim_if_unchanged(
+                    self.db,
+                    Some(&current),
+                    &aged
+                )
+                .unwrap());
+            }
             if let Some(theirs) = self.takeover.take() {
                 assert!(dispatch_state::claim_if_unchanged(
                     self.db,
@@ -10752,6 +10818,27 @@ satisfies it on its own"
             run.terminal
         );
         assert_eq!(b.seen.len(), 1);
+    }
+
+    /// R1: a dispatch that ran past its lease has it renewed as soon as
+    /// it returns, before its outcome is recorded: the record still
+    /// lands, and the renewed lease keeps an adopter out.
+    #[test]
+    fn a_dispatch_past_its_lease_is_renewed_before_its_outcome_is_recorded() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        let mut b = ClaudeEvidence::new(&db, Vec::new());
+        b.age_claim_on_dispatch = true;
+        b.outcomes.push_back(met());
+        let run = run_issue(&db, &issue(), &brief(), &wt, &config(), &mut b).unwrap();
+        assert!(
+            matches!(run.terminal, TerminalReason::Met { .. }),
+            "{:?}",
+            run.terminal
+        );
+        // The met was recorded, not dropped as taken over.
+        let status = lineage::get_issue_status(&db, &issue()).unwrap().unwrap();
+        assert_eq!(status.cumulative_attempt_n, 1);
     }
 
     /// C-I2: a run whose own claim is near the end of its lease claims again
