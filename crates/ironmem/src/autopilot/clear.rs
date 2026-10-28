@@ -128,19 +128,22 @@ pub(crate) fn clear_dispatch_with(
             }));
         }
     };
-    // A claim still within its lease may be a run between its claim and
-    // its launch, showing no process yet (R8): not cleared, lock or no
-    // lock.
-    if let Some(claim) = dispatch_state::get_claim(db, issue)? {
-        if claim.leased(chrono::Utc::now()) {
-            return Err(refuse(format!(
-                "its claim is still within its {}s lease (claimed {}), so its run \
-                 may not have launched yet; wait up to {}s, or until that run ends, and \
-                 clear again",
-                dispatch_state::CLAIM_LEASE.as_secs(),
-                claim.age_phrase(chrono::Utc::now()).unwrap_or_default(),
-                dispatch_state::CLAIM_LEASE.as_secs()
-            )));
+    // A Claude claim still within its lease may be a run between its
+    // claim and its launch, showing no process yet (R8): not cleared,
+    // lock or no lock. A supervised CLI's invocation is itself the
+    // evidence below, so its lease does not refuse.
+    if !state.implementer.recovers_invocations() {
+        if let Some(claim) = dispatch_state::get_claim(db, issue)? {
+            if claim.leased(chrono::Utc::now()) {
+                return Err(refuse(format!(
+                    "its claim is still within its {}s lease (claimed {}), so its run \
+                     may not have launched yet; wait up to {}s, or until that run ends, and \
+                     clear again",
+                    dispatch_state::CLAIM_LEASE.as_secs(),
+                    claim.age_phrase(chrono::Utc::now()).unwrap_or_default(),
+                    dispatch_state::CLAIM_LEASE.as_secs()
+                )));
+            }
         }
     }
     if let Some(reason) = refusal(&observe(), &state, attempt_recorded(db, &state)?) {
