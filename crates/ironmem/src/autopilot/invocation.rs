@@ -713,7 +713,14 @@ pub(crate) fn persist_private_atomic(
         Ok(())
     })();
     if result.is_err() {
-        let _ = std::fs::remove_file(tmp);
+        match std::fs::remove_file(&tmp) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => tracing::warn!(
+                error = %e,
+                path = %tmp.display(),
+                "autopilot could not remove a private temporary invocation file"
+            ),
+            _ => {}
+        }
     }
     result
 }
