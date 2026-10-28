@@ -592,9 +592,24 @@ fn supervise_in_flight(
     config: &LeadConfig,
     problems: &mut Vec<TickProblem>,
 ) -> Result<Vec<SupervisionReport>, MemoryError> {
-    let states = super::dispatch_state::all_dispatch_states(db, IN_FLIGHT_SCAN_LIMIT)?;
+    let scan = super::dispatch_state::scan_dispatch_states(db, IN_FLIGHT_SCAN_LIMIT)?;
+    // A drawer that cannot be read holds its slot in the queue and is
+    // supervised by no one, so the tick names it, whatever repo it is for
+    // (its repo cannot be read either). Reading writes nothing, so a dry run
+    // names it too.
+    for (key, why) in &scan.unreadable {
+        problems.push(TickProblem {
+            what: format!("read the dispatch state {key}"),
+            detail: format!(
+                "it cannot be read ({}); it holds a concurrency slot until a binary that reads \
+                 it runs, or, once nothing runs for its issue, `ironmem autopilot \
+                 clear-dispatch <repo> <issue>` releases it",
+                scrub_and_bound(why, 200).text
+            ),
+        });
+    }
     let mut reports = Vec::new();
-    for state in states {
+    for state in scan.states {
         if !config.targets.iter().any(|t| t.repo == state.issue.repo) {
             continue;
         }
@@ -1689,6 +1704,33 @@ mod tests {
         )
         .unwrap();
         assert!(report.supervision.is_empty());
+    }
+
+    /// F14: a dispatch-state drawer that cannot be read holds a slot and is
+    /// supervised by no one, so the tick names it, in no backlog or not.
+    #[test]
+    fn a_tick_names_a_dispatch_state_it_cannot_read() {
+        let db = approved_db();
+        let f = fixture();
+        let key = dispatch_state::dispatch_state_key(&IssueRef::new("ironrace/elsewhere", 9));
+        crate::autopilot::write_current(&db, &key, "not json").unwrap();
+        let mut gh_runner = ScriptedGh::new(vec![Ok(GhOutput::ok("[]")), Ok(GhOutput::ok("[]"))]);
+        let report = lead_tick(
+            &db,
+            &mut gh_runner,
+            &mut empty_registry(),
+            &mut RefusingDispatcher,
+            &mut no_advisor(),
+            &config(&f),
+        )
+        .unwrap();
+        assert!(
+            report.problems.iter().any(|p| p.what.contains(&key)
+                && p.detail.contains("cannot be read")
+                && p.detail.contains("ironmem autopilot clear-dispatch")),
+            "{:?}",
+            report.problems
+        );
     }
 
     #[test]

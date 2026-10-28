@@ -557,11 +557,11 @@ pub fn all_dispatch_states(db: &Database, limit: usize) -> Result<Vec<DispatchSt
 pub(crate) struct DispatchStateScan {
     /// The drawers that read as dispatch states.
     pub states: Vec<DispatchState>,
-    /// The logical keys ([`dispatch_state_key`]) of the drawers that did not:
-    /// corrupt, refused by [`DispatchState::validate`], or written by a newer
-    /// binary (an implementer this one does not know). Any of them may be a
-    /// live invocation.
-    pub unreadable: Vec<String>,
+    /// The logical key ([`dispatch_state_key`]) of each drawer that did not,
+    /// with why: corrupt, refused by [`DispatchState::validate`], or written
+    /// by a newer binary (an implementer this one does not know). Any of them
+    /// may be a live invocation.
+    pub unreadable: Vec<(String, String)>,
 }
 
 /// [`all_dispatch_states`], also naming the drawers it could not read.
@@ -579,13 +579,14 @@ pub(crate) fn scan_dispatch_states(
     for drawer in drawers {
         match state_from_content(&drawer.content) {
             Ok(state) => scan.states.push(state),
-            Err(_) => scan.unreadable.push(
+            Err(why) => scan.unreadable.push((
                 drawer
                     .source_file
                     .strip_prefix(crate::mcp::tools::LOGICAL_KEY_SOURCE_PREFIX)
                     .unwrap_or(&drawer.source_file)
                     .to_string(),
-            ),
+                why.to_string(),
+            )),
         }
     }
     Ok(scan)
@@ -620,16 +621,18 @@ pub fn clear_dispatch_state(db: &Database, issue: &IssueRef) -> Result<bool, Mem
 }
 
 /// [`clear_dispatch_state`], but only while the drawer still holds
-/// `expected`. Read and delete share one transaction, so a dispatch that
-/// rewrote the state after the caller judged it is never deleted unseen.
-/// Returns `false`, deleting nothing, when the state changed or is gone.
+/// `expected`. Read and delete share one `BEGIN IMMEDIATE` transaction, so a
+/// dispatch that rewrote the state after the caller judged it is never
+/// deleted unseen, and a concurrent writer is waited for rather than failing
+/// the read-then-delete with `SQLITE_BUSY`. Returns `false`, deleting
+/// nothing, when the state changed or is gone.
 pub fn clear_dispatch_state_if_unchanged(
     db: &Database,
     expected: &DispatchState,
 ) -> Result<bool, MemoryError> {
     use rusqlite::OptionalExtension;
     let id = super::logical_drawer_id(&dispatch_state_key(&expected.issue));
-    db.with_transaction(|tx| {
+    db.with_immediate_transaction(|tx| {
         let content: Option<String> = tx
             .query_row("SELECT content FROM drawers WHERE id = ?1", [&id], |row| {
                 row.get(0)
@@ -657,7 +660,8 @@ pub fn clear_dispatch_state_if_unchanged(
 
 /// [`clear_dispatch_state_if_unchanged`] for a drawer that may not be
 /// readable: deleted only while its raw content is still exactly
-/// `expected_raw`, compared byte for byte in the same transaction.
+/// `expected_raw`, compared byte for byte in the same `BEGIN IMMEDIATE`
+/// transaction.
 pub(crate) fn clear_raw_dispatch_state_if_unchanged(
     db: &Database,
     issue: &IssueRef,
@@ -665,7 +669,7 @@ pub(crate) fn clear_raw_dispatch_state_if_unchanged(
 ) -> Result<bool, MemoryError> {
     use rusqlite::OptionalExtension;
     let id = super::logical_drawer_id(&dispatch_state_key(issue));
-    db.with_transaction(|tx| {
+    db.with_immediate_transaction(|tx| {
         let content: Option<String> = tx
             .query_row("SELECT content FROM drawers WHERE id = ?1", [&id], |row| {
                 row.get(0)
@@ -750,6 +754,43 @@ mod tests {
         assert_eq!(turn(&db), Some(1));
         assert!(!upsert_dispatch_state_if_unchanged(&db, Some(&theirs), &theirs).unwrap());
         assert_eq!(turn(&db), Some(1));
+    }
+
+    /// F47/F48: a conditional clear waits out another connection's write
+    /// lock instead of failing with `SQLITE_BUSY` on its read-then-delete.
+    #[test]
+    fn a_conditional_clear_waits_for_a_concurrent_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.sqlite3");
+        let db = Database::open(&path).unwrap();
+        db.migrate().unwrap();
+        let issue = IssueRef::new("ironrace/ironmem", 283);
+        upsert_dispatch_state(&db, &sample(&issue, 1)).unwrap();
+        let judged = get_dispatch_state(&db, &issue).unwrap().unwrap();
+        let raw = raw_dispatch_state(&db, &issue).unwrap().unwrap();
+        for raw_clear in [false, true] {
+            if raw_clear {
+                upsert_dispatch_state(&db, &sample(&issue, 1)).unwrap();
+            }
+            let holder = rusqlite::Connection::open(&path).unwrap();
+            holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+            let clearer = {
+                let (path, issue, judged, raw) =
+                    (path.clone(), issue.clone(), judged.clone(), raw.clone());
+                std::thread::spawn(move || {
+                    let db = Database::open(&path).unwrap();
+                    if raw_clear {
+                        clear_raw_dispatch_state_if_unchanged(&db, &issue, &raw)
+                    } else {
+                        clear_dispatch_state_if_unchanged(&db, &judged)
+                    }
+                })
+            };
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            holder.execute_batch("COMMIT").unwrap();
+            assert!(clearer.join().unwrap().unwrap(), "raw={raw_clear}");
+            assert!(get_dispatch_state(&db, &issue).unwrap().is_none());
+        }
     }
 
     /// Two runs that judged the same state and would write identical ones:
@@ -1086,7 +1127,13 @@ mod tests {
         assert!(err.contains("Claude"), "{err}");
         let scan = scan_dispatch_states(&db, 100).unwrap();
         assert!(scan.states.is_empty());
-        assert_eq!(scan.unreadable, vec![dispatch_state_key(&issue)]);
+        assert_eq!(scan.unreadable.len(), 1);
+        let (key, why) = &scan.unreadable[0];
+        assert_eq!(key, &dispatch_state_key(&issue));
+        assert!(
+            why.contains("Claude state carrying supervised-CLI invocation artifacts"),
+            "{why}"
+        );
     }
 
     #[test]
@@ -1098,6 +1145,8 @@ mod tests {
         super::super::write_current(&db, &corrupt, "not json").unwrap();
         let scan = scan_dispatch_states(&db, 100).unwrap();
         assert_eq!(scan.states.len(), 1);
-        assert_eq!(scan.unreadable, vec![corrupt]);
+        assert_eq!(scan.unreadable.len(), 1);
+        assert_eq!(scan.unreadable[0].0, corrupt);
+        assert!(!scan.unreadable[0].1.is_empty());
     }
 }

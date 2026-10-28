@@ -1271,6 +1271,10 @@ pub fn supervise_issue(
     })
 }
 
+/// How many unreadable dispatch states an orphan's hold names before
+/// counting the rest.
+const NAMED_UNREADABLE_STATES: usize = 3;
+
 /// Why an issue whose dispatch state cannot be read is held.
 fn unreadable_state_reason(why: &str) -> String {
     format!(
@@ -1351,23 +1355,39 @@ pub fn reconcile(
     let dispatch_state::DispatchStateScan { states, unreadable } =
         dispatch_state::scan_dispatch_states(db, MAX_IN_FLIGHT_DISPATCH_STATES)?;
     let mut out = Vec::new();
-    for key in &unreadable {
+    for (key, why) in &unreadable {
         out.push(Reconciliation {
             issue: None,
             session_name: key.clone(),
             verdict: ReconcileVerdict::Hold {
-                reason: unreadable_state_reason("not a dispatch state this binary understands"),
+                reason: unreadable_state_reason(why),
             },
         });
     }
+    // Every unreadable drawer is its own row above; an orphan's hold names
+    // only the first few, so one row's reason stays bounded however many
+    // there are.
+    let unreadable_keys = {
+        let mut named: Vec<&str> = unreadable
+            .iter()
+            .take(NAMED_UNREADABLE_STATES)
+            .map(|(key, _)| key.as_str())
+            .collect::<Vec<_>>();
+        let more = unreadable.len().saturating_sub(NAMED_UNREADABLE_STATES);
+        let more = format!("and {more} more");
+        if unreadable.len() > NAMED_UNREADABLE_STATES {
+            named.push(&more);
+        }
+        named.join(", ")
+    };
     let orphan = || {
         if unreadable.is_empty() {
             ReconcileVerdict::Orphan
         } else {
             ReconcileVerdict::Hold {
                 reason: format!(
-                    "no readable dispatch state names it, but {} cannot be read and may be its",
-                    unreadable.join(", ")
+                    "no readable dispatch state names it, but {unreadable_keys} cannot be read \
+                     and may be its"
                 ),
             }
         }
@@ -2883,6 +2903,111 @@ mod tests {
                 .iter()
                 .any(|r| r.verdict == ReconcileVerdict::Orphan && r.session_name == a.schema_path),
             "a known Muse marker must not be reported as an orphan: {rows:?}"
+        );
+    }
+
+    /// A live invocation marker no readable state names, while a drawer
+    /// cannot be read, may be that drawer's: held, and an orphan only once
+    /// the drawer is gone (F28).
+    #[test]
+    fn a_marker_is_held_while_an_unreadable_state_may_be_its_and_an_orphan_after() {
+        use crate::autopilot::process_tree::{testing, ProcessSnapshot};
+        use crate::autopilot::registry::HarnessSnapshots;
+        let db = Database::open_in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let invocation = dir
+            .path()
+            .join(".git/ironmem/autopilot/owner-repo-42/0f0e0d0c-0b0a-4908-8706-050403020100");
+        std::fs::create_dir_all(&invocation).unwrap();
+        let (a, mut root) = testing::invocation(&invocation);
+        root.args = format!(
+            "/u/muse-bin-1.4.13-R6996.1 exec --json --output-schema {} --prompt-file /p.md",
+            a.schema_path
+        );
+        write_unreadable_state(&db, &issue());
+        let snapshots = HarnessSnapshots {
+            claude: RegistrySnapshot::Available(Vec::new()),
+            processes: ProcessSnapshot::Available(vec![root]),
+        };
+        let marker_row = |rows: &[Reconciliation]| {
+            rows.iter()
+                .find(|r| r.session_name == a.schema_path)
+                .cloned()
+                .unwrap_or_else(|| panic!("no row for the marker: {rows:?}"))
+        };
+        let rows = reconcile(&db, &snapshots).unwrap();
+        assert!(
+            matches!(marker_row(&rows).verdict, ReconcileVerdict::Hold { .. }),
+            "{rows:?}"
+        );
+        dispatch_state::clear_dispatch_state(&db, &issue()).unwrap();
+        let rows = reconcile(&db, &snapshots).unwrap();
+        assert_eq!(marker_row(&rows).verdict, ReconcileVerdict::Orphan);
+    }
+
+    /// An orphan's hold names at most three unreadable drawers (F100), and
+    /// each unreadable drawer's own row says why it cannot be read (F9).
+    #[test]
+    fn an_orphans_hold_names_three_unreadable_states_and_counts_the_rest() {
+        let db = Database::open_in_memory().unwrap();
+        for n in 1..=5 {
+            write_unreadable_state(&db, &IssueRef::new("owner/repo", n));
+        }
+        let snapshot = RegistrySnapshot::Available(vec![AgentEntry {
+            name: "ic-owner-repo-99".into(),
+            status: None,
+        }]);
+        let rows = reconcile(&db, &snapshot).unwrap();
+        let orphan = rows
+            .iter()
+            .find(|r| r.session_name == "ic-owner-repo-99")
+            .unwrap();
+        let ReconcileVerdict::Hold { reason } = &orphan.verdict else {
+            panic!("{orphan:?}");
+        };
+        assert_eq!(reason.matches("dispatch-state:").count(), 3, "{reason}");
+        assert!(reason.contains("and 2 more"), "{reason}");
+    }
+
+    #[test]
+    fn an_unreadable_states_hold_says_why_it_cannot_be_read() {
+        let db = Database::open_in_memory().unwrap();
+        let mut state = state_for(&issue(), true);
+        state.invocation_artifacts = None;
+        let mut body = serde_json::to_value(serde_json::json!({
+            "implementer": "claude",
+            "issue": issue().number,
+            "repo": issue().repo,
+            "worktree_path": "/w",
+            "ic_session_name": state.ic_session_name,
+            "dispatch_class": "logic",
+            "attempt_n": 1,
+            "state": "dispatching",
+            "started_at": "now",
+            "session_uuid": state.session_uuid,
+            "turn_n": 0,
+        }))
+        .unwrap();
+        body["codex_artifacts"] = serde_json::json!({
+            "invocation_id": "i",
+            "schema_path": "/s",
+            "journal_path": "/j",
+            "final_path": "/f",
+            "stderr_path": "/e",
+            "exit_path": "/x",
+        });
+        crate::autopilot::write_current(
+            &db,
+            &dispatch_state::dispatch_state_key(&issue()),
+            &body.to_string(),
+        )
+        .unwrap();
+        let rows = reconcile(&db, &RegistrySnapshot::Available(Vec::new())).unwrap();
+        assert!(
+            rows.iter()
+                .any(|r| matches!(&r.verdict, ReconcileVerdict::Hold { reason }
+                if reason.contains("Claude state carrying supervised-CLI invocation artifacts"))),
+            "{rows:?}"
         );
     }
 }

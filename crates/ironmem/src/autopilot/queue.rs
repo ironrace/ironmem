@@ -352,8 +352,8 @@ pub enum DeferReason {
     /// newer binary wrote it for a harness this one does not know. It may be
     /// a live invocation, so it holds its slot and its issue until a binary
     /// that reads it (or a human who has checked nothing runs for it)
-    /// releases it.
-    DispatchStateUnreadable,
+    /// releases it. `why` says why it cannot be read.
+    DispatchStateUnreadable { why: String },
     /// The issue's dispatch state was written by the other harness, which the
     /// configured runner refuses to resume. Only that harness, or a human
     /// clearing the state, moves it.
@@ -548,8 +548,9 @@ pub fn plan_queue(
                 continue;
             }
 
-            if unreadable.contains(&dispatch_state::dispatch_state_key(&issue)) {
-                defer(DeferReason::DispatchStateUnreadable);
+            let key = dispatch_state::dispatch_state_key(&issue);
+            if let Some((_, why)) = unreadable.iter().find(|(k, _)| *k == key) {
+                defer(DeferReason::DispatchStateUnreadable { why: why.clone() });
                 continue;
             }
             let state = in_flight.iter().find(|s| s.issue == issue);
@@ -1915,7 +1916,12 @@ mod tests {
             &cfg,
         )
         .unwrap();
-        assert_eq!(reason_for(&plan, 1), DeferReason::DispatchStateUnreadable);
+        assert!(
+            matches!(reason_for(&plan, 1), DeferReason::DispatchStateUnreadable { why }
+                if !why.is_empty()),
+            "{:?}",
+            reason_for(&plan, 1)
+        );
         assert!(
             matches!(reason_for(&plan, 2), DeferReason::ConcurrencyCap { .. }),
             "{:?}",
