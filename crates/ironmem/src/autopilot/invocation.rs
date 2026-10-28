@@ -552,8 +552,14 @@ pub(crate) const INVOCATION_RETENTION: Duration = Duration::from_secs(14 * 24 * 
 /// (`<common_dir>/ironmem/autopilot/<slug>/<uuid>`) last modified more than
 /// `older_than` ago, except `keep`, the invocation the issue's dispatch
 /// state still names. Only UUID-named directories are touched, never
-/// followed through a symlink. A directory that cannot be removed is
-/// logged and left. Returns how many were removed.
+/// followed through a symlink; one that vanishes meanwhile (another
+/// prune) is skipped. A directory that cannot be removed is logged and
+/// left. Returns how many were removed.
+///
+/// `slug` must have an issue slug's shape (`IssueRef::slug`: a single path
+/// name ending `-<number>`), so nothing else under
+/// `<common_dir>/ironmem/autopilot/`, such as the `locks/` directory, can
+/// ever be pruned.
 // run_issue's clear and release_settled_dispatches call this; until that
 // wiring lands only the tests do.
 #[cfg_attr(not(test), allow(dead_code))]
@@ -563,6 +569,15 @@ pub(crate) fn prune_invocations(
     keep: Option<&str>,
     older_than: Duration,
 ) -> Result<usize, MemoryError> {
+    let issue_shaped = !slug.contains('/')
+        && slug
+            .rsplit_once('-')
+            .is_some_and(|(name, number)| !name.is_empty() && number.parse::<u64>().is_ok());
+    if !issue_shaped {
+        return Err(validation(format!(
+            "{slug:?} is not an issue slug, so its invocations cannot be pruned"
+        )));
+    }
     let issue_dir = common_dir.join("ironmem/autopilot").join(slug);
     let entries = match std::fs::read_dir(&issue_dir) {
         Ok(entries) => entries,
@@ -578,7 +593,11 @@ pub(crate) fn prune_invocations(
         if Some(name) == keep || uuid::Uuid::parse_str(name).is_err() {
             continue;
         }
-        let meta = std::fs::symlink_metadata(entry.path())?;
+        let meta = match std::fs::symlink_metadata(entry.path()) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e.into()),
+        };
         let old = meta
             .modified()
             .ok()
@@ -589,6 +608,7 @@ pub(crate) fn prune_invocations(
         }
         match std::fs::remove_dir_all(entry.path()) {
             Ok(()) => pruned += 1,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => tracing::warn!(
                 error = %e,
                 dir = %entry.path().display(),
@@ -2056,6 +2076,40 @@ pub(crate) mod contract_tests {
             prune_invocations(common.path(), "owner-repo-7", None, INVOCATION_RETENTION).unwrap(),
             0
         );
+        // A UUID-named symlink is never followed, however old its target.
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("keep-me");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("data"), "x").unwrap();
+        File::open(&target)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - 20 * day)
+            .unwrap();
+        let link = issue.join("31111111-2222-4333-8444-555555555555");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        prune_invocations(common.path(), "owner-repo-42", None, INVOCATION_RETENTION).unwrap();
+        assert!(target.join("data").exists() && link.symlink_metadata().is_ok());
+        // Only an issue's slug is pruned: never track 1's lock directory,
+        // nor anything a slug could climb to.
+        let locks = common.path().join("ironmem/autopilot/locks");
+        make_in(&locks, "41111111-2222-4333-8444-555555555555", 20 * day);
+        for slug in ["locks", "..", "owner-repo-42/..", "", "no-number"] {
+            assert!(
+                prune_invocations(common.path(), slug, None, INVOCATION_RETENTION).is_err(),
+                "{slug:?}"
+            );
+        }
+        assert!(locks.join("41111111-2222-4333-8444-555555555555").exists());
+    }
+
+    /// An old invocation-shaped directory `name` in `parent`, `age` old.
+    fn make_in(parent: &Path, name: &str, age: Duration) {
+        let dir = parent.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        File::open(&dir)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - age)
+            .unwrap();
     }
 
     /// A failure after the invocation directory is created (a full disk,
