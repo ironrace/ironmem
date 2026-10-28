@@ -3105,10 +3105,11 @@ pub fn run_issue(
             .as_ref()
             .is_some_and(|s| s.signing_held && s.is_parked()),
     };
-    // What this run's own states record: its reading, and a parked run's
-    // carried forward unless an operator has since opted the branch out.
+    // What this run's own states record: its reading, and an earlier
+    // run's — parked or interrupted — carried forward unless an operator
+    // has since opted the branch out (R10).
     let signing_held = policy_at_start
-        || (seen.by_parked_run
+        || ((seen.by_parked_run || seen.by_interrupted_run)
             && !matches!(
                 worktree::signing_holder(&worktree.path, &worktree.branch),
                 Ok(worktree::SigningHold::OptedOut)
@@ -3345,6 +3346,8 @@ pub fn run_issue(
     let mut owned = existing_claim.clone();
 
     // A recovering harness publishes each invocation just before it launches.
+    // Claude's signing reading is recorded right before its first launch
+    // instead (R9, in the loop below), as the other harnesses' is.
     if !config.implementer.recovers_invocations() {
         write_state(
             &mut owned,
@@ -3356,8 +3359,6 @@ pub fn run_issue(
             (&native_session_id, &invocation_artifacts),
             (&session_model, resume_refusals),
         )?;
-        record_signing_reading();
-        signing_recorded = true;
     }
 
     let mut dispatches = Vec::new();
@@ -3681,6 +3682,13 @@ pub fn run_issue(
                         reserved.settle(None)?;
                     }
                     return Err(taken_over());
+                }
+                // Right before the first launch, as the other harnesses
+                // record it (R9): after this run's claim, and never for a
+                // run held before launching at all.
+                if !signing_recorded {
+                    record_signing_reading();
+                    signing_recorded = true;
                 }
             }
             launched = true;
@@ -8524,6 +8532,51 @@ sleep 0.5
                 .unwrap()
                 .unwrap();
             assert_eq!(state.signing_held, !opt_out, "{state:?}");
+        }
+    }
+
+    /// R9: a Claude run records its signing reading only right before
+    /// its first launch: a run held before launching records nothing.
+    #[test]
+    fn a_claude_run_held_before_its_first_launch_records_no_signing_reading() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
+        let mut b = ClaudeEvidence::new(&db, Vec::new());
+        b.own_evidence.push_back(InvocationRecovery::Alive);
+        let run = run_issue(&db, &issue(), &brief(), &wt, &config(), &mut b).unwrap();
+        assert!(
+            matches!(run.terminal, TerminalReason::ImplementationInFlight { .. }),
+            "{:?}",
+            run.terminal
+        );
+        assert!(b.seen.is_empty());
+        assert!(!worktree::signing_recorded(&wt.path, &wt.branch));
+    }
+
+    /// R10: an interrupted (non-parked) run's signing reading is carried
+    /// into this run's states too, unless the branch is opted out.
+    #[test]
+    fn an_interrupted_runs_signing_reading_is_carried_forward() {
+        for opt_out in [false, true] {
+            let db = approved_db();
+            let (_dir, wt) = fixture_worktree(); // policy off
+            if opt_out {
+                let key = format!("branch.{}.ironmemSigning", wt.branch);
+                git_in(&wt.path, &["config", &key, "false"]);
+            }
+            let mut state = pending_invocation(Implementer::Claude, &db, &wt, None);
+            state.signing_held = true;
+            dispatch_state::upsert_dispatch_state(&db, &state).unwrap();
+            let mut b = ClaudeEvidence::new(&db, Vec::new());
+            b.outcomes.push_back(no_verdict_error());
+            let mut c = config();
+            c.max_consecutive_infrastructure_failures = 1;
+            run_issue(&db, &issue(), &brief(), &wt, &c, &mut b).unwrap();
+            let written = dispatch_state::get_dispatch_state(&db, &issue())
+                .unwrap()
+                .unwrap();
+            assert_eq!(written.signing_held, !opt_out, "{written:?}");
         }
     }
 
