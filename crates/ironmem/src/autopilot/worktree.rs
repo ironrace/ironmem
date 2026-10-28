@@ -1114,8 +1114,11 @@ enum CreationEntry {
     /// made again since it was cut. For a branch found existing, whose
     /// history this run did not see made.
     OnBaseOnly,
-    /// As it is: another controller made the branch moments ago, from a base
-    /// that may not be this run's, so the entry is its creation.
+    /// As it is when it is the reflog's only line: another controller made
+    /// the branch moments ago, from a base that may not be this run's. A
+    /// longer reflog was not made just now (a `git branch -m` onto the name
+    /// brings the old branch's reflog, `checkout -B` adds a line), so it is
+    /// held to the base as [`Self::OnBaseOnly`] is.
     Fresh,
 }
 
@@ -1174,7 +1177,19 @@ fn infer_cut(
             .flatten()
     });
     if let Some(sha) = created {
-        if entry == CreationEntry::Fresh || is_ancestor(root, &sha, &base_sha)? {
+        if is_ancestor(root, &sha, &base_sha)? {
+            return Ok((sha, CutSource::Reflog));
+        }
+        if entry == CreationEntry::Fresh && log.lines().count() == 1 {
+            tracing::warn!(
+                branch = %branch,
+                created = %sha,
+                base = %base,
+                restore = %format!("git config {} {sha}", cut_key(branch)),
+                "the issue branch another controller just made is not on this run's base; its \
+                 creation entry is recorded as its cut. If that controller's base was wrong, set \
+                 the cut with `git config` as `restore` shows, naming the commit it should be"
+            );
             return Ok((sha, CutSource::Reflog));
         }
         tracing::warn!(
@@ -3947,10 +3962,47 @@ mod tests {
         run(&root, &["checkout", "-q", "main"]);
         let ours = advance_operator_head(&root, "later");
         let path = worktree_path(roots.path(), &issue());
-        let err = create_branch_with(&root, &branch, &path, "HEAD", &ours, || {
-            run(&root, &["branch", &branch, &theirs]);
+        let (err, log) = with_captured_log(|| {
+            create_branch_with(&root, &branch, &path, "HEAD", &ours, || {
+                run(&root, &["branch", &branch, &theirs]);
+            })
         });
         assert!(err.is_err());
-        assert_eq!(read_config(&root, &issue_cut_key()), Some(theirs));
+        assert_eq!(read_config(&root, &issue_cut_key()), Some(theirs.clone()));
+        // Off this run's base, so it says so, and how to set another.
+        assert!(log.contains("not on this run's base"), "{log}");
+        assert!(
+            log.contains(&format!("git config {} {theirs}", issue_cut_key())),
+            "{log}"
+        );
+    }
+
+    /// A branch renamed onto the issue branch's name in the same window
+    /// brings its own reflog, whose oldest line is its old creation: not
+    /// this branch's fresh creation, so it is not trusted as one.
+    #[test]
+    fn a_branch_renamed_onto_the_issue_branch_is_not_trusted_as_fresh() {
+        let repo = fixture_repo();
+        let roots = tempfile::tempdir().unwrap();
+        let root = resolve_repo_root(repo.path()).unwrap();
+        let branch = branch_name(&issue());
+        let seed = resolve_commit(&root, "HEAD").unwrap();
+        run(&root, &["checkout", "-q", "-b", "side"]);
+        let old_creation = advance_operator_head(&root, "side-work");
+        run(&root, &["checkout", "-q", "main"]);
+        run(&root, &["branch", "old", &old_creation]);
+        let ours = advance_operator_head(&root, "later");
+        let path = worktree_path(roots.path(), &issue());
+        let err = create_branch_with(&root, &branch, &path, "HEAD", &ours, || {
+            run(&root, &["branch", "-m", "old", &branch]);
+        });
+        assert!(err.is_err());
+        let recorded = read_config(&root, &issue_cut_key());
+        assert_ne!(
+            recorded.as_deref(),
+            Some(old_creation.as_str()),
+            "the renamed branch's old creation was trusted"
+        );
+        assert_eq!(recorded, Some(seed), "the merge base with the base");
     }
 }
