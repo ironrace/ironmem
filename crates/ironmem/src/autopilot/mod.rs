@@ -208,6 +208,7 @@ pub mod gate_config;
 pub mod gh;
 pub mod implementer;
 pub mod invocation;
+pub mod issue_lock;
 pub mod labels;
 pub mod lead;
 pub mod lineage;

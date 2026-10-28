@@ -361,6 +361,12 @@ pub enum DeferReason {
         persisted: Implementer,
         configured: Implementer,
     },
+    /// Selected, but another controller (another Lead, or a manual
+    /// `autopilot run`) holds the issue's lock
+    /// ([`super::issue_lock`]), so this tick neither provisions nor
+    /// dispatches it. Added by the Lead after planning, not by
+    /// [`plan_queue`].
+    HeldByAnotherController { detail: String },
 }
 
 /// One deferred issue and why.

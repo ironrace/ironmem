@@ -93,7 +93,15 @@ pub(crate) fn clear_dispatch_with(
             issue.canonical()
         )));
     };
-    let state = match dispatch_state::parse_dispatch_state(&raw) {
+    let parsed = dispatch_state::parse_dispatch_state(&raw);
+    // A controller holding the issue's lock may have published this state
+    // and not yet spawned (or registered) its implementer, when no evidence
+    // shows it yet. Held through the delete, so none starts meanwhile.
+    let _lock = match controller_lock(issue, &parsed, &raw) {
+        Ok(lock) => lock,
+        Err(reason) => return Err(refuse(reason)),
+    };
+    let state = match parsed {
         dispatch_state::Parsed::Readable(state) => *state,
         dispatch_state::Parsed::Unreadable(why) => {
             if let Some(reason) = unreadable_refusal(&observe(), issue, &raw, pids) {
@@ -134,6 +142,52 @@ pub(crate) fn clear_dispatch_with(
         state: state.state,
         invocation_artifacts: state.invocation_artifacts,
     }))
+}
+
+/// The issue's lock ([`super::issue_lock`]), taken in the repository of the
+/// worktree the state names, or why clearing must refuse: a controller
+/// holds it, or it cannot be looked for. A state naming no worktree, or one
+/// that no longer exists or is in no repository, has no controller that
+/// could be launching into it, and takes no lock.
+fn controller_lock(
+    issue: &IssueRef,
+    parsed: &dispatch_state::Parsed,
+    raw: &str,
+) -> Result<Option<super::issue_lock::IssueLock>, String> {
+    let worktree = match parsed {
+        dispatch_state::Parsed::Readable(state) => Some(state.worktree_path.clone()),
+        dispatch_state::Parsed::Unreadable(_) => serde_json::from_str::<serde_json::Value>(raw)
+            .ok()
+            .and_then(|v| v.get("worktree_path")?.as_str().map(str::to_owned)),
+    };
+    let Some(worktree) = worktree.map(std::path::PathBuf::from) else {
+        return Ok(None);
+    };
+    match std::fs::metadata(&worktree) {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => return Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(format!(
+                "its worktree {} cannot be read ({e}), so whether a controller is running \
+                 this issue cannot be checked",
+                worktree.display()
+            ))
+        }
+    }
+    let path = super::issue_lock::lock_path_if_repository(&worktree, issue).map_err(|e| {
+        format!("whether a controller is running this issue cannot be checked: {e}")
+    })?;
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    match super::issue_lock::try_lock_path(&path).map_err(|e| e.to_string())? {
+        super::issue_lock::IssueLockAttempt::Acquired(lock) => Ok(Some(lock)),
+        super::issue_lock::IssueLockAttempt::Held { path } => Err(format!(
+            "a controller is running this issue (it holds {}); rerun once it finishes",
+            path.display()
+        )),
+    }
 }
 
 /// Why an issue whose dispatch state cannot be read may still be running,
@@ -247,14 +301,23 @@ fn unreadable_refusal(
             return Some(reason);
         }
     }
-    // Both the drawer's own IC name, the one its Claude IC ran under, and
-    // the name every Claude dispatch for the issue takes: either held refuses.
+    let own = field("ic_session_name").and_then(|v| v.as_str().map(str::to_owned));
+    claude_ic_holder(snapshots, rows, issue, own.as_deref())
+}
+
+/// Why a Claude IC for the issue may be running: its registry lists it, or
+/// an active process names it with `--name`. Both the drawer's own IC name
+/// (`own`, the one its Claude IC ran under) and the name every Claude
+/// dispatch for the issue takes ([`super::dispatch::ic_name`]) count.
+pub(crate) fn claude_ic_holder(
+    snapshots: &HarnessSnapshots,
+    rows: &[super::process_tree::ProcessRow],
+    issue: &IssueRef,
+    own: Option<&str>,
+) -> Option<String> {
     let mut names = vec![super::dispatch::ic_name(issue)];
-    if let Some(own) = field("ic_session_name")
-        .and_then(|v| v.as_str().map(str::to_owned))
-        .filter(|name| !name.is_empty() && !names.contains(name))
-    {
-        names.insert(0, own);
+    if let Some(own) = own.filter(|name| !name.is_empty() && !names.iter().any(|n| n == name)) {
+        names.insert(0, own.to_string());
     }
     for ic in &names {
         if snapshots.claude.liveness(ic) == Liveness::Alive {
@@ -317,6 +380,15 @@ fn refusal(
                 state.issue.number,
                 implementer.cli_name()
             ))
+        }
+        // The registry lists an IC only once it registers, so a Claude IC
+        // just launched (or one the registry dropped) is looked for in the
+        // process table by name too, as an unreadable state's is.
+        (Implementer::Claude, Liveness::NotListed) => {
+            let super::process_tree::ProcessSnapshot::Available(rows) = &snapshots.processes else {
+                return Some(snapshots.processes.reason());
+            };
+            claude_ic_holder(snapshots, rows, &state.issue, Some(&state.ic_session_name))
         }
         (_, Liveness::NotListed) => None,
         // Unknown is exactly the hold this exists for — but only once a fresh
@@ -809,6 +881,88 @@ mod tests {
             readable(clear_dispatch(&db, &issue(), || snaps.clone())).implementer,
             Implementer::Claude
         );
+    }
+
+    /// A Claude IC the registry does not list yet (just launched, not yet
+    /// registered) is still found by the name it was launched under.
+    #[test]
+    fn a_readable_claude_state_is_kept_while_a_process_names_its_ic() {
+        let db = Database::open_in_memory().unwrap();
+        let mut state = held_state(
+            Implementer::Claude,
+            testing::invocation(tempfile::tempdir().unwrap().path()).0,
+        );
+        state.invocation_artifacts = None;
+        dispatch_state::upsert_dispatch_state(&db, &state).unwrap();
+        for args in [
+            "claude -p /goal x --name ic-owner-repo-42 --model m",
+            "claude -p /goal x --name=ic-owner-repo-42 --model m",
+        ] {
+            let err = clear_dispatch(&db, &issue(), || snapshots(vec![row(98, 98, args)]))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("process 98 names its IC session"), "{err}");
+        }
+        let unavailable = HarnessSnapshots {
+            claude: RegistrySnapshot::Available(Vec::new()),
+            processes: ProcessSnapshot::Unavailable {
+                reason: "ps timed out".into(),
+            },
+        };
+        assert!(clear_dispatch(&db, &issue(), || unavailable)
+            .unwrap_err()
+            .to_string()
+            .contains("ps timed out"));
+        assert!(dispatch_state::get_dispatch_state(&db, &issue())
+            .unwrap()
+            .is_some());
+        readable(clear_dispatch(&db, &issue(), || snapshots(Vec::new())));
+    }
+
+    /// A controller holding the issue's lock may have published its state
+    /// and not yet spawned anything: no process evidence exists, and the
+    /// lock is what says it is running.
+    #[test]
+    fn a_state_whose_controller_holds_the_issue_lock_is_kept() {
+        let repo = tempfile::tempdir().unwrap();
+        crate::autopilot::test_git::output(repo.path(), &["init", "-q"]);
+        let db = Database::open_in_memory().unwrap();
+        // Published with fresh artifacts, before any spawn: the directory
+        // (and so its process.json) is gone with its dropped tempdir.
+        let (a, _) = testing::invocation(tempfile::tempdir().unwrap().path());
+        let mut state = held_state(Implementer::Muse, a);
+        state.worktree_path = repo.path().to_string_lossy().into_owned();
+        dispatch_state::upsert_dispatch_state(&db, &state).unwrap();
+        let held =
+            match crate::autopilot::issue_lock::try_lock_issue(repo.path(), &issue()).unwrap() {
+                crate::autopilot::issue_lock::IssueLockAttempt::Acquired(lock) => lock,
+                crate::autopilot::issue_lock::IssueLockAttempt::Held { .. } => unreachable!(),
+            };
+        let err = clear_dispatch(&db, &issue(), || snapshots(Vec::new()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("a controller is running this issue"), "{err}");
+        assert!(dispatch_state::get_dispatch_state(&db, &issue())
+            .unwrap()
+            .is_some());
+        // An unreadable state naming the same worktree is kept the same way.
+        write_raw(
+            &db,
+            &serde_json::json!({
+                "implementer": "some-future-harness",
+                "worktree_path": repo.path(),
+            })
+            .to_string(),
+        );
+        let err = clear_dispatch(&db, &issue(), || snapshots(Vec::new()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("a controller is running this issue"), "{err}");
+        assert!(raw_drawer(&db).is_some());
+        // Released, the readable state clears.
+        dispatch_state::upsert_dispatch_state(&db, &state).unwrap();
+        drop(held);
+        readable(clear_dispatch(&db, &issue(), || snapshots(Vec::new())));
     }
 
     /// A marker path in Autopilot's layout for issue `owner-repo-<n>`.

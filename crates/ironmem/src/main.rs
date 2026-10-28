@@ -2158,6 +2158,13 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                 // Resolve the selected harness before provisioning a worktree,
                 // but after the useful unapproved-repo diagnostic above.
                 let mut dispatcher = resolve_dispatcher(implementer)?;
+                // Held from before the first check until the run ends, so a
+                // Lead (or another manual run) cannot provision or dispatch
+                // the issue meanwhile; see `autopilot::issue_lock`.
+                let _lock = ironmem::autopilot::issue_lock::lock_for_run(
+                    std::path::Path::new(&path),
+                    &issue_ref,
+                )?;
                 ironmem::autopilot::run::preflight_worktree_provisioning(
                     &database,
                     &issue_ref,

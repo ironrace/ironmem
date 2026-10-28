@@ -389,16 +389,25 @@ pub fn lead_tick(
 
     // ── 5. dispatch the top of the queue ────────────────────────────────
     let mut runs = Vec::new();
+    let mut plan = plan;
     if !config.dry_run {
+        let mut held = Vec::new();
         for queued in plan.dispatch.iter().take(config.max_dispatches_per_tick) {
             match dispatch_one(db, queued, config, dispatcher, advisor, &mut advice) {
-                Ok(run) => runs.push(run),
+                Ok(Dispatched::Ran(run)) => runs.push(run),
+                // Another controller has it: skipped this tick, said so.
+                Ok(Dispatched::Held { detail }) => held.push(queue::Deferred {
+                    issue: queued.issue.clone(),
+                    priority: queued.priority,
+                    reason: queue::DeferReason::HeldByAnotherController { detail },
+                }),
                 Err(e) => problems.push(TickProblem {
                     what: format!("dispatch {}", queued.issue.canonical()),
                     detail: e.to_string(),
                 }),
             }
         }
+        plan.deferred.extend(held);
     }
 
     // ── 6. close out every issue at its attempt cap ─────────────────────
@@ -970,7 +979,18 @@ pub fn resolve_class(
     Ok((class, Some(advice)))
 }
 
-/// Provision a worktree and drive one issue.
+/// What [`dispatch_one`] did with a selected issue.
+enum Dispatched {
+    Ran(IssueRun),
+    /// Another controller holds the issue's lock: nothing was provisioned
+    /// or dispatched.
+    Held {
+        detail: String,
+    },
+}
+
+/// Provision a worktree and drive one issue, holding its lock
+/// ([`super::issue_lock`]) from before the first check until the run ends.
 fn dispatch_one(
     db: &Database,
     queued: &queue::QueuedIssue,
@@ -978,7 +998,7 @@ fn dispatch_one(
     dispatcher: &mut dyn Dispatcher,
     advisor: &mut dyn Advisor,
     advice: &mut Vec<Advice>,
-) -> Result<IssueRun, MemoryError> {
+) -> Result<Dispatched, MemoryError> {
     let target = config
         .targets
         .iter()
@@ -990,6 +1010,18 @@ fn dispatch_one(
                 queued.issue.canonical()
             ))
         })?;
+
+    // Taken before any check and held through the run, dispatch included:
+    // a second controller that passed the same checks while this one waited
+    // on the advisor would otherwise quarantine this one's live worktree.
+    let _lock = match super::issue_lock::try_lock_issue(&target.path, &queued.issue)? {
+        super::issue_lock::IssueLockAttempt::Acquired(lock) => lock,
+        super::issue_lock::IssueLockAttempt::Held { path } => {
+            return Ok(Dispatched::Held {
+                detail: super::issue_lock::held_reason(&queued.issue, &path),
+            })
+        }
+    };
 
     // Queue liveness admitted this issue under its persisted owner. Re-check
     // the current state through the injected dispatcher before advice or
@@ -1027,6 +1059,7 @@ fn dispatch_one(
         &run_config,
         dispatcher,
     )
+    .map(Dispatched::Ran)
 }
 
 #[cfg(test)]
@@ -1355,6 +1388,71 @@ mod tests {
         assert_eq!(report.runs[0].issue.number, 3, "the high-priority one");
         assert_eq!(dispatcher.seen.len(), 1);
         assert!(report.problems.is_empty());
+    }
+
+    #[test]
+    fn an_issue_another_controller_holds_is_skipped_with_the_reason() {
+        let db = approved_db();
+        let f = fixture();
+        let issue = IssueRef::new(REPO, 7);
+        let tick = |db: &Database, dispatcher: &mut dyn Dispatcher| {
+            let mut gh_runner = ScriptedGh::new(vec![
+                Ok(GhOutput::ok("[]")),
+                Ok(GhOutput::ok(&issue_list_json(&[(7, &["agent:ready"])]))),
+            ]);
+            lead_tick(
+                db,
+                &mut gh_runner,
+                &mut empty_registry(),
+                dispatcher,
+                &mut no_advisor(),
+                &config(&f),
+            )
+            .unwrap()
+        };
+        let held = match crate::autopilot::issue_lock::try_lock_issue(&f.repo_path, &issue).unwrap()
+        {
+            crate::autopilot::issue_lock::IssueLockAttempt::Acquired(lock) => lock,
+            crate::autopilot::issue_lock::IssueLockAttempt::Held { .. } => unreachable!(),
+        };
+
+        let report = tick(&db, &mut RefusingDispatcher);
+        assert!(report.runs.is_empty());
+        assert!(report.problems.is_empty(), "{:?}", report.problems);
+        let deferred = report
+            .plan
+            .deferred
+            .iter()
+            .find(|d| d.issue == issue)
+            .expect("the held issue is reported as deferred");
+        match &deferred.reason {
+            queue::DeferReason::HeldByAnotherController { detail } => {
+                assert!(
+                    detail.contains("another controller holds issue"),
+                    "{detail}"
+                );
+                assert!(
+                    detail.contains(&held.path().display().to_string()),
+                    "{detail}"
+                );
+            }
+            other => panic!("deferred for {other:?}"),
+        }
+        assert!(
+            !worktree::worktree_path(&f.worktree_root, &issue).exists(),
+            "nothing is provisioned for an issue another controller holds"
+        );
+        assert!(dispatch_state::get_dispatch_state(&db, &issue)
+            .unwrap()
+            .is_none());
+
+        // Released (a crashed holder's descriptor closes the same way), the
+        // next tick runs it.
+        drop(held);
+        let mut dispatcher = RecordingDispatcher::new();
+        let report = tick(&db, &mut dispatcher);
+        assert_eq!(report.runs.len(), 1);
+        assert_eq!(dispatcher.seen.len(), 1);
     }
 
     #[test]
