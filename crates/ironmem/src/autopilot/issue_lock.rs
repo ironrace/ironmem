@@ -72,37 +72,85 @@ pub(crate) fn lock_path_if_repository(
     repo: &Path,
     issue: &IssueRef,
 ) -> Result<Option<PathBuf>, MemoryError> {
+    Ok(git_common_dir(repo)?.map(|common| lock_path_in(&common, issue)))
+}
+
+/// The lock file for `issue` under the git common directory `common`.
+///
+/// Named by the issue's slug for a reader, plus a hash of its canonical
+/// `owner/repo#n`: slugs collide (`a-b/c#1` and `a/b-c#1` are both
+/// `a-b-c-1`), and two issues must never share a lock.
+pub(crate) fn lock_path_in(common: &Path, issue: &IssueRef) -> PathBuf {
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(issue.canonical().as_bytes());
+    let hash: String = digest.iter().take(6).map(|b| format!("{b:02x}")).collect();
+    common
+        .join("ironmem/autopilot/locks")
+        .join(format!("{}-{hash}.lock", issue.slug()))
+}
+
+/// The git common directory of the repository at `repo` (any checkout or
+/// worktree of it), or `None` when `repo` is in no git repository.
+///
+/// A worktree whose link to its repository is broken (its administrative
+/// directory was pruned) still names that repository in its `.git` file, and
+/// its lock is still the repository's: it is found from there.
+///
+/// Refused when the common directory is on a remote filesystem
+/// ([`super::local_fs`]).
+pub fn git_common_dir(repo: &Path) -> Result<Option<PathBuf>, MemoryError> {
     let mut git = Command::new("git");
     git.args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
         .current_dir(repo);
     crate::mcp::tools::scrub_git_environment(&mut git);
+    // Its message is matched below, so it must be git's own English.
+    git.env("LC_ALL", "C").env_remove("LANGUAGE");
     let output = git.output().map_err(|e| {
-        MemoryError::Validation(format!(
-            "cannot run git to find {}'s lock in {}: {e}",
-            issue.canonical(),
-            repo.display()
-        ))
+        MemoryError::Validation(format!("cannot run git in {}: {e}", repo.display()))
     })?;
-    if !output.status.success() {
+    let common = if output.status.success() {
+        let common = std::str::from_utf8(&output.stdout)
+            .map_err(|_| MemoryError::Validation("the git common directory is not UTF-8".into()))?
+            .trim_end_matches(['\n', '\r']);
+        PathBuf::from(common)
+    } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        if stderr.contains("not a git repository") {
-            return Ok(None);
+        if !stderr.contains("not a git repository") {
+            return Err(MemoryError::Validation(format!(
+                "cannot find the git common directory of {}: {}",
+                repo.display(),
+                super::scrub::scrub_and_bound(&stderr, 500).text
+            )));
         }
-        return Err(MemoryError::Validation(format!(
-            "cannot find the git common directory of {} for {}'s lock: {}",
-            repo.display(),
-            issue.canonical(),
-            super::scrub::scrub_and_bound(&stderr, 500).text
-        )));
-    }
-    let common = std::str::from_utf8(&output.stdout)
-        .map_err(|_| MemoryError::Validation("the git common directory is not UTF-8".into()))?
-        .trim_end_matches(['\n', '\r']);
-    Ok(Some(
-        Path::new(common)
-            .join("ironmem/autopilot/locks")
-            .join(format!("{}.lock", issue.slug())),
-    ))
+        match common_dir_of_broken_worktree(repo) {
+            Some(common) => common,
+            None => return Ok(None),
+        }
+    };
+    super::local_fs::require_local(&common, "the git common directory")?;
+    Ok(Some(common))
+}
+
+/// The common directory a worktree's `.git` file names when git no longer
+/// reads it: `gitdir: <common>/worktrees/<name>`, through that directory's
+/// `commondir` when it is still there.
+fn common_dir_of_broken_worktree(repo: &Path) -> Option<PathBuf> {
+    let link = std::fs::read_to_string(repo.join(".git")).ok()?;
+    let gitdir = PathBuf::from(link.trim().strip_prefix("gitdir:")?.trim());
+    let gitdir = if gitdir.is_absolute() {
+        gitdir
+    } else {
+        repo.join(gitdir)
+    };
+    let common = match std::fs::read_to_string(gitdir.join("commondir")) {
+        Ok(named) => gitdir.join(named.trim()),
+        Err(_) => {
+            let worktrees = gitdir.parent()?;
+            (worktrees.file_name()? == "worktrees").then_some(())?;
+            worktrees.parent()?.to_path_buf()
+        }
+    };
+    common.join("HEAD").is_file().then_some(common)
 }
 
 /// Take `issue`'s lock in the repository at `repo` without waiting.
@@ -113,43 +161,74 @@ pub fn try_lock_issue(repo: &Path, issue: &IssueRef) -> Result<IssueLockAttempt,
 /// Take the lock at `path` without waiting, creating it (0600, in a 0700
 /// directory) if needed.
 pub(crate) fn try_lock_path(path: &Path) -> Result<IssueLockAttempt, MemoryError> {
+    try_lock_path_with(path, &|| {})
+}
+
+/// How many times a lock whose file was replaced between its open and its
+/// `flock` is taken again before giving up.
+const REPLACED_LOCK_RETRIES: usize = 5;
+
+/// [`try_lock_path`], with `after_open` run between the open and the
+/// `flock` (a test's window to replace the file).
+fn try_lock_path_with(path: &Path, after_open: &dyn Fn()) -> Result<IssueLockAttempt, MemoryError> {
+    use std::os::unix::fs::MetadataExt;
     let cannot = |e: std::io::Error| {
         MemoryError::Validation(format!(
             "cannot open the issue lock {}: {e}",
             path.display()
         ))
     };
-    if let Some(dir) = path.parent() {
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(dir)
+    for _ in 0..REPLACED_LOCK_RETRIES {
+        if let Some(dir) = path.parent() {
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(dir)
+                .map_err(cannot)?;
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(path)
             .map_err(cannot)?;
-    }
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-        .open(path)
-        .map_err(cannot)?;
-    // SAFETY: `file` owns a valid descriptor for the duration of the call.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-        return Ok(IssueLockAttempt::Acquired(IssueLock {
-            _file: file,
-            path: path.to_path_buf(),
-        }));
-    }
-    let e = std::io::Error::last_os_error();
-    if e.raw_os_error() == Some(libc::EWOULDBLOCK) {
-        return Ok(IssueLockAttempt::Held {
-            path: path.to_path_buf(),
-        });
+        after_open();
+        // SAFETY: `file` owns a valid descriptor for the duration of the call.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            let e = std::io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::EWOULDBLOCK) {
+                return Ok(IssueLockAttempt::Held {
+                    path: path.to_path_buf(),
+                });
+            }
+            return Err(MemoryError::Validation(format!(
+                "the issue lock {} cannot be taken ({e}): file locks do not work on this \
+                 filesystem, so no controller can coordinate here; Autopilot needs the \
+                 repository on a local disk",
+                path.display()
+            )));
+        }
+        // A lock on a file no longer at `path` (removed, or replaced, after
+        // the open) excludes no one: another controller opening `path` now
+        // gets another file. Taken again on whatever is there.
+        let held = file.metadata().map_err(cannot)?;
+        match std::fs::metadata(path) {
+            Ok(now) if now.dev() == held.dev() && now.ino() == held.ino() => {
+                return Ok(IssueLockAttempt::Acquired(IssueLock {
+                    _file: file,
+                    path: path.to_path_buf(),
+                }));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(cannot(e)),
+        }
     }
     Err(MemoryError::Validation(format!(
-        "cannot lock the issue lock {}: {e}",
+        "the issue lock {} kept being replaced while it was taken; something is removing it",
         path.display()
     )))
 }
@@ -238,6 +317,71 @@ mod tests {
         assert!(err.contains(&held.path().display().to_string()), "{err}");
         drop(held);
         lock_for_run(repo.path(), &issue).unwrap();
+    }
+
+    /// C-M3: a lock taken on a file that was replaced since it was opened
+    /// is taken again on the file now at the path, which another controller
+    /// holds.
+    #[test]
+    fn a_lock_file_replaced_before_its_flock_is_taken_again_on_the_new_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("locks/owner-repo-7.lock");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "").unwrap();
+        let other = std::cell::RefCell::new(None);
+        let replace = || {
+            if other.borrow().is_none() {
+                std::fs::remove_file(&path).unwrap();
+                *other.borrow_mut() = Some(acquired(try_lock_path(&path).unwrap()));
+            }
+        };
+        match try_lock_path_with(&path, &replace).unwrap() {
+            IssueLockAttempt::Held { .. } => {}
+            IssueLockAttempt::Acquired(_) => {
+                panic!("a lock on the replaced file was taken as the issue's")
+            }
+        }
+    }
+
+    /// Slugs collide; locks do not.
+    #[test]
+    fn two_issues_whose_slugs_collide_have_two_locks() {
+        let a = IssueRef::new("a-b/c", 1);
+        let b = IssueRef::new("a/b-c", 1);
+        assert_eq!(a.slug(), b.slug());
+        let common = Path::new("/r/.git");
+        assert_ne!(lock_path_in(common, &a), lock_path_in(common, &b));
+        assert!(lock_path_in(common, &a)
+            .to_string_lossy()
+            .contains("/ironmem/autopilot/locks/a-b-c-1-"));
+    }
+
+    /// C-M4: a worktree whose administrative directory was pruned still
+    /// finds its repository's common directory, and so its lock.
+    #[test]
+    fn a_worktree_with_a_broken_link_finds_its_repositorys_common_dir() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let git = |dir: &Path, args: &[&str]| {
+            super::super::test_git::output(dir, args);
+        };
+        git(&repo, &["init", "-q", "--initial-branch=main"]);
+        git(&repo, &["config", "user.email", "t@example.com"]);
+        git(&repo, &["config", "user.name", "T"]);
+        git(&repo, &["config", "commit.gpgsign", "false"]);
+        git(&repo, &["commit", "-q", "--allow-empty", "-m", "seed"]);
+        let wt = root.path().join("wt");
+        git(
+            &repo,
+            &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "x"],
+        );
+        let common = git_common_dir(&wt).unwrap().unwrap();
+        std::fs::remove_dir_all(common.join("worktrees")).unwrap();
+        assert_eq!(
+            std::fs::canonicalize(git_common_dir(&wt).unwrap().unwrap()).unwrap(),
+            std::fs::canonicalize(&common).unwrap()
+        );
     }
 
     #[test]

@@ -1483,6 +1483,15 @@ fn default_worktree_root() -> Result<std::path::PathBuf, MemoryError> {
 /// inline rather than through a shared helper; that pre-existing duplication
 /// is out of scope here, but the new `Autopilot` arms at least don't add
 /// to it.
+/// [`open_migrated_db`] for an Autopilot controller (a Lead, a manual run,
+/// clear-dispatch), which refuses a database on a remote filesystem: SQLite
+/// and the controllers' coordination hold on one host only.
+fn open_controller_db(db: Option<String>) -> Result<ironmem::db::schema::Database, MemoryError> {
+    let cfg = config::Config::load(db.clone())?;
+    ironmem::autopilot::local_fs::require_local(&cfg.db_path, "the ironmem database")?;
+    open_migrated_db(db)
+}
+
 fn open_migrated_db(db: Option<String>) -> Result<ironmem::db::schema::Database, MemoryError> {
     let cfg = config::Config::load(db)?;
     let database = ironmem::db::schema::Database::open(&cfg.db_path)?;
@@ -2149,7 +2158,7 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                 };
                 ironmem::autopilot::run::validate_worktree_root(implementer, &worktree_root)?;
 
-                let database = open_migrated_db(db)?;
+                let database = open_controller_db(db)?;
                 // Refuse an unapproved repo *before* creating a worktree and
                 // branch for it — `run_issue` checks this too, but by then
                 // the checkout already exists on disk.
@@ -2462,7 +2471,7 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                 db,
                 json,
             } => {
-                let database = open_migrated_db(db)?;
+                let database = open_controller_db(db)?;
                 let issue_ref = ironmem::autopilot::IssueRef::new(&repo, issue);
                 // Every harness's evidence (Claude's registry and the
                 // supervised CLIs' process table), sampled by
@@ -2904,7 +2913,7 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                 // fail on the config, not on a missing `gh`.
                 config.validate()?;
 
-                let database = open_migrated_db(db)?;
+                let database = open_controller_db(db)?;
                 let mut gh_runner = ironmem::autopilot::gh::GhCli::resolve(
                     config
                         .targets

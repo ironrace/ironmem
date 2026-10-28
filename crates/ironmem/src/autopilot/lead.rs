@@ -322,6 +322,11 @@ pub fn lead_tick(
     config: &LeadConfig,
 ) -> Result<LeadReport, MemoryError> {
     config.validate()?;
+    // One host only: every target's repository on a local disk, or nothing
+    // this tick proves about another controller holds.
+    for target in &config.targets {
+        super::issue_lock::git_common_dir(&target.path)?;
+    }
 
     let mut problems: Vec<TickProblem> = Vec::new();
     let mut advice: Vec<Advice> = Vec::new();

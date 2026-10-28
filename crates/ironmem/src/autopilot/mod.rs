@@ -212,6 +212,7 @@ pub mod issue_lock;
 pub mod labels;
 pub mod lead;
 pub mod lineage;
+pub mod local_fs;
 pub mod merge;
 pub mod muse_dispatch;
 pub mod onboard;
