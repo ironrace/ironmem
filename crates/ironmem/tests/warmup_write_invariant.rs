@@ -51,6 +51,8 @@ use ironmem::mcp::readiness::ReadinessGate;
 use ironmem::mcp::server::dispatch;
 use serde_json::{json, Value};
 
+mod git_env;
+
 /// Serializes tests that override `IRONMEM_WRITE_READINESS_TIMEOUT_SECS`: env
 /// vars are process-global and would otherwise race under the parallel test
 /// runner within this binary (mirrors `crates/ironmem/src/config.rs`'s own
@@ -152,6 +154,21 @@ fn force_readiness_failed(app: &mut App, reason: &str) {
     );
 }
 
+/// Fixture git in `dir` ([`git_env::fixture_git_env`]: no inherited
+/// `GIT_DIR` can aim it at another repository, and no global config signs
+/// or hooks it), asserting it succeeds; its stdout, trimmed.
+fn fixture_git(dir: &std::path::Path, args: &[&str]) -> String {
+    let mut command = std::process::Command::new("git");
+    git_env::fixture_git_env(&mut command);
+    let out = command.args(args).current_dir(dir).output().unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).unwrap().trim().to_string()
+}
+
 /// Mirrors `code_maps.rs`'s own test helper: a minimal real git repo so
 /// `code_map_write`'s `repo`/`head_sha` validation (which shells out to git)
 /// can succeed.
@@ -162,44 +179,18 @@ fn make_git_repo_with_file(
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_path_buf();
 
-    std::process::Command::new("git")
-        .args(["init"])
-        .current_dir(&root)
-        .output()
-        .unwrap();
-    std::process::Command::new("git")
-        .args(["config", "user.email", "test@test.com"])
-        .current_dir(&root)
-        .output()
-        .unwrap();
-    std::process::Command::new("git")
-        .args(["config", "user.name", "Test"])
-        .current_dir(&root)
-        .output()
-        .unwrap();
+    fixture_git(&root, &["init"]);
+    fixture_git(&root, &["config", "user.email", "test@test.com"]);
+    fixture_git(&root, &["config", "user.name", "Test"]);
 
     let file_path = root.join(filename);
     if let Some(parent) = file_path.parent() {
         std::fs::create_dir_all(parent).unwrap();
     }
     std::fs::write(&file_path, contents).unwrap();
-    std::process::Command::new("git")
-        .args(["add", "."])
-        .current_dir(&root)
-        .output()
-        .unwrap();
-    std::process::Command::new("git")
-        .args(["commit", "-m", "initial"])
-        .current_dir(&root)
-        .output()
-        .unwrap();
-
-    let out = std::process::Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(&root)
-        .output()
-        .unwrap();
-    let sha = String::from_utf8(out.stdout).unwrap().trim().to_string();
+    fixture_git(&root, &["add", "."]);
+    fixture_git(&root, &["commit", "-m", "initial"]);
+    let sha = fixture_git(&root, &["rev-parse", "HEAD"]);
 
     (dir, root, sha)
 }

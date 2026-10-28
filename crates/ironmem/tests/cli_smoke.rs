@@ -10,6 +10,8 @@ use ironmem::mcp::protocol::JsonRpcRequest;
 use ironmem::mcp::server::dispatch;
 use serde_json::json;
 
+mod git_env;
+
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_ironmem")
 }
@@ -308,34 +310,28 @@ fn cli_report_json_smoke_test() {
 
 // ── Helper: create a minimal git repo with one committed Rust file ──────────
 
+/// Fixture git in `root` ([`git_env::fixture_git_env`]: no inherited
+/// `GIT_DIR` can aim it at another repository, and no global config signs
+/// or hooks it), asserting it succeeds.
+fn fixture_git(root: &Path, args: &[&str]) {
+    let mut command = Command::new("git");
+    git_env::fixture_git_env(&mut command);
+    let out = command.args(args).current_dir(root).output().unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 fn make_git_repo_with_rust(root: &Path, rs_content: &str) {
     std::fs::create_dir_all(root).unwrap();
-    Command::new("git")
-        .args(["init", "-b", "main"])
-        .current_dir(root)
-        .output()
-        .unwrap();
-    Command::new("git")
-        .args(["config", "user.email", "test@example.com"])
-        .current_dir(root)
-        .output()
-        .unwrap();
-    Command::new("git")
-        .args(["config", "user.name", "Test"])
-        .current_dir(root)
-        .output()
-        .unwrap();
+    fixture_git(root, &["init", "-b", "main"]);
+    fixture_git(root, &["config", "user.email", "test@example.com"]);
+    fixture_git(root, &["config", "user.name", "Test"]);
     std::fs::write(root.join("lib.rs"), rs_content).unwrap();
-    Command::new("git")
-        .args(["add", "-A"])
-        .current_dir(root)
-        .output()
-        .unwrap();
-    Command::new("git")
-        .args(["commit", "-m", "init"])
-        .current_dir(root)
-        .output()
-        .unwrap();
+    fixture_git(root, &["add", "-A"]);
+    fixture_git(root, &["commit", "-m", "init"]);
 }
 
 fn symbols_cmd(db_path: &PathBuf, home: &Path) -> Command {

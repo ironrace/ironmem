@@ -15,7 +15,12 @@
 //! - every `Command::new("git")` under `src/` is bound with `let mut <name>`
 //!   and followed, within a few lines, by `scrub_git_environment(&mut
 //!   <name>)`, the one shared scrub, which removes every redirecting variable
-//!   unconditionally.
+//!   unconditionally;
+//! - every `Command::new("git")` under `tests/` is bound the same way and
+//!   scrubbed by `tests/git_env`'s `scrub_git_env` or `fixture_git_env` (or
+//!   `scrub_git_env` imported as `scrub_git_environment`), which remove the
+//!   same variables: an integration fixture's `git init` or `git commit` under
+//!   an inherited `GIT_DIR` would act on the outer repository.
 //!
 //! They read the source rather than spawn anything: a call site that forgot
 //! is invisible at runtime until the day a variable is set beside it.
@@ -127,11 +132,23 @@ fn mutable_binding(line: &str) -> Option<&str> {
     (end > 0 && rest[end..].trim_start().starts_with(['=', ':'])).then(|| &rest[..end])
 }
 
+/// The one scrub `src/` may use.
+const SRC_SCRUBS: &[&str] = &["scrub_git_environment"];
+
+/// The scrubs `tests/` may use: `tests/git_env`'s two, and `scrub_git_env`
+/// under the alias `review_diff.rs` imports it by.
+const TEST_SCRUBS: &[&str] = &["scrub_git_env", "fixture_git_env", "scrub_git_environment"];
+
 /// `Command::new("git")` sites (one-based lines) under `src/` that are not
 /// bound to a `let mut <name>` scrubbed by `scrub_git_environment(&mut
 /// <name>)` within [`SCRUB_WINDOW`] lines: a scrub of another binding in the
 /// window does not count.
 fn unscrubbed_git_commands(source: &str) -> Vec<usize> {
+    git_commands_unscrubbed_by(source, SRC_SCRUBS)
+}
+
+/// [`unscrubbed_git_commands`], accepting a call to any of `scrubs`.
+fn git_commands_unscrubbed_by(source: &str, scrubs: &[&str]) -> Vec<usize> {
     let lines: Vec<&str> = source.lines().collect();
     lines
         .iter()
@@ -141,10 +158,13 @@ fn unscrubbed_git_commands(source: &str) -> Vec<usize> {
             let Some(name) = mutable_binding(line) else {
                 return true;
             };
-            let scrub = format!("scrub_git_environment(&mut {name})");
+            let calls: Vec<String> = scrubs
+                .iter()
+                .map(|scrub| format!("{scrub}(&mut {name})"))
+                .collect();
             !lines[*at..lines.len().min(at + SCRUB_WINDOW + 1)]
                 .iter()
-                .any(|line| !is_comment(line) && line.contains(&scrub))
+                .any(|line| !is_comment(line) && calls.iter().any(|call| line.contains(call)))
         })
         .map(|(at, _)| at + 1)
         .collect()
@@ -186,6 +206,49 @@ fn every_git_command_is_scrubbed_by_the_one_shared_scrub() {
     );
 }
 
+/// The integration tests' twin of
+/// [`every_git_command_is_scrubbed_by_the_one_shared_scrub`]: their git goes
+/// through `tests/git_env`, whose scrubs are defined there and nowhere else.
+#[test]
+fn every_integration_test_git_command_is_scrubbed_by_git_env() {
+    let mut unscrubbed = Vec::new();
+    let mut definitions = Vec::new();
+    for file in rust_files(&crate_dir("tests")) {
+        let source = std::fs::read_to_string(&file).unwrap();
+        for line in git_commands_unscrubbed_by(&source, TEST_SCRUBS) {
+            unscrubbed.push(format!("{}:{line}", file.display()));
+        }
+        for scrub in TEST_SCRUBS {
+            let definition = format!("fn {scrub}(");
+            if source
+                .lines()
+                .any(|line| !is_comment(line) && line.contains(&definition))
+            {
+                definitions.push(format!("{}: {scrub}", file.display()));
+            }
+        }
+    }
+    assert!(
+        unscrubbed.is_empty(),
+        "these integration-test git commands are not bound with `let mut <name>` and \
+         scrubbed by `git_env::scrub_git_env(&mut <name>)` or \
+         `git_env::fixture_git_env(&mut <name>)` within {SCRUB_WINDOW} lines, so an \
+         inherited GIT_DIR can redirect them:\n{}",
+        unscrubbed.join("\n")
+    );
+    // A local function of the same name would satisfy the scan above while
+    // scrubbing less.
+    let git_env = crate_dir("tests/git_env/mod.rs").display().to_string();
+    assert_eq!(
+        definitions,
+        vec![
+            format!("{git_env}: scrub_git_env"),
+            format!("{git_env}: fixture_git_env"),
+        ],
+        "the integration tests' git scrubs must be defined once, in tests/git_env"
+    );
+}
+
 #[test]
 fn the_scans_find_what_they_look_for() {
     let writes = process_git_env_writes(
@@ -218,6 +281,17 @@ fn the_scans_find_what_they_look_for() {
          crate::mcp::tools::scrub_git_environment(&mut c);\n",
     );
     assert_eq!(unscrubbed, vec![1, 4]);
+    // The integration tests' scrubs count there, and only there.
+    let source = "let mut a = Command::new(\"git\");\n\
+         git_env::fixture_git_env(&mut a);\n\
+         let mut b = Command::new(\"git\");\n\
+         scrub_git_env(&mut b);\n\
+         let mut c = Command::new(\"git\");\n\
+         scrub_git_environment(&mut c);\n\
+         let mut d = Command::new(\"git\");\n\
+         fixture_git_env(&mut a);\n";
+    assert_eq!(git_commands_unscrubbed_by(source, TEST_SCRUBS), vec![7]);
+    assert_eq!(unscrubbed_git_commands(source), vec![1, 3, 7]);
 }
 
 /// The integration tests cannot import the lib's private

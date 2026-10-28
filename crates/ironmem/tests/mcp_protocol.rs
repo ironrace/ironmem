@@ -6610,19 +6610,11 @@ fn commit_file_deterministic(
     write_file(&cwd.join(filename), contents);
     git(&["add", filename], cwd);
     let mut command = Command::new("git");
-    // Scrub every inherited `GIT_*` var first — same reason `git()` does —
-    // before setting the specific author/committer ones below. An inherited
-    // `GIT_DIR` would silently redirect this commit (and the determinism
-    // `GATE_HEAD` depends on) to a different repo than `cwd`.
-    for (key, _) in std::env::vars_os() {
-        if key
-            .to_string_lossy()
-            .to_ascii_uppercase()
-            .starts_with("GIT_")
-        {
-            command.env_remove(key);
-        }
-    }
+    // Scrubbed first — same reason `git()` is — before setting the specific
+    // author/committer variables below. An inherited `GIT_DIR` would
+    // silently redirect this commit (and the determinism `GATE_HEAD` depends
+    // on) to a different repo than `cwd`.
+    fixture_git_env(&mut command);
     command
         .args(["commit", "-m", message])
         .current_dir(cwd)

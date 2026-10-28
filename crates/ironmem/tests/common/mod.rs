@@ -29,21 +29,17 @@ use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Run `git`, first scrubbing every inherited `GIT_*` environment variable —
-/// an inherited `GIT_DIR`/`GIT_WORK_TREE` would otherwise make `git` operate
-/// on (or report shas from) a different repo than the fixture at `cwd`,
-/// silently. Same idiom as `review_diff.rs`'s `scrub_git_environment`.
+#[path = "../git_env/mod.rs"]
+mod git_env;
+pub(crate) use git_env::fixture_git_env;
+
+/// Run fixture `git` through [`fixture_git_env`]: every redirecting `GIT_*`
+/// variable removed (an inherited `GIT_DIR`/`GIT_WORK_TREE` would otherwise
+/// make `git` operate on, or report shas from, a different repo than the
+/// fixture at `cwd`, silently), and no global or system config read.
 pub(crate) fn git(args: &[&str], cwd: &Path) -> String {
     let mut command = Command::new("git");
-    for (key, _) in std::env::vars_os() {
-        if key
-            .to_string_lossy()
-            .to_ascii_uppercase()
-            .starts_with("GIT_")
-        {
-            command.env_remove(key);
-        }
-    }
+    fixture_git_env(&mut command);
     let output = command
         .args(args)
         .current_dir(cwd)
