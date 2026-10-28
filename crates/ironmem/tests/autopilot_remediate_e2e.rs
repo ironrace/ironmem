@@ -131,7 +131,9 @@ exit 0
 
     // The IC. It records the condition it was handed — which is how the test
     // asserts the findings reached the *real* argv — and, when told to, makes
-    // a real commit, so the branch head genuinely moves.
+    // a real commit, so the branch head genuinely moves. Only a dispatch
+    // (`-p` among its arguments) does any of that: `claude agents` is a
+    // registry read, which answers an empty registry and touches nothing.
     stub(
         &stubs,
         "claude",
@@ -142,13 +144,19 @@ unset $(env | grep -o '^GIT_[A-Za-z0-9_]*' || true)
 # Nor the operator's global or system config: it may sign the commit with
 # their key or run their hooks.
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+if [ "$1" = agents ]; then
+  printf '[]'
+  exit 0
+fi
 echo "claude $*" >> "$AP_LOG"
 prev=""
+dispatch=""
 for a in "$@"; do
+  if [ "$a" = "-p" ]; then dispatch=1; fi
   if [ "$prev" = "-p" ]; then printf '%s' "$a" > "$AP_FIXTURES/last_condition.txt"; fi
   prev="$a"
 done
-if [ -f "$AP_FIXTURES/ic_should_commit" ]; then
+if [ -n "$dispatch" ] && [ -f "$AP_FIXTURES/ic_should_commit" ]; then
   echo "fix $(date +%s%N)" >> fix.txt
   git add fix.txt || exit 1
   git -c user.email=ic@example.com -c user.name=IC commit -qm "address review findings" || exit 1
