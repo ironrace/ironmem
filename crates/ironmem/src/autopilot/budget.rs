@@ -17,9 +17,25 @@ use crate::error::MemoryError;
 
 use super::{read_current, write_current_tx};
 
+/// One reserved dollar ceiling, held against a date's total from before
+/// its dispatch launches until it settles. Identified, and tied to its
+/// issue, so a reservation its controller died holding can be released
+/// by the run that next takes the issue over.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpendReservationRecord {
+    pub id: String,
+    /// The issue's canonical `owner/repo#n`.
+    pub issue: String,
+    pub amount_usd: f64,
+}
+
 /// One date's accumulated spend.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BudgetLedgerEntry {
+    /// Dollar ceilings currently reserved (see [`SpendReservationRecord`]);
+    /// their amounts are already inside `total_cost_usd`.
+    #[serde(default)]
+    pub spend_reservations: Vec<SpendReservationRecord>,
     /// Durable invocation identities reserved before launching unpriced implementations.
     #[serde(default)]
     pub reserved_unpriced_dispatch_ids: Vec<String>,
@@ -294,6 +310,8 @@ pub fn reserve_spend_if_within(
     date: &str,
     amount_usd: f64,
     budget_usd: f64,
+    issue: &str,
+    id: &str,
 ) -> Result<SpendReservation, MemoryError> {
     validate_date(date)?;
     validate_amount(amount_usd)?;
@@ -307,33 +325,69 @@ pub fn reserve_spend_if_within(
             );
         }
         entry.total_cost_usd += amount_usd;
+        entry.spend_reservations.push(SpendReservationRecord {
+            id: id.to_string(),
+            issue: issue.to_string(),
+            amount_usd,
+        });
         (true, SpendReservation::Reserved)
     })?;
     Ok(decision)
 }
 
-/// Settle a [`reserve_spend_if_within`] reservation of `reserved_usd` on
-/// `date` (the day it was reserved on): the measured `cost_usd` replaces it
-/// and counts as a dispatch, or, with no price, the reservation is only
-/// released (the caller records the unpriced dispatch on its own counter).
+/// Settle the [`reserve_spend_if_within`] reservation `id` on `date` (the
+/// day it was reserved on): the measured `cost_usd` replaces it and
+/// counts as a dispatch, or, with no price, the reservation is only
+/// released (the caller records the unpriced dispatch on its own
+/// counter). A reservation already released (its controller died and
+/// the next run released it) subtracts nothing; its cost still counts.
 pub fn settle_reserved_spend(
     db: &Database,
     date: &str,
-    reserved_usd: f64,
+    id: &str,
     cost_usd: Option<f64>,
 ) -> Result<BudgetLedgerEntry, MemoryError> {
     validate_date(date)?;
-    validate_amount(reserved_usd)?;
     if let Some(cost) = cost_usd {
         validate_amount(cost)?;
     }
     update_ledger(db, date, |entry| {
-        entry.total_cost_usd = (entry.total_cost_usd - reserved_usd).max(0.0);
+        if let Some(at) = entry.spend_reservations.iter().position(|r| r.id == id) {
+            let record = entry.spend_reservations.remove(at);
+            entry.total_cost_usd = (entry.total_cost_usd - record.amount_usd).max(0.0);
+        }
         if let Some(cost) = cost_usd {
             entry.total_cost_usd += cost;
             entry.dispatch_count += 1;
         }
     })
+}
+
+/// Release every spend reservation held for `issue` on `date`, returning
+/// what it gave back: a reservation its controller died holding (killed
+/// or crashed between reserving and settling) otherwise inflates the
+/// day's total until midnight, however idle the issue now is.
+pub fn release_issue_spend_reservations(
+    db: &Database,
+    date: &str,
+    issue: &str,
+) -> Result<f64, MemoryError> {
+    validate_date(date)?;
+    let (_, released) = transact_ledger(db, date, |entry| {
+        let released: f64 = entry
+            .spend_reservations
+            .iter()
+            .filter(|r| r.issue == issue)
+            .map(|r| r.amount_usd)
+            .sum();
+        if released == 0.0 {
+            return (false, 0.0);
+        }
+        entry.spend_reservations.retain(|r| r.issue != issue);
+        entry.total_cost_usd = (entry.total_cost_usd - released).max(0.0);
+        (true, released)
+    })?;
+    Ok(released)
 }
 
 fn validate_amount(amount_usd: f64) -> Result<(), MemoryError> {
@@ -427,6 +481,7 @@ fn transact_ledger<T>(
         let mut entry = match read_current(db, &key)? {
             Some(drawer) => serde_json::from_str::<BudgetLedgerEntry>(&drawer.content)?,
             None => BudgetLedgerEntry {
+                spend_reservations: Vec::new(),
                 reserved_unpriced_dispatch_ids: Vec::new(),
                 date: date.to_string(),
                 total_cost_usd: 0.0,
@@ -597,18 +652,18 @@ mod tests {
         let date = "2026-09-03";
         accumulate_daily_spend(&db, date, 22.0).unwrap();
         assert_eq!(
-            reserve_spend_if_within(&db, date, 2.5, 25.0).unwrap(),
+            reserve_spend_if_within(&db, date, 2.5, 25.0, "owner/repo#1", "r1").unwrap(),
             SpendReservation::Reserved
         );
         assert_eq!(
-            reserve_spend_if_within(&db, date, 2.5, 25.0).unwrap(),
+            reserve_spend_if_within(&db, date, 2.5, 25.0, "owner/repo#1", "r1").unwrap(),
             SpendReservation::BudgetReached { spent_usd: 24.5 }
         );
-        let entry = settle_reserved_spend(&db, date, 2.5, Some(1.0)).unwrap();
+        let entry = settle_reserved_spend(&db, date, "r1", Some(1.0)).unwrap();
         assert!((entry.total_cost_usd - 23.0).abs() < 1e-9, "{entry:?}");
         assert_eq!(entry.dispatch_count, 2);
-        reserve_spend_if_within(&db, date, 2.0, 25.0).unwrap();
-        let entry = settle_reserved_spend(&db, date, 2.0, None).unwrap();
+        reserve_spend_if_within(&db, date, 2.0, 25.0, "owner/repo#1", "r2").unwrap();
+        let entry = settle_reserved_spend(&db, date, "r2", None).unwrap();
         assert!((entry.total_cost_usd - 23.0).abs() < 1e-9, "{entry:?}");
         assert_eq!(
             entry.dispatch_count, 2,
@@ -616,12 +671,38 @@ mod tests {
         );
     }
 
+    /// A reservation whose controller died is released by issue, and
+    /// its late settle still counts the measured cost exactly once.
+    #[test]
+    fn an_orphaned_spend_reservation_is_released_by_issue() {
+        let db = Database::open_in_memory().unwrap();
+        let date = "2026-09-03";
+        assert_eq!(
+            reserve_spend_if_within(&db, date, 2.5, 25.0, "owner/repo#1", "r1").unwrap(),
+            SpendReservation::Reserved
+        );
+        assert_eq!(
+            reserve_spend_if_within(&db, date, 2.5, 25.0, "owner/repo#2", "r2").unwrap(),
+            SpendReservation::Reserved
+        );
+        let released = release_issue_spend_reservations(&db, date, "owner/repo#1").unwrap();
+        assert!((released - 2.5).abs() < 1e-9, "{released}");
+        let entry = get_daily_spend(&db, date).unwrap().unwrap();
+        assert!((entry.total_cost_usd - 2.5).abs() < 1e-9, "{entry:?}");
+        assert_eq!(entry.spend_reservations.len(), 1);
+        // The dead controller's settle, arriving late, counts its cost
+        // without subtracting the released ceiling a second time.
+        let entry = settle_reserved_spend(&db, date, "r1", Some(1.0)).unwrap();
+        assert!((entry.total_cost_usd - 3.5).abs() < 1e-9, "{entry:?}");
+        assert_eq!(entry.dispatch_count, 1);
+    }
+
     #[test]
     fn concurrent_spend_reservations_never_pass_the_budget() {
         let (_dir, path) = shared_db();
         accumulate_daily_spend(&Database::open(&path).unwrap(), "2026-09-03", 22.0).unwrap();
         let reserved = race(&path, 4, |_, db| {
-            reserve_spend_if_within(db, "2026-09-03", 2.5, 25.0).unwrap()
+            reserve_spend_if_within(db, "2026-09-03", 2.5, 25.0, "owner/repo#1", "race").unwrap()
                 == SpendReservation::Reserved
         });
         assert_eq!(reserved.iter().filter(|r| **r).count(), 1, "{reserved:?}");
@@ -788,6 +869,7 @@ mod tests {
         // Mutation guard for `||`: each counter alone must mark the total
         // a floor. An `&&` (or a dropped advice arm) stays red here.
         let mut entry = BudgetLedgerEntry {
+            spend_reservations: Vec::new(),
             reserved_unpriced_dispatch_ids: Vec::new(),
             date: "2026-09-03".to_string(),
             total_cost_usd: 0.0,

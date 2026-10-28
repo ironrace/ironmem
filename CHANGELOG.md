@@ -259,7 +259,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `remote` (an `Option<&str>`: the remote the goal condition's push names,
   `None` for none); `DispatchState` has new required fields `session_model`,
   `resume_refusals` and `signing_held`, and `DispatchOutcome` a new required
-  field `session_refusal`; the new `Implementer::Muse` variant breaks
+  field `session_refusal`; `BudgetLedgerEntry` has a new field
+  `spend_reservations` (reserved ceilings are now recorded per issue, so
+  one its controller died holding is released by the next run); the new `Implementer::Muse` variant breaks
   exhaustive matches on `Implementer`; `dispatch_state`'s
   `upsert_dispatch_state_if_unchanged`, `dispatch_state_is` and
   `clear_dispatch_state_if_unchanged` are removed (the claim

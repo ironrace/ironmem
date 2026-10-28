@@ -2366,6 +2366,32 @@ fn record_and_advance(
         Ok(true)
     })?;
     if recorded {
+        // A finished run's claim is gone, so no later clear prunes for
+        // it: old invocation directories age out here, keeping the one
+        // just recorded (F52's completed-issue case).
+        if then.is_none() {
+            if let Some(claim) = owned.as_ref() {
+                if let Some(common) = &claim.common_dir {
+                    let keep = claim
+                        .state
+                        .invocation_artifacts
+                        .as_ref()
+                        .map(|a| a.invocation_id.as_str());
+                    if let Err(e) = super::invocation::prune_invocations(
+                        Path::new(common),
+                        &issue.slug(),
+                        keep,
+                        super::invocation::INVOCATION_RETENTION,
+                    ) {
+                        tracing::warn!(
+                            error = %e,
+                            issue = %issue.canonical(),
+                            "autopilot could not prune old invocation directories"
+                        );
+                    }
+                }
+            }
+        }
         *owned = then;
     }
     Ok(recorded)
@@ -2723,16 +2749,16 @@ fn taken_over(issue: &IssueRef) -> MemoryError {
 struct ReservedSpend<'a> {
     db: &'a Database,
     date: String,
-    amount_usd: f64,
+    id: String,
     settled: bool,
 }
 
 impl<'a> ReservedSpend<'a> {
-    fn new(db: &'a Database, date: String, amount_usd: f64) -> Self {
+    fn new(db: &'a Database, date: String, id: String) -> Self {
         Self {
             db,
             date,
-            amount_usd,
+            id,
             settled: false,
         }
     }
@@ -2740,7 +2766,7 @@ impl<'a> ReservedSpend<'a> {
     /// Replace the reservation with the measured cost, or release it.
     fn settle(mut self, cost_usd: Option<f64>) -> Result<(), MemoryError> {
         self.settled = true;
-        budget::settle_reserved_spend(self.db, &self.date, self.amount_usd, cost_usd).map(|_| ())
+        budget::settle_reserved_spend(self.db, &self.date, &self.id, cost_usd).map(|_| ())
     }
 }
 
@@ -2749,7 +2775,7 @@ impl Drop for ReservedSpend<'_> {
         if self.settled {
             return;
         }
-        if let Err(e) = budget::settle_reserved_spend(self.db, &self.date, self.amount_usd, None) {
+        if let Err(e) = budget::settle_reserved_spend(self.db, &self.date, &self.id, None) {
             tracing::warn!(
                 error = %e,
                 date = %self.date,
@@ -3386,6 +3412,23 @@ pub fn run_issue(
     };
     let mut owned = existing_claim.clone();
 
+    // A previous run that died holding a spend reservation for this
+    // issue leaves it released here, where this run takes the issue
+    // over: its dispatch is proven idle or finished by the checks
+    // above, and its own late settle counts its cost without
+    // subtracting the ceiling twice (see `budget`).
+    if existing_claim.is_some() {
+        if let Err(e) =
+            budget::release_issue_spend_reservations(db, &today_utc(), &issue.canonical())
+        {
+            tracing::warn!(
+                error = %e,
+                issue = %issue.canonical(),
+                "autopilot could not release a previous run's spend reservation"
+            );
+        }
+    }
+
     // A recovering harness publishes each invocation just before it launches.
     // Claude's signing reading is recorded right before its first launch
     // instead (R9, in the loop below), as the other harnesses' is.
@@ -3707,14 +3750,17 @@ pub fn run_issue(
                 // the top of the loop is only a cheap pre-filter. Settled
                 // to the measured cost once the dispatch returns.
                 let date = today_utc();
+                let reservation_id = uuid::Uuid::new_v4().to_string();
                 match budget::reserve_spend_if_within(
                     db,
                     &date,
                     config.max_budget_usd,
                     config.daily_budget_usd,
+                    &issue.canonical(),
+                    &reservation_id,
                 )? {
                     budget::SpendReservation::Reserved => {
-                        reserved_spend = Some(ReservedSpend::new(db, date, config.max_budget_usd));
+                        reserved_spend = Some(ReservedSpend::new(db, date, reservation_id));
                     }
                     budget::SpendReservation::BudgetReached { spent_usd } => {
                         break TerminalReason::DailyBudgetExhausted { spent_usd };
@@ -11131,8 +11177,8 @@ satisfies it on its own"
     fn an_unsettled_spend_reservation_is_released_when_dropped() {
         let db = Database::open_in_memory().unwrap();
         let date = today_utc();
-        budget::reserve_spend_if_within(&db, &date, 2.5, 25.0).unwrap();
-        drop(ReservedSpend::new(&db, date.clone(), 2.5));
+        budget::reserve_spend_if_within(&db, &date, 2.5, 25.0, "owner/repo#1", "r1").unwrap();
+        drop(ReservedSpend::new(&db, date.clone(), "r1".to_string()));
         let ledger = budget::get_daily_spend(&db, &date).unwrap().unwrap();
         assert_eq!(ledger.total_cost_usd, 0.0);
     }

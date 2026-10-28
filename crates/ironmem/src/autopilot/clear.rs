@@ -159,6 +159,18 @@ pub(crate) fn clear_dispatch_with(
                 .into(),
         ));
     }
+    // Its run is gone with its state: any spend reservation it died
+    // holding goes back to the day (best effort; a wrong date is a
+    // no-op, and the next run releases its own day's).
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    if let Err(e) = super::budget::release_issue_spend_reservations(db, &today, &issue.canonical())
+    {
+        tracing::warn!(
+            error = %e,
+            issue = %issue.canonical(),
+            "autopilot could not release a cleared run's spend reservation"
+        );
+    }
     Ok(Cleared::Dispatch(ClearedDispatch {
         issue: issue.canonical(),
         implementer: state.implementer,
