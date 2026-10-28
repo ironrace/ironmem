@@ -39,14 +39,6 @@ impl ProcessRow {
         !self.stat.starts_with('Z') || self.stat.contains('l')
     }
 
-    /// Whether cleanup's SIGSTOP shows on the row. An active `Z` row (see
-    /// [`Self::active`]) counts: its dead leader's `Z` stays in `ps` after
-    /// the stop reaches its live threads (measured), as it did when such a
-    /// row counted as inactive and was never waited for.
-    pub(crate) fn stopped(&self) -> bool {
-        self.stat.starts_with('T') || self.stat.starts_with('Z')
-    }
-
     /// ps does not preserve argv boundaries. Only argv words the harness
     /// grammar verifies as options can supply an invocation marker: Codex's
     /// option prefix before its first positional prompt, or Muse's whole
@@ -1116,6 +1108,109 @@ fn kernel_observation(pid: u32) -> Result<Option<KernelProcess>, String> {
     }
 }
 
+/// Whether cleanup's SIGSTOP shows on `row`: `T` in `ps`. A `Z`-led row
+/// that is still active (`Zl`, see [`ProcessRow::active`]) keeps its dead
+/// leader's `Z` in `ps` after the stop reaches its live threads (measured),
+/// so its tasks are read instead (`task_states`, each task's state letter):
+/// every one that has not exited (`Z`, `X`) must read `T` or `t`. A task
+/// list that cannot be read is not stopped, so quiesce keeps sampling and
+/// then fails closed ("did not quiesce") rather than call it stable while a
+/// thread may still fork.
+fn row_stopped(
+    row: &ProcessRow,
+    task_states: impl FnOnce(u32) -> Result<Vec<char>, String>,
+) -> bool {
+    if row.stat.starts_with('T') {
+        return true;
+    }
+    if !row.stat.starts_with('Z') {
+        return false;
+    }
+    task_states(row.pid).is_ok_and(|states| {
+        states
+            .into_iter()
+            .filter(|state| !matches!(state, 'Z' | 'X'))
+            .all(|state| matches!(state, 'T' | 't'))
+    })
+}
+
+/// Each task's state letter under Linux's `/proc/<pid>/task`; an error
+/// wherever one cannot be read. No other platform has per-task states here.
+fn task_states(pid: u32) -> Result<Vec<char>, String> {
+    #[cfg(target_os = "linux")]
+    {
+        let tasks = std::fs::read_dir(format!("/proc/{pid}/task"))
+            .map_err(|e| format!("cannot list process {pid}'s tasks: {e}"))?;
+        let mut states = Vec::new();
+        for task in tasks {
+            let task = task.map_err(|e| e.to_string())?;
+            let stat = std::fs::read_to_string(task.path().join("stat"))
+                .map_err(|e| format!("cannot read a task of process {pid}: {e}"))?;
+            states.push(task_state(&stat).ok_or("malformed task stat")?);
+        }
+        Ok(states)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Err(format!(
+            "process {pid}'s task states are unreadable on this platform"
+        ))
+    }
+}
+
+/// The state letter of a Linux task's `stat` text: the first field after
+/// the LAST `)` of comm. Linux only, but tested everywhere.
+#[cfg(any(target_os = "linux", test))]
+fn task_state(stat: &str) -> Option<char> {
+    stat.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .next()?
+        .chars()
+        .next()
+}
+
+/// The working directory of `pid` for the worktree scan on Linux, from
+/// `/proc/<pid>/cwd` through `read_link`. `None` once it is gone.
+///
+/// A process whose leader thread exited while another thread runs (`ps`
+/// `Zl`) has no `/proc/<pid>/cwd` (ENOENT), yet still runs, and its live
+/// thread's `/proc/<pid>/task/<tid>/cwd` reads where it is (measured). So
+/// when its own link is gone but the kernel (`running`) still has it
+/// running, each other task's link (from `list_tasks`) is read; if none
+/// reads, its directory is unreadable, which holds, never skipped. Linux
+/// only, but tested everywhere.
+#[cfg(any(target_os = "linux", test))]
+fn linux_cwd(
+    pid: u32,
+    read_link: impl Fn(&Path) -> std::io::Result<PathBuf>,
+    list_tasks: impl FnOnce(u32) -> std::io::Result<Vec<u32>>,
+    running: impl FnOnce(u32) -> Result<bool, String>,
+) -> Result<Option<PathBuf>, String> {
+    let gone = |e: &std::io::Error| {
+        e.kind() == std::io::ErrorKind::NotFound || e.raw_os_error() == Some(libc::ESRCH)
+    };
+    match read_link(Path::new(&format!("/proc/{pid}/cwd"))) {
+        Ok(cwd) => return Ok(Some(cwd)),
+        Err(e) if !gone(&e) => return Err(e.to_string()),
+        Err(_) => {}
+    }
+    if !running(pid)? {
+        return Ok(None);
+    }
+    let tasks = match list_tasks(pid) {
+        Ok(tasks) => tasks,
+        Err(e) if gone(&e) => return Ok(None),
+        Err(e) => return Err(format!("its tasks cannot be listed: {e}")),
+    };
+    for tid in tasks.into_iter().filter(|tid| *tid != pid) {
+        if let Ok(cwd) = read_link(Path::new(&format!("/proc/{pid}/task/{tid}/cwd"))) {
+            return Ok(Some(cwd));
+        }
+    }
+    Err("its main thread has exited and no live thread's working directory can be read".into())
+}
+
 /// One process's kernel record from the text of its Linux
 /// `/proc/<pid>/stat`, or `None` once it has exited, a zombie or a dead
 /// process (`X`) included, as macOS's `kinfo_proc` reads `SZOMB`. A zombie
@@ -1663,10 +1758,23 @@ fn processes_with_cwd(
                 )
             }))
         };
-        let cwd_of = |pid: u32| match std::fs::read_link(format!("/proc/{pid}/cwd")) {
-            Ok(cwd) => Ok(Some(cwd)),
-            Err(e) if gone(&e) => Ok(None),
-            Err(e) => Err(e.to_string()),
+        let cwd_of = |pid: u32| {
+            linux_cwd(
+                pid,
+                std::fs::read_link,
+                |pid| {
+                    std::fs::read_dir(format!("/proc/{pid}/task"))?
+                        .map(|task| {
+                            Ok(task?
+                                .file_name()
+                                .to_string_lossy()
+                                .parse::<u32>()
+                                .unwrap_or(0))
+                        })
+                        .collect()
+                },
+                |pid| kernel_observation(pid).map(|process| process.is_some()),
+            )
         };
         scan_cwds(pids, uid, spawned, known, owner_birth, cwd_of)
     }
@@ -2262,7 +2370,7 @@ impl ProcessTracker {
                             && !self.refused.contains(&r.pid)
                             && self.known.iter().any(|(k, _)| k.pid == r.pid)
                     })
-                    .all(ProcessRow::stopped);
+                    .all(|r| row_stopped(r, task_states));
                 if before == self.known.len() && stopped {
                     stable = true;
                     break;
@@ -4057,12 +4165,120 @@ pub(crate) mod tests {
         assert!(!row("Z+").active());
         assert!(!row("Zs").active());
         assert!(row("Sl").active());
-        // After SIGSTOP its live thread is `T`, but `ps` still shows the
-        // dead leader's `Zl` (measured), so cleanup counts it as stopped
-        // rather than waiting for a `T` that never comes.
-        assert!(row("Zl").stopped());
-        assert!(row("T").stopped() && row("Tl").stopped());
-        assert!(!row("Sl").stopped() && !row("R").stopped());
+    }
+
+    /// After SIGSTOP the live thread of a `Zl` process reads `T` in its
+    /// `/proc/<pid>/task/<tid>/stat`, but `ps` still shows the dead
+    /// leader's `Zl` (measured). So such a row is stopped only when every
+    /// live task is, and an unreadable task list is not stopped: quiesce
+    /// keeps waiting, then fails closed.
+    #[test]
+    fn a_zombie_led_row_is_stopped_only_when_every_live_task_is() {
+        let row = |stat: &str| ProcessRow {
+            pid: 42,
+            ppid: 1,
+            pgid: 42,
+            stat: stat.into(),
+            args: "[python3] <defunct>".into(),
+        };
+        let never = |_: u32| -> Result<Vec<char>, String> { panic!("tasks read for a ps state") };
+        assert!(row_stopped(&row("T"), never));
+        assert!(row_stopped(&row("Tl"), never));
+        assert!(!row_stopped(&row("Sl"), never));
+        assert!(!row_stopped(&row("R"), never));
+        let tasks = |states: &'static [char]| {
+            move |pid: u32| {
+                assert_eq!(pid, 42);
+                Ok::<_, String>(states.to_vec())
+            }
+        };
+        assert!(row_stopped(&row("Zl"), tasks(&['Z', 'T'])));
+        assert!(row_stopped(&row("Zl"), tasks(&['Z', 't', 'T'])));
+        assert!(
+            !row_stopped(&row("Zl"), tasks(&['Z', 'S'])),
+            "a live thread runs"
+        );
+        assert!(!row_stopped(&row("Zl"), tasks(&['Z', 'T', 'R'])));
+        assert!(
+            !row_stopped(&row("Zl"), |_| Err("unreadable".to_string())),
+            "an unreadable task list is not stopped"
+        );
+        // Every task gone to `Z`/`X`: nothing runs.
+        assert!(row_stopped(&row("Zl"), tasks(&['Z', 'X'])));
+    }
+
+    /// A Linux `/proc/<pid>/task/<tid>/stat` line's state, after the last
+    /// `)` of comm.
+    #[test]
+    fn a_task_stat_reads_its_state_after_the_last_parenthesis() {
+        assert_eq!(task_state("10 (python3) T 1 8 8 0"), Some('T'));
+        assert_eq!(task_state("10 (a) Z (b) S 1 8 8 0"), Some('S'));
+        assert_eq!(task_state("10 (python3"), None);
+    }
+
+    /// A process whose leader thread exited while another runs (`Zl`) has
+    /// no `/proc/<pid>/cwd` (ENOENT), but its live thread's
+    /// `/proc/<pid>/task/<tid>/cwd` still reads the worktree (measured). The
+    /// scan reads that rather than skip it, and holds when none reads.
+    #[test]
+    fn a_zombie_led_process_is_scanned_by_a_live_threads_working_directory() {
+        use std::io::{Error, ErrorKind};
+        let enoent = || Error::from(ErrorKind::NotFound);
+        let links = |own: Option<&'static str>, task10: Option<&'static str>| {
+            move |path: &Path| -> std::io::Result<PathBuf> {
+                let found = match path.to_str().unwrap() {
+                    "/proc/8/cwd" => own,
+                    "/proc/8/task/10/cwd" => task10,
+                    "/proc/8/task/8/cwd" => None,
+                    other => panic!("unexpected read {other}"),
+                };
+                found.map(PathBuf::from).ok_or_else(enoent)
+            }
+        };
+        let tasks = |_: u32| -> std::io::Result<Vec<u32>> { Ok(vec![8, 10]) };
+        let running = |_: u32| -> Result<bool, String> { Ok(true) };
+        // Its own link reads: that is the answer.
+        assert_eq!(
+            linux_cwd(8, links(Some("/wt"), None), tasks, running),
+            Ok(Some(PathBuf::from("/wt")))
+        );
+        // `Zl`: its own link is gone, a live thread's reads.
+        assert_eq!(
+            linux_cwd(8, links(None, Some("/wt")), tasks, running),
+            Ok(Some(PathBuf::from("/wt")))
+        );
+        // Running, but no live thread's directory reads: unreadable, held.
+        let err = linux_cwd(8, links(None, None), tasks, running).unwrap_err();
+        assert!(err.contains("thread"), "{err}");
+        // Gone by the kernel: skipped, as before.
+        assert_eq!(
+            linux_cwd(8, links(None, None), tasks, |_| Ok(false)),
+            Ok(None)
+        );
+        // Its task list gone too: it exited meanwhile.
+        assert_eq!(
+            linux_cwd(8, links(None, None), |_| Err(enoent()), running),
+            Ok(None)
+        );
+        // A kernel read that fails is no proof it is gone.
+        assert!(linux_cwd(8, links(None, None), tasks, |_| Err("refused".into())).is_err());
+        // Any other error on its own link is unreadable, as before.
+        assert!(linux_cwd(
+            8,
+            |_: &Path| Err(Error::from(ErrorKind::PermissionDenied)),
+            tasks,
+            running
+        )
+        .is_err());
+        // In the scan, that unreadable directory fails closed on the process.
+        let spawned = Birth(100, 0);
+        let owner_birth =
+            |_: u32| -> Result<Option<(u32, Birth)>, String> { Ok(Some((501, Birth(150, 0)))) };
+        let err = scan_cwds([8], 501, spawned, &[], owner_birth, |pid| {
+            linux_cwd(pid, links(None, None), tasks, running)
+        })
+        .unwrap_err();
+        assert_eq!(err.unreadable, Some((8, Birth(150, 0))), "{err}");
     }
 
     /// Linux reads, like macOS's `kinfo_proc`, count a zombie or a dead
