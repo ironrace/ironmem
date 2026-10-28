@@ -441,9 +441,16 @@ pub struct Worktree {
 /// subsystem chose. `collab_session`'s scrub states that every
 /// `Command::new("git")` in the crate must call it; autopilot was the module
 /// that never did.
+///
+/// `core.fsmonitor` is pinned off: it names a program, and the shared
+/// `.git/config` that sets it is writable by the unconfined agent, so `git
+/// status` here would run whatever the agent put there, in the controller.
+/// Hooks are left on (git-lfs needs `post-checkout`); every command is
+/// bounded in time instead ([`run_git_output`]).
 fn git_command() -> Command {
     let mut command = Command::new("git");
     crate::mcp::tools::scrub_git_environment(&mut command);
+    command.args(["-c", "core.fsmonitor=false"]);
     command
 }
 
@@ -500,20 +507,117 @@ impl GitOutput {
     }
 }
 
-/// Run `command` with `args` in `cwd`; only a failure to spawn is an error.
-fn run_git_output(
+/// How long one git command may run before it is killed with its process
+/// group: long enough for `git worktree add` to check out a large
+/// repository, and a bound on a hook or filter (which the agent can install
+/// in the shared repository) that never returns, so it cannot stall the
+/// Lead for good.
+const GIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// The longest wait between two checks on a running git; the first checks
+/// come sooner, so a quick command is not held back.
+const GIT_POLL_MAX: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// Run `command` with `args` in `cwd` within [`GIT_TIMEOUT`]; see
+/// [`run_git_output_within`].
+fn run_git_output(command: Command, cwd: &Path, args: &[&str]) -> Result<GitOutput, MemoryError> {
+    run_git_output_within(command, cwd, args, GIT_TIMEOUT)
+}
+
+/// Run `command` with `args` in `cwd`. Any exit is an answer; a failure to
+/// spawn, a git still running at `timeout`, or one whose output is still held
+/// open then (by a process it started), is an error.
+///
+/// As the signing guard's git does, the command runs in its own process
+/// group, and at the deadline the whole group is killed: a hook's
+/// background job dies with it rather than running on outside any bound.
+/// git is reaped only once it has exited and its pipes are closed, so its
+/// group id cannot name someone else's group when it is killed
+/// ([`super::dispatch::exited_unreaped`]).
+fn run_git_output_within(
     mut command: Command,
     cwd: &Path,
     args: &[&str],
+    timeout: std::time::Duration,
 ) -> Result<GitOutput, MemoryError> {
-    let output =
-        command.args(args).current_dir(cwd).output().map_err(|e| {
-            MemoryError::NotFound(format!("failed to run git {}: {e}", args.join(" ")))
-        })?;
+    use std::process::Stdio;
+    let label = || format!("git {} in {}", args.join(" "), cwd.display());
+    command
+        .args(args)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = super::dispatch::retry_on_etxtbsy(|| command.spawn())
+        .map_err(|e| MemoryError::NotFound(format!("failed to run git {}: {e}", args.join(" "))))?;
+    let stdout = read_pipe(child.stdout.take());
+    let stderr = read_pipe(child.stderr.take());
+    let deadline = std::time::Instant::now() + timeout;
+    let mut poll = std::time::Duration::from_millis(1);
+    loop {
+        let exited = super::dispatch::exited_unreaped(&mut child);
+        let closed = stdout.is_finished() && stderr.is_finished();
+        match exited {
+            Ok(true) if closed => break,
+            Ok(_) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(poll);
+                poll = (poll * 2).min(GIT_POLL_MAX);
+            }
+            waited => {
+                super::dispatch::kill_process_group(&mut child);
+                let _ = child.wait();
+                let secs = timeout.as_secs_f64();
+                return Err(MemoryError::Validation(match waited {
+                    Err(e) => format!("{} could not be waited on: {e}", label()),
+                    Ok(true) => format!(
+                        "{} exited but left its output open past {secs}s, held by a process it                          started, and was killed with it",
+                        label()
+                    ),
+                    Ok(false) => format!(
+                        "{} did not finish within {secs}s and was killed",
+                        label()
+                    ),
+                }));
+            }
+        }
+    }
+    let status = child
+        .wait()
+        .map_err(|e| MemoryError::Validation(format!("{} could not be waited on: {e}", label())))?;
+    let read = |pipe: PipeReader, name: &str| -> Result<String, MemoryError> {
+        let bytes = pipe
+            .join()
+            .map_err(|_| std::io::Error::other("its reader panicked"))
+            .and_then(|read| read)
+            .map_err(|e| {
+                MemoryError::Validation(format!("{}: its {name} could not be read: {e}", label()))
+            })?;
+        Ok(String::from_utf8_lossy(&bytes).trim().to_string())
+    };
     Ok(GitOutput {
-        code: output.status.code(),
-        stdout: String::from_utf8_lossy(&output.stdout).trim().to_string(),
-        stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        code: status.code(),
+        stdout: read(stdout, "stdout")?,
+        stderr: read(stderr, "stderr")?,
+    })
+}
+
+/// A thread reading one of a git command's pipes to its end.
+type PipeReader = std::thread::JoinHandle<std::io::Result<Vec<u8>>>;
+
+/// Read `pipe` to its end on its own thread, so a full pipe cannot stall the
+/// git [`run_git_output_within`] is polling for exit.
+fn read_pipe<R: std::io::Read + Send + 'static>(pipe: Option<R>) -> PipeReader {
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut pipe) = pipe {
+            pipe.read_to_end(&mut buf)?;
+        }
+        Ok(buf)
     })
 }
 
@@ -522,32 +626,20 @@ fn run_git_output(
 /// existence probes, where "this ref does not exist" is a normal answer and
 /// not a fault.
 fn git_ok(cwd: &Path, args: &[&str]) -> Result<bool, MemoryError> {
-    let mut command = git_command();
-    let status = command
-        .args(args)
-        .current_dir(cwd)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map_err(|e| MemoryError::NotFound(format!("failed to run git {}: {e}", args.join(" "))))?;
-    Ok(status.success())
+    Ok(run_git_output(git_command(), cwd, args)?.code == Some(0))
 }
 
 /// `git config --get key` in `cwd`: `None` when the key is unset (git exits
 /// 1), and an error for any other failure, which is not a reading at all.
 fn config_get(cwd: &Path, args: &[&str]) -> Result<Option<String>, String> {
-    let out = git_command()
-        .arg("config")
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .map_err(|e| e.to_string())?;
-    match out.status.code() {
-        Some(0) => Ok(Some(
-            String::from_utf8_lossy(&out.stdout).trim().to_string(),
-        )),
+    let args: Vec<&str> = std::iter::once("config")
+        .chain(args.iter().copied())
+        .collect();
+    let out = run_git_output(git_command(), cwd, &args).map_err(|e| e.to_string())?;
+    match out.code {
+        Some(0) => Ok(Some(out.stdout)),
         Some(1) => Ok(None),
-        _ => Err(bounded_stderr(&out.stderr)),
+        _ => Err(bounded_stderr(out.stderr.as_bytes())),
     }
 }
 
@@ -1365,8 +1457,11 @@ pub fn is_dirty(worktree: &Path) -> Result<bool, MemoryError> {
 /// it. A checkout that was already dirty is the case a boolean cannot serve:
 /// dirty before and dirty after says nothing, while the same porcelain text
 /// before and after says nothing changed.
+///
+/// `--no-optional-locks`: the status is only read, so it never refreshes and
+/// rewrites the index an agent's git may be using.
 pub fn status_porcelain(worktree: &Path) -> Result<String, MemoryError> {
-    git(worktree, &["status", "--porcelain"])
+    git(worktree, &["--no-optional-locks", "status", "--porcelain"])
 }
 
 /// Resolve `path` through symlinks when it exists, falling back to the path
@@ -3372,5 +3467,117 @@ mod tests {
         assert!(err.contains("its reflog could not be read"), "{err}");
         assert!(err.contains("exit Some(128)"), "git's own failure: {err}");
         assert_eq!(read_config(repo.path(), &issue_cut_key()), None, "{err}");
+    }
+
+    /// `core.fsmonitor` is a program the agent can set in the shared
+    /// `.git/config`; the controller's own git never runs it.
+    #[test]
+    #[cfg(unix)]
+    fn the_controllers_git_status_runs_no_configured_fsmonitor() {
+        use std::os::unix::fs::PermissionsExt;
+        let repo = fixture_repo();
+        let scratch = tempfile::tempdir().unwrap();
+        let sentinel = scratch.path().join("ran");
+        let hook = scratch.path().join("fsmonitor.sh");
+        std::fs::write(
+            &hook,
+            format!("#!/bin/sh\ntouch '{}'\n", sentinel.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        run(
+            repo.path(),
+            &["config", "core.fsmonitor", &hook.to_string_lossy()],
+        );
+        assert!(!is_dirty(repo.path()).unwrap());
+        assert!(!sentinel.exists(), "the fsmonitor hook ran");
+        // The fixture's own git does run it, so the check above can fail.
+        test_git::output(repo.path(), &["status", "--porcelain"]);
+        assert!(sentinel.exists(), "the fixture's fsmonitor never runs");
+    }
+
+    /// `git status` refreshes and rewrites the index when a tracked file's
+    /// stat data changed; the controller's status takes no optional lock, so
+    /// it never writes the index an agent's git may be using.
+    #[test]
+    #[cfg(unix)]
+    fn the_controllers_git_status_does_not_rewrite_the_index() {
+        use std::os::unix::fs::MetadataExt;
+        let repo = fixture_repo();
+        let index = repo.path().join(".git/index");
+        let restat = || {
+            let readme = std::fs::File::options()
+                .write(true)
+                .open(repo.path().join("README.md"))
+                .unwrap();
+            readme
+                .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600))
+                .unwrap();
+        };
+        restat();
+        let before = std::fs::metadata(&index).unwrap().ino();
+        assert!(!is_dirty(repo.path()).unwrap());
+        assert_eq!(std::fs::metadata(&index).unwrap().ino(), before);
+        // The fixture's own status does rewrite it, so the check above can fail.
+        restat();
+        test_git::output(repo.path(), &["status", "--porcelain"]);
+        assert_ne!(std::fs::metadata(&index).unwrap().ino(), before);
+    }
+
+    /// A git that does not finish (a hook, or a program the shared config
+    /// names) is killed at the deadline, with every process it started.
+    #[test]
+    #[cfg(unix)]
+    fn a_git_command_past_its_deadline_is_killed_with_its_process_group() {
+        let repo = fixture_repo();
+        let scratch = tempfile::tempdir().unwrap();
+        let pid_file = scratch.path().join("pid");
+        run(
+            repo.path(),
+            &[
+                "config",
+                "alias.hang",
+                &format!("!sleep 30 & echo $! > '{}'; wait", pid_file.display()),
+            ],
+        );
+        let started = std::time::Instant::now();
+        let err = run_git_output_within(
+            git_command(),
+            repo.path(),
+            &["hang"],
+            std::time::Duration::from_millis(500),
+        )
+        .err()
+        .expect("a hung git must fail")
+        .to_string();
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        assert!(err.contains("git hang") && err.contains("killed"), "{err}");
+        let pid = std::fs::read_to_string(&pid_file).unwrap();
+        let alive = Command::new("kill")
+            .args(["-0", pid.trim()])
+            .status()
+            .unwrap()
+            .success();
+        assert!(!alive, "the alias's `sleep` survived the kill");
+    }
+
+    /// A git that exits while something it started still holds its output
+    /// open is killed too: its output never ends, and what holds it runs on
+    /// outside any bound.
+    #[test]
+    #[cfg(unix)]
+    fn a_git_command_that_leaves_its_output_open_is_killed_at_the_deadline() {
+        let repo = fixture_repo();
+        run(repo.path(), &["config", "alias.linger", "!sleep 30 &"]);
+        let err = run_git_output_within(
+            git_command(),
+            repo.path(),
+            &["linger"],
+            std::time::Duration::from_millis(500),
+        )
+        .err()
+        .expect("output held open past the deadline must fail")
+        .to_string();
+        assert!(err.contains("left its output open"), "{err}");
     }
 }
