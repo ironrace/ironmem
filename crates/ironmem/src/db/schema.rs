@@ -2376,6 +2376,114 @@ mod tests {
         assert_eq!(committed, 0, "the failed one-shot attempt must roll back");
     }
 
+    /// `with_immediate_transaction` commits what an `Ok` closure wrote, and
+    /// runs the closure once.
+    #[test]
+    fn with_immediate_transaction_commits_on_success_and_runs_once() {
+        let (_dir, db, contender) = retry_harness();
+        let calls = std::cell::Cell::new(0usize);
+        db.with_immediate_transaction(|tx| {
+            calls.set(calls.get() + 1);
+            tx.execute("INSERT INTO retry_probe (v) VALUES (1)", [])?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(calls.get(), 1, "the closure runs exactly once");
+        // Read from another connection: committed, not only visible to `db`.
+        let committed: i64 = contender
+            .query_row("SELECT COUNT(*) FROM retry_probe WHERE v = 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(committed, 1);
+    }
+
+    /// An `Err` from the closure rolls back everything it wrote, and comes
+    /// back unchanged, after one run.
+    #[test]
+    fn with_immediate_transaction_rolls_back_on_error() {
+        let (_dir, db, contender) = retry_harness();
+        let calls = std::cell::Cell::new(0usize);
+        let result: Result<(), _> = db.with_immediate_transaction(|tx| {
+            calls.set(calls.get() + 1);
+            let inserted = tx.execute("INSERT INTO retry_probe (v) VALUES (1)", [])?;
+            assert_eq!(inserted, 1);
+            Err(MemoryError::Validation("forced rollback".into()))
+        });
+        match result {
+            Err(MemoryError::Validation(msg)) => assert_eq!(msg, "forced rollback"),
+            other => panic!("expected the closure's error unchanged, got {other:?}"),
+        }
+        assert_eq!(calls.get(), 1, "an error is never retried");
+        for conn in [&db.conn, &contender] {
+            let count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM retry_probe", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(count, 0, "the failed closure's write must roll back");
+        }
+    }
+
+    /// The write lock is taken at `BEGIN`, before the closure's first read:
+    /// another connection cannot write between that read and the closure's
+    /// own write. A deferred transaction that has only read holds no write
+    /// lock, so this would let the contender in.
+    #[test]
+    fn with_immediate_transaction_holds_the_write_lock_before_its_first_read() {
+        let (_dir, db, contender) = retry_harness();
+        contender.busy_timeout(Duration::ZERO).unwrap();
+        db.with_immediate_transaction(|tx| {
+            let _seen: i64 =
+                tx.query_row("SELECT COUNT(*) FROM retry_probe", [], |row| row.get(0))?;
+            let refused = contender.execute("INSERT INTO retry_probe (v) VALUES (1)", []);
+            assert!(
+                matches!(refused, Err(ref e) if is_busy_error(e)),
+                "another writer got in after the first read: {refused:?}"
+            );
+            tx.execute("INSERT INTO retry_probe (v) VALUES (2)", [])?;
+            Ok(())
+        })
+        .unwrap();
+        let values: Vec<i64> = db
+            .conn
+            .prepare("SELECT v FROM retry_probe ORDER BY v")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(values, vec![2]);
+    }
+
+    /// Another connection holding the write lock makes the transaction wait
+    /// for it (busy timeout), not fail at once, and its reads then see what
+    /// that connection committed.
+    #[test]
+    fn with_immediate_transaction_waits_for_a_held_write_lock() {
+        let (_dir, db, holder) = retry_harness();
+        holder
+            .execute_batch("BEGIN IMMEDIATE; INSERT INTO retry_probe (v) VALUES (1);")
+            .unwrap();
+        let hold = Duration::from_millis(200);
+        let waiter = std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let seen = db.with_immediate_transaction(|tx| {
+                tx.query_row("SELECT COUNT(*) FROM retry_probe", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .map_err(MemoryError::from)
+            });
+            (seen, started.elapsed())
+        });
+        std::thread::sleep(hold);
+        holder.execute_batch("COMMIT").unwrap();
+        let (seen, waited) = waiter.join().unwrap();
+        assert_eq!(seen.unwrap(), 1, "it read after the holder committed");
+        assert!(
+            waited >= hold,
+            "it began before the lock was free: {waited:?}"
+        );
+    }
+
     #[test]
     fn with_transaction_retry_never_retries_semantic_error() {
         // (iii) Negative: a semantic error is not a busy snapshot — the
