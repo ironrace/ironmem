@@ -1403,7 +1403,7 @@ fn proc_stat_text(pid: u32) -> Result<Option<String>, String> {
 /// A kernel record read for the invocation root, which may already have
 /// exited ([`root_observation`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct RootRecord {
+pub(crate) struct RootRecord {
     process: KernelProcess,
     /// Its zombie: it has exited but is not yet reaped.
     exited: bool,
@@ -2255,6 +2255,9 @@ pub(crate) struct ProcessTracker {
     /// The root's kernel birth, once read ([`Self::adopt_root`] or a
     /// sample). Kept when the root exits, for the worktree check.
     root_birth: Option<Birth>,
+    /// Why [`Self::adopt_root`] could not read the root's birth, if it
+    /// could not, for the hold that its absence later causes.
+    root_unread: Option<String>,
     /// Processes owned and not yet seen gone, the root included while it
     /// runs, by PID: each with its authenticated row and kernel birth.
     known: std::collections::HashMap<u32, Tracked>,
@@ -2347,6 +2350,7 @@ impl ProcessTracker {
         Self {
             root_pid,
             root_birth: None,
+            root_unread: None,
             known: std::collections::HashMap::new(),
             exited: std::collections::HashSet::new(),
             next_seq: 0,
@@ -2963,12 +2967,21 @@ impl ProcessTracker {
     /// record is the root's. That gives completion the root's birth even
     /// when the root exits before the first sample; [`Self::observed_root`]
     /// stays false until a sample binds its process-table row. A read that
-    /// fails leaves the birth unknown.
+    /// fails leaves the birth unknown, logged and kept for the hold that
+    /// follows ([`Self::root_unread`]).
     pub(crate) fn adopt_root(&mut self) {
+        self.adopt_root_with(root_observation);
+    }
+
+    /// [`Self::adopt_root`] over `read`, a seam for a failed kernel read.
+    pub(crate) fn adopt_root_with(
+        &mut self,
+        read: impl FnOnce(u32) -> Result<Option<RootRecord>, String>,
+    ) {
         if self.root_birth.is_some() {
             return;
         }
-        let read = root_observation(self.root_pid);
+        let read = read(self.root_pid);
         match read
             .as_ref()
             .ok()
@@ -2987,12 +3000,26 @@ impl ProcessTracker {
             }
             // Not fatal: the first sample may still bind the root; without
             // either, completion holds as unproven.
-            None => tracing::debug!(
-                pid = self.root_pid,
-                outcome = ?read,
-                "could not read the invocation root's kernel record at spawn"
-            ),
+            None => {
+                let why = match &read {
+                    Err(e) => format!("its kernel record could not be read at spawn: {e}"),
+                    Ok(None) => "it was already gone at spawn".to_owned(),
+                    Ok(Some(_)) => {
+                        "the record read at spawn was not this supervisor's child".to_owned()
+                    }
+                };
+                tracing::warn!(
+                    pid = self.root_pid,
+                    "could not read the invocation root's kernel birth: {why}"
+                );
+                self.root_unread = Some(why);
+            }
         }
+    }
+
+    /// Why the root's kernel birth was never read at spawn, if it was not.
+    pub(crate) fn root_unread(&self) -> Option<&str> {
+        self.root_unread.as_deref()
     }
 
     pub(crate) fn observed_root(&self) -> bool {

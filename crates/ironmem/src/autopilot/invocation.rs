@@ -1030,9 +1030,12 @@ fn finish_supervised(
     // record never yields a met verdict (`unobserved_root`).
     let unobserved_root = !tracker.observed_root();
     if unobserved_root && tracker.root_birth().is_none() {
+        let why = tracker
+            .root_unread()
+            .map_or_else(String::new, |why| format!(" ({why})"));
         return Err(validation(format!(
             "{} root exited before process-tree observation, and its kernel birth was never \
-             read; descendant completion is unproven",
+             read{why}; descendant completion is unproven",
             cli.label()
         )));
     }
@@ -2132,6 +2135,8 @@ exit {code}"#
         let started = Instant::now();
         let mut child = spawn_fixture_invocation(&bin, dir.path(), &spec);
         let mut tracker = ProcessTracker::owning_every_descendant(child.id());
+        // The read at spawn failed, and the hold says why.
+        tracker.adopt_root_with(|_| Err("the kernel refused the read".into()));
         let status = child.wait().unwrap();
         let error = finish_supervised(
             &CodexCli,
@@ -2151,6 +2156,10 @@ exit {code}"#
             error
                 .to_string()
                 .contains("before process-tree observation"),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains("the kernel refused the read"),
             "{error}"
         );
         assert!(!has_valid_exit_record(a));
