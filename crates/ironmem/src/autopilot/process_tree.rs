@@ -1761,7 +1761,7 @@ fn processes_with_cwd(
         let cwd_of = |pid: u32| {
             linux_cwd(
                 pid,
-                std::fs::read_link,
+                |path: &Path| std::fs::read_link(path),
                 |pid| {
                     std::fs::read_dir(format!("/proc/{pid}/task"))?
                         .map(|task| {
