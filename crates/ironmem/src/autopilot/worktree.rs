@@ -180,15 +180,11 @@ pub(crate) fn pick_push_remote<'a>(
         .or_else(|| (remotes.len() == 1).then(|| remotes[0].0))
 }
 
-/// [`pick_push_remote`] for `branch` of `repo` in the repository at `dir`,
-/// from `git remote -v`: each remote's fetch URL and its push URLs (a
-/// `pushurl` may differ from the fetch URL, and is where a push goes). A
-/// remote list that cannot be read counts as none. The URLs, which may hold
-/// a token, are never logged.
-pub(crate) fn push_remote(dir: &Path, branch: &str, repo: &str) -> Option<String> {
-    let listed = git(dir, &["remote", "-v"]).unwrap_or_default();
+/// Each remote in `git remote -v` output, in order, with every URL listed
+/// for it: its fetch URL and its push URLs.
+pub(crate) fn remote_urls(listing: &str) -> Vec<(&str, Vec<&str>)> {
     let mut remotes: Vec<(&str, Vec<&str>)> = Vec::new();
-    for line in listed.lines() {
+    for line in listing.lines() {
         let Some((name, rest)) = line.split_once('\t') else {
             continue;
         };
@@ -201,6 +197,17 @@ pub(crate) fn push_remote(dir: &Path, branch: &str, repo: &str) -> Option<String
             None => remotes.push((name, vec![url])),
         }
     }
+    remotes
+}
+
+/// [`pick_push_remote`] for `branch` of `repo` in the repository at `dir`,
+/// from `git remote -v`: each remote's fetch URL and its push URLs (a
+/// `pushurl` may differ from the fetch URL, and is where a push goes). A
+/// remote list that cannot be read counts as none. The URLs, which may hold
+/// a token, are never logged.
+pub(crate) fn push_remote(dir: &Path, branch: &str, repo: &str) -> Option<String> {
+    let listed = git(dir, &["remote", "-v"]).unwrap_or_default();
+    let remotes = remote_urls(&listed);
     let remotes: Vec<(&str, &[&str])> = remotes
         .iter()
         .map(|(name, urls)| (*name, urls.as_slice()))

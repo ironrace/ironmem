@@ -994,13 +994,13 @@ enum SigningViolation {
     /// The issue branch is gone, so nothing that ships can be checked.
     MissingBranch { branch: String },
     /// Commits on the branch are unsigned or carry a bad signature: short
-    /// shas, newest first, and the remote the recipe pushes to, if one can
-    /// be named.
+    /// shas, newest first, and the remotes the recipe force-pushes to, the
+    /// push clause's first; empty when none can be named.
     Unsigned {
         flagged: Vec<String>,
         cut: String,
         branch: String,
-        remote: Option<String>,
+        remotes: Vec<String>,
     },
 }
 
@@ -1024,8 +1024,8 @@ impl std::fmt::Display for SigningViolation {
                 flagged,
                 cut,
                 branch,
-                remote,
-            } => f.write_str(&unsigned_violation(flagged, cut, branch, remote.as_deref())),
+                remotes,
+            } => f.write_str(&unsigned_violation(flagged, cut, branch, remotes)),
         }
     }
 }
@@ -1409,21 +1409,23 @@ fn warn_unreadable_scope_once(warned: &WarnedScopes, scope: &'static str, error:
 fn signing_violation(
     worktree: &Worktree,
     seen: SigningPolicySeen,
+    repo: &str,
 ) -> Result<Option<SigningViolation>, GuardFault> {
-    check_signing(worktree, seen, SIGNING_GUARD_TIMEOUT)
+    check_signing(worktree, seen, repo, SIGNING_GUARD_TIMEOUT)
 }
 
 /// [`signing_violation`], with all its git commands bounded by `timeout`.
 fn check_signing(
     worktree: &Worktree,
     seen: SigningPolicySeen,
+    repo: &str,
     timeout: std::time::Duration,
 ) -> Result<Option<SigningViolation>, GuardFault> {
     if let std::ops::ControlFlow::Break(answer) = policy_gate(worktree, seen)? {
         return Ok(answer);
     }
     let git = GuardGit::new(&worktree.path, timeout).map_err(GuardFault::GitUnreadable)?;
-    check_range(worktree, &git)
+    check_range(worktree, &git, Some(repo))
 }
 
 /// The signing policy's part of [`signing_violation`]: `Break` with the
@@ -1460,6 +1462,7 @@ fn policy_gate(
 fn check_range(
     worktree: &Worktree,
     git: &GuardGit<'_>,
+    repo: Option<&str>,
 ) -> Result<Option<SigningViolation>, GuardFault> {
     let unreadable = GuardFault::GitUnreadable;
     let branch = worktree.branch.as_str();
@@ -1617,20 +1620,43 @@ fn check_range(
             identity: identity.unwrap_or_default().join(" or "),
         });
     }
-    // The recipe force-pushes where the goal condition's push clause does
-    // (`worktree::pick_push_remote`), less its first step: the guard has no
-    // issue repo, and the flagged commits matter where they were pushed. So
-    // the remote already tracking the issue branch (`origin` first), else a
-    // configured `origin`, else the only remote, else none.
-    let remotes: Vec<(&str, &[&str])> =
-        configured.iter().map(|remote| (*remote, &[][..])).collect();
-    let tracking: Vec<&str> = own.iter().map(|(remote, _)| *remote).collect();
-    let remote = worktree::pick_push_remote(&remotes, &tracking, None);
+    // The recipe force-pushes first where the goal condition's push clause
+    // pushes (`worktree::pick_push_remote`, with the issue's repo), then to
+    // every other remote holding the issue branch: the guard reads each, so
+    // one left with the old commits keeps it failing. A remote list that
+    // cannot be read names only the holders.
+    let listing = git
+        .run(&["remote", "-v"], None)
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+        .unwrap_or_default();
+    let listed = worktree::remote_urls(&listing);
+    let remotes: Vec<(&str, &[&str])> = configured
+        .iter()
+        .map(|remote| {
+            let urls = listed
+                .iter()
+                .find(|(name, _)| name == remote)
+                .map_or(&[][..], |(_, urls)| urls.as_slice());
+            (*remote, urls)
+        })
+        .collect();
+    let holding: Vec<&str> = own.iter().map(|(remote, _)| *remote).collect();
+    let mut push_to: Vec<String> = worktree::pick_push_remote(&remotes, &holding, repo)
+        .map(str::to_string)
+        .into_iter()
+        .collect();
+    for remote in holding {
+        if !push_to.iter().any(|named| named == remote) {
+            push_to.push(remote.to_string());
+        }
+    }
     Ok(Some(SigningViolation::Unsigned {
         flagged: flagged.into_iter().map(|(sha, _)| sha).collect(),
         cut: worktree.cut.to_string(),
         branch: branch.to_string(),
-        remote: remote.map(str::to_string),
+        remotes: push_to,
     }))
 }
 
@@ -1675,7 +1701,8 @@ fn collaborator_check_at_start(worktree: &Worktree, seen: SigningPolicySeen) -> 
     START_CHECKS.with(|n| n.set(n.get() + 1));
     let verdict = match policy_gate(worktree, seen) {
         Ok(std::ops::ControlFlow::Break(answer)) => Ok(answer),
-        Ok(std::ops::ControlFlow::Continue(())) => check_range(worktree, &git),
+        // Only a fault matters here, so the recipe needs no issue repo.
+        Ok(std::ops::ControlFlow::Continue(())) => check_range(worktree, &git, None),
         Err(fault) => Err(fault),
     };
     match verdict {
@@ -1828,13 +1855,17 @@ fn has_signature_header(commit_object: &str) -> bool {
 /// How many flagged commits a violation names before counting the rest.
 const NAMED_UNSIGNED_COMMITS: usize = 5;
 
+/// How many remotes a signing violation's recipe names before it says how
+/// many more hold the branch.
+const NAMED_REMOTES: usize = 3;
+
 /// The violation for `flagged` short shas, newest first. The recipe re-signs
 /// only those commits, on the issue `branch`, and pushes it to `remote` by
 /// name: rebasing from the cut would rewrite the upstream commits merged in,
 /// which the guard deliberately does not blame. It is a plain rebase, not
 /// `--rebase-merges`: that would also re-pick, and so rewrite, the upstream
 /// commits on a merged-in side, so a merge is redone by hand instead.
-fn unsigned_violation(flagged: &[String], cut: &str, branch: &str, remote: Option<&str>) -> String {
+fn unsigned_violation(flagged: &[String], cut: &str, branch: &str, remotes: &[String]) -> String {
     let mut list = flagged
         .iter()
         .take(NAMED_UNSIGNED_COMMITS)
@@ -1849,12 +1880,28 @@ fn unsigned_violation(flagged: &[String], cut: &str, branch: &str, remote: Optio
     }
     let oldest = flagged.last().map(String::as_str).unwrap_or_default();
     let short_cut = prefix(cut, SHORT_SHA_CHARS);
-    let push = match remote {
-        Some(remote) => format!("`git push --force-with-lease {remote} {branch}`"),
-        None => format!(
+    let push = match remotes {
+        [] => format!(
             "`git push --force-with-lease <remote> {branch}`, naming the remote of the issue's \
              repository"
         ),
+        [remote] => format!("`git push --force-with-lease {remote} {branch}`"),
+        [first, rest @ ..] => {
+            let named = rest
+                .iter()
+                .take(NAMED_REMOTES - 1)
+                .map(|remote| format!("`{remote}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let more = match rest.len().saturating_sub(NAMED_REMOTES - 1) {
+                0 => String::new(),
+                n => format!(" and {n} more (`git branch -r`)"),
+            };
+            format!(
+                "`git push --force-with-lease {first} {branch}`, then the same to each other \
+                 remote holding it (every one is checked): {named}{more}"
+            )
+        }
     };
     format!(
         "commit.gpgsign is on, but commit(s) {list} on this branch since its cut {short_cut} are \
@@ -3171,7 +3218,7 @@ pub fn run_issue(
             // An interrupted run's reading holds only its own recovered
             // invocation's met.
             let seen = if recovered { seen } else { seen.fresh() };
-            match signing_violation(worktree, seen) {
+            match signing_violation(worktree, seen, &issue.repo) {
                 Ok(None) => {}
                 Ok(Some(violation)) => {
                     let original = outcome.reason.take();
@@ -5457,7 +5504,7 @@ sleep 0.5
 
     /// The guard's verdict on `wt` as text, with nothing held from memory.
     fn check(wt: &Worktree) -> Result<Option<String>, String> {
-        signing_violation(wt, SigningPolicySeen::default())
+        signing_violation(wt, SigningPolicySeen::default(), &issue().repo)
             .map(|violation| violation.map(|v| v.to_string()))
             .map_err(|fault| fault.to_string())
     }
@@ -5541,7 +5588,8 @@ sleep 0.5
         git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
         commit_in(&wt.path, "b", &["-c", "commit.gpgsign=false"]);
         wt.cut = worktree::CommitSha::unchecked("--all");
-        let fault = signing_violation(&wt, SigningPolicySeen::default()).unwrap_err();
+        let fault =
+            signing_violation(&wt, SigningPolicySeen::default(), &issue().repo).unwrap_err();
         assert!(fault.stops_run(), "{fault}");
         assert!(fault.to_string().contains("--all"), "{fault}");
     }
@@ -6713,13 +6761,95 @@ sleep 0.5
 
     /// With no remote it can name, the recipe says which one to push to
     /// rather than naming one that may not exist.
+    /// The guard reads the issue branch on every remote that holds it, so
+    /// re-signing clears it only once each is force-pushed: the recipe
+    /// names them all, the push clause's remote first.
+    #[test]
+    fn a_recipe_names_every_remote_that_holds_the_branch() {
+        let violation = |remotes: &[&str]| {
+            SigningViolation::Unsigned {
+                flagged: vec!["abc123".into()],
+                cut: "c".repeat(40),
+                branch: "autopilot/o-r-1".into(),
+                remotes: remotes.iter().map(|r| r.to_string()).collect(),
+            }
+            .to_string()
+        };
+        let one = violation(&["upstream"]);
+        assert!(
+            one.contains("`git push --force-with-lease upstream autopilot/o-r-1`"),
+            "{one}"
+        );
+        let two = violation(&["upstream", "origin"]);
+        assert!(
+            two.contains("`git push --force-with-lease upstream autopilot/o-r-1`"),
+            "{two}"
+        );
+        assert!(
+            two.contains("each other remote holding it") && two.contains("`origin`"),
+            "{two}"
+        );
+        let many = violation(&["a", "b", "c", "d", "e"]);
+        assert!(
+            many.contains("`b`, `c` and 2 more (`git branch -r`)"),
+            "{many}"
+        );
+    }
+
+    /// The recipe force-pushes first where the goal condition's push clause
+    /// pushes (the remote naming the issue's repo, though a fork `origin`
+    /// holds the branch), then to every other remote holding it.
+    #[test]
+    fn the_recipe_pushes_where_the_push_clause_does_then_to_every_holder() {
+        let (dir, wt) = remote_fixture();
+        let mirror = dir.path().join("mirror.git");
+        git_in(
+            dir.path(),
+            &["init", "-q", "--bare", mirror.to_str().unwrap()],
+        );
+        git_in(
+            &wt.path,
+            &["remote", "add", "mirror", mirror.to_str().unwrap()],
+        );
+        git_in(
+            &wt.path,
+            &[
+                "remote",
+                "add",
+                "upstream",
+                "git@github.com:ironrace/ironmem.git",
+            ],
+        );
+        git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
+        commit_in(&wt.path, "work", &["-c", "commit.gpgsign=false"]);
+        git_in(&wt.path, &["push", "-q", "origin", &wt.branch]);
+        git_in(&wt.path, &["push", "-q", "mirror", &wt.branch]);
+        assert_eq!(
+            worktree::push_remote(&wt.path, &wt.branch, &issue().repo).as_deref(),
+            Some("upstream"),
+            "the push clause's remote"
+        );
+        let violation = check(&wt).unwrap().unwrap();
+        let first = format!("`git push --force-with-lease upstream {}`", wt.branch);
+        assert!(violation.contains(&first), "{violation}");
+        let at = |what: &str| {
+            violation
+                .find(what)
+                .unwrap_or_else(|| panic!("{what}: {violation}"))
+        };
+        assert!(
+            at(&first) < at("`origin`") && at(&first) < at("`mirror`"),
+            "{violation}"
+        );
+    }
+
     #[test]
     fn a_recipe_with_no_remote_names_none() {
         let violation = SigningViolation::Unsigned {
             flagged: vec!["abc123".into()],
             cut: "c".repeat(40),
             branch: "autopilot/o-r-1".into(),
-            remote: None,
+            remotes: Vec::new(),
         }
         .to_string();
         assert!(
@@ -6741,7 +6871,10 @@ sleep 0.5
             flagged,
             cut: "c".repeat(64),
             branch,
-            remote: Some("r".repeat(40)),
+            // Many remotes holding the branch, each with a long name.
+            remotes: (0..50)
+                .map(|i| format!("{i:02}{}", "r".repeat(38)))
+                .collect(),
         }
         .to_string();
         assert!(
