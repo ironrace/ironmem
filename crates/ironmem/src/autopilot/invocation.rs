@@ -3197,16 +3197,22 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
     #[cfg(unix)]
     #[test]
     fn cleanup_leaves_a_shared_daemon_the_harness_autospawned_running() {
-        struct KillGroup(i32);
+        /// Kills the fake daemon's group however the test ends, until the
+        /// test disarms it: never once that group is confirmed gone, when
+        /// its ID may already name someone else's.
+        struct KillGroup(Option<i32>);
         impl Drop for KillGroup {
             fn drop(&mut self) {
-                // SAFETY: a negative PID signals the fake daemon's own group.
-                unsafe {
-                    libc::kill(-self.0, libc::SIGKILL);
+                if let Some(pid) = self.0 {
+                    // SAFETY: a negative PID signals the fake daemon's own group.
+                    unsafe {
+                        libc::kill(-pid, libc::SIGKILL);
+                    }
                 }
             }
         }
-        // SAFETY: signal 0 only probes that the process exists.
+        // SAFETY: signal 0 only probes that the process (or, negative, the
+        // group) exists.
         let exists = |pid: i32| unsafe { libc::kill(pid, 0) } == 0;
         for on_configured_socket in [true, false] {
             let (dir, s) = setup();
@@ -3264,18 +3270,22 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
                 .ok()
                 .and_then(|pid| pid.trim().parse().ok())
                 .unwrap_or_else(|| panic!("the fixture never started its daemon: {result:?}"));
-            let _cleanup = KillGroup(pid);
+            let mut cleanup = KillGroup(Some(pid));
             let o = result.unwrap();
             assert!(o.process_success && o.is_met(), "{o:?}");
             if on_configured_socket {
                 assert!(exists(pid), "supervision cleanup killed the shared daemon");
             } else {
-                // Killed by cleanup; give its new parent a moment to reap it.
+                // Killed by cleanup, its `sleep` child too; give their new
+                // parent a moment to reap them.
                 let deadline = Instant::now() + Duration::from_secs(2);
-                while exists(pid) && Instant::now() < deadline {
+                while (exists(pid) || exists(-pid)) && Instant::now() < deadline {
                     std::thread::sleep(Duration::from_millis(20));
                 }
                 assert!(!exists(pid), "a daemon on another socket escaped cleanup");
+                assert!(!exists(-pid), "a process in its group escaped cleanup");
+                // Confirmed gone, so its group ID is free for reuse.
+                cleanup.0.take();
             }
         }
     }
@@ -3349,11 +3359,15 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
     #[cfg(unix)]
     #[test]
     fn a_descendant_cleanup_cannot_signal_holds_completion_until_gone() {
-        struct KillOnDrop(i32);
+        /// Kills the tool however the test ends, until the test kills it
+        /// itself: init reaps it, so its PID is free once it is gone.
+        struct KillOnDrop(Option<i32>);
         impl Drop for KillOnDrop {
             fn drop(&mut self) {
-                // SAFETY: the fixture's own tool.
-                unsafe { libc::kill(self.0, libc::SIGKILL) };
+                if let Some(pid) = self.0 {
+                    // SAFETY: the fixture's own tool.
+                    unsafe { libc::kill(pid, libc::SIGKILL) };
+                }
             }
         }
         let (dir, s) = setup();
@@ -3390,7 +3404,7 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
             }
             std::thread::sleep(Duration::from_millis(10));
         };
-        let _guard = KillOnDrop(tool as i32);
+        let mut guard = KillOnDrop(Some(tool as i32));
         REFUSED.store(tool, std::sync::atomic::Ordering::SeqCst);
         record_identity(a, &mut identity, &tracker).unwrap();
         std::fs::write(dir.path().join("root-release"), "").unwrap();
@@ -3432,8 +3446,11 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
             )
         };
         assert!(settle().is_err_and(|e| e.contains(&tool.to_string())));
-        // SAFETY: the fixture's own tool.
-        unsafe { libc::kill(tool as i32, libc::SIGKILL) };
+        // Disarmed as it is killed: never signalled again once gone.
+        if let Some(pid) = guard.0.take() {
+            // SAFETY: the fixture's own tool, still running (probed above).
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
         let deadline = Instant::now() + Duration::from_secs(30);
         let mut settled = settle();
         while settled != Ok(true) && Instant::now() < deadline {
