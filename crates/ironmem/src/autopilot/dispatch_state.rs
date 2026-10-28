@@ -110,6 +110,14 @@ impl DispatchState {
                 self.issue.canonical()
             )));
         }
+        // F13: artifacts a state names must be the layout
+        // `prepare_artifacts` makes for this issue, or recovery would
+        // read and settle whatever files a forged drawer points at.
+        if let Some(artifacts) = &self.invocation_artifacts {
+            artifacts
+                .check_layout(&self.issue)
+                .map_err(MemoryError::Validation)?;
+        }
         Ok(())
     }
 }
@@ -892,6 +900,26 @@ mod tests {
         assert_eq!(DispatchPhase::parse("in_progress"), None);
     }
 
+    /// F13: a supervised state whose artifacts are not the layout
+    /// `prepare_artifacts` makes is refused at validate, so it reads as
+    /// unreadable rather than pointing recovery at arbitrary files.
+    #[test]
+    fn a_supervised_state_with_forged_artifact_paths_is_unreadable() {
+        let issue = IssueRef::new("ironmem", 283);
+        let mut state = sample(&issue, 7);
+        state.implementer = Implementer::Codex;
+        state.invocation_artifacts = Some(InvocationArtifacts {
+            invocation_id: "invocation".into(),
+            schema_path: "/original/schema".into(),
+            journal_path: "/original/journal".into(),
+            final_path: "/original/final".into(),
+            stderr_path: "/original/stderr".into(),
+            exit_path: "/original/exit".into(),
+        });
+        let err = state.validate().unwrap_err().to_string();
+        assert!(err.contains("not an Autopilot invocation"), "{err}");
+    }
+
     #[test]
     fn codex_wire_roundtrip_keeps_native_identity_and_absolute_artifacts() {
         let db = Database::open_in_memory().unwrap();
@@ -900,12 +928,12 @@ mod tests {
         state.implementer = Implementer::Codex;
         state.native_session_id = Some("native-id".into());
         state.invocation_artifacts = Some(InvocationArtifacts {
-            invocation_id: "invocation".into(),
-            schema_path: "/original/schema".into(),
-            journal_path: "/original/journal".into(),
-            final_path: "/original/final".into(),
-            stderr_path: "/original/stderr".into(),
-            exit_path: "/original/exit".into(),
+            invocation_id: "11111111-2222-3333-4444-555555555555".into(),
+            schema_path: "/r/.git/ironmem/autopilot/ironmem-283/11111111-2222-3333-4444-555555555555/schema.json".into(),
+            journal_path: "/r/.git/ironmem/autopilot/ironmem-283/11111111-2222-3333-4444-555555555555/journal.jsonl".into(),
+            final_path: "/r/.git/ironmem/autopilot/ironmem-283/11111111-2222-3333-4444-555555555555/final.json".into(),
+            stderr_path: "/r/.git/ironmem/autopilot/ironmem-283/11111111-2222-3333-4444-555555555555/stderr.log".into(),
+            exit_path: "/r/.git/ironmem/autopilot/ironmem-283/11111111-2222-3333-4444-555555555555/exit.json".into(),
         });
         upsert_dispatch_state(&db, &state).unwrap();
         assert_eq!(get_dispatch_state(&db, &issue).unwrap(), Some(state));

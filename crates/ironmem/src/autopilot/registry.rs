@@ -552,6 +552,21 @@ pub(crate) fn invocation_state_liveness_with(
     daemon: fn() -> Option<crate::autopilot::process_tree::SharedDaemon>,
     pids: crate::autopilot::process_tree::ScanPids<'_>,
 ) -> Liveness {
+    // F13: artifacts proven outside the worktree's common directory are
+    // not this issue's invocation to judge, however the process table
+    // reads. A common directory that cannot be resolved at all (the
+    // worktree is gone, or was never a checkout) proves nothing either
+    // way, so process evidence still decides; `run`'s recovery, which
+    // reads the artifacts, is the strict check.
+    if let Some(artifacts) = &state.invocation_artifacts {
+        if let Err(reason) =
+            artifacts.check_common_dir(std::path::Path::new(&state.worktree_path))
+        {
+            if reason.contains("is not under the common Git directory") {
+                return Liveness::Unknown;
+            }
+        }
+    }
     match state.invocation_artifacts.as_ref() {
         Some(artifacts) => match snapshot.liveness_with(Some(artifacts), &daemon) {
             Liveness::Unknown
@@ -585,6 +600,14 @@ pub(crate) fn invocation_state_reason_with(
     daemon: fn() -> Option<crate::autopilot::process_tree::SharedDaemon>,
     pids: crate::autopilot::process_tree::ScanPids<'_>,
 ) -> String {
+    if let Some(artifacts) = &state.invocation_artifacts {
+        if let Err(reason) = artifacts.check_common_dir(std::path::Path::new(&state.worktree_path))
+        {
+            if reason.contains("is not under the common Git directory") {
+                return reason;
+            }
+        }
+    }
     match state.invocation_artifacts.as_ref() {
         Some(artifacts) => match settle_awaiting_quiet(snapshot, artifacts, daemon, pids) {
             Err(held) => {

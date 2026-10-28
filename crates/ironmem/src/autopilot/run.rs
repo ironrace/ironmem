@@ -959,6 +959,15 @@ impl Dispatcher for CliDispatcher {
         state: &DispatchState,
     ) -> Result<InvocationRecovery, MemoryError> {
         self.check_harness(state.implementer)?;
+        // F13: recovery reads only artifacts under the worktree's common
+        // directory, where `prepare_artifacts` put them.
+        if let Some(artifacts) = &state.invocation_artifacts {
+            if let Err(reason) =
+                artifacts.check_common_dir(Path::new(&state.worktree_path))
+            {
+                return Ok(InvocationRecovery::Unknown { reason });
+            }
+        }
         let snapshot = super::process_tree::snapshot(&mut super::process_tree::UnixProcesses);
         match super::registry::invocation_state_liveness(&snapshot, state) {
             super::registry::Liveness::Alive => Ok(InvocationRecovery::Alive),

@@ -2839,7 +2839,11 @@ mod tests {
         use crate::autopilot::registry::HarnessSnapshots;
         let db = Database::open_in_memory().unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let (a, row) = testing::invocation(dir.path());
+        let (a, row) = testing::invocation_in(
+            dir.path(),
+            crate::autopilot::implementer::Implementer::Codex,
+            "ironrace-ironmem-283",
+        );
         let mut state = state_for(&issue(), true);
         state.implementer = crate::autopilot::implementer::Implementer::Codex;
         state.invocation_artifacts = Some(a.clone());
@@ -2884,7 +2888,11 @@ mod tests {
             .path()
             .join(".git/ironmem/autopilot/owner-repo-42/0f0e0d0c-0b0a-4908-8706-050403020100");
         std::fs::create_dir_all(&invocation).unwrap();
-        let (a, mut root) = testing::invocation(&invocation);
+        let (a, mut root) = testing::invocation_in(
+            &invocation,
+            crate::autopilot::implementer::Implementer::Muse,
+            "ironrace-ironmem-283",
+        );
         root.args = format!(
             "/u/muse-bin-1.4.13-R6996.1 exec --json --output-schema {} --prompt-file /p.md",
             a.schema_path

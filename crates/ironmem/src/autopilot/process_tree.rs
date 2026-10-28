@@ -3213,9 +3213,29 @@ pub(crate) mod testing {
         dir: &Path,
         implementer: Implementer,
     ) -> (InvocationArtifacts, ProcessRow) {
-        let path = |name: &str| dir.join(name).to_str().unwrap().to_owned();
+        // In the layout `prepare_artifacts` makes (F13), for the issue
+        // most callers build a state for; `invocation_in` is the general
+        // form.
+        invocation_in(dir, implementer, "owner-repo-42")
+    }
+
+    /// [`invocation_for`] for the issue `slug` names, in its layout
+    /// under `dir` as a common directory.
+    pub(crate) fn invocation_in(
+        dir: &Path,
+        implementer: Implementer,
+        slug: &str,
+    ) -> (InvocationArtifacts, ProcessRow) {
+        let invocation_id = "11111111-2222-3333-4444-555555555555";
+        let nested = dir
+            .join("ironmem")
+            .join("autopilot")
+            .join(slug)
+            .join(invocation_id);
+        std::fs::create_dir_all(&nested).unwrap();
+        let path = |name: &str| nested.join(name).to_str().unwrap().to_owned();
         let a = InvocationArtifacts {
-            invocation_id: "invocation".into(),
+            invocation_id: invocation_id.into(),
             schema_path: path("schema.json"),
             journal_path: path("journal.jsonl"),
             final_path: path("final.json"),

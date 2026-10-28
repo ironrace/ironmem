@@ -66,9 +66,8 @@ pub struct InvocationArtifacts {
 /// journal, final, stderr and exit, in [`InvocationArtifacts`] field order.
 const ARTIFACT_FILES: [&str; 4] = ["journal.jsonl", "final.json", "stderr.log", "exit.json"];
 
-// `DispatchState::validate` (layout) and recovery (common directory) call
-// these; until that wiring lands only the tests do.
-#[cfg_attr(not(test), allow(dead_code))]
+// `DispatchState::validate` (layout) and recovery (common directory)
+// call these.
 impl InvocationArtifacts {
     /// Whether these paths are the layout [`prepare_artifacts`] makes for
     /// `issue`: the schema marker is an Autopilot marker path
