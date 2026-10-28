@@ -1684,9 +1684,33 @@ struct ProcOwner {
     ruid: u32,
     ppid: u32,
     pgid: u32,
-    /// The parent's kernel birth, read only for a process that is the
-    /// user's by real uid alone; `None` when not read or unreadable.
-    parent_birth: Option<Birth>,
+    /// The parent's kernel record, read only for a process that is the
+    /// user's by real uid alone.
+    parent: Parent,
+}
+
+/// What a scan learned of a process's parent ([`ProcOwner::parent`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Parent {
+    /// Not read: the process is the user's by effective uid, which decides.
+    NotRead,
+    /// Read, with this kernel birth.
+    Born(Birth),
+    /// Gone when read: the process is about to be reparented.
+    Gone,
+    /// The read failed, so nothing rules out its being the invocation's.
+    Unreadable,
+}
+
+impl Parent {
+    /// The parent as a kernel read of it answered.
+    fn read<E>(read: Result<Option<Birth>, E>) -> Self {
+        match read {
+            Ok(Some(birth)) => Self::Born(birth),
+            Ok(None) => Self::Gone,
+            Err(_) => Self::Unreadable,
+        }
+    }
 }
 
 /// An owner known only by its effective uid (a test seam's shorthand).
@@ -1697,7 +1721,7 @@ impl From<u32> for ProcOwner {
             ruid: uid,
             ppid: 0,
             pgid: 0,
-            parent_birth: None,
+            parent: Parent::NotRead,
         }
     }
 }
@@ -1715,7 +1739,10 @@ impl ProcOwner {
     ///   orphan keeps when Linux hands it to a `systemd --user` subreaper;
     /// - it was reparented to init (`launchd` on macOS);
     /// - its parent was itself born during the invocation (`spawned` or
-    ///   later): a process that appeared during it, between two samples.
+    ///   later): a process that appeared during it, between two samples;
+    /// - its parent cannot be authenticated: gone when read (it is being
+    ///   reparented) or a read that failed. Either way nothing rules the
+    ///   process out, so the scan fails closed on it.
     ///
     /// One whose parent and group predate the invocation (the operator's
     /// shells and terminals: a Terminal tab's `login`, a `sudo` or `top` run
@@ -1726,7 +1753,11 @@ impl ProcOwner {
                 && (self.ppid == 1
                     || known.contains(&self.ppid)
                     || known.contains(&self.pgid)
-                    || self.parent_birth.is_some_and(|born| born >= spawned)))
+                    || match self.parent {
+                        Parent::Born(born) => born >= spawned,
+                        Parent::Gone | Parent::Unreadable => true,
+                        Parent::NotRead => false,
+                    }))
     }
 }
 
@@ -1838,17 +1869,20 @@ fn processes_with_cwd(
         let owner_birth = |pid: u32| {
             Ok(kinfo_proc(pid)?.map(|record| {
                 // The parent is read only for a real-uid-only process.
-                let parent_birth = (record.euid != uid && record.ruid == uid)
-                    .then(|| kinfo_proc(record.process.ppid).ok().flatten())
-                    .flatten()
-                    .map(|parent| parent.process.birth);
+                let parent = if record.euid != uid && record.ruid == uid {
+                    Parent::read(
+                        kinfo_proc(record.process.ppid).map(|p| p.map(|p| p.process.birth)),
+                    )
+                } else {
+                    Parent::NotRead
+                };
                 (
                     ProcOwner {
                         euid: record.euid,
                         ruid: record.ruid,
                         ppid: record.process.ppid,
                         pgid: record.process.pgid,
-                        parent_birth,
+                        parent,
                     },
                     record.process.birth,
                 )
@@ -1904,17 +1938,18 @@ fn processes_with_cwd(
             let ruid = real_and_effective_uid(pid).map_or(owner, |(real, _)| real);
             Ok(kernel_observation(pid)?.map(|process| {
                 // The parent is read only for a real-uid-only process.
-                let parent_birth = (owner != uid && ruid == uid)
-                    .then(|| kernel_observation(process.ppid).ok().flatten())
-                    .flatten()
-                    .map(|parent| parent.birth);
+                let parent = if owner != uid && ruid == uid {
+                    Parent::read(kernel_observation(process.ppid).map(|p| p.map(|p| p.birth)))
+                } else {
+                    Parent::NotRead
+                };
                 (
                     ProcOwner {
                         euid: owner,
                         ruid,
                         ppid: process.ppid,
                         pgid: process.pgid,
-                        parent_birth,
+                        parent,
                     },
                     process.birth,
                 )
@@ -4244,7 +4279,7 @@ pub(crate) mod tests {
             ruid: uid,
             ppid,
             pgid: 300,
-            parent_birth: Some(Birth(50, 0)),
+            parent: Parent::Born(Birth(50, 0)),
         };
         let owner_birth = |pid: u32| -> Result<Option<(ProcOwner, Birth)>, String> {
             Ok(Some(match pid {
@@ -4261,7 +4296,7 @@ pub(crate) mod tests {
                         ruid: uid,
                         ppid: 300,
                         pgid: 300,
-                        parent_birth: Some(Birth(50, 0)),
+                        parent: Parent::Born(Birth(50, 0)),
                     },
                     Birth(150, 0),
                 ),
@@ -4283,6 +4318,36 @@ pub(crate) mod tests {
         assert!(!reads.borrow().contains(&10), "an unrelated login was read");
         let err = scan_cwds([10, 11], uid, spawned, &[root], owner_birth, cwd_of).unwrap_err();
         assert_eq!(err.unreadable, Some((11, Birth(150, 0))), "{err}");
+    }
+
+    /// A real-uid-only process whose parent cannot be authenticated is tied
+    /// to the invocation, so the scan fails closed on it: a parent that
+    /// exited before it was read (the child is not yet seen reparented) and
+    /// a parent read that failed both count, as a parent born in the window
+    /// does. Only a parent read and found older than the invocation unties
+    /// it.
+    #[test]
+    fn a_real_uid_process_whose_parent_cannot_be_read_counts_as_tied() {
+        let spawned = Birth(100, 0);
+        let uid = 501;
+        let owner = |parent: Parent| ProcOwner {
+            euid: 0,
+            ruid: uid,
+            ppid: 5000,
+            pgid: 5000,
+            parent,
+        };
+        assert!(owner(Parent::Gone).is_users(uid, &[], spawned));
+        assert!(owner(Parent::Unreadable).is_users(uid, &[], spawned));
+        assert!(owner(Parent::Born(Birth(150, 0))).is_users(uid, &[], spawned));
+        assert!(!owner(Parent::Born(Birth(50, 0))).is_users(uid, &[], spawned));
+        assert!(!owner(Parent::NotRead).is_users(uid, &[], spawned));
+        // Another user's process is never the user's, whatever its parent.
+        assert!(!ProcOwner {
+            ruid: uid + 1,
+            ..owner(Parent::Gone)
+        }
+        .is_users(uid, &[], spawned));
     }
 
     /// A Linux `/proc/<pid>/stat` line: pid, comm in parentheses, then state
@@ -4775,7 +4840,7 @@ pub(crate) mod tests {
                     ruid,
                     ppid,
                     pgid,
-                    parent_birth: Some(parent_birth),
+                    parent: Parent::Born(parent_birth),
                 },
                 Birth(150, 0),
             )))
