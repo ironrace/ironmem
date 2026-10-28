@@ -2909,22 +2909,37 @@ impl ProcessTracker {
     /// unaccounted for, and completion must not be recorded over it. It gets
     /// a second's grace to finish a shutdown it began.
     pub(crate) fn verify_group_drained(&self) -> Result<(), MemoryError> {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-        let mut straggler = None;
-        while std::time::Instant::now() < deadline {
-            straggler = Self::rows()?
-                .into_iter()
-                .find(|r| r.active() && r.pgid == self.root_pid && !self.known.contains_key(&r.pid))
-                .map(|r| r.pid);
-            if straggler.is_none() {
+        self.verify_group_drained_with(Self::rows, std::time::Duration::from_secs(1))
+    }
+
+    /// [`Self::verify_group_drained`] over `rows`, for `grace`.
+    fn verify_group_drained_with(
+        &self,
+        mut rows: impl FnMut() -> Result<Vec<ProcessRow>, MemoryError>,
+        grace: std::time::Duration,
+    ) -> Result<(), MemoryError> {
+        let deadline = std::time::Instant::now() + grace;
+        let straggler = loop {
+            let rows = rows()?;
+            // Once the root is reaped, a live process holding its PID shows
+            // the group ID was freed and reused: the group is someone
+            // else's (as `recorded_tree_evidence` and settling read it).
+            if self.root_reaped && rows.iter().any(|r| r.active() && r.pid == self.root_pid) {
                 return Ok(());
             }
+            let Some(straggler) = rows.into_iter().find(|r| {
+                r.active() && r.pgid == self.root_pid && !self.known.contains_key(&r.pid)
+            }) else {
+                return Ok(());
+            };
+            if std::time::Instant::now() >= deadline {
+                break straggler.pid;
+            }
             std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        };
         Err(MemoryError::Validation(format!(
-            "untracked process {} remained in invocation process group {} after cleanup; \
-             completion is unproven",
-            straggler.unwrap_or_default(),
+            "untracked process {straggler} remained in invocation process group {} after \
+             cleanup; completion is unproven",
             self.root_pid
         )))
     }
@@ -5766,6 +5781,32 @@ pub(crate) mod tests {
         assert!(alive);
         assert!(tracker.exited.contains(&pid) && !tracker.known.contains_key(&pid));
         assert_eq!(tracker.root_birth(), Some(Birth(1, 0)));
+    }
+
+    /// Once the root is reaped its PID, and so its group ID, can be reused.
+    /// A stranger now holding the root's PID shows the group ID was freed:
+    /// its members are someone else's, not the invocation's stragglers, as
+    /// `recorded_tree_evidence` and settling read it. Before reaping the
+    /// root's PID is ours, and an untracked member is a straggler.
+    #[test]
+    fn a_reused_root_group_after_reaping_is_no_straggler() {
+        let mut tracker = ProcessTracker::owning_every_descendant(10);
+        let reused = vec![process_row(10, 1, 10), process_row(500, 10, 10)];
+        tracker.root_reaped = true;
+        tracker
+            .verify_group_drained_with(|| Ok(reused.clone()), std::time::Duration::ZERO)
+            .unwrap();
+        // Without the root's PID in the table, the member is unaccounted for.
+        let member = vec![process_row(500, 1, 10)];
+        let err = tracker
+            .verify_group_drained_with(|| Ok(member.clone()), std::time::Duration::ZERO)
+            .unwrap_err();
+        assert!(err.to_string().contains("untracked process 500"), "{err}");
+        // Before reaping, the root's own row is no reuse.
+        tracker.root_reaped = false;
+        assert!(tracker
+            .verify_group_drained_with(|| Ok(reused.clone()), std::time::Duration::ZERO)
+            .is_err());
     }
 
     /// A PID cleanup was refused permission to signal, seen exit and then
