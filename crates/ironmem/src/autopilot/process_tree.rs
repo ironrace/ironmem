@@ -1642,7 +1642,7 @@ fn scan_cwds<O: Into<ProcOwner>>(
     pids: impl IntoIterator<Item = u32>,
     uid: u32,
     spawned: Birth,
-    known: &[u32],
+    known: &Known,
     mut owner_birth: impl FnMut(u32) -> Result<Option<(O, Birth)>, String>,
     mut cwd_of: impl FnMut(u32) -> Result<Option<PathBuf>, String>,
 ) -> Result<Vec<CwdProcess>, ScanError> {
@@ -1747,7 +1747,7 @@ impl ProcOwner {
     /// One whose parent and group predate the invocation (the operator's
     /// shells and terminals: a Terminal tab's `login`, a `sudo` or `top` run
     /// by hand) is skipped and never fails the scan.
-    fn is_users(self, uid: u32, known: &[u32], spawned: Birth) -> bool {
+    fn is_users(self, uid: u32, known: &Known, spawned: Birth) -> bool {
         self.euid == uid
             || (self.ruid == uid
                 && (self.ppid == 1
@@ -1772,6 +1772,10 @@ fn uids_from_status(status: &str) -> Option<(u32, u32)> {
         .map(|id| id.parse::<u32>().ok());
     Some((ids.next()??, ids.next()??))
 }
+
+/// The invocation's PIDs a worktree scan ties processes to
+/// ([`ProcOwner::is_users`]).
+type Known = std::collections::HashSet<u32>;
 
 /// The PIDs a worktree-quiet scan reads. Production scans every process
 /// the current user owns ([`user_pids`]). A test passes only the processes
@@ -1860,7 +1864,7 @@ pub(crate) fn user_pids() -> Result<Vec<u32>, String> {
 fn processes_with_cwd(
     pids: Vec<u32>,
     spawned: Birth,
-    known: &[u32],
+    known: &Known,
 ) -> Result<Vec<CwdProcess>, ScanError> {
     let uid = current_uid().ok_or("process working directories are unreadable here")?;
     #[cfg(target_os = "macos")]
@@ -1992,7 +1996,7 @@ fn processes_with_cwd(
 #[cfg(any(target_os = "linux", test))]
 fn cwd_unless_refused_stranger(
     pid: u32,
-    known: &[u32],
+    known: &Known,
     spawned: Birth,
     read: impl FnOnce(u32) -> Result<Option<PathBuf>, String>,
     refused: impl FnOnce(u32) -> bool,
@@ -2023,7 +2027,7 @@ fn cwd_unless_refused_stranger(
 fn scan_with(
     pids: ScanPids<'_>,
     spawned: Birth,
-    known: &[u32],
+    known: &Known,
 ) -> Result<Vec<CwdProcess>, ScanError> {
     processes_with_cwd(pids()?, spawned, known)
 }
@@ -2128,7 +2132,8 @@ impl<'a> QuietCheck<'a> {
         pids: ScanPids<'_>,
     ) -> Result<Quiet, String> {
         let check = Self::new(worktree, spawned, daemon, kernel_executable)?;
-        let scanned = scan_with(pids, spawned, known).map_err(|e| e.reason)?;
+        let known: Known = known.iter().copied().collect();
+        let scanned = scan_with(pids, spawned, &known).map_err(|e| e.reason)?;
         let found = check.stragglers(scanned, || Ok(rows.to_vec()))?;
         Ok(check.verdict(found))
     }
@@ -2247,7 +2252,19 @@ pub(crate) fn kernel_birth(pid: u32) -> Result<Option<Birth>, String> {
 
 pub(crate) struct ProcessTracker {
     root_pid: u32,
-    known: Vec<(ProcessRow, Birth)>,
+    /// The root's kernel birth, once read ([`Self::adopt_root`] or a
+    /// sample). Kept when the root exits, for the worktree check.
+    root_birth: Option<Birth>,
+    /// Processes owned and not yet seen gone, the root included while it
+    /// runs, by PID: each with its authenticated row and kernel birth.
+    known: std::collections::HashMap<u32, Tracked>,
+    /// PIDs once in `known` that the kernel has since shown gone. They are
+    /// never read, signalled or waited for again: the PID may already be a
+    /// stranger's. A scan still counts them as the invocation's
+    /// ([`Self::scan_known`]), which fails closed.
+    exited: std::collections::HashSet<u32>,
+    /// The next enrolment's sequence number ([`Tracked::seq`]).
+    next_seq: u64,
     observed_root: bool,
     root_reaped: bool,
     /// A daemon on its socket, running its executable, is never owned;
@@ -2255,8 +2272,6 @@ pub(crate) struct ProcessTracker {
     shared_daemon: Option<SharedDaemon>,
     /// [`kernel_executable`]; a seam so tests need no real daemon binary.
     kernel_exe: fn(u32) -> Option<PathBuf>,
-    /// Descendants whose kernel birth the last observe authenticated.
-    live: std::collections::HashSet<u32>,
     /// [`unix_kill`]; a seam so tests can stand in for a process the
     /// kernel will not let the operator signal.
     kill: fn(u32, i32) -> std::io::Result<()>,
@@ -2265,6 +2280,15 @@ pub(crate) struct ProcessTracker {
     /// failure of the run, and never ignored: completion waits until each
     /// is gone ([`Self::hold_unsignalable`]).
     refused: std::collections::HashSet<u32>,
+}
+
+/// One process the tracker owns.
+#[derive(Debug, Clone)]
+struct Tracked {
+    row: ProcessRow,
+    birth: Birth,
+    /// Enrolment order: cleanup kills the newest first.
+    seq: u64,
 }
 
 /// What signalling one known process did.
@@ -2313,15 +2337,26 @@ impl ProcessTracker {
     fn new(root_pid: u32, shared_daemon: Option<&SharedDaemon>) -> Self {
         Self {
             root_pid,
-            known: Vec::new(),
+            root_birth: None,
+            known: std::collections::HashMap::new(),
+            exited: std::collections::HashSet::new(),
+            next_seq: 0,
             observed_root: false,
             root_reaped: false,
             shared_daemon: shared_daemon.cloned(),
             kernel_exe: kernel_executable,
-            live: std::collections::HashSet::new(),
             kill: unix_kill,
             refused: std::collections::HashSet::new(),
         }
+    }
+
+    /// Own `row`'s process at `birth`, newest so far; a PID seen exit
+    /// before and now authenticated again is a new process.
+    fn enrol(&mut self, row: ProcessRow, birth: Birth) {
+        self.exited.remove(&row.pid);
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        self.known.insert(row.pid, Tracked { row, birth, seq });
     }
 
     /// Signal through `kill` instead of [`unix_kill`] (tests).
@@ -2359,32 +2394,38 @@ impl ProcessTracker {
         // below refuses as it would any.
         //
         // The daemon test reads a kernel path, so it runs once per row here
-        // and never per tracked descendant: `known` keeps every exited one.
+        // and never per tracked descendant.
         let shared_daemon: std::collections::HashSet<u32> = rows
             .iter()
             .filter(|r| r.active() && self.is_shared_daemon(r))
             .map(|r| r.pid)
             .collect();
         let mut released = Vec::new();
-        for (old, expected) in &self.known {
-            let shows_daemon = old.pid != self.root_pid && shared_daemon.contains(&old.pid);
+        for (&pid, tracked) in &self.known {
+            let shows_daemon = pid != self.root_pid && shared_daemon.contains(&pid);
             if shows_daemon
-                && kernel(old.pid)
+                && kernel(pid)
                     .map_err(MemoryError::Validation)?
-                    .is_some_and(|actual| actual.pid == old.pid && actual.birth == *expected)
+                    .is_some_and(|actual| actual.pid == pid && actual.birth == tracked.birth)
             {
-                released.push(old.pid);
+                released.push(pid);
             }
         }
-        self.known.retain(|(old, _)| !released.contains(&old.pid));
+        for pid in released {
+            self.known.remove(&pid);
+        }
         // Existing descendants remain owned only while their kernel birth
         // token matches. Keep those tokens with the ancestry seeds; a bare
-        // PID from ps must never authorize enrollment of a new subtree.
+        // PID from ps must never authorize enrollment of a new subtree. One
+        // the kernel shows gone moves to `exited` and is never read again,
+        // so a later reuse of its PID is a stranger, not an identity change.
         let mut seeds = std::collections::HashMap::new();
-        for (old, expected) in &self.known {
-            match kernel(old.pid).map_err(MemoryError::Validation)? {
-                Some(actual) if actual.pid == old.pid && actual.birth == *expected => {
-                    seeds.insert(old.pid, *expected);
+        let mut gone = Vec::new();
+        for (&pid, tracked) in &self.known {
+            let expected = &tracked.birth;
+            match kernel(pid).map_err(MemoryError::Validation)? {
+                Some(actual) if actual.pid == pid && actual.birth == *expected => {
+                    seeds.insert(pid, *expected);
                 }
                 Some(_) => {
                     return Err(MemoryError::Validation(
@@ -2398,10 +2439,10 @@ impl ProcessTracker {
                     // shared daemon outlives its proxy by design and was
                     // never ours to authenticate.
                     for row in rows.iter().filter(|row| {
-                        row.ppid == old.pid
+                        row.ppid == pid
                             && row.active()
                             && !shared_daemon.contains(&row.pid)
-                            && !self.known.iter().any(|(known, _)| known.pid == row.pid)
+                            && !self.known.contains_key(&row.pid)
                     }) {
                         if kernel(row.pid).map_err(MemoryError::Validation)?.is_some() {
                             return Err(MemoryError::Validation(
@@ -2410,8 +2451,13 @@ impl ProcessTracker {
                             ));
                         }
                     }
+                    gone.push(pid);
                 }
             }
+        }
+        for pid in gone {
+            self.known.remove(&pid);
+            self.exited.insert(pid);
         }
         // The spawned root's PID is reserved by our unreaped Child. Still
         // bind its ps ancestry/group to the same kernel birth observation.
@@ -2424,18 +2470,19 @@ impl ProcessTracker {
                     if actual.pid != root.pid
                         || actual.ppid != root.ppid
                         || actual.pgid != root.pgid
-                        || seeds
-                            .get(&root.pid)
-                            .is_some_and(|expected| *expected != actual.birth)
+                        || self
+                            .root_birth
+                            .is_some_and(|expected| expected != actual.birth)
                     {
                         return Err(MemoryError::Validation(
                             "invocation root identity changed during authentication".into(),
                         ));
                     }
                     self.observed_root = true;
+                    self.root_birth = Some(actual.birth);
                     seeds.insert(root.pid, actual.birth);
-                    if !self.known.iter().any(|(old, _)| old.pid == root.pid) {
-                        self.known.push((root.clone(), actual.birth));
+                    if !self.known.contains_key(&root.pid) {
+                        self.enrol(root.clone(), actual.birth);
                     }
                 }
                 None => {
@@ -2453,7 +2500,7 @@ impl ProcessTracker {
                 .iter()
                 .filter(|r| r.active() && !shared_daemon.contains(&r.pid))
             {
-                if self.known.iter().any(|(old, _)| old.pid == row.pid) {
+                if self.known.contains_key(&row.pid) {
                     continue;
                 }
                 let Some(expected_parent) = seeds.get(&row.ppid).copied() else {
@@ -2501,7 +2548,7 @@ impl ProcessTracker {
                 // authoritative metadata, not an ownership input to PID kills.
                 let mut authenticated = row.clone();
                 authenticated.pgid = actual.pgid;
-                self.known.push((authenticated, actual.birth));
+                self.enrol(authenticated, actual.birth);
                 seeds.insert(row.pid, actual.birth);
                 enrolled = true;
             }
@@ -2509,30 +2556,29 @@ impl ProcessTracker {
                 break;
             }
         }
-        self.live = seeds
-            .into_keys()
-            .filter(|pid| *pid != self.root_pid)
-            .collect();
         Ok(rows)
     }
 
-    /// Descendants newest first, then the root, each with its birth.
-    fn kill_order(&self) -> impl Iterator<Item = &(ProcessRow, Birth)> + '_ {
-        let root = self.root_pid;
-        self.known
-            .iter()
-            .rev()
-            .filter(move |(r, _)| r.pid != root)
-            .chain(self.known.iter().filter(move |(r, _)| r.pid == root))
+    /// Descendants newest first, then the root.
+    fn kill_order(&self) -> Vec<&Tracked> {
+        let mut order: Vec<&Tracked> = self.known.values().collect();
+        // The root sorts last whenever it enrolled.
+        order.sort_by_key(|t| {
+            (
+                std::cmp::Reverse(t.row.pid != self.root_pid),
+                std::cmp::Reverse(t.seq),
+            )
+        });
+        order
     }
 
     fn signal(&self, pid: u32, signal: i32) -> Result<(), MemoryError> {
-        let Some((_, expected)) = self.known.iter().find(|(r, _)| r.pid == pid) else {
+        let Some(tracked) = self.known.get(&pid) else {
             return Err(MemoryError::Validation(
                 "cannot signal unauthenticated invocation process".into(),
             ));
         };
-        match self.signal_known(pid, *expected, signal)? {
+        match self.signal_known(pid, tracked.birth, signal)? {
             Signalled::Refused => Err(MemoryError::Validation(format!(
                 "not permitted to signal invocation process {pid}"
             ))),
@@ -2582,9 +2628,11 @@ impl ProcessTracker {
         let result = (|| {
             if !root_reaped {
                 self.observe()?;
-                if let Some(&(_, birth)) = self.known.iter().find(|(r, _)| r.pid == self.root_pid) {
+                if let Some(birth) = self.known.get(&self.root_pid).map(|t| t.birth) {
                     self.signal_or_keep(self.root_pid, birth, STOP_SIGNAL)?;
-                } else {
+                } else if !self.exited.contains(&self.root_pid) {
+                    // A root seen gone needs no stop; one never seen
+                    // cannot be signalled unauthenticated.
                     self.signal(self.root_pid, STOP_SIGNAL)?;
                 }
             }
@@ -2597,7 +2645,7 @@ impl ProcessTracker {
                 // here like any tool. That is harmless: it never bound the
                 // socket or served anyone, and the next proxy spawns another.
                 let known: Vec<(u32, Birth)> =
-                    self.known.iter().map(|(r, b)| (r.pid, *b)).collect();
+                    self.known.iter().map(|(&pid, t)| (pid, t.birth)).collect();
                 for (pid, birth) in known {
                     self.signal_or_keep(pid, birth, STOP_SIGNAL)?;
                 }
@@ -2607,7 +2655,7 @@ impl ProcessTracker {
                     .filter(|r| {
                         r.active()
                             && !self.refused.contains(&r.pid)
-                            && self.known.iter().any(|(k, _)| k.pid == r.pid)
+                            && self.known.contains_key(&r.pid)
                     })
                     .all(|r| row_stopped(r, task_states));
                 if before == self.known.len() && stopped {
@@ -2634,8 +2682,8 @@ impl ProcessTracker {
         let mut signal_error = None;
         let mut refused = Vec::new();
         let temp = std::env::temp_dir();
-        for (row, birth) in self.kill_order() {
-            let pid = row.pid;
+        for tracked in self.kill_order() {
+            let (pid, row, birth) = (tracked.row.pid, &tracked.row, &tracked.birth);
             if let Some(socket) = foreign_daemon_socket(row, self.shared_daemon.as_ref(), &temp) {
                 tracing::warn!(
                     pid,
@@ -2661,17 +2709,22 @@ impl ProcessTracker {
     }
     pub(crate) fn verify_gone(&self) -> Result<(), MemoryError> {
         for _ in 0..VERIFY_GONE_ATTEMPTS {
-            let rows = Self::rows()?;
+            let active: std::collections::HashSet<u32> = Self::rows()?
+                .into_iter()
+                .filter(ProcessRow::active)
+                .map(|r| r.pid)
+                .collect();
             let mut live = false;
             // One cleanup may not signal is evidence, not a failure: it is
             // waited for by `hold_unsignalable`, after cleanup.
-            for (old, expected) in self
+            for (&pid, tracked) in self
                 .known
                 .iter()
-                .filter(|(r, _)| !self.refused.contains(&r.pid))
+                .filter(|(pid, _)| !self.refused.contains(pid))
             {
-                if rows.iter().any(|r| r.pid == old.pid && r.active()) {
-                    match birth(old.pid).map_err(MemoryError::Validation)? {
+                let expected = &tracked.birth;
+                if active.contains(&pid) {
+                    match birth(pid).map_err(MemoryError::Validation)? {
                         None => {} // The ps row raced a completed process exit.
                         Some(actual) if actual == *expected => live = true,
                         Some(_) => {
@@ -2702,11 +2755,7 @@ impl ProcessTracker {
         while std::time::Instant::now() < deadline {
             straggler = Self::rows()?
                 .into_iter()
-                .find(|r| {
-                    r.active()
-                        && r.pgid == self.root_pid
-                        && !self.known.iter().any(|(k, _)| k.pid == r.pid)
-                })
+                .find(|r| r.active() && r.pgid == self.root_pid && !self.known.contains_key(&r.pid))
                 .map(|r| r.pid);
             if straggler.is_none() {
                 return Ok(());
@@ -2738,15 +2787,23 @@ impl ProcessTracker {
         grace: std::time::Duration,
         pids: ScanPids<'_>,
     ) -> Result<Quiet, MemoryError> {
-        let known: Vec<u32> = std::iter::once(self.root_pid)
-            .chain(self.known.iter().map(|(r, _)| r.pid))
-            .collect();
+        let known = self.scan_known();
         self.verify_worktree_quiet_with(
             worktree,
             |spawned| scan_with(pids, spawned, &known),
             Self::rows,
             grace,
         )
+    }
+
+    /// Every PID the invocation ever had, exited ones included, for a scan
+    /// to tie processes to ([`ProcOwner::is_users`]): a group an exited
+    /// descendant led still ties its members, which fails closed.
+    fn scan_known(&self) -> Known {
+        std::iter::once(self.root_pid)
+            .chain(self.known.keys().copied())
+            .chain(self.exited.iter().copied())
+            .collect()
     }
 
     fn verify_worktree_quiet_with(
@@ -2759,14 +2816,9 @@ impl ProcessTracker {
         let unproven = |reason: String| {
             MemoryError::Validation(format!("{reason}; invocation completion is unproven"))
         };
-        let spawned = self
-            .known
-            .iter()
-            .find(|(r, _)| r.pid == self.root_pid)
-            .map(|(_, birth)| *birth)
-            .ok_or_else(|| {
-                unproven("the invocation root's kernel birth was never observed".into())
-            })?;
+        let spawned = self.root_birth.ok_or_else(|| {
+            unproven("the invocation root's kernel birth was never observed".into())
+        })?;
         let check = QuietCheck::new(
             worktree,
             spawned,
@@ -2811,13 +2863,13 @@ impl ProcessTracker {
         }
         let rows = Self::rows()?;
         let mut held: Vec<(u32, Birth)> = Vec::new();
-        for (row, expected) in self
+        for (&pid, tracked) in self
             .known
             .iter()
-            .filter(|(r, _)| self.refused.contains(&r.pid))
+            .filter(|(pid, _)| self.refused.contains(pid))
         {
-            if birth(row.pid).map_err(MemoryError::Validation)? == Some(*expected) {
-                held.push((row.pid, *expected));
+            if birth(pid).map_err(MemoryError::Validation)? == Some(tracked.birth) {
+                held.push((pid, tracked.birth));
             }
         }
         // Their descendants in the process table, by parent, to any depth.
@@ -2891,7 +2943,7 @@ impl ProcessTracker {
     /// stays false until a sample binds its process-table row. A read that
     /// fails leaves the birth unknown.
     pub(crate) fn adopt_root(&mut self) {
-        if self.known.iter().any(|(r, _)| r.pid == self.root_pid) {
+        if self.root_birth.is_some() {
             return;
         }
         let read = root_observation(self.root_pid);
@@ -2908,7 +2960,8 @@ impl ProcessTracker {
                     stat: String::new(),
                     args: String::new(),
                 };
-                self.known.push((row, root.birth));
+                self.root_birth = Some(root.birth);
+                self.enrol(row, root.birth);
             }
             // Not fatal: the first sample may still bind the root; without
             // either, completion holds as unproven.
@@ -2926,24 +2979,24 @@ impl ProcessTracker {
 
     /// The root's kernel birth, once read ([`Self::adopt_root`] or a sample).
     pub(crate) fn root_birth(&self) -> Option<Birth> {
-        self.recorded().0
+        self.root_birth
     }
     /// What the identity file records: the root's kernel birth, once
-    /// observed, and the descendants alive at the last sample. Exited ones
-    /// are left out, so the file stays bounded over a long dispatch.
+    /// observed, and the descendants not yet seen gone, oldest first.
+    /// Exited ones are left out, so the file stays bounded over a long
+    /// dispatch.
     pub(crate) fn recorded(&self) -> (Option<Birth>, Vec<RecordedProcess>) {
-        let root_birth = self
+        let mut descendants: Vec<&Tracked> = self
             .known
-            .iter()
-            .find(|(r, _)| r.pid == self.root_pid)
-            .map(|(_, birth)| *birth);
-        let descendants = self
-            .known
-            .iter()
-            .filter(|(r, _)| r.pid != self.root_pid && self.live.contains(&r.pid))
-            .map(|(r, birth)| RecordedProcess::new(r, *birth))
+            .values()
+            .filter(|t| t.row.pid != self.root_pid)
             .collect();
-        (root_birth, descendants)
+        descendants.sort_by_key(|t| t.seq);
+        let descendants = descendants
+            .into_iter()
+            .map(|t| RecordedProcess::new(&t.row, t.birth))
+            .collect();
+        (self.root_birth, descendants)
     }
 }
 
@@ -3014,6 +3067,11 @@ pub(crate) mod testing {
 pub(crate) mod tests {
     use super::*;
     use crate::autopilot::implementer::Implementer;
+
+    /// A scan's [`Known`] PIDs.
+    fn pid_set(pids: &[u32]) -> Known {
+        pids.iter().copied().collect()
+    }
 
     /// The fixture's root row is the named harness's own command, carrying
     /// the invocation's marker, so a Muse test never leans on a Codex row.
@@ -3340,24 +3398,17 @@ pub(crate) mod tests {
             stat: "T".into(),
             args: "test".into(),
         };
-        let tracker = ProcessTracker {
-            root_pid: 10,
-            known: vec![
-                (row(20), Birth(1, 0)),
-                (row(10), Birth(2, 0)),
-                (row(30), Birth(3, 0)),
-            ],
-            observed_root: true,
-            root_reaped: false,
-            shared_daemon: None,
-            kernel_exe: kernel_executable,
-            live: std::collections::HashSet::new(),
-            kill: unix_kill,
-            refused: std::collections::HashSet::new(),
-        };
-        let order = tracker.kill_order().map(|(r, _)| r.pid).collect::<Vec<_>>();
-        assert_eq!(order.last(), Some(&10));
-        assert_eq!(order.len(), 3);
+        let mut tracker = ProcessTracker::owning_every_descendant(10);
+        tracker.enrol(row(20), Birth(1, 0));
+        tracker.enrol(row(10), Birth(2, 0));
+        tracker.enrol(row(30), Birth(3, 0));
+        let order = tracker
+            .kill_order()
+            .into_iter()
+            .map(|t| t.row.pid)
+            .collect::<Vec<_>>();
+        // Descendants newest first, the root last.
+        assert_eq!(order, vec![30, 20, 10]);
     }
     #[test]
     fn legacy_unversioned_process_identity_does_not_authorize_restart() {
@@ -3672,7 +3723,7 @@ pub(crate) mod tests {
     }
 
     fn owned(tracker: &ProcessTracker) -> Vec<u32> {
-        let mut owned: Vec<_> = tracker.known.iter().map(|(r, _)| r.pid).collect();
+        let mut owned: Vec<_> = tracker.known.keys().copied().collect();
         owned.sort_unstable();
         owned
     }
@@ -3686,7 +3737,11 @@ pub(crate) mod tests {
         let assert_owns_only_root_and_proxy = |tracker: &ProcessTracker| {
             assert_eq!(owned(tracker), vec![10, 20]);
             assert_eq!(
-                tracker.kill_order().map(|(r, _)| r.pid).collect::<Vec<_>>(),
+                tracker
+                    .kill_order()
+                    .into_iter()
+                    .map(|t| t.row.pid)
+                    .collect::<Vec<_>>(),
                 vec![20, 10]
             );
             for pid in [30, 31] {
@@ -3712,7 +3767,7 @@ pub(crate) mod tests {
         let mut before_exec = daemon_rows(PROXY);
         before_exec.pop();
         tracker.observe_rows(before_exec, daemon_kernel).unwrap();
-        assert!(tracker.known.iter().any(|(r, _)| r.pid == 30));
+        assert!(tracker.known.contains_key(&30));
         tracker
             .observe_rows(daemon_rows(DAEMON_DB), daemon_kernel)
             .unwrap();
@@ -3798,9 +3853,7 @@ pub(crate) mod tests {
             .unwrap();
         // Fifty descendants that have since exited.
         for pid in 1000..1050 {
-            tracker
-                .known
-                .push((process_row(pid, 20, 10), Birth(u64::from(pid), 0)));
+            tracker.enrol(process_row(pid, 20, 10), Birth(u64::from(pid), 0));
         }
         LOOKUPS.store(0, Ordering::SeqCst);
         tracker
@@ -3932,15 +3985,30 @@ pub(crate) mod tests {
                 _ => Ok(Some(PathBuf::from(format!("/w/{pid}")))),
             }
         };
-        let found =
-            scan_cwds([1, 3, 4, 6, 7], uid, spawned, &[], owner_birth, &mut cwd_of).unwrap();
+        let found = scan_cwds(
+            [1, 3, 4, 6, 7],
+            uid,
+            spawned,
+            &pid_set(&[]),
+            owner_birth,
+            &mut cwd_of,
+        )
+        .unwrap();
         assert_eq!(found.iter().map(|p| p.pid).collect::<Vec<_>>(), vec![7]);
         assert_eq!(
             cwd_reads.borrow().clone(),
             vec![4, 7],
             "old, gone and foreign processes are never read"
         );
-        let err = scan_cwds([1, 2, 7], uid, spawned, &[], owner_birth, &mut cwd_of).unwrap_err();
+        let err = scan_cwds(
+            [1, 2, 7],
+            uid,
+            spawned,
+            &pid_set(&[]),
+            owner_birth,
+            &mut cwd_of,
+        )
+        .unwrap_err();
         assert!(
             err.reason.contains("process 2") && err.reason.contains("not permitted"),
             "{err}"
@@ -3954,9 +4022,11 @@ pub(crate) mod tests {
             reads += 1;
             Ok((reads == 1).then_some((uid, Birth(150, 0))))
         };
-        assert!(scan_cwds([8], uid, spawned, &[], vanishing, &mut cwd_of)
-            .unwrap()
-            .is_empty());
+        assert!(
+            scan_cwds([8], uid, spawned, &pid_set(&[]), vanishing, &mut cwd_of)
+                .unwrap()
+                .is_empty()
+        );
         // Replaced by a new process under the same PID: the directory may
         // be the newcomer's, so the scan cannot vouch for it.
         let mut reads = 0;
@@ -3964,7 +4034,7 @@ pub(crate) mod tests {
             reads += 1;
             Ok(Some((uid, Birth(150 + reads, 0))))
         };
-        let err = scan_cwds([9], uid, spawned, &[], replaced, &mut cwd_of).unwrap_err();
+        let err = scan_cwds([9], uid, spawned, &pid_set(&[]), replaced, &mut cwd_of).unwrap_err();
         assert_eq!(
             err.unreadable, None,
             "a replaced PID names no process: {err}"
@@ -4067,7 +4137,8 @@ pub(crate) mod tests {
         let started = std::time::Instant::now();
         let pids = user_pids().unwrap();
         assert!(pids.contains(&std::process::id()), "{} pids", pids.len());
-        let processes = processes_with_cwd(vec![std::process::id()], Birth(0, 0), &[]).unwrap();
+        let processes =
+            processes_with_cwd(vec![std::process::id()], Birth(0, 0), &pid_set(&[])).unwrap();
         let elapsed = started.elapsed();
         let me = processes
             .iter()
@@ -4194,7 +4265,7 @@ pub(crate) mod tests {
         let mut before = daemon_rows(PROXY);
         before.pop();
         tracker.observe_rows(before, daemon_kernel).unwrap();
-        assert!(tracker.known.iter().any(|(r, _)| r.pid == 30));
+        assert!(tracker.known.contains_key(&30));
         let err = tracker
             .observe_rows(daemon_rows(DAEMON_DB), |pid| {
                 if pid == 30 {
@@ -4337,13 +4408,29 @@ pub(crate) mod tests {
                 _ => Ok(Some(PathBuf::from(format!("/w/{pid}")))),
             }
         };
-        let found = scan_cwds([10, 12, 13], uid, spawned, &[root], owner_birth, cwd_of).unwrap();
+        let found = scan_cwds(
+            [10, 12, 13],
+            uid,
+            spawned,
+            &pid_set(&[root]),
+            owner_birth,
+            cwd_of,
+        )
+        .unwrap();
         assert_eq!(
             found.iter().map(|p| p.pid).collect::<Vec<_>>(),
             vec![12, 13]
         );
         assert!(!reads.borrow().contains(&10), "an unrelated login was read");
-        let err = scan_cwds([10, 11], uid, spawned, &[root], owner_birth, cwd_of).unwrap_err();
+        let err = scan_cwds(
+            [10, 11],
+            uid,
+            spawned,
+            &pid_set(&[root]),
+            owner_birth,
+            cwd_of,
+        )
+        .unwrap_err();
         assert_eq!(err.unreadable, Some((11, Birth(150, 0))), "{err}");
     }
 
@@ -4375,7 +4462,14 @@ pub(crate) mod tests {
         let denied = || Err::<Option<PathBuf>, _>("Permission denied (os error 13)".to_owned());
         type Kernel<'a> = &'a dyn Fn(u32) -> Result<Option<KernelProcess>, String>;
         let decide = |refused: bool, kernel: Kernel<'_>| {
-            cwd_unless_refused_stranger(7, &[root], spawned, |_| denied(), |_| refused, kernel)
+            cwd_unless_refused_stranger(
+                7,
+                &pid_set(&[root]),
+                spawned,
+                |_| denied(),
+                |_| refused,
+                kernel,
+            )
         };
         // The operator's own: an old parent, in an old group of its own.
         assert_eq!(decide(true, &kernel(300, 300, Some(Some(50)))), Ok(None));
@@ -4398,7 +4492,7 @@ pub(crate) mod tests {
         // A directory that reads is the answer; nothing else is asked.
         let read = cwd_unless_refused_stranger(
             7,
-            &[root],
+            &pid_set(&[root]),
             spawned,
             |_| Ok(Some(PathBuf::from("/w"))),
             |_| panic!("re-read a readable directory"),
@@ -4408,19 +4502,26 @@ pub(crate) mod tests {
         // Through the scan: the stranger is skipped and the rest listed.
         let owner_birth =
             |_: u32| -> Result<Option<(u32, Birth)>, String> { Ok(Some((501, Birth(150, 0)))) };
-        let found = scan_cwds([7, 8], 501, spawned, &[root], owner_birth, |pid| {
-            if pid == 8 {
-                return Ok(Some(PathBuf::from("/w/8")));
-            }
-            cwd_unless_refused_stranger(
-                pid,
-                &[root],
-                spawned,
-                |_| denied(),
-                |_| true,
-                kernel(300, 300, Some(Some(50))),
-            )
-        })
+        let found = scan_cwds(
+            [7, 8],
+            501,
+            spawned,
+            &pid_set(&[root]),
+            owner_birth,
+            |pid| {
+                if pid == 8 {
+                    return Ok(Some(PathBuf::from("/w/8")));
+                }
+                cwd_unless_refused_stranger(
+                    pid,
+                    &pid_set(&[root]),
+                    spawned,
+                    |_| denied(),
+                    |_| true,
+                    kernel(300, 300, Some(Some(50))),
+                )
+            },
+        )
         .unwrap();
         assert_eq!(found.iter().map(|p| p.pid).collect::<Vec<_>>(), vec![8]);
     }
@@ -4437,7 +4538,7 @@ pub(crate) mod tests {
         // the child even when the test runs alone.
         std::thread::sleep(std::time::Duration::from_millis(50));
         // SAFETY: the child only makes async-signal-safe calls (chdir,
-        // prctl, pause, _exit) before it is killed.
+        // prctl, pause) until it is killed.
         let child = unsafe { libc::fork() };
         assert!(child >= 0, "fork: {}", std::io::Error::last_os_error());
         if child == 0 {
@@ -4477,10 +4578,11 @@ pub(crate) mod tests {
         let spawned = birth(child).unwrap().expect("the child runs");
         assert!(birth(std::process::id()).unwrap().unwrap() < spawned);
         assert_eq!(
-            processes_with_cwd(vec![child], spawned, &[]).map(|found| found.len()),
+            processes_with_cwd(vec![child], spawned, &pid_set(&[])).map(|found| found.len()),
             Ok(0)
         );
-        let err = processes_with_cwd(vec![child], spawned, &[std::process::id()]).unwrap_err();
+        let err =
+            processes_with_cwd(vec![child], spawned, &pid_set(&[std::process::id()])).unwrap_err();
         assert_eq!(err.unreadable.map(|(pid, _)| pid), Some(child), "{err}");
     }
 
@@ -4501,17 +4603,17 @@ pub(crate) mod tests {
             pgid: 5000,
             parent,
         };
-        assert!(owner(Parent::Gone).is_users(uid, &[], spawned));
-        assert!(owner(Parent::Unreadable).is_users(uid, &[], spawned));
-        assert!(owner(Parent::Born(Birth(150, 0))).is_users(uid, &[], spawned));
-        assert!(!owner(Parent::Born(Birth(50, 0))).is_users(uid, &[], spawned));
-        assert!(!owner(Parent::NotRead).is_users(uid, &[], spawned));
+        assert!(owner(Parent::Gone).is_users(uid, &pid_set(&[]), spawned));
+        assert!(owner(Parent::Unreadable).is_users(uid, &pid_set(&[]), spawned));
+        assert!(owner(Parent::Born(Birth(150, 0))).is_users(uid, &pid_set(&[]), spawned));
+        assert!(!owner(Parent::Born(Birth(50, 0))).is_users(uid, &pid_set(&[]), spawned));
+        assert!(!owner(Parent::NotRead).is_users(uid, &pid_set(&[]), spawned));
         // Another user's process is never the user's, whatever its parent.
         assert!(!ProcOwner {
             ruid: uid + 1,
             ..owner(Parent::Gone)
         }
-        .is_users(uid, &[], spawned));
+        .is_users(uid, &pid_set(&[]), spawned));
     }
 
     /// A Linux `/proc/<pid>/stat` line: pid, comm in parentheses, then state
@@ -4901,7 +5003,7 @@ pub(crate) mod tests {
         let spawned = Birth(100, 0);
         let owner_birth =
             |_: u32| -> Result<Option<(u32, Birth)>, String> { Ok(Some((501, Birth(150, 0)))) };
-        let err = scan_cwds([8], 501, spawned, &[], owner_birth, |pid| {
+        let err = scan_cwds([8], 501, spawned, &pid_set(&[]), owner_birth, |pid| {
             linux_cwd(pid, links(None, None), tasks, running)
         })
         .unwrap_err();
@@ -5014,7 +5116,15 @@ pub(crate) mod tests {
             reads.borrow_mut().push(pid);
             Ok(Some(PathBuf::from(format!("/w/{pid}"))))
         };
-        let found = scan_cwds([1, 2, 3, 4, 5], 501, spawned, &[root], owner_birth, cwd_of).unwrap();
+        let found = scan_cwds(
+            [1, 2, 3, 4, 5],
+            501,
+            spawned,
+            &pid_set(&[root]),
+            owner_birth,
+            cwd_of,
+        )
+        .unwrap();
         assert_eq!(
             found.iter().map(|p| p.pid).collect::<Vec<_>>(),
             vec![2, 3, 4]
@@ -5055,8 +5165,8 @@ pub(crate) mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         let listed = user_pids();
-        let unrelated = processes_with_cwd(vec![pid], spawned, &[]);
-        let tied = processes_with_cwd(vec![pid], spawned, &[std::process::id()]);
+        let unrelated = processes_with_cwd(vec![pid], spawned, &pid_set(&[]));
+        let tied = processes_with_cwd(vec![pid], spawned, &pid_set(&[std::process::id()]));
         let _ = child.kill();
         let _ = child.wait();
         assert!(listed.unwrap().contains(&pid), "not listed by real uid");
@@ -5175,7 +5285,7 @@ pub(crate) mod tests {
                     "a genuinely gone tool must not abort an ordinary live invocation"
                 );
             }
-            assert!(!tracker.known.iter().any(|(row, _)| row.pid == 20));
+            assert!(!tracker.known.contains_key(&20));
             assert!(tracker
                 .signal(20, STOP_SIGNAL)
                 .unwrap_err()
@@ -5191,7 +5301,7 @@ pub(crate) mod tests {
         let replacement_parent = kernel_process(20, 999, 999, 3);
         let child = kernel_process(30, 20, 30, 4);
         let mut tracker = ProcessTracker::owning_every_descendant(10);
-        tracker.known.push((process_row(20, 10, 20), parent.birth));
+        tracker.enrol(process_row(20, 10, 20), parent.birth);
         let mut parent_reads = 0;
         let result = tracker.observe_rows(
             vec![
@@ -5216,7 +5326,7 @@ pub(crate) mod tests {
             },
         );
         assert!(result.is_err(), "parent birth changed during enrollment");
-        assert!(!tracker.known.iter().any(|(row, _)| row.pid == 30));
+        assert!(!tracker.known.contains_key(&30));
         assert!(tracker
             .signal(30, STOP_SIGNAL)
             .unwrap_err()
@@ -5235,15 +5345,16 @@ pub(crate) mod tests {
                 |pid| Ok(Some(if pid == 10 { root } else { child })),
             )
             .unwrap();
-        assert!(tracker.known.iter().any(|(row, token)| row.pid == 20
-            && row.pgid != tracker.root_pid
-            && *token == child.birth));
+        assert!(tracker
+            .known
+            .get(&20)
+            .is_some_and(|t| t.row.pgid != tracker.root_pid && t.birth == child.birth));
     }
     #[test]
     fn vanished_known_parent_cannot_authorize_a_snapshot_child() {
         let root = kernel_process(10, 1, 10, 1);
         let mut tracker = ProcessTracker::owning_every_descendant(10);
-        tracker.known.push((process_row(20, 10, 20), Birth(2, 0)));
+        tracker.enrol(process_row(20, 10, 20), Birth(2, 0));
         let result = tracker.observe_rows(
             vec![
                 process_row(10, 1, 10),
@@ -5263,12 +5374,132 @@ pub(crate) mod tests {
             result.is_err(),
             "lost ancestry evidence must hold the snapshot child"
         );
-        assert!(!tracker.known.iter().any(|(row, _)| row.pid == 30));
+        assert!(!tracker.known.contains_key(&30));
         assert!(tracker
             .signal(30, STOP_SIGNAL)
             .unwrap_err()
             .to_string()
             .contains("unauthenticated"));
+    }
+
+    /// A descendant the kernel has shown gone is never read again: its PID,
+    /// reused by an unrelated process under heavy build churn, is a
+    /// stranger, not a "tracked PID was reused" abort, and it is neither
+    /// enrolled nor signalled.
+    #[test]
+    fn an_exited_descendants_reused_pid_is_a_stranger_not_an_abort() {
+        let root = kernel_process(10, 1, 10, 1);
+        let mut tracker = ProcessTracker::owning_every_descendant(10);
+        tracker.set_kill(|pid, _| panic!("signalled {pid}"));
+        tracker
+            .observe_rows(
+                vec![process_row(10, 1, 10), process_row(20, 10, 10)],
+                |pid| {
+                    Ok(Some(if pid == 10 {
+                        root
+                    } else {
+                        kernel_process(20, 10, 10, 2)
+                    }))
+                },
+            )
+            .unwrap();
+        // It exits.
+        tracker
+            .observe_rows(vec![process_row(10, 1, 10)], |pid| {
+                Ok((pid == 10).then_some(root))
+            })
+            .unwrap();
+        // Its PID now belongs to someone else.
+        let stranger = kernel_process(20, 1, 20, 9);
+        let mut reads = Vec::new();
+        tracker
+            .observe_rows(
+                vec![process_row(10, 1, 10), process_row(20, 1, 20)],
+                |pid| {
+                    reads.push(pid);
+                    Ok(Some(if pid == 10 { root } else { stranger }))
+                },
+            )
+            .unwrap();
+        assert!(!reads.contains(&20), "an exited PID was re-read: {reads:?}");
+        assert!(tracker.recorded().1.is_empty(), "{:?}", tracker.recorded());
+        assert!(tracker
+            .signal(20, STOP_SIGNAL)
+            .unwrap_err()
+            .to_string()
+            .contains("unauthenticated"));
+    }
+
+    /// The same through cleanup, against the real process table and kernel:
+    /// two processes the tracker once enrolled and saw exit, whose PIDs real
+    /// processes now hold, are neither re-authenticated, stopped, killed nor
+    /// waited for.
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_never_reads_or_signals_an_exited_entrys_reused_pid() {
+        let spawn = || {
+            Command::new("sleep")
+                .arg("30")
+                .stdin(std::process::Stdio::null())
+                .spawn()
+                .unwrap()
+        };
+        let (mut a, mut b) = (spawn(), spawn());
+        let (pa, pb) = (a.id(), b.id());
+        let me = std::process::id();
+        let mut tracker = ProcessTracker::owning_every_descendant(pa);
+        tracker.set_kill(|pid, _| panic!("signalled {pid}"));
+        // Enrolled under births these real processes never had…
+        tracker
+            .observe_rows(
+                vec![process_row(pa, me, pa), process_row(pb, pa, pa)],
+                |pid| {
+                    Ok(Some(if pid == pa {
+                        kernel_process(pa, me, pa, 1)
+                    } else {
+                        kernel_process(pb, pa, pa, 2)
+                    }))
+                },
+            )
+            .unwrap();
+        // …then seen exit.
+        tracker.observe_rows(Vec::new(), |_| Ok(None)).unwrap();
+        let cleaned = tracker.cleanup(true);
+        let alive = |c: &mut std::process::Child| c.try_wait().unwrap().is_none();
+        let both_alive = alive(&mut a) && alive(&mut b);
+        for child in [&mut a, &mut b] {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        cleaned.unwrap();
+        assert!(both_alive, "cleanup signalled a stranger");
+    }
+
+    /// Exited descendants still tie a scanned process to the invocation: a
+    /// group an exited descendant led still holds its members.
+    #[test]
+    fn the_worktree_scan_counts_exited_descendants_as_the_invocations() {
+        let root = kernel_process(10, 1, 10, 1);
+        let mut tracker = ProcessTracker::owning_every_descendant(10);
+        tracker
+            .observe_rows(
+                vec![process_row(10, 1, 10), process_row(20, 10, 20)],
+                |pid| {
+                    Ok(Some(if pid == 10 {
+                        root
+                    } else {
+                        kernel_process(20, 10, 20, 2)
+                    }))
+                },
+            )
+            .unwrap();
+        tracker
+            .observe_rows(vec![process_row(10, 1, 10)], |pid| {
+                Ok((pid == 10).then_some(root))
+            })
+            .unwrap();
+        let known = tracker.scan_known();
+        assert!(known.contains(&10) && known.contains(&20), "{known:?}");
     }
 
     #[test]
@@ -5277,7 +5508,7 @@ pub(crate) mod tests {
         // sample and the kernel check: the stale child row escaped nothing.
         let root = kernel_process(10, 1, 10, 1);
         let mut tracker = ProcessTracker::owning_every_descendant(10);
-        tracker.known.push((process_row(20, 10, 20), Birth(2, 0)));
+        tracker.enrol(process_row(20, 10, 20), Birth(2, 0));
         tracker
             .observe_rows(
                 vec![
@@ -5288,7 +5519,7 @@ pub(crate) mod tests {
                 |pid| Ok(if pid == 10 { Some(root) } else { None }),
             )
             .unwrap();
-        assert!(!tracker.known.iter().any(|(row, _)| row.pid == 30));
+        assert!(!tracker.known.contains_key(&30));
     }
 
     #[test]
@@ -5309,7 +5540,7 @@ pub(crate) mod tests {
             .unwrap_err()
             .to_string()
             .contains("kernel source failed"));
-        assert!(!tracker.known.iter().any(|(row, _)| row.pid == 20));
+        assert!(!tracker.known.contains_key(&20));
         assert!(tracker
             .signal(20, STOP_SIGNAL)
             .unwrap_err()
@@ -5425,7 +5656,7 @@ pub(crate) mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("kernel identity changed"));
-            assert!(!tracker.known.iter().any(|(row, _)| row.pid == 20));
+            assert!(!tracker.known.contains_key(&20));
             assert!(tracker
                 .signal(20, STOP_SIGNAL)
                 .unwrap_err()
@@ -5454,7 +5685,7 @@ pub(crate) mod tests {
             result.is_ok(),
             "a completed short-lived tool is not a PID replacement"
         );
-        assert!(!tracker.known.iter().any(|(row, _)| row.pid == 20));
+        assert!(!tracker.known.contains_key(&20));
         assert!(tracker
             .signal(20, STOP_SIGNAL)
             .unwrap_err()
