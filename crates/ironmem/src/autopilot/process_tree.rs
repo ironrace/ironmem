@@ -922,7 +922,8 @@ pub(crate) struct Birth(u64, u64);
 /// The kernel birth a process started at wall-clock `at` would carry, for
 /// comparing a recorded start time against process births. macOS births
 /// are wall-clock; Linux births are clock ticks since boot, so its boot time
-/// (`btime` in `/proc/stat`) is subtracted. `None` where that cannot be read.
+/// (`btime` in `/proc/stat`) is subtracted ([`birth_since_boot`]), and a
+/// start before boot counts from boot. `None` where that cannot be read.
 pub(crate) fn birth_at(at: std::time::SystemTime) -> Option<Birth> {
     let since_epoch = at.duration_since(std::time::UNIX_EPOCH).ok()?;
     #[cfg(target_os = "macos")]
@@ -943,8 +944,7 @@ pub(crate) fn birth_at(at: std::time::SystemTime) -> Option<Birth> {
             .ok()?;
         // SAFETY: sysconf has no preconditions.
         let ticks = u64::try_from(unsafe { libc::sysconf(libc::_SC_CLK_TCK) }).ok()?;
-        let after_boot = since_epoch.checked_sub(std::time::Duration::from_secs(boot))?;
-        Some(Birth(after_boot.as_secs() * ticks, 0))
+        Some(birth_since_boot(since_epoch, boot, ticks))
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
@@ -952,6 +952,18 @@ pub(crate) fn birth_at(at: std::time::SystemTime) -> Option<Birth> {
         None
     }
 }
+/// The Linux birth (clock ticks since boot, at `ticks` a second) for a time
+/// `since_epoch` after the epoch, with the machine booted `boot_secs` after
+/// it. A time before boot is clamped to boot: a recorded start from before a
+/// reboot (or skewed) then checks every process born since boot, which is
+/// every process running, instead of reading as unknown. Linux only, but
+/// tested everywhere.
+#[cfg(any(target_os = "linux", test))]
+fn birth_since_boot(since_epoch: std::time::Duration, boot_secs: u64, ticks: u64) -> Birth {
+    let after_boot = since_epoch.saturating_sub(std::time::Duration::from_secs(boot_secs));
+    Birth(after_boot.as_secs() * ticks, 0)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct KernelProcess {
     pid: u32,
@@ -4648,6 +4660,18 @@ pub(crate) mod tests {
         );
         assert!(kernel_process_from_stat(43, &proc_stat_line(42, "sh", 'S')).is_err());
         assert!(kernel_process_from_stat(42, "42 (sh S 1 2 3").is_err());
+    }
+
+    /// A start recorded before this boot (a dispatch state from before a
+    /// reboot, or clock skew) is clamped to boot: the check then covers
+    /// every process born since, which is every process running, rather
+    /// than reading as unknown and refusing for that reason.
+    #[test]
+    fn a_start_before_boot_is_counted_from_boot() {
+        let at = |secs| std::time::Duration::from_secs(secs);
+        assert_eq!(birth_since_boot(at(1_500), 1_000, 100), Birth(50_000, 0));
+        assert_eq!(birth_since_boot(at(1_000), 1_000, 100), Birth(0, 0));
+        assert_eq!(birth_since_boot(at(400), 1_000, 100), Birth(0, 0));
     }
 
     /// The Linux reading of a process's owners, from `/proc/<pid>/status`,
