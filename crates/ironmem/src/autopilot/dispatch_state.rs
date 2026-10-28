@@ -1178,7 +1178,10 @@ mod tests {
         assert_eq!(scan.claims.len(), 1);
         let (raw, scanned) = &scan.claims[0];
         assert_eq!(scanned, &normalized(&claim).unwrap());
-        assert_eq!(raw_dispatch_state(&db, &issue).unwrap().as_deref(), Some(raw.as_str()));
+        assert_eq!(
+            raw_dispatch_state(&db, &issue).unwrap().as_deref(),
+            Some(raw.as_str())
+        );
         // Rewritten identically but for its owner since the scan: the
         // scanned bytes no longer clear it.
         let theirs = bare(sample(&issue, 1), Some("owner-b"));

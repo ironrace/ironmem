@@ -172,7 +172,11 @@ fn mountinfo_fstype(mountinfo: &str, path: &Path) -> Option<String> {
             .replace("\\012", "\n")
             .replace("\\134", "\\");
         let holds = path.strip_prefix(&mount_point).is_ok();
-        if holds && best.as_ref().is_none_or(|(len, _)| mount_point.len() > *len) {
+        if holds
+            && best
+                .as_ref()
+                .is_none_or(|(len, _)| mount_point.len() > *len)
+        {
             if let Some(fstype) = types.split_whitespace().next() {
                 best = Some((mount_point.len(), fstype.to_string()));
             }
@@ -216,10 +220,7 @@ fn statfs_kind(path: &Path) -> std::io::Result<FsKind> {
     let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
     let absolute = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     Ok(match linux_remote_type(magic, &mountinfo, &absolute) {
-        Some(name) => FsKind {
-            local: false,
-            name,
-        },
+        Some(name) => FsKind { local: false, name },
         None => FsKind {
             local: true,
             name: format!("{:#x}", magic & 0xFFFF_FFFF),

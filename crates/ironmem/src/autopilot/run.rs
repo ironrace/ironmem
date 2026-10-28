@@ -10600,12 +10600,9 @@ satisfies it on its own"
                 let mut aged = current.clone();
                 aged.claimed_at =
                     Some((chrono::Utc::now() - chrono::Duration::seconds(200)).to_rfc3339());
-                assert!(dispatch_state::claim_if_unchanged(
-                    self.db,
-                    Some(&current),
-                    &aged
-                )
-                .unwrap());
+                assert!(
+                    dispatch_state::claim_if_unchanged(self.db, Some(&current), &aged).unwrap()
+                );
             }
             if let Some(theirs) = self.takeover.take() {
                 assert!(dispatch_state::claim_if_unchanged(

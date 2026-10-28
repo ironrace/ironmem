@@ -392,9 +392,7 @@ pub(crate) fn claude_ic_process_holder<'a>(
         let names_ic = |args: &str| {
             let words: Vec<&str> = args.split_whitespace().collect();
             words.windows(2).any(|w| w[0] == "--name" && w[1] == ic)
-                || words
-                    .iter()
-                    .any(|w| w.strip_prefix("--name=") == Some(ic))
+                || words.iter().any(|w| w.strip_prefix("--name=") == Some(ic))
         };
         if let Some(r) = rows.iter().find(|r| r.active() && names_ic(&r.args)) {
             return Some(format!(
