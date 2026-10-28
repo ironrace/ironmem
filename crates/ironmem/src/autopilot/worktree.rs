@@ -488,6 +488,7 @@ fn run_git(command: Command, cwd: &Path, args: &[&str]) -> Result<String, Memory
 
 /// A finished git command: its exit code and trimmed output, for a caller
 /// that reads some non-zero exits as answers rather than failures.
+#[derive(Debug)]
 struct GitOutput {
     code: Option<i32>,
     stdout: String,
@@ -508,12 +509,37 @@ impl GitOutput {
     }
 }
 
-/// How long one git command may run before it is killed with its process
-/// group: long enough for `git worktree add` to check out a large
-/// repository, and a bound on a hook or filter (which the agent can install
-/// in the shared repository) that never returns, so it cannot stall the
-/// Lead for good.
+/// How long one git command that checks out no files may run before it is
+/// killed with its process group: a bound on a hook or filter (which the
+/// agent can install in the shared repository) that never returns, so it
+/// cannot stall the Lead for good. Commands that check files out have
+/// [`GIT_CHECKOUT_TIMEOUT`].
 const GIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// How long a command that checks files out (`git worktree add`, `git
+/// checkout`) may run. A guard against a hang, not a speed limit: a checkout
+/// of a large repository, with its filters and hooks, has never been
+/// measured against it, so it is set far above any checkout expected to
+/// finish. A checkout killed partway leaves a worktree no later run can reuse
+/// ([`worktree_add`]).
+const GIT_CHECKOUT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// [`GIT_CHECKOUT_TIMEOUT`], or a test's own bound.
+fn checkout_timeout() -> std::time::Duration {
+    #[cfg(test)]
+    if let Some(timeout) = CHECKOUT_TIMEOUT_FOR_TEST.with(std::cell::Cell::get) {
+        return timeout;
+    }
+    GIT_CHECKOUT_TIMEOUT
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A checkout bound for this thread's tests, in place of
+    /// [`GIT_CHECKOUT_TIMEOUT`].
+    static CHECKOUT_TIMEOUT_FOR_TEST: std::cell::Cell<Option<std::time::Duration>> =
+        const { std::cell::Cell::new(None) };
+}
 
 /// The longest wait between two checks on a running git; the first checks
 /// come sooner, so a quick command is not held back.
@@ -522,7 +548,24 @@ const GIT_POLL_MAX: std::time::Duration = std::time::Duration::from_millis(20);
 /// Run `command` with `args` in `cwd` within [`GIT_TIMEOUT`]; see
 /// [`run_git_output_within`].
 fn run_git_output(command: Command, cwd: &Path, args: &[&str]) -> Result<GitOutput, MemoryError> {
-    run_git_output_within(command, cwd, args, GIT_TIMEOUT)
+    run_git_output_within(command, cwd, args, GIT_TIMEOUT).map_err(MemoryError::from)
+}
+
+/// Why [`run_git_output_within`] has no output to give.
+#[derive(Debug)]
+enum GitRunFailure {
+    /// It could not be run or waited on, or its output could not be read.
+    Failed(MemoryError),
+    /// It was killed at its deadline, with its process group.
+    Killed(MemoryError),
+}
+
+impl From<GitRunFailure> for MemoryError {
+    fn from(failure: GitRunFailure) -> Self {
+        match failure {
+            GitRunFailure::Failed(e) | GitRunFailure::Killed(e) => e,
+        }
+    }
 }
 
 /// Run `command` with `args` in `cwd`. Any exit is an answer; a failure to
@@ -545,7 +588,7 @@ fn run_git_output_within(
     cwd: &Path,
     args: &[&str],
     timeout: std::time::Duration,
-) -> Result<GitOutput, MemoryError> {
+) -> Result<GitOutput, GitRunFailure> {
     use std::process::Stdio;
     let label = || format!("git {} in {}", args.join(" "), cwd.display());
     command
@@ -559,8 +602,12 @@ fn run_git_output_within(
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
-    let mut child = super::dispatch::retry_on_etxtbsy(|| command.spawn())
-        .map_err(|e| MemoryError::NotFound(format!("failed to run git {}: {e}", args.join(" "))))?;
+    let mut child = super::dispatch::retry_on_etxtbsy(|| command.spawn()).map_err(|e| {
+        GitRunFailure::Failed(MemoryError::NotFound(format!(
+            "failed to run git {}: {e}",
+            args.join(" ")
+        )))
+    })?;
     let stdout = read_pipe(child.stdout.take());
     let stderr = read_pipe(child.stderr.take());
     let deadline = std::time::Instant::now() + timeout;
@@ -578,31 +625,39 @@ fn run_git_output_within(
                 super::dispatch::kill_process_group(&mut child);
                 let _ = child.wait();
                 let secs = timeout.as_secs_f64();
-                return Err(MemoryError::Validation(match waited {
-                    Err(e) => format!("{} could not be waited on: {e}", label()),
+                if let Err(e) = waited {
+                    return Err(GitRunFailure::Failed(MemoryError::Validation(format!(
+                        "{} could not be waited on: {e}",
+                        label()
+                    ))));
+                }
+                return Err(GitRunFailure::Killed(MemoryError::Validation(match waited {
                     Ok(true) => format!(
                         "{} exited but left its output open past {secs}s, held by a process it \
                          started, and was killed with it",
                         label()
                     ),
-                    Ok(false) => format!(
-                        "{} did not finish within {secs}s and was killed",
-                        label()
-                    ),
-                }));
+                    _ => format!("{} did not finish within {secs}s and was killed", label()),
+                })));
             }
         }
     }
-    let status = child
-        .wait()
-        .map_err(|e| MemoryError::Validation(format!("{} could not be waited on: {e}", label())))?;
-    let read = |pipe: PipeReader, name: &str| -> Result<String, MemoryError> {
+    let status = child.wait().map_err(|e| {
+        GitRunFailure::Failed(MemoryError::Validation(format!(
+            "{} could not be waited on: {e}",
+            label()
+        )))
+    })?;
+    let read = |pipe: PipeReader, name: &str| -> Result<String, GitRunFailure> {
         let bytes = pipe
             .join()
             .map_err(|_| std::io::Error::other("its reader panicked"))
             .and_then(|read| read)
             .map_err(|e| {
-                MemoryError::Validation(format!("{}: its {name} could not be read: {e}", label()))
+                GitRunFailure::Failed(MemoryError::Validation(format!(
+                    "{}: its {name} could not be read: {e}",
+                    label()
+                )))
             })?;
         Ok(String::from_utf8_lossy(&bytes).trim().to_string())
     };
@@ -626,6 +681,40 @@ fn read_pipe<R: std::io::Read + Send + 'static>(pipe: Option<R>) -> PipeReader {
         }
         Ok(buf)
     })
+}
+
+/// `git worktree add` with `args`, making the worktree at `path`, bounded by
+/// [`checkout_timeout`]. Killed at that deadline, git can leave the worktree
+/// registered with a partial checkout, and locked if git was still
+/// initializing it (measured): a later run can neither move it aside nor
+/// reuse it, so the error names it and the steps that remove it.
+fn worktree_add(root: &Path, path: &Path, args: &[&str]) -> Result<(), MemoryError> {
+    let args: Vec<&str> = ["worktree", "add"]
+        .into_iter()
+        .chain(args.iter().copied())
+        .collect();
+    let out = run_git_output_within(git_command(), root, &args, checkout_timeout()).map_err(
+        |failure| match failure {
+            GitRunFailure::Killed(e) => {
+                let detail = match e {
+                    MemoryError::Validation(detail) => detail,
+                    other => other.to_string(),
+                };
+                let path = path.display();
+                MemoryError::Validation(format!(
+                    "{detail}; the worktree at {path} may be left registered, with a partial \
+                     checkout: run `git worktree unlock '{path}'` (if `git worktree list` shows \
+                     it locked), then `git worktree remove --force '{path}'`, in {}",
+                    root.display()
+                ))
+            }
+            GitRunFailure::Failed(e) => e,
+        },
+    )?;
+    if out.code != Some(0) {
+        return Err(out.failure(root, &args));
+    }
+    Ok(())
 }
 
 /// Like [`git`], but reports whether the command succeeded instead of
@@ -1213,18 +1302,7 @@ fn create_branch_with(
     write_cut(root, branch, cut)?;
     before_add();
     let path_str = path.to_string_lossy().to_string();
-    if let Err(e) = git(
-        root,
-        &[
-            "worktree",
-            "add",
-            "--no-track",
-            "-b",
-            branch,
-            &path_str,
-            cut,
-        ],
-    ) {
+    if let Err(e) = worktree_add(root, path, &["--no-track", "-b", branch, &path_str, cut]) {
         return Err(after_failed_add(root, branch, base, cut, &owner, e));
     }
     settle_created(root, branch, cut)
@@ -1574,7 +1652,12 @@ fn quarantine(repo_root: &Path, path: &Path) -> Result<PathBuf, MemoryError> {
         repo_root,
         &["worktree", "move", &path_str, &destination_str],
     )?;
-    git(&destination, &["checkout", "--detach"])?;
+    // A checkout, so its hooks run: bounded as one.
+    let detach = ["checkout", "--detach"];
+    let out = run_git_output_within(git_command(), &destination, &detach, checkout_timeout())?;
+    if out.code != Some(0) {
+        return Err(out.failure(&destination, &detach));
+    }
     Ok(canonical_or_self(&destination))
 }
 
@@ -1701,7 +1784,7 @@ pub fn ensure_worktree(
 
     if branch_exists {
         let path_str = path.to_string_lossy().to_string();
-        git(&root, &["worktree", "add", &path_str, &branch])?;
+        worktree_add(&root, &path, &[&path_str, &branch])?;
     } else {
         create_branch(&root, &branch, &path, base, &cut)?;
     }
@@ -3555,6 +3638,45 @@ mod tests {
         assert_ne!(std::fs::metadata(&index).unwrap().ino(), before);
     }
 
+    /// Whether the process `pid` names is gone within about 2s: a killed
+    /// process may linger briefly before its parent reaps it.
+    #[cfg(unix)]
+    fn dies_soon(pid: &str) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let alive = Command::new("kill")
+                .args(["-0", pid.trim()])
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap()
+                .success();
+            if !alive {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    /// Run the git alias `name` (`!<script>`), bounded by a 2s deadline,
+    /// long enough for the shell to write its pid file first.
+    #[cfg(unix)]
+    fn run_alias_within_2s(repo: &Path, name: &str, script: &str) -> GitRunFailure {
+        run(repo, &["config", &format!("alias.{name}"), script]);
+        let started = std::time::Instant::now();
+        let failure = run_git_output_within(
+            git_command(),
+            repo,
+            &[name],
+            std::time::Duration::from_secs(2),
+        )
+        .expect_err("past its deadline, the alias must fail");
+        assert!(started.elapsed() < std::time::Duration::from_secs(15));
+        failure
+    }
+
     /// A git that does not finish (a hook, or a program the shared config
     /// names) is killed at the deadline, with every process it started.
     #[test]
@@ -3563,33 +3685,18 @@ mod tests {
         let repo = fixture_repo();
         let scratch = tempfile::tempdir().unwrap();
         let pid_file = scratch.path().join("pid");
-        run(
+        let failure = run_alias_within_2s(
             repo.path(),
-            &[
-                "config",
-                "alias.hang",
-                &format!("!sleep 30 & echo $! > '{}'; wait", pid_file.display()),
-            ],
+            "hang",
+            &format!("!sleep 30 & echo $! > '{}'; wait", pid_file.display()),
         );
-        let started = std::time::Instant::now();
-        let err = run_git_output_within(
-            git_command(),
-            repo.path(),
-            &["hang"],
-            std::time::Duration::from_millis(500),
-        )
-        .err()
-        .expect("a hung git must fail")
-        .to_string();
-        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        let GitRunFailure::Killed(err) = failure else {
+            panic!("expected a kill: {failure:?}");
+        };
+        let err = err.to_string();
         assert!(err.contains("git hang") && err.contains("killed"), "{err}");
         let pid = std::fs::read_to_string(&pid_file).unwrap();
-        let alive = Command::new("kill")
-            .args(["-0", pid.trim()])
-            .status()
-            .unwrap()
-            .success();
-        assert!(!alive, "the alias's `sleep` survived the kill");
+        assert!(dies_soon(&pid), "the alias's `sleep` survived the kill");
     }
 
     /// A git that exits while something it started still holds its output
@@ -3599,17 +3706,20 @@ mod tests {
     #[cfg(unix)]
     fn a_git_command_that_leaves_its_output_open_is_killed_at_the_deadline() {
         let repo = fixture_repo();
-        run(repo.path(), &["config", "alias.linger", "!sleep 30 &"]);
-        let err = run_git_output_within(
-            git_command(),
+        let scratch = tempfile::tempdir().unwrap();
+        let pid_file = scratch.path().join("pid");
+        let failure = run_alias_within_2s(
             repo.path(),
-            &["linger"],
-            std::time::Duration::from_millis(500),
-        )
-        .err()
-        .expect("output held open past the deadline must fail")
-        .to_string();
+            "linger",
+            &format!("!sleep 30 & echo $! > '{}'", pid_file.display()),
+        );
+        let GitRunFailure::Killed(err) = failure else {
+            panic!("expected a kill: {failure:?}");
+        };
+        let err = err.to_string();
         assert!(err.contains("left its output open"), "{err}");
+        let pid = std::fs::read_to_string(&pid_file).unwrap();
+        assert!(dies_soon(&pid), "the `sleep` holding the output survived");
     }
 
     #[test]
@@ -3641,5 +3751,68 @@ mod tests {
         assert!(err.contains("cannot be read"), "{err}");
         assert!(err.contains("permission denied"), "{err}");
         assert!(err.contains("config.lock"), "{err}");
+    }
+
+    /// Run `f` with checkouts on this thread bounded by `timeout`.
+    fn with_checkout_timeout<T>(timeout: std::time::Duration, f: impl FnOnce() -> T) -> T {
+        CHECKOUT_TIMEOUT_FOR_TEST.with(|bound| bound.set(Some(timeout)));
+        let out = f();
+        CHECKOUT_TIMEOUT_FOR_TEST.with(|bound| bound.set(None));
+        out
+    }
+
+    /// A checkout killed at its deadline (here by a `post-checkout` hook
+    /// that never returns) can leave the new worktree registered, and locked
+    /// while git was still initializing it, which no later run can move or
+    /// reuse. The error says how to remove it, for a new branch and for an
+    /// existing one, and the steps it names do clear the way.
+    #[test]
+    #[cfg(unix)]
+    fn a_checkout_killed_at_its_deadline_names_the_worktree_and_how_to_remove_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let repo = fixture_repo();
+        let roots = tempfile::tempdir().unwrap();
+        let hooks = tempfile::tempdir().unwrap();
+        let hook = hooks.path().join("post-checkout");
+        std::fs::write(&hook, "#!/bin/sh\nsleep 30\n").unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        run(
+            repo.path(),
+            &["config", "core.hooksPath", &hooks.path().to_string_lossy()],
+        );
+        let path = worktree_path(roots.path(), &issue()).display().to_string();
+        let remove = |path: &str| {
+            // Unlocking a worktree that is not locked fails; that is fine.
+            let _ = test_git::command()
+                .args(["worktree", "unlock", path])
+                .current_dir(repo.path())
+                .output()
+                .unwrap();
+            run(repo.path(), &["worktree", "remove", "--force", path]);
+        };
+        // A new branch, then the same branch once it exists.
+        for case in ["new branch", "existing branch"] {
+            let started = std::time::Instant::now();
+            let err = with_checkout_timeout(std::time::Duration::from_secs(2), || {
+                ensure_worktree(repo.path(), roots.path(), &issue(), "HEAD")
+            })
+            .unwrap_err()
+            .to_string();
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(20),
+                "{case}: the hook was waited out"
+            );
+            assert!(err.contains("killed"), "{case}: {err}");
+            for needle in [
+                format!("git worktree unlock '{path}'"),
+                format!("git worktree remove --force '{path}'"),
+            ] {
+                assert!(err.contains(&needle), "{case}: {needle} missing: {err}");
+            }
+            remove(&path);
+        }
+        run(repo.path(), &["config", "core.hooksPath", "/dev/null"]);
+        let reused = ensure_worktree(repo.path(), roots.path(), &issue(), "HEAD").unwrap();
+        assert!(reused.created, "after the steps, the worktree is made again");
     }
 }
