@@ -1986,6 +1986,63 @@ mod tests {
         assert!(!body.contains("worktree was on"), "{body}");
     }
 
+    /// The cleanup after a merge removes nothing while a controller holds
+    /// the issue: it may be dispatching into that worktree.
+    #[test]
+    fn cleanup_skips_an_issue_another_controller_holds() {
+        let db = approved_db();
+        let repo = tempfile::tempdir().unwrap();
+        crate::autopilot::test_git::output(repo.path(), &["init", "-q"]);
+        let state = crate::autopilot::DispatchState {
+            implementer: crate::autopilot::implementer::Implementer::Claude,
+            native_session_id: None,
+            invocation_artifacts: None,
+            issue: issue(),
+            worktree_path: "/nowhere".into(),
+            ic_session_name: "ic".into(),
+            dispatch_class: "logic".into(),
+            attempt_n: 1,
+            state: "dispatching".into(),
+            started_at: "now".into(),
+            session_uuid: "11111111-1111-1111-1111-111111111111".into(),
+            turn_n: 0,
+            session_claimed: true,
+            session_model: None,
+            resume_refusals: 0,
+            signing_held: false,
+        };
+        dispatch_state::upsert_dispatch_state(&db, &state).unwrap();
+        let candidate = Candidate {
+            issue: issue(),
+            issue_title: "t".into(),
+            repo_path: repo.path().to_path_buf(),
+            risk_label: None,
+            green_commit_sha: None,
+        };
+        let roots = tempfile::tempdir().unwrap();
+        let cfg = config(roots.path(), repo.path());
+        let held =
+            match crate::autopilot::issue_lock::try_lock_issue(repo.path(), &issue()).unwrap() {
+                crate::autopilot::issue_lock::IssueLockAttempt::Acquired(lock) => lock,
+                crate::autopilot::issue_lock::IssueLockAttempt::Held { .. } => unreachable!(),
+            };
+        let cleanup = clean_up(&db, &candidate, &cfg);
+        assert!(!cleanup.dispatch_state_cleared);
+        assert!(
+            cleanup
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("another controller holds issue")),
+            "{:?}",
+            cleanup.error
+        );
+        assert!(dispatch_state::get_dispatch_state(&db, &issue())
+            .unwrap()
+            .is_some());
+        drop(held);
+        assert!(clean_up(&db, &candidate, &cfg).dispatch_state_cleared);
+    }
+
     #[test]
     fn a_blank_issue_title_still_names_the_issue() {
         // `gh pr create --title ""` is refused, and that refusal would be
