@@ -5454,6 +5454,10 @@ sleep 0.5
     fn git_in(repo: &Path, args: &[&str]) -> String {
         let mut c = std::process::Command::new("git");
         crate::mcp::tools::scrub_git_environment(&mut c);
+        // The fixtures never read the operator's global or system config: a
+        // signing key there let a commit that CI cannot sign pass locally.
+        c.env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1");
         let out = c.args(args).current_dir(repo).output().unwrap();
         assert!(
             out.status.success(),
@@ -5957,10 +5961,15 @@ sleep 0.5
         assert!(child.wait().unwrap().success());
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_run_start_check_builds_one_guard_git_for_one_deadline() {
+        let keys = tempfile::tempdir().unwrap();
+        let Some(key) = ssh_key(keys.path()) else {
+            return;
+        };
         let (_dir, wt) = fixture_worktree();
-        git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
+        sign_with(&wt.path, keys.path(), &key);
         commit_in(&wt.path, "work", &[]);
         let built = || GUARD_GITS_BUILT.with(std::cell::Cell::get);
         let before = built();
@@ -5972,7 +5981,7 @@ sleep 0.5
     fn a_cut_that_is_not_a_commit_name_stops_a_run_at_its_start() {
         let (_dir, mut wt) = fixture_worktree();
         git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
-        commit_in(&wt.path, "b", &[]);
+        commit_in(&wt.path, "b", &["-c", "commit.gpgsign=false"]);
         wt.cut = worktree::CommitSha::unchecked("--all");
         assert!(matches!(
             collaborator_check_at_start(&wt, SigningPolicySeen::default()),
@@ -6005,10 +6014,15 @@ sleep 0.5
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_run_start_check_of_an_unchanged_range_is_not_repeated() {
+        let keys = tempfile::tempdir().unwrap();
+        let Some(key) = ssh_key(keys.path()) else {
+            return;
+        };
         let (_dir, wt) = fixture_worktree();
-        git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
+        sign_with(&wt.path, keys.path(), &key);
         commit_in(&wt.path, "work", &[]);
         let checks = || START_CHECKS.with(std::cell::Cell::get);
         let seen = SigningPolicySeen::default();
