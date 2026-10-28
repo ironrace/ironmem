@@ -473,6 +473,63 @@ fn make_invocation_dir(
     populated
 }
 
+/// How long an invocation directory is kept once nothing names it: its
+/// journal records tool output (secrets a gate printed included) and its
+/// prompt the whole condition.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const INVOCATION_RETENTION: Duration = Duration::from_secs(14 * 24 * 60 * 60);
+
+/// Remove `slug`'s invocation directories
+/// (`<common_dir>/ironmem/autopilot/<slug>/<uuid>`) last modified more than
+/// `older_than` ago, except `keep`, the invocation the issue's dispatch
+/// state still names. Only UUID-named directories are touched, never
+/// followed through a symlink. A directory that cannot be removed is
+/// logged and left. Returns how many were removed.
+// run_issue's clear and release_settled_dispatches call this; until that
+// wiring lands only the tests do.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn prune_invocations(
+    common_dir: &Path,
+    slug: &str,
+    keep: Option<&str>,
+    older_than: Duration,
+) -> Result<usize, MemoryError> {
+    let issue_dir = common_dir.join("ironmem/autopilot").join(slug);
+    let entries = match std::fs::read_dir(&issue_dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e.into()),
+    };
+    let now = std::time::SystemTime::now();
+    let mut pruned = 0;
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if Some(name) == keep || uuid::Uuid::parse_str(name).is_err() {
+            continue;
+        }
+        let meta = std::fs::symlink_metadata(entry.path())?;
+        let old = meta
+            .modified()
+            .ok()
+            .and_then(|at| now.duration_since(at).ok())
+            .is_some_and(|age| age > older_than);
+        if !meta.is_dir() || !old {
+            continue;
+        }
+        match std::fs::remove_dir_all(entry.path()) {
+            Ok(()) => pruned += 1,
+            Err(e) => tracing::warn!(
+                error = %e,
+                dir = %entry.path().display(),
+                "autopilot could not prune an old invocation directory"
+            ),
+        }
+    }
+    Ok(pruned)
+}
+
 pub(crate) fn validate_spec<'a>(
     cli: &dyn SupervisedCli,
     spec: &'a DispatchSpec,
@@ -1873,6 +1930,46 @@ pub(crate) mod contract_tests {
         assert_eq!(
             settle_awaiting_quiet(&a, &rows, None, |_| Ok(None), &no_pids),
             Ok(false)
+        );
+    }
+
+    /// Invocation directories (journals that may quote secrets, prompts)
+    /// are pruned past their retention: an old one goes, the one the issue's
+    /// state still names stays however old, and anything not an invocation
+    /// directory, or newer, is left alone.
+    #[test]
+    fn old_invocation_directories_are_pruned_except_the_named_one() {
+        let common = tempfile::tempdir().unwrap();
+        let issue = common.path().join("ironmem/autopilot/owner-repo-42");
+        let make = |name: &str, age: Duration| {
+            let dir = issue.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("journal.jsonl"), "{}").unwrap();
+            File::open(&dir)
+                .unwrap()
+                .set_modified(std::time::SystemTime::now() - age)
+                .unwrap();
+            dir
+        };
+        let day = Duration::from_secs(24 * 60 * 60);
+        let old = make("0f0e0d0c-0b0a-4908-8706-050403020100", 20 * day);
+        let named = make("11111111-2222-4333-8444-555555555555", 20 * day);
+        let recent = make("21111111-2222-4333-8444-555555555555", day);
+        let other = make("not-an-invocation", 20 * day);
+        let pruned = prune_invocations(
+            common.path(),
+            "owner-repo-42",
+            Some("11111111-2222-4333-8444-555555555555"),
+            INVOCATION_RETENTION,
+        )
+        .unwrap();
+        assert_eq!(pruned, 1);
+        assert!(!old.exists());
+        assert!(named.exists() && recent.exists() && other.exists());
+        // An issue with no invocations has nothing to prune.
+        assert_eq!(
+            prune_invocations(common.path(), "owner-repo-7", None, INVOCATION_RETENTION).unwrap(),
+            0
         );
     }
 
