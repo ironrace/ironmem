@@ -183,14 +183,15 @@ pub(crate) struct Claim {
 /// How long a claim that is not parked keeps another run from adopting it.
 ///
 /// A run claims the issue and only then launches its implementer, and until
-/// that implementer shows (a process naming its IC, a registry entry, an
-/// identity file) nothing distinguishes it from a crashed run. Spawning and
-/// exec take well under a second and registration a few, even on a loaded
-/// host, so two minutes covers that window many times over; the cost is
-/// that a crashed run's issue waits two minutes before another run adopts
-/// it. A run whose own claim is older than [`CLAIM_LEASE`] less
-/// [`CLAIM_REFRESH_MARGIN`] claims again before it launches, so a long gap
-/// between its claim and its launch never lets the lease lapse first.
+/// that implementer is visible in the process table (a process naming its
+/// IC with `--name`) nothing distinguishes it from a crashed run. Spawning
+/// and exec take well under a second, even on a loaded host, so two minutes
+/// covers the window from claim to a process visible in `ps` many times
+/// over; the cost is that a crashed run's issue waits two minutes before
+/// another run adopts it. A run whose own claim is older than
+/// [`CLAIM_LEASE`] less [`CLAIM_REFRESH_MARGIN`] claims again before it
+/// launches, so a long gap between its claim and its launch never lets the
+/// lease lapse first.
 pub(crate) const CLAIM_LEASE: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// How much of [`CLAIM_LEASE`] must remain at a launch, or the run claims
@@ -199,12 +200,14 @@ pub(crate) const CLAIM_REFRESH_MARGIN: std::time::Duration = std::time::Duration
 
 impl Claim {
     /// How long ago its run claimed it, or `None` when it holds no lease
-    /// (no time, or one that does not parse). A time in the future reads as
-    /// just now.
+    /// (no time, or one that does not parse). A time in the future is
+    /// measured by its distance too: a far-future time (a clock set wrong
+    /// on the claiming host) must not read as a fresh lease for ever.
     pub fn age(&self, now: chrono::DateTime<chrono::Utc>) -> Option<std::time::Duration> {
         let at = chrono::DateTime::parse_from_rfc3339(self.claimed_at.as_deref()?).ok()?;
         Some(
             now.signed_duration_since(at.with_timezone(&chrono::Utc))
+                .abs()
                 .to_std()
                 .unwrap_or_default(),
         )
@@ -763,7 +766,9 @@ mod tests {
         claim.claimed_at = Some((now - chrono::Duration::seconds(121)).to_rfc3339());
         assert!(!claim.leased(now), "lapsed");
         claim.claimed_at = Some((now + chrono::Duration::seconds(30)).to_rfc3339());
-        assert!(claim.leased(now), "a future time reads as just now");
+        assert!(claim.leased(now), "a near future time is within the lease");
+        claim.claimed_at = Some((now + chrono::Duration::seconds(3600)).to_rfc3339());
+        assert!(!claim.leased(now), "a far-future time is not a fresh lease");
         claim.state.state = DispatchPhase::PausedDailyBudget.as_str().into();
         assert!(!claim.leased(now), "a parked claim's run has ended");
         // Round-tripped with its common directory.
