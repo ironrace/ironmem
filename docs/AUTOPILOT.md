@@ -715,7 +715,9 @@ commits merged in, as follows:
   that holds the issue branch, since the guard checks each one and a remote left
   with the old commits keeps failing it. The recipe names up to three and counts
   the rest. With no remote it can name, it says `<remote>` and asks for the
-  issue's repository's remote.
+  issue's repository's remote. Remote names too long for the recipe's share of
+  the prompt lose detail: first the other remotes are only counted, then the
+  recipe says `<remote>`.
 
 Make sure the signing key or agent is reachable from wherever the Lead runs,
 including inside an external sandbox. Otherwise every attempt fails.

@@ -1865,11 +1865,19 @@ const MAX_VIOLATION_CHARS: usize = turn_prompt::MAX_CONDITION_CHARS / 3;
 const NAMED_REMOTES: usize = 3;
 
 /// The violation for `flagged` short shas, newest first. The recipe re-signs
-/// only those commits, on the issue `branch`, and pushes it to `remote` by
-/// name: rebasing from the cut would rewrite the upstream commits merged in,
-/// which the guard deliberately does not blame. It is a plain rebase, not
-/// `--rebase-merges`: that would also re-pick, and so rewrite, the upstream
-/// commits on a merged-in side, so a merge is redone by hand instead.
+/// only those commits, on the issue `branch`: rebasing from the cut would
+/// rewrite the upstream commits merged in, which the guard deliberately does
+/// not blame. It is a plain rebase, not `--rebase-merges`: that would also
+/// re-pick, and so rewrite, the upstream commits on a merged-in side, so a
+/// merge is redone by hand instead.
+///
+/// It then force-pushes the branch by name to each of `remotes`: first the
+/// push clause's remote, then every other remote holding the branch, since
+/// the guard checks each one (up to [`NAMED_REMOTES`] named, the rest
+/// counted). With none, it says `<remote>` and tells the IC to use the
+/// remote of the issue's repository. However long the remote names are, it
+/// stays within [`MAX_VIOLATION_CHARS`]: the other holders are only counted
+/// when naming them would not fit, then it says `<remote>` instead.
 fn unsigned_violation(flagged: &[String], cut: &str, branch: &str, remotes: &[String]) -> String {
     let mut list = flagged
         .iter()
