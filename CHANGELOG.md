@@ -60,6 +60,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Linux: a process whose main thread has exited is no longer missed.** A
+  process whose main thread called `pthread_exit` while another thread runs
+  shows `Zl` in `ps`, and its `/proc/<pid>/cwd` is gone, yet it still runs.
+  Released Linux builds read that `ps` row as a zombie, so cleanup could not
+  enrol it, or its children through it, once its main thread had exited;
+  `verify_gone` and the process-group drain did not wait for it; and the
+  quiet-worktree scan skipped it, so completion could be trusted while it
+  still worked. Cleanup, `verify_gone`, the group drain and the quiet scan now
+  count it as running and hold for it: the scan reads a live thread's working
+  directory, and cleanup waits until SIGSTOP has reached every live thread.
 - **The daily unpriced cap and the budget ledger hold under concurrent
   Leads.** Every ledger update now reads and writes in one `BEGIN IMMEDIATE`
   transaction, so two Leads (or a Lead and a reviewer) sharing a database no
