@@ -88,6 +88,7 @@ use crate::db::schema::Database;
 use crate::error::MemoryError;
 
 use super::dispatch::{self, DispatchOutcome, DispatchSpec, SessionMode, SessionRefusal, Verdict};
+use super::dispatch_state::DispatchPhase;
 use super::implementer::{Implementer, RESUME_REFUSALS_BEFORE_ROTATION};
 use super::invocation::{InvocationArtifacts, InvocationRecovery};
 use super::worktree::{self, Worktree};
@@ -687,12 +688,54 @@ impl ClaudeDispatcher {
 }
 
 impl Dispatcher for ClaudeDispatcher {
+    /// Whether the IC a Claude state names may be running, on a fresh
+    /// registry and process table. Claude leaves nothing to recover, so an
+    /// idle IC is [`InvocationRecovery::NoPriorInvocation`].
+    fn recover(
+        &mut self,
+        _repo: &Path,
+        state: &DispatchState,
+    ) -> Result<InvocationRecovery, MemoryError> {
+        let mut monitor = super::registry::HarnessProcessMonitor::default();
+        Ok(claude_recovery(
+            &super::registry::HarnessMonitor::snapshot(&mut monitor),
+            state,
+        ))
+    }
+
     fn dispatch(
         &mut self,
         repo: &Path,
         spec: &DispatchSpec,
     ) -> Result<DispatchOutcome, MemoryError> {
         dispatch::run_dispatch(&self.bin, repo, spec)
+    }
+}
+
+/// What fresh evidence says of the Claude IC `state` names: alive when the
+/// registry lists it or a process names it with `--name` (a just-launched IC
+/// registers late); uncertain when the process table cannot be read, since
+/// the registry alone never proves an IC gone; otherwise idle.
+fn claude_recovery(
+    snapshots: &super::registry::HarnessSnapshots,
+    state: &DispatchState,
+) -> InvocationRecovery {
+    let super::process_tree::ProcessSnapshot::Available(rows) = &snapshots.processes else {
+        return InvocationRecovery::Unknown {
+            reason: format!(
+                "whether its Claude IC runs cannot be checked: {}",
+                snapshots.processes.reason()
+            ),
+        };
+    };
+    match super::clear::claude_ic_holder(
+        snapshots,
+        rows,
+        &state.issue,
+        Some(&state.ic_session_name),
+    ) {
+        Some(_) => InvocationRecovery::Alive,
+        None => InvocationRecovery::NoPriorInvocation,
     }
 }
 
@@ -2019,9 +2062,15 @@ fn refused_met_record(violation: &str, original: Option<String>) -> (String, Str
 
 /// Persist one attempt: the append-only lineage record plus the issue's
 /// current-state drawer, whose `cumulative_attempt_n` is the spec's
-/// cross-dispatch stagnation counter. `prior` is the issue's status as read
-/// *before* this attempt, which is what makes the no-downgrade rule below
-/// possible.
+/// cross-dispatch stagnation counter, and with them the run's next dispatch
+/// state (`then`; `None` clears it).
+///
+/// All in one `BEGIN IMMEDIATE` transaction that first checks the drawer
+/// still holds `owned`, the state this run last wrote: a run another took
+/// the issue over from records nothing (`Ok(false)`), so its stale outcome
+/// can neither append an attempt nor overwrite the status the other run
+/// records, and two runs recovering one finished invocation record it once.
+/// The status it improves on is read inside the transaction too.
 ///
 /// `best_verdict`/`best_commit_sha` are never downgraded: once an issue has
 /// recorded a success, a later failed attempt (a re-run, a follow-up fix
@@ -2030,63 +2079,84 @@ fn refused_met_record(violation: &str, original: Option<String>) -> (String, Str
 fn record_and_advance(
     db: &Database,
     record: &AttemptRecord,
-    prior: Option<&IssueStatus>,
     recovering_harness: Option<Implementer>,
-) -> Result<(), MemoryError> {
-    // A recovering harness (Codex, Muse) can replay durable artifacts after a crash between the append-only
-    // attempt and current-status writes. Complete that same ordinal instead
-    // of appending it twice. Terminal summaries are markers, not attempts.
-    let existing = if recovering_harness.is_some() {
-        recorded_attempt(db, &record.issue, record.attempt_n)?
-    } else {
-        None
-    };
-    if existing
-        .as_ref()
-        .is_some_and(|attempt| attempt.verdict != record.verdict)
-    {
-        let Some(harness) = recovering_harness else {
-            unreachable!("only a recovering harness looks up an existing ordinal");
-        };
-        debug_assert!(harness.recovers_invocations());
-        let label = harness.label();
-        return Err(MemoryError::Validation(format!(
-            "recovered {label} verdict conflicts with the already recorded attempt ordinal"
-        )));
-    }
-    if existing.is_none() {
-        lineage::record_attempt(db, record)?;
-    }
-    let record = existing.as_ref().unwrap_or(record);
-
+    owned: &mut Option<dispatch_state::Claim>,
+    then: Option<dispatch_state::Claim>,
+) -> Result<bool, MemoryError> {
     let issue = &record.issue;
-    let verdict = record.verdict;
-    let prior_success =
-        prior.and_then(|status| status.best_verdict) == Some(AttemptOutcome::Success);
-    let (best_verdict, best_commit_sha) = if verdict == AttemptOutcome::Success {
-        (Some(AttemptOutcome::Success), record.commit_sha.clone())
-    } else if prior_success {
-        (
-            Some(AttemptOutcome::Success),
-            prior.and_then(|status| status.best_commit_sha.clone()),
-        )
-    } else {
-        (
-            Some(AttemptOutcome::Failed),
-            prior.and_then(|status| status.best_commit_sha.clone()),
-        )
-    };
+    let recorded = db.with_immediate_transaction(|tx| {
+        if !dispatch_state::claim_is_tx(tx, issue, owned.as_ref())? {
+            return Ok(false);
+        }
+        // A recovering harness (Codex, Muse) can replay durable artifacts
+        // after a crash between the append-only attempt and current-status
+        // writes. Complete that same ordinal instead of appending it twice.
+        // Terminal summaries are markers, not attempts. Reads through `db`
+        // see this transaction: it is the same connection.
+        let existing = if recovering_harness.is_some() {
+            recorded_attempt(db, issue, record.attempt_n)?
+        } else {
+            None
+        };
+        if existing
+            .as_ref()
+            .is_some_and(|attempt| attempt.verdict != record.verdict)
+        {
+            let Some(harness) = recovering_harness else {
+                unreachable!("only a recovering harness looks up an existing ordinal");
+            };
+            debug_assert!(harness.recovers_invocations());
+            let label = harness.label();
+            return Err(MemoryError::Validation(format!(
+                "recovered {label} verdict conflicts with the already recorded attempt ordinal"
+            )));
+        }
+        if existing.is_none() {
+            lineage::record_attempt_tx(tx, record)?;
+        }
+        let record = existing.as_ref().unwrap_or(record);
 
-    lineage::upsert_issue_status(
-        db,
-        &IssueStatus {
-            issue: issue.clone(),
-            best_verdict,
-            best_commit_sha,
-            cumulative_attempt_n: record.attempt_n,
-        },
-    )?;
-    Ok(())
+        let prior = lineage::get_issue_status(db, issue)?;
+        let prior = prior.as_ref();
+        let verdict = record.verdict;
+        let prior_success =
+            prior.and_then(|status| status.best_verdict) == Some(AttemptOutcome::Success);
+        let (best_verdict, best_commit_sha) = if verdict == AttemptOutcome::Success {
+            (Some(AttemptOutcome::Success), record.commit_sha.clone())
+        } else if prior_success {
+            (
+                Some(AttemptOutcome::Success),
+                prior.and_then(|status| status.best_commit_sha.clone()),
+            )
+        } else {
+            (
+                Some(AttemptOutcome::Failed),
+                prior.and_then(|status| status.best_commit_sha.clone()),
+            )
+        };
+        lineage::upsert_issue_status_tx(
+            tx,
+            &IssueStatus {
+                issue: issue.clone(),
+                best_verdict,
+                best_commit_sha,
+                cumulative_attempt_n: record.attempt_n,
+            },
+        )?;
+        match &then {
+            Some(next) => dispatch_state::write_claim_tx(tx, next)?,
+            None => {
+                if owned.is_some() {
+                    dispatch_state::delete_claim_tx(tx, issue)?;
+                }
+            }
+        }
+        Ok(true)
+    })?;
+    if recorded {
+        *owned = then;
+    }
+    Ok(recorded)
 }
 
 /// The attempt already recorded at ordinal `attempt_n`, if any. Attempt-cap
@@ -2236,8 +2306,18 @@ pub fn validate_dispatch_owner(
     issue: &IssueRef,
     implementer: Implementer,
 ) -> Result<Option<DispatchState>, MemoryError> {
-    let state = dispatch_state::get_dispatch_state(db, issue)?;
-    if let Some(state) = &state {
+    Ok(validate_dispatch_claim(db, issue, implementer)?.map(|claim| claim.state))
+}
+
+/// [`validate_dispatch_owner`], with the token of the run that wrote the
+/// state.
+fn validate_dispatch_claim(
+    db: &Database,
+    issue: &IssueRef,
+    implementer: Implementer,
+) -> Result<Option<dispatch_state::Claim>, MemoryError> {
+    let claim = dispatch_state::get_claim(db, issue)?;
+    if let Some(dispatch_state::Claim { state, .. }) = &claim {
         if state.implementer != implementer {
             return Err(MemoryError::Validation(format!(
                 "implementation harness mismatch: persisted {:?}, configured {:?}; resume with \
@@ -2247,7 +2327,7 @@ pub fn validate_dispatch_owner(
             )));
         }
     }
-    Ok(state)
+    Ok(claim)
 }
 
 /// Refuse unsafe worktree provisioning for a persisted supervised CLI dispatch.
@@ -2273,7 +2353,9 @@ pub fn preflight_worktree_provisioning(
     let Some(state) = validate_dispatch_owner(db, issue, implementer)? else {
         return Ok(());
     };
-    if !implementer.recovers_invocations() {
+    // A parked Claude state's run has ended; any other may be one still
+    // running, whose IC the dispatcher looks for.
+    if !implementer.recovers_invocations() && state.is_parked() {
         return Ok(());
     }
     match dispatcher.recover(Path::new(&state.worktree_path), &state)? {
@@ -2347,12 +2429,56 @@ fn kept_mid_run(implementer: Implementer) -> &'static str {
     }
 }
 
+/// The error of a run that found the issue's dispatch state changed since it
+/// last wrote (or read) it: another run took the issue over.
+fn taken_over(issue: &IssueRef) -> MemoryError {
+    MemoryError::Validation(format!(
+        "another run took over {} after this one started (its dispatch state changed), so \
+         this run launches and writes nothing more; the other run's state is left as it is",
+        issue.canonical()
+    ))
+}
+
 /// What restart recovery decided before a run dispatches anything.
 enum Recovered {
     /// The run ends here without dispatching.
     Done(IssueRun),
     /// The run continues, first classifying a finished invocation if any.
     Continue(Option<DispatchOutcome>),
+}
+
+/// The run a Claude `state` that may still be another run's ends in, or
+/// `None` once fresh evidence shows its IC idle and the state may be
+/// adopted. Nothing is written either way.
+fn claude_in_flight(
+    dispatcher: &mut dyn Dispatcher,
+    worktree: &Worktree,
+    state: &DispatchState,
+    issue: &IssueRef,
+    cumulative_attempt_n: u32,
+    wall_clock_timeout_secs: Option<u64>,
+) -> Result<Option<IssueRun>, MemoryError> {
+    let detail = match dispatcher.recover(&worktree.path, state)? {
+        InvocationRecovery::NoPriorInvocation | InvocationRecovery::Finished(_) => return Ok(None),
+        InvocationRecovery::Alive => format!(
+            "its Claude IC {} is still running, so this run adopts nothing and launches \
+             nothing",
+            state.ic_session_name
+        ),
+        InvocationRecovery::Unknown { reason } => format!(
+            "{reason}, so this run adopts nothing and launches nothing; {}",
+            release_hint(issue, None)
+        ),
+    };
+    Ok(Some(IssueRun {
+        unpriced_dispatches: 0,
+        issue: issue.clone(),
+        terminal: TerminalReason::ImplementationInFlight { detail },
+        dispatches: Vec::new(),
+        total_cost_usd: 0.0,
+        cumulative_attempt_n,
+        wall_clock_timeout_secs,
+    }))
 }
 
 /// Adopt, hold, or finish the invocation a persisted state names, for a
@@ -2363,12 +2489,13 @@ fn recover_invocation(
     issue: &IssueRef,
     worktree: &Worktree,
     dispatcher: &mut dyn Dispatcher,
-    state: &DispatchState,
+    claim: &dispatch_state::Claim,
     cumulative_attempt_n: u32,
     wall_clock_timeout_secs: Option<u64>,
     native_session_id: &mut Option<String>,
     invocation_artifacts: &mut Option<InvocationArtifacts>,
 ) -> Result<Recovered, MemoryError> {
+    let state = &claim.state;
     match dispatcher.recover(&worktree.path, state)? {
         recovery @ (InvocationRecovery::Alive | InvocationRecovery::Unknown { .. }) => {
             let detail = match recovery {
@@ -2418,8 +2545,11 @@ fn recover_invocation(
                     })
                 {
                     // Only the state recovery judged; one another run wrote
-                    // since is theirs (every write is a compare-and-set).
-                    dispatch_state::clear_dispatch_state_if_unchanged(db, state)?;
+                    // since is theirs (every write is a compare-and-set),
+                    // and so is the verdict: this run reports none.
+                    if !dispatch_state::clear_claim_if_unchanged(db, claim)? {
+                        return Err(taken_over(issue));
+                    }
                     return Ok(Recovered::Done(IssueRun {
                         unpriced_dispatches: 1,
                         issue: issue.clone(),
@@ -2473,7 +2603,11 @@ pub fn run_issue(
     if config.implementer != dispatcher.implementer() {
         return Err(MemoryError::Validation(format!("implementation harness mismatch: configured {:?}, dispatcher {:?}; select the matching dispatcher", config.implementer, dispatcher.implementer())));
     }
-    let existing_state = validate_dispatch_owner(db, issue, config.implementer)?;
+    let existing_claim = validate_dispatch_claim(db, issue, config.implementer)?;
+    let existing_state = existing_claim.as_ref().map(|claim| claim.state.clone());
+    // This run's token, carried by every state it writes; see
+    // `dispatch_state::Claim`.
+    let owner = uuid::Uuid::new_v4().to_string();
     let gate_commands = approved_gate_commands(db, &issue.repo)?;
     // Report the effective bound, including a supervised CLI harness's mandatory finite fallback.
     // Claude retains the repo's optional bound.
@@ -2481,7 +2615,7 @@ pub fn run_issue(
         .or_else(|| config.implementer.fallback_wall_clock_secs());
     let wall_clock_timeout = wall_clock_timeout_secs.map(std::time::Duration::from_secs);
 
-    let mut status = lineage::get_issue_status(db, issue)?;
+    let status = lineage::get_issue_status(db, issue)?;
     // Rung 11's second, narrower reason to dispatch a finished issue: a
     // reviewer read its PR and asked for changes. Read once here and reused
     // for every dispatch of this run — a remediation cannot arrive mid-run,
@@ -2492,8 +2626,14 @@ pub fn run_issue(
         if existing.best_verdict == Some(AttemptOutcome::Success) && remediation.is_none() {
             if config.implementer.recovers_invocations() {
                 // Only the state this run read; see `write_state`.
-                if let Some(state) = &existing_state {
-                    dispatch_state::clear_dispatch_state_if_unchanged(db, state)?;
+                if let Some(claim) = &existing_claim {
+                    if !dispatch_state::clear_claim_if_unchanged(db, claim)? {
+                        tracing::info!(
+                            issue = %issue.canonical(),
+                            "autopilot left the dispatch state of an already succeeded issue to \
+                             the run that changed it"
+                        );
+                    }
                 }
             }
             return Ok(IssueRun {
@@ -2552,7 +2692,7 @@ pub fn run_issue(
     // replaces it (see the model rotation below).
     let parked_in_use = existing_state
         .as_ref()
-        .is_some_and(|s| s.state == "paused-session-in-use");
+        .is_some_and(|s| s.phase() == Some(DispatchPhase::PausedSessionInUse));
     let mut recovered_outcome = None;
     // A policy that cannot be read stops the run here, before recovery or
     // any dispatch: the guard would refuse every `met` as an infrastructure
@@ -2604,7 +2744,26 @@ pub fn run_issue(
     // Set by a guard fault every later `met` would meet too: the run stops
     // after recording it, before paying for another dispatch.
     let mut guard_stop: Option<GuardFault> = None;
+    // A Claude state not parked may be another run's, still going: its first
+    // write reuses everything this run read, so the compare-and-set alone
+    // would let this run launch a second IC on the same session. Adopted
+    // only once fresh evidence shows its IC idle, before anything is written.
     if let Some(state) = existing_state
+        .as_ref()
+        .filter(|s| !config.implementer.recovers_invocations() && !s.is_parked())
+    {
+        if let Some(run) = claude_in_flight(
+            dispatcher,
+            worktree,
+            state,
+            issue,
+            cumulative_attempt_n,
+            wall_clock_timeout_secs,
+        )? {
+            return Ok(run);
+        }
+    }
+    if let Some(claim) = existing_claim
         .as_ref()
         .filter(|_| config.implementer.recovers_invocations())
     {
@@ -2613,7 +2772,7 @@ pub fn run_issue(
             issue,
             worktree,
             dispatcher,
-            state,
+            claim,
             cumulative_attempt_n,
             wall_clock_timeout_secs,
             &mut native_session_id,
@@ -2669,23 +2828,16 @@ pub fn run_issue(
     // implementers in one worktree with one named by no state, and any write
     // at all would overwrite the state that names the other run's
     // invocation, releasing its slot while it may still run.
-    let taken_over = || {
-        MemoryError::Validation(format!(
-            "another run took over {} after this one started (its dispatch state changed), so \
-             this run launches and writes nothing more; the other run's state is left as it is",
-            issue.canonical()
-        ))
-    };
-    let write_state = |owned: &mut Option<DispatchState>,
-                       attempt_n: u32,
-                       turn_n: u32,
-                       state: &str,
-                       session_uuid: &str,
-                       session_claimed: bool,
-                       identity: (&Option<String>, &Option<InvocationArtifacts>),
-                       session: (&Option<String>, u32)|
-     -> Result<(), MemoryError> {
-        let next = DispatchState {
+    let taken_over = || taken_over(issue);
+    let next_claim = |attempt_n: u32,
+                      turn_n: u32,
+                      phase: DispatchPhase,
+                      session_uuid: &str,
+                      session_claimed: bool,
+                      identity: (&Option<String>, &Option<InvocationArtifacts>),
+                      session: (&Option<String>, u32)|
+     -> dispatch_state::Claim {
+        let state = DispatchState {
             implementer: config.implementer,
             native_session_id: if config.implementer.assigns_own_session_id() {
                 identity.0.clone()
@@ -2698,7 +2850,7 @@ pub fn run_issue(
             ic_session_name: ic_session_name.clone(),
             dispatch_class: config.dispatch_class.clone(),
             attempt_n,
-            state: state.to_string(),
+            state: phase.as_str().to_string(),
             started_at: started_at.clone(),
             session_uuid: session_uuid.to_string(),
             turn_n,
@@ -2708,13 +2860,36 @@ pub fn run_issue(
             // What this run saw, never a carried-forward older reading.
             signing_held: policy_at_start,
         };
-        if !dispatch_state::upsert_dispatch_state_if_unchanged(db, owned.as_ref(), &next)? {
+        dispatch_state::Claim {
+            state,
+            owner: Some(owner.clone()),
+        }
+    };
+    let write_state = |owned: &mut Option<dispatch_state::Claim>,
+                       attempt_n: u32,
+                       turn_n: u32,
+                       phase: DispatchPhase,
+                       session_uuid: &str,
+                       session_claimed: bool,
+                       identity: (&Option<String>, &Option<InvocationArtifacts>),
+                       session: (&Option<String>, u32)|
+     -> Result<(), MemoryError> {
+        let next = next_claim(
+            attempt_n,
+            turn_n,
+            phase,
+            session_uuid,
+            session_claimed,
+            identity,
+            session,
+        );
+        if !dispatch_state::claim_if_unchanged(db, owned.as_ref(), &next)? {
             return Err(taken_over());
         }
         *owned = Some(next);
         Ok(())
     };
-    let mut owned = existing_state.clone();
+    let mut owned = existing_claim.clone();
 
     // A recovering harness publishes each invocation just before it launches.
     if !config.implementer.recovers_invocations() {
@@ -2722,7 +2897,7 @@ pub fn run_issue(
             &mut owned,
             cumulative_attempt_n,
             turn_n,
-            "dispatching",
+            DispatchPhase::Dispatching,
             &session_uuid,
             resuming,
             (&native_session_id, &invocation_artifacts),
@@ -2734,6 +2909,8 @@ pub fn run_issue(
     let mut total_cost_usd = 0.0;
     let mut unpriced_dispatches = 0u32;
     let mut consecutive_infrastructure_failures = 0u32;
+    // Whether this run has launched anything yet.
+    let mut launched = false;
 
     let terminal = loop {
         if recovered_outcome.is_none() {
@@ -2850,7 +3027,7 @@ pub fn run_issue(
                         &mut owned,
                         cumulative_attempt_n,
                         turn_n,
-                        "paused-condition-too-long",
+                        DispatchPhase::PausedConditionTooLong,
                         &session_uuid,
                         resuming,
                         (&native_session_id, &invocation_artifacts),
@@ -2938,7 +3115,7 @@ pub fn run_issue(
                 if let Some(artifacts) = &spec.invocation_artifacts {
                     // Another run that took the issue over since this one
                     // last wrote it is seen before a unit is reserved.
-                    if !dispatch_state::dispatch_state_is(db, issue, owned.as_ref())? {
+                    if !dispatch_state::claim_is(db, issue, owned.as_ref())? {
                         super::invocation::discard_unlaunched(artifacts);
                         return Err(taken_over());
                     }
@@ -2973,7 +3150,7 @@ pub fn run_issue(
                         &mut owned,
                         cumulative_attempt_n,
                         turn_n,
-                        "dispatching",
+                        DispatchPhase::Dispatching,
                         &session_uuid,
                         resuming,
                         (&native_session_id, &invocation_artifacts),
@@ -2984,7 +3161,30 @@ pub fn run_issue(
                     }
                     unpriced_dispatches += 1;
                 }
+            } else {
+                // Claude's launch is claimed by no write of its own: look
+                // that no other run took the issue over since this one last
+                // wrote it, and, before this run's first launch, that no IC
+                // for the issue has started meanwhile.
+                if !dispatch_state::claim_is(db, issue, owned.as_ref())? {
+                    return Err(taken_over());
+                }
+                if !launched {
+                    if let Some(claim) = &owned {
+                        if let Some(run) = claude_in_flight(
+                            dispatcher,
+                            worktree,
+                            &claim.state,
+                            issue,
+                            cumulative_attempt_n,
+                            wall_clock_timeout_secs,
+                        )? {
+                            break run.terminal;
+                        }
+                    }
+                }
             }
+            launched = true;
             dispatcher.dispatch(&worktree.path, &spec)
         };
         let mut outcome = match outcome_result {
@@ -3034,7 +3234,7 @@ pub fn run_issue(
                     &mut owned,
                     cumulative_attempt_n,
                     turn_n,
-                    "infrastructure-failure",
+                    DispatchPhase::InfrastructureFailure,
                     &session_uuid,
                     resuming,
                     (&native_session_id, &invocation_artifacts),
@@ -3315,10 +3515,14 @@ pub fn run_issue(
             reason: outcome.reason.clone(),
         });
 
+        let recovering = config
+            .implementer
+            .recovers_invocations()
+            .then_some(config.implementer);
         match classification {
             DispatchClassification::Met => {
                 let commit_sha = recorded_commit_sha.unwrap_or_else(|| branch_tip(worktree));
-                record_and_advance(
+                if !record_and_advance(
                     db,
                     &AttemptRecord {
                         issue: issue.clone(),
@@ -3328,16 +3532,16 @@ pub fn run_issue(
                         why_failed: None,
                         commit_sha: commit_sha.clone(),
                     },
-                    status.as_ref(),
-                    config
-                        .implementer
-                        .recovers_invocations()
-                        .then_some(config.implementer),
-                )?;
+                    recovering,
+                    &mut owned,
+                    None,
+                )? {
+                    return Err(taken_over());
+                }
                 break TerminalReason::Met { commit_sha };
             }
             DispatchClassification::Impossible => {
-                record_and_advance(
+                if !record_and_advance(
                     db,
                     &AttemptRecord {
                         issue: issue.clone(),
@@ -3347,12 +3551,12 @@ pub fn run_issue(
                         why_failed: Some(why_failed_text(&outcome, classification)),
                         commit_sha: None,
                     },
-                    status.as_ref(),
-                    config
-                        .implementer
-                        .recovers_invocations()
-                        .then_some(config.implementer),
-                )?;
+                    recovering,
+                    &mut owned,
+                    None,
+                )? {
+                    return Err(taken_over());
+                }
                 break TerminalReason::Impossible {
                     reason: outcome.reason.clone(),
                 };
@@ -3365,7 +3569,18 @@ pub fn run_issue(
                         why_failed_text(&outcome, classification),
                     ),
                 };
-                record_and_advance(
+                // The attempt, the status and the next state land together,
+                // and only while this run still owns the issue.
+                let next = next_claim(
+                    cumulative_attempt_n,
+                    turn_n,
+                    DispatchPhase::Dispatching,
+                    &session_uuid,
+                    resuming,
+                    (&native_session_id, &invocation_artifacts),
+                    (&session_model, resume_refusals),
+                );
+                if !record_and_advance(
                     db,
                     &AttemptRecord {
                         issue: issue.clone(),
@@ -3375,23 +3590,12 @@ pub fn run_issue(
                         why_failed: Some(why_failed),
                         commit_sha: None,
                     },
-                    status.as_ref(),
-                    config
-                        .implementer
-                        .recovers_invocations()
-                        .then_some(config.implementer),
-                )?;
-                status = lineage::get_issue_status(db, issue)?;
-                write_state(
+                    recovering,
                     &mut owned,
-                    cumulative_attempt_n,
-                    turn_n,
-                    "dispatching",
-                    &session_uuid,
-                    resuming,
-                    (&native_session_id, &invocation_artifacts),
-                    (&session_model, resume_refusals),
-                )?;
+                    Some(next),
+                )? {
+                    return Err(taken_over());
+                }
             }
             DispatchClassification::InfrastructureFailure => {
                 // A guard fault every later met would meet too: stop like the
@@ -3405,7 +3609,7 @@ pub fn run_issue(
                             &mut owned,
                             cumulative_attempt_n,
                             turn_n,
-                            "infrastructure-failure",
+                            DispatchPhase::InfrastructureFailure,
                             &session_uuid,
                             resuming,
                             (&native_session_id, &invocation_artifacts),
@@ -3427,7 +3631,7 @@ pub fn run_issue(
                     &mut owned,
                     cumulative_attempt_n,
                     turn_n,
-                    "infrastructure-failure",
+                    DispatchPhase::InfrastructureFailure,
                     &session_uuid,
                     resuming,
                     (&native_session_id, &invocation_artifacts),
@@ -3447,13 +3651,20 @@ pub fn run_issue(
     if terminal.clears_dispatch_state() {
         // Only the state this run owns; one another run wrote is theirs.
         if let Some(owned) = &owned {
-            dispatch_state::clear_dispatch_state_if_unchanged(db, owned)?;
+            if !dispatch_state::clear_claim_if_unchanged(db, owned)? {
+                tracing::warn!(
+                    issue = %issue.canonical(),
+                    terminal = ?terminal,
+                    "autopilot left the issue's dispatch state to the run that changed it \
+                     after this one last wrote it"
+                );
+            }
         }
     } else if !matches!(terminal, TerminalReason::ImplementationInFlight { .. }) {
         let state_label = match &terminal {
-            TerminalReason::DailyBudgetExhausted { .. } => "paused-daily-budget",
-            TerminalReason::SessionInUse { .. } => "paused-session-in-use",
-            _ => "paused-infrastructure-failure",
+            TerminalReason::DailyBudgetExhausted { .. } => DispatchPhase::PausedDailyBudget,
+            TerminalReason::SessionInUse { .. } => DispatchPhase::PausedSessionInUse,
+            _ => DispatchPhase::PausedInfrastructureFailure,
         };
         write_state(
             &mut owned,
@@ -3480,6 +3691,18 @@ pub fn run_issue(
 
 #[cfg(test)]
 mod tests {
+    /// [`record_and_advance`] as the run that owns whatever dispatch state
+    /// is stored, leaving it as it is.
+    fn record_as_owner(
+        db: &Database,
+        record: &AttemptRecord,
+        recovering: Option<Implementer>,
+    ) -> Result<bool, MemoryError> {
+        let mut owned = dispatch_state::get_claim(db, &record.issue)?;
+        let then = owned.clone();
+        record_and_advance(db, record, recovering, &mut owned, then)
+    }
+
     use super::*;
     use crate::autopilot::{retry, worktree};
 
@@ -3701,7 +3924,7 @@ mod tests {
             .unwrap();
             let mut result = impossible();
             result.cost_usd = None;
-            record_and_advance(
+            record_as_owner(
                 &db,
                 &AttemptRecord {
                     issue: issue(),
@@ -3711,7 +3934,6 @@ mod tests {
                     why_failed: Some(why_failed_text(&result, DispatchClassification::Impossible)),
                     commit_sha: None,
                 },
-                None,
                 Some(Implementer::Codex),
             )
             .unwrap();
@@ -3786,7 +4008,7 @@ mod tests {
                 &state.invocation_artifacts.as_ref().unwrap().invocation_id,
             )
             .unwrap();
-            record_and_advance(
+            record_as_owner(
                 &db,
                 &AttemptRecord {
                     issue: issue(),
@@ -3796,7 +4018,6 @@ mod tests {
                     why_failed: Some("not met".into()),
                     commit_sha: None,
                 },
-                None,
                 Some(Implementer::Codex),
             )
             .unwrap();
@@ -4510,11 +4731,10 @@ sleep 0.5
         };
         for (harness, label) in [(Implementer::Muse, "Muse"), (Implementer::Codex, "Codex")] {
             let db = Database::open_in_memory().unwrap();
-            record_and_advance(&db, &record(AttemptOutcome::Failed), None, Some(harness)).unwrap();
-            let err =
-                record_and_advance(&db, &record(AttemptOutcome::Success), None, Some(harness))
-                    .unwrap_err()
-                    .to_string();
+            record_as_owner(&db, &record(AttemptOutcome::Failed), Some(harness)).unwrap();
+            let err = record_as_owner(&db, &record(AttemptOutcome::Success), Some(harness))
+                .unwrap_err()
+                .to_string();
             assert!(
                 err.contains(&format!(
                     "recovered {label} verdict conflicts with the already recorded attempt ordinal"
@@ -7504,7 +7724,7 @@ sleep 0.5
     }
 
     #[test]
-    fn a_recovered_impossible_never_clears_a_state_another_run_took() {
+    fn a_recovered_impossible_on_a_state_another_run_took_clears_and_reports_nothing() {
         let db = approved_db();
         let (_dir, wt) = fixture_worktree();
         let ours = pending_muse(&db, &wt, None);
@@ -7529,12 +7749,12 @@ sleep 0.5
             dispatched: false,
             recovery: Some(InvocationRecovery::Finished(finished)),
         };
-        let run = run_issue(&db, &issue(), &brief(), &wt, &muse_config(), &mut d).unwrap();
-        assert!(
-            matches!(run.terminal, TerminalReason::Impossible { .. }),
-            "{:?}",
-            run.terminal
-        );
+        // The issue is the other run's now, and so is its verdict: this run
+        // reports none for it to act on.
+        let err = run_issue(&db, &issue(), &brief(), &wt, &muse_config(), &mut d)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("another run took over"), "{err}");
         let stored = dispatch_state::get_dispatch_state(&db, &issue()).unwrap();
         assert_eq!(stored.map(|s| s.session_uuid), Some(theirs.session_uuid));
     }
@@ -9096,7 +9316,7 @@ satisfies it on its own"
 
         // Force a follow-up failed attempt directly through the same helper
         // the loop uses, bypassing the already-succeeded short circuit.
-        record_and_advance(
+        record_as_owner(
             &db,
             &AttemptRecord {
                 issue: issue(),
@@ -9106,7 +9326,6 @@ satisfies it on its own"
                 why_failed: Some("still red".to_string()),
                 commit_sha: None,
             },
-            Some(&succeeded),
             None,
         )
         .unwrap();
@@ -9293,5 +9512,267 @@ satisfies it on its own"
                 .unwrap()
                 .is_none());
         }
+    }
+
+    /// A Claude dispatcher whose IC evidence is scripted, and that can take
+    /// the issue over (as another run would) while its dispatch runs.
+    struct ClaudeEvidence<'a> {
+        db: &'a Database,
+        /// What each `recover` call reports, in order; then idle.
+        evidence: std::collections::VecDeque<InvocationRecovery>,
+        recovered: usize,
+        /// A state another run writes while this run's dispatch runs.
+        takeover: Option<dispatch_state::Claim>,
+        outcomes: std::collections::VecDeque<DispatchOutcome>,
+        seen: Vec<DispatchSpec>,
+    }
+
+    impl<'a> ClaudeEvidence<'a> {
+        fn new(db: &'a Database, evidence: Vec<InvocationRecovery>) -> Self {
+            Self {
+                db,
+                evidence: evidence.into(),
+                recovered: 0,
+                takeover: None,
+                outcomes: std::collections::VecDeque::new(),
+                seen: Vec::new(),
+            }
+        }
+    }
+
+    impl Dispatcher for ClaudeEvidence<'_> {
+        fn recover(
+            &mut self,
+            _repo: &Path,
+            _state: &DispatchState,
+        ) -> Result<InvocationRecovery, MemoryError> {
+            self.recovered += 1;
+            Ok(self
+                .evidence
+                .pop_front()
+                .unwrap_or(InvocationRecovery::NoPriorInvocation))
+        }
+
+        fn dispatch(
+            &mut self,
+            _repo: &Path,
+            spec: &DispatchSpec,
+        ) -> Result<DispatchOutcome, MemoryError> {
+            self.seen.push(spec.clone());
+            if let Some(theirs) = self.takeover.take() {
+                assert!(dispatch_state::claim_if_unchanged(
+                    self.db,
+                    dispatch_state::get_claim(self.db, &theirs.state.issue)
+                        .unwrap()
+                        .as_ref(),
+                    &theirs,
+                )
+                .unwrap());
+            }
+            Ok(self.outcomes.pop_front().expect("a scripted outcome"))
+        }
+    }
+
+    /// Run A's freshly written Claude state: dispatching, session claimed,
+    /// under A's token.
+    fn claude_in_flight_state(db: &Database, wt: &Worktree) -> dispatch_state::Claim {
+        let mut state = pending_invocation(Implementer::Claude, db, wt, None);
+        state.session_uuid = "33333333-4444-5555-6666-777777777777".into();
+        state.native_session_id = Some(state.session_uuid.clone());
+        state.session_claimed = true;
+        let claim = dispatch_state::Claim {
+            state,
+            owner: Some("run-a".into()),
+        };
+        assert!(dispatch_state::claim_if_unchanged(
+            db,
+            dispatch_state::get_claim(db, &issue()).unwrap().as_ref(),
+            &claim,
+        )
+        .unwrap());
+        dispatch_state::get_claim(db, &issue()).unwrap().unwrap()
+    }
+
+    /// F4: run B reads run A's fresh `dispatching` state while A's IC is
+    /// live. B adopts nothing, writes nothing and launches nothing.
+    #[test]
+    fn a_claude_run_never_adopts_a_state_whose_ic_is_live() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        let a = claude_in_flight_state(&db, &wt);
+        for evidence in [
+            InvocationRecovery::Alive,
+            InvocationRecovery::Unknown {
+                reason: "ps timed out".into(),
+            },
+        ] {
+            let mut b = ClaudeEvidence::new(&db, vec![evidence]);
+            let run = run_issue(&db, &issue(), &brief(), &wt, &config(), &mut b).unwrap();
+            assert!(
+                matches!(run.terminal, TerminalReason::ImplementationInFlight { .. }),
+                "{:?}",
+                run.terminal
+            );
+            assert!(b.seen.is_empty(), "nothing is launched");
+            assert_eq!(
+                dispatch_state::get_claim(&db, &issue()).unwrap().as_ref(),
+                Some(&a),
+                "run A's state, token and all, is untouched"
+            );
+        }
+        assert!(lineage::attempts_for_issue(&db, &issue())
+            .unwrap()
+            .is_empty());
+    }
+
+    /// A crashed run's Claude state, whose IC is gone, is still adopted: its
+    /// session is resumed.
+    #[test]
+    fn a_claude_state_whose_ic_is_idle_is_adopted_and_resumed() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        let a = claude_in_flight_state(&db, &wt);
+        let mut b = ClaudeEvidence::new(&db, Vec::new());
+        b.outcomes.push_back(met());
+        let run = run_issue(&db, &issue(), &brief(), &wt, &config(), &mut b).unwrap();
+        assert!(
+            matches!(run.terminal, TerminalReason::Met { .. }),
+            "{:?}",
+            run.terminal
+        );
+        assert_eq!(b.seen.len(), 1);
+        assert_eq!(
+            b.seen[0].session,
+            SessionMode::Resume {
+                session_uuid: a.state.session_uuid.clone()
+            }
+        );
+        // Checked at the start and again right before the launch.
+        assert_eq!(b.recovered, 2);
+    }
+
+    /// An IC for the issue that starts after the run read nothing (a fresh
+    /// issue) and before its first launch stops the launch.
+    #[test]
+    fn a_claude_ic_that_appears_before_the_first_launch_stops_it() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        let mut b = ClaudeEvidence::new(&db, vec![InvocationRecovery::Alive]);
+        let run = run_issue(&db, &issue(), &brief(), &wt, &config(), &mut b).unwrap();
+        assert!(
+            matches!(run.terminal, TerminalReason::ImplementationInFlight { .. }),
+            "{:?}",
+            run.terminal
+        );
+        assert!(b.seen.is_empty());
+    }
+
+    /// A run whose issue another run took over while its dispatch ran
+    /// records nothing of its stale outcome: no attempt, no status.
+    #[test]
+    fn a_stale_failed_attempt_from_a_run_that_lost_the_issue_records_nothing() {
+        for outcome in [not_met(), met(), impossible()] {
+            let db = approved_db();
+            let (_dir, wt) = fixture_worktree();
+            let mut b = ClaudeEvidence::new(&db, Vec::new());
+            let mut theirs = pending_invocation(
+                Implementer::Claude,
+                &Database::open_in_memory().unwrap(),
+                &wt,
+                None,
+            );
+            theirs.session_uuid = "44444444-5555-6666-7777-888888888888".into();
+            b.takeover = Some(dispatch_state::Claim {
+                state: theirs,
+                owner: Some("run-c".into()),
+            });
+            b.outcomes.push_back(outcome.clone());
+            let err = run_issue(&db, &issue(), &brief(), &wt, &config(), &mut b)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("another run took over"), "{outcome:?}: {err}");
+            assert!(
+                lineage::attempts_for_issue(&db, &issue())
+                    .unwrap()
+                    .is_empty(),
+                "{outcome:?}"
+            );
+            assert_eq!(lineage::get_issue_status(&db, &issue()).unwrap(), None);
+            assert_eq!(
+                dispatch_state::get_claim(&db, &issue())
+                    .unwrap()
+                    .and_then(|c| c.owner),
+                Some("run-c".into())
+            );
+        }
+    }
+
+    #[test]
+    fn claude_evidence_reads_the_registry_and_the_ic_name_in_the_process_table() {
+        use crate::autopilot::process_tree::{ProcessRow, ProcessSnapshot};
+        use crate::autopilot::registry::{AgentEntry, HarnessSnapshots, RegistrySnapshot};
+        let mut state = pending_invocation(
+            Implementer::Claude,
+            &Database::open_in_memory().unwrap(),
+            &fixture_worktree().1,
+            None,
+        );
+        state.ic_session_name = dispatch::ic_name(&issue());
+        let ic = state.ic_session_name.clone();
+        let row = |args: String| ProcessRow {
+            pid: 70,
+            ppid: 1,
+            pgid: 70,
+            stat: "S".into(),
+            args,
+        };
+        let snaps = |claude: RegistrySnapshot, processes: ProcessSnapshot| HarnessSnapshots {
+            claude,
+            processes,
+        };
+        let listed = RegistrySnapshot::Available(vec![AgentEntry {
+            name: ic.clone(),
+            status: None,
+        }]);
+        let unreadable = RegistrySnapshot::Unavailable {
+            reason: "claude not found".into(),
+        };
+        assert_eq!(
+            claude_recovery(
+                &snaps(listed, ProcessSnapshot::Available(Vec::new())),
+                &state
+            ),
+            InvocationRecovery::Alive
+        );
+        assert_eq!(
+            claude_recovery(
+                &snaps(
+                    unreadable.clone(),
+                    ProcessSnapshot::Available(vec![row(format!("claude -p x --name {ic}"))])
+                ),
+                &state
+            ),
+            InvocationRecovery::Alive
+        );
+        assert!(matches!(
+            claude_recovery(
+                &snaps(
+                    RegistrySnapshot::Available(Vec::new()),
+                    ProcessSnapshot::Unavailable {
+                        reason: "ps timed out".into()
+                    }
+                ),
+                &state
+            ),
+            InvocationRecovery::Unknown { reason } if reason.contains("ps timed out")
+        ));
+        // The process table settles it even with no registry.
+        assert_eq!(
+            claude_recovery(
+                &snaps(unreadable, ProcessSnapshot::Available(Vec::new())),
+                &state
+            ),
+            InvocationRecovery::NoPriorInvocation
+        );
     }
 }

@@ -22,7 +22,7 @@ use crate::db::schema::Database;
 use crate::error::MemoryError;
 
 use super::scrub::scrub_and_bound;
-use super::{validate_repo, write_current, zero_embedding, IssueRef, ADDED_BY, ROOM, WING};
+use super::{validate_repo, zero_embedding, IssueRef, ADDED_BY, ROOM, WING};
 
 /// Per-field bound applied to `approach` and `why_failed` before they are
 /// persisted. Chosen to comfortably hold a real diagnostic (a failing test
@@ -115,6 +115,16 @@ pub fn record_attempt(
     db: &Database,
     record: &AttemptRecord,
 ) -> Result<RecordedAttempt, MemoryError> {
+    db.with_transaction(|tx| record_attempt_tx(tx, record))
+}
+
+/// [`record_attempt`] inside a caller's transaction, for a run that must
+/// record an attempt only while it still owns the issue (see
+/// `run::record_and_advance`).
+pub(crate) fn record_attempt_tx(
+    tx: &rusqlite::Transaction<'_>,
+    record: &AttemptRecord,
+) -> Result<RecordedAttempt, MemoryError> {
     validate_repo(&record.issue.repo)?;
 
     let approach_scrub = scrub_and_bound(&record.approach, MAX_LINEAGE_FIELD_CHARS);
@@ -148,33 +158,30 @@ pub fn record_attempt(
     // Drawer + knowledge-graph edge are written in one transaction so a
     // crash between the two can never leave an attempt drawer with no edge
     // (or vice versa) for a restarted Lead to trip over.
-    db.with_transaction(|tx| {
-        Database::insert_drawer_tx(
-            tx, &drawer_id, &content, &embedding, WING, ROOM, "", ADDED_BY,
-        )?;
-        KnowledgeGraph::add_triple_tx(
-            tx,
-            &issue_entity,
-            ISSUE_ENTITY_TYPE,
-            HAS_ATTEMPT_PREDICATE,
-            &drawer_id,
-            ATTEMPT_ENTITY_TYPE,
-            None,
-            1.0,
-            None,
-        )?;
-        Database::wal_log_tx(
-            tx,
-            "autopilot_record_attempt",
-            &json!({
-                "drawer_id": &drawer_id,
-                "issue": &body.issue,
-                "attempt_n": body.attempt_n,
-            }),
-            None,
-        )?;
-        Ok(())
-    })?;
+    Database::insert_drawer_tx(
+        tx, &drawer_id, &content, &embedding, WING, ROOM, "", ADDED_BY,
+    )?;
+    KnowledgeGraph::add_triple_tx(
+        tx,
+        &issue_entity,
+        ISSUE_ENTITY_TYPE,
+        HAS_ATTEMPT_PREDICATE,
+        &drawer_id,
+        ATTEMPT_ENTITY_TYPE,
+        None,
+        1.0,
+        None,
+    )?;
+    Database::wal_log_tx(
+        tx,
+        "autopilot_record_attempt",
+        &json!({
+            "drawer_id": &drawer_id,
+            "issue": &body.issue,
+            "attempt_n": body.attempt_n,
+        }),
+        None,
+    )?;
 
     Ok(RecordedAttempt {
         drawer_id,
@@ -269,6 +276,14 @@ fn issue_status_key(issue: &IssueRef) -> String {
 
 /// Write (overwrite) an issue's current-state drawer.
 pub fn upsert_issue_status(db: &Database, status: &IssueStatus) -> Result<String, MemoryError> {
+    db.with_transaction(|tx| upsert_issue_status_tx(tx, status))
+}
+
+/// [`upsert_issue_status`] inside a caller's transaction.
+pub(crate) fn upsert_issue_status_tx(
+    tx: &rusqlite::Transaction<'_>,
+    status: &IssueStatus,
+) -> Result<String, MemoryError> {
     validate_repo(&status.issue.repo)?;
     let body = IssueStatusBody {
         issue: status.issue.canonical(),
@@ -280,7 +295,7 @@ pub fn upsert_issue_status(db: &Database, status: &IssueStatus) -> Result<String
         updated_at: chrono::Utc::now().to_rfc3339(),
     };
     let content = serde_json::to_string(&body)?;
-    write_current(db, &issue_status_key(&status.issue), &content)
+    super::write_current_tx(tx, &issue_status_key(&status.issue), &content)
 }
 
 /// Read an issue's current-state drawer, if one has been written yet.

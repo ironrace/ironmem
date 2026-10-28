@@ -80,6 +80,19 @@ pub struct DispatchState {
 }
 
 impl DispatchState {
+    /// The phase [`Self::state`] names, or `None` for a label no run of this
+    /// binary writes.
+    pub fn phase(&self) -> Option<DispatchPhase> {
+        DispatchPhase::parse(&self.state)
+    }
+
+    /// Whether the run that wrote this state has certainly ended: it is
+    /// parked. Any other label, unknown ones included, may be a run still
+    /// going.
+    pub fn is_parked(&self) -> bool {
+        self.phase().is_some_and(DispatchPhase::is_parked)
+    }
+
     /// Refuse a combination no harness writes: a Claude state carrying
     /// supervised-CLI invocation artifacts, whose artifacts every Claude path
     /// would silently ignore. Checked where a state is written and where one
@@ -127,6 +140,93 @@ struct DispatchStateBody {
     resume_refusals: u32,
     #[serde(default)]
     signing_held: bool,
+    /// The token of the run that wrote this record ([`Claim::owner`]).
+    /// Absent from records written before it existed, and from those written
+    /// outside a run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    owner: Option<String>,
+}
+
+/// A dispatch state as stored, with the token of the run that wrote it.
+///
+/// Every state a run writes carries a token fresh to that run, so two runs
+/// that would otherwise write byte-identical states (a Claude run's first
+/// write reuses everything it read) never pass each other's
+/// compare-and-set: what one run wrote is never what another read. Kept
+/// beside [`DispatchState`] rather than in it so the state's public shape is
+/// unchanged; only a run's own writes compare it.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Claim {
+    pub state: DispatchState,
+    pub owner: Option<String>,
+}
+
+/// Where a dispatch stands, as [`DispatchState::state`] spells it on the
+/// wire. The one list of the labels a run writes, so a reader and a writer
+/// cannot spell one differently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DispatchPhase {
+    /// Written before a launch, and between launches of one run.
+    Dispatching,
+    /// A launch failed; the run that wrote it may launch again.
+    InfrastructureFailure,
+    /// Parked at the end of a run: the day's dollar budget is spent.
+    PausedDailyBudget,
+    /// Parked at the end of a run by repeated infrastructure failures, the
+    /// day's unpriced cap, or an escalation.
+    PausedInfrastructureFailure,
+    /// Parked: the goal condition is too long to dispatch.
+    PausedConditionTooLong,
+    /// Parked: the harness reported the session still in use.
+    PausedSessionInUse,
+}
+
+impl DispatchPhase {
+    /// Every phase, for a reader that must know them all.
+    pub const ALL: [DispatchPhase; 6] = [
+        DispatchPhase::Dispatching,
+        DispatchPhase::InfrastructureFailure,
+        DispatchPhase::PausedDailyBudget,
+        DispatchPhase::PausedInfrastructureFailure,
+        DispatchPhase::PausedConditionTooLong,
+        DispatchPhase::PausedSessionInUse,
+    ];
+
+    /// The wire label.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            DispatchPhase::Dispatching => "dispatching",
+            DispatchPhase::InfrastructureFailure => "infrastructure-failure",
+            DispatchPhase::PausedDailyBudget => "paused-daily-budget",
+            DispatchPhase::PausedInfrastructureFailure => "paused-infrastructure-failure",
+            DispatchPhase::PausedConditionTooLong => "paused-condition-too-long",
+            DispatchPhase::PausedSessionInUse => "paused-session-in-use",
+        }
+    }
+
+    /// The phase a wire label names, if any.
+    pub fn parse(label: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|phase| phase.as_str() == label)
+    }
+
+    /// Whether only a run that has ended writes it. A run in progress may
+    /// hold any other phase, and launch again from it.
+    pub const fn is_parked(self) -> bool {
+        match self {
+            DispatchPhase::Dispatching | DispatchPhase::InfrastructureFailure => false,
+            DispatchPhase::PausedDailyBudget
+            | DispatchPhase::PausedInfrastructureFailure
+            | DispatchPhase::PausedConditionTooLong
+            | DispatchPhase::PausedSessionInUse => true,
+        }
+    }
+}
+
+impl std::fmt::Display for DispatchPhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// Logical-key prefix shared by every dispatch-state drawer. One constant
@@ -197,6 +297,11 @@ pub fn dispatch_state_is(
 /// The persisted body of `state`, refused when [`DispatchState::validate`]
 /// refuses it.
 fn content_of(state: &DispatchState) -> Result<String, MemoryError> {
+    content_owned_by(state, None)
+}
+
+/// [`content_of`], carrying the token of the run that writes it.
+fn content_owned_by(state: &DispatchState, owner: Option<&str>) -> Result<String, MemoryError> {
     state.validate()?;
     let body = DispatchStateBody {
         implementer: state.implementer,
@@ -216,8 +321,118 @@ fn content_of(state: &DispatchState) -> Result<String, MemoryError> {
         session_model: state.session_model.clone(),
         resume_refusals: state.resume_refusals,
         signing_held: state.signing_held,
+        owner: owner.map(str::to_owned),
     };
     Ok(serde_json::to_string(&body)?)
+}
+
+/// `claim` as it reads back from the drawer it would be written to, for an
+/// exact comparison with what is stored.
+fn normalized(claim: &Claim) -> Result<Claim, MemoryError> {
+    claim_from_content(&content_owned_by(&claim.state, claim.owner.as_deref())?)
+}
+
+/// The issue's dispatch state and its owner token, if a drawer exists.
+pub(crate) fn get_claim(db: &Database, issue: &IssueRef) -> Result<Option<Claim>, MemoryError> {
+    let Some(drawer) = read_current(db, &dispatch_state_key(issue))? else {
+        return Ok(None);
+    };
+    claim_from_content(&drawer.content).map(Some)
+}
+
+/// Whether, inside `tx`, the issue's drawer holds exactly `expected` (`None`:
+/// no drawer), owner token included.
+pub(crate) fn claim_is_tx(
+    tx: &rusqlite::Transaction<'_>,
+    issue: &IssueRef,
+    expected: Option<&Claim>,
+) -> Result<bool, MemoryError> {
+    use rusqlite::OptionalExtension;
+    let expected = expected.map(normalized).transpose()?;
+    let id = super::logical_drawer_id(&dispatch_state_key(issue));
+    let current: Option<String> = tx
+        .query_row("SELECT content FROM drawers WHERE id = ?1", [&id], |row| {
+            row.get(0)
+        })
+        .optional()?;
+    let current = current.map(|c| claim_from_content(&c)).transpose()?;
+    Ok(current == expected)
+}
+
+/// Write `claim` as the issue's dispatch state inside `tx`.
+pub(crate) fn write_claim_tx(
+    tx: &rusqlite::Transaction<'_>,
+    claim: &Claim,
+) -> Result<(), MemoryError> {
+    validate_repo(&claim.state.issue.repo)?;
+    let content = content_owned_by(&claim.state, claim.owner.as_deref())?;
+    super::write_current_tx(tx, &dispatch_state_key(&claim.state.issue), &content)?;
+    Ok(())
+}
+
+/// Delete the issue's dispatch state inside `tx`, logged as
+/// [`clear_dispatch_state`] logs it.
+pub(crate) fn delete_claim_tx(
+    tx: &rusqlite::Transaction<'_>,
+    issue: &IssueRef,
+) -> Result<bool, MemoryError> {
+    let id = super::logical_drawer_id(&dispatch_state_key(issue));
+    let deleted = Database::delete_drawer_tx(tx, &id)?;
+    Database::wal_log_tx(
+        tx,
+        "autopilot_clear_dispatch_state",
+        &json!({
+            "drawer_id": &id,
+            "issue": issue.canonical(),
+            "deleted": deleted,
+            "conditional": true,
+        }),
+        None,
+    )?;
+    Ok(deleted)
+}
+
+/// Write `next` only while the drawer holds exactly `expected` (`None`: no
+/// drawer), owner token included, in one `BEGIN IMMEDIATE` transaction.
+/// Returns `false`, writing nothing, when it changed.
+pub(crate) fn claim_if_unchanged(
+    db: &Database,
+    expected: Option<&Claim>,
+    next: &Claim,
+) -> Result<bool, MemoryError> {
+    db.with_immediate_transaction(|tx| {
+        if !claim_is_tx(tx, &next.state.issue, expected)? {
+            return Ok(false);
+        }
+        write_claim_tx(tx, next)?;
+        Ok(true)
+    })
+}
+
+/// Whether the drawer holds exactly `expected`, owner token included: a
+/// cheap look before work a later [`claim_if_unchanged`] claims for good.
+pub(crate) fn claim_is(
+    db: &Database,
+    issue: &IssueRef,
+    expected: Option<&Claim>,
+) -> Result<bool, MemoryError> {
+    let expected = expected.map(normalized).transpose()?;
+    Ok(get_claim(db, issue)? == expected)
+}
+
+/// Delete the drawer only while it holds exactly `expected`, owner token
+/// included, in one `BEGIN IMMEDIATE` transaction. Returns `false`,
+/// deleting nothing, when it changed or is gone.
+pub(crate) fn clear_claim_if_unchanged(
+    db: &Database,
+    expected: &Claim,
+) -> Result<bool, MemoryError> {
+    db.with_immediate_transaction(|tx| {
+        if !claim_is_tx(tx, &expected.state.issue, Some(expected))? {
+            return Ok(false);
+        }
+        delete_claim_tx(tx, &expected.state.issue)
+    })
 }
 
 /// Read the dispatch-state drawer for an issue, if one is currently in
@@ -283,6 +498,10 @@ pub(crate) fn parse_dispatch_state(raw: &str) -> Parsed {
 }
 
 fn state_from_content(content: &str) -> Result<DispatchState, MemoryError> {
+    claim_from_content(content).map(|claim| claim.state)
+}
+
+fn claim_from_content(content: &str) -> Result<Claim, MemoryError> {
     let body: DispatchStateBody = serde_json::from_str(content)?;
     let state = DispatchState {
         implementer: body.implementer,
@@ -305,7 +524,10 @@ fn state_from_content(content: &str) -> Result<DispatchState, MemoryError> {
         signing_held: body.signing_held,
     };
     state.validate()?;
-    Ok(state)
+    Ok(Claim {
+        state,
+        owner: body.owner,
+    })
 }
 
 /// Every in-flight issue's dispatch-state drawer.
@@ -530,6 +752,55 @@ mod tests {
         assert_eq!(turn(&db), Some(1));
     }
 
+    /// Two runs that judged the same state and would write identical ones:
+    /// their tokens tell the writes apart, so only the first lands, and the
+    /// state each read is no longer there for the other.
+    #[test]
+    fn identical_states_written_by_two_runs_never_both_pass_the_compare_and_set() {
+        let db = Database::open_in_memory().unwrap();
+        let issue = IssueRef::new("ironrace/ironmem", 283);
+        let claim = |owner: &str| Claim {
+            state: sample(&issue, 1),
+            owner: Some(owner.into()),
+        };
+        let read = Claim {
+            state: sample(&issue, 1),
+            owner: None,
+        };
+        upsert_dispatch_state(&db, &read.state).unwrap();
+        let read = get_claim(&db, &issue).unwrap().unwrap();
+        assert_eq!(read.owner, None);
+        assert!(claim_if_unchanged(&db, Some(&read), &claim("a")).unwrap());
+        assert!(!claim_if_unchanged(&db, Some(&read), &claim("b")).unwrap());
+        assert_eq!(
+            get_claim(&db, &issue).unwrap(),
+            Some(normalized(&claim("a")).unwrap())
+        );
+        assert!(claim_is(&db, &issue, Some(&claim("a"))).unwrap());
+        assert!(!claim_is(&db, &issue, Some(&claim("b"))).unwrap());
+        assert!(!clear_claim_if_unchanged(&db, &claim("b")).unwrap());
+        // The token is invisible to every reader of the state itself.
+        assert_eq!(
+            get_dispatch_state(&db, &issue).unwrap(),
+            Some(normalized(&claim("a")).unwrap().state)
+        );
+        assert!(clear_claim_if_unchanged(&db, &claim("a")).unwrap());
+        assert!(get_claim(&db, &issue).unwrap().is_none());
+    }
+
+    #[test]
+    fn every_phase_round_trips_its_label_and_only_pauses_are_parked() {
+        for phase in DispatchPhase::ALL {
+            assert_eq!(DispatchPhase::parse(phase.as_str()), Some(phase));
+            assert_eq!(
+                serde_json::to_string(&phase).unwrap(),
+                format!("\"{}\"", phase.as_str())
+            );
+            assert_eq!(phase.is_parked(), phase.as_str().starts_with("paused-"));
+        }
+        assert_eq!(DispatchPhase::parse("in_progress"), None);
+    }
+
     #[test]
     fn codex_wire_roundtrip_keeps_native_identity_and_absolute_artifacts() {
         let db = Database::open_in_memory().unwrap();
@@ -574,6 +845,7 @@ mod tests {
             session_model: None,
             resume_refusals: 0,
             signing_held: false,
+            owner: None,
         }
     }
 
@@ -623,6 +895,7 @@ mod tests {
             session_model: None,
             resume_refusals: 0,
             signing_held: false,
+            owner: None,
         })
         .unwrap();
         for key in [
