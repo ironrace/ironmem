@@ -2459,8 +2459,11 @@ impl ProcessTracker {
 
     /// Own `row`'s process at `birth`, newest so far; a PID seen exit
     /// before and now authenticated again is a new process.
+    /// An old refusal ([`Self::refused`]) under the same PID was another
+    /// process's.
     fn enrol(&mut self, row: ProcessRow, birth: Birth) {
         self.exited.remove(&row.pid);
+        self.refused.remove(&row.pid);
         let seq = self.next_seq;
         self.next_seq += 1;
         self.known.insert(row.pid, Tracked { row, birth, seq });
@@ -2750,6 +2753,11 @@ impl ProcessTracker {
     /// Sampling is practical tool cleanup, not malicious fork containment.
     pub(crate) fn cleanup(&mut self, root_reaped: bool) -> Result<(), MemoryError> {
         self.root_reaped = root_reaped;
+        // A reaped root's PID is free for reuse: never read or signal it
+        // again. Its birth stays in `root_birth`.
+        if root_reaped && self.known.remove(&self.root_pid).is_some() {
+            self.exited.insert(self.root_pid);
+        }
         let result = (|| {
             if !root_reaped {
                 self.observe()?;
@@ -2763,7 +2771,10 @@ impl ProcessTracker {
             }
             let mut stable = false;
             for _ in 0..32 {
-                let before = self.known.len();
+                // Enrolments, not the count: exits now shrink `known`, so
+                // one exit and one new enrolment in a pass would leave its
+                // size unchanged.
+                let before = self.next_seq;
                 let rows = self.observe()?;
                 // A shared daemon a sample caught between its fork and exec,
                 // still wearing its spawner's argv, is stopped and killed
@@ -2783,15 +2794,15 @@ impl ProcessTracker {
                             && self.known.contains_key(&r.pid)
                     })
                     .all(|r| row_stopped(r, task_states));
-                if before == self.known.len() && stopped {
+                if before == self.next_seq && stopped {
                     stable = true;
                     break;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
             // Fail closed, by design: a refused process (one cleanup may not
-            // signal) that keeps forking grows `known` on every pass, so the
-            // tree never reads as stable. Cleanup then ends "did not
+            // signal) that keeps forking enrols a child on every pass, so
+            // the tree never reads as stable. Cleanup then ends "did not
             // quiesce", no exit record is written, the invocation stays held,
             // and only `clear-dispatch`, once that process is gone, releases
             // it.
@@ -5687,6 +5698,72 @@ pub(crate) mod tests {
             signal_pinned(&pinned, 0).unwrap_err().raw_os_error(),
             Some(libc::ESRCH)
         );
+    }
+
+    /// Once the root is reaped its PID is free, so cleanup never reads or
+    /// signals it again: a stranger holding it now (here, a real process
+    /// enrolled under a birth it never had) is no "tracked PID was reused".
+    #[cfg(unix)]
+    #[test]
+    fn a_reaped_roots_pid_is_never_read_again_by_cleanup() {
+        let mut stranger = Command::new("sleep")
+            .arg("30")
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = stranger.id();
+        let mut tracker = ProcessTracker::owning_every_descendant(pid);
+        tracker.set_kill(|p, _| panic!("signalled {}", p.pid));
+        tracker.enrol_for_test(process_row(pid, 1, pid), Birth(1, 0));
+        tracker.root_birth = Some(Birth(1, 0));
+        let cleaned = tracker.cleanup(true);
+        let alive = stranger.try_wait().unwrap().is_none();
+        let _ = stranger.kill();
+        let _ = stranger.wait();
+        cleaned.unwrap();
+        assert!(alive);
+        assert!(tracker.exited.contains(&pid) && !tracker.known.contains_key(&pid));
+        assert_eq!(tracker.root_birth(), Some(Birth(1, 0)));
+    }
+
+    /// A PID cleanup was refused permission to signal, seen exit and then
+    /// enrolled again is a new process: the old refusal is not its.
+    #[test]
+    fn a_reenrolled_pid_carries_no_old_refusal() {
+        let root = kernel_process(10, 1, 10, 1);
+        let mut tracker = ProcessTracker::owning_every_descendant(10);
+        tracker
+            .observe_rows(
+                vec![process_row(10, 1, 10), process_row(20, 10, 10)],
+                |pid| {
+                    Ok(Some(if pid == 10 {
+                        root
+                    } else {
+                        kernel_process(20, 10, 10, 2)
+                    }))
+                },
+            )
+            .unwrap();
+        tracker.refused.insert(20);
+        tracker
+            .observe_rows(vec![process_row(10, 1, 10)], |pid| {
+                Ok((pid == 10).then_some(root))
+            })
+            .unwrap();
+        tracker
+            .observe_rows(
+                vec![process_row(10, 1, 10), process_row(20, 10, 10)],
+                |pid| {
+                    Ok(Some(if pid == 10 {
+                        root
+                    } else {
+                        kernel_process(20, 10, 10, 5)
+                    }))
+                },
+            )
+            .unwrap();
+        assert!(tracker.known.contains_key(&20));
+        assert!(!tracker.refused.contains(&20));
     }
 
     /// A cleanup that fails to quiesce and then fails to kill reports both,
