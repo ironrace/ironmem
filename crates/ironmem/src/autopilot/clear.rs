@@ -958,7 +958,12 @@ mod tests {
         let worktree = tempfile::tempdir().unwrap();
         // The recorded root (PID 1234 in the fixture) has exited.
         let (a, _) = testing::invocation(artifacts_dir.path());
-        let started = (chrono::Utc::now() - chrono::Duration::seconds(60)).to_rfc3339();
+        // Just before the `sleep` below, which is all the window needs. Not a
+        // minute: on Linux a start is counted from boot, and a CI VM (or a
+        // Docker VM just restarted) may have booted under a minute ago, when
+        // a start before boot reads as unknown and the clear refuses for that
+        // reason instead.
+        let started = (chrono::Utc::now() - chrono::Duration::seconds(2)).to_rfc3339();
         write_raw(
             &db,
             &serde_json::json!({
