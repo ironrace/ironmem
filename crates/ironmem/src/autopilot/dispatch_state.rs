@@ -579,6 +579,10 @@ pub fn all_dispatch_states(db: &Database, limit: usize) -> Result<Vec<DispatchSt
 pub(crate) struct DispatchStateScan {
     /// The drawers that read as dispatch states.
     pub states: Vec<DispatchState>,
+    /// Each readable drawer exactly as stored, with its parsed claim
+    /// (owner token and lease included), for a caller that must clear
+    /// against the bytes it judged rather than a later re-read.
+    pub claims: Vec<(String, Claim)>,
     /// The logical key ([`dispatch_state_key`]) of each drawer that did not,
     /// with why: corrupt, refused by [`DispatchState::validate`], or written
     /// by a newer binary (an implementer this one does not know). Any of them
@@ -602,8 +606,11 @@ pub(crate) fn scan_dispatch_states(
     let drawers = db.get_drawers_by_source_prefix(super::WING, super::ROOM, &prefix, limit)?;
     let mut scan = DispatchStateScan::default();
     for drawer in drawers {
-        match state_from_content(&drawer.content) {
-            Ok(state) => scan.states.push(state),
+        match claim_from_content(&drawer.content) {
+            Ok(claim) => {
+                scan.states.push(claim.state.clone());
+                scan.claims.push((drawer.content.clone(), claim));
+            }
             // Scrubbed and bounded once, here: a parse error can quote the
             // drawer, and every reader (the queue, reconcile, the tick's
             // problems) reports it.
@@ -1157,6 +1164,27 @@ mod tests {
             why.contains("Claude state carrying supervised-CLI invocation artifacts"),
             "{why}"
         );
+    }
+
+    /// R7: a scan keeps each readable drawer's raw bytes with its parsed
+    /// claim, so a caller can clear against exactly what it judged.
+    #[test]
+    fn a_scan_keeps_the_raw_bytes_of_each_claim_it_reads() {
+        let db = Database::open_in_memory().unwrap();
+        let issue = IssueRef::new("ironrace/ironmem", 283);
+        let claim = bare(sample(&issue, 1), Some("owner-a"));
+        assert!(claim_if_unchanged(&db, None, &claim).unwrap());
+        let scan = scan_dispatch_states(&db, 100).unwrap();
+        assert_eq!(scan.claims.len(), 1);
+        let (raw, scanned) = &scan.claims[0];
+        assert_eq!(scanned, &normalized(&claim).unwrap());
+        assert_eq!(raw_dispatch_state(&db, &issue).unwrap().as_deref(), Some(raw.as_str()));
+        // Rewritten identically but for its owner since the scan: the
+        // scanned bytes no longer clear it.
+        let theirs = bare(sample(&issue, 1), Some("owner-b"));
+        assert!(claim_if_unchanged(&db, Some(&claim), &theirs).unwrap());
+        assert!(!clear_raw_dispatch_state_if_unchanged(&db, &issue, raw).unwrap());
+        assert!(get_claim(&db, &issue).unwrap().is_some());
     }
 
     #[test]

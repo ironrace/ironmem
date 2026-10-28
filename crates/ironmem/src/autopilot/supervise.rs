@@ -1352,8 +1352,11 @@ pub fn reconcile(
     // A drawer that cannot be read (corrupt, or written by a newer binary)
     // may name a live invocation: it is reported as a hold, and while one
     // cannot be read no live session or marker can be proven an orphan.
-    let dispatch_state::DispatchStateScan { states, unreadable } =
-        dispatch_state::scan_dispatch_states(db, MAX_IN_FLIGHT_DISPATCH_STATES)?;
+    let dispatch_state::DispatchStateScan {
+        states,
+        unreadable,
+        ..
+    } = dispatch_state::scan_dispatch_states(db, MAX_IN_FLIGHT_DISPATCH_STATES)?;
     let mut out = Vec::new();
     for (key, why) in &unreadable {
         out.push(Reconciliation {

@@ -443,6 +443,7 @@ pub fn plan_queue(
     let dispatch_state::DispatchStateScan {
         states: in_flight,
         unreadable,
+        ..
     } = dispatch_state::scan_dispatch_states(db, IN_FLIGHT_SCAN_LIMIT)?;
 
     // The same predicate `run_issue` uses, deliberately spelled the same way

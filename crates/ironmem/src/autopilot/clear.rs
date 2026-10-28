@@ -530,8 +530,13 @@ pub fn release_settled_dispatches(
     attempt_cap: u32,
 ) -> Result<Vec<IssueRef>, MemoryError> {
     let mut released = Vec::new();
-    for state in dispatch_state::all_dispatch_states(db, super::queue::IN_FLIGHT_SCAN_LIMIT)? {
-        if snapshots.liveness(&state) != Liveness::NotListed {
+    // Judged as scanned (raw bytes plus parsed claim), and cleared
+    // against those same bytes: a claim rewritten since, identically
+    // but for its owner, is a live run's, not this release's (R7).
+    let scan = dispatch_state::scan_dispatch_states(db, super::queue::IN_FLIGHT_SCAN_LIMIT)?;
+    for (raw, claim) in &scan.claims {
+        let state = &claim.state;
+        if snapshots.liveness(state) != Liveness::NotListed {
             continue;
         }
         // A session parked as still in use waits for an operator, who knows
@@ -563,20 +568,15 @@ pub fn release_settled_dispatches(
         if !finished || unrecorded {
             continue;
         }
-        // Exactly the drawer judged, owner token included, and only while no
-        // controller holds the issue: one that does may be about to launch.
-        let Some(raw) = dispatch_state::raw_dispatch_state(db, &state.issue)? else {
+        // Exactly the drawer judged as scanned, owner token included, and
+        // only while no controller holds the issue: one that does may be
+        // about to launch.
+        let parsed = dispatch_state::Parsed::Readable(Box::new(state.clone()));
+        let Ok(_lock) = controller_lock(&state.issue, &parsed, raw) else {
             continue;
         };
-        let parsed = dispatch_state::parse_dispatch_state(&raw);
-        if !matches!(&parsed, dispatch_state::Parsed::Readable(read) if **read == state) {
-            continue;
-        }
-        let Ok(_lock) = controller_lock(&state.issue, &parsed, &raw) else {
-            continue;
-        };
-        if dispatch_state::clear_raw_dispatch_state_if_unchanged(db, &state.issue, &raw)? {
-            released.push(state.issue);
+        if dispatch_state::clear_raw_dispatch_state_if_unchanged(db, &state.issue, raw)? {
+            released.push(state.issue.clone());
         }
     }
     Ok(released)
