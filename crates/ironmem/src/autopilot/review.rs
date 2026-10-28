@@ -517,13 +517,6 @@ fn reviewer_binary_in(
     crate::launcher::find_launcher(harness.binary(), path_var)
 }
 
-/// A scratch directory holding the schema and last-message files for one
-/// review, removed on drop.
-///
-/// Hand-rolled rather than `tempfile::TempDir` because `tempfile` is a
-/// dev-dependency here (see `Cargo.toml`'s note on keeping it out of release
-/// builds), and pulling it into `[dependencies]` for two files would change
-/// what every release build compiles.
 /// Write `bytes` to a new file at `path` readable by its owner only.
 fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
@@ -537,6 +530,13 @@ fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     options.open(path)?.write_all(bytes)
 }
 
+/// A scratch directory holding the schema and last-message files for one
+/// review, removed on drop.
+///
+/// Hand-rolled rather than `tempfile::TempDir` because `tempfile` is a
+/// dev-dependency here (see `Cargo.toml`'s note on keeping it out of release
+/// builds), and pulling it into `[dependencies]` for two files would change
+/// what every release build compiles.
 struct ScratchDir {
     path: PathBuf,
 }

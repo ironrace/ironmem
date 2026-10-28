@@ -8,7 +8,7 @@
 //! worktree is touched before it.
 //!
 //! So each controller takes `flock(LOCK_EX | LOCK_NB)` on
-//! `<git common dir>/ironmem/autopilot/locks/<slug>.lock` before it checks
+//! `<git common dir>/ironmem/autopilot/locks/<slug>-<hash>.lock` before it checks
 //! the issue, and holds it until the run ends, dispatch included. One that
 //! cannot take it does not provision: the Lead skips the issue for the tick,
 //! a manual run refuses, and `clear-dispatch` refuses. The kernel releases a
@@ -30,7 +30,13 @@
 //!   a run that lost the issue launches and writes nothing more;
 //! - a Claude run still adopts another run's claim only once its lease
 //!   (`dispatch_state::CLAIM_LEASE`) has lapsed and fresh evidence shows its
-//!   IC idle;
+//!   IC idle; the lease is renewed as soon as a dispatch returns, before
+//!   its outcome is recorded, so a lapsed lease in the post-run window
+//!   means the controller is gone;
+//! - the lease, and track 2's launch window alike, assume the controller
+//!   is not suspended (SIGSTOP, or the host asleep) between its last
+//!   ownership check and its exec or identity write; a clock jump has the
+//!   same exposure, and no lease length closes it;
 //! - a Codex or Muse run still adopts a published invocation only on process
 //!   evidence, but an invocation published and not yet spawned shows none,
 //!   so between another run's claim and its spawn a second implementer can

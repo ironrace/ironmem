@@ -1477,12 +1477,6 @@ fn default_worktree_root() -> Result<std::path::PathBuf, MemoryError> {
     Ok(home.join(".ironrace-memory").join("autopilot-worktrees"))
 }
 
-/// Load config, open, and migrate the database — the sequence every
-/// `Autopilot` subcommand handler needs before touching storage. Several
-/// other command handlers in this file repeat the same three-line sequence
-/// inline rather than through a shared helper; that pre-existing duplication
-/// is out of scope here, but the new `Autopilot` arms at least don't add
-/// to it.
 /// [`open_migrated_db`] for an Autopilot controller (a Lead, a manual run,
 /// clear-dispatch), which refuses a database on a remote filesystem: SQLite
 /// and the controllers' coordination hold on one host only.
@@ -1492,6 +1486,12 @@ fn open_controller_db(db: Option<String>) -> Result<ironmem::db::schema::Databas
     open_migrated_db(db)
 }
 
+/// Load config, open, and migrate the database — the sequence every
+/// `Autopilot` subcommand handler needs before touching storage. Several
+/// other command handlers in this file repeat the same three-line sequence
+/// inline rather than through a shared helper; that pre-existing duplication
+/// is out of scope here, but the new `Autopilot` arms at least don't add
+/// to it.
 fn open_migrated_db(db: Option<String>) -> Result<ironmem::db::schema::Database, MemoryError> {
     let cfg = config::Config::load(db)?;
     let database = ironmem::db::schema::Database::open(&cfg.db_path)?;
