@@ -5705,8 +5705,26 @@ pub(crate) mod tests {
         let pid = child.id();
         let pinned = PinnedProcess::open(pid).unwrap().expect("the child runs");
         assert_eq!(pinned.pid, pid);
+        // A kernel before 5.3 (ENOSYS), or a seccomp filter (EPERM), has no
+        // pidfds: the fallback to kill(2) is all there is to test there.
         #[cfg(target_os = "linux")]
-        assert!(pinned.fd.is_some(), "no pidfd on Linux");
+        if pinned.fd.is_none() {
+            // SAFETY: pidfd_open with a PID and no flags; a descriptor it
+            // returns is closed at once.
+            let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as i32, 0) };
+            let error = std::io::Error::last_os_error();
+            if fd >= 0 {
+                // SAFETY: the descriptor just opened.
+                unsafe { libc::close(fd as i32) };
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            if matches!(error.raw_os_error(), Some(libc::ENOSYS | libc::EPERM)) && fd < 0 {
+                eprintln!("skipped: this kernel offers no pidfd ({error})");
+                return;
+            }
+            panic!("no pidfd for a running child: {error}");
+        }
         let born = birth(pid).unwrap().unwrap();
         let mut tracker = ProcessTracker::owning_every_descendant(pid);
         tracker.enrol(process_row(pid, std::process::id(), pid), born);
