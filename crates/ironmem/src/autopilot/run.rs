@@ -5449,20 +5449,11 @@ sleep 0.5
             .map_err(|fault| fault.to_string())
     }
 
+    /// Fixture git ([`crate::autopilot::test_git`]): no global or system
+    /// config (a signing key there let a commit that CI cannot sign pass
+    /// locally), success asserted, trimmed stdout returned.
     fn git_in(repo: &Path, args: &[&str]) -> String {
-        let mut c = std::process::Command::new("git");
-        crate::mcp::tools::scrub_git_environment(&mut c);
-        // The fixtures never read the operator's global or system config: a
-        // signing key there let a commit that CI cannot sign pass locally.
-        c.env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_NOSYSTEM", "1");
-        let out = c.args(args).current_dir(repo).output().unwrap();
-        assert!(
-            out.status.success(),
-            "git {args:?}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        String::from_utf8_lossy(&out.stdout).trim().to_string()
+        crate::autopilot::test_git::run(repo, args)
     }
 
     /// Commit `file` in `repo` with `extra` leading git args; returns the new HEAD.
@@ -5909,6 +5900,8 @@ sleep 0.5
     fn a_guard_with_no_home_warns_about_it_exactly_once() {
         let (_dir, wt) = fixture_worktree();
         // Only where git cannot read the global config without `$HOME`.
+        // Not fixture git: this probes the operator's own git, whose global
+        // config is the point, and it only reads.
         let mut probe = std::process::Command::new("git");
         crate::mcp::tools::scrub_git_environment(&mut probe);
         let probe = probe
@@ -6543,9 +6536,7 @@ sleep 0.5
             }
             script.push('\n');
         }
-        let mut command = std::process::Command::new("git");
-        crate::mcp::tools::scrub_git_environment(&mut command);
-        let mut child = command
+        let mut child = crate::autopilot::test_git::command()
             .args(["fast-import", "--quiet"])
             .current_dir(&wt.path)
             .stdin(std::process::Stdio::piped())
@@ -6974,14 +6965,11 @@ sleep 0.5
             format!("branch.{}.ironmemSigning", wt.branch),
             "ironmem.autopilotSigning".to_string(),
         ] {
-            let mut c = std::process::Command::new("git");
-            crate::mcp::tools::scrub_git_environment(&mut c);
-            let out = c
-                .args(["config", "--get", &key])
-                .current_dir(&wt.path)
-                .output()
-                .unwrap();
-            assert_eq!(out.status.code(), Some(1), "{key} was written");
+            assert_eq!(
+                crate::autopilot::test_git::config_get(&wt.path, &key),
+                None,
+                "{key} was written"
+            );
         }
     }
 
@@ -7573,14 +7561,11 @@ sleep 0.5
         assert!(matches!(run.terminal, TerminalReason::Met { .. }));
         let branch_flag = format!("branch.{}.ironmemSigning", wt.branch);
         for key in [branch_flag.as_str(), "ironmem.autopilotSigning"] {
-            let mut c = std::process::Command::new("git");
-            crate::mcp::tools::scrub_git_environment(&mut c);
-            let out = c
-                .args(["config", "--get", key])
-                .current_dir(&wt.path)
-                .output()
-                .unwrap();
-            assert_eq!(out.status.code(), Some(1), "no {key} may be recorded");
+            assert_eq!(
+                crate::autopilot::test_git::config_get(&wt.path, key),
+                None,
+                "no {key} may be recorded"
+            );
         }
     }
 

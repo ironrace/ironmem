@@ -1532,10 +1532,11 @@ pub(crate) mod contract_tests {
     use crate::autopilot::IssueRef;
 
     pub(crate) const THREAD: &str = "11111111-2222-3333-4444-555555555555";
+    /// Fixture git ([`crate::autopilot::test_git`]) in `repo`; each caller
+    /// asserts its status.
     fn git(repo: &Path) -> std::process::Command {
-        let mut command = std::process::Command::new("git");
+        let mut command = crate::autopilot::test_git::command();
         command.current_dir(repo);
-        crate::mcp::tools::scrub_git_environment(&mut command);
         command
     }
     pub(crate) fn setup() -> (tempfile::TempDir, DispatchSpec) {

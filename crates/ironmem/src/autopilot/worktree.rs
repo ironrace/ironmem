@@ -1474,31 +1474,11 @@ pub(crate) mod testing {
 mod tests {
     use super::testing::with_captured_log;
     use super::*;
+    use crate::autopilot::test_git;
 
-    /// [`git_command`] for the fixtures' own git: never the operator's
-    /// global or system config (a signing key or hook there would let a
-    /// fixture pass locally that fails in CI). Set after the scrub, which
-    /// removes every inherited `GIT_*` variable.
-    fn fixture_git() -> Command {
-        let mut command = git_command();
-        command
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_NOSYSTEM", "1");
-        command
-    }
-
+    /// Fixture git ([`crate::autopilot::test_git`]), asserting success.
     fn run(cwd: &Path, args: &[&str]) {
-        let output = fixture_git()
-            .args(args)
-            .current_dir(cwd)
-            .output()
-            .expect("git should be runnable in tests");
-        assert!(
-            output.status.success(),
-            "git {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr)
-        );
+        test_git::output(cwd, args);
     }
 
     /// A real single-commit git repo. These tests drive the actual `git`
@@ -1540,34 +1520,17 @@ mod tests {
         IssueRef::new("ironrace/ironmem", 283)
     }
 
-    /// The fixtures' own git never reads the operator's global or system
-    /// config, and their repos use the files ref backend, which tests that
-    /// hold a ref's lock file rely on.
+    /// Fixture repos use the files ref backend, which tests that hold a
+    /// ref's lock file rely on.
     #[test]
-    fn fixture_git_never_reads_the_operators_config_and_uses_files_refs() {
-        let command = fixture_git();
-        let envs: Vec<_> = command.get_envs().collect();
-        assert!(
-            envs.contains(&(
-                std::ffi::OsStr::new("GIT_CONFIG_GLOBAL"),
-                Some(std::ffi::OsStr::new("/dev/null"))
-            )),
-            "{envs:?}"
-        );
-        assert!(
-            envs.contains(&(
-                std::ffi::OsStr::new("GIT_CONFIG_NOSYSTEM"),
-                Some(std::ffi::OsStr::new("1"))
-            )),
-            "{envs:?}"
-        );
+    fn fixture_repos_use_files_refs() {
         let repo = fixture_repo();
         assert!(repo.path().join(".git/refs/heads").is_dir());
         assert!(!repo.path().join(".git/reftable").exists());
     }
 
     fn read_config(repo: &Path, key: &str) -> Option<String> {
-        git(repo, &["config", "--get", key]).ok()
+        test_git::config_get(repo, key)
     }
 
     fn issue_cut_key() -> String {
@@ -1653,8 +1616,8 @@ mod tests {
         run(repo.path(), &["config", "--unset", &issue_cut_key()]);
         drop_issue_reflog(repo.path());
         // A base that shares no history with the branch.
-        let tree = git(repo.path(), &["mktree"]).unwrap();
-        let orphan = git(repo.path(), &["commit-tree", &tree, "-m", "orphan"]).unwrap();
+        let tree = test_git::run(repo.path(), &["mktree"]);
+        let orphan = test_git::run(repo.path(), &["commit-tree", &tree, "-m", "orphan"]);
         let err = ensure_worktree(repo.path(), roots.path(), &issue(), &orphan)
             .unwrap_err()
             .to_string();
@@ -1869,11 +1832,7 @@ mod tests {
             assert!(err.contains("cannot resolve the base"), "got: {err}");
             assert!(err.contains(base), "got: {err}");
             assert!(!worktree_path(roots.path(), &issue()).exists());
-            assert!(!git_ok(
-                repo.path(),
-                &["rev-parse", "--verify", "--quiet", &branch_name(&issue())]
-            )
-            .unwrap());
+            assert!(!test_git::verifies(repo.path(), &branch_name(&issue())));
         }
     }
 
@@ -2374,16 +2333,10 @@ mod tests {
         assert_eq!(err.matches("Validation error").count(), 1, "got: {err}");
         // The cut is written first, so a branch never exists without one.
         assert!(!worktree_path(roots.path(), &issue()).exists());
-        assert!(!git_ok(
+        assert!(!test_git::verifies(
             repo.path(),
-            &[
-                "rev-parse",
-                "--verify",
-                "--quiet",
-                &format!("refs/heads/{}", branch_name(&issue()))
-            ]
-        )
-        .unwrap());
+            &format!("refs/heads/{}", branch_name(&issue()))
+        ));
     }
 
     #[test]
@@ -2405,7 +2358,7 @@ mod tests {
         assert!(wt.created);
         assert!(wt.quarantined_from.is_none());
         assert!(wt.path.join("README.md").is_file());
-        let head = git(&wt.path, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap();
+        let head = test_git::run(&wt.path, &["rev-parse", "--abbrev-ref", "HEAD"]);
         assert_eq!(head, "autopilot/ironrace-ironmem-283");
     }
 
@@ -2473,9 +2426,9 @@ mod tests {
             "quarantine must preserve the dead IC's work, not delete it"
         );
         // And the branch is free: the replacement, not the quarantine, holds it.
-        let head = git(&second.path, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap();
+        let head = test_git::run(&second.path, &["rev-parse", "--abbrev-ref", "HEAD"]);
         assert_eq!(head, branch_name(&issue()));
-        let quarantined_head = git(&quarantined, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap();
+        let quarantined_head = test_git::run(&quarantined, &["rev-parse", "--abbrev-ref", "HEAD"]);
         assert_eq!(
             quarantined_head, "HEAD",
             "the quarantined copy must be detached"
@@ -2653,7 +2606,7 @@ mod tests {
         ensure_worktree(repo.path(), roots.path(), &issue(), "HEAD").unwrap();
         remove_worktree(repo.path(), roots.path(), &issue()).unwrap();
 
-        let branches = git(repo.path(), &["branch", "--list", &branch_name(&issue())]).unwrap();
+        let branches = test_git::run(repo.path(), &["branch", "--list", &branch_name(&issue())]);
         assert!(
             branches.contains(&branch_name(&issue())),
             "branch survives removal, got {branches:?}"

@@ -29,6 +29,25 @@ impl Drop for KillOnDrop {
     }
 }
 
+/// Fixture git reads no global or system config; the binary under test is
+/// left to read whatever its environment gives it.
+#[test]
+fn fixture_git_reads_no_global_config_but_the_binary_under_test_does() {
+    let mut fixture = Command::new("git");
+    autopilot_support::fixture_git_env(&mut fixture);
+    let fixture: Vec<_> = fixture.get_envs().collect();
+    let binary = ironmem();
+    let binary: Vec<_> = binary.get_envs().collect();
+    for (key, value) in [
+        ("GIT_CONFIG_GLOBAL", "/dev/null"),
+        ("GIT_CONFIG_NOSYSTEM", "1"),
+    ] {
+        let set = (std::ffi::OsStr::new(key), Some(std::ffi::OsStr::new(value)));
+        assert!(fixture.contains(&set), "{key}: {fixture:?}");
+        assert!(!binary.contains(&set), "{key}: {binary:?}");
+    }
+}
+
 #[test]
 fn public_run_defaults_to_claude_and_passes_the_claude_default_model() {
     let root = tempfile::tempdir().unwrap();

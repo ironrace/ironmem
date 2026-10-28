@@ -1191,18 +1191,7 @@ mod tests {
     /// A real git checkout, so `ensure_worktree` has something to cut from.
     fn git_repo(dir: &Path) {
         let run = |args: &[&str]| {
-            let mut command = std::process::Command::new("git");
-            crate::mcp::tools::scrub_git_environment(&mut command);
-            let status = command
-                .args(args)
-                .current_dir(dir)
-                .output()
-                .expect("git must be available");
-            assert!(
-                status.status.success(),
-                "git {args:?} failed: {}",
-                String::from_utf8_lossy(&status.stderr)
-            );
+            crate::autopilot::test_git::output(dir, args);
         };
         run(&["init", "--initial-branch=main"]);
         run(&["config", "user.email", "test@example.com"]);

@@ -1552,14 +1552,7 @@ mod tests {
     fn checkout_with_worktree() -> (tempfile::TempDir, tempfile::TempDir) {
         let repo = tempfile::tempdir().unwrap();
         let run = |args: &[&str]| {
-            let mut command = std::process::Command::new("git");
-            crate::mcp::tools::scrub_git_environment(&mut command);
-            let out = command
-                .args(args)
-                .current_dir(repo.path())
-                .output()
-                .expect("git must be available");
-            assert!(out.status.success(), "git {args:?}");
+            crate::autopilot::test_git::output(repo.path(), args);
         };
         run(&["init", "--initial-branch=main"]);
         run(&["config", "user.email", "t@example.com"]);

@@ -35,7 +35,8 @@ const ATTEMPT_CAP: u32 = 5;
 /// so an inherited one aims these calls at whatever repo the environment
 /// names. This suite is threaded and another module's tests set `GIT_DIR`
 /// process-wide, so the variables are stripped here the way
-/// `autopilot::worktree`'s own `git_command` strips them.
+/// `autopilot::worktree`'s own `git_command` strips them. Fixture git only:
+/// the code under test runs its own.
 fn git(dir: &Path, args: &[&str]) {
     let mut command = std::process::Command::new("git");
     for (key, _) in std::env::vars_os() {
@@ -47,6 +48,11 @@ fn git(dir: &Path, args: &[&str]) {
             command.env_remove(key);
         }
     }
+    // And no global or system config: the operator's may sign commits with
+    // their key, run their hooks, or change a default this fixture relies on.
+    command
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1");
     let out = command
         .args(args)
         .current_dir(dir)

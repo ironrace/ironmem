@@ -2622,17 +2622,7 @@ not json at all
     fn fixture_repo(branch: &str) -> (tempfile::TempDir, String) {
         let dir = tempfile::tempdir().unwrap();
         let run = |args: &[&str]| {
-            let out = std::process::Command::new("git")
-                .args(args)
-                .current_dir(dir.path())
-                .output()
-                .expect("git should be runnable in tests");
-            assert!(
-                out.status.success(),
-                "git {} failed: {}",
-                args.join(" "),
-                String::from_utf8_lossy(&out.stderr)
-            );
+            crate::autopilot::test_git::output(dir.path(), args);
         };
         run(&["init", "-q", "-b", branch]);
         std::fs::write(dir.path().join("README.md"), "hello").unwrap();
@@ -2646,12 +2636,7 @@ not json at all
             "-qm",
             "init",
         ]);
-        let out = std::process::Command::new("git")
-            .args(["rev-parse", "HEAD"])
-            .current_dir(dir.path())
-            .output()
-            .unwrap();
-        let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let sha = crate::autopilot::test_git::run(dir.path(), &["rev-parse", "HEAD"]);
         (dir, sha)
     }
 
@@ -3361,19 +3346,11 @@ not json at all
             vec!["config", "user.email", "t@example.com"],
             vec!["config", "user.name", "t"],
         ] {
-            std::process::Command::new("git")
-                .args(&args)
-                .current_dir(repo)
-                .output()
-                .unwrap();
+            crate::autopilot::test_git::output(repo, &args);
         }
         std::fs::write(repo.join("tracked.txt"), "original\n").unwrap();
         for args in [vec!["add", "-A"], vec!["commit", "-qm", "seed"]] {
-            std::process::Command::new("git")
-                .args(&args)
-                .current_dir(repo)
-                .output()
-                .unwrap();
+            crate::autopilot::test_git::output(repo, &args);
         }
 
         let event = muse_terminal_event(
@@ -3423,11 +3400,7 @@ not json at all
         let repo = &dir.path().join("repo");
         std::fs::create_dir(repo).unwrap();
         let git = |args: &[&str]| {
-            std::process::Command::new("git")
-                .args(args)
-                .current_dir(repo)
-                .output()
-                .unwrap();
+            crate::autopilot::test_git::output(repo, args);
         };
         git(&["init", "-q"]);
         git(&["config", "user.email", "t@example.com"]);
@@ -3441,8 +3414,11 @@ not json at all
         );
         // Edits, commits, and reports a clean PASS — a spotless worktree with
         // the reviewer's own work now on the branch.
+        // The stub's own git reads no global or system config either: the
+        // operator's would sign its commit with their key and run their hooks.
         let script = format!(
             "#!/bin/sh\n\
+             export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1\n\
              cd \"{repo}\"\n\
              echo MUTATED > tracked.txt\n\
              git add tracked.txt\n\
@@ -3462,11 +3438,7 @@ not json at all
         .unwrap();
 
         assert!(
-            std::process::Command::new("git")
-                .args(["status", "--porcelain"])
-                .current_dir(repo)
-                .output()
-                .unwrap()
+            crate::autopilot::test_git::output(repo, &["status", "--porcelain"])
                 .stdout
                 .is_empty(),
             "the premise: the tree the reviewer left behind is clean"
@@ -3492,11 +3464,7 @@ not json at all
             vec!["config", "user.email", "t@example.com"],
             vec!["config", "user.name", "t"],
         ] {
-            std::process::Command::new("git")
-                .args(&args)
-                .current_dir(repo)
-                .output()
-                .unwrap();
+            crate::autopilot::test_git::output(repo, &args);
         }
         std::fs::write(repo.join("untracked.txt"), "left behind\n").unwrap();
 

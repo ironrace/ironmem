@@ -252,6 +252,8 @@ pub mod run;
 pub mod scrub;
 pub mod stagnation;
 pub mod supervise;
+#[cfg(test)]
+pub(crate) mod test_git;
 pub mod turn_prompt;
 pub mod worktree;
 

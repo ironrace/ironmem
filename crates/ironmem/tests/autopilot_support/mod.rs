@@ -49,10 +49,21 @@ pub fn ironmem() -> Command {
     command
 }
 
-/// Run git in `dir` with `GIT_*` stripped, asserting it succeeds.
+/// [`scrub_git_env`] for a fixture's own git, which also reads no global or
+/// system config: the operator's may sign commits with their key, run their
+/// hooks, or change a default a fixture relies on. Never for the ironmem
+/// binary under test ([`ironmem`]), whose git behaviour is what the tests
+/// check.
+pub fn fixture_git_env(command: &mut Command) -> &mut Command {
+    scrub_git_env(command)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+}
+
+/// Run fixture git in `dir` ([`fixture_git_env`]), asserting it succeeds.
 pub fn git(dir: &Path, args: &[&str]) -> Output {
     let mut command = Command::new("git");
-    scrub_git_env(&mut command);
+    fixture_git_env(&mut command);
     let output = command.args(args).current_dir(dir).output().unwrap();
     assert!(
         output.status.success(),
