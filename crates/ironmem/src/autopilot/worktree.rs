@@ -728,25 +728,23 @@ fn backfill_cut(
 /// The cut is written first, with this call's owner token
 /// ([`cut_owner_key`]): a held config lock then fails before anything exists.
 /// A branch that appeared since the caller looked (another controller created
-/// it) is refused, never given this call's cut. `base` is passed to git as
-/// written, so a remote-tracking base still sets the upstream. Once the add
-/// has made the branch at `cut`, the cut is read back and recorded again if
-/// another controller's take-back removed it meanwhile.
+/// it) is refused, never given this call's cut. The add names `cut` itself,
+/// never `base`: git would resolve a ref name again, and a `base` that moved
+/// since `cut` was resolved would make the branch somewhere else. So the
+/// branch is made at `cut` by construction, and nothing is ever rolled back
+/// ([`settle_created`]). A remote-tracking `base` still gives the branch
+/// that upstream ([`set_upstream`]).
 ///
 /// If `git worktree add` fails, whether the branch exists decides:
 ///
 /// - It does not: the cut is taken back, unless another controller has since
 ///   written its own, or the same value as its own ([`take_back_cut`]).
 /// - It does, at `cut`: the cut stays. Either this add made the branch and
-///   then failed (a held lock on the upstream write), or another controller
-///   made it from the same commit; either way `cut` is its cut, and the next
-///   run reuses it.
+///   then failed, or another controller made it from the same commit; either
+///   way `cut` is its cut, and the next run reuses it.
 /// - It does, elsewhere: another controller made it from another base. If
 ///   the recorded cut is still this call's, it is replaced by the branch's own
 ///   ([`infer_cut`]); a value the other controller wrote is left alone.
-///
-/// If the new branch's tip is not `cut` (`base` moved after it was resolved)
-/// or cannot be read, the creation is rolled back ([`roll_back_creation`]).
 fn create_branch(
     root: &Path,
     branch: &str,
@@ -792,22 +790,90 @@ fn create_branch_with(
     write_cut(root, branch, cut)?;
     before_add();
     let path_str = path.to_string_lossy().to_string();
-    if let Err(e) = git(root, &["worktree", "add", "-b", branch, &path_str, base]) {
+    if let Err(e) = git(root, &["worktree", "add", "-b", branch, &path_str, cut]) {
         return Err(after_failed_add(root, branch, base, cut, &owner, e));
     }
-    let tip = resolve_commit(root, &format!("refs/heads/{branch}"));
-    let problem = match &tip {
-        Some(tip) if tip == cut => return record_cut_again_if_taken(root, branch, cut),
+    settle_created(root, branch, base, cut)
+}
+
+/// Finish a `branch` this call's add just made at `cut`: give it `base`'s
+/// upstream ([`set_upstream`]), and record `cut` again if another
+/// controller's take-back removed it ([`record_cut_again_if_taken`]).
+///
+/// Nothing here deletes or removes anything. The add named `cut`, so a tip
+/// that is not `cut` is someone's work on the branch (another controller
+/// reusing the fresh worktree), and a tip that cannot be read is no proof of
+/// anything: either way the branch, its worktree and its cut are kept, and
+/// the run stops so that the next one reuses them.
+fn settle_created(root: &Path, branch: &str, base: &str, cut: &str) -> Result<(), MemoryError> {
+    let kept = "the branch, its worktree and its cut are kept; run again to reuse them";
+    match resolve_commit(root, &format!("refs/heads/{branch}")) {
+        Some(tip) if tip == cut => {}
         Some(tip) => {
-            format!("it landed on {tip}, not on {cut}, which `{base}` resolved to a moment earlier")
+            return Err(MemoryError::Validation(format!(
+                "the issue branch `{branch}` was just created at {cut} in {}, but it already \
+                 reads {tip}, so another controller is working on it; {kept}",
+                root.display()
+            )))
         }
-        None => "its tip could not be read back".to_string(),
+        None => {
+            return Err(MemoryError::Validation(format!(
+                "the issue branch `{branch}` was just created at {cut} in {}, but its tip could \
+                 not be read back; {kept}",
+                root.display()
+            )))
+        }
+    }
+    set_upstream(root, branch, base);
+    record_cut_again_if_taken(root, branch, cut)
+}
+
+/// Give a `branch` just made at `base`'s sha the upstream `git worktree add
+/// -b <branch> <path> <base>` would have given it: a remote-tracking `base`
+/// becomes its upstream (`branch.<branch>.remote` and `.merge`, plus
+/// `.rebase` under `branch.autoSetupRebase`, as measured), unless
+/// `branch.autoSetupMerge` is `false` or `inherit` (a remote-tracking ref has
+/// no upstream of its own to inherit), or is `simple` and the upstream's name
+/// is not the branch's. A local `base` gets none, as `-b` gives it by default;
+/// `always`'s upstream on a local base is not reproduced.
+///
+/// A failed write (a config lock held past [`config_waiting`]'s retries)
+/// only warns. Autopilot never reads the upstream: it checks the branch
+/// against its recorded cut and the remote refs, and any push it asks for
+/// names the remote and branch. The branch at its cut is correct without
+/// one, and failing the run would only leave the same branch for the next
+/// run to reuse, still with no upstream.
+fn set_upstream(root: &Path, branch: &str, base: &str) {
+    let Ok(full) = git(root, &["rev-parse", "--symbolic-full-name", base]) else {
+        return;
     };
-    let rolled_back = roll_back_creation(root, branch, &path_str, tip.as_deref());
-    Err(MemoryError::Validation(format!(
-        "the issue branch `{branch}` was just created in {}, but {problem}; {rolled_back}",
-        root.display()
-    )))
+    let Some(tracked) = full.strip_prefix("refs/remotes/") else {
+        return;
+    };
+    let mode = config_get(root, &["--get", "branch.autoSetupMerge"])
+        .ok()
+        .flatten()
+        .map(|mode| mode.to_ascii_lowercase());
+    let wanted = match mode.as_deref() {
+        Some("false" | "no" | "off" | "0" | "inherit") => false,
+        Some("simple") => tracked
+            .split_once('/')
+            .is_some_and(|(_, name)| name == branch),
+        _ => true,
+    };
+    if !wanted {
+        return;
+    }
+    let upstream = format!("--set-upstream-to={full}");
+    if let Err(e) = config_waiting(root, &["branch", "-q", &upstream, branch], &[], |_| {}) {
+        tracing::warn!(
+            branch = %branch,
+            upstream = %full,
+            error = %e,
+            "autopilot created the issue branch at its cut but could not set its upstream; \
+             the branch and its cut are kept, and Autopilot does not need the upstream"
+        );
+    }
 }
 
 /// After this call's add made `branch` at `cut`: record `cut` again if it no
@@ -975,46 +1041,6 @@ fn keep_the_branchs_own_cut(root: &Path, branch: &str, base: &str, cut: &str, ti
                  was cut: set it with `git config {key} <sha>` before running again"
             )
         }
-    }
-}
-
-/// Undo [`create_branch`]'s `git worktree add -b`, describing the outcome.
-///
-/// The worktree is removed without `--force`: one another controller has
-/// already started using is kept, and so is the branch. `tip`, where the
-/// branch really landed, is then recorded as its cut, so the branch is never
-/// kept with a cut it was not cut from. Deleting the branch drops its config
-/// section, the cut included.
-fn roll_back_creation(root: &Path, branch: &str, path: &str, tip: Option<&str>) -> String {
-    // Kept: correct the cut to where the branch really is.
-    let recorded = || match tip {
-        Some(tip) => match write_cut(root, branch, tip) {
-            Ok(()) => format!("its cut is now recorded as its tip {tip}"),
-            Err(e) => format!(
-                "its cut could not be corrected to its tip {tip} ({e}): set it with `git config \
-                 {} {tip}`",
-                cut_key(branch)
-            ),
-        },
-        None => format!(
-            "its tip could not be read: check `{}` before running again",
-            cut_key(branch)
-        ),
-    };
-    if let Err(e) = git(root, &["worktree", "remove", path]) {
-        return format!(
-            "removing the worktree failed ({e}), so the worktree at {path} and the branch \
-             `{branch}` are kept and {}",
-            recorded()
-        );
-    }
-    match git(root, &["branch", "-D", branch]) {
-        Ok(_) => "the branch and its worktree were removed; run again".to_string(),
-        Err(e) => format!(
-            "the worktree at {path} was removed, but deleting the branch failed ({e}), so the \
-             branch `{branch}` is kept and {}",
-            recorded()
-        ),
     }
 }
 
@@ -1485,6 +1511,10 @@ mod tests {
         // Pinned: the global config signs and runs hooks; worktrees share this.
         run(path, &["config", "commit.gpgsign", "false"]);
         run(path, &["config", "core.hooksPath", "/dev/null"]);
+        // And git's defaults for the upstream a new branch gets, which the
+        // operator's global config could otherwise change.
+        run(path, &["config", "branch.autoSetupMerge", "true"]);
+        run(path, &["config", "branch.autoSetupRebase", "never"]);
         std::fs::write(path.join("README.md"), "seed\n").unwrap();
         run(path, &["add", "README.md"]);
         run(path, &["commit", "-m", "seed"]);
@@ -1835,6 +1865,51 @@ mod tests {
         )
         .unwrap();
         assert_eq!(upstream, "origin/main");
+        // The keys `worktree add -b <branch> <path> origin/main` writes
+        // (measured, git 2.55), and no others.
+        let branch = branch_name(&issue());
+        assert_eq!(
+            git(
+                repo.path(),
+                &[
+                    "config",
+                    "--get-regexp",
+                    &format!("^branch\\.{branch}\\.(remote|merge|rebase)$")
+                ]
+            )
+            .unwrap(),
+            format!("branch.{branch}.remote origin\nbranch.{branch}.merge refs/heads/main")
+        );
+    }
+
+    #[test]
+    fn a_remote_tracking_base_sets_no_upstream_when_auto_setup_merge_is_off() {
+        let (repo, _origin) = fixture_repo_with_origin();
+        run(repo.path(), &["config", "branch.autoSetupMerge", "false"]);
+        let roots = tempfile::tempdir().unwrap();
+        let wt = ensure_worktree(repo.path(), roots.path(), &issue(), "origin/main").unwrap();
+        assert_eq!(wt.cut, resolve_commit(repo.path(), "origin/main").unwrap());
+        assert_eq!(
+            read_config(
+                repo.path(),
+                &format!("branch.{}.merge", branch_name(&issue()))
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_local_base_sets_no_upstream() {
+        let repo = fixture_repo();
+        let roots = tempfile::tempdir().unwrap();
+        ensure_worktree(repo.path(), roots.path(), &issue(), "main").unwrap();
+        assert_eq!(
+            read_config(
+                repo.path(),
+                &format!("branch.{}.merge", branch_name(&issue()))
+            ),
+            None
+        );
     }
 
     #[test]
@@ -1981,11 +2056,18 @@ mod tests {
         let cut = resolve_commit(&root, "HEAD").unwrap();
         let path = worktree_path(roots.path(), &issue());
         let elsewhere = roots.path().join("elsewhere");
+        // A held lock on the branch's ref fails the other controller's add
+        // before it makes the branch (measured: exit 255, no branch). A
+        // directory already there would not: git makes the branch first.
+        let ref_lock = root.join(format!(".git/refs/heads/{branch}.lock"));
+        std::fs::create_dir_all(ref_lock.parent().unwrap()).unwrap();
         // Between this controller's cut write and its add, another records
         // the same cut as its own, fails its add with no branch made, and
         // takes its cut back: the value this controller's add relies on.
         create_branch_with(&root, &branch, &path, "HEAD", &cut, || {
-            let other = create_branch(&root, &branch, &elsewhere, "refs/heads/no-such", &cut);
+            std::fs::write(&ref_lock, "").unwrap();
+            let other = create_branch(&root, &branch, &elsewhere, "HEAD", &cut);
+            std::fs::remove_file(&ref_lock).unwrap();
             assert!(other.is_err());
             assert_eq!(read_config(&root, &issue_cut_key()), None);
         })
@@ -2008,7 +2090,7 @@ mod tests {
     }
 
     /// A repo whose `origin/main` is a remote-tracking base, so creating a
-    /// branch from it writes the upstream into `.git/config`.
+    /// branch from it sets the upstream in `.git/config`.
     fn fixture_repo_with_origin() -> (tempfile::TempDir, tempfile::TempDir) {
         let repo = fixture_repo();
         let origin = tempfile::tempdir().unwrap();
@@ -2025,39 +2107,35 @@ mod tests {
     }
 
     #[test]
-    fn a_branch_created_by_an_add_that_then_failed_keeps_its_cut() {
-        // Measured: `worktree add -b` from a remote-tracking base creates the
-        // branch, then fails on the upstream config write while another git
-        // holds `.git/config`'s lock, and exits 255 with no worktree.
+    fn an_upstream_write_a_held_config_lock_refuses_keeps_the_branch_and_its_cut() {
+        // Before, `worktree add -b` from a remote-tracking base wrote the
+        // upstream itself, and a held `.git/config` lock failed the whole add
+        // after it had made the branch. The add now names the cut's sha and
+        // writes no config; the upstream is set after it, and a refusal only
+        // warns: Autopilot never reads it.
         let (repo, _origin) = fixture_repo_with_origin();
         let roots = tempfile::tempdir().unwrap();
         let root = resolve_repo_root(repo.path()).unwrap();
         let cut = resolve_commit(&root, "origin/main").unwrap();
         let path = worktree_path(roots.path(), &issue());
+        let branch = branch_name(&issue());
         let mut lock = None;
-        let err = create_branch_with(
-            &root,
-            &branch_name(&issue()),
-            &path,
-            "origin/main",
-            &cut,
-            || {
+        let (created, log) = with_captured_log(|| {
+            create_branch_with(&root, &branch, &path, "origin/main", &cut, || {
                 lock = Some(hold_config_lock(&root));
-            },
-        );
+            })
+        });
         std::fs::remove_file(lock.unwrap()).unwrap();
-        let err = err.unwrap_err().to_string();
-        assert_eq!(
-            branch_tip(&root),
-            Some(cut.clone()),
-            "the add made the branch"
-        );
+        created.unwrap();
+        assert_eq!(branch_tip(&root), Some(cut.clone()));
+        assert!(path.is_dir(), "the worktree is kept");
         assert_eq!(
             read_config(&root, &issue_cut_key()),
             Some(cut.clone()),
             "a branch never exists without its cut"
         );
-        assert!(err.contains("kept"), "got: {err}");
+        assert_eq!(read_config(&root, &format!("branch.{branch}.merge")), None);
+        assert!(log.contains("upstream") && log.contains(&branch), "{log}");
         // The next run reuses the branch and its cut.
         let reused = ensure_worktree(repo.path(), roots.path(), &issue(), "origin/main").unwrap();
         assert_eq!(reused.cut, cut);
@@ -2065,17 +2143,16 @@ mod tests {
 
     #[test]
     fn an_add_that_failed_after_making_the_branch_never_takes_its_cut_back() {
-        // The state the upstream-lock failure leaves, without a lock that
-        // would also block the take-back: the branch at the cut, the cut
-        // recorded, the add reported failed.
+        // The state an add that made the branch and then failed leaves (git
+        // makes the branch before it checks the worktree path, measured):
+        // the branch at the cut, the cut recorded, the add reported failed.
         let repo = fixture_repo();
         let root = resolve_repo_root(repo.path()).unwrap();
         let branch = branch_name(&issue());
         let cut = resolve_commit(&root, "HEAD").unwrap();
         run(&root, &["config", &issue_cut_key(), &cut]);
         run(&root, &["branch", &branch, &cut]);
-        let failed =
-            MemoryError::Validation("unable to write upstream branch configuration".into());
+        let failed = MemoryError::Validation("fatal: '/elsewhere' already exists".into());
         let err = after_failed_add(&root, &branch, "HEAD", &cut, "owner", failed).to_string();
         assert!(err.contains("kept"), "got: {err}");
         assert_eq!(read_config(&root, &issue_cut_key()), Some(cut));
@@ -2182,37 +2259,75 @@ mod tests {
         assert!(!log.contains("no longer exists"), "{log}");
     }
 
-    #[test]
-    fn a_rollback_never_destroys_a_worktree_someone_started_using() {
-        let repo = fixture_repo();
-        let roots = tempfile::tempdir().unwrap();
-        let root = resolve_repo_root(repo.path()).unwrap();
-        let resolved = resolve_commit(&root, "HEAD").unwrap();
-        let moved = advance_operator_head(&root, "moved");
-        let branch = branch_name(&issue());
-        let path = worktree_path(roots.path(), &issue());
-        run(&root, &["config", &issue_cut_key(), &resolved]);
+    /// A worktree `git worktree add -b <branch> <path> <cut>` just made, as
+    /// [`create_branch`] makes it, with the cut recorded.
+    fn added_at_cut(root: &Path, path: &Path) -> String {
+        let cut = resolve_commit(root, "HEAD").unwrap();
+        run(root, &["config", &issue_cut_key(), &cut]);
         run(
-            &root,
+            root,
             &[
                 "worktree",
                 "add",
                 "-q",
                 "-b",
-                &branch,
+                &branch_name(&issue()),
                 path.to_str().unwrap(),
-                "HEAD",
+                &cut,
             ],
         );
+        cut
+    }
+
+    /// Greptile's race on the old rollback: a second controller reuses the
+    /// fresh, clean worktree and commits before the first reads the tip,
+    /// and the first then deleted the branch holding that commit. No delete
+    /// is left: the add names `cut` itself, so a tip that is not `cut` can
+    /// only be someone's work, which is kept. `settle_created` is what runs
+    /// between the add and anything else, so calling it after a commit
+    /// lands is that window.
+    #[test]
+    fn a_commit_landing_on_a_new_branch_right_after_its_add_is_never_deleted() {
+        let repo = fixture_repo();
+        let roots = tempfile::tempdir().unwrap();
+        let root = resolve_repo_root(repo.path()).unwrap();
+        let path = worktree_path(roots.path(), &issue());
+        let branch = branch_name(&issue());
+        let cut = added_at_cut(&root, &path);
+        let landed = commit_in(&path, "another-run");
+        let err = settle_created(&root, &branch, "HEAD", &cut)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(&branch) && err.contains(&landed), "got: {err}");
+        assert!(err.contains("run again"), "got: {err}");
+        assert_eq!(branch_tip(&root), Some(landed));
+        assert!(path.join("another-run").is_file(), "the worktree is kept");
+        assert_eq!(read_config(&root, &issue_cut_key()), Some(cut));
+    }
+
+    /// A tip that cannot be read back is no licence to delete anything.
+    #[test]
+    fn a_new_branch_whose_tip_cannot_be_read_back_keeps_everything() {
+        let repo = fixture_repo();
+        let roots = tempfile::tempdir().unwrap();
+        let root = resolve_repo_root(repo.path()).unwrap();
+        let path = worktree_path(roots.path(), &issue());
+        let branch = branch_name(&issue());
+        let cut = added_at_cut(&root, &path);
         std::fs::write(path.join("someone.txt"), "in use\n").unwrap();
-        let outcome =
-            roll_back_creation(&root, &branch, path.to_str().unwrap(), Some(moved.as_str()));
-        assert!(outcome.contains(path.to_str().unwrap()), "got: {outcome}");
-        assert!(outcome.contains(&branch), "got: {outcome}");
-        assert!(path.join("someone.txt").is_file(), "never removed by force");
-        assert_eq!(branch_tip(&root), Some(moved.clone()));
-        // Kept, so its cut is where it was really created.
-        assert_eq!(read_config(&root, &issue_cut_key()), Some(moved));
+        run(
+            &root,
+            &["update-ref", "-d", &format!("refs/heads/{branch}")],
+        );
+        let err = settle_created(&root, &branch, "HEAD", &cut)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(&branch) && err.contains("read back"),
+            "got: {err}"
+        );
+        assert!(path.join("someone.txt").is_file(), "the worktree is kept");
+        assert_eq!(read_config(&root, &issue_cut_key()), Some(cut));
     }
 
     #[test]
@@ -2242,37 +2357,23 @@ mod tests {
     }
 
     #[test]
-    fn a_base_that_moved_during_creation_rolls_the_creation_back() {
+    fn a_base_that_moves_after_it_was_resolved_still_cuts_the_branch_at_its_sha() {
         let repo = fixture_repo();
         let roots = tempfile::tempdir().unwrap();
         let root = resolve_repo_root(repo.path()).unwrap();
         let resolved = resolve_commit(&root, "HEAD").unwrap();
-        // `HEAD` moves between its resolution and `git worktree add`.
-        let moved = advance_operator_head(&root, "moved");
         let branch = branch_name(&issue());
         let path = worktree_path(roots.path(), &issue());
-        let err = create_branch(&root, &branch, &path, "HEAD", &resolved)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains(&branch), "got: {err}");
-        assert!(
-            err.contains(&resolved) && err.contains(&moved),
-            "got: {err}"
-        );
-        assert!(err.contains("just created"), "got: {err}");
-        assert!(!err.contains("--base"), "not the operator's base: {err}");
-        assert!(!path.exists(), "the worktree is rolled back");
-        assert!(!git_ok(
-            &root,
-            &[
-                "rev-parse",
-                "--verify",
-                "--quiet",
-                &format!("refs/heads/{branch}")
-            ]
-        )
-        .unwrap());
-        assert_eq!(read_config(&root, &issue_cut_key()), None);
+        let mut moved = None;
+        // `HEAD` moves between its resolution and `git worktree add`.
+        create_branch_with(&root, &branch, &path, "HEAD", &resolved, || {
+            moved = Some(advance_operator_head(&root, "moved"));
+        })
+        .unwrap();
+        assert_ne!(moved.as_deref(), Some(resolved.as_str()));
+        assert_eq!(branch_tip(&root), Some(resolved.clone()), "at the cut");
+        assert!(path.is_dir(), "nothing is rolled back");
+        assert_eq!(read_config(&root, &issue_cut_key()), Some(resolved));
     }
 
     #[test]

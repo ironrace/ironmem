@@ -567,22 +567,27 @@ model can quietly pass `-c commit.gpgsign=false`.
   SHA-256) in your checkout and stored as `branch.<branch>.ironmemCut` before
   the issue branch is created, so a branch never exists without one. A base that
   does not resolve, or a cut that cannot be stored, is refused before any
-  worktree exists. If `git worktree add` fails after making the branch (for
-  example on the upstream write while another git holds the config lock), the
-  branch keeps its cut and the next run reuses it; the cut is taken back only
-  when no branch was made, and only while both its value and the run's own token
+  worktree exists. The branch is created at that sha, never at `--base` by
+  name, so a `--base` that moves meanwhile cannot move the branch. A
+  remote-tracking `--base` still becomes its upstream, as `git worktree add -b`
+  sets one by default (not when `branch.autoSetupMerge` is `false` or
+  `inherit`); if that write fails (another git holds the config lock for longer
+  than the retries), the run logs a warning and carries on, since Autopilot
+  never uses the upstream. If `git worktree add` fails after making the branch,
+  the branch keeps its cut and the next run reuses it; the cut is taken back
+  only when no branch was made, and only while both its value and the run's own token
   in `branch.<branch>.ironmemCutOwner` still read as that run's, so a take-back
   never removes the same value another controller recorded after it. Once its
   add has made the branch, a run reads the cut back and records it again if
   another controller's take-back removed it meanwhile. A branch another
   controller creates at the same moment is never given this run's cut: the run
-  stops and asks you to run again. If `--base` moves between being resolved and
-  the branch being created, the new branch and worktree are removed again (never
-  by force: a worktree someone has started using is kept, with its cut corrected
-  to where the branch really is) and the run asks you to run again. An existing
-  branch with no recorded cut (an older branch) gets the commit its reflog says
-  it was created from, or, without that entry, the merge base of the branch and
-  `--base`; never `--base` itself, which may have moved. That run logs a warning
+  stops and asks you to run again. A run never deletes a branch or worktree it
+  has just created: if the new branch already holds someone else's commit, or
+  its tip cannot be read back, the run stops, keeps both with their cut, and
+  asks you to run again. An existing branch with no recorded cut (an older
+  branch) gets the commit its reflog says it was created from, or, without that
+  entry, the merge base of the branch and `--base`; never `--base` itself,
+  which may have moved. That run logs a warning
   naming the branch, the source and the sha. A branch that shares no history
   with `--base`, or one whose merge base with `--base` is its own tip (merged
   into it, or empty) while it has commits on no remote (that merge base would
