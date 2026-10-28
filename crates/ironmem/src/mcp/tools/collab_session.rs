@@ -7296,10 +7296,10 @@ mod tests {
         );
     }
 
-    /// `idle_secs` saturates to `i64::MIN` for an activity timestamp far in the
+    /// `idle_secs` goes hugely negative for an activity timestamp far in the
     /// future — the symmetric case of the `i64::MIN` corruption
     /// `crate::collab::idle_secs` documents. The refusal's "{}s remaining"
-    /// arithmetic must not panic on it.
+    /// arithmetic must not panic or wrap on it.
     ///
     /// `collab_checkpoints.updated_at` is `INTEGER NOT NULL` with no range
     /// CHECK, so this is reachable by the same hand-repair path that doc
@@ -7308,18 +7308,35 @@ mod tests {
     /// renders a nonsensical negative.
     #[test]
     fn abandon_refusal_survives_an_activity_timestamp_from_the_future() {
+        let (_temp, repo_path, heads) = git_ancestor_chain(2);
         let app = test_app();
-        let sid = start_session(&app);
-        drive_to_implement(&app, &sid);
-        app.db
+        let sid = start_session_in_scope(&app, &repo_path, "main");
+        drive_to_implement_with_head(&app, &sid, &heads[0]);
+        // A checkpoint for the hand repair below to move into the future;
+        // `drive_to_implement` files none.
+        super::super::collab_checkpoint::handle_collab_checkpoint(
+            &app,
+            &json!({
+                "session_id": sid, "agent": "claude",
+                "task_id": 1, "task_title": "first task",
+                "status": "started",
+                "head_sha": heads[1], "completed_task_ids": "",
+            }),
+        )
+        .expect("the implementer may file progress");
+        let updated = app
+            .db
             .with_transaction(|tx| {
-                tx.execute(
+                Ok(tx.execute(
                     "UPDATE collab_checkpoints SET updated_at = ?2 WHERE session_id = ?1",
                     rusqlite::params![sid, i64::MAX],
-                )?;
-                Ok(())
+                )?)
             })
             .unwrap();
+        assert_eq!(
+            updated, 1,
+            "the premise: the session has a checkpoint to move"
+        );
 
         let err = handle_collab_end(&app, &abandon_args(&sid, "claude", "x")).unwrap_err();
         let message = err.to_string();
@@ -7327,9 +7344,20 @@ mod tests {
             message.contains("is still live"),
             "a session whose newest activity is in the future is live: {message}"
         );
+        // The countdown is `remaining_secs_before_dead`'s honest arithmetic:
+        // saturating, floored at zero, and a future activity reported as the
+        // long wait it really is (its doc), so it never panics or wraps
+        // negative. This once asserted "0s remaining", which never held: it
+        // passed only because no checkpoint existed for the hand repair to
+        // move, and "21600s remaining" (idle 0s) contains "0s remaining".
+        let remaining: i64 = message
+            .split_once("s remaining")
+            .and_then(|(before, _)| before.rsplit(' ').next())
+            .and_then(|secs| secs.parse().ok())
+            .unwrap_or_else(|| panic!("a remaining-seconds countdown: {message}"));
         assert!(
-            message.contains("0s remaining"),
-            "the remaining seconds must clamp at zero rather than wrap: {message}"
+            remaining >= crate::collab::COLLAB_DEAD_SESSION_SECS,
+            "the remaining seconds must not wrap below the threshold: {message}"
         );
         assert!(
             app.db
