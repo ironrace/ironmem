@@ -438,10 +438,15 @@ impl SupervisedCli for MuseCli {
             saw_expected |= ours;
             match envelope.payload.kind.as_deref() {
                 Some("run_terminal") if ours => {
-                    // The envelope parsed, so the line is a JSON object.
-                    let value: serde_json::Value =
-                        serde_json::from_str(line).unwrap_or(serde_json::Value::Null);
-                    terminals.push(value["payload"].clone());
+                    // The envelope parsed, so this should too; if it does
+                    // not, nothing about the run is trusted.
+                    match serde_json::from_str::<serde_json::Value>(line) {
+                        Ok(value) => terminals.push(value["payload"].clone()),
+                        Err(e) => errors.push(format!(
+                            "terminal record could not be parsed: {}",
+                            excerpt(&e.to_string())
+                        )),
+                    }
                 }
                 Some("run_usage") if on_stream(&envelope, "exec.usage") => {
                     if let Some(n) = envelope.payload.completed_calls {
@@ -998,6 +1003,26 @@ mod tests {
             );
             assert!(!parsed.errors().is_empty(), "no error for: {journal}");
         }
+    }
+
+    /// A terminal record whose envelope reads but whose whole line does
+    /// not (a float out of range, which the envelope skips unread) is
+    /// reported, never turned into an empty record.
+    #[test]
+    fn an_unparseable_terminal_record_is_reported() {
+        let line = format!(
+            r#"{{"stream":{{"kind":"session","id":"{SID}"}},"payload":{{"kind":"run_terminal","terminal":"completed","text":"{{}}","n":1e400}}}}"#
+        );
+        let parsed = MuseCli.parse(&line, Ok(String::new()), Some(SID));
+        assert!(parsed.verdict().is_none());
+        assert!(
+            parsed
+                .errors()
+                .iter()
+                .any(|e| e.starts_with("terminal record could not be parsed: ")),
+            "{:?}",
+            parsed.errors()
+        );
     }
 
     #[test]
