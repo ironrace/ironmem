@@ -1855,6 +1855,11 @@ fn has_signature_header(commit_object: &str) -> bool {
 /// How many flagged commits a violation names before counting the rest.
 const NAMED_UNSIGNED_COMMITS: usize = 5;
 
+/// The longest a signing violation may be: a third of the turn prompt's
+/// budget, so its prior-attempt line, beside the model's bounded reason,
+/// fits with the prompt's fixed text rather than being dropped.
+const MAX_VIOLATION_CHARS: usize = turn_prompt::MAX_CONDITION_CHARS / 3;
+
 /// How many remotes a signing violation's recipe names before it says how
 /// many more hold the branch.
 const NAMED_REMOTES: usize = 3;
@@ -1880,12 +1885,38 @@ fn unsigned_violation(flagged: &[String], cut: &str, branch: &str, remotes: &[St
     }
     let oldest = flagged.last().map(String::as_str).unwrap_or_default();
     let short_cut = prefix(cut, SHORT_SHA_CHARS);
-    let push = match remotes {
-        [] => format!(
+    let render = |push: &str| {
+        format!(
+            "commit.gpgsign is on, but commit(s) {list} on this branch since its cut {short_cut} \
+             are unsigned or carry a bad signature. Re-sign only these commits, never upstream \
+             ones merged in. First `git checkout {branch}`. Then, if only the tip is flagged, \
+             `git commit --amend --no-edit -S`; otherwise `git rebase --exec 'git commit --amend \
+             --no-edit -S' {oldest}^`. If a merge commit is flagged or lies in that rebase's \
+             range, redo the merge (signed) instead of rebasing over it. Then {push}. If signing \
+             fails in your environment, return verdict impossible with the signing error; never \
+             bypass with -c commit.gpgsign=false, --no-gpg-sign, or by changing git config."
+        )
+    };
+    // Remote names have no length limit, so the push step loses detail
+    // until the recipe fits its budget: every holder named (up to
+    // NAMED_REMOTES), then the others only counted, then not even the push
+    // clause's remote named. The last always fits: the rest of the recipe is
+    // bounded (NAMED_UNSIGNED_COMMITS, a short cut, a branch name derived
+    // from GitHub's longest repository name).
+    let unnamed = match remotes {
+        [] | [_] => format!(
             "`git push --force-with-lease <remote> {branch}`, naming the remote of the issue's \
              repository"
         ),
-        [remote] => format!("`git push --force-with-lease {remote} {branch}`"),
+        _ => format!(
+            "`git push --force-with-lease <remote> {branch}` to each remote holding it, the \
+             issue's repository's first (`git branch -r`)"
+        ),
+    };
+    let mut steps = Vec::new();
+    match remotes {
+        [] => {}
+        [remote] => steps.push(format!("`git push --force-with-lease {remote} {branch}`")),
         [first, rest @ ..] => {
             let named = rest
                 .iter()
@@ -1897,23 +1928,21 @@ fn unsigned_violation(flagged: &[String], cut: &str, branch: &str, remotes: &[St
                 0 => String::new(),
                 n => format!(" and {n} more (`git branch -r`)"),
             };
-            format!(
+            steps.push(format!(
                 "`git push --force-with-lease {first} {branch}`, then the same to each other \
                  remote holding it (every one is checked): {named}{more}"
-            )
+            ));
+            steps.push(format!(
+                "`git push --force-with-lease {first} {branch}`, then the same to each other \
+                 remote holding it (every one is checked; `git branch -r`)"
+            ));
         }
-    };
-    format!(
-        "commit.gpgsign is on, but commit(s) {list} on this branch since its cut {short_cut} are \
-         unsigned or carry a bad signature. Re-sign only these commits, never upstream ones \
-         merged in. First `git checkout {branch}`. Then, if only the tip is flagged, `git commit \
-         --amend --no-edit -S`; otherwise `git rebase --exec 'git commit --amend --no-edit -S' \
-         {oldest}^`. If a merge commit is flagged or lies in that rebase's range, redo the merge \
-         (signed) instead of rebasing over it. Then {push}. If signing fails in your \
-         environment, return \
-         verdict impossible with the signing error; never bypass with -c commit.gpgsign=false, \
-         --no-gpg-sign, or by changing git config."
-    )
+    }
+    steps
+        .iter()
+        .map(|push| render(push))
+        .find(|recipe| recipe.chars().count() <= MAX_VIOLATION_CHARS)
+        .unwrap_or_else(|| render(&unnamed))
 }
 
 /// The prior-attempt context the turn prompt shows the IC, newest-last, so a
@@ -6754,11 +6783,6 @@ sleep 0.5
         assert!(!matches!(run.terminal, TerminalReason::Met { .. }));
     }
 
-    /// The longest a violation may be: a third of the turn prompt's budget,
-    /// so its prior-attempt line, beside the model's bounded reason, fits
-    /// with the prompt's fixed text rather than being dropped.
-    const MAX_VIOLATION_CHARS: usize = turn_prompt::MAX_CONDITION_CHARS / 3;
-
     /// With no remote it can name, the recipe says which one to push to
     /// rather than naming one that may not exist.
     /// The guard reads the issue branch on every remote that holds it, so
@@ -6881,6 +6905,61 @@ sleep 0.5
             violation.chars().count() <= MAX_VIOLATION_CHARS,
             "{} > {MAX_VIOLATION_CHARS}: {violation}",
             violation.chars().count()
+        );
+    }
+
+    /// Remote names have no length limit (anyone who can write the
+    /// repository's config chooses them), so the recipe falls back to
+    /// counting the other holders, and then to `<remote>`, rather than ever
+    /// exceed its share of the prompt; it names the push clause's remote
+    /// whenever that fits.
+    #[test]
+    fn a_recipe_stays_within_its_budget_whatever_the_remote_names() {
+        let longest = worktree::branch_name(&IssueRef::new(
+            format!("{}/{}", "o".repeat(39), "r".repeat(100)),
+            u64::MAX,
+        ));
+        let worst: Vec<String> = (0..1000).map(|i| format!("{i:012x}")).collect();
+        let render = |flagged: &[String], branch: &str, remotes: Vec<String>| {
+            SigningViolation::Unsigned {
+                flagged: flagged.to_vec(),
+                cut: "c".repeat(64),
+                branch: branch.to_string(),
+                remotes,
+            }
+            .to_string()
+        };
+        for len in [40, 44, 200, 1000] {
+            for count in [1, 2, 3, 50] {
+                let remotes: Vec<String> = (0..count)
+                    .map(|i| format!("{i:02}{}", "r".repeat(len - 2)))
+                    .collect();
+                let violation = render(&worst, &longest, remotes.clone());
+                assert!(
+                    violation.chars().count() <= MAX_VIOLATION_CHARS,
+                    "{len}x{count}: {} > {MAX_VIOLATION_CHARS}: {violation}",
+                    violation.chars().count()
+                );
+                let named = violation.contains(&format!("--force-with-lease {} ", remotes[0]));
+                assert!(
+                    named || violation.contains("--force-with-lease <remote> "),
+                    "{len}x{count}: {violation}"
+                );
+                if len <= 44 {
+                    assert!(
+                        named,
+                        "{len}x{count}: the push clause's remote fits: {violation}"
+                    );
+                }
+            }
+        }
+        // A short branch and a few commits leave room for a 200-character
+        // name, which is then named.
+        let long = "r".repeat(200);
+        let violation = render(&["abc123".into()], "autopilot/o-r-1", vec![long.clone()]);
+        assert!(
+            violation.contains(&format!("--force-with-lease {long} ")),
+            "{violation}"
         );
     }
 
