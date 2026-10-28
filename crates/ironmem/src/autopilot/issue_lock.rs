@@ -141,16 +141,20 @@ pub fn git_common_dir(repo: &Path) -> Result<Option<PathBuf>, MemoryError> {
         PathBuf::from(common)
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        if !stderr.contains("not a git repository") {
-            return Err(MemoryError::Validation(format!(
-                "cannot find the git common directory of {}: {}",
-                repo.display(),
-                super::scrub::scrub_and_bound(&stderr, 500).text
-            )));
-        }
+        // A broken worktree link is named differently by different git
+        // versions ("not a git repository" here, "gitfile does not point
+        // to a valid repository" there), so the link itself is tried
+        // first, whatever git said.
         match common_dir_of_broken_worktree(repo) {
             Some(common) => common,
-            None => return Ok(None),
+            None if stderr.contains("not a git repository") => return Ok(None),
+            None => {
+                return Err(MemoryError::Validation(format!(
+                    "cannot find the git common directory of {}: {}",
+                    repo.display(),
+                    super::scrub::scrub_and_bound(&stderr, 500).text
+                )));
+            }
         }
     };
     super::local_fs::require_local(&common, "the git common directory")?;
