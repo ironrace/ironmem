@@ -125,3 +125,9 @@ No paid live Claude/Codex/Muse dispatch, no OS confinement implementation, no
 merge, no new dependency, and no repeat of the prior completed Linux Docker
 suite. CI on the pushed head supplies Linux validation. Real Claude ps argv
 sampling is still an approval-required open item for Jeff (#368).
+Greptile P2 on `86513dab` then flagged that those messages named a
+`--confirm-dead` flag `ClearDispatch` never had. Verified: `--help` lists
+only `--db`/`--json` and the flag errors as unexpected. The messages/docs
+now name the real plain command, which already refuses while leftover
+evidence could be the issue's work; no bypass flag was added. The pipe-holder
+test now asserts the named command and the absence of the invented flag.

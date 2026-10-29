@@ -642,7 +642,7 @@ impl LivenessSnapshot for HarnessSnapshots {
     }
     fn state_reason(&self, state: &DispatchState) -> String {
         if state.phase() == Some(super::dispatch_state::DispatchPhase::PausedCompletionUnproven) {
-            return "dispatch completion is unproven; inspect and stop leftover tools before explicit clear-dispatch --confirm-dead".into();
+            return "dispatch completion is unproven; inspect and stop leftover tools, then run clear-dispatch (it refuses while leftovers remain)".into();
         }
         match state.implementer {
             Implementer::Claude => self.reason(state.implementer),

@@ -1175,6 +1175,7 @@ records one unpriced dispatch, and consumes no attempt. The queue defers it as
 `completion_unproven`; later runs, provisioning, advance review/merge and
 automatic settled-state release leave it held even if the Claude registry is
 empty. Inspect and stop leftover tool processes, then explicitly run
-`ironmem autopilot clear-dispatch <repo> <issue> --confirm-dead`. No signal is
+`ironmem autopilot clear-dispatch <repo> <issue>` (it refuses while any
+leftover could still be the issue's work). No signal is
 sent to a possibly reused PID/group as a shortcut. This hold does not replace
 the wider Claude process-observation work tracked in #368.

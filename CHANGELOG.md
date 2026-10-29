@@ -84,8 +84,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A Claude post-exit drain/read failure now writes a durable
   `paused-completion-unproven` operator hold instead of automatically retrying
   beside a tool child still running. Queue/provisioning/review/merge/release
-  respect the hold; explicit `clear-dispatch --confirm-dead` releases it after
-  the operator stops leftovers. The public error enum adds `DispatchUnsettled`.
+  respect the hold; explicit `clear-dispatch` releases it after the operator
+  stops leftovers (and refuses while any remain). The public error enum adds
+  `DispatchUnsettled`.
 
 - Per-issue kernel locks coordinate Lead/run, review/merge and cleanup within
   one clone/host. Held locks skip/refuse with their path; kernel exit releases

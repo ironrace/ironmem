@@ -2593,7 +2593,7 @@ fn validate_dispatch_claim(
     if let Some(dispatch_state::Claim { state, .. }) = &claim {
         if state.phase() == Some(DispatchPhase::PausedCompletionUnproven) {
             return Err(MemoryError::Validation(format!(
-                "completion is unproven for {}; inspect and stop leftover tool processes, then use ironmem autopilot clear-dispatch {} {} --confirm-dead; automatic retry is refused",
+                "completion is unproven for {}; inspect and stop leftover tool processes, then use ironmem autopilot clear-dispatch {} {}; automatic retry is refused",
                 issue.canonical(), issue.repo, issue.number
             )));
         }
@@ -3866,7 +3866,7 @@ pub fn run_issue(
                         reason: Some(err.to_string()),
                     });
                     break TerminalReason::ImplementationInFlight {
-                        detail: format!("{err}; inspect and stop leftover tool processes before ironmem autopilot clear-dispatch {} {} --confirm-dead; the issue is held without retry", issue.repo, issue.number),
+                        detail: format!("{err}; inspect and stop leftover tool processes before ironmem autopilot clear-dispatch {} {}; the issue is held without retry", issue.repo, issue.number),
                     };
                 }
                 if config.implementer.recovers_invocations() {
@@ -4465,6 +4465,10 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("completion is unproven"), "{error}");
+        assert!(
+            error.contains("ironmem autopilot clear-dispatch") && !error.contains("--confirm-dead"),
+            "{error}"
+        );
         assert_eq!(std::fs::read_to_string(&pids).unwrap().lines().count(), 1);
         lineage::upsert_issue_status(
             &db,
