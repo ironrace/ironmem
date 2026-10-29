@@ -343,6 +343,8 @@ pub enum DeferReason {
     /// shortens the issue or its gates, so it is not resumed ahead of the
     /// backlog every tick; `autopilot clear-dispatch` releases it.
     ConditionTooLong,
+    /// A previous dispatch's tools may still run; only an operator clears it.
+    CompletionUnproven,
     /// The last run's harness reported `session_uuid` still in use after an
     /// invocation finished: something still holds it. Retrying can never
     /// succeed and a fresh session could start a second implementer, so it
@@ -562,6 +564,10 @@ pub fn plan_queue(
             }
             let state = in_flight.iter().find(|s| s.issue == issue);
             if let Some(state) = state {
+                if state.phase() == Some(DispatchPhase::PausedCompletionUnproven) {
+                    defer(DeferReason::CompletionUnproven);
+                    continue;
+                }
                 match snapshot.liveness(state) {
                     Liveness::Alive => {
                         defer(DeferReason::SessionLive {
@@ -582,6 +588,10 @@ pub fn plan_queue(
                 match state.phase() {
                     Some(DispatchPhase::PausedConditionTooLong) => {
                         defer(DeferReason::ConditionTooLong);
+                        continue;
+                    }
+                    Some(DispatchPhase::PausedCompletionUnproven) => {
+                        defer(DeferReason::CompletionUnproven);
                         continue;
                     }
                     Some(DispatchPhase::PausedSessionInUse) => {
@@ -1732,6 +1742,31 @@ mod tests {
     /// A run that Muse refused because something still holds its session is
     /// parked: retrying can never succeed, so a Lead never re-dispatches it
     /// until an operator clears it.
+    #[test]
+    fn completion_unproven_is_deferred_even_when_the_registry_lists_nothing() {
+        let db = approved(&[REPO]);
+        let issue = IssueRef::new(REPO, 1);
+        put_state(&db, &issue, "ic-test");
+        let mut state = dispatch_state::get_dispatch_state(&db, &issue)
+            .unwrap()
+            .unwrap();
+        state.state = "paused-completion-unproven".into();
+        dispatch_state::upsert_dispatch_state(&db, &state).unwrap();
+        let snapshot = RegistrySnapshot::Available(Vec::new());
+        let plan = plan_queue(
+            &db,
+            &[backlog(REPO, vec![ready(1), ready(2)])],
+            &snapshot,
+            &config(),
+        )
+        .unwrap();
+        assert!(matches!(
+            reason_for(&plan, 1),
+            DeferReason::CompletionUnproven
+        ));
+        assert_eq!(numbers(&plan), vec![2]);
+    }
+
     #[test]
     fn a_session_in_use_refusal_is_deferred_until_an_operator_clears_it() {
         use crate::autopilot::implementer::Implementer;

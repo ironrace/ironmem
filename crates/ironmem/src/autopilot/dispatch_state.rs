@@ -277,17 +277,21 @@ pub enum DispatchPhase {
     PausedConditionTooLong,
     /// Parked: the harness reported the session still in use.
     PausedSessionInUse,
+    /// A started Claude dispatch left uncertain process completion. Only
+    /// explicit operator clearance permits another launch or review.
+    PausedCompletionUnproven,
 }
 
 impl DispatchPhase {
     /// Every phase, for a reader that must know them all.
-    pub const ALL: [DispatchPhase; 6] = [
+    pub const ALL: [DispatchPhase; 7] = [
         DispatchPhase::Dispatching,
         DispatchPhase::InfrastructureFailure,
         DispatchPhase::PausedDailyBudget,
         DispatchPhase::PausedInfrastructureFailure,
         DispatchPhase::PausedConditionTooLong,
         DispatchPhase::PausedSessionInUse,
+        DispatchPhase::PausedCompletionUnproven,
     ];
 
     /// The wire label.
@@ -299,6 +303,7 @@ impl DispatchPhase {
             DispatchPhase::PausedInfrastructureFailure => "paused-infrastructure-failure",
             DispatchPhase::PausedConditionTooLong => "paused-condition-too-long",
             DispatchPhase::PausedSessionInUse => "paused-session-in-use",
+            DispatchPhase::PausedCompletionUnproven => "paused-completion-unproven",
         }
     }
 
@@ -315,7 +320,8 @@ impl DispatchPhase {
             DispatchPhase::PausedDailyBudget
             | DispatchPhase::PausedInfrastructureFailure
             | DispatchPhase::PausedConditionTooLong
-            | DispatchPhase::PausedSessionInUse => true,
+            | DispatchPhase::PausedSessionInUse
+            | DispatchPhase::PausedCompletionUnproven => true,
         }
     }
 }

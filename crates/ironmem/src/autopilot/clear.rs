@@ -554,7 +554,13 @@ pub fn release_settled_dispatches(
         }
         // A session parked as still in use waits for an operator, who knows
         // what holds it; a Claude IC is looked for by name too.
-        if state.phase() == Some(dispatch_state::DispatchPhase::PausedSessionInUse) {
+        if matches!(
+            state.phase(),
+            Some(
+                dispatch_state::DispatchPhase::PausedSessionInUse
+                    | dispatch_state::DispatchPhase::PausedCompletionUnproven
+            )
+        ) {
             continue;
         }
         if state.implementer == Implementer::Claude {

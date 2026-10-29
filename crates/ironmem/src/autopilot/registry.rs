@@ -624,6 +624,9 @@ pub(crate) fn invocation_state_reason_with(
 
 impl LivenessSnapshot for HarnessSnapshots {
     fn liveness(&self, state: &DispatchState) -> Liveness {
+        if state.phase() == Some(super::dispatch_state::DispatchPhase::PausedCompletionUnproven) {
+            return Liveness::Unknown;
+        }
         match state.implementer {
             Implementer::Claude => self.claude.liveness(&state.ic_session_name),
             Implementer::Codex | Implementer::Muse => {
@@ -638,6 +641,9 @@ impl LivenessSnapshot for HarnessSnapshots {
         }
     }
     fn state_reason(&self, state: &DispatchState) -> String {
+        if state.phase() == Some(super::dispatch_state::DispatchPhase::PausedCompletionUnproven) {
+            return "dispatch completion is unproven; inspect and stop leftover tools before explicit clear-dispatch --confirm-dead".into();
+        }
         match state.implementer {
             Implementer::Claude => self.reason(state.implementer),
             Implementer::Codex | Implementer::Muse => {
@@ -656,6 +662,9 @@ impl LivenessSnapshot for HarnessSnapshots {
 /// supervised CLI invocation's death from the absence of a Claude session.
 impl LivenessSnapshot for RegistrySnapshot {
     fn liveness(&self, state: &DispatchState) -> Liveness {
+        if state.phase() == Some(super::dispatch_state::DispatchPhase::PausedCompletionUnproven) {
+            return Liveness::Unknown;
+        }
         match state.implementer {
             Implementer::Claude => self.liveness(&state.ic_session_name),
             // A supervised CLI harness is judged on process evidence, which

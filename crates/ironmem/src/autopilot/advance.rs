@@ -924,6 +924,16 @@ fn advance_issue(
         }
     };
 
+    // Re-read under the lock: a prior Claude dispatch may have released its
+    // controller lock while a tool still holds the checkout/output pipe.
+    if dispatch_state::get_dispatch_state(db, &candidate.issue)?.is_some_and(|state| {
+        state.phase() == Some(dispatch_state::DispatchPhase::PausedCompletionUnproven)
+    }) {
+        return Err(MemoryError::Validation(format!(
+            "completion is unproven for {}; review and merge wait for operator clearance",
+            candidate.issue.canonical()
+        )));
+    }
     let mut review = None;
     if let AdvanceStep::Review { base_branch, .. } = &step {
         if config.dry_run {
@@ -2315,6 +2325,54 @@ mod tests {
             merge::MergeOutcome::Held(_)
         ));
         super::super::issue_lock::lock_for_run(repo.path(), &issue()).unwrap();
+    }
+
+    #[test]
+    fn completion_unproven_blocks_review_and_merge() {
+        let db = approved_db();
+        let (repo, roots) = checkout_with_worktree();
+        let state = crate::autopilot::DispatchState {
+            issue: issue(),
+            implementer: crate::autopilot::Implementer::Claude,
+            native_session_id: None,
+            invocation_artifacts: None,
+            worktree_path: worktree::worktree_path(roots.path(), &issue())
+                .to_str()
+                .unwrap()
+                .into(),
+            ic_session_name: "ic-test".into(),
+            dispatch_class: "logic".into(),
+            attempt_n: 0,
+            state: "paused-completion-unproven".into(),
+            started_at: "now".into(),
+            session_uuid: "11111111-2222-4333-8444-555555555555".into(),
+            turn_n: 1,
+            session_claimed: true,
+            session_model: None,
+            resume_refusals: 0,
+            signing_held: false,
+        };
+        dispatch_state::upsert_dispatch_state(&db, &state).unwrap();
+        let candidate = Candidate {
+            issue: issue(),
+            issue_title: "test".into(),
+            repo_path: repo.path().into(),
+            risk_label: None,
+            green_commit_sha: Some(GREEN.into()),
+        };
+        let cfg = config(roots.path(), repo.path());
+        let mut gh = ScriptedGh::new(vec![ok(&pr_list_json(322, GREEN))]);
+        let error = advance_issue(&db, &mut gh, &mut ForbiddenReviewer, &candidate, &cfg)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("completion is unproven"), "{error}");
+        reviewed_at(&db, &issue(), 322, GREEN);
+        let mut gh = ScriptedGh::new(vec![ok(&pr_list_json(322, GREEN))]);
+        let error = advance_issue(&db, &mut gh, &mut ForbiddenReviewer, &candidate, &cfg)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("completion is unproven"), "{error}");
+        assert_eq!(gh.seen.len(), 1, "no merge API call is allowed");
     }
 
     #[test]

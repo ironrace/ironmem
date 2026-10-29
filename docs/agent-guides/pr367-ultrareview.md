@@ -55,7 +55,7 @@ contracts and risk notes are in [AUTOPILOT.md](../AUTOPILOT.md).
 | G12 | Negative/fractional/string usage counts preserve last valid integer; existing u32 overflow clamp test retained. |
 | H2 | git_common_dir errors warn and refuse claim publication, rather than silently publishing no durable lock pointer. |
 | H3 | Settled-state release warns for lock-check errors; Held remains a normal quiet deferral. |
-| H4 | Unreadable Linux FUSE mountinfo refuses startup instead of assuming local. |
+| H4 | Unreadable Linux FUSE mountinfo refuses startup instead of assuming local. Linux CI caught an inherited reference to nonexistent libc::FUSE_MAGIC; classification now uses the module constant in the cross-platform helper, with an empty-mountinfo regression tested on every platform. |
 | H5, I4 | Present malformed claimed_at holds its lease; write-side common_dir must be absolute. Legacy missing claim fields remain tolerated. |
 | H6 | Reservation lookup explicitly documented as a lower bound at API and recovery call site; corrupt drawers warn and do not hide another day’s valid reservation. |
 | H7 | Ambiguous orphan marker rows now warn with pid and scrubbed reason, instead of disappearing silently. They are not promoted into authenticated markers. |
@@ -86,6 +86,19 @@ contracts and risk notes are in [AUTOPILOT.md](../AUTOPILOT.md).
 | K7 | Teardown full-table polls exponentially back off to 100ms within the existing one-second grace. Regression measured 22 scans/250ms before fix and now permits at most 8. Direct kernel-only replacement deferred because multithreaded zombies require active-task semantics. |
 | K8 | **Documented, unpatched:** historical reservation scan remains unbounded. A cutoff would lose long-lived holds; indexing/dedicated reservation schema needs migration design. |
 | K10 | Quiet candidates use pid index plus per-pass daemon-executable memo; unsignalable traversal uses parent index and seen set. |
+
+## Post-push review follow-up
+
+Greptile P1 `discussion_r4407090159` identified that a bounded Claude drain
+error could retry beside the still-running pipe holder. A real stub spawning
+a 60-second tool reproduced two dispatches before the infrastructure cap.
+`DispatchUnsettled` now writes `paused-completion-unproven` before accounting,
+returns implementation-in-flight, charges one unpriced unit and no attempt,
+and refuses subsequent run/provisioning. Queue, liveness, advance review/merge
+and automatic release keep the hold until explicit operator clearance.
+Tests cover the real pipe holder, subsequent run, release after an old success,
+queue deferral and both advance review/merge paths. No bare PID/group is killed
+after the root has been reaped.
 
 ## Validation and work not run
 

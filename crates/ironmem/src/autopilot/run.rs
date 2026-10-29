@@ -669,7 +669,10 @@ pub struct IssueRun {
 /// created no session, whereas one that ran and then produced no parseable
 /// result probably did, and re-supplying `--session-id` for a uuid that
 /// already exists fails. [`dispatch::run_dispatch`] follows this — it returns
-/// `NotFound` only from the `Command::output()` call itself.
+/// `NotFound` only from the `Command::output()` call itself. A started dispatch
+/// whose remaining processes cannot be proven complete must instead return
+/// `DispatchUnsettled`: it writes a durable operator hold, never an automatic
+/// infrastructure retry.
 pub trait Dispatcher {
     fn implementer(&self) -> Implementer {
         Implementer::Claude
@@ -2588,6 +2591,12 @@ fn validate_dispatch_claim(
 ) -> Result<Option<dispatch_state::Claim>, MemoryError> {
     let claim = dispatch_state::get_claim(db, issue)?;
     if let Some(dispatch_state::Claim { state, .. }) = &claim {
+        if state.phase() == Some(DispatchPhase::PausedCompletionUnproven) {
+            return Err(MemoryError::Validation(format!(
+                "completion is unproven for {}; inspect and stop leftover tool processes, then use ironmem autopilot clear-dispatch {} {} --confirm-dead; automatic retry is refused",
+                issue.canonical(), issue.repo, issue.number
+            )));
+        }
         if state.implementer != implementer {
             return Err(MemoryError::Validation(format!(
                 "implementation harness mismatch: persisted {:?}, configured {:?}; resume with \
@@ -3831,6 +3840,35 @@ pub fn run_issue(
         let mut outcome = match outcome_result {
             Ok(outcome) => outcome,
             Err(err) => {
+                if matches!(&err, MemoryError::DispatchUnsettled(_)) {
+                    // Publish the safety hold before any accounting can fail.
+                    write_state(
+                        &mut owned,
+                        cumulative_attempt_n,
+                        turn_n,
+                        DispatchPhase::PausedCompletionUnproven,
+                        &session_uuid,
+                        true,
+                        (&native_session_id, &invocation_artifacts),
+                        (&session_model, resume_refusals),
+                    )?;
+                    if let Some(reserved) = reserved {
+                        reserved.settle(None)?;
+                    }
+                    budget::record_unpriced_dispatch(db, &today_utc())?;
+                    unpriced_dispatches += 1;
+                    dispatches.push(DispatchSummary {
+                        attempt_n: None,
+                        classification: DispatchClassification::InfrastructureFailure,
+                        total_cost_usd: None,
+                        num_turns: 0,
+                        verdict: None,
+                        reason: Some(err.to_string()),
+                    });
+                    break TerminalReason::ImplementationInFlight {
+                        detail: format!("{err}; inspect and stop leftover tool processes before ironmem autopilot clear-dispatch {} {} --confirm-dead; the issue is held without retry", issue.repo, issue.number),
+                    };
+                }
                 if config.implementer.recovers_invocations() {
                     dispatches.push(DispatchSummary {
                         attempt_n: None,
@@ -4365,6 +4403,93 @@ mod tests {
     /// An invocation held only for a busy worktree finishes by itself; the
     /// hold message says so, and names `clear-dispatch` as the manual
     /// release. Any other held invocation still needs the operator.
+    #[cfg(unix)]
+    #[test]
+    fn a_claude_pipe_descendant_holds_the_issue_instead_of_retrying() {
+        use std::os::unix::fs::PermissionsExt;
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        gate_config::set_wall_clock_timeout(&db, &issue().repo, Some(2)).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let pids = temp.path().join("children");
+        struct Children(std::path::PathBuf);
+        impl Drop for Children {
+            fn drop(&mut self) {
+                if let Ok(text) = std::fs::read_to_string(&self.0) {
+                    for pid in text.lines().filter_map(|line| line.parse::<i32>().ok()) {
+                        // SAFETY: only this fixture's own still-sleeping children.
+                        unsafe {
+                            libc::kill(pid, libc::SIGKILL);
+                        }
+                    }
+                }
+            }
+        }
+        let _children = Children(pids.clone());
+        let bin = temp.path().join("claude-stub");
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\nsleep 60 &\necho $! >> '{}'\nexit 0\n",
+                pids.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut config = config();
+        config.max_consecutive_infrastructure_failures = 2;
+        let mut dispatcher = ClaudeDispatcher { bin };
+        let result = run_issue(&db, &issue(), &brief(), &wt, &config, &mut dispatcher).unwrap();
+        assert!(
+            matches!(
+                result.terminal,
+                TerminalReason::ImplementationInFlight { .. }
+            ),
+            "{:?}",
+            result.terminal
+        );
+        assert_eq!(
+            std::fs::read_to_string(&pids).unwrap().lines().count(),
+            1,
+            "no retry may overlap the child"
+        );
+        let state = dispatch_state::get_dispatch_state(&db, &issue())
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.state, "paused-completion-unproven");
+        assert_eq!(result.unpriced_dispatches, 1);
+        assert!(lineage::attempts_for_issue(&db, &issue())
+            .unwrap()
+            .is_empty());
+        let error = run_issue(&db, &issue(), &brief(), &wt, &config, &mut dispatcher)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("completion is unproven"), "{error}");
+        assert_eq!(std::fs::read_to_string(&pids).unwrap().lines().count(), 1);
+        lineage::upsert_issue_status(
+            &db,
+            &IssueStatus {
+                issue: issue(),
+                best_verdict: Some(AttemptOutcome::Success),
+                best_commit_sha: None,
+                cumulative_attempt_n: 0,
+            },
+        )
+        .unwrap();
+        let snapshot = super::super::registry::HarnessSnapshots {
+            claude: super::super::registry::RegistrySnapshot::Available(Vec::new()),
+            processes: super::super::process_tree::ProcessSnapshot::Available(Vec::new()),
+        };
+        assert!(
+            super::super::clear::release_settled_dispatches(&db, &snapshot, 1)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(dispatch_state::get_dispatch_state(&db, &issue())
+            .unwrap()
+            .is_some());
+    }
+
     #[test]
     fn ultrareview_absolute_muse_root_does_not_read_cwd() {
         let no_cwd = || Err(std::io::Error::from(std::io::ErrorKind::NotFound));

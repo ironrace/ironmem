@@ -528,10 +528,10 @@ pub fn run_dispatch_bounded(
 
     let status = child
         .wait()
-        .map_err(|e| MemoryError::Validation(format!("IC dispatch output was lost: {e}")))?;
+        .map_err(|e| MemoryError::DispatchUnsettled(format!("IC dispatch output was lost: {e}")))?;
     let read = |handle: DrainHandle, pipe: &str| {
         drained(handle).map_err(|e| {
-            MemoryError::Validation(format!("IC dispatch {pipe} could not be read: {e}"))
+            MemoryError::DispatchUnsettled(format!("IC dispatch {pipe} could not be read: {e}"))
         })
     };
     let output = std::process::Output {

@@ -1165,3 +1165,16 @@ boundaries. `Worktree` values supplied by a library caller must come from
 `ensure_worktree` (absolute checkout path, valid branch and recorded cut).
 Unknown/legacy dispatch labels remain readable for compatibility but the queue
 defers unknown labels instead of treating them as resumable.
+
+### Claude completion holds
+
+When a bounded Claude dispatch exits but a descendant keeps stdout/stderr open
+past the five-second drain grace (or the post-exit output cannot be read), the
+run parks as `paused-completion-unproven`. It returns implementation-in-flight,
+records one unpriced dispatch, and consumes no attempt. The queue defers it as
+`completion_unproven`; later runs, provisioning, advance review/merge and
+automatic settled-state release leave it held even if the Claude registry is
+empty. Inspect and stop leftover tool processes, then explicitly run
+`ironmem autopilot clear-dispatch <repo> <issue> --confirm-dead`. No signal is
+sent to a possibly reused PID/group as a shortcut. This hold does not replace
+the wider Claude process-observation work tracked in #368.

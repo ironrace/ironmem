@@ -126,6 +126,9 @@ const FUSE_MAGIC: u64 = 0x6573_5546;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn linux_remote_type(magic: u64, mountinfo: &str, path: &Path) -> Option<String> {
     if magic & 0xFFFF_FFFF == FUSE_MAGIC {
+        if mountinfo.is_empty() {
+            return Some("fuse (subtype unreadable)".into());
+        }
         let fstype = mountinfo_fstype(mountinfo, path)?;
         let subtype = fuse_network_subtype(&fstype)?;
         return Some(format!("fuse.{subtype}"));
@@ -223,14 +226,7 @@ fn statfs_kind(path: &Path) -> std::io::Result<FsKind> {
     // filesystem the subtype that decides local vs network lives only
     // there, so failing to read it fails closed below.
     let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
-    let mountinfo_read = !mountinfo.is_empty();
     let absolute = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    if magic == libc::FUSE_MAGIC as u64 && !mountinfo_read {
-        return Ok(FsKind {
-            local: false,
-            name: "fuse (subtype unreadable)".into(),
-        });
-    }
     Ok(match linux_remote_type(magic, &mountinfo, &absolute) {
         Some(name) => FsKind { local: false, name },
         None => FsKind {
@@ -260,6 +256,17 @@ mod tests {
                 name: name.to_string(),
             })
         }
+    }
+
+    #[test]
+    fn unreadable_mountinfo_refuses_only_fuse_filesystems() {
+        for magic in [FUSE_MAGIC, FUSE_MAGIC | 0xFFFF_FFFF_0000_0000] {
+            assert_eq!(
+                linux_remote_type(magic, "", Path::new("/repo")),
+                Some("fuse (subtype unreadable)".into())
+            );
+        }
+        assert_eq!(linux_remote_type(0xEF53, "", Path::new("/repo")), None);
     }
 
     #[test]
