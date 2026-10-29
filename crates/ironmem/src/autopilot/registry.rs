@@ -105,7 +105,7 @@ pub trait AgentRegistry {
 }
 
 /// How long `claude agents --json` may take. Every controller samples it,
-/// including a Codex-only Lead, so a hung Claude CLI must read as an
+/// including a Codex- or Muse-only Lead, so a hung Claude CLI must read as an
 /// unavailable registry rather than stall the whole tick.
 const REGISTRY_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -113,6 +113,9 @@ const REGISTRY_TIMEOUT: Duration = Duration::from_secs(15);
 pub struct ClaudeAgentRegistry {
     bin: PathBuf,
     timeout: Duration,
+    /// Where `claude agents` runs; the controller's own directory when
+    /// `None`.
+    dir: Option<PathBuf>,
 }
 
 impl ClaudeAgentRegistry {
@@ -124,6 +127,7 @@ impl ClaudeAgentRegistry {
         Ok(Self {
             bin: super::dispatch::resolve_claude_binary()?,
             timeout: REGISTRY_TIMEOUT,
+            dir: None,
         })
     }
 }
@@ -131,6 +135,9 @@ impl ClaudeAgentRegistry {
 impl AgentRegistry for ClaudeAgentRegistry {
     fn list(&mut self) -> Result<RegistryOutput, MemoryError> {
         let mut command = Command::new(&self.bin);
+        if let Some(dir) = &self.dir {
+            command.current_dir(dir);
+        }
         command
             .args(build_argv())
             .stdin(Stdio::null())
@@ -142,8 +149,16 @@ impl AgentRegistry for ClaudeAgentRegistry {
             use std::os::unix::process::CommandExt;
             command.process_group(0);
         }
-        let mut child = super::dispatch::retry_on_etxtbsy(|| command.spawn())
-            .map_err(|e| MemoryError::NotFound(format!("failed to start claude agents: {e}")))?;
+        let mut child = super::dispatch::retry_on_etxtbsy(|| command.spawn()).map_err(|e| {
+            MemoryError::NotFound(match &self.dir {
+                Some(dir) => format!(
+                    "failed to start claude agents in {} (its working directory, or the \
+                     spawn, failed): {e}",
+                    dir.display()
+                ),
+                None => format!("failed to start claude agents: {e}"),
+            })
+        })?;
         // Drained on their own threads so a full pipe cannot read as a hang.
         let stdout = super::dispatch::drain(child.stdout.take());
         let stderr = super::dispatch::drain(child.stderr.take());
@@ -175,8 +190,13 @@ impl AgentRegistry for ClaudeAgentRegistry {
                 }
             }
         };
-        let stdout = stdout.join().unwrap_or_default();
-        let stderr = stderr.join().unwrap_or_default();
+        let read = |handle, pipe: &str| {
+            super::dispatch::drained(handle).map_err(|e| {
+                MemoryError::Validation(format!("claude agents {pipe} could not be read: {e}"))
+            })
+        };
+        let stdout = read(stdout, "stdout")?;
+        let stderr = read(stderr, "stderr")?;
         Ok(RegistryOutput {
             stdout: String::from_utf8_lossy(&stdout).to_string(),
             stderr: String::from_utf8_lossy(&stderr).to_string(),
@@ -278,12 +298,11 @@ pub enum Liveness {
 /// One reading of the whole registry.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RegistrySnapshot {
+    #[non_exhaustive]
     Available(Vec<AgentEntry>),
     /// The registry could not be read. Carries why, so a held reconciliation
     /// can say what it is waiting on rather than reporting a bare "unknown".
-    Unavailable {
-        reason: String,
-    },
+    Unavailable { reason: String },
 }
 
 impl RegistrySnapshot {
@@ -350,9 +369,9 @@ pub fn snapshot(registry: &mut dyn AgentRegistry) -> RegistrySnapshot {
     }
 }
 
-pub use crate::autopilot::codex_process::{parse_codex_processes, CodexProcessSnapshot};
 use crate::autopilot::dispatch_state::DispatchState;
 use crate::autopilot::implementer::Implementer;
+pub use crate::autopilot::process_tree::{parse_processes, ProcessSnapshot};
 
 /// The decision seam routes exclusively by the persisted dispatch harness.
 pub trait LivenessSnapshot {
@@ -362,45 +381,41 @@ pub trait LivenessSnapshot {
         self.reason(state.implementer)
     }
     fn claude_names(&self) -> Vec<&str>;
-    fn codex_markers(&self) -> Vec<&str> {
+    fn invocation_markers(&self) -> Vec<&str> {
         Vec::new()
     }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct HarnessSnapshots {
-    pub claude: RegistrySnapshot,
-    pub codex: CodexProcessSnapshot,
+    pub(crate) claude: RegistrySnapshot,
+    pub(crate) processes: ProcessSnapshot,
 }
 impl HarnessSnapshots {
     pub fn is_available(&self, implementer: Implementer) -> bool {
         match implementer {
             Implementer::Claude => self.claude.is_available(),
-            Implementer::Codex => self.codex.is_available(),
+            Implementer::Codex | Implementer::Muse => self.processes.is_available(),
         }
     }
 }
 /// `run_issue` persists dispatching + exact new artifacts atomically before
-/// every Codex spawn, and retains pending artifacts whenever completion is
+/// every supervised CLI spawn, and retains pending artifacts whenever completion is
 /// uncertain. Every label `run_issue` writes with no pending artifacts
 /// therefore establishes an idle invocation, including a pause or refusal
 /// before the first launch and a between-invocation state an early `?` left
 /// behind. An unrecognized label still holds, a fresh source is still
 /// required, and identifiable conflicting work holds.
-fn idle_codex_pause(snapshot: &CodexProcessSnapshot, state: &DispatchState) -> Result<(), String> {
-    let CodexProcessSnapshot::Available(rows) = snapshot else {
+fn idle_invocation_pause(snapshot: &ProcessSnapshot, state: &DispatchState) -> Result<(), String> {
+    let ProcessSnapshot::Available(rows) = snapshot else {
         return Err(snapshot.reason());
     };
-    if !matches!(
-        state.state.as_str(),
-        "paused-daily-budget"
-            | "paused-infrastructure-failure"
-            | "paused-condition-too-long"
-            | "dispatching"
-            | "infrastructure-failure"
-    ) {
+    // Every phase a run writes is written without pending artifacts at some
+    // point; only a label no run writes is refused.
+    if state.phase().is_none() {
         return Err(format!(
-            "Codex state {:?} has no pending invocation identity and is not a state autopilot writes without one",
+            "{} state {:?} has no pending invocation identity and is not a state autopilot writes without one",
+            state.implementer.label(),
             state.state
         ));
     }
@@ -409,84 +424,257 @@ fn idle_codex_pause(snapshot: &CodexProcessSnapshot, state: &DispatchState) -> R
         .as_ref()
         .is_some_and(|id| uuid::Uuid::parse_str(id).is_err())
     {
-        return Err("paused Codex state has an invalid native session UUID".into());
+        return Err(format!(
+            "paused {} state has an invalid native session UUID",
+            state.implementer.label()
+        ));
     }
+    // The ambiguous or matching row may belong to either supervised harness,
+    // whatever this state's implementer, so these two name none.
     if let Some(reason) = rows
         .iter()
         .filter(|row| row.active())
         .find_map(|row| row.marker().err())
     {
-        return Err(format!("Codex process marker is ambiguous: {reason}"));
+        return Err(format!(
+            "an invocation process marker is ambiguous: {reason}"
+        ));
     }
     let slug = state.issue.slug();
     if snapshot.orphan_markers().iter().any(|marker| {
-        crate::autopilot::codex_process::marker_issue_slug(marker) == Some(slug.as_str())
+        crate::autopilot::process_tree::marker_issue_slug(marker) == Some(slug.as_str())
     }) {
-        return Err("an active Codex Autopilot marker matches this issue; paused state has no exact invocation identity to adopt safely".into());
+        return Err("an active Autopilot marker matches this issue; paused state has no exact invocation identity to adopt safely".into());
     }
     Ok(())
 }
 
-pub(crate) fn codex_state_liveness(
-    snapshot: &CodexProcessSnapshot,
+/// The shared daemon a harness's MCP proxy may have autospawned in the
+/// worktree: the operator's configured socket and the controller's own
+/// executable. Without it nothing is exempt, which only holds longer.
+pub(crate) fn configured_shared_daemon() -> Option<crate::autopilot::process_tree::SharedDaemon> {
+    configured_shared_daemon_from(crate::config::Config::load(None))
+}
+
+/// Whether [`configured_shared_daemon_from`] has warned about a config that
+/// failed to load, in this process: liveness reads it on every check.
+static CONFIG_FAILURE_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// [`configured_shared_daemon`] from a loaded (or failed) config. A config
+/// that failed to load exempts nothing, which only holds longer, and says
+/// so once per process.
+pub(crate) fn configured_shared_daemon_from(
+    config: Result<crate::config::Config, MemoryError>,
+) -> Option<crate::autopilot::process_tree::SharedDaemon> {
+    match config {
+        Ok(config) => crate::autopilot::process_tree::SharedDaemon::for_current_exe(
+            config.daemon_socket_path(),
+        ),
+        Err(e) => {
+            if !CONFIG_FAILURE_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::warn!(
+                    error = %e,
+                    "autopilot cannot load the ironmem config, so the shared daemon is not \
+                     exempt from the worktree-quiet check"
+                );
+            }
+            None
+        }
+    }
+}
+
+/// A worktree-quiet hold's reason, saying too when the shared daemon could
+/// not be exempted because the config failed to load: a daemon the agent's
+/// MCP proxy autospawned in the worktree then holds it.
+fn awaiting_quiet_reason(
+    implementer: Implementer,
+    held: &str,
+    config: Result<crate::config::Config, MemoryError>,
+) -> String {
+    let mut reason = format!(
+        "{} invocation finished, but its completion waits until nothing it started remains: \
+         {held}",
+        implementer.label()
+    );
+    if let Err(e) = config {
+        reason.push_str(&format!(
+            "; the shared daemon is not exempt: the ironmem config failed to load: {}",
+            super::scrub::scrub_and_bound(&e.to_string(), 300).text
+        ));
+    }
+    reason
+}
+
+/// An invocation whose supervisor refused completion only because its
+/// worktree was not quiet is upgraded to a trusted completion here once what
+/// the supervisor recorded is resolved
+/// ([`crate::autopilot::invocation::settle_awaiting_quiet`]). Every liveness
+/// decision for a recovering harness (the queue, reconcile, status,
+/// `clear-dispatch`, `CliDispatcher::recover`) goes through this, so any of
+/// them may finish it, and a Lead records it on a later tick.
+fn settle_awaiting_quiet(
+    snapshot: &ProcessSnapshot,
+    artifacts: &crate::autopilot::invocation::InvocationArtifacts,
+    daemon: fn() -> Option<crate::autopilot::process_tree::SharedDaemon>,
+    pids: crate::autopilot::process_tree::ScanPids<'_>,
+) -> Result<bool, String> {
+    if !crate::autopilot::invocation::is_awaiting_quiet(artifacts) {
+        return Ok(false);
+    }
+    crate::autopilot::invocation::settle_awaiting_quiet(
+        artifacts,
+        snapshot,
+        daemon().as_ref(),
+        crate::autopilot::process_tree::kernel_birth,
+        pids,
+    )
+}
+
+pub(crate) fn invocation_state_liveness(
+    snapshot: &ProcessSnapshot,
     state: &DispatchState,
 ) -> Liveness {
-    match state.codex_artifacts.as_ref() {
-        Some(artifacts) => snapshot.liveness(Some(artifacts)),
-        None => match idle_codex_pause(snapshot, state) {
+    invocation_state_liveness_with(
+        snapshot,
+        state,
+        configured_shared_daemon,
+        &crate::autopilot::process_tree::user_pids,
+    )
+}
+
+/// [`invocation_state_liveness`] with the shared-daemon exemption and the
+/// PIDs a worktree scan reads injected.
+pub(crate) fn invocation_state_liveness_with(
+    snapshot: &ProcessSnapshot,
+    state: &DispatchState,
+    daemon: fn() -> Option<crate::autopilot::process_tree::SharedDaemon>,
+    pids: crate::autopilot::process_tree::ScanPids<'_>,
+) -> Liveness {
+    // artifacts proven outside the worktree's common directory are
+    // not this issue's invocation to judge, however the process table
+    // reads. A common directory that cannot be resolved at all (the
+    // worktree is gone, or was never a checkout) proves nothing either
+    // way, so process evidence still decides; `run`'s recovery, which
+    // reads the artifacts, is the strict check.
+    if let Some(artifacts) = &state.invocation_artifacts {
+        if artifacts.outside_common_dir(std::path::Path::new(&state.worktree_path)) {
+            return Liveness::Unknown;
+        }
+    }
+    match state.invocation_artifacts.as_ref() {
+        Some(artifacts) => match snapshot.liveness_with(Some(artifacts), &daemon) {
+            Liveness::Unknown
+                if settle_awaiting_quiet(snapshot, artifacts, daemon, pids) == Ok(true) =>
+            {
+                snapshot.liveness_with(Some(artifacts), &daemon)
+            }
+            liveness => liveness,
+        },
+        None => match idle_invocation_pause(snapshot, state) {
             Ok(()) => Liveness::NotListed,
             Err(_) => Liveness::Unknown,
         },
     }
 }
 
-pub(crate) fn codex_state_reason(snapshot: &CodexProcessSnapshot, state: &DispatchState) -> String {
-    match state.codex_artifacts.as_ref() {
-        Some(artifacts) => snapshot.invocation_reason(Some(artifacts)),
-        None => idle_codex_pause(snapshot, state)
+pub(crate) fn invocation_state_reason(snapshot: &ProcessSnapshot, state: &DispatchState) -> String {
+    invocation_state_reason_with(
+        snapshot,
+        state,
+        configured_shared_daemon,
+        &crate::autopilot::process_tree::user_pids,
+    )
+}
+
+/// [`invocation_state_reason`] with the shared-daemon exemption and the
+/// PIDs a worktree scan reads injected.
+pub(crate) fn invocation_state_reason_with(
+    snapshot: &ProcessSnapshot,
+    state: &DispatchState,
+    daemon: fn() -> Option<crate::autopilot::process_tree::SharedDaemon>,
+    pids: crate::autopilot::process_tree::ScanPids<'_>,
+) -> String {
+    if let Some(artifacts) = &state.invocation_artifacts {
+        if artifacts.outside_common_dir(std::path::Path::new(&state.worktree_path)) {
+            if let Err(reason) =
+                artifacts.check_common_dir(std::path::Path::new(&state.worktree_path))
+            {
+                return reason;
+            }
+        }
+    }
+    match state.invocation_artifacts.as_ref() {
+        Some(artifacts) => match settle_awaiting_quiet(snapshot, artifacts, daemon, pids) {
+            Err(held) => {
+                awaiting_quiet_reason(state.implementer, &held, crate::config::Config::load(None))
+            }
+            Ok(_) => snapshot.invocation_reason_with(Some(artifacts), &daemon),
+        },
+        None => idle_invocation_pause(snapshot, state)
             .err()
-            .unwrap_or_else(|| "Codex has no pending invocation in a durable paused state".into()),
+            .unwrap_or_else(|| {
+                format!(
+                    "{} has no pending invocation in a durable paused state",
+                    state.implementer.label()
+                )
+            }),
     }
 }
 
 impl LivenessSnapshot for HarnessSnapshots {
     fn liveness(&self, state: &DispatchState) -> Liveness {
+        if state.phase() == Some(super::dispatch_state::DispatchPhase::PausedCompletionUnproven) {
+            return Liveness::Unknown;
+        }
         match state.implementer {
             Implementer::Claude => self.claude.liveness(&state.ic_session_name),
-            Implementer::Codex => codex_state_liveness(&self.codex, state),
+            Implementer::Codex | Implementer::Muse => {
+                invocation_state_liveness(&self.processes, state)
+            }
         }
     }
     fn reason(&self, implementer: Implementer) -> String {
         match implementer {
             Implementer::Claude => LivenessSnapshot::reason(&self.claude, implementer),
-            Implementer::Codex => self.codex.reason(),
+            Implementer::Codex | Implementer::Muse => self.processes.reason(),
         }
     }
     fn state_reason(&self, state: &DispatchState) -> String {
+        if state.phase() == Some(super::dispatch_state::DispatchPhase::PausedCompletionUnproven) {
+            return "dispatch completion is unproven; inspect and stop leftover tools, then run clear-dispatch (it refuses while leftovers remain)".into();
+        }
         match state.implementer {
             Implementer::Claude => self.reason(state.implementer),
-            Implementer::Codex => codex_state_reason(&self.codex, state),
+            Implementer::Codex | Implementer::Muse => {
+                invocation_state_reason(&self.processes, state)
+            }
         }
     }
     fn claude_names(&self) -> Vec<&str> {
         self.claude.names()
     }
-    fn codex_markers(&self) -> Vec<&str> {
-        self.codex.orphan_markers()
+    fn invocation_markers(&self) -> Vec<&str> {
+        self.processes.orphan_markers()
     }
 }
 /// Compatibility for callers providing only Claude evidence: never infer a
-/// Codex death from the absence of a Claude session.
+/// supervised CLI invocation's death from the absence of a Claude session.
 impl LivenessSnapshot for RegistrySnapshot {
     fn liveness(&self, state: &DispatchState) -> Liveness {
+        if state.phase() == Some(super::dispatch_state::DispatchPhase::PausedCompletionUnproven) {
+            return Liveness::Unknown;
+        }
         match state.implementer {
             Implementer::Claude => self.liveness(&state.ic_session_name),
-            Implementer::Codex => Liveness::Unknown,
+            // A supervised CLI harness is judged on process evidence, which
+            // this Claude-only registry does not hold.
+            Implementer::Codex | Implementer::Muse => Liveness::Unknown,
         }
     }
     fn reason(&self, implementer: Implementer) -> String {
-        if implementer == Implementer::Codex {
-            return "Codex process source was not supplied".into();
+        if implementer.recovers_invocations() {
+            return "invocation process source was not supplied".into();
         }
         match self {
             Self::Unavailable { reason } => reason.clone(),
@@ -498,12 +686,14 @@ impl LivenessSnapshot for RegistrySnapshot {
     }
 }
 
+/// A snapshot of every harness's liveness evidence: Claude's registry
+/// plus the process table that covers Codex and Muse.
 pub trait HarnessMonitor {
     fn snapshot(&mut self) -> HarnessSnapshots;
 }
 impl<T: AgentRegistry + ?Sized> HarnessMonitor for T {
     fn snapshot(&mut self) -> HarnessSnapshots {
-        // Keep this adapter Claude-only; real controllers use TwoHarnessMonitor.
+        // Keep this adapter Claude-only; real controllers use HarnessProcessMonitor.
         let claude = match self.list() {
             Ok(output) if output.success => match parse_agents(&output.stdout) {
                 Ok(rows) => RegistrySnapshot::Available(rows),
@@ -521,26 +711,48 @@ impl<T: AgentRegistry + ?Sized> HarnessMonitor for T {
         };
         HarnessSnapshots {
             claude,
-            codex: CodexProcessSnapshot::Unavailable {
-                reason: "Codex process source was not supplied".into(),
+            processes: ProcessSnapshot::Unavailable {
+                reason: "invocation process source was not supplied".into(),
             },
         }
     }
 }
 
-pub struct TwoHarnessMonitor {
+/// The real controllers' monitor: Claude's agent registry plus the process
+/// table, which covers every supervised CLI harness (Codex and Muse).
+pub struct HarnessProcessMonitor {
     claude: Result<ClaudeAgentRegistry, String>,
-    codex: super::codex_process::UnixCodexProcesses,
+    processes: super::process_tree::UnixProcesses,
 }
-impl Default for TwoHarnessMonitor {
+/// The monitor's name from when it watched two harnesses.
+#[deprecated(
+    note = "renamed to `HarnessProcessMonitor`; it watches every harness; removal in 0.7.0"
+)]
+pub type TwoHarnessMonitor = HarnessProcessMonitor;
+
+impl HarnessProcessMonitor {
+    /// A monitor whose registry read runs in `dir`, not in the controller's
+    /// own directory, which may be a checkout that nothing the read starts
+    /// should touch. Callers pass a fixed neutral directory
+    /// ([`std::env::temp_dir`]), never a worktree the model can write.
+    pub(crate) fn in_dir(dir: &std::path::Path) -> Self {
+        let mut monitor = Self::default();
+        if let Ok(registry) = &mut monitor.claude {
+            registry.dir = Some(dir.to_path_buf());
+        }
+        monitor
+    }
+}
+
+impl Default for HarnessProcessMonitor {
     fn default() -> Self {
         Self {
             claude: ClaudeAgentRegistry::resolve().map_err(|e| e.to_string()),
-            codex: super::codex_process::UnixCodexProcesses,
+            processes: super::process_tree::UnixProcesses,
         }
     }
 }
-impl HarnessMonitor for TwoHarnessMonitor {
+impl HarnessMonitor for HarnessProcessMonitor {
     fn snapshot(&mut self) -> HarnessSnapshots {
         let claude = match &mut self.claude {
             Ok(registry) => snapshot(registry),
@@ -550,7 +762,7 @@ impl HarnessMonitor for TwoHarnessMonitor {
         };
         HarnessSnapshots {
             claude,
-            codex: super::codex_process::snapshot(&mut self.codex),
+            processes: super::process_tree::snapshot(&mut self.processes),
         }
     }
 }
@@ -558,6 +770,20 @@ impl HarnessMonitor for TwoHarnessMonitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The monitor's old name, from when it watched two harnesses, still
+    /// names the same type for anyone outside the crate, deprecated.
+    #[test]
+    #[allow(deprecated)]
+    fn the_process_monitor_keeps_its_old_name_as_a_deprecated_alias() {
+        fn same(monitor: TwoHarnessMonitor) -> HarnessProcessMonitor {
+            monitor
+        }
+        fn back(monitor: HarnessProcessMonitor) -> crate::autopilot::TwoHarnessMonitor {
+            monitor
+        }
+        let _ = (same, back);
+    }
 
     #[cfg(unix)]
     #[test]
@@ -571,6 +797,7 @@ mod tests {
             ClaudeAgentRegistry {
                 bin,
                 timeout: Duration::from_millis(300),
+                dir: None,
             }
         };
         // Hung outright, and exited while a child holds its output open.
@@ -627,6 +854,46 @@ mod tests {
                 Err(e) => Err(MemoryError::Validation(e.to_string())),
             }
         }
+    }
+
+    /// a config that fails to load exempts no daemon, and the hold
+    /// says why.
+    #[test]
+    fn a_config_that_fails_to_load_is_named_in_the_quiet_hold() {
+        let failed = || Err(MemoryError::Validation("IRONMEM_X is not a number".into()));
+        assert!(configured_shared_daemon_from(failed()).is_none());
+        let reason = awaiting_quiet_reason(Implementer::Muse, "process 7 is in it", failed());
+        assert!(reason.contains("process 7 is in it"), "{reason}");
+        assert!(
+            reason.contains("the shared daemon is not exempt: the ironmem config failed to load"),
+            "{reason}"
+        );
+        assert!(reason.contains("IRONMEM_X is not a number"), "{reason}");
+    }
+
+    /// A registry read for an issue runs in its worktree, never in the
+    /// controller's own directory: whatever `claude agents` starts or
+    /// writes stays out of the controller's checkout.
+    #[cfg(unix)]
+    #[test]
+    fn a_registry_read_in_a_directory_runs_there() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("claude");
+        std::fs::write(&bin, "#!/bin/sh\npwd -P > \"$0.cwd\"\necho '[]'\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut registry = ClaudeAgentRegistry {
+            bin: bin.clone(),
+            timeout: Duration::from_secs(10),
+            dir: Some(worktree.path().to_path_buf()),
+        };
+        assert!(registry.list().unwrap().success);
+        let ran_in = std::fs::read_to_string(dir.path().join("claude.cwd")).unwrap();
+        assert_eq!(
+            std::path::Path::new(ran_in.trim()),
+            std::fs::canonicalize(worktree.path()).unwrap()
+        );
     }
 
     #[test]
@@ -870,7 +1137,7 @@ mod harness_tests {
                 name: "ic-test".into(),
                 status: None,
             }]),
-            codex: CodexProcessSnapshot::Unavailable {
+            processes: ProcessSnapshot::Unavailable {
                 reason: "ps unavailable".into(),
             },
         };
@@ -881,7 +1148,7 @@ mod harness_tests {
 
     #[test]
     fn codex_parser_uses_executable_and_option_position() {
-        let rows = parse_codex_processes("10 1 10 S /opt/codex exec --output-schema /tmp/.git/ironmem/autopilot/repo/uuid/schema.json prompt\n11 1 11 S /bin/sh -c codex exec --output-schema /tmp/.git/ironmem/autopilot/repo/uuid/schema.json\n12 1 12 S codex exec --json reviewer prompt\n13 1 13 S codex exec resume --output-schema /tmp/.git/ironmem/autopilot/repo/other/schema.json native prompt\n").unwrap();
+        let rows = parse_processes("10 1 10 S /opt/codex exec --output-schema /tmp/.git/ironmem/autopilot/repo/uuid/schema.json prompt\n11 1 11 S /bin/sh -c codex exec --output-schema /tmp/.git/ironmem/autopilot/repo/uuid/schema.json\n12 1 12 S codex exec --json reviewer prompt\n13 1 13 S codex exec resume --output-schema /tmp/.git/ironmem/autopilot/repo/other/schema.json native prompt\n").unwrap();
         assert_eq!(rows.len(), 4);
         assert_eq!(
             rows[0].marker().unwrap(),
@@ -890,27 +1157,26 @@ mod harness_tests {
         assert_eq!(rows[1].marker().unwrap(), None);
         assert_eq!(rows[2].marker().unwrap(), None);
         let reviewer =
-            parse_codex_processes("16 1 16 S codex exec --future-review-flag reviewer\n").unwrap();
+            parse_processes("16 1 16 S codex exec --future-review-flag reviewer\n").unwrap();
         assert_eq!(reviewer[0].marker().unwrap(), None);
         assert_eq!(
             rows[3].marker().unwrap(),
             Some("/tmp/.git/ironmem/autopilot/repo/other/schema.json")
         );
-        let bad = parse_codex_processes(
-            "14 1 14 S codex exec --output-schema /tmp/.git/ironmem/autopilot/repo/uuid/schema.json --future-flag v p\n",
+        let bad = parse_processes(
+            "14 1 14 S codex exec --output-schema /tmp/.git/ironmem/autopilot/owner-repo-42/11111111-2222-3333-4444-555555555555/schema.json --future-flag v p\n",
         )
         .unwrap();
         assert!(bad[0].marker().is_err());
         let prompt =
-            parse_codex_processes("15 1 15 S codex exec prompt --output-schema /tmp/false\n")
-                .unwrap();
+            parse_processes("15 1 15 S codex exec prompt --output-schema /tmp/false\n").unwrap();
         assert_eq!(prompt[0].marker().unwrap(), None);
     }
-    fn paused_codex_state() -> DispatchState {
+    fn paused_state(implementer: Implementer) -> DispatchState {
         DispatchState {
-            implementer: Implementer::Codex,
+            implementer,
             native_session_id: Some("11111111-2222-3333-4444-555555555555".into()),
-            codex_artifacts: None,
+            invocation_artifacts: None,
             issue: crate::autopilot::IssueRef::new("owner/repo", 42),
             worktree_path: "/tmp/wt".into(),
             ic_session_name: "ic-owner-repo-42".into(),
@@ -921,7 +1187,66 @@ mod harness_tests {
             session_uuid: "controller-only".into(),
             turn_n: 3,
             session_claimed: true,
+            session_model: None,
+            resume_refusals: 0,
+            signing_held: false,
         }
+    }
+    #[test]
+    fn a_muse_state_is_judged_by_process_evidence_never_by_the_claude_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        let (artifacts, mut root) = crate::autopilot::process_tree::testing::invocation(dir.path());
+        root.args = format!(
+            "/u/muse-bin-1.4.13-R6996.1 exec --json --output-schema {} --prompt-file /p.md",
+            artifacts.schema_path
+        );
+        let mut state = paused_state(Implementer::Muse);
+        state.state = "dispatching".into();
+        state.invocation_artifacts = Some(artifacts);
+        let alive = HarnessSnapshots {
+            claude: RegistrySnapshot::Unavailable {
+                reason: "registry unreadable".into(),
+            },
+            processes: ProcessSnapshot::Available(vec![root]),
+        };
+        assert_eq!(alive.liveness(&state), Liveness::Alive);
+        // Claude-only evidence can never prove a Muse invocation dead.
+        assert_eq!(
+            LivenessSnapshot::liveness(&RegistrySnapshot::Available(Vec::new()), &state),
+            Liveness::Unknown
+        );
+        assert_eq!(
+            LivenessSnapshot::reason(&RegistrySnapshot::Available(Vec::new()), Implementer::Muse),
+            "invocation process source was not supplied"
+        );
+        // Muse availability follows the process source alone: the Claude
+        // registry above is unavailable and must not matter.
+        assert!(!alive.is_available(Implementer::Claude));
+        assert!(alive.is_available(Implementer::Muse));
+    }
+    #[test]
+    fn an_idle_muse_pause_names_muse_when_it_holds() {
+        let mut state = paused_state(Implementer::Muse);
+        let mut snapshots = paused_snapshots();
+        assert_eq!(snapshots.liveness(&state), Liveness::NotListed);
+        snapshots.processes = ProcessSnapshot::Available(
+            parse_processes(
+                "10 1 10 S /u/muse-bin-1.4.13-R6996.1 exec --output-schema /x/.git/ironmem/autopilot/owner-repo-42/11111111-2222-3333-4444-555555555555/schema.json --brand-new-flag\n",
+            )
+            .unwrap(),
+        );
+        assert_eq!(snapshots.liveness(&state), Liveness::Unknown);
+        // The ambiguous row's own harness, not the state's, is in its reason.
+        assert_eq!(
+            snapshots.state_reason(&state),
+            "an invocation process marker is ambiguous: unrecognized Muse option"
+        );
+        state.state = "paused-other".into();
+        assert!(
+            snapshots.state_reason(&state).starts_with("Muse state "),
+            "got: {}",
+            snapshots.state_reason(&state)
+        );
     }
     fn paused_snapshots() -> HarnessSnapshots {
         HarnessSnapshots {
@@ -929,12 +1254,12 @@ mod harness_tests {
                 name: "ic-owner-repo-42".into(),
                 status: None,
             }]),
-            codex: CodexProcessSnapshot::Available(Vec::new()),
+            processes: ProcessSnapshot::Available(Vec::new()),
         }
     }
     #[test]
     fn explicit_idle_codex_pauses_require_available_source_and_valid_optional_native_id() {
-        let mut state = paused_codex_state();
+        let mut state = paused_state(Implementer::Codex);
         let snapshots = paused_snapshots();
         for label in [
             "paused-daily-budget",
@@ -943,6 +1268,7 @@ mod harness_tests {
             // before the first launch, and the between-invocation states a
             // failed `?` on the next iteration leaves behind.
             "paused-condition-too-long",
+            "paused-session-in-use",
             "dispatching",
             "infrastructure-failure",
         ] {
@@ -960,9 +1286,9 @@ mod harness_tests {
             state.native_session_id = Some(bad.into());
             assert_eq!(snapshots.liveness(&state), Liveness::Unknown);
         }
-        let state = paused_codex_state();
+        let state = paused_state(Implementer::Codex);
         let mut unavailable = paused_snapshots();
-        unavailable.codex = CodexProcessSnapshot::Unavailable {
+        unavailable.processes = ProcessSnapshot::Unavailable {
             reason: "ps unavailable".into(),
         };
         assert_eq!(unavailable.liveness(&state), Liveness::Unknown);
@@ -974,7 +1300,7 @@ mod harness_tests {
     }
     #[test]
     fn absent_codex_identity_in_an_unknown_phase_still_holds() {
-        let mut state = paused_codex_state();
+        let mut state = paused_state(Implementer::Codex);
         let snapshots = paused_snapshots();
         for phase in ["paused-other", "", "Dispatching"] {
             state.state = phase.into();
@@ -983,11 +1309,11 @@ mod harness_tests {
     }
     #[test]
     fn a_paused_label_never_bypasses_pending_codex_identity_or_completion() {
-        use crate::autopilot::codex_process::testing;
+        use crate::autopilot::process_tree::testing;
         let dir = tempfile::tempdir().unwrap();
         let (a, _) = testing::invocation(dir.path());
-        let mut state = paused_codex_state();
-        state.codex_artifacts = Some(a.clone());
+        let mut state = paused_state(Implementer::Codex);
+        state.invocation_artifacts = Some(a.clone());
         let snapshots = paused_snapshots();
         assert_eq!(snapshots.liveness(&state), Liveness::Unknown);
         testing::complete(&a);
@@ -1003,29 +1329,29 @@ mod harness_tests {
     }
     #[test]
     fn fresh_same_issue_or_ambiguous_codex_process_evidence_overrides_idle_pause() {
-        let state = paused_codex_state();
+        let state = paused_state(Implementer::Codex);
         let mut snapshots = paused_snapshots();
         assert_eq!(snapshots.liveness(&state), Liveness::NotListed);
-        snapshots.codex = CodexProcessSnapshot::Available(parse_codex_processes("10 1 10 S codex exec --output-schema /other-clone/.git/ironmem/autopilot/owner-repo-42/11111111-2222-3333-4444-555555555555/schema.json prompt\n").unwrap());
+        snapshots.processes = ProcessSnapshot::Available(parse_processes("10 1 10 S codex exec --output-schema /other-clone/.git/ironmem/autopilot/owner-repo-42/11111111-2222-3333-4444-555555555555/schema.json prompt\n").unwrap());
         assert_eq!(
             snapshots.liveness(&state),
             Liveness::Unknown,
             "without a persisted invocation marker, hold rather than adopt an inferred root"
         );
         assert!(snapshots.state_reason(&state).contains("active"));
-        snapshots.codex = CodexProcessSnapshot::Available(
-            parse_codex_processes(
-                "10 1 10 S codex exec --future-flag v --output-schema /x/schema.json p\n",
+        snapshots.processes = ProcessSnapshot::Available(
+            parse_processes(
+                "10 1 10 S codex exec --future-flag v --output-schema /x/.git/ironmem/autopilot/owner-repo-7/11111111-2222-3333-4444-555555555555/schema.json p\n",
             )
             .unwrap(),
         );
         assert_eq!(snapshots.liveness(&state), Liveness::Unknown);
-        // An unparseable row that names no schema.json cannot be ours.
-        snapshots.codex = CodexProcessSnapshot::Available(
-            parse_codex_processes("10 1 10 S codex exec --output-schema\n").unwrap(),
+        // An unparseable row that names no Autopilot-shaped marker cannot be ours.
+        snapshots.processes = ProcessSnapshot::Available(
+            parse_processes("10 1 10 S codex exec --output-schema\n").unwrap(),
         );
         assert_eq!(snapshots.liveness(&state), Liveness::NotListed);
-        snapshots.codex = CodexProcessSnapshot::Available(parse_codex_processes("10 1 10 S codex exec --output-schema /other/.git/ironmem/autopilot/owner-repo-99/11111111-2222-3333-4444-555555555555/schema.json prompt\n11 1 11 S codex exec reviewer prompt\n12 1 12 S /bin/sh -c codex exec --output-schema /other-clone/.git/ironmem/autopilot/owner-repo-42/11111111-2222-3333-4444-555555555555/schema.json\n").unwrap());
+        snapshots.processes = ProcessSnapshot::Available(parse_processes("10 1 10 S codex exec --output-schema /other/.git/ironmem/autopilot/owner-repo-99/11111111-2222-3333-4444-555555555555/schema.json prompt\n11 1 11 S codex exec reviewer prompt\n12 1 12 S /bin/sh -c codex exec --output-schema /other-clone/.git/ironmem/autopilot/owner-repo-42/11111111-2222-3333-4444-555555555555/schema.json\n").unwrap());
         assert_eq!(
             snapshots.liveness(&state),
             Liveness::NotListed,

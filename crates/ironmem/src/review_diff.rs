@@ -228,7 +228,10 @@ fn resolve_expansion_target(
 
 fn read_source(request: &ReviewDiffRequest) -> Result<String, MemoryError> {
     let mut command = Command::new("git");
-    scrub_git_environment(&mut command);
+    // Git repository and configuration overrides can redirect a command away
+    // from `request.repo`. The shared scrub removes the redirecting ones
+    // unconditionally, so one set after this line is not inherited either.
+    crate::git_env::scrub_git_environment(&mut command);
     command.current_dir(&request.repo);
     command.args(["diff", "--no-ext-diff", "--no-textconv", "--unified=3"]);
     match &request.source {
@@ -257,21 +260,6 @@ fn read_source(request: &ReviewDiffRequest) -> Result<String, MemoryError> {
     String::from_utf8(output.stdout).map_err(|_| {
         MemoryError::Validation("review-diff git diff produced non-UTF-8 output".into())
     })
-}
-
-fn scrub_git_environment(command: &mut Command) {
-    // Git repository and configuration overrides can redirect a command away
-    // from `request.repo`; preserve normal environment such as PATH, but not
-    // inherited Git-specific process controls.
-    for (key, _) in std::env::vars_os() {
-        if key
-            .to_string_lossy()
-            .to_ascii_uppercase()
-            .starts_with("GIT_")
-        {
-            command.env_remove(key);
-        }
-    }
 }
 
 fn validate_revision(revision: &str, name: &str) -> Result<(), MemoryError> {

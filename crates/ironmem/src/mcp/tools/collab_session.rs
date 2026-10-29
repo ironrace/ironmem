@@ -1,6 +1,5 @@
 use rusqlite::OptionalExtension;
 use serde_json::{json, Value};
-use std::process::Command;
 use uuid::Uuid;
 
 use crate::collab::queue::SessionRecord;
@@ -1601,88 +1600,9 @@ fn require_checkpoint_proof(
     Ok(())
 }
 
-/// Strip every inherited `GIT_*` variable before spawning git.
-///
-/// `git -C <path>` is not enough on its own: an inherited `GIT_DIR` /
-/// `GIT_WORK_TREE` (and friends) silently redirects the command at a
-/// *different* repository, so a checkpoint would be compared against the wrong
-/// HEAD — and could be reported `head_check: matches` while the session's real
-/// repo has drifted. That is an unverified claim presented as verified, the
-/// exact failure issue #273 exists to end, arriving through the environment
-/// rather than through a stale record.
-///
-/// Not hypothetical, and not novel here: `review::diff`'s helper of the same
-/// name says these overrides "can redirect a command away from `request.repo`",
-/// the review hook does the same, and this file's own test fixtures already
-/// scrub — the production path was the one left exposed. PATH and the rest of
-/// the environment are deliberately preserved; only git's process controls go.
-///
-/// `pub(crate)` so every git shell-out in the crate goes through the same
-/// scrub rather than growing a second, unscrubbed spelling — `collab_checkpoint`'s
-/// inspection and range-verification shell-outs (Task 10), and `code_maps`'
-/// worktree probe and freshness diff. Every `Command::new("git")` in the crate
-/// must call it before `.output()`.
-///
-/// Widened from `pub(super)` because the two `code_maps` spawns were the
-/// remaining exposure, and it was not theoretical: this module's own test
-/// fixtures set `GIT_DIR`/`GIT_WORK_TREE` process-wide (see `ScopedGitEnv`),
-/// and `cargo test` runs the lib binary's tests on parallel threads — so an
-/// unscrubbed `git rev-parse --show-toplevel` beside them intermittently
-/// resolved to the fixture's repo instead of its own `current_dir`, failing
-/// two `code_maps` tests at random. The mutex `ScopedGitEnv` holds cannot help
-/// there: it serializes the tests that *set* the variables, not the unrelated
-/// ones that merely inherit them.
-///
-/// The removal is recorded in two passes, and the first one is what makes the
-/// guarantee unconditional. `Command` applies recorded removals against the
-/// environment as it exists at *spawn* time, so a sweep of `vars_os()` alone
-/// only strips what happened to be set at scrub time — a `GIT_DIR` that
-/// appears between the sweep and `.output()` is inherited, which is exactly
-/// the race this module's own `ScopedGitEnv` fixtures run: they set `GIT_*`
-/// process-wide while `cargo test` runs other threads' git calls beside them.
-/// `env_remove` records the removal whether or not the variable is currently
-/// set, so naming the redirecting variables outright ([`REDIRECTING_GIT_VARS`])
-/// closes that window. The sweep still runs afterward, for anything outside
-/// that list that is already set.
-pub(crate) fn scrub_git_environment(command: &mut Command) {
-    for key in REDIRECTING_GIT_VARS {
-        command.env_remove(key);
-    }
-    for (key, _) in std::env::vars_os() {
-        if key
-            .to_string_lossy()
-            .to_ascii_uppercase()
-            .starts_with("GIT_")
-        {
-            command.env_remove(key);
-        }
-    }
-}
-
-/// The `GIT_*` variables that decide *which* repository or configuration a
-/// command reads — the ones whose inheritance is a correctness problem rather
-/// than a cosmetic one. Removed unconditionally by [`scrub_git_environment`]
-/// so the removal is in effect at spawn time no matter when the variable is
-/// set. `GIT_CONFIG_COUNT` covers the whole `GIT_CONFIG_KEY_<n>` /
-/// `GIT_CONFIG_VALUE_<n>` family: git ignores those without the count, and the
-/// family is unbounded, so it cannot be enumerated here.
-const REDIRECTING_GIT_VARS: [&str; 15] = [
-    "GIT_DIR",
-    "GIT_WORK_TREE",
-    "GIT_COMMON_DIR",
-    "GIT_INDEX_FILE",
-    "GIT_OBJECT_DIRECTORY",
-    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-    "GIT_NAMESPACE",
-    "GIT_CEILING_DIRECTORIES",
-    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
-    "GIT_PREFIX",
-    "GIT_CONFIG",
-    "GIT_CONFIG_GLOBAL",
-    "GIT_CONFIG_SYSTEM",
-    "GIT_CONFIG_NOSYSTEM",
-    "GIT_CONFIG_COUNT",
-];
+#[cfg(test)]
+use crate::git_env::REDIRECTING_GIT_VARS;
+pub(crate) use crate::git_env::{scrub_git_environment, scrubbed_git};
 
 /// Refuse a reported head that is not a real, git-verified descendant of the
 /// session's last recorded head.
@@ -1714,6 +1634,18 @@ fn validate_global_review_head_advance(
     repo_path: &str,
     last_head_sha: &str,
     head_sha: &str,
+) -> Result<(), MemoryError> {
+    validate_global_review_head_advance_with(repo_path, last_head_sha, head_sha, &[])
+}
+
+/// [`validate_global_review_head_advance`], its git commands built by
+/// [`scrubbed_git`] with `inherited` (a test's hostile environment; empty in
+/// production).
+fn validate_global_review_head_advance_with(
+    repo_path: &str,
+    last_head_sha: &str,
+    head_sha: &str,
+    inherited: &[(&str, &std::ffi::OsStr)],
 ) -> Result<(), MemoryError> {
     // Both revisions must *look like* object names before git is allowed to
     // resolve them. `git merge-base --is-ancestor` accepts any revision
@@ -1824,12 +1756,10 @@ fn validate_global_review_head_advance(
              comparison skipped, existence check only (session seeded before \
              the #284 seed-site shape checks)"
         );
-        return validate_head_sha_exists(repo_path, head_sha);
+        return validate_head_sha_exists(repo_path, head_sha, inherited);
     }
 
-    let mut command = Command::new("git");
-    scrub_git_environment(&mut command);
-    let output = command
+    let output = scrubbed_git(inherited)
         .args([
             "-C",
             repo_path,
@@ -1911,11 +1841,13 @@ fn validate_global_review_head_advance(
 /// separator (there `--` guards a leading `-`; here it would make git read the
 /// argument as a pathspec and report every sha as unresolvable) and why
 /// `^{commit}` cannot be caller-supplied syntax.
-fn validate_head_sha_exists(repo_path: &str, head_sha: &str) -> Result<(), MemoryError> {
+fn validate_head_sha_exists(
+    repo_path: &str,
+    head_sha: &str,
+    inherited: &[(&str, &std::ffi::OsStr)],
+) -> Result<(), MemoryError> {
     let revision = format!("{head_sha}^{{commit}}");
-    let mut command = Command::new("git");
-    scrub_git_environment(&mut command);
-    let output = command
+    let output = scrubbed_git(inherited)
         .args([
             "-C",
             repo_path,
@@ -1972,9 +1904,16 @@ fn validate_head_sha_exists(repo_path: &str, head_sha: &str) -> Result<(), Memor
 /// check" into one answer and report `diverged: false` for an unreadable repo.
 /// See [`HeadCheck`].
 pub(super) fn git_head_sha(repo_path: &str) -> Result<String, MemoryError> {
-    let mut command = Command::new("git");
-    scrub_git_environment(&mut command);
-    let output = command
+    git_head_sha_with(repo_path, &[])
+}
+
+/// [`git_head_sha`], its git command built by [`scrubbed_git`] with
+/// `inherited` (a test's hostile environment; empty in production).
+fn git_head_sha_with(
+    repo_path: &str,
+    inherited: &[(&str, &std::ffi::OsStr)],
+) -> Result<String, MemoryError> {
+    let output = scrubbed_git(inherited)
         .args(["-C", repo_path, "rev-parse", "HEAD"])
         .output()
         .map_err(|err| {
@@ -7255,30 +7194,47 @@ mod tests {
         );
     }
 
-    /// `idle_secs` saturates to `i64::MIN` for an activity timestamp far in the
+    /// `idle_secs` goes hugely negative for an activity timestamp far in the
     /// future — the symmetric case of the `i64::MIN` corruption
-    /// `crate::collab::idle_secs` documents. The refusal's "{}s remaining"
-    /// arithmetic must not panic on it.
+    /// `crate::collab::idle_secs` documents.
     ///
     /// `collab_checkpoints.updated_at` is `INTEGER NOT NULL` with no range
     /// CHECK, so this is reachable by the same hand-repair path that doc
-    /// contemplates. Under debug assertions the unfixed subtraction panics
-    /// *inside* the `with_transaction` closure; under release it wraps and
-    /// renders a nonsensical negative.
+    /// contemplates. It cannot overflow the countdown (see
+    /// `crate::collab::remaining_secs_before_dead`), so this is no panic
+    /// guard: it pins the refusal's honest, very long countdown, and that the
+    /// refusal leaves the session unsealed.
     #[test]
     fn abandon_refusal_survives_an_activity_timestamp_from_the_future() {
+        let (_temp, repo_path, heads) = git_ancestor_chain(2);
         let app = test_app();
-        let sid = start_session(&app);
-        drive_to_implement(&app, &sid);
-        app.db
+        let sid = start_session_in_scope(&app, &repo_path, "main");
+        drive_to_implement_with_head(&app, &sid, &heads[0]);
+        // A checkpoint for the hand repair below to move into the future;
+        // `drive_to_implement` files none.
+        super::super::collab_checkpoint::handle_collab_checkpoint(
+            &app,
+            &json!({
+                "session_id": sid, "agent": "claude",
+                "task_id": 1, "task_title": "first task",
+                "status": "started",
+                "head_sha": heads[1], "completed_task_ids": "",
+            }),
+        )
+        .expect("the implementer may file progress");
+        let updated = app
+            .db
             .with_transaction(|tx| {
-                tx.execute(
+                Ok(tx.execute(
                     "UPDATE collab_checkpoints SET updated_at = ?2 WHERE session_id = ?1",
                     rusqlite::params![sid, i64::MAX],
-                )?;
-                Ok(())
+                )?)
             })
             .unwrap();
+        assert_eq!(
+            updated, 1,
+            "the premise: the session has a checkpoint to move"
+        );
 
         let err = handle_collab_end(&app, &abandon_args(&sid, "claude", "x")).unwrap_err();
         let message = err.to_string();
@@ -7286,9 +7242,20 @@ mod tests {
             message.contains("is still live"),
             "a session whose newest activity is in the future is live: {message}"
         );
+        // The countdown is `remaining_secs_before_dead`'s honest arithmetic:
+        // saturating, floored at zero, and a future activity reported as the
+        // long wait it really is (its doc), so it never panics or wraps
+        // negative. This once asserted "0s remaining", which never held: it
+        // passed only because no checkpoint existed for the hand repair to
+        // move, and "21600s remaining" (idle 0s) contains "0s remaining".
+        let remaining: i64 = message
+            .split_once("s remaining")
+            .and_then(|(before, _)| before.rsplit(' ').next())
+            .and_then(|secs| secs.parse().ok())
+            .unwrap_or_else(|| panic!("a remaining-seconds countdown: {message}"));
         assert!(
-            message.contains("0s remaining"),
-            "the remaining seconds must clamp at zero rather than wrap: {message}"
+            remaining >= crate::collab::COLLAB_DEAD_SESSION_SECS,
+            "the remaining seconds must not wrap below the threshold: {message}"
         );
         assert!(
             app.db
@@ -10521,51 +10488,6 @@ mod tests {
         crate::collab::CollabCheckpoint::from_json(&payload).unwrap()
     }
 
-    /// Serializes the tests below that mutate `GIT_*` process-wide. Separate
-    /// from `METRICS_ENV_LOCK` because it guards a different variable family;
-    /// sharing one lock would couple two unrelated suites.
-    static GIT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Sets `GIT_*` overrides for the duration of a test and restores them on
-    /// drop, holding [`GIT_ENV_LOCK`] throughout — `std::env::set_var` is
-    /// process-global, so an unsynchronized test would leak into whatever runs
-    /// beside it.
-    struct ScopedGitEnv {
-        previous: Vec<(String, Option<std::ffi::OsString>)>,
-        _guard: std::sync::MutexGuard<'static, ()>,
-    }
-
-    impl ScopedGitEnv {
-        fn set(vars: &[(&str, &str)]) -> Self {
-            let guard = GIT_ENV_LOCK
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            let previous = vars
-                .iter()
-                .map(|(key, value)| {
-                    let old = std::env::var_os(key);
-                    std::env::set_var(key, value);
-                    ((*key).to_string(), old)
-                })
-                .collect();
-            Self {
-                previous,
-                _guard: guard,
-            }
-        }
-    }
-
-    impl Drop for ScopedGitEnv {
-        fn drop(&mut self) {
-            for (key, old) in &self.previous {
-                match old {
-                    Some(value) => std::env::set_var(key, value),
-                    None => std::env::remove_var(key),
-                }
-            }
-        }
-    }
-
     /// A second repo whose history is genuinely disjoint from
     /// [`git_repo_with_two_commits`]'s.
     ///
@@ -10608,21 +10530,38 @@ mod tests {
              redirected read would return the right answer by accident"
         );
 
+        // Put on git's own command, where an inherited environment reaches
+        // it: never on the process, where it would redirect every other test
+        // thread's git while it is set.
         let hostile_git_dir = hostile_dir.path().join(".git");
-        let _overrides = ScopedGitEnv::set(&[
-            ("GIT_DIR", hostile_git_dir.to_string_lossy().as_ref()),
-            (
-                "GIT_WORK_TREE",
-                hostile_dir.path().to_string_lossy().as_ref(),
-            ),
-        ]);
+        let inherited = [
+            ("GIT_DIR", hostile_git_dir.as_os_str()),
+            ("GIT_WORK_TREE", hostile_dir.path().as_os_str()),
+        ];
 
-        let read = git_head_sha(&intended_dir.path().to_string_lossy()).unwrap();
+        let read = git_head_sha_with(&intended_dir.path().to_string_lossy(), &inherited).unwrap();
         assert_eq!(
             read, intended_head,
             "the repo_path argument must win over inherited Git overrides"
         );
         assert_ne!(read, hostile_head);
+    }
+
+    /// The seam takes only the variables the scrub removes, so it can never
+    /// put anything on production git: a key such as `GIT_SSH_COMMAND`,
+    /// `GIT_EXEC_PATH` or `PATH` is refused outright.
+    #[test]
+    fn the_scrub_seam_takes_only_redirecting_variables() {
+        let value = std::ffi::OsStr::new("/elsewhere");
+        for key in REDIRECTING_GIT_VARS {
+            scrubbed_git(&[(key, value)]);
+        }
+        for key in ["GIT_SSH_COMMAND", "GIT_EXEC_PATH", "PATH"] {
+            let refused = std::panic::catch_unwind(|| {
+                scrubbed_git(&[(key, value)]);
+            });
+            assert!(refused.is_err(), "{key} was accepted");
+        }
     }
 
     /// The same hazard on the ancestry spawn: an inherited `GIT_DIR` would
@@ -10637,22 +10576,21 @@ mod tests {
             "fixture precondition: the hostile repo must not share history"
         );
 
+        // On git's own command, as in the HEAD-read test above.
         let hostile_git_dir = hostile_dir.path().join(".git");
-        let _overrides = ScopedGitEnv::set(&[
-            ("GIT_DIR", hostile_git_dir.to_string_lossy().as_ref()),
-            (
-                "GIT_WORK_TREE",
-                hostile_dir.path().to_string_lossy().as_ref(),
-            ),
-        ]);
+        let inherited = [
+            ("GIT_DIR", hostile_git_dir.as_os_str()),
+            ("GIT_WORK_TREE", hostile_dir.path().as_os_str()),
+        ];
 
         // `second` descends from `first` in the intended repo. Neither sha
         // exists in the hostile one, so a redirected command cannot answer
         // this correctly — it errors on an unknown revision instead.
-        validate_global_review_head_advance(
+        validate_global_review_head_advance_with(
             &intended_dir.path().to_string_lossy(),
             &first,
             &second,
+            &inherited,
         )
         .expect("the repo_path argument must win over inherited Git overrides");
     }

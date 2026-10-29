@@ -6610,19 +6610,11 @@ fn commit_file_deterministic(
     write_file(&cwd.join(filename), contents);
     git(&["add", filename], cwd);
     let mut command = Command::new("git");
-    // Scrub every inherited `GIT_*` var first — same reason `git()` does —
-    // before setting the specific author/committer ones below. An inherited
-    // `GIT_DIR` would silently redirect this commit (and the determinism
-    // `GATE_HEAD` depends on) to a different repo than `cwd`.
-    for (key, _) in std::env::vars_os() {
-        if key
-            .to_string_lossy()
-            .to_ascii_uppercase()
-            .starts_with("GIT_")
-        {
-            command.env_remove(key);
-        }
-    }
+    // Scrubbed first — same reason `git()` is — before setting the specific
+    // author/committer variables below. An inherited `GIT_DIR` would
+    // silently redirect this commit (and the determinism `GATE_HEAD` depends
+    // on) to a different repo than `cwd`.
+    fixture_git_env(&mut command);
     command
         .args(["commit", "-m", message])
         .current_dir(cwd)
@@ -8445,18 +8437,12 @@ fn inspect_divergence_caps_and_flags_a_very_long_commit_range() {
     );
 
     let mut command = Command::new("bash");
-    // Same scrub every other git call in this file performs: an inherited
+    // The git this shell runs inherits the shell's environment, so it is
+    // scrubbed as every other fixture git in this file is: an inherited
     // GIT_DIR would land these commits in a different repository and the test
-    // would pass against an unchanged fixture.
-    for (key, _) in std::env::vars_os() {
-        if key
-            .to_string_lossy()
-            .to_ascii_uppercase()
-            .starts_with("GIT_")
-        {
-            command.env_remove(key);
-        }
-    }
+    // would pass against an unchanged fixture. The scan in `git_env_scan`
+    // looks only for `Command::new("git")`, so it cannot see this one.
+    fixture_git_env(&mut command);
     let status = command
         .arg("-c")
         .arg("for i in $(seq 1 205); do git commit -q --allow-empty -m \"filler $i\" || exit 1; done")

@@ -261,13 +261,16 @@ pub fn dead_session_threshold_human() -> String {
 /// an identical `saturating_sub(...).max(0)` with an identical justification
 /// hand-copied into each until this extraction.
 ///
-/// `saturating_sub`: `idle` is caller-influenced only through the clock, but
-/// e.g. `collab_checkpoints.updated_at` is `INTEGER NOT NULL` with no range
-/// `CHECK`, so a hand-repaired row can hold `i64::MAX` — an activity
-/// timestamp far in the future — and [`idle_secs`] then saturates to
-/// `i64::MIN`. Plain subtraction of that panics under debug assertions
-/// (unwinding out of a `with_transaction` closure) and wraps to a
-/// nonsensical negative "remaining" under release ones.
+/// `saturating_sub`: defends against an `idle` near `i64::MIN`, where plain
+/// subtraction would overflow (a panic under debug assertions, a wrapped
+/// negative "remaining" under release ones). A future activity timestamp
+/// cannot produce one while `now > COLLAB_DEAD_SESSION_SECS`: even a
+/// hand-repaired `collab_checkpoints.updated_at` of `i64::MAX` (the column is
+/// `INTEGER NOT NULL` with no range `CHECK`) gives `idle` of about
+/// `-9.22e18` today, and `COLLAB_DEAD_SESSION_SECS - idle` fits. Only a
+/// clock at or before 1970-01-01T05:59:59Z could reach it, so the guard is
+/// for robustness, and such a timestamp is reported as the honest, very
+/// long wait it implies.
 ///
 /// `max(0)` is a FLOOR, not a cap: it guards `idle >= COLLAB_DEAD_SESSION_SECS`,
 /// which would otherwise render a negative countdown on an already-dead

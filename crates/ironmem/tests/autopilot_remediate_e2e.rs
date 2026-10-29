@@ -28,25 +28,22 @@ use ironmem::autopilot::worktree;
 use ironmem::autopilot::{gate_config, IssueRef};
 use ironmem::db::schema::Database;
 
+mod git_env;
+
 const REPO: &str = "owner/repo";
 const ATTEMPT_CAP: u32 = 5;
 
 /// `current_dir` is **not** a repository selector: git reads `GIT_DIR` first,
 /// so an inherited one aims these calls at whatever repo the environment
-/// names. This suite is threaded and another module's tests set `GIT_DIR`
-/// process-wide, so the variables are stripped here the way
-/// `autopilot::worktree`'s own `git_command` strips them.
+/// names, so the variables are stripped here ([`git_env::fixture_git_env`]),
+/// the way `autopilot::worktree`'s own `git_command` strips them. Fixture git
+/// only: the code under test runs its own.
 fn git(dir: &Path, args: &[&str]) {
     let mut command = std::process::Command::new("git");
-    for (key, _) in std::env::vars_os() {
-        if key
-            .to_string_lossy()
-            .to_ascii_uppercase()
-            .starts_with("GIT_")
-        {
-            command.env_remove(key);
-        }
-    }
+    // Scrubbed (every redirecting variable, unconditionally), and no global
+    // or system config: the operator's may sign commits with their key, run
+    // their hooks, or change a default this fixture relies on.
+    git_env::fixture_git_env(&mut command);
     let out = command
         .args(args)
         .current_dir(dir)
@@ -134,7 +131,9 @@ exit 0
 
     // The IC. It records the condition it was handed — which is how the test
     // asserts the findings reached the *real* argv — and, when told to, makes
-    // a real commit, so the branch head genuinely moves.
+    // a real commit, so the branch head genuinely moves. Only a dispatch
+    // (`-p` among its arguments) does any of that: `claude agents` is a
+    // registry read, which answers an empty registry and touches nothing.
     stub(
         &stubs,
         "claude",
@@ -142,16 +141,25 @@ exit 0
 # This stub commits, so the same rule applies to it: an inherited GIT_DIR
 # would aim `git commit` at a repository nothing in this test chose.
 unset $(env | grep -o '^GIT_[A-Za-z0-9_]*' || true)
+# Nor the operator's global or system config: it may sign the commit with
+# their key or run their hooks.
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+if [ "$1" = agents ]; then
+  printf '[]'
+  exit 0
+fi
 echo "claude $*" >> "$AP_LOG"
 prev=""
+dispatch=""
 for a in "$@"; do
+  if [ "$a" = "-p" ]; then dispatch=1; fi
   if [ "$prev" = "-p" ]; then printf '%s' "$a" > "$AP_FIXTURES/last_condition.txt"; fi
   prev="$a"
 done
-if [ -f "$AP_FIXTURES/ic_should_commit" ]; then
+if [ -n "$dispatch" ] && [ -f "$AP_FIXTURES/ic_should_commit" ]; then
   echo "fix $(date +%s%N)" >> fix.txt
-  git add fix.txt >/dev/null 2>&1
-  git -c user.email=ic@example.com -c user.name=IC commit -qm "address review findings" >/dev/null 2>&1
+  git add fix.txt || exit 1
+  git -c user.email=ic@example.com -c user.name=IC commit -qm "address review findings" || exit 1
 fi
 printf '{"total_cost_usd":0.0,"num_turns":2,"duration_ms":5,"is_error":false,"session_id":"11111111-2222-3333-4444-555555555555","structured_output":{"verdict":"met"}}'
 exit 0
@@ -190,6 +198,9 @@ exit 0
     git(&checkout, &["init", "-q", "--initial-branch=main"]);
     git(&checkout, &["config", "user.email", "t@example.com"]);
     git(&checkout, &["config", "user.name", "T"]);
+    // Pinned: the global config signs and runs hooks; worktrees share this.
+    git(&checkout, &["config", "commit.gpgsign", "false"]);
+    git(&checkout, &["config", "core.hooksPath", "/dev/null"]);
     std::fs::write(checkout.join("README.md"), "seed\n").unwrap();
     git(&checkout, &["add", "README.md"]);
     git(&checkout, &["commit", "-qm", "seed"]);

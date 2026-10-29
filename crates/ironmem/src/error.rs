@@ -78,6 +78,11 @@ pub enum MemoryError {
     #[error("Validation error: {0}")]
     Validation(String),
 
+    /// A dispatch started, but its remaining processes cannot be proven
+    /// finished. Retrying requires an operator to release the durable hold.
+    #[error("Dispatch completion is unproven: {0}")]
+    DispatchUnsettled(String),
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 

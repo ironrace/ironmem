@@ -366,8 +366,6 @@ impl ClaudeAdvisor {
 
 impl Advisor for ClaudeAdvisor {
     fn advise(&mut self, cwd: &Path, spec: &AdviceSpec) -> Result<AdviceOutput, MemoryError> {
-        use std::io::Read;
-
         let mut child = std::process::Command::new(&self.bin)
             .args(build_argv(spec))
             .current_dir(cwd)
@@ -388,17 +386,8 @@ impl Advisor for ClaudeAdvisor {
         // output outruns the OS pipe buffer, and the bound would then kill a
         // healthy call and report it as a timeout — rung 7's own finding, in
         // the module that copied its shape.
-        fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> std::thread::JoinHandle<Vec<u8>> {
-            std::thread::spawn(move || {
-                let mut buf = Vec::new();
-                if let Some(mut pipe) = pipe {
-                    let _ = pipe.read_to_end(&mut buf);
-                }
-                buf
-            })
-        }
-        let stdout_drain = drain(child.stdout.take());
-        let stderr_drain = drain(child.stderr.take());
+        let stdout_drain = super::dispatch::drain(child.stdout.take());
+        let stderr_drain = super::dispatch::drain(child.stderr.take());
 
         let started = std::time::Instant::now();
         loop {
@@ -450,13 +439,31 @@ impl Advisor for ClaudeAdvisor {
         }
 
         let status = child.wait();
+        // A pipe that could not be read is a call that ran and answered
+        // nothing trustworthy: never success, and said so in stderr.
+        let stdout = super::dispatch::drained(stdout_drain);
+        let stderr = super::dispatch::drained(stderr_drain);
+        let unread: Vec<String> = [("stdout", &stdout), ("stderr", &stderr)]
+            .into_iter()
+            .filter_map(|(pipe, read)| {
+                read.as_ref()
+                    .err()
+                    .map(|e| format!("the advisor's {pipe} could not be read: {e}"))
+            })
+            .collect();
+        let mut stderr_text =
+            String::from_utf8_lossy(stderr.as_deref().unwrap_or_default()).to_string();
+        if !unread.is_empty() {
+            stderr_text = format!("{}; {stderr_text}", unread.join("; "));
+        }
         Ok(AdviceOutput {
-            stdout: String::from_utf8_lossy(&stdout_drain.join().unwrap_or_default()).to_string(),
-            stderr: String::from_utf8_lossy(&stderr_drain.join().unwrap_or_default()).to_string(),
+            stdout: String::from_utf8_lossy(stdout.as_deref().unwrap_or_default()).to_string(),
+            stderr: stderr_text,
             // A `wait` that fails leaves the exit status unknown, and unknown
             // is not success: the answer is refused and the call is still
-            // banked, because the process ran either way.
-            success: status.map(|s| s.success()).unwrap_or(false),
+            // banked, because the process ran either way. So is output that
+            // could not be read.
+            success: unread.is_empty() && status.map(|s| s.success()).unwrap_or(false),
         })
     }
 }

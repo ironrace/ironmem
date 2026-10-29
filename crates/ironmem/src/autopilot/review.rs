@@ -307,18 +307,13 @@ pub fn build_argv(spec: &ReviewSpec, repo_dir: &Path) -> Vec<String> {
         args.push("-m".to_string());
         args.push(model.clone());
     }
-    // The prompt is `codex exec`'s single trailing positional, so it is
-    // pushed after every flag and its value.
-    //
-    // Note what this does *not* buy: being last does not protect a prompt
-    // that begins with `-`, because clap dispatches on the leading dash, not
-    // on position — such a prompt would be rejected as an unknown flag, and a
-    // prompt of exactly `-` means "read the instructions from stdin". Neither
-    // is reachable today ([`super::review_prompt::render`] always opens with
-    // "You are a fresh-context..."), and both fail closed if it ever changes,
-    // so no `--` escape is spelled here; the guarantee just isn't the one the
-    // ordering suggests.
-    args.push(spec.prompt.clone());
+    // The prompt is read from stdin (`-`, codex-cli 0.163, measured), never
+    // passed as an argument: an argument is visible to every user in `ps`,
+    // and the prompt quotes the issue, the diff and the gate output.
+    // [`run_review_bounded`] writes `spec.prompt` to a private file and makes
+    // it the reviewer's stdin. `-` is the trailing positional, after every
+    // flag and its value.
+    args.push("-".to_string());
     args
 }
 
@@ -497,13 +492,42 @@ fn find_total_token_usage(value: &serde_json::Value) -> Option<ReviewTokenUsage>
 /// validation — the spec's *Reuse* section: "this is what makes a Codex
 /// reviewer nearly free".
 pub fn resolve_codex_binary() -> Result<PathBuf, MemoryError> {
-    crate::launcher::find_on_path(crate::launcher::Harness::Codex.binary())
+    reviewer_binary_in(
+        crate::launcher::Harness::Codex,
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )
 }
 
 /// Resolve `muse` on `PATH`, through the harness registry rather than a
 /// literal — the registry is the single place a harness's binary name lives.
 pub fn resolve_muse_binary() -> Result<PathBuf, MemoryError> {
-    crate::launcher::find_on_path(crate::launcher::Harness::Muse.binary())
+    reviewer_binary_in(
+        crate::launcher::Harness::Muse,
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )
+}
+
+/// `harness`'s binary on `path_var`, skipping relative entries: a review
+/// runs in the PR's checkout, where a relative entry such as `.` would reach
+/// a file in the repository under review.
+fn reviewer_binary_in(
+    harness: crate::launcher::Harness,
+    path_var: &std::ffi::OsStr,
+) -> Result<PathBuf, MemoryError> {
+    crate::launcher::find_launcher(harness.binary(), path_var)
+}
+
+/// Write `bytes` to a new file at `path` readable by its owner only.
+fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)?.write_all(bytes)
 }
 
 /// A scratch directory holding the schema and last-message files for one
@@ -520,6 +544,21 @@ struct ScratchDir {
 impl ScratchDir {
     fn create() -> Result<Self, MemoryError> {
         let path = std::env::temp_dir().join(format!("ironmem-review-{}", uuid::Uuid::new_v4()));
+        // Owner-only: the files inside hold the issue text and the diff.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&path)
+                .map_err(|e| {
+                    MemoryError::Config(format!(
+                        "cannot create reviewer scratch dir {}: {e}",
+                        path.display()
+                    ))
+                })?;
+        }
+        #[cfg(not(unix))]
         std::fs::create_dir_all(&path).map_err(|e| {
             MemoryError::Config(format!(
                 "cannot create reviewer scratch dir {}: {e}",
@@ -608,20 +647,31 @@ fn spawn_bounded(
     args: &[String],
     repo_dir: &Path,
     timeout: std::time::Duration,
+    stdin: Option<std::fs::File>,
 ) -> Result<BoundedRun, MemoryError> {
-    use std::io::Read;
-
     let mut command = std::process::Command::new(bin);
+    // The reviewer judges a local diff; it never needs the controller's
+    // GitHub token or SSH agent, and a prompt-injected reviewer must not
+    // inherit them. Its own harness credentials (config files, API keys)
+    // are untouched.
+    command
+        .env_remove("GH_TOKEN")
+        .env_remove("GITHUB_TOKEN")
+        .env_remove("SSH_AUTH_SOCK");
     command
         .args(args)
         .current_dir(repo_dir)
-        // Nulled explicitly. `spawn` inherits all three streams where the
-        // `output` call this replaced nulled stdin for you, and inheriting it
-        // hands the reviewer the caller's stdin — a TTY under an interactive
-        // `autopilot review` — so a reviewer that reads it blocks until the
-        // bound fires. That is the wedge the bound exists to prevent, made
-        // likelier by the bound that prevents it.
-        .stdin(std::process::Stdio::null())
+        // A file, or nulled explicitly. `spawn` inherits all three streams
+        // where the `output` call this replaced nulled stdin for you, and
+        // inheriting it hands the reviewer the caller's stdin — a TTY under
+        // an interactive `autopilot review` — so a reviewer that reads it
+        // blocks until the bound fires. That is the wedge the bound exists to
+        // prevent, made likelier by the bound that prevents it. A file ends,
+        // so it cannot wedge.
+        .stdin(match stdin {
+            Some(file) => std::process::Stdio::from(file),
+            None => std::process::Stdio::null(),
+        })
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     // Its own process group, so the bound reaps what the reviewer *started*.
@@ -650,17 +700,8 @@ fn spawn_bounded(
     // would deadlock, and the bound would then kill a healthy review and
     // report it as timed out. Rung 7's finding, carried over rather than
     // rediscovered.
-    fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> std::thread::JoinHandle<Vec<u8>> {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            if let Some(mut pipe) = pipe {
-                let _ = pipe.read_to_end(&mut buf);
-            }
-            buf
-        })
-    }
-    let stdout_drain = drain(child.stdout.take());
-    let stderr_drain = drain(child.stderr.take());
+    let stdout_drain = super::dispatch::drain(child.stdout.take());
+    let stderr_drain = super::dispatch::drain(child.stderr.take());
 
     let started = std::time::Instant::now();
     let timed_out = loop {
@@ -703,11 +744,22 @@ fn spawn_bounded(
     // stream (or, on the Codex path, the last-message file it names). Draining
     // it is not optional even so — an undrained pipe is what deadlocks the
     // process the bound is timing.
+    let mut status = status;
     let stdout = if timed_out {
         Vec::new()
     } else {
         let _ = stderr_drain.join();
-        stdout_drain.join().unwrap_or_default()
+        // Output cut short is never read as the whole review: the run is
+        // reported as one whose exit cannot be trusted, which is no success.
+        match super::dispatch::drained(stdout_drain) {
+            Ok(stdout) => stdout,
+            Err(e) => {
+                status = Err(std::io::Error::other(format!(
+                    "the reviewer's output could not be read: {e}"
+                )));
+                Vec::new()
+            }
+        }
     };
 
     Ok(BoundedRun {
@@ -744,6 +796,14 @@ pub fn run_review_bounded(
         ))
     })?;
 
+    // Owner-only: it holds the issue and the diff, and stays out of `ps`.
+    let prompt_path = scratch.path.join("review-prompt.txt");
+    write_private(&prompt_path, prompt.as_bytes()).map_err(|e| {
+        MemoryError::Config(format!(
+            "cannot write reviewer prompt to {}: {e}",
+            prompt_path.display()
+        ))
+    })?;
     let spec = ReviewSpec {
         model,
         prompt,
@@ -751,7 +811,13 @@ pub fn run_review_bounded(
         last_message_path: last_message_path.clone(),
     };
     let args = build_argv(&spec, repo_dir);
-    let run = spawn_bounded(bin, &args, repo_dir, timeout)?;
+    let stdin = std::fs::File::open(&prompt_path).map_err(|e| {
+        MemoryError::Config(format!(
+            "cannot open reviewer prompt {}: {e}",
+            prompt_path.display()
+        ))
+    })?;
+    let run = spawn_bounded(bin, &args, repo_dir, timeout, Some(stdin))?;
 
     let stdout = String::from_utf8_lossy(&run.stdout);
     let token_usage = parse_codex_token_usage(&stdout);
@@ -1410,7 +1476,9 @@ pub fn run_muse_review_bounded(
 ) -> Result<ReviewOutcome, MemoryError> {
     let scratch = ScratchDir::create()?;
     let prompt_path = scratch.path.join("review-prompt.txt");
-    std::fs::write(&prompt_path, &prompt).map_err(|e| {
+    // Owner-only, as the Codex path's prompt: it holds the issue and the
+    // diff, which may themselves carry secrets.
+    write_private(&prompt_path, prompt.as_bytes()).map_err(|e| {
         MemoryError::Config(format!(
             "cannot write reviewer prompt to {}: {e}",
             prompt_path.display()
@@ -1426,7 +1494,7 @@ pub fn run_muse_review_bounded(
     // failure.
     let before = checkout_snapshot(repo_dir);
 
-    let run = spawn_bounded(bin, &args, repo_dir, timeout)?;
+    let run = spawn_bounded(bin, &args, repo_dir, timeout, None)?;
 
     let stdout = String::from_utf8_lossy(&run.stdout);
     let terminal = parse_muse_terminal(&stdout);
@@ -1893,6 +1961,19 @@ pub fn review_pr(
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_reviewer_binary_is_never_found_through_a_relative_path_entry() {
+        for harness in [
+            crate::launcher::Harness::Codex,
+            crate::launcher::Harness::Muse,
+        ] {
+            let (_planted, relative) =
+                super::super::run::planted_relative_path_entry(harness.binary());
+            let err = reviewer_binary_in(harness, relative.as_os_str()).unwrap_err();
+            assert!(matches!(err, MemoryError::NotFound(_)), "{err}");
+        }
+    }
+
     // ── risk classes ────────────────────────────────────────────────────
 
     #[test]
@@ -2032,17 +2113,54 @@ mod tests {
     }
 
     #[test]
-    fn the_prompt_is_the_trailing_positional() {
-        // The prompt lands after every flag *and every flag's value* — a
-        // prompt emitted between `-m` and the model name would be consumed as
-        // the model. Note this says nothing about a prompt that begins with
-        // `-`; see `build_argv`'s note on why that is not a guarantee here.
+    fn the_prompt_is_read_from_stdin_and_never_in_the_argv() {
+        // `-`, after every flag *and every flag's value*: emitted between
+        // `-m` and the model name it would be consumed as the model. The
+        // prompt itself is never an argument, where `ps` would show it.
         let mut spec = sample_spec();
         spec.model = Some("gpt-5-codex".to_string());
-        spec.prompt = "review this".to_string();
+        spec.prompt = "review this secret diff".to_string();
         let args = build_argv(&spec, Path::new("/repo"));
-        assert_eq!(args.last().unwrap(), "review this");
+        assert_eq!(args.last().unwrap(), "-");
+        assert!(
+            !args.iter().any(|a| a.contains("review this secret diff")),
+            "{args:?}"
+        );
         assert_eq!(value_after(&args, "-m"), "gpt-5-codex");
+    }
+
+    /// The bounded run hands the reviewer its prompt on stdin, from a file
+    /// only its owner can read.
+    #[cfg(unix)]
+    #[test]
+    fn the_codex_reviewer_reads_its_prompt_from_a_private_file_on_stdin() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("seen");
+        let bin = dir.path().join("codex");
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\ncat > '{0}.stdin'\nfor a in \"$@\"; do echo \"$a\"; done > '{0}.argv'\nexit 0\n",
+                out.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        run_review_bounded(
+            &bin,
+            repo.path(),
+            None,
+            "the prompt".into(),
+            std::time::Duration::from_secs(10),
+        )
+        .unwrap();
+        let stdin = std::fs::read_to_string(dir.path().join("seen.stdin")).unwrap();
+        assert_eq!(stdin, "the prompt");
+        let argv = std::fs::read_to_string(dir.path().join("seen.argv")).unwrap();
+        assert!(!argv.contains("the prompt"), "{argv}");
+        assert_eq!(argv.lines().last(), Some("-"));
     }
 
     #[test]
@@ -2593,17 +2711,7 @@ not json at all
     fn fixture_repo(branch: &str) -> (tempfile::TempDir, String) {
         let dir = tempfile::tempdir().unwrap();
         let run = |args: &[&str]| {
-            let out = std::process::Command::new("git")
-                .args(args)
-                .current_dir(dir.path())
-                .output()
-                .expect("git should be runnable in tests");
-            assert!(
-                out.status.success(),
-                "git {} failed: {}",
-                args.join(" "),
-                String::from_utf8_lossy(&out.stderr)
-            );
+            crate::autopilot::test_git::output(dir.path(), args);
         };
         run(&["init", "-q", "-b", branch]);
         std::fs::write(dir.path().join("README.md"), "hello").unwrap();
@@ -2617,12 +2725,7 @@ not json at all
             "-qm",
             "init",
         ]);
-        let out = std::process::Command::new("git")
-            .args(["rev-parse", "HEAD"])
-            .current_dir(dir.path())
-            .output()
-            .unwrap();
-        let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let sha = crate::autopilot::test_git::run(dir.path(), &["rev-parse", "HEAD"]);
         (dir, sha)
     }
 
@@ -3332,19 +3435,11 @@ not json at all
             vec!["config", "user.email", "t@example.com"],
             vec!["config", "user.name", "t"],
         ] {
-            std::process::Command::new("git")
-                .args(&args)
-                .current_dir(repo)
-                .output()
-                .unwrap();
+            crate::autopilot::test_git::output(repo, &args);
         }
         std::fs::write(repo.join("tracked.txt"), "original\n").unwrap();
         for args in [vec!["add", "-A"], vec!["commit", "-qm", "seed"]] {
-            std::process::Command::new("git")
-                .args(&args)
-                .current_dir(repo)
-                .output()
-                .unwrap();
+            crate::autopilot::test_git::output(repo, &args);
         }
 
         let event = muse_terminal_event(
@@ -3394,11 +3489,7 @@ not json at all
         let repo = &dir.path().join("repo");
         std::fs::create_dir(repo).unwrap();
         let git = |args: &[&str]| {
-            std::process::Command::new("git")
-                .args(args)
-                .current_dir(repo)
-                .output()
-                .unwrap();
+            crate::autopilot::test_git::output(repo, args);
         };
         git(&["init", "-q"]);
         git(&["config", "user.email", "t@example.com"]);
@@ -3412,8 +3503,11 @@ not json at all
         );
         // Edits, commits, and reports a clean PASS — a spotless worktree with
         // the reviewer's own work now on the branch.
+        // The stub's own git reads no global or system config either: the
+        // operator's would sign its commit with their key and run their hooks.
         let script = format!(
             "#!/bin/sh\n\
+             export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1\n\
              cd \"{repo}\"\n\
              echo MUTATED > tracked.txt\n\
              git add tracked.txt\n\
@@ -3433,11 +3527,7 @@ not json at all
         .unwrap();
 
         assert!(
-            std::process::Command::new("git")
-                .args(["status", "--porcelain"])
-                .current_dir(repo)
-                .output()
-                .unwrap()
+            crate::autopilot::test_git::output(repo, &["status", "--porcelain"])
                 .stdout
                 .is_empty(),
             "the premise: the tree the reviewer left behind is clean"
@@ -3463,11 +3553,7 @@ not json at all
             vec!["config", "user.email", "t@example.com"],
             vec!["config", "user.name", "t"],
         ] {
-            std::process::Command::new("git")
-                .args(&args)
-                .current_dir(repo)
-                .output()
-                .unwrap();
+            crate::autopilot::test_git::output(repo, &args);
         }
         std::fs::write(repo.join("untracked.txt"), "left behind\n").unwrap();
 

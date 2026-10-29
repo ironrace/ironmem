@@ -60,7 +60,7 @@ fn changed_files(repo_root: &Path, build_sha: &str) -> Result<Vec<String>, Strin
     // against the wrong repository would report freshness about work this map
     // was never built from.
     let mut command = std::process::Command::new("git");
-    crate::mcp::tools::scrub_git_environment(&mut command);
+    crate::git_env::scrub_git_environment(&mut command);
     let output = command
         .args(["-c", "core.quotepath=false", "diff", "--name-only", &range])
         .current_dir(repo_root)
@@ -153,21 +153,9 @@ mod tests {
     fn make_git_repo() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_path_buf();
-        std::process::Command::new("git")
-            .args(["init"])
-            .current_dir(&root)
-            .output()
-            .unwrap();
-        std::process::Command::new("git")
-            .args(["config", "user.email", "test@test.com"])
-            .current_dir(&root)
-            .output()
-            .unwrap();
-        std::process::Command::new("git")
-            .args(["config", "user.name", "Test"])
-            .current_dir(&root)
-            .output()
-            .unwrap();
+        crate::autopilot::test_git::output(&root, &["init"]);
+        crate::autopilot::test_git::output(&root, &["config", "user.email", "test@test.com"]);
+        crate::autopilot::test_git::output(&root, &["config", "user.name", "Test"]);
         (dir, root)
     }
 
@@ -177,21 +165,9 @@ mod tests {
             std::fs::create_dir_all(parent).unwrap();
         }
         std::fs::write(&full_path, content).unwrap();
-        std::process::Command::new("git")
-            .args(["add", "."])
-            .current_dir(root)
-            .output()
-            .unwrap();
-        std::process::Command::new("git")
-            .args(["commit", "-m", "test commit"])
-            .current_dir(root)
-            .output()
-            .unwrap();
-        let out = std::process::Command::new("git")
-            .args(["rev-parse", "HEAD"])
-            .current_dir(root)
-            .output()
-            .unwrap();
+        crate::autopilot::test_git::output(root, &["add", "."]);
+        crate::autopilot::test_git::output(root, &["commit", "-m", "test commit"]);
+        let out = crate::autopilot::test_git::output(root, &["rev-parse", "HEAD"]);
         String::from_utf8(out.stdout).unwrap().trim().to_string()
     }
 
@@ -343,16 +319,8 @@ mod tests {
         let build_sha = commit_file(&root, "foo.rs", "// original");
         // Delete the file and commit
         std::fs::remove_file(root.join("foo.rs")).unwrap();
-        std::process::Command::new("git")
-            .args(["add", "."])
-            .current_dir(&root)
-            .output()
-            .unwrap();
-        std::process::Command::new("git")
-            .args(["commit", "-m", "delete foo.rs"])
-            .current_dir(&root)
-            .output()
-            .unwrap();
+        crate::autopilot::test_git::output(&root, &["add", "."]);
+        crate::autopilot::test_git::output(&root, &["commit", "-m", "delete foo.rs"]);
 
         let map = dummy_code_map(&build_sha, vec!["foo.rs".to_string()]);
         let result = classify(&map, &root);

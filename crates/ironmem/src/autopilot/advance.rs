@@ -898,6 +898,42 @@ fn advance_issue(
         } => (*pr_number, head_sha.clone(), *gate_green),
     };
 
+    // Review and merge read and judge the live issue worktree, so they
+    // run under the issue's lock, held from here to the end of the step:
+    // a Lead dispatching into that worktree concurrently would make the
+    // reviewed tree differ from the pinned head the review is recorded
+    // against. Held means another controller owns the issue; this pass
+    // leaves it for the next one.
+    let mut _issue_lock = if config.dry_run {
+        None
+    } else {
+        match super::issue_lock::try_lock_issue(&candidate.repo_path, &candidate.issue) {
+            Ok(super::issue_lock::IssueLockAttempt::Acquired(lock)) => Some(lock),
+            Ok(super::issue_lock::IssueLockAttempt::Held { .. }) => {
+                return Ok(Advanced {
+                    issue: candidate.issue.clone(),
+                    dispatch_class: class,
+                    step,
+                    review: None,
+                    remediation: None,
+                    merge: None,
+                    cleanup: None,
+                });
+            }
+            Err(e) => return Err(e),
+        }
+    };
+
+    // Re-read under the lock: a prior Claude dispatch may have released its
+    // controller lock while a tool still holds the checkout/output pipe.
+    if dispatch_state::get_dispatch_state(db, &candidate.issue)?.is_some_and(|state| {
+        state.phase() == Some(dispatch_state::DispatchPhase::PausedCompletionUnproven)
+    }) {
+        return Err(MemoryError::Validation(format!(
+            "completion is unproven for {}; review and merge wait for operator clearance",
+            candidate.issue.canonical()
+        )));
+    }
     let mut review = None;
     if let AdvanceStep::Review { base_branch, .. } = &step {
         if config.dry_run {
@@ -1052,6 +1088,9 @@ fn advance_issue(
             dry_run: merge_dry_run,
         },
     )?;
+
+    // Released before cleanup, which takes the same lock itself.
+    drop(_issue_lock.take());
 
     // Only for a PR that has actually landed, and never during a rehearsal.
     let cleanup = if execution.outcome.landed() && !merge_dry_run {
@@ -1223,7 +1262,7 @@ const MAX_PR_TITLE_CHARS: usize = 256;
 fn pr_body(candidate: &Candidate, base: &str) -> String {
     let green = match candidate.green_commit_sha.as_deref().map(str::trim) {
         Some(sha) if !sha.is_empty() => format!(
-            "The gate was recorded green at `{sha}` — the commit the IC's worktree was on when it reported the gate met."
+            "The gate was recorded green at `{sha}` — the issue branch's tip when the IC reported the gate met."
         ),
         _ => "No green commit was recorded for this issue.".to_string(),
     };
@@ -1252,17 +1291,65 @@ fn pr_body(candidate: &Candidate, base: &str) -> String {
 /// listing this pass is built from and nothing brings it back. Whatever this
 /// call leaves behind — a refused dirty worktree, a drawer a storage error
 /// kept — is left behind for good, which is why the error is reported on
-/// stdout rather than only stored.
+/// stdout rather than only stored. One exception is named as such: cleanup
+/// skipped because a controller holds the issue frees its dispatch state
+/// later (the Lead's release step) but no step of its own removes its
+/// worktree — it goes only if a later pass reaches cleanup again while
+/// the issue is still listed (the label-write-failed path above), and
+/// otherwise by hand. So that worktree's removal is reported as
+/// [`WorktreeRemoval::Skipped`] with the command that removes it.
 fn clean_up(db: &Database, candidate: &Candidate, config: &AdvanceConfig) -> Cleanup {
-    let mut error = None;
-
-    let dispatch_state_cleared = match dispatch_state::clear_dispatch_state(db, &candidate.issue) {
-        Ok(cleared) => cleared,
+    // Not while a controller holds the issue: it may be dispatching into the
+    // worktree this would remove. Left for it, and said so.
+    let _lock = match super::issue_lock::try_lock_issue(&candidate.repo_path, &candidate.issue) {
+        Ok(super::issue_lock::IssueLockAttempt::Acquired(lock)) => lock,
+        Ok(super::issue_lock::IssueLockAttempt::Held { path }) => {
+            let worktree = worktree::worktree_path(&config.worktree_root, &candidate.issue);
+            return Cleanup {
+                dispatch_state_cleared: false,
+                worktree: WorktreeRemoval::Skipped {
+                    path: worktree.to_string_lossy().into_owned(),
+                },
+                error: Some(format!(
+                    "cleanup skipped: {}; the worktree {} is left in place (a later \
+                     pass retries it while the issue is still listed, or remove it \
+                     with `git worktree remove {}` once no controller holds the issue)",
+                    super::issue_lock::held_reason(&candidate.issue, &path),
+                    worktree.display(),
+                    worktree.display()
+                )),
+            };
+        }
         Err(e) => {
-            error = Some(format!("could not clear the dispatch state: {e}"));
-            false
+            return Cleanup {
+                dispatch_state_cleared: false,
+                // Nothing was inspected, let alone removed: Skipped, the
+                // variant that says a worktree may remain. Absent would
+                // claim the checkout is gone.
+                worktree: WorktreeRemoval::Skipped {
+                    path: worktree::worktree_path(&config.worktree_root, &candidate.issue)
+                        .to_string_lossy()
+                        .into_owned(),
+                },
+                error: Some(format!("cleanup skipped: the issue's lock: {e}")),
+            };
         }
     };
+    let mut error = None;
+
+    // Only the exact drawer read, owner token included: one a run wrote
+    // since is that run's.
+    let dispatch_state_cleared =
+        match dispatch_state::get_claim(db, &candidate.issue).and_then(|claim| match claim {
+            Some(claim) => dispatch_state::clear_claim_if_unchanged(db, &claim),
+            None => Ok(false),
+        }) {
+            Ok(cleared) => cleared,
+            Err(e) => {
+                error = Some(format!("could not clear the dispatch state: {e}"));
+                false
+            }
+        };
 
     let worktree = match worktree::remove_worktree(
         &candidate.repo_path,
@@ -1552,16 +1639,14 @@ mod tests {
     fn checkout_with_worktree() -> (tempfile::TempDir, tempfile::TempDir) {
         let repo = tempfile::tempdir().unwrap();
         let run = |args: &[&str]| {
-            let out = std::process::Command::new("git")
-                .args(args)
-                .current_dir(repo.path())
-                .output()
-                .expect("git must be available");
-            assert!(out.status.success(), "git {args:?}");
+            crate::autopilot::test_git::output(repo.path(), args);
         };
         run(&["init", "--initial-branch=main"]);
         run(&["config", "user.email", "t@example.com"]);
         run(&["config", "user.name", "T"]);
+        // Pinned: the global config signs and runs hooks; worktrees share this.
+        run(&["config", "commit.gpgsign", "false"]);
+        run(&["config", "core.hooksPath", "/dev/null"]);
         std::fs::write(repo.path().join("README.md"), "seed\n").unwrap();
         run(&["add", "README.md"]);
         run(&["commit", "-m", "seed"]);
@@ -1944,6 +2029,96 @@ mod tests {
     }
 
     #[test]
+    fn the_pr_body_names_the_green_commit_as_the_issue_branchs_tip() {
+        // The run records the issue branch's tip, not whatever the IC's
+        // worktree had checked out (`run::branch_tip`).
+        let candidate = Candidate {
+            issue: issue(),
+            issue_title: "t".into(),
+            repo_path: PathBuf::from("/nowhere"),
+            risk_label: None,
+            green_commit_sha: Some(GREEN.into()),
+        };
+        let body = pr_body(&candidate, "main");
+        assert!(body.contains(GREEN), "{body}");
+        assert!(body.contains("the issue branch's tip"), "{body}");
+        assert!(!body.contains("worktree was on"), "{body}");
+    }
+
+    /// The cleanup after a merge removes nothing while a controller holds
+    /// the issue: it may be dispatching into that worktree.
+    #[test]
+    fn cleanup_skips_an_issue_another_controller_holds() {
+        let db = approved_db();
+        let repo = tempfile::tempdir().unwrap();
+        crate::autopilot::test_git::output(repo.path(), &["init", "-q"]);
+        let state = crate::autopilot::DispatchState {
+            implementer: crate::autopilot::implementer::Implementer::Claude,
+            native_session_id: None,
+            invocation_artifacts: None,
+            issue: issue(),
+            worktree_path: "/nowhere".into(),
+            ic_session_name: "ic".into(),
+            dispatch_class: "logic".into(),
+            attempt_n: 1,
+            state: "dispatching".into(),
+            started_at: "now".into(),
+            session_uuid: "11111111-1111-1111-1111-111111111111".into(),
+            turn_n: 0,
+            session_claimed: true,
+            session_model: None,
+            resume_refusals: 0,
+            signing_held: false,
+        };
+        dispatch_state::upsert_dispatch_state(&db, &state).unwrap();
+        let candidate = Candidate {
+            issue: issue(),
+            issue_title: "t".into(),
+            repo_path: repo.path().to_path_buf(),
+            risk_label: None,
+            green_commit_sha: None,
+        };
+        let roots = tempfile::tempdir().unwrap();
+        let cfg = config(roots.path(), repo.path());
+        let held =
+            match crate::autopilot::issue_lock::try_lock_issue(repo.path(), &issue()).unwrap() {
+                crate::autopilot::issue_lock::IssueLockAttempt::Acquired(lock) => lock,
+                crate::autopilot::issue_lock::IssueLockAttempt::Held { .. } => unreachable!(),
+            };
+        let cleanup = clean_up(&db, &candidate, &cfg);
+        assert!(!cleanup.dispatch_state_cleared);
+        assert!(
+            cleanup
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("another controller holds issue")),
+            "{:?}",
+            cleanup.error
+        );
+        // skipped is its own outcome, naming the worktree left
+        // behind and how to remove it, so a later pass can retry it.
+        let expected = worktree::worktree_path(roots.path(), &issue());
+        assert!(
+            matches!(&cleanup.worktree, WorktreeRemoval::Skipped { path } if path == &expected.to_string_lossy().to_string()),
+            "{:?}",
+            cleanup.worktree
+        );
+        assert!(
+            cleanup
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("git worktree remove")),
+            "{:?}",
+            cleanup.error
+        );
+        assert!(dispatch_state::get_dispatch_state(&db, &issue())
+            .unwrap()
+            .is_some());
+        drop(held);
+        assert!(clean_up(&db, &candidate, &cfg).dispatch_state_cleared);
+    }
+
+    #[test]
     fn a_blank_issue_title_still_names_the_issue() {
         // `gh pr create --title ""` is refused, and that refusal would be
         // reported as an unexplained create failure.
@@ -2097,6 +2272,125 @@ mod tests {
             }
             other => panic!("expected a stall, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn ultrareview_review_respects_and_holds_the_issue_lock() {
+        let db = approved_db();
+        let (repo, roots) = checkout_with_worktree();
+        let candidate = Candidate {
+            issue: issue(),
+            issue_title: "test".into(),
+            repo_path: repo.path().into(),
+            risk_label: None,
+            green_commit_sha: Some(GREEN.into()),
+        };
+        let cfg = config(roots.path(), repo.path());
+        let held = super::super::issue_lock::lock_for_run(repo.path(), &issue()).unwrap();
+        let mut gh = ScriptedGh::new(vec![ok(&pr_list_json(322, GREEN))]);
+        let result = advance_issue(&db, &mut gh, &mut ForbiddenReviewer, &candidate, &cfg).unwrap();
+        assert!(result.review.is_none() && result.merge.is_none());
+        drop(held);
+        struct InspectLock(std::path::PathBuf);
+        impl ReviewRunner for InspectLock {
+            fn review(&mut self, _: &Path, _: &str) -> Result<ReviewOutcome, MemoryError> {
+                assert!(matches!(
+                    super::super::issue_lock::try_lock_issue(&self.0, &issue()).unwrap(),
+                    super::super::issue_lock::IssueLockAttempt::Held { .. }
+                ));
+                Ok(ReviewOutcome {
+                    process_success: false,
+                    reason: Some("lock probe ends review".into()),
+                    ..StubReviewer::passing().outcome
+                })
+            }
+        }
+        let mut gh = ScriptedGh::new(vec![
+            ok(&pr_list_json(322, GREEN)),
+            ok(&pr_view_json(GREEN)),
+        ]);
+        let result = advance_issue(
+            &db,
+            &mut gh,
+            &mut InspectLock(repo.path().into()),
+            &candidate,
+            &cfg,
+        )
+        .unwrap();
+        let review = result.review.unwrap();
+        assert!(!review.outcome.process_success);
+        assert!(review.outcome.reason.unwrap().contains("lock probe"));
+        assert!(matches!(
+            result.merge.unwrap().outcome,
+            merge::MergeOutcome::Held(_)
+        ));
+        super::super::issue_lock::lock_for_run(repo.path(), &issue()).unwrap();
+    }
+
+    #[test]
+    fn completion_unproven_blocks_review_and_merge() {
+        let db = approved_db();
+        let (repo, roots) = checkout_with_worktree();
+        let state = crate::autopilot::DispatchState {
+            issue: issue(),
+            implementer: crate::autopilot::Implementer::Claude,
+            native_session_id: None,
+            invocation_artifacts: None,
+            worktree_path: worktree::worktree_path(roots.path(), &issue())
+                .to_str()
+                .unwrap()
+                .into(),
+            ic_session_name: "ic-test".into(),
+            dispatch_class: "logic".into(),
+            attempt_n: 0,
+            state: "paused-completion-unproven".into(),
+            started_at: "now".into(),
+            session_uuid: "11111111-2222-4333-8444-555555555555".into(),
+            turn_n: 1,
+            session_claimed: true,
+            session_model: None,
+            resume_refusals: 0,
+            signing_held: false,
+        };
+        dispatch_state::upsert_dispatch_state(&db, &state).unwrap();
+        let candidate = Candidate {
+            issue: issue(),
+            issue_title: "test".into(),
+            repo_path: repo.path().into(),
+            risk_label: None,
+            green_commit_sha: Some(GREEN.into()),
+        };
+        let cfg = config(roots.path(), repo.path());
+        let mut gh = ScriptedGh::new(vec![ok(&pr_list_json(322, GREEN))]);
+        let error = advance_issue(&db, &mut gh, &mut ForbiddenReviewer, &candidate, &cfg)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("completion is unproven"), "{error}");
+        reviewed_at(&db, &issue(), 322, GREEN);
+        let mut gh = ScriptedGh::new(vec![ok(&pr_list_json(322, GREEN))]);
+        let error = advance_issue(&db, &mut gh, &mut ForbiddenReviewer, &candidate, &cfg)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("completion is unproven"), "{error}");
+        assert_eq!(gh.seen.len(), 1, "no merge API call is allowed");
+    }
+
+    #[test]
+    fn ultrareview_advance_rehearsal_creates_no_lock_files() {
+        let db = approved_db();
+        let (repo, roots) = checkout_with_worktree();
+        let candidate = Candidate {
+            issue: issue(),
+            issue_title: "test".into(),
+            repo_path: repo.path().into(),
+            risk_label: None,
+            green_commit_sha: Some(GREEN.into()),
+        };
+        let mut cfg = config(roots.path(), repo.path());
+        cfg.dry_run = true;
+        let mut gh = ScriptedGh::new(vec![ok(&pr_list_json(322, GREEN))]);
+        advance_issue(&db, &mut gh, &mut ForbiddenReviewer, &candidate, &cfg).unwrap();
+        assert!(!repo.path().join(".git/ironmem/autopilot/locks").exists());
     }
 
     #[test]
@@ -2339,7 +2633,7 @@ mod tests {
             &DispatchState {
                 implementer: crate::autopilot::implementer::Implementer::Claude,
                 native_session_id: None,
-                codex_artifacts: None,
+                invocation_artifacts: None,
                 issue: issue(),
                 worktree_path: worktree::worktree_path(roots.path(), &issue())
                     .to_string_lossy()
@@ -2352,6 +2646,9 @@ mod tests {
                 session_uuid: "11111111-2222-3333-4444-555555555555".into(),
                 turn_n: 1,
                 session_claimed: true,
+                session_model: None,
+                resume_refusals: 0,
+                signing_held: false,
             },
         )
         .unwrap();

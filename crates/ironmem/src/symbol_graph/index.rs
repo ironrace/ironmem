@@ -373,8 +373,11 @@ pub fn canonicalize_repo(raw: &str) -> Result<String, MemoryError> {
         )));
     }
 
-    // Verify it is a git worktree.
-    let output = std::process::Command::new("git")
+    // Verify it is a git worktree. Scrubbed: an inherited `GIT_DIR` would
+    // answer about another repository than `canonical`.
+    let mut command = std::process::Command::new("git");
+    crate::git_env::scrub_git_environment(&mut command);
+    let output = command
         .args(["rev-parse", "--show-toplevel"])
         .current_dir(&canonical)
         .output()
@@ -392,7 +395,10 @@ pub fn canonicalize_repo(raw: &str) -> Result<String, MemoryError> {
 /// Resolve the current HEAD SHA. Returns (sha, true) on success, or the
 /// placeholder "0000...0" + false when the repo has no commits.
 fn resolve_head(repo: &str) -> (String, bool) {
-    let output = std::process::Command::new("git")
+    // Scrubbed: an inherited `GIT_DIR` would report another repository's HEAD.
+    let mut command = std::process::Command::new("git");
+    crate::git_env::scrub_git_environment(&mut command);
+    let output = command
         .args(["rev-parse", "HEAD"])
         .current_dir(repo)
         .output();
@@ -505,41 +511,20 @@ mod tests {
     use super::*;
     use crate::db::schema::Database;
     use std::path::PathBuf;
-    use std::process::Command;
 
     /// Create a minimal git repo with initial commit; return (TempDir, root_path).
     fn make_git_repo() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_path_buf();
-        Command::new("git")
-            .args(["init"])
-            .current_dir(&root)
-            .output()
-            .unwrap();
-        Command::new("git")
-            .args(["config", "user.email", "t@t.com"])
-            .current_dir(&root)
-            .output()
-            .unwrap();
-        Command::new("git")
-            .args(["config", "user.name", "T"])
-            .current_dir(&root)
-            .output()
-            .unwrap();
+        crate::autopilot::test_git::output(&root, &["init"]);
+        crate::autopilot::test_git::output(&root, &["config", "user.email", "t@t.com"]);
+        crate::autopilot::test_git::output(&root, &["config", "user.name", "T"]);
         (dir, root)
     }
 
-    fn commit_all(root: &PathBuf) {
-        Command::new("git")
-            .args(["add", "."])
-            .current_dir(root)
-            .output()
-            .unwrap();
-        Command::new("git")
-            .args(["commit", "-m", "commit"])
-            .current_dir(root)
-            .output()
-            .unwrap();
+    fn commit_all(root: &Path) {
+        crate::autopilot::test_git::output(root, &["add", "."]);
+        crate::autopilot::test_git::output(root, &["commit", "-m", "commit"]);
     }
 
     fn write_file(root: &Path, rel: &str, content: &str) {

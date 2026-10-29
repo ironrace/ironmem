@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use rusqlite::{Connection, Transaction};
+use rusqlite::{Connection, Transaction, TransactionBehavior};
 
 use crate::db::ReadOnlyDb;
 use crate::error::MemoryError;
@@ -734,6 +734,37 @@ impl Database {
         Ok(result)
     }
 
+    /// Execute a closure inside a `BEGIN IMMEDIATE` transaction and commit on
+    /// success.
+    ///
+    /// For a read-modify-write whose read must not go stale before its write:
+    /// the write lock is taken before the first read, so a concurrent writer
+    /// (another connection, another process) waits on `busy_timeout` rather
+    /// than interleaving. [`Self::with_transaction`] begins deferred, and a
+    /// deferred transaction that reads and then writes is refused with
+    /// `SQLITE_BUSY` at once when another writer got there first; it retries
+    /// only the stale-snapshot case, so its read-modify-writes can fail or
+    /// lose updates under contention.
+    ///
+    /// Reads inside `f` may go through `self` as well as through the
+    /// transaction: both are this one connection, so they see the
+    /// transaction's state. The closure runs once (no replay): with the write
+    /// lock held from the start, no snapshot can go stale under it.
+    pub fn with_immediate_transaction<T>(
+        &self,
+        f: impl FnOnce(&Transaction<'_>) -> Result<T, MemoryError>,
+    ) -> Result<T, MemoryError> {
+        let tx = retry_on_busy(|| {
+            Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)
+        })?;
+        let value = f(&tx)?;
+        // commit() consumes the transaction even on BUSY. Retain it while
+        // retrying COMMIT, never replaying the caller's mutation closure.
+        retry_on_busy(|| tx.execute_batch("COMMIT"))?;
+        tx.finish()?;
+        Ok(value)
+    }
+
     /// Borrow the underlying connection for a read-only closure. Unlike
     /// [`Self::with_transaction`], this opens no transaction — use it for plain
     /// `SELECT`s (e.g. the session-start hook reading collab/diary state) so a
@@ -937,6 +968,42 @@ mod tests {
             rusqlite::params![id, repo_path, branch, task, implementer],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn ultrareview_busy_commit_retries_without_replaying_the_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("commit.db");
+        let db = Database::open(&path).unwrap();
+        db.conn.execute_batch("PRAGMA journal_mode=DELETE; CREATE TABLE commit_probe (value INTEGER); INSERT INTO commit_probe VALUES (0);").unwrap();
+        db.conn.busy_timeout(Duration::from_millis(1)).unwrap();
+        let (start, wait) = std::sync::mpsc::channel();
+        let (ready, held) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let conn = rusqlite::Connection::open(path).unwrap();
+            wait.recv().unwrap();
+            conn.execute_batch("BEGIN; SELECT * FROM commit_probe;")
+                .unwrap();
+            ready.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(150));
+            conn.execute_batch("COMMIT").unwrap();
+        });
+        let mut calls = 0;
+        let result = db.with_immediate_transaction(|tx| {
+            calls += 1;
+            tx.execute("UPDATE commit_probe SET value = value + 1", [])?;
+            start.send(()).unwrap();
+            held.recv().unwrap();
+            Ok(())
+        });
+        reader.join().unwrap();
+        result.unwrap();
+        assert_eq!(calls, 1);
+        let value: i64 = db
+            .conn
+            .query_row("SELECT value FROM commit_probe", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(value, 1);
     }
 
     #[test]
@@ -2346,6 +2413,120 @@ mod tests {
             )
             .unwrap();
         assert_eq!(committed, 0, "the failed one-shot attempt must roll back");
+    }
+
+    /// `with_immediate_transaction` commits what an `Ok` closure wrote, and
+    /// runs the closure once.
+    #[test]
+    fn with_immediate_transaction_commits_on_success_and_runs_once() {
+        let (_dir, db, contender) = retry_harness();
+        let calls = std::cell::Cell::new(0usize);
+        db.with_immediate_transaction(|tx| {
+            calls.set(calls.get() + 1);
+            tx.execute("INSERT INTO retry_probe (v) VALUES (1)", [])?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(calls.get(), 1, "the closure runs exactly once");
+        // Read from another connection: committed, not only visible to `db`.
+        let committed: i64 = contender
+            .query_row("SELECT COUNT(*) FROM retry_probe WHERE v = 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(committed, 1);
+    }
+
+    /// An `Err` from the closure rolls back everything it wrote, and comes
+    /// back unchanged, after one run.
+    #[test]
+    fn with_immediate_transaction_rolls_back_on_error() {
+        let (_dir, db, contender) = retry_harness();
+        let calls = std::cell::Cell::new(0usize);
+        let result: Result<(), _> = db.with_immediate_transaction(|tx| {
+            calls.set(calls.get() + 1);
+            let inserted = tx.execute("INSERT INTO retry_probe (v) VALUES (1)", [])?;
+            assert_eq!(inserted, 1);
+            Err(MemoryError::Validation("forced rollback".into()))
+        });
+        match result {
+            Err(MemoryError::Validation(msg)) => assert_eq!(msg, "forced rollback"),
+            other => panic!("expected the closure's error unchanged, got {other:?}"),
+        }
+        assert_eq!(calls.get(), 1, "an error is never retried");
+        for conn in [&db.conn, &contender] {
+            let count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM retry_probe", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(count, 0, "the failed closure's write must roll back");
+        }
+    }
+
+    /// The write lock is taken at `BEGIN`, before the closure's first read:
+    /// another connection cannot write between that read and the closure's
+    /// own write. A deferred transaction that has only read holds no write
+    /// lock, so this would let the contender in.
+    #[test]
+    fn with_immediate_transaction_holds_the_write_lock_before_its_first_read() {
+        let (_dir, db, contender) = retry_harness();
+        contender.busy_timeout(Duration::ZERO).unwrap();
+        db.with_immediate_transaction(|tx| {
+            let _seen: i64 =
+                tx.query_row("SELECT COUNT(*) FROM retry_probe", [], |row| row.get(0))?;
+            let refused = contender.execute("INSERT INTO retry_probe (v) VALUES (1)", []);
+            assert!(
+                matches!(refused, Err(ref e) if is_busy_error(e)),
+                "another writer got in after the first read: {refused:?}"
+            );
+            tx.execute("INSERT INTO retry_probe (v) VALUES (2)", [])?;
+            Ok(())
+        })
+        .unwrap();
+        let values: Vec<i64> = db
+            .conn
+            .prepare("SELECT v FROM retry_probe ORDER BY v")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(values, vec![2]);
+    }
+
+    /// Another connection holding the write lock makes the transaction wait
+    /// for it (busy timeout), not fail at once, and its reads then see what
+    /// that connection committed.
+    #[test]
+    fn with_immediate_transaction_waits_for_a_held_write_lock() {
+        let (_dir, db, holder) = retry_harness();
+        holder
+            .execute_batch("BEGIN IMMEDIATE; INSERT INTO retry_probe (v) VALUES (1);")
+            .unwrap();
+        let hold = Duration::from_millis(200);
+        // Taken before the spawn: a thread scheduled late would otherwise
+        // start its clock after part of the hold had passed.
+        let started = std::time::Instant::now();
+        let waiter = std::thread::spawn(move || {
+            let seen = db.with_immediate_transaction(|tx| {
+                tx.query_row("SELECT COUNT(*) FROM retry_probe", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .map_err(MemoryError::from)
+            });
+            (seen, std::time::Instant::now())
+        });
+        std::thread::sleep(hold);
+        assert!(
+            !waiter.is_finished(),
+            "the transaction finished while the lock was still held"
+        );
+        holder.execute_batch("COMMIT").unwrap();
+        let (seen, finished) = waiter.join().unwrap();
+        assert_eq!(seen.unwrap(), 1, "it read after the holder committed");
+        assert!(
+            finished.duration_since(started) >= hold,
+            "it finished before the lock was free"
+        );
     }
 
     #[test]

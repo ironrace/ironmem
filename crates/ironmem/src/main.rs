@@ -387,7 +387,11 @@ enum AutopilotCmd {
         /// Committish new issue branches are cut from
         #[arg(long, default_value = "HEAD")]
         base: String,
-        /// Implementation harness for the IC dispatch
+        /// Implementation harness: claude (default), codex or muse. The
+        /// reviewer is chosen separately (`autopilot review` / `advance
+        /// --reviewer`). Codex and Muse run unsandboxed as the operator,
+        /// with the operator's environment and credentials; only choose
+        /// them for repositories trusted at that level.
         #[arg(long, default_value = "claude")]
         implementer: ironmem::autopilot::Implementer,
         /// Model for the IC dispatch
@@ -400,20 +404,31 @@ enum AutopilotCmd {
         #[arg(long)]
         n_turns: Option<u32>,
         /// Hard --max-turns ceiling. Counts tool-call turns, not goal turns,
-        /// so it must clear --n-turns times the per-goal-turn floor
+        /// so it must clear --n-turns times the per-goal-turn floor. Muse:
+        /// passed as --max-model-steps; Codex: unsupported
         #[arg(long)]
         max_turns: Option<u32>,
-        /// Per-dispatch spend ceiling, passed through to --max-budget-usd
+        /// Per-dispatch spend ceiling passed to `claude --max-budget-usd`.
+        /// Claude only: Codex and Muse refuse it; they report no cost, and
+        /// each of their invocations instead reserves one unpriced unit
+        /// against --max-unpriced-dispatches-per-day before it launches
         #[arg(long)]
         max_budget_usd: Option<f64>,
         /// Per-issue attempt cap, cumulative across runs; a remediation gets
         /// its own, counted from the issue's first success
         #[arg(long)]
         attempt_cap: Option<u32>,
-        /// Daily ledger ceiling across all dispatches
+        /// Daily ledger ceiling across all dispatches. Codex and Muse cost is
+        /// unpriced, so the ledger records no dollars for them and their
+        /// effective limit is --max-unpriced-dispatches-per-day; the ceiling
+        /// still gates priced (Claude) dispatches, reviews and advisor calls
+        /// on the same day
         #[arg(long)]
         daily_budget_usd: Option<f64>,
-        /// How many unpriced (timed-out) IC dispatches may run today
+        /// How many unpriced IC dispatches may run today: timed-out Claude
+        /// dispatches and every Codex or Muse invocation (each reserves one
+        /// unit before launch). For Codex and Muse this is the daily dispatch
+        /// cap
         #[arg(long)]
         max_unpriced_dispatches_per_day: Option<u32>,
         /// Emit JSON instead of text
@@ -550,7 +565,7 @@ enum AutopilotCmd {
         json: bool,
     },
     /// Clear a held issue's dispatch state once no process could be its work
-    /// — the human recovery for a Codex invocation whose completion Autopilot
+    /// — the human recovery for a Codex or Muse invocation whose completion Autopilot
     /// cannot prove. Lineage, attempts and spend stand; artifacts are kept.
     ClearDispatch {
         /// Repo identity (e.g. "owner/repo")
@@ -641,7 +656,11 @@ enum AutopilotCmd {
         /// Directory that per-issue worktrees are created under
         #[arg(long)]
         worktree_root: Option<String>,
-        /// Implementation harness for IC dispatches
+        /// Implementation harness: claude (default), codex or muse. The
+        /// reviewer is chosen separately (`autopilot review` / `advance
+        /// --reviewer`). Codex and Muse run unsandboxed as the operator,
+        /// with the operator's environment and credentials; only choose
+        /// them for repositories trusted at that level.
         #[arg(long, default_value = "claude")]
         implementer: ironmem::autopilot::Implementer,
         /// Model for IC dispatches
@@ -686,30 +705,41 @@ enum AutopilotCmd {
         #[arg(long)]
         n_turns: Option<u32>,
         /// Hard --max-turns ceiling. Counts tool-call turns, not goal turns,
-        /// so it must clear --n-turns times the per-goal-turn floor
+        /// so it must clear --n-turns times the per-goal-turn floor. Muse:
+        /// passed as --max-model-steps; Codex: unsupported
         #[arg(long)]
         max_turns: Option<u32>,
-        /// Per-dispatch spend ceiling
+        /// Per-dispatch spend ceiling passed to `claude --max-budget-usd`.
+        /// Claude only: Codex and Muse refuse it; they report no cost, and
+        /// each of their invocations instead reserves one unpriced unit
+        /// against --max-unpriced-dispatches-per-day before it launches
         #[arg(long)]
         max_budget_usd: Option<f64>,
         /// Per-issue attempt cap, cumulative across runs; a remediation gets
         /// its own, counted from the issue's first success
         #[arg(long)]
         attempt_cap: Option<u32>,
-        /// Daily ledger ceiling across all dispatches
+        /// Daily ledger ceiling across all dispatches. Codex and Muse cost is
+        /// unpriced, so the ledger records no dollars for them and their
+        /// effective limit is --max-unpriced-dispatches-per-day; the ceiling
+        /// still gates priced (Claude) dispatches, reviews and advisor calls
+        /// on the same day
         #[arg(long)]
         daily_budget_usd: Option<f64>,
-        /// How many unpriced (timed-out) IC dispatches may run today
+        /// How many unpriced IC dispatches may run today: timed-out Claude
+        /// dispatches and every Codex or Muse invocation (each reserves one
+        /// unit before launch). For Codex and Muse this is the daily dispatch
+        /// cap
         #[arg(long)]
         max_unpriced_dispatches_per_day: Option<u32>,
-        /// Read everything, plan everything, write nothing and spend nothing
+        /// Plan without dispatching or spending; liveness checks may finalize awaiting-quiet evidence
         #[arg(long)]
         dry_run: bool,
         /// Emit JSON instead of text
         #[arg(long)]
         json: bool,
     },
-    /// Show what the Lead would work on next, without touching anything
+    /// Preview the Lead queue; liveness checks may finalize awaiting-quiet evidence
     /// (build-ladder rung 8)
     Queue {
         /// Path to the database
@@ -728,7 +758,7 @@ enum AutopilotCmd {
         /// its own, counted from the issue's first success
         #[arg(long)]
         attempt_cap: Option<u32>,
-        /// Per-dispatch spend ceiling, used for the same pre-authorization
+        /// Per-dispatch ceiling, used for the same priced-spend-plus-ceiling
         /// check `autopilot run` applies
         #[arg(long)]
         max_budget_usd: Option<f64>,
@@ -992,12 +1022,13 @@ fn resolve_implementation_model(
     explicit_max_turns: bool,
     explicit_max_budget_usd: bool,
 ) -> Result<String, MemoryError> {
-    if implementer == ironmem::autopilot::Implementer::Codex && explicit_max_budget_usd {
-        return Err(MemoryError::Validation(
-            "the Codex implementer does not support --max-budget-usd: the native Codex CLI has no such flag; use the daily unpriced invocation cap and wall-clock timeout"
-                .into(),
-        ));
+    if implementer.recovers_invocations() && explicit_max_budget_usd {
+        return Err(MemoryError::Validation(format!(
+            "the {l} implementer does not support --max-budget-usd: the native {l} CLI has no such flag; use the daily unpriced invocation cap and wall-clock timeout",
+            l = implementer.label()
+        )));
     }
+    // Only Codex lacks a native turn cap: Muse has --max-model-steps.
     if implementer == ironmem::autopilot::Implementer::Codex && explicit_max_turns {
         return Err(MemoryError::Validation(
             "the Codex implementer does not support --max-turns: the native Codex CLI has no such flag; --n-turns remains prompt guidance"
@@ -1010,10 +1041,11 @@ fn resolve_implementation_model(
             DEFAULT_CLAUDE_IMPLEMENTATION_MODEL.to_string()
         }
         None => {
-            return Err(MemoryError::Validation(
-                "--model is required for the Codex implementer; pass an explicit Codex model"
-                    .into(),
-            ))
+            return Err(MemoryError::Validation(format!(
+                "--model is required for the {} implementer; pass an explicit {} model",
+                implementer.label(),
+                implementer.label()
+            )))
         }
     };
     ironmem::autopilot::run::validate_implementation_model(implementer, &model)?;
@@ -1028,9 +1060,9 @@ fn resolve_dispatcher(
         ironmem::autopilot::Implementer::Claude => {
             Box::new(ironmem::autopilot::run::ClaudeDispatcher::resolve()?)
         }
-        ironmem::autopilot::Implementer::Codex => {
-            Box::new(ironmem::autopilot::run::CodexDispatcher::resolve()?)
-        }
+        ironmem::autopilot::Implementer::Codex | ironmem::autopilot::Implementer::Muse => Box::new(
+            ironmem::autopilot::run::CliDispatcher::resolve(implementer)?,
+        ),
     })
 }
 
@@ -1269,6 +1301,9 @@ fn print_advance_report(report: &ironmem::autopilot::advance::AdvanceReport) {
             match &cleanup.worktree {
                 WorktreeRemoval::Removed { path } => println!("    worktree removed: {path}"),
                 WorktreeRemoval::Absent => println!("    worktree: nothing to remove"),
+                WorktreeRemoval::Skipped { path } => println!(
+                    "    worktree SKIPPED (a controller holds the issue): {path} is left in place"
+                ),
                 WorktreeRemoval::DirtyRefused { path } => println!(
                     "    worktree KEPT (uncommitted changes the merge did not include): {path}"
                 ),
@@ -1451,6 +1486,15 @@ fn default_worktree_root() -> Result<std::path::PathBuf, MemoryError> {
     let home = dirs::home_dir()
         .ok_or_else(|| MemoryError::Config("Cannot determine home directory".into()))?;
     Ok(home.join(".ironrace-memory").join("autopilot-worktrees"))
+}
+
+/// [`open_migrated_db`] for an Autopilot controller (a Lead, a manual run,
+/// clear-dispatch), which refuses a database on a remote filesystem: SQLite
+/// and the controllers' coordination hold on one host only.
+fn open_controller_db(db: Option<String>) -> Result<ironmem::db::schema::Database, MemoryError> {
+    let cfg = config::Config::load(db.clone())?;
+    ironmem::autopilot::local_fs::require_local(&cfg.db_path, "the ironmem database")?;
+    open_migrated_db(db)
 }
 
 /// Load config, open, and migrate the database — the sequence every
@@ -2119,8 +2163,13 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                 // Validate before provisioning a worktree: a bad config
                 // should not leave a checkout behind.
                 config.validate()?;
+                let worktree_root = match worktree_root {
+                    Some(dir) => std::path::PathBuf::from(dir),
+                    None => default_worktree_root()?,
+                };
+                ironmem::autopilot::run::validate_worktree_root(implementer, &worktree_root)?;
 
-                let database = open_migrated_db(db)?;
+                let database = open_controller_db(db)?;
                 // Refuse an unapproved repo *before* creating a worktree and
                 // branch for it — `run_issue` checks this too, but by then
                 // the checkout already exists on disk.
@@ -2129,6 +2178,13 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                 // Resolve the selected harness before provisioning a worktree,
                 // but after the useful unapproved-repo diagnostic above.
                 let mut dispatcher = resolve_dispatcher(implementer)?;
+                // Held from before the first check until the run ends, so a
+                // Lead (or another manual run) cannot provision or dispatch
+                // the issue meanwhile; see `autopilot::issue_lock`.
+                let _lock = ironmem::autopilot::issue_lock::lock_for_run(
+                    std::path::Path::new(&path),
+                    &issue_ref,
+                )?;
                 ironmem::autopilot::run::preflight_worktree_provisioning(
                     &database,
                     &issue_ref,
@@ -2136,10 +2192,6 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                     dispatcher.as_mut(),
                 )?;
 
-                let worktree_root = match worktree_root {
-                    Some(dir) => std::path::PathBuf::from(dir),
-                    None => default_worktree_root()?,
-                };
                 let worktree = ironmem::autopilot::worktree::ensure_worktree(
                     std::path::Path::new(&path),
                     &worktree_root,
@@ -2430,28 +2482,49 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                 db,
                 json,
             } => {
-                let database = open_migrated_db(db)?;
+                let database = open_controller_db(db)?;
                 let issue_ref = ironmem::autopilot::IssueRef::new(&repo, issue);
-                // Both harnesses' evidence, sampled by `clear_dispatch` only
-                // after it has read the state it will judge.
+                // Every harness's evidence (Claude's registry and the
+                // supervised CLIs' process table), sampled by
+                // `clear_dispatch` only after it has read the state it will
+                // judge.
                 let cleared =
                     ironmem::autopilot::clear::clear_dispatch(&database, &issue_ref, || {
                         let mut monitor =
-                            ironmem::autopilot::registry::TwoHarnessMonitor::default();
+                            ironmem::autopilot::registry::HarnessProcessMonitor::default();
                         ironmem::autopilot::registry::HarnessMonitor::snapshot(&mut monitor)
                     })?;
+                use ironmem::autopilot::clear::Cleared;
                 if json {
                     println!("{}", serde_json::to_string_pretty(&cleared)?);
-                } else {
-                    println!(
-                        "cleared {} ({:?}, was {:?}); lineage, attempts and spend are unchanged, \
-                         and the next dispatch starts a fresh session",
-                        cleared.issue, cleared.implementer, cleared.state
-                    );
-                    if let Some(a) = &cleared.codex_artifacts {
-                        if let Some(dir) = std::path::Path::new(&a.schema_path).parent() {
-                            println!("  invocation evidence kept at {}", dir.display());
+                    return Ok(());
+                }
+                match cleared {
+                    Cleared::Dispatch(cleared) => {
+                        println!(
+                            "cleared {} ({:?}, was {:?}); lineage, attempts and spend are \
+                             unchanged, and the next dispatch starts a fresh session",
+                            cleared.issue, cleared.implementer, cleared.state
+                        );
+                        if let Some(a) = &cleared.invocation_artifacts {
+                            if let Some(dir) = std::path::Path::new(&a.schema_path).parent() {
+                                println!("  invocation evidence kept at {}", dir.display());
+                            }
                         }
+                    }
+                    Cleared::Unreadable(cleared) => {
+                        println!(
+                            "cleared {}'s unreadable dispatch state ({}); lineage, attempts and \
+                             spend are unchanged. It held{}:",
+                            cleared.issue,
+                            cleared.reason,
+                            if cleared.raw_content_truncated {
+                                " (cut, secrets scrubbed)"
+                            } else {
+                                " (secrets scrubbed)"
+                            }
+                        );
+                        println!("{}", cleared.raw_content);
                     }
                 }
                 Ok(())
@@ -2620,7 +2693,7 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                     return Ok(());
                 }
 
-                let mut registry = ironmem::autopilot::registry::TwoHarnessMonitor::default();
+                let mut registry = ironmem::autopilot::registry::HarnessProcessMonitor::default();
                 let snapshot =
                     ironmem::autopilot::registry::HarnessMonitor::snapshot(&mut registry);
                 let report = ironmem::autopilot::supervise::supervise_issue(
@@ -2693,7 +2766,7 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
             AutopilotCmd::Reconcile { db, json } => {
                 use ironmem::autopilot::supervise::ReconcileVerdict;
                 let database = open_migrated_db(db)?;
-                let mut registry = ironmem::autopilot::registry::TwoHarnessMonitor::default();
+                let mut registry = ironmem::autopilot::registry::HarnessProcessMonitor::default();
                 let snapshot =
                     ironmem::autopilot::registry::HarnessMonitor::snapshot(&mut registry);
                 let rows = ironmem::autopilot::supervise::reconcile(&database, &snapshot)?;
@@ -2851,7 +2924,7 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                 // fail on the config, not on a missing `gh`.
                 config.validate()?;
 
-                let database = open_migrated_db(db)?;
+                let database = open_controller_db(db)?;
                 let mut gh_runner = ironmem::autopilot::gh::GhCli::resolve(
                     config
                         .targets
@@ -2859,7 +2932,7 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                         .map(|t| t.path.clone())
                         .unwrap_or_else(|| std::path::PathBuf::from(".")),
                 )?;
-                let mut registry = ironmem::autopilot::registry::TwoHarnessMonitor::default();
+                let mut registry = ironmem::autopilot::registry::HarnessProcessMonitor::default();
                 let mut dispatcher = resolve_dispatcher(implementer)?;
                 let mut advisor: Box<dyn ironmem::autopilot::advise::Advisor> =
                     if config.advice.enabled {
@@ -3020,7 +3093,7 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                 let database = open_migrated_db(db)?;
                 let mut gh_runner =
                     ironmem::autopilot::gh::GhCli::resolve(std::path::PathBuf::from(&path))?;
-                let mut registry = ironmem::autopilot::registry::TwoHarnessMonitor::default();
+                let mut registry = ironmem::autopilot::registry::HarnessProcessMonitor::default();
                 let snapshot =
                     ironmem::autopilot::registry::HarnessMonitor::snapshot(&mut registry);
 
@@ -3851,6 +3924,43 @@ mod tests {
     }
 
     #[test]
+    fn implementation_model_refusals_name_the_selected_recovering_harness() {
+        use ironmem::autopilot::Implementer;
+        let err = |implementer, model: Option<&str>, turns, budget| {
+            resolve_implementation_model(implementer, model.map(str::to_owned), turns, budget)
+                .unwrap_err()
+                .to_string()
+        };
+        assert_eq!(
+            err(Implementer::Codex, None, false, false),
+            "Validation error: --model is required for the Codex implementer; pass an explicit Codex model"
+        );
+        assert_eq!(
+            err(Implementer::Muse, None, false, false),
+            "Validation error: --model is required for the Muse implementer; pass an explicit Muse model"
+        );
+        assert_eq!(
+            err(Implementer::Codex, Some("gpt-6.1-sol"), false, true),
+            "Validation error: the Codex implementer does not support --max-budget-usd: the native Codex CLI has no such flag; use the daily unpriced invocation cap and wall-clock timeout"
+        );
+        assert_eq!(
+            err(Implementer::Muse, Some("muse-wonder-1.0"), false, true),
+            "Validation error: the Muse implementer does not support --max-budget-usd: the native Muse CLI has no such flag; use the daily unpriced invocation cap and wall-clock timeout"
+        );
+        // Muse has a native step cap, so --max-turns stays a valid limit.
+        assert_eq!(
+            resolve_implementation_model(
+                Implementer::Muse,
+                Some("muse-wonder-1.0".into()),
+                true,
+                false
+            )
+            .unwrap(),
+            "muse-wonder-1.0"
+        );
+    }
+
+    #[test]
     fn autopilot_run_and_lead_parse_codex_implementation_selection() {
         let run = Cli::try_parse_from([
             "ironmem",
@@ -3906,6 +4016,92 @@ mod tests {
     }
 
     #[test]
+    fn autopilot_run_and_lead_parse_muse_implementation_selection() {
+        let run = Cli::try_parse_from([
+            "ironmem",
+            "autopilot",
+            "run",
+            "owner/repo",
+            "283",
+            "--title",
+            "t",
+            "--implementer",
+            "muse",
+            "--model",
+            "muse-wonder-1.0",
+        ])
+        .expect("run Muse selection should parse");
+        match run.command {
+            Commands::Autopilot {
+                cmd:
+                    AutopilotCmd::Run {
+                        implementer, model, ..
+                    },
+            } => {
+                assert_eq!(implementer, ironmem::autopilot::Implementer::Muse);
+                assert_eq!(model.as_deref(), Some("muse-wonder-1.0"));
+            }
+            _ => panic!("expected autopilot run"),
+        }
+
+        let lead = Cli::try_parse_from([
+            "ironmem",
+            "autopilot",
+            "lead",
+            "--repo",
+            "owner/repo=/tmp/repo",
+            "--implementer",
+            "muse",
+            "--model",
+            "muse-wonder-1.0",
+        ])
+        .expect("lead Muse selection should parse");
+        match lead.command {
+            Commands::Autopilot {
+                cmd:
+                    AutopilotCmd::Lead {
+                        implementer, model, ..
+                    },
+            } => {
+                assert_eq!(implementer, ironmem::autopilot::Implementer::Muse);
+                assert_eq!(model.as_deref(), Some("muse-wonder-1.0"));
+            }
+            _ => panic!("expected autopilot lead"),
+        }
+    }
+
+    /// `--implementer muse` parses to the Muse harness on both subcommands
+    /// that dispatch. Behaviour, not help prose: rewording the help cannot
+    /// break this, and dropping Muse from the parser cannot pass it.
+    #[test]
+    fn autopilot_implementer_accepts_muse() {
+        use clap::CommandFactory;
+
+        for subcommand in ["run", "lead"] {
+            let mut args = vec!["ironmem", "autopilot", subcommand];
+            if subcommand == "run" {
+                args.extend(["owner/repo", "283", "--title", "t"]);
+            } else {
+                args.extend(["--repo", "owner/repo=/tmp/repo"]);
+            }
+            args.extend(["--implementer", "muse"]);
+            let matches = Cli::command()
+                .try_get_matches_from(args)
+                .unwrap_or_else(|e| panic!("{subcommand}: {e}"));
+            let implementer = matches
+                .subcommand_matches("autopilot")
+                .and_then(|m| m.subcommand_matches(subcommand))
+                .and_then(|m| m.get_one::<ironmem::autopilot::Implementer>("implementer"))
+                .copied();
+            assert_eq!(
+                implementer,
+                Some(ironmem::autopilot::Implementer::Muse),
+                "{subcommand}"
+            );
+        }
+    }
+
+    #[test]
     fn autopilot_unknown_implementer_names_the_supported_harnesses() {
         for subcommand in ["run", "lead"] {
             let mut args = vec!["ironmem", "autopilot", subcommand];
@@ -3921,6 +4117,7 @@ mod tests {
                 .to_string();
             assert!(err.contains("claude"), "got: {err}");
             assert!(err.contains("codex"), "got: {err}");
+            assert!(err.contains("muse"), "got: {err}");
         }
     }
 

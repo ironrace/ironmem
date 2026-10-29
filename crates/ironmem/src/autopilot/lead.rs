@@ -160,7 +160,9 @@ pub struct LeadConfig {
     pub advice: AdviceConfig,
     pub max_dispatches_per_tick: usize,
     pub worktree_root: PathBuf,
-    /// Read everything, decide everything, write nothing and spend nothing.
+    /// Read everything, decide everything, write nothing and spend
+    /// nothing — with one exception: a dry run may finalise the exit
+    /// record of an invocation that was awaiting a quiet worktree.
     pub dry_run: bool,
 }
 
@@ -201,6 +203,7 @@ impl LeadConfig {
         // The run's budget message knows the implementer; the queue's, which
         // checks the same numbers, does not.
         self.run.validate()?;
+        super::run::validate_worktree_root(self.run.implementer, &self.worktree_root)?;
         self.queue.validate()?;
         self.supervision.validate()?;
         self.advice.validate()?;
@@ -321,6 +324,11 @@ pub fn lead_tick(
     config: &LeadConfig,
 ) -> Result<LeadReport, MemoryError> {
     config.validate()?;
+    // One host only: every target's repository on a local disk, or nothing
+    // this tick proves about another controller holds.
+    for target in &config.targets {
+        super::issue_lock::git_common_dir(&target.path)?;
+    }
 
     let mut problems: Vec<TickProblem> = Vec::new();
     let mut advice: Vec<Advice> = Vec::new();
@@ -388,16 +396,40 @@ pub fn lead_tick(
 
     // ── 5. dispatch the top of the queue ────────────────────────────────
     let mut runs = Vec::new();
+    let mut plan = plan;
     if !config.dry_run {
-        for queued in plan.dispatch.iter().take(config.max_dispatches_per_tick) {
+        let mut held = Vec::new();
+        // An issue another controller holds takes none of this tick's
+        // dispatches: the next one in the queue gets its turn.
+        let mut attempted = 0;
+        for queued in &plan.dispatch {
+            if attempted >= config.max_dispatches_per_tick {
+                break;
+            }
             match dispatch_one(db, queued, config, dispatcher, advisor, &mut advice) {
-                Ok(run) => runs.push(run),
-                Err(e) => problems.push(TickProblem {
-                    what: format!("dispatch {}", queued.issue.canonical()),
-                    detail: e.to_string(),
+                Ok(Dispatched::Ran(run)) => {
+                    attempted += 1;
+                    runs.push(run);
+                }
+                // Another controller has it: skipped this tick, said so.
+                Ok(Dispatched::Held { detail }) => held.push(queue::Deferred {
+                    issue: queued.issue.clone(),
+                    priority: queued.priority,
+                    reason: queue::DeferReason::HeldByAnotherController { detail },
                 }),
+                Err(e) => {
+                    attempted += 1;
+                    problems.push(TickProblem {
+                        what: format!("dispatch {}", queued.issue.canonical()),
+                        detail: e.to_string(),
+                    });
+                }
             }
         }
+        // Reported once, as deferred, never also as dispatched.
+        plan.dispatch
+            .retain(|queued| !held.iter().any(|d| d.issue == queued.issue));
+        plan.deferred.extend(held);
     }
 
     // ── 6. close out every issue at its attempt cap ─────────────────────
@@ -582,9 +614,24 @@ fn supervise_in_flight(
     config: &LeadConfig,
     problems: &mut Vec<TickProblem>,
 ) -> Result<Vec<SupervisionReport>, MemoryError> {
-    let states = super::dispatch_state::all_dispatch_states(db, IN_FLIGHT_SCAN_LIMIT)?;
+    let scan = super::dispatch_state::scan_dispatch_states(db, IN_FLIGHT_SCAN_LIMIT)?;
+    // A drawer that cannot be read holds its slot in the queue and is
+    // supervised by no one, so the tick names it, whatever repo it is for
+    // (its repo cannot be read either). Reading writes nothing, so a dry run
+    // names it too.
+    for (key, why) in &scan.unreadable {
+        problems.push(TickProblem {
+            what: format!("read the dispatch state {key}"),
+            detail: format!(
+                "it cannot be read ({}); it holds a concurrency slot until a binary that reads \
+                 it runs, or, once nothing runs for its issue, `ironmem autopilot \
+                 clear-dispatch <repo> <issue>` releases it",
+                scrub_and_bound(why, 200).text
+            ),
+        });
+    }
     let mut reports = Vec::new();
-    for state in states {
+    for state in scan.states {
         if !config.targets.iter().any(|t| t.repo == state.issue.repo) {
             continue;
         }
@@ -969,7 +1016,18 @@ pub fn resolve_class(
     Ok((class, Some(advice)))
 }
 
-/// Provision a worktree and drive one issue.
+/// What [`dispatch_one`] did with a selected issue.
+enum Dispatched {
+    Ran(IssueRun),
+    /// Another controller holds the issue's lock: nothing was provisioned
+    /// or dispatched.
+    Held {
+        detail: String,
+    },
+}
+
+/// Provision a worktree and drive one issue, holding its lock
+/// ([`super::issue_lock`]) from before the first check until the run ends.
 fn dispatch_one(
     db: &Database,
     queued: &queue::QueuedIssue,
@@ -977,7 +1035,7 @@ fn dispatch_one(
     dispatcher: &mut dyn Dispatcher,
     advisor: &mut dyn Advisor,
     advice: &mut Vec<Advice>,
-) -> Result<IssueRun, MemoryError> {
+) -> Result<Dispatched, MemoryError> {
     let target = config
         .targets
         .iter()
@@ -990,10 +1048,22 @@ fn dispatch_one(
             ))
         })?;
 
+    // Taken before any check and held through the run, dispatch included:
+    // a second controller that passed the same checks while this one waited
+    // on the advisor would otherwise quarantine this one's live worktree.
+    let _lock = match super::issue_lock::try_lock_issue(&target.path, &queued.issue)? {
+        super::issue_lock::IssueLockAttempt::Acquired(lock) => lock,
+        super::issue_lock::IssueLockAttempt::Held { path } => {
+            return Ok(Dispatched::Held {
+                detail: super::issue_lock::held_reason(&queued.issue, &path),
+            })
+        }
+    };
+
     // Queue liveness admitted this issue under its persisted owner. Re-check
     // the current state through the injected dispatcher before advice or
     // worktree provisioning so a stale selection cannot mutate the checkout
-    // under the wrong harness or while a Codex process became live meanwhile.
+    // under the wrong harness or while a supervised CLI process became live meanwhile.
     run::preflight_worktree_provisioning(db, &queued.issue, config.run.implementer, dispatcher)?;
 
     let mut run_config = config.run.clone();
@@ -1026,6 +1096,7 @@ fn dispatch_one(
         &run_config,
         dispatcher,
     )
+    .map(Dispatched::Ran)
 }
 
 #[cfg(test)]
@@ -1102,6 +1173,7 @@ mod tests {
                 reason: Some("scripted".to_string()),
                 process_success: true,
                 timed_out: false,
+                session_refusal: None,
             })
         }
     }
@@ -1137,6 +1209,7 @@ mod tests {
                 reason: Some("scripted infrastructure failure".to_string()),
                 process_success: false,
                 timed_out: false,
+                session_refusal: None,
             })
         }
     }
@@ -1188,20 +1261,14 @@ mod tests {
     /// A real git checkout, so `ensure_worktree` has something to cut from.
     fn git_repo(dir: &Path) {
         let run = |args: &[&str]| {
-            let status = std::process::Command::new("git")
-                .args(args)
-                .current_dir(dir)
-                .output()
-                .expect("git must be available");
-            assert!(
-                status.status.success(),
-                "git {args:?} failed: {}",
-                String::from_utf8_lossy(&status.stderr)
-            );
+            crate::autopilot::test_git::output(dir, args);
         };
         run(&["init", "--initial-branch=main"]);
         run(&["config", "user.email", "test@example.com"]);
         run(&["config", "user.name", "Test"]);
+        // Pinned: the global config signs and runs hooks; worktrees share this.
+        run(&["config", "commit.gpgsign", "false"]);
+        run(&["config", "core.hooksPath", "/dev/null"]);
         std::fs::write(dir.join("README.md"), "hi").unwrap();
         run(&["add", "."]);
         run(&["commit", "-m", "init"]);
@@ -1272,6 +1339,20 @@ mod tests {
         let mut cfg = config(&f);
         cfg.max_dispatches_per_tick = 0;
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn a_muse_lead_refuses_a_worktree_root_with_whitespace() {
+        // Every tick would otherwise provision a branch and worktree that
+        // Muse's argv then refuses.
+        let f = fixture();
+        let mut cfg = config(&f);
+        cfg.run.implementer = crate::autopilot::implementer::Implementer::Muse;
+        cfg.run.model = "muse-wonder-1.0".into();
+        cfg.validate().unwrap();
+        cfg.worktree_root = f.worktree_root.join("work trees");
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("whitespace"), "{err}");
     }
 
     // ── risk classification ─────────────────────────────────────────────
@@ -1347,6 +1428,117 @@ mod tests {
     }
 
     #[test]
+    fn an_issue_another_controller_holds_is_skipped_with_the_reason() {
+        let db = approved_db();
+        let f = fixture();
+        let issue = IssueRef::new(REPO, 7);
+        let tick = |db: &Database, dispatcher: &mut dyn Dispatcher| {
+            let mut gh_runner = ScriptedGh::new(vec![
+                Ok(GhOutput::ok("[]")),
+                Ok(GhOutput::ok(&issue_list_json(&[(7, &["agent:ready"])]))),
+            ]);
+            lead_tick(
+                db,
+                &mut gh_runner,
+                &mut empty_registry(),
+                dispatcher,
+                &mut no_advisor(),
+                &config(&f),
+            )
+            .unwrap()
+        };
+        let held = match crate::autopilot::issue_lock::try_lock_issue(&f.repo_path, &issue).unwrap()
+        {
+            crate::autopilot::issue_lock::IssueLockAttempt::Acquired(lock) => lock,
+            crate::autopilot::issue_lock::IssueLockAttempt::Held { .. } => unreachable!(),
+        };
+
+        let report = tick(&db, &mut RefusingDispatcher);
+        assert!(report.runs.is_empty());
+        assert!(report.problems.is_empty(), "{:?}", report.problems);
+        let deferred = report
+            .plan
+            .deferred
+            .iter()
+            .find(|d| d.issue == issue)
+            .expect("the held issue is reported as deferred");
+        match &deferred.reason {
+            queue::DeferReason::HeldByAnotherController { detail } => {
+                assert!(
+                    detail.contains("another controller holds issue"),
+                    "{detail}"
+                );
+                assert!(
+                    detail.contains(&held.path().display().to_string()),
+                    "{detail}"
+                );
+            }
+            other => panic!("deferred for {other:?}"),
+        }
+        assert!(
+            !worktree::worktree_path(&f.worktree_root, &issue).exists(),
+            "nothing is provisioned for an issue another controller holds"
+        );
+        assert!(dispatch_state::get_dispatch_state(&db, &issue)
+            .unwrap()
+            .is_none());
+
+        // Released (a crashed holder's descriptor closes the same way), the
+        // next tick runs it.
+        drop(held);
+        let mut dispatcher = RecordingDispatcher::new();
+        let report = tick(&db, &mut dispatcher);
+        assert_eq!(report.runs.len(), 1);
+        assert_eq!(dispatcher.seen.len(), 1);
+    }
+
+    /// C-M6c: a held issue takes none of the tick's dispatches and is
+    /// reported once, as deferred.
+    #[test]
+    fn a_held_issue_takes_no_dispatch_slot_and_is_reported_only_as_deferred() {
+        let db = approved_db();
+        let f = fixture();
+        let held_issue = IssueRef::new(REPO, 7);
+        let _held = match crate::autopilot::issue_lock::try_lock_issue(&f.repo_path, &held_issue)
+            .unwrap()
+        {
+            crate::autopilot::issue_lock::IssueLockAttempt::Acquired(lock) => lock,
+            crate::autopilot::issue_lock::IssueLockAttempt::Held { .. } => unreachable!(),
+        };
+        let mut gh_runner = ScriptedGh::new(vec![
+            Ok(GhOutput::ok("[]")),
+            Ok(GhOutput::ok(&issue_list_json(&[
+                (7, &["agent:ready", "priority:high"]),
+                (3, &["agent:ready"]),
+            ]))),
+        ]);
+        let mut cfg = config(&f);
+        cfg.max_dispatches_per_tick = 1;
+        let mut dispatcher = RecordingDispatcher::new();
+        let report = lead_tick(
+            &db,
+            &mut gh_runner,
+            &mut empty_registry(),
+            &mut dispatcher,
+            &mut no_advisor(),
+            &cfg,
+        )
+        .unwrap();
+        assert_eq!(report.runs.len(), 1, "{:?}", report.problems);
+        assert_eq!(report.runs[0].issue.number, 3);
+        assert!(!report.plan.dispatch.iter().any(|q| q.issue == held_issue));
+        assert_eq!(
+            report
+                .plan
+                .deferred
+                .iter()
+                .filter(|d| d.issue == held_issue)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn the_dispatched_class_comes_from_the_issues_risk_label() {
         // Asserted against the dispatch-state drawer — the value the
         // Reviewer later compares its own classification against — rather
@@ -1408,6 +1600,104 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(state.dispatch_class, "unclassified");
+    }
+
+    #[test]
+    fn ultrareview_dry_run_only_finalizes_quiet_evidence() {
+        use crate::autopilot::implementer::Implementer;
+        use crate::autopilot::invocation::{self, contract_tests::write_awaiting};
+        use crate::autopilot::process_tree::{self, ProcessIdentity, ProcessSnapshot};
+        use crate::autopilot::registry::{HarnessSnapshots, RegistrySnapshot};
+        struct Monitor;
+        impl HarnessMonitor for Monitor {
+            fn snapshot(&mut self) -> HarnessSnapshots {
+                HarnessSnapshots {
+                    claude: RegistrySnapshot::Available(Vec::new()),
+                    processes: ProcessSnapshot::Available(Vec::new()),
+                }
+            }
+        }
+        let db = approved_db();
+        let f = fixture();
+        let mut cfg = config(&f);
+        cfg.dry_run = true;
+        let issue = IssueRef::new(REPO, 3);
+        let a = invocation::prepare_artifacts(&f.repo_path, &issue).unwrap();
+        // A real reaped child supplies a birth which cannot still own its
+        // reserved group/PID. No invented kernel observation is needed.
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("0.2")
+            .spawn()
+            .unwrap();
+        let birth = process_tree::kernel_birth(child.id()).unwrap().unwrap();
+        child.wait().unwrap();
+        process_tree::persist_identity(
+            &a,
+            &ProcessIdentity {
+                version: 1,
+                root_pid: child.id(),
+                root_pgid: child.id(),
+                root_birth: Some(birth),
+                schema_path: a.schema_path.clone(),
+                invocation_id: a.invocation_id.clone(),
+                descendants: Vec::new(),
+            },
+        )
+        .unwrap();
+        write_awaiting(
+            &a,
+            process_tree::current_uid().unwrap(),
+            &f.repo_path,
+            Vec::new(),
+        );
+        let state = DispatchState {
+            issue: issue.clone(),
+            implementer: Implementer::Codex,
+            invocation_artifacts: Some(a.clone()),
+            native_session_id: None,
+            worktree_path: f.repo_path.to_str().unwrap().into(),
+            ic_session_name: format!("ic-{}", issue.slug()),
+            dispatch_class: "logic".into(),
+            attempt_n: 1,
+            state: "dispatching".into(),
+            started_at: chrono::Utc::now().to_rfc3339(),
+            session_uuid: "controller-only".into(),
+            turn_n: 1,
+            session_claimed: true,
+            session_model: None,
+            resume_refusals: 0,
+            signing_held: false,
+        };
+        dispatch_state::upsert_dispatch_state(&db, &state).unwrap();
+        let drawers = || {
+            db.with_connection(|conn| {
+                let mut stmt = conn.prepare("SELECT id, content FROM drawers ORDER BY id")?;
+                let rows = stmt.query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?;
+                Ok(rows.collect::<Result<Vec<_>, _>>()?)
+            })
+            .unwrap()
+        };
+        let before = drawers();
+        let mut gh = ScriptedGh::new(vec![Ok(GhOutput::ok("[]")), Ok(GhOutput::ok("[]"))]);
+        let report = lead_tick(
+            &db,
+            &mut gh,
+            &mut Monitor,
+            &mut RefusingDispatcher,
+            &mut no_advisor(),
+            &cfg,
+        )
+        .unwrap();
+        assert!(report.runs.is_empty());
+        assert!(invocation::has_valid_exit_record(&a));
+        assert!(!invocation::is_awaiting_quiet(&a));
+        assert_eq!(
+            drawers(),
+            before,
+            "dry runs must leave all database records byte-identical"
+        );
     }
 
     #[test]
@@ -1551,7 +1841,7 @@ mod tests {
             &DispatchState {
                 implementer: crate::autopilot::implementer::Implementer::Claude,
                 native_session_id: None,
-                codex_artifacts: None,
+                invocation_artifacts: None,
                 issue: IssueRef::new("ironrace/elsewhere", 1),
                 worktree_path: "/tmp/wt".to_string(),
                 ic_session_name: "ic-ironrace-elsewhere-1".to_string(),
@@ -1562,6 +1852,9 @@ mod tests {
                 session_uuid: "11111111-2222-3333-4444-555555555555".to_string(),
                 turn_n: 1,
                 session_claimed: true,
+                session_model: None,
+                resume_refusals: 0,
+                signing_held: false,
             },
         )
         .unwrap();
@@ -1577,6 +1870,33 @@ mod tests {
         )
         .unwrap();
         assert!(report.supervision.is_empty());
+    }
+
+    /// a dispatch-state drawer that cannot be read holds a slot and is
+    /// supervised by no one, so the tick names it, in no backlog or not.
+    #[test]
+    fn a_tick_names_a_dispatch_state_it_cannot_read() {
+        let db = approved_db();
+        let f = fixture();
+        let key = dispatch_state::dispatch_state_key(&IssueRef::new("ironrace/elsewhere", 9));
+        crate::autopilot::write_current(&db, &key, "not json").unwrap();
+        let mut gh_runner = ScriptedGh::new(vec![Ok(GhOutput::ok("[]")), Ok(GhOutput::ok("[]"))]);
+        let report = lead_tick(
+            &db,
+            &mut gh_runner,
+            &mut empty_registry(),
+            &mut RefusingDispatcher,
+            &mut no_advisor(),
+            &config(&f),
+        )
+        .unwrap();
+        assert!(
+            report.problems.iter().any(|p| p.what.contains(&key)
+                && p.detail.contains("cannot be read")
+                && p.detail.contains("ironmem autopilot clear-dispatch")),
+            "{:?}",
+            report.problems
+        );
     }
 
     #[test]
@@ -1829,7 +2149,7 @@ mod tests {
             &DispatchState {
                 implementer: crate::autopilot::implementer::Implementer::Claude,
                 native_session_id: None,
-                codex_artifacts: None,
+                invocation_artifacts: None,
                 issue: issue.clone(),
                 worktree_path: f.repo_path.display().to_string(),
                 ic_session_name: crate::autopilot::dispatch::ic_name(&issue),
@@ -1838,6 +2158,9 @@ mod tests {
                 state: "dispatching".to_string(),
                 started_at: chrono::Utc::now().to_rfc3339(),
                 session_claimed: true,
+                session_model: None,
+                resume_refusals: 0,
+                signing_held: false,
                 session_uuid: "11111111-2222-3333-4444-555555555555".to_string(),
                 turn_n: 0,
             },
@@ -2048,7 +2371,7 @@ mod tests {
                 &DispatchState {
                     implementer: crate::autopilot::implementer::Implementer::Claude,
                     native_session_id: None,
-                    codex_artifacts: None,
+                    invocation_artifacts: None,
                     issue: issue.clone(),
                     worktree_path: f.repo_path.display().to_string(),
                     ic_session_name: crate::autopilot::dispatch::ic_name(&issue),
@@ -2057,6 +2380,9 @@ mod tests {
                     state: "dispatching".to_string(),
                     started_at: chrono::Utc::now().to_rfc3339(),
                     session_claimed: true,
+                    session_model: None,
+                    resume_refusals: 0,
+                    signing_held: false,
                     session_uuid: "11111111-2222-3333-4444-555555555555".to_string(),
                     turn_n: 0,
                 },
@@ -2113,7 +2439,7 @@ mod tests {
                 &DispatchState {
                     implementer: crate::autopilot::implementer::Implementer::Claude,
                     native_session_id: None,
-                    codex_artifacts: None,
+                    invocation_artifacts: None,
                     issue: issue.clone(),
                     worktree_path: f.repo_path.display().to_string(),
                     ic_session_name: crate::autopilot::dispatch::ic_name(&issue),
@@ -2122,6 +2448,9 @@ mod tests {
                     state: "dispatching".to_string(),
                     started_at: chrono::Utc::now().to_rfc3339(),
                     session_claimed: true,
+                    session_model: None,
+                    resume_refusals: 0,
+                    signing_held: false,
                     session_uuid: "11111111-2222-3333-4444-555555555555".to_string(),
                     turn_n: 0,
                 },
@@ -2213,7 +2542,7 @@ mod tests {
             &DispatchState {
                 implementer: crate::autopilot::implementer::Implementer::Claude,
                 native_session_id: None,
-                codex_artifacts: None,
+                invocation_artifacts: None,
                 issue: issue.clone(),
                 worktree_path: f.repo_path.display().to_string(),
                 ic_session_name: crate::autopilot::dispatch::ic_name(issue),
@@ -2222,6 +2551,9 @@ mod tests {
                 state: "dispatching".to_string(),
                 started_at: chrono::Utc::now().to_rfc3339(),
                 session_claimed: true,
+                session_model: None,
+                resume_refusals: 0,
+                signing_held: false,
                 session_uuid: "11111111-2222-3333-4444-555555555555".to_string(),
                 turn_n: 0,
             },
@@ -2482,6 +2814,7 @@ mod tests {
                 reason: Some("scripted failure".to_string()),
                 process_success: true,
                 timed_out: false,
+                session_refusal: None,
             })
         }
     }
@@ -3037,7 +3370,7 @@ mod tests {
     }
     #[test]
     fn lead_snapshots_harnesses_once_and_reports_selected_availability() {
-        use crate::autopilot::codex_process::CodexProcessSnapshot;
+        use crate::autopilot::process_tree::ProcessSnapshot;
         use crate::autopilot::registry::{HarnessSnapshots, RegistrySnapshot};
         struct Monitor {
             calls: usize,
@@ -3049,7 +3382,7 @@ mod tests {
                     claude: RegistrySnapshot::Unavailable {
                         reason: "no Claude installed".into(),
                     },
-                    codex: CodexProcessSnapshot::Available(Vec::new()),
+                    processes: ProcessSnapshot::Available(Vec::new()),
                 }
             }
         }

@@ -607,12 +607,10 @@ mod tests {
             .with_timezone(&chrono::Utc)
     }
 
+    /// Fixture git ([`crate::autopilot::test_git`]): scrubbed, no global or
+    /// system config, success asserted.
     fn git(root: &std::path::Path, args: &[&str]) {
-        std::process::Command::new("git")
-            .args(args)
-            .current_dir(root)
-            .output()
-            .unwrap();
+        crate::autopilot::test_git::output(root, args);
     }
 
     /// Build a git repo, commit `path`, return (TempDir, root, head_sha).
@@ -625,11 +623,7 @@ mod tests {
         std::fs::write(root.join(path), content).unwrap();
         git(&root, &["add", "."]);
         git(&root, &["commit", "-m", "c1"]);
-        let out = std::process::Command::new("git")
-            .args(["rev-parse", "HEAD"])
-            .current_dir(&root)
-            .output()
-            .unwrap();
+        let out = crate::autopilot::test_git::output(&root, &["rev-parse", "HEAD"]);
         let sha = String::from_utf8(out.stdout).unwrap().trim().to_string();
         (dir, root, sha)
     }

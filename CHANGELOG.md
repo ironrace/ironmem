@@ -7,8 +7,181 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking storage requirement:** Autopilot `lead`, `run` and
+  `clear-dispatch` refuse known remote repository common directories and
+  databases. Move both to local disk before upgrading. Linux FUSE whose
+  subtype cannot be read is refused too. See `docs/AUTOPILOT.md` for platform
+  limits and recovery.
+- **Breaking Rust API changes:** `clear_dispatch` returns the untagged
+  `Cleared` enum; Rust `codex_artifacts` fields on `ClearedDispatch`,
+  `DispatchState` and `DispatchSpec` are now `invocation_artifacts` (the
+  serialized `codex_artifacts` key stays stable). `DispatchOutcome` adds
+  `session_refusal`. Snapshot `Available` variants cannot be constructed
+  externally; `HarnessSnapshots` and `SharedDaemon` fields are crate-private.
+  Use the snapshot/daemon collection APIs. Deprecated Codex aliases are
+  scheduled for removal in **0.7.0**.
+- Pending invocation exit records have additive strict fields that older
+  readers reject and hold. Finish or clear pending runs with this version
+  before downgrading. Journals/prompts/stderr retain raw tool output; old,
+  unnamed invocation directories are opportunistically pruned after 14 days,
+  keeping the named/current invocation. This is not a guaranteed deletion time.
+
+### Added
+
+- **Muse Code as an Autopilot implementer (#366).** `autopilot run` and
+  `autopilot lead` take `--implementer muse`, alongside `claude` (still the
+  default) and `codex`. Muse runs supervised like Codex: an unpriced
+  reservation per invocation (`--max-unpriced-dispatches-per-day` is its
+  daily dispatch cap), restart recovery that holds rather than re-dispatching
+  while a run might still be alive, and `clear-dispatch` support. Its session
+  continues headlessly across invocations, and `--max-turns` becomes
+  `--max-model-steps`. A session Muse refuses to resume (two refusals in a
+  row: a cross-provider resume, or retained state it cannot read), or one
+  last used with a different `--model`, is replaced with a fresh one at the
+  next launch rather than failing every invocation until `clear-dispatch`. A
+  session Muse reports still in use is never replaced: the run stops after
+  that one dispatch, parks the issue as `paused-session-in-use` (deferred by
+  the queue as `session_in_use`), and says to look for a leftover Muse
+  process and then run `clear-dispatch`. A later run, even with a different
+  `--model`, probes that same session first, and `clear-dispatch` refuses
+  while a process still names it. **Downgrade note:** an ironmem from before
+  this release cannot read a Muse dispatch state and skips it, so its queue
+  undercounts the concurrency cap and its `reconcile` reports the live Muse
+  process as an orphan. Do not downgrade while any Muse dispatch state
+  exists; let it finish, or `clear-dispatch` it, first.
+- **Commit-signing guard for every harness (#366).** With `commit.gpgsign`
+  on, a run that reports success but left unsigned commits on the issue
+  branch now counts as a failed attempt, with a reason naming the commits.
+  Turning signing off during a run, or from another issue's worktree, does
+  not get around it. A run whose `commit.gpgsign` holds an invalid value
+  refuses to start rather than paying for a dispatch it would discard, and
+  keeps any pending invocation for recovery once the value is fixed; a value
+  made invalid during a run stops it after that one dispatch. An unsigned
+  commit someone else committed (a collaborator's push) is never accepted
+  but costs the agent no attempt, and no run starts while one is there. The
+  guard reads a branch of any length in two git processes, falling back to
+  one read per commit only when a signature cannot be parsed, never runs a
+  signature program set in the repository's own config, never fetches (not
+  even through a protocol the repository's config allows), ignores
+  `refs/replace/` refs, and gives the whole check 120 seconds, a run start's
+  check included. A recorded cut that is not a commit name refuses the run at
+  its start.
+- **Codex and Muse supervision waits for a quiet worktree (#366).** A
+  short-lived tool's background child, reparented out of the tracked tree,
+  no longer gets a trusted completion while it still runs in the worktree.
+  The supervisor waits up to 15 seconds, then holds, and a later Lead tick
+  or `autopilot run` finishes the invocation once nothing it started
+  remains, with no `clear-dispatch`. The process-identity file now records
+  live descendants with their kernel birth. **Upgrade note:** do not
+  downgrade the ironmem binary while a Codex or Muse invocation is in
+  flight. An older binary cannot read the new identity format and treats
+  it as "nothing running" in `clear-dispatch`.
+
 ### Fixed
 
+- A Claude post-exit drain/read failure now writes a durable
+  `paused-completion-unproven` operator hold instead of automatically retrying
+  beside a tool child still running. Queue/provisioning/review/merge/release
+  respect the hold; explicit `clear-dispatch` releases it after the operator
+  stops leftovers (and refuses while any remain). The public error enum adds
+  `DispatchUnsettled`.
+
+- Per-issue kernel locks coordinate Lead/run, review/merge and cleanup within
+  one clone/host. Held locks skip/refuse with their path; kernel exit releases
+  them. Never unlink lock files. Remote/shared-clone and suspension limits are
+  documented in `docs/AUTOPILOT.md`.
+- Dispatch drains have a five-second post-exit bound; executable resolution
+  fails closed and refreshes vanished paths. Budget reservations deduplicate
+  retries and validate stored amounts. Unknown dispatch phases defer.
+- Reviewer scratch/prompts are private; reviewer credentials are removed from
+  the child environment. HTTP Basic credentials are scrubbed from summaries.
+  Muse reviewer OS confinement remains an explicit risk in `docs/AUTOPILOT.md`.
+- Supervision read/update operations are transactional; busy immediate COMMITs
+  retry without replaying mutations. Process enrolment uses a parent index,
+  identity comparisons use sets, long-run observation slows down, and teardown
+  polls back off. Authentication captures remain fresh.
+
+
+- **More git lookups ignore an inherited `GIT_DIR` reliably.** The session
+  hooks' workspace branch and repository-name lookup and `ironmem review-diff`
+  now use the shared git scrub, which removes the repository-selecting
+  variables (`GIT_DIR`, `GIT_WORK_TREE`, `GIT_CONFIG_*` and the rest)
+  unconditionally rather than only those set when the command was built. The
+  symbol-graph indexer's worktree check and HEAD read did not scrub git's
+  environment at all, so an inherited `GIT_DIR` could make the check accept a
+  directory that is not a git worktree and record another repository's HEAD
+  for the index (the indexer always walks the directory it was given); they
+  now scrub too.
+- **Linux: a process whose main thread has exited is no longer missed.** A
+  process whose main thread called `pthread_exit` while another thread runs
+  shows `Zl` in `ps`, and its `/proc/<pid>/cwd` is gone, yet it still runs.
+  Released Linux builds read that `ps` row as a zombie, so cleanup could not
+  enrol it, or its children through it, once its main thread had exited;
+  `verify_gone` and the process-group drain did not wait for it; and the
+  quiet-worktree scan skipped it, so completion could be trusted while it
+  still worked. Cleanup, `verify_gone`, the group drain and the quiet scan now
+  count it as running and hold for it: the scan reads a live thread's working
+  directory, and cleanup waits until SIGSTOP has reached every live thread.
+- **The daily unpriced cap and the budget ledger hold under concurrent
+  Leads.** Every ledger update now reads and writes in one `BEGIN IMMEDIATE`
+  transaction, so two Leads (or a Lead and a reviewer) sharing a database no
+  longer lose each other's update or fail with `database is locked`. Codex
+  and Muse check `--max-unpriced-dispatches-per-day` in the same transaction
+  that reserves the invocation, so two Leads racing for the last unit launch
+  one invocation, not two.
+- **Two runs that admit the same issue no longer both launch an
+  implementer.** Every dispatch-state write is now a compare-and-set against
+  what the run last wrote, so of a Codex Lead and a Muse Lead (or a Lead and
+  a manual `autopilot run`) racing for one fresh issue, the second launches
+  nothing and leaves the first's state alone. Before, it overwrote that
+  state, and the first invocation, named by no state, lost its slot while
+  still running.
+- **A dispatch state the queue cannot read holds its concurrency slot.** One
+  that is corrupt, or that a newer ironmem wrote for a harness this one does
+  not know, was skipped, so a Lead could dispatch past its cap. It now keeps
+  its slot and defers its issue (`dispatch_state_unreadable`), and
+  `clear-dispatch` releases it once a fresh process table shows nothing that
+  could be the issue's work (using the artifacts and worktree the drawer
+  still names, if any), printing why it could not be read and its raw
+  content (secrets scrubbed, bounded). A Claude dispatch state carrying Codex
+  or Muse invocation artifacts is refused where it is written and where it is
+  read. **Library:** `clear::clear_dispatch` now returns `clear::Cleared`, an
+  untagged enum of the existing `ClearedDispatch` and the new
+  `ClearedUnreadable`, so a readable state's `--json` output is unchanged.
+- **Codex and Muse implementers no longer kill the shared ironmem daemon at
+  cleanup.** A harness's ironmem MCP server can autospawn the daemon as its
+  own child; the process tracker now never treats the daemon on the
+  operator's configured socket, or its children, as part of an invocation,
+  so it survives and keeps serving. A versioned install (`ironmem-0.9`) is
+  recognised too. When the daemon cannot be recognised (a socket path with
+  whitespace, or an unresolvable executable), or cleanup kills a daemon on a
+  socket other than the configured one outside the temp directory, a
+  warning now says so. A daemon caught between its fork and exec is no
+  longer left in the invocation's process record, where it could hold the
+  issue for as long as it ran.
+- **An agent's tool that runs a setuid binary no longer tears its run
+  down.** On macOS the tracker read every descendant with
+  `PROC_PIDTBSDINFO`, which refuses a process running `ps`, `top` or `sudo`
+  (EPERM), so the run was killed and held for `clear-dispatch`. It now
+  reads `sysctl(KERN_PROC_PID)`, which needs no privilege. A descendant
+  cleanup may not signal is held as evidence, recorded, until it is gone.
+  The worktree check also counts a process that is yours only by real uid (a
+  setuid image) when it was born during the invocation and is tied to it: its
+  parent or its process group is the invocation's, it was reparented to launchd
+  or init (or, on Linux, its group survives a hand-off to a `systemd --user`
+  subreaper), or its parent was itself born during the invocation. So an escaped
+  setuid tool keeps the run held, while a Terminal tab's `login`, or a `sudo` or
+  `top` you run from a shell you already had, does not.
+- **A Codex or Muse run that fails within milliseconds is no longer held
+  for `clear-dispatch`.** A root that exits before the first process sample
+  (a Muse usage error, or "session in use") is recorded once its process
+  group has drained and the worktree is quiet, as an infrastructure failure
+  that is never `met`; a Muse session refusal on its stderr is still read.
+  Muse's launcher phase (`bash …/muse exec …`, before it execs the binary)
+  now counts as the invocation's own process, and a Muse journal may grow
+  to 64 MiB (Codex keeps 16 MiB) before the run is stopped.
 - **`autopilot lead` now closes out an issue at its attempt cap (#345).**
   Before, a tick whose run ended `AttemptCapExhausted` wrote nothing, so
   the issue kept `agent:ready` with no comment. The queue deferred it on
@@ -53,9 +226,96 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   counter is charged afresh from its first success, so once a human
   re-labels it `agent:ready` it may get the rest of that cap without an
   `autopilot retry`.
+- **A Claude run's first launch needs a readable process table.** A
+  Claude run checks `ps` for a process naming its IC before its first
+  launch (and a readable Claude registry only when adopting another
+  run's claim), so a host where `ps` cannot be read holds Claude
+  issues instead of launching. The Codex reviewer now receives its prompt on stdin
+  (`review::build_argv` ends in `-`), as the Codex implementer does.
+  The day's dollar total includes in-flight dispatch reservations, so
+  it can read higher than the settled spend while a dispatch runs.
 
 ### Changed
 
+- **A new Autopilot issue branch has no upstream.** Before, an issue branch
+  cut from a remote-tracking `--base` such as `origin/main` tracked it, so
+  with `push.default=upstream` a bare `git push` from the issue branch went to
+  `main`. Now the branch is created at the resolved sha with `--no-track`, so
+  it no longer tracks the base and a bare `git push` cannot reach the base
+  through an upstream; other push settings (`push.default=matching` or
+  `current`, a `remote.<name>.push` refspec) can still push without naming
+  anything. Push an issue branch by naming the remote and the branch (`git
+  push <remote> <branch>`); the implementer's goal condition now says so,
+  naming the remote whose push URL is the issue's GitHub repository, else
+  (skipping any remote that pushes only to another GitHub repository) the one
+  already tracking the branch, else `origin` if configured, else the only one
+  left, and no remote when none of those applies; a run warns, naming the
+  remotes, when none pushes to the issue's repository but some push to
+  another. Existing branches keep whatever upstream they have; remove it with
+  `git branch --unset-upstream <branch>`.
+- **Existing setups with `commit.gpgsign` on now get a failed attempt when an
+  implementer's commits are unsigned, for Claude as well as Codex and Muse.**
+  Before, such a run could succeed. Make sure the signing key or agent is
+  reachable from wherever the Lead runs. To stop the check on one issue
+  branch, turn `commit.gpgsign` off, then run `git config
+  branch.<branch>.ironmemSigning false` in the repo. To stop it on every
+  branch, turn `commit.gpgsign` off, then unset the repository-wide
+  `ironmem.autopilotSigning` and each branch's `ironmemSigning`. See
+  "Commit signing" in `docs/AUTOPILOT.md`.
+- **An operator's own `codex exec` or `muse exec --output-schema` session no
+  longer stalls Autopilot.** A `ps` row now counts as an ambiguous Autopilot
+  invocation only when it carries an Autopilot-shaped marker path.
+- **A dispatch into an invocation directory that already has a process
+  identity is refused** instead of spawning a second process into it.
+- **The Codex and Muse implementers skip relative `PATH` entries** (such as
+  `.`) when finding their binary. They run in the issue worktree, where a
+  relative entry would find a file in the repository being worked on. So do
+  the Claude implementer and the Codex and Muse reviewers.
+- **Resuming an issue branch with no recorded cut now records the commit the
+  branch was created from** (from its reflog, or else its merge base with
+  `--base`), and refuses the run if neither can be found or that merge base
+  is the branch's own tip while it has unpushed commits. A new branch's cut
+  is recorded before the branch is created, with the creating run's own token
+  in `branch.<branch>.ironmemCutOwner`. It is never taken back from a branch
+  that exists, nor when another controller has recorded the same value since,
+  and a run whose cut was taken back while its add made the branch records
+  it again, so a branch is not left without one. A held-lock error now names
+  the lock file and its age. Cut and signing-flag writes run git in the C
+  locale, so a held lock is recognised in any locale, and SHA-256
+  repositories can provision issue worktrees.
+- **Library: `Worktree::cut` is a `CommitSha`**, a full commit object name
+  (40 or 64 hex digits) checked where it is made, instead of a `String`. It
+  derefs to `str`.
+- **Library: supervised-CLI types renamed.** `CodexArtifacts` is now
+  `InvocationArtifacts`, `CodexRecovery` is `InvocationRecovery`,
+  `CodexDispatcher` is `CliDispatcher::resolve(Implementer::Codex)` (the old
+  type and its argument-free `resolve()` remain as a deprecated wrapper),
+  `registry::TwoHarnessMonitor` is now `HarnessProcessMonitor`, and
+  the `codex_process` module is `process_tree`, where `parse_codex_processes`,
+  `CodexProcessSnapshot`, `CodexProcessSource` and `UnixCodexProcesses` are
+  `parse_processes`, `ProcessSnapshot`, `ProcessSource` and `UnixProcesses`.
+  The old names stay, deprecated, until 0.7.0. These changes have no alias
+  and break a caller at compile time: the `codex_artifacts` field of
+  `DispatchSpec`, `DispatchState` and `ClearedDispatch` is
+  `invocation_artifacts` (the stored and `--json` key is still
+  `codex_artifacts`); `HarnessSnapshots::codex` is `processes`; `Worktree` has
+  a new required field, `cut`; `TurnPromptInputs` has a new required field,
+  `remote` (an `Option<&str>`: the remote the goal condition's push names,
+  `None` for none); `DispatchState` has new required fields `session_model`,
+  `resume_refusals` and `signing_held`, and `DispatchOutcome` a new required
+  field `session_refusal`; `BudgetLedgerEntry` has a new field
+  `spend_reservations` (reserved ceilings are now recorded per issue, so
+  one its controller died holding is released by the next run); the new `Implementer::Muse` variant breaks
+  exhaustive matches on `Implementer`; `dispatch_state`'s
+  `upsert_dispatch_state_if_unchanged`, `dispatch_state_is` and
+  `clear_dispatch_state_if_unchanged` are removed (the claim
+  compare-and-set functions replace them); `codex_dispatch`'s supervision moved to `invocation`,
+  where `prepare_artifacts`, `has_launch_failure_record`,
+  `has_valid_exit_record` and `recover_artifacts` keep their names,
+  `run_codex` is `run_supervised`, and `run_codex_bounded`, `read_artifacts`
+  and `dispatch_timeout` are no longer public; and `codex_dispatch` no longer
+  exports `CODEX_DISPATCH_TIMEOUT_SECS`, `CODEX_VERDICT_JSON_SCHEMA` or
+  `build_argv`.
 - **GitHub releases now carry their version's `CHANGELOG.md` section as the
   description.** Until now the release workflow published every release with
   an empty body. `scripts/release_notes.py` extracts the tag's

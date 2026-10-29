@@ -35,8 +35,8 @@ use serde::Deserialize;
 
 use crate::error::MemoryError;
 
-pub use super::codex_dispatch::CodexArtifacts;
 use super::implementer::Implementer;
+pub use super::invocation::InvocationArtifacts;
 use super::IssueRef;
 
 /// The schema forced onto every IC dispatch via `--json-schema`, verbatim
@@ -55,7 +55,7 @@ pub enum SessionMode {
 }
 
 impl SessionMode {
-    fn session_uuid(&self) -> &str {
+    pub(crate) fn session_uuid(&self) -> &str {
         match self {
             SessionMode::New { session_uuid } | SessionMode::Resume { session_uuid } => {
                 session_uuid
@@ -68,7 +68,7 @@ impl SessionMode {
 #[derive(Debug, Clone, PartialEq)]
 pub struct DispatchSpec {
     pub implementer: Implementer,
-    pub codex_artifacts: Option<CodexArtifacts>,
+    pub invocation_artifacts: Option<InvocationArtifacts>,
     pub session: SessionMode,
     /// `--name`, giving the IC a deterministic address for `ListAgents` and
     /// the abort path. See [`ic_name`] for how this is derived from an issue.
@@ -92,6 +92,29 @@ pub struct DispatchSpec {
     /// runner, so the three bounds travel together and cannot be supplied
     /// from three different places.
     pub wall_clock_timeout: Option<std::time::Duration>,
+}
+
+impl DispatchSpec {
+    /// Shared input checks before a harness reserves/publishes an invocation.
+    /// Native session-ID semantics remain the harness adapter's responsibility.
+    pub fn validate(&self) -> Result<(), MemoryError> {
+        if self.model.is_empty() || self.model.chars().any(char::is_whitespace) {
+            return Err(MemoryError::Validation(
+                "dispatch model must be non-empty and contain no whitespace".into(),
+            ));
+        }
+        if !self.max_budget_usd.is_finite() || self.max_budget_usd < 0.0 {
+            return Err(MemoryError::Validation(
+                "dispatch budget must be finite and non-negative".into(),
+            ));
+        }
+        if self.max_turns == 0 {
+            return Err(MemoryError::Validation(
+                "dispatch max_turns must be at least 1".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// `ic-<repo-slug>-<issue-number>`. The spec's own example (`ic-ironmem-283`)
@@ -217,12 +240,30 @@ pub struct DispatchOutcome {
     /// the ledger's unpriced counter rather than its total; see
     /// [`super::run::run_issue`].
     pub timed_out: bool,
+    /// The harness refused to run on the requested session at all, read
+    /// from its own stderr about that session. `None` for every run that
+    /// was not such a refusal, and always for a harness that never refuses.
+    pub session_refusal: Option<SessionRefusal>,
+}
+
+/// How a harness that keeps the controller's session refused it (Muse; see
+/// `MuseCli::session_refusal` for the measured words).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionRefusal {
+    /// Something still holds the session. The harness's own lock is the one
+    /// guard against a second implementer that does not rest on Autopilot's
+    /// process evidence, so this is never rotated over.
+    InUse,
+    /// The session cannot be resumed: it was created with another provider,
+    /// or its retained state cannot be read. A fresh session is the cure.
+    Unresumable,
 }
 
 impl DispatchOutcome {
     /// The 6a guard, in one place: a dispatch only counts as "met" when the
     /// schema-forced verdict says so, the invocation did not itself error,
-    /// *and* the process exited zero. A dispatch with no verdict (schema not
+    /// the invocation started, did not time out, and the process exited zero.
+    /// A dispatch with no verdict (schema not
     /// honored — e.g. an infrastructure failure mid-turn) or a non-zero exit
     /// (the JSON's own claims are untrustworthy once the process itself
     /// failed) is never treated as met, no matter what the JSON says on its
@@ -239,8 +280,15 @@ impl DispatchOutcome {
     /// *Error handling* table this is "a normal-looking exit" that must be
     /// recorded as a failure, not a completion — callers should route this
     /// to a failed lineage attempt, never treat it as [`Self::is_met`].
+    /// The same trust guards as [`Self::is_met`] apply: an impossible
+    /// verdict from a process that timed out, errored, or exited non-zero
+    /// is not trusted as a judgement.
     pub fn is_impossible(&self) -> bool {
-        self.verdict == Some(Verdict::Impossible)
+        self.invocation_started
+            && self.process_success
+            && !self.timed_out
+            && !self.is_error
+            && self.verdict == Some(Verdict::Impossible)
     }
 }
 
@@ -288,6 +336,7 @@ pub fn parse_dispatch_output(stdout: &str) -> Result<DispatchOutcome, MemoryErro
         reason,
         process_success: true,
         timed_out: false,
+        session_refusal: None,
     })
 }
 
@@ -295,7 +344,14 @@ pub fn parse_dispatch_output(stdout: &str) -> Result<DispatchOutcome, MemoryErro
 /// validation (the spec's *Reuse* section: "`launcher` validates the
 /// assistant binary ... this is what makes a Codex reviewer nearly free").
 pub fn resolve_claude_binary() -> Result<std::path::PathBuf, MemoryError> {
-    crate::launcher::find_on_path(crate::launcher::Harness::Claude.binary())
+    claude_binary_in(&std::env::var_os("PATH").unwrap_or_default())
+}
+
+/// `claude` on `path_var`, skipping relative entries: a dispatch runs in the
+/// issue worktree, where a relative entry such as `.` would reach a file in
+/// the repository being worked on.
+fn claude_binary_in(path_var: &std::ffi::OsStr) -> Result<std::path::PathBuf, MemoryError> {
+    crate::launcher::find_launcher(crate::launcher::Harness::Claude.binary(), path_var)
 }
 
 /// Run one IC dispatch: spawn `bin` with `spec`'s argv, in `repo`, capturing
@@ -322,9 +378,10 @@ pub fn run_dispatch(
 }
 
 fn validate_claude_spec(spec: &DispatchSpec) -> Result<(), MemoryError> {
-    if spec.implementer != Implementer::Claude || spec.codex_artifacts.is_some() {
+    spec.validate()?;
+    if spec.implementer != Implementer::Claude || spec.invocation_artifacts.is_some() {
         return Err(MemoryError::Validation(
-            "Claude dispatch requires implementer claude and no Codex artifacts".into(),
+            "Claude dispatch requires implementer claude and no CLI invocation artifacts".into(),
         ));
     }
     Ok(())
@@ -463,6 +520,7 @@ pub fn run_dispatch_bounded(
                 )),
                 process_success: false,
                 timed_out: true,
+                session_refusal: None,
             });
         }
         std::thread::sleep(TIMEOUT_POLL_INTERVAL);
@@ -470,17 +528,22 @@ pub fn run_dispatch_bounded(
 
     let status = child
         .wait()
-        .map_err(|e| MemoryError::Validation(format!("IC dispatch output was lost: {e}")))?;
+        .map_err(|e| MemoryError::DispatchUnsettled(format!("IC dispatch output was lost: {e}")))?;
+    let read = |handle: DrainHandle, pipe: &str| {
+        drained(handle).map_err(|e| {
+            MemoryError::DispatchUnsettled(format!("IC dispatch {pipe} could not be read: {e}"))
+        })
+    };
     let output = std::process::Output {
         status,
-        stdout: stdout_drain.join().unwrap_or_default(),
-        stderr: stderr_drain.join().unwrap_or_default(),
+        stdout: read(stdout_drain, "stdout")?,
+        stderr: read(stderr_drain, "stderr")?,
     };
     finish_dispatch(output)
 }
 
 /// A background reader collecting one of a bounded dispatch's pipes.
-pub(super) type DrainHandle = std::thread::JoinHandle<Vec<u8>>;
+pub(super) type DrainHandle = std::thread::JoinHandle<std::io::Result<Vec<u8>>>;
 
 /// Read `pipe` to its end on its own thread, so a full pipe buffer cannot
 /// stall a child that a bounded caller is polling for exit.
@@ -488,10 +551,39 @@ pub(super) fn drain<R: std::io::Read + Send + 'static>(pipe: Option<R>) -> Drain
     std::thread::spawn(move || {
         let mut buf = Vec::new();
         if let Some(mut pipe) = pipe {
-            let _ = pipe.read_to_end(&mut buf);
+            pipe.read_to_end(&mut buf)?;
         }
-        buf
+        Ok(buf)
     })
+}
+
+/// How long [`drained`] waits for a pipe to close after its process
+/// exited. A descendant that inherited the pipe can hold it open
+/// indefinitely; joining unboundedly would hang the caller past the
+/// wall-clock bound the dispatch was run under.
+pub(super) const DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// What a [`drain`] collected, once its pipe closed: `Err` when the pipe
+/// could not be read, the reader panicked, or the pipe stayed open past
+/// [`DRAIN_GRACE`] (a descendant is holding it; the reader is detached
+/// and finishes whenever the pipe finally closes). Output that was cut
+/// short is never passed off as all of it.
+pub(super) fn drained(handle: DrainHandle) -> Result<Vec<u8>, String> {
+    let started = std::time::Instant::now();
+    while !handle.is_finished() && started.elapsed() < DRAIN_GRACE {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    if !handle.is_finished() {
+        return Err(format!(
+            "its pipe stayed open more than {}s after the process exited (a descendant is holding it)",
+            DRAIN_GRACE.as_secs()
+        ));
+    }
+    match handle.join() {
+        Ok(Ok(buf)) => Ok(buf),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(_) => Err("its reader panicked".into()),
+    }
 }
 
 /// `ETXTBSY`, which Linux and macOS both number 26.
@@ -548,6 +640,8 @@ pub(crate) fn retry_on_etxtbsy<T>(
 /// On a non-unix target there are no process groups here, so this degrades to
 /// exactly the previous behavior — the direct child only. Stated rather than
 /// silently platform-dependent.
+///
+/// Call it only on a child not yet reaped: see the SAFETY note below.
 pub(super) fn kill_process_group(child: &mut std::process::Child) {
     #[cfg(unix)]
     {
@@ -557,14 +651,60 @@ pub(super) fn kill_process_group(child: &mut std::process::Child) {
         if pid > 0 {
             // SAFETY: `killpg` on a pid we spawned ourselves, with a signal
             // constant. It cannot address a group we did not create: the
-            // child was spawned into its own new group, and its pid is still
-            // reserved because we have not reaped it yet.
+            // child was spawned into its own new group, and the caller has
+            // not reaped it yet (no `wait`, and no `try_wait` that returned a
+            // status), so its pid, and with it the group id, is still
+            // reserved. That is this function's precondition: a caller that
+            // must know whether the child exited first asks
+            // [`exited_unreaped`], which does not reap.
             unsafe {
                 libc::killpg(pid, libc::SIGKILL);
             }
         }
     }
     let _ = child.kill();
+}
+
+/// Whether `child` has exited, without reaping it on unix: an exited but
+/// unreaped child is a zombie whose pid, and so the id of the group it leads,
+/// stays reserved, so [`kill_process_group`] can still kill that group's
+/// remaining members safely. The caller reaps it afterwards (`wait`).
+///
+/// Elsewhere there are no process groups to protect, and this is
+/// `try_wait`, which reaps.
+pub(super) fn exited_unreaped(child: &mut std::process::Child) -> std::io::Result<bool> {
+    #[cfg(unix)]
+    {
+        let pid = libc::id_t::try_from(child.id())
+            .map_err(|_| std::io::Error::other("child pid out of range"))?;
+        loop {
+            // SAFETY: `siginfo_t` is plain data, valid when zeroed, and
+            // `waitid` writes only into it. `WNOWAIT` leaves the child
+            // waitable, so this never reaps it.
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            let rc = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid,
+                    &mut info,
+                    libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+                )
+            };
+            if rc == 0 {
+                // With `WNOHANG` and no state change, `si_pid` stays zero.
+                // SAFETY: reading a field of the struct `waitid` filled.
+                return Ok(unsafe { info.si_pid() } != 0);
+            }
+            let e = std::io::Error::last_os_error();
+            if e.kind() != std::io::ErrorKind::Interrupted {
+                return Err(e);
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        child.try_wait().map(|status| status.is_some())
+    }
 }
 
 /// Turn a completed process's output into an outcome. Shared by the bounded
@@ -589,10 +729,78 @@ fn finish_dispatch(output: std::process::Output) -> Result<DispatchOutcome, Memo
 mod tests {
     use super::*;
 
+    /// Whether `pid` is a zombie: dead, but unreaped where no init
+    /// reaps it (a Linux container without `--init`), so `kill(pid, 0)`
+    /// still succeeds. Elsewhere, and unreadable, false.
+    fn is_zombie(pid: i32) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+                return false;
+            };
+            // The state is the field after the parenthesised comm.
+            stat.rsplit_once(") ")
+                .and_then(|(_, rest)| rest.chars().next())
+                == Some('Z')
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = pid;
+            false
+        }
+    }
+
+    /// a pipe that fails partway is an error, never the bytes read so
+    /// far passed off as all of it.
+    #[test]
+    fn a_pipe_that_fails_partway_is_an_error_not_short_output() {
+        struct FailsAfterTen(usize);
+        impl std::io::Read for FailsAfterTen {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.0 >= 10 {
+                    return Err(std::io::Error::other("pipe broke"));
+                }
+                let n = buf.len().min(10 - self.0);
+                buf[..n].fill(b'x');
+                self.0 += n;
+                Ok(n)
+            }
+        }
+        let err = drained(drain(Some(FailsAfterTen(0)))).unwrap_err();
+        assert!(err.contains("pipe broke"), "{err}");
+        assert_eq!(
+            drained(drain(Some(std::io::Cursor::new(b"all".to_vec())))).unwrap(),
+            b"all"
+        );
+        assert!(drained(drain(None::<std::io::Empty>)).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_pipe_held_open_past_the_grace_is_an_error_not_a_hang() {
+        struct NeverEnds;
+        impl std::io::Read for NeverEnds {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                std::thread::sleep(std::time::Duration::from_secs(60));
+                Ok(0)
+            }
+        }
+        let started = std::time::Instant::now();
+        let err = drained(drain(Some(NeverEnds))).unwrap_err();
+        assert!(err.contains("stayed open"), "{err}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(30));
+    }
+
+    #[test]
+    fn the_claude_binary_is_never_found_through_a_relative_path_entry() {
+        let (_planted, relative) = super::super::run::planted_relative_path_entry("claude");
+        let err = claude_binary_in(relative.as_os_str()).unwrap_err();
+        assert!(matches!(err, MemoryError::NotFound(_)), "{err}");
+    }
+
     fn sample_spec(session: SessionMode) -> DispatchSpec {
         DispatchSpec {
             implementer: Implementer::Claude,
-            codex_artifacts: None,
+            invocation_artifacts: None,
             session,
             name: "ic-ironmem-283".to_string(),
             model: "claude-sonnet-5".to_string(),
@@ -807,7 +1015,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(300));
         // SAFETY: `kill` with signal 0 performs an existence/permission check
         // and delivers no signal.
-        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        let alive = unsafe { libc::kill(pid, 0) } == 0 && !is_zombie(pid);
         if alive {
             // Do not leave a stray `sleep 120` behind if the assertion fails.
             unsafe { libc::kill(pid, libc::SIGKILL) };

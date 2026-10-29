@@ -13,8 +13,8 @@ use serde_json::json;
 use crate::db::schema::Database;
 use crate::error::MemoryError;
 
-use super::codex_dispatch::CodexArtifacts;
 use super::implementer::Implementer;
+use super::invocation::InvocationArtifacts;
 use super::{read_current, validate_repo, write_current, IssueRef};
 
 /// One in-flight IC dispatch. Field names and the literal-shape fields
@@ -33,7 +33,7 @@ use super::{read_current, validate_repo, write_current, IssueRef};
 pub struct DispatchState {
     pub implementer: Implementer,
     pub native_session_id: Option<String>,
-    pub codex_artifacts: Option<CodexArtifacts>,
+    pub invocation_artifacts: Option<InvocationArtifacts>,
     pub issue: IssueRef,
     pub worktree_path: String,
     pub ic_session_name: String,
@@ -58,6 +58,74 @@ pub struct DispatchState {
     /// next dispatch, whereas a spurious `--resume` on a session that was
     /// never opened wedges the issue.
     pub session_claimed: bool,
+    /// The `--model` that `session_uuid` was last dispatched with. A harness
+    /// that [rotates a refused session](Implementer::rotates_refused_session)
+    /// opens a fresh one when the run's model differs: Muse refuses to
+    /// resume a session across providers. `None` for records written before
+    /// this field existed, which never rotate on it.
+    pub session_model: Option<String>,
+    /// Consecutive finished invocations the harness refused to resume
+    /// `session_uuid` for ([`SessionRefusal::Unresumable`]). Kept across runs
+    /// so a run that stops after one refusal still counts it.
+    ///
+    /// [`SessionRefusal::Unresumable`]: super::dispatch::SessionRefusal::Unresumable
+    pub resume_refusals: u32,
+    /// Whether the run that wrote this record saw the commit-signing policy
+    /// on. Written before every launch, so a replacement controller that
+    /// recovers the invocation still holds its `met` to the policy when the
+    /// branch and repository flags could not be written (another agent held
+    /// `.git/config`'s lock) and the policy has since been turned off.
+    /// Defaulted on read: older records hold nothing beyond those flags.
+    pub signing_held: bool,
+}
+
+impl DispatchState {
+    /// The phase [`Self::state`] names, or `None` for a label no run of this
+    /// binary writes.
+    pub fn phase(&self) -> Option<DispatchPhase> {
+        DispatchPhase::parse(&self.state)
+    }
+
+    /// Whether the run that wrote this state has certainly ended: it is
+    /// parked. Any other label, unknown ones included, may be a run still
+    /// going.
+    pub fn is_parked(&self) -> bool {
+        self.phase().is_some_and(DispatchPhase::is_parked)
+    }
+
+    /// Refuse a combination no harness writes: a Claude state carrying
+    /// supervised-CLI invocation artifacts, whose artifacts every Claude path
+    /// would silently ignore. Checked where a state is written and where one
+    /// is read, so a hand-edited or corrupt drawer is refused at load
+    /// rather than half-used.
+    ///
+    /// A supervised (Codex or Muse) state without artifacts is valid: it is
+    /// written before the first launch and by several pauses, and liveness
+    /// then judges it on the process table alone.
+    pub fn validate(&self) -> Result<(), MemoryError> {
+        if self.session_claimed && self.session_uuid.trim().is_empty() {
+            return Err(MemoryError::Validation(format!(
+                "the dispatch state for {} claims a session but names no session uuid",
+                self.issue.canonical()
+            )));
+        }
+        if self.implementer == Implementer::Claude && self.invocation_artifacts.is_some() {
+            return Err(MemoryError::Validation(format!(
+                "the dispatch state for {} is a Claude state carrying supervised-CLI invocation \
+                 artifacts, which no harness writes",
+                self.issue.canonical()
+            )));
+        }
+        // artifacts a state names must be the layout
+        // `prepare_artifacts` makes for this issue, or recovery would
+        // read and settle whatever files a forged drawer points at.
+        if let Some(artifacts) = &self.invocation_artifacts {
+            artifacts
+                .check_layout(&self.issue)
+                .map_err(MemoryError::Validation)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,8 +134,8 @@ struct DispatchStateBody {
     implementer: Implementer,
     #[serde(default)]
     native_session_id: Option<String>,
-    #[serde(default)]
-    codex_artifacts: Option<CodexArtifacts>,
+    #[serde(default, rename = "codex_artifacts")]
+    invocation_artifacts: Option<InvocationArtifacts>,
     issue: u64,
     repo: String,
     worktree_path: String,
@@ -80,6 +148,188 @@ struct DispatchStateBody {
     turn_n: u32,
     #[serde(default)]
     session_claimed: bool,
+    #[serde(default)]
+    session_model: Option<String>,
+    #[serde(default)]
+    resume_refusals: u32,
+    #[serde(default)]
+    signing_held: bool,
+    /// The token of the run that wrote this record ([`Claim::owner`]).
+    /// Absent from records written before it existed, and from those written
+    /// outside a run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    owner: Option<String>,
+    /// When the run wrote it ([`Claim::claimed_at`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    claimed_at: Option<String>,
+    /// The worktree's git common directory ([`Claim::common_dir`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    common_dir: Option<String>,
+}
+
+/// A dispatch state as stored, with the token of the run that wrote it.
+///
+/// Every state a run writes carries a token fresh to that run, so two runs
+/// that would otherwise write byte-identical states (a Claude run's first
+/// write reuses everything it read) never pass each other's
+/// compare-and-set: what one run wrote is never what another read. Kept
+/// beside [`DispatchState`] rather than in it so the state's public shape is
+/// unchanged; only a run's own writes compare it.
+///
+/// It is also a lease: `claimed_at` says when its run last claimed the
+/// issue, and another run never adopts a claim that is not parked while it
+/// is younger than [`CLAIM_LEASE`] (see `run::run_issue`). And it names the
+/// repository's git common directory, so whoever must take the issue's lock
+/// ([`super::issue_lock`]) finds it even once the worktree is gone.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Claim {
+    pub state: DispatchState,
+    pub owner: Option<String>,
+    /// RFC 3339, when the owning run last wrote it; `None` for a record
+    /// written outside a run or before the lease existed, which holds no
+    /// lease.
+    pub claimed_at: Option<String>,
+    /// The git common directory of the worktree it names; `None` when
+    /// unknown.
+    pub common_dir: Option<String>,
+}
+
+/// How long a claim that is not parked keeps another run from adopting it.
+///
+/// A run claims the issue and only then launches its implementer, and until
+/// that implementer is visible in the process table (a process naming its
+/// IC with `--name`) nothing distinguishes it from a crashed run. Spawning
+/// and exec take well under a second, even on a loaded host, so two minutes
+/// covers the window from claim to a process visible in `ps` many times
+/// over; the cost is that a crashed run's issue waits two minutes before
+/// another run adopts it. A run whose own claim is older than
+/// [`CLAIM_LEASE`] less [`CLAIM_REFRESH_MARGIN`] claims again before it
+/// launches, so a long gap between its claim and its launch never lets the
+/// lease lapse first.
+pub(crate) const CLAIM_LEASE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// How much of [`CLAIM_LEASE`] must remain at a launch, or the run claims
+/// again first.
+pub(crate) const CLAIM_REFRESH_MARGIN: std::time::Duration = std::time::Duration::from_secs(30);
+
+impl Claim {
+    /// How long ago its run claimed it, or `None` when it holds no lease
+    /// (no time, or one that does not parse). A time in the future is
+    /// measured by its distance too: a far-future time (a clock set wrong
+    /// on the claiming host) must not read as a fresh lease for ever.
+    pub fn age(&self, now: chrono::DateTime<chrono::Utc>) -> Option<std::time::Duration> {
+        let at = chrono::DateTime::parse_from_rfc3339(self.claimed_at.as_deref()?).ok()?;
+        Some(
+            now.signed_duration_since(at.with_timezone(&chrono::Utc))
+                .abs()
+                .to_std()
+                .unwrap_or_default(),
+        )
+    }
+
+    /// Whether its lease still keeps another run from adopting it: not
+    /// parked, and claimed less than [`CLAIM_LEASE`] ago. A present but
+    /// unparseable `claimed_at` also holds the lease: malformed input
+    /// fails closed (held), never open (adoptable).
+    pub fn leased(&self, now: chrono::DateTime<chrono::Utc>) -> bool {
+        if self.state.is_parked() {
+            return false;
+        }
+        match &self.claimed_at {
+            None => false,
+            Some(raw) => match chrono::DateTime::parse_from_rfc3339(raw) {
+                Ok(_) => self.age(now).is_some_and(|age| age < CLAIM_LEASE),
+                Err(_) => true,
+            },
+        }
+    }
+
+    /// Its claim time for a message, keeping the direction [`Claim::age`]
+    /// drops: "30s ago", or "30s in the future" for a stamp ahead of this
+    /// host's clock. `None` when it holds no lease.
+    pub fn age_phrase(&self, now: chrono::DateTime<chrono::Utc>) -> Option<String> {
+        let at = chrono::DateTime::parse_from_rfc3339(self.claimed_at.as_deref()?).ok()?;
+        let delta = now.signed_duration_since(at.with_timezone(&chrono::Utc));
+        Some(if delta >= chrono::Duration::zero() {
+            format!("{}s ago", delta.num_seconds())
+        } else {
+            format!("{}s in the future", (-delta).num_seconds())
+        })
+    }
+}
+
+/// Where a dispatch stands, as [`DispatchState::state`] spells it on the
+/// wire. The one list of the labels a run writes, so a reader and a writer
+/// cannot spell one differently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DispatchPhase {
+    /// Written before a launch, and between launches of one run.
+    Dispatching,
+    /// A launch failed; the run that wrote it may launch again.
+    InfrastructureFailure,
+    /// Parked at the end of a run: the day's dollar budget is spent.
+    PausedDailyBudget,
+    /// Parked at the end of a run by repeated infrastructure failures, the
+    /// day's unpriced cap, or an escalation.
+    PausedInfrastructureFailure,
+    /// Parked: the goal condition is too long to dispatch.
+    PausedConditionTooLong,
+    /// Parked: the harness reported the session still in use.
+    PausedSessionInUse,
+    /// A started Claude dispatch left uncertain process completion. Only
+    /// explicit operator clearance permits another launch or review.
+    PausedCompletionUnproven,
+}
+
+impl DispatchPhase {
+    /// Every phase, for a reader that must know them all.
+    pub const ALL: [DispatchPhase; 7] = [
+        DispatchPhase::Dispatching,
+        DispatchPhase::InfrastructureFailure,
+        DispatchPhase::PausedDailyBudget,
+        DispatchPhase::PausedInfrastructureFailure,
+        DispatchPhase::PausedConditionTooLong,
+        DispatchPhase::PausedSessionInUse,
+        DispatchPhase::PausedCompletionUnproven,
+    ];
+
+    /// The wire label.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            DispatchPhase::Dispatching => "dispatching",
+            DispatchPhase::InfrastructureFailure => "infrastructure-failure",
+            DispatchPhase::PausedDailyBudget => "paused-daily-budget",
+            DispatchPhase::PausedInfrastructureFailure => "paused-infrastructure-failure",
+            DispatchPhase::PausedConditionTooLong => "paused-condition-too-long",
+            DispatchPhase::PausedSessionInUse => "paused-session-in-use",
+            DispatchPhase::PausedCompletionUnproven => "paused-completion-unproven",
+        }
+    }
+
+    /// The phase a wire label names, if any.
+    pub fn parse(label: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|phase| phase.as_str() == label)
+    }
+
+    /// Whether only a run that has ended writes it. A run in progress may
+    /// hold any other phase, and launch again from it.
+    pub const fn is_parked(self) -> bool {
+        match self {
+            DispatchPhase::Dispatching | DispatchPhase::InfrastructureFailure => false,
+            DispatchPhase::PausedDailyBudget
+            | DispatchPhase::PausedInfrastructureFailure
+            | DispatchPhase::PausedConditionTooLong
+            | DispatchPhase::PausedSessionInUse
+            | DispatchPhase::PausedCompletionUnproven => true,
+        }
+    }
+}
+
+impl std::fmt::Display for DispatchPhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// Logical-key prefix shared by every dispatch-state drawer. One constant
@@ -89,7 +339,7 @@ struct DispatchStateBody {
 /// visible failure.
 pub(crate) const DISPATCH_STATE_KEY_PREFIX: &str = "dispatch-state:";
 
-fn dispatch_state_key(issue: &IssueRef) -> String {
+pub(crate) fn dispatch_state_key(issue: &IssueRef) -> String {
     format!("{DISPATCH_STATE_KEY_PREFIX}{}", issue.slug())
 }
 
@@ -97,10 +347,36 @@ fn dispatch_state_key(issue: &IssueRef) -> String {
 /// dispatch time and at every state transition, per the spec.
 pub fn upsert_dispatch_state(db: &Database, state: &DispatchState) -> Result<String, MemoryError> {
     validate_repo(&state.issue.repo)?;
+    write_current(db, &dispatch_state_key(&state.issue), &content_of(state)?)
+}
+
+/// The persisted body of `state`, refused when [`DispatchState::validate`]
+/// refuses it.
+fn content_of(state: &DispatchState) -> Result<String, MemoryError> {
+    content_of_claim(&Claim {
+        state: state.clone(),
+        owner: None,
+        claimed_at: None,
+        common_dir: None,
+    })
+}
+
+/// [`content_of`], carrying what the claim adds.
+fn content_of_claim(claim: &Claim) -> Result<String, MemoryError> {
+    let state = &claim.state;
+    state.validate()?;
+    if let Some(common_dir) = &claim.common_dir {
+        if !std::path::Path::new(common_dir).is_absolute() {
+            return Err(MemoryError::Validation(format!(
+                "the claim for {} names a non-absolute common directory",
+                state.issue.canonical()
+            )));
+        }
+    }
     let body = DispatchStateBody {
         implementer: state.implementer,
         native_session_id: state.native_session_id.clone(),
-        codex_artifacts: state.codex_artifacts.clone(),
+        invocation_artifacts: state.invocation_artifacts.clone(),
         issue: state.issue.number,
         repo: state.issue.repo.clone(),
         worktree_path: state.worktree_path.clone(),
@@ -112,9 +388,123 @@ pub fn upsert_dispatch_state(db: &Database, state: &DispatchState) -> Result<Str
         session_uuid: state.session_uuid.clone(),
         turn_n: state.turn_n,
         session_claimed: state.session_claimed,
+        session_model: state.session_model.clone(),
+        resume_refusals: state.resume_refusals,
+        signing_held: state.signing_held,
+        owner: claim.owner.clone(),
+        claimed_at: claim.claimed_at.clone(),
+        common_dir: claim.common_dir.clone(),
     };
-    let content = serde_json::to_string(&body)?;
-    write_current(db, &dispatch_state_key(&state.issue), &content)
+    Ok(serde_json::to_string(&body)?)
+}
+
+/// `claim` as it reads back from the drawer it would be written to, for an
+/// exact comparison with what is stored.
+fn normalized(claim: &Claim) -> Result<Claim, MemoryError> {
+    claim_from_content(&content_of_claim(claim)?)
+}
+
+/// The issue's dispatch state and its owner token, if a drawer exists.
+pub(crate) fn get_claim(db: &Database, issue: &IssueRef) -> Result<Option<Claim>, MemoryError> {
+    let Some(drawer) = read_current(db, &dispatch_state_key(issue))? else {
+        return Ok(None);
+    };
+    claim_from_content(&drawer.content).map(Some)
+}
+
+/// Whether, inside `tx`, the issue's drawer holds exactly `expected` (`None`:
+/// no drawer), owner token included.
+pub(crate) fn claim_is_tx(
+    tx: &rusqlite::Transaction<'_>,
+    issue: &IssueRef,
+    expected: Option<&Claim>,
+) -> Result<bool, MemoryError> {
+    use rusqlite::OptionalExtension;
+    let expected = expected.map(normalized).transpose()?;
+    let id = super::logical_drawer_id(&dispatch_state_key(issue));
+    let current: Option<String> = tx
+        .query_row("SELECT content FROM drawers WHERE id = ?1", [&id], |row| {
+            row.get(0)
+        })
+        .optional()?;
+    let current = current.map(|c| claim_from_content(&c)).transpose()?;
+    Ok(current == expected)
+}
+
+/// Write `claim` as the issue's dispatch state inside `tx`.
+pub(crate) fn write_claim_tx(
+    tx: &rusqlite::Transaction<'_>,
+    claim: &Claim,
+) -> Result<(), MemoryError> {
+    validate_repo(&claim.state.issue.repo)?;
+    let content = content_of_claim(claim)?;
+    super::write_current_tx(tx, &dispatch_state_key(&claim.state.issue), &content)?;
+    Ok(())
+}
+
+/// Delete the issue's dispatch state inside `tx`, logged as
+/// [`clear_dispatch_state`] logs it.
+pub(crate) fn delete_claim_tx(
+    tx: &rusqlite::Transaction<'_>,
+    issue: &IssueRef,
+) -> Result<bool, MemoryError> {
+    let id = super::logical_drawer_id(&dispatch_state_key(issue));
+    let deleted = Database::delete_drawer_tx(tx, &id)?;
+    Database::wal_log_tx(
+        tx,
+        "autopilot_clear_dispatch_state",
+        &json!({
+            "drawer_id": &id,
+            "issue": issue.canonical(),
+            "deleted": deleted,
+            "conditional": true,
+        }),
+        None,
+    )?;
+    Ok(deleted)
+}
+
+/// Write `next` only while the drawer holds exactly `expected` (`None`: no
+/// drawer), owner token included, in one `BEGIN IMMEDIATE` transaction.
+/// Returns `false`, writing nothing, when it changed.
+pub(crate) fn claim_if_unchanged(
+    db: &Database,
+    expected: Option<&Claim>,
+    next: &Claim,
+) -> Result<bool, MemoryError> {
+    db.with_immediate_transaction(|tx| {
+        if !claim_is_tx(tx, &next.state.issue, expected)? {
+            return Ok(false);
+        }
+        write_claim_tx(tx, next)?;
+        Ok(true)
+    })
+}
+
+/// Whether the drawer holds exactly `expected`, owner token included: a
+/// cheap look before work a later [`claim_if_unchanged`] claims for good.
+pub(crate) fn claim_is(
+    db: &Database,
+    issue: &IssueRef,
+    expected: Option<&Claim>,
+) -> Result<bool, MemoryError> {
+    let expected = expected.map(normalized).transpose()?;
+    Ok(get_claim(db, issue)? == expected)
+}
+
+/// Delete the drawer only while it holds exactly `expected`, owner token
+/// included, in one `BEGIN IMMEDIATE` transaction. Returns `false`,
+/// deleting nothing, when it changed or is gone.
+pub(crate) fn clear_claim_if_unchanged(
+    db: &Database,
+    expected: &Claim,
+) -> Result<bool, MemoryError> {
+    db.with_immediate_transaction(|tx| {
+        if !claim_is_tx(tx, &expected.state.issue, Some(expected))? {
+            return Ok(false);
+        }
+        delete_claim_tx(tx, &expected.state.issue)
+    })
 }
 
 /// Read the dispatch-state drawer for an issue, if one is currently in
@@ -129,14 +519,68 @@ pub fn get_dispatch_state(
     state_from_content(&drawer.content).map(Some)
 }
 
+/// What an issue's dispatch-state drawer holds.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum StateRead {
+    Absent,
+    Readable(Box<DispatchState>),
+    /// Corrupt, or written by a newer binary for a harness this one does
+    /// not know, with why. It may name a live invocation.
+    Unreadable(String),
+}
+
+/// [`get_dispatch_state`], telling a drawer that cannot be read apart from
+/// a failure to read the database at all.
+pub(crate) fn read_dispatch_state(
+    db: &Database,
+    issue: &IssueRef,
+) -> Result<StateRead, MemoryError> {
+    Ok(match raw_dispatch_state(db, issue)? {
+        None => StateRead::Absent,
+        Some(raw) => match parse_dispatch_state(&raw) {
+            Parsed::Readable(state) => StateRead::Readable(state),
+            Parsed::Unreadable(why) => StateRead::Unreadable(why),
+        },
+    })
+}
+
+/// An issue's dispatch-state drawer exactly as stored, for a caller that must
+/// act on a drawer it cannot read ([`clear_raw_dispatch_state_if_unchanged`]).
+pub(crate) fn raw_dispatch_state(
+    db: &Database,
+    issue: &IssueRef,
+) -> Result<Option<String>, MemoryError> {
+    Ok(read_current(db, &dispatch_state_key(issue))?.map(|drawer| drawer.content))
+}
+
+/// What a drawer that exists holds: [`StateRead`] without `Absent`.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Parsed {
+    Readable(Box<DispatchState>),
+    /// Why it could not be read.
+    Unreadable(String),
+}
+
+/// What a raw dispatch-state drawer holds.
+pub(crate) fn parse_dispatch_state(raw: &str) -> Parsed {
+    match state_from_content(raw) {
+        Ok(state) => Parsed::Readable(Box::new(state)),
+        Err(e) => Parsed::Unreadable(e.to_string()),
+    }
+}
+
 fn state_from_content(content: &str) -> Result<DispatchState, MemoryError> {
+    claim_from_content(content).map(|claim| claim.state)
+}
+
+fn claim_from_content(content: &str) -> Result<Claim, MemoryError> {
     let body: DispatchStateBody = serde_json::from_str(content)?;
-    Ok(DispatchState {
+    let state = DispatchState {
         implementer: body.implementer,
         native_session_id: body.native_session_id.or_else(|| {
             (body.implementer == Implementer::Claude).then(|| body.session_uuid.clone())
         }),
-        codex_artifacts: body.codex_artifacts,
+        invocation_artifacts: body.invocation_artifacts,
         issue: IssueRef::new(body.repo, body.issue),
         worktree_path: body.worktree_path,
         ic_session_name: body.ic_session_name,
@@ -147,6 +591,16 @@ fn state_from_content(content: &str) -> Result<DispatchState, MemoryError> {
         session_uuid: body.session_uuid,
         turn_n: body.turn_n,
         session_claimed: body.session_claimed,
+        session_model: body.session_model,
+        resume_refusals: body.resume_refusals,
+        signing_held: body.signing_held,
+    };
+    state.validate()?;
+    Ok(Claim {
+        state,
+        owner: body.owner,
+        claimed_at: body.claimed_at,
+        common_dir: body.common_dir,
     })
 }
 
@@ -166,22 +620,63 @@ fn state_from_content(content: &str) -> Result<DispatchState, MemoryError> {
 ///
 /// A drawer whose body no longer deserializes is skipped rather than failing
 /// the whole reconciliation: one unreadable record must not take every other
-/// in-flight issue's supervision offline with it.
+/// in-flight issue's supervision offline with it. The queue, which must not
+/// treat it as a free slot, reads [`scan_dispatch_states`] instead.
 pub fn all_dispatch_states(db: &Database, limit: usize) -> Result<Vec<DispatchState>, MemoryError> {
+    Ok(scan_dispatch_states(db, limit)?.states)
+}
+
+/// Every dispatch-state drawer, read or not.
+#[derive(Debug, Default)]
+pub(crate) struct DispatchStateScan {
+    /// The drawers that read as dispatch states.
+    pub states: Vec<DispatchState>,
+    /// Each readable drawer exactly as stored, with its parsed claim
+    /// (owner token and lease included), for a caller that must clear
+    /// against the bytes it judged rather than a later re-read.
+    pub claims: Vec<(String, Claim)>,
+    /// The logical key ([`dispatch_state_key`]) of each drawer that did not,
+    /// with why: corrupt, refused by [`DispatchState::validate`], or written
+    /// by a newer binary (an implementer this one does not know). Any of them
+    /// may be a live invocation.
+    pub unreadable: Vec<(String, String)>,
+}
+
+/// How much of why a drawer cannot be read [`scan_dispatch_states`] keeps.
+const UNREADABLE_REASON_CHARS: usize = 300;
+
+/// [`all_dispatch_states`], also naming the drawers it could not read.
+pub(crate) fn scan_dispatch_states(
+    db: &Database,
+    limit: usize,
+) -> Result<DispatchStateScan, MemoryError> {
     let prefix = format!(
         "{}{}",
         crate::mcp::tools::LOGICAL_KEY_SOURCE_PREFIX,
         DISPATCH_STATE_KEY_PREFIX
     );
     let drawers = db.get_drawers_by_source_prefix(super::WING, super::ROOM, &prefix, limit)?;
-    let mut states = Vec::new();
+    let mut scan = DispatchStateScan::default();
     for drawer in drawers {
-        let Ok(state) = state_from_content(&drawer.content) else {
-            continue;
-        };
-        states.push(state);
+        match claim_from_content(&drawer.content) {
+            Ok(claim) => {
+                scan.states.push(claim.state.clone());
+                scan.claims.push((drawer.content.clone(), claim));
+            }
+            // Scrubbed and bounded once, here: a parse error can quote the
+            // drawer, and every reader (the queue, reconcile, the tick's
+            // problems) reports it.
+            Err(why) => scan.unreadable.push((
+                drawer
+                    .source_file
+                    .strip_prefix(crate::mcp::tools::LOGICAL_KEY_SOURCE_PREFIX)
+                    .unwrap_or(&drawer.source_file)
+                    .to_string(),
+                super::scrub::scrub_and_bound(&why.to_string(), UNREADABLE_REASON_CHARS).text,
+            )),
+        }
     }
-    Ok(states)
+    Ok(scan)
 }
 
 /// Clear an issue's dispatch-state drawer once it's no longer in flight
@@ -212,35 +707,35 @@ pub fn clear_dispatch_state(db: &Database, issue: &IssueRef) -> Result<bool, Mem
     })
 }
 
-/// [`clear_dispatch_state`], but only while the drawer still holds
-/// `expected`. Read and delete share one transaction, so a dispatch that
-/// rewrote the state after the caller judged it is never deleted unseen.
-/// Returns `false`, deleting nothing, when the state changed or is gone.
-pub fn clear_dispatch_state_if_unchanged(
+/// Delete an issue's dispatch-state drawer only while its raw content is
+/// still exactly `expected_raw`, compared byte for byte (owner token, lease
+/// and all) in the same `BEGIN IMMEDIATE` transaction. For a drawer that may
+/// not be readable; [`clear_claim_if_unchanged`] is the same for one that
+/// is.
+pub(crate) fn clear_raw_dispatch_state_if_unchanged(
     db: &Database,
-    expected: &DispatchState,
+    issue: &IssueRef,
+    expected_raw: &str,
 ) -> Result<bool, MemoryError> {
     use rusqlite::OptionalExtension;
-    let id = super::logical_drawer_id(&dispatch_state_key(&expected.issue));
-    db.with_transaction(|tx| {
+    let id = super::logical_drawer_id(&dispatch_state_key(issue));
+    db.with_immediate_transaction(|tx| {
         let content: Option<String> = tx
             .query_row("SELECT content FROM drawers WHERE id = ?1", [&id], |row| {
                 row.get(0)
             })
             .optional()?;
-        let unchanged = match content {
-            Some(content) => state_from_content(&content)? == *expected,
-            None => false,
-        };
+        let unchanged = content.as_deref() == Some(expected_raw);
         let deleted = unchanged && Database::delete_drawer_tx(tx, &id)?;
         Database::wal_log_tx(
             tx,
             "autopilot_clear_dispatch_state",
             &json!({
                 "drawer_id": &id,
-                "issue": expected.issue.canonical(),
+                "issue": issue.canonical(),
                 "deleted": deleted,
                 "conditional": true,
+                "raw": true,
             }),
             None,
         )?;
@@ -256,7 +751,7 @@ mod tests {
         DispatchState {
             implementer: crate::autopilot::implementer::Implementer::Claude,
             native_session_id: None,
-            codex_artifacts: None,
+            invocation_artifacts: None,
             issue: issue.clone(),
             worktree_path: "/tmp/worktrees/ironmem-283".into(),
             ic_session_name: "ic-ironmem-283".into(),
@@ -267,6 +762,19 @@ mod tests {
             session_uuid: "11111111-1111-1111-1111-111111111111".into(),
             turn_n,
             session_claimed: true,
+            session_model: None,
+            resume_refusals: 0,
+            signing_held: false,
+        }
+    }
+
+    /// A claim with no lease and no common directory, as tests write.
+    fn bare(state: DispatchState, owner: Option<&str>) -> Claim {
+        Claim {
+            state,
+            owner: owner.map(str::to_owned),
+            claimed_at: None,
+            common_dir: None,
         }
     }
 
@@ -274,20 +782,184 @@ mod tests {
     fn a_conditional_clear_never_deletes_a_state_rewritten_after_it_was_judged() {
         let db = Database::open_in_memory().unwrap();
         let issue = IssueRef::new("ironrace/ironmem", 283);
-        // Callers judge the state as read back, which normalizes legacy fields.
+        // Callers judge the claim as read back, which normalizes legacy fields.
         upsert_dispatch_state(&db, &sample(&issue, 1)).unwrap();
-        let judged = get_dispatch_state(&db, &issue).unwrap().unwrap();
+        let judged = get_claim(&db, &issue).unwrap().unwrap();
         upsert_dispatch_state(&db, &sample(&issue, 2)).unwrap();
-        let rewritten = get_dispatch_state(&db, &issue).unwrap().unwrap();
-        assert!(!clear_dispatch_state_if_unchanged(&db, &judged).unwrap());
+        let rewritten = get_claim(&db, &issue).unwrap().unwrap();
+        assert!(!clear_claim_if_unchanged(&db, &judged).unwrap());
+        assert_eq!(get_claim(&db, &issue).unwrap(), Some(rewritten.clone()));
+        assert!(clear_claim_if_unchanged(&db, &rewritten).unwrap());
+        assert!(get_dispatch_state(&db, &issue).unwrap().is_none());
+        assert!(!clear_claim_if_unchanged(&db, &rewritten).unwrap());
+    }
+    #[test]
+    fn a_conditional_write_never_overwrites_a_state_another_run_wrote() {
+        let db = Database::open_in_memory().unwrap();
+        let issue = IssueRef::new("ironrace/ironmem", 283);
+        let ours = bare(sample(&issue, 1), Some("ours"));
+        let theirs = bare(sample(&issue, 2), Some("theirs"));
+        let turn = |db: &Database| get_dispatch_state(db, &issue).unwrap().map(|s| s.turn_n);
+        // Both judged "no drawer"; the first to write wins.
+        assert!(claim_if_unchanged(&db, None, &theirs).unwrap());
+        assert!(!claim_if_unchanged(&db, None, &ours).unwrap());
+        assert_eq!(turn(&db), Some(2));
+        // Judged against what is there, the write goes through, compared as
+        // read back (a Claude record's absent native id reads as its uuid).
+        assert!(theirs.state.native_session_id.is_none());
+        assert!(claim_if_unchanged(&db, Some(&theirs), &ours).unwrap());
+        assert_eq!(turn(&db), Some(1));
+        assert!(!claim_if_unchanged(&db, Some(&theirs), &theirs).unwrap());
+        assert_eq!(turn(&db), Some(1));
+    }
+
+    #[test]
+    fn a_claim_is_leased_while_young_and_not_parked() {
+        let issue = IssueRef::new("ironrace/ironmem", 283);
+        let now = chrono::Utc::now();
+        let mut claim = bare(sample(&issue, 1), Some("a"));
+        claim.state.state = DispatchPhase::Dispatching.as_str().into();
+        assert!(!claim.leased(now), "no time, no lease");
+        claim.claimed_at = Some((now - chrono::Duration::seconds(10)).to_rfc3339());
+        assert!(claim.leased(now));
+        claim.claimed_at = Some((now - chrono::Duration::seconds(121)).to_rfc3339());
+        assert!(!claim.leased(now), "lapsed");
+        claim.claimed_at = Some((now - chrono::Duration::seconds(119)).to_rfc3339());
+        assert!(claim.leased(now), "one second inside the lease");
+        claim.claimed_at = Some((now - chrono::Duration::seconds(120)).to_rfc3339());
+        assert!(
+            !claim.leased(now),
+            "exactly at the lease boundary it has lapsed"
+        );
+        claim.claimed_at = Some("not-a-time".into());
+        assert!(claim.leased(now), "a malformed stamp holds, never adopts");
+        claim.claimed_at = Some((now + chrono::Duration::seconds(30)).to_rfc3339());
+        assert!(claim.leased(now), "a near future time is within the lease");
+        claim.claimed_at = Some((now + chrono::Duration::seconds(3600)).to_rfc3339());
+        assert!(!claim.leased(now), "a far-future time is not a fresh lease");
+        // Display keeps the direction: a future stamp is ahead, not ago.
+        claim.claimed_at = Some((now - chrono::Duration::seconds(30)).to_rfc3339());
+        assert_eq!(claim.age_phrase(now).as_deref(), Some("30s ago"));
+        claim.claimed_at = Some((now + chrono::Duration::seconds(30)).to_rfc3339());
+        assert!(
+            claim
+                .age_phrase(now)
+                .is_some_and(|p| p.contains("in the future")),
+            "{:?}",
+            claim.age_phrase(now)
+        );
+        claim.state.state = DispatchPhase::PausedDailyBudget.as_str().into();
+        assert!(!claim.leased(now), "a parked claim's run has ended");
+        // Round-tripped with its common directory.
+        let db = Database::open_in_memory().unwrap();
+        claim.common_dir = Some("/r/.git".into());
+        assert!(claim_if_unchanged(&db, None, &claim).unwrap());
+        assert_eq!(
+            get_claim(&db, &issue).unwrap(),
+            Some(normalized(&claim).unwrap())
+        );
+    }
+
+    /// a conditional clear waits out another connection's write
+    /// lock instead of failing with `SQLITE_BUSY` on its read-then-delete.
+    #[test]
+    fn a_conditional_clear_waits_for_a_concurrent_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.sqlite3");
+        let db = Database::open(&path).unwrap();
+        db.migrate().unwrap();
+        let issue = IssueRef::new("ironrace/ironmem", 283);
+        upsert_dispatch_state(&db, &sample(&issue, 1)).unwrap();
+        let judged = get_claim(&db, &issue).unwrap().unwrap();
+        let raw = raw_dispatch_state(&db, &issue).unwrap().unwrap();
+        for raw_clear in [false, true] {
+            if raw_clear {
+                upsert_dispatch_state(&db, &sample(&issue, 1)).unwrap();
+            }
+            let holder = rusqlite::Connection::open(&path).unwrap();
+            holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+            let clearer = {
+                let (path, issue, judged, raw) =
+                    (path.clone(), issue.clone(), judged.clone(), raw.clone());
+                std::thread::spawn(move || {
+                    let db = Database::open(&path).unwrap();
+                    if raw_clear {
+                        clear_raw_dispatch_state_if_unchanged(&db, &issue, &raw)
+                    } else {
+                        clear_claim_if_unchanged(&db, &judged)
+                    }
+                })
+            };
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            holder.execute_batch("COMMIT").unwrap();
+            assert!(clearer.join().unwrap().unwrap(), "raw={raw_clear}");
+            assert!(get_dispatch_state(&db, &issue).unwrap().is_none());
+        }
+    }
+
+    /// Two runs that judged the same state and would write identical ones:
+    /// their tokens tell the writes apart, so only the first lands, and the
+    /// state each read is no longer there for the other.
+    #[test]
+    fn identical_states_written_by_two_runs_never_both_pass_the_compare_and_set() {
+        let db = Database::open_in_memory().unwrap();
+        let issue = IssueRef::new("ironrace/ironmem", 283);
+        let claim = |owner: &str| bare(sample(&issue, 1), Some(owner));
+        let read = bare(sample(&issue, 1), None);
+        upsert_dispatch_state(&db, &read.state).unwrap();
+        let read = get_claim(&db, &issue).unwrap().unwrap();
+        assert_eq!(read.owner, None);
+        assert!(claim_if_unchanged(&db, Some(&read), &claim("a")).unwrap());
+        assert!(!claim_if_unchanged(&db, Some(&read), &claim("b")).unwrap());
+        assert_eq!(
+            get_claim(&db, &issue).unwrap(),
+            Some(normalized(&claim("a")).unwrap())
+        );
+        assert!(claim_is(&db, &issue, Some(&claim("a"))).unwrap());
+        assert!(!claim_is(&db, &issue, Some(&claim("b"))).unwrap());
+        assert!(!clear_claim_if_unchanged(&db, &claim("b")).unwrap());
+        // The token is invisible to every reader of the state itself.
         assert_eq!(
             get_dispatch_state(&db, &issue).unwrap(),
-            Some(rewritten.clone())
+            Some(normalized(&claim("a")).unwrap().state)
         );
-        assert!(clear_dispatch_state_if_unchanged(&db, &rewritten).unwrap());
-        assert!(get_dispatch_state(&db, &issue).unwrap().is_none());
-        assert!(!clear_dispatch_state_if_unchanged(&db, &rewritten).unwrap());
+        assert!(clear_claim_if_unchanged(&db, &claim("a")).unwrap());
+        assert!(get_claim(&db, &issue).unwrap().is_none());
     }
+
+    #[test]
+    fn every_phase_round_trips_its_label_and_only_pauses_are_parked() {
+        for phase in DispatchPhase::ALL {
+            assert_eq!(DispatchPhase::parse(phase.as_str()), Some(phase));
+            assert_eq!(
+                serde_json::to_string(&phase).unwrap(),
+                format!("\"{}\"", phase.as_str())
+            );
+            assert_eq!(phase.is_parked(), phase.as_str().starts_with("paused-"));
+        }
+        assert_eq!(DispatchPhase::parse("in_progress"), None);
+    }
+
+    /// a supervised state whose artifacts are not the layout
+    /// `prepare_artifacts` makes is refused at validate, so it reads as
+    /// unreadable rather than pointing recovery at arbitrary files.
+    #[test]
+    fn a_supervised_state_with_forged_artifact_paths_is_unreadable() {
+        let issue = IssueRef::new("ironmem", 283);
+        let mut state = sample(&issue, 7);
+        state.implementer = Implementer::Codex;
+        state.invocation_artifacts = Some(InvocationArtifacts {
+            invocation_id: "invocation".into(),
+            schema_path: "/original/schema".into(),
+            journal_path: "/original/journal".into(),
+            final_path: "/original/final".into(),
+            stderr_path: "/original/stderr".into(),
+            exit_path: "/original/exit".into(),
+        });
+        let err = state.validate().unwrap_err().to_string();
+        assert!(err.contains("not an Autopilot invocation"), "{err}");
+    }
+
     #[test]
     fn codex_wire_roundtrip_keeps_native_identity_and_absolute_artifacts() {
         let db = Database::open_in_memory().unwrap();
@@ -295,13 +967,13 @@ mod tests {
         let mut state = sample(&issue, 7);
         state.implementer = Implementer::Codex;
         state.native_session_id = Some("native-id".into());
-        state.codex_artifacts = Some(CodexArtifacts {
-            invocation_id: "invocation".into(),
-            schema_path: "/original/schema".into(),
-            journal_path: "/original/journal".into(),
-            final_path: "/original/final".into(),
-            stderr_path: "/original/stderr".into(),
-            exit_path: "/original/exit".into(),
+        state.invocation_artifacts = Some(InvocationArtifacts {
+            invocation_id: "11111111-2222-3333-4444-555555555555".into(),
+            schema_path: "/r/.git/ironmem/autopilot/ironmem-283/11111111-2222-3333-4444-555555555555/schema.json".into(),
+            journal_path: "/r/.git/ironmem/autopilot/ironmem-283/11111111-2222-3333-4444-555555555555/journal.jsonl".into(),
+            final_path: "/r/.git/ironmem/autopilot/ironmem-283/11111111-2222-3333-4444-555555555555/final.json".into(),
+            stderr_path: "/r/.git/ironmem/autopilot/ironmem-283/11111111-2222-3333-4444-555555555555/stderr.log".into(),
+            exit_path: "/r/.git/ironmem/autopilot/ironmem-283/11111111-2222-3333-4444-555555555555/exit.json".into(),
         });
         upsert_dispatch_state(&db, &state).unwrap();
         assert_eq!(get_dispatch_state(&db, &issue).unwrap(), Some(state));
@@ -313,14 +985,11 @@ mod tests {
         assert!(get_dispatch_state(&db, &issue).is_err());
     }
 
-    #[test]
-    fn old_wire_defaults_to_claude_and_native_uuid() {
-        let db = Database::open_in_memory().unwrap();
-        let issue = IssueRef::new("ironmem", 283);
-        let mut body = serde_json::to_value(DispatchStateBody {
+    fn sample_body() -> DispatchStateBody {
+        DispatchStateBody {
             implementer: Implementer::Claude,
             native_session_id: None,
-            codex_artifacts: None,
+            invocation_artifacts: None,
             issue: 283,
             repo: "ironmem".into(),
             worktree_path: "/absolute/worktree".into(),
@@ -332,9 +1001,74 @@ mod tests {
             session_uuid: "old-id".into(),
             turn_n: 3,
             session_claimed: true,
+            session_model: None,
+            resume_refusals: 0,
+            signing_held: false,
+            owner: None,
+            claimed_at: None,
+            common_dir: None,
+        }
+    }
+
+    #[test]
+    fn invocation_artifacts_keep_the_codex_artifacts_wire_key() {
+        let artifacts = InvocationArtifacts {
+            invocation_id: "11111111-2222-3333-4444-555555555555".into(),
+            schema_path: "/r/.git/ironmem/autopilot/o-r-1/i/schema.json".into(),
+            journal_path: "/r/.git/ironmem/autopilot/o-r-1/i/journal.jsonl".into(),
+            final_path: "/r/.git/ironmem/autopilot/o-r-1/i/final.json".into(),
+            stderr_path: "/r/.git/ironmem/autopilot/o-r-1/i/stderr.log".into(),
+            exit_path: "/r/.git/ironmem/autopilot/o-r-1/i/exit.json".into(),
+        };
+        let body = DispatchStateBody {
+            invocation_artifacts: Some(artifacts.clone()),
+            ..sample_body()
+        };
+        let wire = serde_json::to_value(&body).unwrap();
+        assert_eq!(
+            wire["codex_artifacts"]["invocation_id"],
+            artifacts.invocation_id
+        );
+        assert!(wire.get("invocation_artifacts").is_none());
+        let back: DispatchStateBody = serde_json::from_value(wire).unwrap();
+        assert_eq!(back.invocation_artifacts, Some(artifacts));
+    }
+
+    #[test]
+    fn old_wire_defaults_to_claude_and_native_uuid() {
+        let db = Database::open_in_memory().unwrap();
+        let issue = IssueRef::new("ironmem", 283);
+        let mut body = serde_json::to_value(DispatchStateBody {
+            implementer: Implementer::Claude,
+            native_session_id: None,
+            invocation_artifacts: None,
+            issue: 283,
+            repo: "ironmem".into(),
+            worktree_path: "/absolute/worktree".into(),
+            ic_session_name: "ic".into(),
+            dispatch_class: "logic".into(),
+            attempt_n: 1,
+            state: "dispatching".into(),
+            started_at: "now".into(),
+            session_uuid: "old-id".into(),
+            turn_n: 3,
+            session_claimed: true,
+            session_model: None,
+            resume_refusals: 0,
+            signing_held: false,
+            owner: None,
+            claimed_at: None,
+            common_dir: None,
         })
         .unwrap();
-        for key in ["implementer", "native_session_id", "codex_artifacts"] {
+        for key in [
+            "implementer",
+            "native_session_id",
+            "codex_artifacts",
+            "session_model",
+            "resume_refusals",
+            "signing_held",
+        ] {
             body.as_object_mut().unwrap().remove(key);
         }
         write_current(&db, &dispatch_state_key(&issue), &body.to_string()).unwrap();
@@ -345,6 +1079,25 @@ mod tests {
         );
         assert_eq!(state.native_session_id.as_deref(), Some("old-id"));
         assert!(state.session_claimed);
+        // An older record names no model, so it never rotates on one.
+        assert_eq!(state.session_model, None);
+        assert_eq!(state.resume_refusals, 0);
+        assert!(!state.signing_held);
+    }
+
+    #[test]
+    fn the_session_model_and_refusal_count_round_trip() {
+        let db = Database::open_in_memory().unwrap();
+        let issue = IssueRef::new("ironrace/ironmem", 283);
+        let mut state = sample(&issue, 1);
+        state.session_model = Some("muse-wonder-1.0".into());
+        state.resume_refusals = 1;
+        state.signing_held = true;
+        upsert_dispatch_state(&db, &state).unwrap();
+        let read = get_dispatch_state(&db, &issue).unwrap().unwrap();
+        assert_eq!(read.session_model.as_deref(), Some("muse-wonder-1.0"));
+        assert_eq!(read.resume_refusals, 1);
+        assert!(read.signing_held);
     }
 
     #[test]
@@ -475,5 +1228,79 @@ mod tests {
             })
             .unwrap();
         assert_eq!(count_after_noop, 2);
+    }
+
+    #[test]
+    fn a_claude_state_carrying_invocation_artifacts_is_refused_at_load() {
+        let db = Database::open_in_memory().unwrap();
+        let issue = IssueRef::new("ironrace/ironmem", 283);
+        let mut body: serde_json::Value =
+            serde_json::from_str(&content_of(&sample(&issue, 1)).unwrap()).unwrap();
+        body["codex_artifacts"] = serde_json::json!({
+            "invocation_id": "i",
+            "schema_path": "/s",
+            "journal_path": "/j",
+            "final_path": "/f",
+            "stderr_path": "/e",
+            "exit_path": "/x",
+        });
+        super::super::write_current(&db, &dispatch_state_key(&issue), &body.to_string()).unwrap();
+        let err = get_dispatch_state(&db, &issue).unwrap_err().to_string();
+        assert!(err.contains("Claude"), "{err}");
+        let scan = scan_dispatch_states(&db, 100).unwrap();
+        assert!(scan.states.is_empty());
+        assert_eq!(scan.unreadable.len(), 1);
+        let (key, why) = &scan.unreadable[0];
+        assert_eq!(key, &dispatch_state_key(&issue));
+        assert!(
+            why.contains("Claude state carrying supervised-CLI invocation artifacts"),
+            "{why}"
+        );
+    }
+
+    /// a scan keeps each readable drawer's raw bytes with its parsed
+    /// claim, so a caller can clear against exactly what it judged.
+    #[test]
+    fn a_scan_keeps_the_raw_bytes_of_each_claim_it_reads() {
+        let db = Database::open_in_memory().unwrap();
+        let issue = IssueRef::new("ironrace/ironmem", 283);
+        let claim = bare(sample(&issue, 1), Some("owner-a"));
+        assert!(claim_if_unchanged(&db, None, &claim).unwrap());
+        let scan = scan_dispatch_states(&db, 100).unwrap();
+        assert_eq!(scan.claims.len(), 1);
+        let (raw, scanned) = &scan.claims[0];
+        assert_eq!(scanned, &normalized(&claim).unwrap());
+        assert_eq!(
+            raw_dispatch_state(&db, &issue).unwrap().as_deref(),
+            Some(raw.as_str())
+        );
+        // Rewritten identically but for its owner since the scan: the
+        // scanned bytes no longer clear it.
+        let theirs = bare(sample(&issue, 1), Some("owner-b"));
+        assert!(claim_if_unchanged(&db, Some(&claim), &theirs).unwrap());
+        assert!(!clear_raw_dispatch_state_if_unchanged(&db, &issue, raw).unwrap());
+        assert!(get_claim(&db, &issue).unwrap().is_some());
+    }
+
+    #[test]
+    fn an_unreadable_dispatch_state_is_reported_by_its_key() {
+        let db = Database::open_in_memory().unwrap();
+        let good = IssueRef::new("ironrace/ironmem", 283);
+        upsert_dispatch_state(&db, &sample(&good, 1)).unwrap();
+        let corrupt = format!("{DISPATCH_STATE_KEY_PREFIX}corrupt-1");
+        super::super::write_current(&db, &corrupt, "not json").unwrap();
+        let scan = scan_dispatch_states(&db, 100).unwrap();
+        assert_eq!(scan.states.len(), 1);
+        assert_eq!(scan.unreadable.len(), 1);
+        assert_eq!(scan.unreadable[0].0, corrupt);
+        assert!(!scan.unreadable[0].1.is_empty());
+        // Bounded however long the parse error.
+        let long = format!("{DISPATCH_STATE_KEY_PREFIX}long-1");
+        super::super::write_current(&db, &long, &format!("{{\"x\": {}", "1".repeat(5000))).unwrap();
+        let scan = scan_dispatch_states(&db, 100).unwrap();
+        assert!(scan
+            .unreadable
+            .iter()
+            .all(|(_, why)| why.chars().count() <= UNREADABLE_REASON_CHARS + 1));
     }
 }

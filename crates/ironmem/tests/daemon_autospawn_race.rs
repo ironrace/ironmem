@@ -34,6 +34,9 @@ fn base_command(home: &Path, db_path: &Path, sock: &Path) -> Command {
         .env("IRONMEM_EMBED_MODE", "noop")
         .env("IRONMEM_MCP_MODE", "trusted")
         .env("IRONMEM_AUTO_BOOTSTRAP", "0")
+        // This test is about autospawn; an operator's exported opt-out must
+        // not turn it off.
+        .env_remove("IRONMEM_NO_DAEMON")
         // Idle window: the auto-spawned daemon should clean itself up after
         // this test's proxies all disconnect, rather than lingering as an
         // orphaned background process for the default 300s. NOT razor-thin:

@@ -1,6 +1,23 @@
 use std::path::Path;
 use std::process::Command;
 
+mod git_env;
+
+/// Fixture git in `dir` ([`git_env::fixture_git_env`]: no inherited
+/// `GIT_DIR` can aim it at another repository, and no global config signs
+/// or hooks it), asserting it succeeds; its stdout, trimmed.
+fn fixture_git(dir: &Path, args: &[&str]) -> String {
+    let mut command = Command::new("git");
+    git_env::fixture_git_env(&mut command);
+    let out = command.args(args).current_dir(dir).output().unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).unwrap().trim().to_string()
+}
+
 /// Build a hermetic `ironmem` invocation: isolated HOME, explicit DB, noop embedder.
 fn context_command(home: &Path, db_path: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_ironmem"));
@@ -97,17 +114,7 @@ fn context_fresh_map_surfaces_summary_and_sha() {
     let repo = temp.path().join("repo");
     std::fs::create_dir_all(&repo).unwrap();
     let run = |args: &[&str]| {
-        let ok = std::process::Command::new("git")
-            .args(args)
-            .current_dir(&repo)
-            .output()
-            .unwrap();
-        assert!(
-            ok.status.success(),
-            "git {:?}: {}",
-            args,
-            String::from_utf8_lossy(&ok.stderr)
-        );
+        fixture_git(&repo, args);
     };
     run(&["init", "-q"]);
     run(&["config", "user.email", "t@t.t"]);
@@ -115,17 +122,7 @@ fn context_fresh_map_surfaces_summary_and_sha() {
     std::fs::write(repo.join("a.rs"), "fn a() {}\n").unwrap();
     run(&["add", "."]);
     run(&["commit", "-q", "-m", "seed"]);
-    let head = String::from_utf8(
-        std::process::Command::new("git")
-            .args(["rev-parse", "HEAD"])
-            .current_dir(&repo)
-            .output()
-            .unwrap()
-            .stdout,
-    )
-    .unwrap()
-    .trim()
-    .to_string();
+    let head = fixture_git(&repo, &["rev-parse", "HEAD"]);
     let repo_canon = std::fs::canonicalize(&repo)
         .unwrap()
         .to_string_lossy()
@@ -189,17 +186,7 @@ fn context_stale_map_surfaces_changed_files_and_recommendation() {
     let repo = temp.path().join("repo");
     std::fs::create_dir_all(&repo).unwrap();
     let run = |args: &[&str]| {
-        let ok = std::process::Command::new("git")
-            .args(args)
-            .current_dir(&repo)
-            .output()
-            .unwrap();
-        assert!(
-            ok.status.success(),
-            "git {:?}: {}",
-            args,
-            String::from_utf8_lossy(&ok.stderr)
-        );
+        fixture_git(&repo, args);
     };
     run(&["init", "-q"]);
     run(&["config", "user.email", "t@t.t"]);
@@ -208,17 +195,7 @@ fn context_stale_map_surfaces_changed_files_and_recommendation() {
     std::fs::write(repo.join("a.rs"), "fn a() {}\n").unwrap();
     run(&["add", "."]);
     run(&["commit", "-q", "-m", "seed"]);
-    let build_head = String::from_utf8(
-        std::process::Command::new("git")
-            .args(["rev-parse", "HEAD"])
-            .current_dir(&repo)
-            .output()
-            .unwrap()
-            .stdout,
-    )
-    .unwrap()
-    .trim()
-    .to_string();
+    let build_head = fixture_git(&repo, &["rev-parse", "HEAD"]);
     let repo_canon = std::fs::canonicalize(&repo)
         .unwrap()
         .to_string_lossy()

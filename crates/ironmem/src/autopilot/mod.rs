@@ -1,4 +1,4 @@
-//! Autopilot backlog runner (build-ladder rungs 1-9).
+//! Autopilot backlog runner (build-ladder rungs 1-11).
 //!
 //! See `docs/iron/specs/2026-08-21-autonomous-backlog-runner-design.md` for
 //! the full design. Rung 1 built the storage half — the `backlog-lineage`
@@ -45,6 +45,12 @@
 //! close-out rests on the loop not depending on them. Rung 9 also gives the
 //! escalation itself a voice: before it, an escalation stopped the work and
 //! said so only in a drawer.
+//!
+//! The implementer itself is [`implementer`]: Claude directly, or a
+//! supervised CLI (Codex, Muse) whose every launch is an [`invocation`]
+//! tracked in [`process_tree`] and supervised by [`invocation`], with
+//! [`codex_dispatch`] and [`muse_dispatch`] supplying argv and parsing. The old `codex_process` module stays as a deprecated
+//! shim over `process_tree` until 0.7.0.
 //!
 //! # The drawer kinds, one room
 //!
@@ -202,17 +208,50 @@ pub mod budget;
 pub mod ci_evidence;
 pub mod clear;
 pub mod codex_dispatch;
-pub mod codex_process;
 pub mod dispatch;
 pub mod dispatch_state;
 pub mod gate_config;
 pub mod gh;
 pub mod implementer;
+pub mod invocation;
+pub mod issue_lock;
 pub mod labels;
 pub mod lead;
 pub mod lineage;
+pub mod local_fs;
 pub mod merge;
+pub mod muse_dispatch;
 pub mod onboard;
+pub mod process_tree;
+/// The old name of [`process_tree`], from before Muse joined Codex as a
+/// supervised harness. Kept, deprecated, until 0.7.0.
+#[deprecated(
+    note = "renamed to `process_tree`; it covers every supervised harness; removal in 0.7.0"
+)]
+pub mod codex_process {
+    /// Renamed to [`ProcessSource`]. A trait cannot be aliased on stable
+    /// Rust, so this re-export carries no deprecation warning of its own.
+    pub use super::process_tree::ProcessSource as CodexProcessSource;
+    pub use super::process_tree::*;
+
+    /// Renamed to [`ProcessSnapshot`].
+    #[deprecated(note = "renamed to `process_tree::ProcessSnapshot`; removal in 0.7.0")]
+    pub type CodexProcessSnapshot = ProcessSnapshot;
+
+    /// Renamed to [`UnixProcesses`]: the type, and (below) the unit value.
+    #[deprecated(note = "renamed to `process_tree::UnixProcesses`; removal in 0.7.0")]
+    pub type UnixCodexProcesses = UnixProcesses;
+    /// The unit value of [`UnixCodexProcesses`].
+    #[deprecated(note = "renamed to `process_tree::UnixProcesses`; removal in 0.7.0")]
+    #[allow(non_upper_case_globals)]
+    pub const UnixCodexProcesses: UnixProcesses = UnixProcesses;
+
+    /// Renamed to [`parse_processes`]: it reads every supervised harness's rows.
+    #[deprecated(note = "renamed to `process_tree::parse_processes`; removal in 0.7.0")]
+    pub fn parse_codex_processes(text: &str) -> Result<Vec<ProcessRow>, String> {
+        parse_processes(text)
+    }
+}
 pub mod queue;
 pub mod registry;
 pub mod remediate;
@@ -223,6 +262,8 @@ pub mod run;
 pub mod scrub;
 pub mod stagnation;
 pub mod supervise;
+#[cfg(test)]
+pub(crate) use crate::test_git;
 pub mod turn_prompt;
 pub mod worktree;
 
@@ -240,20 +281,28 @@ use crate::mcp::tools::{LOGICAL_KEY_ID_PREFIX, LOGICAL_KEY_SOURCE_PREFIX};
 pub use advise::{Advice, AdviceConfig, AdviceKind, AdviceStatus, Advisor, ClaudeAdvisor};
 pub use blocked::{ask_human, poll_answer, AskOutcome, BlockedPoll, BlockedRecord, QaPair};
 pub use budget::BudgetLedgerEntry;
-pub use codex_dispatch::{CodexArtifacts, CodexRecovery};
 pub use dispatch::{DispatchOutcome, DispatchSpec, SessionMode, Verdict};
 pub use dispatch_state::DispatchState;
 pub use gate_config::{GateConfig, GateConfigState};
 pub use implementer::Implementer;
+pub use invocation::{InvocationArtifacts, InvocationRecovery};
+/// Renamed to [`InvocationArtifacts`]; kept, deprecated, until 0.7.0.
+#[deprecated(note = "renamed to `InvocationArtifacts`; removal in 0.7.0")]
+pub type CodexArtifacts = InvocationArtifacts;
+/// Renamed to [`InvocationRecovery`]; kept, deprecated, until 0.7.0.
+#[deprecated(note = "renamed to `InvocationRecovery`; removal in 0.7.0")]
+pub type CodexRecovery = InvocationRecovery;
 pub use lead::{lead_tick, LeadConfig, LeadReport, RepoTarget};
 pub use lineage::{AttemptOutcome, AttemptRecord, IssueStatus, RecordedAttempt};
 pub use onboard::{infer_gate_commands, onboard_repo, InferredGates};
 pub use queue::{
     plan_queue, DeferReason, Deferred, Priority, QueueConfig, QueuePlan, QueuedIssue, RepoBacklog,
 };
+#[allow(deprecated)]
+pub use registry::TwoHarnessMonitor;
 pub use registry::{
-    AgentRegistry, ClaudeAgentRegistry, HarnessMonitor, HarnessSnapshots, Liveness,
-    LivenessSnapshot, RegistrySnapshot, TwoHarnessMonitor,
+    AgentRegistry, ClaudeAgentRegistry, HarnessMonitor, HarnessProcessMonitor, HarnessSnapshots,
+    Liveness, LivenessSnapshot, RegistrySnapshot,
 };
 pub use review::reviews_for_issue;
 pub use review::{
@@ -451,28 +500,35 @@ pub(crate) fn write_current(
     key: &str,
     content: &str,
 ) -> Result<String, MemoryError> {
+    db.with_transaction(|tx| write_current_tx(tx, key, content))
+}
+
+/// [`write_current`] inside a caller's transaction, for a read-modify-write
+/// that must commit as one (see [`Database::with_immediate_transaction`]).
+pub(crate) fn write_current_tx(
+    tx: &rusqlite::Transaction<'_>,
+    key: &str,
+    content: &str,
+) -> Result<String, MemoryError> {
     let id = logical_drawer_id(key);
     let source_file = format!("{LOGICAL_KEY_SOURCE_PREFIX}{key}");
     let embedding = zero_embedding();
-    db.with_transaction(|tx| {
-        Database::insert_drawer_tx(
-            tx,
-            &id,
-            content,
-            &embedding,
-            WING,
-            ROOM,
-            &source_file,
-            ADDED_BY,
-        )?;
-        Database::wal_log_tx(
-            tx,
-            "autopilot_write_current",
-            &serde_json::json!({ "id": &id, "logical_key": key }),
-            None,
-        )?;
-        Ok(())
-    })?;
+    Database::insert_drawer_tx(
+        tx,
+        &id,
+        content,
+        &embedding,
+        WING,
+        ROOM,
+        &source_file,
+        ADDED_BY,
+    )?;
+    Database::wal_log_tx(
+        tx,
+        "autopilot_write_current",
+        &serde_json::json!({ "id": &id, "logical_key": key }),
+        None,
+    )?;
     Ok(id)
 }
 
@@ -485,6 +541,37 @@ pub(crate) fn read_current(db: &Database, key: &str) -> Result<Option<Drawer>, M
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pre-Muse public names still resolve, deprecated, to the renamed
+    /// items until 0.7.0.
+    #[test]
+    #[allow(deprecated)]
+    fn the_renamed_supervised_cli_items_keep_their_old_names() {
+        fn artifacts(a: CodexArtifacts) -> InvocationArtifacts {
+            a
+        }
+        fn recovery(r: codex_dispatch::CodexRecovery) -> InvocationRecovery {
+            r
+        }
+        fn snapshot(s: codex_process::CodexProcessSnapshot) -> process_tree::ProcessSnapshot {
+            s
+        }
+        fn source(s: &mut dyn codex_process::CodexProcessSource) -> process_tree::ProcessSnapshot {
+            process_tree::snapshot(s)
+        }
+        // The old constructor's signature, and a dispatcher like any other.
+        let _: fn() -> Result<run::CodexDispatcher, MemoryError> = run::CodexDispatcher::resolve;
+        fn dispatcher(d: run::CodexDispatcher) -> Box<dyn run::Dispatcher> {
+            Box::new(d)
+        }
+        let _ = (artifacts, recovery, snapshot, source, dispatcher);
+        let _: CodexRecovery = InvocationRecovery::NoPriorInvocation;
+        let _: codex_process::UnixCodexProcesses = codex_process::UnixCodexProcesses;
+        assert_eq!(
+            codex_process::parse_codex_processes("").ok(),
+            process_tree::parse_processes("").ok()
+        );
+    }
 
     #[test]
     fn repo_slug_replaces_unsafe_characters() {

@@ -77,6 +77,7 @@
 
 use serde::Serialize;
 
+use super::dispatch_state::DispatchPhase;
 use super::gh::IssueListing;
 use super::implementer::Implementer;
 use super::labels::{self, DispatchEligibility};
@@ -342,6 +343,25 @@ pub enum DeferReason {
     /// shortens the issue or its gates, so it is not resumed ahead of the
     /// backlog every tick; `autopilot clear-dispatch` releases it.
     ConditionTooLong,
+    /// A previous dispatch's tools may still run; only an operator clears it.
+    CompletionUnproven,
+    /// The last run's harness reported `session_uuid` still in use after an
+    /// invocation finished: something still holds it. Retrying can never
+    /// succeed and a fresh session could start a second implementer, so it
+    /// waits for an operator to find the holder and run
+    /// `autopilot clear-dispatch`.
+    SessionInUse { session_uuid: String },
+    /// The issue's dispatch-state drawer cannot be read: it is corrupt, or a
+    /// newer binary wrote it for a harness this one does not know. It may be
+    /// a live invocation, so it holds its slot and its issue until a binary
+    /// that reads it (or a human who has checked nothing runs for it)
+    /// releases it. `why` says why it cannot be read.
+    DispatchStateUnreadable { why: String },
+    /// The issue's dispatch-state phase label is none this binary writes:
+    /// a newer binary's parked phase, or a corrupt label. It is held, not
+    /// resumed — resuming would spend a dispatch attempt only for
+    /// `run_issue` to refuse it, every tick.
+    DispatchPhaseUnknown { label: String },
     /// The issue's dispatch state was written by the other harness, which the
     /// configured runner refuses to resume. Only that harness, or a human
     /// clearing the state, moves it.
@@ -349,6 +369,12 @@ pub enum DeferReason {
         persisted: Implementer,
         configured: Implementer,
     },
+    /// Selected, but another controller (another Lead, or a manual
+    /// `autopilot run`) holds the issue's lock
+    /// ([`super::issue_lock`]), so this tick neither provisions nor
+    /// dispatches it. Added by the Lead after planning, not by
+    /// [`plan_queue`].
+    HeldByAnotherController { detail: String },
 }
 
 /// One deferred issue and why.
@@ -416,8 +442,16 @@ pub fn plan_queue(
     // from drawers rather than from the registry on purpose: a slot is held
     // by *work in progress*, and an IC that has exited between dispatches has
     // not given its slot back.
-    let in_flight: Vec<dispatch_state::DispatchState> =
-        dispatch_state::all_dispatch_states(db, IN_FLIGHT_SCAN_LIMIT)?;
+    //
+    // A drawer that cannot be read (corrupt, or written by a newer binary
+    // for a harness this one does not know) holds its slot and its issue:
+    // it may be a live invocation, and skipping it would dispatch past the
+    // cap, or a second implementer onto its worktree.
+    let dispatch_state::DispatchStateScan {
+        states: in_flight,
+        unreadable,
+        ..
+    } = dispatch_state::scan_dispatch_states(db, IN_FLIGHT_SCAN_LIMIT)?;
 
     // The same predicate `run_issue` uses, deliberately spelled the same way
     // rather than approximated. Note what this does *not* mirror: the
@@ -523,8 +557,17 @@ pub fn plan_queue(
                 continue;
             }
 
+            let key = dispatch_state::dispatch_state_key(&issue);
+            if let Some((_, why)) = unreadable.iter().find(|(k, _)| *k == key) {
+                defer(DeferReason::DispatchStateUnreadable { why: why.clone() });
+                continue;
+            }
             let state = in_flight.iter().find(|s| s.issue == issue);
             if let Some(state) = state {
+                if state.phase() == Some(DispatchPhase::PausedCompletionUnproven) {
+                    defer(DeferReason::CompletionUnproven);
+                    continue;
+                }
                 match snapshot.liveness(state) {
                     Liveness::Alive => {
                         defer(DeferReason::SessionLive {
@@ -540,9 +583,35 @@ pub fn plan_queue(
                     }
                     Liveness::NotListed => {}
                 }
-                if state.state == "paused-condition-too-long" {
-                    defer(DeferReason::ConditionTooLong);
-                    continue;
+                // Exhaustive: a new phase must say whether it waits for a
+                // human, or the queue would resume it ahead of the backlog.
+                match state.phase() {
+                    Some(DispatchPhase::PausedConditionTooLong) => {
+                        defer(DeferReason::ConditionTooLong);
+                        continue;
+                    }
+                    Some(DispatchPhase::PausedCompletionUnproven) => {
+                        defer(DeferReason::CompletionUnproven);
+                        continue;
+                    }
+                    Some(DispatchPhase::PausedSessionInUse) => {
+                        defer(DeferReason::SessionInUse {
+                            session_uuid: state.session_uuid.clone(),
+                        });
+                        continue;
+                    }
+                    Some(
+                        DispatchPhase::Dispatching
+                        | DispatchPhase::InfrastructureFailure
+                        | DispatchPhase::PausedDailyBudget
+                        | DispatchPhase::PausedInfrastructureFailure,
+                    ) => {}
+                    None => {
+                        defer(DeferReason::DispatchPhaseUnknown {
+                            label: state.state.clone(),
+                        });
+                        continue;
+                    }
                 }
                 if let Some(configured) = config.implementer {
                     if state.implementer != configured {
@@ -575,7 +644,8 @@ pub fn plan_queue(
     let mut selected: Vec<QueuedIssue> = Vec::new();
     for candidate in candidates {
         let already_held = candidate.resuming;
-        let in_flight_after = in_flight.len() + selected.iter().filter(|s| !s.resuming).count();
+        let in_flight_after =
+            in_flight.len() + unreadable.len() + selected.iter().filter(|s| !s.resuming).count();
         if !already_held && in_flight_after >= config.concurrency_cap {
             deferred.push(Deferred {
                 issue: candidate.issue,
@@ -593,7 +663,8 @@ pub fn plan_queue(
     let occupied_slots = in_flight
         .iter()
         .filter(|state| !selected.iter().any(|s| s.issue == state.issue))
-        .count();
+        .count()
+        + unreadable.len();
 
     Ok(QueuePlan {
         dispatch: selected,
@@ -731,12 +802,26 @@ mod tests {
     }
 
     fn put_state(db: &Database, issue: &IssueRef, session_name: &str) {
+        put_state_for(
+            db,
+            issue,
+            session_name,
+            crate::autopilot::implementer::Implementer::Claude,
+        );
+    }
+
+    fn put_state_for(
+        db: &Database,
+        issue: &IssueRef,
+        session_name: &str,
+        implementer: crate::autopilot::implementer::Implementer,
+    ) {
         dispatch_state::upsert_dispatch_state(
             db,
             &DispatchState {
-                implementer: crate::autopilot::implementer::Implementer::Claude,
+                implementer,
                 native_session_id: None,
-                codex_artifacts: None,
+                invocation_artifacts: None,
                 issue: issue.clone(),
                 worktree_path: "/tmp/wt".to_string(),
                 ic_session_name: session_name.to_string(),
@@ -747,6 +832,9 @@ mod tests {
                 session_uuid: "11111111-2222-3333-4444-555555555555".to_string(),
                 turn_n: 1,
                 session_claimed: true,
+                session_model: None,
+                resume_refusals: 0,
+                signing_held: false,
             },
         )
         .unwrap();
@@ -1572,7 +1660,7 @@ mod tests {
     }
     #[test]
     fn codex_queue_routes_by_persisted_harness_and_holds_uncertainty() {
-        use crate::autopilot::codex_process::{testing, CodexProcessSnapshot};
+        use crate::autopilot::process_tree::{testing, ProcessSnapshot};
         use crate::autopilot::registry::HarnessSnapshots;
         let db = approved(&[REPO]);
         let issue = IssueRef::new(REPO, 1);
@@ -1582,12 +1670,16 @@ mod tests {
             .unwrap();
         state.implementer = crate::autopilot::implementer::Implementer::Codex;
         let dir = tempfile::tempdir().unwrap();
-        let (a, row) = testing::invocation(dir.path());
-        state.codex_artifacts = Some(a.clone());
+        let (a, row) = testing::invocation_in(
+            dir.path(),
+            crate::autopilot::implementer::Implementer::Codex,
+            "ironrace-ironmem-1",
+        );
+        state.invocation_artifacts = Some(a.clone());
         dispatch_state::upsert_dispatch_state(&db, &state).unwrap();
         let mut snapshots = HarnessSnapshots {
             claude: RegistrySnapshot::Available(Vec::new()),
-            codex: CodexProcessSnapshot::Available(vec![row]),
+            processes: ProcessSnapshot::Available(vec![row]),
         };
         let backlogs = [backlog(REPO, vec![ready(1)])];
         let plan = plan_queue(&db, &backlogs, &snapshots, &config()).unwrap();
@@ -1595,7 +1687,7 @@ mod tests {
             reason_for(&plan, 1),
             DeferReason::SessionLive { .. }
         ));
-        snapshots.codex = CodexProcessSnapshot::Available(Vec::new());
+        snapshots.processes = ProcessSnapshot::Available(Vec::new());
         let plan = plan_queue(&db, &backlogs, &snapshots, &config()).unwrap();
         assert!(matches!(
             reason_for(&plan, 1),
@@ -1616,12 +1708,12 @@ mod tests {
     }
     #[test]
     fn a_condition_too_long_refusal_is_deferred_not_resumed_ahead_of_the_backlog() {
-        use crate::autopilot::codex_process::CodexProcessSnapshot;
         use crate::autopilot::implementer::Implementer;
+        use crate::autopilot::process_tree::ProcessSnapshot;
         use crate::autopilot::registry::HarnessSnapshots;
         let snapshots = HarnessSnapshots {
             claude: RegistrySnapshot::Available(Vec::new()),
-            codex: CodexProcessSnapshot::Available(Vec::new()),
+            processes: ProcessSnapshot::Available(Vec::new()),
         };
         for implementer in [Implementer::Claude, Implementer::Codex] {
             let db = approved(&[REPO]);
@@ -1647,13 +1739,94 @@ mod tests {
             assert_eq!(plan.dispatch[0].issue, IssueRef::new(REPO, 2));
         }
     }
+    /// A run that Muse refused because something still holds its session is
+    /// parked: retrying can never succeed, so a Lead never re-dispatches it
+    /// until an operator clears it.
+    #[test]
+    fn completion_unproven_is_deferred_even_when_the_registry_lists_nothing() {
+        let db = approved(&[REPO]);
+        let issue = IssueRef::new(REPO, 1);
+        put_state(&db, &issue, "ic-test");
+        let mut state = dispatch_state::get_dispatch_state(&db, &issue)
+            .unwrap()
+            .unwrap();
+        state.state = "paused-completion-unproven".into();
+        dispatch_state::upsert_dispatch_state(&db, &state).unwrap();
+        let snapshot = RegistrySnapshot::Available(Vec::new());
+        let plan = plan_queue(
+            &db,
+            &[backlog(REPO, vec![ready(1), ready(2)])],
+            &snapshot,
+            &config(),
+        )
+        .unwrap();
+        assert!(matches!(
+            reason_for(&plan, 1),
+            DeferReason::CompletionUnproven
+        ));
+        assert_eq!(numbers(&plan), vec![2]);
+    }
+
+    #[test]
+    fn a_session_in_use_refusal_is_deferred_until_an_operator_clears_it() {
+        use crate::autopilot::implementer::Implementer;
+        use crate::autopilot::process_tree::ProcessSnapshot;
+        use crate::autopilot::registry::HarnessSnapshots;
+        let snapshots = HarnessSnapshots {
+            claude: RegistrySnapshot::Available(Vec::new()),
+            processes: ProcessSnapshot::Available(Vec::new()),
+        };
+        let db = approved(&[REPO]);
+        let issue = IssueRef::new(REPO, 1);
+        put_state(&db, &issue, "ic-test");
+        let mut state = dispatch_state::get_dispatch_state(&db, &issue)
+            .unwrap()
+            .unwrap();
+        state.implementer = Implementer::Muse;
+        state.session_uuid = "0d6c1e2a-5b8f-4c1d-9e3a-7f2b6a1c4d5e".into();
+        state.native_session_id = Some(state.session_uuid.clone());
+        state.state = "paused-session-in-use".into();
+        dispatch_state::upsert_dispatch_state(&db, &state).unwrap();
+        assert_eq!(snapshots.liveness(&state), Liveness::NotListed);
+        let backlogs = [backlog(REPO, vec![ready(1), ready(2)])];
+        let cfg = QueueConfig {
+            implementer: Some(Implementer::Muse),
+            ..config()
+        };
+        let plan = plan_queue(&db, &backlogs, &snapshots, &cfg).unwrap();
+        assert_eq!(
+            reason_for(&plan, 1),
+            DeferReason::SessionInUse {
+                session_uuid: "0d6c1e2a-5b8f-4c1d-9e3a-7f2b6a1c4d5e".into()
+            }
+        );
+        assert_eq!(plan.dispatch.len(), 1);
+        assert_eq!(plan.dispatch[0].issue, IssueRef::new(REPO, 2));
+        // The parked issue still holds its slot.
+        assert_eq!(plan.occupied_slots, 1);
+        // A Claude Lead sees the parked Muse session the same way: it waits
+        // for an operator, ahead of the harness mismatch.
+        let claude = QueueConfig {
+            implementer: Some(Implementer::Claude),
+            ..config()
+        };
+        let plan = plan_queue(&db, &backlogs, &snapshots, &claude).unwrap();
+        assert_eq!(
+            reason_for(&plan, 1),
+            DeferReason::SessionInUse {
+                session_uuid: "0d6c1e2a-5b8f-4c1d-9e3a-7f2b6a1c4d5e".into()
+            }
+        );
+        assert_eq!(plan.occupied_slots, 1);
+    }
     #[test]
     fn a_state_owned_by_the_other_harness_is_deferred_not_dispatched_ahead_of_the_backlog() {
         use crate::autopilot::implementer::Implementer;
         let db = approved(&[REPO]);
         // A Claude Lead left issue 1 paused; its registry no longer lists the
         // session, so liveness alone would admit it as a resume and sort it
-        // first — into a dispatch the Codex runner must refuse every tick.
+        // first — into a dispatch the configured runner must refuse every
+        // tick.
         put_state(&db, &IssueRef::new(REPO, 1), "ic-stale");
         let backlogs = [backlog(REPO, vec![ready(1), ready(2)])];
         let snapshot = RegistrySnapshot::Available(Vec::new());
@@ -1681,5 +1854,158 @@ mod tests {
             let plan = plan_queue(&db, &backlogs, &snapshot, &cfg).unwrap();
             assert_eq!(plan.dispatch[0].issue, IssueRef::new(REPO, 1));
         }
+    }
+    #[test]
+    fn a_muse_state_is_deferred_for_a_codex_runner_not_dispatched_ahead_of_the_backlog() {
+        use crate::autopilot::implementer::Implementer;
+        use crate::autopilot::process_tree::ProcessSnapshot;
+        use crate::autopilot::registry::HarnessSnapshots;
+        let db = approved(&[REPO]);
+        let issue = IssueRef::new(REPO, 1);
+        put_state_for(&db, &issue, "ic-stale", Implementer::Muse);
+        // An idle pause that readable process evidence proves is not running.
+        let mut state = dispatch_state::get_dispatch_state(&db, &issue)
+            .unwrap()
+            .unwrap();
+        state.state = "paused-daily-budget".into();
+        dispatch_state::upsert_dispatch_state(&db, &state).unwrap();
+        let backlogs = [backlog(REPO, vec![ready(1), ready(2)])];
+        // Claude's registry is unreadable, so a Muse state routed like Claude
+        // would be held rather than deferred as a harness mismatch.
+        let snapshot = HarnessSnapshots {
+            claude: RegistrySnapshot::Unavailable {
+                reason: "claude agents --json exited 1".to_string(),
+            },
+            processes: ProcessSnapshot::Available(Vec::new()),
+        };
+        let codex = QueueConfig {
+            implementer: Some(Implementer::Codex),
+            ..config()
+        };
+        let plan = plan_queue(&db, &backlogs, &snapshot, &codex).unwrap();
+        assert_eq!(
+            reason_for(&plan, 1),
+            DeferReason::HarnessMismatch {
+                persisted: Implementer::Muse,
+                configured: Implementer::Codex,
+            }
+        );
+        assert_eq!(plan.dispatch.len(), 1);
+        assert_eq!(plan.dispatch[0].issue, IssueRef::new(REPO, 2));
+    }
+    #[test]
+    fn muse_queue_routes_by_persisted_harness_and_holds_uncertainty() {
+        use crate::autopilot::implementer::Implementer;
+        use crate::autopilot::process_tree::{testing, ProcessSnapshot};
+        use crate::autopilot::registry::HarnessSnapshots;
+        let db = approved(&[REPO]);
+        let issue = IssueRef::new(REPO, 1);
+        put_state_for(&db, &issue, "ic-test", Implementer::Muse);
+        let mut state = dispatch_state::get_dispatch_state(&db, &issue)
+            .unwrap()
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (a, row) = testing::invocation_in(dir.path(), Implementer::Muse, "ironrace-ironmem-1");
+        state.invocation_artifacts = Some(a.clone());
+        dispatch_state::upsert_dispatch_state(&db, &state).unwrap();
+        // Claude's registry lists nothing: only process evidence may hold it.
+        let mut snapshots = HarnessSnapshots {
+            claude: RegistrySnapshot::Available(Vec::new()),
+            processes: ProcessSnapshot::Available(vec![row]),
+        };
+        let backlogs = [backlog(REPO, vec![ready(1), ready(2)])];
+        let muse = QueueConfig {
+            implementer: Some(Implementer::Muse),
+            ..config()
+        };
+        // A live Muse invocation holds its issue: never a second implementer.
+        let plan = plan_queue(&db, &backlogs, &snapshots, &muse).unwrap();
+        assert!(
+            matches!(reason_for(&plan, 1), DeferReason::SessionLive { .. }),
+            "{:?}",
+            reason_for(&plan, 1)
+        );
+        // Unreadable process evidence holds it too.
+        snapshots.processes = ProcessSnapshot::Unavailable {
+            reason: "ps exited 1".into(),
+        };
+        let plan = plan_queue(&db, &backlogs, &snapshots, &muse).unwrap();
+        assert!(
+            matches!(reason_for(&plan, 1), DeferReason::RegistryUnreadable { .. }),
+            "{:?}",
+            reason_for(&plan, 1)
+        );
+        // Gone, without a completion record: still held as ambiguous.
+        snapshots.processes = ProcessSnapshot::Available(Vec::new());
+        let plan = plan_queue(&db, &backlogs, &snapshots, &muse).unwrap();
+        assert!(
+            matches!(reason_for(&plan, 1), DeferReason::RegistryUnreadable { .. }),
+            "{:?}",
+            reason_for(&plan, 1)
+        );
+        // Completed: a Claude runner is refused it as the other harness's,
+        // even with its session name listed live in Claude's registry.
+        testing::complete(&a);
+        snapshots.claude = RegistrySnapshot::Available(vec![AgentEntry {
+            name: "ic-test".into(),
+            status: None,
+        }]);
+        let claude = QueueConfig {
+            implementer: Some(Implementer::Claude),
+            ..config()
+        };
+        let plan = plan_queue(&db, &backlogs, &snapshots, &claude).unwrap();
+        assert_eq!(
+            reason_for(&plan, 1),
+            DeferReason::HarnessMismatch {
+                persisted: Implementer::Muse,
+                configured: Implementer::Claude,
+            }
+        );
+        assert_eq!(plan.dispatch[0].issue, IssueRef::new(REPO, 2));
+        // And the Muse runner resumes it.
+        let plan = plan_queue(&db, &backlogs, &snapshots, &muse).unwrap();
+        assert_eq!(plan.dispatch[0].issue, issue);
+    }
+
+    #[test]
+    fn an_unreadable_dispatch_state_holds_its_slot_and_its_issue() {
+        // A drawer this binary cannot read (written by a newer one, or
+        // corrupt) may be a live invocation: it is never skipped as free.
+        let db = approved(&[REPO]);
+        super::super::write_current(
+            &db,
+            &format!(
+                "{}{}",
+                dispatch_state::DISPATCH_STATE_KEY_PREFIX,
+                IssueRef::new(REPO, 1).slug()
+            ),
+            r#"{"implementer":"some-future-harness"}"#,
+        )
+        .unwrap();
+        let cfg = QueueConfig {
+            concurrency_cap: 1,
+            ..config()
+        };
+        let plan = plan_queue(
+            &db,
+            &[backlog(REPO, vec![ready(1), ready(2)])],
+            &empty_registry(),
+            &cfg,
+        )
+        .unwrap();
+        assert!(
+            matches!(reason_for(&plan, 1), DeferReason::DispatchStateUnreadable { why }
+                if !why.is_empty()),
+            "{:?}",
+            reason_for(&plan, 1)
+        );
+        assert!(
+            matches!(reason_for(&plan, 2), DeferReason::ConcurrencyCap { .. }),
+            "{:?}",
+            reason_for(&plan, 2)
+        );
+        assert!(plan.dispatch.is_empty());
+        assert_eq!(plan.occupied_slots, 1);
     }
 }

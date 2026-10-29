@@ -1,42 +1,13 @@
 use std::path::Path;
 use std::process::Command;
-use std::sync::{LazyLock, Mutex};
 
 use ironmem::review_diff::{
     build_review_diff, expand_review_diff, ReviewDiffRequest, ReviewDiffSource,
 };
 use tempfile::TempDir;
 
-static GIT_ENV_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-
-struct ScopedEnvVars {
-    previous: Vec<(&'static str, Option<std::ffi::OsString>)>,
-}
-
-impl ScopedEnvVars {
-    fn set(values: &[(&'static str, &str)]) -> Self {
-        let previous = values
-            .iter()
-            .map(|(key, value)| {
-                let previous = std::env::var_os(key);
-                std::env::set_var(key, value);
-                (*key, previous)
-            })
-            .collect();
-        Self { previous }
-    }
-}
-
-impl Drop for ScopedEnvVars {
-    fn drop(&mut self) {
-        for (key, previous) in &self.previous {
-            match previous {
-                Some(value) => std::env::set_var(key, value),
-                None => std::env::remove_var(key),
-            }
-        }
-    }
-}
+mod git_env;
+use git_env::scrub_git_env as scrub_git_environment;
 
 struct DiffFixture {
     tempdir: TempDir,
@@ -151,9 +122,12 @@ fn fixture_contents(file: &str, version: &str) -> String {
         + "\n"
 }
 
+/// Fixture git ([`git_env::fixture_git_env`]): scrubbed, and reading no
+/// global or system config, which may sign commits with the operator's key
+/// or run their hooks. The binary under test keeps the plain scrub.
 fn git(repo: &Path, args: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>) {
     let mut command = Command::new("git");
-    scrub_git_environment(&mut command);
+    git_env::fixture_git_env(&mut command);
     let status = command
         .args(args)
         .current_dir(repo)
@@ -164,7 +138,7 @@ fn git(repo: &Path, args: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>)
 
 fn git_output(repo: &Path, args: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>) -> String {
     let mut command = Command::new("git");
-    scrub_git_environment(&mut command);
+    git_env::fixture_git_env(&mut command);
     let output = command
         .args(args)
         .current_dir(repo)
@@ -175,18 +149,6 @@ fn git_output(repo: &Path, args: impl IntoIterator<Item = impl AsRef<std::ffi::O
         "git fixture command should succeed"
     );
     String::from_utf8(output.stdout).expect("fixture git output should be UTF-8")
-}
-
-fn scrub_git_environment(command: &mut Command) {
-    for (key, _) in std::env::vars_os() {
-        if key
-            .to_string_lossy()
-            .to_ascii_uppercase()
-            .starts_with("GIT_")
-        {
-            command.env_remove(key);
-        }
-    }
 }
 
 #[cfg(feature = "headroom-compression")]
@@ -286,9 +248,13 @@ fn range_rejects_option_like_revisions_before_git_executes() {
     );
 }
 
+/// An inherited `GIT_DIR`, `GIT_WORK_TREE` and `GIT_CONFIG_*` must not
+/// redirect review-diff away from its `--repo`. They are put on the `ironmem`
+/// child process, which inherits them as it would from a hook, and never on
+/// this test process, where they would redirect every other test thread's git
+/// while set.
 #[test]
 fn review_diff_ignores_inherited_git_repository_and_config_overrides() {
-    let _env = GIT_ENV_MUTEX.lock().expect("git env lock");
     let intended = fixture();
     let hostile = tempfile::tempdir().expect("hostile repo");
     git(hostile.path(), ["init"]);
@@ -297,22 +263,29 @@ fn review_diff_ignores_inherited_git_repository_and_config_overrides() {
         ["config", "user.email", "hostile@example.test"],
     );
     git(hostile.path(), ["config", "user.name", "Hostile Git Test"]);
+    git(hostile.path(), ["config", "commit.gpgsign", "false"]);
+    git(hostile.path(), ["config", "core.hooksPath", "/dev/null"]);
     std::fs::write(hostile.path().join("hostile.txt"), "hostile\n").expect("write hostile");
     git(hostile.path(), ["add", "."]);
     git(hostile.path(), ["commit", "-m", "hostile"]);
     let expected = intended.source();
-    let hostile_git_dir = hostile.path().join(".git");
-    let _overrides = ScopedEnvVars::set(&[
-        ("GIT_DIR", hostile_git_dir.to_string_lossy().as_ref()),
-        ("GIT_WORK_TREE", hostile.path().to_string_lossy().as_ref()),
-        ("GIT_CONFIG_COUNT", "1"),
-        ("GIT_CONFIG_KEY_0", "core.quotePath"),
-        ("GIT_CONFIG_VALUE_0", "false"),
-    ]);
-
-    let expanded = expand_review_diff(&intended.request(), "alpha.txt", None)
-        .expect("request repo must win over inherited Git overrides");
-    assert!(expected.contains(&expanded));
+    let output = review_diff_command(&intended)
+        .arg("--expand-file")
+        .arg("alpha.txt")
+        .env("GIT_DIR", hostile.path().join(".git"))
+        .env("GIT_WORK_TREE", hostile.path())
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "core.quotePath")
+        .env("GIT_CONFIG_VALUE_0", "false")
+        .output()
+        .expect("review-diff CLI should start");
+    assert!(
+        output.status.success(),
+        "request repo must win over inherited Git overrides: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let expanded = String::from_utf8(output.stdout).expect("CLI stdout should be UTF-8");
+    assert!(expected.contains(expanded.trim_end()), "{expanded}");
     assert!(expanded.contains("alpha.txt section 1 head changed payload"));
     assert!(!expanded.contains("hostile"));
 }

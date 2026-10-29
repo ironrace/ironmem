@@ -5,76 +5,20 @@
 
 #![cfg(unix)]
 
-use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output};
+use std::path::Path;
+use std::process::{Child, Command};
 
 use ironmem::autopilot::budget;
-use ironmem::autopilot::codex_dispatch;
 use ironmem::autopilot::dispatch_state;
 use ironmem::autopilot::gate_config;
 use ironmem::autopilot::implementer::Implementer;
+use ironmem::autopilot::invocation;
 use ironmem::autopilot::worktree;
 use ironmem::autopilot::{DispatchState, IssueRef};
 use ironmem::db::schema::Database;
 
-const REPO: &str = "owner/repo";
-
-fn bin() -> &'static str {
-    env!("CARGO_BIN_EXE_ironmem")
-}
-
-fn git(dir: &Path, args: &[&str]) -> Output {
-    let mut command = Command::new("git");
-    for (key, _) in std::env::vars_os() {
-        if key
-            .to_string_lossy()
-            .to_ascii_uppercase()
-            .starts_with("GIT_")
-        {
-            command.env_remove(key);
-        }
-    }
-    let output = command.args(args).current_dir(dir).output().unwrap();
-    assert!(
-        output.status.success(),
-        "git {args:?} failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    output
-}
-
-fn make_repo(path: &Path) {
-    std::fs::create_dir_all(path).unwrap();
-    git(path, &["init", "-q", "--initial-branch=main"]);
-    git(path, &["config", "user.email", "test@example.com"]);
-    git(path, &["config", "user.name", "Test"]);
-    std::fs::write(path.join("README.md"), "seed\n").unwrap();
-    git(path, &["add", "README.md"]);
-    git(path, &["commit", "-qm", "seed"]);
-}
-
-fn approve(db_path: &Path) {
-    let db = Database::open(db_path).unwrap();
-    db.migrate().unwrap();
-    gate_config::propose_gate_config(&db, REPO, vec!["true".into()], Vec::new()).unwrap();
-    gate_config::approve_gate_config(&db, REPO).unwrap();
-}
-
-fn executable(path: &Path, body: &str) {
-    std::fs::write(path, body).unwrap();
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
-}
-
-fn isolated_path(stubs: &Path) -> PathBuf {
-    let mut paths = vec![stubs.to_path_buf()];
-    paths.extend(
-        ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]
-            .into_iter()
-            .map(PathBuf::from),
-    );
-    std::env::join_paths(paths).unwrap().into()
-}
+mod autopilot_support;
+use autopilot_support::{approve, executable, git, ironmem, isolated_path, make_repo, REPO};
 
 struct KillOnDrop(Child);
 
@@ -82,6 +26,56 @@ impl Drop for KillOnDrop {
     fn drop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
+    }
+}
+
+/// Fixture git reads no global or system config; the binary under test is
+/// left to read whatever its environment gives it.
+#[test]
+fn fixture_git_reads_no_global_config_but_the_binary_under_test_does() {
+    let mut fixture = Command::new("git");
+    autopilot_support::fixture_git_env(&mut fixture);
+    let fixture: Vec<_> = fixture.get_envs().collect();
+    let binary = ironmem();
+    let binary: Vec<_> = binary.get_envs().collect();
+    for (key, value) in [
+        ("GIT_CONFIG_GLOBAL", "/dev/null"),
+        ("GIT_CONFIG_NOSYSTEM", "1"),
+    ] {
+        let set = (std::ffi::OsStr::new(key), Some(std::ffi::OsStr::new(value)));
+        assert!(fixture.contains(&set), "{key}: {fixture:?}");
+        assert!(!binary.contains(&set), "{key}: {binary:?}");
+    }
+}
+
+/// `tests/git_env`'s scrubs remove every redirecting variable from the
+/// command whether or not it is set now (`Command` applies removals at
+/// spawn), so one set on the process later is not inherited either; the
+/// fixture's then pins its two config keys. Checked on the command rather
+/// than by setting a `GIT_*` variable on this threaded process.
+#[test]
+fn the_git_env_scrubs_remove_every_redirecting_variable_unconditionally() {
+    use std::ffi::OsStr;
+    let mut scrubbed = Command::new("git");
+    autopilot_support::scrub_git_env(&mut scrubbed);
+    let scrubbed: Vec<_> = scrubbed.get_envs().collect();
+    let mut fixture = Command::new("git");
+    autopilot_support::fixture_git_env(&mut fixture);
+    let fixture: Vec<_> = fixture.get_envs().collect();
+    for key in autopilot_support::git_env::REDIRECTING_GIT_VARS {
+        assert!(
+            scrubbed.contains(&(OsStr::new(key), None)),
+            "scrub_git_env leaves {key}: {scrubbed:?}"
+        );
+        let pinned = match key {
+            "GIT_CONFIG_GLOBAL" => Some(OsStr::new("/dev/null")),
+            "GIT_CONFIG_NOSYSTEM" => Some(OsStr::new("1")),
+            _ => None,
+        };
+        assert!(
+            fixture.contains(&(OsStr::new(key), pinned)),
+            "fixture_git_env leaves {key} as other than {pinned:?}: {fixture:?}"
+        );
     }
 }
 
@@ -99,6 +93,7 @@ fn public_run_defaults_to_claude_and_passes_the_claude_default_model() {
     executable(
         &stubs.join("claude"),
         r#"#!/bin/sh
+if [ "$1" = "agents" ]; then echo '[]'; exit 0; fi
 printf '%s\n' "$PWD|$*" >> "$CLAUDE_CALLS"
 printf '%s\n' '{"total_cost_usd":0.0,"num_turns":1,"duration_ms":5,"is_error":false,"session_id":"11111111-2222-3333-4444-555555555555","structured_output":{"verdict":"met"}}'
 "#,
@@ -108,7 +103,7 @@ printf '%s\n' '{"total_cost_usd":0.0,"num_turns":1,"duration_ms":5,"is_error":fa
         "the isolated harness directory must not provide Codex"
     );
 
-    let output = Command::new(bin())
+    let output = ironmem()
         .args([
             "autopilot",
             "run",
@@ -168,6 +163,7 @@ fn public_run_selects_codex_without_resolving_claude() {
         &stubs.join("codex"),
         r#"#!/bin/sh
 printf '%s\n' "$PWD|$*" >> "$CODEX_CALLS"
+printf 'stdin=%s\n' "$(cat)" >> "$CODEX_CALLS"
 args="$*"
 while [ "$#" -gt 0 ]; do
   if [ "$1" = "-o" ]; then shift; final="$1"; fi
@@ -191,7 +187,7 @@ fi
 "#,
     );
 
-    let output = Command::new(bin())
+    let output = ironmem()
         .args([
             "autopilot",
             "run",
@@ -278,7 +274,21 @@ fi
         !calls.contains("--max-budget-usd"),
         "unexpected Claude flag: {calls}"
     );
-    assert!(calls.contains("true, and every commit you have made is pushed"));
+    // The condition reaches Codex on stdin, not in its argv.
+    let stdin = calls
+        .split("stdin=")
+        .nth(1)
+        .expect("the stub recorded what it was fed on stdin");
+    assert!(
+        stdin.contains("true, and every commit you have made is pushed"),
+        "the condition is missing from stdin: {calls}"
+    );
+    for line in calls.lines().filter(|line| line.contains("|exec ")) {
+        assert!(
+            !line.contains("true, and every commit you have made is pushed"),
+            "the condition leaked into argv: {line}"
+        );
+    }
 }
 
 #[test]
@@ -294,7 +304,7 @@ fn public_lead_with_codex_and_advisor_off_does_not_require_claude() {
     executable(&stubs.join("gh"), "#!/bin/sh\nprintf '%s\\n' '[]'\n");
 
     let repo_arg = format!("{REPO}={}", checkout.display());
-    let output = Command::new(bin())
+    let output = ironmem()
         .args([
             "autopilot",
             "lead",
@@ -375,7 +385,7 @@ fn codex_native_limit_validation_precedes_model_and_all_persistent_side_effects(
             "--worktree-root".into(),
             worktrees.display().to_string(),
         ]);
-        let output = Command::new(bin())
+        let output = ironmem()
             .args(&args)
             .env("PATH", &empty_path)
             .output()
@@ -402,7 +412,7 @@ fn codex_native_limit_validation_precedes_model_and_all_persistent_side_effects(
 fn codex_requires_an_explicit_model_before_database_creation() {
     let root = tempfile::tempdir().unwrap();
     let db_path = root.path().join("memory.sqlite3");
-    let output = Command::new(bin())
+    let output = ironmem()
         .args([
             "autopilot",
             "run",
@@ -451,6 +461,7 @@ fn invalid_model_spelling_is_rejected_before_all_cli_side_effects() {
         ("codex-trailing-alias", "codex", "gpt-custom ", "whitespace"),
         ("claude-empty", "claude", "", "must not be empty"),
         ("codex-empty", "codex", "   ", "must not be empty"),
+        ("muse-interior", "muse", "muse wonder", "whitespace"),
     ] {
         let root = tempfile::tempdir().unwrap();
         let db_path = root.path().join("memory.sqlite3");
@@ -459,7 +470,7 @@ fn invalid_model_spelling_is_rejected_before_all_cli_side_effects() {
         let empty_path = root.path().join("empty-path");
         std::fs::create_dir_all(&empty_path).unwrap();
 
-        let output = Command::new(bin())
+        let output = ironmem()
             .args([
                 "autopilot",
                 "run",
@@ -544,7 +555,7 @@ exit 7
 "#,
         );
 
-        let output = Command::new(bin())
+        let output = ironmem()
             .args([
                 "autopilot",
                 "run",
@@ -618,7 +629,7 @@ fn selected_binary_is_resolved_after_approval_but_before_worktree_provisioning()
     std::fs::create_dir_all(&empty_path).unwrap();
     approve(&db_path);
 
-    let output = Command::new(bin())
+    let output = ironmem()
         .args([
             "autopilot",
             "run",
@@ -657,7 +668,7 @@ fn selected_binary_is_resolved_after_approval_but_before_worktree_provisioning()
 
     let unapproved_db = root.path().join("unapproved.sqlite3");
     Database::open(&unapproved_db).unwrap().migrate().unwrap();
-    let output = Command::new(bin())
+    let output = ironmem()
         .args([
             "autopilot",
             "run",
@@ -710,7 +721,7 @@ printf '%s\n' '{"verdict":"not_met","reason":"not done"}' > "$final"
 /bin/sleep 0.5
 "#,
     );
-    let output = Command::new(bin())
+    let output = ironmem()
         .args([
             "autopilot",
             "run",
@@ -778,7 +789,7 @@ printf '%s\n' '{"verdict":"not_met","reason":"not done"}' > "$final"
     );
 
     let repo_arg = format!("{REPO}={}", checkout.display());
-    let output = Command::new(bin())
+    let output = ironmem()
         .args([
             "autopilot",
             "lead",
@@ -839,7 +850,7 @@ exit 97
     std::fs::write(&dirty, "active process work\n").unwrap();
     let registration_before = std::fs::read_to_string(tree.path.join(".git")).unwrap();
     let branch_before = git(&tree.path, &["rev-parse", "--abbrev-ref", "HEAD"]).stdout;
-    let artifacts = codex_dispatch::prepare_artifacts(&tree.path, &issue).unwrap();
+    let artifacts = invocation::prepare_artifacts(&tree.path, &issue).unwrap();
 
     let child = Command::new(stubs.join("codex"))
         .args([
@@ -873,7 +884,7 @@ exit 97
     let state = DispatchState {
         implementer: Implementer::Codex,
         native_session_id: None,
-        codex_artifacts: Some(artifacts.clone()),
+        invocation_artifacts: Some(artifacts.clone()),
         issue: issue.clone(),
         worktree_path: tree.path.display().to_string(),
         ic_session_name: "ic-owner-repo-50".into(),
@@ -884,13 +895,16 @@ exit 97
         session_uuid: "controller-only".into(),
         turn_n: 0,
         session_claimed: false,
+        session_model: None,
+        resume_refusals: 0,
+        signing_held: false,
     };
     let db = Database::open(&db_path).unwrap();
     dispatch_state::upsert_dispatch_state(&db, &state).unwrap();
     let ledger_before =
         budget::reserve_unpriced_dispatch(&db, "2026-10-23", &artifacts.invocation_id).unwrap();
 
-    let output = Command::new(bin())
+    let output = ironmem()
         .args([
             "autopilot",
             "run",
@@ -977,7 +991,7 @@ fn public_run_rejects_wrong_persisted_harness_before_worktree_mutation() {
     let state = DispatchState {
         implementer: Implementer::Codex,
         native_session_id: Some("11111111-2222-3333-4444-555555555555".into()),
-        codex_artifacts: None,
+        invocation_artifacts: None,
         issue: issue.clone(),
         worktree_path: tree.path.display().to_string(),
         ic_session_name: "ic-owner-repo-51".into(),
@@ -988,11 +1002,14 @@ fn public_run_rejects_wrong_persisted_harness_before_worktree_mutation() {
         session_uuid: "controller-only".into(),
         turn_n: 1,
         session_claimed: true,
+        session_model: None,
+        resume_refusals: 0,
+        signing_held: false,
     };
     let db = Database::open(&db_path).unwrap();
     dispatch_state::upsert_dispatch_state(&db, &state).unwrap();
 
-    let output = Command::new(bin())
+    let output = ironmem()
         .args([
             "autopilot",
             "run",
@@ -1078,7 +1095,7 @@ exit 97
     let state = DispatchState {
         implementer: Implementer::Codex,
         native_session_id: Some("11111111-2222-3333-4444-555555555555".into()),
-        codex_artifacts: None,
+        invocation_artifacts: None,
         issue: issue.clone(),
         worktree_path: tree.path.display().to_string(),
         ic_session_name: "ic-owner-repo-52".into(),
@@ -1089,12 +1106,15 @@ exit 97
         session_uuid: "controller-only".into(),
         turn_n: 1,
         session_claimed: true,
+        session_model: None,
+        resume_refusals: 0,
+        signing_held: false,
     };
     let db = Database::open(&db_path).unwrap();
     dispatch_state::upsert_dispatch_state(&db, &state).unwrap();
 
     let repo_arg = format!("{REPO}={}", checkout.display());
-    let output = Command::new(bin())
+    let output = ironmem()
         .args([
             "autopilot",
             "lead",
@@ -1168,7 +1188,7 @@ fn clear_dispatch_refuses_a_live_invocation_and_releases_an_unprovable_dead_one(
     executable(&stubs.join("codex"), "#!/bin/sh\nexec /bin/sleep 30\n");
 
     let issue = IssueRef::new(REPO, 53);
-    let artifacts = codex_dispatch::prepare_artifacts(&checkout, &issue).unwrap();
+    let artifacts = invocation::prepare_artifacts(&checkout, &issue).unwrap();
     let child = Command::new(stubs.join("codex"))
         .args([
             "exec",
@@ -1201,7 +1221,7 @@ fn clear_dispatch_refuses_a_live_invocation_and_releases_an_unprovable_dead_one(
     let state = DispatchState {
         implementer: Implementer::Codex,
         native_session_id: None,
-        codex_artifacts: Some(artifacts.clone()),
+        invocation_artifacts: Some(artifacts.clone()),
         issue: issue.clone(),
         worktree_path: checkout.display().to_string(),
         ic_session_name: "ic-owner-repo-53".into(),
@@ -1212,6 +1232,9 @@ fn clear_dispatch_refuses_a_live_invocation_and_releases_an_unprovable_dead_one(
         session_uuid: "controller-only".into(),
         turn_n: 0,
         session_claimed: false,
+        session_model: None,
+        resume_refusals: 0,
+        signing_held: false,
     };
     let db = Database::open(&db_path).unwrap();
     dispatch_state::upsert_dispatch_state(&db, &state).unwrap();
@@ -1219,7 +1242,7 @@ fn clear_dispatch_refuses_a_live_invocation_and_releases_an_unprovable_dead_one(
         budget::reserve_unpriced_dispatch(&db, "2026-10-26", &artifacts.invocation_id).unwrap();
 
     let clear = || {
-        Command::new(bin())
+        ironmem()
             .args([
                 "autopilot",
                 "clear-dispatch",

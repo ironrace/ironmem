@@ -36,10 +36,16 @@ const REDACTED: &str = "[REDACTED]";
 static BEARER_TOKEN_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{8,}").unwrap());
 
+/// HTTP Basic credentials, including short user/password base64 encodings.
+static BASIC_TOKEN_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bBasic\s+[A-Za-z0-9+/=]{8,}").unwrap());
+
 /// GitHub personal-access/OAuth/server/refresh token prefixes:
-/// `ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_`.
-static GITHUB_TOKEN_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b").unwrap());
+/// `ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_`, and fine-grained personal access
+/// tokens (`github_pat_`, whose body holds `_`).
+static GITHUB_TOKEN_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{22,})\b").unwrap()
+});
 
 /// AWS access key ids (`AKIA...`) and STS session key ids (`ASIA...`).
 static AWS_KEY_RE: LazyLock<Regex> =
@@ -102,14 +108,51 @@ static ENTROPY_CANDIDATE_RE: LazyLock<Regex> =
 /// examples on both sides.
 const ENTROPY_THRESHOLD_BITS_PER_CHAR: f64 = 3.6;
 
+/// A URL's userinfo when it carries a password (`scheme://user:password@`):
+/// the scheme and host are kept, the whole userinfo redacted, since the user
+/// can be a token too (`x-access-token:…`, or a token with any password). A
+/// user with no password (`ssh://git@host`) is no credential and is left
+/// alone.
+///
+/// Neither part may hold what RFC 3986 keeps out of userinfo (whitespace,
+/// `/ ? # " < > \ ^ ` { | } [ ]`), so a URL with an unrelated `@` later on
+/// (`"http://localhost:8080","admin":"ops@example.com"`, or `?email=bob@…`)
+/// is not taken for one. The password may hold a raw `@`, and the match runs
+/// to the authority's last one, so `user:p@ss@host` leaks no `ss`. `,` and
+/// `)` stay allowed (a password may hold them), which over-redacts a URL
+/// ending at one before an unrelated `user@host`: the safe direction.
+static URL_PASSWORD_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?i)\b(?P<prefix>[a-z][a-z0-9+.-]*://)[^\s/?#@:"<>\\^`{|}\[\]]*:[^\s/?#"<>\\^`{|}\[\]]+@"#,
+    )
+    .unwrap()
+});
+
 /// Redact every recognizable credential-shaped substring in `input`.
 /// Returns the scrubbed text and whether anything was redacted.
 pub fn scrub_secrets(input: &str) -> (String, bool) {
+    let (text, redacted) = redact_credentials(input);
+    let (text, entropy_redacted) = redact_high_entropy_tokens(&text);
+    (text, redacted || entropy_redacted)
+}
+
+/// [`scrub_and_bound`] with only the credential shapes (layers 1 and 2, and a
+/// URL's password), not the generic high-entropy pass: for git's own stderr,
+/// whose paths and ref names (`autopilot/<owner-repo-n>`, a temp directory)
+/// that pass would take for secrets, leaving an error that names nothing.
+pub fn scrub_credentials_and_bound(input: &str, max_chars: usize) -> ScrubOutcome {
+    let (scrubbed, redacted) = redact_credentials(input);
+    bound(scrubbed, redacted, max_chars)
+}
+
+/// Layers 1 and 2 of the module doc, plus a URL's password.
+fn redact_credentials(input: &str) -> (String, bool) {
     let mut redacted = false;
     let mut text = input.to_string();
 
     for pattern in [
         &*BEARER_TOKEN_RE,
+        &*BASIC_TOKEN_RE,
         &*GITHUB_TOKEN_RE,
         &*AWS_KEY_RE,
         &*SLACK_TOKEN_RE,
@@ -121,6 +164,15 @@ pub fn scrub_secrets(input: &str) -> (String, bool) {
         }
     }
 
+    if URL_PASSWORD_RE.is_match(&text) {
+        redacted = true;
+        text = URL_PASSWORD_RE
+            .replace_all(&text, |caps: &Captures<'_>| {
+                format!("{}{REDACTED}@", &caps["prefix"])
+            })
+            .into_owned();
+    }
+
     if ASSIGNMENT_RE.is_match(&text) {
         redacted = true;
         text = ASSIGNMENT_RE
@@ -129,9 +181,6 @@ pub fn scrub_secrets(input: &str) -> (String, bool) {
             })
             .into_owned();
     }
-
-    let (text, entropy_redacted) = redact_high_entropy_tokens(&text);
-    redacted |= entropy_redacted;
 
     (text, redacted)
 }
@@ -153,6 +202,11 @@ pub struct ScrubOutcome {
 /// being sliced first and silently surviving as a fragment.
 pub fn scrub_and_bound(input: &str, max_chars: usize) -> ScrubOutcome {
     let (scrubbed, redacted) = scrub_secrets(input);
+    bound(scrubbed, redacted, max_chars)
+}
+
+/// `scrubbed` cut to `max_chars` characters.
+fn bound(scrubbed: String, redacted: bool, max_chars: usize) -> ScrubOutcome {
     let mut chars = scrubbed.chars();
     let bounded: String = chars.by_ref().take(max_chars).collect();
     let truncated = chars.next().is_some();
@@ -246,6 +300,20 @@ fn shannon_entropy_bits_per_char(s: &str) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn short_basic_credentials_are_scrubbed() {
+        for scheme in ["Basic", "basic", "BASIC"] {
+            let input = format!("Authorization: {scheme} dTpwYXNz");
+            assert_eq!(
+                scrub_secrets(&input),
+                ("Authorization: [REDACTED]".into(), true)
+            );
+            assert!(!scrub_credentials_and_bound(&input, 500)
+                .text
+                .contains("dTpwYXNz"));
+        }
+    }
 
     #[test]
     fn redacts_bearer_token() {
@@ -433,5 +501,133 @@ mod tests {
             "a plain constant/env-var name must not be treated as a secret"
         );
         assert_eq!(out, input);
+    }
+
+    /// git's stderr names paths and refs, which the entropy pass would take
+    /// for secrets; the credential scrub keeps them and still redacts the
+    /// credential shapes and a URL's `user:password@`.
+    #[test]
+    fn the_credential_scrub_keeps_paths_and_ref_names_but_not_credentials() {
+        let token = format!("ghp_{}", "a1B2c3D4e5".repeat(4));
+        let input = format!(
+            "fatal: a branch named 'autopilot/ironrace-ironmem-283' already exists in \
+             /private/var/folders/lv/sw669d7j7y9cl9x_ynl_qt2c0000gn/T/.tmpEZ6OPq; \
+             token {token}; remote https://deploy:hunter2pass@git.example.com/o/r.git"
+        );
+        let out = scrub_credentials_and_bound(&input, 10_000);
+        assert!(out.redacted, "{out:?}");
+        for kept in [
+            "autopilot/ironrace-ironmem-283",
+            "/private/var/folders/lv/sw669d7j7y9cl9x_ynl_qt2c0000gn/T/.tmpEZ6OPq",
+            "https://",
+            "@git.example.com/o/r.git",
+        ] {
+            assert!(out.text.contains(kept), "{kept} lost: {}", out.text);
+        }
+        for gone in [token.as_str(), "hunter2pass", "deploy:"] {
+            assert!(!out.text.contains(gone), "{gone} kept: {}", out.text);
+        }
+        let bounded = scrub_credentials_and_bound(&input, 10);
+        assert!(bounded.truncated && bounded.text.chars().count() == 10);
+    }
+
+    /// A URL's `user:password@` is a credential wherever it appears.
+    #[test]
+    fn redacts_a_url_password_in_the_full_scrub_too() {
+        let (out, redacted) = scrub_secrets("cloning https://deploy:hunter2@host/r failed");
+        assert!(redacted);
+        assert!(!out.contains("hunter2"), "{out}");
+        assert!(out.contains("https://") && out.contains("@host/r"), "{out}");
+    }
+
+    /// `ssh://git@host` names a user, not a password.
+    #[test]
+    fn keeps_a_url_user_with_no_password() {
+        let input = "ssh://git@github.com/o/r and git@github.com:o/r";
+        let (out, redacted) = scrub_secrets(input);
+        assert!(!redacted, "{out}");
+        assert_eq!(out, input);
+    }
+
+    /// What a URL's userinfo cannot hold (RFC 3986: no `/ ? # " < > \ ^ `
+    /// { | } [ ]`, nor whitespace) ends the match, so a URL followed by an
+    /// unrelated `@` elsewhere is not taken for `user:password@`.
+    #[test]
+    fn a_url_followed_by_an_unrelated_at_sign_is_untouched() {
+        for input in [
+            r#"{"url":"http://localhost:8080","admin":"ops@example.com"}"#,
+            "GET http://localhost:3000?email=bob@example.com 200",
+            "see http://localhost:3000 or mail me@x.com",
+            "https://github.com/foo:bar@baz",
+            "ssh://git@github.com/o/r",
+        ] {
+            let (out, redacted) = scrub_secrets(input);
+            assert!(!redacted, "{input} became {out}");
+            assert_eq!(out, input);
+        }
+    }
+
+    /// Every `user:password@` form is still redacted, through the last `@`
+    /// of the authority, so a password holding a raw `@` leaks nothing.
+    #[test]
+    fn every_url_password_form_is_redacted_in_full() {
+        for (input, expected) in [
+            ("https://user:p@ss@host/r", "https://[REDACTED]@host/r"),
+            ("https://deploy:hunter2@host/r", "https://[REDACTED]@host/r"),
+            (
+                "postgres://u:p@db:5432/x",
+                "postgres://[REDACTED]@db:5432/x",
+            ),
+            (
+                "redis://:s3cret@cache:6379",
+                "redis://[REDACTED]@cache:6379",
+            ),
+            (
+                "fatal: unable to access 'https://x:tok@github.com/o/r'",
+                "fatal: unable to access 'https://[REDACTED]@github.com/o/r'",
+            ),
+        ] {
+            let (out, redacted) = scrub_secrets(input);
+            assert!(redacted, "{input}");
+            assert_eq!(out, expected, "{input}");
+        }
+    }
+
+    /// Two over-redactions are accepted: `,` and `)` may appear in a
+    /// password (RFC 3986 sub-delims), so excluding them would leak a
+    /// password that holds one. A URL ending at one, followed later by an
+    /// unrelated `user@host`, is redacted up to that `@`: losing some text
+    /// is the safe direction for a scrub.
+    #[test]
+    fn a_url_ended_by_a_comma_or_parenthesis_is_over_redacted_by_design() {
+        for (input, expected) in [
+            (
+                "server=http://127.0.0.1:4000,owner=alice@corp.com",
+                "server=http://[REDACTED]@corp.com",
+            ),
+            (
+                "[link](http://localhost:8000)@bob",
+                "[link](http://[REDACTED]@bob",
+            ),
+        ] {
+            let (out, _) = scrub_secrets(input);
+            assert_eq!(out, expected, "{input}");
+        }
+    }
+
+    /// GitHub's fine-grained personal access tokens (`github_pat_…`), in the
+    /// credential-only scrub too, which has no entropy pass to fall back on.
+    #[test]
+    fn redacts_a_fine_grained_github_token() {
+        // Built so no literal token sits in source.
+        let token = format!("{}_pat_{}{}", "github", "11ABCDEFG0", "Xy".repeat(20));
+        let input = format!("remote: Invalid credentials {token} for o/r");
+        let out = scrub_credentials_and_bound(&input, 10_000);
+        assert!(out.redacted, "{out:?}");
+        assert!(!out.text.contains(&token), "{}", out.text);
+        assert!(!out.text.contains("_pat_"), "{}", out.text);
+        assert!(out.text.contains("for o/r"), "{}", out.text);
+        let (full, _) = scrub_secrets(&input);
+        assert!(!full.contains("_pat_"), "{full}");
     }
 }

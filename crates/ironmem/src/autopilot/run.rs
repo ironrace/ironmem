@@ -87,10 +87,11 @@ use std::path::Path;
 use crate::db::schema::Database;
 use crate::error::MemoryError;
 
-use super::codex_dispatch::{self, CodexArtifacts, CodexRecovery};
-use super::dispatch::{self, DispatchOutcome, DispatchSpec, SessionMode, Verdict};
-use super::implementer::Implementer;
-use super::worktree::Worktree;
+use super::dispatch::{self, DispatchOutcome, DispatchSpec, SessionMode, SessionRefusal, Verdict};
+use super::dispatch_state::DispatchPhase;
+use super::implementer::{Implementer, RESUME_REFUSALS_BEFORE_ROTATION};
+use super::invocation::{InvocationArtifacts, InvocationRecovery};
+use super::worktree::{self, Worktree};
 use super::{
     blocked, budget, dispatch_state, gate_config, lineage, remediate, supervise, today_utc,
     turn_prompt, IssueRef,
@@ -233,10 +234,7 @@ pub fn validate_implementation_model(
     implementer: Implementer,
     model: &str,
 ) -> Result<(), MemoryError> {
-    let harness = match implementer {
-        Implementer::Claude => "Claude",
-        Implementer::Codex => "Codex",
-    };
+    let harness = implementer.label();
     if model.trim().is_empty() {
         return Err(MemoryError::Validation(format!(
             "model must not be empty for the {harness} implementer"
@@ -247,15 +245,72 @@ pub fn validate_implementation_model(
             "model must not contain leading or trailing whitespace for the {harness} implementer"
         )));
     }
-    if implementer == Implementer::Codex && model.starts_with("claude-") {
+    // Refused here rather than first by `MuseCli::argv`, which keeps the same
+    // check: by then the worktree, branch and invocation directory exist.
+    if implementer == Implementer::Muse && !super::muse_dispatch::is_marker_safe(model) {
         return Err(MemoryError::Validation(format!(
-            "model '{model}' is incompatible with the Codex implementer; choose a Codex model"
+            "model {model:?} cannot be passed to the Muse implementer: it must contain no \
+             whitespace and not start with '-'"
         )));
     }
-    if implementer == Implementer::Claude && model.starts_with("gpt-") {
+    let foreign = match implementer {
+        Implementer::Claude => model.starts_with("gpt-") || model.starts_with("muse-"),
+        Implementer::Codex => model.starts_with("claude-") || model.starts_with("muse-"),
+        Implementer::Muse => model.starts_with("claude-") || model.starts_with("gpt-"),
+    };
+    if foreign {
         return Err(MemoryError::Validation(format!(
-            "model '{model}' is incompatible with the Claude implementer; choose a Claude model"
+            "model '{model}' is incompatible with the {harness} implementer; choose a {harness} model"
         )));
+    }
+    Ok(())
+}
+
+/// Refuse a worktree root the selected harness cannot dispatch under, before
+/// anything is provisioned beneath it.
+///
+/// Muse passes the issue worktree as `--workspace`, one word of the
+/// process-table marker grammar, so a root with whitespace would provision a
+/// branch and worktree that every dispatch then refuses. The worktree path is
+/// persisted resolved, so the resolved spelling is checked too.
+pub fn validate_worktree_root(implementer: Implementer, root: &Path) -> Result<(), MemoryError> {
+    validate_worktree_root_from(implementer, root, std::env::current_dir)
+}
+
+/// [`validate_worktree_root`] with a relative `root` read against `cwd()`.
+///
+/// A relative root that does not exist yet resolves to itself, so neither
+/// spelling would carry the working directory's whitespace; the worktree is
+/// still created beneath it. It is made absolute first. The working
+/// directory is read only for Muse, the only harness this check refuses, so
+/// an unreadable one never fails a Claude or Codex run here.
+fn validate_worktree_root_from(
+    implementer: Implementer,
+    root: &Path,
+    cwd: impl FnOnce() -> std::io::Result<std::path::PathBuf>,
+) -> Result<(), MemoryError> {
+    if implementer != Implementer::Muse {
+        return Ok(());
+    }
+    let absolute = if root.is_absolute() {
+        root.to_path_buf()
+    } else {
+        cwd()?.join(root)
+    };
+    for path in [absolute.clone(), worktree::canonical_or_self(&absolute)] {
+        let text = path.to_str().ok_or_else(|| {
+            MemoryError::Validation(format!(
+                "unsupported worktree root for the Muse implementer: {} is not UTF-8",
+                path.display()
+            ))
+        })?;
+        if text.chars().any(char::is_whitespace) {
+            return Err(MemoryError::Validation(format!(
+                "unsupported worktree root for the Muse implementer: {text:?} contains \
+                 whitespace; choose a --worktree-root without whitespace, because Muse's \
+                 --workspace is one word of the argv that process identity recovery parses"
+            )));
+        }
     }
     Ok(())
 }
@@ -334,23 +389,22 @@ impl RunConfig {
                 "daily_budget_usd must be a finite, positive number".into(),
             ));
         }
+        // Every harness uses the priced-spend-plus-ceiling start gate.
+        // Supervised harnesses reserve an unpriced unit, not these dollars.
+        if self.max_budget_usd > self.daily_budget_usd && self.implementer.recovers_invocations() {
+            return Err(MemoryError::Validation(format!(
+                "the {} priced-spend-plus-ceiling start gate cannot pass: raise \
+                 --daily-budget-usd to at least {} (no dollars are reserved by this harness)",
+                self.implementer.label(),
+                self.max_budget_usd
+            )));
+        }
         if self.max_budget_usd > self.daily_budget_usd {
-            // Codex has no --max-budget-usd, so naming it would send the
-            // operator after a flag the CLI refuses for this implementer.
-            return Err(MemoryError::Validation(match self.implementer {
-                Implementer::Claude => format!(
-                    "max_budget_usd ({}) exceeds daily_budget_usd ({}) — no dispatch could \
-                     ever be authorized",
-                    self.max_budget_usd, self.daily_budget_usd
-                ),
-                Implementer::Codex => format!(
-                    "daily_budget_usd ({}) is below the ${} every Codex dispatch reserves \
-                     before it starts — Codex reports no cost, so each invocation is \
-                     pre-authorized at that fixed ceiling. Raise --daily-budget-usd to at \
-                     least {}",
-                    self.daily_budget_usd, self.max_budget_usd, self.max_budget_usd
-                ),
-            }));
+            return Err(MemoryError::Validation(format!(
+                "max_budget_usd ({}) exceeds daily_budget_usd ({}) — no dispatch could \
+                 ever pass the priced-spend-plus-ceiling start gate; raise --daily-budget-usd",
+                self.max_budget_usd, self.daily_budget_usd
+            )));
         }
         Ok(())
     }
@@ -514,22 +568,52 @@ pub enum TerminalReason {
     /// `ironmem autopilot supervise --clear-escalation` retries it, exactly
     /// as `agent:exhausted` requires a human re-label.
     StrategyEscalated { signature: String },
+    /// The harness reported its session still in use after an invocation
+    /// finished: something still holds it. A retry can never succeed and a
+    /// fresh session could start a second implementer over the holder, so
+    /// the run stops on the first one and the state is parked as
+    /// `paused-session-in-use`, which the queue defers until an operator
+    /// clears it. `detail` says how.
+    SessionInUse { detail: String },
+}
+
+/// What a run's end does with the issue's dispatch-state drawer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Disposition {
+    /// Finished for the issue: cleared.
+    Clear,
+    /// "Paused, not finished": the session is kept under this phase, since
+    /// clearing would turn a resumable session into an orphan, which the
+    /// spec's restart table requires be flagged for a human rather than
+    /// silently adopted.
+    Park(DispatchPhase),
+    /// Left exactly as it is: it may name a live invocation.
+    Keep,
 }
 
 impl TerminalReason {
-    /// Whether the issue's dispatch-state drawer should be cleared. False for
-    /// the two "paused, not finished" reasons — clearing those would turn a
-    /// resumable session into an orphan, which the spec's restart table
-    /// requires be flagged for a human rather than silently adopted.
-    fn clears_dispatch_state(&self) -> bool {
-        !matches!(
-            self,
-            TerminalReason::ImplementationInFlight { .. }
-                | TerminalReason::DailyBudgetExhausted { .. }
-                | TerminalReason::InfrastructureFailure { .. }
-                | TerminalReason::StrategyEscalated { .. }
-                | TerminalReason::UnpricedDispatchesExhausted { .. }
-        )
+    /// What the run's end does with the dispatch state. Exhaustive, with no
+    /// wildcard: a new reason must say, since defaulting to a clear would
+    /// release the slot of a session that may still run.
+    fn disposition(&self) -> Disposition {
+        match self {
+            TerminalReason::ImplementationInFlight { .. } => Disposition::Keep,
+            TerminalReason::Met { .. }
+            | TerminalReason::AlreadySucceeded { .. }
+            | TerminalReason::AttemptCapExhausted
+            | TerminalReason::Impossible { .. } => Disposition::Clear,
+            TerminalReason::DailyBudgetExhausted { .. } => {
+                Disposition::Park(DispatchPhase::PausedDailyBudget)
+            }
+            TerminalReason::InfrastructureFailure { .. }
+            | TerminalReason::UnpricedDispatchesExhausted { .. }
+            | TerminalReason::StrategyEscalated { .. } => {
+                Disposition::Park(DispatchPhase::PausedInfrastructureFailure)
+            }
+            TerminalReason::SessionInUse { .. } => {
+                Disposition::Park(DispatchPhase::PausedSessionInUse)
+            }
+        }
     }
 }
 
@@ -563,8 +647,8 @@ pub struct IssueRun {
     pub total_cost_usd: f64,
     /// The issue's cumulative attempt count after the run.
     pub cumulative_attempt_n: u32,
-    /// Effective per-dispatch wall-clock bound. Codex uses the finite backend
-    /// default when the repo has none; Claude retains its optional repo bound.
+    /// Effective per-dispatch wall-clock bound. Supervised CLI harnesses (Codex,
+    /// Muse) use the finite backend default when the repo has none; Claude retains its optional repo bound.
     pub wall_clock_timeout_secs: Option<u64>,
 }
 
@@ -585,7 +669,10 @@ pub struct IssueRun {
 /// created no session, whereas one that ran and then produced no parseable
 /// result probably did, and re-supplying `--session-id` for a uuid that
 /// already exists fails. [`dispatch::run_dispatch`] follows this — it returns
-/// `NotFound` only from the `Command::output()` call itself.
+/// `NotFound` only from the `Command::output()` call itself. A started dispatch
+/// whose remaining processes cannot be proven complete must instead return
+/// `DispatchUnsettled`: it writes a durable operator hold, never an automatic
+/// infrastructure retry.
 pub trait Dispatcher {
     fn implementer(&self) -> Implementer {
         Implementer::Claude
@@ -595,8 +682,20 @@ pub trait Dispatcher {
         &mut self,
         _repo: &Path,
         _state: &DispatchState,
-    ) -> Result<CodexRecovery, MemoryError> {
-        Ok(CodexRecovery::NoPriorInvocation)
+    ) -> Result<InvocationRecovery, MemoryError> {
+        Ok(InvocationRecovery::NoPriorInvocation)
+    }
+
+    /// [`Dispatcher::recover`] for a state this run itself claimed, checked
+    /// again before its first launch: what may still be running needs less
+    /// proof than adopting another run's state does. By default the same
+    /// check; Claude's differs (see `claude_recovery_own`).
+    fn recover_own(
+        &mut self,
+        repo: &Path,
+        state: &DispatchState,
+    ) -> Result<InvocationRecovery, MemoryError> {
+        self.recover(repo, state)
     }
 
     fn dispatch(
@@ -622,6 +721,35 @@ impl ClaudeDispatcher {
 }
 
 impl Dispatcher for ClaudeDispatcher {
+    /// Whether the IC a Claude state names may be running, on a fresh
+    /// registry and process table. Claude leaves nothing to recover, so an
+    /// idle IC is [`InvocationRecovery::NoPriorInvocation`].
+    fn recover(
+        &mut self,
+        _repo: &Path,
+        state: &DispatchState,
+    ) -> Result<InvocationRecovery, MemoryError> {
+        // From a fixed neutral directory: neither the controller's own
+        // checkout nor the worktree, which the model can write.
+        let mut monitor = super::registry::HarnessProcessMonitor::in_dir(&std::env::temp_dir());
+        Ok(claude_recovery(
+            &super::registry::HarnessMonitor::snapshot(&mut monitor),
+            state,
+        ))
+    }
+
+    fn recover_own(
+        &mut self,
+        _repo: &Path,
+        state: &DispatchState,
+    ) -> Result<InvocationRecovery, MemoryError> {
+        let mut monitor = super::registry::HarnessProcessMonitor::in_dir(&std::env::temp_dir());
+        Ok(claude_recovery_own(
+            &super::registry::HarnessMonitor::snapshot(&mut monitor),
+            state,
+        ))
+    }
+
     fn dispatch(
         &mut self,
         repo: &Path,
@@ -631,40 +759,223 @@ impl Dispatcher for ClaudeDispatcher {
     }
 }
 
-/// Codex implementation backend. Process evidence is checked before durable
-/// artifacts; only trusted supervisor cleanup permits completed recovery.
-pub struct CodexDispatcher {
-    bin: std::path::PathBuf,
-}
-
-impl CodexDispatcher {
-    pub fn resolve() -> Result<Self, MemoryError> {
-        Ok(Self {
-            bin: crate::launcher::find_on_path(crate::launcher::Harness::Codex.binary())?,
-        })
+/// What fresh evidence says of the Claude IC `state` names, when a run is
+/// adopting another run's claim: alive when the registry lists it or a
+/// process names it with `--name` (a just-launched IC registers late);
+/// idle only when the registry is readable and does not list it AND the
+/// process table is readable and names it nowhere; otherwise uncertain.
+///
+/// The rule for adoption, which is stricter than clear-dispatch's: a run
+/// never adopts a Claude state on an unreadable registry, whereas
+/// `clear-dispatch`, an operator's action taken once the Leads are
+/// stopped, lets the process table decide when the registry cannot be read
+/// (see `clear::refusal`). A fresh launch, or a launch on this run's own
+/// claim, needs only the process table ([`claude_recovery_own`], D4):
+/// `claude agents --json` was measured never to list a running
+/// `claude -p` IC, so requiring it there made a broken or changed
+/// `claude agents` read every Claude issue as in flight for ever.
+fn claude_recovery(
+    snapshots: &super::registry::HarnessSnapshots,
+    state: &DispatchState,
+) -> InvocationRecovery {
+    let super::process_tree::ProcessSnapshot::Available(rows) = &snapshots.processes else {
+        return InvocationRecovery::Unknown {
+            reason: format!(
+                "whether its Claude IC runs cannot be checked: {}",
+                snapshots.processes.reason()
+            ),
+        };
+    };
+    if super::clear::claude_ic_holder(snapshots, rows, &state.issue, Some(&state.ic_session_name))
+        .is_some()
+    {
+        return InvocationRecovery::Alive;
+    }
+    match &snapshots.claude {
+        super::registry::RegistrySnapshot::Available(_) => InvocationRecovery::NoPriorInvocation,
+        super::registry::RegistrySnapshot::Unavailable { reason } => InvocationRecovery::Unknown {
+            reason: format!(
+                "Claude's session registry cannot be read ({reason}), and a run adopts a Claude \
+                 state only once a readable registry does not list its IC"
+            ),
+        },
     }
 }
 
+/// [`claude_recovery`] for a state this run itself claimed, checked before
+/// its first launch: only the process table decides. A process naming
+/// the IC with `--name` is alive; a readable process table naming it
+/// nowhere is idle, whatever the registry says; an unreadable process
+/// table is uncertain.
+fn claude_recovery_own(
+    snapshots: &super::registry::HarnessSnapshots,
+    state: &DispatchState,
+) -> InvocationRecovery {
+    let super::process_tree::ProcessSnapshot::Available(rows) = &snapshots.processes else {
+        return InvocationRecovery::Unknown {
+            reason: format!(
+                "whether its Claude IC runs cannot be checked: {}",
+                snapshots.processes.reason()
+            ),
+        };
+    };
+    // The name every Claude dispatch for the issue takes.
+    let ic_name = super::dispatch::ic_name(&state.issue);
+    let names = [state.ic_session_name.as_str(), ic_name.as_str()];
+    if super::clear::claude_ic_process_holder(rows, names.iter().copied()).is_some() {
+        return InvocationRecovery::Alive;
+    }
+    InvocationRecovery::NoPriorInvocation
+}
+
+/// The pre-Muse Codex dispatcher, kept, deprecated, until 0.7.0: a
+/// [`CliDispatcher`] for Codex with the old argument-free `resolve()`.
+#[deprecated(note = "use `CliDispatcher::resolve(Implementer::Codex)`; removal in 0.7.0")]
+pub struct CodexDispatcher(CliDispatcher);
+
+#[allow(deprecated)]
+impl CodexDispatcher {
+    /// `CliDispatcher::resolve(Implementer::Codex)`.
+    pub fn resolve() -> Result<Self, MemoryError> {
+        CliDispatcher::resolve(Implementer::Codex).map(Self)
+    }
+}
+
+#[allow(deprecated)]
 impl Dispatcher for CodexDispatcher {
     fn implementer(&self) -> Implementer {
-        Implementer::Codex
+        self.0.implementer()
+    }
+
+    fn recover(
+        &mut self,
+        repo: &Path,
+        state: &DispatchState,
+    ) -> Result<InvocationRecovery, MemoryError> {
+        self.0.recover(repo, state)
+    }
+
+    fn dispatch(
+        &mut self,
+        repo: &Path,
+        spec: &DispatchSpec,
+    ) -> Result<DispatchOutcome, MemoryError> {
+        self.0.dispatch(repo, spec)
+    }
+}
+
+/// A supervised CLI implementation backend (Codex, Muse). Process evidence is
+/// checked before durable artifacts; only trusted supervisor cleanup permits
+/// completed recovery.
+pub struct CliDispatcher {
+    implementer: Implementer,
+    bin: std::path::PathBuf,
+    /// The socket the operator's MCP proxies connect to, and so where one
+    /// autospawns the shared daemon (`harness::proxy_command_args` registers
+    /// `serve --connect` with this same `Config::daemon_socket_path`), with
+    /// the controller's own canonical executable, the binary that daemon
+    /// runs. `None` when that executable cannot be resolved: nothing is
+    /// then exempt from cleanup.
+    shared_daemon: Option<super::process_tree::SharedDaemon>,
+}
+
+impl CliDispatcher {
+    pub fn resolve(implementer: Implementer) -> Result<Self, MemoryError> {
+        super::invocation::cli_for(implementer)?;
+        let path_var = std::env::var_os("PATH").unwrap_or_default();
+        Ok(Self {
+            implementer,
+            bin: crate::launcher::find_launcher(
+                implementer.launcher_harness().binary(),
+                &path_var,
+            )?,
+            // The socket derives from the state directory and
+            // `IRONMEM_DAEMON_SOCKET`, never from a `--db` override.
+            shared_daemon: super::process_tree::SharedDaemon::for_current_exe(
+                shared_daemon_socket(crate::config::Config::load(None))?,
+            ),
+        })
+    }
+
+    /// Refuse work for another harness: `bin` is this dispatcher's binary,
+    /// and handing it another harness's argv or artifacts would run one CLI
+    /// as if it were the other.
+    fn check_harness(&self, other: Implementer) -> Result<(), MemoryError> {
+        if other == self.implementer {
+            return Ok(());
+        }
+        Err(MemoryError::Validation(format!(
+            "implementation harness mismatch: the {} dispatcher was handed a {} invocation",
+            self.implementer.label(),
+            other.label()
+        )))
+    }
+}
+
+/// A directory holding an executable `name`, and that directory spelled as a
+/// PATH entry relative to this process's working directory: the repository
+/// file a relative entry would reach.
+#[cfg(test)]
+pub(crate) fn planted_relative_path_entry(name: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+    let planted = tempfile::tempdir().unwrap();
+    let bin = planted.path().join(name);
+    std::fs::write(&bin, "#!/bin/sh\nsleep 1\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let cwd = std::env::current_dir().unwrap();
+    let up = "../".repeat(cwd.components().count().saturating_sub(1));
+    let relative = Path::new(&up).join(planted.path().strip_prefix("/").unwrap());
+    assert!(relative.join(name).exists());
+    (planted, relative)
+}
+
+/// The shared daemon's socket from a loaded config. Loading it parses every
+/// `IRONMEM_*` setting, so a failure here names what it was loaded for.
+fn shared_daemon_socket(
+    config: Result<crate::config::Config, MemoryError>,
+) -> Result<std::path::PathBuf, MemoryError> {
+    config
+        .map(|config| config.daemon_socket_path())
+        .map_err(|e| {
+            MemoryError::Validation(format!(
+                "cannot resolve the shared ironmem daemon socket, which supervised \
+                 implementer cleanup must spare, because the ironmem config failed to load: {e}"
+            ))
+        })
+}
+
+impl Dispatcher for CliDispatcher {
+    fn implementer(&self) -> Implementer {
+        self.implementer
     }
 
     fn recover(
         &mut self,
         _repo: &Path,
         state: &DispatchState,
-    ) -> Result<CodexRecovery, MemoryError> {
-        let snapshot =
-            super::codex_process::snapshot(&mut super::codex_process::UnixCodexProcesses);
-        match super::registry::codex_state_liveness(&snapshot, state) {
-            super::registry::Liveness::Alive => Ok(CodexRecovery::Alive),
-            super::registry::Liveness::NotListed => match state.codex_artifacts.as_ref() {
-                Some(artifacts) => codex_dispatch::recover_artifacts(Some(artifacts)),
-                None => Ok(CodexRecovery::NoPriorInvocation),
+    ) -> Result<InvocationRecovery, MemoryError> {
+        self.check_harness(state.implementer)?;
+        // recovery reads only artifacts under the worktree's common
+        // directory, where `prepare_artifacts` put them.
+        if let Some(artifacts) = &state.invocation_artifacts {
+            if let Err(reason) = artifacts.check_common_dir(Path::new(&state.worktree_path)) {
+                return Ok(InvocationRecovery::Unknown { reason });
+            }
+        }
+        let snapshot = super::process_tree::snapshot(&mut super::process_tree::UnixProcesses);
+        match super::registry::invocation_state_liveness(&snapshot, state) {
+            super::registry::Liveness::Alive => Ok(InvocationRecovery::Alive),
+            super::registry::Liveness::NotListed => match state.invocation_artifacts.as_ref() {
+                Some(artifacts) => {
+                    super::invocation::recover_artifacts(self.implementer, artifacts)
+                }
+                None => Ok(InvocationRecovery::NoPriorInvocation),
             },
-            super::registry::Liveness::Unknown => Ok(CodexRecovery::Unknown {
-                reason: super::registry::codex_state_reason(&snapshot, state),
+            super::registry::Liveness::Unknown => Ok(InvocationRecovery::Unknown {
+                reason: super::registry::invocation_state_reason(&snapshot, state),
             }),
         }
     }
@@ -674,7 +985,8 @@ impl Dispatcher for CodexDispatcher {
         repo: &Path,
         spec: &DispatchSpec,
     ) -> Result<DispatchOutcome, MemoryError> {
-        codex_dispatch::run_codex(&self.bin, repo, spec)
+        self.check_harness(spec.implementer)?;
+        super::invocation::run_supervised(&self.bin, repo, spec, self.shared_daemon.as_ref())
     }
 }
 
@@ -696,27 +1008,1203 @@ fn serialize_issue<S: serde::Serializer>(
     state.end()
 }
 
-/// The commit the worktree's branch currently points at, for the lineage
-/// record's `commit_sha`. Best-effort: an IC that satisfied a read-only gate
-/// without committing anything is a legitimate success, so an unreadable or
-/// commit-less HEAD degrades to `None` rather than failing a run that
-/// otherwise succeeded.
-fn head_commit(worktree: &Path) -> Option<String> {
-    let mut command = std::process::Command::new("git");
+/// The commit the issue branch (`refs/heads/<branch>`) points at, for the
+/// lineage record's `commit_sha`. It is the branch tip, not `HEAD`, because
+/// the PR is opened from the branch and the IC may have left `HEAD` on
+/// another checkout; it is the same tip the signing guard checked. Best-effort: an IC
+/// that satisfied a read-only gate without committing anything is a
+/// legitimate success, so an unreadable branch degrades to `None` rather than
+/// failing a run that otherwise succeeded.
+fn branch_tip(worktree: &Worktree) -> Option<String> {
+    read_branch_tip(&worktree.path, &worktree.branch).unwrap_or_else(|e| {
+        tracing::warn!(
+            error = %e,
+            branch = %worktree.branch,
+            "autopilot could not read the issue branch's tip; the attempt is recorded without \
+             its commit"
+        );
+        None
+    })
+}
+
+/// `refs/heads/<branch>`'s commit in `dir`: `Ok(None)` when no such branch
+/// exists (`rev-parse --verify --quiet` exits 1), `Err` when git could not
+/// be run or failed any other way.
+fn read_branch_tip(dir: &Path, branch: &str) -> Result<Option<String>, String> {
+    // Through the cached `find_launcher` resolution, like every git spawn.
+    let mut command = std::process::Command::new(crate::launcher::cached_launcher("git"));
     // An inherited `GIT_DIR` overrides `current_dir`, so without this the
     // commit recorded as an attempt's `commit_sha` could be another
-    // repository's HEAD — a wrong answer that looks exactly like a right one.
-    crate::mcp::tools::scrub_git_environment(&mut command);
+    // repository's — a wrong answer that looks exactly like a right one.
+    crate::git_env::scrub_git_environment(&mut command);
     let output = command
-        .args(["rev-parse", "HEAD"])
-        .current_dir(worktree)
+        .args([
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}^{{commit}}"),
+        ])
+        .current_dir(dir)
         .output()
-        .ok()?;
-    if !output.status.success() {
+        .map_err(|e| format!("git could not be run: {e}"))?;
+    match output.status.code() {
+        Some(0) => {
+            let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            Ok((!sha.is_empty()).then_some(sha))
+        }
+        Some(1) => Ok(None),
+        _ => Err(worktree::bounded_stderr(&output.stderr)),
+    }
+}
+
+/// How much of the model's own reason a `met` the guard refused keeps.
+const MODEL_REASON_CHARS: usize = 500;
+
+/// How many hex digits name a commit in a violation.
+const SHORT_SHA_CHARS: usize = 12;
+
+/// How long one signing-guard check may run, all its git commands together,
+/// before the running one is killed with its process group and the guard
+/// fails closed. One deadline for the whole check, so neither a long range
+/// nor the one-commit-at-a-time fallback can stretch it. Generous: a range of
+/// thousands of commits reads in well under a second.
+const SIGNING_GUARD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// How often [`GuardGit::run`] checks on its git process.
+const GUARD_GIT_POLL: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// The first `n` characters of `text`.
+fn prefix(text: &str, n: usize) -> String {
+    text.chars().take(n).collect()
+}
+
+/// What may hold a branch to the signing policy beyond its recorded flags:
+/// the policy as this run, or the interrupted run whose dispatch state it
+/// took over, read it at its start. A value rather than a bare `bool`, so each
+/// source names itself in the violation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SigningPolicySeen {
+    /// `commit.gpgsign` read `true` when this run started.
+    at_run_start: bool,
+    /// The dispatch state this run started from was written mid-dispatch
+    /// (not parked) by a run that saw the policy on
+    /// ([`DispatchState::signing_held`]). That memory survives a controller
+    /// crash, where the run's own does not, so it holds the `met` of the
+    /// invocation that run launched, recovered as finished; a fresh
+    /// dispatch is held by the branch flag recorded from it instead.
+    by_interrupted_run: bool,
+    /// The dispatch state this run started from is parked, and the run that
+    /// parked it saw the policy on. Carried forward: it holds this run's
+    /// fresh dispatches too, and this run's own states keep it, so a flag
+    /// that could not be written (another agent held the config lock) loses
+    /// nothing when a run pauses. An operator's opt-out of the branch
+    /// releases it.
+    by_parked_run: bool,
+}
+
+impl SigningPolicySeen {
+    /// What holds a fresh dispatch's `met`: everything but an interrupted
+    /// run's reading, which holds only its own recovered invocation.
+    fn fresh(self) -> Self {
+        Self {
+            by_interrupted_run: false,
+            ..self
+        }
+    }
+
+    /// What still holds a branch an operator opted out: only this run's
+    /// own reading, since this run is still going and saw it on.
+    fn opted_out(self) -> Self {
+        Self {
+            at_run_start: self.at_run_start,
+            ..Self::default()
+        }
+    }
+
+    /// The source that holds the branch, named for a reason, if any does.
+    fn holder(self) -> Option<&'static str> {
+        if self.at_run_start {
+            Some("the policy, which was on when this run started")
+        } else if self.by_interrupted_run {
+            Some("the policy, which was on when an interrupted run on this issue started")
+        } else if self.by_parked_run {
+            Some("the policy, which was on when an earlier run on this issue saw it, before it paused")
+        } else {
+            None
+        }
+    }
+}
+
+/// Why a `met` breaks the signing policy: the model's to fix, so the `met`
+/// becomes a failed attempt whose reason reaches the next turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SigningViolation {
+    /// `commit.gpgsign` was turned off while `holder` still holds the branch.
+    PolicyDisabled { holder: String },
+    /// The issue branch is gone, so nothing that ships can be checked.
+    MissingBranch { branch: String },
+    /// Commits on the branch are unsigned or carry a bad signature: short
+    /// shas, newest first, and the remotes the recipe force-pushes to, the
+    /// push clause's first; empty when none can be named.
+    Unsigned {
+        flagged: Vec<String>,
+        cut: String,
+        branch: String,
+        remotes: Vec<String>,
+    },
+}
+
+impl std::fmt::Display for SigningViolation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SigningViolation::PolicyDisabled { holder } => write!(
+                f,
+                "commit.gpgsign was turned off, but this branch is still held to signing by \
+                 {holder}. Restore it with `git config --unset commit.gpgsign` (or set it back \
+                 to true) and sign every commit. If signing fails in your environment, return \
+                 verdict impossible with the signing error; never bypass."
+            ),
+            SigningViolation::MissingBranch { branch } => write!(
+                f,
+                "commit.gpgsign is on, but the issue branch `{branch}` does not exist, so the \
+                 commits that ship cannot be checked. Recreate it at your work (`git checkout -B \
+                 {branch} <your last commit>`), with every commit signed."
+            ),
+            SigningViolation::Unsigned {
+                flagged,
+                cut,
+                branch,
+                remotes,
+            } => f.write_str(&unsigned_violation(flagged, cut, branch, remotes)),
+        }
+    }
+}
+
+/// Why the guard could not judge a `met`. Never the model's fault, so never
+/// an attempt; the `met` is still never accepted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GuardFault {
+    /// `commit.gpgsign`, or a flag recording it, cannot be read: an
+    /// operator's config fault that every later `met` would meet too.
+    PolicyUnreadable(String),
+    /// Unsigned commits are on the branch, but none was committed under this
+    /// run's identity: a collaborator's push the model is not to rewrite.
+    ForeignUnsigned {
+        commits: Vec<(String, String)>,
+        identity: String,
+    },
+    /// The recorded cut is not a full commit name, so it cannot bound the
+    /// range: on the right of `git log --not`, a value such as `--all`
+    /// would empty it and pass every commit. An operator's to fix.
+    CutInvalid(String),
+    /// git could not be run, or could not read the branch.
+    GitUnreadable(String),
+}
+
+impl GuardFault {
+    /// Whether every later dispatch's `met` would meet this fault too, so
+    /// the run stops before paying for another one.
+    fn stops_run(&self) -> bool {
+        !matches!(self, GuardFault::GitUnreadable(_))
+    }
+}
+
+impl std::fmt::Display for GuardFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GuardFault::PolicyUnreadable(why) => f.write_str(why),
+            GuardFault::ForeignUnsigned { commits, identity } => {
+                let named = commits
+                    .iter()
+                    .take(NAMED_UNSIGNED_COMMITS)
+                    .map(|(sha, committer)| format!("{sha} (committer {committer})"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let more = commits.len().saturating_sub(NAMED_UNSIGNED_COMMITS);
+                let more = if more > 0 {
+                    format!(" and {more} more")
+                } else {
+                    String::new()
+                };
+                write!(
+                    f,
+                    "commit.gpgsign is on, but commit(s) {named}{more} on this branch are \
+                     unsigned or carry a bad signature, and none was committed as this run's \
+                     identity: the commits name their committers above, and this run commits \
+                     as {identity}. So the model is not charged for them. If those are the \
+                     same person, the implementer committed under another identity. Re-sign \
+                     or drop them and push the branch, or opt it out of signing (see Commit \
+                     signing in docs/AUTOPILOT.md)"
+                )
+            }
+            GuardFault::CutInvalid(cut) => write!(
+                f,
+                "commit.gpgsign is on, but the branch's recorded cut {cut:?} is not a full \
+                 commit name, so the commits since it cannot be checked; set \
+                 `branch.<branch>.ironmemCut` to the commit the branch was cut from"
+            ),
+            GuardFault::GitUnreadable(why) => write!(
+                f,
+                "commit.gpgsign is on, but the branch's commit signatures could not be read: \
+                 {why}"
+            ),
+        }
+    }
+}
+
+/// The signing guard's git: every command bounded in time, with the
+/// signature programs pinned to the operator's own.
+///
+/// `%G?` makes git run `gpg.program`, `gpg.ssh.program` or
+/// `gpg.x509.program` here, in the controller, after the invocation's
+/// supervision has ended. The repository's `.git/config` is writable by the
+/// unconfined agent, so a program set there would run outside any bound. Each
+/// is pinned with `-c` to the operator's global or system value (git's
+/// default when neither sets one), and every command, with its process group,
+/// is killed after the timeout, failing the guard closed. Messages are read
+/// in the C locale, because one of them is matched.
+struct GuardGit<'a> {
+    repo: &'a Path,
+    timeout: std::time::Duration,
+    /// When the whole check must be done, shared by every command.
+    deadline: std::time::Instant,
+    pins: Vec<String>,
+    /// Variables removed from every command's environment (tests only).
+    unset_env: &'static [&'static str],
+}
+
+/// A set of config scopes already warned about (see
+/// [`warn_unreadable_scope_once`]).
+type WarnedScopes = std::sync::Mutex<std::collections::BTreeSet<&'static str>>;
+
+impl<'a> GuardGit<'a> {
+    fn new(repo: &'a Path, timeout: std::time::Duration) -> Result<Self, String> {
+        Self::build(repo, timeout, &[])
+    }
+
+    fn build(
+        repo: &'a Path,
+        timeout: std::time::Duration,
+        unset_env: &'static [&'static str],
+    ) -> Result<Self, String> {
+        Self::build_warning_into(repo, timeout, unset_env, &UNREADABLE_SCOPES_WARNED)
+    }
+
+    /// [`Self::build`], recording the scopes it warned about in `warned`
+    /// (the process-wide set, but for tests).
+    fn build_warning_into(
+        repo: &'a Path,
+        timeout: std::time::Duration,
+        unset_env: &'static [&'static str],
+        warned: &WarnedScopes,
+    ) -> Result<Self, String> {
+        #[cfg(test)]
+        GUARD_GITS_BUILT.with(|n| n.set(n.get() + 1));
+        let mut git = Self {
+            repo,
+            timeout,
+            deadline: std::time::Instant::now() + timeout,
+            pins: Vec::new(),
+            unset_env,
+        };
+        let (mut openpgp, mut ssh, mut x509) = ("gpg", "ssh-keygen", "gpgsm");
+        let mut read = Vec::new();
+        // System, then global: the order git reads them, so a later value wins.
+        for scope in ["--system", "--global"] {
+            let out = git.run(
+                &[
+                    "config",
+                    scope,
+                    "--includes",
+                    "--get-regexp",
+                    r"^gpg\..*program$",
+                ],
+                None,
+            )?;
+            match out.status.code() {
+                Some(0) => read.push(String::from_utf8_lossy(&out.stdout).into_owned()),
+                Some(1) => {} // none set in that scope
+                // Unreadable (`$HOME` unset under launchd exits 128): git's
+                // own defaults stand for that scope, never the repository's.
+                _ => {
+                    warn_unreadable_scope_once(
+                        warned,
+                        scope,
+                        &worktree::bounded_stderr(&out.stderr),
+                    );
+                }
+            }
+        }
+        for line in read.iter().flat_map(|text| text.lines()) {
+            let Some((key, value)) = line.split_once(' ') else {
+                continue;
+            };
+            match key {
+                "gpg.program" | "gpg.openpgp.program" => openpgp = value,
+                "gpg.ssh.program" => ssh = value,
+                "gpg.x509.program" => x509 = value,
+                _ => {}
+            }
+        }
+        git.pins = vec![
+            format!("gpg.program={openpgp}"),
+            format!("gpg.openpgp.program={openpgp}"),
+            format!("gpg.ssh.program={ssh}"),
+            format!("gpg.x509.program={x509}"),
+        ];
+        Ok(git)
+    }
+
+    /// Run git with `args`, writing `input` one line each to its stdin.
+    fn run(&self, args: &[&str], input: Option<&[&str]>) -> Result<std::process::Output, String> {
+        use std::process::Stdio;
+        let label = || format!("git {}", args.join(" "));
+        // Through the cached `find_launcher` resolution, like every git
+        // spawn; scrubbed here as the scan requires of a held name.
+        let mut command = std::process::Command::new(crate::launcher::cached_launcher("git"));
+        crate::git_env::scrub_git_environment(&mut command);
+        // No fetch of any kind: a missing object in a partial clone would
+        // otherwise be fetched through the repository's own transport config.
+        // `protocol.allow=never` alone is not enough, since the repository's
+        // `protocol.<name>.allow` overrides it per protocol;
+        // `GIT_ALLOW_PROTOCOL` overrides every `protocol.*` setting, and it
+        // names no real protocol here. `GIT_NO_REPLACE_OBJECTS` stops a
+        // `refs/replace/` ref (the agent can write one) from changing what a
+        // commit reads as.
+        command
+            .env("LC_ALL", "C")
+            .env("LANG", "C")
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .env("GIT_ALLOW_PROTOCOL", "ironmem-guard-allows-none")
+            .env("GIT_NO_REPLACE_OBJECTS", "1");
+        for key in self.unset_env {
+            command.env_remove(key);
+        }
+        command.args(["-c", "protocol.allow=never"]);
+        for pin in &self.pins {
+            command.arg("-c").arg(pin);
+        }
+        command
+            .args(args)
+            .current_dir(self.repo)
+            .stdin(if input.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+        let mut child = dispatch::retry_on_etxtbsy(|| command.spawn())
+            .map_err(|e| format!("{} could not run: {e}", label()))?;
+        // Written from another thread: git answers as it reads, so a writer
+        // that filled git's input before reading its output would deadlock on
+        // a long range.
+        let writer = match (input, child.stdin.take()) {
+            (Some(lines), Some(mut stdin)) => {
+                let text: String = lines.iter().map(|line| format!("{line}\n")).collect();
+                Some(std::thread::spawn(move || {
+                    std::io::Write::write_all(&mut stdin, text.as_bytes())
+                }))
+            }
+            _ => None,
+        };
+        let stdout = dispatch::drain(child.stdout.take());
+        let stderr = dispatch::drain(child.stderr.take());
+        let deadline = self.deadline;
+        // git is reaped only once it has exited and its pipes are closed.
+        // Until then its pid, and so the id of the group it leads, stays
+        // reserved, so the group can still be killed safely: a descendant
+        // git left behind can hold a pipe open, and a reaped leader's group
+        // id could already name someone else's group.
+        let finished = |handle: Option<&std::thread::JoinHandle<_>>| {
+            handle.is_none_or(std::thread::JoinHandle::is_finished)
+        };
+        loop {
+            let exited = dispatch::exited_unreaped(&mut child);
+            let closed = stdout.is_finished() && stderr.is_finished() && finished(writer.as_ref());
+            match exited {
+                Ok(true) if closed => break,
+                Ok(_) if std::time::Instant::now() < deadline => std::thread::sleep(GUARD_GIT_POLL),
+                waited => {
+                    dispatch::kill_process_group(&mut child);
+                    let _ = child.wait();
+                    return Err(match waited {
+                        Err(e) => format!("{} could not be waited on: {e}", label()),
+                        Ok(true) => format!(
+                            "{} exited but left its output open past {}s",
+                            label(),
+                            self.timeout.as_secs_f64()
+                        ),
+                        Ok(false) => format!(
+                            "{} did not finish within the guard's {}s and was killed",
+                            label(),
+                            self.timeout.as_secs_f64()
+                        ),
+                    });
+                }
+            }
+        }
+        let status = child
+            .wait()
+            .map_err(|e| format!("{} could not be waited on: {e}", label()))?;
+        let read = |handle| {
+            dispatch::drained(handle)
+                .map_err(|e| format!("{} output could not be read: {e}", label()))
+        };
+        let output = std::process::Output {
+            status,
+            stdout: read(stdout)?,
+            stderr: read(stderr)?,
+        };
+        match writer.map(std::thread::JoinHandle::join) {
+            None | Some(Ok(Ok(()))) => Ok(output),
+            // git stopping early (a 128 on a bad signature) cuts the write
+            // short, and its own status says so.
+            Some(Ok(Err(_))) if !output.status.success() => Ok(output),
+            Some(Ok(Err(e))) => Err(format!(
+                "{} succeeded without reading all its input: {e}",
+                label()
+            )),
+            Some(Err(_)) => Err(format!("{} input writer panicked", label())),
+        }
+    }
+}
+
+/// The config scopes whose unreadable signature programs were already
+/// reported, in this process.
+static UNREADABLE_SCOPES_WARNED: WarnedScopes =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// Warn that `scope`'s signature programs cannot be read, once per scope per
+/// process: a guard is built for every `met` and every run start, and an
+/// unset `$HOME` stays unset for the controller's life. Returns whether it
+/// warned.
+fn warn_unreadable_scope_once(warned: &WarnedScopes, scope: &'static str, error: &str) -> bool {
+    let first = warned
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(scope);
+    if first {
+        tracing::warn!(
+            scope,
+            error = %error,
+            "autopilot's commit-signing guard cannot read the operator's signature programs in \
+             this scope; git's defaults are used for it (warned once per process)"
+        );
+    }
+    first
+}
+
+/// Why the issue branch's commits break the repository's signing policy:
+/// `Ok(None)` when they keep it or there is no policy, `Ok(Some(violation))`
+/// for the model to fix, and `Err` when the guard could not judge them.
+///
+/// Measured 2026-10-26: Muse's sandboxed shell could not sign (`No user
+/// exists for uid 501`), and the model silently retried with
+/// `-c commit.gpgsign=false`. Any implementer can do that, so this is checked
+/// for every harness. `%G?` is not a reliable signed/unsigned test (it reads
+/// `U` or `N` for a valid SSH signature without `gpg.ssh.allowedSignersFile`),
+/// so presence comes from the commit's `gpgsig` (or, in a SHA-256 repository,
+/// `gpgsig-sha256`) header and `%G?` only flags `B`, a bad signature.
+///
+/// The commits checked are the ones that ship: everything reachable from the
+/// issue branch (`refs/heads/<branch>`, never `HEAD`, which the IC may have
+/// left elsewhere) and from its own remote-tracking refs
+/// (`refs/remotes/<remote>/<branch>` for each configured remote: what was
+/// pushed and what the PR is opened from), but not from the cut
+/// ([`Worktree::cut`], recorded once when the branch was made) nor from any
+/// other remote-tracking ref. So upstream commits the agent merges or rebases
+/// in are never blamed on it, an earlier dispatch's bypass stays caught after
+/// it is pushed (or after the local branch is reset), and a moving operator
+/// checkout cannot shrink or widen the range. A missing issue branch is a
+/// violation: nothing that ships can be checked.
+///
+/// A flagged commit is the model's only when it was committed as this run's
+/// identity (`git var GIT_COMMITTER_IDENT`, or the controller's
+/// `GIT_COMMITTER_EMAIL`). One a collaborator pushed is still never accepted,
+/// but it is [`GuardFault::ForeignUnsigned`], not the model's failed attempt:
+/// fixing it means rewriting their commit. An identity that cannot be read
+/// counts every commit as the model's. This assumes an implementer commits
+/// as the operator: measured 2026-10-27 on two real Muse commits, whose
+/// committer was exactly the worktree's `git var GIT_COMMITTER_IDENT`.
+/// Codex is unmeasured; it runs with the same inherited configuration and
+/// the same scrubbed `GIT_*` environment, so it is assumed to match. A
+/// mismatch never lets a `met` through: it only stops the run instead of
+/// charging an attempt, and the stop names both identities.
+///
+/// In a mixed range, where some flagged commits are the model's and some a
+/// collaborator's, the violation names them all, the collaborator's
+/// included, and the `met` is the model's failed attempt: fail closed, since
+/// every one of them would ship unsigned.
+///
+/// The policy is enforced when it was on at this run's start (`seen`), when
+/// the branch or the repository recorded it on ([`worktree::record_signing`],
+/// at creation and at each run's start), or when it is on now; an enforced
+/// policy that is now off is a violation of its own, across runs.
+///
+/// The flags survive a deliberate operator change to `commit.gpgsign` too. To
+/// stop enforcing on a branch, run `git config branch.<branch>.ironmemSigning
+/// false` (with the policy off).
+///
+/// `Err` is never the model's fault: the caller makes it an infrastructure
+/// failure, which never counts as `met` and consumes no attempt, and stops
+/// the run on one that every later `met` would meet too
+/// ([`GuardFault::stops_run`]).
+///
+/// This catches a lazy or accidental bypass, not deliberate tampering. An
+/// unconfined agent could just as well opt its branch out, rewrite
+/// `branch.<branch>.ironmemCut` to hide earlier commits, push its commits to
+/// another remote branch (every remote-tracking ref but the issue branch's
+/// own is excluded via `--remotes`), commit under another identity, or sign
+/// with a throwaway key.
+fn signing_violation(
+    worktree: &Worktree,
+    seen: SigningPolicySeen,
+    repo: &str,
+    implementer: Implementer,
+) -> Result<Option<SigningViolation>, GuardFault> {
+    check_signing(worktree, seen, repo, implementer, SIGNING_GUARD_TIMEOUT)
+}
+
+/// The controller's `GIT_COMMITTER_EMAIL`, when `implementer` inherits it
+/// and so may commit under it ([`Implementer::inherits_controller_git_env`]).
+fn controller_git_email(implementer: Implementer) -> Option<String> {
+    controller_git_email_from(implementer, &|key| std::env::var(key).ok())
+}
+
+/// [`controller_git_email`], with the environment read through `env`.
+fn controller_git_email_from(
+    implementer: Implementer,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Option<String> {
+    implementer
+        .inherits_controller_git_env()
+        .then(|| env("GIT_COMMITTER_EMAIL"))
+        .flatten()
+}
+
+/// [`signing_violation`], with all its git commands bounded by `timeout`.
+fn check_signing(
+    worktree: &Worktree,
+    seen: SigningPolicySeen,
+    repo: &str,
+    implementer: Implementer,
+    timeout: std::time::Duration,
+) -> Result<Option<SigningViolation>, GuardFault> {
+    if let std::ops::ControlFlow::Break(answer) = policy_gate(worktree, seen)? {
+        return Ok(answer);
+    }
+    let git = GuardGit::new(&worktree.path, timeout).map_err(GuardFault::GitUnreadable)?;
+    check_range(
+        worktree,
+        &git,
+        Some(repo),
+        controller_git_email(implementer).as_deref(),
+    )
+}
+
+/// The signing policy's part of [`signing_violation`]: `Break` with the
+/// answer when the policy is off, `Continue` when it is on and the branch's
+/// range is to be read.
+fn policy_gate(
+    worktree: &Worktree,
+    seen: SigningPolicySeen,
+) -> Result<std::ops::ControlFlow<Option<SigningViolation>>, GuardFault> {
+    match worktree::signing_policy(&worktree.path) {
+        Err(why) => Err(GuardFault::PolicyUnreadable(format!(
+            "commit.gpgsign could not be read: {why}"
+        ))),
+        Ok(false) => {
+            let holder = match worktree::signing_holder(&worktree.path, &worktree.branch)
+                .map_err(GuardFault::PolicyUnreadable)?
+            {
+                worktree::SigningHold::Held(holder) => Some(holder),
+                // An operator's opt-out releases what an interrupted run
+                // saw, but not a run that is still going and saw it on.
+                worktree::SigningHold::OptedOut => seen.opted_out().holder().map(str::to_string),
+                worktree::SigningHold::NotHeld => seen.holder().map(str::to_string),
+            };
+            Ok(std::ops::ControlFlow::Break(
+                holder.map(|holder| SigningViolation::PolicyDisabled { holder }),
+            ))
+        }
+        Ok(true) => Ok(std::ops::ControlFlow::Continue(())),
+    }
+}
+
+/// The range part of [`signing_violation`], with the policy on: every
+/// command through `git`, so within its one deadline.
+fn check_range(
+    worktree: &Worktree,
+    git: &GuardGit<'_>,
+    repo: Option<&str>,
+    controller_email: Option<&str>,
+) -> Result<Option<SigningViolation>, GuardFault> {
+    let unreadable = GuardFault::GitUnreadable;
+    let branch = worktree.branch.as_str();
+    let local = format!("refs/heads/{branch}");
+    let probe = git
+        .run(
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("{local}^{{commit}}"),
+            ],
+            None,
+        )
+        .map_err(unreadable)?;
+    match probe.status.code() {
+        Some(0) => {}
+        Some(1) => {
+            return Ok(Some(SigningViolation::MissingBranch {
+                branch: branch.to_string(),
+            }))
+        }
+        _ => return Err(unreadable(worktree::bounded_stderr(&probe.stderr))),
+    }
+    let read = |args: &[&str]| -> Result<String, GuardFault> {
+        let out = git.run(args, None).map_err(unreadable)?;
+        if !out.status.success() {
+            return Err(unreadable(worktree::bounded_stderr(&out.stderr)));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    };
+    // The issue branch's own remote-tracking refs: exactly
+    // `refs/remotes/<remote>/<branch>` for a configured remote, so a ref
+    // such as `origin/x/<branch>` (another branch) is never taken for it.
+    let configured = read(&["remote"])?;
+    let configured: Vec<&str> = configured.lines().map(str::trim).collect();
+    let refs = read(&["for-each-ref", "--format=%(refname)", "refs/remotes/"])?;
+    let refs: std::collections::HashSet<&str> = refs.lines().collect();
+    let own: Vec<(&str, String)> = configured
+        .iter()
+        .filter_map(|remote| {
+            let refname = format!("refs/remotes/{remote}/{branch}");
+            refs.contains(refname.as_str())
+                .then_some((*remote, refname))
+        })
+        .collect();
+    // `--no-show-signature` on every `git log`: an operator's
+    // `log.showSignature=true` prints verification lines ahead of each
+    // signed commit, even under `--format`. Listing without `%G?` also keeps
+    // a commit whose signature git cannot parse from failing the whole range
+    // (`%G?` exits 128 on it); that commit is judged on its own below.
+    let mut args = vec![
+        "log".to_string(),
+        "--no-show-signature".into(),
+        "--topo-order".into(),
+        "--format=%H %ce".into(),
+        local.clone(),
+    ];
+    args.extend(own.iter().map(|(_, refname)| refname.clone()));
+    // The cut is checked where it is made; checked again before it reaches
+    // `--not`, where anything but a commit name could empty the range.
+    if !is_full_object_name(worktree.cut.as_str()) {
+        return Err(GuardFault::CutInvalid(prefix(worktree.cut.as_str(), 80)));
+    }
+    // Every ref ending in the branch is kept out of the negated set, not only
+    // the configured remotes' own: a lookalike can only hide commits there.
+    args.extend([
+        "--not".into(),
+        worktree.cut.to_string(),
+        format!("--exclude=*/{branch}"),
+        "--remotes".into(),
+    ]);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    // Children before parents, so the last one flagged has no flagged ancestor.
+    let listed = read(&args)?;
+    let commits: Vec<(&str, &str)> = listed
+        .lines()
+        .filter_map(|line| {
+            let (sha, committer) = line.trim().split_once(' ').unwrap_or((line.trim(), ""));
+            is_full_object_name(sha).then_some((sha, committer))
+        })
+        .collect();
+    let shas: Vec<&str> = commits.iter().map(|(sha, _)| *sha).collect();
+    // Every commit object in one read, so a long range costs two git
+    // processes rather than two per commit.
+    let headers = git
+        .run(&["cat-file", "--batch"], Some(&shas))
+        .map_err(unreadable)?;
+    if !headers.status.success() {
+        return Err(unreadable(worktree::bounded_stderr(&headers.stderr)));
+    }
+    let has_header = signature_headers(&headers.stdout, &shas).map_err(unreadable)?;
+    let with_header: Vec<&str> = shas
+        .iter()
+        .zip(&has_header)
+        .filter_map(|(sha, has)| has.then_some(*sha))
+        .collect();
+    // `%G?` for every commit that carries a header, in one read. A signature
+    // git cannot even parse fails that whole read with 128, so those ranges
+    // are read one commit at a time, where the failure names its commit.
+    let mut statuses = std::collections::HashMap::new();
+    if !with_header.is_empty() {
+        let batch = git
+            .run(
+                &[
+                    "log",
+                    "--no-walk",
+                    "--stdin",
+                    "--no-show-signature",
+                    "--format=%H %G?",
+                ],
+                Some(&with_header),
+            )
+            .map_err(unreadable)?;
+        match batch.status.code() {
+            Some(0) => statuses = signature_statuses(&batch.stdout),
+            Some(128) => {}
+            _ => return Err(unreadable(worktree::bounded_stderr(&batch.stderr))),
+        }
+    }
+    let mut flagged = Vec::new();
+    for ((sha, committer), has) in commits.iter().zip(has_header) {
+        let signed = has
+            && match statuses.get(*sha) {
+                Some(status) => status != "B",
+                None => {
+                    let one = git
+                        .run(
+                            &["log", "-1", "--no-show-signature", "--format=%G?", sha],
+                            None,
+                        )
+                        .map_err(unreadable)?;
+                    signature_kept(&one).map_err(unreadable)?
+                }
+            };
+        if !signed {
+            flagged.push((prefix(sha, SHORT_SHA_CHARS), *committer));
+        }
+    }
+    if flagged.is_empty() {
+        return Ok(None);
+    }
+    let identity = run_identity(git, controller_email).map_err(unreadable)?;
+    let own_commit = |committer: &str| {
+        identity
+            .as_ref()
+            .is_none_or(|emails| emails.iter().any(|e| e.eq_ignore_ascii_case(committer)))
+    };
+    if !flagged.iter().any(|(_, committer)| own_commit(committer)) {
+        return Err(GuardFault::ForeignUnsigned {
+            commits: flagged
+                .into_iter()
+                .map(|(sha, committer)| (sha, committer.to_string()))
+                .collect(),
+            identity: identity.unwrap_or_default().join(" or "),
+        });
+    }
+    // The recipe force-pushes where `recipe_remotes` says. A remote list
+    // that cannot be read is said so, and the recipe names only the holders.
+    let listing = match git.run(&["remote", "-v"], None) {
+        Ok(out) if out.status.success() => Ok(String::from_utf8_lossy(&out.stdout).into_owned()),
+        Ok(out) => Err(worktree::bounded_stderr(&out.stderr)),
+        Err(e) => Err(e),
+    };
+    if let Err(e) = &listing {
+        tracing::warn!(
+            error = %e,
+            branch = %branch,
+            "autopilot's signing guard could not read `git remote -v`; the recipe names only \
+             the remotes holding the branch"
+        );
+    }
+    let holding: Vec<&str> = own.iter().map(|(remote, _)| *remote).collect();
+    let push_to = recipe_remotes(listing.as_deref().ok(), &configured, &holding, repo);
+    Ok(Some(SigningViolation::Unsigned {
+        flagged: flagged.into_iter().map(|(sha, _)| sha).collect(),
+        cut: worktree.cut.to_string(),
+        branch: branch.to_string(),
+        remotes: push_to,
+    }))
+}
+
+/// Where a signing violation's recipe force-pushes the branch: first where
+/// the goal condition's push clause pushes (`worktree::pick_push_remote`,
+/// with the issue's repo), then to every other remote holding the issue
+/// branch, since the guard reads each and one left with the old commits keeps
+/// it failing. `listing` is `git remote -v`; `None` when it could not be
+/// read, when the push clause's remote cannot be told and only the holders
+/// are named.
+fn recipe_remotes(
+    listing: Option<&str>,
+    configured: &[&str],
+    holding: &[&str],
+    repo: Option<&str>,
+) -> Vec<String> {
+    let mut push_to: Vec<String> = match listing {
+        Some(listing) => {
+            let listed = worktree::remote_push_urls(listing);
+            let remotes: Vec<(&str, &[&str])> = configured
+                .iter()
+                .map(|remote| {
+                    let urls = listed
+                        .iter()
+                        .find(|(name, _)| name == remote)
+                        .map_or(&[][..], |(_, urls)| urls.as_slice());
+                    (*remote, urls)
+                })
+                .collect();
+            worktree::pick_push_remote(&remotes, holding, repo)
+                .map(str::to_string)
+                .into_iter()
+                .collect()
+        }
+        None => Vec::new(),
+    };
+    for remote in holding {
+        if !push_to.iter().any(|named| named == remote) {
+            push_to.push(remote.to_string());
+        }
+    }
+    push_to
+}
+
+/// Run-start collaborator checks already found clean, by worktree and
+/// branch: the [`range_key`] each was judged on. In this process only, so a
+/// Lead re-checks an unchanged branch once, not on every tick.
+static CLEAN_AT_START: std::sync::Mutex<
+    std::collections::BTreeMap<(std::path::PathBuf, String), String>,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+#[cfg(test)]
+thread_local! {
+    /// How many run-start checks read the range in full, on this thread.
+    static START_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// How many [`GuardGit`]s were built, each with its own deadline, on
+    /// this thread.
+    static GUARD_GITS_BUILT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// A fault at a run's start that would turn away any `met` the run
+/// produced: a collaborator's unsigned commit on the branch, or a recorded
+/// cut that cannot bound the range (any [`GuardFault::stops_run`]). The range
+/// is read in full only when something it depends on changed since it was
+/// last found clean: every ref tip, the remotes, the cut, the policy, the
+/// identity and the pinned signature programs ([`range_key`]). The key and
+/// the check share one [`GuardGit`], so one deadline. Fail closed: a key
+/// that cannot be read is never cached, and a fault is never remembered as
+/// clean. A git that cannot be run is not a reason to refuse here; the
+/// guard meets it again at the `met`, where it is never accepted.
+fn collaborator_check_at_start(
+    worktree: &Worktree,
+    seen: SigningPolicySeen,
+    implementer: Implementer,
+) -> Option<GuardFault> {
+    let slot = (worktree.path.clone(), worktree.branch.clone());
+    let cache = || CLEAN_AT_START.lock().unwrap_or_else(|e| e.into_inner());
+    let git = match GuardGit::new(&worktree.path, SIGNING_GUARD_TIMEOUT) {
+        Ok(git) => git,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                branch = %worktree.branch,
+                "autopilot's run-start signing check could not set up git; the met will \
+                 judge the branch again"
+            );
+            cache().remove(&slot);
+            return None;
+        }
+    };
+    let controller_email = controller_git_email(implementer);
+    let key = match range_key(worktree, &git, controller_email.as_deref()) {
+        Ok(key) => Some(key),
+        Err(e) => {
+            tracing::debug!(
+                error = %e,
+                branch = %worktree.branch,
+                "autopilot could not read what the run-start signing check depends on, so \
+                 it reads the range in full"
+            );
+            None
+        }
+    };
+    if key.is_some() && cache().get(&slot) == key.as_ref() {
         return None;
     }
-    let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    (!sha.is_empty()).then_some(sha)
+    #[cfg(test)]
+    START_CHECKS.with(|n| n.set(n.get() + 1));
+    let verdict = match policy_gate(worktree, seen) {
+        Ok(std::ops::ControlFlow::Break(answer)) => Ok(answer),
+        // Only a fault matters here, so the recipe needs no issue repo.
+        Ok(std::ops::ControlFlow::Continue(())) => {
+            check_range(worktree, &git, None, controller_email.as_deref())
+        }
+        Err(fault) => Err(fault),
+    };
+    match verdict {
+        Err(fault) if fault.stops_run() => {
+            cache().remove(&slot);
+            Some(fault)
+        }
+        Err(fault) => {
+            tracing::warn!(
+                error = %fault,
+                branch = %worktree.branch,
+                "autopilot's run-start signing check could not read the branch; the met will \
+                 judge it again"
+            );
+            cache().remove(&slot);
+            None
+        }
+        Ok(_) => {
+            if let Some(key) = key {
+                cache().insert(slot, key);
+            }
+            None
+        }
+    }
+}
+
+/// Everything the collaborator check's answer depends on, as one string,
+/// read through the check's own `git`.
+fn range_key(
+    worktree: &Worktree,
+    git: &GuardGit<'_>,
+    controller_email: Option<&str>,
+) -> Result<String, String> {
+    let read = |args: &[&str]| -> Result<String, String> {
+        let out = git.run(args, None)?;
+        if !out.status.success() {
+            return Err(worktree::bounded_stderr(&out.stderr));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    };
+    let refs = read(&[
+        "for-each-ref",
+        "--format=%(objectname) %(refname)",
+        &format!("refs/heads/{}", worktree.branch),
+        "refs/remotes/",
+    ])?;
+    let remotes = read(&["remote"])?;
+    // The ident without its timestamp, which changes every second.
+    let ident = read(&["var", "GIT_COMMITTER_IDENT"])?;
+    let ident = ident.split_once('>').map_or("", |(who, _)| who);
+    let policy = worktree::signing_policy(&worktree.path)?;
+    Ok(format!(
+        "{refs}\0{remotes}\0{ident}\0{:?}\0{}\0{policy}\0{:?}",
+        controller_email, worktree.cut, git.pins
+    ))
+}
+
+/// The committer emails this run's commits carry: the worktree's
+/// `git var GIT_COMMITTER_IDENT`, plus `controller_email`, the controller's
+/// own `GIT_COMMITTER_EMAIL` when the implementer inherits it
+/// ([`controller_git_email`]). `Ok(None)` when git ran and named no email
+/// and there is no controller email: every flagged commit then counts as
+/// this run's. `Err` when git could not be run or failed, which is the
+/// guard's fault, never the model's.
+fn run_identity(
+    git: &GuardGit<'_>,
+    controller_email: Option<&str>,
+) -> Result<Option<Vec<String>>, String> {
+    let out = git.run(&["var", "GIT_COMMITTER_IDENT"], None)?;
+    if !out.status.success() {
+        return Err(worktree::bounded_stderr(&out.stderr));
+    }
+    let mut emails = Vec::new();
+    let ident = String::from_utf8_lossy(&out.stdout);
+    if let Some((_, rest)) = ident.split_once('<') {
+        if let Some((email, _)) = rest.split_once('>') {
+            if !email.trim().is_empty() {
+                emails.push(email.trim().to_string());
+            }
+        }
+    }
+    if let Some(email) = controller_email.map(str::trim).filter(|e| !e.is_empty()) {
+        emails.push(email.to_string());
+    }
+    if emails.is_empty() {
+        tracing::warn!(
+            "autopilot's signing guard read no committer email, so every flagged commit counts \
+             as this run's"
+        );
+    }
+    Ok((!emails.is_empty()).then_some(emails))
+}
+
+/// Whether one commit's own `git log -1 --format=%G?` read keeps its
+/// signature: `true` unless it reads `B`, or git refused it as a signature it
+/// cannot parse (the commit's fault, flagged like a bad one). Any other
+/// failure is the guard's, not the commit's.
+fn signature_kept(out: &std::process::Output) -> Result<bool, String> {
+    match out.status.code() {
+        Some(0) => Ok(String::from_utf8_lossy(&out.stdout).trim() != "B"),
+        Some(128)
+            if String::from_utf8_lossy(&out.stderr).contains("bad/incompatible signature") =>
+        {
+            Ok(false)
+        }
+        _ => Err(worktree::bounded_stderr(&out.stderr)),
+    }
+}
+
+/// From `git cat-file --batch` output for `shas` (in that order), whether
+/// each commit carries a signature header. Anything but one commit object
+/// per requested name, in order, is unreadable rather than guessed at.
+fn signature_headers(mut out: &[u8], shas: &[&str]) -> Result<Vec<bool>, String> {
+    let mut found = Vec::with_capacity(shas.len());
+    for sha in shas {
+        let newline = out
+            .iter()
+            .position(|&b| b == b'\n')
+            .ok_or_else(|| format!("cat-file ended before {sha}"))?;
+        let header = String::from_utf8_lossy(&out[..newline]).into_owned();
+        let mut words = header.split(' ');
+        let (name, kind, size) = (words.next(), words.next(), words.next());
+        if name != Some(sha) || kind != Some("commit") {
+            return Err(format!(
+                "cat-file answered {:?} for commit {sha}",
+                prefix(&header, 120)
+            ));
+        }
+        let size: usize = size
+            .and_then(|size| size.parse().ok())
+            .ok_or_else(|| format!("cat-file gave no size for {sha}"))?;
+        let body = out
+            .get(newline + 1..newline + 1 + size)
+            .ok_or_else(|| format!("cat-file output for {sha} is truncated"))?;
+        found.push(has_signature_header(&String::from_utf8_lossy(body)));
+        out = out.get(newline + 2 + size..).unwrap_or_default();
+    }
+    Ok(found)
+}
+
+/// `%G?` per commit from `git log --format='%H %G?'`. Only lines that are an
+/// object name and one status letter count, so stray verification output can
+/// never be read as a status; a commit missing here is read on its own.
+fn signature_statuses(out: &[u8]) -> std::collections::HashMap<String, String> {
+    String::from_utf8_lossy(out)
+        .lines()
+        .filter_map(|line| {
+            let (sha, status) = line.trim().split_once(' ')?;
+            (is_full_object_name(sha) && status.len() == 1)
+                .then(|| (sha.to_string(), status.to_string()))
+        })
+        .collect()
+}
+
+/// Whether `text` is a full object name: 40 hex digits, or 64 in a SHA-256
+/// repository. Anything else in `git log` output is not a commit to check.
+fn is_full_object_name(text: &str) -> bool {
+    matches!(text.len(), 40 | 64) && text.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Whether a raw commit object carries a signature header: `gpgsig`, or
+/// `gpgsig-sha256` in a SHA-256 repository. Only the header block counts.
+fn has_signature_header(commit_object: &str) -> bool {
+    commit_object
+        .lines()
+        .take_while(|l| !l.is_empty())
+        .any(|l| l.starts_with("gpgsig ") || l.starts_with("gpgsig-sha256 "))
+}
+
+/// How many flagged commits a violation names before counting the rest.
+const NAMED_UNSIGNED_COMMITS: usize = 5;
+
+/// The longest a signing violation may be: a third of the turn prompt's
+/// budget, so its prior-attempt line, beside the model's bounded reason,
+/// fits with the prompt's fixed text rather than being dropped.
+const MAX_VIOLATION_CHARS: usize = turn_prompt::MAX_CONDITION_CHARS / 3;
+
+/// How many remotes a signing violation's recipe names before it says how
+/// many more hold the branch.
+const NAMED_REMOTES: usize = 3;
+
+/// The violation for `flagged` short shas, newest first. The recipe re-signs
+/// only those commits, on the issue `branch`: rebasing from the cut would
+/// rewrite the upstream commits merged in, which the guard deliberately does
+/// not blame. It is a plain rebase, not `--rebase-merges`: that would also
+/// re-pick, and so rewrite, the upstream commits on a merged-in side, so a
+/// merge is redone by hand instead.
+///
+/// It then force-pushes the branch by name to each of `remotes`: first the
+/// push clause's remote, then every other remote holding the branch, since
+/// the guard checks each one (up to [`NAMED_REMOTES`] named, the rest
+/// counted). With none, it says `<remote>` and tells the IC to use the
+/// remote of the issue's repository. However long the remote names are, it
+/// stays within [`MAX_VIOLATION_CHARS`]: the other holders are only counted
+/// when naming them would not fit, then it says `<remote>` instead.
+fn unsigned_violation(flagged: &[String], cut: &str, branch: &str, remotes: &[String]) -> String {
+    let mut list = flagged
+        .iter()
+        .take(NAMED_UNSIGNED_COMMITS)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if flagged.len() > NAMED_UNSIGNED_COMMITS {
+        list.push_str(&format!(
+            " and {} more",
+            flagged.len() - NAMED_UNSIGNED_COMMITS
+        ));
+    }
+    let oldest = flagged.last().map(String::as_str).unwrap_or_default();
+    let short_cut = prefix(cut, SHORT_SHA_CHARS);
+    let render = |push: &str| {
+        format!(
+            "commit.gpgsign is on, but commit(s) {list} on this branch since its cut {short_cut} \
+             are unsigned or carry a bad signature. Re-sign only these commits, never upstream \
+             ones merged in. First `git checkout {branch}`. Then, if only the tip is flagged, \
+             `git commit --amend --no-edit -S`; otherwise `git rebase --exec 'git commit --amend \
+             --no-edit -S' {oldest}^`. If a merge commit is flagged or lies in that rebase's \
+             range, redo the merge (signed) instead of rebasing over it. Then {push}. If signing \
+             fails in your environment, return verdict impossible with the signing error; never \
+             bypass with -c commit.gpgsign=false, --no-gpg-sign, or by changing git config."
+        )
+    };
+    // Remote names have no length limit, so the push step loses detail
+    // until the recipe fits its budget: every holder named (up to
+    // NAMED_REMOTES), then the others only counted, then not even the push
+    // clause's remote named. The last always fits: the rest of the recipe is
+    // bounded (NAMED_UNSIGNED_COMMITS, a short cut, a branch name derived
+    // from GitHub's longest repository name).
+    let unnamed = match remotes {
+        [] | [_] => format!(
+            "`git push --force-with-lease <remote> {branch}`, naming the remote of the issue's \
+             repository"
+        ),
+        _ => format!(
+            "`git push --force-with-lease <remote> {branch}` to each remote holding it, the \
+             issue's repository's first (`git branch -r`)"
+        ),
+    };
+    let mut steps = Vec::new();
+    match remotes {
+        [] => {}
+        [remote] => steps.push(format!("`git push --force-with-lease {remote} {branch}`")),
+        [first, rest @ ..] => {
+            let named = rest
+                .iter()
+                .take(NAMED_REMOTES - 1)
+                .map(|remote| format!("`{remote}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let more = match rest.len().saturating_sub(NAMED_REMOTES - 1) {
+                0 => String::new(),
+                n => format!(" and {n} more (`git branch -r`)"),
+            };
+            steps.push(format!(
+                "`git push --force-with-lease {first} {branch}`, then the same to each other \
+                 remote holding it (every one is checked): {named}{more}"
+            ));
+            steps.push(format!(
+                "`git push --force-with-lease {first} {branch}`, then the same to each other \
+                 remote holding it (every one is checked; `git branch -r`)"
+            ));
+        }
+    }
+    steps
+        .iter()
+        .map(|push| render(push))
+        .find(|recipe| recipe.chars().count() <= MAX_VIOLATION_CHARS)
+        .unwrap_or_else(|| render(&unnamed))
 }
 
 /// The prior-attempt context the turn prompt shows the IC, newest-last, so a
@@ -767,11 +2255,33 @@ fn why_failed_text(outcome: &DispatchOutcome, classification: DispatchClassifica
     }
 }
 
+/// The lineage `approach` and `why_failed` for a `met` the signing guard
+/// refused. The violation goes in `why_failed` only, and the model's own
+/// reason, bounded by [`MODEL_REASON_CHARS`], is the approach: written into
+/// both, a long violation made the prior-attempt line too long for the next
+/// turn's prompt, which then dropped it and never said why the `met` failed.
+fn refused_met_record(violation: &str, original: Option<String>) -> (String, String) {
+    let approach = match original {
+        Some(original) if !original.trim().is_empty() => prefix(&original, MODEL_REASON_CHARS),
+        _ => "reported the gate met, giving no reason".to_string(),
+    };
+    (
+        approach,
+        format!("the commit-signing guard refused the met: {violation}"),
+    )
+}
+
 /// Persist one attempt: the append-only lineage record plus the issue's
 /// current-state drawer, whose `cumulative_attempt_n` is the spec's
-/// cross-dispatch stagnation counter. `prior` is the issue's status as read
-/// *before* this attempt, which is what makes the no-downgrade rule below
-/// possible.
+/// cross-dispatch stagnation counter, and with them the run's next dispatch
+/// state (`then`; `None` clears it).
+///
+/// All in one `BEGIN IMMEDIATE` transaction that first checks the drawer
+/// still holds `owned`, the state this run last wrote: a run another took
+/// the issue over from records nothing (`Ok(false)`), so its stale outcome
+/// can neither append an attempt nor overwrite the status the other run
+/// records, and two runs recovering one finished invocation record it once.
+/// The status it improves on is read inside the transaction too.
 ///
 /// `best_verdict`/`best_commit_sha` are never downgraded: once an issue has
 /// recorded a success, a later failed attempt (a re-run, a follow-up fix
@@ -780,62 +2290,122 @@ fn why_failed_text(outcome: &DispatchOutcome, classification: DispatchClassifica
 fn record_and_advance(
     db: &Database,
     record: &AttemptRecord,
-    prior: Option<&IssueStatus>,
-    recoverable_codex: bool,
-) -> Result<(), MemoryError> {
-    // Codex can replay durable artifacts after a crash between the append-only
-    // attempt and current-status writes. Complete that same ordinal instead
-    // of appending it twice. Terminal summaries are markers, not attempts.
-    let existing = if recoverable_codex {
-        lineage::attempts_for_issue(db, &record.issue)?
-            .into_iter()
-            .find(|attempt| {
-                attempt.attempt_n == record.attempt_n && !is_terminal_summary(&attempt.approach)
-            })
-    } else {
-        None
-    };
-    if existing
-        .as_ref()
-        .is_some_and(|attempt| attempt.verdict != record.verdict)
-    {
-        return Err(MemoryError::Validation(
-            "recovered Codex verdict conflicts with the already recorded attempt ordinal".into(),
-        ));
-    }
-    if existing.is_none() {
-        lineage::record_attempt(db, record)?;
-    }
-    let record = existing.as_ref().unwrap_or(record);
-
+    recovering_harness: Option<Implementer>,
+    owned: &mut Option<dispatch_state::Claim>,
+    then: Option<dispatch_state::Claim>,
+) -> Result<bool, MemoryError> {
     let issue = &record.issue;
-    let verdict = record.verdict;
-    let prior_success =
-        prior.and_then(|status| status.best_verdict) == Some(AttemptOutcome::Success);
-    let (best_verdict, best_commit_sha) = if verdict == AttemptOutcome::Success {
-        (Some(AttemptOutcome::Success), record.commit_sha.clone())
-    } else if prior_success {
-        (
-            Some(AttemptOutcome::Success),
-            prior.and_then(|status| status.best_commit_sha.clone()),
-        )
-    } else {
-        (
-            Some(AttemptOutcome::Failed),
-            prior.and_then(|status| status.best_commit_sha.clone()),
-        )
-    };
+    let recorded = db.with_immediate_transaction(|tx| {
+        if !dispatch_state::claim_is_tx(tx, issue, owned.as_ref())? {
+            return Ok(false);
+        }
+        // A recovering harness (Codex, Muse) can replay durable artifacts
+        // after a crash between the append-only attempt and current-status
+        // writes. Complete that same ordinal instead of appending it twice.
+        // Terminal summaries are markers, not attempts. Reads through `db`
+        // see this transaction: it is the same connection.
+        let existing = if recovering_harness.is_some() {
+            recorded_attempt(db, issue, record.attempt_n)?
+        } else {
+            None
+        };
+        if existing
+            .as_ref()
+            .is_some_and(|attempt| attempt.verdict != record.verdict)
+        {
+            let Some(harness) = recovering_harness else {
+                unreachable!("only a recovering harness looks up an existing ordinal");
+            };
+            debug_assert!(harness.recovers_invocations());
+            let label = harness.label();
+            return Err(MemoryError::Validation(format!(
+                "recovered {label} verdict conflicts with the already recorded attempt ordinal"
+            )));
+        }
+        if existing.is_none() {
+            lineage::record_attempt_tx(tx, record)?;
+        }
+        let record = existing.as_ref().unwrap_or(record);
 
-    lineage::upsert_issue_status(
-        db,
-        &IssueStatus {
-            issue: issue.clone(),
-            best_verdict,
-            best_commit_sha,
-            cumulative_attempt_n: record.attempt_n,
-        },
-    )?;
-    Ok(())
+        let prior = lineage::get_issue_status(db, issue)?;
+        let prior = prior.as_ref();
+        let verdict = record.verdict;
+        let prior_success =
+            prior.and_then(|status| status.best_verdict) == Some(AttemptOutcome::Success);
+        let (best_verdict, best_commit_sha) = if verdict == AttemptOutcome::Success {
+            (Some(AttemptOutcome::Success), record.commit_sha.clone())
+        } else if prior_success {
+            (
+                Some(AttemptOutcome::Success),
+                prior.and_then(|status| status.best_commit_sha.clone()),
+            )
+        } else {
+            (
+                Some(AttemptOutcome::Failed),
+                prior.and_then(|status| status.best_commit_sha.clone()),
+            )
+        };
+        lineage::upsert_issue_status_tx(
+            tx,
+            &IssueStatus {
+                issue: issue.clone(),
+                best_verdict,
+                best_commit_sha,
+                cumulative_attempt_n: record.attempt_n,
+            },
+        )?;
+        match &then {
+            Some(next) => dispatch_state::write_claim_tx(tx, next)?,
+            None => {
+                if owned.is_some() {
+                    dispatch_state::delete_claim_tx(tx, issue)?;
+                }
+            }
+        }
+        Ok(true)
+    })?;
+    if recorded {
+        // A finished run's claim is gone, so no later clear prunes for
+        // it: old invocation directories age out here, keeping the one
+        // just recorded (F52's completed-issue case).
+        if then.is_none() {
+            if let Some(claim) = owned.as_ref() {
+                if let Some(common) = &claim.common_dir {
+                    let keep = claim
+                        .state
+                        .invocation_artifacts
+                        .as_ref()
+                        .map(|a| a.invocation_id.as_str());
+                    if let Err(e) = super::invocation::prune_invocations(
+                        Path::new(common),
+                        &issue.slug(),
+                        keep,
+                        super::invocation::INVOCATION_RETENTION,
+                    ) {
+                        tracing::warn!(
+                            error = %e,
+                            issue = %issue.canonical(),
+                            "autopilot could not prune old invocation directories"
+                        );
+                    }
+                }
+            }
+        }
+        *owned = then;
+    }
+    Ok(recorded)
+}
+
+/// The attempt already recorded at ordinal `attempt_n`, if any. Attempt-cap
+/// terminal summaries are markers, not attempts, so they never match.
+fn recorded_attempt(
+    db: &Database,
+    issue: &IssueRef,
+    attempt_n: u32,
+) -> Result<Option<AttemptRecord>, MemoryError> {
+    Ok(lineage::attempts_for_issue(db, issue)?
+        .into_iter()
+        .find(|attempt| attempt.attempt_n == attempt_n && !is_terminal_summary(&attempt.approach)))
 }
 
 /// Opening words of the attempt-cap terminal record's `approach`. A const
@@ -871,6 +2441,7 @@ pub fn is_terminal_summary(approach: &str) -> bool {
 /// carried separately only for the message, since `attempt_n` is the lifetime
 /// number and sits above the cap after a retry, a remediation, or a cap
 /// lowered between runs.
+#[cfg(test)]
 pub(super) fn record_terminal_summary(
     db: &Database,
     issue: &IssueRef,
@@ -878,6 +2449,45 @@ pub(super) fn record_terminal_summary(
     attempt_cap: u32,
     attempts: &[PriorAttempt],
 ) -> Result<(), MemoryError> {
+    if let Some(record) = terminal_summary(issue, attempt_n, attempt_cap, attempts) {
+        lineage::record_attempt(db, &record)?;
+    }
+    Ok(())
+}
+
+/// [`record_terminal_summary`] for a run, only while it still owns the
+/// issue (`owned`; see `record_and_advance`): the lineage it reads and the
+/// summary it appends share one `BEGIN IMMEDIATE` transaction with that
+/// check. `Ok(false)`, writing nothing, when another run took the issue
+/// over.
+fn record_terminal_summary_owned(
+    db: &Database,
+    issue: &IssueRef,
+    attempt_n: u32,
+    attempt_cap: u32,
+    owned: Option<&dispatch_state::Claim>,
+) -> Result<bool, MemoryError> {
+    db.with_immediate_transaction(|tx| {
+        if !dispatch_state::claim_is_tx(tx, issue, owned)? {
+            return Ok(false);
+        }
+        // Read through `db`, the transaction's own connection.
+        let attempts = prior_attempts(db, issue)?;
+        if let Some(record) = terminal_summary(issue, attempt_n, attempt_cap, &attempts) {
+            lineage::record_attempt_tx(tx, &record)?;
+        }
+        Ok(true)
+    })
+}
+
+/// The terminal record to append, or `None` when one already covers
+/// `attempt_n`.
+fn terminal_summary(
+    issue: &IssueRef,
+    attempt_n: u32,
+    attempt_cap: u32,
+    attempts: &[PriorAttempt],
+) -> Option<AttemptRecord> {
     // Written once, not once per invocation. An exhausted issue is a stable
     // state that a polling Lead re-reads every pass, and each terminal
     // record's summary quotes every attempt before it — including earlier
@@ -895,7 +2505,7 @@ pub(super) fn record_terminal_summary(
         .iter()
         .any(|a| is_terminal_summary(&a.approach) && a.attempt_n >= attempt_n)
     {
-        return Ok(());
+        return None;
     }
     let summary = if attempts.is_empty() {
         "no attempts recorded".to_string()
@@ -916,21 +2526,17 @@ pub(super) fn record_terminal_summary(
             .join("\n")
     };
 
-    lineage::record_attempt(
-        db,
-        &AttemptRecord {
-            issue: issue.clone(),
-            attempt_n,
-            approach: format!(
-                "{TERMINAL_SUMMARY_PREFIX} ({attempt_cap}) reached; this record summarizes \
-                 every attempt and is a marker, not a further attempt"
-            ),
-            verdict: AttemptOutcome::Failed,
-            why_failed: Some(summary),
-            commit_sha: None,
-        },
-    )?;
-    Ok(())
+    Some(AttemptRecord {
+        issue: issue.clone(),
+        attempt_n,
+        approach: format!(
+            "{TERMINAL_SUMMARY_PREFIX} ({attempt_cap}) reached; this record summarizes \
+             every attempt and is a marker, not a further attempt"
+        ),
+        verdict: AttemptOutcome::Failed,
+        why_failed: Some(summary),
+        commit_sha: None,
+    })
 }
 
 /// The repo's approved gate commands, or an error naming the exact next
@@ -973,8 +2579,24 @@ pub fn validate_dispatch_owner(
     issue: &IssueRef,
     implementer: Implementer,
 ) -> Result<Option<DispatchState>, MemoryError> {
-    let state = dispatch_state::get_dispatch_state(db, issue)?;
-    if let Some(state) = &state {
+    Ok(validate_dispatch_claim(db, issue, implementer)?.map(|claim| claim.state))
+}
+
+/// [`validate_dispatch_owner`], with the token of the run that wrote the
+/// state.
+fn validate_dispatch_claim(
+    db: &Database,
+    issue: &IssueRef,
+    implementer: Implementer,
+) -> Result<Option<dispatch_state::Claim>, MemoryError> {
+    let claim = dispatch_state::get_claim(db, issue)?;
+    if let Some(dispatch_state::Claim { state, .. }) = &claim {
+        if state.phase() == Some(DispatchPhase::PausedCompletionUnproven) {
+            return Err(MemoryError::Validation(format!(
+                "completion is unproven for {}; inspect and stop leftover tool processes, then use ironmem autopilot clear-dispatch {} {}; automatic retry is refused",
+                issue.canonical(), issue.repo, issue.number
+            )));
+        }
         if state.implementer != implementer {
             return Err(MemoryError::Validation(format!(
                 "implementation harness mismatch: persisted {:?}, configured {:?}; resume with \
@@ -984,10 +2606,10 @@ pub fn validate_dispatch_owner(
             )));
         }
     }
-    Ok(state)
+    Ok(claim)
 }
 
-/// Refuse unsafe worktree provisioning for a persisted Codex dispatch.
+/// Refuse unsafe worktree provisioning for a persisted supervised CLI dispatch.
 ///
 /// A dirty worktree may belong to a still-running process. Quarantining it
 /// before checking the persisted invocation would move that process's cwd and
@@ -1007,32 +2629,238 @@ pub fn preflight_worktree_provisioning(
             dispatcher.implementer()
         )));
     }
-    let Some(state) = validate_dispatch_owner(db, issue, implementer)? else {
+    let Some(claim) = validate_dispatch_claim(db, issue, implementer)? else {
         return Ok(());
     };
-    if !implementer.recovers_invocations() {
+    let state = &claim.state;
+    // A leased Claude claim's run may be between its claim and its
+    // launch: refuse before provisioning, so `ensure_worktree` never
+    // quarantines its worktree.
+    if !implementer.recovers_invocations() && claim.leased(chrono::Utc::now()) {
+        return Err(MemoryError::Validation(format!(
+            "cannot provision {} while another run's claim is within its {}s lease \
+             (claimed {}, and a recently ended run reads the same way); it is \
+             left to that run",
+            issue.canonical(),
+            dispatch_state::CLAIM_LEASE.as_secs(),
+            claim.age_phrase(chrono::Utc::now()).unwrap_or_default()
+        )));
+    }
+    // A parked Claude state's run has ended; any other may be one still
+    // running, whose IC the dispatcher looks for.
+    if !implementer.recovers_invocations() && state.is_parked() {
         return Ok(());
     }
-    match dispatcher.recover(Path::new(&state.worktree_path), &state)? {
-        CodexRecovery::Alive => Err(MemoryError::Validation(format!(
-            "cannot provision {} while its Codex implementation is still alive",
-            issue.canonical()
-        ))),
-        CodexRecovery::Unknown { reason } => Err(MemoryError::Validation(format!(
-            "cannot provision {} while Codex process completion is uncertain: {reason}; \
-             once no process remains, `ironmem autopilot clear-dispatch {} {}` releases it",
+    match dispatcher.recover(Path::new(&state.worktree_path), state)? {
+        InvocationRecovery::Alive => Err(MemoryError::Validation(format!(
+            "cannot provision {} while its {} implementation is still alive",
             issue.canonical(),
-            issue.repo,
-            issue.number
+            implementer.label()
         ))),
-        CodexRecovery::Finished(_) => Ok(()),
-        CodexRecovery::NoPriorInvocation if state.codex_artifacts.is_none() => Ok(()),
-        CodexRecovery::NoPriorInvocation => Err(MemoryError::Validation(
-            "Codex recovery returned no invocation for persisted artifacts; process completion \
-             is unproven"
-                .into(),
-        )),
+        InvocationRecovery::Unknown { reason } => Err(MemoryError::Validation(format!(
+            "cannot provision {} while {} process completion is uncertain: {reason}; {}",
+            issue.canonical(),
+            implementer.label(),
+            release_hint(issue, state.invocation_artifacts.as_ref())
+        ))),
+        InvocationRecovery::Finished(_) => Ok(()),
+        InvocationRecovery::NoPriorInvocation if state.invocation_artifacts.is_none() => Ok(()),
+        InvocationRecovery::NoPriorInvocation => Err(MemoryError::Validation(format!(
+            "{} recovery returned no invocation for persisted artifacts; process completion \
+             is unproven",
+            implementer.label()
+        ))),
     }
+}
+
+/// How a held supervised invocation is released. One held only because its
+/// worktree was not quiet finishes by itself; any other needs the operator
+/// to confirm nothing is running first.
+fn release_hint(issue: &IssueRef, artifacts: Option<&InvocationArtifacts>) -> String {
+    // an exit record that exists but cannot be read is said so,
+    // rather than letting the hint call the invocation missing.
+    if let Some(unreadable) = artifacts.and_then(super::invocation::exit_record_unreadable) {
+        return format!(
+            "{unreadable}; once no process remains, `ironmem autopilot clear-dispatch {} {}` \
+             releases it",
+            issue.repo, issue.number
+        );
+    }
+    if artifacts.is_some_and(super::invocation::is_awaiting_quiet) {
+        format!(
+            "a later Lead tick or `ironmem autopilot run` finishes it once nothing it started \
+             remains in the worktree; `ironmem autopilot clear-dispatch {} {}` is the manual \
+             release",
+            issue.repo, issue.number
+        )
+    } else {
+        format!(
+            "once no process remains, `ironmem autopilot clear-dispatch {} {}` releases it",
+            issue.repo, issue.number
+        )
+    }
+}
+
+/// What a run refused at its start (before recovery) leaves behind, said
+/// for the harness and the dispatch state it found: only a supervised
+/// harness's pending invocation is recovered.
+fn kept_at_start(implementer: Implementer, state: Option<&DispatchState>) -> &'static str {
+    match state {
+        Some(state)
+            if implementer.recovers_invocations() && state.invocation_artifacts.is_some() =>
+        {
+            "a pending invocation for this issue is kept and will be recovered once this is \
+             fixed; do not clear-dispatch it"
+        }
+        Some(_) => {
+            "the issue's dispatch state is left as it is, and the next run after the fix \
+             continues from it"
+        }
+        None => "nothing was written, so the next run after the fix starts the issue afresh",
+    }
+}
+
+/// What a run stopped after a dispatch by a guard fault leaves behind. The
+/// fault turns a `met` away, so the dispatch returned a verdict: Claude has
+/// already rotated its session by then
+/// ([`Implementer::rotates_session_after_verdict`]).
+fn kept_mid_run(implementer: Implementer) -> &'static str {
+    match implementer {
+        Implementer::Codex | Implementer::Muse => {
+            "the finished invocation is kept, and the first run after the fix checks its met \
+             again; do not clear-dispatch it"
+        }
+        Implementer::Claude => {
+            "the met's commits stay on the branch (state `infrastructure-failure`), and the next \
+             run after the fix opens a fresh session, whose met is checked again"
+        }
+    }
+}
+
+/// The error of a run that found the issue's dispatch state changed since it
+/// last wrote (or read) it: another run took the issue over.
+fn taken_over(issue: &IssueRef) -> MemoryError {
+    MemoryError::Validation(format!(
+        "another run took over {} after this one started (its dispatch state changed), so \
+         this run launches and writes nothing more; the other run's state is left as it is",
+        issue.canonical()
+    ))
+}
+
+/// A Claude dispatch's dollar ceiling reserved on a date
+/// ([`budget::reserve_spend_if_within`]) until its cost is known. One left
+/// unsettled (a `?` return, a panic) is released when dropped, so an
+/// unwound run never keeps the day's total inflated.
+struct ReservedSpend<'a> {
+    db: &'a Database,
+    date: String,
+    id: String,
+    settled: bool,
+}
+
+impl<'a> ReservedSpend<'a> {
+    fn new(db: &'a Database, date: String, id: String) -> Self {
+        Self {
+            db,
+            date,
+            id,
+            settled: false,
+        }
+    }
+
+    /// Replace the reservation with the measured cost, or release it.
+    fn settle(mut self, cost_usd: Option<f64>) -> Result<(), MemoryError> {
+        self.settled = true;
+        budget::settle_reserved_spend(self.db, &self.date, &self.id, cost_usd).map(|_| ())
+    }
+}
+
+impl Drop for ReservedSpend<'_> {
+    fn drop(&mut self) {
+        if self.settled {
+            return;
+        }
+        if let Err(e) = budget::settle_reserved_spend(self.db, &self.date, &self.id, None) {
+            tracing::warn!(
+                error = %e,
+                date = %self.date,
+                "autopilot could not release an unsettled dispatch's reserved spend; the day's \
+                 total stays that much higher"
+            );
+        }
+    }
+}
+
+/// Whether this run still owns the issue right before a Claude launch:
+/// the drawer still holds `owned`. A claim with too little of its lease
+/// left ([`dispatch_state::CLAIM_LEASE`] less
+/// [`dispatch_state::CLAIM_REFRESH_MARGIN`]) is claimed again, with a fresh
+/// time, in the same compare-and-set.
+fn still_owned(
+    db: &Database,
+    issue: &IssueRef,
+    owned: &mut Option<dispatch_state::Claim>,
+) -> Result<bool, MemoryError> {
+    still_owned_at(db, issue, owned, chrono::Utc::now())
+}
+
+fn still_owned_at(
+    db: &Database,
+    issue: &IssueRef,
+    owned: &mut Option<dispatch_state::Claim>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<bool, MemoryError> {
+    let Some(claim) = owned.as_ref() else {
+        return dispatch_state::claim_is(db, issue, None);
+    };
+    let fresh = claim.age(now).is_some_and(|age| {
+        age + dispatch_state::CLAIM_REFRESH_MARGIN < dispatch_state::CLAIM_LEASE
+    });
+    if fresh {
+        return dispatch_state::claim_is(db, issue, Some(claim));
+    }
+    let mut renewed = claim.clone();
+    renewed.claimed_at = Some(now.to_rfc3339());
+    if !dispatch_state::claim_if_unchanged(db, Some(claim), &renewed)? {
+        return Ok(false);
+    }
+    *owned = Some(renewed);
+    Ok(true)
+}
+
+/// Renew this run's lease as soon as a dispatch returns, before any other
+/// work: a dispatch may run far past [`dispatch_state::CLAIM_LEASE`],
+/// and in the post-run window (signing-guard reads, spend settling, then
+/// the record) a lockless run could otherwise adopt the lapsed claim, so
+/// the record failed `taken_over` and the met was dropped. While the
+/// dispatch ran, its IC was itself the evidence an adopter checks; once
+/// it exits, this renewal is what keeps the window closed — renewed
+/// unconditionally here rather than periodically during the dispatch,
+/// which would need a second writer racing the dispatch it watches. The
+/// stored claim is re-read and renewed from it: only its `claimed_at`
+/// may have aged, and its owner token is still this run's, or the run
+/// has lost the issue and this returns `false`.
+fn renew_owned(
+    db: &Database,
+    issue: &IssueRef,
+    owned: &mut Option<dispatch_state::Claim>,
+) -> Result<bool, MemoryError> {
+    let Some(claim) = owned.as_ref() else {
+        return dispatch_state::claim_is(db, issue, None);
+    };
+    let Some(stored) = dispatch_state::get_claim(db, issue)? else {
+        return Ok(false);
+    };
+    if stored.owner != claim.owner {
+        return Ok(false);
+    }
+    let mut renewed = stored.clone();
+    renewed.claimed_at = Some(chrono::Utc::now().to_rfc3339());
+    if !dispatch_state::claim_if_unchanged(db, Some(&stored), &renewed)? {
+        return Ok(false);
+    }
+    *owned = Some(renewed);
+    Ok(true)
 }
 
 /// What restart recovery decided before a run dispatches anything.
@@ -1043,6 +2871,48 @@ enum Recovered {
     Continue(Option<DispatchOutcome>),
 }
 
+/// The run a Claude `state` that may still be another run's ends in, or
+/// `None` once fresh evidence shows its IC idle and the state may be
+/// adopted. Nothing is written either way. `adopting` is false for the
+/// check on this run's own claim before its first launch, which needs
+/// only the process table (D4, [`Dispatcher::recover_own`]).
+fn claude_in_flight(
+    dispatcher: &mut dyn Dispatcher,
+    worktree: &Worktree,
+    state: &DispatchState,
+    issue: &IssueRef,
+    cumulative_attempt_n: u32,
+    wall_clock_timeout_secs: Option<u64>,
+    adopting: bool,
+) -> Result<Option<IssueRun>, MemoryError> {
+    let recovery = if adopting {
+        dispatcher.recover(&worktree.path, state)?
+    } else {
+        dispatcher.recover_own(&worktree.path, state)?
+    };
+    let detail = match recovery {
+        InvocationRecovery::NoPriorInvocation | InvocationRecovery::Finished(_) => return Ok(None),
+        InvocationRecovery::Alive => format!(
+            "its Claude IC {} is still running, so this run adopts nothing and launches \
+             nothing",
+            state.ic_session_name
+        ),
+        InvocationRecovery::Unknown { reason } => format!(
+            "{reason}, so this run adopts nothing and launches nothing; {}",
+            release_hint(issue, None)
+        ),
+    };
+    Ok(Some(IssueRun {
+        unpriced_dispatches: 0,
+        issue: issue.clone(),
+        terminal: TerminalReason::ImplementationInFlight { detail },
+        dispatches: Vec::new(),
+        total_cost_usd: 0.0,
+        cumulative_attempt_n,
+        wall_clock_timeout_secs,
+    }))
+}
+
 /// Adopt, hold, or finish the invocation a persisted state names, for a
 /// harness that [recovers invocations](Implementer::recovers_invocations).
 #[allow(clippy::too_many_arguments)]
@@ -1051,23 +2921,29 @@ fn recover_invocation(
     issue: &IssueRef,
     worktree: &Worktree,
     dispatcher: &mut dyn Dispatcher,
-    state: &DispatchState,
+    claim: &dispatch_state::Claim,
     cumulative_attempt_n: u32,
     wall_clock_timeout_secs: Option<u64>,
     native_session_id: &mut Option<String>,
-    codex_artifacts: &mut Option<CodexArtifacts>,
+    invocation_artifacts: &mut Option<InvocationArtifacts>,
+    session_used: &mut bool,
 ) -> Result<Recovered, MemoryError> {
+    let state = &claim.state;
     match dispatcher.recover(&worktree.path, state)? {
-        recovery @ (CodexRecovery::Alive | CodexRecovery::Unknown { .. }) => {
+        recovery @ (InvocationRecovery::Alive | InvocationRecovery::Unknown { .. }) => {
             let detail = match recovery {
-                CodexRecovery::Unknown { reason } => format!(
-                    "{reason}; once no process remains, `ironmem autopilot \
-                     clear-dispatch {} {}` releases it",
-                    issue.repo, issue.number
+                InvocationRecovery::Unknown { reason } => format!(
+                    "{reason}; {}",
+                    release_hint(issue, state.invocation_artifacts.as_ref())
                 ),
-                _ => "Codex implementation is still alive".into(),
+                _ => format!(
+                    "{} implementation is still alive",
+                    state.implementer.label()
+                ),
             };
-            let unpriced_dispatches = match &state.codex_artifacts {
+            let unpriced_dispatches = match &state.invocation_artifacts {
+                // A corrupt daily drawer is logged and skipped by this lookup;
+                // the recovered count is a lower bound, never proof of no spend.
                 Some(artifacts) => u32::from(budget::has_unpriced_dispatch_reservation(
                     db,
                     &artifacts.invocation_id,
@@ -1084,7 +2960,7 @@ fn recover_invocation(
                 wall_clock_timeout_secs,
             }))
         }
-        CodexRecovery::Finished(outcome) => {
+        InvocationRecovery::Finished(outcome) => {
             if state.attempt_n < cumulative_attempt_n {
                 // The lineage/status write completed before the Lead crashed
                 // clearing this artifact. Its terminal Impossible decision
@@ -1103,7 +2979,12 @@ fn recover_invocation(
                                 .is_none_or(|expected| expected == id)
                     })
                 {
-                    dispatch_state::clear_dispatch_state(db, issue)?;
+                    // Only the state recovery judged; one another run wrote
+                    // since is theirs (every write is a compare-and-set),
+                    // and so is the verdict: this run reports none.
+                    if !dispatch_state::clear_claim_if_unchanged(db, claim)? {
+                        return Err(taken_over(issue));
+                    }
                     return Ok(Recovered::Done(IssueRun {
                         unpriced_dispatches: 1,
                         issue: issue.clone(),
@@ -1117,25 +2998,28 @@ fn recover_invocation(
                     }));
                 }
                 // Preserve the proven conversation for a continuing run,
-                // but never classify or charge the same attempt again.
+                // but never classify or charge the same attempt again. An
+                // invocation that started used the controller's session, so
+                // the next one resumes it rather than opening it again.
+                *session_used = outcome.invocation_started;
                 if native_session_id.is_none() {
                     *native_session_id =
                         outcome.native_session_id.filter(|id| !id.trim().is_empty());
                 }
-                *codex_artifacts = None;
+                *invocation_artifacts = None;
                 Ok(Recovered::Continue(None))
             } else {
                 Ok(Recovered::Continue(Some(outcome)))
             }
         }
-        CodexRecovery::NoPriorInvocation if state.codex_artifacts.is_none() => {
+        InvocationRecovery::NoPriorInvocation if state.invocation_artifacts.is_none() => {
             Ok(Recovered::Continue(None))
         }
-        CodexRecovery::NoPriorInvocation => Err(MemoryError::Validation(
-            "Codex recovery returned no invocation for persisted artifacts; process \
-             completion is unproven"
-                .into(),
-        )),
+        InvocationRecovery::NoPriorInvocation => Err(MemoryError::Validation(format!(
+            "{} recovery returned no invocation for persisted artifacts; process \
+             completion is unproven",
+            state.implementer.label()
+        ))),
     }
 }
 
@@ -1157,15 +3041,19 @@ pub fn run_issue(
     if config.implementer != dispatcher.implementer() {
         return Err(MemoryError::Validation(format!("implementation harness mismatch: configured {:?}, dispatcher {:?}; select the matching dispatcher", config.implementer, dispatcher.implementer())));
     }
-    let existing_state = validate_dispatch_owner(db, issue, config.implementer)?;
+    let existing_claim = validate_dispatch_claim(db, issue, config.implementer)?;
+    let existing_state = existing_claim.as_ref().map(|claim| claim.state.clone());
+    // This run's token, carried by every state it writes; see
+    // `dispatch_state::Claim`.
+    let owner = uuid::Uuid::new_v4().to_string();
     let gate_commands = approved_gate_commands(db, &issue.repo)?;
-    // Report the effective bound, including Codex's mandatory finite fallback.
+    // Report the effective bound, including a supervised CLI harness's mandatory finite fallback.
     // Claude retains the repo's optional bound.
     let wall_clock_timeout_secs = gate_config::wall_clock_timeout(db, &issue.repo)?
         .or_else(|| config.implementer.fallback_wall_clock_secs());
     let wall_clock_timeout = wall_clock_timeout_secs.map(std::time::Duration::from_secs);
 
-    let mut status = lineage::get_issue_status(db, issue)?;
+    let status = lineage::get_issue_status(db, issue)?;
     // Rung 11's second, narrower reason to dispatch a finished issue: a
     // reviewer read its PR and asked for changes. Read once here and reused
     // for every dispatch of this run — a remediation cannot arrive mid-run,
@@ -1175,7 +3063,38 @@ pub fn run_issue(
     if let Some(existing) = &status {
         if existing.best_verdict == Some(AttemptOutcome::Success) && remediation.is_none() {
             if config.implementer.recovers_invocations() {
-                dispatch_state::clear_dispatch_state(db, issue)?;
+                // Only the state this run read; see `write_state`.
+                if let Some(claim) = &existing_claim {
+                    if dispatch_state::clear_claim_if_unchanged(db, claim)? {
+                        // old invocation directories past retention
+                        // go with the state; the cleared one stays.
+                        if let Some(common) = &claim.common_dir {
+                            let keep = claim
+                                .state
+                                .invocation_artifacts
+                                .as_ref()
+                                .map(|a| a.invocation_id.as_str());
+                            if let Err(e) = super::invocation::prune_invocations(
+                                Path::new(common),
+                                &issue.slug(),
+                                keep,
+                                super::invocation::INVOCATION_RETENTION,
+                            ) {
+                                tracing::warn!(
+                                    error = %e,
+                                    issue = %issue.canonical(),
+                                    "autopilot could not prune old invocation directories"
+                                );
+                            }
+                        }
+                    } else {
+                        tracing::info!(
+                            issue = %issue.canonical(),
+                            "autopilot left the dispatch state of an already succeeded issue to \
+                             the run that changed it"
+                        );
+                    }
+                }
             }
             return Ok(IssueRun {
                 unpriced_dispatches: 0,
@@ -1218,11 +3137,135 @@ pub fn run_issue(
     let mut native_session_id = existing_state
         .as_ref()
         .and_then(|s| s.native_session_id.clone());
-    let mut codex_artifacts = existing_state
+    let mut invocation_artifacts = existing_state
         .as_ref()
-        .and_then(|s| s.codex_artifacts.clone());
+        .and_then(|s| s.invocation_artifacts.clone());
+    // The model `session_uuid` was last dispatched with, and how many
+    // finished invocations in a row the harness refused to run on it. See
+    // `Implementer::rotates_refused_session` and the rotations below.
+    let mut session_model = existing_state
+        .as_ref()
+        .map_or_else(|| Some(config.model.clone()), |s| s.session_model.clone());
+    let mut resume_refusals = existing_state.as_ref().map_or(0, |s| s.resume_refusals);
+    // A session the harness last reported still in use. Only the first
+    // launch of this run can be on it; that launch probes it before anything
+    // replaces it (see the model rotation below).
+    let parked_in_use = existing_state
+        .as_ref()
+        .is_some_and(|s| s.phase() == Some(DispatchPhase::PausedSessionInUse));
     let mut recovered_outcome = None;
-    if let Some(state) = existing_state
+    // A policy that cannot be read stops the run here, before recovery or
+    // any dispatch: the guard would refuse every `met` as an infrastructure
+    // failure, so a dispatch would be paid for and then discarded. So does a
+    // flag that holds the branch while the policy is off. Nothing is
+    // written, so the next run proceeds once the value is fixed.
+    let policy_at_start = worktree::signing_policy(&worktree.path).map_err(|why| {
+        MemoryError::Validation(format!(
+            "commit.gpgsign cannot be read in {}, so the commit-signing guard could not check \
+             any result; fix it (`git config --bool commit.gpgsign` must print true or false) \
+             and run again; {}. git said: {why}",
+            worktree.path.display(),
+            kept_at_start(config.implementer, existing_state.as_ref())
+        ))
+    })?;
+    if !policy_at_start {
+        worktree::signing_holder(&worktree.path, &worktree.branch).map_err(|why| {
+            MemoryError::Validation(format!(
+                "{why} in {}, so the commit-signing guard could not check any result; fix it \
+                 (it must read true or false) and run again; {}",
+                worktree.path.display(),
+                kept_at_start(config.implementer, existing_state.as_ref())
+            ))
+        })?;
+    }
+    let seen = SigningPolicySeen {
+        at_run_start: policy_at_start,
+        by_interrupted_run: existing_state
+            .as_ref()
+            .is_some_and(|s| s.signing_held && !s.is_parked()),
+        by_parked_run: existing_state
+            .as_ref()
+            .is_some_and(|s| s.signing_held && s.is_parked()),
+    };
+    // What this run's own states record: its reading, and an earlier
+    // run's — parked or interrupted — carried forward unless an operator
+    // has since opted the branch out.
+    let signing_held = policy_at_start
+        || ((seen.by_parked_run || seen.by_interrupted_run)
+            && !matches!(
+                worktree::signing_holder(&worktree.path, &worktree.branch),
+                Ok(worktree::SigningHold::OptedOut)
+            ));
+    // A fault every later `met` would meet too (`GuardFault::stops_run`: a
+    // collaborator's unsigned commit, a recorded cut that is not a commit
+    // name, a policy or flag that cannot be read) would turn away any `met`
+    // this run produced: refuse before recovery or any dispatch until an
+    // operator deals with it. A git that cannot be run, and anything the
+    // guard finds that is the model's to fix, are judged again when its
+    // `met` arrives.
+    if let Some(fault) = collaborator_check_at_start(worktree, seen.fresh(), config.implementer) {
+        return Err(MemoryError::Validation(format!(
+            "{fault}; the run does not start, since any met it produced would be refused the \
+             same way; {}",
+            kept_at_start(config.implementer, existing_state.as_ref())
+        )));
+    }
+    // The goal condition's push names a remote whose push URL names the
+    // issue's repository when one does. When none does and some push to
+    // another GitHub repository, say so now: the IC's push may miss the
+    // repository the pull request is opened in.
+    worktree::warn_if_no_remote_pushes_to(&worktree.path, &issue.repo);
+    // Set by a guard fault every later `met` would meet too: the run stops
+    // after recording it, before paying for another dispatch.
+    let mut guard_stop: Option<GuardFault> = None;
+    // A Claude state not parked may be another run's, still going: its first
+    // write reuses everything this run read, so the compare-and-set alone
+    // would let this run launch a second IC on the same session. Adopted
+    // only once fresh evidence shows its IC idle, before anything is written.
+    if let Some(claim) = existing_claim
+        .as_ref()
+        .filter(|c| !config.implementer.recovers_invocations() && !c.state.is_parked())
+    {
+        // Within its lease, another run's claim is that run's, however idle
+        // its IC looks: it may be between its claim and its launch.
+        if claim.leased(chrono::Utc::now()) {
+            return Ok(IssueRun {
+                unpriced_dispatches: 0,
+                issue: issue.clone(),
+                terminal: TerminalReason::ImplementationInFlight {
+                    detail: format!(
+                        "another run claimed {} {} and may be about to launch (a \
+                         recently ended run whose lease has not yet lapsed reads the \
+                         same way); it is adopted only once its {}s lease lapses with \
+                         its IC idle",
+                        issue.canonical(),
+                        claim.age_phrase(chrono::Utc::now()).unwrap_or_default(),
+                        dispatch_state::CLAIM_LEASE.as_secs()
+                    ),
+                },
+                dispatches: Vec::new(),
+                total_cost_usd: 0.0,
+                cumulative_attempt_n,
+                wall_clock_timeout_secs,
+            });
+        }
+        let state = &claim.state;
+        if let Some(run) = claude_in_flight(
+            dispatcher,
+            worktree,
+            state,
+            issue,
+            cumulative_attempt_n,
+            wall_clock_timeout_secs,
+            true,
+        )? {
+            return Ok(run);
+        }
+    }
+    // Whether a recovered invocation this run will not classify again used
+    // the session the state names.
+    let mut recovered_session_used = false;
+    if let Some(claim) = existing_claim
         .as_ref()
         .filter(|_| config.implementer.recovers_invocations())
     {
@@ -1231,19 +3274,64 @@ pub fn run_issue(
             issue,
             worktree,
             dispatcher,
-            state,
+            claim,
             cumulative_attempt_n,
             wall_clock_timeout_secs,
             &mut native_session_id,
-            &mut codex_artifacts,
+            &mut invocation_artifacts,
+            &mut recovered_session_used,
         )? {
             Recovered::Done(run) => return Ok(run),
             Recovered::Continue(outcome) => recovered_outcome = outcome,
         }
     }
-    let mut resuming = existing_state
-        .as_ref()
-        .is_some_and(|state| state.session_claimed);
+    // Record a signing policy that is on before any dispatch, so an agent
+    // that turns it off is still held to it, in this run and every later one.
+    // Once this run has first claimed the issue, never before: recovery has
+    // then proven no earlier invocation runs, and no other run can have
+    // launched one since, so no agent can be writing `.git/config` beside
+    // it. A policy a crashed dispatch disabled before any run or
+    // `ensure_worktree` saw it on is not caught: an accepted limitation. A
+    // failed write (another worktree's agent holding the lock) costs only
+    // this cross-run memory: the reading is held in memory for this run and
+    // in every dispatch state it writes (`signing_held`), which a
+    // replacement controller, or the next run after a pause, reads.
+    //
+    // A policy a run interrupted mid-dispatch saw on, and could not record
+    // on the branch, is recorded the same way: off at this run's start, it
+    // would hold only the recovered met, and no fresh dispatch's after it,
+    // though its own agent may be what turned it off. Not over an
+    // operator's opt-out.
+    let record_signing_reading = || {
+        if policy_at_start {
+            if let Err(e) = worktree::record_signing(&worktree.path, &worktree.branch, true) {
+                tracing::warn!(
+                    error = %e,
+                    branch = %worktree.branch,
+                    "autopilot could not record the signing policy on the branch; \
+                     holding this run to it from memory"
+                );
+            }
+        } else if seen.by_interrupted_run {
+            if let Ok(worktree::SigningHold::NotHeld) =
+                worktree::signing_holder(&worktree.path, &worktree.branch)
+            {
+                if let Err(e) = worktree::record_signing(&worktree.path, &worktree.branch, false) {
+                    tracing::warn!(
+                        error = %e,
+                        branch = %worktree.branch,
+                        "autopilot could not record on the branch the signing policy an \
+                         interrupted run saw on; only that run's met is held to it"
+                    );
+                }
+            }
+        }
+    };
+    let mut signing_recorded = false;
+    let mut resuming = recovered_session_used
+        || existing_state
+            .as_ref()
+            .is_some_and(|state| state.session_claimed);
     let started_at = existing_state
         .as_ref()
         .map(|state| state.started_at.clone())
@@ -1254,53 +3342,131 @@ pub fn run_issue(
         .unwrap_or(0);
     let ic_session_name = dispatch::ic_name(issue);
     let worktree_path = worktree.path.to_string_lossy().to_string();
+    // Stored in every claim, so the issue's lock is found even once the
+    // worktree is gone. A just-provisioned worktree is known to be in a
+    // repository, so a failure here is real: publishing a claim with no
+    // common directory would leave no durable pointer to the issue's
+    // lock once the worktree is removed, and a later clear could delete
+    // this live run's state. Refuse rather than store that claim.
+    let common_dir = match super::issue_lock::git_common_dir(&worktree.path) {
+        Ok(dir) => dir.map(|dir| dir.to_string_lossy().into_owned()),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                issue = %issue.canonical(),
+                "autopilot cannot resolve the worktree's git common directory; refusing to claim the issue without a lock pointer"
+            );
+            return Err(e);
+        }
+    };
 
     // `session_uuid` is a parameter rather than a capture because the session
     // is no longer fixed for the life of a run: a dispatch that concludes its
     // goal loop rotates it (see the rotation below), and the drawer must
     // record the uuid the *next* dispatch will use, not the spent one.
-    let write_state = |db: &Database,
+    //
+    // Every write lands only while the drawer still holds `owned`, the state
+    // this run last wrote (at first, the one it read): a compare-and-set, not
+    // a blind upsert. Otherwise another run took the issue over, and the
+    // write fails with `taken_over`. Launching then would put two
+    // implementers in one worktree with one named by no state, and any write
+    // at all would overwrite the state that names the other run's
+    // invocation, releasing its slot while it may still run.
+    let taken_over = || taken_over(issue);
+    let next_claim = |attempt_n: u32,
+                      turn_n: u32,
+                      phase: DispatchPhase,
+                      session_uuid: &str,
+                      session_claimed: bool,
+                      identity: (&Option<String>, &Option<InvocationArtifacts>),
+                      session: (&Option<String>, u32)|
+     -> dispatch_state::Claim {
+        let state = DispatchState {
+            implementer: config.implementer,
+            native_session_id: if config.implementer.assigns_own_session_id() {
+                identity.0.clone()
+            } else {
+                Some(session_uuid.to_string())
+            },
+            invocation_artifacts: identity.1.clone(),
+            issue: issue.clone(),
+            worktree_path: worktree_path.clone(),
+            ic_session_name: ic_session_name.clone(),
+            dispatch_class: config.dispatch_class.clone(),
+            attempt_n,
+            state: phase.as_str().to_string(),
+            started_at: started_at.clone(),
+            session_uuid: session_uuid.to_string(),
+            turn_n,
+            session_claimed,
+            session_model: session.0.clone(),
+            resume_refusals: session.1,
+            // What this run saw, and a parked run's reading carried forward.
+            signing_held,
+        };
+        dispatch_state::Claim {
+            state,
+            owner: Some(owner.clone()),
+            claimed_at: Some(chrono::Utc::now().to_rfc3339()),
+            common_dir: common_dir.clone(),
+        }
+    };
+    let write_state = |owned: &mut Option<dispatch_state::Claim>,
                        attempt_n: u32,
                        turn_n: u32,
-                       state: &str,
+                       phase: DispatchPhase,
                        session_uuid: &str,
                        session_claimed: bool,
-                       identity: (&Option<String>, &Option<CodexArtifacts>)| {
-        dispatch_state::upsert_dispatch_state(
-            db,
-            &DispatchState {
-                implementer: config.implementer,
-                native_session_id: if config.implementer.assigns_own_session_id() {
-                    identity.0.clone()
-                } else {
-                    Some(session_uuid.to_string())
-                },
-                codex_artifacts: identity.1.clone(),
-                issue: issue.clone(),
-                worktree_path: worktree_path.clone(),
-                ic_session_name: ic_session_name.clone(),
-                dispatch_class: config.dispatch_class.clone(),
-                attempt_n,
-                state: state.to_string(),
-                started_at: started_at.clone(),
-                session_uuid: session_uuid.to_string(),
-                turn_n,
-                session_claimed,
-            },
-        )
-        .map(|_| ())
+                       identity: (&Option<String>, &Option<InvocationArtifacts>),
+                       session: (&Option<String>, u32)|
+     -> Result<(), MemoryError> {
+        let next = next_claim(
+            attempt_n,
+            turn_n,
+            phase,
+            session_uuid,
+            session_claimed,
+            identity,
+            session,
+        );
+        if !dispatch_state::claim_if_unchanged(db, owned.as_ref(), &next)? {
+            return Err(taken_over());
+        }
+        *owned = Some(next);
+        Ok(())
     };
+    let mut owned = existing_claim.clone();
+
+    // A previous run that died holding a spend reservation for this
+    // issue leaves it released here, where this run takes the issue
+    // over: its dispatch is proven idle or finished by the checks
+    // above, and its own late settle counts its cost without
+    // subtracting the ceiling twice (see `budget`).
+    if existing_claim.is_some() {
+        if let Err(e) =
+            budget::release_issue_spend_reservations(db, &today_utc(), &issue.canonical())
+        {
+            tracing::warn!(
+                error = %e,
+                issue = %issue.canonical(),
+                "autopilot could not release a previous run's spend reservation"
+            );
+        }
+    }
 
     // A recovering harness publishes each invocation just before it launches.
+    // Claude's signing reading is recorded right before its first launch
+    // instead (R9, in the loop below), as the other harnesses' is.
     if !config.implementer.recovers_invocations() {
         write_state(
-            db,
+            &mut owned,
             cumulative_attempt_n,
             turn_n,
-            "dispatching",
+            DispatchPhase::Dispatching,
             &session_uuid,
             resuming,
-            (&native_session_id, &codex_artifacts),
+            (&native_session_id, &invocation_artifacts),
+            (&session_model, resume_refusals),
         )?;
     }
 
@@ -1308,6 +3474,10 @@ pub fn run_issue(
     let mut total_cost_usd = 0.0;
     let mut unpriced_dispatches = 0u32;
     let mut consecutive_infrastructure_failures = 0u32;
+    // Whether this run has launched anything yet.
+    let mut launched = false;
+    // A Claude dispatch's dollar ceiling reserved on a date, until settled.
+    let mut reserved_spend: Option<ReservedSpend<'_>> = None;
 
     let terminal = loop {
         if recovered_outcome.is_none() {
@@ -1324,14 +3494,15 @@ pub fn run_issue(
             if remediate::attempts_charged(db, issue, cumulative_attempt_n, succeeded)?
                 >= config.attempt_cap
             {
-                let attempts = prior_attempts(db, issue)?;
-                record_terminal_summary(
+                if !record_terminal_summary_owned(
                     db,
                     issue,
                     cumulative_attempt_n,
                     config.attempt_cap,
-                    &attempts,
-                )?;
+                    owned.as_ref(),
+                )? {
+                    return Err(taken_over());
+                }
                 break TerminalReason::AttemptCapExhausted;
             }
 
@@ -1342,9 +3513,13 @@ pub fn run_issue(
                     spent_usd: spent_today,
                 };
             }
-            // Codex always has a finite bound and reserves unknown spend.
             // Claude keeps its existing policy: this cap gates only repos
-            // with a wall-clock bound.
+            // with a wall-clock bound, and a timed-out dispatch is banked
+            // unpriced after it ends. For a supervised CLI harness (always
+            // bounded) this is only a cheap pre-filter that spares rendering,
+            // argv checks and an invocation directory on a capped day; the
+            // transactional reservation below is the authority, since
+            // another Lead can take the last unit after this read.
             if wall_clock_timeout.is_some() {
                 let unpriced_today = ledger
                     .as_ref()
@@ -1401,6 +3576,9 @@ pub fn run_issue(
                 // checkout is on that branch, and it is the value it hands back
                 // that the IC will actually be committing onto.
                 branch: &worktree.branch,
+                // No upstream: the push clause names the remote too.
+                remote: worktree::push_remote(&worktree.path, &worktree.branch, &issue.repo)
+                    .as_deref(),
                 gate_commands: &gate_commands,
                 n_turns: config.n_turns,
             }) {
@@ -1414,26 +3592,57 @@ pub fn run_issue(
                     // refusal that never clears would hold both for ever under a
                     // state that never happened.
                     write_state(
-                        db,
+                        &mut owned,
                         cumulative_attempt_n,
                         turn_n,
-                        "paused-condition-too-long",
+                        DispatchPhase::PausedConditionTooLong,
                         &session_uuid,
                         resuming,
-                        (&native_session_id, &codex_artifacts),
+                        (&native_session_id, &invocation_artifacts),
+                        (&session_model, resume_refusals),
                     )?;
                     return Err(MemoryError::Validation(e.to_string()));
                 }
             };
 
-            let prepared_artifacts = if config.implementer.recovers_invocations() {
-                Some(codex_dispatch::prepare_artifacts(&worktree.path, issue)?)
-            } else {
-                codex_artifacts.clone()
-            };
-            let spec = DispatchSpec {
+            // A session the harness keeps but refuses across providers is
+            // replaced when the model changes. Here, at a fresh launch, no
+            // invocation can be live: recovery has already held or finished
+            // any earlier one, and every in-run outcome is a finished one.
+            //
+            // Not a session parked as still in use: something may still hold
+            // it, and a fresh session would start a second implementer over
+            // the holder. It is resumed first so the harness's own lock
+            // answers. Still held, the run parks again; gone, with the
+            // provider really changed, the harness refuses to resume it and
+            // the usual consecutive refusals rotate it.
+            if config.implementer.rotates_refused_session()
+                && !parked_in_use
+                && session_model
+                    .as_deref()
+                    .is_some_and(|model| model != config.model)
+            {
+                tracing::info!(
+                    issue = %issue.canonical(),
+                    previous_model = session_model.as_deref().unwrap_or_default(),
+                    model = %config.model,
+                    "autopilot opens a fresh {} session for a different model",
+                    config.implementer.label()
+                );
+                session_uuid = uuid::Uuid::new_v4().to_string();
+                resuming = false;
+                resume_refusals = 0;
+            }
+            session_model = Some(config.model.clone());
+            // A supervised harness's artifacts are allocated below, once its
+            // argv is known to be valid.
+            let mut spec = DispatchSpec {
                 implementer: config.implementer,
-                codex_artifacts: prepared_artifacts,
+                invocation_artifacts: if config.implementer.recovers_invocations() {
+                    None
+                } else {
+                    invocation_artifacts.clone()
+                },
                 session: if config.implementer.assigns_own_session_id() {
                     match &native_session_id {
                         Some(id) => SessionMode::Resume {
@@ -1461,30 +3670,205 @@ pub fn run_issue(
             };
 
             if config.implementer.recovers_invocations() {
+                // Refuse a definite input error before allocating an
+                // invocation directory: a Lead repeating the refusal every
+                // tick would otherwise leak one per attempt.
+                super::invocation::validate_argv_before_artifacts(&worktree.path, &spec)?;
+                spec.invocation_artifacts =
+                    Some(super::invocation::prepare_artifacts(&worktree.path, issue)?);
                 // Validate the exact backend argv before publishing a new
                 // invocation or charging unknown spend. Definite input errors
-                // prove no process launched and must leave prior state intact.
-                codex_dispatch::build_argv(&worktree.path, &spec)?;
-                if let Some(artifacts) = &spec.codex_artifacts {
-                    codex_artifacts = Some(artifacts.clone());
-                    write_state(
-                        db,
+                // prove no process launched and must leave prior state intact;
+                // the directory just prepared is discarded with them.
+                if let Err(e) = super::invocation::validate_argv(&worktree.path, &spec) {
+                    if let Some(artifacts) = &spec.invocation_artifacts {
+                        super::invocation::discard_unlaunched(artifacts);
+                    }
+                    return Err(e);
+                }
+                if let Some(artifacts) = &spec.invocation_artifacts {
+                    // Another run that took the issue over since this one
+                    // last wrote it is seen before a unit is reserved.
+                    if !dispatch_state::claim_is(db, issue, owned.as_ref())? {
+                        super::invocation::discard_unlaunched(artifacts);
+                        return Err(taken_over());
+                    }
+                    // The authority on the day's cap: check and reserve in
+                    // one transaction, before this invocation is published,
+                    // so two Leads cannot both take the last unit. At the cap
+                    // nothing launches, no unit is reserved, the prepared
+                    // directory is removed, and this invocation is never
+                    // published; the run then stops like any capped run,
+                    // saving `paused-infrastructure-failure` with the
+                    // session it would have used (a model change may have
+                    // rotated it above) and no invocation. A crash after
+                    // reserving but before publishing over-counts one unit,
+                    // never under-counts.
+                    if let budget::UnpricedReservation::CapReached { unpriced_today } =
+                        budget::reserve_unpriced_dispatch_if_below(
+                            db,
+                            &today_utc(),
+                            &artifacts.invocation_id,
+                            config.max_unpriced_dispatches_per_day,
+                        )?
+                    {
+                        super::invocation::discard_unlaunched(artifacts);
+                        break TerminalReason::UnpricedDispatchesExhausted { unpriced_today };
+                    }
+                    invocation_artifacts = Some(artifacts.clone());
+                    // Claimed only while this run still owns the issue; see
+                    // `write_state`. Nothing has launched yet, so a lost claim
+                    // leaves nothing behind but the reserved unit (the
+                    // look before reserving makes that rare).
+                    if let Err(e) = write_state(
+                        &mut owned,
                         cumulative_attempt_n,
                         turn_n,
-                        "dispatching",
+                        DispatchPhase::Dispatching,
                         &session_uuid,
                         resuming,
-                        (&native_session_id, &codex_artifacts),
-                    )?;
-                    budget::reserve_unpriced_dispatch(db, &today_utc(), &artifacts.invocation_id)?;
+                        (&native_session_id, &invocation_artifacts),
+                        (&session_model, resume_refusals),
+                    ) {
+                        super::invocation::discard_unlaunched(artifacts);
+                        return Err(e);
+                    }
                     unpriced_dispatches += 1;
+                    if !signing_recorded {
+                        record_signing_reading();
+                        signing_recorded = true;
+                    }
+                    // Last, right before the launch: re-check ownership
+                    // (renewing the lease when too little remains), as the
+                    // priced path does. Between publishing this invocation
+                    // and spawning it there is otherwise no check, and a
+                    // controller stalled past the launch window could be
+                    // adopted as dead and then spawn anyway.
+                    if !still_owned(db, issue, &mut owned)? {
+                        super::invocation::discard_unlaunched(artifacts);
+                        return Err(taken_over());
+                    }
+                }
+            } else {
+                // Before this run's first launch, no IC for the issue may
+                // have started since the run began. One has: the issue is
+                // given back exactly as this run found it (a parked label
+                // included), since this run launched nothing.
+                if !launched {
+                    if let Some(claim) = &owned {
+                        if let Some(run) = claude_in_flight(
+                            dispatcher,
+                            worktree,
+                            &claim.state,
+                            issue,
+                            cumulative_attempt_n,
+                            wall_clock_timeout_secs,
+                            false,
+                        )? {
+                            let restored = match &existing_claim {
+                                Some(found) => {
+                                    dispatch_state::claim_if_unchanged(db, owned.as_ref(), found)?
+                                }
+                                None => dispatch_state::clear_claim_if_unchanged(db, claim)?,
+                            };
+                            if !restored {
+                                return Err(taken_over());
+                            }
+                            owned = existing_claim.clone();
+                            break run.terminal;
+                        }
+                    }
+                }
+                // The authority on the day's dollar budget: this dispatch's
+                // ceiling is added in the transaction that checks it, so two
+                // Leads cannot both pass it on the same total; the read at
+                // the top of the loop is only a cheap pre-filter. Settled
+                // to the measured cost once the dispatch returns.
+                let date = today_utc();
+                let reservation_id = uuid::Uuid::new_v4().to_string();
+                match budget::reserve_spend_if_within(
+                    db,
+                    &date,
+                    config.max_budget_usd,
+                    config.daily_budget_usd,
+                    &issue.canonical(),
+                    &reservation_id,
+                )? {
+                    budget::SpendReservation::Reserved => {
+                        reserved_spend = Some(ReservedSpend::new(db, date, reservation_id));
+                    }
+                    budget::SpendReservation::BudgetReached { spent_usd } => {
+                        break TerminalReason::DailyBudgetExhausted { spent_usd };
+                    }
+                }
+                // Last, right before the launch: Claude's launch is claimed
+                // by no write of its own, so this run looks that no other run
+                // took the issue over since it last wrote it, and renews its
+                // lease when too little of it would remain at the launch.
+                if !still_owned(db, issue, &mut owned)? {
+                    if let Some(reserved) = reserved_spend.take() {
+                        reserved.settle(None)?;
+                    }
+                    return Err(taken_over());
+                }
+                // Right before the first launch, as the other harnesses
+                // record it: after this run's claim, and never for a
+                // run held before launching at all.
+                if !signing_recorded {
+                    record_signing_reading();
+                    signing_recorded = true;
                 }
             }
+            launched = true;
             dispatcher.dispatch(&worktree.path, &spec)
         };
+        // First, before the signing-guard reads, the spend settling or
+        // the record below: renew the lease a long dispatch let lapse
+        //, or this run has lost the issue and records nothing.
+        if !recovered
+            && !config.implementer.recovers_invocations()
+            && !renew_owned(db, issue, &mut owned)?
+        {
+            if let Some(reserved) = reserved_spend.take() {
+                reserved.settle(None)?;
+            }
+            return Err(taken_over());
+        }
+        // Whatever came back, the reservation gives way to what is known:
+        // the measured cost below, or, with none, nothing.
+        let reserved = reserved_spend.take();
         let mut outcome = match outcome_result {
             Ok(outcome) => outcome,
             Err(err) => {
+                if matches!(&err, MemoryError::DispatchUnsettled(_)) {
+                    // Publish the safety hold before any accounting can fail.
+                    write_state(
+                        &mut owned,
+                        cumulative_attempt_n,
+                        turn_n,
+                        DispatchPhase::PausedCompletionUnproven,
+                        &session_uuid,
+                        true,
+                        (&native_session_id, &invocation_artifacts),
+                        (&session_model, resume_refusals),
+                    )?;
+                    if let Some(reserved) = reserved {
+                        reserved.settle(None)?;
+                    }
+                    budget::record_unpriced_dispatch(db, &today_utc())?;
+                    unpriced_dispatches += 1;
+                    dispatches.push(DispatchSummary {
+                        attempt_n: None,
+                        classification: DispatchClassification::InfrastructureFailure,
+                        total_cost_usd: None,
+                        num_turns: 0,
+                        verdict: None,
+                        reason: Some(err.to_string()),
+                    });
+                    break TerminalReason::ImplementationInFlight {
+                        detail: format!("{err}; inspect and stop leftover tool processes before ironmem autopilot clear-dispatch {} {}; the issue is held without retry", issue.repo, issue.number),
+                    };
+                }
                 if config.implementer.recovers_invocations() {
                     dispatches.push(DispatchSummary {
                         attempt_n: None,
@@ -1497,9 +3881,9 @@ pub fn run_issue(
                     // Errors do not prove a child is dead; retain the exact invocation for recovery.
                     break TerminalReason::ImplementationInFlight {
                         detail: format!(
-                            "Codex dispatch could not establish completion: {err}; once no \
-                             process remains, `ironmem autopilot clear-dispatch {} {}` releases it",
-                            issue.repo, issue.number
+                            "{} dispatch could not establish completion: {err}; {}",
+                            config.implementer.label(),
+                            release_hint(issue, invocation_artifacts.as_ref())
                         ),
                     };
                 }
@@ -1516,6 +3900,9 @@ pub fn run_issue(
                 if !matches!(err, MemoryError::NotFound(_)) {
                     resuming = true;
                 }
+                if let Some(reserved) = reserved {
+                    reserved.settle(None)?;
+                }
                 consecutive_infrastructure_failures += 1;
                 dispatches.push(DispatchSummary {
                     attempt_n: None,
@@ -1526,13 +3913,14 @@ pub fn run_issue(
                     reason: Some(err.to_string()),
                 });
                 write_state(
-                    db,
+                    &mut owned,
                     cumulative_attempt_n,
                     turn_n,
-                    "infrastructure-failure",
+                    DispatchPhase::InfrastructureFailure,
                     &session_uuid,
                     resuming,
-                    (&native_session_id, &codex_artifacts),
+                    (&native_session_id, &invocation_artifacts),
+                    (&session_model, resume_refusals),
                 )?;
                 if consecutive_infrastructure_failures
                     >= config.max_consecutive_infrastructure_failures
@@ -1554,8 +3942,68 @@ pub fn run_issue(
             if recovered {
                 unpriced_dispatches += 1;
             }
-            codex_artifacts = None;
+            invocation_artifacts = None;
         }
+        // A harness that refuses to resume the session it is handed fails
+        // every later invocation the same way, at no attempt's cost. After
+        // enough refusals in a row the next dispatch opens a fresh session;
+        // the outcome is finished, so nothing can still be running on it.
+        // A session still in use is the exception: never rotated over.
+        let release = format!(
+            "`ironmem autopilot clear-dispatch {} {}`",
+            issue.repo, issue.number
+        );
+        let label = config.implementer.label();
+        let mut session_in_use = None;
+        let refusal_note = match outcome.session_refusal {
+            Some(SessionRefusal::InUse) => {
+                resume_refusals = 0;
+                let note = format!(
+                    "{label} reports session {session_uuid} still in use; Autopilot won't start \
+                     a new session over it; inspect for a leftover {label} process, then \
+                     {release}"
+                );
+                session_in_use = Some(note.clone());
+                Some(note)
+            }
+            Some(SessionRefusal::Unresumable) if config.implementer.rotates_refused_session() => {
+                resume_refusals += 1;
+                let fallback = format!(
+                    "if a fresh session is refused too, check {label}'s provider and \
+                     configuration; {release} releases the issue"
+                );
+                Some(if resume_refusals >= RESUME_REFUSALS_BEFORE_ROTATION {
+                    let refused =
+                        std::mem::replace(&mut session_uuid, uuid::Uuid::new_v4().to_string());
+                    resuming = false;
+                    resume_refusals = 0;
+                    format!(
+                        "{label} refused to resume session {refused} \
+                         {RESUME_REFUSALS_BEFORE_ROTATION} times in a row, so the next dispatch \
+                         opens a fresh session; {fallback}"
+                    )
+                } else {
+                    format!(
+                        "{label} refused to resume its session ({resume_refusals} of \
+                         {RESUME_REFUSALS_BEFORE_ROTATION} before a fresh session is opened); \
+                         {fallback}"
+                    )
+                })
+            }
+            _ => {
+                resume_refusals = 0;
+                None
+            }
+        };
+        if let Some(note) = refusal_note {
+            outcome.reason = Some(match outcome.reason.take() {
+                Some(original) if !original.trim().is_empty() => format!("{note}. {original}"),
+                _ => note,
+            });
+        }
+        // Only a harness that assigns its own session id (see
+        // `Implementer::assigns_own_session_id`) is checked here: it is the
+        // one whose identity the outcome, not the controller, supplies.
         if config.implementer.assigns_own_session_id() {
             // An invocation that never launched has no thread to check, and
             // its own reason (why the spawn failed) is the useful one.
@@ -1573,15 +4021,18 @@ pub fn run_issue(
                 outcome.is_error = true;
                 outcome.process_success = false;
                 // Keep the invocation's own diagnosis (stderr, timeout, exit
-                // code): a Codex that failed before `thread.started` — auth,
-                // config, network — is explained only there.
-                let identity =
-                    "missing or mismatched native Codex session ID; persisted identity retained";
+                // code): a harness that failed before announcing its session
+                // (for Codex, its `thread.started` event) — auth, config,
+                // network — is explained only there.
+                let identity = format!(
+                    "missing or mismatched native {} session ID; persisted identity retained",
+                    config.implementer.label()
+                );
                 outcome.reason = Some(match outcome.reason.take() {
                     Some(original) if !original.trim().is_empty() => {
                         format!("{identity}; {original}")
                     }
-                    _ => identity.into(),
+                    _ => identity,
                 });
             } else if native_session_id.is_none() {
                 native_session_id = outcome.native_session_id.clone();
@@ -1630,16 +4081,108 @@ pub fn run_issue(
         if config.implementer.recovers_invocations() {
             // Reserved before launch; recovery and completion never bill it again.
             outcome.cost_usd = None;
-        } else if outcome.cost_usd.is_none() {
-            unpriced_dispatches += 1;
-            budget::record_unpriced_dispatch(db, &today_utc())?;
         } else {
-            budget::accumulate_daily_spend(
-                db,
-                &today_utc(),
-                outcome.cost_usd.unwrap_or(0.0).max(0.0),
-            )?;
-            total_cost_usd += outcome.cost_usd.unwrap_or(0.0).max(0.0);
+            let cost = outcome.cost_usd.map(|cost| cost.max(0.0));
+            match reserved {
+                Some(reserved) => reserved.settle(cost)?,
+                None => {
+                    if let Some(cost) = cost {
+                        budget::accumulate_daily_spend(db, &today_utc(), cost)?;
+                    }
+                }
+            }
+            match cost {
+                Some(cost) => total_cost_usd += cost,
+                None => {
+                    unpriced_dispatches += 1;
+                    budget::record_unpriced_dispatch(db, &today_utc())?;
+                }
+            }
+        }
+
+        // Every harness: a `met` whose branch holds commits that bypassed the
+        // signing policy is a failed attempt, and the reason reaches the next
+        // turn as `why_failed`. Every commit the branch added since its cut is
+        // checked, not just this dispatch's, so an earlier bypass cannot be
+        // waved through by a later `met` that adds nothing.
+        //
+        // A recovered `met` may replay an attempt that is already recorded:
+        // the attempt record and the status write are separate, and a crash
+        // between them leaves `cumulative_attempt_n` behind, so recovery
+        // replays the outcome onto the same ordinal (a met always consumes
+        // one: `cumulative_attempt_n + 1`). The guard reads live git state
+        // that may have changed since, and a different verdict would make
+        // `record_and_advance` refuse the replay and wedge the issue. The
+        // recorded verdict is authoritative instead, and so is a recorded
+        // success's commit, even when it has none: the branch tip may have
+        // moved since, and the stored status reports the recorded one.
+        let recorded = if recovered && outcome.is_met() {
+            recorded_attempt(db, issue, cumulative_attempt_n + 1)?
+        } else {
+            None
+        };
+        // `Some(commit)` once a recorded success decides the reported commit.
+        let mut recorded_commit_sha: Option<Option<String>> = None;
+        // A met the guard refused: its violation and the model's own reason,
+        // which the lineage keeps apart (see `refused_met_record`).
+        let mut refused_met: Option<(String, Option<String>)> = None;
+        if let Some(recorded) = recorded {
+            if recorded.verdict == AttemptOutcome::Success {
+                recorded_commit_sha = Some(recorded.commit_sha);
+            } else {
+                outcome.verdict = Some(Verdict::NotMet);
+                outcome.reason = Some(
+                    recorded
+                        .why_failed
+                        .filter(|why| !why.trim().is_empty())
+                        .unwrap_or_else(|| "recorded attempt failed".into()),
+                );
+            }
+        } else if outcome.is_met() {
+            let model_reason = |reason: String, original: Option<String>| match original {
+                Some(original) if !original.trim().is_empty() => format!(
+                    "{reason} (model's reason: {})",
+                    prefix(&original, MODEL_REASON_CHARS)
+                ),
+                _ => reason,
+            };
+            // An interrupted run's reading holds only its own recovered
+            // invocation's met.
+            let seen = if recovered { seen } else { seen.fresh() };
+            match signing_violation(worktree, seen, &issue.repo, config.implementer) {
+                Ok(None) => {}
+                Ok(Some(violation)) => {
+                    let original = outcome.reason.take();
+                    outcome.verdict = Some(Verdict::NotMet);
+                    outcome.reason = Some(model_reason(violation.to_string(), original.clone()));
+                    refused_met = Some((violation.to_string(), original));
+                }
+                // The guard could not accept the met, but the model is not to
+                // blame: an errored outcome with no verdict is an
+                // infrastructure failure, which consumes no attempt and
+                // escalates through the consecutive bound, or stops the run
+                // when every later met would meet the same fault.
+                Err(fault) => {
+                    tracing::warn!(
+                        error = %fault,
+                        branch = %worktree.branch,
+                        "autopilot's commit-signing guard did not accept the met; \
+                         it is held as an infrastructure failure"
+                    );
+                    outcome.verdict = None;
+                    outcome.is_error = true;
+                    outcome.reason = Some(model_reason(
+                        format!(
+                            "the commit-signing guard could not check the branch, so the met \
+                             was not accepted: {fault}"
+                        ),
+                        outcome.reason.take(),
+                    ));
+                    if fault.stops_run() {
+                        guard_stop = Some(fault);
+                    }
+                }
+            }
         }
 
         let classification = classify(&outcome);
@@ -1661,10 +4204,14 @@ pub fn run_issue(
             reason: outcome.reason.clone(),
         });
 
+        let recovering = config
+            .implementer
+            .recovers_invocations()
+            .then_some(config.implementer);
         match classification {
             DispatchClassification::Met => {
-                let commit_sha = head_commit(&worktree.path);
-                record_and_advance(
+                let commit_sha = recorded_commit_sha.unwrap_or_else(|| branch_tip(worktree));
+                if !record_and_advance(
                     db,
                     &AttemptRecord {
                         issue: issue.clone(),
@@ -1674,13 +4221,16 @@ pub fn run_issue(
                         why_failed: None,
                         commit_sha: commit_sha.clone(),
                     },
-                    status.as_ref(),
-                    config.implementer.recovers_invocations(),
-                )?;
+                    recovering,
+                    &mut owned,
+                    None,
+                )? {
+                    return Err(taken_over());
+                }
                 break TerminalReason::Met { commit_sha };
             }
             DispatchClassification::Impossible => {
-                record_and_advance(
+                if !record_and_advance(
                     db,
                     &AttemptRecord {
                         issue: issue.clone(),
@@ -1690,47 +4240,91 @@ pub fn run_issue(
                         why_failed: Some(why_failed_text(&outcome, classification)),
                         commit_sha: None,
                     },
-                    status.as_ref(),
-                    config.implementer.recovers_invocations(),
-                )?;
+                    recovering,
+                    &mut owned,
+                    None,
+                )? {
+                    return Err(taken_over());
+                }
                 break TerminalReason::Impossible {
                     reason: outcome.reason.clone(),
                 };
             }
             DispatchClassification::FailedAttempt => {
-                record_and_advance(
+                let (approach, why_failed) = match refused_met.take() {
+                    Some((violation, original)) => refused_met_record(&violation, original),
+                    None => (
+                        approach_text(&outcome, classification),
+                        why_failed_text(&outcome, classification),
+                    ),
+                };
+                // The attempt, the status and the next state land together,
+                // and only while this run still owns the issue.
+                let next = next_claim(
+                    cumulative_attempt_n,
+                    turn_n,
+                    DispatchPhase::Dispatching,
+                    &session_uuid,
+                    resuming,
+                    (&native_session_id, &invocation_artifacts),
+                    (&session_model, resume_refusals),
+                );
+                if !record_and_advance(
                     db,
                     &AttemptRecord {
                         issue: issue.clone(),
                         attempt_n: cumulative_attempt_n,
-                        approach: approach_text(&outcome, classification),
+                        approach,
                         verdict: AttemptOutcome::Failed,
-                        why_failed: Some(why_failed_text(&outcome, classification)),
+                        why_failed: Some(why_failed),
                         commit_sha: None,
                     },
-                    status.as_ref(),
-                    config.implementer.recovers_invocations(),
-                )?;
-                status = lineage::get_issue_status(db, issue)?;
-                write_state(
-                    db,
-                    cumulative_attempt_n,
-                    turn_n,
-                    "dispatching",
-                    &session_uuid,
-                    resuming,
-                    (&native_session_id, &codex_artifacts),
-                )?;
+                    recovering,
+                    &mut owned,
+                    Some(next),
+                )? {
+                    return Err(taken_over());
+                }
             }
             DispatchClassification::InfrastructureFailure => {
+                // A guard fault every later met would meet too: stop like the
+                // run-start check, before another paid dispatch. A supervised
+                // harness's drawer still names this finished invocation, so
+                // the first run after the fix recovers and re-checks it;
+                // Claude's records the session it claimed.
+                if let Some(fault) = guard_stop.take() {
+                    if !config.implementer.recovers_invocations() {
+                        write_state(
+                            &mut owned,
+                            cumulative_attempt_n,
+                            turn_n,
+                            DispatchPhase::InfrastructureFailure,
+                            &session_uuid,
+                            resuming,
+                            (&native_session_id, &invocation_artifacts),
+                            (&session_model, resume_refusals),
+                        )?;
+                    }
+                    return Err(MemoryError::Validation(format!(
+                        "{fault}; the run stops rather than pay for another dispatch whose met \
+                         would be refused the same way; {}",
+                        kept_mid_run(config.implementer)
+                    )));
+                }
+                // Retrying a session still in use can never succeed, so it
+                // spends no more units, in this run or on a later Lead tick.
+                if let Some(detail) = session_in_use {
+                    break TerminalReason::SessionInUse { detail };
+                }
                 write_state(
-                    db,
+                    &mut owned,
                     cumulative_attempt_n,
                     turn_n,
-                    "infrastructure-failure",
+                    DispatchPhase::InfrastructureFailure,
                     &session_uuid,
                     resuming,
-                    (&native_session_id, &codex_artifacts),
+                    (&native_session_id, &invocation_artifacts),
+                    (&session_model, resume_refusals),
                 )?;
                 if consecutive_infrastructure_failures
                     >= config.max_consecutive_infrastructure_failures
@@ -1743,21 +4337,38 @@ pub fn run_issue(
         }
     };
 
-    if terminal.clears_dispatch_state() {
-        dispatch_state::clear_dispatch_state(db, issue)?;
-    } else if !matches!(terminal, TerminalReason::ImplementationInFlight { .. }) {
-        let state_label = match &terminal {
-            TerminalReason::DailyBudgetExhausted { .. } => "paused-daily-budget",
-            _ => "paused-infrastructure-failure",
-        };
+    // A session parked as still in use stays parked until a launch probes
+    // it: a run that stopped before launching (a budget, a cap, an
+    // escalation) learned nothing about its holder, and the park is what
+    // keeps a later run from rotating over it or the queue from admitting it.
+    let disposition = match (&terminal, terminal.disposition()) {
+        (TerminalReason::AttemptCapExhausted, _) | (_, Disposition::Park(_))
+            if parked_in_use && !launched =>
+        {
+            Disposition::Park(DispatchPhase::PausedSessionInUse)
+        }
+        (_, disposition) => disposition,
+    };
+    if disposition == Disposition::Clear {
+        // Only the state this run owns; one another run wrote is theirs.
+        if let Some(owned) = &owned {
+            // Lost: another run owns the issue now, and this run's ending
+            // (an exhausted cap, say, which the Lead would close out) is not
+            // the issue's.
+            if !dispatch_state::clear_claim_if_unchanged(db, owned)? {
+                return Err(taken_over());
+            }
+        }
+    } else if let Disposition::Park(state_label) = disposition {
         write_state(
-            db,
+            &mut owned,
             cumulative_attempt_n,
             turn_n,
             state_label,
             &session_uuid,
             resuming,
-            (&native_session_id, &codex_artifacts),
+            (&native_session_id, &invocation_artifacts),
+            (&session_model, resume_refusals),
         )?;
     }
 
@@ -1774,15 +4385,164 @@ pub fn run_issue(
 
 #[cfg(test)]
 mod tests {
+    /// [`record_and_advance`] as the run that owns whatever dispatch state
+    /// is stored, leaving it as it is.
+    fn record_as_owner(
+        db: &Database,
+        record: &AttemptRecord,
+        recovering: Option<Implementer>,
+    ) -> Result<bool, MemoryError> {
+        let mut owned = dispatch_state::get_claim(db, &record.issue)?;
+        let then = owned.clone();
+        record_and_advance(db, record, recovering, &mut owned, then)
+    }
+
     use super::*;
     use crate::autopilot::{retry, worktree};
+
+    /// An invocation held only for a busy worktree finishes by itself; the
+    /// hold message says so, and names `clear-dispatch` as the manual
+    /// release. Any other held invocation still needs the operator.
+    #[cfg(unix)]
+    #[test]
+    fn a_claude_pipe_descendant_holds_the_issue_instead_of_retrying() {
+        use std::os::unix::fs::PermissionsExt;
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        gate_config::set_wall_clock_timeout(&db, &issue().repo, Some(2)).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let pids = temp.path().join("children");
+        struct Children(std::path::PathBuf);
+        impl Drop for Children {
+            fn drop(&mut self) {
+                if let Ok(text) = std::fs::read_to_string(&self.0) {
+                    for pid in text.lines().filter_map(|line| line.parse::<i32>().ok()) {
+                        // SAFETY: only this fixture's own still-sleeping children.
+                        unsafe {
+                            libc::kill(pid, libc::SIGKILL);
+                        }
+                    }
+                }
+            }
+        }
+        let _children = Children(pids.clone());
+        let bin = temp.path().join("claude-stub");
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\nsleep 60 &\necho $! >> '{}'\nexit 0\n",
+                pids.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut config = config();
+        config.max_consecutive_infrastructure_failures = 2;
+        let mut dispatcher = ClaudeDispatcher { bin };
+        let result = run_issue(&db, &issue(), &brief(), &wt, &config, &mut dispatcher).unwrap();
+        assert!(
+            matches!(
+                result.terminal,
+                TerminalReason::ImplementationInFlight { .. }
+            ),
+            "{:?}",
+            result.terminal
+        );
+        assert_eq!(
+            std::fs::read_to_string(&pids).unwrap().lines().count(),
+            1,
+            "no retry may overlap the child"
+        );
+        let state = dispatch_state::get_dispatch_state(&db, &issue())
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.state, "paused-completion-unproven");
+        assert_eq!(result.unpriced_dispatches, 1);
+        assert!(lineage::attempts_for_issue(&db, &issue())
+            .unwrap()
+            .is_empty());
+        let error = run_issue(&db, &issue(), &brief(), &wt, &config, &mut dispatcher)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("completion is unproven"), "{error}");
+        assert!(
+            error.contains("ironmem autopilot clear-dispatch") && !error.contains("--confirm-dead"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read_to_string(&pids).unwrap().lines().count(), 1);
+        lineage::upsert_issue_status(
+            &db,
+            &IssueStatus {
+                issue: issue(),
+                best_verdict: Some(AttemptOutcome::Success),
+                best_commit_sha: None,
+                cumulative_attempt_n: 0,
+            },
+        )
+        .unwrap();
+        let snapshot = super::super::registry::HarnessSnapshots {
+            claude: super::super::registry::RegistrySnapshot::Available(Vec::new()),
+            processes: super::super::process_tree::ProcessSnapshot::Available(Vec::new()),
+        };
+        assert!(
+            super::super::clear::release_settled_dispatches(&db, &snapshot, 1)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(dispatch_state::get_dispatch_state(&db, &issue())
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn ultrareview_absolute_muse_root_does_not_read_cwd() {
+        let no_cwd = || Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+        validate_worktree_root_from(Implementer::Muse, Path::new("/valid-root"), no_cwd).unwrap();
+        let err = validate_worktree_root_from(Implementer::Muse, Path::new("/bad root"), no_cwd)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("whitespace"), "{err}");
+    }
+
+    #[test]
+    fn the_release_hint_tells_an_awaiting_quiet_hold_it_finishes_by_itself() {
+        let (_dir, s) = crate::autopilot::invocation::contract_tests::setup();
+        let a = s.invocation_artifacts.as_ref().unwrap();
+        let other = release_hint(&issue(), Some(a));
+        assert!(other.contains("once no process remains") && other.contains("clear-dispatch"));
+        let worktree = tempfile::tempdir().unwrap();
+        // SAFETY: geteuid has no preconditions.
+        let uid = unsafe { libc::geteuid() };
+        crate::autopilot::invocation::contract_tests::write_awaiting(
+            a,
+            uid,
+            worktree.path(),
+            Vec::new(),
+        );
+        let awaiting = release_hint(&issue(), Some(a));
+        assert!(
+            awaiting.contains("later Lead tick")
+                && awaiting.contains("autopilot run")
+                && awaiting.contains("manual release")
+                && awaiting.contains("clear-dispatch ironrace/ironmem 283"),
+            "{awaiting}"
+        );
+        // an exit record that exists but cannot be read is named.
+        std::fs::write(&a.exit_path, "not json").unwrap();
+        let unreadable = release_hint(&issue(), Some(a));
+        assert!(
+            unreadable.contains("the exit record cannot be read")
+                && unreadable.contains("clear-dispatch"),
+            "{unreadable}"
+        );
+    }
 
     #[test]
     fn invalid_codex_resume_refuses_before_reservation_or_state_overwrite() {
         let db = approved_db();
         let (_dir, wt) = fixture_worktree();
         let mut state = pending_codex(&db, &wt, Some("invalid-native-uuid"));
-        state.codex_artifacts = None;
+        state.invocation_artifacts = None;
         state.state = "previous-safe-state".into();
         dispatch_state::upsert_dispatch_state(&db, &state).unwrap();
         let ledger =
@@ -1806,8 +4566,8 @@ mod tests {
     #[test]
     fn held_codex_reports_only_its_existing_reservation_including_prior_days() {
         for recovery in [
-            CodexRecovery::Alive,
-            CodexRecovery::Unknown {
+            InvocationRecovery::Alive,
+            InvocationRecovery::Unknown {
                 reason: "unproven completion".into(),
             },
         ] {
@@ -1815,7 +4575,7 @@ mod tests {
                 let db = approved_db();
                 let (_dir, wt) = fixture_worktree();
                 let state = pending_codex(&db, &wt, None);
-                let id = &state.codex_artifacts.as_ref().unwrap().invocation_id;
+                let id = &state.invocation_artifacts.as_ref().unwrap().invocation_id;
                 let unrelated =
                     budget::reserve_unpriced_dispatch(&db, &today_utc(), "unrelated-invocation")
                         .unwrap();
@@ -1876,7 +4636,7 @@ mod tests {
         let mut result = not_met();
         result.cost_usd = None;
         let mut d = codex_script(vec![]);
-        d.recovery = Some(CodexRecovery::Finished(result));
+        d.recovery = Some(InvocationRecovery::Finished(result));
         let run = run_issue(&db, &issue(), &brief(), &wt, &c, &mut d).unwrap();
         let attempts = lineage::attempts_for_issue(&db, &issue()).unwrap();
         assert_eq!(
@@ -1929,17 +4689,19 @@ mod tests {
     #[test]
     fn absolute_pending_artifacts_survive_actual_worktree_quarantine() {
         let db = approved_db();
-        let (repo, _) = fixture_worktree();
+        let (repo, wt) = fixture_worktree();
+        // An operator checkout: the issue branch is the linked worktree's.
+        git_in(&wt.path, &["checkout", "-q", "main"]);
         let roots = tempfile::tempdir().unwrap();
         let first = worktree::ensure_worktree(repo.path(), roots.path(), &issue(), "HEAD").unwrap();
         let state = pending_codex(&db, &first, None);
         std::fs::write(first.path.join("dirty.txt"), "unfinished").unwrap();
         let fresh = worktree::ensure_worktree(repo.path(), roots.path(), &issue(), "HEAD").unwrap();
         assert!(fresh.quarantined_from.is_some());
-        let artifacts = state.codex_artifacts.as_ref().unwrap();
+        let artifacts = state.invocation_artifacts.as_ref().unwrap();
         assert!(Path::new(&artifacts.journal_path).is_file());
         let mut d = codex_script(vec![]);
-        d.recovery = Some(CodexRecovery::Alive);
+        d.recovery = Some(InvocationRecovery::Alive);
         let run = run_issue(&db, &issue(), &brief(), &fresh, &codex_config(), &mut d).unwrap();
         assert!(matches!(
             run.terminal,
@@ -1960,12 +4722,12 @@ mod tests {
             let ledger = budget::reserve_unpriced_dispatch(
                 &db,
                 &today_utc(),
-                &state.codex_artifacts.as_ref().unwrap().invocation_id,
+                &state.invocation_artifacts.as_ref().unwrap().invocation_id,
             )
             .unwrap();
             let mut result = impossible();
             result.cost_usd = None;
-            record_and_advance(
+            record_as_owner(
                 &db,
                 &AttemptRecord {
                     issue: issue(),
@@ -1975,14 +4737,13 @@ mod tests {
                     why_failed: Some(why_failed_text(&result, DispatchClassification::Impossible)),
                     commit_sha: None,
                 },
-                None,
-                true,
+                Some(Implementer::Codex),
             )
             .unwrap();
             let attempts = lineage::attempts_for_issue(&db, &issue()).unwrap();
             let status = lineage::get_issue_status(&db, &issue()).unwrap();
             let mut d = codex_script(vec![met()]);
-            d.recovery = Some(CodexRecovery::Finished(result.clone()));
+            d.recovery = Some(InvocationRecovery::Finished(result.clone()));
             let run = run_issue(&db, &issue(), &brief(), &wt, &codex_config(), &mut d).unwrap();
             assert_eq!(
                 run.terminal,
@@ -2031,26 +4792,42 @@ mod tests {
         missing.native_session_id = None;
         let mut conflicting = impossible();
         conflicting.native_session_id = Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".into());
-        for mut result in [
-            not_met(),
-            nonzero,
-            errored,
-            killed,
-            unstarted,
-            missing,
-            conflicting,
-        ] {
+        for (implementer, mut result) in [Implementer::Codex, Implementer::Muse]
+            .into_iter()
+            .flat_map(|implementer| {
+                [
+                    not_met(),
+                    nonzero.clone(),
+                    errored.clone(),
+                    killed.clone(),
+                    unstarted.clone(),
+                    missing.clone(),
+                    conflicting.clone(),
+                ]
+                .map(|result| (implementer, result))
+            })
+        {
             let db = approved_db();
             let (_dir, wt) = fixture_worktree();
             let native = "11111111-2222-3333-4444-555555555555";
-            let state = pending_codex(&db, &wt, Some(native));
+            let mut state = pending_invocation(implementer, &db, &wt, Some(native));
+            // Muse continues the controller's session, which is its native id.
+            if implementer == Implementer::Muse {
+                state.session_uuid = native.into();
+                dispatch_state::upsert_dispatch_state(&db, &state).unwrap();
+            }
+            let c = if implementer == Implementer::Muse {
+                muse_config()
+            } else {
+                codex_config()
+            };
             budget::reserve_unpriced_dispatch(
                 &db,
                 &today_utc(),
-                &state.codex_artifacts.as_ref().unwrap().invocation_id,
+                &state.invocation_artifacts.as_ref().unwrap().invocation_id,
             )
             .unwrap();
-            record_and_advance(
+            record_as_owner(
                 &db,
                 &AttemptRecord {
                     issue: issue(),
@@ -2060,20 +4837,32 @@ mod tests {
                     why_failed: Some("not met".into()),
                     commit_sha: None,
                 },
-                None,
-                true,
+                Some(implementer),
             )
             .unwrap();
             result.cost_usd = None;
-            let mut d = codex_script(vec![met()]);
-            d.recovery = Some(CodexRecovery::Finished(result));
-            let run = run_issue(&db, &issue(), &brief(), &wt, &codex_config(), &mut d).unwrap();
-            assert!(matches!(run.terminal, TerminalReason::Met { .. }));
+            // Muse resumes the controller's session only once an invocation
+            // used it; one that never started leaves it to be opened.
+            let session = if implementer == Implementer::Muse && !result.invocation_started {
+                SessionMode::New {
+                    session_uuid: native.into(),
+                }
+            } else {
+                SessionMode::Resume {
+                    session_uuid: native.into(),
+                }
+            };
+            let mut d = cli_script(implementer, vec![met()]);
+            d.recovery = Some(InvocationRecovery::Finished(result));
+            let run = run_issue(&db, &issue(), &brief(), &wt, &c, &mut d).unwrap();
+            assert!(
+                matches!(run.terminal, TerminalReason::Met { .. }),
+                "{implementer:?}: {:?}",
+                run.terminal
+            );
             assert_eq!(run.cumulative_attempt_n, 2);
             assert_eq!(d.inner.seen.len(), 1);
-            assert!(
-                matches!(&d.inner.seen[0].session, SessionMode::Resume { session_uuid } if session_uuid == native)
-            );
+            assert_eq!(d.inner.seen[0].session, session, "{implementer:?}");
             assert_eq!(lineage::attempts_for_issue(&db, &issue()).unwrap().len(), 2);
             assert_eq!(
                 budget::get_daily_spend(&db, &today_utc())
@@ -2104,7 +4893,7 @@ mod tests {
         let mut result = not_met();
         result.cost_usd = None;
         let mut d = codex_script(vec![]);
-        d.recovery = Some(CodexRecovery::Finished(result));
+        d.recovery = Some(InvocationRecovery::Finished(result));
         let run = run_issue(&db, &issue(), &brief(), &wt, &c, &mut d).unwrap();
         assert!(matches!(run.terminal, TerminalReason::AttemptCapExhausted));
         assert_eq!(
@@ -2113,7 +4902,11 @@ mod tests {
         );
         assert!(run.dispatches.is_empty());
         assert!(d.inner.seen.is_empty());
-        assert!(state.codex_artifacts.unwrap().journal_path.starts_with('/'));
+        assert!(state
+            .invocation_artifacts
+            .unwrap()
+            .journal_path
+            .starts_with('/'));
     }
     #[cfg(unix)]
     #[test]
@@ -2138,20 +4931,27 @@ sleep 0.5
         )
         .unwrap();
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let mut d = CodexDispatcher { bin };
+        let mut d = CliDispatcher {
+            implementer: Implementer::Codex,
+            bin,
+            shared_daemon: Some(crate::autopilot::process_tree::SharedDaemon {
+                socket: wt.path.join("no-shared-daemon.sock"),
+                exe: std::env::current_exe().unwrap(),
+            }),
+        };
         let state = pending_codex(&db, &wt, None);
         assert!(matches!(
             d.recover(&wt.path, &state).unwrap(),
-            CodexRecovery::Unknown { .. }
+            InvocationRecovery::Unknown { .. }
         ));
         std::fs::write(
-            &state.codex_artifacts.as_ref().unwrap().exit_path,
+            &state.invocation_artifacts.as_ref().unwrap().exit_path,
             "not-json",
         )
         .unwrap();
         assert!(matches!(
             d.recover(&wt.path, &state).unwrap(),
-            CodexRecovery::Unknown { .. }
+            InvocationRecovery::Unknown { .. }
         ));
         dispatch_state::clear_dispatch_state(&db, &issue()).unwrap();
         let run = run_issue(&db, &issue(), &brief(), &wt, &codex_config(), &mut d).unwrap();
@@ -2160,23 +4960,151 @@ sleep 0.5
         assert_eq!(run.unpriced_dispatches, 1);
         assert_eq!(run.total_cost_usd, 0.0);
     }
-    struct CodexScript {
-        inner: ScriptedDispatcher,
-        recovery: Option<super::super::codex_dispatch::CodexRecovery>,
+    #[test]
+    fn a_held_muse_dispatch_refuses_provisioning_in_its_own_name() {
+        struct MuseHold(Option<InvocationRecovery>);
+        impl Dispatcher for MuseHold {
+            fn implementer(&self) -> Implementer {
+                Implementer::Muse
+            }
+            fn recover(
+                &mut self,
+                _repo: &Path,
+                _state: &DispatchState,
+            ) -> Result<InvocationRecovery, MemoryError> {
+                Ok(self.0.take().unwrap())
+            }
+            fn dispatch(
+                &mut self,
+                _repo: &Path,
+                _spec: &DispatchSpec,
+            ) -> Result<DispatchOutcome, MemoryError> {
+                unreachable!("preflight never dispatches")
+            }
+        }
+        let db = Database::open_in_memory().unwrap();
+        dispatch_state::upsert_dispatch_state(
+            &db,
+            &DispatchState {
+                implementer: Implementer::Muse,
+                native_session_id: Some("11111111-2222-3333-4444-555555555555".into()),
+                invocation_artifacts: None,
+                issue: issue(),
+                worktree_path: "/tmp/wt".into(),
+                ic_session_name: "ic".into(),
+                dispatch_class: "logic".into(),
+                attempt_n: 1,
+                state: "dispatching".into(),
+                started_at: "2026-10-26T00:00:00Z".into(),
+                session_uuid: "11111111-2222-3333-4444-555555555555".into(),
+                turn_n: 1,
+                session_claimed: true,
+                session_model: None,
+                resume_refusals: 0,
+                signing_held: false,
+            },
+        )
+        .unwrap();
+        let refuse = |recovery| {
+            preflight_worktree_provisioning(
+                &db,
+                &issue(),
+                Implementer::Muse,
+                &mut MuseHold(Some(recovery)),
+            )
+            .unwrap_err()
+            .to_string()
+        };
+        let alive = refuse(InvocationRecovery::Alive);
+        assert!(
+            alive.contains("its Muse implementation is still alive"),
+            "{alive}"
+        );
+        let unknown = refuse(InvocationRecovery::Unknown {
+            reason: "ps timed out".into(),
+        });
+        assert!(
+            unknown.contains("while Muse process completion is uncertain: ps timed out"),
+            "{unknown}"
+        );
     }
-    impl Dispatcher for CodexScript {
+
+    /// preflight refuses a leased Claude claim before provisioning,
+    /// so `ensure_worktree` never quarantines a live controller's tree.
+    #[test]
+    fn preflight_refuses_a_leased_claude_claim_before_any_recovery() {
+        let db = Database::open_in_memory().unwrap();
+        db.migrate().unwrap();
+        let state = DispatchState {
+            implementer: Implementer::Claude,
+            native_session_id: Some("11111111-2222-3333-4444-555555555555".into()),
+            invocation_artifacts: None,
+            issue: issue(),
+            worktree_path: "/tmp/wt".into(),
+            ic_session_name: "ic".into(),
+            dispatch_class: "logic".into(),
+            attempt_n: 1,
+            state: "dispatching".into(),
+            started_at: "2026-10-26T00:00:00Z".into(),
+            session_uuid: "11111111-2222-3333-4444-555555555555".into(),
+            turn_n: 1,
+            session_claimed: true,
+            session_model: None,
+            resume_refusals: 0,
+            signing_held: false,
+        };
+        let claim = dispatch_state::Claim {
+            state,
+            owner: Some("another-run".into()),
+            claimed_at: Some(chrono::Utc::now().to_rfc3339()),
+            common_dir: None,
+        };
+        assert!(dispatch_state::claim_if_unchanged(&db, None, &claim).unwrap());
+        struct LeasedHold(Option<InvocationRecovery>);
+        impl Dispatcher for LeasedHold {
+            fn recover(
+                &mut self,
+                _repo: &Path,
+                _state: &DispatchState,
+            ) -> Result<InvocationRecovery, MemoryError> {
+                Ok(self.0.take().unwrap())
+            }
+            fn dispatch(
+                &mut self,
+                _repo: &Path,
+                _spec: &DispatchSpec,
+            ) -> Result<DispatchOutcome, MemoryError> {
+                unreachable!("preflight never dispatches")
+            }
+        }
+        let mut hold = LeasedHold(Some(InvocationRecovery::NoPriorInvocation));
+        let err = preflight_worktree_provisioning(&db, &issue(), Implementer::Claude, &mut hold)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("lease"), "{err}");
+        assert!(
+            hold.0.is_some(),
+            "recovery was consulted before the lease refusal"
+        );
+    }
+    struct CliScript {
+        implementer: Implementer,
+        inner: ScriptedDispatcher,
+        recovery: Option<super::super::invocation::InvocationRecovery>,
+    }
+    impl Dispatcher for CliScript {
         fn implementer(&self) -> Implementer {
-            Implementer::Codex
+            self.implementer
         }
         fn recover(
             &mut self,
             _repo: &Path,
             _state: &DispatchState,
-        ) -> Result<CodexRecovery, MemoryError> {
+        ) -> Result<InvocationRecovery, MemoryError> {
             Ok(self
                 .recovery
                 .take()
-                .unwrap_or(CodexRecovery::NoPriorInvocation))
+                .unwrap_or(InvocationRecovery::NoPriorInvocation))
         }
         fn dispatch(
             &mut self,
@@ -2186,8 +5114,9 @@ sleep 0.5
             self.inner.dispatch(repo, spec)
         }
     }
-    fn codex_script(outcomes: Vec<DispatchOutcome>) -> CodexScript {
-        CodexScript {
+    fn cli_script(implementer: Implementer, outcomes: Vec<DispatchOutcome>) -> CliScript {
+        CliScript {
+            implementer,
             inner: ScriptedDispatcher::new(
                 outcomes
                     .into_iter()
@@ -2200,6 +5129,18 @@ sleep 0.5
             recovery: None,
         }
     }
+    fn codex_script(outcomes: Vec<DispatchOutcome>) -> CliScript {
+        cli_script(Implementer::Codex, outcomes)
+    }
+    fn muse_script(outcomes: Vec<DispatchOutcome>) -> CliScript {
+        cli_script(Implementer::Muse, outcomes)
+    }
+    fn muse_config() -> RunConfig {
+        let mut c = config();
+        c.implementer = Implementer::Muse;
+        c.model = "muse-wonder-1.0".into();
+        c
+    }
     fn codex_config() -> RunConfig {
         let mut c = config();
         c.implementer = Implementer::Codex;
@@ -2207,12 +5148,25 @@ sleep 0.5
         c
     }
     fn pending_codex(db: &Database, worktree: &Worktree, native: Option<&str>) -> DispatchState {
-        let artifacts =
-            super::super::codex_dispatch::prepare_artifacts(&worktree.path, &issue()).unwrap();
+        pending_invocation(Implementer::Codex, db, worktree, native)
+    }
+    fn pending_muse(db: &Database, worktree: &Worktree, native: Option<&str>) -> DispatchState {
+        pending_invocation(Implementer::Muse, db, worktree, native)
+    }
+    fn pending_invocation(
+        implementer: Implementer,
+        db: &Database,
+        worktree: &Worktree,
+        native: Option<&str>,
+    ) -> DispatchState {
+        // A Claude state never carries artifacts; its load refuses them.
+        let artifacts = (implementer != Implementer::Claude).then(|| {
+            super::super::invocation::prepare_artifacts(&worktree.path, &issue()).unwrap()
+        });
         let state = DispatchState {
-            implementer: Implementer::Codex,
+            implementer,
             native_session_id: native.map(str::to_string),
-            codex_artifacts: Some(artifacts),
+            invocation_artifacts: artifacts,
             issue: issue(),
             worktree_path: worktree.path.to_string_lossy().into_owned(),
             ic_session_name: "ic".into(),
@@ -2223,6 +5177,9 @@ sleep 0.5
             session_uuid: "controller-placeholder".into(),
             turn_n: 0,
             session_claimed: false,
+            session_model: None,
+            resume_refusals: 0,
+            signing_held: false,
         };
         dispatch_state::upsert_dispatch_state(db, &state).unwrap();
         state
@@ -2238,8 +5195,8 @@ sleep 0.5
             matches!(&d.inner.seen[1].session, SessionMode::Resume { session_uuid } if session_uuid == "11111111-2222-3333-4444-555555555555")
         );
         assert_ne!(
-            d.inner.seen[0].codex_artifacts,
-            d.inner.seen[1].codex_artifacts
+            d.inner.seen[0].invocation_artifacts,
+            d.inner.seen[1].invocation_artifacts
         );
         assert_eq!(run.unpriced_dispatches, 2);
         assert_eq!(run.total_cost_usd, 0.0);
@@ -2283,8 +5240,8 @@ sleep 0.5
     #[test]
     fn codex_recovery_hold_preserves_exact_artifacts_and_never_dispatches() {
         for recovery in [
-            CodexRecovery::Alive,
-            CodexRecovery::Unknown {
+            InvocationRecovery::Alive,
+            InvocationRecovery::Unknown {
                 reason: "not proven dead".into(),
             },
         ] {
@@ -2309,20 +5266,491 @@ sleep 0.5
         }
     }
     #[test]
-    fn recovered_success_at_cap_is_consumed_without_new_call_or_billing() {
+    fn a_live_muse_invocation_is_held_with_a_muse_message_and_never_redispatched() {
+        for (recovery, expected) in [
+            (
+                InvocationRecovery::Alive,
+                "Muse implementation is still alive",
+            ),
+            (
+                InvocationRecovery::Unknown {
+                    reason: "not proven dead".into(),
+                },
+                "not proven dead",
+            ),
+        ] {
+            let db = approved_db();
+            let (_dir, wt) = fixture_worktree();
+            let state = pending_muse(&db, &wt, None);
+            let mut d = muse_script(vec![]);
+            d.recovery = Some(recovery);
+            let run = run_issue(&db, &issue(), &brief(), &wt, &muse_config(), &mut d).unwrap();
+            match run.terminal {
+                TerminalReason::ImplementationInFlight { detail } => {
+                    assert!(detail.contains(expected), "got: {detail}");
+                    assert!(!detail.contains("Codex"), "got: {detail}");
+                }
+                other => panic!("expected a hold, got {other:?}"),
+            }
+            assert!(d.inner.seen.is_empty());
+            assert_eq!(
+                dispatch_state::get_dispatch_state(&db, &issue()).unwrap(),
+                Some(state)
+            );
+        }
+    }
+    /// A finished Muse invocation that ended with no terminal record and a
+    /// non-zero exit, with `stderr` as Muse's own complaint.
+    fn muse_infra_failure(stderr: &str) -> DispatchOutcome {
+        DispatchOutcome {
+            cost_usd: None,
+            num_turns: 0,
+            duration_ms: 900,
+            is_error: true,
+            native_session_id: None,
+            invocation_started: true,
+            verdict: None,
+            reason: Some(format!(
+                "Muse journal never names the requested session; Muse run emitted no terminal \
+                 record; Muse process exited with Some(1); stderr: {stderr}"
+            )),
+            process_success: false,
+            timed_out: false,
+            session_refusal: None,
+        }
+    }
+    /// Measured (Muse 1.4.13 and 1.4.14): a resume on another provider.
+    fn muse_refusal() -> DispatchOutcome {
+        let mut outcome = muse_infra_failure(
+            "failed to read retained session 0d6c1e2a-5b8f-4c1d-9e3a-7f2b6a1c4d5e: session \
+             0d6c1e2a-5b8f-4c1d-9e3a-7f2b6a1c4d5e was created with provider echo; refusing to \
+             resume with provider meta; start a new session to switch providers",
+        );
+        outcome.session_refusal = Some(SessionRefusal::Unresumable);
+        outcome
+    }
+    /// Measured: a second `exec` on a session Muse still holds.
+    fn muse_in_use() -> DispatchOutcome {
+        let mut outcome =
+            muse_infra_failure("session 0d6c1e2a-5b8f-4c1d-9e3a-7f2b6a1c4d5e is already in use");
+        outcome.session_refusal = Some(SessionRefusal::InUse);
+        outcome
+    }
+    fn session_of(spec: &DispatchSpec) -> String {
+        spec.session.session_uuid().to_owned()
+    }
+
+    #[test]
+    fn two_muse_resume_refusals_open_a_fresh_session_for_the_next_dispatch() {
         let db = approved_db();
         let (_dir, wt) = fixture_worktree();
-        let state = pending_codex(&db, &wt, None);
-        let c = codex_config();
+        let mut d = muse_script(vec![muse_refusal(), muse_refusal(), met()]);
+        let run = run_issue(&db, &issue(), &brief(), &wt, &muse_config(), &mut d).unwrap();
+        assert!(
+            matches!(run.terminal, TerminalReason::Met { .. }),
+            "{:?}",
+            run.terminal
+        );
+        let seen = &d.inner.seen;
+        assert_eq!(
+            session_of(&seen[0]),
+            session_of(&seen[1]),
+            "one refusal keeps it"
+        );
+        assert_ne!(
+            session_of(&seen[1]),
+            session_of(&seen[2]),
+            "two refusals rotate it"
+        );
+        assert!(matches!(seen[2].session, SessionMode::New { .. }));
+        let first = run.dispatches[0].reason.as_deref().unwrap();
+        assert!(first.contains("1 of 2"), "{first}");
+        let second = run.dispatches[1].reason.as_deref().unwrap();
+        assert!(second.contains("fresh session"), "{second}");
+        assert!(
+            second.contains("ironmem autopilot clear-dispatch ironrace/ironmem 283"),
+            "{second}"
+        );
+        assert!(
+            second.contains("refusing to resume"),
+            "Muse's own words stay: {second}"
+        );
+    }
+
+    /// Muse's lock is the one guard against a second implementer that does
+    /// not rest on Autopilot's own process evidence. "In use" after a finish
+    /// means something still holds the session, so it is never rotated over,
+    /// and since a retry can never succeed the run stops on the first one and
+    /// parks the issue for an operator instead of spending more units.
+    #[test]
+    fn a_muse_session_in_use_stops_the_run_and_parks_the_issue() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        let mut d = muse_script(vec![muse_in_use(), met()]);
+        let run = run_issue(&db, &issue(), &brief(), &wt, &muse_config(), &mut d).unwrap();
+        assert_eq!(d.inner.seen.len(), 1, "no second dispatch in this run");
+        let session = session_of(&d.inner.seen[0]);
+        let hint = format!(
+            "Muse reports session {session} still in use; Autopilot won't start a new session \
+             over it; inspect for a leftover Muse process, then `ironmem autopilot \
+             clear-dispatch ironrace/ironmem 283`"
+        );
+        match &run.terminal {
+            TerminalReason::SessionInUse { detail } => {
+                assert!(detail.contains(&hint), "{detail}")
+            }
+            other => panic!("expected SessionInUse, got {other:?}"),
+        }
+        assert_eq!(run.dispatches.len(), 1);
+        assert_eq!(
+            run.dispatches[0].classification,
+            DispatchClassification::InfrastructureFailure
+        );
+        assert!(
+            run.dispatches[0].reason.as_deref().unwrap().contains(&hint),
+            "{:?}",
+            run.dispatches[0].reason
+        );
+        assert_eq!(run.cumulative_attempt_n, 0, "no attempt is charged");
+        let state = dispatch_state::get_dispatch_state(&db, &issue())
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.state, "paused-session-in-use");
+        assert_eq!(state.session_uuid, session, "never rotated over");
+        assert!(state.invocation_artifacts.is_none(), "{state:?}");
+        assert_eq!(state.resume_refusals, 0);
+        // An operator who has dealt with the holder may run it again: the
+        // same session continues, and the in-use left no refusal count.
+        let mut again = muse_script(vec![muse_refusal(), met()]);
+        let rerun = run_issue(&db, &issue(), &brief(), &wt, &muse_config(), &mut again).unwrap();
+        assert!(matches!(rerun.terminal, TerminalReason::Met { .. }));
+        let sessions: Vec<_> = again.inner.seen.iter().map(session_of).collect();
+        assert_eq!(sessions, [session.clone(), session]);
+    }
+
+    /// A parked session may still be held, so even a different `--model`
+    /// resumes it first: Muse's lock answers before any fresh session could
+    /// start a second Muse over the holder. Still held, it parks again. Gone,
+    /// with the provider really changed, Muse refuses to resume it and the
+    /// usual two refusals rotate it.
+    #[test]
+    fn a_model_change_on_a_parked_in_use_session_probes_the_same_session_first() {
+        let mut changed = muse_config();
+        changed.model = "muse-wonder-2.0".into();
+        let park = |db: &Database, wt: &Worktree| {
+            let mut d = muse_script(vec![muse_in_use()]);
+            run_issue(db, &issue(), &brief(), wt, &muse_config(), &mut d).unwrap();
+            session_of(&d.inner.seen[0])
+        };
+
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        let held = park(&db, &wt);
+        let mut d = muse_script(vec![muse_in_use()]);
+        let run = run_issue(&db, &issue(), &brief(), &wt, &changed, &mut d).unwrap();
+        assert_eq!(session_of(&d.inner.seen[0]), held, "probe the held session");
+        assert!(matches!(run.terminal, TerminalReason::SessionInUse { .. }));
+        let state = dispatch_state::get_dispatch_state(&db, &issue())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (state.state.as_str(), state.session_uuid.as_str()),
+            ("paused-session-in-use", held.as_str())
+        );
+
+        let db = approved_db();
+        let held = park(&db, &wt);
+        let mut d = muse_script(vec![muse_refusal(), muse_refusal(), met()]);
+        let run = run_issue(&db, &issue(), &brief(), &wt, &changed, &mut d).unwrap();
+        assert!(matches!(run.terminal, TerminalReason::Met { .. }));
+        let sessions: Vec<_> = d.inner.seen.iter().map(session_of).collect();
+        assert_eq!(sessions[..2], [held.clone(), held.clone()], "{sessions:?}");
+        assert_ne!(sessions[2], held, "{sessions:?}");
+    }
+
+    /// a run that stops before it launches (here at the day's unpriced
+    /// cap) learned nothing about a parked session's holder, so the park
+    /// stands, and a later run on another model still probes that session.
+    #[test]
+    fn a_run_that_never_launches_keeps_a_session_parked_as_in_use() {
+        let mut changed = muse_config();
+        changed.model = "muse-wonder-2.0".into();
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        let mut d = muse_script(vec![muse_in_use()]);
+        run_issue(&db, &issue(), &brief(), &wt, &muse_config(), &mut d).unwrap();
+        let held = session_of(&d.inner.seen[0]);
+
+        let mut capped = muse_config();
+        capped.max_unpriced_dispatches_per_day = 1;
+        let mut d = muse_script(Vec::new());
+        let run = run_issue(&db, &issue(), &brief(), &wt, &capped, &mut d).unwrap();
+        assert!(
+            matches!(
+                run.terminal,
+                TerminalReason::UnpricedDispatchesExhausted { .. }
+            ),
+            "{:?}",
+            run.terminal
+        );
+        assert!(d.inner.seen.is_empty());
+        let state = dispatch_state::get_dispatch_state(&db, &issue())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (state.state.as_str(), state.session_uuid.as_str()),
+            ("paused-session-in-use", held.as_str())
+        );
+
+        let mut d = muse_script(vec![met()]);
+        run_issue(&db, &issue(), &brief(), &wt, &changed, &mut d).unwrap();
+        assert_eq!(
+            session_of(&d.inner.seen[0]),
+            held,
+            "the held session is probed"
+        );
+    }
+
+    /// the condition's push clause names the remote whose URL is the
+    /// issue's repository, never the fork `origin` is; with no remote at
+    /// all it names the branch only.
+    #[test]
+    fn the_dispatched_condition_pushes_to_the_issue_repositorys_remote() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        git_in(
+            &wt.path,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/someone/ironmem.git",
+            ],
+        );
+        git_in(
+            &wt.path,
+            &[
+                "remote",
+                "add",
+                "upstream",
+                "https://github.com/ironrace/ironmem.git",
+            ],
+        );
+        let mut d = ScriptedDispatcher::new(vec![Ok(met())]);
+        run_issue(&db, &issue(), &brief(), &wt, &config(), &mut d).unwrap();
+        let push = format!("`git push upstream {}`", wt.branch);
+        assert!(
+            d.seen[0].condition.contains(&push),
+            "{}",
+            d.seen[0].condition
+        );
+
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        let mut d = ScriptedDispatcher::new(vec![Ok(met())]);
+        run_issue(&db, &issue(), &brief(), &wt, &config(), &mut d).unwrap();
+        let condition = &d.seen[0].condition;
+        assert!(
+            condition.contains(&format!("is pushed to this issue's branch `{}`", wt.branch)),
+            "{condition}"
+        );
+        assert!(!condition.contains("git push"), "{condition}");
+    }
+
+    #[test]
+    fn muse_resume_refusals_are_counted_across_runs() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        let mut c = muse_config();
+        c.max_consecutive_infrastructure_failures = 1;
+        let mut sessions = Vec::new();
+        for outcome in [muse_refusal(), muse_refusal(), met()] {
+            let mut d = muse_script(vec![outcome]);
+            run_issue(&db, &issue(), &brief(), &wt, &c, &mut d).unwrap();
+            sessions.push(session_of(&d.inner.seen[0]));
+        }
+        assert_eq!(sessions[0], sessions[1]);
+        assert_ne!(sessions[1], sessions[2]);
+    }
+
+    #[test]
+    fn an_ordinary_muse_infrastructure_failure_keeps_the_session() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        let plain = || muse_infra_failure("error: provider request timed out after 60s");
+        let mut d = muse_script(vec![plain(), plain(), met()]);
+        let run = run_issue(&db, &issue(), &brief(), &wt, &muse_config(), &mut d).unwrap();
+        assert!(matches!(run.terminal, TerminalReason::Met { .. }));
+        let sessions: Vec<_> = d.inner.seen.iter().map(session_of).collect();
+        assert!(sessions.iter().all(|s| *s == sessions[0]), "{sessions:?}");
+        // A refusal between two ordinary failures restarts the count.
+        let db = approved_db();
+        let mut d = muse_script(vec![muse_refusal(), plain(), muse_refusal(), met()]);
+        run_issue(&db, &issue(), &brief(), &wt, &muse_config(), &mut d).unwrap();
+        let sessions: Vec<_> = d.inner.seen.iter().map(session_of).collect();
+        assert!(sessions.iter().all(|s| *s == sessions[0]), "{sessions:?}");
+    }
+
+    #[test]
+    fn a_codex_or_claude_failure_quoting_refusal_text_never_rotates() {
+        for (mut c, implementer) in [
+            (codex_config(), Implementer::Codex),
+            (config(), Implementer::Claude),
+        ] {
+            let db = approved_db();
+            let (_dir, wt) = fixture_worktree();
+            c.max_consecutive_infrastructure_failures = 3;
+            let mut d = cli_script(implementer, vec![muse_refusal(), muse_refusal(), met()]);
+            run_issue(&db, &issue(), &brief(), &wt, &c, &mut d).unwrap();
+            let seen = &d.inner.seen;
+            assert_eq!(
+                session_of(&seen[1]),
+                session_of(&seen[2]),
+                "{implementer:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_model_change_opens_a_fresh_muse_session_and_the_same_model_keeps_it() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        let mut c = muse_config();
+        c.max_consecutive_infrastructure_failures = 1;
+        let plain = || muse_infra_failure("error: provider request timed out after 60s");
+        let mut first = muse_script(vec![plain()]);
+        run_issue(&db, &issue(), &brief(), &wt, &c, &mut first).unwrap();
+        let mut same = muse_script(vec![plain()]);
+        run_issue(&db, &issue(), &brief(), &wt, &c, &mut same).unwrap();
+        assert_eq!(
+            session_of(&first.inner.seen[0]),
+            session_of(&same.inner.seen[0])
+        );
+        c.model = "muse-wonder-2.0".into();
+        let mut changed = muse_script(vec![plain()]);
+        run_issue(&db, &issue(), &brief(), &wt, &c, &mut changed).unwrap();
+        assert_ne!(
+            session_of(&same.inner.seen[0]),
+            session_of(&changed.inner.seen[0])
+        );
+        assert!(matches!(
+            changed.inner.seen[0].session,
+            SessionMode::New { .. }
+        ));
+        // The new session is now the new model's, so the next run keeps it.
+        let mut again = muse_script(vec![met()]);
+        run_issue(&db, &issue(), &brief(), &wt, &c, &mut again).unwrap();
+        assert_eq!(
+            session_of(&changed.inner.seen[0]),
+            session_of(&again.inner.seen[0])
+        );
+    }
+
+    #[test]
+    fn a_model_change_never_rotates_a_session_whose_invocation_may_be_live() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        let mut c = muse_config();
+        c.max_consecutive_infrastructure_failures = 1;
+        let mut first = muse_script(vec![muse_infra_failure("error: timed out")]);
+        run_issue(&db, &issue(), &brief(), &wt, &c, &mut first).unwrap();
+        let stored = dispatch_state::get_dispatch_state(&db, &issue()).unwrap();
+        c.model = "muse-wonder-2.0".into();
+        let mut live = muse_script(vec![met()]);
+        live.recovery = Some(InvocationRecovery::Alive);
+        let run = run_issue(&db, &issue(), &brief(), &wt, &c, &mut live).unwrap();
+        assert!(matches!(
+            run.terminal,
+            TerminalReason::ImplementationInFlight { .. }
+        ));
+        assert!(live.inner.seen.is_empty());
+        assert_eq!(
+            dispatch_state::get_dispatch_state(&db, &issue()).unwrap(),
+            stored
+        );
+    }
+
+    #[test]
+    fn a_dispatch_that_cannot_establish_completion_names_its_harness() {
+        for (implementer, label) in [(Implementer::Muse, "Muse"), (Implementer::Codex, "Codex")] {
+            let db = approved_db();
+            let (_dir, wt) = fixture_worktree();
+            let mut d = cli_script(implementer, vec![]);
+            d.inner = ScriptedDispatcher::new(vec![Err(MemoryError::Validation("boom".into()))]);
+            let mut c = config();
+            c.implementer = implementer;
+            c.model = if implementer == Implementer::Muse {
+                "muse-wonder-1.0"
+            } else {
+                "gpt-6.1-sol"
+            }
+            .into();
+            let run = run_issue(&db, &issue(), &brief(), &wt, &c, &mut d).unwrap();
+            match run.terminal {
+                TerminalReason::ImplementationInFlight { detail } => {
+                    assert!(
+                        detail.starts_with(&format!(
+                            "{label} dispatch could not establish completion"
+                        )),
+                        "got: {detail}"
+                    );
+                }
+                other => panic!("expected a hold, got {other:?}"),
+            }
+        }
+    }
+    #[test]
+    fn a_recovered_ordinal_conflict_names_its_harness() {
+        let record = |verdict| AttemptRecord {
+            issue: issue(),
+            attempt_n: 1,
+            approach: "durable".into(),
+            verdict,
+            why_failed: None,
+            commit_sha: None,
+        };
+        for (harness, label) in [(Implementer::Muse, "Muse"), (Implementer::Codex, "Codex")] {
+            let db = Database::open_in_memory().unwrap();
+            record_as_owner(&db, &record(AttemptOutcome::Failed), Some(harness)).unwrap();
+            let err = record_as_owner(&db, &record(AttemptOutcome::Success), Some(harness))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(&format!(
+                    "recovered {label} verdict conflicts with the already recorded attempt ordinal"
+                )),
+                "got: {err}"
+            );
+        }
+    }
+    #[test]
+    fn recovered_success_at_cap_is_consumed_without_new_call_or_billing() {
+        for implementer in [Implementer::Codex, Implementer::Muse] {
+            recovered_success_at_cap_for(implementer);
+        }
+    }
+    fn recovered_success_at_cap_for(implementer: Implementer) {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        let state = pending_invocation(implementer, &db, &wt, None);
+        let c = if implementer == Implementer::Muse {
+            muse_config()
+        } else {
+            codex_config()
+        };
         for n in 0..c.max_unpriced_dispatches_per_day {
             budget::reserve_unpriced_dispatch(&db, &today_utc(), &format!("other-{n}")).unwrap();
         }
         let mut result = met();
         result.cost_usd = None;
-        let mut d = codex_script(vec![]);
-        d.recovery = Some(CodexRecovery::Finished(result));
+        let mut d = cli_script(implementer, vec![]);
+        d.recovery = Some(InvocationRecovery::Finished(result));
         let run = run_issue(&db, &issue(), &brief(), &wt, &c, &mut d).unwrap();
-        assert!(matches!(run.terminal, TerminalReason::Met { .. }));
+        assert!(
+            matches!(run.terminal, TerminalReason::Met { .. }),
+            "{implementer:?}: {:?}",
+            run.terminal
+        );
         assert!(d.inner.seen.is_empty());
         assert_eq!(run.unpriced_dispatches, 1);
         assert_eq!(run.total_cost_usd, 0.0);
@@ -2346,6 +5774,75 @@ sleep 0.5
             .unwrap()
             .is_none());
     }
+    /// The cap is decided where the invocation is reserved, in the same
+    /// transaction, so a full day launches nothing and leaves nothing behind:
+    /// no prepared invocation directory, no artifacts in the stored state,
+    /// and the ledger exactly as it was.
+    #[test]
+    fn a_supervised_dispatch_at_the_cap_launches_nothing_and_leaves_nothing_half_written() {
+        for c in [codex_config(), muse_config()] {
+            let db = approved_db();
+            let (_dir, wt) = fixture_worktree();
+            for n in 0..c.max_unpriced_dispatches_per_day {
+                budget::reserve_unpriced_dispatch(&db, &today_utc(), &format!("other-{n}"))
+                    .unwrap();
+            }
+            let before = budget::get_daily_spend(&db, &today_utc()).unwrap();
+            let mut d = cli_script(c.implementer, vec![met()]);
+            let run = run_issue(&db, &issue(), &brief(), &wt, &c, &mut d).unwrap();
+            assert_eq!(
+                run.terminal,
+                TerminalReason::UnpricedDispatchesExhausted {
+                    unpriced_today: c.max_unpriced_dispatches_per_day
+                },
+                "{:?}",
+                c.implementer
+            );
+            assert!(d.inner.seen.is_empty(), "nothing may launch at the cap");
+            assert_eq!(run.unpriced_dispatches, 0);
+            assert_eq!(budget::get_daily_spend(&db, &today_utc()).unwrap(), before);
+            let invocations = wt.path.join(".git/ironmem/autopilot").join(issue().slug());
+            let left: Vec<_> = std::fs::read_dir(&invocations)
+                .map(|dir| dir.flatten().map(|e| e.path()).collect())
+                .unwrap_or_default();
+            assert!(left.is_empty(), "prepared and left behind: {left:?}");
+            let state = dispatch_state::get_dispatch_state(&db, &issue()).unwrap();
+            assert!(
+                state
+                    .as_ref()
+                    .is_none_or(|s| s.invocation_artifacts.is_none()),
+                "{state:?}"
+            );
+        }
+    }
+    /// The cheap check before anything is rendered or allocated: a run that
+    /// starts at the cap never even creates its issue's invocation directory.
+    #[test]
+    fn a_supervised_run_already_at_the_cap_allocates_nothing() {
+        for c in [codex_config(), muse_config()] {
+            let db = approved_db();
+            let (_dir, wt) = fixture_worktree();
+            for n in 0..c.max_unpriced_dispatches_per_day {
+                budget::reserve_unpriced_dispatch(&db, &today_utc(), &format!("other-{n}"))
+                    .unwrap();
+            }
+            let mut d = cli_script(c.implementer, vec![met()]);
+            let run = run_issue(&db, &issue(), &brief(), &wt, &c, &mut d).unwrap();
+            assert_eq!(
+                run.terminal,
+                TerminalReason::UnpricedDispatchesExhausted {
+                    unpriced_today: c.max_unpriced_dispatches_per_day
+                }
+            );
+            let issue_dir = wt.path.join(".git/ironmem/autopilot").join(issue().slug());
+            assert!(
+                !issue_dir.exists(),
+                "{:?} allocated {issue_dir:?}",
+                c.implementer
+            );
+        }
+    }
+
     #[test]
     fn codex_cap_applies_without_repo_timeout_and_failed_outputs_are_reserved() {
         let db = approved_db();
@@ -2386,7 +5883,7 @@ sleep 0.5
             result.native_session_id = native.map(str::to_string);
             result.cost_usd = None;
             let mut d = codex_script(vec![]);
-            d.recovery = Some(CodexRecovery::Finished(result));
+            d.recovery = Some(InvocationRecovery::Finished(result));
             let mut c = codex_config();
             c.max_consecutive_infrastructure_failures = 1;
             let run = run_issue(&db, &issue(), &brief(), &wt, &c, &mut d).unwrap();
@@ -2395,11 +5892,20 @@ sleep 0.5
                 TerminalReason::InfrastructureFailure { .. }
             ));
             assert!(d.inner.seen.is_empty());
+            assert!(
+                run.dispatches[0]
+                    .reason
+                    .as_deref()
+                    .unwrap()
+                    .contains("missing or mismatched native Codex session ID"),
+                "got: {:?}",
+                run.dispatches[0].reason
+            );
             let state = dispatch_state::get_dispatch_state(&db, &issue())
                 .unwrap()
                 .unwrap();
             assert_eq!(state.native_session_id.as_deref(), Some("persisted"));
-            assert!(state.codex_artifacts.is_none());
+            assert!(state.invocation_artifacts.is_none());
         }
     }
     /// A dispatcher that replays a scripted list of outcomes, recording the
@@ -2454,6 +5960,7 @@ sleep 0.5
             reason: verdict.map(|v| format!("scripted {v:?}")),
             process_success,
             timed_out: false,
+            session_refusal: None,
         }
     }
 
@@ -2511,6 +6018,245 @@ sleep 0.5
             err.contains("gpt-6.1-sol"),
             "error must name the incompatible model: {err}"
         );
+    }
+
+    #[test]
+    fn muse_refuses_a_model_its_argv_cannot_carry() {
+        for model in ["muse wonder", "muse\twonder", "-muse", "--yolo"] {
+            let err = validate_implementation_model(Implementer::Muse, model)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("Muse implementer"), "{model:?}: {err}");
+            assert!(
+                err.contains("whitespace") && err.contains("'-'"),
+                "{model:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_muse_worktree_root_with_whitespace_is_refused() {
+        let err = validate_worktree_root(Implementer::Muse, Path::new("/tmp/work trees"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Muse") && err.contains("whitespace"), "{err}");
+        validate_worktree_root(Implementer::Muse, Path::new("/tmp/worktrees")).unwrap();
+        // Only Muse carries the workspace as a marker word.
+        for implementer in [Implementer::Claude, Implementer::Codex] {
+            validate_worktree_root(implementer, Path::new("/tmp/work trees")).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_relative_muse_worktree_root_is_read_against_the_working_directory() {
+        // `--worktree-root wt` from a checkout under whitespace: the root
+        // does not exist yet, so only the working directory reveals it.
+        let err = validate_worktree_root_from(Implementer::Muse, Path::new("wt"), || {
+            Ok("/nonexistent/My Work/repo".into())
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("whitespace"), "{err}");
+        assert!(err.contains("My Work"), "{err}");
+        validate_worktree_root_from(Implementer::Muse, Path::new("wt"), || {
+            Ok("/nonexistent/work/repo".into())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn only_muse_needs_a_readable_working_directory_for_its_worktree_root() {
+        let gone = || Err(std::io::Error::other("working directory removed"));
+        for implementer in [Implementer::Claude, Implementer::Codex] {
+            validate_worktree_root_from(implementer, Path::new("wt"), gone).unwrap();
+        }
+        let err = validate_worktree_root_from(Implementer::Muse, Path::new("wt"), gone)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("working directory removed"), "{err}");
+    }
+
+    #[test]
+    fn a_path_of_only_relative_entries_finds_no_launcher() {
+        let planted = tempfile::tempdir().unwrap();
+        let bin = planted.path().join("muse");
+        std::fs::write(&bin, "#!/bin/sh\nsleep 1\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let cwd = std::env::current_dir().unwrap();
+        let up = "../".repeat(cwd.components().count().saturating_sub(1));
+        let relative = Path::new(&up).join(planted.path().strip_prefix("/").unwrap());
+        for path_var in [relative.into_os_string(), std::ffi::OsString::new()] {
+            let err = crate::launcher::find_launcher("muse", &path_var).unwrap_err();
+            assert!(matches!(err, MemoryError::NotFound(_)), "{err}");
+            assert!(err.to_string().contains("absolute PATH"), "{err}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_muse_worktree_root_that_resolves_under_whitespace_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("my disk").join("wt");
+        std::fs::create_dir_all(&target).unwrap();
+        let link = dir.path().join("wt-link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(!link.to_str().unwrap().contains(' '));
+        let err = validate_worktree_root(Implementer::Muse, &link)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("my disk"), "{err}");
+    }
+
+    #[test]
+    fn a_cli_dispatcher_refuses_a_spec_or_state_for_another_harness() {
+        let (_dir, wt) = fixture_worktree();
+        let mut codex = CliDispatcher {
+            implementer: Implementer::Codex,
+            bin: wt.path.join("no-such-codex"),
+            shared_daemon: None,
+        };
+        let spec = DispatchSpec {
+            implementer: Implementer::Muse,
+            invocation_artifacts: None,
+            session: SessionMode::New {
+                session_uuid: "11111111-2222-3333-4444-555555555555".into(),
+            },
+            name: "ic".into(),
+            model: "muse-wonder-1.0".into(),
+            max_budget_usd: 1.0,
+            max_turns: 10,
+            condition: "do it".into(),
+            wall_clock_timeout: None,
+        };
+        let err = codex.dispatch(&wt.path, &spec).unwrap_err().to_string();
+        assert!(err.contains("harness mismatch"), "{err}");
+        assert!(err.contains("Muse") && err.contains("Codex"), "{err}");
+        let state = pending_muse(&approved_db(), &wt, None);
+        let err = codex.recover(&wt.path, &state).unwrap_err().to_string();
+        assert!(err.contains("harness mismatch"), "{err}");
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn the_deprecated_codex_dispatcher_is_a_codex_cli_dispatcher() {
+        let (_dir, wt) = fixture_worktree();
+        let mut codex = CodexDispatcher(CliDispatcher {
+            implementer: Implementer::Codex,
+            bin: wt.path.join("no-such-codex"),
+            shared_daemon: None,
+        });
+        assert_eq!(codex.implementer(), Implementer::Codex);
+        let state = pending_muse(&approved_db(), &wt, None);
+        let err = codex.recover(&wt.path, &state).unwrap_err().to_string();
+        assert!(err.contains("harness mismatch"), "{err}");
+    }
+
+    #[test]
+    fn a_supervised_launcher_is_never_found_through_a_relative_path_entry() {
+        let planted = tempfile::tempdir().unwrap();
+        let real = tempfile::tempdir().unwrap();
+        for dir in [planted.path(), real.path()] {
+            let bin = dir.join("muse");
+            std::fs::write(&bin, "#!/bin/sh\nsleep 1\n").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        }
+        // `planted`, spelled relative to this process's directory, comes
+        // first: a repository file a relative PATH entry would reach.
+        let cwd = std::env::current_dir().unwrap();
+        let up = "../".repeat(cwd.components().count().saturating_sub(1));
+        let relative = Path::new(&up).join(planted.path().strip_prefix("/").unwrap());
+        assert!(relative.join("muse").exists());
+        let path_var = std::env::join_paths([relative.as_path(), real.path()]).unwrap();
+        let found = crate::launcher::find_launcher("muse", &path_var).unwrap();
+        assert_eq!(found, real.path().join("muse"));
+        assert!(found.is_absolute());
+    }
+
+    #[test]
+    fn an_unloadable_config_names_the_daemon_socket_lookup() {
+        let err = shared_daemon_socket(Err(MemoryError::Validation(
+            "unknown embed mode 'fast'".into(),
+        )))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("shared ironmem daemon socket"), "{err}");
+        assert!(err.contains("unknown embed mode 'fast'"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_muse_worktree_root_is_refused() {
+        use std::os::unix::ffi::OsStrExt;
+        let root = Path::new(std::ffi::OsStr::from_bytes(b"/nonexistent/wt-\xff"));
+        let err = validate_worktree_root(Implementer::Muse, root)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not UTF-8"), "{err}");
+    }
+
+    #[test]
+    fn a_muse_argv_refusal_creates_no_invocation_artifacts() {
+        let db = approved_db();
+        let (dir, repo) = fixture_worktree();
+        // A linked worktree under whitespace: the common Git directory, where
+        // artifacts live, is clean, but Muse's --workspace is not.
+        let path = dir.path().join("has space").join("wt");
+        git_in(&repo.path, &["checkout", "-q", "main"]);
+        git_in(
+            &repo.path,
+            &["worktree", "add", path.to_str().unwrap(), &repo.branch],
+        );
+        let wt = Worktree {
+            path: path.clone(),
+            ..repo.clone()
+        };
+        let mut d = muse_script(vec![met()]);
+        let err = run_issue(&db, &issue(), &brief(), &wt, &muse_config(), &mut d)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("workspace"), "{err}");
+        assert!(d.inner.seen.is_empty());
+        assert!(
+            !repo.path.join(".git/ironmem").exists(),
+            "an argv refusal must precede artifact allocation"
+        );
+    }
+
+    #[test]
+    fn muse_rejects_cross_harness_model_prefixes_and_names_its_budget_flag() {
+        for model in ["claude-sonnet-5", "gpt-6.1-sol"] {
+            let err = validate_implementation_model(Implementer::Muse, model)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("Muse implementer"), "got: {err}");
+        }
+        validate_implementation_model(Implementer::Muse, "muse-wonder-1.0").unwrap();
+        for implementer in [Implementer::Claude, Implementer::Codex] {
+            let err = validate_implementation_model(implementer, "muse-wonder-1.0")
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(&format!("{} implementer", implementer.label())),
+                "got: {err}"
+            );
+        }
+        let mut config = RunConfig::new("muse-wonder-1.0", "routine");
+        config.implementer = Implementer::Muse;
+        config.daily_budget_usd = config.max_budget_usd / 2.0;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("priced-spend-plus-ceiling start gate"),
+            "got: {err}"
+        );
+        assert!(err.contains("--daily-budget-usd"), "got: {err}");
     }
 
     #[test]
@@ -2587,6 +6333,7 @@ sleep 0.5
             reason: Some("dispatch exceeded this repo's wall-clock bound".to_string()),
             process_success: false,
             timed_out: true,
+            session_refusal: None,
         }
     }
 
@@ -2609,6 +6356,7 @@ sleep 0.5
             reason: None,
             process_success: true,
             timed_out: false,
+            session_refusal: None,
         }
     }
 
@@ -2978,39 +6726,2642 @@ sleep 0.5
     }
 
     /// A worktree value pointing at a real single-commit repo, so
-    /// `head_commit` has a genuine SHA to read rather than a fabricated one.
+    /// `branch_tip` has a genuine SHA to read rather than a fabricated one.
     fn fixture_worktree() -> (tempfile::TempDir, Worktree) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().to_path_buf();
+        // The operator's global config signs and runs a pre-commit scanner;
+        // both are pinned off so the fixture depends on neither.
         for args in [
             vec!["init", "--initial-branch=main"],
             vec!["config", "user.email", "autopilot@example.test"],
             vec!["config", "user.name", "Autopilot Test"],
+            vec!["config", "commit.gpgsign", "false"],
+            vec!["config", "core.hooksPath", "/dev/null"],
         ] {
-            let ok = std::process::Command::new("git")
-                .args(&args)
-                .current_dir(&path)
-                .output()
-                .unwrap()
-                .status
-                .success();
-            assert!(ok, "git {args:?} failed");
+            git_in(&path, &args);
         }
         std::fs::write(path.join("README.md"), "seed\n").unwrap();
-        for args in [vec!["add", "README.md"], vec!["commit", "-m", "seed"]] {
-            std::process::Command::new("git")
-                .args(&args)
-                .current_dir(&path)
-                .output()
-                .unwrap();
-        }
+        git_in(&path, &["add", "README.md"]);
+        git_in(&path, &["commit", "-m", "seed"]);
+        // On the issue branch, as `ensure_worktree` leaves it: the signing
+        // guard and the recorded commit read that branch, not `HEAD`.
+        let branch = worktree::branch_name(&issue());
+        git_in(&path, &["checkout", "-q", "-b", &branch]);
         let wt = Worktree {
             path: path.clone(),
-            branch: worktree::branch_name(&issue()),
+            branch,
             created: true,
+            cut: worktree::CommitSha::parse(&git_in(&path, &["rev-parse", "HEAD"])).unwrap(),
             quarantined_from: None,
         };
         (dir, wt)
+    }
+
+    // ── commit signing guard ────────────────────────────────────────────
+
+    /// The guard's verdict on `wt` as text, with nothing held from memory.
+    fn check(wt: &Worktree) -> Result<Option<String>, String> {
+        signing_violation(
+            wt,
+            SigningPolicySeen::default(),
+            &issue().repo,
+            Implementer::Claude,
+        )
+        .map(|violation| violation.map(|v| v.to_string()))
+        .map_err(|fault| fault.to_string())
+    }
+
+    /// Fixture git ([`crate::autopilot::test_git`]): no global or system
+    /// config (a signing key there let a commit that CI cannot sign pass
+    /// locally), success asserted, trimmed stdout returned.
+    fn git_in(repo: &Path, args: &[&str]) -> String {
+        crate::autopilot::test_git::run(repo, args)
+    }
+
+    /// Commit `file` in `repo` with `extra` leading git args; returns the new HEAD.
+    fn commit_in(repo: &Path, file: &str, extra: &[&str]) -> String {
+        std::fs::write(repo.join(file), file).unwrap();
+        git_in(repo, &["add", file]);
+        let mut args = extra.to_vec();
+        args.extend(["commit", "-qm", file]);
+        git_in(repo, &args);
+        git_in(repo, &["rev-parse", "HEAD"])
+    }
+
+    /// A Claude-harness dispatcher that runs `before` in the worktree, then
+    /// returns a met outcome, enough to drive the signing guard end to end.
+    struct CommitThenMet<F: FnMut(&Path)>(F);
+    impl<F: FnMut(&Path)> Dispatcher for CommitThenMet<F> {
+        fn dispatch(
+            &mut self,
+            repo: &Path,
+            _spec: &DispatchSpec,
+        ) -> Result<DispatchOutcome, MemoryError> {
+            (self.0)(repo);
+            Ok(met())
+        }
+    }
+
+    #[test]
+    fn no_signing_policy_means_no_violation() {
+        let (_dir, wt) = fixture_worktree(); // commit.gpgsign pinned false
+        commit_in(&wt.path, "a", &[]);
+        commit_in(&wt.path, "b", &[]);
+        assert_eq!(check(&wt).unwrap(), None);
+    }
+
+    #[test]
+    fn an_unsigned_commit_under_gpgsign_is_a_violation_naming_it() {
+        let (_dir, wt) = fixture_worktree();
+        // Turn the policy on *after* the base, as an operator's global config would.
+        git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
+        let bypass = commit_in(&wt.path, "b", &["-c", "commit.gpgsign=false"]);
+        let violation = check(&wt).unwrap().unwrap();
+        assert!(violation.contains(&bypass[..12]), "got: {violation}");
+        assert!(violation.contains(&wt.cut[..12]), "got: {violation}");
+        assert!(violation.contains("impossible"), "got: {violation}");
+        assert!(
+            violation.contains("commit.gpgsign=false"),
+            "got: {violation}"
+        );
+    }
+
+    #[test]
+    fn a_policy_that_cannot_be_read_is_the_guards_failure_with_gits_complaint() {
+        let (_dir, wt) = fixture_worktree();
+        git_in(&wt.path, &["config", "commit.gpgsign", "maybe"]);
+        let why = check(&wt).unwrap_err();
+        assert!(why.contains("could not be read"), "got: {why}");
+        assert!(why.contains("maybe"), "got: {why}");
+    }
+
+    #[test]
+    fn a_cut_that_is_not_a_full_commit_name_is_refused() {
+        for bad in ["--all", "HEAD~3", "abc1234", &"g".repeat(40)] {
+            assert!(worktree::CommitSha::parse(bad).is_err(), "{bad:?}");
+        }
+        for good in ["a".repeat(40), "0F".repeat(32)] {
+            assert_eq!(worktree::CommitSha::parse(&good).unwrap(), good);
+        }
+        // Past the type (it is checked where it is made), the guard refuses
+        // one before `git log --not`, where `--all` would empty the range
+        // and pass an unsigned commit.
+        let (_dir, mut wt) = fixture_worktree();
+        git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
+        commit_in(&wt.path, "b", &["-c", "commit.gpgsign=false"]);
+        wt.cut = worktree::CommitSha::unchecked("--all");
+        let fault = signing_violation(
+            &wt,
+            SigningPolicySeen::default(),
+            &issue().repo,
+            Implementer::Claude,
+        )
+        .unwrap_err();
+        assert!(fault.stops_run(), "{fault}");
+        assert!(fault.to_string().contains("--all"), "{fault}");
+    }
+
+    #[test]
+    fn an_unreadable_cut_is_the_guards_failure_when_the_policy_is_on() {
+        let (_dir, mut wt) = fixture_worktree();
+        // A pruned cut: a well-formed sha naming no object.
+        wt.cut = worktree::CommitSha::parse(&"a".repeat(40)).unwrap();
+        git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
+        let why = check(&wt).unwrap_err();
+        assert!(why.contains("signatures could not be read"), "got: {why}");
+        assert!(why.contains("bad object"), "got: {why}");
+    }
+
+    /// A met whose guard could not run, under `max_consecutive = 1`.
+    fn run_a_met_the_guard_cannot_check(
+        break_it: impl FnOnce(&mut Worktree),
+    ) -> (Database, IssueRun) {
+        let db = approved_db();
+        let (dir, mut wt) = fixture_worktree();
+        git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
+        break_it(&mut wt);
+        let mut dispatcher = CommitThenMet(|_: &Path| {});
+        let mut c = config();
+        c.max_consecutive_infrastructure_failures = 1;
+        let run = run_issue(&db, &issue(), &brief(), &wt, &c, &mut dispatcher).unwrap();
+        drop(dir);
+        (db, run)
+    }
+
+    #[test]
+    fn a_guard_that_cannot_read_the_cut_costs_no_attempt_and_is_never_met() {
+        let (db, run) = run_a_met_the_guard_cannot_check(|wt| {
+            wt.cut = worktree::CommitSha::parse(&"a".repeat(40)).unwrap()
+        });
+        assert_eq!(
+            run.dispatches[0].classification,
+            DispatchClassification::InfrastructureFailure
+        );
+        assert_eq!(run.dispatches[0].attempt_n, None);
+        assert_eq!(run.cumulative_attempt_n, 0);
+        let reason = run.dispatches[0].reason.as_deref().unwrap();
+        assert!(reason.contains("signing guard"), "got: {reason}");
+        assert!(reason.contains("bad object"), "got: {reason}");
+        assert!(
+            matches!(
+                run.terminal,
+                TerminalReason::InfrastructureFailure { consecutive: 1 }
+            ),
+            "{:?}",
+            run.terminal
+        );
+        assert!(lineage::attempts_for_issue(&db, &issue())
+            .unwrap()
+            .is_empty());
+    }
+
+    /// A dispatcher for `implementer` that runs `before` in the worktree,
+    /// then returns a met outcome, counting its dispatches.
+    struct HarnessCommitThenMet<F: FnMut(&Path)> {
+        implementer: Implementer,
+        before: F,
+        dispatched: u32,
+    }
+    impl<F: FnMut(&Path)> Dispatcher for HarnessCommitThenMet<F> {
+        fn implementer(&self) -> Implementer {
+            self.implementer
+        }
+        fn dispatch(
+            &mut self,
+            repo: &Path,
+            _spec: &DispatchSpec,
+        ) -> Result<DispatchOutcome, MemoryError> {
+            self.dispatched += 1;
+            (self.before)(repo);
+            let mut met = met();
+            if self.implementer.recovers_invocations() {
+                met.cost_usd = None;
+            }
+            Ok(met)
+        }
+    }
+
+    #[test]
+    fn a_policy_made_unreadable_mid_run_stops_the_run_after_one_dispatch() {
+        for implementer in [Implementer::Claude, Implementer::Muse] {
+            let db = approved_db();
+            let (_dir, wt) = fixture_worktree();
+            git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
+            // Readable at the run's start; the dispatch leaves a typo behind.
+            let mut dispatcher = HarnessCommitThenMet {
+                implementer,
+                before: |path: &Path| {
+                    git_in(path, &["config", "commit.gpgsign", "maybe"]);
+                },
+                dispatched: 0,
+            };
+            let mut c = if implementer == Implementer::Muse {
+                muse_config()
+            } else {
+                config()
+            };
+            c.max_consecutive_infrastructure_failures = 3;
+            // Claude resumes a session it claimed earlier, and rotates it on
+            // the met's verdict, before the guard turns the met away.
+            let resumed = "55555555-6666-7777-8888-999999999999";
+            if implementer == Implementer::Claude {
+                let mut paused = pending_invocation(Implementer::Claude, &db, &wt, None);
+                paused.state = "paused-infrastructure-failure".into();
+                paused.session_uuid = resumed.into();
+                paused.native_session_id = Some(resumed.into());
+                paused.session_claimed = true;
+                dispatch_state::upsert_dispatch_state(&db, &paused).unwrap();
+            }
+            let err = run_issue(&db, &issue(), &brief(), &wt, &c, &mut dispatcher)
+                .unwrap_err()
+                .to_string();
+            assert_eq!(dispatcher.dispatched, 1, "{implementer:?}: {err}");
+            assert!(err.contains("commit.gpgsign could not be read"), "{err}");
+            assert!(err.contains("maybe"), "{err}");
+            if implementer == Implementer::Muse {
+                assert!(
+                    err.contains(
+                        "the finished invocation is kept, and the first run after the fix \
+                         checks its met again; do not clear-dispatch it"
+                    ),
+                    "{err}"
+                );
+            } else {
+                // Claude has no invocation to recover, and its session has
+                // rotated: the next run opens a fresh one.
+                assert!(!err.contains("invocation"), "{err}");
+                assert!(
+                    err.contains("the next run after the fix opens a fresh session"),
+                    "{err}"
+                );
+            }
+            assert!(lineage::attempts_for_issue(&db, &issue())
+                .unwrap()
+                .is_empty());
+            let state = dispatch_state::get_dispatch_state(&db, &issue())
+                .unwrap()
+                .unwrap();
+            if implementer == Implementer::Muse {
+                // The finished invocation stays named, to be recovered and
+                // checked again once the policy reads.
+                assert!(state.invocation_artifacts.is_some(), "{state:?}");
+            } else {
+                assert_eq!(state.state, "infrastructure-failure", "{state:?}");
+                assert!(!state.session_claimed, "{state:?}");
+                assert_ne!(state.session_uuid, resumed, "{state:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_unreadable_signing_flag_is_the_guards_fault_never_the_models() {
+        let (_dir, wt) = fixture_worktree(); // policy off
+        let key = format!("branch.{}.ironmemSigning", wt.branch);
+        git_in(&wt.path, &["config", &key, "maybe"]);
+        let why = check(&wt).unwrap_err();
+        assert!(why.contains(&key), "{why}");
+        assert!(why.contains("maybe"), "{why}");
+        // Unset on the branch, the repository flag decides, and is read too.
+        git_in(&wt.path, &["config", "--unset", &key]);
+        git_in(&wt.path, &["config", "ironmem.autopilotSigning", "maybe"]);
+        let why = check(&wt).unwrap_err();
+        assert!(why.contains("ironmem.autopilotSigning"), "{why}");
+    }
+
+    #[test]
+    fn an_unreadable_signing_flag_at_the_runs_start_stops_before_any_dispatch() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree(); // policy off
+        let key = format!("branch.{}.ironmemSigning", wt.branch);
+        git_in(&wt.path, &["config", &key, "maybe"]);
+        let mut dispatched = false;
+        let mut dispatcher = CommitThenMet(|_: &Path| dispatched = true);
+        let err = run_issue(&db, &issue(), &brief(), &wt, &config(), &mut dispatcher)
+            .unwrap_err()
+            .to_string();
+        assert!(!dispatched, "{err}");
+        assert!(err.contains(&key), "{err}");
+        assert!(err.contains("nothing was written"), "{err}");
+    }
+
+    #[test]
+    fn an_unsigned_commit_pushed_by_a_collaborator_is_never_met_nor_the_models_attempt() {
+        let (_dir, wt) = fixture_worktree();
+        git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
+        let collaborator = [
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "user.email=human@example.test",
+            "-c",
+            "user.name=Human",
+        ];
+        // Pushed while a dispatch runs: no attempt, and the run stops rather
+        // than pay for another dispatch.
+        let db = approved_db();
+        let mut theirs = String::new();
+        let mut dispatcher = HarnessCommitThenMet {
+            implementer: Implementer::Claude,
+            before: |path: &Path| theirs = commit_in(path, "theirs", &collaborator),
+            dispatched: 0,
+        };
+        let err = run_issue(&db, &issue(), &brief(), &wt, &config(), &mut dispatcher)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(dispatcher.dispatched, 1, "{err}");
+        assert!(err.contains(&short(&theirs)), "{err}");
+        // Both identities, so an operator can spot a harness committing as
+        // someone else.
+        assert!(err.contains("(committer human@example.test)"), "{err}");
+        assert!(
+            err.contains("this run commits as autopilot@example.test"),
+            "{err}"
+        );
+        assert!(lineage::attempts_for_issue(&db, &issue())
+            .unwrap()
+            .is_empty());
+        // Still there at the next run's start: it pays for nothing.
+        let mut next = HarnessCommitThenMet {
+            implementer: Implementer::Claude,
+            before: |_: &Path| {},
+            dispatched: 0,
+        };
+        let err = run_issue(&db, &issue(), &brief(), &wt, &config(), &mut next)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(next.dispatched, 0, "{err}");
+        assert!(err.contains("human@example.test"), "{err}");
+        // One of the run's own beside it is the model's to fix, and both
+        // are named.
+        let ours = commit_in(&wt.path, "ours", &["-c", "commit.gpgsign=false"]);
+        let violation = check(&wt).unwrap().unwrap();
+        assert_eq!(
+            blamed(&violation),
+            [short(&ours), short(&theirs)].into(),
+            "{violation}"
+        );
+    }
+
+    /// An executable `sh` script at `path` that records it ran in `marker`.
+    #[cfg(unix)]
+    fn marker_script(path: &Path, marker: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(
+            path,
+            format!(
+                "#!/bin/sh\ntouch '{}'\nsleep 0.5\nexit 1\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_signature_program_set_in_the_repository_never_runs_in_the_controller() {
+        let (dir, wt) = fixture_worktree();
+        let script = dir.path().join(".git").join("verify");
+        let marker = dir.path().join(".git").join("verify-ran");
+        marker_script(&script, &marker);
+        let allowed = dir.path().join(".git").join("allowed");
+        std::fs::write(&allowed, "").unwrap();
+        for (key, value) in [
+            ("gpg.program", script.to_str().unwrap()),
+            ("gpg.openpgp.program", script.to_str().unwrap()),
+            ("gpg.ssh.program", script.to_str().unwrap()),
+            ("gpg.x509.program", script.to_str().unwrap()),
+            ("gpg.ssh.allowedSignersFile", allowed.to_str().unwrap()),
+            ("commit.gpgsign", "true"),
+        ] {
+            git_in(&wt.path, &["config", key, value]);
+        }
+        for (file, armor) in [
+            ("pgp", "PGP SIGNATURE"),
+            ("ssh", "SSH SIGNATURE"),
+            ("x509", "SIGNED MESSAGE"),
+        ] {
+            let plain = commit_in(&wt.path, file, &["-c", "commit.gpgsign=false"]);
+            forge_signature_header(
+                &wt,
+                &plain,
+                &format!("-----BEGIN {armor}-----\n \n AAAA\n -----END {armor}-----"),
+            );
+        }
+        let _ = check(&wt);
+        assert!(
+            !marker.exists(),
+            "the repository's signature program ran in the controller"
+        );
+    }
+
+    #[test]
+    fn a_guard_with_no_home_pins_gits_default_signature_programs() {
+        // Under launchd `$HOME` can be unset, and `git config --global` then
+        // exits 128: never a reason to turn every met into a guard fault,
+        // nor to fall back on the repository's own programs.
+        let (_dir, wt) = fixture_worktree();
+        let git = GuardGit::build(
+            &wt.path,
+            SIGNING_GUARD_TIMEOUT,
+            &["HOME", "XDG_CONFIG_HOME"],
+        )
+        .unwrap();
+        assert!(
+            git.pins.contains(&"gpg.ssh.program=ssh-keygen".to_string()),
+            "{:?}",
+            git.pins
+        );
+        assert!(
+            git.pins.contains(&"gpg.program=gpg".to_string()),
+            "{:?}",
+            git.pins
+        );
+    }
+
+    #[test]
+    fn a_guard_check_shares_one_deadline_across_its_commands() {
+        let (_dir, wt) = fixture_worktree();
+        let git = GuardGit::new(&wt.path, std::time::Duration::from_millis(1500)).unwrap();
+        let nap = ["-c", "alias.nap=!sleep 0.8", "nap"];
+        git.run(&nap, None).unwrap();
+        let why = git.run(&nap, None).unwrap_err();
+        assert!(why.contains("did not finish"), "{why}");
+    }
+
+    /// a guard git that cannot run is the guard's fault, never "no
+    /// identity", which would blame every flagged commit on the model.
+    #[test]
+    fn an_identity_git_cannot_read_is_an_error_not_no_identity() {
+        let (_dir, wt) = fixture_worktree();
+        let mut git = GuardGit::new(&wt.path, SIGNING_GUARD_TIMEOUT).unwrap();
+        // Its shared deadline already spent, as by a long range before it.
+        git.deadline = std::time::Instant::now();
+        assert!(run_identity(&git, None).is_err());
+        let git = GuardGit::new(&wt.path, SIGNING_GUARD_TIMEOUT).unwrap();
+        assert_eq!(
+            run_identity(&git, None).unwrap(),
+            Some(vec!["autopilot@example.test".to_string()])
+        );
+    }
+
+    /// the controller's own committer email is a commit of this run's
+    /// only for a harness that inherits the controller's environment.
+    #[test]
+    fn the_controllers_committer_email_is_ours_only_for_claude() {
+        let (_dir, wt) = fixture_worktree();
+        let git = GuardGit::new(&wt.path, SIGNING_GUARD_TIMEOUT).unwrap();
+        let emails = run_identity(&git, Some("ops@corp.test")).unwrap().unwrap();
+        assert!(emails.iter().any(|e| e == "ops@corp.test"), "{emails:?}");
+        for implementer in Implementer::ALL {
+            let email = implementer
+                .inherits_controller_git_env()
+                .then_some("ops@corp.test");
+            let emails = run_identity(&git, email).unwrap().unwrap();
+            assert_eq!(
+                emails.iter().any(|e| e == "ops@corp.test"),
+                implementer == Implementer::Claude,
+                "{implementer:?}: {emails:?}"
+            );
+        }
+    }
+
+    /// the controller's committer email is read for Claude only.
+    #[test]
+    fn the_controllers_git_email_is_read_only_for_a_harness_that_inherits_it() {
+        let env = |key: &str| (key == "GIT_COMMITTER_EMAIL").then(|| "ops@corp.test".to_string());
+        assert_eq!(
+            controller_git_email_from(Implementer::Claude, &env).as_deref(),
+            Some("ops@corp.test")
+        );
+        for implementer in [Implementer::Codex, Implementer::Muse] {
+            assert_eq!(controller_git_email_from(implementer, &env), None);
+        }
+        assert_eq!(
+            controller_git_email_from(Implementer::Claude, &|_| None),
+            None
+        );
+    }
+
+    /// an unreadable remote list names only the holders, never a guess
+    /// at the push clause's remote.
+    #[test]
+    fn an_unreadable_remote_list_names_only_the_holders() {
+        let listing = "origin\thttps://github.com/fork/repo.git (fetch)\n\
+                       origin\thttps://github.com/fork/repo.git (push)\n\
+                       upstream\thttps://github.com/ironrace/ironmem.git (fetch)\n\
+                       upstream\thttps://github.com/ironrace/ironmem.git (push)\n";
+        let configured = ["origin", "upstream"];
+        let holding = ["origin", "upstream"];
+        assert_eq!(
+            recipe_remotes(None, &configured, &holding, Some("ironrace/ironmem")),
+            vec!["origin".to_string(), "upstream".to_string()]
+        );
+        // Readable, the push clause's remote leads.
+        assert_eq!(
+            recipe_remotes(
+                Some(listing),
+                &configured,
+                &holding,
+                Some("ironrace/ironmem")
+            ),
+            vec!["upstream".to_string(), "origin".to_string()]
+        );
+    }
+
+    /// a missing branch has no tip; a directory git cannot read is an
+    /// error, never quietly no tip.
+    #[test]
+    fn a_branch_tip_git_cannot_read_is_an_error_and_a_missing_branch_is_none() {
+        let (_dir, wt) = fixture_worktree();
+        assert!(read_branch_tip(&wt.path, &wt.branch).unwrap().is_some());
+        assert_eq!(read_branch_tip(&wt.path, "no-such-branch").unwrap(), None);
+        let not_a_repo = tempfile::tempdir().unwrap();
+        assert!(read_branch_tip(not_a_repo.path(), "main").is_err());
+    }
+
+    /// only a `gpgsig`/`gpgsig-sha256` header in the header block
+    /// counts, and a cat-file reply that is not one commit object per name,
+    /// in order, is refused rather than guessed at.
+    #[test]
+    fn signature_headers_read_only_whole_commit_objects_in_order() {
+        let sha = "a".repeat(40);
+        let other = "b".repeat(40);
+        let object = |sha: &str, body: &str| format!("{sha} commit {}\n{body}\n", body.len());
+        let unsigned = "tree t\nauthor a\n\ngpgsig x in the message";
+        let signed = "tree t\ngpgsig -----BEGIN-----\n continued\n\nmessage";
+        let signed256 = "tree t\ngpgsig-sha256 -----BEGIN-----\n\nmessage";
+        assert!(!has_signature_header(unsigned));
+        assert!(has_signature_header(signed));
+        assert!(has_signature_header(signed256));
+        assert!(!has_signature_header("tree t\ngpgsigx y\n\nm"));
+        let both = format!("{}{}", object(&sha, unsigned), object(&other, signed256));
+        assert_eq!(
+            signature_headers(both.as_bytes(), &[&sha, &other]).unwrap(),
+            vec![false, true]
+        );
+        let one = object(&sha, signed);
+        for (reply, why) in [
+            (String::new(), "missing"),
+            (one[..one.len() - 5].to_string(), "truncated"),
+            (object(&other, signed), "wrong name"),
+            (one.replace(" commit ", " tree "), "wrong kind"),
+            (format!("{sha} commit\n{signed}\n"), "no size"),
+            (format!("{sha} missing\n"), "missing object"),
+        ] {
+            assert!(
+                signature_headers(reply.as_bytes(), &[&sha]).is_err(),
+                "{why}: {reply:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_guard_git_command_never_fetches_and_runs_without_lazy_fetch() {
+        let (_dir, wt) = fixture_worktree();
+        let git = GuardGit::new(&wt.path, SIGNING_GUARD_TIMEOUT).unwrap();
+        let read = |args: &[&str]| {
+            let out = git.run(args, None).unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        assert_eq!(read(&["config", "--get", "protocol.allow"]), "never");
+        assert_eq!(
+            read(&["-c", "alias.lazy=!printenv GIT_NO_LAZY_FETCH", "lazy"]),
+            "1"
+        );
+    }
+
+    #[test]
+    fn a_guard_git_command_cannot_fetch_where_the_repository_allows_a_protocol() {
+        let (_dir, wt) = fixture_worktree();
+        let (_other_dir, other) = fixture_worktree();
+        commit_in(&other.path, "theirs", &[]);
+        // Repository config can allow one protocol over `protocol.allow`.
+        git_in(&wt.path, &["config", "protocol.file.allow", "always"]);
+        let git = GuardGit::new(&wt.path, SIGNING_GUARD_TIMEOUT).unwrap();
+        let url = format!("file://{}", other.path.display());
+        let out = git.run(&["fetch", "-q", &url, "HEAD"], None).unwrap();
+        assert!(
+            !out.status.success(),
+            "the guard's git fetched: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("not allowed"),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    fn a_guard_git_command_reads_a_commit_past_its_replacement() {
+        let (_dir, wt) = fixture_worktree();
+        let real = git_in(&wt.path, &["rev-parse", "HEAD"]);
+        let stand_in = commit_in(&wt.path, "stand-in", &[]);
+        // `git replace` makes every reader see `stand_in` for `real`.
+        git_in(&wt.path, &["replace", &real, &stand_in]);
+        let git = GuardGit::new(&wt.path, SIGNING_GUARD_TIMEOUT).unwrap();
+        let out = git.run(&["log", "-1", "--format=%s", &real], None).unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "seed");
+    }
+
+    #[test]
+    fn a_guard_with_no_home_warns_about_it_exactly_once() {
+        let (_dir, wt) = fixture_worktree();
+        // Only where git cannot read the global config without `$HOME`.
+        // Not fixture git: this probes the operator's own git, whose global
+        // config is the point, and it only reads.
+        let mut probe = std::process::Command::new("git");
+        crate::git_env::scrub_git_environment(&mut probe);
+        let probe = probe
+            .args(["config", "--global", "--get-regexp", "^gpg\\."])
+            .env_remove("HOME")
+            .env_remove("XDG_CONFIG_HOME")
+            .current_dir(&wt.path)
+            .output()
+            .unwrap();
+        if matches!(probe.status.code(), Some(0 | 1)) {
+            eprintln!("skipped: git reads the global config here without $HOME");
+            return;
+        }
+        // A set of its own, so a guard built by another test has not
+        // already spent the process-wide warning.
+        let warned: &'static WarnedScopes = Box::leak(Box::default());
+        let (_, log) = worktree::testing::with_captured_log(|| {
+            // A guard is built for every met and every run start.
+            for _ in 0..3 {
+                GuardGit::build_warning_into(
+                    &wt.path,
+                    SIGNING_GUARD_TIMEOUT,
+                    &["HOME", "XDG_CONFIG_HOME"],
+                    warned,
+                )
+                .unwrap();
+            }
+        });
+        let warnings = log
+            .lines()
+            .filter(|line| line.contains("cannot read the operator's signature programs"))
+            .count();
+        assert_eq!(warnings, 1, "{log}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_exited_child_is_seen_without_being_reaped() {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let started = std::time::Instant::now();
+        while !dispatch::exited_unreaped(&mut child).unwrap() {
+            assert!(started.elapsed() < std::time::Duration::from_secs(10));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // Still a zombie: its pid, and so its group's id, stays reserved.
+        // SAFETY: signal 0 only checks that the pid exists.
+        assert_eq!(unsafe { libc::kill(child.id() as i32, 0) }, 0);
+        assert!(child.wait().unwrap().success());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_run_start_check_builds_one_guard_git_for_one_deadline() {
+        let keys = tempfile::tempdir().unwrap();
+        let Some(key) = ssh_key(keys.path()) else {
+            return;
+        };
+        let (_dir, wt) = fixture_worktree();
+        sign_with(&wt.path, keys.path(), &key);
+        commit_in(&wt.path, "work", &[]);
+        let built = || GUARD_GITS_BUILT.with(std::cell::Cell::get);
+        let before = built();
+        assert!(collaborator_check_at_start(
+            &wt,
+            SigningPolicySeen::default(),
+            Implementer::Claude
+        )
+        .is_none());
+        assert_eq!(built() - before, 1);
+    }
+
+    #[test]
+    fn a_cut_that_is_not_a_commit_name_stops_a_run_at_its_start() {
+        let (_dir, mut wt) = fixture_worktree();
+        git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
+        commit_in(&wt.path, "b", &["-c", "commit.gpgsign=false"]);
+        wt.cut = worktree::CommitSha::unchecked("--all");
+        assert!(matches!(
+            collaborator_check_at_start(&wt, SigningPolicySeen::default(), Implementer::Claude),
+            Some(GuardFault::CutInvalid(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_guard_git_command_that_leaves_its_output_open_has_its_group_killed() {
+        let (_dir, wt) = fixture_worktree();
+        let git = GuardGit::new(&wt.path, std::time::Duration::from_millis(1000)).unwrap();
+        // A background child holds stdout open after git exits.
+        let why = git
+            .run(
+                &["-c", "alias.linger=!(sleep 37.13 &); exit 0", "linger"],
+                None,
+            )
+            .unwrap_err();
+        assert!(why.contains("left its output open"), "{why}");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let left = std::process::Command::new("pgrep")
+            .args(["-f", "sleep 37.13"])
+            .output()
+            .unwrap();
+        assert!(
+            left.stdout.is_empty(),
+            "still running: {}",
+            String::from_utf8_lossy(&left.stdout)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_run_start_check_of_an_unchanged_range_is_not_repeated() {
+        let keys = tempfile::tempdir().unwrap();
+        let Some(key) = ssh_key(keys.path()) else {
+            return;
+        };
+        let (_dir, wt) = fixture_worktree();
+        sign_with(&wt.path, keys.path(), &key);
+        commit_in(&wt.path, "work", &[]);
+        let checks = || START_CHECKS.with(std::cell::Cell::get);
+        let seen = SigningPolicySeen::default();
+        assert!(collaborator_check_at_start(&wt, seen, Implementer::Claude).is_none());
+        let first = checks();
+        assert!(collaborator_check_at_start(&wt, seen, Implementer::Claude).is_none());
+        assert_eq!(checks(), first, "an unchanged range is read again");
+        // Anything that moves the range is read again, and a collaborator's
+        // commit is still found.
+        commit_in(
+            &wt.path,
+            "theirs",
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "user.email=human@example.test",
+            ],
+        );
+        assert!(matches!(
+            collaborator_check_at_start(&wt, seen, Implementer::Claude),
+            Some(GuardFault::ForeignUnsigned { .. })
+        ));
+        assert_eq!(checks(), first + 1);
+        // A found fault is never remembered as clean.
+        assert!(collaborator_check_at_start(&wt, seen, Implementer::Claude).is_some());
+        assert_eq!(checks(), first + 2);
+    }
+
+    #[test]
+    fn a_guard_git_command_that_hangs_is_killed_and_fails_closed() {
+        let (_dir, wt) = fixture_worktree();
+        let git = GuardGit::new(&wt.path, std::time::Duration::from_millis(500)).unwrap();
+        let started = std::time::Instant::now();
+        let why = git
+            .run(&["-c", "alias.hang=!sleep 30", "hang"], None)
+            .unwrap_err();
+        assert!(why.contains("did not finish within"), "{why}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_guard_git_command_that_succeeds_without_its_input_is_unreadable() {
+        let (_dir, wt) = fixture_worktree();
+        let git = GuardGit::new(&wt.path, SIGNING_GUARD_TIMEOUT).unwrap();
+        // Far more than a pipe holds, to a command that reads none of it.
+        let lines = vec!["a".repeat(40); 20_000];
+        let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let why = git
+            .run(&["-c", "alias.skip=!sleep 0.5", "skip"], Some(&lines))
+            .unwrap_err();
+        assert!(why.contains("without reading all its input"), "{why}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn one_commits_signature_read_blames_only_a_signature_git_cannot_parse() {
+        use std::os::unix::process::ExitStatusExt;
+        let read = |code: i32, stdout: &str, stderr: &str| {
+            signature_kept(&std::process::Output {
+                status: std::process::ExitStatus::from_raw(code << 8),
+                stdout: stdout.as_bytes().to_vec(),
+                stderr: stderr.as_bytes().to_vec(),
+            })
+        };
+        assert_eq!(read(0, "G\n", ""), Ok(true));
+        assert_eq!(read(0, "U\n", ""), Ok(true));
+        assert_eq!(read(0, "B\n", ""), Ok(false));
+        assert_eq!(
+            read(128, "", "fatal: bad/incompatible signature 'garbage\n'\n"),
+            Ok(false)
+        );
+        // Any other failure is the guard's, with git's complaint.
+        let why = read(128, "", "fatal: bad object deadbeef").unwrap_err();
+        assert!(why.contains("bad object"), "{why}");
+        assert!(read(1, "", "error: something else").is_err());
+    }
+
+    #[test]
+    fn the_recipe_pushes_to_a_configured_remote_never_a_lookalike_ref() {
+        let (_dir, wt) = remote_fixture();
+        git_in(&wt.path, &["remote", "rename", "origin", "fork"]);
+        git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
+        commit_in(&wt.path, "work", &["-c", "commit.gpgsign=false"]);
+        // No remote tracks the branch yet: the only remote is the one to use.
+        let violation = check(&wt).unwrap().unwrap();
+        assert!(
+            violation.contains(&format!("`git push --force-with-lease fork {}`", wt.branch)),
+            "{violation}"
+        );
+        // A ref that merely ends in the branch name, under no configured
+        // remote, sorting first, is not the branch's remote.
+        git_in(&wt.path, &["push", "-q", "fork", &wt.branch]);
+        let tip = git_in(&wt.path, &["rev-parse", "HEAD"]);
+        git_in(
+            &wt.path,
+            &[
+                "update-ref",
+                &format!("refs/remotes/aaa/{}", wt.branch),
+                &tip,
+            ],
+        );
+        let violation = check(&wt).unwrap().unwrap();
+        assert!(
+            violation.contains(&format!("`git push --force-with-lease fork {}`", wt.branch)),
+            "{violation}"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_policy_at_the_runs_start_stops_before_any_dispatch() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        git_in(&wt.path, &["config", "commit.gpgsign", "maybe"]);
+        let mut dispatched = false;
+        let mut dispatcher = CommitThenMet(|_: &Path| dispatched = true);
+        let err = run_issue(&db, &issue(), &brief(), &wt, &config(), &mut dispatcher)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            !dispatched,
+            "nothing may be paid for a met that would be discarded"
+        );
+        assert!(err.contains("commit.gpgsign"), "got: {err}");
+        assert!(err.contains("maybe"), "got: {err}");
+        // No invocation and no state: it says so, rather than promise a
+        // recovery that cannot happen.
+        assert!(!err.contains("invocation"), "got: {err}");
+        assert!(err.contains("nothing was written"), "got: {err}");
+        assert!(lineage::attempts_for_issue(&db, &issue())
+            .unwrap()
+            .is_empty());
+        // A held invocation is recovered on the next run once the policy
+        // reads; clearing it would discard a run that may still be live.
+        let pending = pending_muse(&db, &wt, None);
+        let mut d = muse_script(vec![]);
+        let err = run_issue(&db, &issue(), &brief(), &wt, &muse_config(), &mut d)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(
+                "a pending invocation for this issue is kept and will be recovered once this \
+                 is fixed; do not clear-dispatch it"
+            ),
+            "got: {err}"
+        );
+        assert_eq!(
+            dispatch_state::get_dispatch_state(&db, &issue()).unwrap(),
+            Some(pending)
+        );
+        // A state with no invocation is left for the next run to resume.
+        let mut paused = pending_codex(&db, &wt, None);
+        paused.invocation_artifacts = None;
+        dispatch_state::upsert_dispatch_state(&db, &paused).unwrap();
+        let err = run_issue(
+            &db,
+            &issue(),
+            &brief(),
+            &wt,
+            &codex_config(),
+            &mut codex_script(vec![]),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("dispatch state is left as it is"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn only_a_full_object_name_is_read_as_a_commit_to_check() {
+        assert!(is_full_object_name(&"a".repeat(40)));
+        assert!(is_full_object_name(&"0F".repeat(32)));
+        for line in [
+            "Good \"git\" signature with ED25519 key SHA256:abc",
+            "No principal matched.",
+            "",
+            &"a".repeat(39),
+            &"g".repeat(40),
+        ] {
+            assert!(!is_full_object_name(line), "{line:?}");
+        }
+    }
+
+    #[test]
+    fn a_met_left_on_another_checkout_is_still_checked_on_the_issue_branch() {
+        let (_dir, wt) = fixture_worktree();
+        git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
+        let bypass = commit_in(&wt.path, "b", &["-c", "commit.gpgsign=false"]);
+        // The IC compares against the base and leaves HEAD there.
+        git_in(&wt.path, &["checkout", "-q", "--detach", &wt.cut]);
+        let violation = check(&wt).unwrap().unwrap();
+        assert_eq!(blamed(&violation), [short(&bypass)].into(), "{violation}");
+    }
+
+    #[test]
+    fn a_met_records_the_issue_branchs_tip_not_wherever_head_was_left() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree(); // policy off: only the sha is at issue
+        let cut = wt.cut.clone();
+        let mut tip = String::new();
+        let mut dispatcher = CommitThenMet(|path: &Path| {
+            tip = commit_in(path, "work", &[]);
+            git_in(path, &["checkout", "-q", "--detach", &cut]);
+        });
+        let run = run_issue(&db, &issue(), &brief(), &wt, &config(), &mut dispatcher).unwrap();
+        match run.terminal {
+            TerminalReason::Met { commit_sha } => assert_eq!(commit_sha, Some(tip)),
+            other => panic!("expected Met, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_missing_issue_branch_is_a_violation_naming_it() {
+        let (_dir, wt) = fixture_worktree();
+        git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
+        git_in(&wt.path, &["checkout", "-q", "--detach"]);
+        git_in(&wt.path, &["branch", "-q", "-D", &wt.branch]);
+        let violation = check(&wt).unwrap().unwrap();
+        assert!(violation.contains(&wt.branch), "got: {violation}");
+        assert!(violation.contains("does not exist"), "got: {violation}");
+    }
+
+    #[test]
+    fn a_commit_only_on_the_issue_branchs_remote_is_checked_and_upstream_is_not() {
+        let (dir, wt) = remote_fixture();
+        git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
+        let pushed = commit_in(&wt.path, "pushed", &["-c", "commit.gpgsign=false"]);
+        git_in(&wt.path, &["push", "-q", "origin", &wt.branch]);
+        // The local branch is reset after the push; the PR still ships it.
+        git_in(&wt.path, &["reset", "-q", "--hard", &wt.cut]);
+        let upstream = push_upstream_commit(dir.path());
+        git_in(&wt.path, &["fetch", "-q", "origin"]);
+        let violation = check(&wt).unwrap().unwrap();
+        assert_eq!(
+            blamed(&violation),
+            [short(&pushed)].into(),
+            "never upstream {}: {violation}",
+            short(&upstream)
+        );
+    }
+
+    #[test]
+    fn the_violation_names_at_most_five_commits_and_re_signs_only_those() {
+        let (_dir, wt) = fixture_worktree();
+        git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
+        let shas: Vec<String> = (0..7)
+            .map(|i| commit_in(&wt.path, &format!("c{i}"), &["-c", "commit.gpgsign=false"]))
+            .collect();
+        let violation = check(&wt).unwrap().unwrap();
+        // Newest first: the five newest are named, the rest counted.
+        for sha in &shas[2..] {
+            assert!(violation.contains(&short(sha)), "{violation}");
+        }
+        assert!(!violation.contains(&short(&shas[1])), "{violation}");
+        assert!(violation.contains("and 2 more"), "{violation}");
+        // The oldest is not in the list, only in the rebase command.
+        assert_eq!(
+            violation.matches(&short(&shas[0])).count(),
+            1,
+            "{violation}"
+        );
+        // The rebase starts at the oldest flagged commit's parent, never the
+        // cut, so upstream commits merged in are not rewritten.
+        let oldest = short(&shas[0]);
+        assert!(
+            violation.contains(&format!("git commit --amend --no-edit -S' {oldest}^")),
+            "{violation}"
+        );
+        assert!(
+            !violation.contains(&format!("-S' {}", short(&wt.cut))),
+            "{violation}"
+        );
+        assert!(
+            violation.contains("`git commit --amend --no-edit -S`"),
+            "{violation}"
+        );
+        assert!(violation.contains("merge"), "{violation}");
+        // It acts on the issue branch, never on wherever HEAD was left, and
+        // pushes it by name. This checkout has no remote at all, so none is
+        // named: never an `origin` that does not exist.
+        assert!(
+            violation.contains(&format!("`git checkout {}`", wt.branch)),
+            "{violation}"
+        );
+        assert!(
+            violation.contains(&format!(
+                "`git push --force-with-lease <remote> {}`",
+                wt.branch
+            )),
+            "{violation}"
+        );
+    }
+
+    #[test]
+    fn the_recipe_pushes_to_the_remote_that_already_tracks_the_issue_branch() {
+        let (_dir, wt) = remote_fixture();
+        git_in(&wt.path, &["remote", "rename", "origin", "fork"]);
+        git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
+        commit_in(&wt.path, "work", &["-c", "commit.gpgsign=false"]);
+        git_in(&wt.path, &["push", "-q", "fork", &wt.branch]);
+        let violation = check(&wt).unwrap().unwrap();
+        assert!(
+            violation.contains(&format!("`git push --force-with-lease fork {}`", wt.branch)),
+            "{violation}"
+        );
+    }
+
+    /// Insert a `gpgsig` header holding `signature` into `sha`'s object and
+    /// point the issue branch at the result; returns the new commit.
+    fn forge_signature_header(wt: &Worktree, sha: &str, signature: &str) -> String {
+        let object = git_in(&wt.path, &["cat-file", "commit", sha]);
+        let (headers, message) = object.split_once("\n\n").unwrap();
+        let forged = format!("{headers}\ngpgsig {signature}\n\n{message}\n");
+        let file = wt.path.join(".git").join("forged-commit");
+        std::fs::write(&file, forged).unwrap();
+        let commit = git_in(
+            &wt.path,
+            &["hash-object", "-t", "commit", "-w", file.to_str().unwrap()],
+        );
+        git_in(
+            &wt.path,
+            &["update-ref", &format!("refs/heads/{}", wt.branch), &commit],
+        );
+        commit
+    }
+
+    #[test]
+    fn a_commit_with_a_garbage_signature_header_is_the_models_failed_attempt() {
+        // Measured (git 2.55): `%G?` on such a commit exits 128 ("bad/
+        // incompatible signature"); listing the range by `%H` alone does not.
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
+        let branch_wt = wt.clone();
+        let mut forged = String::new();
+        let mut dispatcher = CommitThenMet(|path: &Path| {
+            let plain = commit_in(path, "work", &["-c", "commit.gpgsign=false"]);
+            forged = forge_signature_header(&branch_wt, &plain, "garbage");
+        });
+        let mut c = config();
+        c.attempt_cap = 1;
+        let run = run_issue(&db, &issue(), &brief(), &wt, &c, &mut dispatcher).unwrap();
+        assert_eq!(
+            run.dispatches[0].classification,
+            DispatchClassification::FailedAttempt
+        );
+        let reason = run.dispatches[0].reason.as_deref().unwrap();
+        assert_eq!(blamed(reason), [short(&forged)].into(), "{reason}");
+    }
+
+    /// A fresh ed25519 key in `dir`, or `None` when `ssh-keygen` is missing,
+    /// after saying so. Under `CI` a missing `ssh-keygen` fails the test
+    /// instead: CI must never pass these by skipping them.
+    #[cfg(unix)]
+    fn ssh_key(dir: &Path) -> Option<std::path::PathBuf> {
+        let key = dir.join("key");
+        let made = std::process::Command::new("ssh-keygen")
+            .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+            .arg(&key)
+            .stdin(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if made {
+            return Some(key);
+        }
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "ssh-keygen unavailable under CI; the SSH signing tests cannot be skipped there"
+        );
+        eprintln!("SKIPPED: ssh-keygen unavailable");
+        None
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signed_commits_are_read_the_same_under_log_show_signature() {
+        let keys = tempfile::tempdir().unwrap();
+        let Some(key) = ssh_key(keys.path()) else {
+            return;
+        };
+        let (_dir, wt) = fixture_worktree();
+        sign_with(&wt.path, keys.path(), &key);
+        // Measured (git 2.55): this prints "Good \"git\" signature ..." lines
+        // ahead of each signed commit, even under `--format=%H`.
+        git_in(&wt.path, &["config", "log.showSignature", "true"]);
+        commit_in(&wt.path, "one", &[]);
+        commit_in(&wt.path, "two", &[]);
+        assert_eq!(check(&wt), Ok(None));
+    }
+
+    /// Sign in `repo` with `key`, pinned against the operator's global
+    /// config: ssh-keygen as the program and a local allowed-signers file
+    /// listing `key`.
+    #[cfg(unix)]
+    fn sign_with(repo: &Path, keys: &Path, key: &Path) {
+        let public = std::fs::read_to_string(key.with_extension("pub")).unwrap();
+        let allowed = keys.join("allowed");
+        std::fs::write(&allowed, format!("autopilot@example.test {public}")).unwrap();
+        for (k, v) in [
+            ("gpg.format", "ssh"),
+            ("gpg.ssh.program", "ssh-keygen"),
+            ("gpg.ssh.allowedSignersFile", allowed.to_str().unwrap()),
+            ("user.signingkey", key.to_str().unwrap()),
+            ("commit.gpgsign", "true"),
+        ] {
+            git_in(repo, &["config", k, v]);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_signed_commit_whose_signature_no_longer_verifies_is_blamed() {
+        let keys = tempfile::tempdir().unwrap();
+        let Some(key) = ssh_key(keys.path()) else {
+            return;
+        };
+        let (_dir, wt) = fixture_worktree();
+        sign_with(&wt.path, keys.path(), &key);
+        let signed = commit_in(&wt.path, "signed", &[]);
+        // Measured (git 2.55): editing the message of an SSH-signed commit
+        // keeps its `gpgsig` header and reads `%G?` = `B` whatever the
+        // allowed-signers file lists, so only the bad-signature arm catches it.
+        let object = git_in(&wt.path, &["cat-file", "commit", &signed]);
+        let tampered_text = object.replace("\n\nsigned", "\n\ntampered") + "\n";
+        let file = keys.path().join("tampered");
+        std::fs::write(&file, tampered_text).unwrap();
+        let tampered = git_in(
+            &wt.path,
+            &["hash-object", "-t", "commit", "-w", file.to_str().unwrap()],
+        );
+        git_in(
+            &wt.path,
+            &[
+                "update-ref",
+                &format!("refs/heads/{}", wt.branch),
+                &tampered,
+            ],
+        );
+        assert_eq!(
+            git_in(&wt.path, &["log", "-1", "--format=%G?", &tampered]),
+            "B"
+        );
+        // Measured (git 2.55): with this set, `%G?` is printed after the
+        // signature's own verification lines. The batched read keeps only
+        // `<sha> <status>` lines; the per-commit fallback's
+        // `--no-show-signature` is pinned by the mixed-range test below.
+        git_in(&wt.path, &["config", "log.showSignature", "true"]);
+        let violation = check(&wt).unwrap().unwrap();
+        assert_eq!(blamed(&violation), [short(&tampered)].into(), "{violation}");
+    }
+
+    /// Good, unsigned, bad and unparseable signatures in one range, read
+    /// under `log.showSignature=true`: the batched `%G?` read answers the
+    /// first range, and the unparseable header (which fails that read with
+    /// exit 128) sends the second range to one read per commit. Both blame
+    /// exactly the same commits.
+    #[cfg(unix)]
+    #[test]
+    fn a_mixed_range_is_judged_the_same_batched_or_one_commit_at_a_time() {
+        let keys = tempfile::tempdir().unwrap();
+        let Some(key) = ssh_key(keys.path()) else {
+            return;
+        };
+        let (_dir, wt) = fixture_worktree();
+        sign_with(&wt.path, keys.path(), &key);
+        let good = commit_in(&wt.path, "good", &[]);
+        let unsigned = commit_in(&wt.path, "plain", &["-c", "commit.gpgsign=false"]);
+        let signed = commit_in(&wt.path, "signed", &[]);
+        let object = git_in(&wt.path, &["cat-file", "commit", &signed]);
+        let file = keys.path().join("tampered");
+        std::fs::write(&file, object.replace("\n\nsigned", "\n\ntampered") + "\n").unwrap();
+        let bad = git_in(
+            &wt.path,
+            &["hash-object", "-t", "commit", "-w", file.to_str().unwrap()],
+        );
+        git_in(&wt.path, &["reset", "-q", "--hard", &bad]);
+        git_in(&wt.path, &["config", "log.showSignature", "true"]);
+        let batched = check(&wt).unwrap().unwrap();
+        assert_eq!(
+            blamed(&batched),
+            [short(&unsigned), short(&bad)].into(),
+            "never the good {}: {batched}",
+            short(&good)
+        );
+        let plain = commit_in(&wt.path, "garbled", &["-c", "commit.gpgsign=false"]);
+        let garbled = forge_signature_header(&wt, &plain, "garbage");
+        let one_by_one = check(&wt).unwrap().unwrap();
+        assert_eq!(
+            blamed(&one_by_one),
+            [short(&unsigned), short(&bad), short(&garbled)].into(),
+            "never the good {}: {one_by_one}",
+            short(&good)
+        );
+    }
+
+    /// Thousands of commits are read through pipes in both directions; a
+    /// writer that fills git's input before reading its output would hang.
+    #[test]
+    fn a_range_of_thousands_of_commits_is_checked() {
+        const COMMITS: usize = 3000;
+        let (_dir, wt) = fixture_worktree();
+        git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
+        let mut script = String::new();
+        for i in 0..COMMITS {
+            let message = format!("bulk {i}\n");
+            script.push_str(&format!(
+                "commit refs/heads/{}\ncommitter Autopilot Test <autopilot@example.test> {} +0000\n\
+                 data {}\n{message}",
+                wt.branch,
+                1_700_000_000 + i,
+                message.len()
+            ));
+            if i == 0 {
+                script.push_str(&format!("from {}\n", wt.cut));
+            }
+            script.push('\n');
+        }
+        let mut child = crate::autopilot::test_git::command()
+            .args(["fast-import", "--quiet"])
+            .current_dir(&wt.path)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        std::io::Write::write_all(child.stdin.as_mut().unwrap(), script.as_bytes()).unwrap();
+        drop(child.stdin.take());
+        assert!(child.wait().unwrap().success());
+        let violation = check(&wt).unwrap().unwrap();
+        assert!(
+            violation.contains(&format!("and {} more", COMMITS - NAMED_UNSIGNED_COMMITS)),
+            "{violation}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_sha256_repositorys_gpgsig_sha256_header_counts_as_signed() {
+        let keys = tempfile::tempdir().unwrap();
+        let Some(key) = ssh_key(keys.path()) else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        for args in [
+            vec![
+                "init",
+                "-q",
+                "--object-format=sha256",
+                "--initial-branch=main",
+            ],
+            vec!["config", "user.email", "autopilot@example.test"],
+            vec!["config", "user.name", "Autopilot Test"],
+            vec!["config", "commit.gpgsign", "false"],
+            vec!["config", "core.hooksPath", "/dev/null"],
+        ] {
+            git_in(&path, &args);
+        }
+        let cut = commit_in(&path, "seed", &[]);
+        let branch = worktree::branch_name(&issue());
+        git_in(&path, &["checkout", "-q", "-b", &branch]);
+        sign_with(&path, keys.path(), &key);
+        let signed = commit_in(&path, "signed", &[]);
+        // Measured (git 2.55): a SHA-256 repository writes the signature
+        // under `gpgsig-sha256`, never `gpgsig`.
+        let object = git_in(&path, &["cat-file", "commit", &signed]);
+        assert!(object.contains("\ngpgsig-sha256 "), "{object}");
+        assert!(!object.contains("\ngpgsig "), "{object}");
+        let wt = Worktree {
+            path,
+            branch,
+            created: true,
+            cut: worktree::CommitSha::parse(&cut).unwrap(),
+            quarantined_from: None,
+        };
+        assert_eq!(check(&wt).unwrap(), None);
+    }
+
+    #[test]
+    fn a_policy_turned_off_by_a_sibling_issues_agent_still_guards_a_new_branch() {
+        let db = approved_db();
+        let dir = tempfile::tempdir().unwrap();
+        let checkout = operator_checkout(dir.path());
+        git_in(&checkout, &["config", "commit.gpgsign", "true"]);
+        let trees = dir.path().join("trees");
+        let first = worktree::ensure_worktree(&checkout, &trees, &issue(), "HEAD").unwrap();
+        // Issue 1's agent turns signing off in the shared `.git/config`.
+        let mut off = CommitThenMet(|path: &Path| {
+            git_in(path, &["config", "commit.gpgsign", "false"]);
+        });
+        let mut c = config();
+        c.attempt_cap = 1;
+        run_issue(&db, &issue(), &brief(), &first, &c, &mut off).unwrap();
+        // A later issue is provisioned and run with the policy already off.
+        let later = IssueRef::new("ironrace/ironmem", 3);
+        let second = worktree::ensure_worktree(&checkout, &trees, &later, "HEAD").unwrap();
+        let mut unsigned = CommitThenMet(|path: &Path| {
+            commit_in(path, "work", &[]);
+        });
+        let run = run_issue(&db, &later, &brief(), &second, &c, &mut unsigned).unwrap();
+        assert_eq!(
+            run.dispatches[0].classification,
+            DispatchClassification::FailedAttempt
+        );
+        let reason = run.dispatches[0].reason.as_deref().unwrap();
+        assert!(reason.contains("was turned off"), "got: {reason}");
+        assert!(
+            reason.contains("`ironmem.autopilotSigning`"),
+            "the repository flag holds the new branch: {reason}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ssh_signed_commits_are_accepted_whether_or_not_the_signer_is_trusted() {
+        let keys = tempfile::tempdir().unwrap();
+        let Some(key) = ssh_key(keys.path()) else {
+            return;
+        };
+        let public = std::fs::read_to_string(keys.path().join("key.pub")).unwrap();
+        // A listed key typically reads `G` and an unlisted one `U`, but the
+        // exact letter varies by git version; only "signed" is asserted.
+        for listed in [false, true] {
+            let (_dir, wt) = fixture_worktree();
+            let allowed = keys.path().join(format!("allowed-{listed}"));
+            let line = if listed {
+                format!("autopilot@example.test {public}")
+            } else {
+                String::new()
+            };
+            std::fs::write(&allowed, line).unwrap();
+            for (k, v) in [
+                ("gpg.format", "ssh"),
+                ("gpg.ssh.program", "ssh-keygen"),
+                ("gpg.ssh.allowedSignersFile", allowed.to_str().unwrap()),
+                ("user.signingkey", key.to_str().unwrap()),
+                ("commit.gpgsign", "true"),
+            ] {
+                git_in(&wt.path, &["config", k, v]);
+            }
+            commit_in(&wt.path, "signed", &[]);
+            let status = git_in(&wt.path, &["log", "-1", "--format=%G?"]);
+            assert!(
+                !status.is_empty() && status != "N" && status != "B",
+                "listed={listed}: %G? = {status:?}"
+            );
+            assert_eq!(check(&wt).unwrap(), None, "listed={listed}");
+        }
+    }
+
+    #[test]
+    fn a_met_with_an_unsigned_commit_becomes_a_failed_attempt() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
+        let mut dispatcher = CommitThenMet(|path: &Path| {
+            commit_in(path, "work", &["-c", "commit.gpgsign=false"]);
+        });
+        let mut c = config();
+        c.attempt_cap = 1;
+        let run = run_issue(&db, &issue(), &brief(), &wt, &c, &mut dispatcher).unwrap();
+        assert_eq!(
+            run.dispatches[0].classification,
+            DispatchClassification::FailedAttempt
+        );
+        let reason = run.dispatches[0].reason.as_deref().unwrap();
+        assert!(reason.contains("unsigned"), "got: {reason}");
+        // The model's own account is kept beside the violation.
+        assert!(
+            reason.contains("(model's reason: scripted Met)"),
+            "got: {reason}"
+        );
+        assert!(!matches!(run.terminal, TerminalReason::Met { .. }));
+    }
+
+    /// With no remote it can name, the recipe says which one to push to
+    /// rather than naming one that may not exist.
+    /// The guard reads the issue branch on every remote that holds it, so
+    /// re-signing clears it only once each is force-pushed: the recipe
+    /// names them all, the push clause's remote first.
+    #[test]
+    fn a_recipe_names_every_remote_that_holds_the_branch() {
+        let violation = |remotes: &[&str]| {
+            SigningViolation::Unsigned {
+                flagged: vec!["abc123".into()],
+                cut: "c".repeat(40),
+                branch: "autopilot/o-r-1".into(),
+                remotes: remotes.iter().map(|r| r.to_string()).collect(),
+            }
+            .to_string()
+        };
+        let one = violation(&["upstream"]);
+        assert!(
+            one.contains("`git push --force-with-lease upstream autopilot/o-r-1`"),
+            "{one}"
+        );
+        let two = violation(&["upstream", "origin"]);
+        assert!(
+            two.contains("`git push --force-with-lease upstream autopilot/o-r-1`"),
+            "{two}"
+        );
+        assert!(
+            two.contains("each other remote holding it") && two.contains("`origin`"),
+            "{two}"
+        );
+        let many = violation(&["a", "b", "c", "d", "e"]);
+        assert!(
+            many.contains("`b`, `c` and 2 more (`git branch -r`)"),
+            "{many}"
+        );
+    }
+
+    /// The recipe force-pushes first where the goal condition's push clause
+    /// pushes (the remote naming the issue's repo, though a fork `origin`
+    /// holds the branch), then to every other remote holding it.
+    #[test]
+    fn the_recipe_pushes_where_the_push_clause_does_then_to_every_holder() {
+        let (dir, wt) = remote_fixture();
+        let mirror = dir.path().join("mirror.git");
+        git_in(
+            dir.path(),
+            &["init", "-q", "--bare", mirror.to_str().unwrap()],
+        );
+        git_in(
+            &wt.path,
+            &["remote", "add", "mirror", mirror.to_str().unwrap()],
+        );
+        git_in(
+            &wt.path,
+            &[
+                "remote",
+                "add",
+                "upstream",
+                "git@github.com:ironrace/ironmem.git",
+            ],
+        );
+        git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
+        commit_in(&wt.path, "work", &["-c", "commit.gpgsign=false"]);
+        git_in(&wt.path, &["push", "-q", "origin", &wt.branch]);
+        git_in(&wt.path, &["push", "-q", "mirror", &wt.branch]);
+        assert_eq!(
+            worktree::push_remote(&wt.path, &wt.branch, &issue().repo).as_deref(),
+            Some("upstream"),
+            "the push clause's remote"
+        );
+        let violation = check(&wt).unwrap().unwrap();
+        let first = format!("`git push --force-with-lease upstream {}`", wt.branch);
+        assert!(violation.contains(&first), "{violation}");
+        let at = |what: &str| {
+            violation
+                .find(what)
+                .unwrap_or_else(|| panic!("{what}: {violation}"))
+        };
+        assert!(
+            at(&first) < at("`origin`") && at(&first) < at("`mirror`"),
+            "{violation}"
+        );
+    }
+
+    /// The recipe picks by where a push really goes, as the push clause
+    /// does: `upstream` fetches the issue's repo but pushes to a fork, so it
+    /// is not the remote the recipe force-pushes first.
+    #[test]
+    fn the_recipe_ignores_a_remote_that_only_fetches_the_issue_repo() {
+        let (_dir, wt) = remote_fixture();
+        git_in(
+            &wt.path,
+            &[
+                "remote",
+                "add",
+                "upstream",
+                "git@github.com:ironrace/ironmem.git",
+            ],
+        );
+        git_in(
+            &wt.path,
+            &[
+                "config",
+                "remote.upstream.pushurl",
+                "git@github.com:someone/ironmem.git",
+            ],
+        );
+        git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
+        commit_in(&wt.path, "work", &["-c", "commit.gpgsign=false"]);
+        git_in(&wt.path, &["push", "-q", "origin", &wt.branch]);
+        assert_eq!(
+            worktree::push_remote(&wt.path, &wt.branch, &issue().repo).as_deref(),
+            Some("origin")
+        );
+        let violation = check(&wt).unwrap().unwrap();
+        assert!(
+            violation.contains(&format!(
+                "`git push --force-with-lease origin {}`",
+                wt.branch
+            )),
+            "{violation}"
+        );
+        assert!(
+            !violation.contains("upstream autopilot") && !violation.contains("`upstream`"),
+            "{violation}"
+        );
+    }
+
+    #[test]
+    fn a_recipe_with_no_remote_names_none() {
+        let violation = SigningViolation::Unsigned {
+            flagged: vec!["abc123".into()],
+            cut: "c".repeat(40),
+            branch: "autopilot/o-r-1".into(),
+            remotes: Vec::new(),
+        }
+        .to_string();
+        assert!(
+            violation.contains("`git push --force-with-lease <remote> autopilot/o-r-1`"),
+            "{violation}"
+        );
+        assert!(violation.contains("the issue's repository"), "{violation}");
+    }
+
+    #[test]
+    fn the_longest_violation_fits_its_share_of_the_turn_prompt() {
+        // GitHub's longest owner (39) and repository (100) names.
+        let branch = worktree::branch_name(&IssueRef::new(
+            format!("{}/{}", "o".repeat(39), "r".repeat(100)),
+            u64::MAX,
+        ));
+        let flagged: Vec<String> = (0..1000).map(|i| format!("{i:012x}")).collect();
+        let violation = SigningViolation::Unsigned {
+            flagged,
+            cut: "c".repeat(64),
+            branch,
+            // Many remotes holding the branch, each with a long name.
+            remotes: (0..50)
+                .map(|i| format!("{i:02}{}", "r".repeat(38)))
+                .collect(),
+        }
+        .to_string();
+        assert!(
+            violation.chars().count() <= MAX_VIOLATION_CHARS,
+            "{} > {MAX_VIOLATION_CHARS}: {violation}",
+            violation.chars().count()
+        );
+    }
+
+    /// Remote names have no length limit (anyone who can write the
+    /// repository's config chooses them), so the recipe falls back to
+    /// counting the other holders, and then to `<remote>`, rather than ever
+    /// exceed its share of the prompt; it names the push clause's remote
+    /// whenever that fits.
+    #[test]
+    fn a_recipe_stays_within_its_budget_whatever_the_remote_names() {
+        let longest = worktree::branch_name(&IssueRef::new(
+            format!("{}/{}", "o".repeat(39), "r".repeat(100)),
+            u64::MAX,
+        ));
+        let worst: Vec<String> = (0..1000).map(|i| format!("{i:012x}")).collect();
+        let render = |flagged: &[String], branch: &str, remotes: Vec<String>| {
+            SigningViolation::Unsigned {
+                flagged: flagged.to_vec(),
+                cut: "c".repeat(64),
+                branch: branch.to_string(),
+                remotes,
+            }
+            .to_string()
+        };
+        for len in [40, 44, 200, 1000] {
+            for count in [1, 2, 3, 50] {
+                let remotes: Vec<String> = (0..count)
+                    .map(|i| format!("{i:02}{}", "r".repeat(len - 2)))
+                    .collect();
+                let violation = render(&worst, &longest, remotes.clone());
+                assert!(
+                    violation.chars().count() <= MAX_VIOLATION_CHARS,
+                    "{len}x{count}: {} > {MAX_VIOLATION_CHARS}: {violation}",
+                    violation.chars().count()
+                );
+                let named = violation.contains(&format!("--force-with-lease {} ", remotes[0]));
+                assert!(
+                    named || violation.contains("--force-with-lease <remote> "),
+                    "{len}x{count}: {violation}"
+                );
+                if len <= 44 {
+                    assert!(
+                        named,
+                        "{len}x{count}: the push clause's remote fits: {violation}"
+                    );
+                }
+            }
+        }
+        // A short branch and a few commits leave room for a 200-character
+        // name, which is then named.
+        let long = "r".repeat(200);
+        let violation = render(&["abc123".into()], "autopilot/o-r-1", vec![long.clone()]);
+        assert!(
+            violation.contains(&format!("--force-with-lease {long} ")),
+            "{violation}"
+        );
+    }
+
+    /// Commits unsigned work, then reports `met` with `reason`; afterwards
+    /// reports `not_met`. Records every dispatch's condition.
+    struct UnsignedMetThenNotMet {
+        reason: Option<String>,
+        commits: usize,
+        conditions: Vec<String>,
+    }
+    impl Dispatcher for UnsignedMetThenNotMet {
+        fn dispatch(
+            &mut self,
+            repo: &Path,
+            spec: &DispatchSpec,
+        ) -> Result<DispatchOutcome, MemoryError> {
+            self.conditions.push(spec.condition.clone());
+            if self.conditions.len() > 1 {
+                return Ok(not_met());
+            }
+            for i in 0..self.commits {
+                commit_in(repo, &format!("w{i}"), &["-c", "commit.gpgsign=false"]);
+            }
+            let mut met = met();
+            met.reason = self.reason.clone();
+            Ok(met)
+        }
+    }
+
+    fn run_unsigned_met(
+        reason: Option<String>,
+        commits: usize,
+    ) -> (Database, IssueRun, UnsignedMetThenNotMet) {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
+        let mut dispatcher = UnsignedMetThenNotMet {
+            reason,
+            commits,
+            conditions: Vec::new(),
+        };
+        let mut c = config();
+        c.attempt_cap = 2;
+        let run = run_issue(&db, &issue(), &brief(), &wt, &c, &mut dispatcher).unwrap();
+        (db, run, dispatcher)
+    }
+
+    #[test]
+    fn a_refused_met_tells_the_next_turn_why_once_and_bounds_the_models_reason() {
+        let long = "m".repeat(2000);
+        let (db, run, dispatcher) = run_unsigned_met(Some(long), 7);
+        assert_eq!(
+            run.dispatches[0].classification,
+            DispatchClassification::FailedAttempt
+        );
+        // The report keeps the model's reason beside the violation, bounded.
+        let reason = run.dispatches[0].reason.as_deref().unwrap();
+        let quoted = format!("(model's reason: {})", "m".repeat(MODEL_REASON_CHARS));
+        assert!(reason.ends_with(&quoted), "{reason}");
+        // The lineage holds the violation once, in why_failed, and the
+        // model's own account, bounded, as the approach.
+        let attempt = &lineage::attempts_for_issue(&db, &issue()).unwrap()[0];
+        assert_eq!(attempt.approach, "m".repeat(MODEL_REASON_CHARS));
+        let why = attempt.why_failed.as_deref().unwrap();
+        assert!(why.contains("Re-sign only these commits"), "{why}");
+        assert!(!why.contains("mmmm"), "{why}");
+        // ...so the next turn is told why its met was refused.
+        let next = &dispatcher.conditions[1];
+        assert!(next.contains("attempt 1:"), "{next}");
+        assert!(next.contains("Re-sign only these commits"), "{next}");
+    }
+
+    #[test]
+    fn a_refused_met_with_no_reason_of_its_own_gets_no_empty_quote() {
+        for reason in [None, Some("  ".to_string())] {
+            let (db, run, _) = run_unsigned_met(reason.clone(), 1);
+            let report = run.dispatches[0].reason.as_deref().unwrap();
+            assert!(!report.contains("model's reason"), "{reason:?}: {report}");
+            let attempt = &lineage::attempts_for_issue(&db, &issue()).unwrap()[0];
+            assert!(!attempt.approach.trim().is_empty(), "{reason:?}");
+            assert!(!attempt.approach.contains("Re-sign"), "{attempt:?}");
+        }
+    }
+
+    #[test]
+    fn an_unsigned_commit_from_an_earlier_dispatch_still_fails_a_later_met() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
+        let mut calls = 0;
+        let mut first = String::new();
+        let mut dispatcher = CommitThenMet(|path: &Path| {
+            calls += 1;
+            if calls == 1 {
+                first = commit_in(path, "work", &["-c", "commit.gpgsign=false"]);
+            }
+        });
+        let mut c = config();
+        c.attempt_cap = 2;
+        let run = run_issue(&db, &issue(), &brief(), &wt, &c, &mut dispatcher).unwrap();
+        assert_eq!(run.dispatches.len(), 2);
+        for d in &run.dispatches {
+            assert_eq!(d.classification, DispatchClassification::FailedAttempt);
+            assert!(d.reason.as_deref().unwrap().contains(&first[..12]));
+        }
+    }
+
+    #[test]
+    fn a_commit_already_on_the_base_is_never_blamed() {
+        let db = approved_db();
+        let (_dir, mut wt) = fixture_worktree();
+        // The branch is cut after this unsigned commit, so it is the base's.
+        wt.cut = worktree::CommitSha::parse(&commit_in(&wt.path, "old", &[])).unwrap();
+        git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
+        let mut dispatcher = CommitThenMet(|_: &Path| {});
+        let run = run_issue(&db, &issue(), &brief(), &wt, &config(), &mut dispatcher).unwrap();
+        assert!(matches!(run.terminal, TerminalReason::Met { .. }));
+    }
+
+    #[test]
+    fn a_dispatch_that_turns_the_policy_off_is_a_failed_attempt() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
+        let mut dispatcher = CommitThenMet(|path: &Path| {
+            git_in(path, &["config", "commit.gpgsign", "false"]);
+            commit_in(path, "work", &[]);
+        });
+        let mut c = config();
+        c.attempt_cap = 1;
+        let run = run_issue(&db, &issue(), &brief(), &wt, &c, &mut dispatcher).unwrap();
+        assert_eq!(
+            run.dispatches[0].classification,
+            DispatchClassification::FailedAttempt
+        );
+        let reason = run.dispatches[0].reason.as_deref().unwrap();
+        assert!(reason.contains("was turned off"), "got: {reason}");
+        assert!(
+            reason.contains(&format!("`branch.{}.ironmemSigning`", wt.branch)),
+            "the flag holding the branch is named: {reason}"
+        );
+        assert!(reason.contains("--unset commit.gpgsign"), "got: {reason}");
+        assert!(
+            reason.contains("return verdict impossible"),
+            "got: {reason}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_run_whose_branch_already_records_the_policy_writes_no_config() {
+        use std::os::unix::fs::MetadataExt;
+        // A live agent in another worktree may be writing `.git/config`
+        // (`push -u`, `checkout -b`); a needless write here races its lock.
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
+        let flag = format!("branch.{}.ironmemSigning", wt.branch);
+        git_in(&wt.path, &["config", &flag, "true"]);
+        git_in(&wt.path, &["config", "ironmem.autopilotSigning", "true"]);
+        let config_file = wt.path.join(".git/config");
+        let before = std::fs::metadata(&config_file).unwrap().ino();
+        let mut dispatcher = CommitThenMet(|path: &Path| {
+            commit_in(path, "work", &["-c", "commit.gpgsign=false"]);
+        });
+        let mut c = config();
+        c.attempt_cap = 1;
+        let run = run_issue(&db, &issue(), &brief(), &wt, &c, &mut dispatcher).unwrap();
+        assert_eq!(
+            std::fs::metadata(&config_file).unwrap().ino(),
+            before,
+            "git config rewrites by rename, so a new inode means a write"
+        );
+        assert_eq!(
+            run.dispatches[0].classification,
+            DispatchClassification::FailedAttempt
+        );
+    }
+
+    #[test]
+    fn a_held_config_lock_does_not_fail_the_run_and_the_policy_is_still_held() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
+        // Another worktree's agent holds the lock as the run starts.
+        let lock = wt.path.join(".git/config.lock");
+        std::fs::write(&lock, "").unwrap();
+        let mut dispatcher = CommitThenMet(|path: &Path| {
+            std::fs::remove_file(path.join(".git/config.lock")).unwrap();
+            git_in(path, &["config", "commit.gpgsign", "false"]);
+            commit_in(path, "work", &[]);
+        });
+        let mut c = config();
+        c.attempt_cap = 1;
+        let run = run_issue(&db, &issue(), &brief(), &wt, &c, &mut dispatcher).unwrap();
+        assert_eq!(
+            run.dispatches[0].classification,
+            DispatchClassification::FailedAttempt
+        );
+        let reason = run.dispatches[0].reason.as_deref().unwrap();
+        assert!(reason.contains("was turned off"), "got: {reason}");
+        assert!(
+            reason.contains("on when this run started"),
+            "no flag was written, so the run's own reading holds it: {reason}"
+        );
+    }
+
+    #[test]
+    fn a_recovered_met_is_checked_against_the_branch_base() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        pending_codex(&db, &wt, Some("persisted"));
+        git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
+        commit_in(&wt.path, "work", &["-c", "commit.gpgsign=false"]);
+        let mut result = met();
+        result.native_session_id = Some("persisted".into());
+        let mut d = codex_script(vec![]);
+        d.recovery = Some(InvocationRecovery::Finished(result));
+        let mut c = codex_config();
+        c.attempt_cap = 1;
+        let run = run_issue(&db, &issue(), &brief(), &wt, &c, &mut d).unwrap();
+        assert!(!matches!(run.terminal, TerminalReason::Met { .. }));
+        assert!(run.dispatches[0]
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("unsigned"));
+    }
+
+    #[test]
+    fn a_run_holding_a_live_invocation_writes_no_signing_config() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        pending_muse(&db, &wt, None);
+        git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
+        let mut d = muse_script(vec![]);
+        d.recovery = Some(InvocationRecovery::Alive);
+        let run = run_issue(&db, &issue(), &brief(), &wt, &muse_config(), &mut d).unwrap();
+        assert!(
+            matches!(run.terminal, TerminalReason::ImplementationInFlight { .. }),
+            "{:?}",
+            run.terminal
+        );
+        // The live agent may be writing `.git/config` itself; the run that
+        // holds it must not race it for the lock.
+        for key in [
+            format!("branch.{}.ironmemSigning", wt.branch),
+            "ironmem.autopilotSigning".to_string(),
+        ] {
+            assert_eq!(
+                crate::autopilot::test_git::config_get(&wt.path, &key),
+                None,
+                "{key} was written"
+            );
+        }
+    }
+
+    /// A paused dispatch state for `implementer`, as a run that saw the
+    /// signing policy on left it, with no invocation pending.
+    fn paused_state_that_saw_signing_on(
+        implementer: Implementer,
+        db: &Database,
+        wt: &Worktree,
+    ) -> DispatchState {
+        let mut state = pending_invocation(implementer, db, wt, None);
+        state.invocation_artifacts = None;
+        state.session_uuid = "11111111-2222-3333-4444-555555555555".into();
+        state.state = "paused-infrastructure-failure".into();
+        state.signing_held = true;
+        dispatch_state::upsert_dispatch_state(db, &state).unwrap();
+        state
+    }
+
+    #[test]
+    fn a_parked_runs_reading_holds_a_fresh_dispatch_unless_the_branch_is_opted_out() {
+        // D2. Policy off, and either nothing records it on or the operator
+        // opted the branch out; a parked earlier run on the issue saw it on.
+        for (implementer, opt_out) in [
+            (Implementer::Claude, false),
+            (Implementer::Claude, true),
+            (Implementer::Muse, false),
+            (Implementer::Muse, true),
+        ] {
+            let db = approved_db();
+            let (_dir, wt) = fixture_worktree();
+            if opt_out {
+                let key = format!("branch.{}.ironmemSigning", wt.branch);
+                git_in(&wt.path, &["config", &key, "false"]);
+            }
+            paused_state_that_saw_signing_on(implementer, &db, &wt);
+            let mut d = HarnessCommitThenMet {
+                implementer,
+                before: |path: &Path| {
+                    commit_in(path, "work", &["-c", "commit.gpgsign=false"]);
+                },
+                dispatched: 0,
+            };
+            let mut c = if implementer == Implementer::Muse {
+                muse_config()
+            } else {
+                config()
+            };
+            c.attempt_cap = 1;
+            let run = run_issue(&db, &issue(), &brief(), &wt, &c, &mut d).unwrap();
+            if opt_out {
+                assert!(
+                    matches!(run.terminal, TerminalReason::Met { .. }),
+                    "{implementer:?}: the opt-out wins: {:?}",
+                    run.dispatches
+                );
+            } else {
+                assert_eq!(
+                    run.dispatches[0].classification,
+                    DispatchClassification::FailedAttempt,
+                    "{implementer:?}: {:?}",
+                    run.dispatches
+                );
+                let reason = run.dispatches[0].reason.as_deref().unwrap();
+                assert!(reason.contains("before it paused"), "{reason}");
+            }
+        }
+    }
+
+    /// D2 end to end: run 1 sees signing on but cannot record it (another
+    /// agent holds the config lock) and parks; run 2, with the policy since
+    /// turned off, refuses an unsigned met, unless the branch is opted out.
+    #[test]
+    fn a_signing_reading_survives_a_park_when_it_could_not_be_recorded() {
+        for opt_out in [false, true] {
+            let db = approved_db();
+            let (_dir, wt) = fixture_worktree();
+            git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
+            let lock = wt.path.join(".git/config.lock");
+            std::fs::write(&lock, "").unwrap();
+            let mut d = muse_script(vec![muse_infra_failure("network down")]);
+            let mut c = muse_config();
+            c.max_consecutive_infrastructure_failures = 1;
+            run_issue(&db, &issue(), &brief(), &wt, &c, &mut d).unwrap();
+            let parked = dispatch_state::get_dispatch_state(&db, &issue())
+                .unwrap()
+                .unwrap();
+            assert!(parked.is_parked() && parked.signing_held, "{parked:?}");
+            std::fs::remove_file(&lock).unwrap();
+            assert!(!worktree::signing_recorded(&wt.path, &wt.branch));
+            git_in(&wt.path, &["config", "commit.gpgsign", "false"]);
+            if opt_out {
+                let key = format!("branch.{}.ironmemSigning", wt.branch);
+                git_in(&wt.path, &["config", &key, "false"]);
+            }
+            let mut d = HarnessCommitThenMet {
+                implementer: Implementer::Muse,
+                before: |path: &Path| {
+                    commit_in(path, "work", &["-c", "commit.gpgsign=false"]);
+                },
+                dispatched: 0,
+            };
+            c.attempt_cap = 1;
+            let run = run_issue(&db, &issue(), &brief(), &wt, &c, &mut d).unwrap();
+            let classification = run.dispatches[0].classification;
+            if opt_out {
+                assert_eq!(classification, DispatchClassification::Met, "{run:?}");
+            } else {
+                assert_eq!(
+                    classification,
+                    DispatchClassification::FailedAttempt,
+                    "{run:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_explicit_opt_out_also_releases_a_recovered_met() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        let key = format!("branch.{}.ironmemSigning", wt.branch);
+        git_in(&wt.path, &["config", &key, "false"]);
+        let mut state = pending_muse(&db, &wt, None);
+        state.signing_held = true;
+        dispatch_state::upsert_dispatch_state(&db, &state).unwrap();
+        commit_in(&wt.path, "work", &["-c", "commit.gpgsign=false"]);
+        let mut result = met();
+        result.cost_usd = None;
+        let mut d = muse_script(vec![]);
+        d.recovery = Some(InvocationRecovery::Finished(result));
+        let mut c = muse_config();
+        c.attempt_cap = 1;
+        let run = run_issue(&db, &issue(), &brief(), &wt, &c, &mut d).unwrap();
+        assert!(
+            matches!(run.terminal, TerminalReason::Met { .. }),
+            "{:?}",
+            run.dispatches
+        );
+    }
+
+    #[test]
+    fn a_parked_runs_reading_is_carried_forward_unless_the_branch_is_opted_out() {
+        for opt_out in [false, true] {
+            let db = approved_db();
+            let (_dir, wt) = fixture_worktree(); // policy off
+            if opt_out {
+                let key = format!("branch.{}.ironmemSigning", wt.branch);
+                git_in(&wt.path, &["config", &key, "false"]);
+            }
+            paused_state_that_saw_signing_on(Implementer::Muse, &db, &wt);
+            let mut d = muse_script(vec![muse_infra_failure("network down")]);
+            let mut c = muse_config();
+            c.max_consecutive_infrastructure_failures = 1;
+            run_issue(&db, &issue(), &brief(), &wt, &c, &mut d).unwrap();
+            let state = dispatch_state::get_dispatch_state(&db, &issue())
+                .unwrap()
+                .unwrap();
+            assert_eq!(state.signing_held, !opt_out, "{state:?}");
+        }
+    }
+
+    /// a Claude run records its signing reading only right before
+    /// its first launch: a run held before launching records nothing.
+    #[test]
+    fn a_claude_run_held_before_its_first_launch_records_no_signing_reading() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
+        let mut b = ClaudeEvidence::new(&db, Vec::new());
+        b.own_evidence.push_back(InvocationRecovery::Alive);
+        let run = run_issue(&db, &issue(), &brief(), &wt, &config(), &mut b).unwrap();
+        assert!(
+            matches!(run.terminal, TerminalReason::ImplementationInFlight { .. }),
+            "{:?}",
+            run.terminal
+        );
+        assert!(b.seen.is_empty());
+        assert!(!worktree::signing_recorded(&wt.path, &wt.branch));
+    }
+
+    /// an interrupted (non-parked) run's signing reading is carried
+    /// into this run's states too, unless the branch is opted out.
+    #[test]
+    fn an_interrupted_runs_signing_reading_is_carried_forward() {
+        for opt_out in [false, true] {
+            let db = approved_db();
+            let (_dir, wt) = fixture_worktree(); // policy off
+            if opt_out {
+                let key = format!("branch.{}.ironmemSigning", wt.branch);
+                git_in(&wt.path, &["config", &key, "false"]);
+            }
+            let mut state = pending_invocation(Implementer::Claude, &db, &wt, None);
+            state.signing_held = true;
+            dispatch_state::upsert_dispatch_state(&db, &state).unwrap();
+            let mut b = ClaudeEvidence::new(&db, Vec::new());
+            b.outcomes.push_back(no_verdict_error());
+            let mut c = config();
+            c.max_consecutive_infrastructure_failures = 1;
+            run_issue(&db, &issue(), &brief(), &wt, &c, &mut b).unwrap();
+            let written = dispatch_state::get_dispatch_state(&db, &issue())
+                .unwrap()
+                .unwrap();
+            assert_eq!(written.signing_held, !opt_out, "{written:?}");
+        }
+    }
+
+    #[test]
+    fn a_policy_seen_on_by_an_interrupted_run_still_guards_its_recovered_met() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree(); // policy off, no flag recorded
+                                             // The interrupted run saw the policy on, but neither config flag was
+                                             // written (another agent held the lock); only its drawer says so.
+        let mut state = pending_muse(&db, &wt, None);
+        state.signing_held = true;
+        state.session_uuid = "66666666-7777-8888-9999-000000000000".into();
+        dispatch_state::upsert_dispatch_state(&db, &state).unwrap();
+        let mut result = met();
+        result.cost_usd = None;
+        // and the next fresh dispatch's met is held to it too, which
+        // takes the reading recorded on the branch, not only in memory.
+        let mut d = muse_script(vec![met()]);
+        d.recovery = Some(InvocationRecovery::Finished(result));
+        let mut c = muse_config();
+        c.attempt_cap = 2;
+        let run = run_issue(&db, &issue(), &brief(), &wt, &c, &mut d).unwrap();
+        assert!(!matches!(run.terminal, TerminalReason::Met { .. }));
+        let reason = run.dispatches[0].reason.as_deref().unwrap();
+        // Held by the branch flag recorded from the interrupted run's reading.
+        assert!(reason.contains("still held to signing"), "{reason}");
+        assert_eq!(d.inner.seen.len(), 1);
+        assert_eq!(
+            run.dispatches[1].classification,
+            DispatchClassification::FailedAttempt,
+            "{:?}",
+            run.dispatches
+        );
+        assert!(worktree::signing_recorded(&wt.path, &wt.branch));
+    }
+
+    #[test]
+    fn every_published_invocation_records_whether_signing_was_seen_on() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
+        let mut d = muse_script(vec![muse_infra_failure("network down")]);
+        let mut c = muse_config();
+        c.max_consecutive_infrastructure_failures = 1;
+        run_issue(&db, &issue(), &brief(), &wt, &c, &mut d).unwrap();
+        let state = dispatch_state::get_dispatch_state(&db, &issue())
+            .unwrap()
+            .unwrap();
+        assert!(state.signing_held, "{state:?}");
+    }
+
+    /// A dispatcher whose recovery step lets another run take the issue over:
+    /// it writes `theirs` as the dispatch state, as a concurrent Lead would.
+    struct TakenOver<'a> {
+        db: &'a Database,
+        theirs: DispatchState,
+        dispatched: bool,
+        recovery: Option<InvocationRecovery>,
+    }
+    impl Dispatcher for TakenOver<'_> {
+        fn implementer(&self) -> Implementer {
+            Implementer::Muse
+        }
+        fn recover(
+            &mut self,
+            _repo: &Path,
+            _state: &DispatchState,
+        ) -> Result<InvocationRecovery, MemoryError> {
+            dispatch_state::upsert_dispatch_state(self.db, &self.theirs).unwrap();
+            Ok(self
+                .recovery
+                .take()
+                .unwrap_or(InvocationRecovery::NoPriorInvocation))
+        }
+        fn dispatch(
+            &mut self,
+            _repo: &Path,
+            _spec: &DispatchSpec,
+        ) -> Result<DispatchOutcome, MemoryError> {
+            self.dispatched = true;
+            Ok(met())
+        }
+    }
+
+    #[test]
+    fn a_run_whose_issue_another_run_took_over_launches_nothing_and_keeps_theirs() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        let mut ours = pending_muse(&db, &wt, None);
+        ours.invocation_artifacts = None;
+        ours.session_uuid = "11111111-2222-3333-4444-555555555555".into();
+        ours.state = "paused-infrastructure-failure".into();
+        dispatch_state::upsert_dispatch_state(&db, &ours).unwrap();
+        let before = files_under(&wt.path.join(".git/ironmem"));
+        let mut theirs = ours.clone();
+        theirs.session_uuid = "22222222-3333-4444-5555-666666666666".into();
+        theirs.state = "dispatching".into();
+        let mut d = TakenOver {
+            db: &db,
+            theirs: theirs.clone(),
+            dispatched: false,
+            recovery: None,
+        };
+        let err = run_issue(&db, &issue(), &brief(), &wt, &muse_config(), &mut d)
+            .unwrap_err()
+            .to_string();
+        assert!(!d.dispatched, "{err}");
+        assert!(err.contains("another run"), "{err}");
+        let stored = dispatch_state::get_dispatch_state(&db, &issue())
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.session_uuid, theirs.session_uuid);
+        assert_eq!(stored.state, "dispatching");
+        // Nothing reserved for an invocation that never launched.
+        let ledger = budget::get_daily_spend(&db, &today_utc()).unwrap();
+        assert_eq!(ledger.map_or(0, |l| l.unpriced_dispatch_count), 0);
+        // And no invocation directory left behind.
+        assert_eq!(files_under(&wt.path.join(".git/ironmem")), before);
+    }
+
+    #[test]
+    fn a_run_that_stops_before_launching_never_overwrites_the_state_another_run_took() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        let mut ours = pending_muse(&db, &wt, None);
+        ours.invocation_artifacts = None;
+        ours.state = "paused-daily-budget".into();
+        dispatch_state::upsert_dispatch_state(&db, &ours).unwrap();
+        let mut theirs = ours.clone();
+        theirs.state = "dispatching".into();
+        theirs.session_uuid = "22222222-3333-4444-5555-666666666666".into();
+        // The day is spent, so this run pauses without launching.
+        budget::accumulate_daily_spend(&db, &today_utc(), 24.0).unwrap();
+        let mut d = TakenOver {
+            db: &db,
+            theirs: theirs.clone(),
+            dispatched: false,
+            recovery: None,
+        };
+        let err = run_issue(&db, &issue(), &brief(), &wt, &muse_config(), &mut d)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("another run"), "{err}");
+        let stored = dispatch_state::get_dispatch_state(&db, &issue())
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.session_uuid, theirs.session_uuid);
+        assert_eq!(stored.state, "dispatching");
+    }
+
+    #[test]
+    fn a_recovered_impossible_on_a_state_another_run_took_clears_and_reports_nothing() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        let ours = pending_muse(&db, &wt, None);
+        // Its attempt was already recorded before the crash.
+        lineage::upsert_issue_status(
+            &db,
+            &IssueStatus {
+                issue: issue(),
+                best_verdict: Some(AttemptOutcome::Failed),
+                best_commit_sha: None,
+                cumulative_attempt_n: 1,
+            },
+        )
+        .unwrap();
+        let mut theirs = ours.clone();
+        theirs.session_uuid = "22222222-3333-4444-5555-666666666666".into();
+        let mut finished = impossible();
+        finished.cost_usd = None;
+        let mut d = TakenOver {
+            db: &db,
+            theirs: theirs.clone(),
+            dispatched: false,
+            recovery: Some(InvocationRecovery::Finished(finished)),
+        };
+        // The issue is the other run's now, and so is its verdict: this run
+        // reports none for it to act on.
+        let err = run_issue(&db, &issue(), &brief(), &wt, &muse_config(), &mut d)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("another run took over"), "{err}");
+        let stored = dispatch_state::get_dispatch_state(&db, &issue()).unwrap();
+        assert_eq!(stored.map(|s| s.session_uuid), Some(theirs.session_uuid));
+    }
+
+    /// Every file path under `dir`, recursively.
+    fn files_under(dir: &Path) -> std::collections::BTreeSet<std::path::PathBuf> {
+        let mut found = std::collections::BTreeSet::new();
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                found.extend(files_under(&path));
+            } else {
+                found.insert(path);
+            }
+        }
+        found
+    }
+
+    /// The crash window [`a_recovered_met_is_checked_against_the_branch_base`]
+    /// does not cover: the attempt record was written, the status was not, so
+    /// the replay takes the same ordinal while the signing state may have
+    /// changed since.
+    fn record_attempt_one_before_the_crash(
+        db: &Database,
+        verdict: AttemptOutcome,
+        why_failed: Option<&str>,
+        commit_sha: Option<&str>,
+    ) {
+        lineage::record_attempt(
+            db,
+            &AttemptRecord {
+                issue: issue(),
+                attempt_n: 1,
+                approach: "recorded before the crash".into(),
+                verdict,
+                why_failed: why_failed.map(str::to_string),
+                commit_sha: commit_sha.map(str::to_string),
+            },
+        )
+        .unwrap();
+        assert!(
+            lineage::get_issue_status(db, &issue()).unwrap().is_none(),
+            "setup: the crash came before the status write"
+        );
+    }
+
+    fn assert_attempt_one_recorded_once(db: &Database, verdict: AttemptOutcome) {
+        let attempts: Vec<_> = lineage::attempts_for_issue(db, &issue())
+            .unwrap()
+            .into_iter()
+            .filter(|r| !is_terminal_summary(&r.approach))
+            .collect();
+        assert_eq!(attempts.len(), 1, "{attempts:?}");
+        assert_eq!(attempts[0].verdict, verdict);
+        assert_eq!(
+            lineage::get_issue_status(db, &issue())
+                .unwrap()
+                .unwrap()
+                .cumulative_attempt_n,
+            1
+        );
+    }
+
+    #[test]
+    fn a_recovered_met_already_recorded_as_success_skips_the_live_signing_guard() {
+        // The recorded commit is reported even when HEAD has moved since, and
+        // a success recorded without one reports none: never the unchecked
+        // live HEAD, and always what the stored status says.
+        for record_commit in [true, false] {
+            let db = approved_db();
+            let (_dir, wt) = fixture_worktree();
+            pending_codex(&db, &wt, Some("persisted"));
+            let recorded_sha = record_commit.then(|| git_in(&wt.path, &["rev-parse", "HEAD"]));
+            record_attempt_one_before_the_crash(
+                &db,
+                AttemptOutcome::Success,
+                None,
+                recorded_sha.as_deref(),
+            );
+            // Between the crash and the replay the policy came on and an
+            // unsigned commit moved HEAD; the guard would now call the
+            // recorded success a failure, and HEAD is no longer the commit
+            // that succeeded.
+            git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
+            let later = commit_in(&wt.path, "later", &["-c", "commit.gpgsign=false"]);
+            assert_ne!(Some(&later), recorded_sha.as_ref());
+            let mut result = met();
+            result.native_session_id = Some("persisted".into());
+            let mut d = codex_script(vec![]);
+            d.recovery = Some(InvocationRecovery::Finished(result));
+            let mut c = codex_config();
+            c.attempt_cap = 1;
+            let run = run_issue(&db, &issue(), &brief(), &wt, &c, &mut d).unwrap();
+            match &run.terminal {
+                TerminalReason::Met { commit_sha } => {
+                    assert_eq!(commit_sha, &recorded_sha, "record_commit={record_commit}")
+                }
+                other => panic!("expected Met, got {other:?}"),
+            }
+            assert_eq!(
+                run.dispatches[0].classification,
+                DispatchClassification::Met
+            );
+            assert!(d.inner.seen.is_empty());
+            assert_attempt_one_recorded_once(&db, AttemptOutcome::Success);
+            assert_eq!(
+                lineage::get_issue_status(&db, &issue())
+                    .unwrap()
+                    .unwrap()
+                    .best_commit_sha,
+                recorded_sha
+            );
+        }
+    }
+
+    #[test]
+    fn a_recovered_met_already_recorded_as_failed_keeps_the_recorded_failure() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        pending_muse(&db, &wt, None);
+        let recorded =
+            "gate condition not met: commit.gpgsign is on, but commit(s) abc are unsigned";
+        record_attempt_one_before_the_crash(&db, AttemptOutcome::Failed, Some(recorded), None);
+        // The fixture's policy is off and no flag was recorded, so the guard
+        // would now pass the met the recorded attempt failed.
+        let mut d = muse_script(vec![]);
+        d.recovery = Some(InvocationRecovery::Finished(met()));
+        let mut c = muse_config();
+        c.attempt_cap = 1;
+        let run = run_issue(&db, &issue(), &brief(), &wt, &c, &mut d).unwrap();
+        assert!(
+            !matches!(run.terminal, TerminalReason::Met { .. }),
+            "{run:?}"
+        );
+        assert_eq!(
+            run.dispatches[0].classification,
+            DispatchClassification::FailedAttempt
+        );
+        assert_eq!(run.dispatches[0].reason.as_deref(), Some(recorded));
+        assert!(d.inner.seen.is_empty());
+        assert_attempt_one_recorded_once(&db, AttemptOutcome::Failed);
+    }
+
+    /// The short shas a violation blames, from its `commit(s) a, b on` list.
+    fn blamed(violation: &str) -> std::collections::BTreeSet<String> {
+        let list = violation
+            .split_once("commit(s) ")
+            .and_then(|(_, rest)| rest.split_once(" on this branch"))
+            .map_or("", |(list, _)| list);
+        list.split(", ").map(str::to_string).collect()
+    }
+
+    fn short(sha: &str) -> String {
+        sha[..12].to_string()
+    }
+
+    /// An operator checkout under `dir`, pinned against the global config,
+    /// with a bare `origin` it has pushed `main` to.
+    fn operator_checkout(dir: &Path) -> std::path::PathBuf {
+        let origin = dir.join("origin.git");
+        let checkout = dir.join("checkout");
+        std::fs::create_dir_all(&origin).unwrap();
+        std::fs::create_dir_all(&checkout).unwrap();
+        git_in(&origin, &["init", "-q", "--bare", "--initial-branch=main"]);
+        for args in [
+            vec!["init", "-q", "--initial-branch=main"],
+            vec!["config", "user.email", "autopilot@example.test"],
+            vec!["config", "user.name", "Autopilot Test"],
+            vec!["config", "commit.gpgsign", "false"],
+            vec!["config", "core.hooksPath", "/dev/null"],
+        ] {
+            git_in(&checkout, &args);
+        }
+        commit_in(&checkout, "seed", &[]);
+        git_in(
+            &checkout,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        git_in(&checkout, &["push", "-q", "-u", "origin", "main"]);
+        checkout
+    }
+
+    /// The issue's real worktree, cut from the operator checkout's `HEAD`.
+    fn remote_fixture() -> (tempfile::TempDir, Worktree) {
+        let dir = tempfile::tempdir().unwrap();
+        let checkout = operator_checkout(dir.path());
+        let wt = worktree::ensure_worktree(&checkout, &dir.path().join("trees"), &issue(), "HEAD")
+            .unwrap();
+        (dir, wt)
+    }
+
+    /// Someone else lands an unsigned commit on `origin/main`; returns it.
+    fn push_upstream_commit(dir: &Path) -> String {
+        let upstream = dir.join("upstream");
+        let origin = dir.join("origin.git");
+        git_in(
+            dir,
+            &[
+                "clone",
+                "-q",
+                origin.to_str().unwrap(),
+                upstream.to_str().unwrap(),
+            ],
+        );
+        for args in [
+            vec!["config", "user.email", "upstream@example.test"],
+            vec!["config", "user.name", "Upstream"],
+            vec!["config", "commit.gpgsign", "false"],
+            vec!["config", "core.hooksPath", "/dev/null"],
+        ] {
+            git_in(&upstream, &args);
+        }
+        let sha = commit_in(&upstream, "upstream", &[]);
+        git_in(&upstream, &["push", "-q", "origin", "main"]);
+        sha
+    }
+
+    #[test]
+    fn upstream_commits_merged_in_from_the_remote_are_not_blamed() {
+        let (dir, wt) = remote_fixture();
+        let agent1 = commit_in(&wt.path, "agent1", &[]);
+        git_in(&wt.path, &["push", "-q", "origin", &wt.branch]);
+        let upstream = push_upstream_commit(dir.path());
+        git_in(&wt.path, &["fetch", "-q", "origin"]);
+        git_in(&wt.path, &["merge", "-q", "--no-edit", "origin/main"]);
+        let merge = git_in(&wt.path, &["rev-parse", "HEAD"]);
+        let agent2 = commit_in(&wt.path, "agent2", &[]);
+        git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
+        let violation = check(&wt).unwrap().unwrap();
+        assert_eq!(
+            blamed(&violation),
+            [short(&agent1), short(&merge), short(&agent2)].into(),
+            "only the agent's commits, never upstream {}: {violation}",
+            short(&upstream)
+        );
+    }
+
+    #[test]
+    fn upstream_commits_rebased_onto_from_the_remote_are_not_blamed() {
+        let (dir, wt) = remote_fixture();
+        let agent1 = commit_in(&wt.path, "agent1", &[]);
+        git_in(&wt.path, &["push", "-q", "origin", &wt.branch]);
+        let upstream = push_upstream_commit(dir.path());
+        git_in(&wt.path, &["fetch", "-q", "origin"]);
+        git_in(&wt.path, &["rebase", "-q", "origin/main"]);
+        let rebased = git_in(&wt.path, &["rev-parse", "HEAD"]);
+        let agent2 = commit_in(&wt.path, "agent2", &[]);
+        git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
+        // Until the rebase is pushed, the pre-rebase commit still ships.
+        let violation = check(&wt).unwrap().unwrap();
+        assert_eq!(
+            blamed(&violation),
+            [short(&agent1), short(&rebased), short(&agent2)].into(),
+            "{violation}"
+        );
+        git_in(&wt.path, &["push", "-q", "--force", "origin", &wt.branch]);
+        let violation = check(&wt).unwrap().unwrap();
+        assert_eq!(
+            blamed(&violation),
+            [short(&rebased), short(&agent2)].into(),
+            "only the agent's commits, never upstream {}: {violation}",
+            short(&upstream)
+        );
+    }
+
+    #[test]
+    fn a_pushed_unsigned_commit_from_an_earlier_dispatch_still_fails_a_later_met() {
+        let db = approved_db();
+        let (_dir, wt) = remote_fixture();
+        git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
+        let branch = wt.branch.clone();
+        let mut calls = 0;
+        let mut first = String::new();
+        let mut dispatcher = CommitThenMet(|path: &Path| {
+            calls += 1;
+            if calls == 1 {
+                first = commit_in(path, "work", &["-c", "commit.gpgsign=false"]);
+                git_in(path, &["push", "-q", "origin", &branch]);
+            }
+        });
+        let mut c = config();
+        c.attempt_cap = 2;
+        let run = run_issue(&db, &issue(), &brief(), &wt, &c, &mut dispatcher).unwrap();
+        assert_eq!(run.dispatches.len(), 2);
+        for d in &run.dispatches {
+            assert_eq!(d.classification, DispatchClassification::FailedAttempt);
+            assert!(d.reason.as_deref().unwrap().contains(&first[..12]));
+        }
+    }
+
+    #[test]
+    fn a_policy_turned_off_in_an_earlier_run_still_fails_a_later_met() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        git_in(&wt.path, &["config", "commit.gpgsign", "true"]);
+        let mut first = CommitThenMet(|path: &Path| {
+            git_in(path, &["config", "commit.gpgsign", "false"]);
+        });
+        let mut c = config();
+        c.attempt_cap = 1;
+        run_issue(&db, &issue(), &brief(), &wt, &c, &mut first).unwrap();
+        // A fresh run reads the policy as off; the branch remembers it was on.
+        let mut second = CommitThenMet(|path: &Path| {
+            commit_in(path, "work", &[]);
+        });
+        c.attempt_cap = 2;
+        let run = run_issue(&db, &issue(), &brief(), &wt, &c, &mut second).unwrap();
+        assert_eq!(run.dispatches.len(), 1);
+        assert_eq!(
+            run.dispatches[0].classification,
+            DispatchClassification::FailedAttempt
+        );
+        let reason = run.dispatches[0].reason.as_deref().unwrap();
+        assert!(reason.contains("was turned off"), "got: {reason}");
+    }
+
+    #[test]
+    fn a_policy_that_was_never_on_is_not_enforced_and_leaves_no_flags() {
+        let db = approved_db();
+        let (_dir, wt) = remote_fixture(); // commit.gpgsign pinned false
+        let mut dispatcher = CommitThenMet(|path: &Path| {
+            commit_in(path, "work", &[]);
+        });
+        let run = run_issue(&db, &issue(), &brief(), &wt, &config(), &mut dispatcher).unwrap();
+        assert!(matches!(run.terminal, TerminalReason::Met { .. }));
+        let branch_flag = format!("branch.{}.ironmemSigning", wt.branch);
+        for key in [branch_flag.as_str(), "ironmem.autopilotSigning"] {
+            assert_eq!(
+                crate::autopilot::test_git::config_get(&wt.path, key),
+                None,
+                "no {key} may be recorded"
+            );
+        }
     }
 
     // ── config validation ───────────────────────────────────────────────
@@ -4030,11 +10381,13 @@ satisfies it on its own"
         );
         assert_eq!(run.cumulative_attempt_n, 0);
         assert_eq!(run.total_cost_usd, 0.0);
+        // Its reserved ceiling is released, and nothing else is billed.
+        let ledger = budget::get_daily_spend(&db, &today_utc()).unwrap();
         assert!(
-            budget::get_daily_spend(&db, &today_utc())
-                .unwrap()
-                .is_none(),
-            "a dispatch that returned no meter bills nothing"
+            ledger.as_ref().is_none_or(|l| l.total_cost_usd == 0.0
+                && l.dispatch_count == 0
+                && !l.has_unpriced_spend()),
+            "a dispatch that returned no meter bills nothing: {ledger:?}"
         );
     }
 
@@ -4239,7 +10592,7 @@ satisfies it on its own"
 
         // Force a follow-up failed attempt directly through the same helper
         // the loop uses, bypassing the already-succeeded short circuit.
-        record_and_advance(
+        record_as_owner(
             &db,
             &AttemptRecord {
                 issue: issue(),
@@ -4249,8 +10602,7 @@ satisfies it on its own"
                 why_failed: Some("still red".to_string()),
                 commit_sha: None,
             },
-            Some(&succeeded),
-            false,
+            None,
         )
         .unwrap();
 
@@ -4261,8 +10613,8 @@ satisfies it on its own"
     }
     #[test]
     fn completed_codex_pauses_reenter_queue_and_resume_native_identity_once() {
-        use crate::autopilot::codex_process::CodexProcessSnapshot;
         use crate::autopilot::gh::IssueListing;
+        use crate::autopilot::process_tree::ProcessSnapshot;
         use crate::autopilot::queue::{plan_queue, QueueConfig, RepoBacklog};
         use crate::autopilot::registry::{HarnessSnapshots, RegistrySnapshot};
         use crate::autopilot::supervise::{reconcile, ReconcileVerdict};
@@ -4284,11 +10636,16 @@ satisfies it on its own"
                 let state = dispatch_state::get_dispatch_state(self.db, &issue())?.unwrap();
                 assert_eq!(state.state, "dispatching");
                 assert_eq!(
-                    state.codex_artifacts, spec.codex_artifacts,
+                    state.invocation_artifacts, spec.invocation_artifacts,
                     "pending invocation is durable before launch"
                 );
-                self.invocation =
-                    Some(spec.codex_artifacts.as_ref().unwrap().invocation_id.clone());
+                self.invocation = Some(
+                    spec.invocation_artifacts
+                        .as_ref()
+                        .unwrap()
+                        .invocation_id
+                        .clone(),
+                );
                 if self.spend_after {
                     budget::accumulate_daily_spend(self.db, &today_utc(), 1.5)?;
                 }
@@ -4350,7 +10707,7 @@ satisfies it on its own"
                     "paused-infrastructure-failure"
                 }
             );
-            assert!(state.codex_artifacts.is_none());
+            assert!(state.invocation_artifacts.is_none());
             let native = state.native_session_id.clone().unwrap();
             assert_eq!(native, "11111111-2222-3333-4444-555555555555");
             let ledger = budget::get_daily_spend(&db, &today_utc()).unwrap().unwrap();
@@ -4363,7 +10720,7 @@ satisfies it on its own"
                 claude: RegistrySnapshot::Unavailable {
                     reason: "Claude unrelated".into(),
                 },
-                codex: CodexProcessSnapshot::Available(Vec::new()),
+                processes: ProcessSnapshot::Available(Vec::new()),
             };
             let backlog = [RepoBacklog {
                 repo: issue().repo,
@@ -4400,7 +10757,7 @@ satisfies it on its own"
             cfg.daily_budget_usd = 4.0;
             cfg.max_unpriced_dispatches_per_day = 2;
             let mut resumed = codex_script(vec![met()]);
-            resumed.recovery = Some(CodexRecovery::NoPriorInvocation);
+            resumed.recovery = Some(InvocationRecovery::NoPriorInvocation);
             let result = run_issue(&db, &issue(), &brief(), &wt, &cfg, &mut resumed).unwrap();
             assert!(matches!(result.terminal, TerminalReason::Met { .. }));
             assert_eq!(result.unpriced_dispatches, 1);
@@ -4413,7 +10770,7 @@ satisfies it on its own"
             assert_eq!(
                 after.reserved_unpriced_dispatch_ids[1],
                 resumed.inner.seen[0]
-                    .codex_artifacts
+                    .invocation_artifacts
                     .as_ref()
                     .unwrap()
                     .invocation_id
@@ -4431,5 +10788,628 @@ satisfies it on its own"
                 .unwrap()
                 .is_none());
         }
+    }
+
+    /// A Claude dispatcher whose IC evidence is scripted, and that can take
+    /// the issue over (as another run would) while its dispatch runs.
+    struct ClaudeEvidence<'a> {
+        db: &'a Database,
+        /// What each `recover` call reports, in order; then idle.
+        evidence: std::collections::VecDeque<InvocationRecovery>,
+        recovered: usize,
+        /// What `recover_own` reports, in order; empty delegates to
+        /// `recover`.
+        own_evidence: std::collections::VecDeque<InvocationRecovery>,
+        /// Rewrite the stored claim's `claimed_at` 200 s into the past
+        /// during `dispatch`: a dispatch that ran past its lease.
+        age_claim_on_dispatch: bool,
+        /// A state another run writes while this run's dispatch runs.
+        takeover: Option<dispatch_state::Claim>,
+        /// A state another run writes while this run checks its IC.
+        recover_takeover: Option<dispatch_state::Claim>,
+        outcomes: std::collections::VecDeque<DispatchOutcome>,
+        seen: Vec<DispatchSpec>,
+    }
+
+    impl<'a> ClaudeEvidence<'a> {
+        fn new(db: &'a Database, evidence: Vec<InvocationRecovery>) -> Self {
+            Self {
+                db,
+                evidence: evidence.into(),
+                own_evidence: std::collections::VecDeque::new(),
+                age_claim_on_dispatch: false,
+                recovered: 0,
+                takeover: None,
+                recover_takeover: None,
+                outcomes: std::collections::VecDeque::new(),
+                seen: Vec::new(),
+            }
+        }
+    }
+
+    impl Dispatcher for ClaudeEvidence<'_> {
+        fn recover(
+            &mut self,
+            _repo: &Path,
+            _state: &DispatchState,
+        ) -> Result<InvocationRecovery, MemoryError> {
+            self.recovered += 1;
+            if let Some(theirs) = self.recover_takeover.take() {
+                let current = dispatch_state::get_claim(self.db, &theirs.state.issue).unwrap();
+                assert!(
+                    dispatch_state::claim_if_unchanged(self.db, current.as_ref(), &theirs).unwrap()
+                );
+            }
+            Ok(self
+                .evidence
+                .pop_front()
+                .unwrap_or(InvocationRecovery::NoPriorInvocation))
+        }
+
+        fn recover_own(
+            &mut self,
+            repo: &Path,
+            state: &DispatchState,
+        ) -> Result<InvocationRecovery, MemoryError> {
+            match self.own_evidence.pop_front() {
+                Some(evidence) => Ok(evidence),
+                None => self.recover(repo, state),
+            }
+        }
+
+        fn dispatch(
+            &mut self,
+            _repo: &Path,
+            spec: &DispatchSpec,
+        ) -> Result<DispatchOutcome, MemoryError> {
+            self.seen.push(spec.clone());
+            if self.age_claim_on_dispatch {
+                let current = dispatch_state::get_claim(self.db, &issue())
+                    .unwrap()
+                    .unwrap();
+                let mut aged = current.clone();
+                aged.claimed_at =
+                    Some((chrono::Utc::now() - chrono::Duration::seconds(200)).to_rfc3339());
+                assert!(
+                    dispatch_state::claim_if_unchanged(self.db, Some(&current), &aged).unwrap()
+                );
+            }
+            if let Some(theirs) = self.takeover.take() {
+                assert!(dispatch_state::claim_if_unchanged(
+                    self.db,
+                    dispatch_state::get_claim(self.db, &theirs.state.issue)
+                        .unwrap()
+                        .as_ref(),
+                    &theirs,
+                )
+                .unwrap());
+            }
+            Ok(self.outcomes.pop_front().expect("a scripted outcome"))
+        }
+    }
+
+    /// Run A's freshly written Claude state: dispatching, session claimed,
+    /// under A's token.
+    fn claude_in_flight_state(db: &Database, wt: &Worktree) -> dispatch_state::Claim {
+        let mut state = pending_invocation(Implementer::Claude, db, wt, None);
+        state.session_uuid = "33333333-4444-5555-6666-777777777777".into();
+        state.native_session_id = Some(state.session_uuid.clone());
+        state.session_claimed = true;
+        let claim = dispatch_state::Claim {
+            state,
+            owner: Some("run-a".into()),
+            claimed_at: None,
+            common_dir: None,
+        };
+        assert!(dispatch_state::claim_if_unchanged(
+            db,
+            dispatch_state::get_claim(db, &issue()).unwrap().as_ref(),
+            &claim,
+        )
+        .unwrap());
+        dispatch_state::get_claim(db, &issue()).unwrap().unwrap()
+    }
+
+    /// run B reads run A's fresh `dispatching` state while A's IC is
+    /// live. B adopts nothing, writes nothing and launches nothing.
+    #[test]
+    fn a_claude_run_never_adopts_a_state_whose_ic_is_live() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        let a = claude_in_flight_state(&db, &wt);
+        for evidence in [
+            InvocationRecovery::Alive,
+            InvocationRecovery::Unknown {
+                reason: "ps timed out".into(),
+            },
+        ] {
+            let mut b = ClaudeEvidence::new(&db, vec![evidence]);
+            let run = run_issue(&db, &issue(), &brief(), &wt, &config(), &mut b).unwrap();
+            assert!(
+                matches!(run.terminal, TerminalReason::ImplementationInFlight { .. }),
+                "{:?}",
+                run.terminal
+            );
+            assert!(b.seen.is_empty(), "nothing is launched");
+            assert_eq!(
+                dispatch_state::get_claim(&db, &issue()).unwrap().as_ref(),
+                Some(&a),
+                "run A's state, token and all, is untouched"
+            );
+        }
+        assert!(lineage::attempts_for_issue(&db, &issue())
+            .unwrap()
+            .is_empty());
+    }
+
+    /// A crashed run's Claude state, whose IC is gone, is still adopted: its
+    /// session is resumed.
+    #[test]
+    fn a_claude_state_whose_ic_is_idle_is_adopted_and_resumed() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        let a = claude_in_flight_state(&db, &wt);
+        let mut b = ClaudeEvidence::new(&db, Vec::new());
+        b.outcomes.push_back(met());
+        let run = run_issue(&db, &issue(), &brief(), &wt, &config(), &mut b).unwrap();
+        assert!(
+            matches!(run.terminal, TerminalReason::Met { .. }),
+            "{:?}",
+            run.terminal
+        );
+        assert_eq!(b.seen.len(), 1);
+        assert_eq!(
+            b.seen[0].session,
+            SessionMode::Resume {
+                session_uuid: a.state.session_uuid.clone()
+            }
+        );
+        // Checked at the start and again right before the launch.
+        assert_eq!(b.recovered, 2);
+    }
+
+    /// An IC for the issue that starts after the run read nothing (a fresh
+    /// issue) and before its first launch stops the launch.
+    #[test]
+    fn a_claude_ic_that_appears_before_the_first_launch_stops_it() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        let mut b = ClaudeEvidence::new(&db, vec![InvocationRecovery::Alive]);
+        let run = run_issue(&db, &issue(), &brief(), &wt, &config(), &mut b).unwrap();
+        assert!(
+            matches!(run.terminal, TerminalReason::ImplementationInFlight { .. }),
+            "{:?}",
+            run.terminal
+        );
+        assert!(b.seen.is_empty());
+    }
+
+    /// A run whose issue another run took over while its dispatch ran
+    /// records nothing of its stale outcome: no attempt, no status.
+    #[test]
+    fn a_stale_failed_attempt_from_a_run_that_lost_the_issue_records_nothing() {
+        for outcome in [not_met(), met(), impossible()] {
+            let db = approved_db();
+            let (_dir, wt) = fixture_worktree();
+            let mut b = ClaudeEvidence::new(&db, Vec::new());
+            let mut theirs = pending_invocation(
+                Implementer::Claude,
+                &Database::open_in_memory().unwrap(),
+                &wt,
+                None,
+            );
+            theirs.session_uuid = "44444444-5555-6666-7777-888888888888".into();
+            b.takeover = Some(dispatch_state::Claim {
+                state: theirs,
+                owner: Some("run-c".into()),
+                claimed_at: None,
+                common_dir: None,
+            });
+            b.outcomes.push_back(outcome.clone());
+            let err = run_issue(&db, &issue(), &brief(), &wt, &config(), &mut b)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("another run took over"), "{outcome:?}: {err}");
+            assert!(
+                lineage::attempts_for_issue(&db, &issue())
+                    .unwrap()
+                    .is_empty(),
+                "{outcome:?}"
+            );
+            assert_eq!(lineage::get_issue_status(&db, &issue()).unwrap(), None);
+            assert_eq!(
+                dispatch_state::get_claim(&db, &issue())
+                    .unwrap()
+                    .and_then(|c| c.owner),
+                Some("run-c".into())
+            );
+        }
+    }
+
+    #[test]
+    fn claude_evidence_reads_the_registry_and_the_ic_name_in_the_process_table() {
+        use crate::autopilot::process_tree::{ProcessRow, ProcessSnapshot};
+        use crate::autopilot::registry::{AgentEntry, HarnessSnapshots, RegistrySnapshot};
+        let mut state = pending_invocation(
+            Implementer::Claude,
+            &Database::open_in_memory().unwrap(),
+            &fixture_worktree().1,
+            None,
+        );
+        state.ic_session_name = dispatch::ic_name(&issue());
+        let ic = state.ic_session_name.clone();
+        let row = |args: String| ProcessRow {
+            pid: 70,
+            ppid: 1,
+            pgid: 70,
+            stat: "S".into(),
+            args,
+        };
+        let snaps = |claude: RegistrySnapshot, processes: ProcessSnapshot| HarnessSnapshots {
+            claude,
+            processes,
+        };
+        let listed = RegistrySnapshot::Available(vec![AgentEntry {
+            name: ic.clone(),
+            status: None,
+        }]);
+        let unreadable = RegistrySnapshot::Unavailable {
+            reason: "claude not found".into(),
+        };
+        assert_eq!(
+            claude_recovery(
+                &snaps(listed, ProcessSnapshot::Available(Vec::new())),
+                &state
+            ),
+            InvocationRecovery::Alive
+        );
+        assert_eq!(
+            claude_recovery(
+                &snaps(
+                    unreadable.clone(),
+                    ProcessSnapshot::Available(vec![row(format!("claude -p x --name {ic}"))])
+                ),
+                &state
+            ),
+            InvocationRecovery::Alive
+        );
+        assert!(matches!(
+            claude_recovery(
+                &snaps(
+                    RegistrySnapshot::Available(Vec::new()),
+                    ProcessSnapshot::Unavailable {
+                        reason: "ps timed out".into()
+                    }
+                ),
+                &state
+            ),
+            InvocationRecovery::Unknown { reason } if reason.contains("ps timed out")
+        ));
+        // a run never adopts on an unreadable registry, whatever the
+        // process table shows; both readable and silent, it is idle.
+        assert!(matches!(
+            claude_recovery(
+                &snaps(unreadable, ProcessSnapshot::Available(Vec::new())),
+                &state
+            ),
+            InvocationRecovery::Unknown { reason } if reason.contains("claude not found")
+        ));
+        assert_eq!(
+            claude_recovery(
+                &snaps(
+                    RegistrySnapshot::Available(Vec::new()),
+                    ProcessSnapshot::Available(Vec::new())
+                ),
+                &state
+            ),
+            InvocationRecovery::NoPriorInvocation
+        );
+        // the check on this run's own claim, before its first launch,
+        // needs only the process table: an unreadable registry does not
+        // hold a fresh launch, and a process naming the IC still does.
+        assert_eq!(
+            claude_recovery_own(
+                &snaps(
+                    RegistrySnapshot::Unavailable {
+                        reason: "claude not found".into()
+                    },
+                    ProcessSnapshot::Available(Vec::new())
+                ),
+                &state
+            ),
+            InvocationRecovery::NoPriorInvocation
+        );
+        assert_eq!(
+            claude_recovery_own(
+                &snaps(
+                    RegistrySnapshot::Unavailable {
+                        reason: "claude not found".into()
+                    },
+                    ProcessSnapshot::Available(vec![row(format!("claude -p x --name {ic}"))])
+                ),
+                &state
+            ),
+            InvocationRecovery::Alive
+        );
+    }
+
+    /// A claim as another run would write it now: leased.
+    fn leased_claim(state: DispatchState, owner: &str) -> dispatch_state::Claim {
+        dispatch_state::Claim {
+            state,
+            owner: Some(owner.into()),
+            claimed_at: Some(chrono::Utc::now().to_rfc3339()),
+            common_dir: None,
+        }
+    }
+
+    /// within its lease, another run's claim is never adopted, however
+    /// idle its IC looks; once the lease lapses it is.
+    #[test]
+    fn a_claude_run_never_adopts_a_claim_within_its_lease() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        let mut a = claude_in_flight_state(&db, &wt);
+        a.claimed_at = Some(chrono::Utc::now().to_rfc3339());
+        assert!(dispatch_state::claim_if_unchanged(
+            &db,
+            dispatch_state::get_claim(&db, &issue()).unwrap().as_ref(),
+            &a
+        )
+        .unwrap());
+        let a = dispatch_state::get_claim(&db, &issue()).unwrap().unwrap();
+        let mut b = ClaudeEvidence::new(&db, Vec::new());
+        let run = run_issue(&db, &issue(), &brief(), &wt, &config(), &mut b).unwrap();
+        assert!(
+            matches!(&run.terminal, TerminalReason::ImplementationInFlight { detail }
+                if detail.contains("lease")),
+            "{:?}",
+            run.terminal
+        );
+        assert!(b.seen.is_empty());
+        assert_eq!(b.recovered, 0, "no adoption check is even needed");
+        assert_eq!(
+            dispatch_state::get_claim(&db, &issue()).unwrap(),
+            Some(a.clone())
+        );
+
+        // Lapsed: adopted once its IC shows idle.
+        let mut lapsed = a.clone();
+        lapsed.claimed_at =
+            Some((chrono::Utc::now() - chrono::Duration::seconds(200)).to_rfc3339());
+        assert!(dispatch_state::claim_if_unchanged(&db, Some(&a), &lapsed).unwrap());
+        let mut b = ClaudeEvidence::new(&db, Vec::new());
+        b.outcomes.push_back(met());
+        let run = run_issue(&db, &issue(), &brief(), &wt, &config(), &mut b).unwrap();
+        assert!(
+            matches!(run.terminal, TerminalReason::Met { .. }),
+            "{:?}",
+            run.terminal
+        );
+    }
+
+    /// a fresh launch is held only by the process table on its own
+    /// claim, never by an unreadable registry; adopting another run's
+    /// claim (above) still requires the registry.
+    #[test]
+    fn a_fresh_claude_launch_needs_only_the_process_table() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        let mut b = ClaudeEvidence::new(
+            &db,
+            vec![InvocationRecovery::Unknown {
+                reason: "registry unreadable".into(),
+            }],
+        );
+        b.own_evidence
+            .push_back(InvocationRecovery::NoPriorInvocation);
+        b.outcomes.push_back(met());
+        let run = run_issue(&db, &issue(), &brief(), &wt, &config(), &mut b).unwrap();
+        assert!(
+            matches!(run.terminal, TerminalReason::Met { .. }),
+            "{:?}",
+            run.terminal
+        );
+        assert_eq!(b.seen.len(), 1);
+    }
+
+    /// a dispatch that ran past its lease has it renewed as soon as
+    /// it returns, before its outcome is recorded: the record still
+    /// lands, and the renewed lease keeps an adopter out.
+    #[test]
+    fn a_dispatch_past_its_lease_is_renewed_before_its_outcome_is_recorded() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        let mut b = ClaudeEvidence::new(&db, Vec::new());
+        b.age_claim_on_dispatch = true;
+        b.outcomes.push_back(met());
+        let run = run_issue(&db, &issue(), &brief(), &wt, &config(), &mut b).unwrap();
+        assert!(
+            matches!(run.terminal, TerminalReason::Met { .. }),
+            "{:?}",
+            run.terminal
+        );
+        // The met was recorded, not dropped as taken over.
+        let status = lineage::get_issue_status(&db, &issue()).unwrap().unwrap();
+        assert_eq!(status.cumulative_attempt_n, 1);
+    }
+
+    /// R1, at the renewal itself: an aged claim of this run's is renewed
+    /// in place, and an adopter judging the aged bytes can no longer
+    /// claim over them.
+    #[test]
+    fn a_renewed_lease_keeps_an_adopters_cas_out() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        let state = pending_invocation(Implementer::Claude, &db, &wt, None);
+        let mut aged = leased_claim(state.clone(), "us");
+        aged.claimed_at = Some((chrono::Utc::now() - chrono::Duration::seconds(200)).to_rfc3339());
+        let stored = dispatch_state::get_claim(&db, &issue()).unwrap();
+        assert!(dispatch_state::claim_if_unchanged(&db, stored.as_ref(), &aged).unwrap());
+        let mut owned = Some(aged.clone());
+        assert!(renew_owned(&db, &issue(), &mut owned).unwrap());
+        let now = chrono::Utc::now();
+        let renewed = dispatch_state::get_claim(&db, &issue()).unwrap().unwrap();
+        assert!(renewed.leased(now), "{renewed:?}");
+        assert_eq!(owned.as_ref(), Some(&renewed));
+        // The adopter's claim, judged against the aged bytes it read,
+        // no longer lands.
+        let theirs = leased_claim(state, "them");
+        assert!(
+            !dispatch_state::claim_if_unchanged(&db, Some(&aged), &theirs).unwrap(),
+            "an adopter claimed over a renewed lease"
+        );
+    }
+
+    /// a run whose own claim is near the end of its lease claims again
+    /// before it launches; one with time left only looks.
+    #[test]
+    fn ultrareview_claim_refresh_margin_boundaries() {
+        for (age, renews) in [(89, false), (90, true), (91, true)] {
+            let db = approved_db();
+            let (_dir, wt) = fixture_worktree();
+            let state = pending_invocation(Implementer::Claude, &db, &wt, None);
+            let now = chrono::Utc::now();
+            let mut claim = leased_claim(state, "us");
+            claim.claimed_at = Some((now - chrono::Duration::seconds(age)).to_rfc3339());
+            let stored = dispatch_state::get_claim(&db, &issue()).unwrap();
+            assert!(dispatch_state::claim_if_unchanged(&db, stored.as_ref(), &claim).unwrap());
+            let mut owned = Some(claim.clone());
+            assert!(still_owned_at(&db, &issue(), &mut owned, now).unwrap());
+            assert_eq!(
+                owned.as_ref().unwrap().claimed_at != claim.claimed_at,
+                renews,
+                "{age}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_claim_near_the_end_of_its_lease_is_renewed_before_a_launch() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        let state = pending_invocation(Implementer::Claude, &db, &wt, None);
+        let mut old = leased_claim(state, "us");
+        old.claimed_at = Some((chrono::Utc::now() - chrono::Duration::seconds(100)).to_rfc3339());
+        let stored = dispatch_state::get_claim(&db, &issue()).unwrap();
+        assert!(dispatch_state::claim_if_unchanged(&db, stored.as_ref(), &old).unwrap());
+        let mut owned = dispatch_state::get_claim(&db, &issue()).unwrap();
+        assert!(still_owned(&db, &issue(), &mut owned).unwrap());
+        let renewed = owned.clone().unwrap();
+        assert_ne!(renewed.claimed_at, old.claimed_at);
+        assert_eq!(
+            dispatch_state::get_claim(&db, &issue()).unwrap(),
+            Some(renewed.clone())
+        );
+        // Fresh: nothing is written.
+        assert!(still_owned(&db, &issue(), &mut owned).unwrap());
+        assert_eq!(owned, Some(renewed.clone()));
+        // Another run's claim since: not ours.
+        let theirs = leased_claim(renewed.state.clone(), "them");
+        assert!(dispatch_state::claim_if_unchanged(&db, Some(&renewed), &theirs).unwrap());
+        assert!(!still_owned(&db, &issue(), &mut owned).unwrap());
+    }
+
+    /// a parked state stays parked when the check before the first
+    /// launch finds an IC for the issue: the run launched nothing.
+    #[test]
+    fn a_parked_state_stays_parked_when_the_pre_launch_check_holds() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        let mut parked = pending_invocation(Implementer::Claude, &db, &wt, None);
+        parked.state = DispatchPhase::PausedDailyBudget.as_str().into();
+        dispatch_state::upsert_dispatch_state(&db, &parked).unwrap();
+        let before = dispatch_state::get_claim(&db, &issue()).unwrap();
+        let mut b = ClaudeEvidence::new(&db, vec![InvocationRecovery::Alive]);
+        let run = run_issue(&db, &issue(), &brief(), &wt, &config(), &mut b).unwrap();
+        assert!(matches!(
+            run.terminal,
+            TerminalReason::ImplementationInFlight { .. }
+        ));
+        assert!(b.seen.is_empty());
+        assert_eq!(dispatch_state::get_claim(&db, &issue()).unwrap(), before);
+        // With nothing found at the start, nothing is left behind.
+        let db = approved_db();
+        let mut b = ClaudeEvidence::new(&db, vec![InvocationRecovery::Alive]);
+        run_issue(&db, &issue(), &brief(), &wt, &config(), &mut b).unwrap();
+        assert!(dispatch_state::get_claim(&db, &issue()).unwrap().is_none());
+    }
+
+    /// the ownership look comes last before a launch, after the spend
+    /// is reserved, and a lost issue gives the reservation back.
+    #[test]
+    fn a_takeover_found_before_a_launch_releases_the_reserved_spend() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        let mut b = ClaudeEvidence::new(&db, Vec::new());
+        let theirs = pending_invocation(
+            Implementer::Claude,
+            &Database::open_in_memory().unwrap(),
+            &wt,
+            None,
+        );
+        b.recover_takeover = Some(leased_claim(theirs, "them"));
+        let err = run_issue(&db, &issue(), &brief(), &wt, &config(), &mut b)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("another run took over"), "{err}");
+        assert!(b.seen.is_empty());
+        let spent = budget::get_daily_spend(&db, &today_utc())
+            .unwrap()
+            .map_or(0.0, |l| l.total_cost_usd);
+        assert_eq!(spent, 0.0);
+    }
+
+    /// a reservation dropped unsettled (an early return, a panic) is
+    /// released.
+    #[test]
+    fn an_unsettled_spend_reservation_is_released_when_dropped() {
+        let db = Database::open_in_memory().unwrap();
+        let date = today_utc();
+        budget::reserve_spend_if_within(&db, &date, 2.5, 25.0, "owner/repo#1", "r1").unwrap();
+        drop(ReservedSpend::new(&db, date.clone(), "r1".to_string()));
+        let ledger = budget::get_daily_spend(&db, &date).unwrap().unwrap();
+        assert_eq!(ledger.total_cost_usd, 0.0);
+    }
+
+    /// C-M1/a run at its cap whose issue another run took over writes
+    /// no terminal summary and reports no exhaustion.
+    #[test]
+    fn a_capped_run_that_lost_its_issue_records_no_summary_and_no_exhaustion() {
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        let mut ours = pending_muse(&db, &wt, None);
+        ours.invocation_artifacts = None;
+        ours.session_uuid = "11111111-2222-3333-4444-555555555555".into();
+        ours.state = "paused-infrastructure-failure".into();
+        dispatch_state::upsert_dispatch_state(&db, &ours).unwrap();
+        lineage::upsert_issue_status(
+            &db,
+            &IssueStatus {
+                issue: issue(),
+                best_verdict: Some(AttemptOutcome::Failed),
+                best_commit_sha: None,
+                cumulative_attempt_n: 5,
+            },
+        )
+        .unwrap();
+        let mut theirs = ours.clone();
+        theirs.session_uuid = "22222222-3333-4444-5555-666666666666".into();
+        let mut d = TakenOver {
+            db: &db,
+            theirs,
+            dispatched: false,
+            recovery: None,
+        };
+        let mut c = muse_config();
+        c.attempt_cap = 5;
+        let err = run_issue(&db, &issue(), &brief(), &wt, &c, &mut d)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("another run took over"), "{err}");
+        assert!(lineage::attempts_for_issue(&db, &issue())
+            .unwrap()
+            .iter()
+            .all(|a| !is_terminal_summary(&a.approach)));
     }
 }
