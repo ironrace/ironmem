@@ -1,7 +1,7 @@
 # Autopilot — Decomposition, Work Shape, and Merge Authority
 
 **Date:** 2026-09-12
-**Scope:** Amends `2026-08-21-autonomous-backlog-runner-design.md` (rev 11). Changes **what the IC is dispatched against** (a sub-issue, not a whole issue), adds a **second classification axis**, proposes **feature flags as an autonomy mechanism**, and proposes **merge authority**, which rung 6 decided against. Does not touch `collab`, `iron-spec`, `iron-tdd`, or the HumanLayer epic. **Does touch `iron-build`** — see *What this reverses*.
+**Scope:** Amends `2026-08-21-autonomous-backlog-runner-design.md` (rev 11). Changes **what the IC is dispatched against** (a sub-issue, not a whole issue), adds a **second classification axis**, proposes **feature flags as an autonomy mechanism**, and proposes **merge authority**, which rung 6 decided against. Does not touch `collab`, `iron-spec`, `iron-tdd`, or the HumanLayer epic (since closed as not planned, 2026-10-31). **Does touch `iron-build`** — see *What this reverses*.
 **Status:** Approved design, pending implementation plan
 **Revision:** rev 3 — approved at rev 2, then amended with evidence from PR #343's rounds 4-6 (2026-09-14): a fourth prerequisite in Decision 4, and a materially stronger version of Decision 5's own argument. Rev 2's decisions are unchanged; nothing here reverses them.
 rev 2 — rewritten after a three-agent review of rev 1 found a self-contradiction in Decision 5, a circular trigger in Decision 4, and an overstated reading of the parent spec's Goal 5. Rev 1 is superseded, not amended; where it was wrong this document says so rather than quietly correcting.
