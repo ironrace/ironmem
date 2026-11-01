@@ -1190,6 +1190,17 @@ pub struct RecordedReviewSummary {
     pub recorded_at: String,
 }
 
+impl RecordedReviewSummary {
+    /// Whether this review actually produced a judgment: the reviewer
+    /// process succeeded **and** returned a verdict. A crashed, timed-out
+    /// or otherwise unsuccessful invocation is recorded (its spend and
+    /// failure stay visible) but judged nothing, so it must not satisfy
+    /// any "has this been reviewed?" question.
+    pub fn judged(&self) -> bool {
+        self.process_success && self.verdict.is_some()
+    }
+}
+
 /// Every recorded review for an issue, oldest first.
 ///
 /// This is the review half of the spec's "exact issue→attempt traversal":

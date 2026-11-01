@@ -613,6 +613,7 @@ pub fn next_step(
     candidate: &Candidate,
     lookup: &PrLookup,
     worktree_root: &Path,
+    attempt_cap: u32,
 ) -> Result<AdvanceStep, MemoryError> {
     let pr = match lookup {
         PrLookup::None => {
@@ -652,18 +653,28 @@ pub fn next_step(
     // `BaseBranchMismatch` with no way out. `None` is a review that predates
     // the field: unknown, so the comparison is skipped rather than read as a
     // mismatch, exactly as `merge::evaluate` skips it.
-    let reviewed_this_head = review::reviews_for_issue(db, &candidate.issue)?
-        .iter()
-        .any(|r| {
-            r.pr_number == pr.number
-                && r.head_sha
-                    .as_deref()
-                    .is_some_and(|sha| sha.eq_ignore_ascii_case(&pr.head_sha))
-                && {
-                    let reviewed_base = r.base_branch.as_deref().unwrap_or_default();
-                    reviewed_base.is_empty() || reviewed_base == pr.base_branch
-                }
-        });
+    // "The review" is the **latest** review for this PR — the same record
+    // `merge::evaluate` reads through `latest_review_for_pr`. Selecting any
+    // matching review here instead disagreed with that site after a second
+    // retarget: a stale earlier review satisfied this check while the merge
+    // read the newer one and held at `BaseBranchMismatch`, with no pass
+    // able to move either answer (#348).
+    //
+    // The latest review must also have **judged**: a reviewer process that
+    // failed is recorded (spend and failure stay visible) but produced no
+    // verdict, so it cannot satisfy "has this head been reviewed?" — that
+    // reading made a crashed review permanently unreviewable (#350).
+    let latest = merge::latest_review_for_pr(db, &candidate.issue, pr.number)?;
+    let reviewed_this_head = latest.as_ref().is_some_and(|r| {
+        r.judged()
+            && r.head_sha
+                .as_deref()
+                .is_some_and(|sha| sha.eq_ignore_ascii_case(&pr.head_sha))
+            && {
+                let reviewed_base = r.base_branch.as_deref().unwrap_or_default();
+                reviewed_base.is_empty() || reviewed_base == pr.base_branch
+            }
+    });
 
     if reviewed_this_head {
         return Ok(AdvanceStep::Merge {
@@ -671,6 +682,34 @@ pub fn next_step(
             head_sha: pr.head_sha.clone(),
             gate_green,
         });
+    }
+
+    // An unjudged review is retried, but not for ever: once the consecutive
+    // unjudged reviews at this head reach the attempt cap, fall through to
+    // the merge step, whose re-derived decision holds for a human
+    // (`ReviewerDidNotRun`) instead of billing another doomed review. This
+    // reuses the attempt-cap shape rather than inventing a review-specific
+    // counter (#350).
+    if attempt_cap > 0 {
+        let canonical = candidate.issue.canonical();
+        let consecutive_failures = review::reviews_for_issue(db, &candidate.issue)?
+            .iter()
+            .rev()
+            .filter(|r| r.issue.eq_ignore_ascii_case(&canonical) && r.pr_number == pr.number)
+            .take_while(|r| {
+                !r.judged()
+                    && r.head_sha
+                        .as_deref()
+                        .is_some_and(|sha| sha.eq_ignore_ascii_case(&pr.head_sha))
+            })
+            .count();
+        if consecutive_failures >= attempt_cap as usize {
+            return Ok(AdvanceStep::Merge {
+                pr_number: pr.number,
+                head_sha: pr.head_sha.clone(),
+                gate_green,
+            });
+        }
     }
 
     let path = worktree::worktree_path(worktree_root, &candidate.issue);
@@ -851,7 +890,13 @@ fn advance_issue(
 ) -> Result<Advanced, MemoryError> {
     let branch = worktree::branch_name(&candidate.issue);
     let lookup = gh::open_pr_for_branch(gh_runner, &candidate.issue.repo, &branch)?;
-    let mut step = next_step(db, candidate, &lookup, &config.worktree_root)?;
+    let mut step = next_step(
+        db,
+        candidate,
+        &lookup,
+        &config.worktree_root,
+        config.attempt_cap,
+    )?;
     let class = dispatch_class(candidate.risk_label.as_deref());
 
     // Step zero, and for eleven rungs it did not exist. Runs before the
@@ -1382,6 +1427,7 @@ mod tests {
     use crate::autopilot::lineage::IssueStatus;
     use crate::autopilot::merge::MergeOutcome;
     use crate::autopilot::review::{ReviewOutcome, ReviewVerdict, RiskClass};
+    use crate::autopilot::run::DEFAULT_ATTEMPT_CAP;
     use crate::autopilot::{gate_config, DispatchState};
 
     const REPO: &str = "ironrace/ironmem";
@@ -1507,7 +1553,7 @@ mod tests {
             max_advances_per_pass: DEFAULT_MAX_ADVANCES_PER_PASS,
             merge: false,
             remediate: false,
-            attempt_cap: crate::autopilot::run::DEFAULT_ATTEMPT_CAP,
+            attempt_cap: DEFAULT_ATTEMPT_CAP,
             strategy: MergeStrategy::Squash,
             delete_branch: false,
             dry_run: false,
@@ -2239,7 +2285,14 @@ mod tests {
             risk_label: None,
             green_commit_sha: Some(GREEN.into()),
         };
-        let step = next_step(&db, &candidate, &PrLookup::None, root.path()).unwrap();
+        let step = next_step(
+            &db,
+            &candidate,
+            &PrLookup::None,
+            root.path(),
+            DEFAULT_ATTEMPT_CAP,
+        )
+        .unwrap();
         assert!(
             matches!(&step, AdvanceStep::NeedsPr { branch } if branch == "autopilot/ironrace-ironmem-283"),
             "got {step:?}"
@@ -2264,6 +2317,7 @@ mod tests {
                 numbers: vec![7, 42],
             },
             root.path(),
+            DEFAULT_ATTEMPT_CAP,
         )
         .unwrap();
         match step {
@@ -2404,7 +2458,14 @@ mod tests {
             risk_label: None,
             green_commit_sha: Some(GREEN.into()),
         };
-        let step = next_step(&db, &candidate, &found(322, GREEN), roots.path()).unwrap();
+        let step = next_step(
+            &db,
+            &candidate,
+            &found(322, GREEN),
+            roots.path(),
+            DEFAULT_ATTEMPT_CAP,
+        )
+        .unwrap();
         assert!(matches!(step, AdvanceStep::Review { pr_number: 322, .. }));
     }
 
@@ -2424,7 +2485,14 @@ mod tests {
             risk_label: None,
             green_commit_sha: Some(GREEN.into()),
         };
-        let step = next_step(&db, &candidate, &found(322, GREEN), roots.path()).unwrap();
+        let step = next_step(
+            &db,
+            &candidate,
+            &found(322, GREEN),
+            roots.path(),
+            DEFAULT_ATTEMPT_CAP,
+        )
+        .unwrap();
         assert!(matches!(step, AdvanceStep::Merge { pr_number: 322, .. }));
     }
 
@@ -2443,7 +2511,14 @@ mod tests {
             risk_label: None,
             green_commit_sha: Some(GREEN.into()),
         };
-        let step = next_step(&db, &candidate, &found(322, MOVED), roots.path()).unwrap();
+        let step = next_step(
+            &db,
+            &candidate,
+            &found(322, MOVED),
+            roots.path(),
+            DEFAULT_ATTEMPT_CAP,
+        )
+        .unwrap();
         assert!(
             matches!(step, AdvanceStep::Review { .. }),
             "a moved head must be reviewed again, got {step:?}"
@@ -2465,8 +2540,22 @@ mod tests {
             green_commit_sha: Some(GREEN.into()),
         };
 
-        let same = next_step(&db, &candidate, &found(322, GREEN), roots.path()).unwrap();
-        let moved = next_step(&db, &candidate, &found(322, MOVED), roots.path()).unwrap();
+        let same = next_step(
+            &db,
+            &candidate,
+            &found(322, GREEN),
+            roots.path(),
+            DEFAULT_ATTEMPT_CAP,
+        )
+        .unwrap();
+        let moved = next_step(
+            &db,
+            &candidate,
+            &found(322, MOVED),
+            roots.path(),
+            DEFAULT_ATTEMPT_CAP,
+        )
+        .unwrap();
         match (same, moved) {
             (
                 AdvanceStep::Review {
@@ -2500,7 +2589,15 @@ mod tests {
             risk_label: None,
             green_commit_sha: None,
         };
-        match next_step(&db, &candidate, &found(322, GREEN), roots.path()).unwrap() {
+        match next_step(
+            &db,
+            &candidate,
+            &found(322, GREEN),
+            roots.path(),
+            DEFAULT_ATTEMPT_CAP,
+        )
+        .unwrap()
+        {
             AdvanceStep::Review { gate_green, .. } => assert!(!gate_green),
             other => panic!("expected a review, got {other:?}"),
         }
@@ -2522,7 +2619,14 @@ mod tests {
             risk_label: None,
             green_commit_sha: Some(GREEN.into()),
         };
-        let step = next_step(&db, &candidate, &found(322, GREEN), roots.path()).unwrap();
+        let step = next_step(
+            &db,
+            &candidate,
+            &found(322, GREEN),
+            roots.path(),
+            DEFAULT_ATTEMPT_CAP,
+        )
+        .unwrap();
         assert!(
             matches!(step, AdvanceStep::Stalled(Stall::WorktreeMissing { .. })),
             "got {step:?}"
@@ -2544,7 +2648,14 @@ mod tests {
             green_commit_sha: Some(GREEN.into()),
         };
         assert!(matches!(
-            next_step(&db, &candidate, &found(322, GREEN), roots.path()).unwrap(),
+            next_step(
+                &db,
+                &candidate,
+                &found(322, GREEN),
+                roots.path(),
+                DEFAULT_ATTEMPT_CAP
+            )
+            .unwrap(),
             AdvanceStep::Merge { .. }
         ));
     }
@@ -3494,11 +3605,17 @@ remediation record — otherwise the PR sits open and nobody is ever told"
             )),
             ok(&pr_list_json(322, GREEN)),
             ok(&pr_view_json(GREEN)),
+            unprotected(),
+            no_rules(),
         ]);
         let mut config = config(roots.path(), repo.path());
         config.remediate = true;
 
-        let report = advance_pass(&db, &mut gh, &mut ForbiddenReviewer, &config).unwrap();
+        // Since #348, `next_step` reads the latest review only, so the
+        // earlier GREEN review no longer satisfies it and this pass pays
+        // for a fresh review of GREEN (a passing stub here). What this test
+        // pins is unchanged: the MOVED findings themselves arm nothing.
+        let report = advance_pass(&db, &mut gh, &mut StubReviewer::passing(), &config).unwrap();
         assert_eq!(
             report.advanced[0].remediation, None,
             "findings about a commit that is not the head must not arm a fix"
@@ -3625,7 +3742,7 @@ remediation record — otherwise the PR sits open and nobody is ever told"
                 pr_number: 322,
                 head_sha: GREEN,
                 findings: Some("the retry loop is unbounded"),
-                attempt_cap: crate::autopilot::run::DEFAULT_ATTEMPT_CAP,
+                attempt_cap: DEFAULT_ATTEMPT_CAP,
             },
         )
         .unwrap();
@@ -3990,10 +4107,187 @@ skipped: {:?}",
         if let PrLookup::Found(pr) = &mut retargeted {
             pr.base_branch = "release/1.x".to_string();
         }
-        let step = next_step(&db, &candidate, &retargeted, roots.path()).unwrap();
+        let step = next_step(
+            &db,
+            &candidate,
+            &retargeted,
+            roots.path(),
+            DEFAULT_ATTEMPT_CAP,
+        )
+        .unwrap();
         assert!(
             matches!(step, AdvanceStep::Review { .. }),
             "a moved base must be reviewed again, got {step:?}"
+        );
+    }
+
+    /// Record a review of `pr_number` at `head_sha` against `base_branch`
+    /// with an arbitrary outcome, for the selection tests below.
+    fn record_review_with(
+        db: &Database,
+        issue: &IssueRef,
+        pr_number: u64,
+        head_sha: &str,
+        base_branch: &str,
+        outcome: ReviewOutcome,
+    ) {
+        review::record_review(
+            db,
+            &review::ReviewRecord {
+                issue: issue.clone(),
+                pr_number,
+                dispatch_class: "documentation".into(),
+                head_sha: Some(head_sha.into()),
+                base_branch: Some(base_branch.into()),
+                outcome,
+                decision: review::MergeDecision::HoldForHuman(
+                    crate::autopilot::review::HoldReason::ReviewerDidNotRun,
+                ),
+            },
+        )
+        .unwrap();
+    }
+
+    fn failed_review_outcome() -> ReviewOutcome {
+        ReviewOutcome {
+            verdict: None,
+            risk_class: None,
+            reason: None,
+            total_cost_usd: None,
+            token_usage: None,
+            process_success: false,
+        }
+    }
+
+    fn candidate() -> Candidate {
+        Candidate {
+            issue: issue(),
+            issue_title: "A test issue".into(),
+            repo_path: PathBuf::new(),
+            risk_label: None,
+            green_commit_sha: Some(GREEN.into()),
+        }
+    }
+
+    #[test]
+    fn a_failed_review_does_not_suppress_the_next_review() {
+        // #350: a reviewer process that failed produced no judgment, so the
+        // head has not been reviewed — the next pass must review it again
+        // rather than treating the failure record as a completed review.
+        let db = approved_db();
+        let (repo, roots) = checkout_with_worktree();
+        let mut candidate = candidate();
+        candidate.repo_path = repo.path().to_path_buf();
+        record_review_with(&db, &issue(), 322, GREEN, "main", failed_review_outcome());
+
+        let step = next_step(
+            &db,
+            &candidate,
+            &found(322, GREEN),
+            roots.path(),
+            DEFAULT_ATTEMPT_CAP,
+        )
+        .unwrap();
+        assert!(
+            matches!(step, AdvanceStep::Review { .. }),
+            "a failed review must be retried, got {step:?}"
+        );
+    }
+
+    #[test]
+    fn a_review_without_a_verdict_does_not_suppress_the_next_review() {
+        // #350: process success alone is not a judgment either.
+        let db = approved_db();
+        let (repo, roots) = checkout_with_worktree();
+        let mut candidate = candidate();
+        candidate.repo_path = repo.path().to_path_buf();
+        record_review_with(
+            &db,
+            &issue(),
+            322,
+            GREEN,
+            "main",
+            ReviewOutcome {
+                process_success: true,
+                ..failed_review_outcome()
+            },
+        );
+
+        let step = next_step(
+            &db,
+            &candidate,
+            &found(322, GREEN),
+            roots.path(),
+            DEFAULT_ATTEMPT_CAP,
+        )
+        .unwrap();
+        assert!(
+            matches!(step, AdvanceStep::Review { .. }),
+            "a verdict-less review must be retried, got {step:?}"
+        );
+    }
+
+    #[test]
+    fn a_double_retarget_is_reviewed_again_rather_than_held_forever() {
+        // #348: main -> release/1.x -> main. `next_step` must read the same
+        // (latest) review `merge::evaluate` reads; the stale main review
+        // recorded first must not satisfy it while the latest review was
+        // taken against release/1.x.
+        let db = approved_db();
+        let (repo, roots) = checkout_with_worktree();
+        let mut candidate = candidate();
+        candidate.repo_path = repo.path().to_path_buf();
+        reviewed_at(&db, &issue(), 322, GREEN);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        record_review_with(
+            &db,
+            &issue(),
+            322,
+            GREEN,
+            "release/1.x",
+            ReviewOutcome {
+                verdict: Some(ReviewVerdict::Pass),
+                risk_class: Some(RiskClass::Documentation),
+                reason: None,
+                total_cost_usd: None,
+                token_usage: None,
+                process_success: true,
+            },
+        );
+
+        let step = next_step(
+            &db,
+            &candidate,
+            &found(322, GREEN),
+            roots.path(),
+            DEFAULT_ATTEMPT_CAP,
+        )
+        .unwrap();
+        assert!(
+            matches!(step, AdvanceStep::Review { .. }),
+            "the latest review was against another base, so this base must be reviewed again, got {step:?}"
+        );
+    }
+
+    #[test]
+    fn failed_reviews_at_the_attempt_cap_fall_through_to_the_merge_hold() {
+        // #350: an unjudged review is retried, but not for ever. Once the
+        // consecutive failures at this head reach the attempt cap, the step
+        // is the merge — whose decision holds for a human
+        // (`ReviewerDidNotRun`) instead of billing another review.
+        let db = approved_db();
+        let (repo, roots) = checkout_with_worktree();
+        let mut candidate = candidate();
+        candidate.repo_path = repo.path().to_path_buf();
+        for _ in 0..3 {
+            record_review_with(&db, &issue(), 322, GREEN, "main", failed_review_outcome());
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        let step = next_step(&db, &candidate, &found(322, GREEN), roots.path(), 3).unwrap();
+        assert!(
+            matches!(step, AdvanceStep::Merge { .. }),
+            "failures at the cap must stop re-reviewing, got {step:?}"
         );
     }
 

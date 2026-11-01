@@ -886,18 +886,25 @@ re-reviews the same commit against the branch it would now land on, rather
 than holding for ever on a review of a base that no longer applies
 (`a_retargeted_pr_is_reviewed_again_rather_than_held_forever`).
 
-Two exceptions. A review recorded before the base was stored at all has a
+One exception. A review recorded before the base was stored at all has a
 base of `None`, which matches any base, so a retarget does not re-review it.
-And **retargeting *back* strands the PR**: `reviewed_this_head` asks whether
-*any* stored review matches this head and base, while `merge::evaluate`
-reads the *latest* review for the PR (`rfind`, no base filter). Review a
-head against `main`, retarget to `release/1.x` (re-reviewed), then retarget
-back to `main`, and `advance` finds the first review still matching and
-skips the review, while the merge decision reads the `release/1.x` review
-and holds at `BaseBranchMismatch` — with nothing left to re-review it. That
-is the same never-recovers shape the base comparison was added to prevent,
-reached by a second retarget instead of a first. Filed as #348. The cited
-test covers only the first retarget.
+
+Both sites read **the latest review for the PR** — `advance::next_step`
+through the same `latest_review_for_pr` `merge::evaluate` uses — so they
+can no longer disagree about which stored review is the PR's review.
+Retargeting *back* (`main` → `release/1.x` → `main`) therefore re-reviews
+the head against `main`, because the latest review was taken against
+`release/1.x`; before this, `next_step` matched *any* stored review while
+the merge read the latest, and the PR stranded at `BaseBranchMismatch`
+with nothing left to re-review it (#348).
+
+A review only counts as having reviewed the head if it **judged** it: the
+reviewer process succeeded and returned a verdict. A failed reviewer
+invocation is still recorded — its spend and failure stay visible — but
+the next pass reviews the head again. Once the consecutive unjudged
+reviews at one head reach the attempt cap, the pass stops re-reviewing
+and falls through to the merge decision, which holds for a human
+(`ReviewerDidNotRun`) instead of billing another review (#350).
 
 ## The auto-merge envelope
 
