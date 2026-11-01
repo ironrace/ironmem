@@ -72,6 +72,50 @@ pub fn resolve_commit(repo_dir: &Path, rev: &str) -> Option<String> {
     }
 }
 
+/// Resolve an operator's `--base` committish to the branch name a pull
+/// request should target (#338): the checked-out branch for `HEAD`, the
+/// name itself for a local or remote-tracking branch. Anything else (a
+/// SHA, a tag, an unresolvable string) is returned as given, so the
+/// caller records what was actually cut from and `advance` can fail
+/// closed on a base no pull request can target.
+pub fn resolve_base_branch(repo_dir: &Path, base: &str) -> String {
+    let base = base.trim();
+    if base == "HEAD" {
+        if let Ok(branch) = git(repo_dir, &["symbolic-ref", "--short", "-q", "HEAD"]) {
+            let branch = branch.trim();
+            if !branch.is_empty() {
+                return branch.to_string();
+            }
+        }
+        return resolve_commit(repo_dir, "HEAD").unwrap_or_else(|| base.to_string());
+    }
+    if is_branch(repo_dir, base) {
+        return base.to_string();
+    }
+    base.to_string()
+}
+
+/// Whether `name` names a branch a pull request could target: a local
+/// branch, or one known through the `origin` remote-tracking refs.
+pub fn is_branch(repo_dir: &Path, name: &str) -> bool {
+    let name = name.trim();
+    !name.is_empty()
+        && (git(
+            repo_dir,
+            &["rev-parse", "--verify", &format!("refs/heads/{name}")],
+        )
+        .is_ok()
+            || git(
+                repo_dir,
+                &[
+                    "rev-parse",
+                    "--verify",
+                    &format!("refs/remotes/origin/{name}"),
+                ],
+            )
+            .is_ok())
+}
+
 /// The branch an issue's worktree checks out: `autopilot/<repo-slug>-<n>`.
 ///
 /// Uses [`IssueRef::slug`] (the full `owner-repo-number` form) rather than a
@@ -2099,6 +2143,21 @@ mod tests {
 
     fn issue() -> IssueRef {
         IssueRef::new("ironrace/ironmem", 283)
+    }
+
+    /// #338: the dispatch-time base resolution — `HEAD` names the
+    /// checked-out branch, a branch names itself, and a SHA stays a SHA
+    /// (recorded as-is, so `advance` can fail closed on it).
+    #[test]
+    fn a_base_resolves_to_a_branch_name_or_stays_a_committish() {
+        let repo = fixture_repo();
+        assert_eq!(resolve_base_branch(repo.path(), "HEAD"), "main");
+        run(repo.path(), &["branch", "develop"]);
+        assert_eq!(resolve_base_branch(repo.path(), "develop"), "develop");
+        let sha = resolve_commit(repo.path(), "HEAD").unwrap();
+        assert_eq!(resolve_base_branch(repo.path(), &sha), sha);
+        assert!(is_branch(repo.path(), "develop"));
+        assert!(!is_branch(repo.path(), &sha));
     }
 
     /// Fixture repos use the files ref backend, which tests that hold a

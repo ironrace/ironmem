@@ -315,6 +315,57 @@ pub fn get_issue_status(
     }))
 }
 
+fn issue_base_key(issue: &IssueRef) -> String {
+    format!("issue-base:{}", issue.slug())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct IssueBaseBody {
+    issue: String,
+    repo: String,
+    issue_number: u64,
+    base_branch: String,
+    updated_at: String,
+}
+
+/// Record the base an issue's branch was cut from at dispatch time (#338).
+///
+/// Its own drawer rather than a field on the issue-status drawer: the
+/// status is rewritten by every attempt recording, and a base written
+/// before them must survive them all — including the success that clears
+/// the dispatch state. `base` is the dispatch-time resolution of the
+/// operator's `--base`: a branch name when the base is a branch, the raw
+/// committish (SHA, tag) otherwise, so `advance` can fail closed on a
+/// base no pull request can target instead of guessing.
+pub fn record_issue_base(
+    db: &Database,
+    issue: &IssueRef,
+    base: &str,
+) -> Result<String, MemoryError> {
+    validate_repo(&issue.repo)?;
+    let body = IssueBaseBody {
+        issue: issue.canonical(),
+        repo: issue.repo.clone(),
+        issue_number: issue.number,
+        base_branch: base.to_string(),
+        updated_at: chrono::Utc::now().to_rfc3339(),
+    };
+    let content = serde_json::to_string(&body)?;
+    super::write_current(db, &issue_base_key(issue), &content)
+}
+
+/// The base recorded by [`record_issue_base`], if any dispatch recorded
+/// one. `None` is every issue dispatched before the recording existed —
+/// `advance` falls back to the repo's default branch for those, which is
+/// the pre-#338 behaviour and right in the common case.
+pub fn issue_base(db: &Database, issue: &IssueRef) -> Result<Option<String>, MemoryError> {
+    let Some(drawer) = super::read_current(db, &issue_base_key(issue))? else {
+        return Ok(None);
+    };
+    let body: IssueBaseBody = serde_json::from_str(&drawer.content)?;
+    Ok(Some(body.base_branch))
+}
+
 /// Every drawer this module has written in `ROOM` (any wing), for tests
 /// that need to distinguish "many distinct rows" from "one row, repeatedly
 /// overwritten" without depending on knowledge of specific ids.
