@@ -30,6 +30,11 @@ pub struct ClearedDispatch {
     pub issue: String,
     pub implementer: Implementer,
     pub state: String,
+    /// The session the clear discarded: the next dispatch opens a fresh
+    /// one rather than resuming this.
+    pub session_uuid: String,
+    /// How many turns the discarded session had accumulated.
+    pub turn_n: u32,
     /// Serialized as `codex_artifacts` so `clear-dispatch --json` output
     /// keeps its key for scripts written before Muse existed.
     #[serde(rename = "codex_artifacts")]
@@ -175,6 +180,8 @@ pub(crate) fn clear_dispatch_with(
         issue: issue.canonical(),
         implementer: state.implementer,
         state: state.state,
+        session_uuid: state.session_uuid.clone(),
+        turn_n: state.turn_n,
         invocation_artifacts: state.invocation_artifacts,
     }))
 }
@@ -1051,6 +1058,27 @@ mod tests {
         assert!(dispatch_state::get_dispatch_state(&db, &issue())
             .unwrap()
             .is_none());
+    }
+
+    /// #342: the report names what the clear discards — the session and
+    /// its turn count — so an operator releasing a paused dispatch can see
+    /// exactly what is being thrown away (lineage is kept, and the CLI
+    /// output says so).
+    #[test]
+    fn a_clear_reports_the_session_and_turns_it_discards() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_in_memory().unwrap();
+        let mut state = held_state(Implementer::Muse, testing::invocation(dir.path()).0);
+        state.invocation_artifacts = None;
+        state.session_uuid = "0d6c1e2a-5b8f-4c1d-9e3a-7f2b6a1c4d5e".into();
+        state.native_session_id = Some(state.session_uuid.clone());
+        state.state = "paused-infrastructure-failure".into();
+        state.turn_n = 7;
+        dispatch_state::upsert_dispatch_state(&db, &state).unwrap();
+        let cleared = readable(clear_dispatch(&db, &issue(), || snapshots(Vec::new())));
+        assert_eq!(cleared.state, "paused-infrastructure-failure");
+        assert_eq!(cleared.session_uuid, "0d6c1e2a-5b8f-4c1d-9e3a-7f2b6a1c4d5e");
+        assert_eq!(cleared.turn_n, 7);
     }
 
     /// The parked session may be held by a Muse process the tracker never

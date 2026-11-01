@@ -4066,7 +4066,19 @@ pub fn run_issue(
         // the next turn prompt carries the prior attempts and their failure
         // reasons, which is the degradation the spec's crash-safe-state
         // section already designed for ("any Lead can resume any IC").
-        if config.implementer.rotates_session_after_verdict() && outcome.verdict.is_some() {
+        // A dispatch that ran **zero turns** rotates too (#342): there is a
+        // fourth no-verdict case the enumeration above does not cover — the
+        // `/goal` command itself was rejected, so no goal loop ever started
+        // and the session holds no in-context history, which is the only
+        // thing `--resume` buys. Rotating is free and removes the open
+        // question of whether a `/goal` on a resumed-but-never-started
+        // session arms the Stop hook. Only a dispatch whose process
+        // **succeeded** proves that, though: a killed or crashed one also
+        // reports zero turns, and it left the hook armed mid-goal, so it
+        // keeps the resume the enumeration above promises it.
+        if config.implementer.rotates_session_after_verdict()
+            && (outcome.verdict.is_some() || (outcome.num_turns == 0 && outcome.process_success))
+        {
             session_uuid = uuid::Uuid::new_v4().to_string();
             resuming = false;
         }
@@ -9776,6 +9788,41 @@ sleep 0.5
                 );
             }
             other => panic!("an unclaimed session must be opened, not resumed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_zero_turn_dispatch_rotates_rather_than_claims_its_session() {
+        // #342: a dispatch that ran zero turns — the `/goal` command itself
+        // rejected, so no goal loop ever started — has no in-context
+        // history worth preserving, which is the only thing `--resume`
+        // buys. It must rotate like a concluded loop rather than claim the
+        // session for every later dispatch.
+        let db = approved_db();
+        let (_dir, wt) = fixture_worktree();
+        let mut paused = config();
+        paused.daily_budget_usd = 2.6;
+        paused.max_budget_usd = 2.5;
+        let mut zero_turn = no_verdict_error();
+        zero_turn.num_turns = 0;
+        let mut first = ScriptedDispatcher::new(vec![Ok(zero_turn)]);
+        run_issue(&db, &issue(), &brief(), &wt, &paused, &mut first).unwrap();
+
+        let stored = dispatch_state::get_dispatch_state(&db, &issue())
+            .unwrap()
+            .expect("a budget pause must keep the dispatch state");
+        assert!(
+            !stored.session_claimed,
+            "a 0-turn dispatch must not claim its session"
+        );
+
+        let mut second = ScriptedDispatcher::new(vec![Ok(met())]);
+        run_issue(&db, &issue(), &brief(), &wt, &config(), &mut second).unwrap();
+        match &second.seen[0].session {
+            SessionMode::New { session_uuid } => {
+                assert_eq!(session_uuid, &stored.session_uuid);
+            }
+            other => panic!("a rotated session must be opened, not resumed, got {other:?}"),
         }
     }
 
