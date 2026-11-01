@@ -92,6 +92,18 @@ pub fn resolve_base_branch(repo_dir: &Path, base: &str) -> String {
     if is_branch(repo_dir, base) {
         return base.to_string();
     }
+    // A remote-tracking spelling (`origin/develop`): the branch a pull
+    // request targets is the part after the remote's name.
+    if let Some((_, branch)) = base.split_once('/') {
+        if git(
+            repo_dir,
+            &["rev-parse", "--verify", &format!("refs/remotes/{base}")],
+        )
+        .is_ok()
+        {
+            return branch.to_string();
+        }
+    }
     base.to_string()
 }
 
@@ -2158,6 +2170,15 @@ mod tests {
         assert_eq!(resolve_base_branch(repo.path(), &sha), sha);
         assert!(is_branch(repo.path(), "develop"));
         assert!(!is_branch(repo.path(), &sha));
+        run(
+            repo.path(),
+            &["update-ref", "refs/remotes/origin/develop", &sha],
+        );
+        assert_eq!(
+            resolve_base_branch(repo.path(), "origin/develop"),
+            "develop",
+            "a remote-tracking spelling records the branch it tracks"
+        );
     }
 
     /// Fixture repos use the files ref backend, which tests that hold a
