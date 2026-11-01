@@ -628,7 +628,45 @@ impl LivenessSnapshot for HarnessSnapshots {
             return Liveness::Unknown;
         }
         match state.implementer {
-            Implementer::Claude => self.claude.liveness(&state.ic_session_name),
+            Implementer::Claude => {
+                // `claude agents --json` never lists a running `claude -p`
+                // implementer (#368), so the registry alone reports a live
+                // IC as dead. The process table names it with
+                // `--name <ic>` — the evidence `run` and `clear-dispatch`
+                // already judge Claude liveness by. Alive if either source
+                // names it; NotListed only when both read clean and neither
+                // does; otherwise Unknown, never a guessed dead.
+                let registry = self.claude.liveness(&state.ic_session_name);
+                if registry == Liveness::Alive {
+                    return Liveness::Alive;
+                }
+                match &self.processes {
+                    ProcessSnapshot::Available(rows) => {
+                        if super::clear::claude_ic_process_holder(
+                            rows,
+                            std::iter::once(state.ic_session_name.as_str()),
+                        )
+                        .is_some()
+                        {
+                            Liveness::Alive
+                        } else if registry == Liveness::NotListed {
+                            Liveness::NotListed
+                        } else {
+                            Liveness::Unknown
+                        }
+                    }
+                    // A process table that was never supplied (the
+                    // Claude-only adapter) is not evidence either way, so
+                    // the registry's own answer stands. One that was asked
+                    // and failed leaves a `-p` IC unprovable: Unknown.
+                    ProcessSnapshot::Unavailable { reason }
+                        if reason == PROCESS_SOURCE_NOT_SUPPLIED =>
+                    {
+                        registry
+                    }
+                    ProcessSnapshot::Unavailable { .. } => Liveness::Unknown,
+                }
+            }
             Implementer::Codex | Implementer::Muse => {
                 invocation_state_liveness(&self.processes, state)
             }
@@ -686,6 +724,14 @@ impl LivenessSnapshot for RegistrySnapshot {
     }
 }
 
+/// Why a [`HarnessSnapshots`] has no process table: the caller supplied
+/// only Claude evidence (the `AgentRegistry` adapter below). Distinct from
+/// a process table that was asked and failed, which is a real
+/// `Unavailable` with its own reason — the two must not be conflated,
+/// because a failed `ps` leaves a `claude -p` IC unprovable either way
+/// (#368), while an unsupplied one was never going to name it.
+pub(crate) const PROCESS_SOURCE_NOT_SUPPLIED: &str = "invocation process source was not supplied";
+
 /// A snapshot of every harness's liveness evidence: Claude's registry
 /// plus the process table that covers Codex and Muse.
 pub trait HarnessMonitor {
@@ -712,7 +758,7 @@ impl<T: AgentRegistry + ?Sized> HarnessMonitor for T {
         HarnessSnapshots {
             claude,
             processes: ProcessSnapshot::Unavailable {
-                reason: "invocation process source was not supplied".into(),
+                reason: PROCESS_SOURCE_NOT_SUPPLIED.into(),
             },
         }
     }
@@ -1192,6 +1238,48 @@ mod harness_tests {
             signing_held: false,
         }
     }
+    /// #368: `claude agents --json` never lists a running `claude -p`
+    /// implementer, so registry-only liveness reports a live IC as dead.
+    /// The process table names it with `--name <ic>`, as `run` and
+    /// `clear-dispatch` already judge by.
+    #[test]
+    fn a_claude_p_ic_is_alive_in_the_process_table_even_when_the_registry_misses_it() {
+        let state = paused_state(Implementer::Claude);
+        let snapshots = HarnessSnapshots {
+            claude: RegistrySnapshot::Available(Vec::new()),
+            processes: ProcessSnapshot::Available(
+                parse_processes("10 1 10 S claude -p /goal x --name ic-owner-repo-42 --model m\n")
+                    .unwrap(),
+            ),
+        };
+        assert_eq!(snapshots.liveness(&state), Liveness::Alive);
+    }
+
+    #[test]
+    fn a_claude_ic_no_source_names_is_not_listed() {
+        let state = paused_state(Implementer::Claude);
+        let snapshots = HarnessSnapshots {
+            claude: RegistrySnapshot::Available(Vec::new()),
+            processes: ProcessSnapshot::Available(Vec::new()),
+        };
+        assert_eq!(snapshots.liveness(&state), Liveness::NotListed);
+    }
+
+    #[test]
+    fn a_claude_ic_is_unknown_when_the_process_table_cannot_be_read() {
+        // The registry missing the session proves nothing about a `-p` IC
+        // it never lists; with the process table unreadable too, dead
+        // cannot be concluded.
+        let state = paused_state(Implementer::Claude);
+        let snapshots = HarnessSnapshots {
+            claude: RegistrySnapshot::Available(Vec::new()),
+            processes: ProcessSnapshot::Unavailable {
+                reason: "ps unavailable".into(),
+            },
+        };
+        assert_eq!(snapshots.liveness(&state), Liveness::Unknown);
+    }
+
     #[test]
     fn a_muse_state_is_judged_by_process_evidence_never_by_the_claude_registry() {
         let dir = tempfile::tempdir().unwrap();
