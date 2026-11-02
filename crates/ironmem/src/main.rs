@@ -2502,9 +2502,14 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                 match cleared {
                     Cleared::Dispatch(cleared) => {
                         println!(
-                            "cleared {} ({:?}, was {:?}); lineage, attempts and spend are \
-                             unchanged, and the next dispatch starts a fresh session",
-                            cleared.issue, cleared.implementer, cleared.state
+                            "cleared {} ({:?}, was {:?}); discarded session {} ({} turn(s) \
+                             recorded across its dispatches) — lineage, attempts and spend \
+                             are unchanged, and the next dispatch starts a fresh session",
+                            cleared.issue,
+                            cleared.implementer,
+                            cleared.state,
+                            cleared.session_uuid,
+                            cleared.turn_n
                         );
                         if let Some(a) = &cleared.invocation_artifacts {
                             if let Some(dir) = std::path::Path::new(&a.schema_path).parent() {
