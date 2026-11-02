@@ -2502,9 +2502,9 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                 match cleared {
                     Cleared::Dispatch(cleared) => {
                         println!(
-                            "cleared {} ({:?}, was {:?}); discarded session {} after {} \
-                             turn(s) — lineage, attempts and spend are unchanged, and the \
-                             next dispatch starts a fresh session",
+                            "cleared {} ({:?}, was {:?}); discarded session {} ({} turn(s) \
+                             recorded across its dispatches) — lineage, attempts and spend \
+                             are unchanged, and the next dispatch starts a fresh session",
                             cleared.issue,
                             cleared.implementer,
                             cleared.state,

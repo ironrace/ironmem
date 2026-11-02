@@ -31,9 +31,15 @@ pub struct ClearedDispatch {
     pub implementer: Implementer,
     pub state: String,
     /// The session the clear discarded: the next dispatch opens a fresh
-    /// one rather than resuming this.
+    /// one rather than resuming this. For a harness that assigns its own
+    /// session id (Codex), this is that native id, not the controller
+    /// placeholder no thread ever had.
     pub session_uuid: String,
-    /// How many turns the discarded session had accumulated.
+    /// Turns the issue's dispatches had accumulated when cleared —
+    /// cumulative across every session, **not** the discarded session's
+    /// own count: `DispatchState.turn_n` is never reset when a session
+    /// rotates, so a fresh replacement can be discarded "after" turns it
+    /// never ran.
     pub turn_n: u32,
     /// Serialized as `codex_artifacts` so `clear-dispatch --json` output
     /// keeps its key for scripts written before Muse existed.
@@ -180,7 +186,15 @@ pub(crate) fn clear_dispatch_with(
         issue: issue.canonical(),
         implementer: state.implementer,
         state: state.state,
-        session_uuid: state.session_uuid.clone(),
+        session_uuid: if state.implementer.assigns_own_session_id() {
+            state
+                .native_session_id
+                .clone()
+                .filter(|id| !id.is_empty())
+                .unwrap_or_else(|| state.session_uuid.clone())
+        } else {
+            state.session_uuid.clone()
+        },
         turn_n: state.turn_n,
         invocation_artifacts: state.invocation_artifacts,
     }))
@@ -1079,6 +1093,11 @@ mod tests {
         assert_eq!(cleared.state, "paused-infrastructure-failure");
         assert_eq!(cleared.session_uuid, "0d6c1e2a-5b8f-4c1d-9e3a-7f2b6a1c4d5e");
         assert_eq!(cleared.turn_n, 7);
+        // The JSON surface `clear-dispatch --json` prints carries the same
+        // two facts under these keys.
+        let json = serde_json::to_value(Cleared::Dispatch(cleared)).unwrap();
+        assert_eq!(json["session_uuid"], "0d6c1e2a-5b8f-4c1d-9e3a-7f2b6a1c4d5e");
+        assert_eq!(json["turn_n"], 7);
     }
 
     /// The parked session may be held by a Muse process the tracker never
