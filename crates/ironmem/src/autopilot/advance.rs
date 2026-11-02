@@ -1077,6 +1077,36 @@ fn advance_issue(
         });
     }
 
+    // A review that just ran and did not judge must not fall straight
+    // into the merge either (Greptile P1 on #371): `execute_merge` would
+    // hold on it and block the issue, so no later pass could retry the
+    // review the attempt cap exists to bound. Below the cap the pass
+    // stops here and leaves the issue ready; at the cap, `next_step`
+    // re-derives the Merge step and the hold proceeds as designed.
+    if review
+        .as_ref()
+        .is_some_and(|r| !(r.outcome.process_success && r.outcome.verdict.is_some()))
+    {
+        let step_now = next_step(
+            db,
+            candidate,
+            &lookup,
+            &config.worktree_root,
+            config.attempt_cap,
+        )?;
+        if matches!(step_now, AdvanceStep::Review { .. }) {
+            return Ok(Advanced {
+                issue: candidate.issue.clone(),
+                dispatch_class: class,
+                step,
+                review,
+                remediation: None,
+                merge: None,
+                cleanup: None,
+            });
+        }
+    }
+
     // ── Rung 11: the red path ────────────────────────────────────────────
     //
     // Read back from the *stored* review rather than from the `PrReview` in
@@ -2376,8 +2406,11 @@ mod tests {
                     super::super::issue_lock::try_lock_issue(&self.0, &issue()).unwrap(),
                     super::super::issue_lock::IssueLockAttempt::Held { .. }
                 ));
+                // Judged (`needs_changes`), so the pass proceeds to the
+                // merge stage this test exists to exercise; an unjudged
+                // outcome would now stop after the review for a retry.
                 Ok(ReviewOutcome {
-                    process_success: false,
+                    verdict: Some(ReviewVerdict::NeedsChanges),
                     reason: Some("lock probe ends review".into()),
                     ..StubReviewer::passing().outcome
                 })
@@ -2396,7 +2429,7 @@ mod tests {
         )
         .unwrap();
         let review = result.review.unwrap();
-        assert!(!review.outcome.process_success);
+        assert!(review.outcome.process_success);
         assert!(review.outcome.reason.unwrap().contains("lock probe"));
         assert!(matches!(
             result.merge.unwrap().outcome,
@@ -4100,6 +4133,47 @@ skipped: {:?}",
         assert!(
             advanced.merge.is_none(),
             "a refused review must not reach the merge"
+        );
+        assert!(
+            !gh.seen
+                .iter()
+                .any(|argv| argv.contains(&"edit".to_string())),
+            "no label was written: {:?}",
+            gh.seen
+        );
+    }
+
+    #[test]
+    fn an_unjudged_review_below_the_cap_does_not_reach_the_merge() {
+        // Greptile P1 on #371: under `--merge` the pass that records a
+        // failed review used to fall straight into `execute_merge`, which
+        // held and blocked the issue — so the retry the cap exists to
+        // allow never happened. Below the cap the pass must stop after
+        // the review and leave the issue ready for the next pass.
+        let db = approved_db();
+        record_success(&db, &issue(), Some(GREEN));
+        let (repo, roots) = checkout_with_worktree();
+        let mut gh = ScriptedGh::new(vec![
+            ok(&issue_list_json(
+                283,
+                &["agent:ready", "risk:documentation"],
+            )),
+            ok(&pr_list_json(322, GREEN)),
+        ]);
+        let mut config = config(roots.path(), repo.path());
+        config.merge = true;
+        let mut reviewer = StubReviewer {
+            calls: 0,
+            outcome: failed_review_outcome(),
+        };
+
+        let report = advance_pass(&db, &mut gh, &mut reviewer, &config).unwrap();
+        let advanced = &report.advanced[0];
+        assert!(advanced.review.is_some(), "the review ran");
+        assert!(
+            advanced.merge.is_none(),
+            "an unjudged review below the cap must not reach the merge: {:?}",
+            advanced.merge
         );
         assert!(
             !gh.seen

@@ -818,6 +818,24 @@ fn finish(
         head_sha: snapshot.as_ref().map(|s| s.head_ref_oid.clone()),
     };
     let repeat = previous.filter(|p| p.says_the_same_as(&record));
+    // An identical hold after a *new* review is not a repeat (Greptile P1
+    // on #371): the review is a new fact the last hold predates, and
+    // deduping here would freeze the recorded hold that bounds the
+    // failed-review streak, so a re-queued issue went straight back to
+    // the hold without a fresh review ever being counted.
+    let repeat = match repeat {
+        Some(previous) => {
+            let has_newer_review = super::review::reviews_for_issue(db, request.issue)?
+                .iter()
+                .any(|r| r.pr_number == request.pr_number && r.recorded_at > previous.recorded_at);
+            if has_newer_review {
+                None
+            } else {
+                Some(previous)
+            }
+        }
+        None => None,
+    };
 
     let mut commented = false;
     let mut label_plan = None;
@@ -1977,6 +1995,52 @@ mod tests {
     }
 
     // ── freshness guards ────────────────────────────────────────────────
+
+    #[test]
+    fn a_hold_after_a_new_review_is_a_new_record_not_a_repeat() {
+        // Greptile P1 on #371: `record_once` dedups an identical hold, so
+        // the recorded hold that bounds the failed-review streak never
+        // advanced once a new review had landed — a re-queued issue went
+        // straight back to the hold without a fresh review. A review
+        // recorded after the previous hold makes the next identical hold
+        // a new fact, and it must be appended.
+        let database = db();
+        let failed = ReviewOutcome {
+            verdict: None,
+            risk_class: None,
+            reason: None,
+            total_cost_usd: None,
+            token_usage: None,
+            process_success: false,
+        };
+        let script = || {
+            ScriptedGh::new(vec![
+                Ok(pr_view_ok("OPEN", HEAD)),
+                Ok(GhOutput::ok(r#"{"labels":[]}"#)),
+                Ok(GhOutput::ok("")),
+                Ok(label_created()),
+                Ok(GhOutput::ok("")),
+            ])
+        };
+        store_review(&database, 7, Some(HEAD), failed.clone());
+        let mut gh_runner = script();
+        let exec = execute_merge(&database, &mut gh_runner, &request(false)).unwrap();
+        assert!(matches!(
+            exec.outcome,
+            MergeOutcome::Held(MergeHold::Review(_))
+        ));
+        assert_eq!(merges_for_issue(&database, &issue()).unwrap().len(), 1);
+
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        store_review(&database, 7, Some(HEAD), failed);
+        let mut gh_runner = script();
+        execute_merge(&database, &mut gh_runner, &request(false)).unwrap();
+        assert_eq!(
+            merges_for_issue(&database, &issue()).unwrap().len(),
+            2,
+            "a hold after a new review must be appended, not deduped"
+        );
+    }
 
     #[test]
     fn a_review_that_moved_on_is_stale_and_holds() {
