@@ -67,8 +67,10 @@ impl Implementer {
     }
 
     /// A returned verdict spends the session's goal loop, so the next
-    /// dispatch needs a fresh session. Claude's `/goal` arms no hook on
-    /// `--resume`; a Codex thread and a Muse session continue.
+    /// dispatch needs a fresh session — and so does a zero-turn dispatch,
+    /// whose session never started a goal loop at all (#342). Claude's
+    /// `/goal` arms no hook on `--resume`; a Codex thread and a Muse
+    /// session continue.
     pub fn rotates_session_after_verdict(self) -> bool {
         match self {
             Self::Claude => true,
