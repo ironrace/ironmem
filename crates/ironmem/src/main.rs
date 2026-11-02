@@ -2501,14 +2501,19 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                 }
                 match cleared {
                     Cleared::Dispatch(cleared) => {
+                        // Only a prefix of the session id: it names a
+                        // live session's transcript, so the full value
+                        // stays out of terminal/log output (the `--json`
+                        // form above carries it for scripts).
+                        let session_prefix: String = cleared.session_uuid.chars().take(8).collect();
                         println!(
-                            "cleared {} ({:?}, was {:?}); discarded session {} ({} turn(s) \
+                            "cleared {} ({:?}, was {:?}); discarded session {}… ({} turn(s) \
                              recorded across its dispatches) — lineage, attempts and spend \
                              are unchanged, and the next dispatch starts a fresh session",
                             cleared.issue,
                             cleared.implementer,
                             cleared.state,
-                            cleared.session_uuid,
+                            session_prefix,
                             cleared.turn_n
                         );
                         if let Some(a) = &cleared.invocation_artifacts {
