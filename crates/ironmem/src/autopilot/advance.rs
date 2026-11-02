@@ -690,8 +690,31 @@ pub fn next_step(
     // (`ReviewerDidNotRun`) instead of billing another doomed review. This
     // reuses the attempt-cap shape rather than inventing a review-specific
     // counter (#350).
-    if attempt_cap > 0 {
+    //
+    // The streak counts only failures since the latest merge hold for
+    // this PR at this head. That hold is the cap's own consequence — it
+    // blocks the issue for a human, whose documented recovery is to
+    // re-label it `agent:ready` — so a pass that runs after one is, by
+    // construction, acting on a human's re-queue, and it must get a fresh
+    // streak rather than re-holding on the spent one for ever. A cap of 0
+    // is clamped to 1: `next_step` is public and takes the cap bare, and 0
+    // must not silently uncap it for a caller that skipped validation.
+    {
         let canonical = candidate.issue.canonical();
+        let merges = merge::merges_for_issue(db, &candidate.issue)?;
+        let held_since = merges
+            .iter()
+            .filter(|m| {
+                m.issue.eq_ignore_ascii_case(&canonical)
+                    && m.pr_number == pr.number
+                    && !m.dry_run
+                    && matches!(m.outcome, merge::MergeOutcome::Held(_))
+                    && m.head_sha
+                        .as_deref()
+                        .is_some_and(|sha| sha.eq_ignore_ascii_case(&pr.head_sha))
+            })
+            .map(|m| m.recorded_at.as_str())
+            .max();
         let consecutive_failures = review::reviews_for_issue(db, &candidate.issue)?
             .iter()
             .rev()
@@ -701,9 +724,10 @@ pub fn next_step(
                     && r.head_sha
                         .as_deref()
                         .is_some_and(|sha| sha.eq_ignore_ascii_case(&pr.head_sha))
+                    && held_since.is_none_or(|held| r.recorded_at.as_str() > held)
             })
             .count();
-        if consecutive_failures >= attempt_cap as usize {
+        if consecutive_failures >= attempt_cap.max(1) as usize {
             return Ok(AdvanceStep::Merge {
                 pr_number: pr.number,
                 head_sha: pr.head_sha.clone(),
@@ -4288,6 +4312,139 @@ skipped: {:?}",
         assert!(
             matches!(step, AdvanceStep::Merge { .. }),
             "failures at the cap must stop re-reviewing, got {step:?}"
+        );
+    }
+
+    #[test]
+    fn a_verdict_from_a_failed_process_does_not_count_as_judged() {
+        // The AND half of `judged()`: a reviewer that timed out can still
+        // leave a parseable verdict behind (the Codex path parses its last
+        // message regardless of exit), and that must not satisfy the head.
+        let db = approved_db();
+        let (repo, roots) = checkout_with_worktree();
+        let mut candidate = candidate();
+        candidate.repo_path = repo.path().to_path_buf();
+        record_review_with(
+            &db,
+            &issue(),
+            322,
+            GREEN,
+            "main",
+            ReviewOutcome {
+                verdict: Some(ReviewVerdict::Pass),
+                risk_class: Some(RiskClass::Documentation),
+                reason: None,
+                total_cost_usd: None,
+                token_usage: None,
+                process_success: false,
+            },
+        );
+
+        let step = next_step(
+            &db,
+            &candidate,
+            &found(322, GREEN),
+            roots.path(),
+            DEFAULT_ATTEMPT_CAP,
+        )
+        .unwrap();
+        assert!(
+            matches!(step, AdvanceStep::Review { .. }),
+            "a verdict from a failed process must be re-reviewed, got {step:?}"
+        );
+    }
+
+    #[test]
+    fn failures_at_another_head_or_pr_do_not_count_toward_the_cap() {
+        let db = approved_db();
+        let (repo, roots) = checkout_with_worktree();
+        let mut candidate = candidate();
+        candidate.repo_path = repo.path().to_path_buf();
+        // Cap-many failures at a head the PR has moved away from.
+        for _ in 0..3 {
+            record_review_with(&db, &issue(), 322, MOVED, "main", failed_review_outcome());
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let step = next_step(&db, &candidate, &found(322, GREEN), roots.path(), 3).unwrap();
+        assert!(
+            matches!(step, AdvanceStep::Review { .. }),
+            "failures at another head must not cap this one, got {step:?}"
+        );
+        // Cap-many failures on another PR of the same issue.
+        for _ in 0..3 {
+            record_review_with(&db, &issue(), 999, GREEN, "main", failed_review_outcome());
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let step = next_step(&db, &candidate, &found(322, GREEN), roots.path(), 3).unwrap();
+        assert!(
+            matches!(step, AdvanceStep::Review { .. }),
+            "failures on another PR must not cap this one, got {step:?}"
+        );
+        // A judged review interrupts the streak: fail, judged, fail, fail
+        // is two consecutive failures, not three.
+        record_review_with(&db, &issue(), 322, GREEN, "main", failed_review_outcome());
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        reviewed_at(&db, &issue(), 322, GREEN);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        record_review_with(&db, &issue(), 322, GREEN, "main", failed_review_outcome());
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        record_review_with(&db, &issue(), 322, GREEN, "main", failed_review_outcome());
+        let step = next_step(&db, &candidate, &found(322, GREEN), roots.path(), 3).unwrap();
+        assert!(
+            matches!(step, AdvanceStep::Review { .. }),
+            "an intervening judged review resets the streak, got {step:?}"
+        );
+    }
+
+    #[test]
+    fn a_hold_at_the_cap_releases_the_head_for_a_later_retry() {
+        // Once the cap's fall-through has held the PR for a human, the
+        // streak is spent: a human re-queueing the issue (the hold's own
+        // documented recovery) must get a fresh review, not the same hold
+        // for ever.
+        let db = approved_db();
+        let (repo, roots) = checkout_with_worktree();
+        let mut candidate = candidate();
+        candidate.repo_path = repo.path().to_path_buf();
+        for _ in 0..3 {
+            record_review_with(&db, &issue(), 322, GREEN, "main", failed_review_outcome());
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        merge::record_merge(
+            &db,
+            &merge::MergeRecord {
+                issue: issue(),
+                pr_number: 322,
+                gate_green: true,
+                dry_run: false,
+                outcome: MergeOutcome::Held(merge::MergeHold::NotReviewed),
+                base_branch: Some("main".into()),
+                head_sha: Some(GREEN.into()),
+            },
+        )
+        .unwrap();
+
+        let step = next_step(&db, &candidate, &found(322, GREEN), roots.path(), 3).unwrap();
+        assert!(
+            matches!(step, AdvanceStep::Review { .. }),
+            "a held cap must release the head for retry, got {step:?}"
+        );
+    }
+
+    #[test]
+    fn a_zero_attempt_cap_still_bounds_failed_reviews() {
+        // `next_step` is public and takes the cap bare; 0 must not silently
+        // uncap it for a caller that skipped AdvanceConfig validation.
+        let db = approved_db();
+        let (repo, roots) = checkout_with_worktree();
+        let mut candidate = candidate();
+        candidate.repo_path = repo.path().to_path_buf();
+        record_review_with(&db, &issue(), 322, GREEN, "main", failed_review_outcome());
+
+        let step = next_step(&db, &candidate, &found(322, GREEN), roots.path(), 0).unwrap();
+        assert!(
+            matches!(step, AdvanceStep::Merge { .. }),
+            "a zero cap must fall through to the hold, got {step:?}"
         );
     }
 

@@ -904,7 +904,10 @@ invocation is still recorded — its spend and failure stay visible — but
 the next pass reviews the head again. Once the consecutive unjudged
 reviews at one head reach the attempt cap, the pass stops re-reviewing
 and falls through to the merge decision, which holds for a human
-(`ReviewerDidNotRun`) instead of billing another review (#350).
+(`ReviewerDidNotRun`) instead of billing another review (#350). That
+hold spends the streak: a later pass counts only failures recorded
+since it, so a human who re-labels the issue `agent:ready` after fixing
+the reviewer gets a fresh review rather than the same hold for ever.
 
 ## The auto-merge envelope
 
