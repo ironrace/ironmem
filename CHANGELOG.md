@@ -81,6 +81,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Claude implementer liveness in the queue, `supervise` and `reconcile`
+  now reads the process table as well as the `claude agents` registry,
+  which never lists a running `claude -p` IC (#368). A Claude IC reads
+  alive when either source names it (`--name <ic>` in `ps`), dead only
+  when both read clean, and unknown otherwise.
+
 - A Claude post-exit drain/read failure now writes a durable
   `paused-completion-unproven` operator hold instead of automatically retrying
   beside a tool child still running. Queue/provisioning/review/merge/release

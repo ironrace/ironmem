@@ -438,6 +438,19 @@ fn refusal(
         }
     }
     match (state.implementer, snapshots.liveness(state)) {
+        // Claude liveness now reads the process table as well as the
+        // registry (#368): name the process that proves it when one does,
+        // rather than the generic alive below.
+        (Implementer::Claude, Liveness::Alive) => {
+            if let super::process_tree::ProcessSnapshot::Available(rows) = &snapshots.processes {
+                if let Some(reason) =
+                    claude_ic_holder(snapshots, rows, &state.issue, Some(&state.ic_session_name))
+                {
+                    return Some(reason);
+                }
+            }
+            Some("its Claude implementation is alive".into())
+        }
         (_, Liveness::Alive) => Some(format!(
             "its {} implementation is alive",
             state.implementer.label()
