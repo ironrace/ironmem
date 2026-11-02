@@ -330,6 +330,12 @@ pub enum NoPrReason {
     /// the create. Nothing is wrong and nothing needs doing: the next pass's
     /// ordinary lookup finds it.
     RaceLost,
+    /// The base recorded at dispatch time is not a branch — a SHA or a tag,
+    /// both legal `--base` values to cut from, but a pull request cannot
+    /// target a commit (#338). Fails closed rather than silently falling
+    /// back to the repo's default branch, whose diff is not the diff that
+    /// was cut.
+    BaseNotBranch { base: String },
 }
 
 /// The step an issue is at.
@@ -862,7 +868,7 @@ fn advance_issue(
         // The same `branch` the lookup above asked about, deliberately: the
         // guard and the write must name one branch, not two derivations of
         // one.
-        step = open_pull_request(gh_runner, candidate, &branch, config)?;
+        step = open_pull_request(db, gh_runner, candidate, &branch, config)?;
     }
 
     let (pr_number, head_sha, gate_green) = match &step {
@@ -1145,6 +1151,7 @@ fn advance_issue(
 /// minutes, so it runs before anything can fail for an unrelated reason and
 /// tempt a later reader to move it.
 fn open_pull_request(
+    db: &Database,
     gh_runner: &mut dyn GhRunner,
     candidate: &Candidate,
     branch: &str,
@@ -1165,29 +1172,40 @@ fn open_pull_request(
         }));
     }
 
+    // The base the branch was cut from, recorded in lineage at dispatch
+    // time (#338). Before that recording existed this read the repo's
+    // default branch from GitHub and assumed the branch was cut from it:
+    // cut from `develop` on a repo whose default is `main`, the pull
+    // request targeted `main` and its diff carried every commit `develop`
+    // has that `main` lacks — which a reviewer then read, and which
+    // `--merge` could land.
+    //
+    // A recorded base is used as recorded. One that is not a branch (a SHA
+    // or tag, both legal `--base` values to cut from) fails closed with
+    // [`NoPrReason::BaseNotBranch`]: a pull request cannot target a
+    // commit, and silently falling back to the default would open exactly
+    // the wrong diff above. No recorded base — every issue dispatched
+    // before the recording existed — falls back to the default branch,
+    // which is the old behaviour and right in the common case.
+    //
     // Read even on a dry run: reads change nothing, and the base is the one
     // fact that makes the rehearsal worth printing. It is also the read most
     // likely to fail on a repo nobody has tried this against, and finding
     // that out during the rehearsal is the point of having one.
-    //
-    // ⚠️ **Known hazard: this assumes the branch was cut from the default
-    // branch, and nothing here can check it.** `autopilot lead --base` sets
-    // the committish issue branches are cut from, for every repo, and
-    // defaults to the checkout's `HEAD`. Cut from `develop` on a repo whose
-    // default is `main`, the pull request opened here targets `main` and its
-    // diff carries every commit `develop` has that `main` lacks — which a
-    // reviewer then reads, and which `--merge` could land.
-    //
-    // Not guarded here, because the guard would be worse than the gap. The
-    // dispatch-time base is not recoverable at this point: `advance` is a
-    // separate invocation from `lead` and its own CLI hardcodes `base:
-    // "HEAD"` for every target, so the only local signal is the checkout's
-    // *current* HEAD, which may have moved since the dispatch. Refusing on
-    // that proxy would stall issues whose base was in fact correct, on the
-    // one path that opens pull requests at all — re-creating the permanent
-    // stall this module exists to remove. The fix is to record the base in
-    // lineage at dispatch time and read it back here.
-    let base = gh::default_branch(gh_runner, repo)?;
+    let base = match lineage::issue_base(db, &candidate.issue)? {
+        Some(recorded) => {
+            // Branch-ness was judged at dispatch time, in the checkout
+            // whose refs are authoritative; re-probing this checkout's
+            // possibly stale refs could stall a base GitHub still has.
+            if !recorded.is_branch {
+                return Ok(stalled(NoPrReason::BaseNotBranch {
+                    base: recorded.base_branch,
+                }));
+            }
+            recorded.base_branch
+        }
+        None => gh::default_branch(gh_runner, repo)?,
+    };
     if config.dry_run {
         return Ok(AdvanceStep::WouldOpenPr { base_branch: base });
     }
@@ -1936,6 +1954,79 @@ mod tests {
         assert!(
             !gh.seen.iter().any(|argv| argv[0] == "repo"),
             "a stall this certain does not need the base resolved"
+        );
+    }
+
+    #[test]
+    fn a_recorded_dispatch_base_opens_the_pr_against_it_not_the_default() {
+        // #338: the branch was cut from `develop` at dispatch time and that
+        // was recorded, so the PR targets `develop` — not the repo default
+        // the old code asked GitHub for, whose diff would have carried
+        // every commit `develop` has that the default lacks.
+        let db = approved_db();
+        record_success(&db, &issue(), Some(GREEN));
+        lineage::record_issue_base(&db, &issue(), "develop", true).unwrap();
+        let (repo, roots) = checkout_with_worktree();
+        crate::autopilot::test_git::output(repo.path(), &["branch", "develop"]);
+
+        let (report, gh) = pass_with_no_open_pr(
+            &config(roots.path(), repo.path()),
+            &db,
+            vec![
+                ok("[]"),
+                ok("https://github.com/ironrace/ironmem/pull/341\n"),
+            ],
+        );
+        assert!(
+            matches!(
+                &report.advanced[0].step,
+                AdvanceStep::OpenedPr { pr_number: 341, base_branch, .. } if base_branch == "develop"
+            ),
+            "got {:?}",
+            report.advanced[0].step
+        );
+        assert!(
+            !gh.seen.iter().any(|argv| argv[0] == "repo"),
+            "a recorded base needs no default-branch lookup: {:?}",
+            gh.seen
+        );
+        let create = gh
+            .seen
+            .iter()
+            .find(|argv| argv.first().map(String::as_str) == Some("pr") && argv[1] == "create")
+            .expect("a pull request was created");
+        let at = create.iter().position(|a| a == "--base").unwrap();
+        assert_eq!(create[at + 1], "develop");
+    }
+
+    #[test]
+    fn a_recorded_base_that_is_not_a_branch_fails_closed() {
+        // #338: a SHA or tag is a legal `--base` to cut from, but a pull
+        // request cannot target a commit. That fails closed with its own
+        // reason rather than silently falling back to the default branch.
+        let db = approved_db();
+        record_success(&db, &issue(), Some(GREEN));
+        lineage::record_issue_base(&db, &issue(), GREEN, false).unwrap();
+        let (repo, roots) = checkout_with_worktree();
+
+        let (report, gh) =
+            pass_with_no_open_pr(&config(roots.path(), repo.path()), &db, vec![ok("[]")]);
+        assert!(
+            matches!(
+                &report.advanced[0].step,
+                AdvanceStep::Stalled(Stall::NoOpenPr {
+                    reason: NoPrReason::BaseNotBranch { base },
+                    ..
+                }) if base == GREEN
+            ),
+            "got {:?}",
+            report.advanced[0].step
+        );
+        assert!(
+            !gh.seen
+                .iter()
+                .any(|argv| argv[0] == "pr" && argv[1] == "create"),
+            "no pull request may be opened against a non-branch base"
         );
     }
 

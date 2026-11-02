@@ -81,13 +81,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Autopilot records the base each issue branch is cut from at dispatch
+  time (Lead and manual `run`), and `advance` opens the pull request
+  against that recorded base instead of assuming the repo's default
+  branch (#338). A recorded base that is not a branch (a SHA or tag)
+  stalls with a new `BaseNotBranch` reason rather than silently opening
+  the wrong diff; issues dispatched before the recording keep the
+  default-branch fallback.
+
 - A Claude dispatch that ran zero turns (e.g. the `/goal` command itself
   was rejected) now rotates to a fresh session instead of claiming the
   never-started one (#342). A killed or crashed zero-turn dispatch still
   resumes. `autopilot clear-dispatch` — the supported way to clear a
   paused dispatch state — now reports the session and turn count it
   discards, alongside the lineage it keeps.
-
 - A Claude post-exit drain/read failure now writes a durable
   `paused-completion-unproven` operator hold instead of automatically retrying
   beside a tool child still running. Queue/provisioning/review/merge/release

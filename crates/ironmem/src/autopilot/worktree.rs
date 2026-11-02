@@ -72,6 +72,131 @@ pub fn resolve_commit(repo_dir: &Path, rev: &str) -> Option<String> {
     }
 }
 
+/// Resolve an operator's `--base` committish to the branch name a pull
+/// request should target (#338): the checked-out branch for `HEAD`, the
+/// name itself for a local or remote-tracking branch. Anything else (a
+/// SHA, a tag, an unresolvable string) is returned as given, so the
+/// caller records what was actually cut from and `advance` can fail
+/// closed on a base no pull request can target.
+pub fn resolve_base_branch(repo_dir: &Path, base: &str) -> String {
+    resolve_recorded_base(repo_dir, base).0
+}
+
+/// Resolve an operator's `--base` to what a dispatch should record: the
+/// branch name a pull request should target, and whether that name is a
+/// branch at all (Greptile on #373). Judged here, in the dispatch
+/// checkout, against what git itself would cut from:
+///
+/// - `HEAD` names the checked-out branch, or the commit when detached;
+/// - remote spellings (`origin/develop`, `refs/remotes/upstream/x`, on
+///   any remote) name the tracked branch; `<remote>/HEAD` follows the
+///   remote symref to the branch it names;
+/// - a name shared by a tag and a branch at different commits cuts the
+///   tag (git's ref lookup order), so it is not a branch;
+/// - anything else (a SHA, a lone tag) is recorded as given, not a
+///   branch, so `advance` can fail closed on it.
+pub fn resolve_recorded_base(repo_dir: &Path, base: &str) -> (String, bool) {
+    let base = base.trim();
+    let ref_exists =
+        |reference: &str| git(repo_dir, &["rev-parse", "--verify", "--quiet", reference]).is_ok();
+    // Full ref spellings name the same branch as their short forms.
+    if let Some(branch) = base.strip_prefix("refs/heads/") {
+        return (
+            branch.to_string(),
+            ref_exists(&format!("refs/heads/{branch}")),
+        );
+    }
+    if let Some(remote_ref) = base.strip_prefix("refs/remotes/") {
+        return match remote_ref.split_once('/') {
+            Some((remote, "HEAD")) => remote_head_branch(repo_dir, remote)
+                .map(|branch| (branch, true))
+                .unwrap_or_else(|| (base.to_string(), false)),
+            Some((_, branch)) => (
+                branch.to_string(),
+                ref_exists(&format!("refs/remotes/{remote_ref}")),
+            ),
+            None => (base.to_string(), false),
+        };
+    }
+    if base == "HEAD" {
+        if let Ok(branch) = git(repo_dir, &["symbolic-ref", "--short", "-q", "HEAD"]) {
+            let branch = branch.trim();
+            if !branch.is_empty() {
+                return (branch.to_string(), true);
+            }
+        }
+        return (
+            resolve_commit(repo_dir, "HEAD").unwrap_or_else(|| base.to_string()),
+            false,
+        );
+    }
+    // A remote-tracking spelling (`<remote>/<branch>`).
+    if let Some((remote, branch)) = base.split_once('/') {
+        if ref_exists(&format!("refs/remotes/{base}")) {
+            if branch == "HEAD" {
+                return remote_head_branch(repo_dir, remote)
+                    .map(|branch| (branch, true))
+                    .unwrap_or_else(|| (base.to_string(), false));
+            }
+            return (branch.to_string(), true);
+        }
+    }
+    // A plain name. When a tag and a branch share it at different
+    // commits, git resolves the tag first, so the cut is the tag's
+    // commit, not the branch.
+    if ref_exists(&format!("refs/tags/{base}")) {
+        let tag_commit = resolve_commit(repo_dir, &format!("refs/tags/{base}"));
+        let branch_commit = resolve_commit(repo_dir, &format!("refs/heads/{base}"));
+        if branch_commit.is_none() || tag_commit != branch_commit {
+            return (base.to_string(), false);
+        }
+    }
+    (base.to_string(), is_branch(repo_dir, base))
+}
+
+/// The branch `<remote>/HEAD` points at, following the symref.
+fn remote_head_branch(repo_dir: &Path, remote: &str) -> Option<String> {
+    let target = git(
+        repo_dir,
+        &["symbolic-ref", "-q", &format!("refs/remotes/{remote}/HEAD")],
+    )
+    .ok()?;
+    let target = target.trim();
+    let rest = target.strip_prefix("refs/remotes/")?;
+    let (_, branch) = rest.split_once('/')?;
+    Some(branch.to_string())
+}
+
+/// Whether `name` names a branch a pull request could target: a local
+/// branch, or one known through any remote's remote-tracking refs.
+pub fn is_branch(repo_dir: &Path, name: &str) -> bool {
+    let name = name.trim();
+    if name.is_empty() {
+        return false;
+    }
+    if git(
+        repo_dir,
+        &["rev-parse", "--verify", &format!("refs/heads/{name}")],
+    )
+    .is_ok()
+    {
+        return true;
+    }
+    let Ok(remote_refs) = git(
+        repo_dir,
+        &["for-each-ref", "refs/remotes", "--format=%(refname)"],
+    ) else {
+        return false;
+    };
+    remote_refs.lines().any(|reference| {
+        reference
+            .trim()
+            .strip_prefix("refs/remotes/")
+            .and_then(|rest| rest.split_once('/'))
+            .is_some_and(|(_, branch)| branch == name)
+    })
+}
+
 /// The branch an issue's worktree checks out: `autopilot/<repo-slug>-<n>`.
 ///
 /// Uses [`IssueRef::slug`] (the full `owner-repo-number` form) rather than a
@@ -417,6 +542,12 @@ pub struct Worktree {
     /// existing worktree was reused, which is the normal resumed-dispatch
     /// case).
     pub created: bool,
+    /// Whether this call cut the issue branch itself, as opposed to
+    /// reusing a branch that already existed (including when it only
+    /// recreated the checkout on one). A recreated branch is a new cut
+    /// from the current `base`, which is the one case where the recorded
+    /// dispatch base may legitimately change.
+    pub branch_created: bool,
     /// The full commit sha the branch was cut from. Resolved from `base` in
     /// the operator's checkout once, before the branch is created, and kept
     /// in `branch.<branch>.ironmemCut` so a resume reads it back rather than
@@ -1867,6 +1998,7 @@ pub fn ensure_worktree(
                 path: canonical_or_self(&path),
                 branch,
                 created: false,
+                branch_created: false,
                 cut,
                 quarantined_from: None,
             });
@@ -1917,6 +2049,7 @@ pub fn ensure_worktree(
         path: canonical_or_self(&path),
         branch,
         created: true,
+        branch_created: !branch_exists,
         cut,
         quarantined_from,
     })
@@ -2099,6 +2232,112 @@ mod tests {
 
     fn issue() -> IssueRef {
         IssueRef::new("ironrace/ironmem", 283)
+    }
+
+    /// #338: the dispatch-time base resolution — `HEAD` names the
+    /// checked-out branch, a branch names itself, and a SHA stays a SHA
+    /// (recorded as-is, so `advance` can fail closed on it).
+    #[test]
+    fn a_base_resolves_to_a_branch_name_or_stays_a_committish() {
+        let repo = fixture_repo();
+        assert_eq!(resolve_base_branch(repo.path(), "HEAD"), "main");
+        run(repo.path(), &["branch", "develop"]);
+        assert_eq!(resolve_base_branch(repo.path(), "develop"), "develop");
+        let sha = resolve_commit(repo.path(), "HEAD").unwrap();
+        assert_eq!(resolve_base_branch(repo.path(), &sha), sha);
+        assert!(is_branch(repo.path(), "develop"));
+        assert!(!is_branch(repo.path(), &sha));
+        run(
+            repo.path(),
+            &["update-ref", "refs/remotes/origin/develop", &sha],
+        );
+        assert_eq!(
+            resolve_base_branch(repo.path(), "origin/develop"),
+            "develop",
+            "a remote-tracking spelling records the branch it tracks"
+        );
+        assert_eq!(
+            resolve_base_branch(repo.path(), "refs/heads/develop"),
+            "develop",
+            "a full local ref records the branch it names"
+        );
+        assert_eq!(
+            resolve_base_branch(repo.path(), "refs/remotes/origin/develop"),
+            "develop",
+            "a full remote ref records the branch it tracks"
+        );
+        run(repo.path(), &["tag", "v1"]);
+        assert_eq!(resolve_base_branch(repo.path(), "v1"), "v1");
+        assert!(
+            !is_branch(repo.path(), "v1"),
+            "a tag is recorded as a committish, not a branch"
+        );
+    }
+
+    /// Greptile on #373: the recorded base must name what git would cut
+    /// from, for every legal `--base` spelling.
+    #[test]
+    fn a_recorded_base_names_what_git_would_cut_from() {
+        let repo = fixture_repo();
+        run(repo.path(), &["branch", "develop"]);
+        let sha = resolve_commit(repo.path(), "HEAD").unwrap();
+        run(
+            repo.path(),
+            &["update-ref", "refs/remotes/upstream/develop", &sha],
+        );
+        run(
+            repo.path(),
+            &["update-ref", "refs/remotes/origin/develop", &sha],
+        );
+        run(
+            repo.path(),
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/develop",
+            ],
+        );
+        // A branch known only through a non-origin remote.
+        assert_eq!(
+            resolve_recorded_base(repo.path(), "upstream/develop"),
+            ("develop".to_string(), true),
+            "a non-origin remote-tracking base is a branch"
+        );
+        assert!(is_branch(repo.path(), "develop"));
+        // `origin/HEAD` follows the remote symref to its branch.
+        assert_eq!(
+            resolve_recorded_base(repo.path(), "origin/HEAD"),
+            ("develop".to_string(), true),
+            "origin/HEAD records the branch the symref names"
+        );
+        // A tag and a branch sharing a name at different commits: git's
+        // ref lookup takes the tag, so the cut is not the branch.
+        run(repo.path(), &["commit", "--allow-empty", "-m", "second"]);
+        let second = resolve_commit(repo.path(), "HEAD").unwrap();
+        run(repo.path(), &["tag", "shared", &sha]);
+        run(repo.path(), &["branch", "-f", "shared", &second]);
+        assert_eq!(
+            resolve_recorded_base(repo.path(), "shared"),
+            ("shared".to_string(), false),
+            "git cuts the tag when a tag and branch share a name"
+        );
+    }
+
+    /// Greptile on #373: a worktree call that recreates a deleted issue
+    /// branch says so, so the dispatch can refresh the recorded base.
+    #[test]
+    fn a_recreated_branch_reports_branch_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = fixture_repo();
+        let issue = IssueRef::new("ironrace/ironmem", 77);
+        let first = ensure_worktree(repo.path(), dir.path(), &issue, "main").unwrap();
+        assert!(first.branch_created);
+        let second = ensure_worktree(repo.path(), dir.path(), &issue, "main").unwrap();
+        assert!(!second.branch_created, "a reused branch is not a cut");
+        remove_worktree(repo.path(), dir.path(), &issue).unwrap();
+        run(repo.path(), &["branch", "-D", &first.branch]);
+        let third = ensure_worktree(repo.path(), dir.path(), &issue, "main").unwrap();
+        assert!(third.branch_created, "a recreated branch is a new cut");
     }
 
     /// Fixture repos use the files ref backend, which tests that hold a

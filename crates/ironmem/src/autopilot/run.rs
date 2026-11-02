@@ -6777,6 +6777,7 @@ sleep 0.5
             path: path.clone(),
             branch,
             created: true,
+            branch_created: false,
             cut: worktree::CommitSha::parse(&git_in(&path, &["rev-parse", "HEAD"])).unwrap(),
             quarantined_from: None,
         };
@@ -8090,6 +8091,7 @@ sleep 0.5
             path,
             branch,
             created: true,
+            branch_created: false,
             cut: worktree::CommitSha::parse(&cut).unwrap(),
             quarantined_from: None,
         };
