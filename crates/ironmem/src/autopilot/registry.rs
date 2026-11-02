@@ -636,15 +636,21 @@ impl LivenessSnapshot for HarnessSnapshots {
                 // already judge Claude liveness by. Alive if either source
                 // names it; NotListed only when both read clean and neither
                 // does; otherwise Unknown, never a guessed dead.
+                let derived = super::dispatch::ic_name(&state.issue);
                 let registry = self.claude.liveness(&state.ic_session_name);
-                if registry == Liveness::Alive {
+                if registry == Liveness::Alive || self.claude.liveness(&derived) == Liveness::Alive
+                {
                     return Liveness::Alive;
                 }
                 match &self.processes {
                     ProcessSnapshot::Available(rows) => {
+                        // Both names count, as every other judge of this
+                        // evidence holds: the drawer's own IC name and the
+                        // name every dispatch for the issue takes — a
+                        // renamed/legacy session differs in the two.
                         if super::clear::claude_ic_process_holder(
                             rows,
-                            std::iter::once(state.ic_session_name.as_str()),
+                            [state.ic_session_name.as_str(), derived.as_str()].into_iter(),
                         )
                         .is_some()
                         {
@@ -1278,6 +1284,93 @@ mod harness_tests {
             },
         };
         assert_eq!(snapshots.liveness(&state), Liveness::Unknown);
+    }
+
+    #[test]
+    fn a_renamed_claude_ic_is_alive_under_its_derived_name() {
+        // Every other judge of this evidence checks both the stored name
+        // and `ic_name(issue)`; a renamed/legacy session differs in the two.
+        let mut state = paused_state(Implementer::Claude);
+        state.ic_session_name = "ic-renamed-42".into();
+        let snapshots = HarnessSnapshots {
+            claude: RegistrySnapshot::Available(Vec::new()),
+            processes: ProcessSnapshot::Available(
+                parse_processes("10 1 10 S claude -p /goal x --name ic-owner-repo-42 --model m\n")
+                    .unwrap(),
+            ),
+        };
+        assert_eq!(snapshots.liveness(&state), Liveness::Alive);
+    }
+
+    #[test]
+    fn claude_liveness_matrix_over_both_sources() {
+        let state = paused_state(Implementer::Claude);
+        let naming = || {
+            ProcessSnapshot::Available(
+                parse_processes("10 1 10 S claude -p /goal x --name=ic-owner-repo-42 --model m\n")
+                    .unwrap(),
+            )
+        };
+        let clean = || ProcessSnapshot::Available(Vec::new());
+        let failed = || ProcessSnapshot::Unavailable {
+            reason: "ps timed out".into(),
+        };
+        let not_supplied = || ProcessSnapshot::Unavailable {
+            reason: PROCESS_SOURCE_NOT_SUPPLIED.into(),
+        };
+        let empty_registry = || RegistrySnapshot::Available(Vec::new());
+        let dead_registry = || RegistrySnapshot::Unavailable {
+            reason: "registry unreadable".into(),
+        };
+        let listed = || {
+            RegistrySnapshot::Available(vec![AgentEntry {
+                name: "ic-owner-repo-42".into(),
+                status: None,
+            }])
+        };
+        let cases: Vec<(RegistrySnapshot, ProcessSnapshot, Liveness, &str)> = vec![
+            (empty_registry(), naming(), Liveness::Alive, "--name= row"),
+            (
+                dead_registry(),
+                naming(),
+                Liveness::Alive,
+                "registry down, ps names it",
+            ),
+            (
+                dead_registry(),
+                clean(),
+                Liveness::Unknown,
+                "registry down, ps clean",
+            ),
+            (listed(), failed(), Liveness::Alive, "listed, ps failed"),
+            (
+                empty_registry(),
+                not_supplied(),
+                Liveness::NotListed,
+                "adapter: registry answer stands",
+            ),
+            (
+                dead_registry(),
+                not_supplied(),
+                Liveness::Unknown,
+                "adapter: unreadable registry stands",
+            ),
+        ];
+        for (claude, processes, want, label) in cases {
+            let snapshots = HarnessSnapshots { claude, processes };
+            assert_eq!(snapshots.liveness(&state), want, "{label}");
+        }
+        // Near misses name nobody: another issue's IC, and a zombie.
+        for args in [
+            "10 1 10 S claude -p /goal x --name ic-owner-repo-99 --model m\n",
+            "10 1 10 Z claude -p /goal x --name ic-owner-repo-42 --model m\n",
+        ] {
+            let snapshots = HarnessSnapshots {
+                claude: empty_registry(),
+                processes: ProcessSnapshot::Available(parse_processes(args).unwrap()),
+            };
+            assert_eq!(snapshots.liveness(&state), Liveness::NotListed, "{args}");
+        }
     }
 
     #[test]

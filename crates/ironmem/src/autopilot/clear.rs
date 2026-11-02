@@ -444,7 +444,7 @@ fn refusal(
         (Implementer::Claude, Liveness::Alive) => {
             if let super::process_tree::ProcessSnapshot::Available(rows) = &snapshots.processes {
                 if let Some(reason) =
-                    claude_ic_process_holder(rows, std::iter::once(state.ic_session_name.as_str()))
+                    claude_ic_holder(snapshots, rows, &state.issue, Some(&state.ic_session_name))
                 {
                     return Some(reason);
                 }
