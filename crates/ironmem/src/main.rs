@@ -2209,19 +2209,26 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                 )?;
                 // Record the base this branch was cut from, for `advance`
                 // to open the pull request against (#338).
-                let resolved_base = ironmem::autopilot::worktree::resolve_base_branch(
-                    std::path::Path::new(&path),
-                    &base,
-                );
-                ironmem::autopilot::lineage::record_issue_base(
-                    &database,
-                    &issue_ref,
-                    &resolved_base,
-                    ironmem::autopilot::worktree::is_branch(
+                let (resolved_base, is_branch) =
+                    ironmem::autopilot::worktree::resolve_recorded_base(
                         std::path::Path::new(&path),
+                        &base,
+                    );
+                if worktree.branch_created {
+                    ironmem::autopilot::lineage::replace_issue_base(
+                        &database,
+                        &issue_ref,
                         &resolved_base,
-                    ),
-                )?;
+                        is_branch,
+                    )?;
+                } else {
+                    ironmem::autopilot::lineage::record_issue_base(
+                        &database,
+                        &issue_ref,
+                        &resolved_base,
+                        is_branch,
+                    )?;
+                }
                 let run = ironmem::autopilot::run::run_issue(
                     &database,
                     &issue_ref,

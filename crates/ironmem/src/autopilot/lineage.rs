@@ -377,6 +377,30 @@ pub fn record_issue_base(
     super::write_current(db, &issue_base_key(issue), &content)
 }
 
+/// Replace the recorded base unconditionally. Only for a dispatch that
+/// **cut the issue branch in this call** (`branch_created`): a branch
+/// recreated after deletion is a new cut from the current base, and the
+/// old record describes a branch that no longer exists. A reused branch
+/// goes through [`record_issue_base`], which keeps the first record.
+pub fn replace_issue_base(
+    db: &Database,
+    issue: &IssueRef,
+    base: &str,
+    is_branch: bool,
+) -> Result<String, MemoryError> {
+    validate_repo(&issue.repo)?;
+    let body = IssueBaseBody {
+        issue: issue.canonical(),
+        repo: issue.repo.clone(),
+        issue_number: issue.number,
+        base_branch: base.to_string(),
+        is_branch,
+        updated_at: chrono::Utc::now().to_rfc3339(),
+    };
+    let content = serde_json::to_string(&body)?;
+    super::write_current(db, &issue_base_key(issue), &content)
+}
+
 /// The base recorded by [`record_issue_base`], if any dispatch recorded
 /// one. `None` is every issue dispatched before the recording existed —
 /// `advance` falls back to the repo's default branch for those, which is

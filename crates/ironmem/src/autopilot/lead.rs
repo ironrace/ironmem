@@ -1087,13 +1087,12 @@ fn dispatch_one(
     // Record the base this branch was cut from, for `advance` to open the
     // pull request against (#338). Done at dispatch time because `advance`
     // is a separate invocation that cannot recover it later.
-    let resolved_base = worktree::resolve_base_branch(&target.path, &target.base);
-    lineage::record_issue_base(
-        db,
-        &queued.issue,
-        &resolved_base,
-        worktree::is_branch(&target.path, &resolved_base),
-    )?;
+    let (resolved_base, is_branch) = worktree::resolve_recorded_base(&target.path, &target.base);
+    if tree.branch_created {
+        lineage::replace_issue_base(db, &queued.issue, &resolved_base, is_branch)?;
+    } else {
+        lineage::record_issue_base(db, &queued.issue, &resolved_base, is_branch)?;
+    }
 
     run::run_issue(
         db,
