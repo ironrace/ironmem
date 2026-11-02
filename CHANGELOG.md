@@ -81,6 +81,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Claude implementer liveness in the queue, `supervise` and `reconcile`
+  now reads the process table as well as the `claude agents` registry,
+  which never lists a running `claude -p` IC (#368). A Claude IC reads
+  alive when either source names it (`--name <ic>` in `ps`), dead only
+  when both read clean, and unknown otherwise.
+
 - Autopilot `advance` now reads the same latest review for a PR as the
   merge decision (#348), and only a review that judged its head — reviewer
   process succeeded, verdict present — counts as having reviewed it (#350).

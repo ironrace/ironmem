@@ -340,9 +340,14 @@ undecodable argv bytes from unrelated processes to U+FFFD.
 Restart recovery is deliberately conservative. Missing or inconsistent
 kernel identity, process evidence, or trusted supervisor completion produces
 `Unknown` and holds the issue for inspection. Fresh authenticated live-process
-evidence wins over a stale completion record. If `ps` is unavailable, only
-Codex and Muse liveness becomes unknown; if the Claude registry source is
-unavailable, only Claude liveness does.
+evidence wins over a stale completion record. Claude liveness reads the
+registry **and** the process table: `claude agents --json` never lists a
+running `claude -p` implementer, so a live Claude IC is also proved by a
+process naming it with `--name <ic>`, and it reads dead only when both
+sources read clean and neither names it. If `ps` is unavailable, Codex,
+Muse and Claude liveness all become unknown where the registry does not
+already list the session; if the Claude registry source is unavailable,
+only Claude liveness does.
 
 The `codex` or `muse` binary is looked up on the absolute `PATH` entries only.
 The harness runs in the issue worktree, so a relative entry such as `.` would
