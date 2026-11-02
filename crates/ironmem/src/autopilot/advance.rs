@@ -1194,10 +1194,15 @@ fn open_pull_request(
     // that out during the rehearsal is the point of having one.
     let base = match lineage::issue_base(db, &candidate.issue)? {
         Some(recorded) => {
-            if !worktree::is_branch(&candidate.repo_path, &recorded) {
-                return Ok(stalled(NoPrReason::BaseNotBranch { base: recorded }));
+            // Branch-ness was judged at dispatch time, in the checkout
+            // whose refs are authoritative; re-probing this checkout's
+            // possibly stale refs could stall a base GitHub still has.
+            if !recorded.is_branch {
+                return Ok(stalled(NoPrReason::BaseNotBranch {
+                    base: recorded.base_branch,
+                }));
             }
-            recorded
+            recorded.base_branch
         }
         None => gh::default_branch(gh_runner, repo)?,
     };
@@ -1960,7 +1965,7 @@ mod tests {
         // every commit `develop` has that the default lacks.
         let db = approved_db();
         record_success(&db, &issue(), Some(GREEN));
-        lineage::record_issue_base(&db, &issue(), "develop").unwrap();
+        lineage::record_issue_base(&db, &issue(), "develop", true).unwrap();
         let (repo, roots) = checkout_with_worktree();
         crate::autopilot::test_git::output(repo.path(), &["branch", "develop"]);
 
@@ -2001,7 +2006,7 @@ mod tests {
         // reason rather than silently falling back to the default branch.
         let db = approved_db();
         record_success(&db, &issue(), Some(GREEN));
-        lineage::record_issue_base(&db, &issue(), GREEN).unwrap();
+        lineage::record_issue_base(&db, &issue(), GREEN, false).unwrap();
         let (repo, roots) = checkout_with_worktree();
 
         let (report, gh) =

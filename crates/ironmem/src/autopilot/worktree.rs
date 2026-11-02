@@ -80,6 +80,19 @@ pub fn resolve_commit(repo_dir: &Path, rev: &str) -> Option<String> {
 /// closed on a base no pull request can target.
 pub fn resolve_base_branch(repo_dir: &Path, base: &str) -> String {
     let base = base.trim();
+    // Full ref spellings name the same branch as their short forms.
+    if let Some(branch) = base.strip_prefix("refs/heads/") {
+        return branch.to_string();
+    }
+    if let Some(remote_ref) = base.strip_prefix("refs/remotes/") {
+        return match remote_ref.split_once('/') {
+            Some((_, "HEAD")) => {
+                resolve_commit(repo_dir, "HEAD").unwrap_or_else(|| base.to_string())
+            }
+            Some((_, branch)) => branch.to_string(),
+            None => base.to_string(),
+        };
+    }
     if base == "HEAD" {
         if let Ok(branch) = git(repo_dir, &["symbolic-ref", "--short", "-q", "HEAD"]) {
             let branch = branch.trim();
@@ -101,6 +114,11 @@ pub fn resolve_base_branch(repo_dir: &Path, base: &str) -> String {
         )
         .is_ok()
         {
+            // `origin/HEAD` is a symref to the remote's default branch,
+            // not a branch a pull request can target by that name.
+            if branch == "HEAD" {
+                return resolve_commit(repo_dir, base).unwrap_or_else(|| base.to_string());
+            }
             return branch.to_string();
         }
     }
@@ -2178,6 +2196,22 @@ mod tests {
             resolve_base_branch(repo.path(), "origin/develop"),
             "develop",
             "a remote-tracking spelling records the branch it tracks"
+        );
+        assert_eq!(
+            resolve_base_branch(repo.path(), "refs/heads/develop"),
+            "develop",
+            "a full local ref records the branch it names"
+        );
+        assert_eq!(
+            resolve_base_branch(repo.path(), "refs/remotes/origin/develop"),
+            "develop",
+            "a full remote ref records the branch it tracks"
+        );
+        run(repo.path(), &["tag", "v1"]);
+        assert_eq!(resolve_base_branch(repo.path(), "v1"), "v1");
+        assert!(
+            !is_branch(repo.path(), "v1"),
+            "a tag is recorded as a committish, not a branch"
         );
     }
 
