@@ -680,7 +680,22 @@ impl LivenessSnapshot for HarnessSnapshots {
     }
     fn reason(&self, implementer: Implementer) -> String {
         match implementer {
-            Implementer::Claude => LivenessSnapshot::reason(&self.claude, implementer),
+            Implementer::Claude => {
+                let registry_reason = LivenessSnapshot::reason(&self.claude, implementer);
+                // Claude now consults the process table too (#368): when
+                // it was asked and failed while the registry read clean,
+                // name that failure — without it, recordings blame the
+                // registry for an Unknown the `ps` timeout caused
+                // (Greptile on #374).
+                match (&self.claude, &self.processes) {
+                    (RegistrySnapshot::Available(_), ProcessSnapshot::Unavailable { reason })
+                        if reason != PROCESS_SOURCE_NOT_SUPPLIED =>
+                    {
+                        format!("{registry_reason}; process table unavailable: {reason}")
+                    }
+                    _ => registry_reason,
+                }
+            }
             Implementer::Codex | Implementer::Muse => self.processes.reason(),
         }
     }
@@ -1371,6 +1386,25 @@ mod harness_tests {
             };
             assert_eq!(snapshots.liveness(&state), Liveness::NotListed, "{args}");
         }
+    }
+
+    #[test]
+    fn a_claude_reason_names_both_sources_when_the_process_table_failed() {
+        // Greptile on #374: with the registry read clean and `ps` failed,
+        // the recorded reason blamed neither — operators could not tell
+        // the Unknown came from the process-table timeout.
+        let state = paused_state(Implementer::Claude);
+        let snapshots = HarnessSnapshots {
+            claude: RegistrySnapshot::Available(Vec::new()),
+            processes: ProcessSnapshot::Unavailable {
+                reason: "ps timed out after 120s".into(),
+            },
+        };
+        let reason = snapshots.state_reason(&state);
+        assert!(
+            reason.contains("ps timed out after 120s"),
+            "reason must name the process-table failure: {reason}"
+        );
     }
 
     #[test]
