@@ -81,6 +81,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Autopilot `advance` now reads the same latest review for a PR as the
+  merge decision (#348), and only a review that judged its head — reviewer
+  process succeeded, verdict present — counts as having reviewed it (#350).
+  A failed review is retried, bounded by the attempt cap, after which the
+  merge decision holds for a human instead of billing another review.
+
 - A Claude post-exit drain/read failure now writes a durable
   `paused-completion-unproven` operator hold instead of automatically retrying
   beside a tool child still running. Queue/provisioning/review/merge/release
