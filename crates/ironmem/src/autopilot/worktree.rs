@@ -72,6 +72,80 @@ pub fn resolve_commit(repo_dir: &Path, rev: &str) -> Option<String> {
     }
 }
 
+/// Resolve an operator's `--base` committish to the branch name a pull
+/// request should target (#338): the checked-out branch for `HEAD`, the
+/// name itself for a local or remote-tracking branch. Anything else (a
+/// SHA, a tag, an unresolvable string) is returned as given, so the
+/// caller records what was actually cut from and `advance` can fail
+/// closed on a base no pull request can target.
+pub fn resolve_base_branch(repo_dir: &Path, base: &str) -> String {
+    let base = base.trim();
+    // Full ref spellings name the same branch as their short forms.
+    if let Some(branch) = base.strip_prefix("refs/heads/") {
+        return branch.to_string();
+    }
+    if let Some(remote_ref) = base.strip_prefix("refs/remotes/") {
+        return match remote_ref.split_once('/') {
+            Some((_, "HEAD")) => {
+                resolve_commit(repo_dir, "HEAD").unwrap_or_else(|| base.to_string())
+            }
+            Some((_, branch)) => branch.to_string(),
+            None => base.to_string(),
+        };
+    }
+    if base == "HEAD" {
+        if let Ok(branch) = git(repo_dir, &["symbolic-ref", "--short", "-q", "HEAD"]) {
+            let branch = branch.trim();
+            if !branch.is_empty() {
+                return branch.to_string();
+            }
+        }
+        return resolve_commit(repo_dir, "HEAD").unwrap_or_else(|| base.to_string());
+    }
+    if is_branch(repo_dir, base) {
+        return base.to_string();
+    }
+    // A remote-tracking spelling (`origin/develop`): the branch a pull
+    // request targets is the part after the remote's name.
+    if let Some((_, branch)) = base.split_once('/') {
+        if git(
+            repo_dir,
+            &["rev-parse", "--verify", &format!("refs/remotes/{base}")],
+        )
+        .is_ok()
+        {
+            // `origin/HEAD` is a symref to the remote's default branch,
+            // not a branch a pull request can target by that name.
+            if branch == "HEAD" {
+                return resolve_commit(repo_dir, base).unwrap_or_else(|| base.to_string());
+            }
+            return branch.to_string();
+        }
+    }
+    base.to_string()
+}
+
+/// Whether `name` names a branch a pull request could target: a local
+/// branch, or one known through the `origin` remote-tracking refs.
+pub fn is_branch(repo_dir: &Path, name: &str) -> bool {
+    let name = name.trim();
+    !name.is_empty()
+        && (git(
+            repo_dir,
+            &["rev-parse", "--verify", &format!("refs/heads/{name}")],
+        )
+        .is_ok()
+            || git(
+                repo_dir,
+                &[
+                    "rev-parse",
+                    "--verify",
+                    &format!("refs/remotes/origin/{name}"),
+                ],
+            )
+            .is_ok())
+}
+
 /// The branch an issue's worktree checks out: `autopilot/<repo-slug>-<n>`.
 ///
 /// Uses [`IssueRef::slug`] (the full `owner-repo-number` form) rather than a
@@ -2099,6 +2173,46 @@ mod tests {
 
     fn issue() -> IssueRef {
         IssueRef::new("ironrace/ironmem", 283)
+    }
+
+    /// #338: the dispatch-time base resolution — `HEAD` names the
+    /// checked-out branch, a branch names itself, and a SHA stays a SHA
+    /// (recorded as-is, so `advance` can fail closed on it).
+    #[test]
+    fn a_base_resolves_to_a_branch_name_or_stays_a_committish() {
+        let repo = fixture_repo();
+        assert_eq!(resolve_base_branch(repo.path(), "HEAD"), "main");
+        run(repo.path(), &["branch", "develop"]);
+        assert_eq!(resolve_base_branch(repo.path(), "develop"), "develop");
+        let sha = resolve_commit(repo.path(), "HEAD").unwrap();
+        assert_eq!(resolve_base_branch(repo.path(), &sha), sha);
+        assert!(is_branch(repo.path(), "develop"));
+        assert!(!is_branch(repo.path(), &sha));
+        run(
+            repo.path(),
+            &["update-ref", "refs/remotes/origin/develop", &sha],
+        );
+        assert_eq!(
+            resolve_base_branch(repo.path(), "origin/develop"),
+            "develop",
+            "a remote-tracking spelling records the branch it tracks"
+        );
+        assert_eq!(
+            resolve_base_branch(repo.path(), "refs/heads/develop"),
+            "develop",
+            "a full local ref records the branch it names"
+        );
+        assert_eq!(
+            resolve_base_branch(repo.path(), "refs/remotes/origin/develop"),
+            "develop",
+            "a full remote ref records the branch it tracks"
+        );
+        run(repo.path(), &["tag", "v1"]);
+        assert_eq!(resolve_base_branch(repo.path(), "v1"), "v1");
+        assert!(
+            !is_branch(repo.path(), "v1"),
+            "a tag is recorded as a committish, not a branch"
+        );
     }
 
     /// Fixture repos use the files ref backend, which tests that hold a

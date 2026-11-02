@@ -81,6 +81,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Autopilot records the base each issue branch is cut from at dispatch
+  time (Lead and manual `run`), and `advance` opens the pull request
+  against that recorded base instead of assuming the repo's default
+  branch (#338). A recorded base that is not a branch (a SHA or tag)
+  stalls with a new `BaseNotBranch` reason rather than silently opening
+  the wrong diff; issues dispatched before the recording keep the
+  default-branch fallback.
+
 - A Claude post-exit drain/read failure now writes a durable
   `paused-completion-unproven` operator hold instead of automatically retrying
   beside a tool child still running. Queue/provisioning/review/merge/release

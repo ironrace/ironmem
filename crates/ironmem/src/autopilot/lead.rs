@@ -1084,6 +1084,16 @@ fn dispatch_one(
         &queued.issue,
         &target.base,
     )?;
+    // Record the base this branch was cut from, for `advance` to open the
+    // pull request against (#338). Done at dispatch time because `advance`
+    // is a separate invocation that cannot recover it later.
+    let resolved_base = worktree::resolve_base_branch(&target.path, &target.base);
+    lineage::record_issue_base(
+        db,
+        &queued.issue,
+        &resolved_base,
+        worktree::is_branch(&target.path, &resolved_base),
+    )?;
 
     run::run_issue(
         db,

@@ -315,6 +315,83 @@ pub fn get_issue_status(
     }))
 }
 
+fn issue_base_key(issue: &IssueRef) -> String {
+    format!("issue-base:{}", issue.slug())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct IssueBaseBody {
+    issue: String,
+    repo: String,
+    issue_number: u64,
+    base_branch: String,
+    /// Whether `base_branch` named a branch in the dispatch checkout —
+    /// judged once, there, where the refs are authoritative. `advance`
+    /// trusts this instead of re-probing its own possibly stale checkout.
+    #[serde(default)]
+    is_branch: bool,
+    updated_at: String,
+}
+
+/// A recorded dispatch base, as [`issue_base`] reads it back.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IssueBase {
+    pub base_branch: String,
+    pub is_branch: bool,
+}
+
+/// Record the base an issue's branch was cut from at dispatch time (#338).
+///
+/// Its own drawer rather than a field on the issue-status drawer: the
+/// status is rewritten by every attempt recording, and a base written
+/// before them must survive them all — including the success that clears
+/// the dispatch state. `base` is the dispatch-time resolution of the
+/// operator's `--base`: a branch name when the base is a branch, the raw
+/// committish (SHA, tag) otherwise, so `advance` can fail closed on a
+/// base no pull request can target instead of guessing.
+///
+/// **First record wins.** `ensure_worktree` reuses an existing issue
+/// branch without re-cutting it, so a re-dispatch under a different
+/// `--base` (or a moved checkout `HEAD`) must not rewrite the base the
+/// branch was actually cut from — that rewrite would recreate the
+/// wrong-diff defect above. An existing record is returned unchanged.
+pub fn record_issue_base(
+    db: &Database,
+    issue: &IssueRef,
+    base: &str,
+    is_branch: bool,
+) -> Result<String, MemoryError> {
+    validate_repo(&issue.repo)?;
+    if let Some(existing) = super::read_current(db, &issue_base_key(issue))? {
+        return Ok(existing.id);
+    }
+    let body = IssueBaseBody {
+        issue: issue.canonical(),
+        repo: issue.repo.clone(),
+        issue_number: issue.number,
+        base_branch: base.to_string(),
+        is_branch,
+        updated_at: chrono::Utc::now().to_rfc3339(),
+    };
+    let content = serde_json::to_string(&body)?;
+    super::write_current(db, &issue_base_key(issue), &content)
+}
+
+/// The base recorded by [`record_issue_base`], if any dispatch recorded
+/// one. `None` is every issue dispatched before the recording existed —
+/// `advance` falls back to the repo's default branch for those, which is
+/// the pre-#338 behaviour and right in the common case.
+pub fn issue_base(db: &Database, issue: &IssueRef) -> Result<Option<IssueBase>, MemoryError> {
+    let Some(drawer) = super::read_current(db, &issue_base_key(issue))? else {
+        return Ok(None);
+    };
+    let body: IssueBaseBody = serde_json::from_str(&drawer.content)?;
+    Ok(Some(IssueBase {
+        base_branch: body.base_branch,
+        is_branch: body.is_branch,
+    }))
+}
+
 /// Every drawer this module has written in `ROOM` (any wing), for tests
 /// that need to distinguish "many distinct rows" from "one row, repeatedly
 /// overwritten" without depending on knowledge of specific ids.
@@ -341,6 +418,44 @@ mod tests {
             why_failed: why_failed.map(|s| s.to_string()),
             commit_sha: None,
         }
+    }
+
+    /// #338: the recorded base survives the status/attempt rewrites that
+    /// follow it, an unrecorded issue reads as `None`, and a re-dispatch
+    /// cannot overwrite the first record (the branch it describes was cut
+    /// once, from that base).
+    #[test]
+    fn a_recorded_base_survives_status_rewrites_and_is_first_record_wins() {
+        let db = Database::open_in_memory().unwrap();
+        let issue = IssueRef::new("ironmem", 283);
+        assert_eq!(issue_base(&db, &issue).unwrap(), None);
+
+        record_issue_base(&db, &issue, "develop", true).unwrap();
+        record_attempt(&db, &attempt(&issue, 1, AttemptOutcome::Failed, None)).unwrap();
+        upsert_issue_status(
+            &db,
+            &IssueStatus {
+                issue: issue.clone(),
+                best_verdict: Some(AttemptOutcome::Success),
+                best_commit_sha: Some("abc".into()),
+                cumulative_attempt_n: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            issue_base(&db, &issue).unwrap(),
+            Some(IssueBase {
+                base_branch: "develop".into(),
+                is_branch: true,
+            })
+        );
+
+        record_issue_base(&db, &issue, "main", true).unwrap();
+        assert_eq!(
+            issue_base(&db, &issue).unwrap().unwrap().base_branch,
+            "develop",
+            "a re-dispatch must not rewrite the base the branch was cut from"
+        );
     }
 
     // ── Required test 1: N failed attempts produce N distinct drawers ──────

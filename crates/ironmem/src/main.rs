@@ -1193,6 +1193,15 @@ fn print_advance_report(report: &ironmem::autopilot::advance::AdvanceReport) {
                          the next pass picks it up"
                     );
                 }
+                NoPrReason::BaseNotBranch { base } => {
+                    println!(
+                        "    STALLED: the base recorded at dispatch time ({base}) is not a \
+                         branch, and a pull request cannot target a commit"
+                    );
+                    println!(
+                        "    re-dispatch the issue with a branch --base, or open the PR by hand"
+                    );
+                }
             },
             AdvanceStep::Stalled(Stall::AmbiguousPr { numbers }) => {
                 println!(
@@ -2197,6 +2206,21 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                     &worktree_root,
                     &issue_ref,
                     &base,
+                )?;
+                // Record the base this branch was cut from, for `advance`
+                // to open the pull request against (#338).
+                let resolved_base = ironmem::autopilot::worktree::resolve_base_branch(
+                    std::path::Path::new(&path),
+                    &base,
+                );
+                ironmem::autopilot::lineage::record_issue_base(
+                    &database,
+                    &issue_ref,
+                    &resolved_base,
+                    ironmem::autopilot::worktree::is_branch(
+                        std::path::Path::new(&path),
+                        &resolved_base,
+                    ),
                 )?;
                 let run = ironmem::autopilot::run::run_issue(
                     &database,
