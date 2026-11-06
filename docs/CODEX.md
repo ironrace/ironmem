@@ -480,11 +480,12 @@ Recall stays quiet unless the prompt gives it something to go on:
   is searched.
 - Operational collab rooms (`collab-plans`, `collab-task-lists`,
   `collab-checkpoints`, `collab-drafts`, `collab-messages`) and the diary rows
-  hooks write for themselves are never injected, from BM25 or vector hits.
+  hooks write for themselves are never injected, however they were found.
 - A diary entry is injected only when its excerpt, as injected, shares at least
   two content words with the prompt, whether a search found it or it is among the
-  newest 50 non-hook entries, which are checked on every prompt.
-- Text duplicated across wings is injected once.
+  newest 50 injectable entries, which are checked on every prompt.
+- Text duplicated across wings, or between a search hit and a diary entry, is
+  injected once. A dropped copy doesn't count against the diary limit.
 
 Hybrid vector recall is opt-in. It only borrows a ready shared daemon over its
 Unix socket. The hook never initializes, starts, or warms a daemon, and never

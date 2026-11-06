@@ -1247,7 +1247,7 @@ const PROMPT_RECALL_DIARY_WING: &str = "diary";
 /// full window: they can outrank every row worth injecting.
 const PROMPT_RECALL_BM25_WIDENING: usize = 4;
 
-/// Newest non-hook diary entries the prompt is matched against.
+/// Newest injectable diary entries the prompt is matched against.
 const PROMPT_RECALL_DIARY_SCAN: usize = 50;
 
 /// The distinct lowercase words of `text` that carry meaning: not stopwords, and
@@ -1322,6 +1322,14 @@ fn diary_hit_matches(
     let is_diary =
         drawer.wing == PROMPT_RECALL_DIARY_WING || drawer.room == crate::diary::DIARY_ROOM;
     !is_diary || diary_excerpt_matches(prompt_words, &compact_excerpt(&drawer.content, line_bytes))
+}
+
+/// A recent diary entry that matched the prompt, pending a check against the rows
+/// rendered ahead of it.
+struct DiaryMatch {
+    content: String,
+    excerpt: String,
+    line: String,
 }
 
 /// Top `max_hits` BM25-qualifying ids, sorted for stable output. `qualifying`
@@ -1508,26 +1516,25 @@ fn recall_block_from_qualifying_with_vector_poll(
         }
     }
 
-    // Diary excerpt recall. Ids are kept so that an entry BM25 also found renders once.
-    let mut diary_lines: Vec<(String, String)> = Vec::new();
+    // Diary excerpt recall. Every match is kept, not just `diary_max`, because some may
+    // repeat a row rendered below and must not use up a slot.
+    let mut diary_matches: Vec<DiaryMatch> = Vec::new();
     if diary_enabled {
         match db.recent_prompt_recall_diary(PROMPT_RECALL_DIARY_SCAN) {
             Ok(entries) => {
                 let prompt_words = prompt_content_words(prompt);
-                for d in &entries {
-                    if diary_lines.len() >= diary_max {
-                        break;
-                    }
+                for d in entries {
                     let excerpt = compact_excerpt(&d.content, diary_line_bytes);
                     if diary_excerpt_matches(&prompt_words, &excerpt) {
-                        if let (Ok(date), Ok(excerpt)) = (
+                        if let (Ok(date), Ok(escaped)) = (
                             serde_json::to_string(&d.date),
                             serde_json::to_string(&excerpt),
                         ) {
-                            diary_lines.push((
-                                d.id.clone(),
-                                format!("- source=\"diary\" date={date} excerpt={excerpt}"),
-                            ));
+                            diary_matches.push(DiaryMatch {
+                                content: d.content,
+                                excerpt,
+                                line: format!("- source=\"diary\" date={date} excerpt={escaped}"),
+                            });
                         }
                     }
                 }
@@ -1617,10 +1624,17 @@ fn recall_block_from_qualifying_with_vector_poll(
     let mut drawer_lines = Vec::new();
     // The same file mined into two wings would otherwise inject the same text twice.
     let mut seen_excerpts = std::collections::HashSet::new();
+    // Diary lines have their own byte cap, so a copy of a row needn't share its excerpt.
+    // This holds the content of every row whose text is shown, even through another's line.
+    let mut shown_contents = std::collections::HashSet::new();
     for id in &selected_ids {
         if let Some(d) = drawers.get(id) {
             let excerpt = compact_excerpt(&d.content, line_bytes);
-            if !excerpt.is_empty() && seen_excerpts.insert(excerpt.clone()) {
+            if excerpt.is_empty() {
+                continue;
+            }
+            shown_contents.insert(d.content.as_str());
+            if seen_excerpts.insert(excerpt.clone()) {
                 let wing = compact_excerpt(&d.wing, PROMPT_RECALL_LABEL_BYTES);
                 let room = compact_excerpt(&d.room, PROMPT_RECALL_LABEL_BYTES);
                 let source = serde_json::to_string(&format!("{wing}/{room}")).ok()?;
@@ -1631,10 +1645,14 @@ fn recall_block_from_qualifying_with_vector_poll(
     }
     drawer_lines.extend(lines);
     drawer_lines.extend(
-        diary_lines
+        diary_matches
             .into_iter()
-            .filter(|(id, _)| !selected_ids.contains(id))
-            .map(|(_, line)| line),
+            .filter(|m| {
+                !shown_contents.contains(m.content.as_str())
+                    && seen_excerpts.insert(m.excerpt.clone())
+            })
+            .map(|m| m.line)
+            .take(diary_max),
     );
     lines = drawer_lines;
 
@@ -5808,6 +5826,134 @@ mod tests {
         insert_recall_drawer(&db, "ledger rounding entry", "diary", "diary", "diary");
         let block = recall_block_from_db(&db, "ledger rounding", &config, &[]).unwrap();
         assert_eq!(block.matches("ledger rounding entry").count(), 1, "{block}");
+    }
+
+    #[test]
+    fn diary_line_never_comes_from_an_operational_room() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::schema::Database::open(&dir.path().join("m.sqlite3")).unwrap();
+        db.migrate().unwrap();
+        let config = recall_test_config();
+        for room in [
+            "collab-plans",
+            "collab-task-lists",
+            "collab-checkpoints",
+            "collab-drafts",
+            "collab-messages",
+        ] {
+            insert_recall_drawer(&db, "postgres migration plan", "diary", room, "collab");
+        }
+        // BM25 already skips these rooms, so the diary scan is the only path left that
+        // could inject them.
+        assert_eq!(
+            recall_block_from_db(&db, "postgres migration", &config, &[]),
+            None
+        );
+
+        insert_recall_drawer(&db, "postgres migration note", "diary", "diary", "diary");
+        let block = recall_block_from_db(&db, "postgres migration", &config, &[]).unwrap();
+        assert!(block.contains("postgres migration note"), "{block}");
+        assert_eq!(block.matches("- source=").count(), 1, "{block}");
+    }
+
+    #[test]
+    fn diary_line_duplicating_a_rendered_drawer_is_injected_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::schema::Database::open(&dir.path().join("m.sqlite3")).unwrap();
+        db.migrate().unwrap();
+        // The workspace scope hides the diary copy from BM25, so only the diary scan
+        // finds it: same text, different id.
+        insert_recall_drawer(&db, "ledger rounding runbook", "shop", "docs", "mine");
+        insert_recall_drawer(&db, "ledger rounding runbook", "diary", "diary", "diary");
+        let wings = one_wing("shop");
+        let block =
+            recall_block_from_db(&db, "ledger rounding", &recall_test_config(), &wings).unwrap();
+        assert_eq!(block.matches("- source=").count(), 1, "{block}");
+        assert!(block.contains("shop/docs"), "{block}");
+
+        // Each path has its own byte cap, so once they're tuned apart a long copy
+        // renders differently on each.
+        let long = format!(
+            "tax rounding {}",
+            "keeps four decimals in totals ".repeat(30)
+        );
+        insert_recall_drawer(&db, &long, "shop", "docs", "mine");
+        insert_recall_drawer(&db, &long, "diary", "diary", "diary");
+        for (line_bytes, diary_line_bytes) in [(400, 120), (120, 400)] {
+            let config = RecallConfig {
+                line_bytes,
+                diary_line_bytes,
+                ..recall_test_config()
+            };
+            let block = recall_block_from_db(&db, "tax rounding", &config, &wings).unwrap();
+            assert_eq!(
+                block.matches("- source=").count(),
+                1,
+                "drawer {line_bytes} / diary {diary_line_bytes}: {block}"
+            );
+            assert!(block.contains("shop/docs"), "{block}");
+        }
+
+        // Different contents that read the same once cut are the same line.
+        let filler = "keeps four decimals in totals ".repeat(30);
+        insert_recall_drawer(
+            &db,
+            &format!("pension rounding {filler} shop ending"),
+            "shop",
+            "docs",
+            "mine",
+        );
+        insert_recall_drawer(
+            &db,
+            &format!("pension rounding {filler} diary ending"),
+            "diary",
+            "diary",
+            "diary",
+        );
+        let block =
+            recall_block_from_db(&db, "pension rounding", &recall_test_config(), &wings).unwrap();
+        assert_eq!(block.matches("- source=").count(), 1, "{block}");
+    }
+
+    #[test]
+    fn duplicate_diary_lines_are_injected_once_and_use_no_diary_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::schema::Database::open(&dir.path().join("m.sqlite3")).unwrap();
+        db.migrate().unwrap();
+        let backdate = |id: &str, filed_at: &str| {
+            db.with_connection(|conn| {
+                conn.execute(
+                    "UPDATE drawers SET filed_at = ?1 WHERE id = ?2",
+                    rusqlite::params![filed_at, id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        };
+        let wings = one_wing("shop");
+
+        // Two copies among the diary's own entries, from different rooms.
+        let first = insert_recall_drawer(&db, "ledger rounding entry", "diary", "diary", "diary");
+        let second = insert_recall_drawer(&db, "ledger rounding entry", "diary", "daily", "diary");
+        backdate(&first, "2026-01-02");
+        backdate(&second, "2026-01-01");
+        let mut config = recall_test_config();
+        config.diary_max = 3;
+        let block = recall_block_from_db(&db, "ledger rounding", &config, &wings).unwrap();
+        assert_eq!(block.matches("- source=").count(), 1, "{block}");
+
+        // The newest match repeats a rendered drawer. It must not cost the older,
+        // distinct entry the only diary slot.
+        insert_recall_drawer(&db, "tax rounding runbook", "shop", "docs", "mine");
+        let copy = insert_recall_drawer(&db, "tax rounding runbook", "diary", "diary", "diary");
+        let older = insert_recall_drawer(&db, "tax rounding decision", "diary", "diary", "diary");
+        backdate(&copy, "2026-02-02");
+        backdate(&older, "2026-02-01");
+        let block =
+            recall_block_from_db(&db, "tax rounding", &recall_test_config(), &wings).unwrap();
+        assert_eq!(block.matches("tax rounding runbook").count(), 1, "{block}");
+        assert_eq!(block.matches("tax rounding decision").count(), 1, "{block}");
+        assert_eq!(block.matches("- source=").count(), 2, "{block}");
     }
 
     #[test]

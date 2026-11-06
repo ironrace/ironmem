@@ -59,10 +59,20 @@ const PROMPT_RECALL_EXCLUDED_ROOMS: [&str; 5] = [
 ];
 
 /// Whether a drawer may be injected into a prompt by the recall hook. The vector
-/// path's counterpart to [`Database::prompt_recall_bm25_search`]'s SQL filter.
+/// path's counterpart to [`prompt_recall_eligible_sql`].
 pub(crate) fn prompt_recall_eligible(drawer: &Drawer) -> bool {
     !PROMPT_RECALL_EXCLUDED_ROOMS.contains(&drawer.room.as_str())
         && drawer.added_by != HOOK_ADDED_BY
+}
+
+/// [`prompt_recall_eligible`] as `WHERE` conditions over `drawers` aliased `d`. Every
+/// prompt-recall query filters in SQL rather than afterwards, so the rows it drops,
+/// which can outrank or outdate everything else, don't use up its `LIMIT`.
+fn prompt_recall_eligible_sql() -> String {
+    let excluded_rooms = PROMPT_RECALL_EXCLUDED_ROOMS
+        .map(|room| format!("'{room}'"))
+        .join(", ");
+    format!(" AND d.room NOT IN ({excluded_rooms}) AND d.added_by <> '{HOOK_ADDED_BY}'")
 }
 
 /// Cosine-similarity floor for treating two current drawers in one wing/room as
@@ -651,25 +661,26 @@ impl Database {
         self.bm25_search_with_history(query, limit, wing, room, false)
     }
 
-    /// Newest current entries in the `diary` wing, without hook metadata, for the
-    /// prompt hook to match against. Excluding hook rows here rather than in the
-    /// caller keeps them, usually the newest and most numerous, from filling `limit`.
+    /// Newest current entries in the `diary` wing that the recall hook may inject,
+    /// for it to match against the prompt. Hook rows, usually the newest and most
+    /// numerous, would otherwise fill `limit`.
     pub(crate) fn recent_prompt_recall_diary(
         &self,
         limit: usize,
     ) -> Result<Vec<Drawer>, MemoryError> {
         let columns = Self::drawer_projection(&self.conn)?;
+        let eligible = prompt_recall_eligible_sql();
         let current = if Self::has_superseded_by_column(&self.conn)? {
-            " AND superseded_by IS NULL"
+            " AND d.superseded_by IS NULL"
         } else {
             ""
         };
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT {columns} FROM drawers
-             WHERE wing = 'diary' AND added_by <> ?1{current}
-             ORDER BY filed_at DESC, id ASC LIMIT ?2"
+            "SELECT {columns} FROM drawers d
+             WHERE d.wing = 'diary'{eligible}{current}
+             ORDER BY d.filed_at DESC, d.id ASC LIMIT ?1"
         ))?;
-        let rows = stmt.query_map(params![HOOK_ADDED_BY, limit as i64], Self::row_to_drawer)?;
+        let rows = stmt.query_map(params![limit as i64], Self::row_to_drawer)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
@@ -687,20 +698,20 @@ impl Database {
 
     /// BM25 over the drawers the prompt-recall hook may inject: current rows,
     /// optionally in one wing, minus operational collab rooms and hook metadata.
-    /// Filtering in SQL rather than afterwards keeps those rows, which can
-    /// outrank everything else on a prompt's words, from using up `limit`.
     pub(crate) fn prompt_recall_bm25_search(
         &self,
         query: &str,
         limit: usize,
         wing: Option<&str>,
     ) -> Result<Vec<(String, f32)>, MemoryError> {
-        let excluded_rooms = PROMPT_RECALL_EXCLUDED_ROOMS
-            .map(|room| format!("'{room}'"))
-            .join(", ");
-        let eligible =
-            format!(" AND d.room NOT IN ({excluded_rooms}) AND d.added_by <> '{HOOK_ADDED_BY}'");
-        self.bm25_search_filtered(query, limit, wing, None, false, &eligible)
+        self.bm25_search_filtered(
+            query,
+            limit,
+            wing,
+            None,
+            false,
+            &prompt_recall_eligible_sql(),
+        )
     }
 
     /// `extra_filter` is appended to the `WHERE` clause verbatim, so it must be
@@ -1577,6 +1588,36 @@ mod tests {
             .map(|d| d.id)
             .collect();
         assert_eq!(ids, ["old-entry"]);
+    }
+
+    #[test]
+    fn recent_prompt_recall_diary_skips_operational_rooms_before_the_limit() {
+        let db = Database::open_in_memory().unwrap();
+        let emb = dummy_embedding();
+        let insert = |id: &str, room: &str, filed_at: &str| {
+            db.insert_drawer(id, id, &emb, "diary", room, "", "diary")
+                .unwrap();
+            db.conn
+                .execute(
+                    "UPDATE drawers SET filed_at = ?1 WHERE id = ?2",
+                    params![filed_at, id],
+                )
+                .unwrap();
+        };
+        insert("entry", "diary", "2026-01-01");
+        insert("decision", "collab-decisions", "2026-01-02");
+        for room in PROMPT_RECALL_EXCLUDED_ROOMS {
+            insert(room, room, "2026-01-03");
+        }
+
+        // A post-filter over the newest 2 would come back empty.
+        let ids: Vec<String> = db
+            .recent_prompt_recall_diary(2)
+            .unwrap()
+            .into_iter()
+            .map(|d| d.id)
+            .collect();
+        assert_eq!(ids, ["decision", "entry"]);
     }
 
     #[test]
