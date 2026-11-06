@@ -468,6 +468,30 @@ untrusted-memory matches into `hookSpecificOutput.additionalContext`. The local
 path uses FTS5/BM25, then optional KG-triple and diary recall; it never loads
 the embedder. Codex registers no UserPromptSubmit hook.
 
+Recall stays quiet unless the prompt gives it something to go on:
+
+- A prompt with fewer than two content words (`yes`, `go ahead`, `deploy`) skips
+  recall entirely. Function words and common replies don't count as content.
+- The current workspace's memory is preferred, in order: the checkout's, then the
+  repository's, where handoffs and the main checkout's files are. The two differ
+  only in a linked worktree. Each is what is filed in the wing named for its
+  directory, plus every file mined from under that directory, whatever wing mining
+  gave it. Below a non-Git root that is the file's first directory, so `docs/a.md`
+  in `/notes` is in wing `docs` and counts as `/notes`' memory, as does a Git
+  subdirectory mined on its own. Another workspace's `docs` doesn't. A subdirectory
+  of a Git checkout counts as the checkout; outside Git the workspace is the
+  directory itself. A workspace with memory never reaches other wings. One with
+  none does, when the prompt has at least three content words. With no workspace,
+  every wing is searched.
+- Operational collab rooms (`collab-plans`, `collab-task-lists`,
+  `collab-checkpoints`, `collab-drafts`, `collab-messages`) and the diary rows
+  hooks write for themselves are never injected, however they were found.
+- A diary entry is injected only when its excerpt, as injected, shares at least
+  two content words with the prompt, whether a search found it or it is among the
+  newest 50 injectable entries, which are checked on every prompt.
+- Text duplicated across wings, or between a search hit and a diary entry, is
+  injected once. A dropped copy doesn't count against the diary limit.
+
 Hybrid vector recall is opt-in. It only borrows a ready shared daemon over its
 Unix socket. The hook never initializes, starts, or warms a daemon, and never
 opens the daemon database or embedder. A missing/unready daemon, deadline,
@@ -501,7 +525,7 @@ Tunables (all fresh-read per invocation):
 | `IRONMEM_PROMPT_HOOK_KG` | on | `0`, `false`, or `no` disables KG recall; other values use enabled default. |
 | `IRONMEM_PROMPT_HOOK_KG_MAX_TRIPLES` | `3` | KG triples injected; clamped to `1`–`5`. |
 | `IRONMEM_PROMPT_HOOK_DIARY` | on | `0`, `false`, or `no` disables diary recall; other values use enabled default. |
-| `IRONMEM_PROMPT_HOOK_DIARY_MAX` | `1` | Diary excerpts injected; clamped to `1`–`3`. |
+| `IRONMEM_PROMPT_HOOK_DIARY_MAX` | `1` | Matching diary excerpts injected; clamped to `1`–`3`. |
 | `IRONMEM_PROMPT_HOOK_DIARY_LINE_BYTES` | `120` | Byte cap per diary line. |
 
 The hook also supports `IRONMEM_CONTEXT_WARN_PCT` (default `0.60`) and

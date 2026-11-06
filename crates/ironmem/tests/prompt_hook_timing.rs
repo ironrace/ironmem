@@ -471,34 +471,17 @@ fn user_prompt_submit_binary_p95_under_budget_on_10k_drawers() {
         "relevant prompt should inject"
     );
 
-    // `seed_db_file_bulk` now also seeds a diary entry, and diary recall is
-    // unconditional (most-recent N entries, not gated by prompt relevance —
-    // see `hook.rs`'s diary-excerpt section), so an irrelevant prompt still
-    // produces a recall block containing *only* the diary line. The
-    // regression this guards against is BM25/KG noise leaking in for a
-    // prompt that matches nothing: no `excerpt=` (drawer) or `source="kg"`
-    // line should appear.
+    // Diary recall is gated on the prompt (issue #375), so a prompt matching
+    // nothing injects nothing: no drawer, KG, or diary line.
     let (miss, _) = run_prompt_hook_hybrid(
         &db_path,
         &model_dir,
         "zzqqxx nonexistent qwerty",
         &hybrid_socket,
     );
-    let miss_output = miss
-        .get("hookSpecificOutput")
-        .and_then(|h| h.get("additionalContext"))
-        .and_then(|a| a.as_str());
-    let output = miss_output.expect(
-        "diary recall is unconditional and enabled by default; \
-         a miss prompt should still produce a diary-only block",
-    );
     assert!(
-        !output.contains("source=\"bench") && !output.contains("source=\"kg\""),
-        "unrelated prompt should not surface drawer/KG hits: {output}"
-    );
-    assert!(
-        output.contains("source=\"diary\""),
-        "unexpected non-diary output for unrelated prompt: {output}"
+        miss.get("hookSpecificOutput").is_none(),
+        "unrelated prompt should inject nothing: {miss}"
     );
 
     let n = 20;
