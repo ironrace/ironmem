@@ -11,6 +11,8 @@ use ironmem::db::schema::Database;
 use ironrace_embed::embedder::EMBED_DIM;
 use serde_json::Value;
 
+mod git_env;
+
 const CHECKPOINT: &str = "Checkpoint acme/widgets#1 (session 380302a1): Tried: inspected worktree";
 const HOOK_ROW: &str = "Hook stop ran for session 380302a1 summary";
 const MIGRATION_DIARY: &str = "Chose the postgres migration plan with two phases";
@@ -96,11 +98,19 @@ const ROWS: &[(&str, &str, &str, &str, &str)] = &[
     ),
 ];
 
+/// `(ending, wing)` of diary entries that match a prompt only past the point where
+/// the injected excerpt is cut, so BM25 finds them but what would be injected has no
+/// visible connection to the prompt.
+const DEEP_DIARY_ROWS: &[(&str, &str)] = &[
+    ("kafka partition rebalance", "diary"),
+    ("invoice reconciliation", "shop-api"),
+];
+
 fn seed(path: &Path) {
     let db = Database::open(path).unwrap();
     db.migrate().unwrap();
     let zero = vec![0.0f32; EMBED_DIM];
-    for (content, wing, room, added_by, filed_at) in ROWS {
+    let insert = |content: &str, wing: &str, room: &str, added_by: &str, filed_at: &str| {
         let id = generate_id(content, wing, room);
         db.insert_drawer(&id, content, &zero, wing, room, "", added_by)
             .unwrap();
@@ -112,6 +122,13 @@ fn seed(path: &Path) {
             Ok(())
         })
         .unwrap();
+    };
+    for (content, wing, room, added_by, filed_at) in ROWS {
+        insert(content, wing, room, added_by, filed_at);
+    }
+    for (ending, wing) in DEEP_DIARY_ROWS {
+        let content = format!("{}{ending}", "unrelated filler text ".repeat(40));
+        insert(&content, wing, "diary", "diary", "2026-01-15T00:00:00Z");
     }
 }
 
@@ -223,6 +240,10 @@ fn fixed_prompt_set_injects_only_relevant_recall() {
             "the shared runbook escalation steps",
             &[SHARED_RUNBOOK],
         ),
+        // A diary entry BM25 finds only past the excerpt's cut, in the shared diary
+        // wing and in the workspace's own: the text injected would be unrelated.
+        (FRESH, "kafka partition rebalance", &[]),
+        (MINED, "invoice reconciliation", &[]),
     ];
 
     let results: Vec<Vec<String>> = cases
@@ -254,4 +275,130 @@ fn fixed_prompt_set_injects_only_relevant_recall() {
             );
         }
     }
+}
+
+/// Fixture git: scrubbed, and reading no operator config.
+fn git(dir: &Path, args: &[&str]) {
+    let mut command = Command::new("git");
+    git_env::fixture_git_env(&mut command);
+    let output = command
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("git must be available");
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn init_repo(repo: &Path) {
+    std::fs::create_dir_all(repo).unwrap();
+    git(repo, &["init", "-q"]);
+    git(
+        repo,
+        &[
+            "-c",
+            "user.name=fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "init",
+        ],
+    );
+}
+
+fn write_doc(root: &Path, name: &str, content: &str) {
+    let docs = root.join("docs");
+    std::fs::create_dir_all(&docs).unwrap();
+    std::fs::write(docs.join(name), content).unwrap();
+}
+
+/// The real `ironmem mine`, so the wings under test are the ones mining names.
+fn mine(db_path: &Path, root: &Path) {
+    let output = Command::new(env!("CARGO_BIN_EXE_ironmem"))
+        .arg("mine")
+        .arg(root)
+        .env("HOME", db_path.parent().unwrap().join("home"))
+        .env("IRONMEM_DB_PATH", db_path)
+        .env("IRONMEM_MODEL_DIR", db_path.parent().unwrap().join("model"))
+        .env("IRONMEM_EMBED_MODE", "noop")
+        .env("IRONMEM_MCP_MODE", "trusted")
+        .env("IRONMEM_METRICS", "0")
+        .env_remove("IRONMEM_WORKSPACE_ROOT")
+        .env_remove("IRONMEM_DAEMON_SOCKET")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "mine failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn linked_worktree_recalls_what_mining_stored_for_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("memory.sqlite3");
+    let main_checkout = dir.path().join("shop-api");
+    let linked = dir.path().join("feature-x");
+    let other_project = dir.path().join("other-app");
+
+    init_repo(&main_checkout);
+    git(
+        &main_checkout,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feature",
+            linked.to_str().unwrap(),
+        ],
+    );
+    init_repo(&other_project);
+
+    const LINKED_DOC: &str = "The ledger rounding rules keep four decimals";
+    const OTHER_DOC: &str = "Our billing webhook retry policy backs off for an hour";
+    const MAIN_DOC: &str = "The pricing tiers renew on the first of the month";
+    write_doc(&linked, "ledger.md", LINKED_DOC);
+    write_doc(&other_project, "webhooks.md", OTHER_DOC);
+    mine(&db_path, &linked);
+    mine(&db_path, &other_project);
+
+    // The worktree's own two-word match: below the bar for reaching other wings,
+    // so it only appears if the hook searches the wing mining actually wrote.
+    let lines = recall_lines(&db_path, &linked, "ledger rounding");
+    assert_eq!(lines.len(), 1, "{lines:#?}");
+    assert!(
+        lines[0].contains("source=\"feature-x/docs\"") && lines[0].contains(LINKED_DOC),
+        "{lines:#?}"
+    );
+
+    // A subdirectory of the worktree is the same workspace.
+    let lines = recall_lines(&db_path, &linked.join("docs"), "ledger rounding");
+    assert_eq!(lines.len(), 1, "{lines:#?}");
+    assert!(lines[0].contains(LINKED_DOC), "{lines:#?}");
+
+    // The worktree has memory, so another project's match stays out, however
+    // specific the prompt.
+    assert_eq!(
+        recall_lines(&db_path, &linked, "billing webhook retry policy"),
+        Vec::<String>::new()
+    );
+
+    // The repository's wing, shared by every worktree of it, still counts as
+    // this workspace's memory when the worktree's own wing has no hit.
+    write_doc(&main_checkout, "pricing.md", MAIN_DOC);
+    mine(&db_path, &main_checkout);
+    let lines = recall_lines(&db_path, &linked, "pricing tiers");
+    assert_eq!(lines.len(), 1, "{lines:#?}");
+    assert!(
+        lines[0].contains("source=\"shop-api/docs\"") && lines[0].contains(MAIN_DOC),
+        "{lines:#?}"
+    );
 }

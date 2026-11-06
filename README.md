@@ -913,15 +913,18 @@ Recall stays quiet unless the prompt gives it something to go on:
 
 - A prompt with fewer than two content words (`yes`, `go ahead`, `deploy`) skips
   recall entirely. Function words and common replies don't count as content.
-- The current workspace's wing is preferred: the repository's name, as mining
-  names a wing. A workspace with memory of its own never reaches other wings. One
-  with none does, when the prompt has at least three content words. With no
-  workspace, every wing is searched.
+- The current workspace's wings are preferred, in order: the checkout's directory
+  name, which is where mining files it, then the repository's name, where handoffs
+  and the main checkout's files are. The two differ only in a linked worktree. A
+  workspace with memory in either never reaches other wings. One with none does,
+  when the prompt has at least three content words. With no workspace, every wing
+  is searched.
 - Operational collab rooms (`collab-plans`, `collab-task-lists`,
   `collab-checkpoints`, `collab-drafts`, `collab-messages`) and the diary rows
   hooks write for themselves are never injected, from BM25 or vector hits.
-- A diary line appears only when its excerpt, as injected, shares at least two
-  content words with the prompt. The newest 50 non-hook entries are checked.
+- A diary entry is injected only when its excerpt, as injected, shares at least
+  two content words with the prompt, whether a search found it or it is among the
+  newest 50 non-hook entries, which are checked on every prompt.
 - Text duplicated across wings is injected once.
 
 Hybrid recall is opt-in. When enabled, the hook only borrows an already-ready

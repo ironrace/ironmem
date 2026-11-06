@@ -654,7 +654,10 @@ impl Database {
     /// Newest current entries in the `diary` wing, without hook metadata, for the
     /// prompt hook to match against. Excluding hook rows here rather than in the
     /// caller keeps them, usually the newest and most numerous, from filling `limit`.
-    pub fn recent_prompt_recall_diary(&self, limit: usize) -> Result<Vec<Drawer>, MemoryError> {
+    pub(crate) fn recent_prompt_recall_diary(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<Drawer>, MemoryError> {
         let columns = Self::drawer_projection(&self.conn)?;
         let current = if Self::has_superseded_by_column(&self.conn)? {
             " AND superseded_by IS NULL"
@@ -686,7 +689,7 @@ impl Database {
     /// optionally in one wing, minus operational collab rooms and hook metadata.
     /// Filtering in SQL rather than afterwards keeps those rows, which can
     /// outrank everything else on a prompt's words, from using up `limit`.
-    pub fn prompt_recall_bm25_search(
+    pub(crate) fn prompt_recall_bm25_search(
         &self,
         query: &str,
         limit: usize,

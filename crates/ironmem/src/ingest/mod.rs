@@ -283,17 +283,24 @@ fn is_candidate_file(path: &Path) -> bool {
         })
 }
 
+/// The wing mining files a checkout's contents under: the name of the directory
+/// mined, so a linked worktree gets its own rather than its main checkout's. The
+/// prompt hook needs the same name to find them.
+pub(crate) fn checkout_wing(root: &Path) -> String {
+    sanitize_segment(
+        root.file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("workspace"),
+        "workspace",
+    )
+}
+
 fn derive_location(
     root: &Path,
     file_path: &Path,
     root_has_git: bool,
 ) -> Result<(String, String), MemoryError> {
-    let root_name = sanitize_segment(
-        root.file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or("workspace"),
-        "workspace",
-    );
+    let root_name = checkout_wing(root);
     let relative = file_path.strip_prefix(root).map_err(|_| {
         MemoryError::Validation("Failed to compute relative path during mining".into())
     })?;
