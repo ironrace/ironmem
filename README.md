@@ -909,6 +909,21 @@ The ordinary path is local FTS5/BM25, followed by optional KG-triple and
 diary recall; the embedder is never loaded. Codex registers no UserPromptSubmit
 hook.
 
+Recall stays quiet unless the prompt gives it something to go on:
+
+- A prompt with fewer than two content words (`yes`, `go ahead`, `deploy`) skips
+  recall entirely. Function words and common replies don't count as content.
+- The current workspace's wing is preferred: the repository's name, as mining
+  names a wing. A workspace with memory of its own never reaches other wings. One
+  with none does, when the prompt has at least three content words. With no
+  workspace, every wing is searched.
+- Operational collab rooms (`collab-plans`, `collab-task-lists`,
+  `collab-checkpoints`, `collab-drafts`, `collab-messages`) and the diary rows
+  hooks write for themselves are never injected, from BM25 or vector hits.
+- A diary line appears only when its excerpt, as injected, shares at least two
+  content words with the prompt. The newest 50 non-hook entries are checked.
+- Text duplicated across wings is injected once.
+
 Hybrid recall is opt-in. When enabled, the hook only borrows an already-ready
 shared daemon through its Unix socket for vector IDs; it never initializes,
 starts, or warms a daemon and never opens the daemon's database or embedder.
@@ -946,7 +961,7 @@ all recall injection.
 | `IRONMEM_PROMPT_HOOK_KG` | on | Set to `0`, `false`, or `no` to disable KG-triple recall. Other values use the default (enabled). |
 | `IRONMEM_PROMPT_HOOK_KG_MAX_TRIPLES` | `3` | Maximum KG triples injected per prompt. Clamped to `1`–`5`. |
 | `IRONMEM_PROMPT_HOOK_DIARY` | on | Set to `0`, `false`, or `no` to disable diary recall. Other values use the default (enabled). |
-| `IRONMEM_PROMPT_HOOK_DIARY_MAX` | `1` | Maximum diary excerpts injected per prompt. Clamped to `1`–`3`. |
+| `IRONMEM_PROMPT_HOOK_DIARY_MAX` | `1` | Maximum matching diary excerpts injected per prompt. Clamped to `1`–`3`. |
 | `IRONMEM_PROMPT_HOOK_DIARY_LINE_BYTES` | `120` | Byte cap for each injected diary line. |
 | `IRONMEM_CONTEXT_WARN_PCT` | `0.60` | Context-occupancy fraction at which the hook injects a soft warning line (`>= warn`, `< handoff`). Unparseable or outside `0.0..=1.0` falls back to the default. If the resolved warn value `>=` handoff value, both revert to defaults to preserve the `warn < handoff` invariant. Occupancy uses `IRONMEM_CONTEXT_WINDOW` as the denominator. |
 | `IRONMEM_CONTEXT_HANDOFF_PCT` | `0.80` | Context-occupancy fraction at which the hook injects the handoff instruction (`>= handoff`). Same parsing/clamping and `warn < handoff` invariant as above. |

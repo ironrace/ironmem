@@ -468,6 +468,21 @@ untrusted-memory matches into `hookSpecificOutput.additionalContext`. The local
 path uses FTS5/BM25, then optional KG-triple and diary recall; it never loads
 the embedder. Codex registers no UserPromptSubmit hook.
 
+Recall stays quiet unless the prompt gives it something to go on:
+
+- A prompt with fewer than two content words (`yes`, `go ahead`, `deploy`) skips
+  recall entirely. Function words and common replies don't count as content.
+- The current workspace's wing is preferred: the repository's name, as mining
+  names a wing. A workspace with memory of its own never reaches other wings. One
+  with none does, when the prompt has at least three content words. With no
+  workspace, every wing is searched.
+- Operational collab rooms (`collab-plans`, `collab-task-lists`,
+  `collab-checkpoints`, `collab-drafts`, `collab-messages`) and the diary rows
+  hooks write for themselves are never injected, from BM25 or vector hits.
+- A diary line appears only when its excerpt, as injected, shares at least two
+  content words with the prompt. The newest 50 non-hook entries are checked.
+- Text duplicated across wings is injected once.
+
 Hybrid vector recall is opt-in. It only borrows a ready shared daemon over its
 Unix socket. The hook never initializes, starts, or warms a daemon, and never
 opens the daemon database or embedder. A missing/unready daemon, deadline,
@@ -501,7 +516,7 @@ Tunables (all fresh-read per invocation):
 | `IRONMEM_PROMPT_HOOK_KG` | on | `0`, `false`, or `no` disables KG recall; other values use enabled default. |
 | `IRONMEM_PROMPT_HOOK_KG_MAX_TRIPLES` | `3` | KG triples injected; clamped to `1`–`5`. |
 | `IRONMEM_PROMPT_HOOK_DIARY` | on | `0`, `false`, or `no` disables diary recall; other values use enabled default. |
-| `IRONMEM_PROMPT_HOOK_DIARY_MAX` | `1` | Diary excerpts injected; clamped to `1`–`3`. |
+| `IRONMEM_PROMPT_HOOK_DIARY_MAX` | `1` | Matching diary excerpts injected; clamped to `1`–`3`. |
 | `IRONMEM_PROMPT_HOOK_DIARY_LINE_BYTES` | `120` | Byte cap per diary line. |
 
 The hook also supports `IRONMEM_CONTEXT_WARN_PCT` (default `0.60`) and

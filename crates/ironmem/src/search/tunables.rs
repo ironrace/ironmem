@@ -463,7 +463,7 @@ pub fn prompt_hook_diary_enabled() -> bool {
     env_bool("IRONMEM_PROMPT_HOOK_DIARY", true)
 }
 
-/// Max diary entries injected per prompt. Default 1, clamped to 1..=3.
+/// Max prompt-matching diary entries injected per prompt. Default 1, clamped to 1..=3.
 pub fn prompt_hook_diary_max() -> usize {
     env_usize("IRONMEM_PROMPT_HOOK_DIARY_MAX", 1).clamp(1, 3)
 }

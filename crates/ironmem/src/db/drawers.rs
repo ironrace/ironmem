@@ -43,6 +43,28 @@ pub(crate) const PREF_SENTINEL: &str = "pref:";
 /// references and must not be discoverable through generic memory search.
 const COLLAB_MESSAGE_ROOM: &str = "collab-messages";
 
+/// `added_by` of the diary rows hooks write for themselves ("Hook stop ran for
+/// ..."): lifecycle metadata, never something to recall into a prompt.
+pub(crate) const HOOK_ADDED_BY: &str = "hook";
+
+/// Rooms of operational collab artifacts (session plans, task lists, checkpoints,
+/// drafts and transport). Exact names on purpose: durable notes in rooms such as
+/// `collab-decisions` stay recallable.
+const PROMPT_RECALL_EXCLUDED_ROOMS: [&str; 5] = [
+    "collab-plans",
+    "collab-task-lists",
+    "collab-checkpoints",
+    "collab-drafts",
+    COLLAB_MESSAGE_ROOM,
+];
+
+/// Whether a drawer may be injected into a prompt by the recall hook. The vector
+/// path's counterpart to [`Database::prompt_recall_bm25_search`]'s SQL filter.
+pub(crate) fn prompt_recall_eligible(drawer: &Drawer) -> bool {
+    !PROMPT_RECALL_EXCLUDED_ROOMS.contains(&drawer.room.as_str())
+        && drawer.added_by != HOOK_ADDED_BY
+}
+
 /// Cosine-similarity floor for treating two current drawers in one wing/room as
 /// near duplicates. Tuned for the `EMBED_DIM`-wide vectors the bundled embedder
 /// produces; swapping the embedding model invalidates this constant.
@@ -629,6 +651,25 @@ impl Database {
         self.bm25_search_with_history(query, limit, wing, room, false)
     }
 
+    /// Newest current entries in the `diary` wing, without hook metadata, for the
+    /// prompt hook to match against. Excluding hook rows here rather than in the
+    /// caller keeps them, usually the newest and most numerous, from filling `limit`.
+    pub fn recent_prompt_recall_diary(&self, limit: usize) -> Result<Vec<Drawer>, MemoryError> {
+        let columns = Self::drawer_projection(&self.conn)?;
+        let current = if Self::has_superseded_by_column(&self.conn)? {
+            " AND superseded_by IS NULL"
+        } else {
+            ""
+        };
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {columns} FROM drawers
+             WHERE wing = 'diary' AND added_by <> ?1{current}
+             ORDER BY filed_at DESC, id ASC LIMIT ?2"
+        ))?;
+        let rows = stmt.query_map(params![HOOK_ADDED_BY, limit as i64], Self::row_to_drawer)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     /// BM25 full-text search with optional retained-history inclusion.
     pub fn bm25_search_with_history(
         &self,
@@ -637,6 +678,38 @@ impl Database {
         wing: Option<&str>,
         room: Option<&str>,
         include_superseded: bool,
+    ) -> Result<Vec<(String, f32)>, MemoryError> {
+        self.bm25_search_filtered(query, limit, wing, room, include_superseded, "")
+    }
+
+    /// BM25 over the drawers the prompt-recall hook may inject: current rows,
+    /// optionally in one wing, minus operational collab rooms and hook metadata.
+    /// Filtering in SQL rather than afterwards keeps those rows, which can
+    /// outrank everything else on a prompt's words, from using up `limit`.
+    pub fn prompt_recall_bm25_search(
+        &self,
+        query: &str,
+        limit: usize,
+        wing: Option<&str>,
+    ) -> Result<Vec<(String, f32)>, MemoryError> {
+        let excluded_rooms = PROMPT_RECALL_EXCLUDED_ROOMS
+            .map(|room| format!("'{room}'"))
+            .join(", ");
+        let eligible =
+            format!(" AND d.room NOT IN ({excluded_rooms}) AND d.added_by <> '{HOOK_ADDED_BY}'");
+        self.bm25_search_filtered(query, limit, wing, None, false, &eligible)
+    }
+
+    /// `extra_filter` is appended to the `WHERE` clause verbatim, so it must be
+    /// built from constants and never from caller input.
+    fn bm25_search_filtered(
+        &self,
+        query: &str,
+        limit: usize,
+        wing: Option<&str>,
+        room: Option<&str>,
+        include_superseded: bool,
+        extra_filter: &str,
     ) -> Result<Vec<(String, f32)>, MemoryError> {
         if query.trim().is_empty() {
             return Ok(vec![]);
@@ -663,7 +736,7 @@ impl Database {
                     "SELECT drawers_fts.drawer_id, -bm25(drawers_fts) AS score
                  FROM drawers_fts
                  JOIN drawers d ON d.id = drawers_fts.drawer_id
-                 WHERE drawers_fts MATCH ?1 AND d.wing = ?3 AND d.room = ?4{supersession_filter}
+                 WHERE drawers_fts MATCH ?1 AND d.wing = ?3 AND d.room = ?4{supersession_filter}{extra_filter}
                  ORDER BY score DESC LIMIT ?2"
                 )
             }
@@ -672,7 +745,7 @@ impl Database {
                     "SELECT drawers_fts.drawer_id, -bm25(drawers_fts) AS score
                  FROM drawers_fts
                  JOIN drawers d ON d.id = drawers_fts.drawer_id
-                 WHERE drawers_fts MATCH ?1 AND d.wing = ?3{supersession_filter}
+                 WHERE drawers_fts MATCH ?1 AND d.wing = ?3{supersession_filter}{extra_filter}
                  ORDER BY score DESC LIMIT ?2"
                 )
             }
@@ -681,7 +754,7 @@ impl Database {
                     "SELECT drawers_fts.drawer_id, -bm25(drawers_fts) AS score
                  FROM drawers_fts
                  JOIN drawers d ON d.id = drawers_fts.drawer_id
-                 WHERE drawers_fts MATCH ?1 AND d.room = ?3{supersession_filter}
+                 WHERE drawers_fts MATCH ?1 AND d.room = ?3{supersession_filter}{extra_filter}
                  ORDER BY score DESC LIMIT ?2"
                 )
             }
@@ -690,7 +763,7 @@ impl Database {
                     "SELECT drawers_fts.drawer_id, -bm25(drawers_fts) AS score
                  FROM drawers_fts
                  JOIN drawers d ON d.id = drawers_fts.drawer_id
-                 WHERE drawers_fts MATCH ?1{supersession_filter}
+                 WHERE drawers_fts MATCH ?1{supersession_filter}{extra_filter}
                  ORDER BY score DESC LIMIT ?2"
                 )
             }
@@ -1401,6 +1474,106 @@ mod tests {
         assert_eq!(history_ids.len(), 2);
         assert!(history_ids.contains(&predecessor.to_string()));
         assert!(history_ids.contains(&successor.to_string()));
+    }
+
+    #[test]
+    fn prompt_recall_bm25_excludes_operational_rooms_and_hook_rows_before_the_limit() {
+        let db = Database::open_in_memory().unwrap();
+        let emb = dummy_embedding();
+        let insert = |content: &str, wing: &str, room: &str, added_by: &str| {
+            let id = generate_id(content, wing, room);
+            db.insert_drawer(&id, content, &emb, wing, room, "", added_by)
+                .unwrap();
+            id
+        };
+        for room in PROMPT_RECALL_EXCLUDED_ROOMS {
+            for n in 0..3 {
+                insert(
+                    &format!("needle needle needle {n}"),
+                    "alpha",
+                    room,
+                    "collab",
+                );
+            }
+        }
+        insert("needle needle needle hook", "alpha", "diary", HOOK_ADDED_BY);
+        let durable = insert(
+            "needle in a much longer durable note",
+            "alpha",
+            "notes",
+            "mcp",
+        );
+        let decisions = insert(
+            "needle in a longer durable decision",
+            "alpha",
+            "collab-decisions",
+            "mcp",
+        );
+        let other_wing = insert("needle in another wing's note", "beta", "notes", "mcp");
+
+        let ids = |wing: Option<&str>| -> Vec<String> {
+            db.prompt_recall_bm25_search("needle", 3, wing)
+                .unwrap()
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect()
+        };
+
+        // A post-filter over the top 3 would come back empty: every excluded row
+        // outranks every eligible one.
+        let mut scoped = ids(Some("alpha"));
+        scoped.sort();
+        let mut expected = vec![durable.clone(), decisions.clone()];
+        expected.sort();
+        assert_eq!(scoped, expected);
+
+        let unscoped = ids(None);
+        assert_eq!(unscoped.len(), 3);
+        assert!(unscoped.contains(&other_wing));
+    }
+
+    #[test]
+    fn recent_prompt_recall_diary_skips_hook_rows_before_the_limit() {
+        let db = Database::open_in_memory().unwrap();
+        let emb = dummy_embedding();
+        let insert = |id: &str, wing: &str, added_by: &str, filed_at: &str| {
+            db.insert_drawer(id, id, &emb, wing, "diary", "", added_by)
+                .unwrap();
+            db.conn
+                .execute(
+                    "UPDATE drawers SET filed_at = ?1 WHERE id = ?2",
+                    params![filed_at, id],
+                )
+                .unwrap();
+        };
+        insert("old-entry", "diary", "diary", "2026-01-01");
+        insert("newer-entry", "diary", "diary", "2026-01-02");
+        insert("project-entry", "shop", "diary", "2026-01-03");
+        insert("hook-1", "diary", HOOK_ADDED_BY, "2026-01-04");
+        insert("hook-2", "diary", HOOK_ADDED_BY, "2026-01-05");
+
+        let ids: Vec<String> = db
+            .recent_prompt_recall_diary(2)
+            .unwrap()
+            .into_iter()
+            .map(|d| d.id)
+            .collect();
+        assert_eq!(ids, ["newer-entry", "old-entry"]);
+
+        // A superseded entry is history, not something to recall.
+        db.conn
+            .execute(
+                "UPDATE drawers SET superseded_by = 'old-entry' WHERE id = 'newer-entry'",
+                [],
+            )
+            .unwrap();
+        let ids: Vec<String> = db
+            .recent_prompt_recall_diary(2)
+            .unwrap()
+            .into_iter()
+            .map(|d| d.id)
+            .collect();
+        assert_eq!(ids, ["old-entry"]);
     }
 
     #[test]

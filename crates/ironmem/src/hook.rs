@@ -833,9 +833,15 @@ fn run_user_prompt_submit(
     // best-effort. Reserving the same 30ms a second time here would halve hybrid's
     // window whenever occupancy sampling is active, with no corresponding benefit.
     if let Some(prompt) = input.get("prompt").and_then(|v| v.as_str()) {
-        if !prompt.trim().is_empty() && !budget.is_zero() {
-            if let Some(ctx) = search_prompt_context(&config.db_path, prompt, start, budget, hybrid)
-            {
+        if !is_trivial_prompt(prompt) && !budget.is_zero() {
+            if let Some(ctx) = search_prompt_context(
+                &config.db_path,
+                prompt,
+                workspace_root,
+                start,
+                budget,
+                hybrid,
+            ) {
                 response.hook_specific_output = Some(HookSpecificOutput::user_prompt_submit(ctx));
             }
         }
@@ -918,6 +924,7 @@ fn prompt_occupancy_sample_allowed(
 fn search_prompt_context(
     db_path: &Path,
     prompt: &str,
+    workspace_root: Option<&Path>,
     start: Instant,
     budget: Duration,
     hybrid: Option<HybridRecallConfig>,
@@ -958,9 +965,18 @@ fn search_prompt_context(
     let (tx, rx) = std::sync::mpsc::channel();
     let db_path = db_path.to_path_buf();
     let prompt = prompt.to_string();
+    let workspace_root = workspace_root.map(Path::to_path_buf);
     let worker_budget = budget.checked_sub(start.elapsed()).unwrap_or_default();
     std::thread::spawn(move || {
-        let result = prompt_recall_block(&db_path, &prompt, worker_budget, local_vector_handoff);
+        // Spawns git, so it runs here: the `recv_timeout` below bounds a slow one.
+        let workspace_wing = workspace_root.as_deref().and_then(repository_name);
+        let result = prompt_recall_block(
+            &db_path,
+            &prompt,
+            workspace_wing.as_deref(),
+            worker_budget,
+            local_vector_handoff,
+        );
         let _ = tx.send(result); // receiver gone (timed out) → drop silently
     });
 
@@ -979,14 +995,17 @@ fn search_prompt_context(
 fn prompt_recall_block(
     db_path: &Path,
     prompt: &str,
+    workspace_wing: Option<&str>,
     busy: Duration,
     vector: Option<VectorHandoff>,
 ) -> Option<String> {
     let db = crate::db::schema::Database::open_with_busy_timeout(db_path, busy).ok()?;
     let config = RecallConfig::from_tunables();
     match vector {
-        Some(handoff) => recall_block_from_vector_handoff(&db, prompt, &config, handoff),
-        None => recall_block_from_db(&db, prompt, &config),
+        Some(handoff) => {
+            recall_block_from_vector_handoff(&db, prompt, &config, workspace_wing, handoff)
+        }
+        None => recall_block_from_db(&db, prompt, &config, workspace_wing),
     }
 }
 
@@ -1021,56 +1040,184 @@ impl RecallConfig {
     }
 }
 
-/// Format the recall block from an open DB and explicit tunables: BM25, filter
-/// by `config.bm25_floor`, take top-`config.max_hits`, sanitize each hit to
-/// one ≤`config.line_bytes` line; then, if `config.kg_enabled`, append up to
-/// `config.kg_max_triples` KG triples for entities mentioned in `prompt`;
-/// finally, if `config.diary_enabled`, append up to `config.diary_max`
-/// most-recent diary excerpts (each capped to `config.diary_line_bytes`).
+/// Format the recall block from an open DB and explicit tunables: BM25 scoped by
+/// [`bm25_qualifying`], filter by `config.bm25_floor`, take top-`config.max_hits`,
+/// sanitize each hit to one ≤`config.line_bytes` line; then, if `config.kg_enabled`,
+/// append up to `config.kg_max_triples` KG triples for entities mentioned in
+/// `prompt`; finally, if `config.diary_enabled`, append up to `config.diary_max`
+/// recent diary excerpts that match the prompt (see [`diary_excerpt_matches`]).
 fn recall_block_from_db(
     db: &crate::db::schema::Database,
     prompt: &str,
     config: &RecallConfig,
+    workspace_wing: Option<&str>,
 ) -> Option<String> {
-    let qualifying = bm25_qualifying(db, prompt, config)?;
-    recall_block_from_qualifying(db, prompt, config, qualifying, None)
+    let qualifying = bm25_qualifying(db, prompt, config, workspace_wing)?;
+    recall_block_from_qualifying(db, prompt, config, workspace_wing, qualifying, None)
 }
 
 fn recall_block_from_vector_handoff(
     db: &crate::db::schema::Database,
     prompt: &str,
     config: &RecallConfig,
+    workspace_wing: Option<&str>,
     handoff: VectorHandoff,
 ) -> Option<String> {
-    let qualifying = bm25_qualifying(db, prompt, config)?;
+    let qualifying = bm25_qualifying(db, prompt, config, workspace_wing)?;
     recall_block_from_qualifying_with_vector_poll(
         db,
         prompt,
         config,
+        workspace_wing,
         qualifying,
         None,
         Some(&handoff),
     )
 }
 
+/// BM25 hits eligible for injection. The workspace's own wing wins outright; other
+/// wings are searched only when [`cross_wing_recall_allowed`]. With no workspace
+/// wing there is nothing to prefer, so every wing is searched.
 fn bm25_qualifying(
     db: &crate::db::schema::Database,
     prompt: &str,
     config: &RecallConfig,
+    workspace_wing: Option<&str>,
 ) -> Option<Vec<(String, f32)>> {
-    let scored = match db.bm25_search(prompt, config.max_hits * 3, None, None) {
-        Ok(scored) => scored,
-        Err(e) => {
-            tracing::warn!("prompt-hook recall: BM25 query failed: {e}");
-            return None;
+    let search = |wing: Option<&str>| -> Option<Vec<(String, f32)>> {
+        match db.prompt_recall_bm25_search(prompt, config.max_hits * 3, wing) {
+            Ok(scored) => Some(
+                scored
+                    .into_iter()
+                    .filter(|(_, score)| *score >= config.bm25_floor)
+                    .collect(),
+            ),
+            Err(e) => {
+                tracing::warn!("prompt-hook recall: BM25 query failed: {e}");
+                None
+            }
         }
     };
-    Some(
-        scored
-            .into_iter()
-            .filter(|(_, score)| *score >= config.bm25_floor)
-            .collect(),
-    )
+    if let Some(wing) = workspace_wing {
+        let scoped = search(Some(wing))?;
+        if !scoped.is_empty() || !cross_wing_recall_allowed(db, prompt, wing) {
+            return Some(scoped);
+        }
+    }
+    search(None)
+}
+
+/// Hybrid-path counterpart of [`bm25_qualifying`]'s scoping, for the vector ids,
+/// which arrive from the daemon with no wing or room filter: drop what may not be
+/// injected, then apply the same workspace preference to what is left.
+fn scope_recall_candidates(
+    db: &crate::db::schema::Database,
+    candidates: &mut std::collections::HashMap<String, crate::db::drawers::Drawer>,
+    prompt: &str,
+    workspace_wing: Option<&str>,
+) {
+    candidates.retain(|_, drawer| crate::db::drawers::prompt_recall_eligible(drawer));
+    let Some(wing) = workspace_wing else {
+        return;
+    };
+    if candidates.values().any(|drawer| drawer.wing == wing) {
+        candidates.retain(|_, drawer| drawer.wing == wing);
+    } else if !cross_wing_recall_allowed(db, prompt, wing) {
+        candidates.clear();
+    }
+}
+
+/// Words that say nothing about what a prompt is after: function words,
+/// acknowledgements and one-word replies. Sorted for `binary_search`.
+const PROMPT_RECALL_STOPWORDS: &[&str] = &[
+    "a", "about", "after", "again", "agree", "agreed", "ahead", "all", "alright", "also", "am",
+    "an", "and", "any", "are", "as", "at", "awesome", "be", "because", "been", "before", "both",
+    "but", "by", "can", "can't", "cancel", "continue", "cool", "could", "did", "didn't", "do",
+    "does", "doesn't", "don't", "done", "either", "fine", "first", "for", "from", "get", "go",
+    "good", "got", "great", "had", "has", "have", "he", "hello", "her", "here", "hey", "hi", "him",
+    "his", "how", "i", "i'm", "if", "in", "into", "is", "isn't", "it", "it's", "its", "just",
+    "last", "let", "let's", "lgtm", "look", "looks", "maybe", "me", "more", "my", "nah", "need",
+    "neither", "next", "nice", "no", "nope", "not", "now", "of", "ok", "okay", "on", "one", "only",
+    "option", "or", "our", "out", "perfect", "please", "proceed", "right", "same", "second", "she",
+    "should", "so", "some", "sounds", "stop", "sure", "thank", "thanks", "that", "that's", "the",
+    "their", "them", "then", "there", "these", "they", "this", "those", "to", "too", "try", "two",
+    "up", "us", "use", "wait", "want", "was", "we", "were", "what", "what's", "when", "where",
+    "which", "who", "why", "will", "with", "won't", "would", "yeah", "yep", "yes", "you", "your",
+];
+
+/// A prompt needs at least this many content words for recall to run at all. One
+/// word, even an unlisted one like `deploy`, is a reply and not a query: as a bare
+/// FTS term it matches hundreds of rows on no signal.
+const PROMPT_RECALL_MIN_CONTENT_WORDS: usize = 2;
+
+/// Content words a prompt needs before other projects' memory may be injected into a
+/// workspace with none of its own. Two words like `run tests` match hundreds of rows
+/// in a large store.
+const PROMPT_RECALL_CROSS_WING_MIN_CONTENT_WORDS: usize = 3;
+
+/// Content words a diary excerpt must share with the prompt.
+const PROMPT_RECALL_DIARY_MIN_SHARED_WORDS: usize = 2;
+
+/// Newest non-hook diary entries the prompt is matched against.
+const PROMPT_RECALL_DIARY_SCAN: usize = 50;
+
+/// The distinct lowercase words of `text` that carry meaning: not stopwords, and
+/// neither a single character nor a short number (`option 2`). Numbers of three
+/// digits or more stay, since they are issue numbers and ports.
+fn prompt_content_words(text: &str) -> std::collections::HashSet<String> {
+    text.to_lowercase()
+        .replace('\u{2019}', "'")
+        .split(|c: char| !c.is_alphanumeric() && c != '\'')
+        .map(|word| word.trim_matches('\''))
+        .filter(|word| {
+            let min_chars = if word.chars().all(char::is_numeric) {
+                3
+            } else {
+                2
+            };
+            word.chars().count() >= min_chars
+                && PROMPT_RECALL_STOPWORDS.binary_search(word).is_err()
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+/// Whether a prompt is too slight to recall against, like `yes` or `go ahead`. A
+/// non-ASCII word is enough on its own: scripts written without spaces arrive as a
+/// single "word", however long the sentence.
+fn is_trivial_prompt(prompt: &str) -> bool {
+    let words = prompt_content_words(prompt);
+    words.len() < PROMPT_RECALL_MIN_CONTENT_WORDS && words.iter().all(|word| word.is_ascii())
+}
+
+/// Whether another project's memory may be injected for a prompt the workspace's own
+/// wing has no hit for. Never in a workspace that has memory: there, a miss means the
+/// prompt isn't about anything recorded, and what other projects match on its common
+/// words is the noise this hook exists to avoid. An unreadable count fails closed.
+fn cross_wing_recall_allowed(
+    db: &crate::db::schema::Database,
+    prompt: &str,
+    workspace_wing: &str,
+) -> bool {
+    prompt_content_words(prompt).len() >= PROMPT_RECALL_CROSS_WING_MIN_CONTENT_WORDS
+        && match db.count_drawers(Some(workspace_wing)) {
+            Ok(count) => count == 0,
+            Err(e) => {
+                tracing::warn!("prompt-hook recall: workspace drawer count failed: {e}");
+                false
+            }
+        }
+}
+
+/// Whether a diary excerpt, exactly as it would be injected, relates to the prompt.
+/// Matching the excerpt and not the whole entry is deliberate: entries run to
+/// kilobytes and share a couple of common words with most prompts, and a match past
+/// the cut would inject a line with no visible connection to the prompt.
+fn diary_excerpt_matches(prompt_words: &std::collections::HashSet<String>, excerpt: &str) -> bool {
+    let shared = prompt_content_words(excerpt)
+        .intersection(prompt_words)
+        .count();
+    shared >= PROMPT_RECALL_DIARY_MIN_SHARED_WORDS.min(prompt_words.len()) && shared > 0
 }
 
 /// Top `max_hits` BM25-qualifying ids, sorted for stable output. `qualifying`
@@ -1091,6 +1238,7 @@ fn recall_block_from_qualifying(
     db: &crate::db::schema::Database,
     prompt: &str,
     config: &RecallConfig,
+    workspace_wing: Option<&str>,
     qualifying: Vec<(String, f32)>,
     vector_ids: Option<&[String]>,
 ) -> Option<String> {
@@ -1098,6 +1246,7 @@ fn recall_block_from_qualifying(
         db,
         prompt,
         config,
+        workspace_wing,
         qualifying,
         vector_ids.map(|ids| Some(ids.to_vec())),
         None,
@@ -1162,6 +1311,7 @@ fn recall_block_from_qualifying_with_vector_poll(
     db: &crate::db::schema::Database,
     prompt: &str,
     config: &RecallConfig,
+    workspace_wing: Option<&str>,
     qualifying: Vec<(String, f32)>,
     initial_vector_response: Option<Option<Vec<String>>>,
     vector: Option<&VectorHandoff>,
@@ -1254,18 +1404,26 @@ fn recall_block_from_qualifying_with_vector_poll(
         }
     }
 
-    // Diary excerpt recall
+    // Diary excerpt recall. Ids are kept so that an entry BM25 also found renders once.
+    let mut diary_lines: Vec<(String, String)> = Vec::new();
     if diary_enabled {
-        match db.get_drawers(Some("diary"), None, diary_max) {
+        match db.recent_prompt_recall_diary(PROMPT_RECALL_DIARY_SCAN) {
             Ok(entries) => {
+                let prompt_words = prompt_content_words(prompt);
                 for d in &entries {
+                    if diary_lines.len() >= diary_max {
+                        break;
+                    }
                     let excerpt = compact_excerpt(&d.content, diary_line_bytes);
-                    if !excerpt.is_empty() {
+                    if diary_excerpt_matches(&prompt_words, &excerpt) {
                         if let (Ok(date), Ok(excerpt)) = (
                             serde_json::to_string(&d.date),
                             serde_json::to_string(&excerpt),
                         ) {
-                            lines.push(format!("- source=\"diary\" date={date} excerpt={excerpt}"));
+                            diary_lines.push((
+                                d.id.clone(),
+                                format!("- source=\"diary\" date={date} excerpt={excerpt}"),
+                            ));
                         }
                     }
                 }
@@ -1294,13 +1452,14 @@ fn recall_block_from_qualifying_with_vector_poll(
             }
         }
         let lookup_refs: Vec<&str> = lookup_ids.iter().map(String::as_str).collect();
-        let fetched = match db.get_drawers_by_ids_filtered(&lookup_refs, None, None, false) {
+        let mut fetched = match db.get_drawers_by_ids_filtered(&lookup_refs, None, None, false) {
             Ok(drawers) => drawers,
             Err(e) => {
                 tracing::warn!("prompt-hook recall: drawer fetch failed: {e}");
                 return None;
             }
         };
+        scope_recall_candidates(db, &mut fetched, prompt, workspace_wing);
         let current_bm25_ids: Vec<String> = bm25_ids
             .iter()
             .filter(|id| fetched.contains_key(*id))
@@ -1352,10 +1511,12 @@ fn recall_block_from_qualifying_with_vector_poll(
     };
 
     let mut drawer_lines = Vec::new();
-    for id in selected_ids {
-        if let Some(d) = drawers.get(&id) {
+    // The same file mined into two wings would otherwise inject the same text twice.
+    let mut seen_excerpts = std::collections::HashSet::new();
+    for id in &selected_ids {
+        if let Some(d) = drawers.get(id) {
             let excerpt = compact_excerpt(&d.content, line_bytes);
-            if !excerpt.is_empty() {
+            if !excerpt.is_empty() && seen_excerpts.insert(excerpt.clone()) {
                 let wing = compact_excerpt(&d.wing, PROMPT_RECALL_LABEL_BYTES);
                 let room = compact_excerpt(&d.room, PROMPT_RECALL_LABEL_BYTES);
                 let source = serde_json::to_string(&format!("{wing}/{room}")).ok()?;
@@ -1365,6 +1526,12 @@ fn recall_block_from_qualifying_with_vector_poll(
         }
     }
     drawer_lines.extend(lines);
+    drawer_lines.extend(
+        diary_lines
+            .into_iter()
+            .filter(|(id, _)| !selected_ids.contains(id))
+            .map(|(_, line)| line),
+    );
     lines = drawer_lines;
 
     if lines.is_empty() {
@@ -1466,7 +1633,13 @@ fn read_transcript_tail(path: &Path) -> Option<String> {
 }
 
 fn persist_diary_summary(app: &App, content: &str) -> Result<(), MemoryError> {
-    let _ = diary::write_entry(app, content, "diary", "hook", 8_000)?;
+    let _ = diary::write_entry(
+        app,
+        content,
+        "diary",
+        crate::db::drawers::HOOK_ADDED_BY,
+        8_000,
+    )?;
     Ok(())
 }
 
@@ -4221,6 +4394,7 @@ mod tests {
             &db,
             "ignored",
             &config,
+            None,
             vec![
                 (stale_one_id, 1.0),
                 (stale_two_id, 1.0),
@@ -4237,6 +4411,7 @@ mod tests {
             &db,
             "ignored",
             &config,
+            None,
             vec![
                 (lexical_id, 1.0),
                 (bm25_one_id, 1.0),
@@ -4773,7 +4948,7 @@ mod tests {
             diary_max: 1,
             diary_line_bytes: 120,
         };
-        let block = recall_block_from_db(&db, q, &config)
+        let block = recall_block_from_db(&db, q, &config, None)
             .expect("strong match still injects above the floor");
         assert_eq!(
             injected_source_rooms(&block),
@@ -4786,7 +4961,7 @@ mod tests {
             ..config
         };
         assert!(
-            recall_block_from_db(&db, q, &above_floor_config).is_none(),
+            recall_block_from_db(&db, q, &above_floor_config, None).is_none(),
             "floor above all scores yields no recall block"
         );
     }
@@ -4844,7 +5019,8 @@ mod tests {
             diary_max: 1,
             diary_line_bytes: 120,
         };
-        let block = recall_block_from_db(&db, q, &config).expect("five matches → recall injects");
+        let block =
+            recall_block_from_db(&db, q, &config, None).expect("five matches → recall injects");
         let injected = injected_source_rooms(&block);
         assert_eq!(injected.len(), 3, "max_hits caps the block at 3: {block}");
         assert_eq!(
@@ -4877,7 +5053,7 @@ mod tests {
             diary_max: 1,
             diary_line_bytes: 120,
         };
-        let block = recall_block_from_db(&db, "alpha beta", &config).expect("match injects");
+        let block = recall_block_from_db(&db, "alpha beta", &config, None).expect("match injects");
         let summary = block
             .lines()
             .find(|l| l.starts_with("- "))
@@ -4938,7 +5114,7 @@ mod tests {
             diary_max: 1,
             diary_line_bytes: 120,
         };
-        let block = recall_block_from_db(&db, "how does pgbouncer work", &config).unwrap();
+        let block = recall_block_from_db(&db, "how does pgbouncer work", &config, None).unwrap();
         assert!(
             block.contains("source=\"kg\""),
             "KG triple should be included: {block}"
@@ -4995,7 +5171,7 @@ mod tests {
             diary_max: 1,
             diary_line_bytes: 120,
         };
-        let block = recall_block_from_db(&db, "how does pgbouncer work", &config).unwrap();
+        let block = recall_block_from_db(&db, "how does pgbouncer work", &config, None).unwrap();
         assert!(
             !block.contains("source=\"kg\""),
             "KG should not appear when disabled: {block}"
@@ -5037,7 +5213,7 @@ mod tests {
             diary_max: 1,
             diary_line_bytes: 120,
         };
-        let block = recall_block_from_db(&db, "how does pgbouncer work", &config);
+        let block = recall_block_from_db(&db, "how does pgbouncer work", &config, None);
         let block = block.expect("KG hit should produce recall even without BM25 matches");
         assert!(
             block.contains("source=\"kg\""),
@@ -5081,7 +5257,7 @@ mod tests {
             diary_max: 1,
             diary_line_bytes: 120,
         };
-        let block = recall_block_from_db(&db, "auth middleware deployment", &config).unwrap();
+        let block = recall_block_from_db(&db, "auth middleware deployment", &config, None).unwrap();
         assert!(
             block.contains("source=\"diary\""),
             "diary excerpt should appear: {block}"
@@ -5090,6 +5266,257 @@ mod tests {
             block.contains("auth middleware"),
             "diary content should appear: {block}"
         );
+    }
+
+    fn recall_test_config() -> RecallConfig {
+        RecallConfig {
+            bm25_floor: 0.0,
+            max_hits: 3,
+            line_bytes: 120,
+            kg_enabled: false,
+            kg_max_triples: 3,
+            diary_enabled: true,
+            diary_max: 1,
+            diary_line_bytes: 120,
+        }
+    }
+
+    fn insert_recall_drawer(
+        db: &crate::db::schema::Database,
+        content: &str,
+        wing: &str,
+        room: &str,
+        added_by: &str,
+    ) -> String {
+        let zero = vec![0.0f32; ironrace_embed::embedder::EMBED_DIM];
+        let id = generate_id(content, wing, room);
+        db.insert_drawer(&id, content, &zero, wing, room, "", added_by)
+            .unwrap();
+        id
+    }
+
+    #[test]
+    fn prompt_recall_stopwords_stay_sorted_for_binary_search() {
+        assert!(PROMPT_RECALL_STOPWORDS.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[test]
+    fn trivial_prompts_are_replies_and_function_words_only() {
+        for prompt in [
+            "",
+            "   \t\n ",
+            "yes",
+            "YES!",
+            "ok",
+            "k",
+            "continue",
+            "go ahead",
+            "yes, do it",
+            "thanks!",
+            "looks good to me",
+            "option 2",
+            "don\u{2019}t",
+            "deploy",
+            "42",
+        ] {
+            assert!(is_trivial_prompt(prompt), "should be trivial: {prompt:?}");
+        }
+        for prompt in [
+            "auth middleware",
+            "how does pgbouncer work",
+            "what did we decide about 375 retries",
+            "fix ci",
+            // One whitespace-free "word" can be a whole sentence in these scripts.
+            "\u{5982}\u{4f55}\u{914d}\u{7f6e}\u{8fde}\u{63a5}\u{6c60}",
+        ] {
+            assert!(!is_trivial_prompt(prompt), "should recall: {prompt:?}");
+        }
+    }
+
+    #[test]
+    fn recall_stays_in_a_workspace_with_memory_and_falls_back_only_from_one_without() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::schema::Database::open(&dir.path().join("m.sqlite3")).unwrap();
+        db.migrate().unwrap();
+        let mut config = recall_test_config();
+        config.diary_enabled = false;
+        insert_recall_drawer(&db, "ledger rounding rules", "shop", "docs", "mine");
+        insert_recall_drawer(&db, "ledger rounding elsewhere", "other", "docs", "mine");
+        insert_recall_drawer(&db, "webhook retry policy notes", "other", "docs", "mine");
+
+        let block = recall_block_from_db(&db, "ledger rounding", &config, Some("shop")).unwrap();
+        assert!(block.contains("shop/docs"), "{block}");
+        assert!(!block.contains("other/docs"), "{block}");
+
+        // A workspace with memory never reaches other projects, however specific.
+        assert_eq!(
+            recall_block_from_db(&db, "webhook retry policy", &config, Some("shop")),
+            None
+        );
+
+        // A workspace with none: a specific prompt may, a vague one may not.
+        let block =
+            recall_block_from_db(&db, "webhook retry policy", &config, Some("fresh")).unwrap();
+        assert!(block.contains("other/docs"), "{block}");
+        assert_eq!(
+            recall_block_from_db(&db, "webhook retry", &config, Some("fresh")),
+            None
+        );
+
+        // With no workspace there is nothing to prefer: every wing stays searchable.
+        let block = recall_block_from_db(&db, "webhook retry", &config, None).unwrap();
+        assert!(block.contains("other/docs"), "{block}");
+    }
+
+    #[test]
+    fn vector_hits_get_the_same_scoping_as_bm25_hits() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::schema::Database::open(&dir.path().join("m.sqlite3")).unwrap();
+        db.migrate().unwrap();
+        let mut config = recall_test_config();
+        config.diary_enabled = false;
+        let plan = insert_recall_drawer(&db, "vector plan row", "shop", "collab-plans", "collab");
+        let hook = insert_recall_drawer(&db, "vector hook row", "diary", "diary", "hook");
+        let other = insert_recall_drawer(&db, "vector other row", "other", "docs", "mine");
+        let own = insert_recall_drawer(&db, "vector own row", "shop", "docs", "mine");
+
+        // The workspace's eligible row wins; everything else the daemon sent is dropped.
+        let vector = vec![plan.clone(), hook.clone(), other.clone(), own];
+        let block = recall_block_from_qualifying(
+            &db,
+            "vector rows",
+            &config,
+            Some("shop"),
+            vec![],
+            Some(&vector),
+        )
+        .unwrap();
+        assert!(block.contains("vector own row"), "{block}");
+        for absent in ["vector plan row", "vector hook row", "vector other row"] {
+            assert!(!block.contains(absent), "{absent} injected: {block}");
+        }
+
+        // A workspace with memory but no vector hit of its own gets nothing.
+        let vector = vec![plan, hook, other];
+        let specific = "vector rows matching specifically";
+        assert_eq!(
+            recall_block_from_qualifying(
+                &db,
+                specific,
+                &config,
+                Some("shop"),
+                vec![],
+                Some(&vector),
+            ),
+            None
+        );
+
+        // One with none: another project's hit needs a specific prompt, and
+        // ineligible rows never get in, whichever wing they are in.
+        assert_eq!(
+            recall_block_from_qualifying(
+                &db,
+                "vector rows",
+                &config,
+                Some("fresh"),
+                vec![],
+                Some(&vector),
+            ),
+            None
+        );
+        let block = recall_block_from_qualifying(
+            &db,
+            specific,
+            &config,
+            Some("fresh"),
+            vec![],
+            Some(&vector),
+        )
+        .unwrap();
+        assert!(block.contains("vector other row"), "{block}");
+        for absent in ["vector plan row", "vector hook row"] {
+            assert!(!block.contains(absent), "{absent} injected: {block}");
+        }
+    }
+
+    #[test]
+    fn diary_line_requires_a_prompt_match_and_is_never_hook_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::schema::Database::open(&dir.path().join("m.sqlite3")).unwrap();
+        db.migrate().unwrap();
+        let config = recall_test_config();
+        let older = insert_recall_drawer(
+            &db,
+            "Chose the postgres migration plan",
+            "diary",
+            "diary",
+            "diary",
+        );
+        let newest = insert_recall_drawer(
+            &db,
+            "Checkpoint acme/widgets#1 inspected worktree",
+            "diary",
+            "diary",
+            "diary",
+        );
+        insert_recall_drawer(
+            &db,
+            "Hook stop ran for postgres migration session",
+            "diary",
+            "diary",
+            "hook",
+        );
+        // A single shared word deep in an entry is not a match.
+        insert_recall_drawer(
+            &db,
+            &format!("{} postgres migration", "unrelated filler text ".repeat(20)),
+            "diary",
+            "diary",
+            "diary",
+        );
+        for (id, filed_at) in [(&older, "2026-01-01"), (&newest, "2026-01-02")] {
+            db.with_connection(|conn| {
+                conn.execute(
+                    "UPDATE drawers SET filed_at = ?1 WHERE id = ?2",
+                    rusqlite::params![filed_at, id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        }
+
+        // Not the newest entry but the matching one. The hook row, which also
+        // matches, and the entry that matches only past its excerpt stay out.
+        let block = recall_block_from_db(&db, "postgres migration timing", &config, None).unwrap();
+        assert!(block.contains("Chose the postgres migration"), "{block}");
+        assert_eq!(block.matches("- source=").count(), 1, "{block}");
+
+        assert_eq!(
+            recall_block_from_db(&db, "ledger rounding rules", &config, None),
+            None,
+            "an unrelated prompt gets no diary line"
+        );
+        assert_eq!(
+            recall_block_from_db(&db, "postgres rounding rules", &config, None),
+            None,
+            "one shared word is not a match"
+        );
+    }
+
+    #[test]
+    fn recall_renders_duplicated_content_and_bm25_found_diary_entries_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::schema::Database::open(&dir.path().join("m.sqlite3")).unwrap();
+        db.migrate().unwrap();
+        let config = recall_test_config();
+        insert_recall_drawer(&db, "shared runbook steps", "wing-a", "docs", "mine");
+        insert_recall_drawer(&db, "shared runbook steps", "wing-b", "docs", "mine");
+        let block = recall_block_from_db(&db, "shared runbook", &config, None).unwrap();
+        assert_eq!(block.matches("shared runbook steps").count(), 1, "{block}");
+
+        insert_recall_drawer(&db, "ledger rounding entry", "diary", "diary", "diary");
+        let block = recall_block_from_db(&db, "ledger rounding", &config, None).unwrap();
+        assert_eq!(block.matches("ledger rounding entry").count(), 1, "{block}");
     }
 
     #[test]
@@ -5132,7 +5559,7 @@ mod tests {
             diary_max: 1,
             diary_line_bytes: 120,
         };
-        let block = recall_block_from_db(&db, "auth middleware", &config).unwrap();
+        let block = recall_block_from_db(&db, "auth middleware", &config, None).unwrap();
         assert!(
             !block.contains("source=\"diary\""),
             "diary should not appear when disabled: {block}"
