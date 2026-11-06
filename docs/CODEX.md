@@ -472,12 +472,17 @@ Recall stays quiet unless the prompt gives it something to go on:
 
 - A prompt with fewer than two content words (`yes`, `go ahead`, `deploy`) skips
   recall entirely. Function words and common replies don't count as content.
-- The current workspace's wings are preferred, in order: the checkout's directory
-  name, which is where mining files it, then the repository's name, where handoffs
-  and the main checkout's files are. The two differ only in a linked worktree. A
-  workspace with memory in either never reaches other wings. One with none does,
-  when the prompt has at least three content words. With no workspace, every wing
-  is searched.
+- The current workspace's memory is preferred, in order: the checkout's, then the
+  repository's, where handoffs and the main checkout's files are. The two differ
+  only in a linked worktree. Each is what is filed in the wing named for its
+  directory, plus every file mined from under that directory, whatever wing mining
+  gave it. Below a non-Git root that is the file's first directory, so `docs/a.md`
+  in `/notes` is in wing `docs` and counts as `/notes`' memory, as does a Git
+  subdirectory mined on its own. Another workspace's `docs` doesn't. A subdirectory
+  of a Git checkout counts as the checkout; outside Git the workspace is the
+  directory itself. A workspace with memory never reaches other wings. One with
+  none does, when the prompt has at least three content words. With no workspace,
+  every wing is searched.
 - Operational collab rooms (`collab-plans`, `collab-task-lists`,
   `collab-checkpoints`, `collab-drafts`, `collab-messages`) and the diary rows
   hooks write for themselves are never injected, however they were found.

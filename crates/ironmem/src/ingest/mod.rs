@@ -153,7 +153,7 @@ pub fn mine_directory(app: &App, path: &str) -> Result<(), MemoryError> {
                     &wing,
                     &room,
                     &source_file,
-                    "mine",
+                    crate::db::drawers::MINED_ADDED_BY,
                 )?;
             }
             Ok(())
@@ -283,9 +283,9 @@ fn is_candidate_file(path: &Path) -> bool {
         })
 }
 
-/// The wing mining files a checkout's contents under: the name of the directory
-/// mined, so a linked worktree gets its own rather than its main checkout's. The
-/// prompt hook needs the same name to find them.
+/// The wing mining files a Git checkout's contents under, and a non-Git directory's
+/// root-level files: the name of the directory mined, so a linked worktree gets its
+/// own rather than its main checkout's.
 pub(crate) fn checkout_wing(root: &Path) -> String {
     sanitize_segment(
         root.file_name()

@@ -12,7 +12,7 @@ use crate::bootstrap::{
     ensure_bootstrapped, ensure_store_bootstrapped, record_workspace_mine, resolve_workspace_root,
 };
 use crate::config::Config;
-use crate::db::drawers::generate_id;
+use crate::db::drawers::{generate_id, RecallScope};
 use crate::diary;
 use crate::error::MemoryError;
 use crate::ingest::mine_directory;
@@ -435,45 +435,57 @@ fn current_workspace_branch_with(
 /// so every worktree of one repository shares a wing. Outside git, the
 /// workspace directory's own name. Sanitized the way mining names a wing.
 fn repository_name(workspace_root: &Path) -> Option<String> {
+    repository_wing(&repository_dir(workspace_root))
+}
+
+fn repository_wing(repository_dir: &Path) -> Option<String> {
+    let name = repository_dir.file_name()?.to_str()?;
+    let name = name.strip_suffix(".git").unwrap_or(name);
+    Some(crate::ingest::sanitize_segment(name, "workspace"))
+}
+
+/// The main worktree's directory; outside git, the workspace itself.
+fn repository_dir(workspace_root: &Path) -> PathBuf {
     let common_dir = workspace_git_output(
         workspace_root,
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
         &[],
     )
     .map(PathBuf::from);
-    let repo_dir = match common_dir {
-        Some(dir) if dir.file_name() == Some(".git".as_ref()) => dir.parent()?.to_path_buf(),
+    match common_dir {
+        Some(dir) if dir.file_name() == Some(".git".as_ref()) => dir
+            .parent()
+            .map_or_else(|| workspace_root.to_path_buf(), Path::to_path_buf),
         // A bare repository is its own common dir (`name.git`).
         Some(dir) => dir,
         None => workspace_root.to_path_buf(),
-    };
-    let name = repo_dir.file_name()?.to_str()?;
-    let name = name.strip_suffix(".git").unwrap_or(name);
-    Some(crate::ingest::sanitize_segment(name, "workspace"))
+    }
 }
 
-/// The wings holding a workspace's memory, the most specific first, for recall to
-/// prefer: the checkout's own, which is where mining files it, then the repository's
-/// ([`repository_name`]), where handoffs and the main checkout's files are. The two
-/// differ only in a linked worktree. A subdirectory counts as the checkout it is in.
-fn workspace_wings(workspace_root: &Path) -> Vec<String> {
+/// The scopes holding a workspace's memory, the most specific first, for recall to
+/// prefer: the checkout's, then the repository's, where handoffs and the main
+/// checkout's files are. The two differ only in a linked worktree. A subdirectory of a
+/// Git checkout counts as that checkout, since mining may have run on any part of it;
+/// outside Git the workspace is the directory itself, and what was mined from a parent
+/// of it under other names is not in scope.
+fn workspace_scopes(workspace_root: &Path) -> Vec<RecallScope> {
     let toplevel = workspace_git_output(workspace_root, &["rev-parse", "--show-toplevel"], &[])
         .map(PathBuf::from);
-    // Mining canonicalizes its root, so a symlink is named for its target. Git's
-    // toplevel already is; outside git it has to be done here.
-    let root = toplevel.unwrap_or_else(|| {
-        workspace_root
-            .canonicalize()
-            .unwrap_or_else(|_| workspace_root.to_path_buf())
-    });
+    // Mining canonicalizes its root, so a symlink is named for its target and its files
+    // are recorded under it. Git's toplevel already is; outside git it has to be done here.
+    let canonical = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let root = toplevel.unwrap_or_else(|| canonical(workspace_root));
     let checkout = crate::ingest::checkout_wing(&root);
-    let mut wings = vec![checkout];
-    if let Some(repository) = repository_name(workspace_root) {
-        if !wings.contains(&repository) {
-            wings.push(repository);
-        }
+    let repository_dir = repository_dir(workspace_root);
+    let repository_root = canonical(&repository_dir);
+    let repository = repository_wing(&repository_dir)
+        .filter(|wing| *wing != checkout || repository_root != root);
+
+    let mut scopes = vec![RecallScope::new(checkout, Some(&root))];
+    if let Some(wing) = repository {
+        scopes.push(RecallScope::new(wing, Some(&repository_root)));
     }
-    wings
+    scopes
 }
 
 /// Run `git -C <workspace_root> <args>` and return its trimmed stdout; `None`
@@ -993,14 +1005,14 @@ fn search_prompt_context(
     let worker_budget = budget.checked_sub(start.elapsed()).unwrap_or_default();
     std::thread::spawn(move || {
         // Spawns git, so it runs here: the `recv_timeout` below bounds a slow one.
-        let wings = workspace_root
+        let scopes = workspace_root
             .as_deref()
-            .map(workspace_wings)
+            .map(workspace_scopes)
             .unwrap_or_default();
         let result = prompt_recall_block(
             &db_path,
             &prompt,
-            &wings,
+            &scopes,
             worker_budget,
             local_vector_handoff,
         );
@@ -1022,7 +1034,7 @@ fn search_prompt_context(
 fn prompt_recall_block(
     db_path: &Path,
     prompt: &str,
-    workspace_wings: &[String],
+    workspace_scopes: &[RecallScope],
     busy: Duration,
     vector: Option<VectorHandoff>,
 ) -> Option<String> {
@@ -1030,9 +1042,9 @@ fn prompt_recall_block(
     let config = RecallConfig::from_tunables();
     match vector {
         Some(handoff) => {
-            recall_block_from_vector_handoff(&db, prompt, &config, workspace_wings, handoff)
+            recall_block_from_vector_handoff(&db, prompt, &config, workspace_scopes, handoff)
         }
-        None => recall_block_from_db(&db, prompt, &config, workspace_wings),
+        None => recall_block_from_db(&db, prompt, &config, workspace_scopes),
     }
 }
 
@@ -1077,46 +1089,47 @@ fn recall_block_from_db(
     db: &crate::db::schema::Database,
     prompt: &str,
     config: &RecallConfig,
-    workspace_wings: &[String],
+    workspace_scopes: &[RecallScope],
 ) -> Option<String> {
-    let qualifying = bm25_qualifying(db, prompt, config, workspace_wings)?;
-    recall_block_from_qualifying(db, prompt, config, workspace_wings, qualifying, None)
+    let qualifying = bm25_qualifying(db, prompt, config, workspace_scopes)?;
+    recall_block_from_qualifying(db, prompt, config, workspace_scopes, qualifying, None)
 }
 
 fn recall_block_from_vector_handoff(
     db: &crate::db::schema::Database,
     prompt: &str,
     config: &RecallConfig,
-    workspace_wings: &[String],
+    workspace_scopes: &[RecallScope],
     handoff: VectorHandoff,
 ) -> Option<String> {
-    let qualifying = bm25_qualifying(db, prompt, config, workspace_wings)?;
+    let qualifying = bm25_qualifying(db, prompt, config, workspace_scopes)?;
     recall_block_from_qualifying_with_vector_poll(
         db,
         prompt,
         config,
-        workspace_wings,
+        workspace_scopes,
         qualifying,
         None,
         Some(&handoff),
     )
 }
 
-/// BM25 hits eligible for injection. The first of the workspace's wings with a hit
-/// wins outright; other wings are searched only when [`cross_wing_recall_allowed`].
-/// With no workspace there is nothing to prefer, so every wing is searched.
+/// BM25 hits eligible for injection. The first of the workspace's scopes with a hit
+/// wins outright; the rest of the store is searched only when
+/// [`cross_wing_recall_allowed`]. With no workspace there is nothing to prefer, so
+/// every wing is searched.
 fn bm25_qualifying(
     db: &crate::db::schema::Database,
     prompt: &str,
     config: &RecallConfig,
-    workspace_wings: &[String],
+    workspace_scopes: &[RecallScope],
 ) -> Option<Vec<(String, f32)>> {
     let window = config.max_hits * 3;
-    let search = |wing: Option<&str>| -> Option<Vec<(String, f32)>> {
+    let search = |scope: Option<&RecallScope>| -> Option<Vec<(String, f32)>> {
         let mut kept = Vec::new();
         for limit in [window, window * PROMPT_RECALL_BM25_WIDENING] {
             let above_floor: Vec<(String, f32)> =
-                match db.prompt_recall_bm25_search(prompt, limit, wing) {
+                match db.prompt_recall_bm25_search(prompt, limit, scope) {
                     Ok(scored) => scored
                         .into_iter()
                         .filter(|(_, score)| *score >= config.bm25_floor)
@@ -1136,13 +1149,13 @@ fn bm25_qualifying(
         kept.truncate(window);
         Some(kept)
     };
-    for wing in workspace_wings {
-        let scoped = search(Some(wing))?;
+    for scope in workspace_scopes {
+        let scoped = search(Some(scope))?;
         if !scoped.is_empty() {
             return Some(scoped);
         }
     }
-    if !workspace_wings.is_empty() && !cross_wing_recall_allowed(db, prompt, workspace_wings) {
+    if !workspace_scopes.is_empty() && !cross_wing_recall_allowed(db, prompt, workspace_scopes) {
         return Some(Vec::new());
     }
     search(None)
@@ -1188,7 +1201,7 @@ fn scope_recall_candidates(
     db: &crate::db::schema::Database,
     candidates: &mut std::collections::HashMap<String, crate::db::drawers::Drawer>,
     prompt: &str,
-    workspace_wings: &[String],
+    workspace_scopes: &[RecallScope],
     line_bytes: usize,
 ) {
     let prompt_words = prompt_content_words(prompt);
@@ -1196,15 +1209,15 @@ fn scope_recall_candidates(
         crate::db::drawers::prompt_recall_eligible(drawer)
             && diary_hit_matches(drawer, &prompt_words, line_bytes)
     });
-    if workspace_wings.is_empty() {
+    if workspace_scopes.is_empty() {
         return;
     }
-    let preferred = workspace_wings
+    let preferred = workspace_scopes
         .iter()
-        .find(|wing| candidates.values().any(|drawer| drawer.wing == **wing));
-    if let Some(wing) = preferred {
-        candidates.retain(|_, drawer| drawer.wing == *wing);
-    } else if !cross_wing_recall_allowed(db, prompt, workspace_wings) {
+        .find(|scope| candidates.values().any(|drawer| scope.contains(drawer)));
+    if let Some(scope) = preferred {
+        candidates.retain(|_, drawer| scope.contains(drawer));
+    } else if !cross_wing_recall_allowed(db, prompt, workspace_scopes) {
         candidates.clear();
     }
 }
@@ -1280,21 +1293,21 @@ fn is_trivial_prompt(prompt: &str) -> bool {
 }
 
 /// Whether another project's memory may be injected for a prompt the workspace's own
-/// wings have no hit for. Never in a workspace that has memory: there, a miss means the
+/// scopes have no hit for. Never in a workspace that has memory: there, a miss means the
 /// prompt isn't about anything recorded, and what other projects match on its common
 /// words is the noise this hook exists to avoid. An unreadable count fails closed.
 fn cross_wing_recall_allowed(
     db: &crate::db::schema::Database,
     prompt: &str,
-    workspace_wings: &[String],
+    workspace_scopes: &[RecallScope],
 ) -> bool {
     prompt_content_words(prompt).len() >= PROMPT_RECALL_CROSS_WING_MIN_CONTENT_WORDS
-        && workspace_wings
+        && workspace_scopes
             .iter()
-            .all(|wing| match db.count_drawers(Some(wing)) {
-                Ok(count) => count == 0,
+            .all(|scope| match db.recall_scope_has_memory(scope) {
+                Ok(found) => !found,
                 Err(e) => {
-                    tracing::warn!("prompt-hook recall: workspace drawer count failed: {e}");
+                    tracing::warn!("prompt-hook recall: workspace memory check failed: {e}");
                     false
                 }
             })
@@ -1350,7 +1363,7 @@ fn recall_block_from_qualifying(
     db: &crate::db::schema::Database,
     prompt: &str,
     config: &RecallConfig,
-    workspace_wings: &[String],
+    workspace_scopes: &[RecallScope],
     qualifying: Vec<(String, f32)>,
     vector_ids: Option<&[String]>,
 ) -> Option<String> {
@@ -1358,7 +1371,7 @@ fn recall_block_from_qualifying(
         db,
         prompt,
         config,
-        workspace_wings,
+        workspace_scopes,
         qualifying,
         vector_ids.map(|ids| Some(ids.to_vec())),
         None,
@@ -1423,7 +1436,7 @@ fn recall_block_from_qualifying_with_vector_poll(
     db: &crate::db::schema::Database,
     prompt: &str,
     config: &RecallConfig,
-    workspace_wings: &[String],
+    workspace_scopes: &[RecallScope],
     qualifying: Vec<(String, f32)>,
     initial_vector_response: Option<Option<Vec<String>>>,
     vector: Option<&VectorHandoff>,
@@ -1570,7 +1583,7 @@ fn recall_block_from_qualifying_with_vector_poll(
                 return None;
             }
         };
-        scope_recall_candidates(db, &mut fetched, prompt, workspace_wings, line_bytes);
+        scope_recall_candidates(db, &mut fetched, prompt, workspace_scopes, line_bytes);
         let current_bm25_ids: Vec<String> = bm25_ids
             .iter()
             .filter(|id| fetched.contains_key(*id))
@@ -3611,11 +3624,14 @@ mod tests {
     }
 
     #[test]
-    fn workspace_wings_are_the_mined_checkout_then_its_repository() {
+    fn workspace_scopes_are_the_checkout_then_its_repository() {
         let temp = tempfile::tempdir().unwrap();
-        let repo = temp.path().join("shop-api");
+        // The roots are recorded canonical, and macOS's temp directory is a symlink.
+        let base = temp.path().canonicalize().unwrap();
+        let scope = |wing: &str, root: &Path| RecallScope::new(wing.to_string(), Some(root));
+        let repo = base.join("shop-api");
         init_git_test_repo(&repo);
-        let linked = temp.path().join("shop-api-feature");
+        let linked = base.join("shop-api-feature");
         git_test_repo(
             &repo,
             &[
@@ -3627,22 +3643,40 @@ mod tests {
                 linked.to_str().unwrap(),
             ],
         );
+        let same_name = base.join("elsewhere").join("shop-api");
+        git_test_repo(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "same-name",
+                same_name.to_str().unwrap(),
+            ],
+        );
         let subdir = linked.join("crates");
         std::fs::create_dir_all(&subdir).unwrap();
-        let plain = temp.path().join("notes");
+        let plain = base.join("notes");
         std::fs::create_dir_all(&plain).unwrap();
 
-        assert_eq!(workspace_wings(&repo), ["shop-api"]);
-        assert_eq!(workspace_wings(&linked), ["shop-api-feature", "shop-api"]);
-        assert_eq!(workspace_wings(&subdir), ["shop-api-feature", "shop-api"]);
-        assert_eq!(workspace_wings(&plain), ["notes"]);
+        let linked_scopes = [scope("shop-api-feature", &linked), scope("shop-api", &repo)];
+        assert_eq!(workspace_scopes(&repo), [scope("shop-api", &repo)]);
+        assert_eq!(workspace_scopes(&linked), linked_scopes);
+        assert_eq!(workspace_scopes(&subdir), linked_scopes);
+        assert_eq!(workspace_scopes(&plain), [scope("notes", &plain)]);
+        // One wing name, but the main checkout's files are under another directory.
+        assert_eq!(
+            workspace_scopes(&same_name),
+            [scope("shop-api", &same_name), scope("shop-api", &repo)]
+        );
 
         #[cfg(unix)]
         {
-            let link = temp.path().join("notes-link");
+            let link = base.join("notes-link");
             std::os::unix::fs::symlink(&plain, &link).unwrap();
-            let wings = workspace_wings(&link);
-            assert_eq!(wings[0], "notes", "named as mining names it: {wings:?}");
+            let scopes = workspace_scopes(&link);
+            assert_eq!(scopes[0], scope("notes", &plain), "as mining names it");
         }
     }
 
@@ -5439,8 +5473,15 @@ mod tests {
         }
     }
 
-    fn one_wing(wing: &str) -> Vec<String> {
-        vec![wing.to_string()]
+    fn one_wing(wing: &str) -> Vec<RecallScope> {
+        wing_scopes(&[wing])
+    }
+
+    fn wing_scopes(wings: &[&str]) -> Vec<RecallScope> {
+        wings
+            .iter()
+            .map(|wing| RecallScope::new((*wing).to_string(), None))
+            .collect()
     }
 
     fn insert_recall_drawer(
@@ -5699,7 +5740,7 @@ mod tests {
         // The workspace's only hit is an unrelated diary entry: that isn't a claim to
         // the prompt, so the repository's wing still gets its turn.
         insert_recall_drawer(&db, "ledger rounding in repo", "repo", "docs", "mine");
-        let wings = vec!["shop".to_string(), "repo".to_string()];
+        let wings = wing_scopes(&["shop", "repo"]);
         let block = recall_block_from_db(&db, "ledger rounding", &config, &wings).unwrap();
         assert!(block.contains("repo/docs"), "{block}");
 
@@ -5731,13 +5772,73 @@ mod tests {
     }
 
     #[test]
+    fn recall_scope_takes_mined_files_under_its_root_in_both_recall_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::schema::Database::open(&dir.path().join("m.sqlite3")).unwrap();
+        db.migrate().unwrap();
+        let mut config = recall_test_config();
+        config.diary_enabled = false;
+        let zero = vec![0.0f32; ironrace_embed::embedder::EMBED_DIM];
+        let insert = |content: &str, wing: &str, source_file: &str, added_by: &str| {
+            let id = generate_id(content, wing, "general");
+            db.insert_drawer(&id, content, &zero, wing, "general", source_file, added_by)
+                .unwrap();
+            id
+        };
+        let own = insert("ledger rounding own", "docs", "/notes/docs/a.md", "mine");
+        let sibling = insert(
+            "ledger rounding sibling",
+            "docs",
+            "/notes-archive/docs/b.md",
+            "mine",
+        );
+        let not_mined = insert("ledger rounding written", "docs", "/notes/c.md", "mcp");
+        let scopes = [RecallScope::new(
+            "notes".to_string(),
+            Some(Path::new("/notes")),
+        )];
+
+        let block = recall_block_from_db(&db, "ledger rounding", &config, &scopes).unwrap();
+        assert!(block.contains("ledger rounding own"), "{block}");
+        assert_eq!(block.matches("- source=").count(), 1, "{block}");
+
+        let block = recall_block_from_qualifying(
+            &db,
+            "vector prompt words",
+            &config,
+            &scopes,
+            vec![],
+            Some(&[sibling.clone(), own.clone(), not_mined.clone()]),
+        )
+        .unwrap();
+        assert!(block.contains("ledger rounding own"), "{block}");
+        assert_eq!(block.matches("- source=").count(), 1, "{block}");
+
+        // Its files are memory, though the workspace's own wing has no rows.
+        let has_memory = |wing: &str, root: Option<&str>| {
+            let scope = RecallScope::new(wing.to_string(), root.map(Path::new));
+            db.recall_scope_has_memory(&scope).unwrap()
+        };
+        assert!(has_memory("notes", Some("/notes")));
+        assert!(has_memory("unused", Some("/notes-archive/")));
+        assert!(has_memory("docs", None));
+        assert!(!has_memory("unused", None));
+        // Prefix of a path but not a directory of it, and a row that wasn't mined.
+        assert!(!has_memory("unused", Some("/note")));
+        insert("a written note", "elsewhere", "/drafts/c.md", "mcp");
+        assert!(!has_memory("unused", Some("/drafts")));
+        // A filesystem root holds every absolute path.
+        assert!(has_memory("unused", Some("/")));
+    }
+
+    #[test]
     fn recall_prefers_a_workspace_wing_in_order_and_counts_all_of_them_as_memory() {
         let dir = tempfile::tempdir().unwrap();
         let db = crate::db::schema::Database::open(&dir.path().join("m.sqlite3")).unwrap();
         db.migrate().unwrap();
         let mut config = recall_test_config();
         config.diary_enabled = false;
-        let linked = vec!["feature".to_string(), "shop".to_string()];
+        let linked = wing_scopes(&["feature", "shop"]);
         let own = insert_recall_drawer(&db, "ledger rounding own", "feature", "docs", "mine");
         let repo = insert_recall_drawer(&db, "ledger rounding repo", "shop", "docs", "mine");
         let repo_only = insert_recall_drawer(&db, "pricing tiers repo", "shop", "docs", "mine");
@@ -5799,13 +5900,13 @@ mod tests {
         );
 
         // Memory in the repository's wing alone is memory: no reaching elsewhere.
-        let unmined_checkout = vec!["unmined".to_string(), "shop".to_string()];
+        let unmined_checkout = wing_scopes(&["unmined", "shop"]);
         assert_eq!(
             recall_block_from_db(&db, "webhook retry policy", &config, &unmined_checkout),
             None
         );
         // Neither wing has any: a specific prompt may.
-        let fresh_checkout = vec!["unmined".to_string(), "unmined-repo".to_string()];
+        let fresh_checkout = wing_scopes(&["unmined", "unmined-repo"]);
         only(
             recall_block_from_db(&db, "webhook retry policy", &config, &fresh_checkout),
             "webhook retry policy",

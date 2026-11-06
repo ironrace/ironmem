@@ -402,3 +402,168 @@ fn linked_worktree_recalls_what_mining_stored_for_it() {
         "{lines:#?}"
     );
 }
+
+fn write_file(root: &Path, relative: &str, content: &str) {
+    let path = root.join(relative);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, content).unwrap();
+}
+
+#[test]
+fn non_git_workspace_recalls_every_wing_mining_gave_its_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("memory.sqlite3");
+    let notes = dir.path().join("notes");
+    let fresh = dir.path().join("fresh");
+    std::fs::create_dir_all(&fresh).unwrap();
+
+    const LEDGER: &str = "The ledger rounding rules keep four decimals";
+    const NESTED: &str = "The invoice numbering scheme restarts every year";
+    const ROOT_FILE: &str = "The ledger rounding overview lives at the top level";
+    write_file(&notes, "docs/ledger.md", LEDGER);
+    write_file(&notes, "projects/2026/invoices.md", NESTED);
+    mine(&db_path, &notes);
+
+    // Mining files these under `docs` and `projects`, and nothing under `notes`.
+    let lines = recall_lines(&db_path, &notes, "ledger rounding");
+    assert_eq!(lines.len(), 1, "{lines:#?}");
+    assert!(
+        lines[0].contains("source=\"docs/general\"") && lines[0].contains(LEDGER),
+        "{lines:#?}"
+    );
+    let lines = recall_lines(&db_path, &notes, "invoice numbering");
+    assert_eq!(lines.len(), 1, "{lines:#?}");
+    assert!(
+        lines[0].contains("source=\"projects/2026\"") && lines[0].contains(NESTED),
+        "{lines:#?}"
+    );
+
+    // Those files are its memory, so another project's match stays out even though
+    // nothing is filed under the workspace's own name.
+    const OTHER: &str = "Our billing webhook retry policy backs off for an hour";
+    write_file(&fresh, "elsewhere/webhooks.md", OTHER);
+    mine(&db_path, &fresh);
+    assert_eq!(
+        recall_lines(&db_path, &notes, "billing webhook retry policy"),
+        Vec::<String>::new()
+    );
+
+    // A root-level file fills the workspace's own wing without hiding the others,
+    // for a prompt that matches only them or one that matches both.
+    write_file(&notes, "overview.md", ROOT_FILE);
+    mine(&db_path, &notes);
+    let lines = recall_lines(&db_path, &notes, "invoice numbering scheme restarts");
+    assert_eq!(lines.len(), 1, "{lines:#?}");
+    assert!(lines[0].contains(NESTED), "{lines:#?}");
+    let lines = recall_lines(&db_path, &notes, "ledger rounding");
+    assert_eq!(lines.len(), 2, "{lines:#?}");
+    for expected in [LEDGER, ROOT_FILE] {
+        assert!(
+            lines.iter().any(|line| line.contains(expected)),
+            "{lines:#?}"
+        );
+    }
+}
+
+#[test]
+fn a_wing_name_shared_with_another_workspace_does_not_leak_its_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("memory.sqlite3");
+    let notes = dir.path().join("notes");
+    // Its files start with `notes`' path: only a directory boundary separates them.
+    let sibling = dir.path().join("notes-archive");
+
+    const OURS: &str = "The ledger rounding rules keep four decimals";
+    const THEIRS: &str = "The pricing tiers renew on the first of the month";
+    write_file(&notes, "docs/ledger.md", OURS);
+    write_file(&sibling, "docs/pricing.md", THEIRS);
+    mine(&db_path, &notes);
+    mine(&db_path, &sibling);
+
+    // Both are in wing `docs`, and only one is under this workspace.
+    assert_eq!(
+        recall_lines(&db_path, &notes, "pricing tiers"),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        recall_lines(&db_path, &notes, "pricing tiers renew month"),
+        Vec::<String>::new()
+    );
+    let lines = recall_lines(&db_path, &notes, "ledger rounding");
+    assert_eq!(lines.len(), 1, "{lines:#?}");
+    assert!(lines[0].contains(OURS), "{lines:#?}");
+}
+
+#[test]
+fn git_subdirectory_mine_is_recalled_from_anywhere_in_the_repository() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("memory.sqlite3");
+    let repo = dir.path().join("shop-api");
+    init_repo(&repo);
+    let crates = repo.join("crates");
+
+    const TOP: &str = "The ledger rounding rules keep four decimals";
+    const NESTED: &str = "The invoice numbering scheme restarts every year";
+    write_file(&crates, "ledger.md", TOP);
+    write_file(&crates, "core/invoices.md", NESTED);
+    // What the stop hook does when a session runs in a subdirectory: no `.git` there,
+    // so mining uses its non-Git rules, and nothing lands in wing `shop-api`.
+    mine(&db_path, &crates);
+
+    for workspace in [&repo, &crates] {
+        let lines = recall_lines(&db_path, workspace, "ledger rounding");
+        assert_eq!(lines.len(), 1, "from {workspace:?}: {lines:#?}");
+        assert!(
+            lines[0].contains("source=\"crates/general\"") && lines[0].contains(TOP),
+            "{lines:#?}"
+        );
+        let lines = recall_lines(&db_path, workspace, "invoice numbering");
+        assert_eq!(lines.len(), 1, "from {workspace:?}: {lines:#?}");
+        assert!(
+            lines[0].contains("source=\"core/general\"") && lines[0].contains(NESTED),
+            "{lines:#?}"
+        );
+    }
+
+    // Another checkout's subdirectory mine shares those wing names and stays out.
+    let other = dir.path().join("other-app");
+    init_repo(&other);
+    const THEIRS: &str = "The pricing tiers renew on the first of the month";
+    write_file(&other.join("crates"), "pricing.md", THEIRS);
+    mine(&db_path, &other.join("crates"));
+    assert_eq!(
+        recall_lines(&db_path, &repo, "pricing tiers"),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn main_checkout_subdirectory_mine_counts_as_the_linked_worktrees_repository() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("memory.sqlite3");
+    let main_checkout = dir.path().join("shop-api");
+    let linked = dir.path().join("feature-x");
+    init_repo(&main_checkout);
+    git(
+        &main_checkout,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feature",
+            linked.to_str().unwrap(),
+        ],
+    );
+
+    const MAIN_DOC: &str = "The pricing tiers renew on the first of the month";
+    write_file(&main_checkout.join("crates"), "pricing.md", MAIN_DOC);
+    mine(&db_path, &main_checkout.join("crates"));
+
+    let lines = recall_lines(&db_path, &linked, "pricing tiers");
+    assert_eq!(lines.len(), 1, "{lines:#?}");
+    assert!(
+        lines[0].contains("source=\"crates/general\"") && lines[0].contains(MAIN_DOC),
+        "{lines:#?}"
+    );
+}

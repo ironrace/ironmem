@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use rusqlite::{params, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -73,6 +75,58 @@ fn prompt_recall_eligible_sql() -> String {
         .map(|room| format!("'{room}'"))
         .join(", ");
     format!(" AND d.room NOT IN ({excluded_rooms}) AND d.added_by <> '{HOOK_ADDED_BY}'")
+}
+
+/// `added_by` of every drawer mining stores, whose `source_file` is the absolute path
+/// of the file it came from.
+pub(crate) const MINED_ADDED_BY: &str = "mine";
+
+/// Part of a workspace's memory for prompt recall: rows filed in `wing`, or mined from
+/// a file under `root`. The path is what identifies mined rows, since the wing a file
+/// gets depends on which directory was mined: below a non-Git root it is the file's
+/// first directory, however unrelated that name is to the workspace, and a name like
+/// `docs` is shared with every other workspace that has one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RecallScope {
+    wing: String,
+    /// The half-open range of `source_file` values under the root, so the lookup can
+    /// use `idx_drawers_source`. Empty without a root, which matches nothing.
+    under_root: (String, String),
+}
+
+impl RecallScope {
+    pub(crate) fn new(wing: String, root: Option<&Path>) -> Self {
+        let under_root = root.map_or_else(Default::default, |root| {
+            let root = root.to_string_lossy();
+            let dir = root.trim_end_matches(std::path::MAIN_SEPARATOR);
+            let separator = std::path::MAIN_SEPARATOR as u8;
+            // The character sorting right after the separator ends the range, so a
+            // sibling like `/notes-archive` stays out of `/notes`.
+            (
+                format!("{dir}{}", separator as char),
+                format!("{dir}{}", (separator + 1) as char),
+            )
+        });
+        Self { wing, under_root }
+    }
+
+    /// [`Self`] for a row already in hand. The SQL counterpart is
+    /// [`prompt_recall_scope_sql`], with this scope's values bound.
+    pub(crate) fn contains(&self, drawer: &Drawer) -> bool {
+        drawer.wing == self.wing
+            || (drawer.added_by == MINED_ADDED_BY
+                && drawer.source_file >= self.under_root.0
+                && drawer.source_file < self.under_root.1)
+    }
+}
+
+/// [`RecallScope::contains`] as a condition over `drawers` aliased `d`, with its wing
+/// and range bound to `?3`, `?4` and `?5`.
+fn prompt_recall_scope_sql() -> String {
+    format!(
+        " AND (d.wing = ?3 OR (d.added_by = '{MINED_ADDED_BY}' \
+         AND d.source_file >= ?4 AND d.source_file < ?5))"
+    )
 }
 
 /// Cosine-similarity floor for treating two current drawers in one wing/room as
@@ -693,29 +747,50 @@ impl Database {
         room: Option<&str>,
         include_superseded: bool,
     ) -> Result<Vec<(String, f32)>, MemoryError> {
-        self.bm25_search_filtered(query, limit, wing, room, include_superseded, "")
+        self.bm25_search_filtered(query, limit, wing, room, include_superseded, "", &[])
     }
 
     /// BM25 over the drawers the prompt-recall hook may inject: current rows,
-    /// optionally in one wing, minus operational collab rooms and hook metadata.
+    /// optionally in one scope, minus operational collab rooms and hook metadata.
     pub(crate) fn prompt_recall_bm25_search(
         &self,
         query: &str,
         limit: usize,
-        wing: Option<&str>,
+        scope: Option<&RecallScope>,
     ) -> Result<Vec<(String, f32)>, MemoryError> {
-        self.bm25_search_filtered(
-            query,
-            limit,
-            wing,
-            None,
-            false,
-            &prompt_recall_eligible_sql(),
-        )
+        let eligible = prompt_recall_eligible_sql();
+        match scope {
+            Some(scope) => {
+                let filter = format!("{}{eligible}", prompt_recall_scope_sql());
+                let params: [&dyn rusqlite::ToSql; 3] =
+                    [&scope.wing, &scope.under_root.0, &scope.under_root.1];
+                self.bm25_search_filtered(query, limit, None, None, false, &filter, &params)
+            }
+            None => self.bm25_search_filtered(query, limit, None, None, false, &eligible, &[]),
+        }
+    }
+
+    /// Whether any row, in any state, is part of `scope`: what tells a workspace with
+    /// memory from one without.
+    pub(crate) fn recall_scope_has_memory(&self, scope: &RecallScope) -> Result<bool, MemoryError> {
+        // Separate `EXISTS` so each side uses its own index.
+        let found: bool = self.conn.query_row(
+            &format!(
+                "SELECT EXISTS(SELECT 1 FROM drawers WHERE wing = ?1)
+                     OR EXISTS(SELECT 1 FROM drawers
+                               WHERE source_file >= ?2 AND source_file < ?3
+                                 AND added_by = '{MINED_ADDED_BY}')"
+            ),
+            params![scope.wing, scope.under_root.0, scope.under_root.1],
+            |row| row.get(0),
+        )?;
+        Ok(found)
     }
 
     /// `extra_filter` is appended to the `WHERE` clause verbatim, so it must be
-    /// built from constants and never from caller input.
+    /// built from constants and never from caller input. `extra_params` are its
+    /// values, numbered from `?3`, so they can't be combined with a wing or room.
+    #[allow(clippy::too_many_arguments)]
     fn bm25_search_filtered(
         &self,
         query: &str,
@@ -724,7 +799,9 @@ impl Database {
         room: Option<&str>,
         include_superseded: bool,
         extra_filter: &str,
+        extra_params: &[&dyn rusqlite::ToSql],
     ) -> Result<Vec<(String, f32)>, MemoryError> {
+        debug_assert!(extra_params.is_empty() || (wing.is_none() && room.is_none()));
         if query.trim().is_empty() {
             return Ok(vec![]);
         }
@@ -811,7 +888,11 @@ impl Database {
             }
             (Some(w), None) => stmt.query_map(rusqlite::params![fts_query, limit_i64, w], query_fn),
             (None, Some(r)) => stmt.query_map(rusqlite::params![fts_query, limit_i64, r], query_fn),
-            (None, None) => stmt.query_map(rusqlite::params![fts_query, limit_i64], query_fn),
+            (None, None) => {
+                let mut params: Vec<&dyn rusqlite::ToSql> = vec![&fts_query, &limit_i64];
+                params.extend_from_slice(extra_params);
+                stmt.query_map(&*params, query_fn)
+            }
         };
 
         match rows {
@@ -1526,7 +1607,8 @@ mod tests {
         let other_wing = insert("needle in another wing's note", "beta", "notes", "mcp");
 
         let ids = |wing: Option<&str>| -> Vec<String> {
-            db.prompt_recall_bm25_search("needle", 3, wing)
+            let scope = wing.map(|wing| RecallScope::new(wing.to_string(), None));
+            db.prompt_recall_bm25_search("needle", 3, scope.as_ref())
                 .unwrap()
                 .into_iter()
                 .map(|(id, _)| id)
