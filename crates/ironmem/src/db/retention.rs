@@ -5,6 +5,10 @@ use rusqlite::{params, Transaction};
 use serde::Serialize;
 use serde_json::json;
 
+use super::drawers::{
+    COLLAB_CHECKPOINT_ROOM as CHECKPOINT_ROOM, COLLAB_PLAN_ROOM as PLAN_ROOM,
+    COLLAB_TASK_LIST_ROOM as TASK_LIST_ROOM, COLLAB_WING,
+};
 use super::schema::Database;
 use crate::error::MemoryError;
 
@@ -13,10 +17,6 @@ pub const DEFAULT_COLLAB_ARTIFACT_RETENTION_DAYS: i64 = 180;
 pub const DEFAULT_GC_LIMIT: usize = 500;
 
 const MAX_GC_LIMIT: usize = 10_000;
-const COLLAB_WING: &str = "ironrace-memory";
-const CHECKPOINT_ROOM: &str = "collab-checkpoints";
-const PLAN_ROOM: &str = "collab-plans";
-const TASK_LIST_ROOM: &str = "collab-task-lists";
 
 #[derive(Debug, Clone)]
 pub struct MemoryGcOptions {

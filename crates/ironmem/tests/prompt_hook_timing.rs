@@ -8,6 +8,8 @@ use ironmem::db::schema::Database;
 use ironrace_embed::embedder::EMBED_DIM;
 use serde_json::Value;
 
+mod git_env;
+
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_ironmem")
 }
@@ -109,6 +111,8 @@ struct HookOptions {
     summary_max_bytes: Option<usize>,
     kg_enabled: Option<bool>,
     diary_enabled: Option<bool>,
+    /// The session's `cwd`. Without one the hook has no workspace to scope to.
+    cwd: Option<PathBuf>,
 }
 
 struct HookRun {
@@ -160,11 +164,14 @@ fn run_prompt_hook_with_options(
     prompt: &str,
     options: HookOptions,
 ) -> HookRun {
-    let payload = serde_json::json!({
+    let mut payload = serde_json::json!({
         "prompt": prompt,
         "session_id": "timing"
-    })
-    .to_string();
+    });
+    if let Some(cwd) = &options.cwd {
+        payload["cwd"] = serde_json::json!(cwd);
+    }
+    let payload = payload.to_string();
     let start = Instant::now();
     let mut command = Command::new(bin());
     command
@@ -178,6 +185,8 @@ fn run_prompt_hook_with_options(
         .env("IRONMEM_EMBED_MODE", "real")
         .env("IRONMEM_MCP_MODE", "read-only")
         .env("IRONMEM_METRICS", "0")
+        // An exported workspace would scope recall away from the bench rows.
+        .env_remove("IRONMEM_WORKSPACE_ROOT")
         .env(
             "IRONMEM_PROMPT_HOOK_BUDGET_MS",
             options.hook_budget_ms.to_string(),
@@ -503,6 +512,122 @@ fn user_prompt_submit_binary_p95_under_budget_on_10k_drawers() {
     );
 }
 
+/// A Git checkout of `name` under `parent`, with one commit, made by scrubbed git.
+fn init_checkout(parent: &Path, name: &str) -> PathBuf {
+    let root = parent.join(name);
+    std::fs::create_dir_all(&root).unwrap();
+    for args in [
+        &["init", "-q"][..],
+        &[
+            "-c",
+            "user.name=fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "init",
+        ][..],
+    ] {
+        let mut command = Command::new("git");
+        git_env::fixture_git_env(&mut command);
+        let output = command.args(args).current_dir(&root).output().unwrap();
+        assert!(output.status.success(), "git {args:?} failed");
+    }
+    // Mining records canonical paths, and macOS's temp directory is a symlink.
+    root.canonicalize().unwrap()
+}
+
+/// `n` rows mined from files under `root` into its wing, and enough diary entries to
+/// fill the diary scan, so the timed path is the one a real session takes: git
+/// discovery, the scoped search and the workspace memory check.
+fn seed_db_file_mined(path: &Path, n: usize, root: &Path) {
+    let db = Database::open(path).unwrap();
+    db.migrate().unwrap();
+    let zero = vec![0.0f32; EMBED_DIM];
+    let wing = root.file_name().unwrap().to_str().unwrap();
+    db.with_connection(|c| Ok(c.execute_batch("BEGIN")?))
+        .unwrap();
+    for i in 0..n {
+        let content = format!("drawer {i} token alpha beta gamma context entry number {i}");
+        let source = root.join("docs").join(format!("note-{i:05}.md"));
+        db.insert_drawer(
+            &format!("mined-{i:05}"),
+            &content,
+            &zero,
+            wing,
+            "docs",
+            source.to_str().unwrap(),
+            "mine",
+        )
+        .unwrap();
+    }
+    for i in 0..60 {
+        db.insert_drawer(
+            &format!("diary-{i:02}"),
+            &format!("worked on unrelated subject {i} today"),
+            &zero,
+            "diary",
+            "diary",
+            "",
+            "diary",
+        )
+        .unwrap();
+    }
+    db.with_connection(|c| Ok(c.execute_batch("COMMIT")?))
+        .unwrap();
+}
+
+#[test]
+fn user_prompt_submit_binary_p95_under_budget_in_a_mined_git_checkout() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("m.sqlite3");
+    let model_dir = dir.path().join("missing-model");
+    let checkout = init_checkout(dir.path(), "shop-api");
+    seed_db_file_mined(&db_path, 10_000, &checkout);
+    let run = |prompt: &str| {
+        run_prompt_hook_with_options(
+            &db_path,
+            &model_dir,
+            prompt,
+            HookOptions {
+                hook_budget_ms: PROMPT_HOOK_BUDGET_MS,
+                hybrid_budget_ms: 40,
+                hybrid_limit: 10,
+                cwd: Some(checkout.clone()),
+                ..HookOptions::default()
+            },
+        )
+    };
+
+    let n = 20;
+    let mut samples = Vec::with_capacity(2 * n);
+    for i in 0..n {
+        let hit = run(&format!("drawer token alpha number {i}"));
+        assert!(
+            hit.json.get("hookSpecificOutput").is_some(),
+            "timed in-scope prompt should inject, not silently time out"
+        );
+        // No hit in scope: the workspace memory check runs, and must keep other
+        // wings out.
+        let miss = run(&format!("zzqqxx nonexistent qwerty {i}00"));
+        assert!(
+            miss.json.get("hookSpecificOutput").is_none(),
+            "unrelated prompt should inject nothing: {}",
+            miss.json
+        );
+        samples.push(hit.elapsed.as_millis() as u64);
+        samples.push(miss.elapsed.as_millis() as u64);
+    }
+    samples.sort_unstable();
+    let p95 = samples[((samples.len() as f64 * 0.95) as usize).saturating_sub(1)];
+    assert!(
+        p95 <= PROMPT_HOOK_BUDGET_MS,
+        "binary p95 {p95}ms exceeds 150ms budget; samples={samples:?}"
+    );
+}
+
 #[test]
 fn user_prompt_submit_includes_kg_and_diary_alongside_drawers() {
     let dir = tempfile::tempdir().unwrap();
@@ -808,6 +933,7 @@ fn prompt_hook_warm_noop_daemon_fuses_compact_remote_ids_into_local_rendering() 
             summary_max_bytes: Some(48),
             kg_enabled: Some(false),
             diary_enabled: Some(false),
+            cwd: None,
         },
     );
     let on = run_prompt_hook_with_options(
@@ -824,6 +950,7 @@ fn prompt_hook_warm_noop_daemon_fuses_compact_remote_ids_into_local_rendering() 
             summary_max_bytes: Some(48),
             kg_enabled: Some(false),
             diary_enabled: Some(false),
+            cwd: None,
         },
     );
     let request = proxy.take_request();

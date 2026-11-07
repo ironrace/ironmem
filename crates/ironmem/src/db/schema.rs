@@ -37,11 +37,13 @@ const CHECKPOINT_ATTESTATION_CHECK_SQL: &str =
     include_str!("../../migrations/021_checkpoint_attestation_check.sql");
 const COLLAB_HANDOFF_PROVENANCE_SQL: &str =
     include_str!("../../migrations/022_collab_handoff_provenance.sql");
+const PROMPT_RECALL_INDEXES_SQL: &str =
+    include_str!("../../migrations/023_prompt_recall_indexes.sql");
 
 /// Highest schema version a fully-migrated database reports. Bump alongside the
 /// `run_version_gated_migrations` ladder below so `ironmem doctor` can tell a
 /// behind-migration database from an up-to-date one.
-pub const LATEST_SCHEMA_VERSION: i64 = 22;
+pub const LATEST_SCHEMA_VERSION: i64 = 23;
 
 /// Total attempts (first try included) `with_transaction` makes when every
 /// attempt fails with `SQLITE_BUSY_SNAPSHOT`. See the retry-policy section of
@@ -502,6 +504,14 @@ impl Database {
         // Do not "simplify" this back to a flag.
         if current_version < 22 {
             self.conn.execute_batch(COLLAB_HANDOFF_PROVENANCE_SQL)?;
+        }
+
+        // v23: two indexes for the prompt-recall hook's per-prompt reads (issue
+        // #375): a partial one over the rows a path doesn't place, for whether a
+        // workspace has memory, and one over the current rows' (wing, filed_at), for
+        // the newest diary entries. Index-only; no data changes.
+        if current_version < 23 {
+            self.conn.execute_batch(PROMPT_RECALL_INDEXES_SQL)?;
         }
 
         Ok(())
@@ -1012,7 +1022,7 @@ mod tests {
         // fully-migrated database reports — doctor compares against it.
         let db = Database::open_in_memory().unwrap();
         assert_eq!(LATEST_SCHEMA_VERSION, db.schema_version().unwrap());
-        assert_eq!(LATEST_SCHEMA_VERSION, 22);
+        assert_eq!(LATEST_SCHEMA_VERSION, 23);
     }
 
     #[test]
@@ -2559,7 +2569,7 @@ mod tests {
     fn migration_020_creates_collab_checkpoints_table() {
         let db = Database::open_in_memory().unwrap();
         assert_eq!(schema_version_of(&db), LATEST_SCHEMA_VERSION);
-        assert_eq!(LATEST_SCHEMA_VERSION, 22);
+        assert_eq!(LATEST_SCHEMA_VERSION, 23);
 
         // The table exists and carries every column the checkpoint contract
         // needs, at the declared affinity the header argues for. Asserting the
@@ -3260,7 +3270,7 @@ mod tests {
 
         db.migrate().unwrap();
         assert_eq!(schema_version_of(&db), LATEST_SCHEMA_VERSION);
-        assert_eq!(LATEST_SCHEMA_VERSION, 22);
+        assert_eq!(LATEST_SCHEMA_VERSION, 23);
         assert!(table_exists(&db, "collab_checkpoints"));
 
         // The pre-upgrade session must survive the migration intact.

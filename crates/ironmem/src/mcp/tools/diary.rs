@@ -21,7 +21,10 @@ pub(super) fn validate_diary_write_args(args: &Value) -> Result<DiaryWriteArgs<'
             .get("content")
             .and_then(|v| v.as_str())
             .ok_or_else(|| MemoryError::Validation("content is required".into()))?,
-        wing: args.get("wing").and_then(|v| v.as_str()).unwrap_or("diary"),
+        wing: args
+            .get("wing")
+            .and_then(|v| v.as_str())
+            .unwrap_or(crate::db::drawers::SHARED_DIARY_WING),
     })
 }
 
@@ -42,7 +45,10 @@ pub(super) fn handle_diary_write(app: &App, args: &Value) -> Result<Value, Memor
 }
 
 pub(super) fn handle_diary_read(app: &App, args: &Value) -> Result<Value, MemoryError> {
-    let wing_raw = args.get("wing").and_then(|v| v.as_str()).unwrap_or("diary");
+    let wing_raw = args
+        .get("wing")
+        .and_then(|v| v.as_str())
+        .unwrap_or(crate::db::drawers::SHARED_DIARY_WING);
     let wing = sanitize::sanitize_name(wing_raw, "wing")?;
     let limit =
         (args.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize).min(MAX_READ_LIMIT);

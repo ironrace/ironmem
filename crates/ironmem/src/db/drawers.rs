@@ -41,45 +41,86 @@ use crate::error::MemoryError;
 /// A synthetic drawer has `source_file = "pref:<parent_drawer_id>"`.
 pub(crate) const PREF_SENTINEL: &str = "pref:";
 
+/// Wing of the collab protocol's own rows, whatever repository they are about.
+pub(crate) const COLLAB_WING: &str = "ironrace-memory";
+/// Collab session plans.
+pub(crate) const COLLAB_PLAN_ROOM: &str = "collab-plans";
+/// Collab batch task lists.
+pub(crate) const COLLAB_TASK_LIST_ROOM: &str = "collab-task-lists";
+/// Collab implementation checkpoints.
+pub(crate) const COLLAB_CHECKPOINT_ROOM: &str = "collab-checkpoints";
+/// Collab drafts. A convention agents follow through `add_drawer`; ironmem itself
+/// writes nothing here.
+pub(crate) const COLLAB_DRAFT_ROOM: &str = "collab-drafts";
 /// Transport-only collab message bodies are retrieved by their opaque drawer
 /// references and must not be discoverable through generic memory search.
-const COLLAB_MESSAGE_ROOM: &str = "collab-messages";
+pub(crate) const COLLAB_MESSAGE_ROOM: &str = "collab-messages";
 
-/// `added_by` of the diary rows hooks write for themselves ("Hook stop ran for
-/// ..."): lifecycle metadata, never something to recall into a prompt.
+/// The shared diary's wing, where hooks and `diary_write` file by default.
+pub(crate) const SHARED_DIARY_WING: &str = "diary";
+
+/// Wing of the code reviews the stop hook captures from transcripts.
+pub(crate) const REVIEW_WING: &str = "reviews";
+
+/// `added_by` of every row a hook writes: its own diary rows ("Hook stop ran for
+/// ..."), and the code reviews it captures from transcripts.
 pub(crate) const HOOK_ADDED_BY: &str = "hook";
 
-/// Rooms of operational collab artifacts (session plans, task lists, checkpoints,
-/// drafts and transport). Exact names on purpose: durable notes in rooms such as
-/// `collab-decisions` stay recallable.
-const PROMPT_RECALL_EXCLUDED_ROOMS: [&str; 5] = [
-    "collab-plans",
-    "collab-task-lists",
-    "collab-checkpoints",
-    "collab-drafts",
+/// Rooms of operational artifacts: collab session plans, task lists, checkpoints,
+/// drafts and transport, and Autopilot's dispatch lineage. Exact names on purpose:
+/// durable notes in rooms such as `collab-decisions` stay recallable.
+const PROMPT_RECALL_EXCLUDED_ROOMS: [&str; 6] = [
+    COLLAB_PLAN_ROOM,
+    COLLAB_TASK_LIST_ROOM,
+    COLLAB_CHECKPOINT_ROOM,
+    COLLAB_DRAFT_ROOM,
     COLLAB_MESSAGE_ROOM,
+    crate::autopilot::ROOM,
+];
+
+/// Wings every project files into, so no workspace's memory is the wing as a whole,
+/// whatever the workspace directory happens to be called.
+const SHARED_WINGS: [&str; 4] = [
+    SHARED_DIARY_WING,
+    REVIEW_WING,
+    COLLAB_WING,
+    crate::autopilot::WING,
 ];
 
 /// Whether a drawer may be injected into a prompt by the recall hook. The vector
 /// path's counterpart to [`prompt_recall_eligible_sql`].
 pub(crate) fn prompt_recall_eligible(drawer: &Drawer) -> bool {
     !PROMPT_RECALL_EXCLUDED_ROOMS.contains(&drawer.room.as_str())
-        && drawer.added_by != HOOK_ADDED_BY
+        // A hook's own diary rows are lifecycle metadata; the reviews it captures
+        // are durable content, which stays recallable.
+        && !(drawer.added_by == HOOK_ADDED_BY && drawer.room == crate::diary::DIARY_ROOM)
 }
 
 /// [`prompt_recall_eligible`] as `WHERE` conditions over `drawers` aliased `d`. Every
 /// prompt-recall query filters in SQL rather than afterwards, so the rows it drops,
-/// which can outrank or outdate everything else, don't use up its `LIMIT`.
+/// which can outrank or outdate everything else, don't use up its `LIMIT`. Built from
+/// constants, which a test checks hold no quote.
 fn prompt_recall_eligible_sql() -> String {
     let excluded_rooms = PROMPT_RECALL_EXCLUDED_ROOMS
         .map(|room| format!("'{room}'"))
         .join(", ");
-    format!(" AND d.room NOT IN ({excluded_rooms}) AND d.added_by <> '{HOOK_ADDED_BY}'")
+    let diary_room = crate::diary::DIARY_ROOM;
+    format!(
+        " AND d.room NOT IN ({excluded_rooms}) \
+         AND NOT (d.added_by = '{HOOK_ADDED_BY}' AND d.room = '{diary_room}')"
+    )
 }
 
-/// `added_by` of every drawer mining stores, whose `source_file` is the absolute path
-/// of the file it came from.
+/// `added_by` of every drawer mining stores. Its `source_file` is the absolute,
+/// canonical path of the file it came from, which [`RecallScope`] places it by; a
+/// value that isn't, from a store written some other way, sorts outside every
+/// workspace's range, so the row counts as no workspace's memory.
 pub(crate) const MINED_ADDED_BY: &str = "mine";
+
+/// The rows a path doesn't place, which their wing does. Exactly the `WHERE` of the
+/// partial index `idx_drawers_wing_unplaced` (migration 023), so a query that repeats
+/// it can use the index.
+const UNPLACED_BY_PATH: &str = "(added_by <> 'mine' OR source_file = '')";
 
 /// Part of a workspace's memory for prompt recall: rows mined from a file under `root`,
 /// and the other rows filed in `wing`. The path alone places a mined row, since the
@@ -89,25 +130,26 @@ pub(crate) const MINED_ADDED_BY: &str = "mine";
 /// directory of that name. A mined row without a path falls back to its wing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RecallScope {
-    wing: String,
+    /// `None` when the workspace's name is one of the [`SHARED_WINGS`]: a directory
+    /// named `diary` doesn't own every project's diary.
+    wing: Option<String>,
     /// The half-open range of `source_file` values under the root, so the lookup can
-    /// use `idx_drawers_source`. Empty without a root, which matches nothing.
+    /// use `idx_drawers_source`.
     under_root: (String, String),
 }
 
 impl RecallScope {
-    pub(crate) fn new(wing: String, root: Option<&Path>) -> Self {
-        let under_root = root.map_or_else(Default::default, |root| {
-            let root = root.to_string_lossy();
-            let dir = root.trim_end_matches(std::path::MAIN_SEPARATOR);
-            let separator = std::path::MAIN_SEPARATOR as u8;
-            // The character sorting right after the separator ends the range, so a
-            // sibling like `/notes-archive` stays out of `/notes`.
-            (
-                format!("{dir}{}", separator as char),
-                format!("{dir}{}", (separator + 1) as char),
-            )
-        });
+    pub(crate) fn new(wing: String, root: &Path) -> Self {
+        let root = root.to_string_lossy();
+        let dir = root.trim_end_matches(std::path::MAIN_SEPARATOR);
+        let separator = std::path::MAIN_SEPARATOR as u8;
+        // The character sorting right after the separator ends the range, so a
+        // sibling like `/notes-archive` stays out of `/notes`.
+        let under_root = (
+            format!("{dir}{}", separator as char),
+            format!("{dir}{}", (separator + 1) as char),
+        );
+        let wing = (!SHARED_WINGS.contains(&wing.as_str())).then_some(wing);
         Self { wing, under_root }
     }
 
@@ -117,17 +159,41 @@ impl RecallScope {
         if drawer.added_by == MINED_ADDED_BY && !drawer.source_file.is_empty() {
             drawer.source_file >= self.under_root.0 && drawer.source_file < self.under_root.1
         } else {
-            drawer.wing == self.wing
+            self.wing.as_deref() == Some(drawer.wing.as_str())
         }
     }
 }
 
 /// [`RecallScope::contains`] as a condition over `drawers` aliased `d`, with its wing
-/// and range bound to `?3`, `?4` and `?5`.
+/// and range bound to `?3`, `?4` and `?5`. A `NULL` wing matches no row.
 fn prompt_recall_scope_sql() -> String {
     format!(
         " AND (CASE WHEN d.added_by = '{MINED_ADDED_BY}' AND d.source_file <> '' \
          THEN d.source_file >= ?4 AND d.source_file < ?5 ELSE d.wing = ?3 END)"
+    )
+}
+
+/// Which rows a BM25 search may return, beyond its wing and room.
+enum Bm25Rows<'a> {
+    /// Every row.
+    All,
+    /// The rows the prompt-recall hook may inject, optionally in one scope. Its errors
+    /// are reported rather than read as "no hits", since the hook chooses whose
+    /// memory to inject from what comes back.
+    PromptRecall(Option<&'a RecallScope>),
+}
+
+/// Whether FTS5 rejected the query text itself, which a user's prompt can do: a
+/// syntax error, or a `-` it reads as a column filter (`needle - note` asks for
+/// column `note`). Only ever raised while stepping a statement that already
+/// prepared, so a "no such column" here is the query's, not the schema's. Any other
+/// failure (a busy or locked database, I/O, corruption) is not "no hits".
+fn is_fts_query_rejection(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(failure, Some(message))
+            if failure.code == rusqlite::ErrorCode::Unknown
+                && (message.starts_with("fts5:") || message.starts_with("no such column:"))
     )
 }
 
@@ -717,7 +783,7 @@ impl Database {
         self.bm25_search_with_history(query, limit, wing, room, false)
     }
 
-    /// Newest current entries in the `diary` wing that the recall hook may inject,
+    /// Newest current entries in the shared diary wing that the recall hook may inject,
     /// for it to match against the prompt. Hook rows, usually the newest and most
     /// numerous, would otherwise fill `limit`.
     pub(crate) fn recent_prompt_recall_diary(
@@ -733,10 +799,13 @@ impl Database {
         };
         let mut stmt = self.conn.prepare(&format!(
             "SELECT {columns} FROM drawers d
-             WHERE d.wing = 'diary'{eligible}{current}
+             WHERE d.wing = ?2{eligible}{current}
              ORDER BY d.filed_at DESC, d.id ASC LIMIT ?1"
         ))?;
-        let rows = stmt.query_map(params![limit as i64], Self::row_to_drawer)?;
+        let rows = stmt.query_map(
+            params![limit as i64, SHARED_DIARY_WING],
+            Self::row_to_drawer,
+        )?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
@@ -749,51 +818,58 @@ impl Database {
         room: Option<&str>,
         include_superseded: bool,
     ) -> Result<Vec<(String, f32)>, MemoryError> {
-        self.bm25_search_filtered(query, limit, wing, room, include_superseded, "", &[])
+        self.bm25_search_filtered(query, limit, wing, room, include_superseded, Bm25Rows::All)
     }
 
     /// BM25 over the drawers the prompt-recall hook may inject: current rows,
-    /// optionally in one scope, minus operational collab rooms and hook metadata.
+    /// optionally in one scope, minus operational rooms and the hooks' own diary rows.
+    /// Unlike [`Self::bm25_search`], a failure other than FTS5 rejecting the query
+    /// text is an error, not an empty result.
     pub(crate) fn prompt_recall_bm25_search(
         &self,
         query: &str,
         limit: usize,
         scope: Option<&RecallScope>,
     ) -> Result<Vec<(String, f32)>, MemoryError> {
-        let eligible = prompt_recall_eligible_sql();
-        match scope {
-            Some(scope) => {
-                let filter = format!("{}{eligible}", prompt_recall_scope_sql());
-                let params: [&dyn rusqlite::ToSql; 3] =
-                    [&scope.wing, &scope.under_root.0, &scope.under_root.1];
-                self.bm25_search_filtered(query, limit, None, None, false, &filter, &params)
-            }
-            None => self.bm25_search_filtered(query, limit, None, None, false, &eligible, &[]),
-        }
+        self.bm25_search_filtered(
+            query,
+            limit,
+            None,
+            None,
+            false,
+            Bm25Rows::PromptRecall(scope),
+        )
     }
 
     /// Whether any row, in any state, is part of `scope`: what tells a workspace with
-    /// memory from one without.
+    /// memory from one without. Deliberately not just rows recall may inject: a
+    /// workspace with only operational or superseded rows is still one ironmem knows,
+    /// and treating it as new would open other projects' memory to it.
     pub(crate) fn recall_scope_has_memory(&self, scope: &RecallScope) -> Result<bool, MemoryError> {
-        // Separate `EXISTS` so each side uses its own index.
-        let found: bool = self.conn.query_row(
+        // Two queries, the path range first: a mined workspace answers from
+        // `idx_drawers_source` alone, and the wing side, which a mined wing's rows
+        // would otherwise make a scan, reads only the partial index of rows a path
+        // doesn't place (migration 023).
+        let mined: bool = self.conn.query_row(
             &format!(
-                "SELECT EXISTS(SELECT 1 FROM drawers WHERE wing = ?1
-                               AND (added_by <> '{MINED_ADDED_BY}' OR source_file = ''))
-                     OR EXISTS(SELECT 1 FROM drawers
-                               WHERE source_file >= ?2 AND source_file < ?3
+                "SELECT EXISTS(SELECT 1 FROM drawers
+                               WHERE source_file >= ?1 AND source_file < ?2
                                  AND added_by = '{MINED_ADDED_BY}')"
             ),
-            params![scope.wing, scope.under_root.0, scope.under_root.1],
+            params![scope.under_root.0, scope.under_root.1],
             |row| row.get(0),
         )?;
-        Ok(found)
+        let Some(wing) = scope.wing.as_deref().filter(|_| !mined) else {
+            return Ok(mined);
+        };
+        let filed: bool = self.conn.query_row(
+            &format!("SELECT EXISTS(SELECT 1 FROM drawers WHERE wing = ?1 AND {UNPLACED_BY_PATH})"),
+            params![wing],
+            |row| row.get(0),
+        )?;
+        Ok(filed)
     }
 
-    /// `extra_filter` is appended to the `WHERE` clause verbatim, so it must be
-    /// built from constants and never from caller input. `extra_params` are its
-    /// values, numbered from `?3`, so they can't be combined with a wing or room.
-    #[allow(clippy::too_many_arguments)]
     fn bm25_search_filtered(
         &self,
         query: &str,
@@ -801,10 +877,28 @@ impl Database {
         wing: Option<&str>,
         room: Option<&str>,
         include_superseded: bool,
-        extra_filter: &str,
-        extra_params: &[&dyn rusqlite::ToSql],
+        rows_filter: Bm25Rows<'_>,
     ) -> Result<Vec<(String, f32)>, MemoryError> {
-        debug_assert!(extra_params.is_empty() || (wing.is_none() && room.is_none()));
+        // The prompt-recall filter numbers its values from `?3`, where a wing or room
+        // would go; nothing combines them, and a release build must not either.
+        let (extra_filter, scope, strict) = match rows_filter {
+            Bm25Rows::All => (String::new(), None, false),
+            Bm25Rows::PromptRecall(_) if wing.is_some() || room.is_some() => {
+                return Err(MemoryError::Validation(
+                    "prompt-recall BM25 takes no wing or room filter".into(),
+                ));
+            }
+            Bm25Rows::PromptRecall(Some(scope)) => (
+                format!(
+                    "{}{}",
+                    prompt_recall_scope_sql(),
+                    prompt_recall_eligible_sql()
+                ),
+                Some(scope),
+                true,
+            ),
+            Bm25Rows::PromptRecall(None) => (prompt_recall_eligible_sql(), None, true),
+        };
         if query.trim().is_empty() {
             return Ok(vec![]);
         }
@@ -891,11 +985,19 @@ impl Database {
             }
             (Some(w), None) => stmt.query_map(rusqlite::params![fts_query, limit_i64, w], query_fn),
             (None, Some(r)) => stmt.query_map(rusqlite::params![fts_query, limit_i64, r], query_fn),
-            (None, None) => {
-                let mut params: Vec<&dyn rusqlite::ToSql> = vec![&fts_query, &limit_i64];
-                params.extend_from_slice(extra_params);
-                stmt.query_map(&*params, query_fn)
-            }
+            (None, None) => match scope {
+                Some(scope) => stmt.query_map(
+                    rusqlite::params![
+                        fts_query,
+                        limit_i64,
+                        scope.wing,
+                        scope.under_root.0,
+                        scope.under_root.1
+                    ],
+                    query_fn,
+                ),
+                None => stmt.query_map(rusqlite::params![fts_query, limit_i64], query_fn),
+            },
         };
 
         match rows {
@@ -906,6 +1008,9 @@ impl Database {
                     tracing::warn!("BM25 query bound the wrong parameter count: {sql}: {e}");
                     return Err(e.into());
                 }
+                if strict && !is_fts_query_rejection(&e) {
+                    return Err(e.into());
+                }
                 tracing::debug!("BM25 query failed (will use vector-only): {e}");
                 Ok(vec![])
             }
@@ -914,6 +1019,8 @@ impl Database {
                 for row in rows {
                     match row {
                         Ok(pair) => result.push(pair),
+                        // A truncated result would read as complete.
+                        Err(e) if strict && !is_fts_query_rejection(&e) => return Err(e.into()),
                         Err(e) => {
                             tracing::debug!("BM25 row error: {e}");
                             break;
@@ -1610,7 +1717,8 @@ mod tests {
         let other_wing = insert("needle in another wing's note", "beta", "notes", "mcp");
 
         let ids = |wing: Option<&str>| -> Vec<String> {
-            let scope = wing.map(|wing| RecallScope::new(wing.to_string(), None));
+            let scope =
+                wing.map(|wing| RecallScope::new(wing.to_string(), Path::new("/elsewhere")));
             db.prompt_recall_bm25_search("needle", 3, scope.as_ref())
                 .unwrap()
                 .into_iter()
@@ -1629,6 +1737,141 @@ mod tests {
         let unscoped = ids(None);
         assert_eq!(unscoped.len(), 3);
         assert!(unscoped.contains(&other_wing));
+    }
+
+    #[test]
+    fn prompt_recall_sql_literals_hold_no_quote() {
+        // They are spliced into SQL, not bound.
+        for value in PROMPT_RECALL_EXCLUDED_ROOMS.iter().chain([
+            &HOOK_ADDED_BY,
+            &MINED_ADDED_BY,
+            &crate::diary::DIARY_ROOM,
+        ]) {
+            assert!(!value.contains('\''), "{value}");
+        }
+        // The partial index's WHERE, repeated by the query that has to match it.
+        let migration = include_str!("../../migrations/023_prompt_recall_indexes.sql");
+        let index_where = UNPLACED_BY_PATH
+            .trim_start_matches('(')
+            .trim_end_matches(')');
+        assert!(
+            migration.contains(&format!("WHERE {index_where};")),
+            "{index_where}"
+        );
+        assert!(UNPLACED_BY_PATH.contains(&format!("'{MINED_ADDED_BY}'")));
+    }
+
+    #[test]
+    fn prompt_recall_reads_use_their_indexes() {
+        let db = Database::open_in_memory().unwrap();
+        let plan = |sql: &str, wing: &str| -> String {
+            let mut stmt = db
+                .conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap();
+            let rows = stmt
+                .query_map(params![wing], |row| row.get::<_, String>(3))
+                .unwrap();
+            rows.map(Result::unwrap).collect::<Vec<_>>().join("\n")
+        };
+        let filed = plan(
+            &format!("SELECT EXISTS(SELECT 1 FROM drawers WHERE wing = ?1 AND {UNPLACED_BY_PATH})"),
+            "shop",
+        );
+        assert!(filed.contains("idx_drawers_wing_unplaced"), "{filed}");
+        let eligible = prompt_recall_eligible_sql();
+        let diary = plan(
+            &format!(
+                "SELECT d.id FROM drawers d WHERE d.wing = ?1{eligible} AND d.superseded_by IS NULL \
+                 ORDER BY d.filed_at DESC, d.id ASC LIMIT 50"
+            ),
+            SHARED_DIARY_WING,
+        );
+        assert!(diary.contains("idx_drawers_current_wing_filed"), "{diary}");
+        assert!(!diary.contains("USE TEMP B-TREE FOR ORDER BY"), "{diary}");
+    }
+
+    #[test]
+    fn prompt_recall_bm25_refuses_a_wing_or_room_filter() {
+        let db = Database::open_in_memory().unwrap();
+        let scope = RecallScope::new("shop".to_string(), Path::new("/shop"));
+        for (wing, room) in [(Some("shop"), None), (None, Some("docs"))] {
+            let result = db.bm25_search_filtered(
+                "needle",
+                3,
+                wing,
+                room,
+                false,
+                Bm25Rows::PromptRecall(Some(&scope)),
+            );
+            assert!(
+                matches!(result, Err(MemoryError::Validation(_))),
+                "{result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn prompt_recall_bm25_reports_failures_but_not_rejected_query_text() {
+        let db = Database::open_in_memory().unwrap();
+        let emb = dummy_embedding();
+        db.insert_drawer("n", "needle note", &emb, "shop", "docs", "", "mcp")
+            .unwrap();
+        // Text FTS5 can't parse is a prompt's doing, not a failure.
+        for prompt in ["needle -", "needle - note", "\"needle", "NOT", "needle AND"] {
+            assert!(
+                db.prompt_recall_bm25_search(prompt, 3, None).is_ok(),
+                "{prompt:?}"
+            );
+        }
+        let busy = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            Some("database is locked".to_string()),
+        );
+        assert!(!is_fts_query_rejection(&busy));
+        let syntax = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+            Some("fts5: syntax error near \"-\"".to_string()),
+        );
+        assert!(is_fts_query_rejection(&syntax));
+        let column = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+            Some("no such column: note".to_string()),
+        );
+        assert!(is_fts_query_rejection(&column));
+    }
+
+    #[test]
+    fn hook_reviews_are_recallable_and_hook_diary_rows_are_not() {
+        let db = Database::open_in_memory().unwrap();
+        let emb = dummy_embedding();
+        db.insert_drawer(
+            "review",
+            "needle review",
+            &emb,
+            REVIEW_WING,
+            "pr-7",
+            "/t.jsonl",
+            HOOK_ADDED_BY,
+        )
+        .unwrap();
+        db.insert_drawer(
+            "summary",
+            "needle hook ran",
+            &emb,
+            SHARED_DIARY_WING,
+            crate::diary::DIARY_ROOM,
+            "",
+            HOOK_ADDED_BY,
+        )
+        .unwrap();
+        let ids: Vec<String> = db
+            .prompt_recall_bm25_search("needle", 5, None)
+            .unwrap()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(ids, ["review"]);
     }
 
     #[test]

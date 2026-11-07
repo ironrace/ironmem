@@ -170,10 +170,13 @@ fn recall_lines(db_path: &Path, workspace: &Path, prompt: &str) -> Vec<String> {
         .write_all(payload.as_bytes())
         .unwrap();
     let output = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "hook failed: {stderr}");
+    // "Nothing injected" must mean nothing qualified: a recall that failed, timed out
+    // or was skipped would pass every negative case.
     assert!(
-        output.status.success(),
-        "hook failed: {}",
-        String::from_utf8_lossy(&output.stderr)
+        !stderr.contains("prompt-hook recall:"),
+        "recall did not run cleanly for {prompt:?}: {stderr}"
     );
     let json: Value = serde_json::from_slice(&output.stdout).unwrap();
     json.get("hookSpecificOutput")
@@ -239,6 +242,15 @@ fn fixed_prompt_set_injects_only_relevant_recall() {
             FRESH,
             "the shared runbook escalation steps",
             &[SHARED_RUNBOOK],
+        ),
+        // A long prompt shares a couple of words with most diary entries; that alone
+        // is not a match.
+        (
+            MINED,
+            "Please refactor the TOML config loader so environment overrides win over \
+             file values, keep the defaults in one table, and add tests for precedence. \
+             I inspected the worktree earlier and the loader is the only caller left.",
+            &[],
         ),
         // A diary entry BM25 finds only past the excerpt's cut, in the shared diary
         // wing and in the workspace's own: the text injected would be unrelated.
@@ -366,6 +378,8 @@ fn linked_worktree_recalls_what_mining_stored_for_it() {
     const OTHER_DOC: &str = "Our billing webhook retry policy backs off for an hour";
     const MAIN_DOC: &str = "The pricing tiers renew on the first of the month";
     write_doc(&linked, "ledger.md", LINKED_DOC);
+    // Tracked, so `docs` is a directory of the checkout and not a project inside it.
+    git(&linked, &["add", "docs/ledger.md"]);
     write_doc(&other_project, "webhooks.md", OTHER_DOC);
     mine(&db_path, &linked);
     mine(&db_path, &other_project);
@@ -535,6 +549,8 @@ fn git_subdirectory_mine_is_recalled_from_anywhere_in_the_repository() {
     const NESTED: &str = "The invoice numbering scheme restarts every year";
     write_file(&crates, "ledger.md", TOP);
     write_file(&crates, "core/invoices.md", NESTED);
+    // Tracked, so `crates` is a directory of the checkout and not a project inside it.
+    git(&repo, &["add", "crates"]);
     // What the stop hook does when a session runs in a subdirectory: no `.git` there,
     // so mining uses its non-Git rules, and nothing lands in wing `shop-api`.
     mine(&db_path, &crates);
@@ -594,5 +610,33 @@ fn main_checkout_subdirectory_mine_counts_as_the_linked_worktrees_repository() {
     assert!(
         lines[0].contains("source=\"crates/general\"") && lines[0].contains(MAIN_DOC),
         "{lines:#?}"
+    );
+}
+
+#[test]
+fn non_git_projects_inside_a_git_parent_keep_their_memory_apart() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("memory.sqlite3");
+    // A dotfiles-style work tree that tracks none of the projects under it
+    // (`status.showUntrackedFiles=no`, rather than a `.gitignore`, so mining still
+    // reads them).
+    let home = dir.path().join("home");
+    init_repo(&home);
+    let acme = home.join("clients").join("acme-notes");
+    let globex = home.join("clients").join("globex-notes");
+
+    const OURS: &str = "Acme contract renewal terms run for two years";
+    const THEIRS: &str = "Globex contract renewal terms run for one year";
+    write_file(&acme, "contracts/acme.md", OURS);
+    write_file(&globex, "contracts/globex.md", THEIRS);
+    mine(&db_path, &acme);
+    mine(&db_path, &globex);
+
+    let lines = recall_lines(&db_path, &acme, "contract renewal terms");
+    assert_eq!(lines.len(), 1, "{lines:#?}");
+    assert!(lines[0].contains(OURS), "{lines:#?}");
+    assert_eq!(
+        recall_lines(&db_path, &acme, "globex contract renewal terms"),
+        Vec::<String>::new()
     );
 }
