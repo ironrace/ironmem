@@ -753,7 +753,7 @@ Codex and Claude Code read from and write to the **same database by default** (`
 The DB is updated automatically as you work:
 
 - **Session start** — bootstrap runs if this is the first time; the workspace is mined if it hasn't been indexed yet. In Claude Code the injected status block also tells the session to say "ironmem tools failed to load" when no ironmem tools reached it, so a rejected tool list or dead server is loud instead of a session silently working without memory
-- **UserPromptSubmit** (Claude Code only) — every prompt triggers bounded local BM25/KG/diary recall (with opt-in ready-daemon hybrid vector recall; embedder never loaded by the hook) that injects sanitized untrusted-memory excerpts as `additionalContext`; see [docs/CODEX.md](docs/CODEX.md) for all prompt-recall tunables and daemon cost caveats
+- **UserPromptSubmit** (Claude Code only) — every prompt with at least two content words triggers bounded local BM25/KG/diary recall, with drawers scoped to the current workspace (with opt-in ready-daemon hybrid vector recall; embedder never loaded by the hook) that injects sanitized untrusted-memory excerpts as `additionalContext`; see [docs/CODEX.md](docs/CODEX.md) for all prompt-recall tunables and daemon cost caveats, and [UserPromptSubmit recall](#userpromptsubmit-recall-claude-code-only) for what is and isn't recalled
 - **Stop / PreCompact** — changed files are detected via SHA-256 manifest and re-mined incrementally; a session summary is appended to the diary. A hook without write access (`ironmem hook` run with `IRONMEM_MCP_MODE` unset or `read-only`, the default for hand-registered hook commands) never mines and only records metrics, from the database alone: the embedder and vector index are never loaded, so a Stop costs milliseconds instead of seconds on a large store. The plugin's hooks run `trusted` and still load them to mine
 - **Stop handoff nudge** (Claude Code only) — after a commit, push or PR, or 5+ file edits since the session last saved to ironmem, the Stop is blocked once with a request to save a handoff drawer (wing = repository name, room `handoffs`, logical_key `<branch>-handoff`), so the next session in any harness resumes from memory. At most once per 30 minutes per session, never on a stop that is already retrying; `IRONMEM_HANDOFF_NUDGE=0` (or `false`/`no`/`off`) turns it off
 - **Later sessions** — only files whose content hash changed since the last hook run are re-embedded, so updates are fast
@@ -903,7 +903,7 @@ Bound how many triples the KG layer serves and walks so a well-connected hub ent
 
 ### UserPromptSubmit recall (Claude Code only)
 
-On every prompt, ironmem runs a bounded, fail-closed recall lookup and injects
+On every prompt with enough content (below), ironmem runs a bounded, fail-closed recall lookup and injects
 sanitized untrusted-memory excerpts as `hookSpecificOutput.additionalContext`.
 The ordinary path is local FTS5/BM25, followed by optional KG-triple and
 diary recall; the embedder is never loaded. Codex registers no UserPromptSubmit
@@ -911,8 +911,11 @@ hook.
 
 Recall stays quiet unless the prompt gives it something to go on:
 
-- A prompt with fewer than two content words (`yes`, `go ahead`, `deploy`) skips
-  recall entirely. Function words and common replies don't count as content.
+- A prompt with fewer than two content words (`yes`, `go ahead`, `deploy`, `да`)
+  skips recall entirely, KG and diary included. Function words and common replies
+  don't count as content; verbs that name what a short prompt is about (`use
+  pgbouncer`, `stop hook`) do. In a script written without spaces (Chinese,
+  Japanese, Thai and the like) one run of at least four characters is enough.
 - The current workspace's memory is preferred, in order: the checkout's, then the
   repository's, where handoffs and the main checkout's files are. The two differ
   only in a linked worktree. Each is every file mined from under its directory,
@@ -922,18 +925,43 @@ Recall stays quiet unless the prompt gives it something to go on:
   memory, as does a Git subdirectory mined on its own. A mined file counts only
   where it was mined from: another workspace's `docs` doesn't, nor does
   `/other/notes/b.md`, though mining `/other` puts it in wing `notes`. A subdirectory
-  of a Git checkout counts as the checkout; outside Git the workspace is the
-  directory itself. A workspace with memory never reaches other wings. One with
-  none does, when the prompt has at least three content words. With no workspace,
-  every wing is searched.
-- Operational collab rooms (`collab-plans`, `collab-task-lists`,
-  `collab-checkpoints`, `collab-drafts`, `collab-messages`) and the diary rows
-  hooks write for themselves are never injected, however they were found.
+  of a Git checkout counts as the checkout when the checkout tracks a file in it; one
+  it tracks nothing in, such as a project under a `$HOME` kept in Git for dotfiles,
+  is its own workspace, as is any directory outside Git. `GIT_CEILING_DIRECTORIES`
+  is honored. A directory named for a wing every project shares (`diary`,
+  `reviews`, `autopilot`, `ironrace-memory`) doesn't own that wing.
+- A workspace with memory, meaning any row that is part of it, recallable or not,
+  never gets other projects' drawers. One with none does, when the prompt has at
+  least three content words. With no workspace, every wing is searched.
+- KG triples and the shared diary are not scoped by workspace: an entity the prompt
+  names is recalled from any project's triples, and a matching entry in the
+  `diary` wing, which every project's `diary_write` uses by default, is injected
+  whichever project wrote it.
+- Operational rooms (`collab-plans`, `collab-task-lists`, `collab-checkpoints`,
+  `collab-drafts`, `collab-messages`, and Autopilot's `backlog-lineage`) and the
+  diary entries hooks write for themselves (`Hook stop ran ...`) are never
+  injected, however they were found. Code reviews the Stop hook captures stay
+  recallable.
 - A diary entry is injected only when its excerpt, as injected, shares at least
-  two content words with the prompt, whether a search found it or it is among the
+  two content words with the prompt, and at least three in ten of the words of
+  whichever is shorter, the prompt or the excerpt, so a long prompt's common words
+  aren't a match. That holds whether a search found the entry or it is among the
   newest 50 injectable entries, which are checked on every prompt.
 - Text duplicated across wings, or between a search hit and a diary entry, is
-  injected once. A dropped copy doesn't count against the diary limit.
+  injected once: the best-ranked copy is kept and the next hit takes the other's
+  slot. A dropped copy doesn't count against the diary limit.
+- When the workspace path can't be resolved, or Git fails for a workspace inside a
+  checkout, recall is skipped for that prompt, and a recall that fails or runs
+  over the budget logs a warning rather than reading as "nothing relevant".
+
+Known limits: the thresholds above (two content words, three to reach other
+projects, the 50-entry diary scan) are fixed, not tunables. BM25 matches only rows
+containing every word of the prompt. A non-Git subdirectory of a mined non-Git root
+doesn't see the root's other files ([#388](https://github.com/ironrace/ironmem/issues/388)),
+and a non-Git `$HOME` used directly as the workspace takes in everything mined
+below it ([#389](https://github.com/ironrace/ironmem/issues/389)). A new
+subdirectory of a checkout counts as its own workspace until a file in it is
+added to Git.
 
 Hybrid recall is opt-in. When enabled, the hook only borrows an already-ready
 shared daemon through its Unix socket for vector IDs; it never initializes,
@@ -972,7 +1000,7 @@ all recall injection.
 | `IRONMEM_PROMPT_HOOK_KG` | on | Set to `0`, `false`, or `no` to disable KG-triple recall. Other values use the default (enabled). |
 | `IRONMEM_PROMPT_HOOK_KG_MAX_TRIPLES` | `3` | Maximum KG triples injected per prompt. Clamped to `1`–`5`. |
 | `IRONMEM_PROMPT_HOOK_DIARY` | on | Set to `0`, `false`, or `no` to disable diary recall. Other values use the default (enabled). |
-| `IRONMEM_PROMPT_HOOK_DIARY_MAX` | `1` | Maximum matching diary excerpts injected per prompt. Clamped to `1`–`3`. |
+| `IRONMEM_PROMPT_HOOK_DIARY_MAX` | `1` | Maximum diary excerpts injected per prompt, counting only entries that match the prompt (it used to cap the newest entries, matching or not). Clamped to `1`–`3`. |
 | `IRONMEM_PROMPT_HOOK_DIARY_LINE_BYTES` | `120` | Byte cap for each injected diary line. |
 | `IRONMEM_CONTEXT_WARN_PCT` | `0.60` | Context-occupancy fraction at which the hook injects a soft warning line (`>= warn`, `< handoff`). Unparseable or outside `0.0..=1.0` falls back to the default. If the resolved warn value `>=` handoff value, both revert to defaults to preserve the `warn < handoff` invariant. Occupancy uses `IRONMEM_CONTEXT_WINDOW` as the denominator. |
 | `IRONMEM_CONTEXT_HANDOFF_PCT` | `0.80` | Context-occupancy fraction at which the hook injects the handoff instruction (`>= handoff`). Same parsing/clamping and `warn < handoff` invariant as above. |
