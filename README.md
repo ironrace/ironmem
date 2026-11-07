@@ -915,11 +915,13 @@ Recall stays quiet unless the prompt gives it something to go on:
   recall entirely. Function words and common replies don't count as content.
 - The current workspace's memory is preferred, in order: the checkout's, then the
   repository's, where handoffs and the main checkout's files are. The two differ
-  only in a linked worktree. Each is what is filed in the wing named for its
-  directory, plus every file mined from under that directory, whatever wing mining
-  gave it. Below a non-Git root that is the file's first directory, so `docs/a.md`
-  in `/notes` is in wing `docs` and counts as `/notes`' memory, as does a Git
-  subdirectory mined on its own. Another workspace's `docs` doesn't. A subdirectory
+  only in a linked worktree. Each is every file mined from under its directory,
+  whatever wing mining gave it, plus what was filed by other means in the wing named
+  for that directory. Below a non-Git root a mined file's wing is its first
+  directory, so `docs/a.md` in `/notes` is in wing `docs` and counts as `/notes`'
+  memory, as does a Git subdirectory mined on its own. A mined file counts only
+  where it was mined from: another workspace's `docs` doesn't, nor does
+  `/other/notes/b.md`, though mining `/other` puts it in wing `notes`. A subdirectory
   of a Git checkout counts as the checkout; outside Git the workspace is the
   directory itself. A workspace with memory never reaches other wings. One with
   none does, when the prompt has at least three content words. With no workspace,

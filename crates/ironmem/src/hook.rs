@@ -5793,6 +5793,16 @@ mod tests {
             "mine",
         );
         let not_mined = insert("ledger rounding written", "docs", "/notes/c.md", "mcp");
+        // Mining `/other` names its `notes` directory's files wing `notes`: the
+        // workspace's own wing, from a path outside it.
+        let same_wing = insert(
+            "ledger rounding same wing",
+            "notes",
+            "/other/notes/d.md",
+            "mine",
+        );
+        // Not mined, so its wing is all that places it.
+        let filed = insert("ledger rounding filed", "notes", "", "mcp");
         let scopes = [RecallScope::new(
             "notes".to_string(),
             Some(Path::new("/notes")),
@@ -5800,7 +5810,8 @@ mod tests {
 
         let block = recall_block_from_db(&db, "ledger rounding", &config, &scopes).unwrap();
         assert!(block.contains("ledger rounding own"), "{block}");
-        assert_eq!(block.matches("- source=").count(), 1, "{block}");
+        assert!(block.contains("ledger rounding filed"), "{block}");
+        assert_eq!(block.matches("- source=").count(), 2, "{block}");
 
         let block = recall_block_from_qualifying(
             &db,
@@ -5808,11 +5819,18 @@ mod tests {
             &config,
             &scopes,
             vec![],
-            Some(&[sibling.clone(), own.clone(), not_mined.clone()]),
+            Some(&[
+                sibling.clone(),
+                same_wing.clone(),
+                own.clone(),
+                not_mined.clone(),
+                filed.clone(),
+            ]),
         )
         .unwrap();
         assert!(block.contains("ledger rounding own"), "{block}");
-        assert_eq!(block.matches("- source=").count(), 1, "{block}");
+        assert!(block.contains("ledger rounding filed"), "{block}");
+        assert_eq!(block.matches("- source=").count(), 2, "{block}");
 
         // Its files are memory, though the workspace's own wing has no rows.
         let has_memory = |wing: &str, root: Option<&str>| {
@@ -5821,7 +5839,13 @@ mod tests {
         };
         assert!(has_memory("notes", Some("/notes")));
         assert!(has_memory("unused", Some("/notes-archive/")));
+        // Wing `docs` has a row that wasn't mined, which its wing places.
         assert!(has_memory("docs", None));
+        // Once the filed row is gone, wing `notes` holds only a mined row from
+        // `/other`, which is that root's memory and not a workspace's elsewhere.
+        db.delete_drawer(&filed).unwrap();
+        assert!(!has_memory("notes", Some("/fresh")));
+        assert!(has_memory("notes", Some("/other")));
         assert!(!has_memory("unused", None));
         // Prefix of a path but not a directory of it, and a row that wasn't mined.
         assert!(!has_memory("unused", Some("/note")));

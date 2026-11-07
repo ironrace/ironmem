@@ -81,11 +81,12 @@ fn prompt_recall_eligible_sql() -> String {
 /// of the file it came from.
 pub(crate) const MINED_ADDED_BY: &str = "mine";
 
-/// Part of a workspace's memory for prompt recall: rows filed in `wing`, or mined from
-/// a file under `root`. The path is what identifies mined rows, since the wing a file
-/// gets depends on which directory was mined: below a non-Git root it is the file's
-/// first directory, however unrelated that name is to the workspace, and a name like
-/// `docs` is shared with every other workspace that has one.
+/// Part of a workspace's memory for prompt recall: rows mined from a file under `root`,
+/// and the other rows filed in `wing`. The path alone places a mined row, since the
+/// wing a file gets depends on which directory was mined: below a non-Git root it is
+/// the file's first directory, however unrelated that name is to the workspace, so a
+/// name like `docs`, or the workspace's own, is shared with any other root that has a
+/// directory of that name. A mined row without a path falls back to its wing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RecallScope {
     wing: String,
@@ -113,10 +114,11 @@ impl RecallScope {
     /// [`Self`] for a row already in hand. The SQL counterpart is
     /// [`prompt_recall_scope_sql`], with this scope's values bound.
     pub(crate) fn contains(&self, drawer: &Drawer) -> bool {
-        drawer.wing == self.wing
-            || (drawer.added_by == MINED_ADDED_BY
-                && drawer.source_file >= self.under_root.0
-                && drawer.source_file < self.under_root.1)
+        if drawer.added_by == MINED_ADDED_BY && !drawer.source_file.is_empty() {
+            drawer.source_file >= self.under_root.0 && drawer.source_file < self.under_root.1
+        } else {
+            drawer.wing == self.wing
+        }
     }
 }
 
@@ -124,8 +126,8 @@ impl RecallScope {
 /// and range bound to `?3`, `?4` and `?5`.
 fn prompt_recall_scope_sql() -> String {
     format!(
-        " AND (d.wing = ?3 OR (d.added_by = '{MINED_ADDED_BY}' \
-         AND d.source_file >= ?4 AND d.source_file < ?5))"
+        " AND (CASE WHEN d.added_by = '{MINED_ADDED_BY}' AND d.source_file <> '' \
+         THEN d.source_file >= ?4 AND d.source_file < ?5 ELSE d.wing = ?3 END)"
     )
 }
 
@@ -776,7 +778,8 @@ impl Database {
         // Separate `EXISTS` so each side uses its own index.
         let found: bool = self.conn.query_row(
             &format!(
-                "SELECT EXISTS(SELECT 1 FROM drawers WHERE wing = ?1)
+                "SELECT EXISTS(SELECT 1 FROM drawers WHERE wing = ?1
+                               AND (added_by <> '{MINED_ADDED_BY}' OR source_file = ''))
                      OR EXISTS(SELECT 1 FROM drawers
                                WHERE source_file >= ?2 AND source_file < ?3
                                  AND added_by = '{MINED_ADDED_BY}')"

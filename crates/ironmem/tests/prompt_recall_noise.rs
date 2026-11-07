@@ -495,6 +495,35 @@ fn a_wing_name_shared_with_another_workspace_does_not_leak_its_files() {
 }
 
 #[test]
+fn another_roots_files_mined_into_the_workspaces_own_wing_stay_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("memory.sqlite3");
+    let notes = dir.path().join("notes");
+    let other = dir.path().join("other");
+
+    const OURS: &str = "The ledger rounding rules keep four decimals";
+    const THEIRS: &str = "The pricing tiers renew on the first of the month";
+    write_file(&notes, "docs/ledger.md", OURS);
+    // Mining `other` files this under its first directory: wing `notes`, the
+    // workspace's own wing name, from a path outside the workspace.
+    write_file(&other, "notes/pricing.md", THEIRS);
+    mine(&db_path, &notes);
+    mine(&db_path, &other);
+
+    assert_eq!(
+        recall_lines(&db_path, &notes, "pricing tiers"),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        recall_lines(&db_path, &notes, "pricing tiers renew month"),
+        Vec::<String>::new()
+    );
+    let lines = recall_lines(&db_path, &notes, "ledger rounding");
+    assert_eq!(lines.len(), 1, "{lines:#?}");
+    assert!(lines[0].contains(OURS), "{lines:#?}");
+}
+
+#[test]
 fn git_subdirectory_mine_is_recalled_from_anywhere_in_the_repository() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("memory.sqlite3");

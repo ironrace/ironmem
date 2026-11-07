@@ -12,7 +12,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Prompt recall injects less noise (#375).** The `user-prompt-submit` hook
   skips prompts with fewer than two content words, such as `yes` or `go ahead`,
   and prefers the current workspace's memory, its checkout's and then its
-  repository's, including files mined from under them into other wings: a workspace
+  repository's, placing a mined file by the path it was mined from rather than the
+  wing mining gave it: a workspace
   with memory no longer reaches other wings, and one with none does so only on a
   prompt with at least three content words.
   Operational collab rooms and hook-written diary rows are no longer injected, a
