@@ -503,9 +503,15 @@ fn main_worktree_dir(
 /// for `--path-format`): the fallback scopes would be narrower than the workspace's
 /// memory, and a miss in them would open cross-wing recall for a workspace that has
 /// memory. The caller skips recall then, failing closed.
-fn workspace_recall_scopes(workspace_root: &Path) -> Option<Vec<RecallScope>> {
+///
+/// A linked worktree's own scope also holds its repository's filed rows, so its
+/// handoffs and decisions rank with its files rather than behind them. A checkout
+/// nested in a scope's directory and mined on its own, as `state_dir` records, is left
+/// out of that scope: its files are its own memory.
+fn workspace_recall_scopes(workspace_root: &Path, state_dir: &Path) -> Option<Vec<RecallScope>> {
     let ceiling = std::env::var_os("GIT_CEILING_DIRECTORIES");
-    workspace_recall_scopes_with(workspace_root, ceiling.as_deref())
+    let mined_roots = crate::bootstrap::mined_workspace_roots(state_dir);
+    workspace_recall_scopes_with(workspace_root, ceiling.as_deref(), &mined_roots)
 }
 
 /// [`workspace_recall_scopes`] with the operator's `GIT_CEILING_DIRECTORIES`, which
@@ -514,6 +520,7 @@ fn workspace_recall_scopes(workspace_root: &Path) -> Option<Vec<RecallScope>> {
 fn workspace_recall_scopes_with(
     workspace_root: &Path,
     ceiling: Option<&std::ffi::OsStr>,
+    mined_roots: &[PathBuf],
 ) -> Option<Vec<RecallScope>> {
     let skip = |why: &str| {
         tracing::warn!(
@@ -532,13 +539,20 @@ fn workspace_recall_scopes_with(
         Ok(checkout) => checkout,
         Err(why) => return skip(why),
     };
+    let scope = |wing: String, root: &Path| {
+        nested_checkouts(root, mined_roots)
+            .iter()
+            .fold(RecallScope::new(wing, root), |scope, nested| {
+                scope.excluding(nested)
+            })
+    };
     let Some(GitCheckout {
         toplevel,
         common_dir,
     }) = checkout
     else {
         let wing = crate::ingest::checkout_wing(&workspace);
-        return Some(vec![RecallScope::new(wing, &workspace)]);
+        return Some(vec![scope(wing, &workspace)]);
     };
     let checkout = crate::ingest::checkout_wing(&toplevel);
     let repository_dir = main_worktree_dir(&workspace, &common_dir, ceiling);
@@ -548,11 +562,33 @@ fn workspace_recall_scopes_with(
     let repository = repository_wing(&repository_dir)
         .filter(|wing| *wing != checkout || repository_root != toplevel);
 
-    let mut scopes = vec![RecallScope::new(checkout, &toplevel)];
-    if let Some(wing) = repository {
-        scopes.push(RecallScope::new(wing, &repository_root));
-    }
-    Some(scopes)
+    let Some(repository) = repository else {
+        return Some(vec![scope(checkout, &toplevel)]);
+    };
+    Some(vec![
+        scope(checkout, &toplevel).with_filed_wing(repository.clone()),
+        scope(repository, &repository_root),
+    ])
+}
+
+/// The checkouts nested under `root` that were mined on their own: for each mined
+/// root strictly below it, the outermost directory on the way down that has a `.git`
+/// of its own. A mined subdirectory of `root`'s own checkout has none, and stays.
+fn nested_checkouts(root: &Path, mined_roots: &[PathBuf]) -> Vec<PathBuf> {
+    let mut nested: Vec<PathBuf> = mined_roots
+        .iter()
+        .filter_map(|mined| {
+            let relative = mined.strip_prefix(root).ok()?;
+            let mut dir = root.to_path_buf();
+            relative.components().find_map(|component| {
+                dir.push(component);
+                dir.join(".git").exists().then(|| dir.clone())
+            })
+        })
+        .collect();
+    nested.sort();
+    nested.dedup();
+    nested
 }
 
 /// A Git checkout's canonical top level and absolute common Git directory.
@@ -658,7 +694,8 @@ fn checkout_tracks_a_file_under(
 /// [`workspace_recall_scopes`] for a workspace where Git answers, as the tests build.
 #[cfg(test)]
 fn workspace_scopes(workspace_root: &Path) -> Vec<RecallScope> {
-    workspace_recall_scopes_with(workspace_root, None).expect("git resolves the test workspace")
+    workspace_recall_scopes_with(workspace_root, None, &[])
+        .expect("git resolves the test workspace")
 }
 
 /// `git -C <workspace_root>`, scrubbed. `inherited` is set on git's command before the
@@ -1080,6 +1117,7 @@ fn run_user_prompt_submit(
         if !is_trivial_prompt(prompt) && !budget.is_zero() {
             if let Some(ctx) = search_prompt_context(
                 &config.db_path,
+                &config.state_dir,
                 prompt,
                 workspace_root,
                 start,
@@ -1167,6 +1205,7 @@ fn prompt_occupancy_sample_allowed(
 /// additionalContext, or `None`.
 fn search_prompt_context(
     db_path: &Path,
+    state_dir: &Path,
     prompt: &str,
     workspace_root: Option<&Path>,
     start: Instant,
@@ -1210,9 +1249,13 @@ fn search_prompt_context(
     let db_path = db_path.to_path_buf();
     let prompt = prompt.to_string();
     let workspace_root = workspace_root.map(Path::to_path_buf);
+    let state_dir = state_dir.to_path_buf();
     std::thread::spawn(move || {
         // Spawns git, so it runs here: the `recv_timeout` below bounds a slow one.
-        let scopes = match workspace_root.as_deref().map(workspace_recall_scopes) {
+        let scopes = match workspace_root
+            .as_deref()
+            .map(|root| workspace_recall_scopes(root, &state_dir))
+        {
             Some(Some(scopes)) => scopes,
             // Git failed inside a checkout: no recall rather than an unscoped one.
             Some(None) => {
@@ -1381,9 +1424,9 @@ enum RecallReach {
 
 /// BM25 hits eligible for injection. The first of the workspace's scopes with a hit
 /// wins outright; the rest of the store is searched only when
-/// [`cross_wing_recall_allowed`]. With no workspace there is nothing to prefer, so
-/// every wing is searched. A failed search recalls no drawers, but leaves KG and
-/// diary recall, which don't depend on it, to run.
+/// [`cross_wing_recall_allowed`]. With no workspace there is nothing to prefer, and
+/// every wing is searched under that same bar. A failed search recalls no drawers, but
+/// leaves KG and diary recall, which don't depend on it, to run.
 fn bm25_qualifying(
     db: &crate::db::schema::Database,
     prompt: &str,
@@ -1454,8 +1497,7 @@ fn bm25_qualifying(
             Err(e) => return failed(e),
         }
     }
-    let allowed =
-        workspace_scopes.is_empty() || cross_wing_recall_allowed(db, words, workspace_scopes);
+    let allowed = cross_wing_recall_allowed(db, words, workspace_scopes);
     if !allowed {
         return Bm25Qualifying {
             hits: Vec::new(),
@@ -1559,8 +1601,8 @@ const PROMPT_RECALL_STOPWORDS: &[&str] = &[
 const PROMPT_RECALL_MIN_CONTENT_WORDS: usize = 2;
 
 /// Content words a prompt needs before other projects' memory may be injected into a
-/// workspace with none of its own. Two words like `run tests` match hundreds of rows
-/// in a large store.
+/// workspace with none of its own, or into a prompt with no workspace at all. Two
+/// words like `run tests` match hundreds of rows in a large store.
 const PROMPT_RECALL_CROSS_WING_MIN_CONTENT_WORDS: usize = 3;
 
 /// Content words a diary excerpt must share with the prompt, at the least.
@@ -1637,7 +1679,8 @@ fn is_unsegmented_script(c: char) -> bool {
 /// Whether another project's memory may be injected for a prompt the workspace's own
 /// scopes have no hit for. Never in a workspace that has memory: there, a miss means the
 /// prompt isn't about anything recorded, and what other projects match on its common
-/// words is the noise this hook exists to avoid. An unreadable count fails closed.
+/// words is the noise this hook exists to avoid. With no workspace (no scopes), only
+/// the content-word bar applies. An unreadable count fails closed.
 fn cross_wing_recall_allowed(
     db: &crate::db::schema::Database,
     words: &std::collections::HashSet<String>,
@@ -1751,8 +1794,7 @@ fn recall_block_from_qualifying(
     let words = prompt_content_words(prompt);
     let reach = if qualifying.is_empty() {
         RecallReach::Elsewhere {
-            allowed: workspace_scopes.is_empty()
-                || cross_wing_recall_allowed(db, &words, workspace_scopes),
+            allowed: cross_wing_recall_allowed(db, &words, workspace_scopes),
         }
     } else {
         let ids: Vec<&str> = qualifying.iter().map(|(id, _)| id.as_str()).collect();
@@ -4067,7 +4109,11 @@ mod tests {
         let plain = base.join("notes");
         std::fs::create_dir_all(&plain).unwrap();
 
-        let linked_scopes = [scope("shop-api-feature", &linked), scope("shop-api", &repo)];
+        // A linked worktree's own scope holds its repository's filed rows too.
+        let linked_scopes = [
+            scope("shop-api-feature", &linked).with_filed_wing("shop-api".to_string()),
+            scope("shop-api", &repo),
+        ];
         assert_eq!(workspace_scopes(&repo), [scope("shop-api", &repo)]);
         assert_eq!(workspace_scopes(&linked), linked_scopes);
         assert_eq!(workspace_scopes(&subdir), linked_scopes);
@@ -4344,7 +4390,7 @@ mod tests {
             "user-prompt-submit",
             "claude-code",
             config,
-            serde_json::json!({ "prompt": "zigzag widget" }),
+            serde_json::json!({ "prompt": "zigzag widget instructions" }),
         )
         .unwrap();
         let v = serde_json::to_value(&resp).unwrap();
@@ -5652,7 +5698,8 @@ mod tests {
             diary_max: 1,
             diary_line_bytes: 120,
         };
-        let block = recall_block_from_db(&db, "alpha beta", &config, &[]).expect("match injects");
+        let block =
+            recall_block_from_db(&db, "alpha beta gamma", &config, &[]).expect("match injects");
         let summary = block
             .lines()
             .find(|l| l.starts_with("- "))
@@ -5770,7 +5817,8 @@ mod tests {
             diary_max: 1,
             diary_line_bytes: 120,
         };
-        let block = recall_block_from_db(&db, "how does pgbouncer work", &config, &[]).unwrap();
+        let block =
+            recall_block_from_db(&db, "how does pgbouncer pooling work", &config, &[]).unwrap();
         assert!(
             !block.contains("source=\"kg\""),
             "KG should not appear when disabled: {block}"
@@ -5975,9 +6023,14 @@ mod tests {
             None
         );
 
-        // With no workspace there is nothing to prefer: every wing stays searchable.
-        let block = recall_block_from_db(&db, "webhook retry", &config, &[]).unwrap();
+        // With no workspace every wing is searched, so the prompt clears the same bar
+        // as the fallback from a workspace without memory.
+        let block = recall_block_from_db(&db, "webhook retry policy", &config, &[]).unwrap();
         assert!(block.contains("other/docs"), "{block}");
+        assert_eq!(
+            recall_block_from_db(&db, "webhook retry", &config, &[]),
+            None
+        );
     }
 
     #[test]
@@ -6124,16 +6177,28 @@ mod tests {
         config.diary_enabled = false;
         config.max_hits = 1;
         let deep = |ending: &str| format!("{}{ending}", "unrelated filler text ".repeat(20));
-        let shared = insert_recall_drawer(&db, &deep("ledger rounding"), "diary", "diary", "diary");
-        let project = insert_recall_drawer(&db, &deep("ledger rounding"), "shop", "diary", "diary");
+        let shared = insert_recall_drawer(
+            &db,
+            &deep("ledger rounding cents"),
+            "diary",
+            "diary",
+            "diary",
+        );
+        let project = insert_recall_drawer(
+            &db,
+            &deep("ledger rounding cents"),
+            "shop",
+            "diary",
+            "diary",
+        );
         let room_elsewhere =
-            insert_recall_drawer(&db, &deep("ledger rounding"), "diary", "notes", "mcp");
+            insert_recall_drawer(&db, &deep("ledger rounding cents"), "diary", "notes", "mcp");
         // A longer row, so every diary entry outranks it and only a filter ahead of
         // the `max_hits` cut leaves it standing.
         insert_recall_drawer(
             &db,
             &format!(
-                "ledger rounding {}",
+                "ledger rounding cents {}",
                 "keeps four decimals in totals ".repeat(30)
             ),
             "wing",
@@ -6141,7 +6206,7 @@ mod tests {
             "mine",
         );
 
-        let block = recall_block_from_db(&db, "ledger rounding", &config, &[]).unwrap();
+        let block = recall_block_from_db(&db, "ledger rounding cents", &config, &[]).unwrap();
         assert!(block.contains("wing/docs"), "{block}");
         assert_eq!(block.matches("- source=").count(), 1, "{block}");
 
@@ -6157,7 +6222,7 @@ mod tests {
         assert_eq!(
             recall_block_from_qualifying(
                 &db,
-                "ledger rounding",
+                "ledger rounding cents",
                 &config,
                 &[],
                 vec![],
@@ -6165,18 +6230,23 @@ mod tests {
             ),
             None
         );
-        let matching =
-            insert_recall_drawer(&db, "the ledger rounding entry", "shop", "diary", "diary");
+        let matching = insert_recall_drawer(
+            &db,
+            "the ledger rounding cents entry",
+            "shop",
+            "diary",
+            "diary",
+        );
         let block = recall_block_from_qualifying(
             &db,
-            "ledger rounding",
+            "ledger rounding cents",
             &config,
             &[],
             vec![],
             Some(&[matching]),
         )
         .unwrap();
-        assert!(block.contains("the ledger rounding entry"), "{block}");
+        assert!(block.contains("the ledger rounding cents entry"), "{block}");
     }
 
     #[test]
@@ -6351,11 +6421,11 @@ mod tests {
         let config = recall_test_config();
         insert_recall_drawer(&db, "shared runbook steps", "wing-a", "docs", "mine");
         insert_recall_drawer(&db, "shared runbook steps", "wing-b", "docs", "mine");
-        let block = recall_block_from_db(&db, "shared runbook", &config, &[]).unwrap();
+        let block = recall_block_from_db(&db, "shared runbook steps", &config, &[]).unwrap();
         assert_eq!(block.matches("shared runbook steps").count(), 1, "{block}");
 
         insert_recall_drawer(&db, "ledger rounding entry", "diary", "diary", "diary");
-        let block = recall_block_from_db(&db, "ledger rounding", &config, &[]).unwrap();
+        let block = recall_block_from_db(&db, "ledger rounding entry", &config, &[]).unwrap();
         assert_eq!(block.matches("ledger rounding entry").count(), 1, "{block}");
     }
 
@@ -6527,7 +6597,7 @@ mod tests {
             diary_max: 1,
             diary_line_bytes: 120,
         };
-        let block = recall_block_from_db(&db, "auth middleware", &config, &[]).unwrap();
+        let block = recall_block_from_db(&db, "auth middleware tokens", &config, &[]).unwrap();
         assert!(
             !block.contains("source=\"diary\""),
             "diary should not appear when disabled: {block}"
@@ -7848,16 +7918,16 @@ mod tests {
         git_test_repo(&home, &["add", "clients/acme-notes/notes.md"]);
         let scope = |wing: &str, root: &Path| RecallScope::new(wing.to_string(), root);
         assert_eq!(
-            workspace_recall_scopes_with(&acme, None),
+            workspace_recall_scopes_with(&acme, None, &[]),
             Some(vec![scope("home", &home)])
         );
         assert_eq!(
-            workspace_recall_scopes_with(&acme, Some(home.as_os_str())),
+            workspace_recall_scopes_with(&acme, Some(home.as_os_str()), &[]),
             Some(vec![scope("acme-notes", &acme)])
         );
         // The ceiling only narrows discovery: the work tree itself is still one.
         assert_eq!(
-            workspace_recall_scopes_with(&home, Some(home.as_os_str())),
+            workspace_recall_scopes_with(&home, Some(home.as_os_str()), &[]),
             Some(vec![scope("home", &home)])
         );
     }
@@ -7895,7 +7965,10 @@ mod tests {
     #[test]
     fn workspace_that_cannot_be_resolved_skips_recall() {
         let temp = tempfile::tempdir().unwrap();
-        assert_eq!(workspace_recall_scopes(&temp.path().join("deleted")), None);
+        assert_eq!(
+            workspace_recall_scopes(&temp.path().join("deleted"), temp.path()),
+            None
+        );
     }
 
     #[test]
@@ -8207,5 +8280,163 @@ mod tests {
                 .is_some_and(|b| b.contains("postgres migration diary note")),
             "{block:?}"
         );
+    }
+
+    // ---- PR #387: worktree filed rows, nested checkouts ----
+
+    /// A mined row with its file's path, as mining stores it.
+    fn insert_mined_drawer(
+        db: &crate::db::schema::Database,
+        content: &str,
+        wing: &str,
+        source_file: &Path,
+    ) -> String {
+        let zero = vec![0.0f32; ironrace_embed::embedder::EMBED_DIM];
+        let source_file = source_file.to_string_lossy();
+        let id = generate_id(content, wing, &source_file);
+        db.insert_drawer(
+            &id,
+            content,
+            &zero,
+            wing,
+            "docs",
+            &source_file,
+            crate::db::drawers::MINED_ADDED_BY,
+        )
+        .unwrap();
+        id
+    }
+
+    #[test]
+    fn a_linked_worktree_recalls_its_repositorys_filed_rows_with_its_own_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let repo = base.join("shop-api");
+        init_git_test_repo(&repo);
+        let linked = base.join("shop-api-feature");
+        git_test_repo(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feature",
+                linked.to_str().unwrap(),
+            ],
+        );
+        let db = crate::db::schema::Database::open(&base.join("m.sqlite3")).unwrap();
+        db.migrate().unwrap();
+        let mut config = recall_test_config();
+        config.diary_enabled = false;
+        // The worktree's mined copy of the docs matches the prompt, which used to end
+        // the search before the repository's hand-filed decision was looked at.
+        insert_mined_drawer(
+            &db,
+            "collab task limit is configurable per session",
+            "shop-api-feature",
+            &linked.join("docs").join("COLLAB.md"),
+        );
+        insert_recall_drawer(
+            &db,
+            "collab task limit decision: back to ten",
+            "shop-api",
+            "collab-decisions",
+            "mcp",
+        );
+
+        let scopes = workspace_scopes(&linked);
+        let block = recall_block_from_db(&db, "collab task limit", &config, &scopes).unwrap();
+        assert!(block.contains("back to ten"), "{block}");
+        assert!(block.contains("configurable per session"), "{block}");
+    }
+
+    #[test]
+    fn separately_mined_nested_checkouts_are_not_the_parents_memory() {
+        let _prompt = prompt_hook_tunable_defaults();
+        // Room for git on a loaded test runner: this is about scope, not latency.
+        let _budget = ScopedEnvVar::set("IRONMEM_PROMPT_HOOK_BUDGET_MS", "5000");
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let repo = base.join("shop-api");
+        init_git_test_repo(&repo);
+        std::fs::write(repo.join(".gitignore"), ".claude/\nservices/\n").unwrap();
+        // A linked worktree under the main checkout, and an independent repository
+        // the parent ignores: each mined on its own, under the parent's path.
+        let nested_worktree = repo.join(".claude").join("worktrees").join("feature");
+        git_test_repo(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feature",
+                nested_worktree.to_str().unwrap(),
+            ],
+        );
+        let nested_repo = repo.join("services").join("billing");
+        init_git_test_repo(&nested_repo);
+        // A subdirectory of the parent's own checkout mined on its own is still its.
+        let own_subdir = repo.join("crates");
+        std::fs::create_dir_all(&own_subdir).unwrap();
+
+        let db_path = base.join("memory.sqlite3");
+        let db = crate::db::schema::Database::open(&db_path).unwrap();
+        db.migrate().unwrap();
+        insert_mined_drawer(
+            &db,
+            "ledger rounding rules parent copy",
+            "shop-api",
+            &repo.join("docs").join("ledger.md"),
+        );
+        insert_mined_drawer(
+            &db,
+            "ledger rounding rules subdirectory copy",
+            "shop-api",
+            &own_subdir.join("ledger.md"),
+        );
+        insert_mined_drawer(
+            &db,
+            "ledger rounding rules worktree copy",
+            "feature",
+            &nested_worktree.join("docs").join("ledger.md"),
+        );
+        insert_mined_drawer(
+            &db,
+            "ledger rounding rules billing copy",
+            "billing",
+            &nested_repo.join("docs").join("ledger.md"),
+        );
+        drop(db);
+        let config = prompt_hook_config(db_path, base.join("state"));
+        for root in [&nested_worktree, &nested_repo, &own_subdir] {
+            crate::bootstrap::record_workspace_mine(&config, root).unwrap();
+        }
+
+        let recall = |cwd: &Path| {
+            let resp = run_hook_with_input(
+                "user-prompt-submit",
+                "claude-code",
+                config.clone(),
+                serde_json::json!({ "prompt": "ledger rounding rules", "cwd": cwd }),
+            )
+            .unwrap();
+            serde_json::to_value(&resp).unwrap()["hookSpecificOutput"]["additionalContext"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        };
+        let parent = recall(&repo);
+        assert!(parent.contains("parent copy"), "{parent}");
+        assert!(parent.contains("subdirectory copy"), "{parent}");
+        assert!(!parent.contains("worktree copy"), "{parent}");
+        assert!(!parent.contains("billing copy"), "{parent}");
+        // The nested checkouts keep their own files.
+        let billing = recall(&nested_repo);
+        assert!(billing.contains("billing copy"), "{billing}");
+        assert!(!billing.contains("parent copy"), "{billing}");
+        let worktree = recall(&nested_worktree);
+        assert!(worktree.contains("worktree copy"), "{worktree}");
     }
 }

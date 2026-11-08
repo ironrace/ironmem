@@ -128,49 +128,127 @@ const UNPLACED_BY_PATH: &str = "(added_by <> 'mine' OR source_file = '')";
 /// the file's first directory, however unrelated that name is to the workspace, so a
 /// name like `docs`, or the workspace's own, is shared with any other root that has a
 /// directory of that name. A mined row without a path falls back to its wing.
+///
+/// Two refinements: a linked worktree's scope also takes its repository's filed rows
+/// ([`Self::with_filed_wing`]), and a checkout nested under `root` and mined on its own
+/// keeps its files ([`Self::excluding`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RecallScope {
     /// `None` when the workspace's name is one of the [`SHARED_WINGS`]: a directory
     /// named `diary` doesn't own every project's diary.
     wing: Option<String>,
+    /// A second wing whose filed rows are part of the scope: a linked worktree's
+    /// repository, where its handoffs and decisions are filed. Never a shared wing.
+    filed_wing: Option<String>,
     /// The half-open range of `source_file` values under the root, so the lookup can
     /// use `idx_drawers_source`.
     under_root: (String, String),
+    /// Ranges inside `under_root` that belong to other checkouts.
+    excluded: Vec<(String, String)>,
+}
+
+/// The half-open range of `source_file` values under `root`.
+fn source_range(root: &Path) -> (String, String) {
+    let root = root.to_string_lossy();
+    let dir = root.trim_end_matches(std::path::MAIN_SEPARATOR);
+    let separator = std::path::MAIN_SEPARATOR as u8;
+    // The character sorting right after the separator ends the range, so a sibling
+    // like `/notes-archive` stays out of `/notes`.
+    (
+        format!("{dir}{}", separator as char),
+        format!("{dir}{}", (separator + 1) as char),
+    )
 }
 
 impl RecallScope {
     pub(crate) fn new(wing: String, root: &Path) -> Self {
-        let root = root.to_string_lossy();
-        let dir = root.trim_end_matches(std::path::MAIN_SEPARATOR);
-        let separator = std::path::MAIN_SEPARATOR as u8;
-        // The character sorting right after the separator ends the range, so a
-        // sibling like `/notes-archive` stays out of `/notes`.
-        let under_root = (
-            format!("{dir}{}", separator as char),
-            format!("{dir}{}", (separator + 1) as char),
-        );
         let wing = (!SHARED_WINGS.contains(&wing.as_str())).then_some(wing);
-        Self { wing, under_root }
+        Self {
+            wing,
+            filed_wing: None,
+            under_root: source_range(root),
+            excluded: Vec::new(),
+        }
+    }
+
+    /// The scope, also holding the rows filed in `wing` that no path places: what a
+    /// linked worktree recalls from its repository alongside its own files.
+    pub(crate) fn with_filed_wing(mut self, wing: String) -> Self {
+        if !SHARED_WINGS.contains(&wing.as_str()) && self.wing.as_deref() != Some(&wing) {
+            self.filed_wing = Some(wing);
+        }
+        self
+    }
+
+    /// The scope, without the files mined under `root`: a checkout nested in this
+    /// one's directory, whose files are its own memory and not this scope's.
+    pub(crate) fn excluding(mut self, root: &Path) -> Self {
+        let range = source_range(root);
+        if range.0 > self.under_root.0 && range.0 < self.under_root.1 {
+            self.excluded.push(range);
+        }
+        self
+    }
+
+    /// Whether the scope's directory holds `path`, nested checkouts aside. `path` must
+    /// be canonical, as mining records it.
+    fn holds_path(&self, path: &str) -> bool {
+        let in_range =
+            |(start, end): &(String, String)| path >= start.as_str() && path < end.as_str();
+        in_range(&self.under_root) && !self.excluded.iter().any(in_range)
     }
 
     /// [`Self`] for a row already in hand. The SQL counterpart is
-    /// [`prompt_recall_scope_sql`], with this scope's values bound.
+    /// [`RecallScope::sql`], with [`RecallScope::sql_values`] bound.
     pub(crate) fn contains(&self, drawer: &Drawer) -> bool {
         if drawer.added_by == MINED_ADDED_BY && !drawer.source_file.is_empty() {
-            drawer.source_file >= self.under_root.0 && drawer.source_file < self.under_root.1
+            self.holds_path(&drawer.source_file)
         } else {
-            self.wing.as_deref() == Some(drawer.wing.as_str())
+            [&self.wing, &self.filed_wing]
+                .into_iter()
+                .any(|wing| wing.as_deref() == Some(drawer.wing.as_str()))
         }
     }
-}
 
-/// [`RecallScope::contains`] as a condition over `drawers` aliased `d`, with its wing
-/// and range bound to `?3`, `?4` and `?5`. A `NULL` wing matches no row.
-fn prompt_recall_scope_sql() -> String {
-    format!(
-        " AND (CASE WHEN d.added_by = '{MINED_ADDED_BY}' AND d.source_file <> '' \
-         THEN d.source_file >= ?4 AND d.source_file < ?5 ELSE d.wing = ?3 END)"
-    )
+    /// [`Self::contains`] as a condition over `drawers` aliased `d`, its values bound
+    /// from `?{first}` on, in [`Self::sql_values`] order. A `NULL` wing matches no row.
+    fn sql(&self, first: usize) -> String {
+        let excluded: String = (0..self.excluded.len())
+            .map(|n| {
+                let start = first + 4 + 2 * n;
+                format!(
+                    " AND NOT (d.source_file >= ?{start} AND d.source_file < ?{})",
+                    start + 1
+                )
+            })
+            .collect();
+        format!(
+            " AND (CASE WHEN d.added_by = '{MINED_ADDED_BY}' AND d.source_file <> '' \
+             THEN d.source_file >= ?{} AND d.source_file < ?{}{excluded} \
+             ELSE d.wing IN (?{first}, ?{}) END)",
+            first + 2,
+            first + 3,
+            first + 1
+        )
+    }
+
+    /// The values [`Self::sql`] binds, in order.
+    fn sql_values(&self) -> Vec<rusqlite::types::Value> {
+        let text = |value: &str| rusqlite::types::Value::Text(value.to_string());
+        let wing =
+            |wing: &Option<String>| wing.as_deref().map_or(rusqlite::types::Value::Null, text);
+        let mut values = vec![
+            wing(&self.wing),
+            wing(&self.filed_wing),
+            text(&self.under_root.0),
+            text(&self.under_root.1),
+        ];
+        for (start, end) in &self.excluded {
+            values.push(text(start));
+            values.push(text(end));
+        }
+        values
+    }
 }
 
 /// Which rows a BM25 search may return, beyond its wing and room.
@@ -846,28 +924,52 @@ impl Database {
     /// workspace with only operational or superseded rows is still one ironmem knows,
     /// and treating it as new would open other projects' memory to it.
     pub(crate) fn recall_scope_has_memory(&self, scope: &RecallScope) -> Result<bool, MemoryError> {
-        // Two queries, the path range first: a mined workspace answers from
-        // `idx_drawers_source` alone, and the wing side, which a mined wing's rows
-        // would otherwise make a scan, reads only the partial index of rows a path
-        // doesn't place (migration 023).
+        // The path range first: a mined workspace answers from `idx_drawers_source`
+        // alone, and the wing side, which a mined wing's rows would otherwise make a
+        // scan, reads only the partial index of rows a path doesn't place (migration
+        // 023). Each nested checkout's range is left out of the first.
+        let excluded: String = (0..scope.excluded.len())
+            .map(|n| {
+                format!(
+                    " AND NOT (source_file >= ?{} AND source_file < ?{})",
+                    3 + 2 * n,
+                    4 + 2 * n
+                )
+            })
+            .collect();
+        let mut values = vec![
+            rusqlite::types::Value::Text(scope.under_root.0.clone()),
+            rusqlite::types::Value::Text(scope.under_root.1.clone()),
+        ];
+        for (start, end) in &scope.excluded {
+            values.push(rusqlite::types::Value::Text(start.clone()));
+            values.push(rusqlite::types::Value::Text(end.clone()));
+        }
         let mined: bool = self.conn.query_row(
             &format!(
                 "SELECT EXISTS(SELECT 1 FROM drawers
-                               WHERE source_file >= ?1 AND source_file < ?2
+                               WHERE source_file >= ?1 AND source_file < ?2{excluded}
                                  AND added_by = '{MINED_ADDED_BY}')"
             ),
-            params![scope.under_root.0, scope.under_root.1],
+            rusqlite::params_from_iter(values),
             |row| row.get(0),
         )?;
-        let Some(wing) = scope.wing.as_deref().filter(|_| !mined) else {
-            return Ok(mined);
-        };
-        let filed: bool = self.conn.query_row(
-            &format!("SELECT EXISTS(SELECT 1 FROM drawers WHERE wing = ?1 AND {UNPLACED_BY_PATH})"),
-            params![wing],
-            |row| row.get(0),
-        )?;
-        Ok(filed)
+        if mined {
+            return Ok(true);
+        }
+        for wing in [&scope.wing, &scope.filed_wing].into_iter().flatten() {
+            let filed: bool = self.conn.query_row(
+                &format!(
+                    "SELECT EXISTS(SELECT 1 FROM drawers WHERE wing = ?1 AND {UNPLACED_BY_PATH})"
+                ),
+                params![wing],
+                |row| row.get(0),
+            )?;
+            if filed {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn bm25_search_filtered(
@@ -889,11 +991,7 @@ impl Database {
                 ));
             }
             Bm25Rows::PromptRecall(Some(scope)) => (
-                format!(
-                    "{}{}",
-                    prompt_recall_scope_sql(),
-                    prompt_recall_eligible_sql()
-                ),
+                format!("{}{}", scope.sql(3), prompt_recall_eligible_sql()),
                 Some(scope),
                 true,
             ),
@@ -986,16 +1084,14 @@ impl Database {
             (Some(w), None) => stmt.query_map(rusqlite::params![fts_query, limit_i64, w], query_fn),
             (None, Some(r)) => stmt.query_map(rusqlite::params![fts_query, limit_i64, r], query_fn),
             (None, None) => match scope {
-                Some(scope) => stmt.query_map(
-                    rusqlite::params![
-                        fts_query,
-                        limit_i64,
-                        scope.wing,
-                        scope.under_root.0,
-                        scope.under_root.1
-                    ],
-                    query_fn,
-                ),
+                Some(scope) => {
+                    let mut values = vec![
+                        rusqlite::types::Value::Text(fts_query.clone()),
+                        rusqlite::types::Value::Integer(limit_i64),
+                    ];
+                    values.extend(scope.sql_values());
+                    stmt.query_map(rusqlite::params_from_iter(values), query_fn)
+                }
                 None => stmt.query_map(rusqlite::params![fts_query, limit_i64], query_fn),
             },
         };
@@ -1789,6 +1885,68 @@ mod tests {
         );
         assert!(diary.contains("idx_drawers_current_wing_filed"), "{diary}");
         assert!(!diary.contains("USE TEMP B-TREE FOR ORDER BY"), "{diary}");
+    }
+
+    #[test]
+    fn recall_scope_sql_agrees_with_contains_for_filed_wings_and_nested_checkouts() {
+        let db = Database::open_in_memory().unwrap();
+        let emb = dummy_embedding();
+        let rows = [
+            ("own", "shop", "/shop/docs/a.md", MINED_ADDED_BY, true),
+            (
+                "nested",
+                "feature",
+                "/shop/wt/feature/a.md",
+                MINED_ADDED_BY,
+                false,
+            ),
+            ("sibling", "shop", "/shopx/a.md", MINED_ADDED_BY, false),
+            ("filed", "shop", "", "mcp", true),
+            ("repository", "shop-api", "", "mcp", true),
+            ("unplaced", "shop-api", "", MINED_ADDED_BY, true),
+            ("other", "other", "", "mcp", false),
+        ];
+        for (id, wing, source_file, added_by, _) in rows {
+            db.insert_drawer(id, "needle note", &emb, wing, "docs", source_file, added_by)
+                .unwrap();
+        }
+        let scope = RecallScope::new("shop".to_string(), Path::new("/shop"))
+            .with_filed_wing("shop-api".to_string())
+            .excluding(Path::new("/shop/wt/feature"))
+            // Not under the root: no range to leave out.
+            .excluding(Path::new("/elsewhere"));
+        let mut found: Vec<String> = db
+            .prompt_recall_bm25_search("needle", 20, Some(&scope))
+            .unwrap()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        found.sort();
+        let mut expected: Vec<String> = rows
+            .iter()
+            .filter(|row| row.4)
+            .map(|row| row.0.to_string())
+            .collect();
+        expected.sort();
+        assert_eq!(found, expected);
+        for (id, ..) in rows {
+            let drawer = db.get_drawer(id).unwrap().unwrap();
+            assert_eq!(
+                scope.contains(&drawer),
+                expected.contains(&id.to_string()),
+                "{id}"
+            );
+        }
+
+        // A parent whose only mined rows are a nested checkout's has no memory.
+        let parent = RecallScope::new("wt".to_string(), Path::new("/shop/wt"));
+        assert!(db.recall_scope_has_memory(&parent).unwrap());
+        let parent = parent.excluding(Path::new("/shop/wt/feature"));
+        assert!(!db.recall_scope_has_memory(&parent).unwrap());
+        // A shared wing is never a filed wing, nor the scope's own wing twice.
+        let scope = RecallScope::new("shop".to_string(), Path::new("/shop"));
+        assert_eq!(scope.clone().with_filed_wing("diary".to_string()), scope);
+        assert_eq!(scope.clone().with_filed_wing("shop".to_string()), scope);
     }
 
     #[test]

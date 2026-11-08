@@ -918,13 +918,18 @@ Recall stays quiet unless the prompt gives it something to go on:
   Japanese, Thai and the like) one run of at least four characters is enough.
 - The current workspace's memory is preferred, in order: the checkout's, then the
   repository's, where handoffs and the main checkout's files are. The two differ
-  only in a linked worktree. Each is every file mined from under its directory,
+  only in a linked worktree, whose own scope also holds what was filed in the
+  repository's wing, so its handoffs and decisions rank with the worktree's files
+  rather than behind them. Each is every file mined from under its directory,
   whatever wing mining gave it, plus what was filed by other means in the wing named
   for that directory. Below a non-Git root a mined file's wing is its first
   directory, so `docs/a.md` in `/notes` is in wing `docs` and counts as `/notes`'
   memory, as does a Git subdirectory mined on its own. A mined file counts only
   where it was mined from: another workspace's `docs` doesn't, nor does
-  `/other/notes/b.md`, though mining `/other` puts it in wing `notes`. A subdirectory
+  `/other/notes/b.md`, though mining `/other` puts it in wing `notes`. A checkout
+  nested in the directory and mined on its own, such as a linked worktree under
+  `.claude/worktrees/` or a repository the parent ignores, keeps its files: they
+  are its memory, not the parent's. A subdirectory
   of a Git checkout counts as the checkout when the checkout tracks a file in it; one
   it tracks nothing in, such as a project under a `$HOME` kept in Git for dotfiles,
   is its own workspace, as is any directory outside Git. `GIT_CEILING_DIRECTORIES`
@@ -932,7 +937,8 @@ Recall stays quiet unless the prompt gives it something to go on:
   `reviews`, `autopilot`, `ironrace-memory`) doesn't own that wing.
 - A workspace with memory, meaning any row that is part of it, recallable or not,
   never gets other projects' drawers. One with none does, when the prompt has at
-  least three content words. With no workspace, every wing is searched.
+  least three content words. With no workspace (no `cwd`), every wing is searched,
+  under the same three-word bar.
 - KG triples and the shared diary are not scoped by workspace: an entity the prompt
   names is recalled from any project's triples, and a matching entry in the
   `diary` wing, which every project's `diary_write` uses by default, is injected
@@ -955,7 +961,9 @@ Recall stays quiet unless the prompt gives it something to go on:
   over the budget logs a warning rather than reading as "nothing relevant".
 
 Known limits: the thresholds above (two content words, three to reach other
-projects, the 50-entry diary scan) are fixed, not tunables. BM25 matches only rows
+projects or to search with no workspace, the 50-entry diary scan) are fixed, not
+tunables. A nested checkout is told apart from the parent only once it has been
+mined on its own, and only while its `.git` is there. BM25 matches only rows
 containing every word of the prompt. A non-Git subdirectory of a mined non-Git root
 doesn't see the root's other files ([#388](https://github.com/ironrace/ironmem/issues/388)),
 and a non-Git `$HOME` used directly as the workspace takes in everything mined
