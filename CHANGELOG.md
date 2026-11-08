@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The Stop hook's handoff nudge names the wing prompt recall reads.** A
+  project inside a Git work tree that tracks none of its files, or one behind
+  `GIT_CEILING_DIRECTORIES`, was asked to save its handoff in the parent
+  repository's wing, which its own prompt recall no longer reads once it has
+  mined memory. The nudge now resolves the workspace as recall does.
 - **Prompt recall injects less noise (#375).** The `user-prompt-submit` hook
   skips prompts with fewer than two content words, such as `yes`, `go ahead` or
   `да`. It prefers the current workspace's memory, its checkout's and then its
