@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use rusqlite::{params, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -39,9 +41,239 @@ use crate::error::MemoryError;
 /// A synthetic drawer has `source_file = "pref:<parent_drawer_id>"`.
 pub(crate) const PREF_SENTINEL: &str = "pref:";
 
+/// Wing of the collab protocol's own rows, whatever repository they are about.
+pub(crate) const COLLAB_WING: &str = "ironrace-memory";
+/// Collab session plans.
+pub(crate) const COLLAB_PLAN_ROOM: &str = "collab-plans";
+/// Collab batch task lists.
+pub(crate) const COLLAB_TASK_LIST_ROOM: &str = "collab-task-lists";
+/// Collab implementation checkpoints.
+pub(crate) const COLLAB_CHECKPOINT_ROOM: &str = "collab-checkpoints";
+/// Collab drafts. A convention agents follow through `add_drawer`; ironmem itself
+/// writes nothing here.
+pub(crate) const COLLAB_DRAFT_ROOM: &str = "collab-drafts";
 /// Transport-only collab message bodies are retrieved by their opaque drawer
 /// references and must not be discoverable through generic memory search.
-const COLLAB_MESSAGE_ROOM: &str = "collab-messages";
+pub(crate) const COLLAB_MESSAGE_ROOM: &str = "collab-messages";
+
+/// The shared diary's wing, where hooks and `diary_write` file by default.
+pub(crate) const SHARED_DIARY_WING: &str = "diary";
+
+/// Wing of the code reviews the stop hook captures from transcripts.
+pub(crate) const REVIEW_WING: &str = "reviews";
+
+/// `added_by` of every row a hook writes: its own diary rows ("Hook stop ran for
+/// ..."), and the code reviews it captures from transcripts.
+pub(crate) const HOOK_ADDED_BY: &str = "hook";
+
+/// Rooms of operational artifacts: collab session plans, task lists, checkpoints,
+/// drafts and transport, and Autopilot's dispatch lineage. Exact names on purpose:
+/// durable notes in rooms such as `collab-decisions` stay recallable.
+const PROMPT_RECALL_EXCLUDED_ROOMS: [&str; 6] = [
+    COLLAB_PLAN_ROOM,
+    COLLAB_TASK_LIST_ROOM,
+    COLLAB_CHECKPOINT_ROOM,
+    COLLAB_DRAFT_ROOM,
+    COLLAB_MESSAGE_ROOM,
+    crate::autopilot::ROOM,
+];
+
+/// Wings every project files into, so no workspace's memory is the wing as a whole,
+/// whatever the workspace directory happens to be called.
+const SHARED_WINGS: [&str; 4] = [
+    SHARED_DIARY_WING,
+    REVIEW_WING,
+    COLLAB_WING,
+    crate::autopilot::WING,
+];
+
+/// Whether a drawer may be injected into a prompt by the recall hook. The vector
+/// path's counterpart to [`prompt_recall_eligible_sql`].
+pub(crate) fn prompt_recall_eligible(drawer: &Drawer) -> bool {
+    !PROMPT_RECALL_EXCLUDED_ROOMS.contains(&drawer.room.as_str())
+        // A hook's own diary rows are lifecycle metadata; the reviews it captures
+        // are durable content, which stays recallable.
+        && !(drawer.added_by == HOOK_ADDED_BY && drawer.room == crate::diary::DIARY_ROOM)
+}
+
+/// [`prompt_recall_eligible`] as `WHERE` conditions over `drawers` aliased `d`. Every
+/// prompt-recall query filters in SQL rather than afterwards, so the rows it drops,
+/// which can outrank or outdate everything else, don't use up its `LIMIT`. Built from
+/// constants, which a test checks hold no quote.
+fn prompt_recall_eligible_sql() -> String {
+    let excluded_rooms = PROMPT_RECALL_EXCLUDED_ROOMS
+        .map(|room| format!("'{room}'"))
+        .join(", ");
+    let diary_room = crate::diary::DIARY_ROOM;
+    format!(
+        " AND d.room NOT IN ({excluded_rooms}) \
+         AND NOT (d.added_by = '{HOOK_ADDED_BY}' AND d.room = '{diary_room}')"
+    )
+}
+
+/// `added_by` of every drawer mining stores. Its `source_file` is the absolute,
+/// canonical path of the file it came from, which [`RecallScope`] places it by; a
+/// value that isn't, from a store written some other way, sorts outside every
+/// workspace's range, so the row counts as no workspace's memory.
+pub(crate) const MINED_ADDED_BY: &str = "mine";
+
+/// The rows a path doesn't place, which their wing does. Exactly the `WHERE` of the
+/// partial index `idx_drawers_wing_unplaced` (migration 023), so a query that repeats
+/// it can use the index.
+const UNPLACED_BY_PATH: &str = "(added_by <> 'mine' OR source_file = '')";
+
+/// Part of a workspace's memory for prompt recall: rows mined from a file under `root`,
+/// and the other rows filed in `wing`. The path alone places a mined row, since the
+/// wing a file gets depends on which directory was mined: below a non-Git root it is
+/// the file's first directory, however unrelated that name is to the workspace, so a
+/// name like `docs`, or the workspace's own, is shared with any other root that has a
+/// directory of that name. A mined row without a path falls back to its wing.
+///
+/// Two refinements: a linked worktree's scope also takes its repository's filed rows
+/// ([`Self::with_filed_wing`]), and a checkout nested under `root` and mined on its own
+/// keeps its files ([`Self::excluding`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RecallScope {
+    /// `None` when the workspace's name is one of the [`SHARED_WINGS`]: a directory
+    /// named `diary` doesn't own every project's diary.
+    wing: Option<String>,
+    /// A second wing whose filed rows are part of the scope: a linked worktree's
+    /// repository, where its handoffs and decisions are filed. Never a shared wing.
+    filed_wing: Option<String>,
+    /// The half-open range of `source_file` values under the root, so the lookup can
+    /// use `idx_drawers_source`.
+    under_root: (String, String),
+    /// Ranges inside `under_root` that belong to other checkouts.
+    excluded: Vec<(String, String)>,
+}
+
+/// The half-open range of `source_file` values under `root`.
+fn source_range(root: &Path) -> (String, String) {
+    let root = root.to_string_lossy();
+    let dir = root.trim_end_matches(std::path::MAIN_SEPARATOR);
+    let separator = std::path::MAIN_SEPARATOR as u8;
+    // The character sorting right after the separator ends the range, so a sibling
+    // like `/notes-archive` stays out of `/notes`.
+    (
+        format!("{dir}{}", separator as char),
+        format!("{dir}{}", (separator + 1) as char),
+    )
+}
+
+impl RecallScope {
+    pub(crate) fn new(wing: String, root: &Path) -> Self {
+        let wing = (!SHARED_WINGS.contains(&wing.as_str())).then_some(wing);
+        Self {
+            wing,
+            filed_wing: None,
+            under_root: source_range(root),
+            excluded: Vec::new(),
+        }
+    }
+
+    /// The scope, also holding the rows filed in `wing` that no path places: what a
+    /// linked worktree recalls from its repository alongside its own files.
+    pub(crate) fn with_filed_wing(mut self, wing: String) -> Self {
+        if !SHARED_WINGS.contains(&wing.as_str()) && self.wing.as_deref() != Some(&wing) {
+            self.filed_wing = Some(wing);
+        }
+        self
+    }
+
+    /// The scope, without the files mined under `root`: a checkout nested in this
+    /// one's directory, whose files are its own memory and not this scope's.
+    pub(crate) fn excluding(mut self, root: &Path) -> Self {
+        let range = source_range(root);
+        if range.0 > self.under_root.0 && range.0 < self.under_root.1 {
+            self.excluded.push(range);
+        }
+        self
+    }
+
+    /// Whether the scope's directory holds `path`, nested checkouts aside. `path` must
+    /// be canonical, as mining records it.
+    fn holds_path(&self, path: &str) -> bool {
+        let in_range =
+            |(start, end): &(String, String)| path >= start.as_str() && path < end.as_str();
+        in_range(&self.under_root) && !self.excluded.iter().any(in_range)
+    }
+
+    /// [`Self`] for a row already in hand. The SQL counterpart is
+    /// [`RecallScope::sql`], with [`RecallScope::sql_values`] bound.
+    pub(crate) fn contains(&self, drawer: &Drawer) -> bool {
+        if drawer.added_by == MINED_ADDED_BY && !drawer.source_file.is_empty() {
+            self.holds_path(&drawer.source_file)
+        } else {
+            [&self.wing, &self.filed_wing]
+                .into_iter()
+                .any(|wing| wing.as_deref() == Some(drawer.wing.as_str()))
+        }
+    }
+
+    /// [`Self::contains`] as a condition over `drawers` aliased `d`, its values bound
+    /// from `?{first}` on, in [`Self::sql_values`] order. A `NULL` wing matches no row.
+    fn sql(&self, first: usize) -> String {
+        let excluded: String = (0..self.excluded.len())
+            .map(|n| {
+                let start = first + 4 + 2 * n;
+                format!(
+                    " AND NOT (d.source_file >= ?{start} AND d.source_file < ?{})",
+                    start + 1
+                )
+            })
+            .collect();
+        format!(
+            " AND (CASE WHEN d.added_by = '{MINED_ADDED_BY}' AND d.source_file <> '' \
+             THEN d.source_file >= ?{} AND d.source_file < ?{}{excluded} \
+             ELSE d.wing IN (?{first}, ?{}) END)",
+            first + 2,
+            first + 3,
+            first + 1
+        )
+    }
+
+    /// The values [`Self::sql`] binds, in order.
+    fn sql_values(&self) -> Vec<rusqlite::types::Value> {
+        let text = |value: &str| rusqlite::types::Value::Text(value.to_string());
+        let wing =
+            |wing: &Option<String>| wing.as_deref().map_or(rusqlite::types::Value::Null, text);
+        let mut values = vec![
+            wing(&self.wing),
+            wing(&self.filed_wing),
+            text(&self.under_root.0),
+            text(&self.under_root.1),
+        ];
+        for (start, end) in &self.excluded {
+            values.push(text(start));
+            values.push(text(end));
+        }
+        values
+    }
+}
+
+/// Which rows a BM25 search may return, beyond its wing and room.
+enum Bm25Rows<'a> {
+    /// Every row.
+    All,
+    /// The rows the prompt-recall hook may inject, optionally in one scope. Its errors
+    /// are reported rather than read as "no hits", since the hook chooses whose
+    /// memory to inject from what comes back.
+    PromptRecall(Option<&'a RecallScope>),
+}
+
+/// Whether FTS5 rejected the query text itself, which a user's prompt can do: a
+/// syntax error, or a `-` it reads as a column filter (`needle - note` asks for
+/// column `note`). Only ever raised while stepping a statement that already
+/// prepared, so a "no such column" here is the query's, not the schema's. Any other
+/// failure (a busy or locked database, I/O, corruption) is not "no hits".
+fn is_fts_query_rejection(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(failure, Some(message))
+            if failure.code == rusqlite::ErrorCode::Unknown
+                && (message.starts_with("fts5:") || message.starts_with("no such column:"))
+    )
+}
 
 /// Cosine-similarity floor for treating two current drawers in one wing/room as
 /// near duplicates. Tuned for the `EMBED_DIM`-wide vectors the bundled embedder
@@ -629,6 +861,32 @@ impl Database {
         self.bm25_search_with_history(query, limit, wing, room, false)
     }
 
+    /// Newest current entries in the shared diary wing that the recall hook may inject,
+    /// for it to match against the prompt. Hook rows, usually the newest and most
+    /// numerous, would otherwise fill `limit`.
+    pub(crate) fn recent_prompt_recall_diary(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<Drawer>, MemoryError> {
+        let columns = Self::drawer_projection(&self.conn)?;
+        let eligible = prompt_recall_eligible_sql();
+        let current = if Self::has_superseded_by_column(&self.conn)? {
+            " AND d.superseded_by IS NULL"
+        } else {
+            ""
+        };
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {columns} FROM drawers d
+             WHERE d.wing = ?2{eligible}{current}
+             ORDER BY d.filed_at DESC, d.id ASC LIMIT ?1"
+        ))?;
+        let rows = stmt.query_map(
+            params![limit as i64, SHARED_DIARY_WING],
+            Self::row_to_drawer,
+        )?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     /// BM25 full-text search with optional retained-history inclusion.
     pub fn bm25_search_with_history(
         &self,
@@ -638,6 +896,107 @@ impl Database {
         room: Option<&str>,
         include_superseded: bool,
     ) -> Result<Vec<(String, f32)>, MemoryError> {
+        self.bm25_search_filtered(query, limit, wing, room, include_superseded, Bm25Rows::All)
+    }
+
+    /// BM25 over the drawers the prompt-recall hook may inject: current rows,
+    /// optionally in one scope, minus operational rooms and the hooks' own diary rows.
+    /// Unlike [`Self::bm25_search`], a failure other than FTS5 rejecting the query
+    /// text is an error, not an empty result.
+    pub(crate) fn prompt_recall_bm25_search(
+        &self,
+        query: &str,
+        limit: usize,
+        scope: Option<&RecallScope>,
+    ) -> Result<Vec<(String, f32)>, MemoryError> {
+        self.bm25_search_filtered(
+            query,
+            limit,
+            None,
+            None,
+            false,
+            Bm25Rows::PromptRecall(scope),
+        )
+    }
+
+    /// Whether any row, in any state, is part of `scope`: what tells a workspace with
+    /// memory from one without. Deliberately not just rows recall may inject: a
+    /// workspace with only operational or superseded rows is still one ironmem knows,
+    /// and treating it as new would open other projects' memory to it.
+    pub(crate) fn recall_scope_has_memory(&self, scope: &RecallScope) -> Result<bool, MemoryError> {
+        // The path range first: a mined workspace answers from `idx_drawers_source`
+        // alone, and the wing side, which a mined wing's rows would otherwise make a
+        // scan, reads only the partial index of rows a path doesn't place (migration
+        // 023). Each nested checkout's range is left out of the first.
+        let excluded: String = (0..scope.excluded.len())
+            .map(|n| {
+                format!(
+                    " AND NOT (source_file >= ?{} AND source_file < ?{})",
+                    3 + 2 * n,
+                    4 + 2 * n
+                )
+            })
+            .collect();
+        let mut values = vec![
+            rusqlite::types::Value::Text(scope.under_root.0.clone()),
+            rusqlite::types::Value::Text(scope.under_root.1.clone()),
+        ];
+        for (start, end) in &scope.excluded {
+            values.push(rusqlite::types::Value::Text(start.clone()));
+            values.push(rusqlite::types::Value::Text(end.clone()));
+        }
+        let mined: bool = self.conn.query_row(
+            &format!(
+                "SELECT EXISTS(SELECT 1 FROM drawers
+                               WHERE source_file >= ?1 AND source_file < ?2{excluded}
+                                 AND added_by = '{MINED_ADDED_BY}')"
+            ),
+            rusqlite::params_from_iter(values),
+            |row| row.get(0),
+        )?;
+        if mined {
+            return Ok(true);
+        }
+        for wing in [&scope.wing, &scope.filed_wing].into_iter().flatten() {
+            let filed: bool = self.conn.query_row(
+                &format!(
+                    "SELECT EXISTS(SELECT 1 FROM drawers WHERE wing = ?1 AND {UNPLACED_BY_PATH})"
+                ),
+                params![wing],
+                |row| row.get(0),
+            )?;
+            if filed {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn bm25_search_filtered(
+        &self,
+        query: &str,
+        limit: usize,
+        wing: Option<&str>,
+        room: Option<&str>,
+        include_superseded: bool,
+        rows_filter: Bm25Rows<'_>,
+    ) -> Result<Vec<(String, f32)>, MemoryError> {
+        // The prompt-recall filter numbers its values from `?3`, where a wing or room
+        // would go; nothing combines them, and a release build must not either.
+        let (extra_filter, scope, strict) = match rows_filter {
+            Bm25Rows::All => (String::new(), None, false),
+            Bm25Rows::PromptRecall(_) if wing.is_some() || room.is_some() => {
+                return Err(MemoryError::Validation(
+                    "prompt-recall BM25 takes no wing or room filter".into(),
+                ));
+            }
+            Bm25Rows::PromptRecall(Some(scope)) => (
+                format!("{}{}", scope.sql(3), prompt_recall_eligible_sql()),
+                Some(scope),
+                true,
+            ),
+            Bm25Rows::PromptRecall(None) => (prompt_recall_eligible_sql(), None, true),
+        };
         if query.trim().is_empty() {
             return Ok(vec![]);
         }
@@ -663,7 +1022,7 @@ impl Database {
                     "SELECT drawers_fts.drawer_id, -bm25(drawers_fts) AS score
                  FROM drawers_fts
                  JOIN drawers d ON d.id = drawers_fts.drawer_id
-                 WHERE drawers_fts MATCH ?1 AND d.wing = ?3 AND d.room = ?4{supersession_filter}
+                 WHERE drawers_fts MATCH ?1 AND d.wing = ?3 AND d.room = ?4{supersession_filter}{extra_filter}
                  ORDER BY score DESC LIMIT ?2"
                 )
             }
@@ -672,7 +1031,7 @@ impl Database {
                     "SELECT drawers_fts.drawer_id, -bm25(drawers_fts) AS score
                  FROM drawers_fts
                  JOIN drawers d ON d.id = drawers_fts.drawer_id
-                 WHERE drawers_fts MATCH ?1 AND d.wing = ?3{supersession_filter}
+                 WHERE drawers_fts MATCH ?1 AND d.wing = ?3{supersession_filter}{extra_filter}
                  ORDER BY score DESC LIMIT ?2"
                 )
             }
@@ -681,7 +1040,7 @@ impl Database {
                     "SELECT drawers_fts.drawer_id, -bm25(drawers_fts) AS score
                  FROM drawers_fts
                  JOIN drawers d ON d.id = drawers_fts.drawer_id
-                 WHERE drawers_fts MATCH ?1 AND d.room = ?3{supersession_filter}
+                 WHERE drawers_fts MATCH ?1 AND d.room = ?3{supersession_filter}{extra_filter}
                  ORDER BY score DESC LIMIT ?2"
                 )
             }
@@ -690,7 +1049,7 @@ impl Database {
                     "SELECT drawers_fts.drawer_id, -bm25(drawers_fts) AS score
                  FROM drawers_fts
                  JOIN drawers d ON d.id = drawers_fts.drawer_id
-                 WHERE drawers_fts MATCH ?1{supersession_filter}
+                 WHERE drawers_fts MATCH ?1{supersession_filter}{extra_filter}
                  ORDER BY score DESC LIMIT ?2"
                 )
             }
@@ -724,7 +1083,17 @@ impl Database {
             }
             (Some(w), None) => stmt.query_map(rusqlite::params![fts_query, limit_i64, w], query_fn),
             (None, Some(r)) => stmt.query_map(rusqlite::params![fts_query, limit_i64, r], query_fn),
-            (None, None) => stmt.query_map(rusqlite::params![fts_query, limit_i64], query_fn),
+            (None, None) => match scope {
+                Some(scope) => {
+                    let mut values = vec![
+                        rusqlite::types::Value::Text(fts_query.clone()),
+                        rusqlite::types::Value::Integer(limit_i64),
+                    ];
+                    values.extend(scope.sql_values());
+                    stmt.query_map(rusqlite::params_from_iter(values), query_fn)
+                }
+                None => stmt.query_map(rusqlite::params![fts_query, limit_i64], query_fn),
+            },
         };
 
         match rows {
@@ -735,6 +1104,9 @@ impl Database {
                     tracing::warn!("BM25 query bound the wrong parameter count: {sql}: {e}");
                     return Err(e.into());
                 }
+                if strict && !is_fts_query_rejection(&e) {
+                    return Err(e.into());
+                }
                 tracing::debug!("BM25 query failed (will use vector-only): {e}");
                 Ok(vec![])
             }
@@ -743,6 +1115,8 @@ impl Database {
                 for row in rows {
                     match row {
                         Ok(pair) => result.push(pair),
+                        // A truncated result would read as complete.
+                        Err(e) if strict && !is_fts_query_rejection(&e) => return Err(e.into()),
                         Err(e) => {
                             tracing::debug!("BM25 row error: {e}");
                             break;
@@ -1401,6 +1775,335 @@ mod tests {
         assert_eq!(history_ids.len(), 2);
         assert!(history_ids.contains(&predecessor.to_string()));
         assert!(history_ids.contains(&successor.to_string()));
+    }
+
+    #[test]
+    fn prompt_recall_bm25_excludes_operational_rooms_and_hook_rows_before_the_limit() {
+        let db = Database::open_in_memory().unwrap();
+        let emb = dummy_embedding();
+        let insert = |content: &str, wing: &str, room: &str, added_by: &str| {
+            let id = generate_id(content, wing, room);
+            db.insert_drawer(&id, content, &emb, wing, room, "", added_by)
+                .unwrap();
+            id
+        };
+        for room in PROMPT_RECALL_EXCLUDED_ROOMS {
+            for n in 0..3 {
+                insert(
+                    &format!("needle needle needle {n}"),
+                    "alpha",
+                    room,
+                    "collab",
+                );
+            }
+        }
+        insert("needle needle needle hook", "alpha", "diary", HOOK_ADDED_BY);
+        let durable = insert(
+            "needle in a much longer durable note",
+            "alpha",
+            "notes",
+            "mcp",
+        );
+        let decisions = insert(
+            "needle in a longer durable decision",
+            "alpha",
+            "collab-decisions",
+            "mcp",
+        );
+        let other_wing = insert("needle in another wing's note", "beta", "notes", "mcp");
+
+        let ids = |wing: Option<&str>| -> Vec<String> {
+            let scope =
+                wing.map(|wing| RecallScope::new(wing.to_string(), Path::new("/elsewhere")));
+            db.prompt_recall_bm25_search("needle", 3, scope.as_ref())
+                .unwrap()
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect()
+        };
+
+        // A post-filter over the top 3 would come back empty: every excluded row
+        // outranks every eligible one.
+        let mut scoped = ids(Some("alpha"));
+        scoped.sort();
+        let mut expected = vec![durable.clone(), decisions.clone()];
+        expected.sort();
+        assert_eq!(scoped, expected);
+
+        let unscoped = ids(None);
+        assert_eq!(unscoped.len(), 3);
+        assert!(unscoped.contains(&other_wing));
+    }
+
+    #[test]
+    fn prompt_recall_sql_literals_hold_no_quote() {
+        // They are spliced into SQL, not bound.
+        for value in PROMPT_RECALL_EXCLUDED_ROOMS.iter().chain([
+            &HOOK_ADDED_BY,
+            &MINED_ADDED_BY,
+            &crate::diary::DIARY_ROOM,
+        ]) {
+            assert!(!value.contains('\''), "{value}");
+        }
+        // The partial index's WHERE, repeated by the query that has to match it.
+        let migration = include_str!("../../migrations/023_prompt_recall_indexes.sql");
+        let index_where = UNPLACED_BY_PATH
+            .trim_start_matches('(')
+            .trim_end_matches(')');
+        assert!(
+            migration.contains(&format!("WHERE {index_where};")),
+            "{index_where}"
+        );
+        assert!(UNPLACED_BY_PATH.contains(&format!("'{MINED_ADDED_BY}'")));
+    }
+
+    #[test]
+    fn prompt_recall_reads_use_their_indexes() {
+        let db = Database::open_in_memory().unwrap();
+        let plan = |sql: &str, wing: &str| -> String {
+            let mut stmt = db
+                .conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap();
+            let rows = stmt
+                .query_map(params![wing], |row| row.get::<_, String>(3))
+                .unwrap();
+            rows.map(Result::unwrap).collect::<Vec<_>>().join("\n")
+        };
+        let filed = plan(
+            &format!("SELECT EXISTS(SELECT 1 FROM drawers WHERE wing = ?1 AND {UNPLACED_BY_PATH})"),
+            "shop",
+        );
+        assert!(filed.contains("idx_drawers_wing_unplaced"), "{filed}");
+        let eligible = prompt_recall_eligible_sql();
+        let diary = plan(
+            &format!(
+                "SELECT d.id FROM drawers d WHERE d.wing = ?1{eligible} AND d.superseded_by IS NULL \
+                 ORDER BY d.filed_at DESC, d.id ASC LIMIT 50"
+            ),
+            SHARED_DIARY_WING,
+        );
+        assert!(diary.contains("idx_drawers_current_wing_filed"), "{diary}");
+        assert!(!diary.contains("USE TEMP B-TREE FOR ORDER BY"), "{diary}");
+    }
+
+    #[test]
+    fn recall_scope_sql_agrees_with_contains_for_filed_wings_and_nested_checkouts() {
+        let db = Database::open_in_memory().unwrap();
+        let emb = dummy_embedding();
+        let rows = [
+            ("own", "shop", "/shop/docs/a.md", MINED_ADDED_BY, true),
+            (
+                "nested",
+                "feature",
+                "/shop/wt/feature/a.md",
+                MINED_ADDED_BY,
+                false,
+            ),
+            ("sibling", "shop", "/shopx/a.md", MINED_ADDED_BY, false),
+            ("filed", "shop", "", "mcp", true),
+            ("repository", "shop-api", "", "mcp", true),
+            ("unplaced", "shop-api", "", MINED_ADDED_BY, true),
+            ("other", "other", "", "mcp", false),
+        ];
+        for (id, wing, source_file, added_by, _) in rows {
+            db.insert_drawer(id, "needle note", &emb, wing, "docs", source_file, added_by)
+                .unwrap();
+        }
+        let scope = RecallScope::new("shop".to_string(), Path::new("/shop"))
+            .with_filed_wing("shop-api".to_string())
+            .excluding(Path::new("/shop/wt/feature"))
+            // Not under the root: no range to leave out.
+            .excluding(Path::new("/elsewhere"));
+        let mut found: Vec<String> = db
+            .prompt_recall_bm25_search("needle", 20, Some(&scope))
+            .unwrap()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        found.sort();
+        let mut expected: Vec<String> = rows
+            .iter()
+            .filter(|row| row.4)
+            .map(|row| row.0.to_string())
+            .collect();
+        expected.sort();
+        assert_eq!(found, expected);
+        for (id, ..) in rows {
+            let drawer = db.get_drawer(id).unwrap().unwrap();
+            assert_eq!(
+                scope.contains(&drawer),
+                expected.contains(&id.to_string()),
+                "{id}"
+            );
+        }
+
+        // A parent whose only mined rows are a nested checkout's has no memory.
+        let parent = RecallScope::new("wt".to_string(), Path::new("/shop/wt"));
+        assert!(db.recall_scope_has_memory(&parent).unwrap());
+        let parent = parent.excluding(Path::new("/shop/wt/feature"));
+        assert!(!db.recall_scope_has_memory(&parent).unwrap());
+        // A shared wing is never a filed wing, nor the scope's own wing twice.
+        let scope = RecallScope::new("shop".to_string(), Path::new("/shop"));
+        assert_eq!(scope.clone().with_filed_wing("diary".to_string()), scope);
+        assert_eq!(scope.clone().with_filed_wing("shop".to_string()), scope);
+    }
+
+    #[test]
+    fn prompt_recall_bm25_refuses_a_wing_or_room_filter() {
+        let db = Database::open_in_memory().unwrap();
+        let scope = RecallScope::new("shop".to_string(), Path::new("/shop"));
+        for (wing, room) in [(Some("shop"), None), (None, Some("docs"))] {
+            let result = db.bm25_search_filtered(
+                "needle",
+                3,
+                wing,
+                room,
+                false,
+                Bm25Rows::PromptRecall(Some(&scope)),
+            );
+            assert!(
+                matches!(result, Err(MemoryError::Validation(_))),
+                "{result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn prompt_recall_bm25_reports_failures_but_not_rejected_query_text() {
+        let db = Database::open_in_memory().unwrap();
+        let emb = dummy_embedding();
+        db.insert_drawer("n", "needle note", &emb, "shop", "docs", "", "mcp")
+            .unwrap();
+        // Text FTS5 can't parse is a prompt's doing, not a failure.
+        for prompt in ["needle -", "needle - note", "\"needle", "NOT", "needle AND"] {
+            assert!(
+                db.prompt_recall_bm25_search(prompt, 3, None).is_ok(),
+                "{prompt:?}"
+            );
+        }
+        let busy = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            Some("database is locked".to_string()),
+        );
+        assert!(!is_fts_query_rejection(&busy));
+        let syntax = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+            Some("fts5: syntax error near \"-\"".to_string()),
+        );
+        assert!(is_fts_query_rejection(&syntax));
+        let column = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+            Some("no such column: note".to_string()),
+        );
+        assert!(is_fts_query_rejection(&column));
+    }
+
+    #[test]
+    fn hook_reviews_are_recallable_and_hook_diary_rows_are_not() {
+        let db = Database::open_in_memory().unwrap();
+        let emb = dummy_embedding();
+        db.insert_drawer(
+            "review",
+            "needle review",
+            &emb,
+            REVIEW_WING,
+            "pr-7",
+            "/t.jsonl",
+            HOOK_ADDED_BY,
+        )
+        .unwrap();
+        db.insert_drawer(
+            "summary",
+            "needle hook ran",
+            &emb,
+            SHARED_DIARY_WING,
+            crate::diary::DIARY_ROOM,
+            "",
+            HOOK_ADDED_BY,
+        )
+        .unwrap();
+        let ids: Vec<String> = db
+            .prompt_recall_bm25_search("needle", 5, None)
+            .unwrap()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(ids, ["review"]);
+    }
+
+    #[test]
+    fn recent_prompt_recall_diary_skips_hook_rows_before_the_limit() {
+        let db = Database::open_in_memory().unwrap();
+        let emb = dummy_embedding();
+        let insert = |id: &str, wing: &str, added_by: &str, filed_at: &str| {
+            db.insert_drawer(id, id, &emb, wing, "diary", "", added_by)
+                .unwrap();
+            db.conn
+                .execute(
+                    "UPDATE drawers SET filed_at = ?1 WHERE id = ?2",
+                    params![filed_at, id],
+                )
+                .unwrap();
+        };
+        insert("old-entry", "diary", "diary", "2026-01-01");
+        insert("newer-entry", "diary", "diary", "2026-01-02");
+        insert("project-entry", "shop", "diary", "2026-01-03");
+        insert("hook-1", "diary", HOOK_ADDED_BY, "2026-01-04");
+        insert("hook-2", "diary", HOOK_ADDED_BY, "2026-01-05");
+
+        let ids: Vec<String> = db
+            .recent_prompt_recall_diary(2)
+            .unwrap()
+            .into_iter()
+            .map(|d| d.id)
+            .collect();
+        assert_eq!(ids, ["newer-entry", "old-entry"]);
+
+        // A superseded entry is history, not something to recall.
+        db.conn
+            .execute(
+                "UPDATE drawers SET superseded_by = 'old-entry' WHERE id = 'newer-entry'",
+                [],
+            )
+            .unwrap();
+        let ids: Vec<String> = db
+            .recent_prompt_recall_diary(2)
+            .unwrap()
+            .into_iter()
+            .map(|d| d.id)
+            .collect();
+        assert_eq!(ids, ["old-entry"]);
+    }
+
+    #[test]
+    fn recent_prompt_recall_diary_skips_operational_rooms_before_the_limit() {
+        let db = Database::open_in_memory().unwrap();
+        let emb = dummy_embedding();
+        let insert = |id: &str, room: &str, filed_at: &str| {
+            db.insert_drawer(id, id, &emb, "diary", room, "", "diary")
+                .unwrap();
+            db.conn
+                .execute(
+                    "UPDATE drawers SET filed_at = ?1 WHERE id = ?2",
+                    params![filed_at, id],
+                )
+                .unwrap();
+        };
+        insert("entry", "diary", "2026-01-01");
+        insert("decision", "collab-decisions", "2026-01-02");
+        for room in PROMPT_RECALL_EXCLUDED_ROOMS {
+            insert(room, room, "2026-01-03");
+        }
+
+        // A post-filter over the newest 2 would come back empty.
+        let ids: Vec<String> = db
+            .recent_prompt_recall_diary(2)
+            .unwrap()
+            .into_iter()
+            .map(|d| d.id)
+            .collect();
+        assert_eq!(ids, ["decision", "entry"]);
     }
 
     #[test]

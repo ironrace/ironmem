@@ -12,14 +12,13 @@ use crate::bootstrap::{
     ensure_bootstrapped, ensure_store_bootstrapped, record_workspace_mine, resolve_workspace_root,
 };
 use crate::config::Config;
-use crate::db::drawers::generate_id;
+use crate::db::drawers::{generate_id, RecallScope, REVIEW_WING};
 use crate::diary;
 use crate::error::MemoryError;
 use crate::ingest::mine_directory;
 use crate::mcp::app::App;
 use crate::sanitize::{sanitize_harness, sanitize_session_id};
 
-const REVIEW_WING: &str = "reviews";
 const REVIEW_MAX_BYTES: usize = 24_000;
 const METRICS_TRANSCRIPT_TAIL_BYTES: u64 = 2 * 1024 * 1024;
 const METRICS_FULL_TRANSCRIPT_MAX_BYTES: u64 = 128 * 1024 * 1024;
@@ -435,21 +434,290 @@ fn current_workspace_branch_with(
 /// so every worktree of one repository shares a wing. Outside git, the
 /// workspace directory's own name. Sanitized the way mining names a wing.
 fn repository_name(workspace_root: &Path) -> Option<String> {
-    let common_dir = workspace_git_output(
+    repository_wing(&repository_dir(workspace_root))
+}
+
+fn repository_wing(repository_dir: &Path) -> Option<String> {
+    let name = repository_dir.file_name()?.to_str()?;
+    let name = name.strip_suffix(".git").unwrap_or(name);
+    Some(crate::ingest::sanitize_segment(name, "workspace"))
+}
+
+/// The main worktree's directory; outside git, the workspace itself.
+fn repository_dir(workspace_root: &Path) -> PathBuf {
+    match workspace_common_dir(workspace_root) {
+        Some(common_dir) => main_worktree_dir(workspace_root, &common_dir, None),
+        None => workspace_root.to_path_buf(),
+    }
+}
+
+/// The repository's absolute common Git directory; `None` outside git or when git fails.
+fn workspace_common_dir(workspace_root: &Path) -> Option<PathBuf> {
+    workspace_git_output(
         workspace_root,
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
         &[],
     )
-    .map(PathBuf::from);
-    let repo_dir = match common_dir {
-        Some(dir) if dir.file_name() == Some(".git".as_ref()) => dir.parent()?.to_path_buf(),
-        // A bare repository is its own common dir (`name.git`).
-        Some(dir) => dir,
-        None => workspace_root.to_path_buf(),
+    .map(PathBuf::from)
+}
+
+/// The main worktree of the repository whose common Git directory is `common_dir`,
+/// as seen from `workspace_root` inside it.
+fn main_worktree_dir(
+    workspace_root: &Path,
+    common_dir: &Path,
+    ceiling: Option<&std::ffi::OsStr>,
+) -> PathBuf {
+    if common_dir.file_name() == Some(".git".as_ref()) {
+        return common_dir
+            .parent()
+            .map_or_else(|| workspace_root.to_path_buf(), Path::to_path_buf);
+    }
+    // A submodule's Git directory (`.git/modules/<name>`) records its work tree,
+    // relative to itself.
+    if let Some(worktree) = workspace_git_output_with(
+        workspace_root,
+        &["config", "--get", "core.worktree"],
+        &[],
+        ceiling,
+    ) {
+        let dir = common_dir.join(worktree);
+        return dir.canonicalize().unwrap_or(dir);
+    }
+    // A bare repository is its own common dir (`name.git`). So is one whose main
+    // checkout used `--separate-git-dir`: Git keeps no path back to that checkout.
+    common_dir.to_path_buf()
+}
+
+/// The scopes holding a workspace's memory, the most specific first, for recall to
+/// prefer: the checkout's, then the repository's, where handoffs and the main
+/// checkout's files are. The two differ only in a linked worktree. A subdirectory of a
+/// Git checkout counts as that checkout, since mining may have run on any part of it,
+/// as long as the checkout tracks a file in it: a project that merely sits inside a
+/// work tree, such as one under a `$HOME` kept in Git for dotfiles, is its own. Outside
+/// Git the workspace is the directory itself, and what was mined from a parent of it
+/// under other names is not in scope.
+///
+/// `None`, with a warning, when the workspace can't be resolved, or Git fails for one
+/// inside a Git checkout (git not on `PATH`, a `safe.directory` refusal, a git too old
+/// for `--path-format`): the fallback scopes would be narrower than the workspace's
+/// memory, and a miss in them would open cross-wing recall for a workspace that has
+/// memory. The caller skips recall then, failing closed.
+///
+/// A linked worktree's own scope also holds its repository's filed rows, so its
+/// handoffs and decisions rank with its files rather than behind them. A checkout
+/// nested in a scope's directory and mined on its own, as `state_dir` records, is left
+/// out of that scope: its files are its own memory.
+fn workspace_recall_scopes(workspace_root: &Path, state_dir: &Path) -> Option<Vec<RecallScope>> {
+    let ceiling = std::env::var_os("GIT_CEILING_DIRECTORIES");
+    let mined_roots = crate::bootstrap::mined_workspace_roots(state_dir);
+    workspace_recall_scopes_with(workspace_root, ceiling.as_deref(), &mined_roots)
+}
+
+/// [`workspace_recall_scopes`] with the operator's `GIT_CEILING_DIRECTORIES`, which
+/// Git discovery honors here: unlike the variables [`crate::git_env`] scrubs, it can
+/// only stop discovery short, never point it at another repository.
+fn workspace_recall_scopes_with(
+    workspace_root: &Path,
+    ceiling: Option<&std::ffi::OsStr>,
+    mined_roots: &[PathBuf],
+) -> Option<Vec<RecallScope>> {
+    let skip = |why: &str| {
+        tracing::warn!(
+            "prompt-hook recall: skipped, {why}: {}",
+            workspace_root.display()
+        );
+        None
     };
-    let name = repo_dir.file_name()?.to_str()?;
-    let name = name.strip_suffix(".git").unwrap_or(name);
-    Some(crate::ingest::sanitize_segment(name, "workspace"))
+    // Mining canonicalizes its root, so a symlink is named for its target and its
+    // files are recorded under it.
+    let workspace = match workspace_root.canonicalize() {
+        Ok(workspace) => workspace,
+        Err(e) => return skip(&format!("the workspace can't be resolved ({e})")),
+    };
+    let checkout = match git_checkout(&workspace, ceiling) {
+        Ok(checkout) => checkout,
+        Err(why) => return skip(why),
+    };
+    let scope = |wing: String, root: &Path| {
+        nested_checkouts(root, mined_roots)
+            .iter()
+            .fold(RecallScope::new(wing, root), |scope, nested| {
+                scope.excluding(nested)
+            })
+    };
+    let Some(GitCheckout {
+        toplevel,
+        common_dir,
+    }) = checkout
+    else {
+        let wing = crate::ingest::checkout_wing(&workspace);
+        return Some(vec![scope(wing, &workspace)]);
+    };
+    let checkout = crate::ingest::checkout_wing(&toplevel);
+    let repository_dir = main_worktree_dir(&workspace, &common_dir, ceiling);
+    let repository_root = repository_dir
+        .canonicalize()
+        .unwrap_or_else(|_| repository_dir.clone());
+    let repository = repository_wing(&repository_dir)
+        .filter(|wing| *wing != checkout || repository_root != toplevel);
+
+    let Some(repository) = repository else {
+        return Some(vec![scope(checkout, &toplevel)]);
+    };
+    Some(vec![
+        scope(checkout, &toplevel).with_filed_wing(repository.clone()),
+        scope(repository, &repository_root),
+    ])
+}
+
+/// The checkouts nested under `root` that were mined on their own: for each mined
+/// root strictly below it, the outermost directory on the way down that has a `.git`
+/// of its own. A mined subdirectory of `root`'s own checkout has none, and stays.
+fn nested_checkouts(root: &Path, mined_roots: &[PathBuf]) -> Vec<PathBuf> {
+    let mut nested: Vec<PathBuf> = mined_roots
+        .iter()
+        .filter_map(|mined| {
+            let relative = mined.strip_prefix(root).ok()?;
+            let mut dir = root.to_path_buf();
+            relative.components().find_map(|component| {
+                dir.push(component);
+                dir.join(".git").exists().then(|| dir.clone())
+            })
+        })
+        .collect();
+    nested.sort();
+    nested.dedup();
+    nested
+}
+
+/// A Git checkout's canonical top level and absolute common Git directory.
+struct GitCheckout {
+    toplevel: PathBuf,
+    common_dir: PathBuf,
+}
+
+/// The Git checkout the canonical `workspace` is part of; `None` outside one, or
+/// inside a work tree that tracks no file under it. Why not, when Git can't say.
+fn git_checkout(
+    workspace: &Path,
+    ceiling: Option<&std::ffi::OsStr>,
+) -> Result<Option<GitCheckout>, &'static str> {
+    let Some(output) = workspace_git_output_with(
+        workspace,
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--show-toplevel",
+            "--git-common-dir",
+        ],
+        &[],
+        ceiling,
+    ) else {
+        // Git said no, or couldn't answer: only a `.git` it could have found tells
+        // the two apart.
+        return if git_dir_discoverable(workspace, ceiling) {
+            Err("git could not resolve the checkout")
+        } else {
+            Ok(None)
+        };
+    };
+    let mut lines = output.lines();
+    let (Some(toplevel), Some(common_dir), None) = (lines.next(), lines.next(), lines.next())
+    else {
+        return Err("git answered with no checkout");
+    };
+    // Mining records canonical paths, and Git's top level needn't be one (a symlinked
+    // parent, or Windows' verbatim prefix).
+    let toplevel = Path::new(toplevel)
+        .canonicalize()
+        .map_err(|_| "the checkout's top level can't be resolved")?;
+    if toplevel != workspace && !checkout_tracks_a_file_under(workspace, ceiling)? {
+        return Ok(None);
+    }
+    Ok(Some(GitCheckout {
+        toplevel,
+        common_dir: PathBuf::from(common_dir),
+    }))
+}
+
+/// Whether Git discovery, starting at `workspace`, could reach a `.git`: in it, or in
+/// a parent below the nearest of the `ceiling` directories.
+fn git_dir_discoverable(workspace: &Path, ceiling: Option<&std::ffi::OsStr>) -> bool {
+    let ceilings: Vec<PathBuf> = ceiling
+        .map(|ceiling| {
+            std::env::split_paths(ceiling)
+                .filter(|dir| dir.is_absolute())
+                .map(|dir| dir.canonicalize().unwrap_or(dir))
+                .collect()
+        })
+        .unwrap_or_default();
+    std::iter::once(workspace)
+        .chain(
+            workspace
+                .ancestors()
+                .skip(1)
+                .take_while(|dir| !ceilings.iter().any(|ceiling| ceiling == dir)),
+        )
+        .any(|dir| dir.join(".git").exists())
+}
+
+/// Whether the checkout tracks any file under `workspace`, its subdirectory. Reads
+/// only as far as the first one.
+fn checkout_tracks_a_file_under(
+    workspace: &Path,
+    ceiling: Option<&std::ffi::OsStr>,
+) -> Result<bool, &'static str> {
+    const FAILED: &str = "git could not list the checkout's files";
+    let mut child = workspace_git(workspace, &[], ceiling)
+        .args(["ls-files", "-z", "--", "."])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|_| FAILED)?;
+    let mut first = [0u8; 1];
+    let read = child
+        .stdout
+        .take()
+        .map(|mut stdout| stdout.read(&mut first));
+    // Done with it either way: one byte answers the question.
+    let _ = child.kill();
+    let status = child.wait();
+    match read {
+        Some(Ok(n)) if n > 0 => Ok(true),
+        Some(Ok(_)) if status.is_ok_and(|status| status.success()) => Ok(false),
+        _ => Err(FAILED),
+    }
+}
+
+/// [`workspace_recall_scopes`] for a workspace where Git answers, as the tests build.
+#[cfg(test)]
+fn workspace_scopes(workspace_root: &Path) -> Vec<RecallScope> {
+    workspace_recall_scopes_with(workspace_root, None, &[])
+        .expect("git resolves the test workspace")
+}
+
+/// `git -C <workspace_root>`, scrubbed. `inherited` is set on git's command before the
+/// scrub ([`current_workspace_branch_with`]); empty in production. `ceiling`, a
+/// `GIT_CEILING_DIRECTORIES` value, is set after it.
+fn workspace_git(
+    workspace_root: &Path,
+    inherited: &[(&str, &std::ffi::OsStr)],
+    ceiling: Option<&std::ffi::OsStr>,
+) -> std::process::Command {
+    // Git treats GIT_* variables as repository-selection and configuration
+    // overrides. Retain the normal process environment (especially PATH) but
+    // remove every Git override so a hook's inherited environment cannot point
+    // this workspace lookup at another repository. The shared scrub removes
+    // the redirecting ones unconditionally, so one set after the scrub is not
+    // inherited either. `inherited` is a test's; it must be such a variable.
+    let mut command = crate::git_env::scrubbed_git(inherited);
+    if let Some(ceiling) = ceiling {
+        command.env("GIT_CEILING_DIRECTORIES", ceiling);
+    }
+    command.arg("-C").arg(workspace_root);
+    command
 }
 
 /// Run `git -C <workspace_root> <args>` and return its trimmed stdout; `None`
@@ -460,19 +728,32 @@ fn workspace_git_output(
     args: &[&str],
     inherited: &[(&str, &std::ffi::OsStr)],
 ) -> Option<String> {
-    // Git treats GIT_* variables as repository-selection and configuration
-    // overrides. Retain the normal process environment (especially PATH) but
-    // remove every Git override so a hook's inherited environment cannot point
-    // this workspace lookup at another repository. The shared scrub removes
-    // the redirecting ones unconditionally, so one set after the scrub is not
-    // inherited either. `inherited` is a test's; it must be such a variable.
-    let output = crate::git_env::scrubbed_git(inherited)
-        .arg("-C")
-        .arg(workspace_root)
+    workspace_git_output_with(workspace_root, args, inherited, None)
+}
+
+/// [`workspace_git_output`], with a `GIT_CEILING_DIRECTORIES` for discovery.
+fn workspace_git_output_with(
+    workspace_root: &Path,
+    args: &[&str],
+    inherited: &[(&str, &std::ffi::OsStr)],
+    ceiling: Option<&std::ffi::OsStr>,
+) -> Option<String> {
+    let output = workspace_git(workspace_root, inherited, ceiling)
         .args(args)
-        .output()
-        .ok()?;
+        .output();
+    let output = match output {
+        Ok(output) => output,
+        Err(e) => {
+            tracing::debug!("workspace git {args:?}: spawn failed: {e}");
+            return None;
+        }
+    };
     if !output.status.success() {
+        tracing::debug!(
+            "workspace git {args:?}: {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
         return None;
     }
     let stdout = String::from_utf8(output.stdout).ok()?;
@@ -833,9 +1114,16 @@ fn run_user_prompt_submit(
     // best-effort. Reserving the same 30ms a second time here would halve hybrid's
     // window whenever occupancy sampling is active, with no corresponding benefit.
     if let Some(prompt) = input.get("prompt").and_then(|v| v.as_str()) {
-        if !prompt.trim().is_empty() && !budget.is_zero() {
-            if let Some(ctx) = search_prompt_context(&config.db_path, prompt, start, budget, hybrid)
-            {
+        if !is_trivial_prompt(prompt) && !budget.is_zero() {
+            if let Some(ctx) = search_prompt_context(
+                &config.db_path,
+                &config.state_dir,
+                prompt,
+                workspace_root,
+                start,
+                budget,
+                hybrid,
+            ) {
                 response.hook_specific_output = Some(HookSpecificOutput::user_prompt_submit(ctx));
             }
         }
@@ -917,7 +1205,9 @@ fn prompt_occupancy_sample_allowed(
 /// additionalContext, or `None`.
 fn search_prompt_context(
     db_path: &Path,
+    state_dir: &Path,
     prompt: &str,
+    workspace_root: Option<&Path>,
     start: Instant,
     budget: Duration,
     hybrid: Option<HybridRecallConfig>,
@@ -958,16 +1248,44 @@ fn search_prompt_context(
     let (tx, rx) = std::sync::mpsc::channel();
     let db_path = db_path.to_path_buf();
     let prompt = prompt.to_string();
-    let worker_budget = budget.checked_sub(start.elapsed()).unwrap_or_default();
+    let workspace_root = workspace_root.map(Path::to_path_buf);
+    let state_dir = state_dir.to_path_buf();
     std::thread::spawn(move || {
-        let result = prompt_recall_block(&db_path, &prompt, worker_budget, local_vector_handoff);
+        // Spawns git, so it runs here: the `recv_timeout` below bounds a slow one.
+        let scopes = match workspace_root
+            .as_deref()
+            .map(|root| workspace_recall_scopes(root, &state_dir))
+        {
+            Some(Some(scopes)) => scopes,
+            // Git failed inside a checkout: no recall rather than an unscoped one.
+            Some(None) => {
+                let _ = tx.send(None);
+                return;
+            }
+            None => Vec::new(),
+        };
+        // The database's busy timeout gets what git left of the budget.
+        let busy = budget.checked_sub(start.elapsed()).unwrap_or_default();
+        let result = prompt_recall_block(&db_path, &prompt, &scopes, busy, local_vector_handoff);
         let _ = tx.send(result); // receiver gone (timed out) → drop silently
     });
 
     let local_remaining = budget.checked_sub(start.elapsed()).unwrap_or_default();
     match rx.recv_timeout(local_remaining) {
-        Ok(Some(block)) => Some(block),
-        _ => None, // timeout, disconnect, or no qualifying hits
+        Ok(block) => block,
+        // A recall that never arrives otherwise reads as "nothing relevant".
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            tracing::warn!(
+                "prompt-hook recall: dropped, over the {}ms budget (workspace git and the \
+                 database reads share it)",
+                budget.as_millis()
+            );
+            None
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            tracing::warn!("prompt-hook recall: dropped, the recall worker stopped");
+            None
+        }
     }
 }
 
@@ -979,15 +1297,34 @@ fn search_prompt_context(
 fn prompt_recall_block(
     db_path: &Path,
     prompt: &str,
+    workspace_scopes: &[RecallScope],
     busy: Duration,
     vector: Option<VectorHandoff>,
 ) -> Option<String> {
-    let db = crate::db::schema::Database::open_with_busy_timeout(db_path, busy).ok()?;
+    let db = match crate::db::schema::Database::open_with_busy_timeout(db_path, busy) {
+        Ok(db) => db,
+        Err(e) => {
+            tracing::warn!("prompt-hook recall: skipped, the database didn't open: {e}");
+            return None;
+        }
+    };
     let config = RecallConfig::from_tunables();
-    match vector {
-        Some(handoff) => recall_block_from_vector_handoff(&db, prompt, &config, handoff),
-        None => recall_block_from_db(&db, prompt, &config),
+    // One snapshot for every read, so the gates (whether a workspace has memory) and
+    // the searches they gate can't see the store at two different moments.
+    let snapshot = db.with_connection(|conn| Ok(conn.execute_batch("BEGIN DEFERRED")?));
+    if let Err(e) = &snapshot {
+        tracing::warn!("prompt-hook recall: reading without one snapshot: {e}");
     }
+    let block = match vector {
+        Some(handoff) => {
+            recall_block_from_vector_handoff(&db, prompt, &config, workspace_scopes, handoff)
+        }
+        None => recall_block_from_db(&db, prompt, &config, workspace_scopes),
+    };
+    if snapshot.is_ok() {
+        let _ = db.with_connection(|conn| Ok(conn.execute_batch("COMMIT")?));
+    }
+    block
 }
 
 /// Tuning parameters for [`recall_block_from_db`], grouped to keep the
@@ -1021,84 +1358,462 @@ impl RecallConfig {
     }
 }
 
-/// Format the recall block from an open DB and explicit tunables: BM25, filter
-/// by `config.bm25_floor`, take top-`config.max_hits`, sanitize each hit to
-/// one ≤`config.line_bytes` line; then, if `config.kg_enabled`, append up to
-/// `config.kg_max_triples` KG triples for entities mentioned in `prompt`;
-/// finally, if `config.diary_enabled`, append up to `config.diary_max`
-/// most-recent diary excerpts (each capped to `config.diary_line_bytes`).
+/// Format the recall block from an open DB and explicit tunables: BM25 scoped by
+/// [`bm25_qualifying`], filter by `config.bm25_floor`, take top-`config.max_hits`,
+/// sanitize each hit to one ≤`config.line_bytes` line; then, if `config.kg_enabled`,
+/// append up to `config.kg_max_triples` KG triples for entities mentioned in
+/// `prompt`; finally, if `config.diary_enabled`, append up to `config.diary_max`
+/// recent diary excerpts that match the prompt (see [`diary_excerpt_matches`]).
 fn recall_block_from_db(
     db: &crate::db::schema::Database,
     prompt: &str,
     config: &RecallConfig,
+    workspace_scopes: &[RecallScope],
 ) -> Option<String> {
-    let qualifying = bm25_qualifying(db, prompt, config)?;
-    recall_block_from_qualifying(db, prompt, config, qualifying, None)
+    let words = prompt_content_words(prompt);
+    let qualifying = bm25_qualifying(db, prompt, &words, config, workspace_scopes);
+    recall_block_from_qualifying_with_vector_poll(
+        db,
+        prompt,
+        &words,
+        config,
+        workspace_scopes,
+        qualifying,
+        None,
+        None,
+    )
 }
 
 fn recall_block_from_vector_handoff(
     db: &crate::db::schema::Database,
     prompt: &str,
     config: &RecallConfig,
+    workspace_scopes: &[RecallScope],
     handoff: VectorHandoff,
 ) -> Option<String> {
-    let qualifying = bm25_qualifying(db, prompt, config)?;
+    let words = prompt_content_words(prompt);
+    let qualifying = bm25_qualifying(db, prompt, &words, config, workspace_scopes);
     recall_block_from_qualifying_with_vector_poll(
         db,
         prompt,
+        &words,
         config,
+        workspace_scopes,
         qualifying,
         None,
         Some(&handoff),
     )
 }
 
+/// What BM25 found for a prompt, and where recall may take rows from.
+struct Bm25Qualifying {
+    hits: Vec<(String, f32)>,
+    reach: RecallReach,
+}
+
+/// Where a prompt's drawer recall may take rows from, decided once per prompt so the
+/// BM25 and vector paths can't disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecallReach {
+    /// The workspace scope at this index had a BM25 hit: only its rows.
+    Scope(usize),
+    /// No scope had one. A vector candidate in a scope still keeps recall there;
+    /// `allowed` says whether, failing that, other projects' memory may be used.
+    Elsewhere { allowed: bool },
+}
+
+/// BM25 hits eligible for injection. The first of the workspace's scopes with a hit
+/// wins outright; the rest of the store is searched only when
+/// [`cross_wing_recall_allowed`]. With no workspace there is nothing to prefer, and
+/// every wing is searched under that same bar. A failed search recalls no drawers, but
+/// leaves KG and diary recall, which don't depend on it, to run.
 fn bm25_qualifying(
     db: &crate::db::schema::Database,
     prompt: &str,
+    words: &std::collections::HashSet<String>,
     config: &RecallConfig,
-) -> Option<Vec<(String, f32)>> {
-    let scored = match db.bm25_search(prompt, config.max_hits * 3, None, None) {
-        Ok(scored) => scored,
-        Err(e) => {
-            tracing::warn!("prompt-hook recall: BM25 query failed: {e}");
-            return None;
+    workspace_scopes: &[RecallScope],
+) -> Bm25Qualifying {
+    let window = config.max_hits * 3;
+    let search = |scope: Option<&RecallScope>| -> Result<Vec<(String, f32)>, String> {
+        let mut kept = Vec::new();
+        for (pass, limit) in [window, window * PROMPT_RECALL_BM25_WIDENING]
+            .into_iter()
+            .enumerate()
+        {
+            let attempt = db
+                .prompt_recall_bm25_search(prompt, limit, scope)
+                .and_then(|scored| {
+                    let above_floor: Vec<(String, f32)> = scored
+                        .into_iter()
+                        .filter(|(_, score)| *score >= config.bm25_floor)
+                        .collect();
+                    let found = above_floor.len();
+                    without_unrelated_diary_hits(db, words, config.line_bytes, above_floor)
+                        .map(|kept| (found, kept))
+                });
+            match attempt {
+                Ok((found, pass_kept)) => {
+                    kept = pass_kept;
+                    // Only a window that filled and then lost rows can be hiding others.
+                    if kept.len() >= window || found < limit {
+                        break;
+                    }
+                }
+                // The first window's rows are still good.
+                Err(e) if pass > 0 => {
+                    tracing::warn!(
+                        "prompt-hook recall: widened BM25 search (limit {limit}) of {scope:?} \
+                         failed, keeping the first window: {e}"
+                    );
+                    break;
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "BM25 search (limit {limit}) of {scope:?} failed: {e}"
+                    ))
+                }
+            }
+        }
+        kept.truncate(window);
+        Ok(kept)
+    };
+    let failed = |e: String| {
+        tracing::warn!("prompt-hook recall: no drawers recalled, {e}");
+        Bm25Qualifying {
+            hits: Vec::new(),
+            reach: RecallReach::Elsewhere { allowed: false },
         }
     };
-    Some(
-        scored
-            .into_iter()
-            .filter(|(_, score)| *score >= config.bm25_floor)
-            .collect(),
+    for (index, scope) in workspace_scopes.iter().enumerate() {
+        match search(Some(scope)) {
+            Ok(hits) if hits.is_empty() => {}
+            Ok(hits) => {
+                return Bm25Qualifying {
+                    hits,
+                    reach: RecallReach::Scope(index),
+                }
+            }
+            Err(e) => return failed(e),
+        }
+    }
+    let allowed = cross_wing_recall_allowed(db, words, workspace_scopes);
+    if !allowed {
+        return Bm25Qualifying {
+            hits: Vec::new(),
+            reach: RecallReach::Elsewhere { allowed },
+        };
+    }
+    match search(None) {
+        Ok(hits) => Bm25Qualifying {
+            hits,
+            reach: RecallReach::Elsewhere { allowed },
+        },
+        Err(e) => failed(e),
+    }
+}
+
+/// Drop diary entries from BM25 hits unless [`diary_hit_matches`]. FTS matches the
+/// whole entry, so these are the rows that match only past the injected excerpt.
+/// Done here rather than at render so they use up neither `max_hits` nor a workspace
+/// wing's claim to the prompt. A hit whose row is gone by the fetch can't be rendered,
+/// so it's dropped too.
+fn without_unrelated_diary_hits(
+    db: &crate::db::schema::Database,
+    words: &std::collections::HashSet<String>,
+    line_bytes: usize,
+    hits: Vec<(String, f32)>,
+) -> Result<Vec<(String, f32)>, MemoryError> {
+    if hits.is_empty() {
+        return Ok(hits);
+    }
+    let ids: Vec<&str> = hits.iter().map(|(id, _)| id.as_str()).collect();
+    let drawers = db.get_drawers_by_ids(&ids)?;
+    let missing = hits
+        .iter()
+        .filter(|(id, _)| !drawers.contains_key(id))
+        .count();
+    if missing > 0 {
+        tracing::debug!("prompt-hook recall: {missing} BM25 hit(s) gone before the fetch");
+    }
+    Ok(hits
+        .into_iter()
+        .filter(|(id, _)| {
+            drawers
+                .get(id)
+                .is_some_and(|d| diary_hit_matches(d, words, line_bytes))
+        })
+        .collect())
+}
+
+/// Hybrid-path counterpart of [`bm25_qualifying`]'s scoping, for the vector ids,
+/// which arrive from the daemon with no wing or room filter: drop what may not be
+/// injected, then keep what `reach` allows. The scope BM25 chose stands, since a
+/// vector neighbour has no similarity floor and one in a nearer scope says nothing.
+fn scope_recall_candidates(
+    candidates: &mut std::collections::HashMap<String, crate::db::drawers::Drawer>,
+    words: &std::collections::HashSet<String>,
+    workspace_scopes: &[RecallScope],
+    reach: RecallReach,
+    line_bytes: usize,
+) {
+    candidates.retain(|_, drawer| {
+        crate::db::drawers::prompt_recall_eligible(drawer)
+            && diary_hit_matches(drawer, words, line_bytes)
+    });
+    let preferred = match reach {
+        RecallReach::Scope(index) => workspace_scopes.get(index),
+        RecallReach::Elsewhere { .. } => workspace_scopes
+            .iter()
+            .find(|scope| candidates.values().any(|drawer| scope.contains(drawer))),
+    };
+    if let Some(scope) = preferred {
+        candidates.retain(|_, drawer| scope.contains(drawer));
+    } else if reach == (RecallReach::Elsewhere { allowed: false }) {
+        candidates.clear();
+    }
+}
+
+/// Words that say nothing about what a prompt is after: function words,
+/// acknowledgements and one-word replies. Not verbs or ordinals that name what a
+/// short prompt is about (`use pgbouncer`, `stop hook`, `last release`): those count
+/// as content, and a reply built from one of them (`try again`, `next one`) is still a
+/// single word. Sorted for `binary_search`.
+const PROMPT_RECALL_STOPWORDS: &[&str] = &[
+    "a", "about", "after", "again", "agree", "agreed", "ahead", "all", "alright", "also", "am",
+    "an", "and", "any", "are", "as", "at", "awesome", "be", "because", "been", "before", "both",
+    "but", "by", "can", "can't", "continue", "cool", "could", "did", "didn't", "do", "does",
+    "doesn't", "don't", "done", "either", "fine", "for", "from", "good", "got", "great", "had",
+    "has", "have", "he", "hello", "her", "here", "hey", "hi", "him", "his", "how", "i", "i'm",
+    "if", "in", "into", "is", "isn't", "it", "it's", "its", "just", "let", "let's", "lgtm",
+    "looks", "maybe", "me", "more", "my", "nah", "neither", "nice", "no", "nope", "not", "now",
+    "of", "ok", "okay", "on", "one", "only", "option", "or", "our", "out", "perfect", "please",
+    "proceed", "right", "same", "second", "she", "should", "so", "some", "sounds", "sure", "thank",
+    "thanks", "that", "that's", "the", "their", "them", "then", "there", "these", "they", "this",
+    "those", "to", "too", "two", "up", "us", "wait", "was", "we", "were", "what", "what's", "when",
+    "where", "which", "who", "why", "will", "with", "won't", "would", "yeah", "yep", "yes", "you",
+    "your",
+];
+
+/// A prompt needs at least this many content words for recall to run at all. One
+/// word, even an unlisted one like `deploy`, is a reply and not a query: as a bare
+/// FTS term it matches hundreds of rows on no signal.
+const PROMPT_RECALL_MIN_CONTENT_WORDS: usize = 2;
+
+/// Content words a prompt needs before other projects' memory may be injected into a
+/// workspace with none of its own, or into a prompt with no workspace at all. Two
+/// words like `run tests` match hundreds of rows in a large store.
+const PROMPT_RECALL_CROSS_WING_MIN_CONTENT_WORDS: usize = 3;
+
+/// Content words a diary excerpt must share with the prompt, at the least.
+const PROMPT_RECALL_DIARY_MIN_SHARED_WORDS: usize = 2;
+
+/// Share, in tenths, of the shorter side's content words (the prompt's or the
+/// excerpt's) a diary excerpt must share with the prompt, when that is more than
+/// [`PROMPT_RECALL_DIARY_MIN_SHARED_WORDS`]. A long prompt shares two common words
+/// (`tests`, `retry`) with most entries.
+const PROMPT_RECALL_DIARY_MIN_SHARED_TENTHS: usize = 3;
+
+/// A word in a script written without spaces needs this many characters to count as
+/// a query on its own: shorter ones are replies (`好的`, `谢谢`, `はい`).
+const PROMPT_RECALL_UNSEGMENTED_MIN_CHARS: usize = 4;
+
+/// How much wider BM25 looks, once, when unrelated diary entries were dropped from a
+/// full window: they can outrank every row worth injecting.
+const PROMPT_RECALL_BM25_WIDENING: usize = 4;
+
+/// Newest injectable diary entries the prompt is matched against.
+const PROMPT_RECALL_DIARY_SCAN: usize = 50;
+
+/// The distinct lowercase words of `text` that carry meaning: not stopwords, and
+/// neither a single character nor a short number (`option 2`). Numbers of three
+/// digits or more stay, since they are issue numbers and ports.
+fn prompt_content_words(text: &str) -> std::collections::HashSet<String> {
+    text.to_lowercase()
+        .replace('\u{2019}', "'")
+        .split(|c: char| !c.is_alphanumeric() && c != '\'')
+        .map(|word| word.trim_matches('\''))
+        .filter(|word| {
+            let min_chars = if word.chars().all(char::is_numeric) {
+                3
+            } else {
+                2
+            };
+            word.chars().count() >= min_chars
+                && PROMPT_RECALL_STOPWORDS.binary_search(word).is_err()
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+/// Whether a prompt is too slight to recall against, like `yes` or `go ahead`, in any
+/// script: `да` and `sí` are one word like any other. The exception is a script
+/// written without spaces, where a whole sentence arrives as a single "word": one of
+/// at least [`PROMPT_RECALL_UNSEGMENTED_MIN_CHARS`] characters is enough on its own.
+fn is_trivial_prompt(prompt: &str) -> bool {
+    let words = prompt_content_words(prompt);
+    words.len() < PROMPT_RECALL_MIN_CONTENT_WORDS
+        && !words.iter().any(|word| {
+            word.chars().any(is_unsegmented_script)
+                && word.chars().count() >= PROMPT_RECALL_UNSEGMENTED_MIN_CHARS
+        })
+}
+
+/// Whether `c` belongs to a script written without spaces between words: Han,
+/// Hiragana, Katakana, Thai, Lao, Myanmar or Khmer.
+fn is_unsegmented_script(c: char) -> bool {
+    matches!(
+        c,
+        '\u{3040}'..='\u{30FF}'   // Hiragana, Katakana
+            | '\u{31F0}'..='\u{31FF}' // Katakana phonetic extensions
+            | '\u{3400}'..='\u{4DBF}' // CJK extension A
+            | '\u{4E00}'..='\u{9FFF}' // CJK unified ideographs
+            | '\u{F900}'..='\u{FAFF}' // CJK compatibility ideographs
+            | '\u{20000}'..='\u{3134F}' // CJK extensions B onwards
+            | '\u{0E00}'..='\u{0EFF}' // Thai, Lao
+            | '\u{1000}'..='\u{109F}' // Myanmar
+            | '\u{1780}'..='\u{17FF}' // Khmer
     )
 }
 
-/// Top `max_hits` BM25-qualifying ids, sorted for stable output. `qualifying`
-/// comes from `db.bm25_search`, which already excludes superseded rows, so a
-/// drawer map already fetched for a superset of these ids (e.g. `fetched` in
-/// the vector-fusion path) can be reused directly without a second query.
-fn bm25_only_ids(qualifying: &[(String, f32)], max_hits: usize) -> Vec<String> {
-    let mut ids: Vec<String> = qualifying
+/// Whether another project's memory may be injected for a prompt the workspace's own
+/// scopes have no hit for. Never in a workspace that has memory: there, a miss means the
+/// prompt isn't about anything recorded, and what other projects match on its common
+/// words is the noise this hook exists to avoid. With no workspace (no scopes), only
+/// the content-word bar applies. An unreadable count fails closed.
+fn cross_wing_recall_allowed(
+    db: &crate::db::schema::Database,
+    words: &std::collections::HashSet<String>,
+    workspace_scopes: &[RecallScope],
+) -> bool {
+    words.len() >= PROMPT_RECALL_CROSS_WING_MIN_CONTENT_WORDS
+        && workspace_scopes
+            .iter()
+            .all(|scope| match db.recall_scope_has_memory(scope) {
+                Ok(found) => !found,
+                Err(e) => {
+                    tracing::warn!(
+                        "prompt-hook recall: memory check of {scope:?} failed, staying in \
+                         the workspace: {e}"
+                    );
+                    false
+                }
+            })
+}
+
+/// Whether a diary excerpt, exactly as it would be injected, relates to the prompt.
+/// Matching the excerpt and not the whole entry is deliberate: entries run to
+/// kilobytes and share a couple of common words with most prompts, and a match past
+/// the cut would inject a line with no visible connection to the prompt.
+///
+/// How many words it must share grows with the shorter side: at least
+/// [`PROMPT_RECALL_DIARY_MIN_SHARED_WORDS`], and
+/// [`PROMPT_RECALL_DIARY_MIN_SHARED_TENTHS`] of the shorter side's words when that is
+/// more, never more than the prompt has.
+fn diary_excerpt_matches(prompt_words: &std::collections::HashSet<String>, excerpt: &str) -> bool {
+    let excerpt_words = prompt_content_words(excerpt);
+    let shared = excerpt_words.intersection(prompt_words).count();
+    let shorter = prompt_words.len().min(excerpt_words.len());
+    let proportional = (shorter * PROMPT_RECALL_DIARY_MIN_SHARED_TENTHS).div_ceil(10);
+    let required = PROMPT_RECALL_DIARY_MIN_SHARED_WORDS
+        .max(proportional)
+        .min(prompt_words.len());
+    shared >= required && shared > 0
+}
+
+/// Whether a BM25 or vector hit may be injected as far as diary relevance goes: any
+/// row that isn't a diary entry may, and a diary entry, in the shared diary wing or a
+/// project's diary room, must pass [`diary_excerpt_matches`] on its injected excerpt.
+/// A mined file is never a diary entry, though mining names a `diary/` directory's
+/// room `diary`.
+fn diary_hit_matches(
+    drawer: &crate::db::drawers::Drawer,
+    prompt_words: &std::collections::HashSet<String>,
+    line_bytes: usize,
+) -> bool {
+    let is_diary = drawer.added_by != crate::db::drawers::MINED_ADDED_BY
+        && (drawer.wing == crate::db::drawers::SHARED_DIARY_WING
+            || drawer.room == crate::diary::DIARY_ROOM);
+    !is_diary || diary_excerpt_matches(prompt_words, &compact_excerpt(&drawer.content, line_bytes))
+}
+
+/// A recent diary entry that matched the prompt, pending a check against the rows
+/// rendered ahead of it.
+struct DiaryMatch {
+    content: String,
+    excerpt: String,
+    line: String,
+}
+
+/// The BM25-qualifying ids, best first. They come from [`bm25_qualifying`]: current
+/// rows only, already scoped, eligible and diary-checked, so a drawer map fetched for
+/// a superset of them (`fetched` in the vector-fusion path, after
+/// [`scope_recall_candidates`] has kept what `reach` allows) holds every one still in
+/// play, and a second query is not needed.
+fn bm25_ranked_ids(qualifying: &[(String, f32)]) -> Vec<String> {
+    qualifying.iter().map(|(id, _)| id.clone()).collect()
+}
+
+/// Up to `max_hits` of the `ranked` ids that `drawers` holds, best first, sorted for
+/// stable output. An id whose excerpt repeats one already chosen is skipped rather
+/// than chosen: the same file mined into two wings would otherwise inject the same
+/// text twice, or leave its slot empty when it isn't rendered twice.
+fn distinct_top_ids(
+    ranked: &[String],
+    drawers: &std::collections::HashMap<String, crate::db::drawers::Drawer>,
+    max_hits: usize,
+    line_bytes: usize,
+) -> Vec<String> {
+    let mut excerpts = std::collections::HashSet::new();
+    let mut ids: Vec<String> = ranked
         .iter()
+        .filter(|id| {
+            drawers.get(*id).is_some_and(|d| {
+                let excerpt = compact_excerpt(&d.content, line_bytes);
+                !excerpt.is_empty() && excerpts.insert(excerpt)
+            })
+        })
         .take(max_hits)
-        .map(|(id, _)| id.clone())
+        .cloned()
         .collect();
     ids.sort_unstable();
     ids
 }
 
+/// [`recall_block_from_qualifying_with_vector_poll`] for hits a test has in hand, with
+/// the reach [`bm25_qualifying`] would give them.
+#[cfg(test)]
 fn recall_block_from_qualifying(
     db: &crate::db::schema::Database,
     prompt: &str,
     config: &RecallConfig,
+    workspace_scopes: &[RecallScope],
     qualifying: Vec<(String, f32)>,
     vector_ids: Option<&[String]>,
 ) -> Option<String> {
+    let words = prompt_content_words(prompt);
+    let reach = if qualifying.is_empty() {
+        RecallReach::Elsewhere {
+            allowed: cross_wing_recall_allowed(db, &words, workspace_scopes),
+        }
+    } else {
+        let ids: Vec<&str> = qualifying.iter().map(|(id, _)| id.as_str()).collect();
+        let drawers = db.get_drawers_by_ids(&ids).unwrap();
+        workspace_scopes
+            .iter()
+            .position(|scope| drawers.values().any(|d| scope.contains(d)))
+            .map_or(RecallReach::Elsewhere { allowed: true }, RecallReach::Scope)
+    };
     recall_block_from_qualifying_with_vector_poll(
         db,
         prompt,
+        &words,
         config,
-        qualifying,
+        workspace_scopes,
+        Bm25Qualifying {
+            hits: qualifying,
+            reach,
+        },
         vector_ids.map(|ids| Some(ids.to_vec())),
         None,
     )
@@ -1158,14 +1873,21 @@ fn opportunistic_vector_response(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn recall_block_from_qualifying_with_vector_poll(
     db: &crate::db::schema::Database,
     prompt: &str,
+    words: &std::collections::HashSet<String>,
     config: &RecallConfig,
-    qualifying: Vec<(String, f32)>,
+    workspace_scopes: &[RecallScope],
+    qualifying: Bm25Qualifying,
     initial_vector_response: Option<Option<Vec<String>>>,
     vector: Option<&VectorHandoff>,
 ) -> Option<String> {
+    let Bm25Qualifying {
+        hits: qualifying,
+        reach,
+    } = qualifying;
     let RecallConfig {
         max_hits,
         line_bytes,
@@ -1254,18 +1976,24 @@ fn recall_block_from_qualifying_with_vector_poll(
         }
     }
 
-    // Diary excerpt recall
+    // Diary excerpt recall. Every match is kept, not just `diary_max`, because some may
+    // repeat a row rendered below and must not use up a slot.
+    let mut diary_matches: Vec<DiaryMatch> = Vec::new();
     if diary_enabled {
-        match db.get_drawers(Some("diary"), None, diary_max) {
+        match db.recent_prompt_recall_diary(PROMPT_RECALL_DIARY_SCAN) {
             Ok(entries) => {
-                for d in &entries {
+                for d in entries {
                     let excerpt = compact_excerpt(&d.content, diary_line_bytes);
-                    if !excerpt.is_empty() {
-                        if let (Ok(date), Ok(excerpt)) = (
+                    if diary_excerpt_matches(words, &excerpt) {
+                        if let (Ok(date), Ok(escaped)) = (
                             serde_json::to_string(&d.date),
                             serde_json::to_string(&excerpt),
                         ) {
-                            lines.push(format!("- source=\"diary\" date={date} excerpt={excerpt}"));
+                            diary_matches.push(DiaryMatch {
+                                content: d.content,
+                                excerpt,
+                                line: format!("- source=\"diary\" date={date} excerpt={escaped}"),
+                            });
                         }
                     }
                 }
@@ -1286,7 +2014,7 @@ fn recall_block_from_qualifying_with_vector_poll(
         .and_then(|response| response.as_deref());
     let (selected_ids, drawers) = if let Some(vector_ids) = vector_ids.filter(|ids| !ids.is_empty())
     {
-        let bm25_ids: Vec<String> = qualifying.iter().map(|(id, _)| id.clone()).collect();
+        let bm25_ids = bm25_ranked_ids(&qualifying);
         let mut lookup_ids = bm25_ids.clone();
         for id in vector_ids {
             if !lookup_ids.iter().any(|candidate| candidate == id) {
@@ -1294,13 +2022,14 @@ fn recall_block_from_qualifying_with_vector_poll(
             }
         }
         let lookup_refs: Vec<&str> = lookup_ids.iter().map(String::as_str).collect();
-        let fetched = match db.get_drawers_by_ids_filtered(&lookup_refs, None, None, false) {
+        let mut fetched = match db.get_drawers_by_ids_filtered(&lookup_refs, None, None, false) {
             Ok(drawers) => drawers,
             Err(e) => {
                 tracing::warn!("prompt-hook recall: drawer fetch failed: {e}");
                 return None;
             }
         };
+        scope_recall_candidates(&mut fetched, words, workspace_scopes, reach, line_bytes);
         let current_bm25_ids: Vec<String> = bm25_ids
             .iter()
             .filter(|id| fetched.contains_key(*id))
@@ -1318,7 +2047,8 @@ fn recall_block_from_qualifying_with_vector_poll(
             // superseded row (BM25 search excludes them already) — so it already
             // holds exactly what a fresh `get_drawers_by_ids` fetch for these ids
             // would return. No second query needed.
-            (bm25_only_ids(&qualifying, max_hits), fetched)
+            let ids = distinct_top_ids(&bm25_ids, &fetched, max_hits, line_bytes);
+            (ids, fetched)
         } else {
             let bm25_weight = crate::search::pipeline::sparse_bm25_weight(
                 current_bm25_ids.len(),
@@ -1330,17 +2060,12 @@ fn recall_block_from_qualifying_with_vector_poll(
                 crate::search::tunables::rrf_k(),
                 bm25_weight,
             );
-            let mut ids: Vec<String> = merged
-                .into_iter()
-                .filter(|id| fetched.contains_key(id))
-                .take(max_hits)
-                .collect();
-            ids.sort_unstable();
+            let ids = distinct_top_ids(&merged, &fetched, max_hits, line_bytes);
             (ids, fetched)
         }
     } else {
-        let ids = bm25_only_ids(&qualifying, max_hits);
-        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let ranked = bm25_ranked_ids(&qualifying);
+        let refs: Vec<&str> = ranked.iter().map(String::as_str).collect();
         let drawers = match db.get_drawers_by_ids(&refs) {
             Ok(drawers) => drawers,
             Err(e) => {
@@ -1348,14 +2073,26 @@ fn recall_block_from_qualifying_with_vector_poll(
                 return None;
             }
         };
-        (ids, drawers)
+        (
+            distinct_top_ids(&ranked, &drawers, max_hits, line_bytes),
+            drawers,
+        )
     };
 
     let mut drawer_lines = Vec::new();
-    for id in selected_ids {
-        if let Some(d) = drawers.get(&id) {
+    // The same file mined into two wings would otherwise inject the same text twice.
+    let mut seen_excerpts = std::collections::HashSet::new();
+    // Diary lines have their own byte cap, so a copy of a row needn't share its excerpt.
+    // This holds the content of every row whose text is shown, even through another's line.
+    let mut shown_contents = std::collections::HashSet::new();
+    for id in &selected_ids {
+        if let Some(d) = drawers.get(id) {
             let excerpt = compact_excerpt(&d.content, line_bytes);
-            if !excerpt.is_empty() {
+            if excerpt.is_empty() {
+                continue;
+            }
+            shown_contents.insert(d.content.as_str());
+            if seen_excerpts.insert(excerpt.clone()) {
                 let wing = compact_excerpt(&d.wing, PROMPT_RECALL_LABEL_BYTES);
                 let room = compact_excerpt(&d.room, PROMPT_RECALL_LABEL_BYTES);
                 let source = serde_json::to_string(&format!("{wing}/{room}")).ok()?;
@@ -1365,6 +2102,16 @@ fn recall_block_from_qualifying_with_vector_poll(
         }
     }
     drawer_lines.extend(lines);
+    drawer_lines.extend(
+        diary_matches
+            .into_iter()
+            .filter(|m| {
+                !shown_contents.contains(m.content.as_str())
+                    && seen_excerpts.insert(m.excerpt.clone())
+            })
+            .map(|m| m.line)
+            .take(diary_max),
+    );
     lines = drawer_lines;
 
     if lines.is_empty() {
@@ -1466,7 +2213,13 @@ fn read_transcript_tail(path: &Path) -> Option<String> {
 }
 
 fn persist_diary_summary(app: &App, content: &str) -> Result<(), MemoryError> {
-    let _ = diary::write_entry(app, content, "diary", "hook", 8_000)?;
+    let _ = diary::write_entry(
+        app,
+        content,
+        crate::db::drawers::SHARED_DIARY_WING,
+        crate::db::drawers::HOOK_ADDED_BY,
+        8_000,
+    )?;
     Ok(())
 }
 
@@ -1592,7 +2345,7 @@ fn persist_transcript_review_from_path(
         REVIEW_WING,
         &room,
         source_file.as_ref(),
-        "hook",
+        crate::db::drawers::HOOK_ADDED_BY,
     )?;
     app.mark_dirty();
     Ok(Some(StoredReview { id, room }))
@@ -3316,6 +4069,71 @@ mod tests {
     }
 
     #[test]
+    fn workspace_scopes_are_the_checkout_then_its_repository() {
+        let temp = tempfile::tempdir().unwrap();
+        // The roots are recorded canonical, and macOS's temp directory is a symlink.
+        let base = temp.path().canonicalize().unwrap();
+        let scope = |wing: &str, root: &Path| RecallScope::new(wing.to_string(), root);
+        let repo = base.join("shop-api");
+        init_git_test_repo(&repo);
+        let linked = base.join("shop-api-feature");
+        git_test_repo(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feature",
+                linked.to_str().unwrap(),
+            ],
+        );
+        let same_name = base.join("elsewhere").join("shop-api");
+        git_test_repo(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "same-name",
+                same_name.to_str().unwrap(),
+            ],
+        );
+        // A directory the checkout tracks a file in: one it tracks nothing in is a
+        // project that merely sits in the work tree.
+        let subdir = linked.join("crates");
+        std::fs::create_dir_all(&subdir).unwrap();
+        std::fs::write(subdir.join("lib.rs"), "fn main() {}\n").unwrap();
+        git_test_repo(&linked, &["add", "crates/lib.rs"]);
+        let plain = base.join("notes");
+        std::fs::create_dir_all(&plain).unwrap();
+
+        // A linked worktree's own scope holds its repository's filed rows too.
+        let linked_scopes = [
+            scope("shop-api-feature", &linked).with_filed_wing("shop-api".to_string()),
+            scope("shop-api", &repo),
+        ];
+        assert_eq!(workspace_scopes(&repo), [scope("shop-api", &repo)]);
+        assert_eq!(workspace_scopes(&linked), linked_scopes);
+        assert_eq!(workspace_scopes(&subdir), linked_scopes);
+        assert_eq!(workspace_scopes(&plain), [scope("notes", &plain)]);
+        // One wing name, but the main checkout's files are under another directory.
+        assert_eq!(
+            workspace_scopes(&same_name),
+            [scope("shop-api", &same_name), scope("shop-api", &repo)]
+        );
+
+        #[cfg(unix)]
+        {
+            let link = base.join("notes-link");
+            std::os::unix::fs::symlink(&plain, &link).unwrap();
+            let scopes = workspace_scopes(&link);
+            assert_eq!(scopes[0], scope("notes", &plain), "as mining names it");
+        }
+    }
+
+    #[test]
     fn session_start_codex_prefix_variants_omit_others_emit() {
         // "codex" is matched exactly in the sibling tests; here "codex-cli" must
         // also omit additionalContext because it is classified as the codex spec
@@ -3572,7 +4390,7 @@ mod tests {
             "user-prompt-submit",
             "claude-code",
             config,
-            serde_json::json!({ "prompt": "zigzag widget" }),
+            serde_json::json!({ "prompt": "zigzag widget instructions" }),
         )
         .unwrap();
         let v = serde_json::to_value(&resp).unwrap();
@@ -4221,6 +5039,7 @@ mod tests {
             &db,
             "ignored",
             &config,
+            &[],
             vec![
                 (stale_one_id, 1.0),
                 (stale_two_id, 1.0),
@@ -4237,6 +5056,7 @@ mod tests {
             &db,
             "ignored",
             &config,
+            &[],
             vec![
                 (lexical_id, 1.0),
                 (bm25_one_id, 1.0),
@@ -4773,7 +5593,7 @@ mod tests {
             diary_max: 1,
             diary_line_bytes: 120,
         };
-        let block = recall_block_from_db(&db, q, &config)
+        let block = recall_block_from_db(&db, q, &config, &[])
             .expect("strong match still injects above the floor");
         assert_eq!(
             injected_source_rooms(&block),
@@ -4786,7 +5606,7 @@ mod tests {
             ..config
         };
         assert!(
-            recall_block_from_db(&db, q, &above_floor_config).is_none(),
+            recall_block_from_db(&db, q, &above_floor_config, &[]).is_none(),
             "floor above all scores yields no recall block"
         );
     }
@@ -4844,7 +5664,8 @@ mod tests {
             diary_max: 1,
             diary_line_bytes: 120,
         };
-        let block = recall_block_from_db(&db, q, &config).expect("five matches → recall injects");
+        let block =
+            recall_block_from_db(&db, q, &config, &[]).expect("five matches → recall injects");
         let injected = injected_source_rooms(&block);
         assert_eq!(injected.len(), 3, "max_hits caps the block at 3: {block}");
         assert_eq!(
@@ -4877,7 +5698,8 @@ mod tests {
             diary_max: 1,
             diary_line_bytes: 120,
         };
-        let block = recall_block_from_db(&db, "alpha beta", &config).expect("match injects");
+        let block =
+            recall_block_from_db(&db, "alpha beta gamma", &config, &[]).expect("match injects");
         let summary = block
             .lines()
             .find(|l| l.starts_with("- "))
@@ -4938,7 +5760,7 @@ mod tests {
             diary_max: 1,
             diary_line_bytes: 120,
         };
-        let block = recall_block_from_db(&db, "how does pgbouncer work", &config).unwrap();
+        let block = recall_block_from_db(&db, "how does pgbouncer work", &config, &[]).unwrap();
         assert!(
             block.contains("source=\"kg\""),
             "KG triple should be included: {block}"
@@ -4995,7 +5817,8 @@ mod tests {
             diary_max: 1,
             diary_line_bytes: 120,
         };
-        let block = recall_block_from_db(&db, "how does pgbouncer work", &config).unwrap();
+        let block =
+            recall_block_from_db(&db, "how does pgbouncer pooling work", &config, &[]).unwrap();
         assert!(
             !block.contains("source=\"kg\""),
             "KG should not appear when disabled: {block}"
@@ -5037,7 +5860,7 @@ mod tests {
             diary_max: 1,
             diary_line_bytes: 120,
         };
-        let block = recall_block_from_db(&db, "how does pgbouncer work", &config);
+        let block = recall_block_from_db(&db, "how does pgbouncer work", &config, &[]);
         let block = block.expect("KG hit should produce recall even without BM25 matches");
         assert!(
             block.contains("source=\"kg\""),
@@ -5081,7 +5904,7 @@ mod tests {
             diary_max: 1,
             diary_line_bytes: 120,
         };
-        let block = recall_block_from_db(&db, "auth middleware deployment", &config).unwrap();
+        let block = recall_block_from_db(&db, "auth middleware deployment", &config, &[]).unwrap();
         assert!(
             block.contains("source=\"diary\""),
             "diary excerpt should appear: {block}"
@@ -5090,6 +5913,648 @@ mod tests {
             block.contains("auth middleware"),
             "diary content should appear: {block}"
         );
+    }
+
+    fn recall_test_config() -> RecallConfig {
+        RecallConfig {
+            bm25_floor: 0.0,
+            max_hits: 3,
+            line_bytes: 120,
+            kg_enabled: false,
+            kg_max_triples: 3,
+            diary_enabled: true,
+            diary_max: 1,
+            diary_line_bytes: 120,
+        }
+    }
+
+    fn one_wing(wing: &str) -> Vec<RecallScope> {
+        wing_scopes(&[wing])
+    }
+
+    fn wing_scopes(wings: &[&str]) -> Vec<RecallScope> {
+        wings
+            .iter()
+            // These tests' rows carry no path, so only the wing places them.
+            .map(|wing| RecallScope::new((*wing).to_string(), &Path::new("/workspaces").join(wing)))
+            .collect()
+    }
+
+    fn insert_recall_drawer(
+        db: &crate::db::schema::Database,
+        content: &str,
+        wing: &str,
+        room: &str,
+        added_by: &str,
+    ) -> String {
+        let zero = vec![0.0f32; ironrace_embed::embedder::EMBED_DIM];
+        let id = generate_id(content, wing, room);
+        db.insert_drawer(&id, content, &zero, wing, room, "", added_by)
+            .unwrap();
+        id
+    }
+
+    #[test]
+    fn prompt_recall_stopwords_stay_sorted_for_binary_search() {
+        assert!(PROMPT_RECALL_STOPWORDS.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[test]
+    fn trivial_prompts_are_replies_and_function_words_only() {
+        for prompt in [
+            "",
+            "   \t\n ",
+            "yes",
+            "YES!",
+            "ok",
+            "k",
+            "continue",
+            "go ahead",
+            "yes, do it",
+            "thanks!",
+            "looks good to me",
+            "option 2",
+            "don\u{2019}t",
+            "deploy",
+            "42",
+        ] {
+            assert!(is_trivial_prompt(prompt), "should be trivial: {prompt:?}");
+        }
+        for prompt in [
+            "auth middleware",
+            "how does pgbouncer work",
+            "what did we decide about 375 retries",
+            "fix ci",
+            // One whitespace-free "word" can be a whole sentence in these scripts.
+            "\u{5982}\u{4f55}\u{914d}\u{7f6e}\u{8fde}\u{63a5}\u{6c60}",
+        ] {
+            assert!(!is_trivial_prompt(prompt), "should recall: {prompt:?}");
+        }
+    }
+
+    #[test]
+    fn recall_stays_in_a_workspace_with_memory_and_falls_back_only_from_one_without() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::schema::Database::open(&dir.path().join("m.sqlite3")).unwrap();
+        db.migrate().unwrap();
+        let mut config = recall_test_config();
+        config.diary_enabled = false;
+        insert_recall_drawer(&db, "ledger rounding rules", "shop", "docs", "mine");
+        insert_recall_drawer(&db, "ledger rounding elsewhere", "other", "docs", "mine");
+        insert_recall_drawer(&db, "webhook retry policy notes", "other", "docs", "mine");
+
+        let block =
+            recall_block_from_db(&db, "ledger rounding", &config, &one_wing("shop")).unwrap();
+        assert!(block.contains("shop/docs"), "{block}");
+        assert!(!block.contains("other/docs"), "{block}");
+
+        // A workspace with memory never reaches other projects, however specific.
+        assert_eq!(
+            recall_block_from_db(&db, "webhook retry policy", &config, &one_wing("shop")),
+            None
+        );
+
+        // A workspace with none: a specific prompt may, a vague one may not.
+        let block =
+            recall_block_from_db(&db, "webhook retry policy", &config, &one_wing("fresh")).unwrap();
+        assert!(block.contains("other/docs"), "{block}");
+        assert_eq!(
+            recall_block_from_db(&db, "webhook retry", &config, &one_wing("fresh")),
+            None
+        );
+
+        // With no workspace every wing is searched, so the prompt clears the same bar
+        // as the fallback from a workspace without memory.
+        let block = recall_block_from_db(&db, "webhook retry policy", &config, &[]).unwrap();
+        assert!(block.contains("other/docs"), "{block}");
+        assert_eq!(
+            recall_block_from_db(&db, "webhook retry", &config, &[]),
+            None
+        );
+    }
+
+    #[test]
+    fn vector_hits_get_the_same_scoping_as_bm25_hits() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::schema::Database::open(&dir.path().join("m.sqlite3")).unwrap();
+        db.migrate().unwrap();
+        let mut config = recall_test_config();
+        config.diary_enabled = false;
+        let plan = insert_recall_drawer(&db, "vector plan row", "shop", "collab-plans", "collab");
+        let hook = insert_recall_drawer(&db, "vector hook row", "diary", "diary", "hook");
+        let other = insert_recall_drawer(&db, "vector other row", "other", "docs", "mine");
+        let own = insert_recall_drawer(&db, "vector own row", "shop", "docs", "mine");
+
+        // The workspace's eligible row wins; everything else the daemon sent is dropped.
+        let vector = vec![plan.clone(), hook.clone(), other.clone(), own];
+        let block = recall_block_from_qualifying(
+            &db,
+            "vector rows",
+            &config,
+            &one_wing("shop"),
+            vec![],
+            Some(&vector),
+        )
+        .unwrap();
+        assert!(block.contains("vector own row"), "{block}");
+        for absent in ["vector plan row", "vector hook row", "vector other row"] {
+            assert!(!block.contains(absent), "{absent} injected: {block}");
+        }
+
+        // A workspace with memory but no vector hit of its own gets nothing.
+        let vector = vec![plan, hook, other];
+        let specific = "vector rows matching specifically";
+        assert_eq!(
+            recall_block_from_qualifying(
+                &db,
+                specific,
+                &config,
+                &one_wing("shop"),
+                vec![],
+                Some(&vector),
+            ),
+            None
+        );
+
+        // One with none: another project's hit needs a specific prompt, and
+        // ineligible rows never get in, whichever wing they are in.
+        assert_eq!(
+            recall_block_from_qualifying(
+                &db,
+                "vector rows",
+                &config,
+                &one_wing("fresh"),
+                vec![],
+                Some(&vector),
+            ),
+            None
+        );
+        let block = recall_block_from_qualifying(
+            &db,
+            specific,
+            &config,
+            &one_wing("fresh"),
+            vec![],
+            Some(&vector),
+        )
+        .unwrap();
+        assert!(block.contains("vector other row"), "{block}");
+        for absent in ["vector plan row", "vector hook row"] {
+            assert!(!block.contains(absent), "{absent} injected: {block}");
+        }
+    }
+
+    #[test]
+    fn diary_line_requires_a_prompt_match_and_is_never_hook_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::schema::Database::open(&dir.path().join("m.sqlite3")).unwrap();
+        db.migrate().unwrap();
+        let config = recall_test_config();
+        let older = insert_recall_drawer(
+            &db,
+            "Chose the postgres migration plan",
+            "diary",
+            "diary",
+            "diary",
+        );
+        let newest = insert_recall_drawer(
+            &db,
+            "Checkpoint acme/widgets#1 inspected worktree",
+            "diary",
+            "diary",
+            "diary",
+        );
+        insert_recall_drawer(
+            &db,
+            "Hook stop ran for postgres migration session",
+            "diary",
+            "diary",
+            "hook",
+        );
+        // A single shared word deep in an entry is not a match.
+        insert_recall_drawer(
+            &db,
+            &format!("{} postgres migration", "unrelated filler text ".repeat(20)),
+            "diary",
+            "diary",
+            "diary",
+        );
+        for (id, filed_at) in [(&older, "2026-01-01"), (&newest, "2026-01-02")] {
+            db.with_connection(|conn| {
+                conn.execute(
+                    "UPDATE drawers SET filed_at = ?1 WHERE id = ?2",
+                    rusqlite::params![filed_at, id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        }
+
+        // Not the newest entry but the matching one. The hook row, which also
+        // matches, and the entry BM25 finds only past its excerpt stay out.
+        let block = recall_block_from_db(&db, "postgres migration", &config, &[]).unwrap();
+        assert!(block.contains("Chose the postgres migration"), "{block}");
+        assert_eq!(block.matches("- source=").count(), 1, "{block}");
+
+        assert_eq!(
+            recall_block_from_db(&db, "ledger rounding rules", &config, &[]),
+            None,
+            "an unrelated prompt gets no diary line"
+        );
+        assert_eq!(
+            recall_block_from_db(&db, "postgres rounding rules", &config, &[]),
+            None,
+            "one shared word is not a match"
+        );
+    }
+
+    #[test]
+    fn diary_hits_must_match_on_their_excerpt_on_every_retrieval_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::schema::Database::open(&dir.path().join("m.sqlite3")).unwrap();
+        db.migrate().unwrap();
+        let mut config = recall_test_config();
+        config.diary_enabled = false;
+        config.max_hits = 1;
+        let deep = |ending: &str| format!("{}{ending}", "unrelated filler text ".repeat(20));
+        let shared = insert_recall_drawer(
+            &db,
+            &deep("ledger rounding cents"),
+            "diary",
+            "diary",
+            "diary",
+        );
+        let project = insert_recall_drawer(
+            &db,
+            &deep("ledger rounding cents"),
+            "shop",
+            "diary",
+            "diary",
+        );
+        let room_elsewhere =
+            insert_recall_drawer(&db, &deep("ledger rounding cents"), "diary", "notes", "mcp");
+        // A longer row, so every diary entry outranks it and only a filter ahead of
+        // the `max_hits` cut leaves it standing.
+        insert_recall_drawer(
+            &db,
+            &format!(
+                "ledger rounding cents {}",
+                "keeps four decimals in totals ".repeat(30)
+            ),
+            "wing",
+            "docs",
+            "mine",
+        );
+
+        let block = recall_block_from_db(&db, "ledger rounding cents", &config, &[]).unwrap();
+        assert!(block.contains("wing/docs"), "{block}");
+        assert_eq!(block.matches("- source=").count(), 1, "{block}");
+
+        // The workspace's only hit is an unrelated diary entry: that isn't a claim to
+        // the prompt, so the repository's wing still gets its turn.
+        insert_recall_drawer(&db, "ledger rounding in repo", "repo", "docs", "mine");
+        let wings = wing_scopes(&["shop", "repo"]);
+        let block = recall_block_from_db(&db, "ledger rounding", &config, &wings).unwrap();
+        assert!(block.contains("repo/docs"), "{block}");
+
+        // Vector hits skip BM25 entirely.
+        let vector = vec![shared, project, room_elsewhere];
+        assert_eq!(
+            recall_block_from_qualifying(
+                &db,
+                "ledger rounding cents",
+                &config,
+                &[],
+                vec![],
+                Some(&vector),
+            ),
+            None
+        );
+        let matching = insert_recall_drawer(
+            &db,
+            "the ledger rounding cents entry",
+            "shop",
+            "diary",
+            "diary",
+        );
+        let block = recall_block_from_qualifying(
+            &db,
+            "ledger rounding cents",
+            &config,
+            &[],
+            vec![],
+            Some(&[matching]),
+        )
+        .unwrap();
+        assert!(block.contains("the ledger rounding cents entry"), "{block}");
+    }
+
+    #[test]
+    fn recall_scope_takes_mined_files_under_its_root_in_both_recall_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::schema::Database::open(&dir.path().join("m.sqlite3")).unwrap();
+        db.migrate().unwrap();
+        let mut config = recall_test_config();
+        config.diary_enabled = false;
+        let zero = vec![0.0f32; ironrace_embed::embedder::EMBED_DIM];
+        let insert = |content: &str, wing: &str, source_file: &str, added_by: &str| {
+            let id = generate_id(content, wing, "general");
+            db.insert_drawer(&id, content, &zero, wing, "general", source_file, added_by)
+                .unwrap();
+            id
+        };
+        let own = insert("ledger rounding own", "docs", "/notes/docs/a.md", "mine");
+        let sibling = insert(
+            "ledger rounding sibling",
+            "docs",
+            "/notes-archive/docs/b.md",
+            "mine",
+        );
+        let not_mined = insert("ledger rounding written", "docs", "/notes/c.md", "mcp");
+        // Mining `/other` names its `notes` directory's files wing `notes`: the
+        // workspace's own wing, from a path outside it.
+        let same_wing = insert(
+            "ledger rounding same wing",
+            "notes",
+            "/other/notes/d.md",
+            "mine",
+        );
+        // Not mined, so its wing is all that places it.
+        let filed = insert("ledger rounding filed", "notes", "", "mcp");
+        let scopes = [RecallScope::new("notes".to_string(), Path::new("/notes"))];
+
+        let block = recall_block_from_db(&db, "ledger rounding", &config, &scopes).unwrap();
+        assert!(block.contains("ledger rounding own"), "{block}");
+        assert!(block.contains("ledger rounding filed"), "{block}");
+        assert_eq!(block.matches("- source=").count(), 2, "{block}");
+
+        let block = recall_block_from_qualifying(
+            &db,
+            "vector prompt words",
+            &config,
+            &scopes,
+            vec![],
+            Some(&[
+                sibling.clone(),
+                same_wing.clone(),
+                own.clone(),
+                not_mined.clone(),
+                filed.clone(),
+            ]),
+        )
+        .unwrap();
+        assert!(block.contains("ledger rounding own"), "{block}");
+        assert!(block.contains("ledger rounding filed"), "{block}");
+        assert_eq!(block.matches("- source=").count(), 2, "{block}");
+
+        // Its files are memory, though the workspace's own wing has no rows.
+        let has_memory = |wing: &str, root: Option<&str>| {
+            // No root: one that holds nothing.
+            let scope = RecallScope::new(wing.to_string(), Path::new(root.unwrap_or("/nowhere")));
+            db.recall_scope_has_memory(&scope).unwrap()
+        };
+        assert!(has_memory("notes", Some("/notes")));
+        assert!(has_memory("unused", Some("/notes-archive/")));
+        // Wing `docs` has a row that wasn't mined, which its wing places.
+        assert!(has_memory("docs", None));
+        // Once the filed row is gone, wing `notes` holds only a mined row from
+        // `/other`, which is that root's memory and not a workspace's elsewhere.
+        db.delete_drawer(&filed).unwrap();
+        assert!(!has_memory("notes", Some("/fresh")));
+        assert!(has_memory("notes", Some("/other")));
+        assert!(!has_memory("unused", None));
+        // Prefix of a path but not a directory of it, and a row that wasn't mined.
+        assert!(!has_memory("unused", Some("/note")));
+        insert("a written note", "elsewhere", "/drafts/c.md", "mcp");
+        assert!(!has_memory("unused", Some("/drafts")));
+        // A filesystem root holds every absolute path.
+        assert!(has_memory("unused", Some("/")));
+    }
+
+    #[test]
+    fn recall_prefers_a_workspace_wing_in_order_and_counts_all_of_them_as_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::schema::Database::open(&dir.path().join("m.sqlite3")).unwrap();
+        db.migrate().unwrap();
+        let mut config = recall_test_config();
+        config.diary_enabled = false;
+        let linked = wing_scopes(&["feature", "shop"]);
+        let own = insert_recall_drawer(&db, "ledger rounding own", "feature", "docs", "mine");
+        let repo = insert_recall_drawer(&db, "ledger rounding repo", "shop", "docs", "mine");
+        let repo_only = insert_recall_drawer(&db, "pricing tiers repo", "shop", "docs", "mine");
+        let other = insert_recall_drawer(&db, "webhook retry policy", "other", "docs", "mine");
+
+        let only = |block: Option<String>, room_line: &str| {
+            let block = block.unwrap();
+            assert!(block.contains(room_line), "{block}");
+            assert_eq!(block.matches("- source=").count(), 1, "{block}");
+        };
+
+        // BM25: the checkout's wing, then the repository's, and no further.
+        only(
+            recall_block_from_db(&db, "ledger rounding", &config, &linked),
+            "ledger rounding own",
+        );
+        only(
+            recall_block_from_db(&db, "pricing tiers", &config, &linked),
+            "pricing tiers repo",
+        );
+        assert_eq!(
+            recall_block_from_db(&db, "webhook retry policy", &config, &linked),
+            None
+        );
+
+        // Vector hits the same way.
+        let vectors =
+            |ids: &[&String]| -> Vec<String> { ids.iter().map(|id| (*id).clone()).collect() };
+        only(
+            recall_block_from_qualifying(
+                &db,
+                "vector prompt words",
+                &config,
+                &linked,
+                vec![],
+                Some(&vectors(&[&repo, &own, &other])),
+            ),
+            "ledger rounding own",
+        );
+        let block = recall_block_from_qualifying(
+            &db,
+            "vector prompt words",
+            &config,
+            &linked,
+            vec![],
+            Some(&vectors(&[&repo_only, &other])),
+        );
+        only(block, "pricing tiers repo");
+        assert_eq!(
+            recall_block_from_qualifying(
+                &db,
+                "vector prompt words",
+                &config,
+                &linked,
+                vec![],
+                Some(&vectors(&[&other])),
+            ),
+            None
+        );
+
+        // Memory in the repository's wing alone is memory: no reaching elsewhere.
+        let unmined_checkout = wing_scopes(&["unmined", "shop"]);
+        assert_eq!(
+            recall_block_from_db(&db, "webhook retry policy", &config, &unmined_checkout),
+            None
+        );
+        // Neither wing has any: a specific prompt may.
+        let fresh_checkout = wing_scopes(&["unmined", "unmined-repo"]);
+        only(
+            recall_block_from_db(&db, "webhook retry policy", &config, &fresh_checkout),
+            "webhook retry policy",
+        );
+    }
+
+    #[test]
+    fn recall_renders_duplicated_content_and_bm25_found_diary_entries_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::schema::Database::open(&dir.path().join("m.sqlite3")).unwrap();
+        db.migrate().unwrap();
+        let config = recall_test_config();
+        insert_recall_drawer(&db, "shared runbook steps", "wing-a", "docs", "mine");
+        insert_recall_drawer(&db, "shared runbook steps", "wing-b", "docs", "mine");
+        let block = recall_block_from_db(&db, "shared runbook steps", &config, &[]).unwrap();
+        assert_eq!(block.matches("shared runbook steps").count(), 1, "{block}");
+
+        insert_recall_drawer(&db, "ledger rounding entry", "diary", "diary", "diary");
+        let block = recall_block_from_db(&db, "ledger rounding entry", &config, &[]).unwrap();
+        assert_eq!(block.matches("ledger rounding entry").count(), 1, "{block}");
+    }
+
+    #[test]
+    fn diary_line_never_comes_from_an_operational_room() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::schema::Database::open(&dir.path().join("m.sqlite3")).unwrap();
+        db.migrate().unwrap();
+        let config = recall_test_config();
+        for room in [
+            "collab-plans",
+            "collab-task-lists",
+            "collab-checkpoints",
+            "collab-drafts",
+            "collab-messages",
+        ] {
+            insert_recall_drawer(&db, "postgres migration plan", "diary", room, "collab");
+        }
+        // BM25 already skips these rooms, so the diary scan is the only path left that
+        // could inject them.
+        assert_eq!(
+            recall_block_from_db(&db, "postgres migration", &config, &[]),
+            None
+        );
+
+        insert_recall_drawer(&db, "postgres migration note", "diary", "diary", "diary");
+        let block = recall_block_from_db(&db, "postgres migration", &config, &[]).unwrap();
+        assert!(block.contains("postgres migration note"), "{block}");
+        assert_eq!(block.matches("- source=").count(), 1, "{block}");
+    }
+
+    #[test]
+    fn diary_line_duplicating_a_rendered_drawer_is_injected_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::schema::Database::open(&dir.path().join("m.sqlite3")).unwrap();
+        db.migrate().unwrap();
+        // The workspace scope hides the diary copy from BM25, so only the diary scan
+        // finds it: same text, different id.
+        insert_recall_drawer(&db, "ledger rounding runbook", "shop", "docs", "mine");
+        insert_recall_drawer(&db, "ledger rounding runbook", "diary", "diary", "diary");
+        let wings = one_wing("shop");
+        let block =
+            recall_block_from_db(&db, "ledger rounding", &recall_test_config(), &wings).unwrap();
+        assert_eq!(block.matches("- source=").count(), 1, "{block}");
+        assert!(block.contains("shop/docs"), "{block}");
+
+        // Each path has its own byte cap, so once they're tuned apart a long copy
+        // renders differently on each.
+        let long = format!(
+            "tax rounding {}",
+            "keeps four decimals in totals ".repeat(30)
+        );
+        insert_recall_drawer(&db, &long, "shop", "docs", "mine");
+        insert_recall_drawer(&db, &long, "diary", "diary", "diary");
+        for (line_bytes, diary_line_bytes) in [(400, 120), (120, 400)] {
+            let config = RecallConfig {
+                line_bytes,
+                diary_line_bytes,
+                ..recall_test_config()
+            };
+            let block = recall_block_from_db(&db, "tax rounding", &config, &wings).unwrap();
+            assert_eq!(
+                block.matches("- source=").count(),
+                1,
+                "drawer {line_bytes} / diary {diary_line_bytes}: {block}"
+            );
+            assert!(block.contains("shop/docs"), "{block}");
+        }
+
+        // Different contents that read the same once cut are the same line.
+        let filler = "keeps four decimals in totals ".repeat(30);
+        insert_recall_drawer(
+            &db,
+            &format!("pension rounding {filler} shop ending"),
+            "shop",
+            "docs",
+            "mine",
+        );
+        insert_recall_drawer(
+            &db,
+            &format!("pension rounding {filler} diary ending"),
+            "diary",
+            "diary",
+            "diary",
+        );
+        let block =
+            recall_block_from_db(&db, "pension rounding", &recall_test_config(), &wings).unwrap();
+        assert_eq!(block.matches("- source=").count(), 1, "{block}");
+    }
+
+    #[test]
+    fn duplicate_diary_lines_are_injected_once_and_use_no_diary_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::schema::Database::open(&dir.path().join("m.sqlite3")).unwrap();
+        db.migrate().unwrap();
+        let backdate = |id: &str, filed_at: &str| {
+            db.with_connection(|conn| {
+                conn.execute(
+                    "UPDATE drawers SET filed_at = ?1 WHERE id = ?2",
+                    rusqlite::params![filed_at, id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        };
+        let wings = one_wing("shop");
+
+        // Two copies among the diary's own entries, from different rooms.
+        let first = insert_recall_drawer(&db, "ledger rounding entry", "diary", "diary", "diary");
+        let second = insert_recall_drawer(&db, "ledger rounding entry", "diary", "daily", "diary");
+        backdate(&first, "2026-01-02");
+        backdate(&second, "2026-01-01");
+        let mut config = recall_test_config();
+        config.diary_max = 3;
+        let block = recall_block_from_db(&db, "ledger rounding", &config, &wings).unwrap();
+        assert_eq!(block.matches("- source=").count(), 1, "{block}");
+
+        // The newest match repeats a rendered drawer. It must not cost the older,
+        // distinct entry the only diary slot.
+        insert_recall_drawer(&db, "tax rounding runbook", "shop", "docs", "mine");
+        let copy = insert_recall_drawer(&db, "tax rounding runbook", "diary", "diary", "diary");
+        let older = insert_recall_drawer(&db, "tax rounding decision", "diary", "diary", "diary");
+        backdate(&copy, "2026-02-02");
+        backdate(&older, "2026-02-01");
+        let block =
+            recall_block_from_db(&db, "tax rounding", &recall_test_config(), &wings).unwrap();
+        assert_eq!(block.matches("tax rounding runbook").count(), 1, "{block}");
+        assert_eq!(block.matches("tax rounding decision").count(), 1, "{block}");
+        assert_eq!(block.matches("- source=").count(), 2, "{block}");
     }
 
     #[test]
@@ -5132,7 +6597,7 @@ mod tests {
             diary_max: 1,
             diary_line_bytes: 120,
         };
-        let block = recall_block_from_db(&db, "auth middleware", &config).unwrap();
+        let block = recall_block_from_db(&db, "auth middleware tokens", &config, &[]).unwrap();
         assert!(
             !block.contains("source=\"diary\""),
             "diary should not appear when disabled: {block}"
@@ -6361,5 +7826,617 @@ mod tests {
             crate::harness::TranscriptParserKind::None,
             "gemini must use the None transcript parser"
         );
+    }
+
+    // ---- PR #387 review findings ----
+
+    /// The hybrid path as the worker runs it, with the daemon's ids already in hand.
+    fn recall_block_from_vector_handoff_for_test(
+        db: &crate::db::schema::Database,
+        prompt: &str,
+        config: &RecallConfig,
+        scopes: &[RecallScope],
+        vector_ids: &[String],
+    ) -> Option<String> {
+        let words = prompt_content_words(prompt);
+        let qualifying = bm25_qualifying(db, prompt, &words, config, scopes);
+        recall_block_from_qualifying_with_vector_poll(
+            db,
+            prompt,
+            &words,
+            config,
+            scopes,
+            qualifying,
+            Some(Some(vector_ids.to_vec())),
+            None,
+        )
+    }
+
+    /// A dotfiles-style Git work tree around unrelated, non-Git projects: `ignore`
+    /// is its `.gitignore`, if any.
+    fn git_parent_with_projects(base: &Path, ignore: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let home = base.join("home");
+        init_git_test_repo(&home);
+        if !ignore.is_empty() {
+            std::fs::write(home.join(".gitignore"), ignore).unwrap();
+        }
+        let acme = home.join("clients").join("acme-notes");
+        let globex = home.join("clients").join("globex-notes");
+        for project in [&acme, &globex] {
+            std::fs::create_dir_all(project).unwrap();
+            std::fs::write(project.join("notes.md"), "notes\n").unwrap();
+        }
+        (home, acme, globex)
+    }
+
+    #[test]
+    fn non_git_project_inside_a_git_parent_is_its_own_workspace() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let scope = |wing: &str, root: &Path| RecallScope::new(wing.to_string(), root);
+        // Untracked (`status.showUntrackedFiles=no` dotfiles), ignored, and ignored
+        // file by file.
+        for (n, ignore) in ["", "*\n", "*\n!*/\n"].into_iter().enumerate() {
+            let (home, acme, globex) = git_parent_with_projects(&base.join(n.to_string()), ignore);
+            assert_eq!(
+                workspace_scopes(&acme),
+                [scope("acme-notes", &acme)],
+                "{ignore:?}"
+            );
+            assert_eq!(
+                workspace_scopes(&globex),
+                [scope("globex-notes", &globex)],
+                "{ignore:?}"
+            );
+            assert_eq!(
+                workspace_scopes(&home),
+                [scope("home", &home)],
+                "{ignore:?}"
+            );
+        }
+        // A directory the checkout tracks a file in is part of it, even once Git
+        // discovery has to cross one it doesn't.
+        let repo = base.join("shop-api");
+        init_git_test_repo(&repo);
+        let tracked = repo.join("crates").join("core");
+        std::fs::create_dir_all(&tracked).unwrap();
+        std::fs::write(tracked.join("lib.rs"), "fn main() {}\n").unwrap();
+        git_test_repo(&repo, &["add", "crates/core/lib.rs"]);
+        assert_eq!(workspace_scopes(&tracked), [scope("shop-api", &repo)]);
+        assert_eq!(
+            workspace_scopes(&repo.join("crates")),
+            [scope("shop-api", &repo)]
+        );
+    }
+
+    #[test]
+    fn git_ceiling_directories_bound_workspace_discovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let (home, acme, _) = git_parent_with_projects(&base, "");
+        // Tracked, so only the ceiling keeps it out of the checkout.
+        git_test_repo(&home, &["add", "clients/acme-notes/notes.md"]);
+        let scope = |wing: &str, root: &Path| RecallScope::new(wing.to_string(), root);
+        assert_eq!(
+            workspace_recall_scopes_with(&acme, None, &[]),
+            Some(vec![scope("home", &home)])
+        );
+        assert_eq!(
+            workspace_recall_scopes_with(&acme, Some(home.as_os_str()), &[]),
+            Some(vec![scope("acme-notes", &acme)])
+        );
+        // The ceiling only narrows discovery: the work tree itself is still one.
+        assert_eq!(
+            workspace_recall_scopes_with(&home, Some(home.as_os_str()), &[]),
+            Some(vec![scope("home", &home)])
+        );
+    }
+
+    #[test]
+    fn a_submodule_is_its_own_repository_not_its_git_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let upstream = base.join("upstream").join("shop-lib");
+        init_git_test_repo(&upstream);
+        let superproject = base.join("shop-api");
+        init_git_test_repo(&superproject);
+        git_test_repo(
+            &superproject,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                upstream.to_str().unwrap(),
+                "shop-lib",
+            ],
+        );
+        let submodule = superproject.join("shop-lib");
+        let scope = |wing: &str, root: &Path| RecallScope::new(wing.to_string(), root);
+        // Its common Git directory is `.git/modules/shop-lib`, where nothing is mined.
+        assert_eq!(
+            workspace_scopes(&submodule),
+            [scope("shop-lib", &submodule)]
+        );
+        assert_eq!(repository_name(&submodule).as_deref(), Some("shop-lib"));
+    }
+
+    #[test]
+    fn workspace_that_cannot_be_resolved_skips_recall() {
+        let temp = tempfile::tempdir().unwrap();
+        assert_eq!(
+            workspace_recall_scopes(&temp.path().join("deleted"), temp.path()),
+            None
+        );
+    }
+
+    #[test]
+    fn a_workspace_named_for_a_shared_wing_does_not_own_that_wing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::schema::Database::open(&dir.path().join("m.sqlite3")).unwrap();
+        db.migrate().unwrap();
+        let mut config = recall_test_config();
+        config.diary_enabled = false;
+        for wing in ["diary", "reviews", "autopilot", "ironrace-memory"] {
+            insert_recall_drawer(
+                &db,
+                &format!("{wing} ledger rounding rules"),
+                wing,
+                "notes",
+                "mcp",
+            );
+            let scopes = [RecallScope::new(
+                wing.to_string(),
+                &Path::new("/work").join(wing),
+            )];
+            assert!(!db.recall_scope_has_memory(&scopes[0]).unwrap(), "{wing}");
+            assert_eq!(
+                recall_block_from_db(&db, "ledger rounding", &config, &scopes),
+                None,
+                "{wing}"
+            );
+        }
+    }
+
+    #[test]
+    fn stored_reviews_stay_recallable_while_the_hooks_own_diary_rows_do_not() {
+        let app = App::open_for_test().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let transcript = temp.path().join("transcript.jsonl");
+        std::fs::write(
+            &transcript,
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "role": "assistant",
+                    "content": "Findings\n- High: ledger rounding drops a cent in crates/ironmem/src/hook.rs:52\n- Medium: add a regression test\nPR #7"
+                })
+            ),
+        )
+        .unwrap();
+        persist_transcript_review_from_path(&app, None, &transcript, Some("s"))
+            .unwrap()
+            .unwrap();
+        persist_diary_summary(&app, "Hook stop ran for ledger rounding session").unwrap();
+
+        let mut config = recall_test_config();
+        config.diary_max = 3;
+        let block = recall_block_from_db(&app.db, "ledger rounding cent", &config, &[]).unwrap();
+        assert!(block.contains("source=\"reviews/pr-7\""), "{block}");
+        assert!(!block.contains("Hook stop ran"), "{block}");
+    }
+
+    #[test]
+    fn autopilot_bookkeeping_is_never_injected() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::schema::Database::open(&dir.path().join("m.sqlite3")).unwrap();
+        db.migrate().unwrap();
+        let config = recall_test_config();
+        insert_recall_drawer(
+            &db,
+            "autopilot dispatch review findings lineage",
+            crate::autopilot::WING,
+            crate::autopilot::ROOM,
+            "autopilot",
+        );
+        assert_eq!(
+            recall_block_from_db(&db, "autopilot dispatch review findings", &config, &[]),
+            None
+        );
+    }
+
+    #[test]
+    fn one_word_replies_are_trivial_in_any_script() {
+        for prompt in [
+            "да",
+            "sí",
+            "ок",
+            "好的",
+            "谢谢",
+            "继续",
+            "はい",
+            "café",
+            "très",
+            "déploiement",
+        ] {
+            assert!(is_trivial_prompt(prompt), "should be trivial: {prompt:?}");
+        }
+        for prompt in [
+            "如何配置连接池",
+            "データベース移行",
+            "use pgbouncer",
+            "cancel subscription",
+            "stop hook",
+            "last release",
+            "next migration",
+        ] {
+            assert!(!is_trivial_prompt(prompt), "should recall: {prompt:?}");
+        }
+        for prompt in [
+            "try again",
+            "next one",
+            "go ahead",
+            "use that",
+            "wait, stop",
+            "let's go",
+        ] {
+            assert!(is_trivial_prompt(prompt), "should be trivial: {prompt:?}");
+        }
+    }
+
+    #[test]
+    fn a_long_prompt_needs_more_than_two_common_words_to_match_a_diary_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::schema::Database::open(&dir.path().join("m.sqlite3")).unwrap();
+        db.migrate().unwrap();
+        let config = recall_test_config();
+        insert_recall_drawer(
+            &db,
+            "other-app: Checkpoint acme/widgets#1 tests failing on retry",
+            "diary",
+            "diary",
+            "diary",
+        );
+        let long = "Refactor the TOML config loader so environment overrides win over file \
+                    values, keep the defaults table in one place, add tests for the precedence \
+                    rules between flags, environment and file, and document the merge order in \
+                    the module header. Also add a retry when the file is locked by an editor.";
+        assert_eq!(recall_block_from_db(&db, long, &config, &[]), None);
+        // A short prompt on the entry's subject still recalls it.
+        let block = recall_block_from_db(&db, "widgets tests failing retry", &config, &[]).unwrap();
+        assert!(block.contains("Checkpoint acme/widgets#1"), "{block}");
+    }
+
+    #[test]
+    fn a_mined_file_in_a_diary_directory_is_not_a_diary_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::schema::Database::open(&dir.path().join("m.sqlite3")).unwrap();
+        db.migrate().unwrap();
+        let mut config = recall_test_config();
+        config.diary_enabled = false;
+        let zero = vec![0.0f32; ironrace_embed::embedder::EMBED_DIM];
+        let content = format!(
+            "use std::collections::HashMap;\nuse std::path::Path;\n{}\n// diary sync conflict resolution keeps the newest edit",
+            "fn helper() {}\n".repeat(20)
+        );
+        db.insert_drawer(
+            "mined-diary",
+            &content,
+            &zero,
+            "journal-app",
+            "diary",
+            "/code/journal-app/diary/sync.rs",
+            "mine",
+        )
+        .unwrap();
+        let block =
+            recall_block_from_db(&db, "diary sync conflict resolution", &config, &[]).unwrap();
+        assert!(block.contains("journal-app/diary"), "{block}");
+    }
+
+    #[test]
+    fn diary_scan_reaches_the_fiftieth_newest_entry_and_no_further() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::schema::Database::open(&dir.path().join("m.sqlite3")).unwrap();
+        db.migrate().unwrap();
+        let mut config = recall_test_config();
+        config.max_hits = 1;
+        let zero = vec![0.0f32; ironrace_embed::embedder::EMBED_DIM];
+        let insert = |id: &str, content: &str, filed_at: &str| {
+            db.insert_drawer(id, content, &zero, "diary", "diary", "", "diary")
+                .unwrap();
+            db.with_connection(|conn| {
+                conn.execute(
+                    "UPDATE drawers SET filed_at = ?1 WHERE id = ?2",
+                    rusqlite::params![filed_at, id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        };
+        insert(
+            "match",
+            "kafka partition rebalance notes",
+            "2026-01-01T00:00:00Z",
+        );
+        for n in 0..PROMPT_RECALL_DIARY_SCAN - 1 {
+            insert(
+                &format!("newer-{n:02}"),
+                &format!("unrelated entry {n}"),
+                &format!("2026-02-01T00:00:{n:02}Z"),
+            );
+        }
+        // BM25 can't reach the entry: the scan has to.
+        let ids = |prompt: &str| -> bool {
+            recall_block_from_qualifying(&db, prompt, &config, &[], vec![], None)
+                .is_some_and(|block| block.contains("kafka partition rebalance"))
+        };
+        assert!(
+            ids("kafka partition rebalance"),
+            "the 50th newest entry is scanned"
+        );
+        insert("newest", "one more unrelated entry", "2026-03-01T00:00:00Z");
+        assert!(
+            !ids("kafka partition rebalance"),
+            "the 51st newest entry is not"
+        );
+    }
+
+    #[test]
+    fn a_duplicate_excerpt_leaves_its_slot_to_the_next_hit() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::schema::Database::open(&dir.path().join("m.sqlite3")).unwrap();
+        db.migrate().unwrap();
+        let mut config = recall_test_config();
+        config.diary_enabled = false;
+        insert_recall_drawer(
+            &db,
+            "shared runbook escalation steps",
+            "wing-a",
+            "docs",
+            "mine",
+        );
+        insert_recall_drawer(
+            &db,
+            "shared runbook escalation steps",
+            "wing-b",
+            "docs",
+            "mine",
+        );
+        insert_recall_drawer(
+            &db,
+            "shared runbook escalation contacts list",
+            "wing-c",
+            "docs",
+            "mine",
+        );
+        insert_recall_drawer(
+            &db,
+            "shared runbook escalation pager rota for the weekend",
+            "wing-d",
+            "docs",
+            "mine",
+        );
+        let block = recall_block_from_db(&db, "shared runbook escalation", &config, &[]).unwrap();
+        assert_eq!(block.matches("- source=").count(), 3, "{block}");
+        assert_eq!(
+            block.matches("shared runbook escalation steps").count(),
+            1,
+            "{block}"
+        );
+    }
+
+    #[test]
+    fn a_vector_neighbour_does_not_override_the_scope_bm25_chose() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::schema::Database::open(&dir.path().join("m.sqlite3")).unwrap();
+        db.migrate().unwrap();
+        let mut config = recall_test_config();
+        config.diary_enabled = false;
+        let linked = wing_scopes(&["feature", "shop"]);
+        let neighbour =
+            insert_recall_drawer(&db, "unrelated worktree chunk", "feature", "docs", "mine");
+        let repo_doc =
+            insert_recall_drawer(&db, "pricing tiers renew monthly", "shop", "docs", "mine");
+        let block = recall_block_from_vector_handoff_for_test(
+            &db,
+            "pricing tiers renew",
+            &config,
+            &linked,
+            &[neighbour],
+        );
+        let block = block.unwrap();
+        assert!(block.contains("pricing tiers renew monthly"), "{block}");
+        assert!(!block.contains("unrelated worktree chunk"), "{block}");
+        let _ = repo_doc;
+    }
+
+    #[test]
+    fn a_search_failure_still_leaves_kg_and_diary_recall() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::schema::Database::open(&dir.path().join("m.sqlite3")).unwrap();
+        db.migrate().unwrap();
+        insert_recall_drawer(
+            &db,
+            "postgres migration diary note",
+            "diary",
+            "diary",
+            "diary",
+        );
+        // An FTS table that is no longer one: every MATCH fails, and not as a missing table.
+        db.with_connection(|conn| {
+            conn.execute_batch(
+                "DROP TABLE drawers_fts; CREATE TABLE drawers_fts(drawer_id TEXT, content TEXT);",
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let block =
+            recall_block_from_db(&db, "postgres migration diary", &recall_test_config(), &[]);
+        assert!(
+            block
+                .as_deref()
+                .is_some_and(|b| b.contains("postgres migration diary note")),
+            "{block:?}"
+        );
+    }
+
+    // ---- PR #387: worktree filed rows, nested checkouts ----
+
+    /// A mined row with its file's path, as mining stores it.
+    fn insert_mined_drawer(
+        db: &crate::db::schema::Database,
+        content: &str,
+        wing: &str,
+        source_file: &Path,
+    ) -> String {
+        let zero = vec![0.0f32; ironrace_embed::embedder::EMBED_DIM];
+        let source_file = source_file.to_string_lossy();
+        let id = generate_id(content, wing, &source_file);
+        db.insert_drawer(
+            &id,
+            content,
+            &zero,
+            wing,
+            "docs",
+            &source_file,
+            crate::db::drawers::MINED_ADDED_BY,
+        )
+        .unwrap();
+        id
+    }
+
+    #[test]
+    fn a_linked_worktree_recalls_its_repositorys_filed_rows_with_its_own_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let repo = base.join("shop-api");
+        init_git_test_repo(&repo);
+        let linked = base.join("shop-api-feature");
+        git_test_repo(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feature",
+                linked.to_str().unwrap(),
+            ],
+        );
+        let db = crate::db::schema::Database::open(&base.join("m.sqlite3")).unwrap();
+        db.migrate().unwrap();
+        let mut config = recall_test_config();
+        config.diary_enabled = false;
+        // The worktree's mined copy of the docs matches the prompt, which used to end
+        // the search before the repository's hand-filed decision was looked at.
+        insert_mined_drawer(
+            &db,
+            "collab task limit is configurable per session",
+            "shop-api-feature",
+            &linked.join("docs").join("COLLAB.md"),
+        );
+        insert_recall_drawer(
+            &db,
+            "collab task limit decision: back to ten",
+            "shop-api",
+            "collab-decisions",
+            "mcp",
+        );
+
+        let scopes = workspace_scopes(&linked);
+        let block = recall_block_from_db(&db, "collab task limit", &config, &scopes).unwrap();
+        assert!(block.contains("back to ten"), "{block}");
+        assert!(block.contains("configurable per session"), "{block}");
+    }
+
+    #[test]
+    fn separately_mined_nested_checkouts_are_not_the_parents_memory() {
+        let _prompt = prompt_hook_tunable_defaults();
+        // Room for git on a loaded test runner: this is about scope, not latency.
+        let _budget = ScopedEnvVar::set("IRONMEM_PROMPT_HOOK_BUDGET_MS", "5000");
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let repo = base.join("shop-api");
+        init_git_test_repo(&repo);
+        std::fs::write(repo.join(".gitignore"), ".claude/\nservices/\n").unwrap();
+        // A linked worktree under the main checkout, and an independent repository
+        // the parent ignores: each mined on its own, under the parent's path.
+        let nested_worktree = repo.join(".claude").join("worktrees").join("feature");
+        git_test_repo(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feature",
+                nested_worktree.to_str().unwrap(),
+            ],
+        );
+        let nested_repo = repo.join("services").join("catalog");
+        init_git_test_repo(&nested_repo);
+        // A subdirectory of the parent's own checkout mined on its own is still its.
+        let own_subdir = repo.join("crates");
+        std::fs::create_dir_all(&own_subdir).unwrap();
+
+        let db_path = base.join("memory.sqlite3");
+        let db = crate::db::schema::Database::open(&db_path).unwrap();
+        db.migrate().unwrap();
+        insert_mined_drawer(
+            &db,
+            "ledger rounding rules parent copy",
+            "shop-api",
+            &repo.join("docs").join("ledger.md"),
+        );
+        insert_mined_drawer(
+            &db,
+            "ledger rounding rules subdirectory copy",
+            "shop-api",
+            &own_subdir.join("ledger.md"),
+        );
+        insert_mined_drawer(
+            &db,
+            "ledger rounding rules worktree copy",
+            "feature",
+            &nested_worktree.join("docs").join("ledger.md"),
+        );
+        insert_mined_drawer(
+            &db,
+            "ledger rounding rules catalog copy",
+            "catalog",
+            &nested_repo.join("docs").join("ledger.md"),
+        );
+        drop(db);
+        let config = prompt_hook_config(db_path, base.join("state"));
+        for root in [&nested_worktree, &nested_repo, &own_subdir] {
+            crate::bootstrap::record_workspace_mine(&config, root).unwrap();
+        }
+
+        let recall = |cwd: &Path| {
+            let resp = run_hook_with_input(
+                "user-prompt-submit",
+                "claude-code",
+                config.clone(),
+                serde_json::json!({ "prompt": "ledger rounding rules", "cwd": cwd }),
+            )
+            .unwrap();
+            serde_json::to_value(&resp).unwrap()["hookSpecificOutput"]["additionalContext"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        };
+        let parent = recall(&repo);
+        assert!(parent.contains("parent copy"), "{parent}");
+        assert!(parent.contains("subdirectory copy"), "{parent}");
+        assert!(!parent.contains("worktree copy"), "{parent}");
+        assert!(!parent.contains("catalog copy"), "{parent}");
+        // The nested checkouts keep their own files.
+        let catalog = recall(&nested_repo);
+        assert!(catalog.contains("catalog copy"), "{catalog}");
+        assert!(!catalog.contains("parent copy"), "{catalog}");
+        let worktree = recall(&nested_worktree);
+        assert!(worktree.contains("worktree copy"), "{worktree}");
     }
 }

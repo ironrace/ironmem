@@ -6,6 +6,13 @@ use crate::collab::queue::SessionRecord;
 use crate::collab::{
     apply_event, start_global_review_session, Agent, CollabError, CollabEvent, Phase,
 };
+// Collaboration-owned drawer artifacts are filed under `COLLAB_WING`. Runtime
+// collab paths dereference these drawers by id; each dedicated room keeps its
+// artifacts auditable/filterable even though the generic drawer FTS index still
+// sees their content.
+use crate::db::drawers::{
+    COLLAB_MESSAGE_ROOM, COLLAB_PLAN_ROOM, COLLAB_TASK_LIST_ROOM, COLLAB_WING,
+};
 use crate::error::MemoryError;
 use crate::mcp::app::App;
 use crate::sanitize;
@@ -18,15 +25,6 @@ use super::shared::{
     collab_counterpart, require_agent, require_implementer, require_pilot, require_str,
     resolve_optional_agent_field, sha256_hex, MAX_COLLAB_CONTENT_CHARS,
 };
-
-/// Wing under which collaboration-owned drawer artifacts are filed. Runtime
-/// collab paths dereference these drawers by id; each dedicated room keeps its
-/// artifacts auditable/filterable even though the generic drawer FTS index
-/// still sees their content.
-const COLLAB_WING: &str = "ironrace-memory";
-const COLLAB_PLAN_ROOM: &str = "collab-plans";
-const COLLAB_TASK_LIST_ROOM: &str = "collab-task-lists";
-const COLLAB_MESSAGE_ROOM: &str = "collab-messages";
 
 pub(super) fn collab_error_to_memory_error(error: CollabError) -> MemoryError {
     MemoryError::Validation(error.to_string())

@@ -416,7 +416,7 @@ pub fn search(
 }
 
 fn drawer_matches_filters(drawer: &Drawer, filters: &SearchFilters) -> bool {
-    drawer.room != "collab-messages"
+    drawer.room != crate::db::drawers::COLLAB_MESSAGE_ROOM
         && (filters.include_superseded || drawer.superseded_by.is_none())
         && filters
             .wing

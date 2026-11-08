@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Prompt recall injects less noise (#375).** The `user-prompt-submit` hook
+  skips prompts with fewer than two content words, such as `yes`, `go ahead` or
+  `да`. It prefers the current workspace's memory, its checkout's and then its
+  repository's, and places a mined file by the path it was mined from rather than
+  the wing mining gave it. A workspace with memory no longer gets other projects'
+  drawers; one with none does only on a prompt with at least three content words,
+  as does a prompt with no workspace. A linked worktree recalls its repository's
+  filed rows, such as handoffs and decisions, alongside its own files, and a
+  checkout nested in another's directory and mined on its own is not the parent's
+  memory. A project inside a Git work tree that tracks none of its files (a dotfiles
+  `$HOME`) is its own workspace, and `GIT_CEILING_DIRECTORIES` is honored. KG
+  triples and the shared `diary` wing are still recalled from every project.
+  Operational collab rooms, Autopilot's `backlog-lineage` and the hooks' own
+  diary rows are no longer injected; reviews the Stop hook captures still are. A
+  diary entry appears only when its excerpt matches the prompt, however it was
+  found, so `IRONMEM_PROMPT_HOOK_DIARY_MAX` now caps matching entries rather than
+  the newest ones. Text duplicated across wings or diary entries is injected once.
+  Schema migration 023 adds two indexes for these per-prompt reads.
 - **Breaking storage requirement:** Autopilot `lead`, `run` and
   `clear-dispatch` refuse known remote repository common directories and
   databases. Move both to local disk before upgrading. Linux FUSE whose

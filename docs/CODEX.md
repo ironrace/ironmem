@@ -463,10 +463,72 @@ Without write access (`IRONMEM_MCP_MODE` unset or `read-only`), `session-start`,
 
 ### UserPromptSubmit recall (Claude Code only)
 
-On every prompt, ironmem runs bounded, fail-closed recall and injects sanitized
-untrusted-memory matches into `hookSpecificOutput.additionalContext`. The local
+On every prompt with enough content (below), ironmem runs bounded, fail-closed
+recall and injects sanitized untrusted-memory matches into `hookSpecificOutput.additionalContext`. The local
 path uses FTS5/BM25, then optional KG-triple and diary recall; it never loads
 the embedder. Codex registers no UserPromptSubmit hook.
+
+Recall stays quiet unless the prompt gives it something to go on:
+
+- A prompt with fewer than two content words (`yes`, `go ahead`, `deploy`, `да`)
+  skips recall entirely, KG and diary included. Function words and common replies
+  don't count as content; verbs that name what a short prompt is about (`use
+  pgbouncer`, `stop hook`) do. In a script written without spaces (Chinese,
+  Japanese, Thai and the like) one run of at least four characters is enough.
+- The current workspace's memory is preferred, in order: the checkout's, then the
+  repository's, where handoffs and the main checkout's files are. The two differ
+  only in a linked worktree, whose own scope also holds what was filed in the
+  repository's wing, so its handoffs and decisions rank with the worktree's files
+  rather than behind them. Each is every file mined from under its directory,
+  whatever wing mining gave it, plus what was filed by other means in the wing named
+  for that directory. Below a non-Git root a mined file's wing is its first
+  directory, so `docs/a.md` in `/notes` is in wing `docs` and counts as `/notes`'
+  memory, as does a Git subdirectory mined on its own. A mined file counts only
+  where it was mined from: another workspace's `docs` doesn't, nor does
+  `/other/notes/b.md`, though mining `/other` puts it in wing `notes`. A checkout
+  nested in the directory and mined on its own, such as a linked worktree under
+  `.claude/worktrees/` or a repository the parent ignores, keeps its files: they
+  are its memory, not the parent's. A subdirectory
+  of a Git checkout counts as the checkout when the checkout tracks a file in it; one
+  it tracks nothing in, such as a project under a `$HOME` kept in Git for dotfiles,
+  is its own workspace, as is any directory outside Git. `GIT_CEILING_DIRECTORIES`
+  is honored. A directory named for a wing every project shares (`diary`,
+  `reviews`, `autopilot`, `ironrace-memory`) doesn't own that wing.
+- A workspace with memory, meaning any row that is part of it, recallable or not,
+  never gets other projects' drawers. One with none does, when the prompt has at
+  least three content words. With no workspace (no `cwd`), every wing is searched,
+  under the same three-word bar.
+- KG triples and the shared diary are not scoped by workspace: an entity the prompt
+  names is recalled from any project's triples, and a matching entry in the
+  `diary` wing, which every project's `diary_write` uses by default, is injected
+  whichever project wrote it.
+- Operational rooms (`collab-plans`, `collab-task-lists`, `collab-checkpoints`,
+  `collab-drafts`, `collab-messages`, and Autopilot's `backlog-lineage`) and the
+  diary entries hooks write for themselves (`Hook stop ran ...`) are never
+  injected, however they were found. Code reviews the Stop hook captures stay
+  recallable.
+- A diary entry is injected only when its excerpt, as injected, shares at least
+  two content words with the prompt, and at least three in ten of the words of
+  whichever is shorter, the prompt or the excerpt, so a long prompt's common words
+  aren't a match. That holds whether a search found the entry or it is among the
+  newest 50 injectable entries, which are checked on every prompt.
+- Text duplicated across wings, or between a search hit and a diary entry, is
+  injected once: the best-ranked copy is kept and the next hit takes the other's
+  slot. A dropped copy doesn't count against the diary limit.
+- When the workspace path can't be resolved, or Git fails for a workspace inside a
+  checkout, recall is skipped for that prompt, and a recall that fails or runs
+  over the budget logs a warning rather than reading as "nothing relevant".
+
+Known limits: the thresholds above (two content words, three to reach other
+projects or to search with no workspace, the 50-entry diary scan) are fixed, not
+tunables. A nested checkout is told apart from the parent only once it has been
+mined on its own, and only while its `.git` is there. BM25 matches only rows
+containing every word of the prompt. A non-Git subdirectory of a mined non-Git root
+doesn't see the root's other files ([#388](https://github.com/ironrace/ironmem/issues/388)),
+and a non-Git `$HOME` used directly as the workspace takes in everything mined
+below it ([#389](https://github.com/ironrace/ironmem/issues/389)). A new
+subdirectory of a checkout counts as its own workspace until a file in it is
+added to Git.
 
 Hybrid vector recall is opt-in. It only borrows a ready shared daemon over its
 Unix socket. The hook never initializes, starts, or warms a daemon, and never
@@ -501,7 +563,7 @@ Tunables (all fresh-read per invocation):
 | `IRONMEM_PROMPT_HOOK_KG` | on | `0`, `false`, or `no` disables KG recall; other values use enabled default. |
 | `IRONMEM_PROMPT_HOOK_KG_MAX_TRIPLES` | `3` | KG triples injected; clamped to `1`–`5`. |
 | `IRONMEM_PROMPT_HOOK_DIARY` | on | `0`, `false`, or `no` disables diary recall; other values use enabled default. |
-| `IRONMEM_PROMPT_HOOK_DIARY_MAX` | `1` | Diary excerpts injected; clamped to `1`–`3`. |
+| `IRONMEM_PROMPT_HOOK_DIARY_MAX` | `1` | Diary excerpts injected, counting only entries that match the prompt; clamped to `1`–`3`. |
 | `IRONMEM_PROMPT_HOOK_DIARY_LINE_BYTES` | `120` | Byte cap per diary line. |
 
 The hook also supports `IRONMEM_CONTEXT_WARN_PCT` (default `0.60`) and

@@ -21,6 +21,9 @@ use serde_json::{json, Value};
 
 use crate::collab::queue::{LeaseSignals, SessionRecord};
 use crate::collab::{claim_handoff_token, read_actor_generation, Agent, Phase};
+use crate::db::drawers::{
+    COLLAB_CHECKPOINT_ROOM as CHECKPOINT_ROOM, COLLAB_WING as CHECKPOINT_WING,
+};
 use crate::error::MemoryError;
 use crate::mcp::app::App;
 
@@ -30,8 +33,6 @@ use super::shared::{optional_bool, require_agent, require_str};
 // ── Checkpoint constants ─────────────────────────────────────────────────────
 
 const HANDOFF_FENCE: &str = "ironrace-session-handoff";
-const CHECKPOINT_WING: &str = "ironrace-memory";
-const CHECKPOINT_ROOM: &str = "collab-checkpoints";
 
 // ── Generation-lease guard ───────────────────────────────────────────────────
 

@@ -367,6 +367,36 @@ fn init_thread_body(config: Config, memory_ready: Arc<ReadinessGate>) {
     }
 }
 
+/// The canonical roots of every workspace whose mining has completed, as recorded in
+/// `state_dir`. A root that no longer resolves is gone, and left out, as is any entry
+/// that can't be read: recall uses these only to narrow a parent's scope.
+pub(crate) fn mined_workspace_roots(state_dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(state_dir.join("workspaces")) else {
+        return Vec::new();
+    };
+    let mut roots: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .filter_map(|path| {
+            let raw = std::fs::read_to_string(&path).ok()?;
+            match serde_json::from_str::<WorkspaceBootstrapState>(&raw) {
+                Ok(state) if state.initial_mine_completed && !state.workspace_root.is_empty() => {
+                    Path::new(&state.workspace_root).canonicalize().ok()
+                }
+                Ok(_) => None,
+                Err(e) => {
+                    tracing::debug!("skipping workspace state {}: {e}", path.display());
+                    None
+                }
+            }
+        })
+        .collect();
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
 pub fn record_workspace_mine(config: &Config, workspace_root: &Path) -> Result<(), MemoryError> {
     let workspace_state_path = workspace_state_path(config, workspace_root);
     let mut workspace_state = load_workspace_state(&workspace_state_path, workspace_root)?;
