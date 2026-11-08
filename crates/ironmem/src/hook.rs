@@ -8375,7 +8375,7 @@ mod tests {
                 nested_worktree.to_str().unwrap(),
             ],
         );
-        let nested_repo = repo.join("services").join("billing");
+        let nested_repo = repo.join("services").join("catalog");
         init_git_test_repo(&nested_repo);
         // A subdirectory of the parent's own checkout mined on its own is still its.
         let own_subdir = repo.join("crates");
@@ -8404,8 +8404,8 @@ mod tests {
         );
         insert_mined_drawer(
             &db,
-            "ledger rounding rules billing copy",
-            "billing",
+            "ledger rounding rules catalog copy",
+            "catalog",
             &nested_repo.join("docs").join("ledger.md"),
         );
         drop(db);
@@ -8431,11 +8431,11 @@ mod tests {
         assert!(parent.contains("parent copy"), "{parent}");
         assert!(parent.contains("subdirectory copy"), "{parent}");
         assert!(!parent.contains("worktree copy"), "{parent}");
-        assert!(!parent.contains("billing copy"), "{parent}");
+        assert!(!parent.contains("catalog copy"), "{parent}");
         // The nested checkouts keep their own files.
-        let billing = recall(&nested_repo);
-        assert!(billing.contains("billing copy"), "{billing}");
-        assert!(!billing.contains("parent copy"), "{billing}");
+        let catalog = recall(&nested_repo);
+        assert!(catalog.contains("catalog copy"), "{catalog}");
+        assert!(!catalog.contains("parent copy"), "{catalog}");
         let worktree = recall(&nested_worktree);
         assert!(worktree.contains("worktree copy"), "{worktree}");
     }
