@@ -352,8 +352,9 @@ fn handoff_nudge_reason(
     if !crate::handoff_nudge::should_nudge(&app.config.state_dir, &event, now) {
         return None;
     }
+    let ceiling = std::env::var_os("GIT_CEILING_DIRECTORIES");
     let wing = workspace_root
-        .and_then(repository_name)
+        .and_then(|root| handoff_wing_with(root, ceiling.as_deref()))
         .unwrap_or_else(|| "workspace".to_string());
     let branch = workspace_root
         .and_then(current_workspace_branch)
@@ -430,7 +431,20 @@ fn current_workspace_branch_with(
     workspace_git_output(workspace_root, &["branch", "--show-current"], inherited)
 }
 
-/// The repository's name, for a handoff wing: the main worktree's directory,
+/// The wing a Stop-hook handoff is filed in: the wing of the workspace's broadest
+/// recall scope, the repository's, so prompt recall in that workspace reads it back
+/// (a linked worktree's own scope reads its repository's filed rows too). Resolved
+/// as recall resolves it, `ceiling` (`GIT_CEILING_DIRECTORIES`) included, so a
+/// project inside a dotfiles work tree files under its own name. Falls back to
+/// [`repository_name`] when Git can't resolve the workspace, or its name is a
+/// shared wing that no scope owns.
+fn handoff_wing_with(workspace_root: &Path, ceiling: Option<&std::ffi::OsStr>) -> Option<String> {
+    workspace_recall_scopes_with(workspace_root, ceiling, &[])
+        .and_then(|scopes| scopes.last()?.wing().map(str::to_owned))
+        .or_else(|| repository_name(workspace_root))
+}
+
+/// The repository's name, the handoff wing's fallback: the main worktree's directory,
 /// so every worktree of one repository shares a wing. Outside git, the
 /// workspace directory's own name. Sanitized the way mining names a wing.
 fn repository_name(workspace_root: &Path) -> Option<String> {
@@ -4041,6 +4055,45 @@ mod tests {
             Some("block"),
             "control: the same stop nudges once enabled"
         );
+    }
+
+    #[test]
+    fn handoff_wing_is_the_wing_recall_reads_filed_rows_from() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let wing = |root: &Path, ceiling: Option<&Path>| {
+            handoff_wing_with(root, ceiling.map(Path::as_os_str))
+        };
+        // A project that merely sits inside a dotfiles work tree is its own workspace,
+        // so its handoffs go to its own wing, not the work tree's.
+        let (home, acme, _) = git_parent_with_projects(&base, "");
+        assert_eq!(wing(&acme, None).as_deref(), Some("acme-notes"));
+        assert_eq!(wing(&home, None).as_deref(), Some("home"));
+        // Tracked by the work tree it is part of it, unless the ceiling stops discovery.
+        git_test_repo(&home, &["add", "clients/acme-notes/notes.md"]);
+        assert_eq!(wing(&acme, None).as_deref(), Some("home"));
+        assert_eq!(wing(&acme, Some(&home)).as_deref(), Some("acme-notes"));
+        // A linked worktree files in its repository's wing, which its scope reads.
+        let repo = base.join("shop-api");
+        init_git_test_repo(&repo);
+        let linked = base.join("shop-api-feature");
+        git_test_repo(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feature",
+                linked.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(wing(&linked, None).as_deref(), Some("shop-api"));
+        assert_eq!(wing(&repo, None).as_deref(), Some("shop-api"));
+        // Outside Git, the directory's own name.
+        let plain = base.join("notes");
+        std::fs::create_dir_all(&plain).unwrap();
+        assert_eq!(wing(&plain, None).as_deref(), Some("notes"));
     }
 
     #[test]

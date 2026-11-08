@@ -173,6 +173,11 @@ impl RecallScope {
 
     /// The scope, also holding the rows filed in `wing` that no path places: what a
     /// linked worktree recalls from its repository alongside its own files.
+    /// The workspace's own wing; `None` when its name is a shared wing.
+    pub(crate) fn wing(&self) -> Option<&str> {
+        self.wing.as_deref()
+    }
+
     pub(crate) fn with_filed_wing(mut self, wing: String) -> Self {
         if !SHARED_WINGS.contains(&wing.as_str()) && self.wing.as_deref() != Some(&wing) {
             self.filed_wing = Some(wing);
