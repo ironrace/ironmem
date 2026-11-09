@@ -471,9 +471,10 @@ the embedder. Codex registers no UserPromptSubmit hook.
 Each drawer and diary line carries the drawer's `id`
 (`- source="wing/room" id="..." excerpt="..."`), so `get_drawer` with that id
 opens a hit whose short excerpt doesn't answer the question. This includes ids the
-ChromaDB migration kept as they were (`drawer_<wing>_<room>_<hex>`), which
-`get_drawer` accepts alongside generated hex ids. KG triple lines are not drawers
-and have no id.
+ChromaDB migration kept as they were (usually `drawer_<wing>_<room>_<hex>`, but
+with no charset or length limit): `get_drawer` accepts any id string, and the
+line JSON-escapes the id like the excerpt, so decode it before passing it on.
+KG triple lines are not drawers and have no id.
 
 Recall stays quiet unless the prompt gives it something to go on:
 

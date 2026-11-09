@@ -13,8 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the `user-prompt-submit` hook injects now reads
   `- source="wing/room" id="..." excerpt="..."`, and the block's header says
   `get_drawer` opens it, so an agent can read the whole drawer instead of
-  searching again. `get_drawer` now accepts the ids the ChromaDB migration kept
-  (`drawer_<wing>_<room>_<hex>`): 1 to 128 ASCII letters, digits, `_` or `-`.
+  searching again. `get_drawer` now accepts any id string, not just 16/32-char
+  hex, because the ChromaDB migration keeps source ids verbatim with no charset
+  or length limit (`drawer_<wing>_<room>_<hex>` is the usual shape); an id that
+  matches no row is a `found: false` miss. The id is JSON-escaped like the
+  excerpt and never shortened, so every recalled hit gets one.
   On a fixed four-prompt fixture the injected text grew from 1,455 to 1,888 bytes.
 - **The Stop hook's handoff nudge names the wing prompt recall reads.** A
   project inside a Git work tree that tracks none of its files, or one behind

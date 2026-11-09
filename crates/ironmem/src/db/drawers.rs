@@ -319,23 +319,6 @@ pub struct SearchFilters {
     pub include_superseded: bool,
 }
 
-/// Longest drawer id [`is_openable_drawer_id`] accepts. Generated ids are 32
-/// bytes; ids the ChromaDB migration keeps verbatim (`drawer_<wing>_<room>_<hex>`)
-/// run to about 55.
-pub(crate) const MAX_OPENABLE_DRAWER_ID_BYTES: usize = 128;
-
-/// Whether `get_drawer` accepts `id`: 1 to [`MAX_OPENABLE_DRAWER_ID_BYTES`] bytes
-/// of ASCII letters, digits, `_` and `-`. That covers generated hex ids and the
-/// ChromaDB ids `migrate::chromadb` imports as they were, so prompt
-/// recall can hand out any row's id as a pointer (#376).
-pub(crate) fn is_openable_drawer_id(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= MAX_OPENABLE_DRAWER_ID_BYTES
-        && id
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-}
-
 /// Generate a deterministic drawer ID from content + wing + room.
 pub fn generate_id(content: &str, wing: &str, room: &str) -> String {
     let mut hasher = Sha256::new();

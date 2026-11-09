@@ -1891,16 +1891,12 @@ fn opportunistic_vector_response(
 }
 
 /// The ` id="..."` field of a drawer or diary recall line, so the agent can open
-/// the hit with `get_drawer`. The id is never shortened, since a cut id opens
-/// nothing; one `get_drawer` would refuse anyway gets no field rather than a dead
-/// pointer.
+/// the hit with `get_drawer`. Every line gets one: ids the ChromaDB migration kept
+/// verbatim can hold any characters at any length, so the id is JSON-escaped like
+/// the excerpt (a quote or newline in it cannot end the field or forge a line) and
+/// never shortened, since a cut id opens nothing (#376).
 fn recall_id_field(id: &str) -> String {
-    if crate::db::drawers::is_openable_drawer_id(id) {
-        // The charset needs no JSON escaping, so the quotes are the whole encoding.
-        format!(" id=\"{id}\"")
-    } else {
-        String::new()
-    }
+    format!(" id={}", serde_json::Value::from(id))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5845,13 +5841,33 @@ mod tests {
         );
     }
 
+    /// A ChromaDB id the migration kept verbatim, chosen to break every shape
+    /// rule an id check might assume: quotes, spaces, a newline, a backslash,
+    /// `/`, `#`, non-ASCII text, and well over 128 bytes.
+    fn unruly_imported_id() -> String {
+        format!(
+            "chroma \"import\" 7/notes.md#L2\nsecond line \\ ünïcode-🔑 {}",
+            "x".repeat(150)
+        )
+    }
+
     /// The fixed fixture and prompt set #376 measures recall output on: drawers
-    /// with generated and ChromaDB-imported ids, a matching diary entry and a KG
-    /// triple. Returns the app and the injected block for each prompt.
+    /// with generated and ChromaDB-imported ids (one of them [`unruly_imported_id`]),
+    /// a matching diary entry and a KG triple. Returns the app and the injected
+    /// block for each prompt.
     fn id_recall_fixture() -> (App, Vec<(&'static str, String)>) {
         let app = App::open_for_test().unwrap();
         let zero = vec![0.0f32; ironrace_embed::embedder::EMBED_DIM];
-        let rows: [(Option<&str>, &str, &str, &str, &str); 5] = [
+        let unruly_id = unruly_imported_id();
+        let rows: [(Option<&str>, &str, &str, &str, &str); 6] = [
+            (
+                Some(unruly_id.as_str()),
+                "kubernetes ingress annotations rewrite the target path before the \
+                 request reaches the dashboard service",
+                "infra",
+                "k8s",
+                "mempalace",
+            ),
             (
                 None,
                 "# Autopilot defect 5: the review round never reached the merge because \
@@ -5926,6 +5942,7 @@ mod tests {
             "pgbouncer pooling transaction mode prepared statements",
             "autopilot review round merge gate",
             "frontend login form validation errors",
+            "kubernetes ingress annotations rewrite target path",
             // Matches no drawer through BM25, so the diary row arrives as a diary line.
             "how does pgbouncer pooling work in transaction mode",
         ]
@@ -5998,24 +6015,49 @@ mod tests {
                 opened.push(id);
             }
         }
-        assert!(
-            opened
-                .iter()
-                .any(|id| id == "drawer_recover_lead_frontend_0298432cfbef65c6d7922f02"),
-            "the ChromaDB-imported id must be recalled and opened: {opened:?}"
-        );
+        for imported in [
+            "drawer_recover_lead_frontend_0298432cfbef65c6d7922f02".to_string(),
+            unruly_imported_id(),
+        ] {
+            assert!(
+                opened.contains(&imported),
+                "the ChromaDB-imported id {imported:?} must be recalled and opened: {opened:?}"
+            );
+        }
         assert!(diary_lines > 0, "the diary path must be exercised");
     }
 
+    /// Every id gets a field, JSON-escaped so it cannot end the field early or
+    /// break the line, and it decodes back to the exact id (#376).
     #[test]
-    fn recall_id_field_omits_ids_get_drawer_would_refuse() {
+    fn recall_id_field_escapes_every_id_and_round_trips() {
         assert_eq!(recall_id_field("0123abcd"), " id=\"0123abcd\"");
         assert_eq!(
             recall_id_field("drawer_recover_lead_frontend_02"),
             " id=\"drawer_recover_lead_frontend_02\""
         );
-        for refused in ["", "has space", "quote\"d", &"a".repeat(129)] {
-            assert_eq!(recall_id_field(refused), "", "{refused:?}");
+        assert_eq!(
+            recall_id_field("say \"hi\"\nnext"),
+            r#" id="say \"hi\"\nnext""#
+        );
+        let unruly = unruly_imported_id();
+        for id in [
+            "",
+            "has space",
+            "quote\"d",
+            "a\\b",
+            &"a".repeat(129),
+            &unruly,
+        ] {
+            let field = recall_id_field(id);
+            assert!(!field.contains('\n'), "{field:?} must stay on one line");
+            let line = format!("- source=\"w/r\"{field} excerpt=\"e\"");
+            assert_eq!(
+                recall_line_field(&line, "id").as_deref(),
+                Some(id),
+                "{line:?}"
+            );
+            assert_eq!(recall_line_field(&line, "excerpt").as_deref(), Some("e"));
         }
     }
 

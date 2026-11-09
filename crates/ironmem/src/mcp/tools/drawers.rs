@@ -378,14 +378,11 @@ pub(super) fn handle_get_drawer(app: &App, args: &Value) -> Result<Value, Memory
             ));
         }
         (Some(id), None) => {
-            // Wider than `validate_hex_id`: prompt recall hands out ChromaDB-imported
-            // ids too, and every id it shows must open here.
-            if !crate::db::drawers::is_openable_drawer_id(id) {
-                return Err(MemoryError::Validation(format!(
-                    "id must be 1 to {} ASCII letters, digits, '_' or '-'",
-                    crate::db::drawers::MAX_OPENABLE_DRAWER_ID_BYTES
-                )));
-            }
+            // No shape check (unlike `validate_hex_id`): the ChromaDB migration keeps
+            // source ids verbatim, with no charset or length limit, and prompt recall
+            // hands every recalled row's id out as a pointer that must open here
+            // (#376). The id is only ever an exact-match bound SQL parameter, so any
+            // string is safe; one that matches no row is a miss, not an error.
             id.to_string()
         }
         (None, Some(logical_key)) => {
@@ -1534,37 +1531,42 @@ mod tests {
         assert!(out.get("content").is_none(), "no content on a miss");
     }
 
-    /// Prompt recall hands out ChromaDB-imported ids verbatim (#376), so
-    /// `get_drawer` must open them, not refuse them as non-hex.
+    /// Prompt recall hands out ChromaDB-imported ids verbatim (#376), and the
+    /// migration puts no charset or length limit on them, so `get_drawer` must
+    /// open any stored id: the usual `drawer_<wing>_<room>_<hex>` shape, and ones
+    /// with punctuation, quotes, whitespace, non-ASCII text or over 128 bytes.
     #[test]
-    fn get_drawer_opens_a_chromadb_imported_id() {
+    fn get_drawer_opens_any_chromadb_imported_id() {
         let app = test_app();
-        let id = "drawer_python-repos_general_0298432cfbef65c6d7922f02";
+        let long = format!("chroma/{}", "x".repeat(300));
+        let ids = [
+            "drawer_python-repos_general_0298432cfbef65c6d7922f02",
+            "doc:2024/notes.md#L1?v=2",
+            "has \"quotes\" and spaces\nand a newline",
+            "ünïcode-ид-🔑",
+            "",
+            long.as_str(),
+        ];
         let zero = vec![0.0f32; ironrace_embed::embedder::EMBED_DIM];
-        app.db
-            .insert_drawer(
-                id,
-                "imported body",
-                &zero,
-                "python-repos",
-                "general",
-                "",
-                "mempalace",
-            )
-            .unwrap();
-        let out = handle_get_drawer(&app, &json!({ "id": id })).unwrap();
-        assert_eq!(out["found"], true, "{out}");
-        assert_eq!(out["content"], "imported body");
-        let too_long = "a".repeat(crate::db::drawers::MAX_OPENABLE_DRAWER_ID_BYTES + 1);
-        assert!(handle_get_drawer(&app, &json!({ "id": too_long })).is_err());
-        assert!(handle_get_drawer(&app, &json!({ "id": "" })).is_err());
+        for (i, id) in ids.iter().enumerate() {
+            let body = format!("imported body {i}");
+            app.db
+                .insert_drawer(id, &body, &zero, "python-repos", "general", "", "mempalace")
+                .unwrap();
+            let out = handle_get_drawer(&app, &json!({ "id": id }))
+                .unwrap_or_else(|e| panic!("get_drawer {id:?} failed: {e}"));
+            assert_eq!(out["found"], true, "{id:?}: {out}");
+            assert_eq!(out["content"], body, "{id:?}");
+        }
     }
 
     #[test]
-    fn get_drawer_rejects_non_hex_id() {
+    fn get_drawer_reports_an_unknown_id_as_a_miss_and_rejects_bad_arguments() {
         let app = test_app();
-        assert!(handle_get_drawer(&app, &json!({"id": "not-a-hex-id!!"})).is_err());
-        // Missing id is also a validation error.
+        // Any string is a valid id (#376); one that matches no row is a miss.
+        let out = handle_get_drawer(&app, &json!({"id": "not-a-hex-id!!"})).unwrap();
+        assert_eq!(out["found"], false, "{out}");
+        // Missing id is a validation error.
         assert!(handle_get_drawer(&app, &json!({})).is_err());
         assert!(handle_get_drawer(
             &app,
