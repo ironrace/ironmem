@@ -14,6 +14,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   database together with a `-wal` file whose page size differed from the
   database's. `rusqlite` moves from 0.32 to 0.41, which bundles SQLite 3.54
   through `libsqlite3-sys` 0.39.
+  The two benchmark workspaces that link SQLite, `benchmarks/abeval` and
+  `benchmarks/provbench/phase1`, are separate Cargo workspaces with their own
+  lockfiles and were still on `rusqlite` 0.31; both move to 0.41 as well, with
+  no source change. `benchmarks/provbench/baseline`'s lockfile moves `h2`,
+  `quinn-proto`, `rustls`, `rustls-webpki` and `webpki-roots` to their patched
+  releases. The `benchmarks/provbench/labeler` and `phase1` lockfiles still
+  report RUSTSEC-2025-0140 (`gix-date`) and RUSTSEC-2025-0021
+  (`gix-features`), which need `gix` 0.77 or later in place of 0.66, and CI
+  still audits only the root lockfile.
   The optional `headroom-compression` feature's `headroom-core` git dependency
   moves from commit `5bd2266f` to `74b7ac23`, the first upstream commit on
   `rusqlite` 0.41: only one crate in a build may link SQLite, so the old pin
