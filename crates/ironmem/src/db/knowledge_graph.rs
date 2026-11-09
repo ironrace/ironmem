@@ -1,3 +1,6 @@
+use std::sync::LazyLock;
+
+use regex::Regex;
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -26,34 +29,76 @@ pub struct Triple {
     pub extracted_at: String,
 }
 
-/// Lowercase `s`, turn every character that is neither alphanumeric nor
-/// whitespace into a space, and collapse whitespace runs to single spaces.
+/// One combining mark (Unicode general category M). std has no test for it.
+static COMBINING_MARK: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\p{M}$").expect("static regex compiles"));
+
+/// Whether `c` belongs to a word: a letter, a digit, or a combining mark,
+/// which continues the letter before it. `char::is_alphanumeric` is false for
+/// many marks (the acute of a decomposed "é", a virama, a Thai tone mark), and
+/// reading those as punctuation would split a word in two and let a mention
+/// match the front of a longer word.
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || (!c.is_ascii() && COMBINING_MARK.is_match(c.encode_utf8(&mut [0; 4])))
+}
+
+/// The ASCII character a typographic quote or hyphen stands for, so a prompt
+/// pasted from a document names `O'Brien` or `iron-build` the way the entity
+/// is stored (and the reverse). An em dash separates clauses and is left alone.
+fn fold_typographic(c: char) -> char {
+    match c {
+        '\u{2018}' | '\u{2019}' => '\'',
+        '\u{201C}' | '\u{201D}' => '"',
+        // Hyphen, non-breaking hyphen, figure dash, en dash, minus sign.
+        '\u{2010}'..='\u{2013}' | '\u{2212}' => '-',
+        _ => c,
+    }
+}
+
+/// Lowercase `s`, turn every character that is neither part of a word
+/// ([`is_word_char`]) nor whitespace into a space, and collapse whitespace
+/// runs to single spaces.
 /// `find_entities_in_text` applies it to both the text and each entity name.
 fn normalize_mention(s: &str) -> String {
-    let mapped: String = s
-        .to_lowercase()
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c.is_whitespace() {
-                c
-            } else {
-                ' '
-            }
-        })
-        .collect();
-    collapse_whitespace(&mapped)
+    let mut out = String::new();
+    push_collapsed(&mut out, &s.to_lowercase(), false);
+    out
 }
 
-/// Trim `s` and collapse each internal whitespace run to a single space.
+/// Trim `s`, collapse each internal whitespace run to a single space, and
+/// fold typographic quotes and hyphens to ASCII ([`fold_typographic`]).
 fn collapse_whitespace(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ")
+    let mut out = String::new();
+    push_collapsed(&mut out, s, true);
+    out
 }
 
-/// Whether `needle` occurs in `haystack` with no alphanumeric character
-/// directly before or after that occurrence. Every occurrence is tried,
-/// overlapping ones included, so an embedded one (the "c++" in "abc++")
-/// does not hide a standalone one later in the text.
-fn contains_bounded(haystack: &str, needle: &str) -> bool {
+/// Append `s` to `out`, trimmed and with each separator run collapsed to a
+/// single space. Whitespace always separates; with `keep_punctuation` unset,
+/// so does every other character that is not part of a word. Punctuation
+/// that is kept is folded to ASCII ([`fold_typographic`]). Appending lets the
+/// per-entity scan in `find_entities_in_text` reuse its buffers.
+fn push_collapsed(out: &mut String, s: &str, keep_punctuation: bool) {
+    let start = out.len();
+    let mut pending_space = false;
+    for c in s.chars() {
+        if c.is_whitespace() || !(keep_punctuation || is_word_char(c)) {
+            pending_space = true;
+            continue;
+        }
+        if pending_space && out.len() > start {
+            out.push(' ');
+        }
+        pending_space = false;
+        out.push(fold_typographic(c));
+    }
+}
+
+/// Whether `needle` occurs in `haystack` with no word character
+/// ([`is_word_char`]) directly before or after that occurrence. Every
+/// occurrence is tried, overlapping ones included, so an embedded one (the
+/// "c++" in "abc++") does not hide a standalone one later in the text.
+pub(crate) fn contains_bounded(haystack: &str, needle: &str) -> bool {
     if needle.is_empty() {
         return false;
     }
@@ -64,11 +109,11 @@ fn contains_bounded(haystack: &str, needle: &str) -> bool {
         let before_ok = haystack[..start]
             .chars()
             .next_back()
-            .is_none_or(|c| !c.is_alphanumeric());
+            .is_none_or(|c| !is_word_char(c));
         let after_ok = haystack[end..]
             .chars()
             .next()
-            .is_none_or(|c| !c.is_alphanumeric());
+            .is_none_or(|c| !is_word_char(c));
         if before_ok && after_ok {
             return true;
         }
@@ -247,8 +292,9 @@ impl<'a> KnowledgeGraph<'a> {
     /// The comparison runs in Rust rather than SQL because SQLite has no way
     /// to apply the same normalization to `name`, and its `LOWER` folds ASCII
     /// only. A substring filter in SQL could not use an index either, so this
-    /// scans no more rows; names are borrowed and only matched rows allocate
-    /// an `Entity`.
+    /// scans no more rows. Each row costs one allocation (the lowercased
+    /// name); the normalized forms reuse two buffers and only matched rows
+    /// allocate an `Entity`.
     pub fn find_entities_in_text(&self, text: &str) -> Result<Vec<Entity>, MemoryError> {
         const MAX_MATCHES: usize = 100;
 
@@ -262,29 +308,40 @@ impl<'a> KnowledgeGraph<'a> {
         let mut rows = stmt.query([])?;
 
         let mut matches = Vec::new();
+        // `needle` holds the name's tokens padded with a space on each side;
+        // both buffers are reused across rows.
         let mut needle = String::new();
+        let mut name_verbatim = String::new();
         while let Some(row) = rows.next()? {
-            let name = row.get_ref(1)?.as_str().map_err(rusqlite::Error::from)?;
-            let name_tokens = normalize_mention(name);
-            // A name of only punctuation/whitespace normalizes to nothing and
-            // would otherwise match any text through the bare `"  "` needle.
-            if name_tokens.is_empty() {
+            // Every row's name is read, so a name that is not text (a BLOB an
+            // outside import wrote) is skipped, not allowed to fail the scan
+            // and with it every search.
+            let Ok(name) = row.get_ref(1)?.as_str() else {
+                tracing::warn!("skipping a KG entity whose name is not text");
                 continue;
-            }
+            };
+            let name_lower = name.to_lowercase();
             needle.clear();
             needle.push(' ');
-            needle.push_str(&name_tokens);
+            push_collapsed(&mut needle, &name_lower, false);
+            // A name of only punctuation/whitespace normalizes to nothing and
+            // would otherwise match any text through the bare `"  "` needle.
+            if needle.len() == 1 {
+                continue;
+            }
             needle.push(' ');
             if !text_tokens.contains(needle.as_str()) {
                 continue;
             }
+            let name_tokens = &needle[1..needle.len() - 1];
             // A punctuated name needs one occurrence that is both verbatim and
             // a whole word. Checking the tokens and the verbatim text apart
             // would let "plan c ... abc++" match "c++": the bare "c" supplies
             // the token and "abc++" the characters. A bounded verbatim
             // occurrence also yields the tokens, so the check above is only a
             // cheap prefilter here.
-            let name_verbatim = collapse_whitespace(&name.to_lowercase());
+            name_verbatim.clear();
+            push_collapsed(&mut name_verbatim, &name_lower, true);
             if name_verbatim != name_tokens && !contains_bounded(&text_verbatim, &name_verbatim) {
                 continue;
             }
@@ -1061,6 +1118,131 @@ mod tests {
         assert!(contains_bounded("é c++ é", "c++"));
         assert!(!contains_bounded("éc++", "c++"));
         assert!(contains_bounded("ünï-côde.", "ünï-côde"));
+    }
+
+    #[test]
+    fn test_find_entities_folds_case_and_whitespace_beyond_ascii() {
+        let db = Database::open_in_memory().unwrap();
+        let kg = KnowledgeGraph::new(&db);
+
+        // SQLite's `LOWER` left "É" alone, so the old SQL comparison could
+        // not match a name with a non-ASCII capital. Irregular whitespace in
+        // a stored name, punctuated or not, is collapsed like the text's.
+        kg.upsert_entity("Émile Zola", "person").unwrap();
+        kg.upsert_entity("  Big\t Table ", "system").unwrap();
+        kg.upsert_entity("St.  Louis", "city").unwrap();
+
+        let cases = [
+            ("books by ÉMILE zola?", "Émile Zola"),
+            ("is big   table down", "  Big\t Table "),
+            ("flying to st.\nlouis tomorrow", "St.  Louis"),
+        ];
+
+        for (query, expected) in cases {
+            let matches = kg.find_entities_in_text(query).unwrap();
+            assert!(
+                matches.iter().any(|e| e.name == expected),
+                "Expected {expected:?} to match in: {query}, got {matches:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_normalize_mention_and_collapse_whitespace() {
+        assert_eq!(normalize_mention("  Use Iron-Build.\n"), "use iron build");
+        assert_eq!(normalize_mention("--a__b--"), "a b");
+        assert_eq!(normalize_mention(" \t-- "), "");
+        assert_eq!(collapse_whitespace("  St.  \tLouis \n"), "St. Louis");
+        assert_eq!(collapse_whitespace(" \n "), "");
+    }
+
+    /// A prompt pasted from a document carries curly quotes and typographic
+    /// hyphens. They spell the same mention as the ASCII name, in either
+    /// direction; an em dash separates clauses and is not a hyphen.
+    #[test]
+    fn test_find_entities_folds_typographic_punctuation() {
+        let db = Database::open_in_memory().unwrap();
+        let kg = KnowledgeGraph::new(&db);
+
+        kg.upsert_entity("O'Brien", "person").unwrap();
+        kg.upsert_entity("iron-build", "tool").unwrap();
+        kg.upsert_entity("D\u{2019}Angelo", "person").unwrap();
+
+        let cases = [
+            ("ask O\u{2019}Brien about it", "O'Brien"),
+            ("ask O\u{2018}Brien about it", "O'Brien"),
+            ("run iron\u{2010}build now", "iron-build"),
+            ("run iron\u{2011}build now", "iron-build"),
+            ("run iron\u{2013}build now", "iron-build"),
+            ("an album by d'angelo", "D\u{2019}Angelo"),
+        ];
+        for (query, expected) in cases {
+            let matches = kg.find_entities_in_text(query).unwrap();
+            assert!(
+                matches.iter().any(|e| e.name == expected),
+                "Expected {expected:?} to match in: {query:?}, got {matches:?}"
+            );
+        }
+
+        let matches = kg.find_entities_in_text("iron\u{2014}build").unwrap();
+        assert!(
+            matches.is_empty(),
+            "an em dash is not a hyphen: {matches:?}"
+        );
+    }
+
+    /// A combining mark continues the word it follows. Counting it as
+    /// punctuation would make the decomposed spelling of "café" a mention of
+    /// the entity "cafe", which the composed spelling is not, and would let
+    /// a punctuated name match the front of a longer marked word.
+    #[test]
+    fn test_find_entities_treats_a_combining_mark_as_part_of_the_word() {
+        // The premise: std does not class the mark as alphanumeric.
+        assert!(!'\u{301}'.is_alphanumeric());
+
+        let db = Database::open_in_memory().unwrap();
+        let kg = KnowledgeGraph::new(&db);
+        kg.upsert_entity("cafe", "place").unwrap();
+        kg.upsert_entity("x-y", "pair").unwrap();
+        kg.upsert_entity("राम", "person").unwrap();
+
+        for query in [
+            "the caf\u{e9} opens",
+            "the cafe\u{301} opens",
+            "plot x-y\u{301} here",
+            "रामायण",
+        ] {
+            let matches = kg.find_entities_in_text(query).unwrap();
+            assert!(
+                matches.is_empty(),
+                "Expected no match in: {query:?}, got {matches:?}"
+            );
+        }
+        assert!(!contains_bounded("x-y\u{301} z", "x-y"));
+        assert!(!contains_bounded("a\u{301}x-y", "x-y"));
+
+        // The marked word is a mention of an entity stored the same way.
+        kg.upsert_entity("cafe\u{301}", "venue").unwrap();
+        let matches = kg.find_entities_in_text("the CAFE\u{301} opens").unwrap();
+        let names: Vec<&str> = matches.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["cafe\u{301}"]);
+    }
+
+    /// The scan reads every row's name, so one row whose name is not text (a
+    /// BLOB an outside import wrote) must not fail every search.
+    #[test]
+    fn test_find_entities_skips_a_name_that_is_not_text() {
+        let db = Database::open_in_memory().unwrap();
+        let kg = KnowledgeGraph::new(&db);
+        kg.upsert_entity("cat", "animal").unwrap();
+        db.exec_raw(
+            "INSERT INTO entities (id, name, entity_type) VALUES ('blob-row', x'636174ff', 'thing')",
+        )
+        .unwrap();
+
+        let matches = kg.find_entities_in_text("I have a cat").unwrap();
+        let names: Vec<&str> = matches.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["cat"]);
     }
 
     #[test]

@@ -104,6 +104,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- KG boost and the prompt hook's KG recall now match entities whose names
+  contain punctuation or a non-ASCII capital (#378). An entity such as
+  `iron-build`, `kg_boost`, `Node.js` or `Émile` could never match a query,
+  even one containing that exact string. A punctuated name matches only
+  where it appears as written, as a whole word: `c++` is not matched by a
+  bare `c` or by `abc++`, nor `iron-build` by `iron build`. No letter or
+  digit may touch the name, as for plain names, so `c++` is not matched by
+  `C++17`. Curly quotes and typographic hyphens count as their ASCII forms
+  (`O’Brien` names `O'Brien`), and a combining mark is part of its word, so
+  a decomposed `café` is no longer read as the entity `cafe`. KG boost also
+  raises a drawer only when it mentions the entity as a whole word: a query
+  naming `cat` used to boost a drawer about a `category`. An entity row
+  whose name is not text is skipped; it used to fail the search.
+
 - Claude implementer liveness in the queue, `supervise` and `reconcile`
   now reads the process table as well as the `claude agents` registry,
   which never lists a running `claude -p` IC (#368). A Claude IC reads

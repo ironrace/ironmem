@@ -14,7 +14,7 @@ use std::collections::HashMap;
 
 use crate::db::{
     drawers::{Drawer, PREF_SENTINEL},
-    knowledge_graph::KnowledgeGraph,
+    knowledge_graph::{contains_bounded, KnowledgeGraph},
     ScoredDrawer, SearchFilters,
 };
 use crate::error::MemoryError;
@@ -689,18 +689,20 @@ fn kg_boost(
         related_names.remove(name);
     }
 
-    // Apply boosts
+    // Apply boosts. A drawer mentions an entity only as a whole word, the rule
+    // the query side uses: a query naming "c++" or "cat" is no reason to boost
+    // a drawer about "abc++" or a "category".
     for candidate in candidates.iter_mut() {
         let content_lower = candidate.drawer.content.to_lowercase();
 
         for name in &direct_names {
-            if content_lower.contains(name) {
+            if contains_bounded(&content_lower, name) {
                 candidate.score *= 1.15; // 15% boost for direct entity match
             }
         }
 
         for name in &related_names {
-            if content_lower.contains(name) {
+            if contains_bounded(&content_lower, name) {
                 candidate.score *= 1.05; // 5% boost for related entity
             }
         }
@@ -773,6 +775,36 @@ mod tests {
         );
 
         std::env::remove_var("IRONMEM_KG_BOOST_FANOUT");
+    }
+
+    /// The query side matches an entity only as a whole word (#378), so the
+    /// drawer side must too: "c++" in the query is no reason to boost a
+    /// drawer about "abc++", nor "cat" one about a "category".
+    #[test]
+    fn kg_boost_boosts_only_drawers_that_mention_the_entity_as_a_whole_word() {
+        let _g = KG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("IRONMEM_KG_QUERY_LIMIT");
+        std::env::remove_var("IRONMEM_KG_BOOST_FANOUT");
+
+        let db = Database::open_in_memory().unwrap();
+        let kg = KnowledgeGraph::new(&db);
+        kg.upsert_entity("c++", "language").unwrap();
+        kg.upsert_entity("cat", "animal").unwrap();
+
+        let mut candidates = vec![
+            candidate("whole-punctuated", "notes on C++ templates"),
+            candidate("embedded-punctuated", "abc++ compiles"),
+            candidate("whole-plain", "the cat, asleep"),
+            candidate("embedded-plain", "a category of things"),
+        ];
+        kg_boost(&mut candidates, "c++ and my cat", &kg).unwrap();
+
+        let boosted: Vec<&str> = candidates
+            .iter()
+            .filter(|c| c.score > 1.0)
+            .map(|c| c.drawer.id.as_str())
+            .collect();
+        assert_eq!(boosted, ["whole-punctuated", "whole-plain"]);
     }
 
     #[test]
