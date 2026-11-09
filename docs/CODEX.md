@@ -468,6 +468,13 @@ recall and injects sanitized untrusted-memory matches into `hookSpecificOutput.a
 path uses FTS5/BM25, then optional KG-triple and diary recall; it never loads
 the embedder. Codex registers no UserPromptSubmit hook.
 
+Each drawer and diary line carries the drawer's `id`
+(`- source="wing/room" id="..." excerpt="..."`), so `get_drawer` with that id
+opens a hit whose short excerpt doesn't answer the question. This includes ids the
+ChromaDB migration kept as they were (`drawer_<wing>_<room>_<hex>`), which
+`get_drawer` accepts alongside generated hex ids. KG triple lines are not drawers
+and have no id.
+
 Recall stays quiet unless the prompt gives it something to go on:
 
 - A prompt with fewer than two content words (`yes`, `go ahead`, `deploy`, `да`)

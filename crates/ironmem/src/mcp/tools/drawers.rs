@@ -378,7 +378,14 @@ pub(super) fn handle_get_drawer(app: &App, args: &Value) -> Result<Value, Memory
             ));
         }
         (Some(id), None) => {
-            validate_hex_id(id, "id")?;
+            // Wider than `validate_hex_id`: prompt recall hands out ChromaDB-imported
+            // ids too, and every id it shows must open here.
+            if !crate::db::drawers::is_openable_drawer_id(id) {
+                return Err(MemoryError::Validation(format!(
+                    "id must be 1 to {} ASCII letters, digits, '_' or '-'",
+                    crate::db::drawers::MAX_OPENABLE_DRAWER_ID_BYTES
+                )));
+            }
             id.to_string()
         }
         (None, Some(logical_key)) => {
@@ -1525,6 +1532,32 @@ mod tests {
         assert_eq!(out["found"].as_bool(), Some(false));
         assert_eq!(out["id"].as_str(), Some(missing.as_str()));
         assert!(out.get("content").is_none(), "no content on a miss");
+    }
+
+    /// Prompt recall hands out ChromaDB-imported ids verbatim (#376), so
+    /// `get_drawer` must open them, not refuse them as non-hex.
+    #[test]
+    fn get_drawer_opens_a_chromadb_imported_id() {
+        let app = test_app();
+        let id = "drawer_python-repos_general_0298432cfbef65c6d7922f02";
+        let zero = vec![0.0f32; ironrace_embed::embedder::EMBED_DIM];
+        app.db
+            .insert_drawer(
+                id,
+                "imported body",
+                &zero,
+                "python-repos",
+                "general",
+                "",
+                "mempalace",
+            )
+            .unwrap();
+        let out = handle_get_drawer(&app, &json!({ "id": id })).unwrap();
+        assert_eq!(out["found"], true, "{out}");
+        assert_eq!(out["content"], "imported body");
+        let too_long = "a".repeat(crate::db::drawers::MAX_OPENABLE_DRAWER_ID_BYTES + 1);
+        assert!(handle_get_drawer(&app, &json!({ "id": too_long })).is_err());
+        assert!(handle_get_drawer(&app, &json!({ "id": "" })).is_err());
     }
 
     #[test]
