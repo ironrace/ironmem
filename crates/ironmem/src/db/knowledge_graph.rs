@@ -49,6 +49,36 @@ fn collapse_whitespace(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Whether `needle` occurs in `haystack` with no alphanumeric character
+/// directly before or after that occurrence. Every occurrence is tried,
+/// overlapping ones included, so an embedded one (the "c++" in "abc++")
+/// does not hide a standalone one later in the text.
+fn contains_bounded(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    let mut from = 0;
+    while let Some(offset) = haystack[from..].find(needle) {
+        let start = from + offset;
+        let end = start + needle.len();
+        let before_ok = haystack[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_alphanumeric());
+        let after_ok = haystack[end..]
+            .chars()
+            .next()
+            .is_none_or(|c| !c.is_alphanumeric());
+        if before_ok && after_ok {
+            return true;
+        }
+        // Step one character past this occurrence's start, not past its end,
+        // so an overlapping occurrence is still found.
+        from = start + haystack[start..].chars().next().map_or(1, char::len_utf8);
+    }
+    false
+}
+
 fn entity_id(name: &str, entity_type: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(name.to_lowercase().as_bytes());
@@ -208,8 +238,11 @@ impl<'a> KnowledgeGraph<'a> {
     /// acts as a word boundary: "cat." matches entity "cat", and the entity
     /// "iron-build" matches "use iron-build." as the tokens `iron build`.
     /// A name that itself contains punctuation must also appear verbatim
-    /// (case- and whitespace-insensitively) in the text: without that check
-    /// "c++" would match any bare "c", and "iron-build" would match "iron build".
+    /// (case- and whitespace-insensitively) as a whole word, with no letter
+    /// or digit directly on either side: without that check "c++" would
+    /// match any bare "c" or the tail of "abc++", and "iron-build" would
+    /// match "iron build". Both conditions hold for the same occurrence, so
+    /// "plan c ... abc++" is not a mention of "c++".
     ///
     /// The comparison runs in Rust rather than SQL because SQLite has no way
     /// to apply the same normalization to `name`, and its `LOWER` folds ASCII
@@ -245,8 +278,14 @@ impl<'a> KnowledgeGraph<'a> {
             if !text_tokens.contains(needle.as_str()) {
                 continue;
             }
+            // A punctuated name needs one occurrence that is both verbatim and
+            // a whole word. Checking the tokens and the verbatim text apart
+            // would let "plan c ... abc++" match "c++": the bare "c" supplies
+            // the token and "abc++" the characters. A bounded verbatim
+            // occurrence also yields the tokens, so the check above is only a
+            // cheap prefilter here.
             let name_verbatim = collapse_whitespace(&name.to_lowercase());
-            if name_verbatim != name_tokens && !text_verbatim.contains(name_verbatim.as_str()) {
+            if name_verbatim != name_tokens && !contains_bounded(&text_verbatim, &name_verbatim) {
                 continue;
             }
             matches.push(Entity {
@@ -971,7 +1010,16 @@ mod tests {
         // Normalizing "c++" leaves the single token "c", so a bare "c" in the
         // query must not be read as a mention; nor may a longer word ending
         // in the punctuated name, or the words without their joining hyphen.
-        for query in ["plan c is the fallback", "abc++ compiles", "iron build"] {
+        // The token and the verbatim text must also be the same occurrence:
+        // in the combined query the bare "c" supplies the token and "abc++"
+        // the characters, but no single occurrence is a mention of "c++".
+        for query in [
+            "plan c is the fallback",
+            "abc++ compiles",
+            "iron build",
+            "plan c is the fallback; abc++ compiles",
+            "iron build or xiron-build",
+        ] {
             let matches = kg.find_entities_in_text(query).unwrap();
             assert!(
                 matches.is_empty(),
@@ -979,8 +1027,40 @@ mod tests {
             );
         }
 
-        let matches = kg.find_entities_in_text("I write C++ daily").unwrap();
-        assert!(matches.iter().any(|e| e.name == "c++"), "got {matches:?}");
+        // A standalone mention still matches, including after an embedded
+        // one, at the very start or end of the text, and next to punctuation.
+        for query in [
+            "I write C++ daily",
+            "abc++ is not c++",
+            "c++",
+            "(c++), mostly",
+        ] {
+            let matches = kg.find_entities_in_text(query).unwrap();
+            assert!(
+                matches.iter().any(|e| e.name == "c++"),
+                "Expected 'c++' to match in: {query}, got {matches:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_contains_bounded() {
+        assert!(contains_bounded("i write c++ daily", "c++"));
+        assert!(contains_bounded("c++", "c++"));
+        assert!(contains_bounded("use iron-build.", "iron-build"));
+        assert!(!contains_bounded("abc++ compiles", "c++"));
+        assert!(!contains_bounded("xiron-buildy", "iron-build"));
+        assert!(!contains_bounded("anything", ""));
+        // A later, separate occurrence is found after an embedded one.
+        assert!(contains_bounded("xa.a a.a", "a.a"));
+        // "a.a" occurs at 1 (after "x") and, overlapping it, at 3 (after
+        // "."); only the second is bounded. A non-overlapping scan resumes
+        // at 4 and would miss it.
+        assert!(contains_bounded("xa.a.a", "a.a"));
+        // Multibyte characters around and inside the needle.
+        assert!(contains_bounded("é c++ é", "c++"));
+        assert!(!contains_bounded("éc++", "c++"));
+        assert!(contains_bounded("ünï-côde.", "ünï-côde"));
     }
 
     #[test]
