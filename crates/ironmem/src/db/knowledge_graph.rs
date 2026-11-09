@@ -26,6 +26,29 @@ pub struct Triple {
     pub extracted_at: String,
 }
 
+/// Lowercase `s`, turn every character that is neither alphanumeric nor
+/// whitespace into a space, and collapse whitespace runs to single spaces.
+/// `find_entities_in_text` applies it to both the text and each entity name.
+fn normalize_mention(s: &str) -> String {
+    let mapped: String = s
+        .to_lowercase()
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c.is_whitespace() {
+                c
+            } else {
+                ' '
+            }
+        })
+        .collect();
+    collapse_whitespace(&mapped)
+}
+
+/// Trim `s` and collapse each internal whitespace run to a single space.
+fn collapse_whitespace(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 fn entity_id(name: &str, entity_type: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(name.to_lowercase().as_bytes());
@@ -180,44 +203,61 @@ impl<'a> KnowledgeGraph<'a> {
 
     /// Find entities whose name appears in the given text.
     /// Used by KG-boosted search to detect entity mentions in queries.
-    /// Normalizes punctuation to spaces so "cat." matches entity "cat".
+    ///
+    /// Text and name both go through [`normalize_mention`], so punctuation
+    /// acts as a word boundary: "cat." matches entity "cat", and the entity
+    /// "iron-build" matches "use iron-build." as the tokens `iron build`.
+    /// A name that itself contains punctuation must also appear verbatim
+    /// (case- and whitespace-insensitively) in the text: without that check
+    /// "c++" would match any bare "c", and "iron-build" would match "iron build".
+    ///
+    /// The comparison runs in Rust rather than SQL because SQLite has no way
+    /// to apply the same normalization to `name`, and its `LOWER` folds ASCII
+    /// only. A substring filter in SQL could not use an index either, so this
+    /// scans no more rows; names are borrowed and only matched rows allocate
+    /// an `Entity`.
     pub fn find_entities_in_text(&self, text: &str) -> Result<Vec<Entity>, MemoryError> {
-        // Normalize: lowercase, replace non-alphanumeric with spaces, collapse, pad
-        let normalized: String = text
-            .to_lowercase()
-            .chars()
-            .map(|c| {
-                if c.is_alphanumeric() || c.is_whitespace() {
-                    c
-                } else {
-                    ' '
-                }
-            })
-            .collect();
-        let text_padded = format!(
-            " {} ",
-            normalized.split_whitespace().collect::<Vec<_>>().join(" ")
-        );
+        const MAX_MATCHES: usize = 100;
 
-        let mut stmt = self.db.conn.prepare(
-            "SELECT id, name, entity_type, created_at
-             FROM entities
-             WHERE INSTR(?1, ' ' || LOWER(name) || ' ') > 0
-             LIMIT 100",
-        )?;
+        let text_tokens = format!(" {} ", normalize_mention(text));
+        let text_verbatim = collapse_whitespace(&text.to_lowercase());
 
-        let rows = stmt.query_map(params![text_padded], |row| {
-            Ok(Entity {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                entity_type: row.get(2)?,
-                created_at: row.get(3)?,
-            })
-        })?;
+        let mut stmt = self
+            .db
+            .conn
+            .prepare("SELECT id, name, entity_type, created_at FROM entities")?;
+        let mut rows = stmt.query([])?;
 
         let mut matches = Vec::new();
-        for row in rows {
-            matches.push(row?);
+        let mut needle = String::new();
+        while let Some(row) = rows.next()? {
+            let name = row.get_ref(1)?.as_str().map_err(rusqlite::Error::from)?;
+            let name_tokens = normalize_mention(name);
+            // A name of only punctuation/whitespace normalizes to nothing and
+            // would otherwise match any text through the bare `"  "` needle.
+            if name_tokens.is_empty() {
+                continue;
+            }
+            needle.clear();
+            needle.push(' ');
+            needle.push_str(&name_tokens);
+            needle.push(' ');
+            if !text_tokens.contains(needle.as_str()) {
+                continue;
+            }
+            let name_verbatim = collapse_whitespace(&name.to_lowercase());
+            if name_verbatim != name_tokens && !text_verbatim.contains(name_verbatim.as_str()) {
+                continue;
+            }
+            matches.push(Entity {
+                id: row.get(0)?,
+                name: name.to_string(),
+                entity_type: row.get(2)?,
+                created_at: row.get(3)?,
+            });
+            if matches.len() >= MAX_MATCHES {
+                break;
+            }
         }
         Ok(matches)
     }
@@ -890,6 +930,73 @@ mod tests {
             assert!(
                 matches.iter().any(|e| e.name == "cat"),
                 "Expected 'cat' to match in: {query}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_find_entities_with_punctuation_in_name() {
+        let db = Database::open_in_memory().unwrap();
+        let kg = KnowledgeGraph::new(&db);
+
+        kg.upsert_entity("iron-build", "tool").unwrap();
+        kg.upsert_entity("kg_boost", "function").unwrap();
+        kg.upsert_entity("Node.js", "runtime").unwrap();
+
+        // Each entity is named in a query, including next to the punctuation
+        // the query normalization strips (a trailing period, a comma).
+        let cases = [
+            ("how does iron-build dispatch tasks?", "iron-build"),
+            ("is kg_boost capped, or not", "kg_boost"),
+            ("we run on node.js.", "Node.js"),
+        ];
+
+        for (query, expected) in cases {
+            let matches = kg.find_entities_in_text(query).unwrap();
+            assert!(
+                matches.iter().any(|e| e.name == expected),
+                "Expected '{expected}' to match in: {query}, got {matches:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_find_entities_punctuated_name_needs_exact_mention() {
+        let db = Database::open_in_memory().unwrap();
+        let kg = KnowledgeGraph::new(&db);
+
+        kg.upsert_entity("c++", "language").unwrap();
+        kg.upsert_entity("iron-build", "tool").unwrap();
+
+        // Normalizing "c++" leaves the single token "c", so a bare "c" in the
+        // query must not be read as a mention; nor may a longer word ending
+        // in the punctuated name, or the words without their joining hyphen.
+        for query in ["plan c is the fallback", "abc++ compiles", "iron build"] {
+            let matches = kg.find_entities_in_text(query).unwrap();
+            assert!(
+                matches.is_empty(),
+                "Expected no match in: {query}, got {matches:?}"
+            );
+        }
+
+        let matches = kg.find_entities_in_text("I write C++ daily").unwrap();
+        assert!(matches.iter().any(|e| e.name == "c++"), "got {matches:?}");
+    }
+
+    #[test]
+    fn test_find_entities_skips_name_of_only_punctuation() {
+        let db = Database::open_in_memory().unwrap();
+        let kg = KnowledgeGraph::new(&db);
+
+        // "---" normalizes to the empty string; its needle would be a bare
+        // pair of spaces, which an empty query's padded text contains.
+        kg.upsert_entity("---", "separator").unwrap();
+
+        for query in ["", "---", "hello world"] {
+            let matches = kg.find_entities_in_text(query).unwrap();
+            assert!(
+                matches.is_empty(),
+                "Expected no match in: {query:?}, got {matches:?}"
             );
         }
     }
