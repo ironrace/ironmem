@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-09
+
 ### Changed
 
 - **The Stop hook's handoff nudge names the wing prompt recall reads.** A
@@ -44,7 +46,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `session_refusal`. Snapshot `Available` variants cannot be constructed
   externally; `HarnessSnapshots` and `SharedDaemon` fields are crate-private.
   Use the snapshot/daemon collection APIs. Deprecated Codex aliases are
-  scheduled for removal in **0.7.0**.
+  scheduled for removal in **0.8.0**.
 - Pending invocation exit records have additive strict fields that older
   readers reject and hold. Finish or clear pending runs with this version
   before downgrading. Journals/prompts/stderr retain raw tool output; old,
@@ -343,7 +345,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the `codex_process` module is `process_tree`, where `parse_codex_processes`,
   `CodexProcessSnapshot`, `CodexProcessSource` and `UnixCodexProcesses` are
   `parse_processes`, `ProcessSnapshot`, `ProcessSource` and `UnixProcesses`.
-  The old names stay, deprecated, until 0.7.0. These changes have no alias
+  The old names stay, deprecated, until 0.8.0. These changes have no alias
   and break a caller at compile time: the `codex_artifacts` field of
   `DispatchSpec`, `DispatchState` and `ClearedDispatch` is
   `invocation_artifacts` (the stored and `--json` key is still
