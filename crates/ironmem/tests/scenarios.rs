@@ -555,16 +555,34 @@ fn empty_content_is_rejected() {
     );
 }
 
+/// `delete_drawer` took only 16/32-char hex ids until #376, and this test
+/// asserted that anything else was a tool error. A ChromaDB-imported drawer keeps
+/// its source id (`drawer_<wing>_<room>_<hex>`), which that rule made impossible
+/// to delete, so any string is an id now: one that matches no row deletes nothing
+/// and says that ids match exactly. A missing or non-string id is still an error.
 #[test]
-fn delete_with_invalid_id_format_is_rejected() {
+fn delete_with_an_id_that_matches_nothing_is_a_miss_not_an_error() {
     let app = App::open_for_test().unwrap();
+    let kept = call(
+        &app,
+        "add_drawer",
+        json!({ "content": "a drawer no wrong id may remove", "wing": "projects" }),
+    );
 
-    for bad_id in &["not-a-hex", "tooshort", &"z".repeat(32)] {
-        let resp = call_raw(&app, "delete_drawer", json!({ "id": bad_id }));
+    for unknown_id in &["not-a-hex", "tooshort", &"z".repeat(32)] {
+        let out = call(&app, "delete_drawer", json!({ "id": unknown_id }));
+        assert_eq!(out["success"], false, "{unknown_id}: {out}");
         assert!(
-            is_tool_error(&resp),
-            "invalid id '{bad_id}' must return a tool error"
+            out["hint"].as_str().is_some_and(|h| h.contains("exactly")),
+            "a miss on '{unknown_id}' must say ids match exactly: {out}"
         );
+    }
+    let still_there = call(&app, "get_drawer", json!({ "id": kept["id"] }));
+    assert_eq!(still_there["found"], true, "{still_there}");
+
+    for bad_args in [json!({}), json!({ "id": 7 }), json!({ "id": null })] {
+        let resp = call_raw(&app, "delete_drawer", bad_args.clone());
+        assert!(is_tool_error(&resp), "{bad_args} must return a tool error");
     }
 }
 

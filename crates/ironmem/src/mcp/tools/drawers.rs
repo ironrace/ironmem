@@ -6,7 +6,7 @@ use crate::sanitize;
 use crate::search;
 
 use super::shared::{
-    optional_bool, render_search_excerpt, render_sensitive_text, sha256_hex, validate_hex_id,
+    drawer_id_miss_hint, optional_bool, render_search_excerpt, render_sensitive_text, sha256_hex,
     MAX_DRAWER_CONTENT_CHARS, MAX_SEARCH_EXCERPT_CHARS, MAX_SEARCH_LIMIT,
     MAX_SEARCH_RESPONSE_CHARS, MAX_SENSITIVE_FIELD_CHARS,
 };
@@ -57,12 +57,12 @@ pub(super) fn validate_add_drawer_args(args: &Value) -> Result<AddDrawerArgs<'_>
         .transpose()?;
     let supersedes = match args.get("supersedes") {
         Some(value) => {
+            // Any string, as `get_drawer` takes: a ChromaDB-imported drawer keeps
+            // its source id, and that is the id recall and `search` show for it
+            // (#376). One that names no drawer fails below as not found.
             let value = value.as_str().ok_or_else(|| {
-                MemoryError::Validation(
-                    "supersedes must be a 32-character hexadecimal drawer id".into(),
-                )
+                MemoryError::Validation("supersedes must be a drawer id string".into())
             })?;
-            validate_hex_id(value, "supersedes")?;
             Some(value.to_string())
         }
         None => None,
@@ -380,9 +380,10 @@ pub(super) fn handle_get_drawer(app: &App, args: &Value) -> Result<Value, Memory
         (Some(id), None) => {
             // No shape check (unlike `validate_hex_id`): the ChromaDB migration keeps
             // source ids verbatim, with no charset or length limit, and prompt recall
-            // hands every recalled row's id out as a pointer that must open here
+            // hands a recalled row's id out as a pointer that must open here
             // (#376). The id is only ever an exact-match bound SQL parameter, so any
-            // string is safe; one that matches no row is a miss, not an error.
+            // string is safe; one that matches no row is a miss, not an error, and
+            // the miss carries `drawer_id_miss_hint` when the id is no native shape.
             id.to_string()
         }
         (None, Some(logical_key)) => {
@@ -432,7 +433,11 @@ pub(super) fn handle_get_drawer(app: &App, args: &Value) -> Result<Value, Memory
     let drawer = match app.db.get_drawer(&id)? {
         Some(d) => d,
         None => {
-            return Ok(json!({ "found": false, "id": id }));
+            let mut miss = json!({ "found": false, "id": id });
+            if let Some(hint) = drawer_id_miss_hint(&id) {
+                miss["hint"] = json!(hint);
+            }
+            return Ok(miss);
         }
     };
 
@@ -495,8 +500,11 @@ pub(super) fn handle_delete_drawer(app: &App, args: &Value) -> Result<Value, Mem
         .get("id")
         .and_then(|v| v.as_str())
         .ok_or_else(|| MemoryError::Validation("id is required".into()))?;
-    validate_hex_id(id, "id")?;
-
+    // No shape check, for the reason `get_drawer` has none: recall and `search`
+    // show a ChromaDB-imported drawer under its source id, and a drawer an agent
+    // can open it must be able to remove (#376). The id is an exact-match bound
+    // SQL parameter here and in the sibling cascade, whose `pref:` prefix keeps
+    // it to synthetic rows whatever the id is.
     let deleted = app.db.with_transaction(|tx| {
         if crate::db::schema::Database::is_referenced_collab_drawer_tx(tx, id)? {
             return Err(MemoryError::Validation(
@@ -512,7 +520,13 @@ pub(super) fn handle_delete_drawer(app: &App, args: &Value) -> Result<Value, Mem
         app.mark_dirty();
     }
 
-    Ok(json!({ "success": deleted, "id": id }))
+    let mut out = json!({ "success": deleted, "id": id });
+    if !deleted {
+        if let Some(hint) = drawer_id_miss_hint(id) {
+            out["hint"] = json!(hint);
+        }
+    }
+    Ok(out)
 }
 
 pub(super) fn handle_list_wings(app: &App) -> Result<Value, MemoryError> {
@@ -1582,6 +1596,135 @@ mod tests {
             }),
         )
         .is_err());
+    }
+
+    /// Recall and `search` hand out ChromaDB-imported ids, and `get_drawer` opens
+    /// them (#376), so the tool that removes a drawer must take the same ids: an
+    /// agent that opens a stale imported drawer has to be able to delete it.
+    #[test]
+    fn delete_drawer_removes_any_chromadb_imported_id() {
+        let app = test_app();
+        let long = format!("chroma/{}", "x".repeat(300));
+        let ids = [
+            "drawer_python-repos_general_0298432cfbef65c6d7922f02",
+            "doc:2024/notes.md#L1?v=2",
+            "has \"quotes\" and spaces\nand a newline",
+            "ünïcode-ид-🔑",
+            "",
+            long.as_str(),
+        ];
+        let zero = vec![0.0f32; ironrace_embed::embedder::EMBED_DIM];
+        for (i, id) in ids.iter().enumerate() {
+            let body = format!("imported body {i}");
+            app.db
+                .insert_drawer(id, &body, &zero, "python-repos", "general", "", "mempalace")
+                .unwrap();
+        }
+        for id in ids {
+            let out = handle_delete_drawer(&app, &json!({ "id": id }))
+                .unwrap_or_else(|e| panic!("delete_drawer {id:?} failed: {e}"));
+            assert_eq!(out["success"], true, "{id:?}: {out}");
+            assert!(out.get("hint").is_none(), "{id:?}: {out}");
+            let after = handle_get_drawer(&app, &json!({ "id": id })).unwrap();
+            assert_eq!(after["found"], false, "{id:?} must be gone: {after}");
+        }
+        assert_eq!(app.db.count_drawers(None).unwrap(), 0);
+    }
+
+    /// `supersedes` names a drawer by the id `get_drawer` and recall show for it,
+    /// so it takes a ChromaDB-imported id too (#376).
+    #[test]
+    fn add_drawer_supersedes_a_chromadb_imported_id() {
+        let app = test_app();
+        let imported = "drawer_python-repos_general_0298432cfbef65c6d7922f02";
+        let zero = vec![0.0f32; ironrace_embed::embedder::EMBED_DIM];
+        app.db
+            .insert_drawer(
+                imported,
+                "imported and now stale",
+                &zero,
+                "python-repos",
+                "general",
+                "",
+                "mempalace",
+            )
+            .unwrap();
+
+        let successor = handle_add_drawer(
+            &app,
+            &json!({
+                "content": "the current wording",
+                "wing": "python-repos",
+                "room": "general",
+                "supersedes": imported,
+            }),
+        )
+        .unwrap_or_else(|e| panic!("superseding {imported:?} failed: {e}"));
+        assert_eq!(successor["supersedes"].as_str(), Some(imported));
+
+        let retired = handle_get_drawer(&app, &json!({ "id": imported })).unwrap();
+        assert_eq!(retired["found"], true, "{retired}");
+        assert_eq!(
+            retired["superseded_by"].as_str(),
+            successor["id"].as_str(),
+            "{retired}"
+        );
+
+        // A non-string is still refused, and the message no longer claims hex.
+        let error = handle_add_drawer(
+            &app,
+            &json!({
+                "content": "other wording",
+                "wing": "python-repos",
+                "room": "general",
+                "supersedes": 7,
+            }),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&error, MemoryError::Validation(m) if !m.contains("hex")),
+            "{error}"
+        );
+    }
+
+    /// With no shape rule left on `id`, a shortened or padded id is an ordinary
+    /// miss, the same answer as a drawer that does not exist. The session-start
+    /// line prints only the first 8 characters of the last diary id, so the miss
+    /// has to say that ids match exactly or the agent concludes the entry is gone.
+    #[test]
+    fn a_miss_on_an_id_of_no_native_shape_says_ids_match_exactly() {
+        let app = test_app();
+        let added = handle_add_drawer(
+            &app,
+            &json!({"content": "opened by its full id only", "wing": "project"}),
+        )
+        .unwrap();
+        let id = added["id"].as_str().unwrap().to_owned();
+
+        for not_the_id in [id[..8].to_string(), format!("{id}\n"), format!(" {id}")] {
+            let got = handle_get_drawer(&app, &json!({ "id": not_the_id })).unwrap();
+            assert_eq!(got["found"], false, "{got}");
+            let hint = got["hint"]
+                .as_str()
+                .unwrap_or_else(|| panic!("get_drawer {not_the_id:?} needs a hint: {got}"));
+            assert!(hint.contains("exactly"), "{hint}");
+
+            let deleted = handle_delete_drawer(&app, &json!({ "id": not_the_id })).unwrap();
+            assert_eq!(deleted["success"], false, "{deleted}");
+            assert_eq!(deleted["hint"].as_str(), Some(hint), "{deleted}");
+        }
+        // Nothing above removed the drawer.
+        let got = handle_get_drawer(&app, &json!({ "id": id })).unwrap();
+        assert_eq!(got["found"], true, "{got}");
+        assert!(got.get("hint").is_none(), "{got}");
+
+        // A well-formed id that matches no row is a plain miss: nothing to explain.
+        let missing = "0".repeat(32);
+        let got = handle_get_drawer(&app, &json!({ "id": missing })).unwrap();
+        assert!(got.get("hint").is_none(), "{got}");
+        let deleted = handle_delete_drawer(&app, &json!({ "id": missing })).unwrap();
+        assert_eq!(deleted["success"], false, "{deleted}");
+        assert!(deleted.get("hint").is_none(), "{deleted}");
     }
 
     #[test]

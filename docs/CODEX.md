@@ -472,9 +472,12 @@ Each drawer and diary line carries the drawer's `id`
 (`- source="wing/room" id="..." excerpt="..."`), so `get_drawer` with that id
 opens a hit whose short excerpt doesn't answer the question. This includes ids the
 ChromaDB migration kept as they were (usually `drawer_<wing>_<room>_<hex>`, but
-with no charset or length limit): `get_drawer` accepts any id string, and the
-line JSON-escapes the id like the excerpt, so decode it before passing it on.
-KG triple lines are not drawers and have no id.
+with no charset or length limit): `get_drawer`, `delete_drawer` and
+`add_drawer`'s `supersedes` accept any id string, and the line JSON-escapes the
+id like the excerpt, so decode it before passing it on. Ids match exactly; a
+miss on an id that isn't 16 or 32 hex characters comes back with a `hint` saying
+so. A line whose id is over 256 bytes carries no id, so one imported row can't
+flood the prompt. KG triple lines are not drawers and have no id.
 
 Recall stays quiet unless the prompt gives it something to go on:
 

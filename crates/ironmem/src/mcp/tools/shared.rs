@@ -163,6 +163,21 @@ pub(super) fn validate_hex_id(value: &str, field_name: &str) -> Result<(), Memor
     Ok(())
 }
 
+/// What to tell a caller whose drawer `id` matched no row, when the id is not
+/// one ironmem generates. Drawer tools take any id string, because the ChromaDB
+/// migration keeps source ids verbatim (#376), so a shortened or padded id is a
+/// miss rather than a shape error, and a bare miss reads as "that drawer is
+/// gone". `None` for a well-formed id: that one really matches nothing.
+pub(super) fn drawer_id_miss_hint(id: &str) -> Option<&'static str> {
+    validate_hex_id(id, "id").is_err().then_some(
+        "No drawer has exactly this id. Ids match as whole strings: ironmem's own \
+         are 16 or 32 hex characters and imported ones are kept as they were. A \
+         shortened id (the session-start line prints only the first 8 characters) \
+         or one with extra whitespace matches nothing; search and diary_read \
+         return full ids.",
+    )
+}
+
 /// Validate that a date string matches YYYY-MM-DD format.
 pub(super) fn validate_date_format(value: &str, field_name: &str) -> Result<(), MemoryError> {
     if chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").is_err() {

@@ -13,12 +13,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the `user-prompt-submit` hook injects now reads
   `- source="wing/room" id="..." excerpt="..."`, and the block's header says
   `get_drawer` opens it, so an agent can read the whole drawer instead of
-  searching again. `get_drawer` now accepts any id string, not just 16/32-char
-  hex, because the ChromaDB migration keeps source ids verbatim with no charset
-  or length limit (`drawer_<wing>_<room>_<hex>` is the usual shape); an id that
-  matches no row is a `found: false` miss. The id is JSON-escaped like the
-  excerpt and never shortened, so every recalled hit gets one.
-  On a fixed four-prompt fixture the injected text grew from 1,455 to 1,888 bytes.
+  searching again. `get_drawer`, `delete_drawer` and `add_drawer`'s `supersedes`
+  now accept any id string, not just 16/32-char hex, because the ChromaDB
+  migration keeps source ids verbatim with no charset or length limit
+  (`drawer_<wing>_<room>_<hex>` is the usual shape), so an imported drawer can
+  be opened, deleted and superseded. An id that matches no row is a miss
+  (`found: false`, or `success: false` from `delete_drawer`), and when the id
+  isn't 16 or 32 hex characters the miss carries a `hint` that ids match
+  exactly, since a shortened id such as the 8 characters the session-start line
+  prints used to be refused for its shape. The id is JSON-escaped like the
+  excerpt and never shortened; control characters, line breaks, invisible
+  characters and code fences that JSON leaves raw are `\u`-escaped, so the id
+  still decodes exactly. An id over 256 bytes is left off its line, which keeps
+  its source and excerpt, so one imported row can't flood the prompt.
+  On a fixed five-prompt fixture, one of whose ids is a 209-byte import, the
+  injected text grew from 1,700 to 2,398 bytes.
 - **The Stop hook's handoff nudge names the wing prompt recall reads.** A
   project inside a Git work tree that tracks none of its files, or one behind
   `GIT_CEILING_DIRECTORIES`, was asked to save its handoff in the parent
