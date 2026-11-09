@@ -224,7 +224,7 @@ impl Database {
     /// transaction stops noticing the change.
     #[cfg(test)]
     pub(crate) fn arm_busy_snapshot_once(
-        &self,
+        &mut self,
         path: &Path,
     ) -> Result<BusySnapshotProbe, MemoryError> {
         self.arm_busy_snapshot_once_with(
@@ -240,9 +240,13 @@ impl Database {
     /// must take no parameters. It commits on its own connection, so it sees
     /// only committed state — it cannot observe or depend on the closure's
     /// in-flight transaction.
+    ///
+    /// Takes `&mut self` because rusqlite 0.41's `Connection::authorizer` does;
+    /// a test holding the database in an `Arc<App>` arms it through
+    /// `Arc::get_mut` before sharing the handle.
     #[cfg(test)]
     pub(crate) fn arm_busy_snapshot_once_with(
-        &self,
+        &mut self,
         path: &Path,
         contending_sql: &str,
     ) -> Result<BusySnapshotProbe, MemoryError> {
@@ -289,7 +293,7 @@ impl Database {
                 _ => {}
             }
             Authorization::Allow
-        }));
+        }))?;
 
         Ok(BusySnapshotProbe {
             transactions,

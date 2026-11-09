@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The bundled SQLite is upgraded to 3.54 to fix RUSTSEC-2026-0459.** SQLite
+  before 3.54.0 could return uninitialized page-cache memory when it opened a
+  database together with a `-wal` file whose page size differed from the
+  database's. `rusqlite` moves from 0.32 to 0.41, which bundles SQLite 3.54
+  through `libsqlite3-sys` 0.39.
+  The optional `headroom-compression` feature's `headroom-core` git dependency
+  moves from commit `5bd2266f` to `74b7ac23`, the first upstream commit on
+  `rusqlite` 0.41: only one crate in a build may link SQLite, so the old pin
+  kept the whole workspace on 0.32 even with the feature off.
+
 ### Changed
 
 - **The Stop hook's handoff nudge names the wing prompt recall reads.** A

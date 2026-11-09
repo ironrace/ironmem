@@ -337,8 +337,8 @@ lockfile — no separate process manager, cron job, or `kill` required.
 
 The `headroom-compression` Cargo feature is disabled by default. It pins
 `headroom-core` from `https://github.com/headroomlabs-ai/headroom.git` at the
-immutable revision `5bd2266f16bb351a7a7334e1c29c598d28187b1d`; the reviewed
-source is Apache-2.0 per its [pinned upstream LICENSE](https://github.com/headroomlabs-ai/headroom/blob/5bd2266f16bb351a7a7334e1c29c598d28187b1d/LICENSE).
+immutable revision `74b7ac23861944f1411d30c5394043ec0505b334`; the source
+at that revision is Apache-2.0 per its [pinned upstream LICENSE](https://github.com/headroomlabs-ai/headroom/blob/74b7ac23861944f1411d30c5394043ec0505b334/LICENSE).
 Build the optional artifact command when a review workflow can use it:
 
 ```bash

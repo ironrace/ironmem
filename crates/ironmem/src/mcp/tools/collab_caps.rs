@@ -117,7 +117,7 @@ mod tests {
     fn collab_register_caps_commits_exactly_once_under_busy_snapshot_replay() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("mem.sqlite3");
-        let app = test_app_with_db_path(db_path.clone(), dir.path());
+        let mut app = test_app_with_db_path(db_path.clone(), dir.path());
         let session_id = "caps-exactly-once";
 
         // Seed the session row the capability FK requires. This runs *before*
@@ -138,7 +138,11 @@ mod tests {
             })
             .unwrap();
 
-        let probe = app.db.arm_busy_snapshot_once(&db_path).unwrap();
+        let probe = std::sync::Arc::get_mut(&mut app)
+            .expect("the test holds the only handle to the app")
+            .db
+            .arm_busy_snapshot_once(&db_path)
+            .unwrap();
 
         let response = handle_collab_register_caps(
             &app,
