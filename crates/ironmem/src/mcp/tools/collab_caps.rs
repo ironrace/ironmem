@@ -89,7 +89,7 @@ pub(super) fn handle_collab_get_caps(app: &App, args: &Value) -> Result<Value, M
 mod tests {
     use super::*;
     use crate::collab::{Agent, CollabRoles};
-    use crate::mcp::tools::test_support::test_app_with_db_path;
+    use crate::mcp::tools::test_support::{sole_db_mut, test_app_with_db_path};
 
     /// A **production** closure — the one inside
     /// [`handle_collab_register_caps`] — must survive a replayed
@@ -138,9 +138,7 @@ mod tests {
             })
             .unwrap();
 
-        let probe = std::sync::Arc::get_mut(&mut app)
-            .expect("the test holds the only handle to the app")
-            .db
+        let probe = sole_db_mut(&mut app)
             .arm_busy_snapshot_once(&db_path)
             .unwrap();
 

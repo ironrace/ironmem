@@ -243,7 +243,7 @@ impl Database {
     ///
     /// Takes `&mut self` because rusqlite 0.41's `Connection::authorizer` does;
     /// a test holding the database in an `Arc<App>` arms it through
-    /// `Arc::get_mut` before sharing the handle.
+    /// `test_support::sole_db_mut` before sharing the handle.
     #[cfg(test)]
     pub(crate) fn arm_busy_snapshot_once_with(
         &mut self,

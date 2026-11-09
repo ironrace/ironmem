@@ -4190,7 +4190,7 @@ mod tests {
     use super::*;
     use crate::collab::queue::SessionRecord;
     use crate::collab::CollabSession;
-    use crate::mcp::tools::test_support::{git_ancestor_chain, test_app_with_db_path};
+    use crate::mcp::tools::test_support::{git_ancestor_chain, sole_db_mut, test_app_with_db_path};
     use std::sync::Arc;
 
     // ── test helpers ──────────────────────────────────────────────────────────
@@ -7363,9 +7363,7 @@ mod tests {
 
         // Armed after the fixture is built, so the contender interferes with
         // the abandon transaction and nothing before it.
-        let probe = Arc::get_mut(&mut app)
-            .expect("the test holds the only handle to the app")
-            .db
+        let probe = sole_db_mut(&mut app)
             .arm_busy_snapshot_once(&db_path)
             .unwrap();
 
@@ -7436,9 +7434,7 @@ mod tests {
         drive_to_implement(&app, &sid);
         age_session(&app, &sid, crate::collab::COLLAB_DEAD_SESSION_SECS + 60);
 
-        let probe = Arc::get_mut(&mut app)
-            .expect("the test holds the only handle to the app")
-            .db
+        let probe = sole_db_mut(&mut app)
             .arm_busy_snapshot_once_with(
                 &db_path,
                 "UPDATE collab_sessions SET updated_at = datetime('now')

@@ -356,6 +356,34 @@ ironmem review-diff --repo <repo> --base <base> --head <head> \
   --expand-file <path> --hunk <ordinal>
 ```
 
+The artifact is an index of every source file and hunk, then the compressed
+diff. The compressor splits a hunk wherever it trims context and renumbers the
+pieces, so a file's body hunks do not line up with its index hunks by position
+or by line numbers. Each body hunk header names the index hunk it came from,
+after the closing `@@` and before any section text:
+
+```text
+review-diff source index
+file: src/lib.rs
+  src/lib.rs#hunk-1: @@ -7,19 +7,19 @@ fn main() {
+
+review-diff compressed body
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -8,5 +8,5 @@ [src/lib.rs#hunk-1] fn main() {
+ ...
+@@ -14,5 +14,5 @@ [src/lib.rs#hunk-1] fn main() {
+ ...
+```
+
+Both body hunks above expand with `--expand-file src/lib.rs --hunk 1`. The tag
+is the index selector byte for byte, so a path Git quotes stays quoted
+(`["line\nbreak.txt"#hunk-1]`). A body hunk header without a tag means no index
+hunk of the file section it sits in holds its lines: the compressor can file a
+hunk of a path Git quotes under the file before it. The index still lists every
+source hunk.
+
 This feature currently targets review-diff ingestion; it does not compress MCP
 responses, collab output, or failure logs.
 

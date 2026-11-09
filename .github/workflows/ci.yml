@@ -151,6 +151,29 @@ jobs:
           name: ironmem-linux
           path: target/debug/ironmem
 
+      # `cargo test --workspace` above builds without `headroom-compression`,
+      # so it never runs the compressor, and the `--all-features` clippy in
+      # `check` only compiles it. The compressed body is not ours: it comes
+      # from the `headroom-core` git revision pinned in
+      # crates/ironmem/Cargo.toml. Moving that pin from 5bd2266f to 74b7ac23
+      # changed the body (hunks split and renumbered as context is trimmed)
+      # and no step in this workflow ran the compressor to notice. The
+      # integration target asserts the exact hunk headers the feature build
+      # renders, so a pin move that changes the compressor's output fails
+      # here; the unit target runs the hunk-tagging tests in the same build.
+      #
+      # Two steps, so each command reports its own exit status. Only the
+      # review-diff tests, not `--all-features` over the workspace: the
+      # feature gates no other code. Last in the job, after the smoke
+      # test and upload, so `target/debug/ironmem` is the default-feature
+      # binary whenever those steps read it. Cost: the feature build compiles
+      # `headroom-core`, tree-sitter and eight grammar crates on each runner.
+      - name: cargo test review-diff unit tests (headroom-compression)
+        run: "rustup run stable cargo test -p ironmem --features headroom-compression --lib review_diff"
+
+      - name: cargo test review-diff integration tests (headroom-compression)
+        run: "rustup run stable cargo test -p ironmem --features headroom-compression --test review_diff"
+
   build:
     name: Build Binary (macos-latest)
     runs-on: macos-latest

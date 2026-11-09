@@ -18,6 +18,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   moves from commit `5bd2266f` to `74b7ac23`, the first upstream commit on
   `rusqlite` 0.41: only one crate in a build may link SQLite, so the old pin
   kept the whole workspace on 0.32 even with the feature off.
+  The new pin changes what a `--features headroom-compression` build does in
+  two ways. The compressor now splits a hunk wherever it trims context and
+  renumbers each piece, so the hunks in an `ironmem review-diff` artifact's
+  body no longer match its index one for one: the third body hunk of a file
+  need not be index hunk 3. Each body hunk header therefore carries the
+  selector of the index hunk it came from, after the closing `@@` and before
+  any section text, as in `@@ -8,5 +8,5 @@ [src/lib.rs#hunk-1]`; `--expand-file
+  <path> --hunk <N>` opens that hunk. A body hunk with no source hunk to name
+  is left untagged. The feature build also compiles `tree-sitter`, eight
+  `tree-sitter` grammar crates and `tree-sitter-language`, none of which the
+  old pin needed. CI now runs the review-diff tests with the feature on, so a
+  later pin move that changes the compressor's output fails there.
 
 ### Changed
 
