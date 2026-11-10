@@ -793,7 +793,7 @@ pub struct HarnessProcessMonitor {
 }
 /// The monitor's name from when it watched two harnesses.
 #[deprecated(
-    note = "renamed to `HarnessProcessMonitor`; it watches every harness; removal in 0.7.0"
+    note = "renamed to `HarnessProcessMonitor`; it watches every harness; removal in 0.8.0"
 )]
 pub type TwoHarnessMonitor = HarnessProcessMonitor;
 

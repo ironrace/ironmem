@@ -50,7 +50,7 @@
 //! supervised CLI (Codex, Muse) whose every launch is an [`invocation`]
 //! tracked in [`process_tree`] and supervised by [`invocation`], with
 //! [`codex_dispatch`] and [`muse_dispatch`] supplying argv and parsing. The old `codex_process` module stays as a deprecated
-//! shim over `process_tree` until 0.7.0.
+//! shim over `process_tree` until 0.8.0.
 //!
 //! # The drawer kinds, one room
 //!
@@ -224,9 +224,9 @@ pub mod muse_dispatch;
 pub mod onboard;
 pub mod process_tree;
 /// The old name of [`process_tree`], from before Muse joined Codex as a
-/// supervised harness. Kept, deprecated, until 0.7.0.
+/// supervised harness. Kept, deprecated, until 0.8.0.
 #[deprecated(
-    note = "renamed to `process_tree`; it covers every supervised harness; removal in 0.7.0"
+    note = "renamed to `process_tree`; it covers every supervised harness; removal in 0.8.0"
 )]
 pub mod codex_process {
     /// Renamed to [`ProcessSource`]. A trait cannot be aliased on stable
@@ -235,19 +235,19 @@ pub mod codex_process {
     pub use super::process_tree::*;
 
     /// Renamed to [`ProcessSnapshot`].
-    #[deprecated(note = "renamed to `process_tree::ProcessSnapshot`; removal in 0.7.0")]
+    #[deprecated(note = "renamed to `process_tree::ProcessSnapshot`; removal in 0.8.0")]
     pub type CodexProcessSnapshot = ProcessSnapshot;
 
     /// Renamed to [`UnixProcesses`]: the type, and (below) the unit value.
-    #[deprecated(note = "renamed to `process_tree::UnixProcesses`; removal in 0.7.0")]
+    #[deprecated(note = "renamed to `process_tree::UnixProcesses`; removal in 0.8.0")]
     pub type UnixCodexProcesses = UnixProcesses;
     /// The unit value of [`UnixCodexProcesses`].
-    #[deprecated(note = "renamed to `process_tree::UnixProcesses`; removal in 0.7.0")]
+    #[deprecated(note = "renamed to `process_tree::UnixProcesses`; removal in 0.8.0")]
     #[allow(non_upper_case_globals)]
     pub const UnixCodexProcesses: UnixProcesses = UnixProcesses;
 
     /// Renamed to [`parse_processes`]: it reads every supervised harness's rows.
-    #[deprecated(note = "renamed to `process_tree::parse_processes`; removal in 0.7.0")]
+    #[deprecated(note = "renamed to `process_tree::parse_processes`; removal in 0.8.0")]
     pub fn parse_codex_processes(text: &str) -> Result<Vec<ProcessRow>, String> {
         parse_processes(text)
     }
@@ -286,11 +286,11 @@ pub use dispatch_state::DispatchState;
 pub use gate_config::{GateConfig, GateConfigState};
 pub use implementer::Implementer;
 pub use invocation::{InvocationArtifacts, InvocationRecovery};
-/// Renamed to [`InvocationArtifacts`]; kept, deprecated, until 0.7.0.
-#[deprecated(note = "renamed to `InvocationArtifacts`; removal in 0.7.0")]
+/// Renamed to [`InvocationArtifacts`]; kept, deprecated, until 0.8.0.
+#[deprecated(note = "renamed to `InvocationArtifacts`; removal in 0.8.0")]
 pub type CodexArtifacts = InvocationArtifacts;
-/// Renamed to [`InvocationRecovery`]; kept, deprecated, until 0.7.0.
-#[deprecated(note = "renamed to `InvocationRecovery`; removal in 0.7.0")]
+/// Renamed to [`InvocationRecovery`]; kept, deprecated, until 0.8.0.
+#[deprecated(note = "renamed to `InvocationRecovery`; removal in 0.8.0")]
 pub type CodexRecovery = InvocationRecovery;
 pub use lead::{lead_tick, LeadConfig, LeadReport, RepoTarget};
 pub use lineage::{AttemptOutcome, AttemptRecord, IssueStatus, RecordedAttempt};
@@ -543,7 +543,7 @@ mod tests {
     use super::*;
 
     /// The pre-Muse public names still resolve, deprecated, to the renamed
-    /// items until 0.7.0.
+    /// items until 0.8.0.
     #[test]
     #[allow(deprecated)]
     fn the_renamed_supervised_cli_items_keep_their_old_names() {

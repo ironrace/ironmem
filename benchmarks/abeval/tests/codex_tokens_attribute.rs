@@ -1,12 +1,16 @@
-use std::fs;
-use std::path::Path;
 use abeval::codex_tokens::{attribute_codex_tokens, TimeWindow};
 use chrono::{DateTime, Utc};
+use std::fs;
+use std::path::Path;
 
 fn win(start: &str, end: &str) -> TimeWindow {
     TimeWindow {
-        start: DateTime::parse_from_rfc3339(start).unwrap().with_timezone(&Utc),
-        end: DateTime::parse_from_rfc3339(end).unwrap().with_timezone(&Utc),
+        start: DateTime::parse_from_rfc3339(start)
+            .unwrap()
+            .with_timezone(&Utc),
+        end: DateTime::parse_from_rfc3339(end)
+            .unwrap()
+            .with_timezone(&Utc),
     }
 }
 
@@ -35,15 +39,32 @@ fn sums_only_matching_cwd_within_window() {
     let wt_str = wt.to_str().unwrap();
 
     // Matching session (right cwd, in window): 100/40/10 -> total 110.
-    write_rollout(&root, "rollout-a.jsonl", &rollout(wt_str, "2026-06-17T05:43:08.955Z", 100, 40, 10));
+    write_rollout(
+        &root,
+        "rollout-a.jsonl",
+        &rollout(wt_str, "2026-06-17T05:43:08.955Z", 100, 40, 10),
+    );
     // Wrong cwd: excluded.
-    write_rollout(&root, "rollout-b.jsonl", &rollout("/somewhere/else", "2026-06-17T05:43:08.955Z", 999, 0, 999));
+    write_rollout(
+        &root,
+        "rollout-b.jsonl",
+        &rollout("/somewhere/else", "2026-06-17T05:43:08.955Z", 999, 0, 999),
+    );
     // Right cwd but OUTSIDE the window (next day): excluded.
     let day2 = root.join("2026").join("06").join("18");
     fs::create_dir_all(&day2).unwrap();
-    fs::write(day2.join("rollout-c.jsonl"), rollout(wt_str, "2026-06-18T05:43:08.955Z", 500, 0, 500)).unwrap();
+    fs::write(
+        day2.join("rollout-c.jsonl"),
+        rollout(wt_str, "2026-06-18T05:43:08.955Z", 500, 0, 500),
+    )
+    .unwrap();
 
-    let usage = attribute_codex_tokens(&root, &wt, win("2026-06-17T00:00:00Z", "2026-06-17T23:59:59Z")).unwrap();
+    let usage = attribute_codex_tokens(
+        &root,
+        &wt,
+        win("2026-06-17T00:00:00Z", "2026-06-17T23:59:59Z"),
+    )
+    .unwrap();
     assert_eq!(usage.input_tokens, 60); // 100 - 40
     assert_eq!(usage.cache_read_input_tokens, 40);
     assert_eq!(usage.output_tokens, 10);
@@ -63,11 +84,24 @@ fn multiple_matching_sessions_are_summed() {
     let wt_str = wt.to_str().unwrap();
 
     // First rollout: input=100, cached=40, output=10  → net input=60, total=110
-    write_rollout(&root, "rollout-x.jsonl", &rollout(wt_str, "2026-06-17T05:00:00Z", 100, 40, 10));
+    write_rollout(
+        &root,
+        "rollout-x.jsonl",
+        &rollout(wt_str, "2026-06-17T05:00:00Z", 100, 40, 10),
+    );
     // Second rollout (same cwd, same day): input=200, cached=50, output=20 → net input=150, total=220
-    write_rollout(&root, "rollout-y.jsonl", &rollout(wt_str, "2026-06-17T06:00:00Z", 200, 50, 20));
+    write_rollout(
+        &root,
+        "rollout-y.jsonl",
+        &rollout(wt_str, "2026-06-17T06:00:00Z", 200, 50, 20),
+    );
 
-    let usage = attribute_codex_tokens(&root, &wt, win("2026-06-17T00:00:00Z", "2026-06-17T23:59:59Z")).unwrap();
+    let usage = attribute_codex_tokens(
+        &root,
+        &wt,
+        win("2026-06-17T00:00:00Z", "2026-06-17T23:59:59Z"),
+    )
+    .unwrap();
     // Corrected mapping sums both: net inputs = (100-40) + (200-50) = 60 + 150 = 210
     assert_eq!(usage.input_tokens, (100 - 40) + (200 - 50));
     assert_eq!(usage.cache_read_input_tokens, 40 + 50);
@@ -91,9 +125,17 @@ fn window_boundary_at_start_is_inclusive() {
     let wt_out_str = wt_out.to_str().unwrap();
 
     // Exactly at window.start — must be INCLUDED.
-    write_rollout(&root, "rollout-at.jsonl",   &rollout(wt_in_str,  "2026-06-17T08:00:00Z", 300, 0, 30));
+    write_rollout(
+        &root,
+        "rollout-at.jsonl",
+        &rollout(wt_in_str, "2026-06-17T08:00:00Z", 300, 0, 30),
+    );
     // One second BEFORE window.start — must be EXCLUDED.
-    write_rollout(&root, "rollout-before.jsonl", &rollout(wt_out_str, "2026-06-17T07:59:59Z", 999, 0, 999));
+    write_rollout(
+        &root,
+        "rollout-before.jsonl",
+        &rollout(wt_out_str, "2026-06-17T07:59:59Z", 999, 0, 999),
+    );
 
     let window = win("2026-06-17T08:00:00Z", "2026-06-17T23:59:59Z");
     let usage = attribute_codex_tokens(&root, &wt_in, window).unwrap();
@@ -104,7 +146,11 @@ fn window_boundary_at_start_is_inclusive() {
 
     // Confirm the before-boundary rollout is excluded.
     let before_usage = attribute_codex_tokens(&root, &wt_out, window).unwrap();
-    assert_eq!(before_usage.total(), 0, "rollout before window.start must be excluded");
+    assert_eq!(
+        before_usage.total(),
+        0,
+        "rollout before window.start must be excluded"
+    );
 }
 
 #[test]
@@ -114,6 +160,11 @@ fn zero_match_returns_zero_usage() {
     fs::create_dir_all(&root).unwrap();
     let wt = dir.path().join("wt-none");
     fs::create_dir_all(&wt).unwrap();
-    let usage = attribute_codex_tokens(&root, &wt, win("2026-06-17T00:00:00Z", "2026-06-17T23:59:59Z")).unwrap();
+    let usage = attribute_codex_tokens(
+        &root,
+        &wt,
+        win("2026-06-17T00:00:00Z", "2026-06-17T23:59:59Z"),
+    )
+    .unwrap();
     assert_eq!(usage.total(), 0);
 }
