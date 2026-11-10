@@ -4943,18 +4943,8 @@ pub(crate) mod tests {
                 }
             }
         }
+        let _reap = crate::test_fork::Reap(child);
         let child = child as u32;
-        struct Reap(u32);
-        impl Drop for Reap {
-            fn drop(&mut self) {
-                // SAFETY: our own unreaped child.
-                unsafe {
-                    libc::kill(self.0 as i32, libc::SIGKILL);
-                    libc::waitpid(self.0 as i32, std::ptr::null_mut(), 0);
-                }
-            }
-        }
-        let _reap = Reap(child);
         let started = std::time::Instant::now();
         while !std::fs::read_link(format!("/proc/{child}/cwd"))
             .is_err_and(|e| e.raw_os_error() == Some(libc::EACCES))

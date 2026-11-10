@@ -25,6 +25,13 @@
 //! it would find its own issue held. Only a controller that dies while it is
 //! spawning leaves that moment to the kernel.
 //!
+//! Only the process that took the lock unlocks it. A forked copy of that
+//! process has a copy of the guard too, and `LOCK_UN` through its copy of
+//! the descriptor would release the lock its parent still holds. So the
+//! guard remembers the pid that took the lock, and a drop in any other
+//! process only closes its copy of the file, which releases nothing while
+//! the holder has its own open.
+//!
 //! The lock lives in the common directory, which every worktree of a clone
 //! shares, so it covers controllers working one clone on one host
 //! ([`super::local_fs`] refuses a remote filesystem). The file is named by
@@ -69,6 +76,8 @@ use super::IssueRef;
 pub struct IssueLock {
     file: File,
     path: PathBuf,
+    /// The process that took the lock, and the only one that unlocks it.
+    owner: u32,
 }
 
 impl Drop for IssueLock {
@@ -76,12 +85,10 @@ impl Drop for IssueLock {
     /// releases the lock only once every copy of the descriptor is closed,
     /// and a child being spawned by another thread holds one until its exec
     /// (see the module documentation). `LOCK_UN` releases it whoever else
-    /// has the file open.
+    /// has the file open, so only the process that took the lock unlocks:
+    /// a forked copy of it only closes.
     fn drop(&mut self) {
-        // SAFETY: `file` owns a valid descriptor for the duration of the
-        // call. A failure is left to the close, which is all there was
-        // before.
-        unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+        self.unlock();
     }
 }
 
@@ -89,6 +96,21 @@ impl IssueLock {
     /// The lock file.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// What dropping the guard does before its file closes: unlocks, in
+    /// the process that took the lock, and nothing in any other.
+    fn unlock(&self) {
+        if std::process::id() != self.owner {
+            return;
+        }
+        // Tried again when a signal interrupts it. Any other failure is left
+        // to the close, which is all there was before.
+        // SAFETY: `file` owns a valid descriptor for the duration of the
+        // calls.
+        while unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) } != 0
+            && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+        {}
     }
 }
 
@@ -269,6 +291,7 @@ fn try_lock_path_with(path: &Path, after_open: &dyn Fn()) -> Result<IssueLockAtt
         let lock = IssueLock {
             file,
             path: path.to_path_buf(),
+            owner: std::process::id(),
         };
         // A lock on a file no longer at `path` (removed, or replaced, after
         // the open) excludes no one: another controller opening `path` now
@@ -440,30 +463,66 @@ mod tests {
     /// dropped and taken again.
     #[test]
     fn a_dropped_lock_is_free_while_a_forked_child_has_not_reached_its_exec() {
-        struct Reap(libc::pid_t);
-        impl Drop for Reap {
-            fn drop(&mut self) {
-                // SAFETY: our own unreaped child.
-                unsafe {
-                    libc::kill(self.0, libc::SIGKILL);
-                    libc::waitpid(self.0, std::ptr::null_mut(), 0);
-                }
-            }
-        }
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("locks/owner-repo-7.lock");
         let lock = acquired(try_lock_path(&path).unwrap());
-        // SAFETY: the child only makes an async-signal-safe call (pause)
-        // until it is killed.
+        let kept = lock.file.as_raw_fd();
+        // SAFETY: the child only makes async-signal-safe calls (alarm,
+        // close, pause) until it is killed.
         let child = unsafe { libc::fork() };
         assert!(child >= 0, "fork: {}", std::io::Error::last_os_error());
         if child == 0 {
-            loop {
-                // SAFETY: the forked child, as above.
-                unsafe { libc::pause() };
+            // SAFETY: the forked child, as above. Only the lock's
+            // descriptor is wanted.
+            unsafe {
+                crate::test_fork::keep_only(kept);
+                loop {
+                    libc::pause();
+                }
             }
         }
-        let _reap = Reap(child);
+        let _reap = crate::test_fork::Reap(child);
+        drop(lock);
+        acquired(try_lock_path(&path).unwrap());
+    }
+
+    /// A forked copy of the process has a copy of the guard as well as of
+    /// the descriptor, and `LOCK_UN` through either copy acts on the one
+    /// lock. The copy's guard must leave it alone: the lock is the
+    /// parent's until the parent drops its own.
+    #[test]
+    fn a_guard_dropped_in_a_forked_copy_of_the_process_leaves_the_parents_lock_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("locks/owner-repo-7.lock");
+        let lock = acquired(try_lock_path(&path).unwrap());
+        let kept = lock.file.as_raw_fd();
+        // SAFETY: the child makes only async-signal-safe calls (alarm,
+        // close, _exit) and the two system calls of the guard's unlock
+        // (getpid, flock), which take no lock in the process.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork: {}", std::io::Error::last_os_error());
+        if child == 0 {
+            // SAFETY: the forked child, as above.
+            unsafe {
+                crate::test_fork::keep_only(kept);
+                // All that dropping the guard does to the lock. The drop
+                // itself would also free the guard's memory, which a copy
+                // of a multi-threaded process cannot safely do.
+                lock.unlock();
+                libc::_exit(0);
+            }
+        }
+        let status = crate::test_fork::Reap(child).wait();
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "the forked copy did not exit cleanly: wait status {status}"
+        );
+        match try_lock_path(&path).unwrap() {
+            IssueLockAttempt::Held { path: held } => assert_eq!(held, path),
+            IssueLockAttempt::Acquired(_) => {
+                panic!("a forked copy of the process released the lock its parent holds")
+            }
+        }
         drop(lock);
         acquired(try_lock_path(&path).unwrap());
     }

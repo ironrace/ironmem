@@ -78,9 +78,11 @@ owner, manual run and clear refuse, and advance skip the step or cleanup.
 The refusal/report names the issue and lock path. A controller unlocks it as
 soon as its step ends, so it is free at once even while that controller is
 starting other processes; the kernel releases it when the holder exits or
-crashes. **Never delete a lock file**, even if it looks
-idle: a controller may already have opened its inode, and replacing it can
-allow two controllers to hold different files for the same issue.
+crashes. Only the process that took a lock unlocks it: a forked copy of a
+controller leaves the controller's lock held. **Never delete a lock file**,
+even if it looks idle: a controller may already have opened its inode, and
+replacing it can allow two controllers to hold different files for the same
+issue.
 
 This excludes controllers using one clone on one host. It does not coordinate
 two clones, older controllers, or hosts sharing a database. Without it,
