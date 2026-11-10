@@ -5,7 +5,11 @@ use abeval::report::build_arm_metric;
 fn build_arm_metric_folds_codex_tokens_and_rework() {
     let outcome = ArmOutcome {
         arm: abeval::arms::Arm::Ironmem,
-        usage: Usage { input_tokens: 1000, output_tokens: 200, ..Default::default() },
+        usage: Usage {
+            input_tokens: 1000,
+            output_tokens: 200,
+            ..Default::default()
+        },
         codex_usage: Usage {
             input_tokens: 60,            // uncached input
             cache_read_input_tokens: 40, // cached
@@ -33,7 +37,11 @@ fn build_arm_metric_folds_codex_tokens_and_rework() {
 fn superpowers_arm_has_zero_codex_and_rework() {
     let outcome = ArmOutcome {
         arm: abeval::arms::Arm::Superpowers,
-        usage: Usage { input_tokens: 500, output_tokens: 100, ..Default::default() },
+        usage: Usage {
+            input_tokens: 500,
+            output_tokens: 100,
+            ..Default::default()
+        },
         codex_usage: Usage::default(),
         review_rounds: 0,
         fix_commits: 0,

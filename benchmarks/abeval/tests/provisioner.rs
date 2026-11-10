@@ -25,10 +25,7 @@ fn task() -> Task {
 
 #[test]
 fn clone_argv_is_no_shell_local_and_terminated() {
-    let (program, argv) = clone_argv(
-        &PathBuf::from("/repo"),
-        &PathBuf::from("/ws/t1/ironmem"),
-    );
+    let (program, argv) = clone_argv(&PathBuf::from("/repo"), &PathBuf::from("/ws/t1/ironmem"));
     assert_eq!(program, "git");
     assert_eq!(
         argv,

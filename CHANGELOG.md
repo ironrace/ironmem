@@ -16,14 +16,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   through `libsqlite3-sys` 0.39.
   The two benchmark workspaces that link SQLite, `benchmarks/abeval` and
   `benchmarks/provbench/phase1`, are separate Cargo workspaces with their own
-  lockfiles and were still on `rusqlite` 0.31; both move to 0.41 as well, with
-  no source change. `benchmarks/provbench/baseline`'s lockfile moves `h2`,
-  `quinn-proto`, `rustls`, `rustls-webpki` and `webpki-roots` to their patched
-  releases, and `rand` from 0.9 to 0.10 with the new `quinn-proto`. The
-  `benchmarks/provbench/labeler` and `phase1` lockfiles still report
-  RUSTSEC-2025-0140 (`gix-date`) and RUSTSEC-2025-0021 (`gix-features`), which
-  need `gix` 0.77 or later in place of 0.66, and CI still audits only the root
-  lockfile.
+  lockfiles and were still on `rusqlite` 0.31; both move to 0.41 as well, a
+  move that needs no source change. `benchmarks/provbench/baseline`'s lockfile
+  moves `h2`, `quinn-proto`, `rustls`, `rustls-webpki` and `webpki-roots` to
+  their patched releases, and `rand` from 0.9 to 0.10 with the new
+  `quinn-proto`.
+  The other advisories in the five benchmark lockfiles are cleared too.
+  `benchmarks/provbench/labeler` and `phase1` move `gix` from 0.66 to 0.77,
+  which fixes RUSTSEC-2025-0140 (`gix-date`) and RUSTSEC-2025-0021
+  (`gix-features`) and replaces the unsound `faster-hex` 0.9
+  (RUSTSEC-2026-0306); the one call that changed is
+  `Tree::lookup_entry_by_path`, which no longer takes a scratch buffer. All
+  five lockfiles take `anyhow` 1.0.104 (RUSTSEC-2026-0190), `baseline` takes
+  `tokio` 1.54.1 (RUSTSEC-2026-0386), and `labeler` and `phase1` take `memmap2`
+  0.9.12 (RUSTSEC-2026-0186). `baseline` drops its `indicatif` dependency,
+  which none of its code used and which brought in the unmaintained
+  `number_prefix` (RUSTSEC-2025-0119). `cargo audit` now reports no
+  vulnerability and no warning for any of the five; the one advisory the root
+  `.cargo/audit.toml` ignore list hides in them is RUSTSEC-2024-0436 (`paste`,
+  a proc-macro that `statrs` reaches through `nalgebra` and `simba`), in
+  `baseline`, `phase1` and `scoring`, and the list's comment now names that
+  chain. CI's Security Audit job audits each benchmark lockfile as well as
+  the root one; it read only the root one before.
+  Three checks in those workspaces that were already failing are repaired:
+  `cargo fmt --check` over four of `abeval`'s test files, a clippy
+  `manual_ok_err` in a `phase1` test, and `phase1`'s `load_roundtrip` test,
+  which read gitignored corpus files absent from a fresh checkout and now reads
+  committed fixtures in the labeler's output formats.
   The optional `headroom-compression` feature's `headroom-core` git dependency
   moves from commit `5bd2266f` to `74b7ac23`, the first upstream commit on
   `rusqlite` 0.41: only one crate in a build may link SQLite, so the old pin

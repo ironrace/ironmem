@@ -20,7 +20,10 @@ fn parses_cwd_and_final_cumulative_usage() {
     // The whole point: total() equals Codex's own total_tokens (no double-count).
     assert_eq!(parsed.usage.total(), 367237);
     // started_at comes from session_meta.payload.timestamp.
-    assert_eq!(parsed.started_at.to_rfc3339(), "2026-06-17T05:43:08.955+00:00");
+    assert_eq!(
+        parsed.started_at.to_rfc3339(),
+        "2026-06-17T05:43:08.955+00:00"
+    );
 }
 
 #[test]
@@ -60,5 +63,8 @@ fn rollout_with_cached_exceeding_input_is_an_error() {
 {"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"cached_input_tokens":40,"output_tokens":2,"reasoning_output_tokens":0,"total_tokens":12}}}}
 "#;
     let err = parse_rollout(bad).unwrap_err();
-    assert!(err.to_string().to_lowercase().contains("cached"), "must name the corrupt field: {err}");
+    assert!(
+        err.to_string().to_lowercase().contains("cached"),
+        "must name the corrupt field: {err}"
+    );
 }

@@ -1,0 +1,1 @@
+{"commit_sha":"bbbb222222222222222222222222222222222222","parent_sha":"aaaa111111111111111111111111111111111111","unified_diff":"diff --git a/src/config.rs b/src/config.rs\n--- a/src/config.rs\n+++ b/src/config.rs\n@@ -1,5 +1,5 @@\n pub struct Config {\n     pub name: String,\n     pub verbose: bool,\n-    pub retries: u32,\n+    pub retries: u64,\n }\n"}
