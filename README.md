@@ -378,11 +378,17 @@ diff --git a/src/lib.rs b/src/lib.rs
 ```
 
 Both body hunks above expand with `--expand-file src/lib.rs --hunk 1`. The tag
-is the index selector byte for byte, so a path Git quotes stays quoted
-(`["line\nbreak.txt"#hunk-1]`). A body hunk header without a tag means no index
-hunk of the file section it sits in holds its lines: the compressor can file a
-hunk of a path Git quotes under the file before it. The index still lists every
-source hunk.
+is the index selector byte for byte, the same text that hunk's index entry
+starts with. It is the index's rendering of the path, not Git's. The index
+quotes and escapes a path only when it holds a control character, `"` or `\`
+(`["line\nbreak.txt"#hunk-1]`); a path Git quotes for any other reason is
+written as it is, so `é.txt`, which Git writes as `"\303\251.txt"`, is tagged
+`[é.txt#hunk-1]`. The tag names the file whose `diff --git` line opens the file
+section the hunk sits in. A body hunk header without a tag means no index hunk
+of that file holds its lines: the compressor does not read the quoted
+`diff --git` line of a path Git quotes as the start of a file, and can leave
+that file's hunks, and its `rename` lines, under the file before it. The index
+still lists every source hunk.
 
 This feature currently targets review-diff ingestion; it does not compress MCP
 responses, collab output, or failure logs.

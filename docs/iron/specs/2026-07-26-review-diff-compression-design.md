@@ -56,19 +56,34 @@ body:   @@ -8,5 +8,5 @@ [src/lib.rs#hunk-1] fn main() {
         @@ -14,5 +14,5 @@ [src/lib.rs#hunk-1] fn main() {
 ```
 
-- The tag is the index selector byte for byte, including the quoting of a path
-  Git quotes: `["line\nbreak.txt"#hunk-1]`. It is always the first thing after
-  the closing `@@`, and it always names the file section the hunk sits in.
-- A header is tagged only when exactly one index hunk of that file section
-  holds the body hunk's lines at the body hunk's line numbers. Line numbers
-  alone are not enough: the compressor does not read a quoted
-  `diff --git "a/..."` line as a file header, and when a file has more hunks
-  than it keeps it can leave the quoted file's hunk inside the section before
-  it, where the hunk fits the wrong file's ranges.
+- The tag is the index selector byte for byte, the same text that hunk's index
+  entry starts with. It is the index's rendering of the path, not Git's.
+  The index quotes and escapes a path only when it holds a control character,
+  `"` or `\` (`["line\nbreak.txt"#hunk-1]`); a path Git quotes for any other
+  reason is written as it is, so `é.txt`, which Git writes as
+  `"\303\251.txt"`, is tagged `[é.txt#hunk-1]`. The tag is always the first
+  thing after the closing `@@`.
+- The tag always names the file section the hunk sits in, and that file is
+  the index file whose source section opens with the same `diff --git` line,
+  which the compressor writes as it read it. Nothing under that line is used
+  to name the file: the compressor does not read a quoted
+  `diff --git "a/..."` line as a file header, so it prints the quoted file's
+  `similarity` and `rename` lines directly under the `diff --git` line of the
+  file before it.
+- A header is tagged only when exactly one index hunk of that file holds the
+  body hunk's lines at the body hunk's line numbers. Line numbers alone are
+  not enough: the compressor counts a quoted file's hunks as hunks of the
+  file before it, and when those are together more than it keeps it can
+  leave the quoted file's hunk inside that file's section, where the hunk
+  fits the wrong file's ranges.
+- Tagging reads each source file once, when its section opens in the body, and
+  finds a body hunk's place in it by the hunk's first old and new line
+  numbers, so the work is linear in the size of the source plus the body.
 - Anything else is left exactly as the compressor wrote it. An untagged header
   means no source hunk was found, never a guess. Untagged cases: a hunk filed
   under the wrong file as above, a path the index lists twice (a type change is
-  a deletion and a creation of one path), and combined-diff sections
+  a deletion and a creation of one path, under one `diff --git` line), and
+  combined-diff sections
   (`diff --cc`, `@@@`), which the index does not parse and neither supported
   source (`<base>...<head>`, `HEAD`) produces.
 - Git's own section text can start with `[` (a CSS attribute selector under the
@@ -157,5 +172,9 @@ Tests will cover:
 
 The final validation runs the feature-enabled Rust tests plus the project's
 standard formatting, Clippy, and workspace-test gates. CI runs the
-feature-enabled review-diff tests on every push, because the compressed body
-comes from the pinned dependency and a pin move can change it.
+feature-enabled review-diff tests on every pull request that targets `main` or
+`master` and on every push to those branches, because the compressed body
+comes from the pinned dependency and a pin move can change it. Those tests
+assert the hunk headers and tags, file sections and changed lines of their
+fixtures' bodies, so they fail on a change to that content, not on every
+change to the compressor's output.

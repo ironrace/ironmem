@@ -19,10 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lockfiles and were still on `rusqlite` 0.31; both move to 0.41 as well, with
   no source change. `benchmarks/provbench/baseline`'s lockfile moves `h2`,
   `quinn-proto`, `rustls`, `rustls-webpki` and `webpki-roots` to their patched
-  releases. The `benchmarks/provbench/labeler` and `phase1` lockfiles still
-  report RUSTSEC-2025-0140 (`gix-date`) and RUSTSEC-2025-0021
-  (`gix-features`), which need `gix` 0.77 or later in place of 0.66, and CI
-  still audits only the root lockfile.
+  releases, and `rand` from 0.9 to 0.10 with the new `quinn-proto`. The
+  `benchmarks/provbench/labeler` and `phase1` lockfiles still report
+  RUSTSEC-2025-0140 (`gix-date`) and RUSTSEC-2025-0021 (`gix-features`), which
+  need `gix` 0.77 or later in place of 0.66, and CI still audits only the root
+  lockfile.
   The optional `headroom-compression` feature's `headroom-core` git dependency
   moves from commit `5bd2266f` to `74b7ac23`, the first upstream commit on
   `rusqlite` 0.41: only one crate in a build may link SQLite, so the old pin
@@ -38,7 +39,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is left untagged. The feature build also compiles `tree-sitter`, eight
   `tree-sitter` grammar crates and `tree-sitter-language`, none of which the
   old pin needed. CI now runs the review-diff tests with the feature on, so a
-  later pin move that changes the compressor's output fails there.
+  later pin move fails there if it changes what those tests assert about their
+  fixtures' bodies: the hunk headers and tags, the file section each hunk sits
+  in, and the changed lines. A change to the compressor's output that leaves
+  those alone still passes.
 
 ### Changed
 

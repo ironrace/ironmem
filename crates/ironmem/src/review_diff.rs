@@ -1,5 +1,7 @@
 //! Deterministic Git diff artifacts for bounded review ingestion.
 
+#[cfg(any(feature = "headroom-compression", test))]
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -596,31 +598,40 @@ fn estimated_tokens(bytes: usize) -> usize {
 ///
 /// A header is tagged only when exactly one source hunk of the file section
 /// it sits in holds the body hunk's lines at the body hunk's line numbers.
-/// Line numbers alone are not enough: the compressor does not read a quoted
-/// `diff --git "a/..."` line as a file header and can leave that file's hunks
-/// inside the section before it, where they fit the wrong file's ranges.
-/// Everything else is returned byte for byte, so an untagged header means
-/// "no source hunk found", never a guess.
+/// The file is the one whose `diff --git` line opens the section, a line the
+/// compressor writes as it read it. Nothing under that line names the file:
+/// the compressor does not read a quoted `diff --git "a/..."` line as a file
+/// header, so it prints that file's `rename` lines in the section before it
+/// and can leave that file's hunks there too, where they fit the wrong
+/// file's line numbers. Everything else is returned byte for byte, so an
+/// untagged header means "no source hunk found", never a guess.
 ///
 /// Combined-diff headers (`@@@`) and `diff --cc` / `diff --combined` file
 /// sections are left untagged: the source index parses neither, so there is
 /// no selector to give them. `git diff <base>...<head>` and `git diff HEAD`
 /// do not write them.
+///
+/// The work is linear in the size of `body` plus `source`: each source file
+/// is read once, when its section opens, and each body hunk is compared with
+/// source lines once per source hunk that reaches its first line's numbers.
 #[cfg(any(feature = "headroom-compression", test))]
 fn tag_body_hunks(body: &str, source: &[ParsedFile]) -> String {
     let lines = body.split('\n').collect::<Vec<_>>();
+    let files = taggable_files(source);
     let mut tagged = String::with_capacity(body.len());
     // The source hunks of the file section being read; none before the first
     // section and in a section with no file to tag from.
-    let mut section_hunks = Vec::new();
+    let mut section = SectionHunks::default();
     for (index, line) in lines.iter().enumerate() {
         if index > 0 {
             tagged.push('\n');
         }
         if is_body_section_start(line) {
-            section_hunks = body_section_hunks(&lines[index..], source);
+            section = files
+                .get(line)
+                .map_or_else(SectionHunks::default, |file| SectionHunks::read(file));
         }
-        match body_hunk_tag(&section_hunks, &lines[index..]) {
+        match section.tag(&lines[index..]) {
             Some((selector, ranges_end)) => {
                 tagged.push_str(&line[..ranges_end]);
                 tagged.push_str(" [");
@@ -641,59 +652,125 @@ fn is_body_section_start(line: &str) -> bool {
         .any(|prefix| line.starts_with(prefix))
 }
 
-/// The source hunks, each with its header's ranges, of the indexed file a
-/// body file section belongs to. `section` starts at the section's `diff`
-/// line; the path is read the way the index reads it.
+/// The indexed files a body file section can be tagged from, by the
+/// `diff --git` line that opens their section in the source.
 ///
-/// Empty for a combined section, a path the index does not list, and a path
-/// it lists twice: a type change is a deletion and a creation of one path,
-/// both render the same selectors, and expansion opens the first.
+/// A file is left out when another has its `diff --git` line or its path. A
+/// type change is a deletion and a creation of one path under one such line;
+/// both index entries render the same selectors, and expansion opens the
+/// first. A combined section's line is not a `diff --git` line, so it finds
+/// no file here.
 #[cfg(any(feature = "headroom-compression", test))]
-fn body_section_hunks<'a>(
-    section: &[&str],
-    source: &'a [ParsedFile],
-) -> Vec<(HunkRanges, &'a ParsedHunk)> {
-    if !section
-        .first()
-        .is_some_and(|line| line.starts_with("diff --git "))
-    {
-        return Vec::new();
+fn taggable_files(source: &[ParsedFile]) -> HashMap<&str, &ParsedFile> {
+    let mut paths = HashMap::<&str, usize>::new();
+    let mut diff_lines = HashMap::<&str, usize>::new();
+    for file in source {
+        *paths.entry(file.public.path.as_str()).or_default() += 1;
+        *diff_lines.entry(diff_line(file)).or_default() += 1;
     }
-    let end = section[1..]
+    source
         .iter()
-        .position(|line| is_body_section_start(line))
-        .map_or(section.len(), |next| next + 1);
-    let Some(path) = stable_path(&section[..end]) else {
-        return Vec::new();
-    };
-    let mut listed = source.iter().filter(|file| file.public.path == path);
-    let (Some(file), None) = (listed.next(), listed.next()) else {
-        return Vec::new();
-    };
-    file.hunks
-        .iter()
-        .filter_map(|hunk| Some((parse_hunk_header(&hunk.public.header)?.0, hunk)))
+        .filter(|file| paths[file.public.path.as_str()] == 1 && diff_lines[diff_line(file)] == 1)
+        .map(|file| (diff_line(file), file))
         .collect()
 }
 
-/// The selector to tag the body hunk header at `lines[0]` with, and the byte
-/// offset of the end of its closing `@@`, where the tag goes. `None` unless
-/// exactly one of `section_hunks` holds the body hunk.
+/// The line that opens a file's section in the source, as the compressor
+/// reads it: without its newline.
 #[cfg(any(feature = "headroom-compression", test))]
-fn body_hunk_tag<'a>(
-    section_hunks: &[(HunkRanges, &'a ParsedHunk)],
-    lines: &[&str],
-) -> Option<(&'a str, usize)> {
-    let (ranges, ranges_end) = parse_hunk_header(lines.first()?)?;
-    let body = hunk_lines(&lines[1..], ranges)?;
-    let mut holding = section_hunks
-        .iter()
-        .filter(|(within, hunk)| source_hunk_holds(*within, &hunk.source, ranges, body));
-    let (_, hunk) = holding.next()?;
-    holding
-        .next()
-        .is_none()
-        .then_some((hunk.public.selector.as_str(), ranges_end))
+fn diff_line(file: &ParsedFile) -> &str {
+    file.section.split('\n').next().unwrap_or_default()
+}
+
+/// The source hunks of the indexed file a body file section belongs to, read
+/// once for every body hunk of the section.
+#[cfg(any(feature = "headroom-compression", test))]
+#[derive(Default)]
+struct SectionHunks<'a> {
+    hunks: Vec<SourceHunk<'a>>,
+    /// Where the source reaches each pair of old and new line numbers: the
+    /// hunk, by its place in `hunks`, and the place in its `lines` of the
+    /// line that starts there. Hunks that Git wrote never share a pair.
+    starts: HashMap<(usize, usize), Vec<(usize, usize)>>,
+}
+
+#[cfg(any(feature = "headroom-compression", test))]
+struct SourceHunk<'a> {
+    ranges: HunkRanges,
+    selector: &'a str,
+    /// The text after the header line, split as a body is.
+    lines: Vec<&'a str>,
+}
+
+#[cfg(any(feature = "headroom-compression", test))]
+impl<'a> SectionHunks<'a> {
+    fn read(file: &'a ParsedFile) -> Self {
+        let mut section = Self::default();
+        for hunk in &file.hunks {
+            let Some((ranges, _)) = parse_hunk_header(&hunk.public.header) else {
+                continue;
+            };
+            let lines = hunk.source.split('\n').skip(1).collect::<Vec<_>>();
+            let (mut old, mut new) = (ranges.old_start, ranges.new_start);
+            for (index, line) in lines.iter().enumerate() {
+                // Nothing after a line that is not hunk content is numbered.
+                let Some(step) = hunk_line_advance(line) else {
+                    break;
+                };
+                // A `\` line is on neither side, so the line after it starts
+                // at the same numbers; `tag` steps back over those.
+                if step != (0, 0) {
+                    section
+                        .starts
+                        .entry((old, new))
+                        .or_default()
+                        .push((section.hunks.len(), index));
+                }
+                old = old.saturating_add(step.0);
+                new = new.saturating_add(step.1);
+            }
+            section.hunks.push(SourceHunk {
+                ranges,
+                selector: &hunk.public.selector,
+                lines,
+            });
+        }
+        section
+    }
+
+    /// The selector to tag the body hunk header at `lines[0]` with, and the
+    /// byte offset of the end of its closing `@@`, where the tag goes. `None`
+    /// unless exactly one source hunk holds the body hunk: its header's
+    /// ranges contain the body hunk's, and its text has the body hunk's
+    /// lines at the body hunk's line numbers.
+    fn tag(&self, lines: &[&str]) -> Option<(&'a str, usize)> {
+        let (ranges, ranges_end) = parse_hunk_header(lines.first()?)?;
+        let body = hunk_lines(&lines[1..], ranges)?;
+        // `hunk_lines` ends on a line that is on a side, so `body` has one
+        // and the `\` lines before its first share that line's numbers.
+        let markers = body
+            .iter()
+            .take_while(|line| line.starts_with('\\'))
+            .count();
+        let mut holding = self
+            .starts
+            .get(&(ranges.old_start, ranges.new_start))?
+            .iter()
+            .filter(|&&(hunk, line)| {
+                let hunk = &self.hunks[hunk];
+                hunk.ranges.contains(ranges)
+                    && line
+                        .checked_sub(markers)
+                        .is_some_and(|start| hunk.lines[start..].starts_with(body))
+            })
+            .map(|&(hunk, _)| hunk);
+        let hunk = holding.next()?;
+        // One hunk can hold the lines at two places only where its line
+        // numbers have stopped counting, at `usize::MAX`.
+        holding
+            .all(|other| other == hunk)
+            .then_some((self.hunks[hunk].selector, ranges_end))
+    }
 }
 
 /// The lines a two-way hunk header covers on each side. `start` is the first
@@ -797,30 +874,6 @@ fn hunk_lines<'a, 'b>(lines: &'a [&'b str], ranges: HunkRanges) -> Option<&'a [&
         taken += 1;
     }
     (taken > 0 && old == ranges.old_len && new == ranges.new_len).then(|| &lines[..taken])
-}
-
-/// Whether the source hunk with header ranges `within` and text `source`
-/// (its header line, then its lines) holds `body` at the line numbers
-/// `ranges` gives it.
-#[cfg(any(feature = "headroom-compression", test))]
-fn source_hunk_holds(within: HunkRanges, source: &str, ranges: HunkRanges, body: &[&str]) -> bool {
-    // The ranges rule most source hunks out before their text is read.
-    if !within.contains(ranges) {
-        return false;
-    }
-    let lines = source.split('\n').skip(1).collect::<Vec<_>>();
-    let (mut old, mut new) = (within.old_start, within.new_start);
-    for (index, line) in lines.iter().enumerate() {
-        if (old, new) == (ranges.old_start, ranges.new_start) && lines[index..].starts_with(body) {
-            return true;
-        }
-        let Some((old_step, new_step)) = hunk_line_advance(line) else {
-            return false;
-        };
-        old = old.saturating_add(old_step);
-        new = new.saturating_add(new_step);
-    }
-    false
 }
 
 #[cfg(test)]
@@ -973,6 +1026,269 @@ mod tests {
         assert_eq!(parsed.len(), 2);
 
         assert_eq!(tag_body_hunks(source, &parsed), source);
+    }
+
+    /// The preamble Git writes for a renamed file whose path it quotes.
+    const QUOTED_RENAME: &str = "diff --git \"a/docs/r\\303\\251sum\\303\\251.md\" \"b/docs/r\\303\\251sum\\303\\251-old.md\"\n\
+                                 similarity index 90%\n\
+                                 rename from \"docs/r\\303\\251sum\\303\\251.md\"\n\
+                                 rename to \"docs/r\\303\\251sum\\303\\251-old.md\"\n\
+                                 --- \"a/docs/r\\303\\251sum\\303\\251.md\"\n\
+                                 +++ \"b/docs/r\\303\\251sum\\303\\251-old.md\"\n";
+
+    #[test]
+    fn a_body_section_is_matched_by_its_diff_line_not_by_rename_lines_inside_it() {
+        let own = [hunk("a", 1, 13, &[4, 10]), hunk("a", 40, 46, &[43])];
+        let source = file_section("docs/a.md", &own) + QUOTED_RENAME + &hunk("r", 20, 26, &[23]);
+        let parsed = parse_unified_diff(&source);
+        assert_eq!(
+            parsed
+                .iter()
+                .map(|file| file.public.path.as_str())
+                .collect::<Vec<_>>(),
+            ["docs/a.md", "docs/résumé-old.md"]
+        );
+
+        // The compressor does not read the quoted `diff --git` line as a file
+        // header. It prints the renamed file's `similarity` and `rename`
+        // lines right after the `diff --git` line of the file before it, and
+        // past its hunk cap it sorts the renamed file's hunk in among that
+        // file's own.
+        let rename_lines = QUOTED_RENAME
+            .lines()
+            .filter(|line| line.starts_with("similarity ") || line.starts_with("rename "))
+            .map(|line| format!("{line}\n"))
+            .collect::<String>();
+        let body = format!(
+            "diff --git a/docs/a.md b/docs/a.md\n{rename_lines}--- a/docs/a.md\n+++ b/docs/a.md\n{}{}{}{}",
+            hunk("a", 2, 6, &[4]),
+            hunk("a", 8, 12, &[10]),
+            hunk("r", 21, 25, &[23]),
+            hunk("a", 41, 45, &[43]),
+        );
+
+        assert_eq!(
+            hunk_headers(&tag_body_hunks(&body, &parsed)),
+            [
+                "@@ -2,5 +2,5 @@ [docs/a.md#hunk-1]",
+                "@@ -8,5 +8,5 @@ [docs/a.md#hunk-1]",
+                // The renamed file's hunk, under a section that is not its own.
+                "@@ -21,5 +21,5 @@",
+                "@@ -41,5 +41,5 @@ [docs/a.md#hunk-2]",
+            ]
+        );
+
+        // Under the cap the compressor keeps the quoted `diff --git` line,
+        // as a line of the hunk before it. The renamed file's hunks then
+        // follow their own section line and carry their own selector.
+        let body = format!(
+            "diff --git a/docs/a.md b/docs/a.md\n{rename_lines}--- a/docs/a.md\n+++ b/docs/a.md\n{}{}{QUOTED_RENAME}{}",
+            hunk("a", 2, 6, &[4]),
+            own[1],
+            hunk("r", 21, 25, &[23]),
+        );
+
+        assert_eq!(
+            hunk_headers(&tag_body_hunks(&body, &parsed)),
+            [
+                "@@ -2,5 +2,5 @@ [docs/a.md#hunk-1]",
+                "@@ -40,7 +40,7 @@ [docs/a.md#hunk-2]",
+                "@@ -21,5 +21,5 @@ [docs/résumé-old.md#hunk-1]",
+            ]
+        );
+    }
+
+    #[test]
+    fn body_hunks_of_one_path_under_two_diff_lines_stay_untagged() {
+        // Two index entries render `new.txt#hunk-1` and expansion opens the
+        // first, so neither section's hunk may claim that selector, though
+        // each `diff --git` line is in the index once.
+        let renamed = "diff --git a/old.txt b/new.txt\nrename from old.txt\nrename to new.txt\n--- a/old.txt\n+++ b/new.txt\n"
+            .to_owned()
+            + &hunk("renamed", 1, 7, &[4]);
+        let source = renamed + &file_section("new.txt", &[hunk("plain", 1, 7, &[4])]);
+        let parsed = parse_unified_diff(&source);
+        assert_eq!(
+            parsed
+                .iter()
+                .map(|file| file.public.hunks[0].selector.as_str())
+                .collect::<Vec<_>>(),
+            ["new.txt#hunk-1", "new.txt#hunk-1"]
+        );
+
+        assert_eq!(tag_body_hunks(&source, &parsed), source);
+    }
+
+    #[test]
+    fn body_hunks_under_a_diff_line_two_index_files_open_with_stay_untagged() {
+        // Git does not write this: one `diff --git` line over two paths.
+        // The line then names neither file, and the hunk is in both.
+        let section = |path: &str| {
+            format!(
+                "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/{path}\n{}",
+                hunk("same", 1, 7, &[4])
+            )
+        };
+        let parsed = parse_unified_diff(&(section("one.txt") + &section("two.txt")));
+        assert_eq!(
+            parsed
+                .iter()
+                .map(|file| file.public.path.as_str())
+                .collect::<Vec<_>>(),
+            ["one.txt", "two.txt"]
+        );
+        let body = section("one.txt");
+
+        assert_eq!(tag_body_hunks(&body, &parsed), body);
+    }
+
+    #[test]
+    fn a_body_hunk_that_opens_on_a_no_newline_marker_is_tagged() {
+        // The marker is on neither side, so the body hunk starts at the
+        // numbers of the line after it: old line 3, new line 2.
+        let source = "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n\
+                      @@ -1,3 +1,3 @@\n one\n-two\n\\ No newline at end of file\n+TWO\n three\n";
+        let parsed = parse_unified_diff(source);
+        let body = "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n\
+                    @@ -3 +2,2 @@\n\\ No newline at end of file\n+TWO\n three\n";
+
+        assert_eq!(
+            hunk_headers(&tag_body_hunks(body, &parsed)),
+            ["@@ -3 +2,2 @@ [a.txt#hunk-1]"]
+        );
+        // The same lines after a different marker are not the source's.
+        let other = body.replace("No newline at end of file", "Some other marker");
+        assert_eq!(tag_body_hunks(&other, &parsed), other);
+    }
+
+    #[test]
+    fn source_text_after_a_line_that_is_not_hunk_content_gives_no_tag() {
+        let source = "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n\
+                      @@ -1,4 +1,4 @@\n one\nnot a hunk line\n two\n-three\n+THREE\n four\n";
+        let parsed = parse_unified_diff(source);
+        let section =
+            |hunk: &str| format!("diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n{hunk}");
+        let after = section("@@ -2,3 +2,3 @@\n two\n-three\n+THREE\n four\n");
+
+        assert_eq!(tag_body_hunks(&after, &parsed), after);
+        assert_eq!(
+            hunk_headers(&tag_body_hunks(&section("@@ -1 +1 @@\n one\n"), &parsed)),
+            ["@@ -1 +1 @@ [a.txt#hunk-1]"]
+        );
+    }
+
+    #[test]
+    fn a_body_hunk_one_source_hunk_holds_at_two_places_is_tagged() {
+        // Line numbers stop counting at `usize::MAX`, so both source lines
+        // start at the same numbers and each holds the one-line body hunk.
+        // That is still one source hunk.
+        let last = usize::MAX;
+        let section =
+            |hunk: String| format!("diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n{hunk}");
+        let parsed = parse_unified_diff(&section(format!(
+            "@@ -{last},2 +{last},2 @@\n same\n same\n"
+        )));
+        let body = section(format!("@@ -{last} +{last} @@\n same\n"));
+
+        assert_eq!(
+            hunk_headers(&tag_body_hunks(&body, &parsed)),
+            [format!("@@ -{last} +{last} @@ [a.txt#hunk-1]").as_str()]
+        );
+    }
+
+    #[test]
+    fn a_body_hunk_claiming_a_blank_line_after_its_source_hunk_stays_untagged() {
+        let source = file_section("a.txt", &[hunk("a", 1, 7, &[4])]);
+        let parsed = parse_unified_diff(&source);
+        // Under `diff.suppressBlankEmpty` a blank context line is an empty
+        // line. This body claims one as line 8, after the last line of the
+        // source hunk, where the source text has only its final newline.
+        let body = file_section(
+            "a.txt",
+            &["@@ -3,6 +3,6 @@\n a line 3\n-a line 4 old\n+a line 4 new\n a line 5\n a line 6\n a line 7\n\n".to_owned()],
+        );
+
+        assert_eq!(tag_body_hunks(&body, &parsed), body);
+        // Without the claimed line 8 the same hunk is the source hunk's.
+        let within = file_section("a.txt", &[hunk("a", 3, 7, &[4])]);
+        assert_eq!(
+            hunk_headers(&tag_body_hunks(&within, &parsed)),
+            ["@@ -3,5 +3,5 @@ [a.txt#hunk-1]"]
+        );
+    }
+
+    #[test]
+    fn a_body_hunk_past_the_lines_its_source_header_counts_stays_untagged() {
+        // A source header that counts three lines a side, over text that
+        // runs on for two more: lines 4 and 5 are not in the hunk the index
+        // lists, whatever follows it in the source.
+        let understated = file_section(
+            "a.txt",
+            &["@@ -1,3 +1,3 @@\n a line 1\n-a line 2 old\n+a line 2 new\n a line 3\n a line 4\n a line 5\n".to_owned()],
+        );
+        let parsed = parse_unified_diff(&understated);
+        let body = file_section(
+            "a.txt",
+            &["@@ -4,2 +4,2 @@\n a line 4\n a line 5\n".to_owned()],
+        );
+
+        assert_eq!(tag_body_hunks(&body, &parsed), body);
+        let within = file_section(
+            "a.txt",
+            &["@@ -2,2 +2,2 @@\n-a line 2 old\n+a line 2 new\n a line 3\n".to_owned()],
+        );
+        assert_eq!(
+            hunk_headers(&tag_body_hunks(&within, &parsed)),
+            ["@@ -2,2 +2,2 @@ [a.txt#hunk-1]"]
+        );
+    }
+
+    #[test]
+    fn every_piece_of_one_large_source_hunk_is_tagged_from_a_single_read_of_it() {
+        // A regenerated lockfile: one source hunk the compressor cuts into
+        // thousands of pieces. Piece `p` keeps lines `6p+1..=6p+5`, whose
+        // third line changed; the compressor dropped line `6p+6`.
+        //
+        // Sized so that reading the source hunk again for each piece is
+        // 20,000 passes over 120,000 lines: that took this test 109 seconds
+        // in a debug build, against a fraction of a second for one pass. No
+        // time is asserted; a test that runs for minutes is the signal.
+        const PIECES: usize = 20_000;
+        let lines = PIECES * 6;
+        let mut source_hunk = format!("@@ -1,{lines} +1,{lines} @@\n");
+        let mut pieces = String::new();
+        for piece in 0..PIECES {
+            let first = piece * 6 + 1;
+            pieces.push_str(&format!("@@ -{first},5 +{first},5 @@\n"));
+            for line in first..first + 6 {
+                let text = if line == first + 2 {
+                    format!("-lock line {line} old\n+lock line {line} new\n")
+                } else {
+                    format!(" lock line {line}\n")
+                };
+                source_hunk.push_str(&text);
+                if line < first + 5 {
+                    pieces.push_str(&text);
+                }
+            }
+        }
+        let parsed = parse_unified_diff(&file_section("Cargo.lock", &[source_hunk]));
+        assert_eq!(parsed[0].public.hunks.len(), 1);
+        let body = file_section("Cargo.lock", &[pieces]);
+
+        let tagged = tag_body_hunks(&body, &parsed);
+
+        let headers = hunk_headers(&tagged);
+        assert_eq!(headers.len(), PIECES);
+        assert_eq!(headers[0], "@@ -1,5 +1,5 @@ [Cargo.lock#hunk-1]");
+        assert_eq!(
+            headers[PIECES - 1],
+            format!("@@ -{0},5 +{0},5 @@ [Cargo.lock#hunk-1]", lines - 5)
+        );
+        assert!(headers
+            .iter()
+            .all(|header| header.ends_with(" @@ [Cargo.lock#hunk-1]")));
+        assert_eq!(tagged.replace(" [Cargo.lock#hunk-1]", ""), body);
     }
 
     #[test]
