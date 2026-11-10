@@ -2716,9 +2716,11 @@ pub(crate) mod contract_tests {
     /// `sleep`, waits until the identity file records the probe as an
     /// enrolled descendant (which takes a sample that saw the root), then
     /// kills it. A signal from the tracker itself, not a guess at how long
-    /// a sample takes under load. Exits 97 if it never comes.
+    /// a sample takes under load. Exits 97 if it never comes. The probe
+    /// sleeps for longer than the wait (6000 turns of at least 10 ms), so
+    /// it is there to be recorded for all of it.
     pub(crate) fn await_first_sample() -> &'static str {
-        "sleep 30 & probe=$!\n\
+        "sleep 120 & probe=$!\n\
          sampled=0\n\
          for _ in $(seq 1 6000); do\n\
          if grep -q \"\\\"pid\\\":$probe,\" \"$IRONMEM_TEST_IDENTITY_PATH\" 2>/dev/null; \
