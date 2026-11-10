@@ -53,6 +53,92 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unnamed invocation directories are opportunistically pruned after 14 days,
   keeping the named/current invocation. This is not a guaranteed deletion time.
 
+- **A new Autopilot issue branch has no upstream.** Before, an issue branch
+  cut from a remote-tracking `--base` such as `origin/main` tracked it, so
+  with `push.default=upstream` a bare `git push` from the issue branch went to
+  `main`. Now the branch is created at the resolved sha with `--no-track`, so
+  it no longer tracks the base and a bare `git push` cannot reach the base
+  through an upstream; other push settings (`push.default=matching` or
+  `current`, a `remote.<name>.push` refspec) can still push without naming
+  anything. Push an issue branch by naming the remote and the branch (`git
+  push <remote> <branch>`); the implementer's goal condition now says so,
+  naming the remote whose push URL is the issue's GitHub repository, else
+  (skipping any remote that pushes only to another GitHub repository) the one
+  already tracking the branch, else `origin` if configured, else the only one
+  left, and no remote when none of those applies; a run warns, naming the
+  remotes, when none pushes to the issue's repository but some push to
+  another. Existing branches keep whatever upstream they have; remove it with
+  `git branch --unset-upstream <branch>`.
+- **Existing setups with `commit.gpgsign` on now get a failed attempt when an
+  implementer's commits are unsigned, for Claude as well as Codex and Muse.**
+  Before, such a run could succeed. Make sure the signing key or agent is
+  reachable from wherever the Lead runs. To stop the check on one issue
+  branch, turn `commit.gpgsign` off, then run `git config
+  branch.<branch>.ironmemSigning false` in the repo. To stop it on every
+  branch, turn `commit.gpgsign` off, then unset the repository-wide
+  `ironmem.autopilotSigning` and each branch's `ironmemSigning`. See
+  "Commit signing" in `docs/AUTOPILOT.md`.
+- **An operator's own `codex exec` or `muse exec --output-schema` session no
+  longer stalls Autopilot.** A `ps` row now counts as an ambiguous Autopilot
+  invocation only when it carries an Autopilot-shaped marker path.
+- **A dispatch into an invocation directory that already has a process
+  identity is refused** instead of spawning a second process into it.
+- **The Codex and Muse implementers skip relative `PATH` entries** (such as
+  `.`) when finding their binary. They run in the issue worktree, where a
+  relative entry would find a file in the repository being worked on. So do
+  the Claude implementer and the Codex and Muse reviewers.
+- **Resuming an issue branch with no recorded cut now records the commit the
+  branch was created from** (from its reflog, or else its merge base with
+  `--base`), and refuses the run if neither can be found or that merge base
+  is the branch's own tip while it has unpushed commits. A new branch's cut
+  is recorded before the branch is created, with the creating run's own token
+  in `branch.<branch>.ironmemCutOwner`. It is never taken back from a branch
+  that exists, nor when another controller has recorded the same value since,
+  and a run whose cut was taken back while its add made the branch records
+  it again, so a branch is not left without one. A held-lock error now names
+  the lock file and its age. Cut and signing-flag writes run git in the C
+  locale, so a held lock is recognised in any locale, and SHA-256
+  repositories can provision issue worktrees.
+- **Library: `Worktree::cut` is a `CommitSha`**, a full commit object name
+  (40 or 64 hex digits) checked where it is made, instead of a `String`. It
+  derefs to `str`.
+- **Library: supervised-CLI types renamed.** `CodexArtifacts` is now
+  `InvocationArtifacts`, `CodexRecovery` is `InvocationRecovery`,
+  `CodexDispatcher` is `CliDispatcher::resolve(Implementer::Codex)` (the old
+  type and its argument-free `resolve()` remain as a deprecated wrapper),
+  `registry::TwoHarnessMonitor` is now `HarnessProcessMonitor`, and
+  the `codex_process` module is `process_tree`, where `parse_codex_processes`,
+  `CodexProcessSnapshot`, `CodexProcessSource` and `UnixCodexProcesses` are
+  `parse_processes`, `ProcessSnapshot`, `ProcessSource` and `UnixProcesses`.
+  The old names stay, deprecated, until 0.8.0. These changes have no alias
+  and break a caller at compile time: the `codex_artifacts` field of
+  `DispatchSpec`, `DispatchState` and `ClearedDispatch` is
+  `invocation_artifacts` (the stored and `--json` key is still
+  `codex_artifacts`); `HarnessSnapshots::codex` is `processes`; `Worktree` has
+  a new required field, `cut`; `TurnPromptInputs` has a new required field,
+  `remote` (an `Option<&str>`: the remote the goal condition's push names,
+  `None` for none); `DispatchState` has new required fields `session_model`,
+  `resume_refusals` and `signing_held`, and `DispatchOutcome` a new required
+  field `session_refusal`; `BudgetLedgerEntry` has a new field
+  `spend_reservations` (reserved ceilings are now recorded per issue, so
+  one its controller died holding is released by the next run); the new `Implementer::Muse` variant breaks
+  exhaustive matches on `Implementer`; `dispatch_state`'s
+  `upsert_dispatch_state_if_unchanged`, `dispatch_state_is` and
+  `clear_dispatch_state_if_unchanged` are removed (the claim
+  compare-and-set functions replace them); `codex_dispatch`'s supervision moved to `invocation`,
+  where `prepare_artifacts`, `has_launch_failure_record`,
+  `has_valid_exit_record` and `recover_artifacts` keep their names,
+  `run_codex` is `run_supervised`, and `run_codex_bounded`, `read_artifacts`
+  and `dispatch_timeout` are no longer public; and `codex_dispatch` no longer
+  exports `CODEX_DISPATCH_TIMEOUT_SECS`, `CODEX_VERDICT_JSON_SCHEMA` or
+  `build_argv`.
+- **GitHub releases now carry their version's `CHANGELOG.md` section as the
+  description.** Until now the release workflow published every release with
+  an empty body. `scripts/release_notes.py` extracts the tag's
+  `## [X.Y.Z]` section, and a tag without one fails before the builds start.
+  A section over GitHub's 125,000-character limit is cut at a line and links
+  to the full CHANGELOG.
+
 ### Added
 
 - **Muse Code as an Autopilot implementer (#366).** `autopilot run` and
@@ -285,94 +371,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`review::build_argv` ends in `-`), as the Codex implementer does.
   The day's dollar total includes in-flight dispatch reservations, so
   it can read higher than the settled spend while a dispatch runs.
-
-### Changed
-
-- **A new Autopilot issue branch has no upstream.** Before, an issue branch
-  cut from a remote-tracking `--base` such as `origin/main` tracked it, so
-  with `push.default=upstream` a bare `git push` from the issue branch went to
-  `main`. Now the branch is created at the resolved sha with `--no-track`, so
-  it no longer tracks the base and a bare `git push` cannot reach the base
-  through an upstream; other push settings (`push.default=matching` or
-  `current`, a `remote.<name>.push` refspec) can still push without naming
-  anything. Push an issue branch by naming the remote and the branch (`git
-  push <remote> <branch>`); the implementer's goal condition now says so,
-  naming the remote whose push URL is the issue's GitHub repository, else
-  (skipping any remote that pushes only to another GitHub repository) the one
-  already tracking the branch, else `origin` if configured, else the only one
-  left, and no remote when none of those applies; a run warns, naming the
-  remotes, when none pushes to the issue's repository but some push to
-  another. Existing branches keep whatever upstream they have; remove it with
-  `git branch --unset-upstream <branch>`.
-- **Existing setups with `commit.gpgsign` on now get a failed attempt when an
-  implementer's commits are unsigned, for Claude as well as Codex and Muse.**
-  Before, such a run could succeed. Make sure the signing key or agent is
-  reachable from wherever the Lead runs. To stop the check on one issue
-  branch, turn `commit.gpgsign` off, then run `git config
-  branch.<branch>.ironmemSigning false` in the repo. To stop it on every
-  branch, turn `commit.gpgsign` off, then unset the repository-wide
-  `ironmem.autopilotSigning` and each branch's `ironmemSigning`. See
-  "Commit signing" in `docs/AUTOPILOT.md`.
-- **An operator's own `codex exec` or `muse exec --output-schema` session no
-  longer stalls Autopilot.** A `ps` row now counts as an ambiguous Autopilot
-  invocation only when it carries an Autopilot-shaped marker path.
-- **A dispatch into an invocation directory that already has a process
-  identity is refused** instead of spawning a second process into it.
-- **The Codex and Muse implementers skip relative `PATH` entries** (such as
-  `.`) when finding their binary. They run in the issue worktree, where a
-  relative entry would find a file in the repository being worked on. So do
-  the Claude implementer and the Codex and Muse reviewers.
-- **Resuming an issue branch with no recorded cut now records the commit the
-  branch was created from** (from its reflog, or else its merge base with
-  `--base`), and refuses the run if neither can be found or that merge base
-  is the branch's own tip while it has unpushed commits. A new branch's cut
-  is recorded before the branch is created, with the creating run's own token
-  in `branch.<branch>.ironmemCutOwner`. It is never taken back from a branch
-  that exists, nor when another controller has recorded the same value since,
-  and a run whose cut was taken back while its add made the branch records
-  it again, so a branch is not left without one. A held-lock error now names
-  the lock file and its age. Cut and signing-flag writes run git in the C
-  locale, so a held lock is recognised in any locale, and SHA-256
-  repositories can provision issue worktrees.
-- **Library: `Worktree::cut` is a `CommitSha`**, a full commit object name
-  (40 or 64 hex digits) checked where it is made, instead of a `String`. It
-  derefs to `str`.
-- **Library: supervised-CLI types renamed.** `CodexArtifacts` is now
-  `InvocationArtifacts`, `CodexRecovery` is `InvocationRecovery`,
-  `CodexDispatcher` is `CliDispatcher::resolve(Implementer::Codex)` (the old
-  type and its argument-free `resolve()` remain as a deprecated wrapper),
-  `registry::TwoHarnessMonitor` is now `HarnessProcessMonitor`, and
-  the `codex_process` module is `process_tree`, where `parse_codex_processes`,
-  `CodexProcessSnapshot`, `CodexProcessSource` and `UnixCodexProcesses` are
-  `parse_processes`, `ProcessSnapshot`, `ProcessSource` and `UnixProcesses`.
-  The old names stay, deprecated, until 0.8.0. These changes have no alias
-  and break a caller at compile time: the `codex_artifacts` field of
-  `DispatchSpec`, `DispatchState` and `ClearedDispatch` is
-  `invocation_artifacts` (the stored and `--json` key is still
-  `codex_artifacts`); `HarnessSnapshots::codex` is `processes`; `Worktree` has
-  a new required field, `cut`; `TurnPromptInputs` has a new required field,
-  `remote` (an `Option<&str>`: the remote the goal condition's push names,
-  `None` for none); `DispatchState` has new required fields `session_model`,
-  `resume_refusals` and `signing_held`, and `DispatchOutcome` a new required
-  field `session_refusal`; `BudgetLedgerEntry` has a new field
-  `spend_reservations` (reserved ceilings are now recorded per issue, so
-  one its controller died holding is released by the next run); the new `Implementer::Muse` variant breaks
-  exhaustive matches on `Implementer`; `dispatch_state`'s
-  `upsert_dispatch_state_if_unchanged`, `dispatch_state_is` and
-  `clear_dispatch_state_if_unchanged` are removed (the claim
-  compare-and-set functions replace them); `codex_dispatch`'s supervision moved to `invocation`,
-  where `prepare_artifacts`, `has_launch_failure_record`,
-  `has_valid_exit_record` and `recover_artifacts` keep their names,
-  `run_codex` is `run_supervised`, and `run_codex_bounded`, `read_artifacts`
-  and `dispatch_timeout` are no longer public; and `codex_dispatch` no longer
-  exports `CODEX_DISPATCH_TIMEOUT_SECS`, `CODEX_VERDICT_JSON_SCHEMA` or
-  `build_argv`.
-- **GitHub releases now carry their version's `CHANGELOG.md` section as the
-  description.** Until now the release workflow published every release with
-  an empty body. `scripts/release_notes.py` extracts the tag's
-  `## [X.Y.Z]` section, and a tag without one fails before the builds start.
-  A section over GitHub's 125,000-character limit is cut at a line and links
-  to the full CHANGELOG.
 
 ## [0.6.0] - 2026-10-17
 
