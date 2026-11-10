@@ -319,6 +319,12 @@ pub struct SearchFilters {
     pub include_superseded: bool,
 }
 
+/// The message of the `NotFound` error [`Database::mark_drawer_superseded_tx`]
+/// returns when the predecessor id names no drawer. `add_drawer` matches on it to
+/// tell that miss from a missing successor before it adds its id hint, so both
+/// sides read this one constant.
+pub(crate) const PREDECESSOR_NOT_FOUND: &str = "predecessor drawer not found";
+
 /// Generate a deterministic drawer ID from content + wing + room.
 pub fn generate_id(content: &str, wing: &str, room: &str) -> String {
     let mut hasher = Sha256::new();
@@ -424,7 +430,7 @@ impl Database {
         let Some((actual_wing, actual_room, predecessor_superseded_by)) =
             Self::drawer_lineage_tx(tx, predecessor_id)?
         else {
-            return Err(MemoryError::NotFound("predecessor drawer not found".into()));
+            return Err(MemoryError::NotFound(PREDECESSOR_NOT_FOUND.into()));
         };
         if actual_wing != wing || actual_room != room {
             return Err(MemoryError::Validation(

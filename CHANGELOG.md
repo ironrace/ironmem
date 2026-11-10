@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Prompt recall lines carry the drawer id (#376).** Each drawer and diary line
+  the `user-prompt-submit` hook injects now reads
+  `- source="wing/room" id="..." excerpt="..."`, and the block's header says
+  `get_drawer` opens it, so an agent can read the whole drawer instead of
+  searching again. `get_drawer`, `delete_drawer` and `add_drawer`'s `supersedes`
+  now accept any id string, not just 16/32-char hex, because the ChromaDB
+  migration keeps source ids verbatim with no charset or length limit
+  (`drawer_<wing>_<room>_<hex>` is the usual shape), so an imported drawer can
+  be opened, deleted and superseded. An id that matches no row is a miss:
+  `found: false` from `get_drawer`, `success: false` from `delete_drawer`, and
+  a "predecessor drawer not found" error from `add_drawer`, which cannot
+  supersede a drawer that isn't there. When that id isn't 32 lowercase hex
+  characters, the one shape ironmem writes itself, the two misses carry a
+  `hint` that ids match exactly and the error ends with the same text, since a
+  shortened id such as the 8 characters the session-start line prints used to
+  be refused for its shape. The id is written as a JSON string and never
+  shortened, and it is escaped further than the excerpt beside it: every
+  control, format, private-use and unassigned character, every space but the
+  plain one, every character Unicode marks as drawn as nothing (variation
+  selectors, Hangul fillers) and the backticks of a code fence become `\u`
+  escapes, so they show on the line instead of hiding in the id, and the id
+  still decodes exactly. An id over 256 bytes is left off its line, which keeps
+  its source and excerpt, so one imported row can't flood the prompt.
+  On a fixed five-prompt fixture, one of whose ids is a 209-byte import, the
+  injected text grew from 1,700 to 2,398 bytes.
+
 ### Fixed
 
 - KG boost and the prompt hook's KG recall now match entities whose names

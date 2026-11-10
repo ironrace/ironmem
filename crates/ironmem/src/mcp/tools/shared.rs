@@ -163,6 +163,39 @@ pub(super) fn validate_hex_id(value: &str, field_name: &str) -> Result<(), Memor
     Ok(())
 }
 
+/// Whether `id` has the one shape ironmem writes for a drawer: 32 lowercase hex
+/// characters. Every generator produces it, either the first 32 characters of a
+/// SHA-256 hex digest (`generate_id`, mined-chunk and diary ids) or
+/// `Uuid::simple` (collab message bodies), and `{:x}` never prints uppercase.
+///
+/// This is narrower than [`validate_hex_id`], which also takes 16 characters and
+/// uppercase "for backwards compatibility with existing data". For drawers there
+/// is no such data: no revision in this repository's history cut a drawer id to
+/// 16 characters (`git log -G` finds `[..16]` only on manifest file names), and
+/// the id column compares case-sensitively.
+fn is_native_drawer_id(id: &str) -> bool {
+    id.len() == 32 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// What to tell a caller whose drawer `id` matched no row, when the id is not
+/// the shape ironmem writes ([`is_native_drawer_id`]). Drawer tools take any id
+/// string, because the ChromaDB migration keeps source ids verbatim (#376), so a
+/// shortened, padded or re-cased id is a miss rather than a shape error, and a
+/// bare miss reads as "that drawer is gone". `None` for an id of the native
+/// shape: that one really matches nothing, and there is nothing to explain.
+///
+/// An imported id that matches nothing gets the hint too. It cannot be told from
+/// a mistyped one, and every sentence of the hint is true of it.
+pub(super) fn drawer_id_miss_hint(id: &str) -> Option<&'static str> {
+    (!is_native_drawer_id(id)).then_some(
+        "No drawer has exactly this id, and ids match only as whole strings. \
+         ironmem's own drawer ids are 32 lowercase hex characters; imported ones \
+         are kept as they were. A shortened id (the session-start line prints \
+         only the first 8 characters), a different letter case or extra \
+         whitespace matches nothing. search and diary_read return full ids.",
+    )
+}
+
 /// Validate that a date string matches YYYY-MM-DD format.
 pub(super) fn validate_date_format(value: &str, field_name: &str) -> Result<(), MemoryError> {
     if chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").is_err() {
@@ -484,7 +517,7 @@ fn outward_right_boundary(chars: &[char], end: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{optional_bool, require_pilot, sanitize_error_value};
+    use super::{drawer_id_miss_hint, optional_bool, require_pilot, sanitize_error_value};
     use crate::error::MemoryError;
     use serde_json::json;
 
@@ -603,5 +636,54 @@ mod tests {
             error_msg.contains("gpt4"),
             "Error message should name the rejected value for debuggability"
         );
+    }
+
+    /// Every drawer id ironmem has written is 32 lowercase hex characters: the
+    /// first 32 of a SHA-256 hex digest (`generate_id`, mined and diary ids) or
+    /// `Uuid::simple` (collab message bodies). No version in this repository's
+    /// history cut a drawer id to 16, and `{:x}` never prints uppercase, so a
+    /// 16-character or uppercase id is as much a mistyped id as an 8-character
+    /// one and gets the same hint. `validate_hex_id` is looser and stays so for
+    /// KG triple ids.
+    #[test]
+    fn drawer_id_miss_hint_is_given_for_every_id_ironmem_never_wrote() {
+        let native = crate::db::drawers::generate_id("content", "wing", "room");
+        assert_eq!(native.len(), 32, "{native}");
+        let upper = native.to_uppercase();
+        assert_ne!(upper, native, "the fixture id needs a hex letter");
+        assert_eq!(drawer_id_miss_hint(&native), None);
+        assert_eq!(
+            drawer_id_miss_hint(&uuid::Uuid::new_v4().simple().to_string()),
+            None
+        );
+        assert_eq!(drawer_id_miss_hint(&"0".repeat(32)), None);
+
+        let never_written = [
+            native[..16].to_string(),
+            upper,
+            "0".repeat(16),
+            "ABCDEF0123456789".to_string(),
+            native[..8].to_string(),
+            native[..31].to_string(),
+            format!("{native}0"),
+            format!(" {native}"),
+            format!("{native}\n"),
+            format!("{}g", &native[..31]),
+            "drawer_python-repos_general_0298432cfbef65c6d7922f02".to_string(),
+            String::new(),
+        ];
+        for id in &never_written {
+            let hint = drawer_id_miss_hint(id)
+                .unwrap_or_else(|| panic!("a miss on {id:?} needs the hint"));
+            assert!(hint.contains("exactly"), "{hint}");
+            assert!(
+                hint.contains("32 lowercase hex characters"),
+                "the hint must name the one shape ironmem writes: {hint}"
+            );
+            assert!(
+                !hint.contains("16"),
+                "ironmem never wrote a 16-character drawer id: {hint}"
+            );
+        }
     }
 }

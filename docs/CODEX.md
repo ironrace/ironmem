@@ -468,6 +468,26 @@ recall and injects sanitized untrusted-memory matches into `hookSpecificOutput.a
 path uses FTS5/BM25, then optional KG-triple and diary recall; it never loads
 the embedder. Codex registers no UserPromptSubmit hook.
 
+Each drawer and diary line carries the drawer's `id`
+(`- source="wing/room" id="..." excerpt="..."`), so `get_drawer` with that id
+opens a hit whose short excerpt doesn't answer the question. This includes ids the
+ChromaDB migration kept as they were (usually `drawer_<wing>_<room>_<hex>`, but
+with no charset or length limit): `get_drawer`, `delete_drawer` and
+`add_drawer`'s `supersedes` accept any id string. The line writes the id as a
+JSON string, so decode it before passing it on. It is escaped further than the
+excerpt beside it: characters that draw nothing or draw a blank (zero-width,
+bidi and other format characters, variation selectors, every space but the
+plain one) come as `\u` escapes, so they show on the line instead of hiding in
+the id.
+
+Ids match exactly. When an id that matches no drawer isn't 32 lowercase hex
+characters, the one shape ironmem writes itself, the answer says so:
+`get_drawer` (`found: false`) and `delete_drawer` (`success: false`) add a
+`hint`, and `add_drawer`, for which a `supersedes` that names no drawer is an
+error, ends its "predecessor drawer not found" message with the same text. A
+line whose id is over 256 bytes carries no id, so one imported row can't flood
+the prompt. KG triple lines are not drawers and have no id.
+
 Recall stays quiet unless the prompt gives it something to go on:
 
 - A prompt with fewer than two content words (`yes`, `go ahead`, `deploy`, `да`)
