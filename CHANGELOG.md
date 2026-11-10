@@ -7,6 +7,189 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-09
+
+### Changed
+
+- **The Stop hook's handoff nudge names the wing prompt recall reads.** A
+  project inside a Git work tree that tracks none of its files, or one behind
+  `GIT_CEILING_DIRECTORIES`, was asked to save its handoff in the parent
+  repository's wing, which its own prompt recall no longer reads once it has
+  mined memory. The nudge now resolves the workspace as recall does.
+- **Prompt recall injects less noise (#375).** The `user-prompt-submit` hook
+  skips prompts with fewer than two content words, such as `yes`, `go ahead` or
+  `да`. It prefers the current workspace's memory, its checkout's and then its
+  repository's, and places a mined file by the path it was mined from rather than
+  the wing mining gave it. A workspace with memory no longer gets other projects'
+  drawers; one with none does only on a prompt with at least three content words,
+  as does a prompt with no workspace. A linked worktree recalls its repository's
+  filed rows, such as handoffs and decisions, alongside its own files, and a
+  checkout nested in another's directory and mined on its own is not the parent's
+  memory. A project inside a Git work tree that tracks none of its files (a dotfiles
+  `$HOME`) is its own workspace, and `GIT_CEILING_DIRECTORIES` is honored. KG
+  triples and the shared `diary` wing are still recalled from every project.
+  Operational collab rooms, Autopilot's `backlog-lineage` and the hooks' own
+  diary rows are no longer injected; reviews the Stop hook captures still are. A
+  diary entry appears only when its excerpt matches the prompt, however it was
+  found, so `IRONMEM_PROMPT_HOOK_DIARY_MAX` now caps matching entries rather than
+  the newest ones. Text duplicated across wings or diary entries is injected once.
+  Schema migration 023 adds two indexes for these per-prompt reads.
+- **Breaking storage requirement:** Autopilot `lead`, `run` and
+  `clear-dispatch` refuse known remote repository common directories and
+  databases. Move both to local disk before upgrading. Linux FUSE whose
+  subtype cannot be read is refused too. See `docs/AUTOPILOT.md` for platform
+  limits and recovery.
+- **Breaking Rust API changes:** `clear_dispatch` returns the untagged
+  `Cleared` enum; Rust `codex_artifacts` fields on `ClearedDispatch`,
+  `DispatchState` and `DispatchSpec` are now `invocation_artifacts` (the
+  serialized `codex_artifacts` key stays stable). `DispatchOutcome` adds
+  `session_refusal`. Snapshot `Available` variants cannot be constructed
+  externally; `HarnessSnapshots` and `SharedDaemon` fields are crate-private.
+  Use the snapshot/daemon collection APIs. Deprecated Codex aliases are
+  scheduled for removal in **0.8.0**.
+- Pending invocation exit records have additive strict fields that older
+  readers reject and hold. Finish or clear pending runs with this version
+  before downgrading. Journals/prompts/stderr retain raw tool output; old,
+  unnamed invocation directories are opportunistically pruned after 14 days,
+  keeping the named/current invocation. This is not a guaranteed deletion time.
+
+- **A new Autopilot issue branch has no upstream.** Before, an issue branch
+  cut from a remote-tracking `--base` such as `origin/main` tracked it, so
+  with `push.default=upstream` a bare `git push` from the issue branch went to
+  `main`. Now the branch is created at the resolved sha with `--no-track`, so
+  it no longer tracks the base and a bare `git push` cannot reach the base
+  through an upstream; other push settings (`push.default=matching` or
+  `current`, a `remote.<name>.push` refspec) can still push without naming
+  anything. Push an issue branch by naming the remote and the branch (`git
+  push <remote> <branch>`); the implementer's goal condition now says so,
+  naming the remote whose push URL is the issue's GitHub repository, else
+  (skipping any remote that pushes only to another GitHub repository) the one
+  already tracking the branch, else `origin` if configured, else the only one
+  left, and no remote when none of those applies; a run warns, naming the
+  remotes, when none pushes to the issue's repository but some push to
+  another. Existing branches keep whatever upstream they have; remove it with
+  `git branch --unset-upstream <branch>`.
+- **Existing setups with `commit.gpgsign` on now get a failed attempt when an
+  implementer's commits are unsigned, for Claude as well as Codex and Muse.**
+  Before, such a run could succeed. Make sure the signing key or agent is
+  reachable from wherever the Lead runs. To stop the check on one issue
+  branch, turn `commit.gpgsign` off, then run `git config
+  branch.<branch>.ironmemSigning false` in the repo. To stop it on every
+  branch, turn `commit.gpgsign` off, then unset the repository-wide
+  `ironmem.autopilotSigning` and each branch's `ironmemSigning`. See
+  "Commit signing" in `docs/AUTOPILOT.md`.
+- **An operator's own `codex exec` or `muse exec --output-schema` session no
+  longer stalls Autopilot.** A `ps` row now counts as an ambiguous Autopilot
+  invocation only when it carries an Autopilot-shaped marker path.
+- **A dispatch into an invocation directory that already has a process
+  identity is refused** instead of spawning a second process into it.
+- **The Codex and Muse implementers skip relative `PATH` entries** (such as
+  `.`) when finding their binary. They run in the issue worktree, where a
+  relative entry would find a file in the repository being worked on. So do
+  the Claude implementer and the Codex and Muse reviewers.
+- **Resuming an issue branch with no recorded cut now records the commit the
+  branch was created from** (from its reflog, or else its merge base with
+  `--base`), and refuses the run if neither can be found or that merge base
+  is the branch's own tip while it has unpushed commits. A new branch's cut
+  is recorded before the branch is created, with the creating run's own token
+  in `branch.<branch>.ironmemCutOwner`. It is never taken back from a branch
+  that exists, nor when another controller has recorded the same value since,
+  and a run whose cut was taken back while its add made the branch records
+  it again, so a branch is not left without one. A held-lock error now names
+  the lock file and its age. Cut and signing-flag writes run git in the C
+  locale, so a held lock is recognised in any locale, and SHA-256
+  repositories can provision issue worktrees.
+- **Library: `Worktree::cut` is a `CommitSha`**, a full commit object name
+  (40 or 64 hex digits) checked where it is made, instead of a `String`. It
+  derefs to `str`.
+- **Library: supervised-CLI types renamed.** `CodexArtifacts` is now
+  `InvocationArtifacts`, `CodexRecovery` is `InvocationRecovery`,
+  `CodexDispatcher` is `CliDispatcher::resolve(Implementer::Codex)` (the old
+  type and its argument-free `resolve()` remain as a deprecated wrapper),
+  `registry::TwoHarnessMonitor` is now `HarnessProcessMonitor`, and
+  the `codex_process` module is `process_tree`, where `parse_codex_processes`,
+  `CodexProcessSnapshot`, `CodexProcessSource` and `UnixCodexProcesses` are
+  `parse_processes`, `ProcessSnapshot`, `ProcessSource` and `UnixProcesses`.
+  The old names stay, deprecated, until 0.8.0. These changes have no alias
+  and break a caller at compile time: the `codex_artifacts` field of
+  `DispatchSpec`, `DispatchState` and `ClearedDispatch` is
+  `invocation_artifacts` (the stored and `--json` key is still
+  `codex_artifacts`); `HarnessSnapshots::codex` is `processes`; `Worktree` has
+  a new required field, `cut`; `TurnPromptInputs` has a new required field,
+  `remote` (an `Option<&str>`: the remote the goal condition's push names,
+  `None` for none); `DispatchState` has new required fields `session_model`,
+  `resume_refusals` and `signing_held`, and `DispatchOutcome` a new required
+  field `session_refusal`; `BudgetLedgerEntry` has a new field
+  `spend_reservations` (reserved ceilings are now recorded per issue, so
+  one its controller died holding is released by the next run); the new `Implementer::Muse` variant breaks
+  exhaustive matches on `Implementer`; `dispatch_state`'s
+  `upsert_dispatch_state_if_unchanged`, `dispatch_state_is` and
+  `clear_dispatch_state_if_unchanged` are removed (the claim
+  compare-and-set functions replace them); `codex_dispatch`'s supervision moved to `invocation`,
+  where `prepare_artifacts`, `has_launch_failure_record`,
+  `has_valid_exit_record` and `recover_artifacts` keep their names,
+  `run_codex` is `run_supervised`, and `run_codex_bounded`, `read_artifacts`
+  and `dispatch_timeout` are no longer public; and `codex_dispatch` no longer
+  exports `CODEX_DISPATCH_TIMEOUT_SECS`, `CODEX_VERDICT_JSON_SCHEMA` or
+  `build_argv`.
+- **GitHub releases now carry their version's `CHANGELOG.md` section as the
+  description.** Until now the release workflow published every release with
+  an empty body. `scripts/release_notes.py` extracts the tag's
+  `## [X.Y.Z]` section, and a tag without one fails before the builds start.
+  A section over GitHub's 125,000-character limit is cut at a line and links
+  to the full CHANGELOG.
+
+### Added
+
+- **Muse Code as an Autopilot implementer (#366).** `autopilot run` and
+  `autopilot lead` take `--implementer muse`, alongside `claude` (still the
+  default) and `codex`. Muse runs supervised like Codex: an unpriced
+  reservation per invocation (`--max-unpriced-dispatches-per-day` is its
+  daily dispatch cap), restart recovery that holds rather than re-dispatching
+  while a run might still be alive, and `clear-dispatch` support. Its session
+  continues headlessly across invocations, and `--max-turns` becomes
+  `--max-model-steps`. A session Muse refuses to resume (two refusals in a
+  row: a cross-provider resume, or retained state it cannot read), or one
+  last used with a different `--model`, is replaced with a fresh one at the
+  next launch rather than failing every invocation until `clear-dispatch`. A
+  session Muse reports still in use is never replaced: the run stops after
+  that one dispatch, parks the issue as `paused-session-in-use` (deferred by
+  the queue as `session_in_use`), and says to look for a leftover Muse
+  process and then run `clear-dispatch`. A later run, even with a different
+  `--model`, probes that same session first, and `clear-dispatch` refuses
+  while a process still names it. **Downgrade note:** an ironmem from before
+  this release cannot read a Muse dispatch state and skips it, so its queue
+  undercounts the concurrency cap and its `reconcile` reports the live Muse
+  process as an orphan. Do not downgrade while any Muse dispatch state
+  exists; let it finish, or `clear-dispatch` it, first.
+- **Commit-signing guard for every harness (#366).** With `commit.gpgsign`
+  on, a run that reports success but left unsigned commits on the issue
+  branch now counts as a failed attempt, with a reason naming the commits.
+  Turning signing off during a run, or from another issue's worktree, does
+  not get around it. A run whose `commit.gpgsign` holds an invalid value
+  refuses to start rather than paying for a dispatch it would discard, and
+  keeps any pending invocation for recovery once the value is fixed; a value
+  made invalid during a run stops it after that one dispatch. An unsigned
+  commit someone else committed (a collaborator's push) is never accepted
+  but costs the agent no attempt, and no run starts while one is there. The
+  guard reads a branch of any length in two git processes, falling back to
+  one read per commit only when a signature cannot be parsed, never runs a
+  signature program set in the repository's own config, never fetches (not
+  even through a protocol the repository's config allows), ignores
+  `refs/replace/` refs, and gives the whole check 120 seconds, a run start's
+  check included. A recorded cut that is not a commit name refuses the run at
+  its start.
+- **Codex and Muse supervision waits for a quiet worktree (#366).** A
+  short-lived tool's background child, reparented out of the tracked tree,
+  no longer gets a trusted completion while it still runs in the worktree.
+  The supervisor waits up to 15 seconds, then holds, and a later Lead tick
+  or `autopilot run` finishes the invocation once nothing it started
+  remains, with no `clear-dispatch`. The process-identity file now records
+  live descendants with their kernel birth. **Upgrade note:** do not
+  downgrade the ironmem binary while a Codex or Muse invocation is in
+  flight. An older binary cannot read the new identity format and treats
+  it as "nothing running" in `clear-dispatch`.
+
 ### Fixed
 
 - **The bundled SQLite is upgraded to 3.54 to fix RUSTSEC-2026-0459.** SQLite
@@ -62,103 +245,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fixtures' bodies: the hunk headers and tags, the file section each hunk sits
   in, and the changed lines. A change to the compressor's output that leaves
   those alone still passes.
-
-### Changed
-
-- **The Stop hook's handoff nudge names the wing prompt recall reads.** A
-  project inside a Git work tree that tracks none of its files, or one behind
-  `GIT_CEILING_DIRECTORIES`, was asked to save its handoff in the parent
-  repository's wing, which its own prompt recall no longer reads once it has
-  mined memory. The nudge now resolves the workspace as recall does.
-- **Prompt recall injects less noise (#375).** The `user-prompt-submit` hook
-  skips prompts with fewer than two content words, such as `yes`, `go ahead` or
-  `да`. It prefers the current workspace's memory, its checkout's and then its
-  repository's, and places a mined file by the path it was mined from rather than
-  the wing mining gave it. A workspace with memory no longer gets other projects'
-  drawers; one with none does only on a prompt with at least three content words,
-  as does a prompt with no workspace. A linked worktree recalls its repository's
-  filed rows, such as handoffs and decisions, alongside its own files, and a
-  checkout nested in another's directory and mined on its own is not the parent's
-  memory. A project inside a Git work tree that tracks none of its files (a dotfiles
-  `$HOME`) is its own workspace, and `GIT_CEILING_DIRECTORIES` is honored. KG
-  triples and the shared `diary` wing are still recalled from every project.
-  Operational collab rooms, Autopilot's `backlog-lineage` and the hooks' own
-  diary rows are no longer injected; reviews the Stop hook captures still are. A
-  diary entry appears only when its excerpt matches the prompt, however it was
-  found, so `IRONMEM_PROMPT_HOOK_DIARY_MAX` now caps matching entries rather than
-  the newest ones. Text duplicated across wings or diary entries is injected once.
-  Schema migration 023 adds two indexes for these per-prompt reads.
-- **Breaking storage requirement:** Autopilot `lead`, `run` and
-  `clear-dispatch` refuse known remote repository common directories and
-  databases. Move both to local disk before upgrading. Linux FUSE whose
-  subtype cannot be read is refused too. See `docs/AUTOPILOT.md` for platform
-  limits and recovery.
-- **Breaking Rust API changes:** `clear_dispatch` returns the untagged
-  `Cleared` enum; Rust `codex_artifacts` fields on `ClearedDispatch`,
-  `DispatchState` and `DispatchSpec` are now `invocation_artifacts` (the
-  serialized `codex_artifacts` key stays stable). `DispatchOutcome` adds
-  `session_refusal`. Snapshot `Available` variants cannot be constructed
-  externally; `HarnessSnapshots` and `SharedDaemon` fields are crate-private.
-  Use the snapshot/daemon collection APIs. Deprecated Codex aliases are
-  scheduled for removal in **0.7.0**.
-- Pending invocation exit records have additive strict fields that older
-  readers reject and hold. Finish or clear pending runs with this version
-  before downgrading. Journals/prompts/stderr retain raw tool output; old,
-  unnamed invocation directories are opportunistically pruned after 14 days,
-  keeping the named/current invocation. This is not a guaranteed deletion time.
-
-### Added
-
-- **Muse Code as an Autopilot implementer (#366).** `autopilot run` and
-  `autopilot lead` take `--implementer muse`, alongside `claude` (still the
-  default) and `codex`. Muse runs supervised like Codex: an unpriced
-  reservation per invocation (`--max-unpriced-dispatches-per-day` is its
-  daily dispatch cap), restart recovery that holds rather than re-dispatching
-  while a run might still be alive, and `clear-dispatch` support. Its session
-  continues headlessly across invocations, and `--max-turns` becomes
-  `--max-model-steps`. A session Muse refuses to resume (two refusals in a
-  row: a cross-provider resume, or retained state it cannot read), or one
-  last used with a different `--model`, is replaced with a fresh one at the
-  next launch rather than failing every invocation until `clear-dispatch`. A
-  session Muse reports still in use is never replaced: the run stops after
-  that one dispatch, parks the issue as `paused-session-in-use` (deferred by
-  the queue as `session_in_use`), and says to look for a leftover Muse
-  process and then run `clear-dispatch`. A later run, even with a different
-  `--model`, probes that same session first, and `clear-dispatch` refuses
-  while a process still names it. **Downgrade note:** an ironmem from before
-  this release cannot read a Muse dispatch state and skips it, so its queue
-  undercounts the concurrency cap and its `reconcile` reports the live Muse
-  process as an orphan. Do not downgrade while any Muse dispatch state
-  exists; let it finish, or `clear-dispatch` it, first.
-- **Commit-signing guard for every harness (#366).** With `commit.gpgsign`
-  on, a run that reports success but left unsigned commits on the issue
-  branch now counts as a failed attempt, with a reason naming the commits.
-  Turning signing off during a run, or from another issue's worktree, does
-  not get around it. A run whose `commit.gpgsign` holds an invalid value
-  refuses to start rather than paying for a dispatch it would discard, and
-  keeps any pending invocation for recovery once the value is fixed; a value
-  made invalid during a run stops it after that one dispatch. An unsigned
-  commit someone else committed (a collaborator's push) is never accepted
-  but costs the agent no attempt, and no run starts while one is there. The
-  guard reads a branch of any length in two git processes, falling back to
-  one read per commit only when a signature cannot be parsed, never runs a
-  signature program set in the repository's own config, never fetches (not
-  even through a protocol the repository's config allows), ignores
-  `refs/replace/` refs, and gives the whole check 120 seconds, a run start's
-  check included. A recorded cut that is not a commit name refuses the run at
-  its start.
-- **Codex and Muse supervision waits for a quiet worktree (#366).** A
-  short-lived tool's background child, reparented out of the tracked tree,
-  no longer gets a trusted completion while it still runs in the worktree.
-  The supervisor waits up to 15 seconds, then holds, and a later Lead tick
-  or `autopilot run` finishes the invocation once nothing it started
-  remains, with no `clear-dispatch`. The process-identity file now records
-  live descendants with their kernel birth. **Upgrade note:** do not
-  downgrade the ironmem binary while a Codex or Muse invocation is in
-  flight. An older binary cannot read the new identity format and treats
-  it as "nothing running" in `clear-dispatch`.
-
-### Fixed
 
 - Claude implementer liveness in the queue, `supervise` and `reconcile`
   now reads the process table as well as the `claude agents` registry,
@@ -339,94 +425,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`review::build_argv` ends in `-`), as the Codex implementer does.
   The day's dollar total includes in-flight dispatch reservations, so
   it can read higher than the settled spend while a dispatch runs.
-
-### Changed
-
-- **A new Autopilot issue branch has no upstream.** Before, an issue branch
-  cut from a remote-tracking `--base` such as `origin/main` tracked it, so
-  with `push.default=upstream` a bare `git push` from the issue branch went to
-  `main`. Now the branch is created at the resolved sha with `--no-track`, so
-  it no longer tracks the base and a bare `git push` cannot reach the base
-  through an upstream; other push settings (`push.default=matching` or
-  `current`, a `remote.<name>.push` refspec) can still push without naming
-  anything. Push an issue branch by naming the remote and the branch (`git
-  push <remote> <branch>`); the implementer's goal condition now says so,
-  naming the remote whose push URL is the issue's GitHub repository, else
-  (skipping any remote that pushes only to another GitHub repository) the one
-  already tracking the branch, else `origin` if configured, else the only one
-  left, and no remote when none of those applies; a run warns, naming the
-  remotes, when none pushes to the issue's repository but some push to
-  another. Existing branches keep whatever upstream they have; remove it with
-  `git branch --unset-upstream <branch>`.
-- **Existing setups with `commit.gpgsign` on now get a failed attempt when an
-  implementer's commits are unsigned, for Claude as well as Codex and Muse.**
-  Before, such a run could succeed. Make sure the signing key or agent is
-  reachable from wherever the Lead runs. To stop the check on one issue
-  branch, turn `commit.gpgsign` off, then run `git config
-  branch.<branch>.ironmemSigning false` in the repo. To stop it on every
-  branch, turn `commit.gpgsign` off, then unset the repository-wide
-  `ironmem.autopilotSigning` and each branch's `ironmemSigning`. See
-  "Commit signing" in `docs/AUTOPILOT.md`.
-- **An operator's own `codex exec` or `muse exec --output-schema` session no
-  longer stalls Autopilot.** A `ps` row now counts as an ambiguous Autopilot
-  invocation only when it carries an Autopilot-shaped marker path.
-- **A dispatch into an invocation directory that already has a process
-  identity is refused** instead of spawning a second process into it.
-- **The Codex and Muse implementers skip relative `PATH` entries** (such as
-  `.`) when finding their binary. They run in the issue worktree, where a
-  relative entry would find a file in the repository being worked on. So do
-  the Claude implementer and the Codex and Muse reviewers.
-- **Resuming an issue branch with no recorded cut now records the commit the
-  branch was created from** (from its reflog, or else its merge base with
-  `--base`), and refuses the run if neither can be found or that merge base
-  is the branch's own tip while it has unpushed commits. A new branch's cut
-  is recorded before the branch is created, with the creating run's own token
-  in `branch.<branch>.ironmemCutOwner`. It is never taken back from a branch
-  that exists, nor when another controller has recorded the same value since,
-  and a run whose cut was taken back while its add made the branch records
-  it again, so a branch is not left without one. A held-lock error now names
-  the lock file and its age. Cut and signing-flag writes run git in the C
-  locale, so a held lock is recognised in any locale, and SHA-256
-  repositories can provision issue worktrees.
-- **Library: `Worktree::cut` is a `CommitSha`**, a full commit object name
-  (40 or 64 hex digits) checked where it is made, instead of a `String`. It
-  derefs to `str`.
-- **Library: supervised-CLI types renamed.** `CodexArtifacts` is now
-  `InvocationArtifacts`, `CodexRecovery` is `InvocationRecovery`,
-  `CodexDispatcher` is `CliDispatcher::resolve(Implementer::Codex)` (the old
-  type and its argument-free `resolve()` remain as a deprecated wrapper),
-  `registry::TwoHarnessMonitor` is now `HarnessProcessMonitor`, and
-  the `codex_process` module is `process_tree`, where `parse_codex_processes`,
-  `CodexProcessSnapshot`, `CodexProcessSource` and `UnixCodexProcesses` are
-  `parse_processes`, `ProcessSnapshot`, `ProcessSource` and `UnixProcesses`.
-  The old names stay, deprecated, until 0.7.0. These changes have no alias
-  and break a caller at compile time: the `codex_artifacts` field of
-  `DispatchSpec`, `DispatchState` and `ClearedDispatch` is
-  `invocation_artifacts` (the stored and `--json` key is still
-  `codex_artifacts`); `HarnessSnapshots::codex` is `processes`; `Worktree` has
-  a new required field, `cut`; `TurnPromptInputs` has a new required field,
-  `remote` (an `Option<&str>`: the remote the goal condition's push names,
-  `None` for none); `DispatchState` has new required fields `session_model`,
-  `resume_refusals` and `signing_held`, and `DispatchOutcome` a new required
-  field `session_refusal`; `BudgetLedgerEntry` has a new field
-  `spend_reservations` (reserved ceilings are now recorded per issue, so
-  one its controller died holding is released by the next run); the new `Implementer::Muse` variant breaks
-  exhaustive matches on `Implementer`; `dispatch_state`'s
-  `upsert_dispatch_state_if_unchanged`, `dispatch_state_is` and
-  `clear_dispatch_state_if_unchanged` are removed (the claim
-  compare-and-set functions replace them); `codex_dispatch`'s supervision moved to `invocation`,
-  where `prepare_artifacts`, `has_launch_failure_record`,
-  `has_valid_exit_record` and `recover_artifacts` keep their names,
-  `run_codex` is `run_supervised`, and `run_codex_bounded`, `read_artifacts`
-  and `dispatch_timeout` are no longer public; and `codex_dispatch` no longer
-  exports `CODEX_DISPATCH_TIMEOUT_SECS`, `CODEX_VERDICT_JSON_SCHEMA` or
-  `build_argv`.
-- **GitHub releases now carry their version's `CHANGELOG.md` section as the
-  description.** Until now the release workflow published every release with
-  an empty body. `scripts/release_notes.py` extracts the tag's
-  `## [X.Y.Z]` section, and a tag without one fails before the builds start.
-  A section over GitHub's 125,000-character limit is cut at a line and links
-  to the full CHANGELOG.
 
 ## [0.6.0] - 2026-10-17
 

@@ -22,12 +22,12 @@ mod test_support;
 
 /// For `git_env_scan`, which checks the integration tests' copy against it.
 #[cfg(test)]
-#[allow(unused_imports)] // Compatibility path through 0.6.
+#[allow(unused_imports)] // Compatibility path through 0.7.
 pub(crate) use crate::git_env::REDIRECTING_GIT_VARS;
 /// Re-exported so every `Command::new("git")` in the crate can reach the one
 /// scrub, rather than a module outside `mcp::tools` growing a second spelling
 /// of it. See the function's own doc for why an unscrubbed spawn is a defect.
-#[allow(unused_imports)] // Compatibility import path through 0.6; remove in 0.7.
+#[allow(unused_imports)] // Compatibility import path through 0.7; remove in 0.8.
 pub(crate) use crate::git_env::{scrub_git_environment, scrubbed_git};
 /// Re-exported so `crate::autopilot`'s logical-key drawers land on the exact
 /// same id/source-file scheme `add_drawer{logical_key}` uses, rather than
