@@ -473,11 +473,20 @@ Each drawer and diary line carries the drawer's `id`
 opens a hit whose short excerpt doesn't answer the question. This includes ids the
 ChromaDB migration kept as they were (usually `drawer_<wing>_<room>_<hex>`, but
 with no charset or length limit): `get_drawer`, `delete_drawer` and
-`add_drawer`'s `supersedes` accept any id string, and the line JSON-escapes the
-id like the excerpt, so decode it before passing it on. Ids match exactly; a
-miss on an id that isn't 16 or 32 hex characters comes back with a `hint` saying
-so. A line whose id is over 256 bytes carries no id, so one imported row can't
-flood the prompt. KG triple lines are not drawers and have no id.
+`add_drawer`'s `supersedes` accept any id string. The line writes the id as a
+JSON string, so decode it before passing it on. It is escaped further than the
+excerpt beside it: characters that draw nothing or draw a blank (zero-width,
+bidi and other format characters, variation selectors, every space but the
+plain one) come as `\u` escapes, so they show on the line instead of hiding in
+the id.
+
+Ids match exactly. When an id that matches no drawer isn't 32 lowercase hex
+characters, the one shape ironmem writes itself, the answer says so:
+`get_drawer` (`found: false`) and `delete_drawer` (`success: false`) add a
+`hint`, and `add_drawer`, for which a `supersedes` that names no drawer is an
+error, ends its "predecessor drawer not found" message with the same text. A
+line whose id is over 256 bytes carries no id, so one imported row can't flood
+the prompt. KG triple lines are not drawers and have no id.
 
 Recall stays quiet unless the prompt gives it something to go on:
 

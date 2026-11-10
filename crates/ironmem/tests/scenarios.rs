@@ -586,6 +586,54 @@ fn delete_with_an_id_that_matches_nothing_is_a_miss_not_an_error() {
     }
 }
 
+/// `add_drawer`'s `supersedes` names its predecessor by id, and any string is an
+/// id since #376. One that matches no drawer is still an error, because nothing
+/// can be superseded, and when the id is not a shape ironmem writes the error
+/// text the caller receives says that ids match exactly, as the `hint` on a
+/// `get_drawer` or `delete_drawer` miss does.
+#[test]
+fn supersedes_with_an_id_that_matches_nothing_says_ids_match_exactly() {
+    let app = App::open_for_test().unwrap();
+    let kept = call(
+        &app,
+        "add_drawer",
+        json!({ "content": "the wording in force", "wing": "projects", "room": "notes" }),
+    );
+    let id = kept["id"].as_str().unwrap();
+    let shortened = &id[..8];
+
+    let resp = call_raw(
+        &app,
+        "add_drawer",
+        json!({
+            "content": "the wording that would replace it",
+            "wing": "projects",
+            "room": "notes",
+            "supersedes": shortened,
+        }),
+    );
+    assert!(is_tool_error(&resp), "a missing predecessor is an error");
+    let text = resp.result.unwrap()["content"][0]["text"]
+        .as_str()
+        .expect("content[0].text must be a string")
+        .to_owned();
+    let payload: Value = serde_json::from_str(&text).expect("tool error must be valid JSON");
+    let error = payload["error"].as_str().expect("error must be a string");
+    assert!(error.contains("predecessor drawer not found"), "{error}");
+
+    let miss = call(&app, "get_drawer", json!({ "id": shortened }));
+    let hint = miss["hint"].as_str().expect("a shortened id gets a hint");
+    assert!(hint.contains("exactly"), "{hint}");
+    assert!(
+        error.contains(hint),
+        "the supersedes error must carry the get_drawer hint: {error}"
+    );
+
+    let still_current = call(&app, "get_drawer", json!({ "id": id }));
+    assert_eq!(still_current["found"], true, "{still_current}");
+    assert!(still_current["superseded_by"].is_null(), "{still_current}");
+}
+
 // ── Scenario 10: Unknown tool returns structured error ────────────────────────
 
 #[test]

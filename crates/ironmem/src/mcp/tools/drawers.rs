@@ -59,7 +59,8 @@ pub(super) fn validate_add_drawer_args(args: &Value) -> Result<AddDrawerArgs<'_>
         Some(value) => {
             // Any string, as `get_drawer` takes: a ChromaDB-imported drawer keeps
             // its source id, and that is the id recall and `search` show for it
-            // (#376). One that names no drawer fails below as not found.
+            // (#376). One that names no drawer fails below as not found, with
+            // `drawer_id_miss_hint` in the error when the id is no native shape.
             let value = value.as_str().ok_or_else(|| {
                 MemoryError::Validation("supersedes must be a drawer id string".into())
             })?;
@@ -95,6 +96,22 @@ pub(super) fn handle_add_drawer(app: &App, args: &Value) -> Result<Value, Memory
     };
 
     handle_add_drawer_with_embedding(app, add_args, embedding)
+}
+
+/// `supersedes` named no drawer. That is an error, not a `found: false`, because
+/// nothing can be filed as the successor of a drawer that is not there; but with
+/// no shape rule on the id (#376) a shortened or padded id lands here too, so the
+/// error carries the hint `get_drawer` and `delete_drawer` put on the same miss.
+/// It stays a `NotFound`, and every other error passes through untouched.
+fn explain_supersedes_miss(error: MemoryError, predecessor_id: &str) -> MemoryError {
+    match (error, drawer_id_miss_hint(predecessor_id)) {
+        (MemoryError::NotFound(message), Some(hint))
+            if message == crate::db::drawers::PREDECESSOR_NOT_FOUND =>
+        {
+            MemoryError::NotFound(format!("{message}. {hint}"))
+        }
+        (error, _) => error,
+    }
 }
 
 /// Finish an `add_drawer` after its primary content has been embedded.
@@ -165,7 +182,8 @@ fn handle_add_drawer_with_embedding(
                 &id,
                 &wing,
                 &room,
-            )?;
+            )
+            .map_err(|error| explain_supersedes_miss(error, predecessor_id))?;
         }
         if let Some((sid, scontent, semb)) = synth.as_ref() {
             let parent_ref = format!("{}{id}", crate::db::drawers::PREF_SENTINEL);
@@ -1701,7 +1719,16 @@ mod tests {
         .unwrap();
         let id = added["id"].as_str().unwrap().to_owned();
 
-        for not_the_id in [id[..8].to_string(), format!("{id}\n"), format!(" {id}")] {
+        // A 16-character or uppercase spelling is no id ironmem ever wrote
+        // either, so it is explained the same way.
+        let not_the_id = [
+            id[..8].to_string(),
+            format!("{id}\n"),
+            format!(" {id}"),
+            id[..16].to_string(),
+            id.to_uppercase(),
+        ];
+        for not_the_id in not_the_id {
             let got = handle_get_drawer(&app, &json!({ "id": not_the_id })).unwrap();
             assert_eq!(got["found"], false, "{got}");
             let hint = got["hint"]
@@ -1725,6 +1752,82 @@ mod tests {
         let deleted = handle_delete_drawer(&app, &json!({ "id": missing })).unwrap();
         assert_eq!(deleted["success"], false, "{deleted}");
         assert!(deleted.get("hint").is_none(), "{deleted}");
+    }
+
+    /// `supersedes` takes any id string too (#376), so a shortened, padded or
+    /// re-cased predecessor id is a miss, not a shape error. Here a miss is an
+    /// error, since nothing can be filed as the successor of a drawer that is not
+    /// there, and the error carries the hint `get_drawer` gives for the same id.
+    #[test]
+    fn a_supersedes_miss_on_an_id_of_no_native_shape_says_ids_match_exactly() {
+        let app = test_app();
+        let added = handle_add_drawer(
+            &app,
+            &json!({"content": "original", "wing": "project", "room": "state"}),
+        )
+        .unwrap();
+        let id = added["id"].as_str().unwrap().to_owned();
+
+        let not_the_id = [
+            id[..8].to_string(),
+            format!("{id}\n"),
+            "drawer_project_state_0298432cfbef65c6d7922f02".to_string(),
+            id[..16].to_string(),
+            id.to_uppercase(),
+        ];
+        for (i, not_the_id) in not_the_id.iter().enumerate() {
+            let error = handle_add_drawer(
+                &app,
+                &json!({
+                    "content": format!("replacement {i}"),
+                    "wing": "project",
+                    "room": "state",
+                    "supersedes": not_the_id,
+                }),
+            )
+            .unwrap_err();
+            let MemoryError::NotFound(message) = &error else {
+                panic!("supersedes {not_the_id:?} must be a not-found error: {error}");
+            };
+            assert!(
+                message.starts_with("predecessor drawer not found"),
+                "{message}"
+            );
+            assert!(
+                message.contains("exactly"),
+                "supersedes {not_the_id:?} must say ids match exactly: {message}"
+            );
+            let got = handle_get_drawer(&app, &json!({ "id": not_the_id })).unwrap();
+            let hint = got["hint"]
+                .as_str()
+                .unwrap_or_else(|| panic!("get_drawer {not_the_id:?} needs a hint: {got}"));
+            assert!(
+                message.ends_with(hint),
+                "supersedes and get_drawer must give {not_the_id:?} one hint: {message}"
+            );
+        }
+        // Each refused successor went with its transaction, and the drawer whose
+        // id was misspelled is still current.
+        assert_eq!(app.db.count_drawers(None).unwrap(), 1);
+        let got = handle_get_drawer(&app, &json!({ "id": id })).unwrap();
+        assert_eq!(got["found"], true, "{got}");
+        assert!(got["superseded_by"].is_null(), "{got}");
+
+        // A well-formed id that names no drawer is a plain miss: nothing to explain.
+        let error = handle_add_drawer(
+            &app,
+            &json!({
+                "content": "replacement for nothing",
+                "wing": "project",
+                "room": "state",
+                "supersedes": "0".repeat(32),
+            }),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&error, MemoryError::NotFound(m) if m == "predecessor drawer not found"),
+            "{error}"
+        );
     }
 
     #[test]
