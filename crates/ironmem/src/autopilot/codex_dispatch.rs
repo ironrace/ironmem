@@ -15,12 +15,12 @@ use crate::autopilot::invocation::{
 use crate::error::MemoryError;
 
 /// Renamed to [`InvocationArtifacts`] and moved to [`super::invocation`];
-/// kept here, deprecated, until 0.7.0.
-#[deprecated(note = "renamed to `invocation::InvocationArtifacts`; removal in 0.7.0")]
+/// kept here, deprecated, until 0.8.0.
+#[deprecated(note = "renamed to `invocation::InvocationArtifacts`; removal in 0.8.0")]
 pub type CodexArtifacts = InvocationArtifacts;
 /// Renamed to [`super::invocation::InvocationRecovery`]; kept here,
-/// deprecated, until 0.7.0.
-#[deprecated(note = "renamed to `invocation::InvocationRecovery`; removal in 0.7.0")]
+/// deprecated, until 0.8.0.
+#[deprecated(note = "renamed to `invocation::InvocationRecovery`; removal in 0.8.0")]
 pub type CodexRecovery = crate::autopilot::invocation::InvocationRecovery;
 
 /// Codex CLI. It assigns its own thread ID, reported by `thread.started`, so

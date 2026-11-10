@@ -337,8 +337,8 @@ lockfile — no separate process manager, cron job, or `kill` required.
 
 The `headroom-compression` Cargo feature is disabled by default. It pins
 `headroom-core` from `https://github.com/headroomlabs-ai/headroom.git` at the
-immutable revision `5bd2266f16bb351a7a7334e1c29c598d28187b1d`; the reviewed
-source is Apache-2.0 per its [pinned upstream LICENSE](https://github.com/headroomlabs-ai/headroom/blob/5bd2266f16bb351a7a7334e1c29c598d28187b1d/LICENSE).
+immutable revision `74b7ac23861944f1411d30c5394043ec0505b334`; the source
+at that revision is Apache-2.0 per its [pinned upstream LICENSE](https://github.com/headroomlabs-ai/headroom/blob/74b7ac23861944f1411d30c5394043ec0505b334/LICENSE).
 Build the optional artifact command when a review workflow can use it:
 
 ```bash
@@ -355,6 +355,40 @@ source hunk without retaining the entire raw diff as reviewer context:
 ironmem review-diff --repo <repo> --base <base> --head <head> \
   --expand-file <path> --hunk <ordinal>
 ```
+
+The artifact is an index of every source file and hunk, then the compressed
+diff. The compressor splits a hunk wherever it trims context and renumbers the
+pieces, so a file's body hunks do not line up with its index hunks by position
+or by line numbers. Each body hunk header names the index hunk it came from,
+after the closing `@@` and before any section text:
+
+```text
+review-diff source index
+file: src/lib.rs
+  src/lib.rs#hunk-1: @@ -7,19 +7,19 @@ fn main() {
+
+review-diff compressed body
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -8,5 +8,5 @@ [src/lib.rs#hunk-1] fn main() {
+ ...
+@@ -14,5 +14,5 @@ [src/lib.rs#hunk-1] fn main() {
+ ...
+```
+
+Both body hunks above expand with `--expand-file src/lib.rs --hunk 1`. The tag
+is the index selector byte for byte, the same text that hunk's index entry
+starts with. It is the index's rendering of the path, not Git's. The index
+quotes and escapes a path only when it holds a control character, `"` or `\`
+(`["line\nbreak.txt"#hunk-1]`); a path Git quotes for any other reason is
+written as it is, so `é.txt`, which Git writes as `"\303\251.txt"`, is tagged
+`[é.txt#hunk-1]`. The tag names the file whose `diff --git` line opens the file
+section the hunk sits in. A body hunk header without a tag means no index hunk
+of that file holds its lines: the compressor does not read the quoted
+`diff --git` line of a path Git quotes as the start of a file, and can leave
+that file's hunks, and its `rename` lines, under the file before it. The index
+still lists every source hunk.
 
 This feature currently targets review-diff ingestion; it does not compress MCP
 responses, collab output, or failure logs.

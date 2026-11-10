@@ -1,6 +1,6 @@
 [package]
 name = "ironmem"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 rust-version.workspace = true
 description = "AI memory MCP server — semantic search + knowledge graph in a single binary"
@@ -32,7 +32,7 @@ ironrace-core = { version = "0.3.4", path = "../ironrace-core" }
 ironrace-embed = { version = "0.3.4", path = "../ironrace-embed" }
 ironrace-pref-extract = { version = "0.3.4", path = "../ironrace-pref-extract" }
 ironrace-rerank = { version = "0.4.0", path = "../ironrace-rerank" }
-headroom-core = { git = "https://github.com/headroomlabs-ai/headroom.git", rev = "5bd2266f16bb351a7a7334e1c29c598d28187b1d", package = "headroom-core", default-features = false, optional = true }
+headroom-core = { git = "https://github.com/headroomlabs-ai/headroom.git", rev = "74b7ac23861944f1411d30c5394043ec0505b334", package = "headroom-core", default-features = false, optional = true }
 
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util", "net", "signal", "sync", "time"] }
 hyper = { version = "1", features = ["http1", "server"] }
@@ -41,7 +41,7 @@ http-body-util = "0.1"
 bytes = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 anyhow = "1"
 thiserror = "2"
 sha2 = "0.10"
@@ -70,4 +70,4 @@ tempfile = "3"
 # so `hooks` would be enabled for every build no matter which table declares
 # it. A virtual workspace does not get v2 implicitly from the edition, so
 # dropping that key during a manifest refactor silently re-enables hooks here.
-rusqlite = { version = "0.32", features = ["bundled", "hooks"] }
+rusqlite = { version = "0.41", features = ["bundled", "hooks"] }

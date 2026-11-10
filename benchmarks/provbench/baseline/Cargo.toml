@@ -26,7 +26,6 @@ hex = "0.4"
 rand_chacha = "0.3"
 rand = "0.8"
 provbench-scoring = { path = "../scoring" }
-indicatif = "0.17"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs", "io-util", "sync"] }

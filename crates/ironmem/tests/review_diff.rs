@@ -151,6 +151,177 @@ fn git_output(repo: &Path, args: impl IntoIterator<Item = impl AsRef<std::ffi::O
     String::from_utf8(output.stdout).expect("fixture git output should be UTF-8")
 }
 
+/// Lines Git's three lines of context join into one hunk and the compressor's
+/// two split again: five unchanged lines lie between each neighbouring pair
+/// in a group. Four source hunks, seven body hunks.
+#[cfg(feature = "headroom-compression")]
+const WIDE_CHANGED_LINES: [usize; 7] = [10, 16, 22, 60, 100, 106, 150];
+
+/// Bulk for every line, so the context the compressor drops outweighs the
+/// index, the extra hunk headers and their tags.
+#[cfg(feature = "headroom-compression")]
+const WIDE_PADDING: &str = "repeated repeated repeated repeated repeated";
+
+/// Lines far enough apart that Git writes each as a source hunk of its own:
+/// eight source hunks, which with any other file's exceed the ten hunks the
+/// compressor keeps per file.
+#[cfg(feature = "headroom-compression")]
+const SPREAD_CHANGED_LINES: [usize; 8] = [30, 40, 50, 70, 80, 90, 120, 130];
+
+/// Two hundred lines that each carry `label`; those in `changed` also carry
+/// `version`.
+#[cfg(feature = "headroom-compression")]
+fn wide_contents(label: &str, version: &str, changed: &[usize]) -> String {
+    (1..=200)
+        .map(|line| {
+            // Lines open with a digit so Git finds no section text for the
+            // hunk headers; `fixture()` covers headers that carry some.
+            if changed.contains(&line) {
+                format!("{line:03} {label} {version} payload {WIDE_PADDING}\n")
+            } else {
+                format!("{line:03} {label} unchanged context {WIDE_PADDING}\n")
+            }
+        })
+        .collect()
+}
+
+/// A repository whose range diff changes `WIDE_CHANGED_LINES` in each of
+/// `files`, whose lines carry the file's own name.
+#[cfg(feature = "headroom-compression")]
+fn wide_fixture(files: &[&str]) -> DiffFixture {
+    let labelled = files.iter().map(|file| (*file, *file)).collect::<Vec<_>>();
+    wide_fixture_labelled(&labelled)
+}
+
+/// A repository whose range diff changes `WIDE_CHANGED_LINES` in each
+/// `(path, label)` of `files`. Files that share a label are identical, line
+/// for line, in both commits.
+#[cfg(feature = "headroom-compression")]
+fn wide_fixture_labelled(files: &[(&str, &str)]) -> DiffFixture {
+    let tempdir = tempfile::tempdir().expect("wide temp repo");
+    git(tempdir.path(), ["init"]);
+    git(
+        tempdir.path(),
+        ["config", "user.email", "review-diff@example.test"],
+    );
+    git(tempdir.path(), ["config", "user.name", "Review Diff Test"]);
+
+    let commit = |version: &str| {
+        for (file, label) in files {
+            std::fs::write(
+                tempdir.path().join(file),
+                wide_contents(label, version, &WIDE_CHANGED_LINES),
+            )
+            .expect("write wide fixture");
+        }
+        git(tempdir.path(), ["add", "."]);
+        git(tempdir.path(), ["commit", "-m", version]);
+        git_output(tempdir.path(), ["rev-parse", "HEAD"])
+            .trim()
+            .to_owned()
+    };
+    let base = commit("base");
+    let head = commit("head");
+
+    DiffFixture {
+        tempdir,
+        base,
+        head,
+    }
+}
+
+/// One hunk of an artifact's compressed body.
+#[cfg(feature = "headroom-compression")]
+#[derive(Debug)]
+struct BodyHunk {
+    /// The `diff --git` line of the file section the hunk sits in.
+    section: String,
+    header: String,
+    /// The index selector the header carries, if it carries one.
+    tag: Option<String>,
+    /// The hunk's `+` and `-` lines.
+    changed: Vec<String>,
+}
+
+#[cfg(feature = "headroom-compression")]
+fn body_hunks(rendered: &str) -> Vec<BodyHunk> {
+    let (_, body) = rendered
+        .split_once("\nreview-diff compressed body\n")
+        .expect("artifact has a compressed body");
+    let (body, _) = body
+        .rsplit_once("\nreview-diff metrics\n")
+        .expect("artifact has a metrics footer");
+
+    let mut hunks = Vec::new();
+    let mut section = String::new();
+    let mut in_hunk = false;
+    for line in body.split('\n') {
+        if line.starts_with("diff --git ") {
+            section = line.to_owned();
+            in_hunk = false;
+        } else if line.starts_with("@@ -") {
+            hunks.push(BodyHunk {
+                section: section.clone(),
+                header: line.to_owned(),
+                tag: body_hunk_tag(line).map(str::to_owned),
+                changed: Vec::new(),
+            });
+            in_hunk = true;
+        } else if in_hunk && (line.starts_with('+') || line.starts_with('-')) {
+            hunks
+                .last_mut()
+                .expect("a hunk is open")
+                .changed
+                .push(line.to_owned());
+        }
+    }
+    hunks
+}
+
+/// The selector in `@@ -a,b +c,d @@ [<selector>]`. No fixture path contains
+/// `#hunk-`, so the first one ends the path.
+#[cfg(feature = "headroom-compression")]
+fn body_hunk_tag(header: &str) -> Option<&str> {
+    let (_, rest) = header.split_once(" @@ [")?;
+    let ordinal = rest.find("#hunk-")? + "#hunk-".len();
+    let digits = rest[ordinal..]
+        .bytes()
+        .take_while(u8::is_ascii_digit)
+        .count();
+    (digits > 0 && rest[ordinal + digits..].starts_with(']')).then(|| &rest[..ordinal + digits])
+}
+
+/// Every tagged body hunk must lead to source that holds its changed lines,
+/// by its selector and by the `--expand-file <path> --hunk <N>` form.
+#[cfg(feature = "headroom-compression")]
+fn assert_tags_open_their_own_source(
+    artifact: &ironmem::review_diff::ReviewDiffArtifact,
+    request: &ReviewDiffRequest,
+) {
+    for hunk in body_hunks(&artifact.rendered) {
+        let Some(tag) = &hunk.tag else { continue };
+        assert!(!hunk.changed.is_empty(), "{hunk:?}");
+        let (path, ordinal) = artifact
+            .files
+            .iter()
+            .flat_map(|file| file.hunks.iter().map(move |indexed| (file, indexed)))
+            .find(|(_, indexed)| &indexed.selector == tag)
+            .map(|(file, indexed)| (file.path.clone(), indexed.ordinal))
+            .unwrap_or_else(|| panic!("tag is not an index selector: {hunk:?}"));
+        let by_selector = artifact.expand(tag, None).expect("selector expansion");
+        let by_ordinal =
+            expand_review_diff(request, &path, Some(ordinal)).expect("ordinal expansion");
+        assert_eq!(by_selector, by_ordinal);
+        for line in &hunk.changed {
+            assert!(
+                by_selector.contains(&format!("\n{line}\n")),
+                "{tag} does not hold {line:?}:\n{by_selector}\n{}",
+                artifact.rendered
+            );
+        }
+    }
+}
+
 #[cfg(feature = "headroom-compression")]
 #[test]
 fn compressed_artifact_indexes_every_source_file_and_hunk() {
@@ -775,6 +946,310 @@ fn utf8_escaped_path_retains_unicode_identity_and_selector_expansion() {
         .expand(selector, None)
         .expect("unicode selector expansion")
         .contains("head unicode content"));
+}
+
+#[cfg(feature = "headroom-compression")]
+#[test]
+fn body_hunks_the_compressor_splits_carry_their_source_selector() {
+    let fixture = wide_fixture(&["wide.txt"]);
+    let request = fixture.request();
+    let artifact = build_review_diff(&request).expect("artifact should compress");
+    let rendered = &artifact.rendered;
+
+    assert_eq!(artifact.files.len(), 1);
+    assert_eq!(artifact.files[0].hunks.len(), 4, "{rendered}");
+    let hunks = body_hunks(rendered);
+    assert_eq!(
+        hunks
+            .iter()
+            .map(|hunk| hunk.header.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "@@ -8,5 +8,5 @@ [wide.txt#hunk-1]",
+            "@@ -14,5 +14,5 @@ [wide.txt#hunk-1]",
+            "@@ -20,5 +20,5 @@ [wide.txt#hunk-1]",
+            "@@ -58,5 +58,5 @@ [wide.txt#hunk-2]",
+            "@@ -98,5 +98,5 @@ [wide.txt#hunk-3]",
+            "@@ -104,5 +104,5 @@ [wide.txt#hunk-3]",
+            "@@ -148,5 +148,5 @@ [wide.txt#hunk-4]",
+        ],
+        "{rendered}"
+    );
+    assert_tags_open_their_own_source(&artifact, &request);
+
+    // The mistake the tag prevents: the third body hunk is not index hunk 3.
+    let third = &hunks[2];
+    assert_eq!(
+        third.changed,
+        [
+            format!("-022 wide.txt base payload {WIDE_PADDING}"),
+            format!("+022 wide.txt head payload {WIDE_PADDING}"),
+        ]
+    );
+    let index_hunk_three = artifact.expand("wide.txt", Some(3)).expect("index hunk 3");
+    assert!(!index_hunk_three.contains("022 wide.txt"));
+    assert!(artifact
+        .expand("wide.txt", Some(1))
+        .expect("index hunk 1")
+        .contains("+022 wide.txt head payload"));
+
+    // The tags are part of the artifact the size check measured.
+    assert_eq!(artifact.metrics.artifact_bytes, rendered.len());
+    assert!(rendered.contains(&format!("artifact_bytes={}\n", rendered.len())));
+    assert!(artifact.metrics.artifact_bytes < artifact.metrics.source_bytes);
+}
+
+#[cfg(feature = "headroom-compression")]
+#[test]
+fn body_hunk_tags_use_the_file_whose_section_holds_the_hunk() {
+    // The two files are the same line for line, before and after, so their
+    // hunks are too: only the file section a hunk sits in tells them apart.
+    let fixture = wide_fixture_labelled(&[("first.txt", "same"), ("second.txt", "same")]);
+    let request = fixture.request();
+    let artifact = build_review_diff(&request).expect("artifact should compress");
+
+    let hunks = body_hunks(&artifact.rendered);
+    assert_eq!(hunks.len(), 14, "{}", artifact.rendered);
+    for (first, second) in hunks[..7].iter().zip(&hunks[7..]) {
+        assert_eq!(first.changed, second.changed, "{}", artifact.rendered);
+        assert_eq!(
+            first.header.split(" [").next(),
+            second.header.split(" [").next(),
+            "{}",
+            artifact.rendered
+        );
+    }
+    for (file, hunks) in [("first.txt", &hunks[..7]), ("second.txt", &hunks[7..])] {
+        assert_eq!(
+            hunks
+                .iter()
+                .map(|hunk| (hunk.section.clone(), hunk.tag.clone()))
+                .collect::<Vec<_>>(),
+            [1, 1, 1, 2, 3, 3, 4].map(|ordinal| (
+                format!("diff --git a/{file} b/{file}"),
+                Some(format!("{file}#hunk-{ordinal}"))
+            )),
+            "{}",
+            artifact.rendered
+        );
+    }
+    assert_tags_open_their_own_source(&artifact, &request);
+}
+
+#[cfg(feature = "headroom-compression")]
+#[test]
+fn a_renamed_quoted_file_does_not_take_the_tags_of_the_file_before_it() {
+    // Head changes `docs/a.md` in four hunks and renames a file whose path
+    // Git quotes, changing it in eight. The compressor does not read the
+    // quoted `diff --git` line as a file header: it prints the renamed
+    // file's `similarity` and `rename` lines under `docs/a.md`'s own
+    // `diff --git` line and, twelve hunks being more than it keeps, sorts
+    // the renamed file's hunks in among `docs/a.md`'s.
+    let tempdir = tempfile::tempdir().expect("rename temp repo");
+    let repo = tempdir.path();
+    git(repo, ["init"]);
+    for (key, value) in [
+        ("user.email", "review-diff@example.test"),
+        ("user.name", "Review Diff Test"),
+        // Git's defaults, pinned: the git that `build_review_diff` runs
+        // reads the operator's own config.
+        ("core.quotePath", "true"),
+        ("diff.renames", "true"),
+    ] {
+        git(repo, ["config", key, value]);
+    }
+    std::fs::create_dir(repo.join("docs")).expect("create docs");
+    let write = |file: &str, label: &str, version: &str, changed: &[usize]| {
+        std::fs::write(repo.join(file), wide_contents(label, version, changed))
+            .expect("write rename fixture");
+    };
+    let commit = |version: &str| {
+        git(repo, ["add", "."]);
+        git(repo, ["commit", "-m", version]);
+        git_output(repo, ["rev-parse", "HEAD"]).trim().to_owned()
+    };
+    write("docs/a.md", "alpha", "base", &WIDE_CHANGED_LINES);
+    write("docs/résumé.md", "resume", "base", &SPREAD_CHANGED_LINES);
+    let base = commit("base");
+    write("docs/a.md", "alpha", "head", &WIDE_CHANGED_LINES);
+    git(repo, ["mv", "docs/résumé.md", "docs/résumé-old.md"]);
+    write(
+        "docs/résumé-old.md",
+        "resume",
+        "head",
+        &SPREAD_CHANGED_LINES,
+    );
+    let head = commit("head");
+    let request = ReviewDiffRequest::range(repo, &base, &head);
+    let artifact = build_review_diff(&request).expect("artifact should compress");
+    let rendered = &artifact.rendered;
+
+    assert_eq!(
+        artifact
+            .files
+            .iter()
+            .map(|file| (file.path.as_str(), file.hunks.len()))
+            .collect::<Vec<_>>(),
+        [("docs/a.md", 4), ("docs/résumé-old.md", 8)],
+        "{rendered}"
+    );
+    let own_section = "diff --git a/docs/a.md b/docs/a.md";
+    assert!(
+        rendered.contains(&format!("{own_section}\nsimilarity index "))
+            && rendered.contains(
+                "%\nrename from \"docs/r\\303\\251sum\\303\\251.md\"\nrename to \"docs/r\\303\\251sum\\303\\251-old.md\"\n--- a/docs/a.md\n"
+            ),
+        "the compressor no longer prints the renamed file's lines under docs/a.md; retarget this test:\n{rendered}"
+    );
+    // Each hunk of `docs/a.md` names `docs/a.md`, by the `diff --git` line
+    // above it. A hunk of the renamed file names no file while it sits in
+    // that section: its own selector there would name a file other than the
+    // one whose section holds it. Index hunks 6 and 7 of the renamed file
+    // are the two the compressor dropped.
+    let hunks = body_hunks(rendered);
+    assert_eq!(
+        hunks
+            .iter()
+            .map(|hunk| {
+                let label = hunk.changed[0].split(' ').nth(1).expect("line label");
+                (hunk.section.as_str(), label, hunk.header.as_str())
+            })
+            .collect::<Vec<_>>(),
+        [
+            ("alpha", "@@ -8,5 +8,5 @@ [docs/a.md#hunk-1]"),
+            ("alpha", "@@ -14,5 +14,5 @@ [docs/a.md#hunk-1]"),
+            ("alpha", "@@ -20,5 +20,5 @@ [docs/a.md#hunk-1]"),
+            ("resume", "@@ -28,5 +28,5 @@"),
+            ("resume", "@@ -38,5 +38,5 @@"),
+            ("resume", "@@ -48,5 +48,5 @@"),
+            ("alpha", "@@ -58,5 +58,5 @@ [docs/a.md#hunk-2]"),
+            ("resume", "@@ -68,5 +68,5 @@"),
+            ("resume", "@@ -78,5 +78,5 @@"),
+            ("alpha", "@@ -98,5 +98,5 @@ [docs/a.md#hunk-3]"),
+            ("alpha", "@@ -104,5 +104,5 @@ [docs/a.md#hunk-3]"),
+            ("resume", "@@ -128,5 +128,5 @@"),
+            ("alpha", "@@ -147,7 +147,7 @@ [docs/a.md#hunk-4]"),
+        ]
+        .map(|(label, header)| (own_section, label, header)),
+        "{rendered}"
+    );
+    assert_tags_open_their_own_source(&artifact, &request);
+}
+
+#[cfg(feature = "headroom-compression")]
+#[test]
+fn body_hunks_of_a_quoted_path_carry_its_escaped_selector() {
+    // `wide.txt` sorts first, so the compressor has a file section open when
+    // it meets the quoted one.
+    let special_path = "zeta\tname.txt";
+    let fixture = wide_fixture(&["wide.txt", special_path]);
+    let request = fixture.request();
+    let artifact = build_review_diff(&request).expect("artifact should compress");
+
+    let quoted = body_hunks(&artifact.rendered)
+        .into_iter()
+        .filter(|hunk| hunk.section.contains("zeta"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        quoted
+            .iter()
+            .map(|hunk| hunk.tag.clone())
+            .collect::<Vec<_>>(),
+        [1, 1, 1, 2, 3, 3, 4].map(|ordinal| Some(format!("\"zeta\\tname.txt\"#hunk-{ordinal}"))),
+        "{}",
+        artifact.rendered
+    );
+    assert_tags_open_their_own_source(&artifact, &request);
+    let third = artifact
+        .expand(quoted[2].tag.as_deref().expect("tag"), None)
+        .expect("escaped selector expansion");
+    assert!(third.contains("+022 zeta\tname.txt head payload"));
+}
+
+#[cfg(feature = "headroom-compression")]
+#[test]
+fn a_hunk_the_compressor_files_under_another_file_is_not_tagged_as_that_file() {
+    // The compressor does not read a quoted `diff --git` line as a file
+    // header, and with more hunks than it keeps per file it can drop that
+    // line and leave the quoted file's hunk inside the section before it.
+    // `alpha.txt` hunk 1 covers lines 1-7, so the one-line hunk fits its
+    // line numbers; only its text shows that it belongs elsewhere.
+    let fixture = fixture();
+    let special_path = "line\nbreak.txt";
+    let special_file = fixture.tempdir.path().join(special_path);
+    std::fs::write(&special_file, "base newline content\n").expect("write newline base");
+    git(
+        fixture.tempdir.path(),
+        vec!["add".to_owned(), special_path.to_owned()],
+    );
+    git(fixture.tempdir.path(), ["commit", "-m", "add newline path"]);
+    std::fs::write(&special_file, "head newline content\n").expect("write newline head");
+    std::fs::write(
+        fixture.tempdir.path().join("alpha.txt"),
+        fixture_contents("alpha.txt", "worktree"),
+    )
+    .expect("write enough worktree diff for compression");
+    let request = ReviewDiffRequest::worktree(fixture.tempdir.path());
+    let artifact = build_review_diff(&request).expect("artifact should compress");
+
+    let hunks = body_hunks(&artifact.rendered);
+    let misfiled = hunks
+        .iter()
+        .find(|hunk| hunk.changed.contains(&"+head newline content".to_owned()))
+        .unwrap_or_else(|| panic!("quoted file's hunk left the body:\n{}", artifact.rendered));
+    assert_eq!(
+        misfiled.section, "diff --git a/alpha.txt b/alpha.txt",
+        "the compressor now files the hunk correctly; retarget this test:\n{}",
+        artifact.rendered
+    );
+    assert_eq!(misfiled.tag, None, "{}", artifact.rendered);
+    // The hunks that are alpha.txt's own are still tagged.
+    assert!(
+        hunks
+            .iter()
+            .filter(|hunk| hunk.tag.is_some())
+            .all(|hunk| hunk.changed[0].starts_with("-alpha.txt section ")),
+        "{}",
+        artifact.rendered
+    );
+    assert!(hunks.iter().filter(|hunk| hunk.tag.is_some()).count() >= 9);
+    assert_tags_open_their_own_source(&artifact, &request);
+}
+
+#[cfg(feature = "headroom-compression")]
+#[test]
+fn every_body_hunk_of_the_two_file_fixture_is_tagged_with_its_own_source() {
+    let fixture = fixture();
+    let request = fixture.request();
+    let artifact = build_review_diff(&request).expect("artifact should compress");
+
+    let hunks = body_hunks(&artifact.rendered);
+    assert!(!hunks.is_empty());
+    for hunk in &hunks {
+        let tag = hunk
+            .tag
+            .as_deref()
+            .unwrap_or_else(|| panic!("untagged body hunk {hunk:?}:\n{}", artifact.rendered));
+        let file = tag.split_once("#hunk-").expect("selector").0;
+        assert_eq!(hunk.section, format!("diff --git a/{file} b/{file}"));
+    }
+    // Git's section text stays on the header, after the tag.
+    let with_section_text = hunks
+        .iter()
+        .filter(|hunk| hunk.header.ends_with(" separator"))
+        .collect::<Vec<_>>();
+    assert!(with_section_text.len() >= 16, "{}", artifact.rendered);
+    for hunk in with_section_text {
+        let tag = hunk.tag.as_deref().expect("tagged above");
+        let file = tag.split_once("#hunk-").expect("selector").0;
+        assert!(
+            hunk.header
+                .contains(&format!(" @@ [{tag}] {file} section ")),
+            "{}",
+            hunk.header
+        );
+    }
+    assert_tags_open_their_own_source(&artifact, &request);
 }
 
 fn review_diff_command(fixture: &DiffFixture) -> Command {

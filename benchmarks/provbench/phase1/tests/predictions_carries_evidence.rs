@@ -142,10 +142,7 @@ fn prediction_row_carries_evidence_from_rule_chain() {
     let (decision, _rule_id, _spec_ref, evidence_json) = chain.classify_first_match(&ctx);
 
     // Runner-side parse (runner.rs lines ~177-186 after Task 6 fix).
-    let evidence_value: Option<serde_json::Value> = match serde_json::from_str(&evidence_json) {
-        Ok(v) => Some(v),
-        Err(_) => None,
-    };
+    let evidence_value: Option<serde_json::Value> = serde_json::from_str(&evidence_json).ok();
 
     let pred_row = PredictionRow {
         fact_id: fact.fact_id.clone(),

@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- KG boost and the prompt hook's KG recall now match entities whose names
+  contain punctuation or a non-ASCII capital (#378). An entity such as
+  `iron-build`, `kg_boost`, `Node.js` or `Émile` could never match a query,
+  even one containing that exact string. A punctuated name matches only
+  where it appears as written, as a whole word: `c++` is not matched by a
+  bare `c` or by `abc++`, nor `iron-build` by `iron build`. In a query no
+  letter or digit may touch a name, punctuated or plain, so `c++` is not
+  matched by `C++17`. Curly quotes and typographic hyphens (with the figure
+  dash, the en dash and the minus sign, but not the em dash) count as their
+  ASCII forms in the query, the entity name and the drawer text: `O’Brien`
+  names `O'Brien`. A combining mark is part of the word it continues, so a
+  decomposed `café` is no longer read as the entity `cafe`. A mark that
+  follows a symbol, such as the variation selector of an emoji, continues
+  no word, so a name written straight after an emoji matches. KG boost
+  raises a drawer for a punctuated name only when the drawer mentions it as
+  a whole word: a query naming `c++` does not boost a drawer about `abc++`.
+  A plain name boosts any drawer that contains it, as before, so `cat`
+  boosts a drawer about `cats` and also one about a `category`. An entity
+  row whose name is not text is skipped with a warning, in the query scan
+  and when a triple points at it; such a triple used to fail the search.
+
+## [0.7.0] - 2026-11-09
+
 ### Changed
 
 - **The Stop hook's handoff nudge names the wing prompt recall reads.** A
@@ -44,12 +69,98 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `session_refusal`. Snapshot `Available` variants cannot be constructed
   externally; `HarnessSnapshots` and `SharedDaemon` fields are crate-private.
   Use the snapshot/daemon collection APIs. Deprecated Codex aliases are
-  scheduled for removal in **0.7.0**.
+  scheduled for removal in **0.8.0**.
 - Pending invocation exit records have additive strict fields that older
   readers reject and hold. Finish or clear pending runs with this version
   before downgrading. Journals/prompts/stderr retain raw tool output; old,
   unnamed invocation directories are opportunistically pruned after 14 days,
   keeping the named/current invocation. This is not a guaranteed deletion time.
+
+- **A new Autopilot issue branch has no upstream.** Before, an issue branch
+  cut from a remote-tracking `--base` such as `origin/main` tracked it, so
+  with `push.default=upstream` a bare `git push` from the issue branch went to
+  `main`. Now the branch is created at the resolved sha with `--no-track`, so
+  it no longer tracks the base and a bare `git push` cannot reach the base
+  through an upstream; other push settings (`push.default=matching` or
+  `current`, a `remote.<name>.push` refspec) can still push without naming
+  anything. Push an issue branch by naming the remote and the branch (`git
+  push <remote> <branch>`); the implementer's goal condition now says so,
+  naming the remote whose push URL is the issue's GitHub repository, else
+  (skipping any remote that pushes only to another GitHub repository) the one
+  already tracking the branch, else `origin` if configured, else the only one
+  left, and no remote when none of those applies; a run warns, naming the
+  remotes, when none pushes to the issue's repository but some push to
+  another. Existing branches keep whatever upstream they have; remove it with
+  `git branch --unset-upstream <branch>`.
+- **Existing setups with `commit.gpgsign` on now get a failed attempt when an
+  implementer's commits are unsigned, for Claude as well as Codex and Muse.**
+  Before, such a run could succeed. Make sure the signing key or agent is
+  reachable from wherever the Lead runs. To stop the check on one issue
+  branch, turn `commit.gpgsign` off, then run `git config
+  branch.<branch>.ironmemSigning false` in the repo. To stop it on every
+  branch, turn `commit.gpgsign` off, then unset the repository-wide
+  `ironmem.autopilotSigning` and each branch's `ironmemSigning`. See
+  "Commit signing" in `docs/AUTOPILOT.md`.
+- **An operator's own `codex exec` or `muse exec --output-schema` session no
+  longer stalls Autopilot.** A `ps` row now counts as an ambiguous Autopilot
+  invocation only when it carries an Autopilot-shaped marker path.
+- **A dispatch into an invocation directory that already has a process
+  identity is refused** instead of spawning a second process into it.
+- **The Codex and Muse implementers skip relative `PATH` entries** (such as
+  `.`) when finding their binary. They run in the issue worktree, where a
+  relative entry would find a file in the repository being worked on. So do
+  the Claude implementer and the Codex and Muse reviewers.
+- **Resuming an issue branch with no recorded cut now records the commit the
+  branch was created from** (from its reflog, or else its merge base with
+  `--base`), and refuses the run if neither can be found or that merge base
+  is the branch's own tip while it has unpushed commits. A new branch's cut
+  is recorded before the branch is created, with the creating run's own token
+  in `branch.<branch>.ironmemCutOwner`. It is never taken back from a branch
+  that exists, nor when another controller has recorded the same value since,
+  and a run whose cut was taken back while its add made the branch records
+  it again, so a branch is not left without one. A held-lock error now names
+  the lock file and its age. Cut and signing-flag writes run git in the C
+  locale, so a held lock is recognised in any locale, and SHA-256
+  repositories can provision issue worktrees.
+- **Library: `Worktree::cut` is a `CommitSha`**, a full commit object name
+  (40 or 64 hex digits) checked where it is made, instead of a `String`. It
+  derefs to `str`.
+- **Library: supervised-CLI types renamed.** `CodexArtifacts` is now
+  `InvocationArtifacts`, `CodexRecovery` is `InvocationRecovery`,
+  `CodexDispatcher` is `CliDispatcher::resolve(Implementer::Codex)` (the old
+  type and its argument-free `resolve()` remain as a deprecated wrapper),
+  `registry::TwoHarnessMonitor` is now `HarnessProcessMonitor`, and
+  the `codex_process` module is `process_tree`, where `parse_codex_processes`,
+  `CodexProcessSnapshot`, `CodexProcessSource` and `UnixCodexProcesses` are
+  `parse_processes`, `ProcessSnapshot`, `ProcessSource` and `UnixProcesses`.
+  The old names stay, deprecated, until 0.8.0. These changes have no alias
+  and break a caller at compile time: the `codex_artifacts` field of
+  `DispatchSpec`, `DispatchState` and `ClearedDispatch` is
+  `invocation_artifacts` (the stored and `--json` key is still
+  `codex_artifacts`); `HarnessSnapshots::codex` is `processes`; `Worktree` has
+  a new required field, `cut`; `TurnPromptInputs` has a new required field,
+  `remote` (an `Option<&str>`: the remote the goal condition's push names,
+  `None` for none); `DispatchState` has new required fields `session_model`,
+  `resume_refusals` and `signing_held`, and `DispatchOutcome` a new required
+  field `session_refusal`; `BudgetLedgerEntry` has a new field
+  `spend_reservations` (reserved ceilings are now recorded per issue, so
+  one its controller died holding is released by the next run); the new `Implementer::Muse` variant breaks
+  exhaustive matches on `Implementer`; `dispatch_state`'s
+  `upsert_dispatch_state_if_unchanged`, `dispatch_state_is` and
+  `clear_dispatch_state_if_unchanged` are removed (the claim
+  compare-and-set functions replace them); `codex_dispatch`'s supervision moved to `invocation`,
+  where `prepare_artifacts`, `has_launch_failure_record`,
+  `has_valid_exit_record` and `recover_artifacts` keep their names,
+  `run_codex` is `run_supervised`, and `run_codex_bounded`, `read_artifacts`
+  and `dispatch_timeout` are no longer public; and `codex_dispatch` no longer
+  exports `CODEX_DISPATCH_TIMEOUT_SECS`, `CODEX_VERDICT_JSON_SCHEMA` or
+  `build_argv`.
+- **GitHub releases now carry their version's `CHANGELOG.md` section as the
+  description.** Until now the release workflow published every release with
+  an empty body. `scripts/release_notes.py` extracts the tag's
+  `## [X.Y.Z]` section, and a tag without one fails before the builds start.
+  A section over GitHub's 125,000-character limit is cut at a line and links
+  to the full CHANGELOG.
 
 ### Added
 
@@ -104,26 +215,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- KG boost and the prompt hook's KG recall now match entities whose names
-  contain punctuation or a non-ASCII capital (#378). An entity such as
-  `iron-build`, `kg_boost`, `Node.js` or `Émile` could never match a query,
-  even one containing that exact string. A punctuated name matches only
-  where it appears as written, as a whole word: `c++` is not matched by a
-  bare `c` or by `abc++`, nor `iron-build` by `iron build`. In a query no
-  letter or digit may touch a name, punctuated or plain, so `c++` is not
-  matched by `C++17`. Curly quotes and typographic hyphens (with the figure
-  dash, the en dash and the minus sign, but not the em dash) count as their
-  ASCII forms in the query, the entity name and the drawer text: `O’Brien`
-  names `O'Brien`. A combining mark is part of the word it continues, so a
-  decomposed `café` is no longer read as the entity `cafe`. A mark that
-  follows a symbol, such as the variation selector of an emoji, continues
-  no word, so a name written straight after an emoji matches. KG boost
-  raises a drawer for a punctuated name only when the drawer mentions it as
-  a whole word: a query naming `c++` does not boost a drawer about `abc++`.
-  A plain name boosts any drawer that contains it, as before, so `cat`
-  boosts a drawer about `cats` and also one about a `category`. An entity
-  row whose name is not text is skipped with a warning, in the query scan
-  and when a triple points at it; such a triple used to fail the search.
+- **The bundled SQLite is upgraded to 3.54 to fix RUSTSEC-2026-0459.** SQLite
+  before 3.54.0 could return uninitialized page-cache memory when it opened a
+  database together with a `-wal` file whose page size differed from the
+  database's. `rusqlite` moves from 0.32 to 0.41, which bundles SQLite 3.54
+  through `libsqlite3-sys` 0.39.
+  The two benchmark workspaces that link SQLite, `benchmarks/abeval` and
+  `benchmarks/provbench/phase1`, are separate Cargo workspaces with their own
+  lockfiles and were still on `rusqlite` 0.31; both move to 0.41 as well, a
+  move that needs no source change. `benchmarks/provbench/baseline`'s lockfile
+  moves `h2`, `quinn-proto`, `rustls`, `rustls-webpki` and `webpki-roots` to
+  their patched releases, and `rand` from 0.9 to 0.10 with the new
+  `quinn-proto`.
+  The other advisories in the five benchmark lockfiles are cleared too.
+  `benchmarks/provbench/labeler` and `phase1` move `gix` from 0.66 to 0.77,
+  which fixes RUSTSEC-2025-0140 (`gix-date`) and RUSTSEC-2025-0021
+  (`gix-features`) and replaces the unsound `faster-hex` 0.9
+  (RUSTSEC-2026-0306); the one call that changed is
+  `Tree::lookup_entry_by_path`, which no longer takes a scratch buffer. All
+  five lockfiles take `anyhow` 1.0.104 (RUSTSEC-2026-0190), `baseline` takes
+  `tokio` 1.54.1 (RUSTSEC-2026-0386), and `labeler` and `phase1` take `memmap2`
+  0.9.12 (RUSTSEC-2026-0186). `baseline` drops its `indicatif` dependency,
+  which none of its code used and which brought in the unmaintained
+  `number_prefix` (RUSTSEC-2025-0119). `cargo audit` now reports no
+  vulnerability and no warning for any of the five; the one advisory the root
+  `.cargo/audit.toml` ignore list hides in them is RUSTSEC-2024-0436 (`paste`,
+  a proc-macro that `statrs` reaches through `nalgebra` and `simba`), in
+  `baseline`, `phase1` and `scoring`, and the list's comment now names that
+  chain. CI's Security Audit job audits each benchmark lockfile as well as
+  the root one; it read only the root one before.
+  Three checks in those workspaces that were already failing are repaired:
+  `cargo fmt --check` over four of `abeval`'s test files, a clippy
+  `manual_ok_err` in a `phase1` test, and `phase1`'s `load_roundtrip` test,
+  which read gitignored corpus files absent from a fresh checkout and now reads
+  committed fixtures in the labeler's output formats.
+  The optional `headroom-compression` feature's `headroom-core` git dependency
+  moves from commit `5bd2266f` to `74b7ac23`, the first upstream commit on
+  `rusqlite` 0.41: only one crate in a build may link SQLite, so the old pin
+  kept the whole workspace on 0.32 even with the feature off.
+  The new pin changes what a `--features headroom-compression` build does in
+  two ways. The compressor now splits a hunk wherever it trims context and
+  renumbers each piece, so the hunks in an `ironmem review-diff` artifact's
+  body no longer match its index one for one: the third body hunk of a file
+  need not be index hunk 3. Each body hunk header therefore carries the
+  selector of the index hunk it came from, after the closing `@@` and before
+  any section text, as in `@@ -8,5 +8,5 @@ [src/lib.rs#hunk-1]`; `--expand-file
+  <path> --hunk <N>` opens that hunk. A body hunk with no source hunk to name
+  is left untagged. The feature build also compiles `tree-sitter`, eight
+  `tree-sitter` grammar crates and `tree-sitter-language`, none of which the
+  old pin needed. CI now runs the review-diff tests with the feature on, so a
+  later pin move fails there if it changes what those tests assert about their
+  fixtures' bodies: the hunk headers and tags, the file section each hunk sits
+  in, and the changed lines. A change to the compressor's output that leaves
+  those alone still passes.
 
 - Claude implementer liveness in the queue, `supervise` and `reconcile`
   now reads the process table as well as the `claude agents` registry,
@@ -304,94 +448,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`review::build_argv` ends in `-`), as the Codex implementer does.
   The day's dollar total includes in-flight dispatch reservations, so
   it can read higher than the settled spend while a dispatch runs.
-
-### Changed
-
-- **A new Autopilot issue branch has no upstream.** Before, an issue branch
-  cut from a remote-tracking `--base` such as `origin/main` tracked it, so
-  with `push.default=upstream` a bare `git push` from the issue branch went to
-  `main`. Now the branch is created at the resolved sha with `--no-track`, so
-  it no longer tracks the base and a bare `git push` cannot reach the base
-  through an upstream; other push settings (`push.default=matching` or
-  `current`, a `remote.<name>.push` refspec) can still push without naming
-  anything. Push an issue branch by naming the remote and the branch (`git
-  push <remote> <branch>`); the implementer's goal condition now says so,
-  naming the remote whose push URL is the issue's GitHub repository, else
-  (skipping any remote that pushes only to another GitHub repository) the one
-  already tracking the branch, else `origin` if configured, else the only one
-  left, and no remote when none of those applies; a run warns, naming the
-  remotes, when none pushes to the issue's repository but some push to
-  another. Existing branches keep whatever upstream they have; remove it with
-  `git branch --unset-upstream <branch>`.
-- **Existing setups with `commit.gpgsign` on now get a failed attempt when an
-  implementer's commits are unsigned, for Claude as well as Codex and Muse.**
-  Before, such a run could succeed. Make sure the signing key or agent is
-  reachable from wherever the Lead runs. To stop the check on one issue
-  branch, turn `commit.gpgsign` off, then run `git config
-  branch.<branch>.ironmemSigning false` in the repo. To stop it on every
-  branch, turn `commit.gpgsign` off, then unset the repository-wide
-  `ironmem.autopilotSigning` and each branch's `ironmemSigning`. See
-  "Commit signing" in `docs/AUTOPILOT.md`.
-- **An operator's own `codex exec` or `muse exec --output-schema` session no
-  longer stalls Autopilot.** A `ps` row now counts as an ambiguous Autopilot
-  invocation only when it carries an Autopilot-shaped marker path.
-- **A dispatch into an invocation directory that already has a process
-  identity is refused** instead of spawning a second process into it.
-- **The Codex and Muse implementers skip relative `PATH` entries** (such as
-  `.`) when finding their binary. They run in the issue worktree, where a
-  relative entry would find a file in the repository being worked on. So do
-  the Claude implementer and the Codex and Muse reviewers.
-- **Resuming an issue branch with no recorded cut now records the commit the
-  branch was created from** (from its reflog, or else its merge base with
-  `--base`), and refuses the run if neither can be found or that merge base
-  is the branch's own tip while it has unpushed commits. A new branch's cut
-  is recorded before the branch is created, with the creating run's own token
-  in `branch.<branch>.ironmemCutOwner`. It is never taken back from a branch
-  that exists, nor when another controller has recorded the same value since,
-  and a run whose cut was taken back while its add made the branch records
-  it again, so a branch is not left without one. A held-lock error now names
-  the lock file and its age. Cut and signing-flag writes run git in the C
-  locale, so a held lock is recognised in any locale, and SHA-256
-  repositories can provision issue worktrees.
-- **Library: `Worktree::cut` is a `CommitSha`**, a full commit object name
-  (40 or 64 hex digits) checked where it is made, instead of a `String`. It
-  derefs to `str`.
-- **Library: supervised-CLI types renamed.** `CodexArtifacts` is now
-  `InvocationArtifacts`, `CodexRecovery` is `InvocationRecovery`,
-  `CodexDispatcher` is `CliDispatcher::resolve(Implementer::Codex)` (the old
-  type and its argument-free `resolve()` remain as a deprecated wrapper),
-  `registry::TwoHarnessMonitor` is now `HarnessProcessMonitor`, and
-  the `codex_process` module is `process_tree`, where `parse_codex_processes`,
-  `CodexProcessSnapshot`, `CodexProcessSource` and `UnixCodexProcesses` are
-  `parse_processes`, `ProcessSnapshot`, `ProcessSource` and `UnixProcesses`.
-  The old names stay, deprecated, until 0.7.0. These changes have no alias
-  and break a caller at compile time: the `codex_artifacts` field of
-  `DispatchSpec`, `DispatchState` and `ClearedDispatch` is
-  `invocation_artifacts` (the stored and `--json` key is still
-  `codex_artifacts`); `HarnessSnapshots::codex` is `processes`; `Worktree` has
-  a new required field, `cut`; `TurnPromptInputs` has a new required field,
-  `remote` (an `Option<&str>`: the remote the goal condition's push names,
-  `None` for none); `DispatchState` has new required fields `session_model`,
-  `resume_refusals` and `signing_held`, and `DispatchOutcome` a new required
-  field `session_refusal`; `BudgetLedgerEntry` has a new field
-  `spend_reservations` (reserved ceilings are now recorded per issue, so
-  one its controller died holding is released by the next run); the new `Implementer::Muse` variant breaks
-  exhaustive matches on `Implementer`; `dispatch_state`'s
-  `upsert_dispatch_state_if_unchanged`, `dispatch_state_is` and
-  `clear_dispatch_state_if_unchanged` are removed (the claim
-  compare-and-set functions replace them); `codex_dispatch`'s supervision moved to `invocation`,
-  where `prepare_artifacts`, `has_launch_failure_record`,
-  `has_valid_exit_record` and `recover_artifacts` keep their names,
-  `run_codex` is `run_supervised`, and `run_codex_bounded`, `read_artifacts`
-  and `dispatch_timeout` are no longer public; and `codex_dispatch` no longer
-  exports `CODEX_DISPATCH_TIMEOUT_SECS`, `CODEX_VERDICT_JSON_SCHEMA` or
-  `build_argv`.
-- **GitHub releases now carry their version's `CHANGELOG.md` section as the
-  description.** Until now the release workflow published every release with
-  an empty body. `scripts/release_notes.py` extracts the tag's
-  `## [X.Y.Z]` section, and a tag without one fails before the builds start.
-  A section over GitHub's 125,000-character limit is cut at a line and links
-  to the full CHANGELOG.
 
 ## [0.6.0] - 2026-10-17
 

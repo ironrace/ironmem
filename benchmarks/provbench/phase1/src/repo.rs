@@ -45,8 +45,7 @@ impl Repo {
             Err(_) => return Ok(None),
         };
         let tree = commit.tree().context("commit has no tree")?;
-        let mut buf = Vec::new();
-        let entry = match tree.lookup_entry_by_path(source_path, &mut buf)? {
+        let entry = match tree.lookup_entry_by_path(source_path)? {
             Some(e) => e,
             None => return Ok(None),
         };
