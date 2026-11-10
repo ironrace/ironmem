@@ -10,19 +10,23 @@ use std::os::unix::io::RawFd;
 
 /// A forked child of this test process: killed and reaped when dropped,
 /// however the test ends.
-pub(crate) struct Reap(pub(crate) libc::pid_t);
-
-impl Drop for Reap {
-    fn drop(&mut self) {
-        // SAFETY: our own unreaped child.
-        unsafe {
-            libc::kill(self.0, libc::SIGKILL);
-            libc::waitpid(self.0, std::ptr::null_mut(), 0);
-        }
-    }
-}
+pub(crate) struct Reap(libc::pid_t);
 
 impl Reap {
+    /// The guard for `child`, the pid `fork` returned to the parent.
+    ///
+    /// Only a pid that names one process is taken. `kill` reads 0 as the
+    /// caller's whole process group and -1 as every process the user may
+    /// signal, and those are what `fork` returns in the child and when it
+    /// fails.
+    pub(crate) fn new(child: libc::pid_t) -> Self {
+        assert!(
+            child > 0,
+            "{child} is not the pid of a forked child, and must never be signalled"
+        );
+        Self(child)
+    }
+
     /// Waits for a child that ends by itself, and returns its wait status.
     ///
     /// It is not killed, and nothing signals it afterwards: once reaped, its
@@ -46,8 +50,20 @@ impl Reap {
     }
 }
 
+impl Drop for Reap {
+    fn drop(&mut self) {
+        // SAFETY: our own unreaped child, by a pid `new` checked names one
+        // process.
+        unsafe {
+            libc::kill(self.0, libc::SIGKILL);
+            libc::waitpid(self.0, std::ptr::null_mut(), 0);
+        }
+    }
+}
+
 /// The first thing a forked child does: arrange its own end, and close
-/// every descriptor but `kept`.
+/// every descriptor but `kept` (all of them when `kept` is -1, which no
+/// descriptor is).
 ///
 /// The alarm ends it if the test process is killed before it can reap it:
 /// a child that pauses would otherwise stay for ever. And it holds a copy
@@ -66,6 +82,24 @@ pub(crate) unsafe fn keep_only(kept: RawFd) {
             if fd != kept {
                 libc::close(fd);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Reap;
+
+    /// `kill(0)` signals the test's own process group and `kill(-1)` every
+    /// process the user may signal, so no guard is built for either, nor
+    /// for any other pid that is not one process's.
+    #[test]
+    fn a_pid_that_is_not_one_process_gets_no_guard() {
+        for pid in [0, -1, -4242, libc::pid_t::MIN] {
+            // Forgotten, never dropped: were a guard built for this pid, the
+            // test must not be what sends its signal.
+            let built = std::panic::catch_unwind(|| std::mem::forget(Reap::new(pid)));
+            assert!(built.is_err(), "a guard was built for pid {pid}");
         }
     }
 }

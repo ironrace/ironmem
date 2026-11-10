@@ -481,7 +481,7 @@ mod tests {
                 }
             }
         }
-        let _reap = crate::test_fork::Reap(child);
+        let _reap = crate::test_fork::Reap::new(child);
         drop(lock);
         acquired(try_lock_path(&path).unwrap());
     }
@@ -512,7 +512,7 @@ mod tests {
                 libc::_exit(0);
             }
         }
-        let status = crate::test_fork::Reap(child).wait();
+        let status = crate::test_fork::Reap::new(child).wait();
         assert!(
             libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
             "the forked copy did not exit cleanly: wait status {status}"
