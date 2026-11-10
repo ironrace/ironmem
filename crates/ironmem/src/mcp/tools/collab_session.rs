@@ -4190,7 +4190,7 @@ mod tests {
     use super::*;
     use crate::collab::queue::SessionRecord;
     use crate::collab::CollabSession;
-    use crate::mcp::tools::test_support::{git_ancestor_chain, test_app_with_db_path};
+    use crate::mcp::tools::test_support::{git_ancestor_chain, sole_db_mut, test_app_with_db_path};
     use std::sync::Arc;
 
     // ── test helpers ──────────────────────────────────────────────────────────
@@ -7356,14 +7356,16 @@ mod tests {
     fn abandon_commits_exactly_once_under_busy_snapshot_replay() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("mem.sqlite3");
-        let app = test_app_with_db_path(db_path.clone(), dir.path());
+        let mut app = test_app_with_db_path(db_path.clone(), dir.path());
         let sid = start_session(&app);
         drive_to_implement(&app, &sid);
         age_session(&app, &sid, crate::collab::COLLAB_DEAD_SESSION_SECS + 60);
 
         // Armed after the fixture is built, so the contender interferes with
         // the abandon transaction and nothing before it.
-        let probe = app.db.arm_busy_snapshot_once(&db_path).unwrap();
+        let probe = sole_db_mut(&mut app)
+            .arm_busy_snapshot_once(&db_path)
+            .unwrap();
 
         handle_collab_end(&app, &abandon_args(&sid, "claude", "wedged"))
             .expect("the replayed attempt must succeed, not surface the busy snapshot");
@@ -7427,13 +7429,12 @@ mod tests {
     fn abandon_refuses_a_session_that_goes_live_inside_its_own_transaction() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("mem.sqlite3");
-        let app = test_app_with_db_path(db_path.clone(), dir.path());
+        let mut app = test_app_with_db_path(db_path.clone(), dir.path());
         let sid = start_session(&app);
         drive_to_implement(&app, &sid);
         age_session(&app, &sid, crate::collab::COLLAB_DEAD_SESSION_SECS + 60);
 
-        let probe = app
-            .db
+        let probe = sole_db_mut(&mut app)
             .arm_busy_snapshot_once_with(
                 &db_path,
                 "UPDATE collab_sessions SET updated_at = datetime('now')

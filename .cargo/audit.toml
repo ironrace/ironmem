@@ -18,7 +18,10 @@ ignore = [
     # Only used transitively through hf-hub's progress UI.
     "RUSTSEC-2025-0119",
     # RUSTSEC-2024-0436 — paste is unmaintained.
-    # Only used as a proc-macro dependency under tokenizers; no runtime surface.
+    # Only used as a proc-macro dependency; no runtime surface. The workspace
+    # lockfile has it under tokenizers. CI also audits the benchmark lockfiles
+    # with this list, and benchmarks/provbench/{scoring,baseline,phase1} have
+    # the same proc-macro under simba (statrs -> nalgebra -> simba).
     "RUSTSEC-2024-0436",
     # RUSTSEC-2026-0381 — webpki-roots 0.26.11 is a wrapper pinned by
     # ureq 2.12.1 (`^0.26`, no newer 0.26 exists). The wrapper only

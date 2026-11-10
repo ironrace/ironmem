@@ -828,9 +828,9 @@ fn claude_recovery_own(
     InvocationRecovery::NoPriorInvocation
 }
 
-/// The pre-Muse Codex dispatcher, kept, deprecated, until 0.7.0: a
+/// The pre-Muse Codex dispatcher, kept, deprecated, until 0.8.0: a
 /// [`CliDispatcher`] for Codex with the old argument-free `resolve()`.
-#[deprecated(note = "use `CliDispatcher::resolve(Implementer::Codex)`; removal in 0.7.0")]
+#[deprecated(note = "use `CliDispatcher::resolve(Implementer::Codex)`; removal in 0.8.0")]
 pub struct CodexDispatcher(CliDispatcher);
 
 #[allow(deprecated)]

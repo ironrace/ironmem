@@ -41,7 +41,7 @@ contracts and risk notes are in [AUTOPILOT.md](../AUTOPILOT.md).
 | F4, F5 | Module attributes shared supervision to invocation; is_met docs include started/non-timeout guards. |
 | F6 | Drop opaque review-round codes from comments while preserving the requirements they describe. |
 | F7 | Harness headers require re-measuring argv/options, refusals and journal/usage/terminal shapes on upgrades. Run real argv marker cross-test and parser fixtures; paid probes need approval. |
-| F8 | Deprecated shims now name removal version 0.7.0. |
+| F8 | Deprecated shims now name removal version 0.7.0. (The 0.7.0 release shipped with the shims in place and moved that deadline to 0.8.0.) |
 | G1 | Feed real CodexCli/MuseCli argv into ProcessRow::marker; measured fixtures remain additional cases. |
 | G2 | Scan cached_launcher("git") constructors as well as literal git; regression reproduced missed unsafe constructor. |
 | G3 | Exact 119/120/121-second lease boundaries and malformed stamp; 89/90/91-second refresh margin checked against persisted claims with injected time. |
