@@ -7,8 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.7.0] - 2026-11-09
-
 ### Changed
 
 - **Prompt recall lines carry the drawer id (#376).** Each drawer and diary line
@@ -36,6 +34,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its source and excerpt, so one imported row can't flood the prompt.
   On a fixed five-prompt fixture, one of whose ids is a 209-byte import, the
   injected text grew from 1,700 to 2,398 bytes.
+
+## [0.7.0] - 2026-11-09
+
+### Changed
+
 - **The Stop hook's handoff nudge names the wing prompt recall reads.** A
   project inside a Git work tree that tracks none of its files, or one behind
   `GIT_CEILING_DIRECTORIES`, was asked to save its handoff in the parent
