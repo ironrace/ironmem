@@ -4354,7 +4354,9 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
             // `await_first_sample` does. A sample that shows the probe was
             // taken after the daemon started and shows the daemon too. A
             // fixed sleep here was a guess at how long a sample takes, and
-            // a loaded machine took longer. Exits 97 if no sample comes.
+            // a loaded machine took longer. Exits 97 if no sample comes in
+            // 60 s; the probe sleeps for longer than that, so it is there to
+            // be recorded for the whole wait.
             let spawner = daemon_dir.join("spawn-daemon.py");
             std::fs::write(
                 &spawner,
@@ -4363,7 +4365,7 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
                  p = subprocess.Popen([daemon, 'serve', '--listen', socket], \
                  start_new_session=True, cwd=cwd)\n\
                  open('daemon.pid', 'w').write(str(p.pid))\n\
-                 probe = subprocess.Popen(['sleep', '30'])\n\
+                 probe = subprocess.Popen(['sleep', '120'])\n\
                  recorded = '\"pid\":%d,' % probe.pid\n\
                  sampled = False\n\
                  for _ in range(6000):\n\
