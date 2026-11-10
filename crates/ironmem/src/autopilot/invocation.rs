@@ -4346,17 +4346,46 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
                 daemon_dir.join("temp-test.sock")
             };
             let cli = FakeCli::COMPLETE;
-            // The child that spawned it outlives a few process samples, so
-            // the tracker sees the daemon while its ancestry still leads to
-            // the root.
+            // The daemon leads its own session, so the tracker can own it
+            // only by a sample that shows it while its parent still runs.
+            // The parent therefore stays until the tracker says it took
+            // one: it starts a probe child after the daemon and waits for
+            // the identity file to record the probe, as
+            // `await_first_sample` does. A sample that shows the probe was
+            // taken after the daemon started and shows the daemon too. A
+            // fixed sleep here was a guess at how long a sample takes, and
+            // a loaded machine took longer. Exits 97 if no sample comes.
+            let spawner = daemon_dir.join("spawn-daemon.py");
+            std::fs::write(
+                &spawner,
+                "import os, subprocess, sys, time\n\
+                 daemon, socket, cwd = sys.argv[1:4]\n\
+                 p = subprocess.Popen([daemon, 'serve', '--listen', socket], \
+                 start_new_session=True, cwd=cwd)\n\
+                 open('daemon.pid', 'w').write(str(p.pid))\n\
+                 probe = subprocess.Popen(['sleep', '30'])\n\
+                 recorded = '\"pid\":%d,' % probe.pid\n\
+                 sampled = False\n\
+                 for _ in range(6000):\n\
+                 \x20   try:\n\
+                 \x20       identity = open(os.environ['IRONMEM_TEST_IDENTITY_PATH']).read()\n\
+                 \x20   except OSError:\n\
+                 \x20       identity = ''\n\
+                 \x20   if recorded in identity:\n\
+                 \x20       sampled = True\n\
+                 \x20       break\n\
+                 \x20   time.sleep(0.01)\n\
+                 probe.kill()\n\
+                 probe.wait()\n\
+                 sys.exit(0 if sampled else 97)\n",
+            )
+            .unwrap();
             let bin = binary(
                 dir.path(),
                 &observable(&format!(
-                    "{} -c \"import subprocess,time; \
-                     p=subprocess.Popen(['{}','serve','--listen','{}'],start_new_session=True,cwd='{}'); \
-                     open('daemon.pid','w').write(str(p.pid)); time.sleep(1)\" || exit 5\n\
-                     echo journal",
+                    "'{}' '{}' '{}' '{}' '{}' || exit 5\necho journal",
                     python3(),
+                    spawner.display(),
                     daemon.display(),
                     socket.display(),
                     daemon_dir.display()
