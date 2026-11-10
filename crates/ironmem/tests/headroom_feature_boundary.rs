@@ -25,8 +25,8 @@ fn headroom_compression_is_an_explicitly_optional_manifest_feature() {
         "the dependency must be named headroom-core and use the reviewed upstream repository"
     );
     assert!(
-        headroom_dependency.contains("rev = \"5bd2266f16bb351a7a7334e1c29c598d28187b1d\""),
-        "the dependency must stay pinned to the reviewed commit"
+        headroom_dependency.contains("rev = \"74b7ac23861944f1411d30c5394043ec0505b334\""),
+        "the dependency must stay pinned to the approved commit; moving it is a deliberate change"
     );
     assert!(
         headroom_dependency.contains("package = \"headroom-core\""),
