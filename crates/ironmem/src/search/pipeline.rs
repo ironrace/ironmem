@@ -14,7 +14,7 @@ use std::collections::HashMap;
 
 use crate::db::{
     drawers::{Drawer, PREF_SENTINEL},
-    knowledge_graph::{contains_bounded, KnowledgeGraph},
+    knowledge_graph::{fold_mention, folded_text_mentions, EntityName, KnowledgeGraph},
     ScoredDrawer, SearchFilters,
 };
 use crate::error::MemoryError;
@@ -662,20 +662,34 @@ fn kg_boost(
     // genuine related entities (the mentioned entity itself is skipped).
     let query_limit = tunables::kg_query_limit();
     let fanout_cap = tunables::kg_boost_fanout();
+    // Names are held folded (`fold_mention`), the form the drawer text is
+    // compared in below, so two spellings of one name boost once.
     let mut related_names: HashSet<String> = HashSet::new();
     let mut direct_names: HashSet<String> = HashSet::new();
+    let mut skipped = 0usize;
+    let mut first_skipped: Option<String> = None;
 
     'outer: for entity in &mentioned {
-        direct_names.insert(entity.name.to_lowercase());
+        direct_names.insert(fold_mention(&entity.name));
 
         let triples = kg.query_entity_current(&entity.id, query_limit)?;
         for triple in triples {
             for related_id in [&triple.subject, &triple.object] {
-                if let Some(e) = kg.get_entity(related_id)? {
-                    let name = e.name.to_lowercase();
-                    if !direct_names.contains(&name) {
-                        related_names.insert(name);
+                match kg.entity_name(related_id)? {
+                    Some(EntityName::Text(name)) => {
+                        let name = fold_mention(&name);
+                        if !direct_names.contains(&name) {
+                            related_names.insert(name);
+                        }
                     }
+                    // A row whose name is not text (a BLOB an outside import
+                    // wrote) has no name to look for. It is skipped; failing
+                    // here would fail every search that reaches it.
+                    Some(EntityName::NotText) => {
+                        skipped += 1;
+                        first_skipped.get_or_insert_with(|| related_id.clone());
+                    }
+                    None => {}
                 }
             }
             if related_names.len() >= fanout_cap {
@@ -683,26 +697,33 @@ fn kg_boost(
             }
         }
     }
+    if let Some(id) = first_skipped {
+        tracing::warn!(
+            "KG boost skipped {skipped} related entity lookup(s) whose name is not text; \
+             the first has id {id:?}"
+        );
+    }
 
     // Remove direct names from related (avoid double-boosting)
     for name in &direct_names {
         related_names.remove(name);
     }
 
-    // Apply boosts. A drawer mentions an entity only as a whole word, the rule
-    // the query side uses: a query naming "c++" or "cat" is no reason to boost
-    // a drawer about "abc++" or a "category".
+    // Apply boosts. `folded_text_mentions` decides whether a drawer mentions
+    // a name: one with punctuation in it only as a whole word (a query naming
+    // "c++" is no reason to boost a drawer about "abc++"), a plain one as a
+    // substring, as before #378.
     for candidate in candidates.iter_mut() {
-        let content_lower = candidate.drawer.content.to_lowercase();
+        let content = fold_mention(&candidate.drawer.content);
 
         for name in &direct_names {
-            if contains_bounded(&content_lower, name) {
+            if folded_text_mentions(&content, name) {
                 candidate.score *= 1.15; // 15% boost for direct entity match
             }
         }
 
         for name in &related_names {
-            if contains_bounded(&content_lower, name) {
+            if folded_text_mentions(&content, name) {
                 candidate.score *= 1.05; // 5% boost for related entity
             }
         }
@@ -714,6 +735,7 @@ fn kg_boost(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::autopilot::worktree::testing::with_captured_log;
     use crate::db::drawers::Drawer;
     use crate::db::schema::Database;
     use crate::search::tunables::KG_ENV_LOCK;
@@ -777,11 +799,23 @@ mod tests {
         std::env::remove_var("IRONMEM_KG_BOOST_FANOUT");
     }
 
-    /// The query side matches an entity only as a whole word (#378), so the
-    /// drawer side must too: "c++" in the query is no reason to boost a
-    /// drawer about "abc++", nor "cat" one about a "category".
+    /// The ids of the candidates whose score was raised above the 1.0 they
+    /// start at, in candidate order.
+    fn boosted(candidates: &[ScoredDrawer]) -> Vec<&str> {
+        candidates
+            .iter()
+            .filter(|c| c.score > 1.0)
+            .map(|c| c.drawer.id.as_str())
+            .collect()
+    }
+
+    /// A name that contains punctuation is matchable since #378, and a drawer
+    /// mentions it only as a whole word: "c++" in the query is no reason to
+    /// boost a drawer about "abc++". A plain name keeps the substring match it
+    /// always had, so an inflected form ("cats") still counts, at the known
+    /// cost of also boosting a drawer about a "category".
     #[test]
-    fn kg_boost_boosts_only_drawers_that_mention_the_entity_as_a_whole_word() {
+    fn kg_boost_bounds_a_punctuated_name_and_matches_a_plain_name_as_a_substring() {
         let _g = KG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("IRONMEM_KG_QUERY_LIMIT");
         std::env::remove_var("IRONMEM_KG_BOOST_FANOUT");
@@ -795,16 +829,137 @@ mod tests {
             candidate("whole-punctuated", "notes on C++ templates"),
             candidate("embedded-punctuated", "abc++ compiles"),
             candidate("whole-plain", "the cat, asleep"),
+            candidate("inflected-plain", "two cats asleep"),
             candidate("embedded-plain", "a category of things"),
         ];
         kg_boost(&mut candidates, "c++ and my cat", &kg).unwrap();
 
-        let boosted: Vec<&str> = candidates
-            .iter()
-            .filter(|c| c.score > 1.0)
-            .map(|c| c.drawer.id.as_str())
+        assert_eq!(
+            boosted(&candidates),
+            [
+                "whole-punctuated",
+                "whole-plain",
+                "inflected-plain",
+                "embedded-plain"
+            ]
+        );
+    }
+
+    /// A script written without spaces has no word boundary to find: the
+    /// drawer text runs straight on after the name.
+    #[test]
+    fn kg_boost_boosts_a_drawer_in_a_script_written_without_spaces() {
+        let _g = KG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("IRONMEM_KG_QUERY_LIMIT");
+        std::env::remove_var("IRONMEM_KG_BOOST_FANOUT");
+
+        let db = Database::open_in_memory().unwrap();
+        let kg = KnowledgeGraph::new(&db);
+        kg.upsert_entity("東京", "city").unwrap();
+
+        let mut candidates = vec![
+            candidate("tokyo", "東京の天気は晴れ"),
+            candidate("osaka", "大阪の天気は雨"),
+        ];
+        kg_boost(&mut candidates, "東京 の天気", &kg).unwrap();
+
+        assert_eq!(boosted(&candidates), ["tokyo"]);
+    }
+
+    /// The query side folds curly quotes and typographic hyphens to ASCII, so
+    /// the drawer side must too, in both directions: an ASCII name against a
+    /// drawer pasted from a document, and a name stored curly against an
+    /// ASCII drawer.
+    #[test]
+    fn kg_boost_folds_typographic_punctuation_in_the_drawer_and_the_name() {
+        let _g = KG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("IRONMEM_KG_QUERY_LIMIT");
+        std::env::remove_var("IRONMEM_KG_BOOST_FANOUT");
+
+        let db = Database::open_in_memory().unwrap();
+        let kg = KnowledgeGraph::new(&db);
+        kg.upsert_entity("O'Brien", "person").unwrap();
+        kg.upsert_entity("D\u{2019}Angelo", "person").unwrap();
+        kg.upsert_entity("iron-build", "tool").unwrap();
+
+        let mut candidates = vec![
+            candidate("curly-drawer", "met O\u{2019}Brien today"),
+            candidate("ascii-drawer", "an album by D'Angelo"),
+            candidate("hyphen-drawer", "ran iron\u{2011}build twice"),
+            candidate("neither", "nothing to see here"),
+        ];
+        kg_boost(
+            &mut candidates,
+            "O\u{2019}Brien, d'angelo and iron-build",
+            &kg,
+        )
+        .unwrap();
+
+        assert_eq!(
+            boosted(&candidates),
+            ["curly-drawer", "ascii-drawer", "hyphen-drawer"]
+        );
+    }
+
+    /// A triple can point at an entity row whose name is not text (a BLOB an
+    /// outside import wrote). That row is skipped; it must not fail the
+    /// search, nor stop the rows after it from boosting.
+    #[test]
+    fn kg_boost_skips_a_related_entity_whose_name_is_not_text() {
+        let _g = KG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("IRONMEM_KG_QUERY_LIMIT");
+        std::env::remove_var("IRONMEM_KG_BOOST_FANOUT");
+
+        let db = Database::open_in_memory().unwrap();
+        let kg = KnowledgeGraph::new(&db);
+        kg.add_triple("Hub", "thing", "knows", "Friend", "thing", None, 1.0, None)
+            .unwrap();
+        let hub_id = kg.resolve_entity("Hub", None).unwrap().id;
+        // Dated far ahead so it sorts before the Friend triple and is the
+        // first one the expansion reads.
+        db.exec_raw(&format!(
+            "INSERT INTO entities (id, name, entity_type) VALUES ('blob-row', x'636174ff', 'thing');
+             INSERT INTO triples (id, subject, predicate, object, confidence, extracted_at)
+             VALUES ('blob-triple', '{hub_id}', 'knows', 'blob-row', 1.0, '2999-01-01T00:00:00Z');"
+        ))
+        .unwrap();
+
+        let mut candidates = vec![
+            candidate("direct", "note about hub"),
+            candidate("related", "note about friend"),
+            candidate("neither", "nothing to see here"),
+        ];
+        let (result, log) = with_captured_log(|| kg_boost(&mut candidates, "Hub", &kg));
+        result.unwrap();
+
+        assert_eq!(boosted(&candidates), ["direct", "related"]);
+        // The skip is said once, with the row's id. (The mention scan reads
+        // the same row and reports it too, in a warning of its own.)
+        let warnings: Vec<&str> = log
+            .lines()
+            .filter(|l| l.contains("WARN") && l.contains("KG boost skipped 1 "))
             .collect();
-        assert_eq!(boosted, ["whole-punctuated", "whole-plain"]);
+        assert_eq!(warnings.len(), 1, "{log}");
+        assert!(warnings[0].contains("blob-row"), "{log}");
+    }
+
+    /// A name of nothing but whitespace folds to the empty string, which
+    /// every drawer contains.
+    #[test]
+    fn kg_boost_ignores_a_related_entity_with_a_blank_name() {
+        let _g = KG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("IRONMEM_KG_QUERY_LIMIT");
+        std::env::remove_var("IRONMEM_KG_BOOST_FANOUT");
+
+        let db = Database::open_in_memory().unwrap();
+        let kg = KnowledgeGraph::new(&db);
+        kg.add_triple("Hub", "thing", "knows", " \t", "thing", None, 1.0, None)
+            .unwrap();
+
+        let mut candidates = vec![candidate("unrelated", "nothing to see here")];
+        kg_boost(&mut candidates, "Hub", &kg).unwrap();
+
+        assert_eq!(boosted(&candidates), [] as [&str; 0]);
     }
 
     #[test]

@@ -109,14 +109,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `iron-build`, `kg_boost`, `Node.js` or `Émile` could never match a query,
   even one containing that exact string. A punctuated name matches only
   where it appears as written, as a whole word: `c++` is not matched by a
-  bare `c` or by `abc++`, nor `iron-build` by `iron build`. No letter or
-  digit may touch the name, as for plain names, so `c++` is not matched by
-  `C++17`. Curly quotes and typographic hyphens count as their ASCII forms
-  (`O’Brien` names `O'Brien`), and a combining mark is part of its word, so
-  a decomposed `café` is no longer read as the entity `cafe`. KG boost also
-  raises a drawer only when it mentions the entity as a whole word: a query
-  naming `cat` used to boost a drawer about a `category`. An entity row
-  whose name is not text is skipped; it used to fail the search.
+  bare `c` or by `abc++`, nor `iron-build` by `iron build`. In a query no
+  letter or digit may touch a name, punctuated or plain, so `c++` is not
+  matched by `C++17`. Curly quotes and typographic hyphens (with the figure
+  dash, the en dash and the minus sign, but not the em dash) count as their
+  ASCII forms in the query, the entity name and the drawer text: `O’Brien`
+  names `O'Brien`. A combining mark is part of the word it continues, so a
+  decomposed `café` is no longer read as the entity `cafe`. A mark that
+  follows a symbol, such as the variation selector of an emoji, continues
+  no word, so a name written straight after an emoji matches. KG boost
+  raises a drawer for a punctuated name only when the drawer mentions it as
+  a whole word: a query naming `c++` does not boost a drawer about `abc++`.
+  A plain name boosts any drawer that contains it, as before, so `cat`
+  boosts a drawer about `cats` and also one about a `category`. An entity
+  row whose name is not text is skipped with a warning, in the query scan
+  and when a triple points at it; such a triple used to fail the search.
 
 - Claude implementer liveness in the queue, `supervise` and `reconcile`
   now reads the process table as well as the `claude agents` registry,

@@ -29,17 +29,41 @@ pub struct Triple {
     pub extracted_at: String,
 }
 
-/// One combining mark (Unicode general category M). std has no test for it.
-static COMBINING_MARK: LazyLock<Regex> =
+/// One mark (Unicode general category M). std has no test for it.
+static MARK: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\p{M}$").expect("static regex compiles"));
 
-/// Whether `c` belongs to a word: a letter, a digit, or a combining mark,
-/// which continues the letter before it. `char::is_alphanumeric` is false for
-/// many marks (the acute of a decomposed "é", a virama, a Thai tone mark), and
-/// reading those as punctuation would split a word in two and let a mention
-/// match the front of a longer word.
-fn is_word_char(c: char) -> bool {
-    c.is_alphanumeric() || (!c.is_ascii() && COMBINING_MARK.is_match(c.encode_utf8(&mut [0; 4])))
+/// Whether `c` is a mark: a combining accent, a virama or a tone mark, but
+/// also a variation selector or the enclosing keycap of an emoji.
+fn is_mark(c: char) -> bool {
+    !c.is_ascii() && MARK.is_match(c.encode_utf8(&mut [0; 4]))
+}
+
+/// Whether `c` belongs to a word, given whether the character before it did
+/// (`in_word`). A letter or a digit always does. A mark does only when it
+/// continues a word: `char::is_alphanumeric` is false for many marks (the
+/// acute of a decomposed "é", a virama, a Thai tone mark), and reading those
+/// as punctuation would split a word in two and let a mention match the front
+/// of a longer word. A mark after anything else (the variation selector in
+/// "⚠️", written as U+26A0 U+FE0F) continues no word, and counting it as one
+/// would glue it to a name written straight after the emoji.
+fn is_word_char(c: char, in_word: bool) -> bool {
+    c.is_alphanumeric() || (in_word && is_mark(c))
+}
+
+/// Whether `s` ends inside a word: [`is_word_char`] holds for its last
+/// character, which is so when a letter or digit ends it, alone or followed
+/// only by marks.
+fn ends_in_word(s: &str) -> bool {
+    for c in s.chars().rev() {
+        if c.is_alphanumeric() {
+            return true;
+        }
+        if !is_mark(c) {
+            return false;
+        }
+    }
+    false
 }
 
 /// The ASCII character a typographic quote or hyphen stands for, so a prompt
@@ -81,8 +105,10 @@ fn collapse_whitespace(s: &str) -> String {
 fn push_collapsed(out: &mut String, s: &str, keep_punctuation: bool) {
     let start = out.len();
     let mut pending_space = false;
+    let mut in_word = false;
     for c in s.chars() {
-        if c.is_whitespace() || !(keep_punctuation || is_word_char(c)) {
+        in_word = is_word_char(c, in_word);
+        if c.is_whitespace() || !(keep_punctuation || in_word) {
             pending_space = true;
             continue;
         }
@@ -94,11 +120,54 @@ fn push_collapsed(out: &mut String, s: &str, keep_punctuation: bool) {
     }
 }
 
+/// The form in which entity names, queries and drawer text are compared
+/// character for character: lowercased, whitespace collapsed, typographic
+/// quotes and hyphens folded to ASCII ([`collapse_whitespace`]).
+pub(crate) fn fold_mention(s: &str) -> String {
+    collapse_whitespace(&s.to_lowercase())
+}
+
+/// Whether an entity name, folded with [`fold_mention`], contains
+/// punctuation: some character of it is neither whitespace nor part of a
+/// word, so the name's tokens ([`normalize_mention`]) no longer spell it.
+fn is_punctuated(folded_name: &str) -> bool {
+    let mut in_word = false;
+    folded_name.chars().any(|c| {
+        in_word = is_word_char(c, in_word);
+        !in_word && !c.is_whitespace()
+    })
+}
+
+/// Whether a drawer's text mentions an entity name. Both are passed folded
+/// with [`fold_mention`], so a curly "O’Brien" on either side is the ASCII
+/// name on the other.
+///
+/// A name that contains punctuation ([`is_punctuated`]) must appear as a whole
+/// word ([`contains_bounded`]), as `find_entities_in_text` requires of it in a
+/// query: "c++" is not mentioned by "abc++". A plain name is mentioned by any
+/// substring. Drawers are long-form text, and a whole-word rule there would
+/// drop every inflected form ("cats" for `cat`) and every script written
+/// without spaces ("東京の天気" for `東京`).
+pub(crate) fn folded_text_mentions(text: &str, name: &str) -> bool {
+    // A name of nothing but whitespace folds to "", which every text contains.
+    if name.is_empty() {
+        return false;
+    }
+    if is_punctuated(name) {
+        contains_bounded(text, name)
+    } else {
+        text.contains(name)
+    }
+}
+
 /// Whether `needle` occurs in `haystack` with no word character
-/// ([`is_word_char`]) directly before or after that occurrence. Every
-/// occurrence is tried, overlapping ones included, so an embedded one (the
-/// "c++" in "abc++") does not hide a standalone one later in the text.
-pub(crate) fn contains_bounded(haystack: &str, needle: &str) -> bool {
+/// ([`is_word_char`]) directly before or after that occurrence. A mark
+/// directly after the needle is a word character only when the needle ends
+/// in a word, which the mark then continues. A mark before the needle belongs
+/// to whatever precedes it, so the check looks past it to that character.
+/// Every occurrence is tried, overlapping ones included, so an embedded one
+/// (the "c++" in "abc++") does not hide a standalone one later in the text.
+fn contains_bounded(haystack: &str, needle: &str) -> bool {
     if needle.is_empty() {
         return false;
     }
@@ -106,14 +175,10 @@ pub(crate) fn contains_bounded(haystack: &str, needle: &str) -> bool {
     while let Some(offset) = haystack[from..].find(needle) {
         let start = from + offset;
         let end = start + needle.len();
-        let before_ok = haystack[..start]
-            .chars()
-            .next_back()
-            .is_none_or(|c| !is_word_char(c));
-        let after_ok = haystack[end..]
-            .chars()
-            .next()
-            .is_none_or(|c| !is_word_char(c));
+        let before_ok = !ends_in_word(&haystack[..start]);
+        let after_ok = haystack[end..].chars().next().is_none_or(|c| {
+            !(c.is_alphanumeric() || (is_mark(c) && ends_in_word(&haystack[..end])))
+        });
         if before_ok && after_ok {
             return true;
         }
@@ -145,6 +210,15 @@ fn triple_interval_id(
     hasher.update(valid_from.unwrap_or("").as_bytes());
     hasher.update(extracted_at.as_bytes());
     format!("{:x}", hasher.finalize())[..32].to_string()
+}
+
+/// What the `name` column of an entity row holds
+/// ([`KnowledgeGraph::entity_name`]).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum EntityName {
+    Text(String),
+    /// A BLOB an outside import wrote, or text that is not UTF-8.
+    NotText,
 }
 
 /// Knowledge graph operations on the shared Database.
@@ -299,7 +373,7 @@ impl<'a> KnowledgeGraph<'a> {
         const MAX_MATCHES: usize = 100;
 
         let text_tokens = format!(" {} ", normalize_mention(text));
-        let text_verbatim = collapse_whitespace(&text.to_lowercase());
+        let text_verbatim = fold_mention(text);
 
         let mut stmt = self
             .db
@@ -312,12 +386,22 @@ impl<'a> KnowledgeGraph<'a> {
         // both buffers are reused across rows.
         let mut needle = String::new();
         let mut name_verbatim = String::new();
+        let mut skipped = 0usize;
+        let mut first_skipped: Option<String> = None;
         while let Some(row) = rows.next()? {
             // Every row's name is read, so a name that is not text (a BLOB an
             // outside import wrote) is skipped, not allowed to fail the scan
-            // and with it every search.
+            // and with it every search. The skips are reported once, after
+            // the scan: this runs on every search.
             let Ok(name) = row.get_ref(1)?.as_str() else {
-                tracing::warn!("skipping a KG entity whose name is not text");
+                skipped += 1;
+                if first_skipped.is_none() {
+                    // Such a row's id may be no more text than its name is.
+                    first_skipped = Some(match row.get_ref(0)?.as_str() {
+                        Ok(id) => format!("id {id:?}"),
+                        Err(_) => "an id that is not text".to_string(),
+                    });
+                }
                 continue;
             };
             let name_lower = name.to_lowercase();
@@ -333,7 +417,6 @@ impl<'a> KnowledgeGraph<'a> {
             if !text_tokens.contains(needle.as_str()) {
                 continue;
             }
-            let name_tokens = &needle[1..needle.len() - 1];
             // A punctuated name needs one occurrence that is both verbatim and
             // a whole word. Checking the tokens and the verbatim text apart
             // would let "plan c ... abc++" match "c++": the bare "c" supplies
@@ -342,7 +425,7 @@ impl<'a> KnowledgeGraph<'a> {
             // cheap prefilter here.
             name_verbatim.clear();
             push_collapsed(&mut name_verbatim, &name_lower, true);
-            if name_verbatim != name_tokens && !contains_bounded(&text_verbatim, &name_verbatim) {
+            if is_punctuated(&name_verbatim) && !contains_bounded(&text_verbatim, &name_verbatim) {
                 continue;
             }
             matches.push(Entity {
@@ -354,6 +437,11 @@ impl<'a> KnowledgeGraph<'a> {
             if matches.len() >= MAX_MATCHES {
                 break;
             }
+        }
+        if let Some(first) = first_skipped {
+            tracing::warn!(
+                "skipped {skipped} KG entity row(s) whose name is not text; the first has {first}"
+            );
         }
         Ok(matches)
     }
@@ -455,6 +543,28 @@ impl<'a> KnowledgeGraph<'a> {
             Some(row) => Ok(Some(row?)),
             None => Ok(None),
         }
+    }
+
+    /// The name of the entity `entity_id`, or `None` when no row has that id.
+    ///
+    /// [`Self::get_entity`] fails on a row whose name is not text. A caller
+    /// that walks many related rows (KG boost) needs to tell that one row
+    /// apart from a database error, so that it can skip the row and still
+    /// fail on the error; this reads the name the way `find_entities_in_text`
+    /// does and reports it as [`EntityName::NotText`].
+    pub(crate) fn entity_name(&self, entity_id: &str) -> Result<Option<EntityName>, MemoryError> {
+        let mut stmt = self
+            .db
+            .conn
+            .prepare("SELECT name FROM entities WHERE id = ?1")?;
+        let mut rows = stmt.query(params![entity_id])?;
+        let Some(row) = rows.next()? else {
+            return Ok(None);
+        };
+        Ok(Some(match row.get_ref(0)?.as_str() {
+            Ok(name) => EntityName::Text(name.to_string()),
+            Err(_) => EntityName::NotText,
+        }))
     }
 
     /// Stats: entity count, triple count, current triple count.
@@ -622,6 +732,7 @@ impl<'a> KnowledgeGraph<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::autopilot::worktree::testing::with_captured_log;
     use crate::db::schema::Database;
 
     #[test]
@@ -1197,20 +1308,23 @@ mod tests {
     /// a punctuated name match the front of a longer marked word.
     #[test]
     fn test_find_entities_treats_a_combining_mark_as_part_of_the_word() {
-        // The premise: std does not class the mark as alphanumeric.
+        // The premise: std does not class these marks as alphanumeric. The
+        // virama U+094D joins two Devanagari consonants into one conjunct;
+        // read as punctuation it would split "क्ष" into "क" and "ष".
         assert!(!'\u{301}'.is_alphanumeric());
+        assert!(!'\u{94d}'.is_alphanumeric());
 
         let db = Database::open_in_memory().unwrap();
         let kg = KnowledgeGraph::new(&db);
         kg.upsert_entity("cafe", "place").unwrap();
         kg.upsert_entity("x-y", "pair").unwrap();
-        kg.upsert_entity("राम", "person").unwrap();
+        kg.upsert_entity("\u{915}", "letter").unwrap();
 
         for query in [
             "the caf\u{e9} opens",
             "the cafe\u{301} opens",
             "plot x-y\u{301} here",
-            "रामायण",
+            "\u{915}\u{94d}\u{937}",
         ] {
             let matches = kg.find_entities_in_text(query).unwrap();
             assert!(
@@ -1226,6 +1340,92 @@ mod tests {
         let matches = kg.find_entities_in_text("the CAFE\u{301} opens").unwrap();
         let names: Vec<&str> = matches.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, ["cafe\u{301}"]);
+    }
+
+    /// A variation selector or an enclosing keycap is a mark too, but it
+    /// follows an emoji or a symbol, not a letter. It continues no word, so
+    /// it must not glue itself to a name written straight after it, nor make
+    /// the punctuation that ends a name read as the middle of a word.
+    #[test]
+    fn test_find_entities_does_not_join_a_mark_after_a_symbol_to_the_next_word() {
+        let db = Database::open_in_memory().unwrap();
+        let kg = KnowledgeGraph::new(&db);
+        kg.upsert_entity("iron-build", "tool").unwrap();
+        kg.upsert_entity("cat", "animal").unwrap();
+
+        let cases = [
+            // Warning sign, variation selector 16, then the name.
+            ("\u{26a0}\u{fe0f}iron-build failed", "iron-build"),
+            ("\u{26a0}\u{fe0f}cat", "cat"),
+            // Keycap "#": the symbol, a variation selector, an enclosing mark.
+            ("#\u{fe0f}\u{20e3}cat", "cat"),
+        ];
+        for (query, expected) in cases {
+            let matches = kg.find_entities_in_text(query).unwrap();
+            assert!(
+                matches.iter().any(|e| e.name == expected),
+                "Expected {expected:?} to match in: {query:?}, got {matches:?}"
+            );
+        }
+
+        assert!(contains_bounded("\u{26a0}\u{fe0f}c++ rocks", "c++"));
+        assert!(contains_bounded("c++\u{fe0f} rocks", "c++"));
+        // A mark still continues a word, through any number of marks.
+        assert!(!contains_bounded("e\u{301}\u{302}c++", "c++"));
+        assert!(!contains_bounded("x-e\u{301}\u{302}", "x-e\u{301}"));
+    }
+
+    /// Rows whose name is not text are reported once per scan, with how many
+    /// there were and the id of the first, not once per row with no id.
+    #[test]
+    fn test_find_entities_warns_once_for_every_name_that_is_not_text() {
+        let db = Database::open_in_memory().unwrap();
+        let kg = KnowledgeGraph::new(&db);
+        kg.upsert_entity("cat", "animal").unwrap();
+        db.exec_raw(
+            "INSERT INTO entities (id, name, entity_type) VALUES ('blob-a', x'636174ff', 'thing');
+             INSERT INTO entities (id, name, entity_type) VALUES ('blob-b', x'00', 'thing');",
+        )
+        .unwrap();
+
+        let (matches, log) =
+            with_captured_log(|| kg.find_entities_in_text("I have a cat").unwrap());
+        let names: Vec<&str> = matches.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["cat"]);
+
+        let warnings: Vec<&str> = log.lines().filter(|l| l.contains("WARN")).collect();
+        assert_eq!(warnings.len(), 1, "one warning per scan, got: {log}");
+        assert!(warnings[0].contains("skipped 2 "), "{log}");
+        assert!(warnings[0].contains("blob-a"), "{log}");
+
+        // A scan that skips nothing says nothing.
+        db.exec_raw("DELETE FROM entities WHERE id LIKE 'blob-%'")
+            .unwrap();
+        let (_, log) = with_captured_log(|| kg.find_entities_in_text("I have a cat").unwrap());
+        assert!(!log.contains("WARN"), "{log}");
+    }
+
+    /// The skipped row's id is read for the warning only, so an id that is
+    /// not text either must not fail the scan the skip exists to protect.
+    #[test]
+    fn test_find_entities_reports_a_skipped_row_whose_id_is_not_text_either() {
+        let db = Database::open_in_memory().unwrap();
+        let kg = KnowledgeGraph::new(&db);
+        kg.upsert_entity("cat", "animal").unwrap();
+        db.exec_raw(
+            "INSERT INTO entities (id, name, entity_type) VALUES (x'ff00', x'ff', 'thing')",
+        )
+        .unwrap();
+
+        let (matches, log) =
+            with_captured_log(|| kg.find_entities_in_text("I have a cat").unwrap());
+        let names: Vec<&str> = matches.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["cat"]);
+
+        let warnings: Vec<&str> = log.lines().filter(|l| l.contains("WARN")).collect();
+        assert_eq!(warnings.len(), 1, "{log}");
+        assert!(warnings[0].contains("skipped 1 "), "{log}");
+        assert!(warnings[0].contains("an id that is not text"), "{log}");
     }
 
     /// The scan reads every row's name, so one row whose name is not text (a
