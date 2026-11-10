@@ -19,6 +19,17 @@ pub(crate) fn test_app_with_db_path(db_path: PathBuf, root: &Path) -> Arc<crate:
     Arc::new(crate::mcp::app::App::new(config).unwrap())
 }
 
+/// The app's database, borrowed exclusively.
+///
+/// For fixtures that need `&mut Database` — rusqlite's hook setters take
+/// `&mut Connection` — on an app the test still holds the only handle to.
+/// Panics once the `Arc` has been cloned, so arm before sharing the app.
+pub(crate) fn sole_db_mut(app: &mut Arc<crate::mcp::app::App>) -> &mut crate::db::schema::Database {
+    &mut Arc::get_mut(app)
+        .expect("the test holds the only handle to the app")
+        .db
+}
+
 /// Run `git` in `cwd` with git's environment scrubbed first
 /// ([`super::scrub_git_environment`]) — an inherited `GIT_DIR`/`GIT_WORK_TREE`
 /// would otherwise make this operate on (or report shas from) a different

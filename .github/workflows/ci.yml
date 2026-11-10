@@ -151,6 +151,32 @@ jobs:
           name: ironmem-linux
           path: target/debug/ironmem
 
+      # `cargo test --workspace` above builds without `headroom-compression`,
+      # so it never runs the compressor, and the `--all-features` clippy in
+      # `check` only compiles it. The compressed body is not ours: it comes
+      # from the `headroom-core` git revision pinned in
+      # crates/ironmem/Cargo.toml. Moving that pin from 5bd2266f to 74b7ac23
+      # changed the body (hunks split and renumbered as context is trimmed)
+      # and no step in this workflow ran the compressor to notice. The
+      # integration target asserts the exact hunk headers the feature build
+      # renders for its wide fixtures, and the body lines and expansions it
+      # checks beside them, so a pin move fails here only when it changes
+      # output one of those assertions covers; a change to compressor output
+      # that no test asserts still passes. The unit target runs the
+      # hunk-tagging tests in the same build.
+      #
+      # Two steps, so each command reports its own exit status. Only the
+      # review-diff tests, not `--all-features` over the workspace: the
+      # feature gates no other code. Last in the job, after the smoke
+      # test and upload, so `target/debug/ironmem` is the default-feature
+      # binary whenever those steps read it. Cost: the feature build compiles
+      # `headroom-core`, tree-sitter and eight grammar crates on each runner.
+      - name: cargo test review-diff unit tests (headroom-compression)
+        run: "rustup run stable cargo test -p ironmem --features headroom-compression --lib review_diff"
+
+      - name: cargo test review-diff integration tests (headroom-compression)
+        run: "rustup run stable cargo test -p ironmem --features headroom-compression --test review_diff"
+
   build:
     name: Build Binary (macos-latest)
     runs-on: macos-latest
@@ -195,6 +221,49 @@ jobs:
       - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998  # v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+
+      # The step above reads only the root Cargo.lock. The benchmark crates
+      # are separate Cargo workspaces (excluded in the root Cargo.toml), each
+      # with its own tracked lockfile, so nothing audited them:
+      # benchmarks/provbench/labeler and phase1 carried RUSTSEC-2025-0140
+      # (`gix-date`) and RUSTSEC-2025-0021 (`gix-features`) on `gix` 0.66
+      # until someone ran `cargo audit` on them by hand.
+      #
+      # One step per lockfile. `working-directory` only picks the lockfile:
+      # the action runs `cargo audit --json --file <working-directory>/Cargo.lock`
+      # from the repository root, so the ignore list in .cargo/audit.toml
+      # applies to these runs too. The one id it hides in them is
+      # RUSTSEC-2024-0436 (`paste`, a proc-macro) in provbench/baseline,
+      # phase1 and scoring; abeval and labeler report nothing without it.
+      - name: audit benchmarks/abeval lockfile
+        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998  # v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          working-directory: benchmarks/abeval
+
+      - name: audit benchmarks/provbench/baseline lockfile
+        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998  # v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          working-directory: benchmarks/provbench/baseline
+
+      - name: audit benchmarks/provbench/labeler lockfile
+        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998  # v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          working-directory: benchmarks/provbench/labeler
+
+      - name: audit benchmarks/provbench/phase1 lockfile
+        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998  # v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          working-directory: benchmarks/provbench/phase1
+
+      - name: audit benchmarks/provbench/scoring lockfile
+        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998  # v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          working-directory: benchmarks/provbench/scoring
 
   package:
     name: Package Dry-Run

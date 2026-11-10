@@ -170,7 +170,7 @@ impl Pilot {
             .tree()
             .with_context(|| format!("read_blob_at: tree for {commit_sha}"))?;
         let entry = tree
-            .lookup_entry_by_path(path, &mut Vec::new())
+            .lookup_entry_by_path(path)
             .with_context(|| format!("read_blob_at: lookup {} @ {commit_sha}", path.display()))?;
         match entry {
             None => Ok(None),

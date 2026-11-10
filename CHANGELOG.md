@@ -7,6 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The bundled SQLite is upgraded to 3.54 to fix RUSTSEC-2026-0459.** SQLite
+  before 3.54.0 could return uninitialized page-cache memory when it opened a
+  database together with a `-wal` file whose page size differed from the
+  database's. `rusqlite` moves from 0.32 to 0.41, which bundles SQLite 3.54
+  through `libsqlite3-sys` 0.39.
+  The two benchmark workspaces that link SQLite, `benchmarks/abeval` and
+  `benchmarks/provbench/phase1`, are separate Cargo workspaces with their own
+  lockfiles and were still on `rusqlite` 0.31; both move to 0.41 as well, a
+  move that needs no source change. `benchmarks/provbench/baseline`'s lockfile
+  moves `h2`, `quinn-proto`, `rustls`, `rustls-webpki` and `webpki-roots` to
+  their patched releases, and `rand` from 0.9 to 0.10 with the new
+  `quinn-proto`.
+  The other advisories in the five benchmark lockfiles are cleared too.
+  `benchmarks/provbench/labeler` and `phase1` move `gix` from 0.66 to 0.77,
+  which fixes RUSTSEC-2025-0140 (`gix-date`) and RUSTSEC-2025-0021
+  (`gix-features`) and replaces the unsound `faster-hex` 0.9
+  (RUSTSEC-2026-0306); the one call that changed is
+  `Tree::lookup_entry_by_path`, which no longer takes a scratch buffer. All
+  five lockfiles take `anyhow` 1.0.104 (RUSTSEC-2026-0190), `baseline` takes
+  `tokio` 1.54.1 (RUSTSEC-2026-0386), and `labeler` and `phase1` take `memmap2`
+  0.9.12 (RUSTSEC-2026-0186). `baseline` drops its `indicatif` dependency,
+  which none of its code used and which brought in the unmaintained
+  `number_prefix` (RUSTSEC-2025-0119). `cargo audit` now reports no
+  vulnerability and no warning for any of the five; the one advisory the root
+  `.cargo/audit.toml` ignore list hides in them is RUSTSEC-2024-0436 (`paste`,
+  a proc-macro that `statrs` reaches through `nalgebra` and `simba`), in
+  `baseline`, `phase1` and `scoring`, and the list's comment now names that
+  chain. CI's Security Audit job audits each benchmark lockfile as well as
+  the root one; it read only the root one before.
+  Three checks in those workspaces that were already failing are repaired:
+  `cargo fmt --check` over four of `abeval`'s test files, a clippy
+  `manual_ok_err` in a `phase1` test, and `phase1`'s `load_roundtrip` test,
+  which read gitignored corpus files absent from a fresh checkout and now reads
+  committed fixtures in the labeler's output formats.
+  The optional `headroom-compression` feature's `headroom-core` git dependency
+  moves from commit `5bd2266f` to `74b7ac23`, the first upstream commit on
+  `rusqlite` 0.41: only one crate in a build may link SQLite, so the old pin
+  kept the whole workspace on 0.32 even with the feature off.
+  The new pin changes what a `--features headroom-compression` build does in
+  two ways. The compressor now splits a hunk wherever it trims context and
+  renumbers each piece, so the hunks in an `ironmem review-diff` artifact's
+  body no longer match its index one for one: the third body hunk of a file
+  need not be index hunk 3. Each body hunk header therefore carries the
+  selector of the index hunk it came from, after the closing `@@` and before
+  any section text, as in `@@ -8,5 +8,5 @@ [src/lib.rs#hunk-1]`; `--expand-file
+  <path> --hunk <N>` opens that hunk. A body hunk with no source hunk to name
+  is left untagged. The feature build also compiles `tree-sitter`, eight
+  `tree-sitter` grammar crates and `tree-sitter-language`, none of which the
+  old pin needed. CI now runs the review-diff tests with the feature on, so a
+  later pin move fails there if it changes what those tests assert about their
+  fixtures' bodies: the hunk headers and tags, the file section each hunk sits
+  in, and the changed lines. A change to the compressor's output that leaves
+  those alone still passes.
+
 ### Changed
 
 - **The Stop hook's handoff nudge names the wing prompt recall reads.** A
