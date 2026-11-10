@@ -104,6 +104,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- An Autopilot issue lock is free the moment its holder drops it. It was
+  released by closing its file, which frees a `flock` only once every copy
+  of the descriptor is closed, and a process being started on another thread
+  of the same program holds a copy until its exec. A program that took the
+  lock again in that moment found it held: `advance` skipped the issue for
+  the pass, and `clear-dispatch` refused, naming a running controller. This
+  was seen in the parallel test suite; the `ironmem autopilot` commands
+  start their processes from one thread and are not known to have hit it.
+  The lock is now unlocked explicitly before its file is closed.
+
 - Claude implementer liveness in the queue, `supervise` and `reconcile`
   now reads the process table as well as the `claude agents` registry,
   which never lists a running `claude -p` IC (#368). A Claude IC reads

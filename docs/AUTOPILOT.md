@@ -75,8 +75,10 @@ The Lead holds it through provisioning and dispatch; advance holds it through
 review and merge; cleanup and `clear-dispatch` take it before changing state
 or removing a worktree. A held lock makes the Lead leave the issue to its
 owner, manual run and clear refuse, and advance skip the step or cleanup.
-The refusal/report names the issue and lock path. The kernel releases it when
-the holder exits or crashes. **Never delete a lock file**, even if it looks
+The refusal/report names the issue and lock path. A controller unlocks it as
+soon as its step ends, so it is free at once even while that controller is
+starting other processes; the kernel releases it when the holder exits or
+crashes. **Never delete a lock file**, even if it looks
 idle: a controller may already have opened its inode, and replacing it can
 allow two controllers to hold different files for the same issue.
 

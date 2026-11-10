@@ -17,6 +17,14 @@
 //! crashed controller's lock with its file descriptor, so nothing stale is
 //! ever left to remove.
 //!
+//! A controller that is done unlocks (`LOCK_UN`) before it closes the file.
+//! The lock belongs to the open file description, not the descriptor, and a
+//! child another thread is spawning holds a copy of the descriptor from its
+//! fork to its exec, where `O_CLOEXEC` closes it. A close alone would leave
+//! the lock held for that moment, and the controller that had just released
+//! it would find its own issue held. Only a controller that dies while it is
+//! spawning leaves that moment to the kernel.
+//!
 //! The lock lives in the common directory, which every worktree of a clone
 //! shares, so it covers controllers working one clone on one host
 //! ([`super::local_fs`] refuses a remote filesystem). The file is named by
@@ -56,11 +64,25 @@ use crate::error::MemoryError;
 
 use super::IssueRef;
 
-/// A held issue lock. Dropping it closes the file, which releases the lock.
+/// A held issue lock. Dropping it unlocks the file, then closes it.
 #[derive(Debug)]
 pub struct IssueLock {
-    _file: File,
+    file: File,
     path: PathBuf,
+}
+
+impl Drop for IssueLock {
+    /// Unlocks rather than leaving it to the close that follows: a close
+    /// releases the lock only once every copy of the descriptor is closed,
+    /// and a child being spawned by another thread holds one until its exec
+    /// (see the module documentation). `LOCK_UN` releases it whoever else
+    /// has the file open.
+    fn drop(&mut self) {
+        // SAFETY: `file` owns a valid descriptor for the duration of the
+        // call. A failure is left to the close, which is all there was
+        // before.
+        unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+    }
 }
 
 impl IssueLock {
@@ -243,16 +265,18 @@ fn try_lock_path_with(path: &Path, after_open: &dyn Fn()) -> Result<IssueLockAtt
                 path.display()
             )));
         }
+        // The guard from here on, so every way out of this attempt unlocks.
+        let lock = IssueLock {
+            file,
+            path: path.to_path_buf(),
+        };
         // A lock on a file no longer at `path` (removed, or replaced, after
         // the open) excludes no one: another controller opening `path` now
         // gets another file. Taken again on whatever is there.
-        let held = file.metadata().map_err(cannot)?;
+        let held = lock.file.metadata().map_err(cannot)?;
         match std::fs::metadata(path) {
             Ok(now) if now.dev() == held.dev() && now.ino() == held.ino() => {
-                return Ok(IssueLockAttempt::Acquired(IssueLock {
-                    _file: file,
-                    path: path.to_path_buf(),
-                }));
+                return Ok(IssueLockAttempt::Acquired(lock));
             }
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -387,6 +411,123 @@ mod tests {
         }
         drop(first);
         acquired(try_lock_path(&path).unwrap());
+    }
+
+    /// A lock belongs to the open file description, which every duplicate
+    /// of the descriptor keeps open: here a `dup`, as a child forked by
+    /// another thread holds one until it execs. Dropping the lock must
+    /// release it all the same.
+    #[test]
+    fn a_dropped_lock_is_free_while_a_duplicate_of_its_descriptor_is_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("locks/owner-repo-7.lock");
+        let lock = acquired(try_lock_path(&path).unwrap());
+        let inherited = lock.file.try_clone().unwrap();
+        drop(lock);
+        let again = acquired(try_lock_path(&path).unwrap());
+        // And it still excludes while it is held.
+        assert!(matches!(
+            try_lock_path(&path).unwrap(),
+            IssueLockAttempt::Held { .. }
+        ));
+        drop(again);
+        drop(inherited);
+        acquired(try_lock_path(&path).unwrap());
+    }
+
+    /// The same with a real child: forked while the lock is held, and not
+    /// yet at its exec (where `O_CLOEXEC` closes its copy) when the lock is
+    /// dropped and taken again.
+    #[test]
+    fn a_dropped_lock_is_free_while_a_forked_child_has_not_reached_its_exec() {
+        struct Reap(libc::pid_t);
+        impl Drop for Reap {
+            fn drop(&mut self) {
+                // SAFETY: our own unreaped child.
+                unsafe {
+                    libc::kill(self.0, libc::SIGKILL);
+                    libc::waitpid(self.0, std::ptr::null_mut(), 0);
+                }
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("locks/owner-repo-7.lock");
+        let lock = acquired(try_lock_path(&path).unwrap());
+        // SAFETY: the child only makes an async-signal-safe call (pause)
+        // until it is killed.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork: {}", std::io::Error::last_os_error());
+        if child == 0 {
+            loop {
+                // SAFETY: the forked child, as above.
+                unsafe { libc::pause() };
+            }
+        }
+        let _reap = Reap(child);
+        drop(lock);
+        acquired(try_lock_path(&path).unwrap());
+    }
+
+    /// The race itself, as the parallel test suite runs it: one thread
+    /// takes and drops a lock and takes it again at once, while others
+    /// spawn processes.
+    #[test]
+    fn a_lock_dropped_while_other_threads_spawn_processes_is_free_at_once() {
+        use std::process::Stdio;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("locks/owner-repo-7.lock");
+        let stop = AtomicBool::new(false);
+        let spawned = AtomicUsize::new(0);
+        let (mut cycles, mut held) = (0usize, 0usize);
+        std::thread::scope(|scope| {
+            for _ in 0..2 {
+                scope.spawn(|| {
+                    while !stop.load(Ordering::Relaxed) {
+                        let mut git = Command::new(crate::launcher::cached_launcher("git"));
+                        crate::git_env::scrub_git_environment(&mut git);
+                        git.arg("--version")
+                            .stdin(Stdio::null())
+                            .stdout(Stdio::null())
+                            .stderr(Stdio::null());
+                        if git.status().is_ok() {
+                            spawned.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                });
+            }
+            // Stops the spawners however this thread leaves the scope, which
+            // waits on them: a panic here would otherwise never end.
+            struct Stop<'a>(&'a AtomicBool);
+            impl Drop for Stop<'_> {
+                fn drop(&mut self) {
+                    self.0.store(true, Ordering::Relaxed);
+                }
+            }
+            let _stop = Stop(&stop);
+            // 400 ms of it, and longer (bounded) on a machine too loaded to
+            // have spawned anything by then.
+            let started = std::time::Instant::now();
+            let raced = |elapsed: std::time::Duration| {
+                elapsed >= std::time::Duration::from_millis(400)
+                    && (spawned.load(Ordering::Relaxed) > 0
+                        || elapsed >= std::time::Duration::from_secs(30))
+            };
+            while !raced(started.elapsed()) {
+                cycles += 1;
+                match try_lock_path(&path).unwrap() {
+                    IssueLockAttempt::Acquired(lock) => drop(lock),
+                    IssueLockAttempt::Held { .. } => held += 1,
+                }
+            }
+        });
+        let spawned = spawned.load(Ordering::Relaxed);
+        assert!(spawned > 0, "no process was spawned, so nothing was raced");
+        assert_eq!(
+            held, 0,
+            "a lock this thread had just dropped was held {held} times in {cycles} cycles \
+             ({spawned} processes spawned meanwhile)"
+        );
     }
 
     #[test]
