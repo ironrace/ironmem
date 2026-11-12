@@ -2681,7 +2681,9 @@ impl ProcessTracker {
                     continue;
                 };
                 // A fresh unrelated replacement cannot inherit an old ps
-                // row's ownership: parent, group and birth are one record.
+                // row's ownership: the kernel must still report the row's
+                // parent. The second capture below pins the birth this one
+                // read. The group is not compared (see there).
                 if actual.pid != row.pid || actual.ppid != row.ppid {
                     return Err(MemoryError::Validation(
                         "invocation descendant ancestry changed during authentication".into(),
@@ -2699,17 +2701,26 @@ impl ProcessTracker {
                     // signal target or seed, just as a gone first capture.
                     continue;
                 };
-                if candidate_after != actual {
+                // Identity is PID, parent and birth: a new birth is a reused
+                // PID and a new parent is a reparented process. The group is
+                // left out on purpose. A tool that calls setsid or setpgid
+                // between the two captures is still the same process, and
+                // refusing it would fail the whole invocation.
+                if candidate_after.pid != actual.pid
+                    || candidate_after.ppid != actual.ppid
+                    || candidate_after.birth != actual.birth
+                {
                     return Err(MemoryError::Validation(
                         "invocation descendant kernel identity changed during authentication"
                             .into(),
                     ));
                 }
                 // The same owned parent bracketed a stable kernel capture.
-                // setsid may have changed the group since ps: kernel PGID is
-                // authoritative metadata, not an ownership input to PID kills.
+                // setsid may have changed the group since ps, or between the
+                // captures: the later kernel PGID is authoritative metadata,
+                // not an ownership input to PID kills.
                 let mut authenticated = row.clone();
-                authenticated.pgid = actual.pgid;
+                authenticated.pgid = candidate_after.pgid;
                 self.enrol(authenticated, actual.birth);
                 seeds.insert(row.pid, actual.birth);
                 frontier.push_back(row.pid);
@@ -6208,9 +6219,10 @@ pub(crate) mod tests {
     fn candidate_kernel_identity_must_be_stable_across_parent_authentication() {
         let root = kernel_process(10, 1, 10, 1);
         let candidate = kernel_process(20, 10, 20, 2);
+        // A new birth is a reused PID and a new parent is a reparented
+        // process. A new group is neither (see the next test).
         for changed in [
             kernel_process(20, 10, 20, 3),
-            kernel_process(20, 10, 30, 2),
             kernel_process(20, 999, 20, 2),
         ] {
             let mut tracker = ProcessTracker::owning_every_descendant(10);
@@ -6241,6 +6253,35 @@ pub(crate) mod tests {
                 .to_string()
                 .contains("unauthenticated"));
         }
+    }
+    /// A tool that calls `setsid` or `setpgid` between the two captures
+    /// changes its group and nothing else. It is the same process under the
+    /// same parent, so it is enrolled, with the later group. Refusing it
+    /// would fail a whole invocation on a tool that detached at that moment.
+    #[test]
+    fn a_candidate_that_only_changes_group_between_captures_is_enrolled() {
+        let root = kernel_process(10, 1, 10, 1);
+        let mut tracker = ProcessTracker::owning_every_descendant(10);
+        let mut candidate_reads = 0;
+        tracker
+            .observe_rows(
+                vec![process_row(10, 1, 10), process_row(20, 10, 10)],
+                |pid| {
+                    Ok(Some(if pid == 10 {
+                        root
+                    } else {
+                        candidate_reads += 1;
+                        let group = if candidate_reads == 1 { 10 } else { 20 };
+                        kernel_process(20, 10, group, 2)
+                    }))
+                },
+            )
+            .unwrap();
+        assert_eq!(candidate_reads, 2, "both captures were taken");
+        assert_eq!(
+            tracker.known.get(&20).map(|t| (t.row.pgid, t.birth)),
+            Some((20, Birth(2, 0)))
+        );
     }
     #[test]
     fn candidate_gone_before_final_capture_is_neither_enrolled_nor_signaled() {

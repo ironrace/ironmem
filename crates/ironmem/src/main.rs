@@ -1239,18 +1239,8 @@ fn print_advance_report(report: &ironmem::autopilot::advance::AdvanceReport) {
             }
         }
         if let Some(review) = &step.review {
-            match &review.refusal {
-                // Named rather than folded into the verdict line: a ceiling
-                // that refused the review is "retry when the day rolls over",
-                // and the pass stops the issue here rather than letting the
-                // merge report it as unreviewed.
-                Some(refusal) => println!(
-                    "    review: NOT dispatched ({refusal:?}) — the merge was not attempted"
-                ),
-                None => println!(
-                    "    review: {:?} / {:?}",
-                    review.outcome.verdict, review.decision
-                ),
+            for line in review.advance_lines() {
+                println!("    {line}");
             }
         }
         match &step.remediation {
@@ -2302,7 +2292,7 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                     ironmem::autopilot::run::approved_gate_commands(&database, &issue_ref.repo)?;
 
                 let mut runner = parse_reviewer(&reviewer)?.resolve(model)?;
-                let mut review = ironmem::autopilot::review::review_pr(
+                let review = ironmem::autopilot::review::review_pr(
                     &database,
                     &mut *runner,
                     &ironmem::autopilot::review::ReviewRequest {
@@ -2326,49 +2316,15 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                     },
                 )?;
 
-                // `record_review` scrubs the reason on the way into storage
-                // because a review reason quotes the diff and can carry
-                // anything the diff carried. The *emit* path needs the same
-                // guarantee: this string goes to stdout and, under --json,
-                // into whatever a Lead logs. Scrubbed here rather than inside
-                // `review_pr` so the drawer's `reason_redacted` flag still
-                // records that a redaction happened.
-                if let Some(reason) = review.outcome.reason.take() {
-                    review.outcome.reason = Some(
-                        ironmem::autopilot::scrub::scrub_and_bound(
-                            &reason,
-                            ironmem::autopilot::lineage::MAX_LINEAGE_FIELD_CHARS,
-                        )
-                        .text,
-                    );
-                }
+                // `review_pr` returns the reason and the follow-up scrubbed
+                // and bounded, as `record_review` stored them: both quote
+                // the diff and can carry anything the diff carried, and they
+                // go to stdout and, under --json, into whatever a Lead logs.
 
                 if json {
                     println!("{}", serde_json::to_string_pretty(&review)?);
                 } else {
-                    println!(
-                        "Issue {} PR #{}",
-                        review.issue.canonical(),
-                        review.pr_number
-                    );
-                    if let Some(refusal) = &review.refusal {
-                        println!("  reviewer: not dispatched ({refusal:?})");
-                    }
-                    println!("  verdict: {:?}", review.outcome.verdict);
-                    println!("  diff risk class: {:?}", review.outcome.risk_class);
-                    if let Some(reason) = &review.outcome.reason {
-                        println!("  reason: {reason}");
-                    }
-                    if let Some(usage) = &review.outcome.token_usage {
-                        println!(
-                            "  tokens: {} in ({} cached), {} out — no price reported by Codex",
-                            usage.input_tokens, usage.cached_input_tokens, usage.output_tokens
-                        );
-                    }
-                    println!("  decision: {:?}", review.decision);
-                    if let Some(id) = &review.record_drawer_id {
-                        println!("  recorded: {id}");
-                    }
+                    print!("{}", review.text_report());
                 }
                 Ok(())
             }

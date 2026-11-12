@@ -1515,6 +1515,7 @@ mod tests {
             verdict: Some(ReviewVerdict::Pass),
             risk_class: Some(RiskClass::Documentation),
             reason: Some("docs only".into()),
+            follow_up: None,
             total_cost_usd: None,
             token_usage: None,
             process_success: true,
@@ -1543,6 +1544,7 @@ mod tests {
                 base_branch: base.map(|b| b.to_string()),
                 outcome,
                 decision,
+                round: None,
             },
         )
         .expect("review should record");
@@ -1785,6 +1787,7 @@ mod tests {
                 base_branch: Some("main".into()),
                 outcome,
                 decision,
+                round: None,
             },
         )
         .unwrap();
@@ -1840,6 +1843,7 @@ mod tests {
                 base_branch: Some("main".into()),
                 outcome,
                 decision,
+                round: None,
             },
         )
         .unwrap();
@@ -1906,6 +1910,7 @@ mod tests {
                 verdict: Some(ReviewVerdict::NeedsChanges),
                 risk_class: Some(RiskClass::Documentation),
                 reason: Some("found something".into()),
+                follow_up: None,
                 total_cost_usd: None,
                 token_usage: None,
                 process_success: true,
@@ -1973,6 +1978,7 @@ mod tests {
                 base_branch: Some("main".into()),
                 outcome,
                 decision,
+                round: None,
             },
         )
         .unwrap();
@@ -2009,6 +2015,7 @@ mod tests {
             verdict: None,
             risk_class: None,
             reason: None,
+            follow_up: None,
             total_cost_usd: None,
             token_usage: None,
             process_success: false,

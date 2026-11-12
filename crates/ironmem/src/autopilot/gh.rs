@@ -329,6 +329,40 @@ pub fn issue_comment_argv(issue: &IssueRef, body: &str) -> Vec<String> {
     ]
 }
 
+/// `gh pr comment N --repo R --body <body>` (#403's follow-up comment).
+///
+/// Same single-argv-element body as [`issue_comment_argv`], for the same
+/// reason; the one caller renders a body that starts with
+/// [`super::blocked::AUTOPILOT_COMMENT_MARKER`] and is bounded. Measured
+/// against `gh pr comment --help` (gh 2.x): the PR number is positional,
+/// `--body` takes the text, and `--repo` is inherited.
+pub fn pr_comment_argv(repo: &str, pr_number: u64, body: &str) -> Vec<String> {
+    vec![
+        "pr".into(),
+        "comment".into(),
+        pr_number.to_string(),
+        "--repo".into(),
+        repo.into(),
+        "--body".into(),
+        body.into(),
+    ]
+}
+
+/// Post a comment on a pull request.
+pub fn comment_on_pr(
+    gh: &mut dyn GhRunner,
+    repo: &str,
+    pr_number: u64,
+    body: &str,
+) -> Result<(), MemoryError> {
+    let out = gh.run(&pr_comment_argv(repo, pr_number, body))?;
+    out.require_success(
+        &format!("gh pr comment on {repo}#{pr_number}"),
+        GhFailure::Refused,
+    )?;
+    Ok(())
+}
+
 /// The `--json` field list [`parse_pr_view`] expects, as one comma-separated
 /// value. Named so the builder and the parser cannot drift apart.
 pub const PR_VIEW_FIELDS: &str =
