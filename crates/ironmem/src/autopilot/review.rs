@@ -1996,10 +1996,18 @@ pub fn later_round_context(
     };
     // Filtered on the canonical issue as well as the PR, because
     // `repo_slug` collapses `owner/repo` and `owner-repo` onto one entity.
+    // Compared ignoring ASCII case, as `merge::latest_review_for_pr` does:
+    // the entity is keyed on a lowercased name, so `ironrace/IronMem` and
+    // `ironrace/ironmem` read each other's reviews, and an exact comparison
+    // would drop a genuine earlier round and restart at round one.
     let canonical = request.issue.canonical();
     let mut judged: Vec<RecordedReviewSummary> = reviews_for_issue(db, request.issue)?
         .into_iter()
-        .filter(|r| r.issue == canonical && r.pr_number == request.pr_number && r.judged())
+        .filter(|r| {
+            r.issue.eq_ignore_ascii_case(&canonical)
+                && r.pr_number == request.pr_number
+                && r.judged()
+        })
         .collect();
     // The most recent judged review must have read this same base: after a
     // retarget, `last_judged_head..head` omits code the new base exposes,
@@ -3221,6 +3229,37 @@ not json at all
         );
         assert!(prompt.contains("> judged on main"), "{prompt}");
         assert!(!prompt.contains("judged on release"), "{prompt}");
+    }
+
+    #[test]
+    fn an_earlier_round_recorded_under_another_repo_casing_is_still_this_prs() {
+        // `IssueRef` keeps the caller's casing, but the lineage entity is
+        // keyed on a lowercased name, so `ironrace/IronMem` and
+        // `ironrace/ironmem` read each other's reviews. An exact comparison
+        // of the canonical strings would drop the earlier round and review
+        // the whole PR again — the same equivalence `merge.rs` applies.
+        let (repo, first, second, _) = fix_history_repo();
+        let db = Database::open_in_memory().unwrap();
+        let gates = vec!["cargo test --workspace".to_string()];
+        let recorded_as = IssueRef::new("ironrace/IronMem", 283);
+        review_at(
+            &db,
+            &sample_request(&recorded_as, &gates, repo.path()),
+            &first,
+            needs_changes("the cap is read in two places"),
+        );
+
+        let issue = IssueRef::new("ironrace/ironmem", 283);
+        let request = sample_request(&issue, &gates, repo.path());
+        let prompt = review_at(&db, &request, &second, passing_outcome(RiskClass::Logic));
+        assert!(
+            prompt.contains(&format!("git diff {first}..{second}")),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("> the cap is read in two places"),
+            "{prompt}"
+        );
     }
 
     #[test]
