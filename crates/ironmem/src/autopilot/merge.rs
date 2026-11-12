@@ -1544,6 +1544,7 @@ mod tests {
                 base_branch: base.map(|b| b.to_string()),
                 outcome,
                 decision,
+                round: None,
             },
         )
         .expect("review should record");
@@ -1786,6 +1787,7 @@ mod tests {
                 base_branch: Some("main".into()),
                 outcome,
                 decision,
+                round: None,
             },
         )
         .unwrap();
@@ -1841,6 +1843,7 @@ mod tests {
                 base_branch: Some("main".into()),
                 outcome,
                 decision,
+                round: None,
             },
         )
         .unwrap();
@@ -1975,6 +1978,7 @@ mod tests {
                 base_branch: Some("main".into()),
                 outcome,
                 decision,
+                round: None,
             },
         )
         .unwrap();

@@ -996,7 +996,8 @@ fn review_prints_a_scrubbed_reason_and_follow_up_as_text_and_as_json() {
 /// A stub `gh` for one `advance` pass over one issue with one open PR. It
 /// logs each call's first two words to `$GH_CALLS`, answers the reads from
 /// `$GH_FIXTURES`, and refuses `pr comment` the way the real one does:
-/// several lines on stderr, a tab among them, and exit 1.
+/// several lines on stderr, a tab among them, and exit 1. A fourth line of
+/// 400 `x` makes the refusal longer than the report line may quote.
 const GH_ADVANCE_STUB: &str = r#"#!/bin/bash
 printf '%s\n' "$1 $2" >> "$GH_CALLS"
 case "$1 $2" in
@@ -1007,6 +1008,8 @@ case "$1 $2" in
   "issue view") echo '{"labels":[{"name":"agent:ready"}]}'; exit 0 ;;
   "pr comment")
     printf 'GraphQL: Resource not accessible by integration (addComment)\n\thttp status: 403\nsecond line of the refusal\n' >&2
+    printf 'x%.0s' {1..400} >&2
+    printf '\n' >&2
     exit 1 ;;
 esac
 if [ "$1" = api ]; then
@@ -1111,33 +1114,53 @@ fn advance_prints_a_failed_follow_up_post_on_one_line_naming_the_drawer() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    // The verdict line, then the follow-up line right under it, both at the
-    // review's indent.
+    // The verdict line, then the round line and the follow-up line right
+    // under it, all at the review's indent.
     let lines: Vec<&str> = stdout.lines().collect();
     let verdict_at = lines
         .iter()
         .position(|line| line.starts_with("    review: Some(Pass) / "))
         .unwrap_or_else(|| panic!("no review line: {stdout}"));
+    // This PR has no earlier judged review, so the whole of it was read.
+    assert_eq!(
+        lines.get(verdict_at + 1).copied(),
+        Some("    round: whole PR (no earlier judged review of this PR)"),
+        "{stdout}"
+    );
     let follow_up = lines
-        .get(verdict_at + 1)
-        .unwrap_or_else(|| panic!("nothing after the review line: {stdout}"));
+        .get(verdict_at + 2)
+        .unwrap_or_else(|| panic!("nothing after the round line: {stdout}"));
     let (error, drawer_id) = follow_up
         .strip_prefix("    follow-up: NOT posted as a PR comment (")
         .and_then(|rest| rest.split_once(") — its text is in the review's drawer "))
         .unwrap_or_else(|| panic!("not the failed-post line: {follow_up:?} in {stdout}"));
-    // `gh`'s three stderr lines and its tab, on this one line.
-    assert_eq!(
-        error,
-        format!(
-            "Validation error: gh pr comment on {REPO}#42 failed (exit Some(1)): GraphQL: Resource not \
-             accessible by integration (addComment) http status: 403 second line of the refusal"
-        ),
+    // `gh`'s first three stderr lines and its tab are on this one line, in
+    // order, each break and the tab flattened to one space, and the fourth
+    // line follows them. Before them the error names the command, the
+    // repo and PR, and the exit code, as docs/AUTOPILOT.md says it does.
+    // Only the error type's own prefix in front of that is left unpinned.
+    let refusal = "GraphQL: Resource not accessible by integration (addComment) \
+                   http status: 403 second line of the refusal xxxx";
+    assert!(
+        error.contains(&format!(
+            "gh pr comment on {REPO}#42 failed (exit Some(1)): {refusal}"
+        )),
         "{stdout}"
     );
+    assert!(
+        !follow_up.chars().any(char::is_control),
+        "a control character reached the line: {follow_up:?}"
+    );
+    // Bounded: the refusal is longer than the 300 characters the line
+    // quotes, so it is cut there and the cut is marked.
+    assert_eq!(error.chars().count(), 300, "{error}");
+    assert!(error.ends_with("xxxx…"), "{error}");
     assert_eq!(
         lines
             .iter()
-            .filter(|line| line.contains("follow-up") || line.contains("the refusal"))
+            .filter(|line| line.contains("follow-up")
+                || line.contains("the refusal")
+                || line.contains("xxxx"))
             .count(),
         1,
         "the failed post is one line: {stdout}"

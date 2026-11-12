@@ -920,21 +920,36 @@ the reviewer gets a fresh review rather than the same hold for ever.
 
 The first review of a PR reads the whole diff, `git diff <base>...<head>`.
 Any review after it is a **later round** when the most recent judged review
-of the same PR recorded the same base branch as the one now under review, and
+of the same PR recorded the same base branch as the one now under review,
 that review's head is recorded and is an ancestor of the head now under
-review, in the issue's worktree. Only the most recent judged review decides
-this: an older round against the same base does not make a later round when a
-newer judged review read another base. A later round's prompt:
+review in the issue's worktree, and no merge commit lies between the two.
+Only the most recent judged review decides this: an older round against the
+same base does not make a later round when a newer judged review read another
+base. That review may have passed: a push after a pass is a later round too.
+A later round's prompt:
 
-- names the last judged head and tells the reviewer to read the fix first,
-  `git diff <last-judged-head>..<head>`, and then the whole PR for context;
-- asks whether those commits resolve the earlier findings and whether they
-  add a defect of their own;
+- names the last judged head and tells the reviewer to read the commits
+  since it first, `git diff <last-judged-head>..<head>`, and then the whole
+  PR for context. After a `needs_changes` review the prompt calls those
+  commits the agent's fix. After a pass it calls them the new commits and
+  says they are not a fix for anything that review found;
+- asks whether those commits resolve the earlier findings (after a pass:
+  whether they reopened one) and whether they add a defect of their own;
 - quotes the `reason` text of the earlier judged rounds against the same
-  base, oldest first, each scrubbed and bounded to 1,200 characters as
-  remediation findings are, and only the newest five, and tells the reviewer
-  not to report one again unless the fix failed to resolve it. A round against
-  another base, or one that recorded no base, is not quoted;
+  base that returned `needs_changes`, oldest first, each scrubbed and cut to
+  1,200 characters as remediation findings are (a cut is marked with a quoted
+  line), and only the newest five, labelled `Earlier finding 1` onwards, and
+  tells the reviewer not to report one again unless the fix failed to resolve
+  it. A pass's reason is not a finding and is not quoted; nor is a round
+  against another base, or one that recorded no base. When no earlier round
+  asked for changes, the prompt says there is no earlier finding to check;
+- quotes the `follow_up` text of those earlier rounds, whatever their
+  verdict, under its own heading and the same bounds, and tells the reviewer
+  not to put one in `follow_up` again, so a follow-up is not reported a
+  second time. The prompt says each one is recorded for a human and may not
+  have reached the PR: one recorded by the standalone `ironmem autopilot
+  review`, or one whose post failed, was never posted (retrying a failed
+  post is tracked in #408);
 - allows a new finding in code an earlier round already judged to make the
   verdict `needs_changes` only when it is blocking: wrong results, data loss,
   a security hole or a crash. Anything else goes in the verdict's
@@ -942,31 +957,76 @@ newer judged review read another base. A later round's prompt:
 - asks the reviewer, when a finding is one instance of a pattern, to name the
   pattern and list the other sites it sees.
 
+Every quoted line starts with `> `. A carriage return or a Unicode line
+separator in the quoted text starts a new quoted line, and any other control
+character becomes a space, so quoted text cannot continue as an instruction.
+
 The risk class is still taken from the **whole** PR in every round, so a fix
 that only touches docs cannot reclassify a logic PR as `documentation`. The
 merge decision, the attempt cap and the reviewer's read-only argv are the
 same in every round.
 
-With no earlier judged review, an unrecorded head or base, a base that
-differs from the last judged review's (the PR was retargeted, so the new base
-can expose code no round judged), a head that is not an ancestor (a
-force-push rewrote the branch, or the worktree lacks the commit), or the same
-head again, the review falls back to the first-round prompt, byte for byte.
+The review falls back to the first-round prompt, byte for byte, when any of
+these holds:
+
+- no earlier review of the PR judged it;
+- the head under review could not be resolved;
+- the last judged review recorded no head, or no base;
+- its base differs from the PR's current base (the PR was retargeted, so the
+  new base can expose code no round judged);
+- its head is the head under review (there are no new commits);
+- its head is not an ancestor of the head under review (a force-push rewrote
+  the branch);
+- a merge commit lies between the two heads (the base was merged into the
+  PR branch, so the diff between them holds everything the merge brought in,
+  which is not the fix);
+- git could not answer: the worktree lacks one of the commits, a recorded
+  head is not a full commit SHA, or git failed. This one is logged as a
+  warning with git's error.
+
+Which prompt was used, and why, is recorded on the review (`round` in its
+drawer) and reported: `round` under `--json`, as `{"kind": "whole", "why":
+"<reason>"}` or `{"kind": "later", "last_judged_head": "<sha>"}`, and a
+`round:` line in the text output of `advance` and of `ironmem autopilot
+review`, such as `round: whole PR (the last judged head is not an ancestor
+of this head)` or `round: later round (new commits read from <12 hex>)`. A
+fallback other than "no earlier judged review" is also logged.
 
 `follow_up` is part of the verdict schema in every round: Codex's strict
-schema requires it, typed string or `null`; a Muse reply may omit it. A
-`follow_up` of any other type makes the reply no verdict. When a judged
-review's `follow_up` is non-empty, `advance` posts it once as a PR comment,
-scrubbed and bounded, and opens no issue. A failed post is reported on the
-review as `follow_up_comment: {"status": "failed", ...}` under `--json` and
-as one line in the text output, `follow-up: NOT posted as a PR comment
-(<error>) — its text is in the review's drawer <id>`, and does not stop the
-pass. The text output does not print the follow-up itself: read it from that
-drawer, or from `outcome.follow_up` under `--json`. The line quotes at most
-300 characters of the error, on one line; `--json` carries all of it. A
-successful post prints `follow-up: posted as a PR comment`. The standalone
-`ironmem autopilot review` command posts nothing: it prints the follow-up as
-a `follow-up (non-blocking):` line, or as `outcome.follow_up` under `--json`.
+schema requires it, typed string or `null`; a Muse reply may omit it. Only
+the later-round prompt asks for it, because the first-round prompt is
+unchanged, but it is accepted and posted from any round. An empty or blank
+`follow_up` is read as none. A `follow_up` of any other type makes the reply
+no verdict. When a judged review's `follow_up` is non-empty, `advance` posts
+it as a PR comment, scrubbed and cut to 4,000 characters, and opens no issue.
+The comment says these are non-blocking findings that did not change the
+verdict, and says so under the quoted text when the text was cut. The
+review's drawer records whether the stored follow-up was redacted or cut
+(`follow_up_redacted`, `follow_up_truncated`), as it does for the reason, and
+the report carries `follow_up_truncated: true` when it was cut.
+
+There is at most one comment per judged review: it is posted straight after
+the review that produced it and never again for that review. A failed post is
+not retried. It is not one comment per head: a PR retargeted to another base
+is reviewed again at the same head, and that review posts its own follow-up.
+A failed post is reported on the review as `follow_up_comment: {"status":
+"failed", ...}` under `--json` and as one line in the text output,
+`follow-up: NOT posted as a PR comment (<error>) — its text is in the
+review's drawer <id>`, and does not stop the pass. The text output does not
+print the follow-up itself: read it from that drawer, or from
+`outcome.follow_up` under `--json`. The error is Autopilot's own error text,
+which names the command and ends with `gh`'s stderr, scrubbed. The line
+quotes at most 300 characters of it, on one line; `--json` carries up to
+4,000. A successful post prints `follow-up: posted as a PR comment`.
+
+The standalone `ironmem autopilot review` command posts nothing: it prints
+the follow-up as a `follow-up (non-blocking):` entry, or as
+`outcome.follow_up` under `--json`, and under it a `follow-up was cut to
+4000 characters` line when the reviewer wrote more than that. In that text
+output the reason and the
+follow-up have their control characters removed and their later lines
+indented six spaces, so reviewer text cannot be read as one of the report's
+own fields.
 
 ## The auto-merge envelope
 

@@ -1425,17 +1425,54 @@ fn is_ancestor(root: &Path, ancestor: &str, descendant: &str) -> Result<bool, Me
     }
 }
 
-/// Whether the commit `ancestor` is an ancestor of the commit `descendant`
-/// in `repo_dir`, for a later review round (#403). Both must be full commit
-/// SHAs (40 or 64 hex characters) — anything else, including a value git
-/// could read as an option, is `false` without running git — and every git
-/// failure is `false` too: the caller's fallback is the round-1 review of
-/// the whole PR, so "cannot tell" costs only the narrower prompt.
-pub(crate) fn commit_is_ancestor(repo_dir: &Path, ancestor: &str, descendant: &str) -> bool {
-    let is_sha = |s: &str| matches!(s.len(), 40 | 64) && s.chars().all(|c| c.is_ascii_hexdigit());
-    is_sha(ancestor)
-        && is_sha(descendant)
-        && is_ancestor(repo_dir, ancestor, descendant).unwrap_or(false)
+/// Refuse anything that is not a full commit SHA (40 or 64 hex characters),
+/// so a recorded value git could read as an option or a revision expression
+/// never reaches its command line.
+fn require_commit_sha(value: &str) -> Result<(), MemoryError> {
+    if matches!(value.len(), 40 | 64) && value.chars().all(|c| c.is_ascii_hexdigit()) {
+        Ok(())
+    } else {
+        Err(MemoryError::Validation(
+            "not a full commit SHA (40 or 64 hexadecimal characters)".into(),
+        ))
+    }
+}
+
+/// Whether the commit `ancestor` is `descendant` or one of its ancestors in
+/// `repo_dir`, for a later review round (#403).
+///
+/// `Ok(false)` is git's own "no" (`merge-base --is-ancestor` exit 1). An
+/// `Err` is "cannot tell": either value is not a full commit SHA (refused
+/// without running git), or git failed, as it does when the checkout lacks
+/// one of the commits. The caller reviews the whole PR on both, and logs the
+/// second, so the two are told apart.
+pub(crate) fn commit_is_ancestor(
+    repo_dir: &Path,
+    ancestor: &str,
+    descendant: &str,
+) -> Result<bool, MemoryError> {
+    require_commit_sha(ancestor)?;
+    require_commit_sha(descendant)?;
+    is_ancestor(repo_dir, ancestor, descendant)
+}
+
+/// Whether a merge commit lies in `ancestor..descendant` in `repo_dir`
+/// (`git rev-list --merges --max-count=1`), for a later review round (#403).
+///
+/// When the base branch was merged into the PR branch after `ancestor`,
+/// `git diff ancestor..descendant` holds everything that merge brought in,
+/// so it is not the fix. Same SHA check and the same `Err` for "cannot
+/// tell" as [`commit_is_ancestor`].
+pub(crate) fn merge_commit_between(
+    repo_dir: &Path,
+    ancestor: &str,
+    descendant: &str,
+) -> Result<bool, MemoryError> {
+    require_commit_sha(ancestor)?;
+    require_commit_sha(descendant)?;
+    let range = format!("{ancestor}..{descendant}");
+    let merges = git(repo_dir, &["rev-list", "--merges", "--max-count=1", &range])?;
+    Ok(!merges.trim().is_empty())
 }
 
 /// Record a cut [`infer_cut`] found for an existing `branch` that had none.
@@ -2215,6 +2252,98 @@ mod tests {
     /// assert that we call the commands we already decided to call.
     fn fixture_repo() -> tempfile::TempDir {
         fixture_repo_of("sha1")
+    }
+
+    /// Commit one new file on the current branch; the new head.
+    fn commit_file(repo: &Path, name: &str) -> String {
+        std::fs::write(repo.join(name), name).unwrap();
+        run(repo, &["add", "-A"]);
+        run(repo, &["commit", "-q", "-m", name]);
+        test_git::run(repo, &["rev-parse", "HEAD"])
+    }
+
+    #[test]
+    fn commit_is_ancestor_tells_no_from_cannot_tell() {
+        let repo = fixture_repo();
+        let path = repo.path();
+        let first = test_git::run(path, &["rev-parse", "HEAD"]);
+        let second = commit_file(path, "second.txt");
+        run(path, &["checkout", "-q", "-b", "other", &first]);
+        let sibling = commit_file(path, "sibling.txt");
+
+        assert!(commit_is_ancestor(path, &first, &second).unwrap());
+        // Git's own "no" is an answer.
+        assert!(!commit_is_ancestor(path, &sibling, &second).unwrap());
+        assert!(!commit_is_ancestor(path, &second, &first).unwrap());
+
+        // A commit this repository does not hold is "cannot tell": an
+        // error, not a "no", and the error is git's.
+        let absent = "1".repeat(40);
+        let error = commit_is_ancestor(path, &absent, &second)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("merge-base --is-ancestor"), "{error}");
+        assert!(commit_is_ancestor(path, &first, &absent).is_err());
+    }
+
+    #[test]
+    fn a_value_that_is_not_a_full_commit_sha_never_reaches_git() {
+        let repo = fixture_repo();
+        let path = repo.path();
+        let head = test_git::run(path, &["rev-parse", "HEAD"]);
+        // An option, a short SHA git would happily resolve, a ref name, a
+        // revision expression, and a SHA of the right length with one
+        // character that is not hexadecimal.
+        let short = &head[..7];
+        let not_hex = format!("{}g", &head[..39]);
+        for bad in ["--help", short, "HEAD", "main", "HEAD~0", "", &not_hex] {
+            for result in [
+                commit_is_ancestor(path, bad, &head),
+                commit_is_ancestor(path, &head, bad),
+                merge_commit_between(path, bad, &head),
+                merge_commit_between(path, &head, bad),
+            ] {
+                let error = result.unwrap_err().to_string();
+                assert!(
+                    error.contains("not a full commit SHA"),
+                    "{bad:?} reached git: {error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn merge_commit_between_finds_a_merge_and_only_inside_the_range() {
+        let repo = fixture_repo();
+        let path = repo.path();
+        let first = test_git::run(path, &["rev-parse", "HEAD"]);
+        let second = commit_file(path, "second.txt");
+        run(path, &["checkout", "-q", "-b", "other", &first]);
+        commit_file(path, "sibling.txt");
+        run(path, &["checkout", "-q", "main"]);
+        run(
+            path,
+            &[
+                "merge",
+                "-q",
+                "--no-ff",
+                "-m",
+                "Merge other into main",
+                "other",
+            ],
+        );
+        let merged = test_git::run(path, &["rev-parse", "HEAD"]);
+        let after = commit_file(path, "after.txt");
+
+        // Plain commits only.
+        assert!(!merge_commit_between(path, &first, &second).unwrap());
+        assert!(!merge_commit_between(path, &merged, &after).unwrap());
+        // The merge is in the range, at its end or inside it.
+        assert!(merge_commit_between(path, &second, &merged).unwrap());
+        assert!(merge_commit_between(path, &first, &after).unwrap());
+
+        // A commit the repository lacks is an error, not "no merge".
+        assert!(merge_commit_between(path, &"1".repeat(40), &after).is_err());
     }
 
     /// [`fixture_repo`] with the given `--object-format`.

@@ -133,14 +133,16 @@ use super::{
 /// rung 0 measured that a result carries no verdict field the caller can
 /// trust — but adds `risk_class`, because the spec gives the Reviewer two
 /// jobs and a merge decision needs both answers. `additionalProperties:
-/// false` and all three fields `required`, so a partial answer is a parse
+/// false` and every field `required`, so a partial answer is a parse
 /// failure (→ [`HoldReason::NoVerdict`]) rather than a half-trusted one.
 ///
 /// **Passed to Codex as a file path, not inline** — the opposite of the IC
 /// schema. See the module doc's *Two asymmetries*.
 ///
-/// `follow_up` (#403) is the reviewer's non-blocking findings in code an
-/// earlier round already judged. Codex applies this schema in strict mode,
+/// `follow_up` (#403) is the reviewer's non-blocking findings: the ones that
+/// did not change the verdict. It is accepted in every round, though only
+/// the later-round prompt asks for it — the first round's prompt is
+/// unchanged by #403. Codex applies this schema in strict mode,
 /// which wants every property in `required`, so it is required and typed
 /// `["string","null"]` — "none" is `null`, not an absent key. A Muse reply
 /// that omits it still parses: [`parse_review_message`] defaults it.
@@ -343,9 +345,10 @@ pub struct ReviewOutcome {
     /// `None` on the same conditions as `verdict`.
     pub risk_class: Option<RiskClass>,
     pub reason: Option<String>,
-    /// Non-blocking findings in code an earlier round already judged (#403).
-    /// They never change the verdict; [`super::advance`] posts a non-empty
-    /// one on the PR as a single comment.
+    /// Non-blocking findings that did not change the verdict (#403), from
+    /// any round. [`super::advance`] posts a judged review's non-empty one
+    /// on the PR as a single comment. [`parse_review_message`] reads an
+    /// empty or blank one as `None`.
     pub follow_up: Option<String>,
     /// `None` for a Codex reviewer, which reports no dollar figure. **Not
     /// zero** — see the module doc.
@@ -399,15 +402,19 @@ pub struct ParsedReview {
     pub verdict: Option<ReviewVerdict>,
     pub risk_class: Option<RiskClass>,
     pub reason: Option<String>,
+    /// `None` when the reply had no `follow_up`, a `null` one, or one that
+    /// was empty or only whitespace.
     pub follow_up: Option<String>,
 }
 
-/// Parse the Reviewer's final message into a verdict, class, and reason.
+/// Parse the Reviewer's final message into a verdict, class, reason and
+/// follow-up.
 ///
 /// Tolerates surrounding whitespace and a markdown code fence, because those
 /// are formatting noise around an otherwise-conforming answer. It tolerates
 /// **nothing else**: a message that is prose, truncated, or carries a value
-/// outside the schema's enums yields `(None, None, ...)`, which
+/// outside the schema's enums yields no verdict or no class (a message that
+/// is not the expected JSON yields [`ParsedReview::default`]), which
 /// [`decide_merge`] turns into [`HoldReason::NoVerdict`]. There is
 /// deliberately no path that infers a verdict from prose — that would
 /// reintroduce exactly the guess the `--output-schema` flag exists to
@@ -429,7 +436,7 @@ pub fn parse_review_message(message: &str) -> ParsedReview {
         verdict,
         risk_class,
         reason: raw.reason,
-        follow_up: raw.follow_up,
+        follow_up: raw.follow_up.filter(|text| !text.trim().is_empty()),
     }
 }
 
@@ -973,6 +980,13 @@ pub struct ReviewJudgment {
 }
 
 impl ReviewOutcome {
+    /// Whether this review produced a judgment: the reviewer process
+    /// succeeded **and** returned a verdict. The same rule as
+    /// [`RecordedReviewSummary::judged`], for a review that has just run.
+    pub fn judged(&self) -> bool {
+        self.process_success && self.verdict.is_some()
+    }
+
     /// The subset of this outcome that authorizes (or refuses) a merge.
     pub fn judgment(&self) -> ReviewJudgment {
         ReviewJudgment {
@@ -1055,6 +1069,11 @@ pub struct ReviewRecord {
     pub base_branch: Option<String>,
     pub outcome: ReviewOutcome,
     pub decision: MergeDecision,
+    /// The prompt chosen for the reviewer (#403): the whole PR and why, or
+    /// a later round and the head the new commits are read from. Recorded
+    /// even when the reviewer failed to launch. `None` when the caller does
+    /// not know.
+    pub round: Option<ReviewRound>,
 }
 
 /// The JSON actually written to the drawer.
@@ -1097,6 +1116,16 @@ struct ReviewBody {
     /// review recorded before #403 reads back as having no follow-up.
     #[serde(default)]
     follow_up: Option<String>,
+    /// What the scrub did to `follow_up`, as `reason_redacted` and
+    /// `reason_truncated` say for `reason`. Defaulted for the same reason.
+    #[serde(default)]
+    follow_up_redacted: bool,
+    #[serde(default)]
+    follow_up_truncated: bool,
+    /// [`ReviewRecord::round`]. Defaulted: a review recorded before #403
+    /// reads back as `None`, "not recorded".
+    #[serde(default)]
+    round: Option<ReviewRound>,
 }
 
 /// What [`record_review`] persisted.
@@ -1121,6 +1150,11 @@ pub fn record_review(db: &Database, record: &ReviewRecord) -> Result<RecordedRev
         .reason
         .as_deref()
         .map(|text| scrub_and_bound(text, MAX_LINEAGE_FIELD_CHARS));
+    let follow_up_scrub = record
+        .outcome
+        .follow_up
+        .as_deref()
+        .map(|text| scrub_and_bound(text, MAX_LINEAGE_FIELD_CHARS));
 
     let body = ReviewBody {
         issue: record.issue.canonical(),
@@ -1141,11 +1175,10 @@ pub fn record_review(db: &Database, record: &ReviewRecord) -> Result<RecordedRev
         recorded_at: chrono::Utc::now().to_rfc3339(),
         reason_redacted: reason_scrub.as_ref().is_some_and(|o| o.redacted),
         reason_truncated: reason_scrub.as_ref().is_some_and(|o| o.truncated),
-        follow_up: record
-            .outcome
-            .follow_up
-            .as_deref()
-            .map(|text| scrub_and_bound(text, MAX_LINEAGE_FIELD_CHARS).text),
+        follow_up: follow_up_scrub.as_ref().map(|o| o.text.clone()),
+        follow_up_redacted: follow_up_scrub.as_ref().is_some_and(|o| o.redacted),
+        follow_up_truncated: follow_up_scrub.as_ref().is_some_and(|o| o.truncated),
+        round: record.round.clone(),
     };
 
     let content = serde_json::to_string(&body)?;
@@ -1232,6 +1265,10 @@ pub struct RecordedReviewSummary {
     /// `None` for a review recorded before the field existed.
     #[serde(default)]
     pub follow_up: Option<String>,
+    /// Which prompt this review was given (#403). `None` for a review
+    /// recorded before the field existed.
+    #[serde(default)]
+    pub round: Option<ReviewRound>,
     pub process_success: bool,
     pub recorded_at: String,
 }
@@ -1293,6 +1330,7 @@ pub fn reviews_for_issue(
             risk_class: body.risk_class,
             reason: body.reason,
             follow_up: body.follow_up,
+            round: body.round,
             process_success: body.process_success,
             recorded_at: body.recorded_at,
         });
@@ -1834,6 +1872,95 @@ pub struct PrReview {
     /// caller, never by [`review_pr`], which holds no `gh` runner.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub follow_up_comment: Option<FollowUpComment>,
+    /// Whether `outcome.follow_up` was cut to
+    /// [`MAX_LINEAGE_FIELD_CHARS`] (#403): the reviewer wrote more than
+    /// this report, the review's drawer and the PR comment hold. Left out
+    /// of the JSON when `false`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub follow_up_truncated: bool,
+    /// The prompt chosen for the reviewer (#403), also recorded when the
+    /// reviewer failed to launch and so never read it. `None` only when a
+    /// ceiling refused the review before a prompt was chosen.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub round: Option<ReviewRound>,
+}
+
+/// Which prompt a review was rendered with (#403).
+///
+/// Recorded on the review and printed with it, because a fallback to the
+/// whole PR is otherwise invisible: the review looks the same, costs a
+/// whole-PR read, and nothing says why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ReviewRound {
+    /// The first-round prompt: the whole PR, `git diff <base>...<head>`.
+    Whole { why: WholePrReason },
+    /// The later-round prompt: `git diff <last_judged_head>..<head>` first.
+    Later { last_judged_head: String },
+}
+
+impl ReviewRound {
+    /// One line for the text reports.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Whole { why } => format!("whole PR ({})", why.describe()),
+            Self::Later { last_judged_head } => format!(
+                "later round (new commits read from {})",
+                last_judged_head.chars().take(12).collect::<String>()
+            ),
+        }
+    }
+}
+
+/// Why a review read the whole PR rather than the commits since the last
+/// judged review (#403). `later_round_context` holds the rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WholePrReason {
+    /// The head under review could not be resolved to a commit.
+    HeadUnresolved,
+    /// No earlier review of this PR judged it: this is the first round.
+    NoEarlierJudgedReview,
+    /// The last judged review recorded no base branch.
+    LastJudgedBaseUnrecorded,
+    /// The last judged review read another base: the PR was retargeted.
+    BaseChangedSinceLastJudged,
+    /// The last judged review recorded no head.
+    LastJudgedHeadUnrecorded,
+    /// The last judged review read this same head: there are no new commits.
+    SameHeadAsLastJudged,
+    /// Git says the last judged head is not an ancestor of this head: a
+    /// force-push rewrote the branch.
+    LastJudgedHeadNotAnAncestor,
+    /// A merge commit lies between the last judged head and this head, so
+    /// the diff between them holds whatever the merge brought in.
+    MergeSinceLastJudgedHead,
+    /// Git could not answer (the checkout lacks a commit, a recorded head is
+    /// not a commit SHA, or git failed). The error is logged.
+    AncestryUnreadable,
+}
+
+impl WholePrReason {
+    /// A short phrase for the text reports and the log.
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::HeadUnresolved => "the head under review could not be resolved",
+            Self::NoEarlierJudgedReview => "no earlier judged review of this PR",
+            Self::LastJudgedBaseUnrecorded => "the last judged review recorded no base",
+            Self::BaseChangedSinceLastJudged => "the last judged review read another base",
+            Self::LastJudgedHeadUnrecorded => "the last judged review recorded no head",
+            Self::SameHeadAsLastJudged => "the last judged review read this same head",
+            Self::LastJudgedHeadNotAnAncestor => {
+                "the last judged head is not an ancestor of this head"
+            }
+            Self::MergeSinceLastJudgedHead => {
+                "a merge commit lies between the last judged head and this head"
+            }
+            Self::AncestryUnreadable => {
+                "git could not tell whether the last judged head is an ancestor of this head"
+            }
+        }
+    }
 }
 
 /// What became of a review's follow-up comment (#403).
@@ -1842,50 +1969,70 @@ pub struct PrReview {
 pub enum FollowUpComment {
     Posted,
     /// `gh pr comment` failed. Reported rather than retried: the follow-up
-    /// is still in the review's drawer, and the next pass will not review
-    /// this head again to post it a second time.
+    /// is still in the review's drawer, and a later pass posts only for a
+    /// review it runs itself.
     Failed {
+        /// The failure as [`MemoryError`] prints it (its own prefix, the
+        /// command, and `gh`'s stderr), scrubbed and cut to
+        /// [`MAX_LINEAGE_FIELD_CHARS`].
         error: String,
     },
 }
 
 /// The longest follow-up text a comment quotes, after scrubbing.
-pub const MAX_FOLLOW_UP_CHARS: usize = 4_000;
+const MAX_FOLLOW_UP_CHARS: usize = 4_000;
 
 /// The longest follow-up comment body, everything included. Room for the
 /// text, two fences that can each be one backtick longer than it, and the
 /// fixed prose, so the bound never cuts the closing fence off — and far
 /// under GitHub's 65,536-character comment limit.
-pub const MAX_FOLLOW_UP_COMMENT_CHARS: usize = 3 * MAX_FOLLOW_UP_CHARS + 1_000;
+const MAX_FOLLOW_UP_COMMENT_CHARS: usize = 3 * MAX_FOLLOW_UP_CHARS + 1_000;
 
 /// The PR comment carrying a judged review's non-blocking follow-up (#403),
 /// or `None` when there is nothing to post.
 ///
 /// The reviewer's text is scrubbed and bounded, then fenced with one more
-/// backtick than its longest backtick run, so nothing it quotes from the
-/// diff renders as markdown or notifies an `@`-mentioned account. Opens no
-/// issues: a person reads it and decides.
-pub fn render_follow_up_comment(
+/// backtick than its longest backtick run and never fewer than three, so
+/// nothing it quotes from the diff renders as markdown or notifies an
+/// `@`-mentioned account. Only the text is scrubbed: scrubbing the assembled
+/// body let a text ending in `some_key:` take the closing fence for that
+/// key's value and redact it. When the text was cut, here or (`already_cut`)
+/// by the caller, a line under the fence says so.
+///
+/// `head_sha` is quoted only when it is a full hexadecimal commit SHA: it
+/// comes from `gh`, unvalidated, and anything else is left out rather than
+/// placed in the comment's markdown. Opens no issues: a person reads the
+/// comment and decides.
+pub(crate) fn render_follow_up_comment(
     pr_number: u64,
     head_sha: Option<&str>,
     follow_up: Option<&str>,
+    already_cut: bool,
 ) -> Option<String> {
     let text = follow_up.map(str::trim).filter(|t| !t.is_empty())?;
-    let text = scrub_and_bound(text, MAX_FOLLOW_UP_CHARS).text;
+    let scrubbed = scrub_and_bound(text, MAX_FOLLOW_UP_CHARS);
+    let text = scrubbed.text;
     let longest_run = text.split(|c| c != '`').map(str::len).max().unwrap_or(0);
     let fence = "`".repeat(longest_run.max(2) + 1);
     let at = head_sha
-        .map(|sha| format!(" at `{}`", sha.chars().take(12).collect::<String>()))
+        .filter(|sha| matches!(sha.len(), 40 | 64) && sha.chars().all(|c| c.is_ascii_hexdigit()))
+        .map(|sha| format!(" at `{}`", &sha[..12]))
         .unwrap_or_default();
+    let cut = if scrubbed.truncated || already_cut {
+        format!("\n(The follow-up was cut to {MAX_FOLLOW_UP_CHARS} characters.)\n")
+    } else {
+        String::new()
+    };
     let body = format!(
         "{marker}\n**Autopilot review follow-up for PR #{pr_number}{at}**\n\n\
-         The reviewer noted these non-blocking findings in code an earlier \
-         review round already judged. They did not change the verdict, and \
-         Autopilot has opened no issue for them.\n\n\
-         {fence}text\n{text}\n{fence}\n",
+         The reviewer noted these non-blocking findings that did not change \
+         the verdict. Autopilot has opened no issue for them.\n\n\
+         {fence}text\n{text}\n{fence}\n{cut}",
         marker = super::blocked::AUTOPILOT_COMMENT_MARKER,
     );
-    Some(scrub_and_bound(&body, MAX_FOLLOW_UP_COMMENT_CHARS).text)
+    // Bounded, not scrubbed again: see above. The parts cannot reach the
+    // bound (see `MAX_FOLLOW_UP_COMMENT_CHARS`); this is the backstop.
+    Some(body.chars().take(MAX_FOLLOW_UP_COMMENT_CHARS).collect())
 }
 
 /// Why [`review_pr`] declined to launch a reviewer at all.
@@ -1916,15 +2063,19 @@ impl PrReview {
     /// `--json`, newline-terminated: the issue and PR, then one indented
     /// entry per field. The verdict, diff risk class and decision are always
     /// printed (an absent verdict or class prints `None`). The refusal,
-    /// reason, follow-up, token and record entries are left out when there
-    /// is nothing to say.
+    /// reason, follow-up, round, token and record entries are left out when
+    /// there is nothing to say. A follow-up that was cut
+    /// (`follow_up_truncated`) is followed by a line saying so, as the PR
+    /// comment and the `--json` report say it.
     ///
-    /// Prints the reason and the follow-up (#403) as they are, so the caller
-    /// scrubs both first, as the CLI does. Only an entry's first line is
-    /// indented: a reason or follow-up that holds newlines prints its later
-    /// lines as the reviewer wrote them. The standalone command posts no
-    /// comment, so without `--json` this line is where the person who ran it
-    /// sees the follow-up; it is also stored in the review's drawer.
+    /// The reason and the follow-up (#403) are the reviewer's text, already
+    /// scrubbed by [`review_pr`]. Here their control characters are dropped
+    /// and their later lines are indented six spaces, past the report's own
+    /// two-space fields, so no part of them reads as a report field or
+    /// reaches the terminal as an escape sequence (`report_entry`). The
+    /// standalone command posts no comment, so without `--json` this entry
+    /// is where the person who ran it sees the follow-up; it is also stored
+    /// in the review's drawer.
     pub fn text_report(&self) -> String {
         use std::fmt::Write as _;
         let mut out = String::new();
@@ -1940,15 +2091,25 @@ impl PrReview {
         let _ = writeln!(out, "  verdict: {:?}", self.outcome.verdict);
         let _ = writeln!(out, "  diff risk class: {:?}", self.outcome.risk_class);
         if let Some(reason) = &self.outcome.reason {
-            let _ = writeln!(out, "  reason: {reason}");
+            let _ = writeln!(out, "  reason: {}", report_entry(reason));
         }
         if let Some(follow_up) = self
             .outcome
             .follow_up
             .as_deref()
-            .filter(|t| !t.trim().is_empty())
+            .map(report_entry)
+            .filter(|t| !t.is_empty())
         {
             let _ = writeln!(out, "  follow-up (non-blocking): {follow_up}");
+            if self.follow_up_truncated {
+                let _ = writeln!(
+                    out,
+                    "  follow-up was cut to {MAX_LINEAGE_FIELD_CHARS} characters"
+                );
+            }
+        }
+        if let Some(round) = &self.round {
+            let _ = writeln!(out, "  round: {}", round.describe());
         }
         if let Some(usage) = &self.outcome.token_usage {
             let _ = writeln!(
@@ -1966,15 +2127,17 @@ impl PrReview {
 
     /// The lines `ironmem autopilot advance` prints for this review without
     /// `--json`, unindented: the verdict and decision (or why no reviewer
-    /// ran), then what became of the follow-up comment (#403) when there
-    /// was one to post. A failed post is named here because the pass does
-    /// not stop for it, and the text output would otherwise read like a
-    /// pass whose review had no follow-up.
+    /// ran), which prompt the reviewer was given (#403: the whole PR and
+    /// why, or a later round), then what became of the follow-up comment
+    /// when there was one to post. A failed post is named here because the
+    /// pass does not stop for it, and the text output would otherwise read
+    /// like a pass whose review had no follow-up.
     ///
-    /// Every entry is one line. The failed post's error is `gh`'s stderr,
-    /// which can span lines, so its control characters become spaces and it
-    /// is cut to [`MAX_ADVANCE_LINE_ERROR_CHARS`]; the whole error stays in
-    /// `follow_up_comment` under `--json`. The line ends with the id of the
+    /// Every entry is one line. The failed post's error is the
+    /// [`MemoryError`] text, which ends with `gh`'s stderr and can span
+    /// lines, so its control characters become spaces and it is cut to
+    /// `MAX_ADVANCE_LINE_ERROR_CHARS` (300); `follow_up_comment` under `--json`
+    /// carries up to [`MAX_LINEAGE_FIELD_CHARS`] of it. The line ends with the id of the
     /// review's drawer, where the follow-up text is, because the text
     /// output prints the follow-up nowhere else.
     pub fn advance_lines(&self) -> Vec<String> {
@@ -1988,6 +2151,9 @@ impl PrReview {
             }
             None => format!("review: {:?} / {:?}", self.outcome.verdict, self.decision),
         }];
+        if let Some(round) = &self.round {
+            lines.push(format!("round: {}", round.describe()));
+        }
         match &self.follow_up_comment {
             None => {}
             Some(FollowUpComment::Posted) => {
@@ -2012,9 +2178,37 @@ impl PrReview {
 }
 
 /// The longest error [`PrReview::advance_lines`] quotes on its failed-post
-/// line, in characters. Enough for `gh`'s first line of stderr, which names
-/// the failure; the whole error is in the `--json` report.
-pub const MAX_ADVANCE_LINE_ERROR_CHARS: usize = 300;
+/// line, in characters. Enough for the command and `gh`'s first line of
+/// stderr, which names the failure; the `--json` report carries more.
+const MAX_ADVANCE_LINE_ERROR_CHARS: usize = 300;
+
+/// A reviewer's text as one entry of [`PrReview::text_report`]: every
+/// control character is dropped, every line break (a newline, a carriage
+/// return, or one of Unicode's line and paragraph separators) starts a new
+/// line, blank lines go, and each line after the first is indented six
+/// spaces. The report's own fields sit at two, so reviewer text can neither
+/// forge one nor send the terminal an escape sequence.
+fn report_entry(text: &str) -> String {
+    text.split(is_line_break)
+        .map(|line| {
+            line.chars()
+                .filter(|c| !c.is_control())
+                .collect::<String>()
+                .trim()
+                .to_string()
+        })
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n      ")
+}
+
+/// Whether `c` ends a line in a terminal or a markdown renderer.
+fn is_line_break(c: char) -> bool {
+    matches!(
+        c,
+        '\n' | '\r' | '\u{0B}' | '\u{0C}' | '\u{85}' | '\u{2028}' | '\u{2029}'
+    )
+}
 
 /// `text` as one line of at most `max_chars` characters: every control
 /// character (a newline, a tab, an escape) becomes a space, runs of
@@ -2041,37 +2235,70 @@ where
     serializer.serialize_str(&issue.canonical())
 }
 
-/// What an earlier judged review of a PR already covered (#403).
+/// What the earlier judged reviews of a PR already covered (#403): the
+/// inputs of a later round's prompt.
 #[derive(Debug, Clone, PartialEq)]
-pub struct LaterRoundContext {
+struct LaterRoundContext {
     /// The head the most recent judged review of this PR read.
-    pub last_judged_head: String,
+    last_judged_head: String,
+    /// The head now under review. `last_judged_head` is a strict ancestor
+    /// of it, with no merge commit between them.
+    head_sha: String,
+    /// Whether that most recent judged review returned `needs_changes`.
+    /// When it passed, the commits since are not a fix for anything it
+    /// found, and the prompt says so.
+    last_review_asked_for_changes: bool,
     /// The `reason` of every judged review of this PR against the base now
-    /// under review, oldest first. A judged review against another base, or
-    /// one that recorded no base, is left out.
-    pub earlier_reasons: Vec<String>,
+    /// under review that returned `needs_changes`, oldest first. A pass's
+    /// reason is not a finding and is left out, as is a review against
+    /// another base or one that recorded no base.
+    earlier_findings: Vec<String>,
+    /// The non-empty `follow_up` of every judged review against that base,
+    /// whatever its verdict, oldest first.
+    earlier_follow_ups: Vec<String>,
 }
 
-/// Whether reviewing `head_sha` is a later round of `request`'s PR (#403),
-/// and if so what the earlier rounds said.
+impl LaterRoundContext {
+    fn prompt_inputs(&self) -> super::review_prompt::LaterRound<'_> {
+        super::review_prompt::LaterRound {
+            last_judged_head: &self.last_judged_head,
+            head_sha: &self.head_sha,
+            last_review_asked_for_changes: self.last_review_asked_for_changes,
+            earlier_reasons: &self.earlier_findings,
+            earlier_follow_ups: &self.earlier_follow_ups,
+        }
+    }
+}
+
+/// Whether reviewing `head_sha` is a later round of `request`'s PR (#403):
+/// `Ok` with what the earlier rounds said, or `Err` with why the whole PR is
+/// reviewed instead.
 ///
 /// A later round needs all of: an earlier review of **this** PR that judged
 /// (#350 — a crashed or verdict-less run read nothing), a recorded head on
 /// the most recent one, a recorded base on it equal to the base under review,
-/// and that head being a strict ancestor of the one under review in the
-/// reviewer's checkout. Anything else — no judged review, an unrecorded head
-/// or base, a retargeted PR (the new base exposes code no round judged), a
-/// force-push that rewrote the head, a checkout that lacks it, or the same
-/// head again (there is no fix to read) — is round 1, which reviews the whole
-/// PR as before. Only reviews against the current base are quoted as earlier
-/// rounds.
-pub fn later_round_context(
+/// that head being a strict ancestor of the one under review in the
+/// reviewer's checkout, and no merge commit between the two. Anything else —
+/// no judged review, an unresolved head, an unrecorded head or base, a
+/// retargeted PR (the new base exposes code no round judged), a force-push
+/// that rewrote the head, a checkout that lacks it, the same head again
+/// (there are no new commits to read), or the base merged into the branch
+/// since (the diff from the last judged head would then hold everything the
+/// merge brought in) — is round 1, which reviews the whole PR as before, and
+/// each has its own [`WholePrReason`]. A git failure is logged here and is
+/// round 1 too.
+///
+/// The most recent judged review may have **passed**: a push after a pass is
+/// still a later round. Only the reasons of rounds that returned
+/// `needs_changes` are quoted as findings, and only reviews against the
+/// current base are quoted at all.
+fn later_round_context(
     db: &Database,
     request: &ReviewRequest,
     head_sha: Option<&str>,
-) -> Result<Option<LaterRoundContext>, MemoryError> {
+) -> Result<Result<LaterRoundContext, WholePrReason>, MemoryError> {
     let Some(head_sha) = head_sha else {
-        return Ok(None);
+        return Ok(Err(WholePrReason::HeadUnresolved));
     };
     // Filtered on the canonical issue as well as the PR, because
     // `repo_slug` collapses `owner/repo` and `owner-repo` onto one entity.
@@ -2091,25 +2318,59 @@ pub fn later_round_context(
     // The most recent judged review must have read this same base: after a
     // retarget, `last_judged_head..head` omits code the new base exposes,
     // and a finding there would be wrongly downgraded to a follow-up. An
-    // unrecorded base (a pre-rung-6 review) cannot vouch for it either.
+    // unrecorded base (a review recorded before the base was) cannot vouch
+    // for it either.
     let Some(last) = judged.last() else {
-        return Ok(None);
+        return Ok(Err(WholePrReason::NoEarlierJudgedReview));
     };
-    if last.base_branch.as_deref() != Some(request.base_branch) {
-        return Ok(None);
+    match last.base_branch.as_deref() {
+        None => return Ok(Err(WholePrReason::LastJudgedBaseUnrecorded)),
+        Some(base) if base != request.base_branch => {
+            return Ok(Err(WholePrReason::BaseChangedSinceLastJudged));
+        }
+        Some(_) => {}
     }
     let Some(last_judged_head) = last.head_sha.clone() else {
-        return Ok(None);
+        return Ok(Err(WholePrReason::LastJudgedHeadUnrecorded));
     };
-    judged.retain(|r| r.base_branch.as_deref() == Some(request.base_branch));
-    if last_judged_head.eq_ignore_ascii_case(head_sha)
-        || !super::worktree::commit_is_ancestor(request.repo_dir, &last_judged_head, head_sha)
-    {
-        return Ok(None);
+    let last_review_asked_for_changes = last.verdict == Some(ReviewVerdict::NeedsChanges);
+    if last_judged_head.eq_ignore_ascii_case(head_sha) {
+        return Ok(Err(WholePrReason::SameHeadAsLastJudged));
     }
-    Ok(Some(LaterRoundContext {
+    // "Git said no" and "git could not say" are both round 1, but only the
+    // second is a fault worth a warning.
+    let unreadable = |e: MemoryError| {
+        tracing::warn!(
+            error = %scrub_and_bound(&e.to_string(), MAX_LINEAGE_FIELD_CHARS).text,
+            "autopilot could not compare the last judged head with the head under review; reviewing the whole PR"
+        );
+        WholePrReason::AncestryUnreadable
+    };
+    match super::worktree::commit_is_ancestor(request.repo_dir, &last_judged_head, head_sha) {
+        Ok(true) => {}
+        Ok(false) => return Ok(Err(WholePrReason::LastJudgedHeadNotAnAncestor)),
+        Err(e) => return Ok(Err(unreadable(e))),
+    }
+    match super::worktree::merge_commit_between(request.repo_dir, &last_judged_head, head_sha) {
+        Ok(false) => {}
+        Ok(true) => return Ok(Err(WholePrReason::MergeSinceLastJudgedHead)),
+        Err(e) => return Ok(Err(unreadable(e))),
+    }
+    judged.retain(|r| r.base_branch.as_deref() == Some(request.base_branch));
+    let mut earlier_findings = Vec::new();
+    let mut earlier_follow_ups = Vec::new();
+    for review in judged {
+        if review.verdict == Some(ReviewVerdict::NeedsChanges) {
+            earlier_findings.extend(review.reason);
+        }
+        earlier_follow_ups.extend(review.follow_up.filter(|text| !text.trim().is_empty()));
+    }
+    Ok(Ok(LaterRoundContext {
         last_judged_head,
-        earlier_reasons: judged.into_iter().filter_map(|r| r.reason).collect(),
+        head_sha: head_sha.to_string(),
+        last_review_asked_for_changes,
+        earlier_findings,
+        earlier_follow_ups,
     }))
 }
 
@@ -2179,6 +2440,8 @@ pub fn review_pr(
             record_drawer_id: None,
             refusal: Some(refusal),
             follow_up_comment: None,
+            follow_up_truncated: false,
+            round: None,
         });
     }
 
@@ -2191,6 +2454,27 @@ pub fn review_pr(
         .or_else(|| super::worktree::resolve_commit(request.repo_dir, request.head_branch));
 
     let later = later_round_context(db, request, head_sha.as_deref())?;
+    let round = match &later {
+        Ok(later) => ReviewRound::Later {
+            last_judged_head: later.last_judged_head.clone(),
+        },
+        Err(why) => {
+            // The first review of a PR is the ordinary case; any other
+            // reason is a narrower prompt that was not used.
+            if *why == WholePrReason::NoEarlierJudgedReview {
+                tracing::debug!(
+                    reason = why.describe(),
+                    "autopilot review reads the whole PR"
+                );
+            } else {
+                tracing::info!(
+                    reason = why.describe(),
+                    "autopilot review fell back to the whole PR"
+                );
+            }
+            ReviewRound::Whole { why: *why }
+        }
+    };
     let prompt = super::review_prompt::render(&super::review_prompt::ReviewPromptInputs {
         issue: request.issue,
         pr_number: request.pr_number,
@@ -2198,14 +2482,7 @@ pub fn review_pr(
         head_branch: request.head_branch,
         dispatch_class: request.dispatch_class,
         gate_commands: request.gate_commands,
-        later_round: match (&later, head_sha.as_deref()) {
-            (Some(later), Some(head_sha)) => Some(super::review_prompt::LaterRound {
-                last_judged_head: &later.last_judged_head,
-                head_sha,
-                earlier_reasons: &later.earlier_reasons,
-            }),
-            _ => None,
-        },
+        later_round: later.as_ref().ok().map(LaterRoundContext::prompt_inputs),
     });
 
     // A reviewer that fails to launch is not an error for this function: it
@@ -2273,8 +2550,24 @@ pub fn review_pr(
             base_branch: Some(request.base_branch.to_string()),
             outcome: outcome.clone(),
             decision: decision.clone(),
+            round: Some(round.clone()),
         },
     )?;
+
+    // Scrubbed on the way out, as the record was on the way in: a reason or
+    // follow-up quotes the diff and can carry whatever the diff carried,
+    // and the caller prints it, logs it or posts it. Done here so no caller
+    // can forget to.
+    let mut outcome = outcome;
+    if let Some(reason) = outcome.reason.take() {
+        outcome.reason = Some(scrub_and_bound(&reason, MAX_LINEAGE_FIELD_CHARS).text);
+    }
+    let mut follow_up_truncated = false;
+    if let Some(follow_up) = outcome.follow_up.take() {
+        let scrubbed = scrub_and_bound(&follow_up, MAX_LINEAGE_FIELD_CHARS);
+        follow_up_truncated = scrubbed.truncated;
+        outcome.follow_up = Some(scrubbed.text);
+    }
 
     Ok(PrReview {
         issue: request.issue.clone(),
@@ -2284,6 +2577,8 @@ pub fn review_pr(
         record_drawer_id: Some(recorded.drawer_id),
         refusal: None,
         follow_up_comment: None,
+        follow_up_truncated,
+        round: Some(round),
     })
 }
 
@@ -2527,7 +2822,7 @@ mod tests {
         assert_eq!(parsed.verdict, Some(ReviewVerdict::Pass));
         assert_eq!(parsed.risk_class, Some(RiskClass::Documentation));
         assert_eq!(parsed.reason.as_deref(), Some("docs only"));
-        // A reply without `follow_up` — every Muse round-1 reply — still
+        // A reply without `follow_up` — a typical Muse round-1 reply — still
         // parses, with no follow-up.
         assert_eq!(parsed.follow_up, None);
     }
@@ -2859,6 +3154,7 @@ not json at all
             base_branch: Some("main".to_string()),
             outcome,
             decision,
+            round: None,
         }
     }
 
@@ -3488,6 +3784,8 @@ not json at all
             record_drawer_id: Some("drawer-1".into()),
             refusal: None,
             follow_up_comment: None,
+            follow_up_truncated: false,
+            round: None,
         }
     }
 
@@ -3612,6 +3910,86 @@ not json at all
     }
 
     #[test]
+    fn the_text_report_says_when_the_follow_up_was_cut() {
+        let mut review = reported_review(ReviewOutcome {
+            reason: None,
+            follow_up: Some("rename x".into()),
+            ..passing_outcome(RiskClass::Logic)
+        });
+        review.record_drawer_id = None;
+        review.follow_up_truncated = true;
+        assert_eq!(
+            review.text_report(),
+            "Issue ironrace/ironmem#283 PR #322\n\
+             \x20 verdict: Some(Pass)\n\
+             \x20 diff risk class: Some(Logic)\n\
+             \x20 follow-up (non-blocking): rename x\n\
+             \x20 follow-up was cut to 4000 characters\n\
+             \x20 decision: HoldForHuman(HighRiskClass { class: Logic })\n"
+        );
+
+        // Not cut: no such line.
+        review.follow_up_truncated = false;
+        assert_eq!(
+            review.text_report(),
+            "Issue ironrace/ironmem#283 PR #322\n\
+             \x20 verdict: Some(Pass)\n\
+             \x20 diff risk class: Some(Logic)\n\
+             \x20 follow-up (non-blocking): rename x\n\
+             \x20 decision: HoldForHuman(HighRiskClass { class: Logic })\n"
+        );
+    }
+
+    #[test]
+    fn the_advance_lines_say_which_round_the_review_was() {
+        let mut review = reported_review(passing_outcome(RiskClass::Logic));
+        let verdict = "review: Some(Pass) / HoldForHuman(HighRiskClass { class: Logic })";
+        review.round = Some(ReviewRound::Later {
+            last_judged_head: "0123456789abcdef0123456789abcdef01234567".into(),
+        });
+        review.follow_up_comment = Some(FollowUpComment::Posted);
+        assert_eq!(
+            review.advance_lines(),
+            [
+                verdict,
+                "round: later round (new commits read from 0123456789ab)",
+                "follow-up: posted as a PR comment"
+            ]
+        );
+        assert!(review
+            .text_report()
+            .contains("\n  round: later round (new commits read from 0123456789ab)\n"));
+
+        // Every fallback has its own words, so the line says why the whole
+        // PR was read.
+        let reasons = [
+            WholePrReason::HeadUnresolved,
+            WholePrReason::NoEarlierJudgedReview,
+            WholePrReason::LastJudgedBaseUnrecorded,
+            WholePrReason::BaseChangedSinceLastJudged,
+            WholePrReason::LastJudgedHeadUnrecorded,
+            WholePrReason::SameHeadAsLastJudged,
+            WholePrReason::LastJudgedHeadNotAnAncestor,
+            WholePrReason::MergeSinceLastJudgedHead,
+            WholePrReason::AncestryUnreadable,
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for why in reasons {
+            review.round = Some(ReviewRound::Whole { why });
+            let line = review.advance_lines()[1].clone();
+            assert!(line.starts_with("round: whole PR ("), "{line}");
+            assert!(seen.insert(line.clone()), "two reasons read alike: {line}");
+        }
+        review.round = Some(ReviewRound::Whole {
+            why: WholePrReason::MergeSinceLastJudgedHead,
+        });
+        assert_eq!(
+            review.advance_lines()[1],
+            "round: whole PR (a merge commit lies between the last judged head and this head)"
+        );
+    }
+
+    #[test]
     fn one_line_flattens_control_characters_and_marks_a_cut() {
         assert_eq!(one_line("a\nb\tc\r\n\x1b d", 80), "a b c d");
         assert_eq!(one_line("  padded  ", 80), "padded");
@@ -3624,11 +4002,19 @@ not json at all
 
     #[test]
     fn a_follow_up_comment_is_rendered_only_for_non_empty_text() {
-        assert_eq!(render_follow_up_comment(322, None, None), None);
-        assert_eq!(render_follow_up_comment(322, None, Some("  \n ")), None);
+        assert_eq!(render_follow_up_comment(322, None, None, false), None);
+        assert_eq!(
+            render_follow_up_comment(322, None, Some("  \n "), false),
+            None
+        );
 
-        let body = render_follow_up_comment(322, Some(&"a".repeat(40)), Some("rename x in foo.rs"))
-            .unwrap();
+        let body = render_follow_up_comment(
+            322,
+            Some(&"a".repeat(40)),
+            Some("rename x in foo.rs"),
+            false,
+        )
+        .unwrap();
         assert!(body.starts_with(super::super::blocked::AUTOPILOT_COMMENT_MARKER));
         assert!(body.contains("PR #322 at `aaaaaaaaaaaa`"));
         assert!(body.contains("```text\nrename x in foo.rs\n```"));
@@ -3639,14 +4025,663 @@ not json at all
     fn a_follow_up_comment_is_scrubbed_bounded_and_cannot_close_its_own_fence() {
         let token = format!("ghp_{}", "a1B2c3D4e5".repeat(4));
         let text = format!("see ```` here, cc @someone, {token} {}", "z".repeat(10_000));
-        let body = render_follow_up_comment(322, None, Some(&text)).unwrap();
+        let body = render_follow_up_comment(322, None, Some(&text), false).unwrap();
         assert!(!body.contains(&token));
         assert!(body.chars().count() <= MAX_FOLLOW_UP_COMMENT_CHARS);
         assert!(!body.contains(&"z".repeat(MAX_FOLLOW_UP_CHARS + 1)));
         // A four-backtick run in the text gets a five-backtick fence, and
-        // the closing fence survives the bound.
+        // the closing fence survives the bound (asserted with the line
+        // under it at the end of this test).
         assert!(body.contains("`````text\n"));
-        assert!(body.trim_end().ends_with("`````"));
+        // The mention is inside the fence, where it notifies no one: after
+        // the opening fence and before the closing one.
+        let opened = body.find("`````text\n").unwrap();
+        let closed = body.rfind("\n`````\n").unwrap();
+        let mention = body.find("@someone").expect("the text is quoted");
+        assert!(opened < mention && mention < closed, "{body}");
+        assert_eq!(body.matches("@someone").count(), 1);
+        // The text was cut at the comment's bound, so the body ends with
+        // the closing fence and then the line that says so.
+        assert!(body.ends_with("z\n`````\n\n(The follow-up was cut to 4000 characters.)\n"));
+    }
+
+    #[test]
+    fn an_empty_or_blank_follow_up_parses_as_none() {
+        // "No follow-up" has one spelling after the parse, so no reader has
+        // to test for an empty string as well as `None`.
+        for follow_up in ["", "   ", " \n\t "] {
+            let message = serde_json::json!({
+                "verdict": "pass",
+                "risk_class": "logic",
+                "reason": "r",
+                "follow_up": follow_up,
+            })
+            .to_string();
+            let parsed = parse_review_message(&message);
+            assert_eq!(parsed.verdict, Some(ReviewVerdict::Pass), "{message}");
+            assert_eq!(parsed.follow_up, None, "{message}");
+        }
+    }
+
+    #[test]
+    fn a_follow_up_ending_in_a_key_and_colon_keeps_its_closing_fence() {
+        // `cache_key:` at the end of the text, then the newline and the
+        // closing fence, is the shape the scrubber reads as `KEY: value`.
+        // Scrubbing the assembled body redacted the fence and left the code
+        // block open; only the reviewer's text is scrubbed.
+        let body = render_follow_up_comment(322, None, Some("rename the map's cache_key:"), false)
+            .unwrap();
+        assert!(
+            body.ends_with("```text\nrename the map's cache_key:\n```\n"),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn a_follow_up_comment_names_the_head_only_when_it_is_a_commit_sha() {
+        // The head comes from `gh pr list`, which nothing validates. Only a
+        // full hexadecimal SHA is quoted; anything else is left out rather
+        // than interpolated into the comment's markdown.
+        let sha = "0123456789abcdefABCDEF0123456789abcdef01";
+        let body = render_follow_up_comment(322, Some(sha), Some("x"), false).unwrap();
+        assert!(body.contains("PR #322 at `0123456789ab`**"), "{body}");
+
+        for bad in [
+            "",
+            "abc1234",
+            "`** @someone\n# heading",
+            "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+            "0123456789abcdef0123456789abcdef0123456`",
+        ] {
+            let body = render_follow_up_comment(322, Some(bad), Some("x"), false).unwrap();
+            assert!(
+                body.contains("**Autopilot review follow-up for PR #322**\n"),
+                "{bad:?}: {body}"
+            );
+            assert!(!body.contains("@someone"), "{bad:?}: {body}");
+        }
+    }
+
+    #[test]
+    fn a_follow_up_comment_says_when_the_text_was_cut() {
+        // Cut here, at the comment's own bound.
+        let long = "z".repeat(MAX_FOLLOW_UP_CHARS + 1);
+        let body = render_follow_up_comment(322, None, Some(&long), false).unwrap();
+        let marker = "\n```\n\n(The follow-up was cut to 4000 characters.)\n";
+        assert!(body.ends_with(marker), "{}", &body[body.len() - 120..]);
+
+        // Exactly at the bound nothing was cut, and nothing says so.
+        let exact = "z".repeat(MAX_FOLLOW_UP_CHARS);
+        let body = render_follow_up_comment(322, None, Some(&exact), false).unwrap();
+        assert!(body.ends_with("z\n```\n"), "{}", &body[body.len() - 120..]);
+
+        // Cut before it got here: the caller says so.
+        let body = render_follow_up_comment(322, None, Some("short"), true).unwrap();
+        assert!(body.ends_with(marker), "{body}");
+    }
+
+    #[test]
+    fn a_follow_up_comment_is_worded_for_any_round() {
+        // `follow_up` is accepted and posted in every round, so the comment
+        // must not say the findings are in code an earlier round judged.
+        let body = render_follow_up_comment(322, None, Some("x"), false).unwrap();
+        assert!(
+            body.contains("non-blocking findings that did not change the verdict"),
+            "{body}"
+        );
+        assert!(!body.contains("earlier"), "{body}");
+        assert!(body.contains("opened no issue"), "{body}");
+    }
+
+    #[test]
+    fn a_follow_up_of_four_thousand_backticks_is_still_fenced_whole() {
+        // The worst case for the body bound: the text is all backticks, so
+        // each fence is one longer than the text.
+        let text = "`".repeat(MAX_FOLLOW_UP_CHARS);
+        let body = render_follow_up_comment(322, None, Some(&text), false).unwrap();
+        let fence = "`".repeat(MAX_FOLLOW_UP_CHARS + 1);
+        assert!(body.chars().count() <= MAX_FOLLOW_UP_COMMENT_CHARS);
+        assert!(
+            body.ends_with(&format!("{fence}text\n{text}\n{fence}\n")),
+            "the closing fence was cut off"
+        );
+    }
+
+    /// The PR branch after `other` was merged into it: `first` → `second` →
+    /// a merge commit, which is returned.
+    fn merge_other_into_the_pr_branch(repo: &Path) -> String {
+        crate::autopilot::test_git::output(
+            repo,
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "merge",
+                "-q",
+                "--no-ff",
+                "-m",
+                "Merge other into the PR branch",
+                "other",
+            ],
+        );
+        crate::autopilot::test_git::run(repo, &["rev-parse", "HEAD"])
+    }
+
+    #[test]
+    fn a_merge_commit_since_the_last_judged_head_falls_back_to_round_one() {
+        // The base was merged into the PR branch after the last judged
+        // review. That head is an ancestor of the merge, but
+        // `git diff <last>..<head>` now holds everything the merge brought
+        // in, which is not the fix. The whole PR is reviewed again.
+        let (repo, _, second, _) = fix_history_repo();
+        let db = Database::open_in_memory().unwrap();
+        let issue = IssueRef::new("ironrace/ironmem", 283);
+        let gates = vec!["cargo test --workspace".to_string()];
+        let request = sample_request(&issue, &gates, repo.path());
+
+        review_at(&db, &request, &second, needs_changes("finding"));
+        let merged = merge_other_into_the_pr_branch(repo.path());
+        assert!(
+            crate::autopilot::worktree::commit_is_ancestor(repo.path(), &second, &merged).unwrap()
+        );
+        let prompt = review_at(&db, &request, &merged, passing_outcome(RiskClass::Logic));
+        assert_eq!(prompt, round_one_prompt(&request));
+        assert_eq!(
+            reviews_for_issue(&db, &issue).unwrap()[1].round,
+            Some(ReviewRound::Whole {
+                why: WholePrReason::MergeSinceLastJudgedHead
+            })
+        );
+    }
+
+    #[test]
+    fn a_third_round_reads_the_fix_from_the_second_and_quotes_both_findings_oldest_first() {
+        let (repo, first, second, _) = fix_history_repo();
+        std::fs::write(repo.path().join("third.txt"), "third").unwrap();
+        crate::autopilot::test_git::output(repo.path(), &["add", "-A"]);
+        crate::autopilot::test_git::output(
+            repo.path(),
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-qm",
+                "third",
+            ],
+        );
+        let third = crate::autopilot::test_git::run(repo.path(), &["rev-parse", "HEAD"]);
+        let db = Database::open_in_memory().unwrap();
+        let issue = IssueRef::new("ironrace/ironmem", 283);
+        let gates = vec!["cargo test --workspace".to_string()];
+        let request = sample_request(&issue, &gates, repo.path());
+
+        review_at(&db, &request, &first, needs_changes("round one finding"));
+        review_at(&db, &request, &second, needs_changes("round two finding"));
+        let prompt = review_at(&db, &request, &third, passing_outcome(RiskClass::Logic));
+        assert!(
+            prompt.contains(&format!("git diff {second}..{third}")),
+            "{prompt}"
+        );
+        assert!(
+            !prompt.contains(&format!("git diff {first}..")),
+            "the fix starts at the last judged head, not the first: {prompt}"
+        );
+        assert!(
+            prompt.contains(
+                "Earlier finding 1:\n> round one finding\n\nEarlier finding 2:\n> round two finding\n"
+            ),
+            "{prompt}"
+        );
+    }
+
+    #[test]
+    fn a_push_after_a_pass_is_a_later_round_that_quotes_no_pass_reason_as_a_finding() {
+        // The issue's later round follows any earlier judged review, a pass
+        // included. But a pass found nothing: its reason is not a finding,
+        // and the commits after it are not a fix for one.
+        let (repo, first, second, _) = fix_history_repo();
+        let issue = IssueRef::new("ironrace/ironmem", 283);
+        let gates = vec!["cargo test --workspace".to_string()];
+        let request = sample_request(&issue, &gates, repo.path());
+
+        // Passed, then pushed: nothing to quote.
+        let db = Database::open_in_memory().unwrap();
+        review_at(&db, &request, &first, passing_outcome(RiskClass::Logic));
+        let prompt = review_at(&db, &request, &second, passing_outcome(RiskClass::Logic));
+        assert!(
+            prompt.contains(&format!("git diff {first}..{second}")),
+            "{prompt}"
+        );
+        assert!(prompt.contains("LATER review round"), "{prompt}");
+        assert!(
+            prompt.contains(&format!("judged this PR at commit {first} and passed it")),
+            "{prompt}"
+        );
+        assert!(!prompt.contains("looks correct"), "{prompt}");
+        assert!(
+            !prompt.contains("fix for what that review found"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("No earlier round asked for changes"),
+            "{prompt}"
+        );
+
+        // Asked for changes, then pushed: the fix, and the finding quoted.
+        let db = Database::open_in_memory().unwrap();
+        review_at(&db, &request, &first, needs_changes("off by one"));
+        let prompt = review_at(&db, &request, &second, passing_outcome(RiskClass::Logic));
+        assert!(
+            prompt.contains("are the agent's fix for what that review found"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("Earlier finding 1:\n> off by one\n"),
+            "{prompt}"
+        );
+        assert!(!prompt.contains("passed it"), "{prompt}");
+    }
+
+    #[test]
+    fn a_later_round_after_a_pass_still_quotes_the_findings_of_rounds_before_it() {
+        // needs_changes at `first`, pass at `second`, then a push. The last
+        // review passed, so the new commits are not a fix; the older
+        // finding is still quoted, and the pass's reason is not.
+        let (repo, first, second, _) = fix_history_repo();
+        let merged = merge_free_third_commit(repo.path());
+        let db = Database::open_in_memory().unwrap();
+        let issue = IssueRef::new("ironrace/ironmem", 283);
+        let gates = vec!["cargo test --workspace".to_string()];
+        let request = sample_request(&issue, &gates, repo.path());
+
+        review_at(&db, &request, &first, needs_changes("off by one"));
+        review_at(&db, &request, &second, passing_outcome(RiskClass::Logic));
+        let prompt = review_at(&db, &request, &merged, passing_outcome(RiskClass::Logic));
+        assert!(
+            prompt.contains(&format!("judged this PR at commit {second} and passed it")),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("Earlier finding 1:\n> off by one\n"),
+            "{prompt}"
+        );
+        assert!(!prompt.contains("looks correct"), "{prompt}");
+        assert!(
+            !prompt.contains("fix for what that review found"),
+            "{prompt}"
+        );
+    }
+
+    /// One more ordinary commit on the PR branch; its SHA.
+    fn merge_free_third_commit(repo: &Path) -> String {
+        std::fs::write(repo.join("third.txt"), "third").unwrap();
+        crate::autopilot::test_git::output(repo, &["add", "-A"]);
+        crate::autopilot::test_git::output(
+            repo,
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-qm",
+                "third",
+            ],
+        );
+        crate::autopilot::test_git::run(repo, &["rev-parse", "HEAD"])
+    }
+
+    #[test]
+    fn a_later_round_quotes_earlier_follow_ups_so_they_are_not_posted_again() {
+        let (repo, first, second, _) = fix_history_repo();
+        let db = Database::open_in_memory().unwrap();
+        let issue = IssueRef::new("ironrace/ironmem", 283);
+        let gates = vec!["cargo test --workspace".to_string()];
+        let request = sample_request(&issue, &gates, repo.path());
+        let token = format!("ghp_{}", "a1B2c3D4e5".repeat(4));
+
+        let mut outcome = needs_changes("off by one");
+        outcome.follow_up = Some(format!("rename x in foo.rs\nand in bar.rs {token}"));
+        review_at(&db, &request, &first, outcome);
+        let prompt = review_at(&db, &request, &second, passing_outcome(RiskClass::Logic));
+        assert!(
+            prompt.contains(
+                "Earlier follow-up 1:\n> rename x in foo.rs\n> and in bar.rs [REDACTED]\n"
+            ),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("Do not put any of them in `follow_up` again"),
+            "{prompt}"
+        );
+        assert!(!prompt.contains(&token), "{prompt}");
+
+        // With no earlier follow-up the prompt has no such section.
+        let db = Database::open_in_memory().unwrap();
+        review_at(&db, &request, &first, needs_changes("off by one"));
+        let prompt = review_at(&db, &request, &second, passing_outcome(RiskClass::Logic));
+        assert!(!prompt.contains("Earlier follow-up"), "{prompt}");
+        assert!(!prompt.contains("`follow_up` again"), "{prompt}");
+    }
+
+    #[test]
+    fn review_pr_returns_a_scrubbed_bounded_reason_and_follow_up_and_says_what_was_cut() {
+        // Scrubbed here rather than by each caller, so a caller cannot print
+        // or post the reviewer's text raw by forgetting to.
+        let (repo, first, _, _) = fix_history_repo();
+        let db = Database::open_in_memory().unwrap();
+        let issue = IssueRef::new("ironrace/ironmem", 283);
+        let gates = vec!["cargo test --workspace".to_string()];
+        let request = ReviewRequest {
+            head_sha: Some(first),
+            ..sample_request(&issue, &gates, repo.path())
+        };
+        let token = format!("ghp_{}", "a1B2c3D4e5".repeat(4));
+        let outcome = ReviewOutcome {
+            reason: Some(format!("reason {token}")),
+            follow_up: Some(format!(
+                "follow {token} {}",
+                "y".repeat(MAX_LINEAGE_FIELD_CHARS)
+            )),
+            ..passing_outcome(RiskClass::Logic)
+        };
+        let review = review_pr(&db, &mut StubRunner::returning(outcome), &request).unwrap();
+        assert_eq!(review.outcome.reason.as_deref(), Some("reason [REDACTED]"));
+        let follow_up = review.outcome.follow_up.as_deref().unwrap();
+        assert!(
+            follow_up.starts_with("follow [REDACTED] yyy"),
+            "{follow_up}"
+        );
+        assert_eq!(follow_up.chars().count(), MAX_LINEAGE_FIELD_CHARS);
+        assert!(review.follow_up_truncated);
+
+        // The stored record carries the same flags `reason` has.
+        let drawer = db
+            .get_drawer(review.record_drawer_id.as_deref().unwrap())
+            .unwrap()
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_str(&drawer.content).unwrap();
+        assert_eq!(body["follow_up_redacted"], true, "{body}");
+        assert_eq!(body["follow_up_truncated"], true, "{body}");
+        assert_eq!(body["reason_truncated"], false, "{body}");
+
+        // Nothing cut, nothing flagged.
+        let review = review_pr(
+            &db,
+            &mut StubRunner::returning(ReviewOutcome {
+                follow_up: Some("short".into()),
+                ..passing_outcome(RiskClass::Logic)
+            }),
+            &request,
+        )
+        .unwrap();
+        assert!(!review.follow_up_truncated);
+        let drawer = db
+            .get_drawer(review.record_drawer_id.as_deref().unwrap())
+            .unwrap()
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_str(&drawer.content).unwrap();
+        assert_eq!(body["follow_up_redacted"], false, "{body}");
+        assert_eq!(body["follow_up_truncated"], false, "{body}");
+    }
+
+    #[test]
+    fn a_review_recorded_before_403_still_reads_back() {
+        // The fields #403 added to the stored body are all defaulted, so a
+        // drawer written before them is still a readable review.
+        let db = Database::open_in_memory().unwrap();
+        let issue = IssueRef::new("ironrace/ironmem", 283);
+        let recorded = record_review(&db, &sample_record(&issue, "finding")).unwrap();
+        let drawer = db.get_drawer(&recorded.drawer_id).unwrap().unwrap();
+        let mut body: serde_json::Value = serde_json::from_str(&drawer.content).unwrap();
+        let object = body.as_object_mut().unwrap();
+        for key in [
+            "follow_up",
+            "follow_up_redacted",
+            "follow_up_truncated",
+            "round",
+        ] {
+            assert!(object.remove(key).is_some(), "{key} is stored");
+        }
+        let old: ReviewBody = serde_json::from_value(body).unwrap();
+        assert_eq!(old.follow_up, None);
+        assert!(!old.follow_up_redacted && !old.follow_up_truncated);
+        assert_eq!(old.round, None);
+    }
+
+    #[test]
+    fn every_fallback_to_the_whole_pr_records_why_and_a_later_round_records_its_start() {
+        let (repo, first, second, sibling) = fix_history_repo();
+        let issue = IssueRef::new("ironrace/ironmem", 283);
+        let gates = vec!["cargo test --workspace".to_string()];
+        let request = sample_request(&issue, &gates, repo.path());
+        let round_of = |db: &Database, head: &str| -> Option<ReviewRound> {
+            let request = ReviewRequest {
+                head_sha: Some(head.to_string()),
+                ..request
+            };
+            let review = review_pr(
+                db,
+                &mut StubRunner::returning(needs_changes("finding")),
+                &request,
+            )
+            .unwrap();
+            // What the caller is told is what was stored.
+            let stored = reviews_for_issue(db, &issue).unwrap();
+            assert_eq!(stored.last().unwrap().round, review.round);
+            review.round
+        };
+        let whole = |why| Some(ReviewRound::Whole { why });
+
+        let db = Database::open_in_memory().unwrap();
+        assert_eq!(
+            round_of(&db, &first),
+            whole(WholePrReason::NoEarlierJudgedReview)
+        );
+        assert_eq!(
+            round_of(&db, &second),
+            Some(ReviewRound::Later {
+                last_judged_head: first.clone()
+            })
+        );
+        assert_eq!(
+            round_of(&db, &second),
+            whole(WholePrReason::SameHeadAsLastJudged)
+        );
+        assert_eq!(
+            round_of(&db, &sibling),
+            whole(WholePrReason::LastJudgedHeadNotAnAncestor)
+        );
+
+        // A commit this checkout does not have: git cannot tell, which is
+        // not the same answer as "not an ancestor".
+        let db = Database::open_in_memory().unwrap();
+        let mut absent = sample_record(&issue, "finding");
+        absent.head_sha = Some("1".repeat(40));
+        record_review(&db, &absent).unwrap();
+        assert_eq!(
+            round_of(&db, &second),
+            whole(WholePrReason::AncestryUnreadable)
+        );
+
+        // A recorded head that is not a commit SHA never reaches git.
+        for bad in ["--help", "abc1234"] {
+            let db = Database::open_in_memory().unwrap();
+            let mut record = sample_record(&issue, "finding");
+            record.head_sha = Some(bad.to_string());
+            record_review(&db, &record).unwrap();
+            assert_eq!(
+                round_of(&db, &second),
+                whole(WholePrReason::AncestryUnreadable),
+                "{bad}"
+            );
+        }
+
+        let db = Database::open_in_memory().unwrap();
+        let mut record = sample_record(&issue, "finding");
+        record.head_sha = None;
+        record_review(&db, &record).unwrap();
+        assert_eq!(
+            round_of(&db, &second),
+            whole(WholePrReason::LastJudgedHeadUnrecorded)
+        );
+
+        let db = Database::open_in_memory().unwrap();
+        let mut record = sample_record(&issue, "finding");
+        record.head_sha = Some(first.clone());
+        record.base_branch = None;
+        record_review(&db, &record).unwrap();
+        assert_eq!(
+            round_of(&db, &second),
+            whole(WholePrReason::LastJudgedBaseUnrecorded)
+        );
+
+        let db = Database::open_in_memory().unwrap();
+        let mut record = sample_record(&issue, "finding");
+        record.head_sha = Some(first.clone());
+        record.base_branch = Some("release".into());
+        record_review(&db, &record).unwrap();
+        assert_eq!(
+            round_of(&db, &second),
+            whole(WholePrReason::BaseChangedSinceLastJudged)
+        );
+    }
+
+    #[test]
+    fn a_fallback_to_the_whole_pr_is_logged_and_a_git_failure_is_a_warning() {
+        let (repo, first, second, sibling) = fix_history_repo();
+        let issue = IssueRef::new("ironrace/ironmem", 283);
+        let gates = vec!["cargo test --workspace".to_string()];
+        let request = sample_request(&issue, &gates, repo.path());
+        let logged = |db: &Database, head: &str| -> String {
+            crate::autopilot::worktree::testing::with_captured_log(|| {
+                review_at(db, &request, head, needs_changes("finding"))
+            })
+            .1
+        };
+
+        // Git said no: a fallback, named, and not a fault.
+        let db = Database::open_in_memory().unwrap();
+        review_at(&db, &request, &sibling, needs_changes("finding"));
+        let log = logged(&db, &second);
+        assert!(
+            log.contains("autopilot review fell back to the whole PR"),
+            "{log}"
+        );
+        assert!(
+            log.contains("the last judged head is not an ancestor of this head"),
+            "{log}"
+        );
+        assert!(!log.contains("WARN"), "{log}");
+
+        // Git could not say: the same fallback, and a warning with git's
+        // own error, so a broken checkout is not read as a force-push.
+        let db = Database::open_in_memory().unwrap();
+        let mut absent = sample_record(&issue, "finding");
+        absent.head_sha = Some("1".repeat(40));
+        record_review(&db, &absent).unwrap();
+        let log = logged(&db, &second);
+        assert!(log.contains("WARN"), "{log}");
+        assert!(
+            log.contains("autopilot could not compare the last judged head"),
+            "{log}"
+        );
+        assert!(log.contains("merge-base --is-ancestor"), "{log}");
+        assert!(
+            log.contains("git could not tell whether the last judged head is an ancestor"),
+            "{log}"
+        );
+
+        // A later round falls back to nothing and logs no fallback.
+        let db = Database::open_in_memory().unwrap();
+        review_at(&db, &request, &first, needs_changes("finding"));
+        let log = logged(&db, &second);
+        assert!(!log.contains("the whole PR"), "{log}");
+    }
+
+    #[test]
+    fn a_review_whose_head_cannot_be_resolved_is_a_whole_pr_review() {
+        // No pinned head and a branch the checkout does not have: there is
+        // no head to diff to, so the earlier judged round cannot narrow it.
+        let (repo, first, _, _) = fix_history_repo();
+        let db = Database::open_in_memory().unwrap();
+        let issue = IssueRef::new("ironrace/ironmem", 283);
+        let gates = vec!["cargo test --workspace".to_string()];
+        let request = sample_request(&issue, &gates, repo.path());
+        review_at(&db, &request, &first, needs_changes("finding"));
+
+        let unresolved = ReviewRequest {
+            head_sha: None,
+            head_branch: "no-such-branch",
+            ..request
+        };
+        let mut runner = StubRunner::returning(passing_outcome(RiskClass::Logic));
+        let review = review_pr(&db, &mut runner, &unresolved).unwrap();
+        assert_eq!(runner.last_prompt, round_one_prompt(&unresolved));
+        assert_eq!(
+            review.round,
+            Some(ReviewRound::Whole {
+                why: WholePrReason::HeadUnresolved
+            })
+        );
+    }
+
+    #[test]
+    fn the_follow_up_comment_outcome_serializes_as_a_tagged_status() {
+        assert_eq!(
+            serde_json::to_value(FollowUpComment::Posted).unwrap(),
+            serde_json::json!({"status": "posted"})
+        );
+        assert_eq!(
+            serde_json::to_value(FollowUpComment::Failed {
+                error: "HTTP 403".into()
+            })
+            .unwrap(),
+            serde_json::json!({"status": "failed", "error": "HTTP 403"})
+        );
+        // With nothing to post the key is absent, not `null`.
+        let review = reported_review(passing_outcome(RiskClass::Logic));
+        let value = serde_json::to_value(&review).unwrap();
+        assert!(value.get("follow_up_comment").is_none(), "{value}");
+        let mut review = review;
+        review.follow_up_comment = Some(FollowUpComment::Posted);
+        assert_eq!(
+            serde_json::to_value(&review).unwrap()["follow_up_comment"],
+            serde_json::json!({"status": "posted"})
+        );
+    }
+
+    #[test]
+    fn the_text_report_keeps_reviewer_text_from_forging_a_report_line() {
+        // A reason or follow-up is the reviewer's text. Its control
+        // characters are dropped, and its later lines are indented past the
+        // report's own fields, so none of it reads as one of them.
+        let mut review = reported_review(ReviewOutcome {
+            reason: Some("fine\n  decision: EligibleForMerge\x1b[2J\r\nlast\u{2028}sep".into()),
+            follow_up: Some("rename x\n  verdict: Some(Pass)\x07".into()),
+            ..passing_outcome(RiskClass::Logic)
+        });
+        review.record_drawer_id = None;
+        review.round = Some(ReviewRound::Whole {
+            why: WholePrReason::NoEarlierJudgedReview,
+        });
+        assert_eq!(
+            review.text_report(),
+            "Issue ironrace/ironmem#283 PR #322\n\
+             \x20 verdict: Some(Pass)\n\
+             \x20 diff risk class: Some(Logic)\n\
+             \x20 reason: fine\n\
+             \x20     decision: EligibleForMerge[2J\n\
+             \x20     last\n\
+             \x20     sep\n\
+             \x20 follow-up (non-blocking): rename x\n\
+             \x20     verdict: Some(Pass)\n\
+             \x20 round: whole PR (no earlier judged review of this PR)\n\
+             \x20 decision: HoldForHuman(HighRiskClass { class: Logic })\n"
+        );
     }
 
     #[test]
@@ -3773,6 +4808,13 @@ not json at all
             MergeDecision::HoldForHuman(HoldReason::ReviewerDidNotRun)
         );
         assert!(review.record_drawer_id.is_some());
+        // The prompt was chosen before the launch failed, and which one is
+        // still reported and stored (#403).
+        let whole = Some(ReviewRound::Whole {
+            why: WholePrReason::NoEarlierJudgedReview,
+        });
+        assert_eq!(review.round, whole);
+        assert_eq!(reviews_for_issue(&db, &issue).unwrap()[0].round, whole);
     }
 
     #[test]
@@ -4363,7 +5405,7 @@ not json at all
         }
 
         let event = muse_terminal_event(
-            r#"{"verdict":"pass","risk_class":"documentation","reason":"looks fine"}"#,
+            r#"{"verdict":"pass","risk_class":"documentation","reason":"looks fine","follow_up":"rename x in foo.rs"}"#,
         );
         // The stub reports a clean PASS *and* edits the checkout, which is
         // exactly the shape that must not be trusted.
@@ -4392,6 +5434,9 @@ not json at all
             .as_deref()
             .unwrap_or_default()
             .contains("modified the checkout"));
+        // Its follow-up (#403) goes with the verdict: nothing a reviewer
+        // that wrote to the checkout said is passed on.
+        assert_eq!(outcome.follow_up, None);
     }
 
     #[cfg(unix)]

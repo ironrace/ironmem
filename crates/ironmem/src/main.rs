@@ -2292,7 +2292,7 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                     ironmem::autopilot::run::approved_gate_commands(&database, &issue_ref.repo)?;
 
                 let mut runner = parse_reviewer(&reviewer)?.resolve(model)?;
-                let mut review = ironmem::autopilot::review::review_pr(
+                let review = ironmem::autopilot::review::review_pr(
                     &database,
                     &mut *runner,
                     &ironmem::autopilot::review::ReviewRequest {
@@ -2316,31 +2316,10 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                     },
                 )?;
 
-                // `record_review` scrubs the reason on the way into storage
-                // because a review reason quotes the diff and can carry
-                // anything the diff carried. The *emit* path needs the same
-                // guarantee: this string goes to stdout and, under --json,
-                // into whatever a Lead logs. Scrubbed here rather than inside
-                // `review_pr` so the drawer's `reason_redacted` flag still
-                // records that a redaction happened.
-                if let Some(reason) = review.outcome.reason.take() {
-                    review.outcome.reason = Some(
-                        ironmem::autopilot::scrub::scrub_and_bound(
-                            &reason,
-                            ironmem::autopilot::lineage::MAX_LINEAGE_FIELD_CHARS,
-                        )
-                        .text,
-                    );
-                }
-                if let Some(follow_up) = review.outcome.follow_up.take() {
-                    review.outcome.follow_up = Some(
-                        ironmem::autopilot::scrub::scrub_and_bound(
-                            &follow_up,
-                            ironmem::autopilot::lineage::MAX_LINEAGE_FIELD_CHARS,
-                        )
-                        .text,
-                    );
-                }
+                // `review_pr` returns the reason and the follow-up scrubbed
+                // and bounded, as `record_review` stored them: both quote
+                // the diff and can carry anything the diff carried, and they
+                // go to stdout and, under --json, into whatever a Lead logs.
 
                 if json {
                     println!("{}", serde_json::to_string_pretty(&review)?);

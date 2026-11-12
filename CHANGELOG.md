@@ -13,23 +13,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   has judged it, the next review's prompt names that review's head and tells the
   reviewer to read `git diff <last-judged-head>..<head>` first, asks whether
   those commits resolve the earlier findings and whether they add a defect, and
-  quotes the reasons of the earlier rounds against the current base (scrubbed,
-  1,200 characters each, the newest five) with an instruction not to repeat them
-  unless the fix failed. A new finding in already-judged code changes the
-  verdict only when it is blocking (wrong results, data loss, a security hole, a
-  crash); anything else goes in a new verdict field, `follow_up`, which
-  `advance` posts once as a scrubbed, bounded PR comment; its text output now
-  says whether that comment was posted or failed, and on a failure names the
-  review's drawer, where the follow-up text is. The reviewer is also asked to
-  name a finding's pattern and list its other sites. The risk class is still
-  taken from the whole PR. The first round's prompt is unchanged, and a later
-  round falls back to it when the last judged head is unrecorded or not an
-  ancestor of the current head, or when that review's base is unrecorded or
-  differs from the PR's current base (a retargeted PR). The standalone `ironmem
-  autopilot review` prints the follow-up in its text output as well as under
-  `--json`. `REVIEW_VERDICT_JSON_SCHEMA` now requires `follow_up`, typed
-  `["string","null"]`; a reply without it still parses, and one with any other
-  type is no verdict.
+  quotes the reasons of the earlier rounds against the current base that asked
+  for changes (scrubbed, 1,200 characters each with a cut marked, the newest
+  five) with an instruction not to repeat them unless the fix failed. A push
+  after a pass is a later round too: its prompt calls the commits new rather
+  than a fix, and quotes no pass's reason as a finding. Earlier rounds'
+  follow-ups are quoted under their own heading so they are not reported, and
+  posted, again. A new finding in already-judged code changes the verdict only
+  when it is blocking (wrong results, data loss, a security hole, a crash);
+  anything else goes in a new verdict field, `follow_up`, which is accepted in
+  every round and which `advance` posts as a scrubbed, bounded PR comment, at
+  most one per judged review and never retried; the comment says when the text
+  was cut. Its text output now says whether that comment was posted or failed,
+  and on a failure names the review's drawer, where the follow-up text is. The
+  reviewer is also asked to name a finding's pattern and list its other sites.
+  The risk class is still taken from the whole PR. The first round's prompt is
+  unchanged, and a later round falls back to it when the head under review
+  cannot be resolved, when the last judged head is unrecorded, is the same
+  head again, or is not an ancestor of the current head, when a merge commit
+  lies between the two (the base was merged into the PR branch), when that
+  review's base is unrecorded or differs from the PR's current base (a
+  retargeted PR), or when git cannot tell. Which prompt a review was given, and
+  why, is stored on the review and reported as `round` under `--json` and as a
+  `round:` line in the text output of `advance` and `review`; a fallback is
+  logged, and a git failure is a warning. The standalone `ironmem autopilot
+  review` prints the follow-up in its text output as well as under `--json`,
+  with control characters removed from the reviewer's text and its later lines
+  indented. `REVIEW_VERDICT_JSON_SCHEMA` now requires `follow_up`, typed
+  `["string","null"]`; a reply without it still parses, an empty or blank one
+  is read as none, and one with any other type is no verdict. The stored
+  review records `follow_up_redacted` and `follow_up_truncated`.
 
 - **Prompt recall lines carry the drawer id (#376).** Each drawer and diary line
   the `user-prompt-submit` hook injects now reads

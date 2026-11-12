@@ -1049,44 +1049,37 @@ fn advance_issue(
                 max_unpriced_reviews_per_day: config.max_unpriced_reviews_per_day,
             },
         )?;
-        // Scrubbed on the way out for the reason `autopilot review` scrubs
-        // it: a review reason quotes the diff and can carry whatever the diff
-        // carried, and this string reaches stdout and any log the caller
-        // keeps. The drawer's own redaction flag still records that a
-        // redaction happened on the storage path.
-        if let Some(reason) = done.outcome.reason.take() {
-            done.outcome.reason =
-                Some(super::scrub::scrub_and_bound(&reason, lineage::MAX_LINEAGE_FIELD_CHARS).text);
-        }
-        if let Some(follow_up) = done.outcome.follow_up.take() {
-            done.outcome.follow_up = Some(
-                super::scrub::scrub_and_bound(&follow_up, lineage::MAX_LINEAGE_FIELD_CHARS).text,
-            );
-        }
+        // `review_pr` returns the reason and the follow-up scrubbed and
+        // bounded, so what reaches stdout, the log and the PR from here is
+        // never the reviewer's raw text.
+        //
         // #403: a judged review's non-blocking follow-up reaches a person as
-        // one PR comment. Exactly one: this head was reviewed once, and
-        // `next_step` never re-reviews a head a judged review already read.
-        // A failed post is reported, not retried, and does not stop the pass
-        // — the follow-up never affects the verdict, and its text is still
-        // in the review's drawer.
-        if done.dispatched() && done.outcome.process_success && done.outcome.verdict.is_some() {
+        // a PR comment. At most one per judged review: it is posted here,
+        // straight after the review that produced it, and never again for
+        // that review — a failed post is reported, not retried, and does
+        // not stop the pass, because the follow-up never affects the verdict
+        // and its text is still in the review's drawer. It is not one per
+        // head: `next_step` reviews the same head again when the PR is
+        // retargeted to another base, and that review posts its own.
+        if done.dispatched() && done.outcome.judged() {
             if let Some(body) = review::render_follow_up_comment(
                 pr_number,
                 Some(&head_sha),
                 done.outcome.follow_up.as_deref(),
+                done.follow_up_truncated,
             ) {
                 done.follow_up_comment = Some(
                     match gh::comment_on_pr(gh_runner, &candidate.issue.repo, pr_number, &body) {
                         Ok(()) => review::FollowUpComment::Posted,
                         Err(e) => {
-                            tracing::warn!(error = %e, "autopilot could not post a review follow-up");
-                            review::FollowUpComment::Failed {
-                                error: super::scrub::scrub_and_bound(
-                                    &e.to_string(),
-                                    lineage::MAX_LINEAGE_FIELD_CHARS,
-                                )
-                                .text,
-                            }
+                            // `gh`'s stderr can quote the body it refused.
+                            let error = super::scrub::scrub_and_bound(
+                                &e.to_string(),
+                                lineage::MAX_LINEAGE_FIELD_CHARS,
+                            )
+                            .text;
+                            tracing::warn!(error = %error, "autopilot could not post a review follow-up");
+                            review::FollowUpComment::Failed { error }
                         }
                     },
                 );
@@ -1594,6 +1587,7 @@ mod tests {
                 decision: review::MergeDecision::EligibleForMerge {
                     class: RiskClass::Documentation,
                 },
+                round: None,
             },
         )
         .unwrap();
@@ -1626,6 +1620,7 @@ mod tests {
                 decision: review::MergeDecision::HoldForHuman(
                     crate::autopilot::review::HoldReason::NeedsChanges,
                 ),
+                round: None,
             },
         )
         .unwrap();
@@ -4175,6 +4170,262 @@ skipped: {:?}",
         );
     }
 
+    /// One pass over the one issue with its PR open at `GREEN`, with
+    /// `after_the_listing` scripted between the listings and the rehearsal
+    /// reads.
+    fn pass_with(
+        db: &Database,
+        reviewer: &mut dyn ReviewRunner,
+        cfg: &AdvanceConfig,
+        after_the_listing: Vec<Result<GhOutput, MemoryError>>,
+    ) -> (AdvanceReport, ScriptedGh) {
+        let mut responses = vec![
+            ok(&issue_list_json(
+                283,
+                &["agent:ready", "risk:documentation"],
+            )),
+            ok(&pr_list_json(322, GREEN)),
+        ];
+        responses.extend(after_the_listing);
+        responses.extend(rehearsal_reads());
+        let mut gh = ScriptedGh::new(responses);
+        let report = advance_pass(db, &mut gh, reviewer, cfg).unwrap();
+        (report, gh)
+    }
+
+    #[test]
+    fn a_review_that_did_not_judge_posts_no_follow_up() {
+        // A follow-up is posted only for a judged review (#350): a reviewer
+        // whose process failed, or that returned no verdict, judged
+        // nothing, and its text is not a finding to put in front of a
+        // person.
+        for (what, process_success, verdict) in [
+            ("a failed process", false, Some(ReviewVerdict::Pass)),
+            ("no verdict", true, None),
+        ] {
+            let db = approved_db();
+            record_success(&db, &issue(), Some(GREEN));
+            let (repo, roots) = checkout_with_worktree();
+            let cfg = config(roots.path(), repo.path());
+            let mut reviewer = StubReviewer::passing();
+            reviewer.outcome.follow_up = Some("rename x".into());
+            reviewer.outcome.process_success = process_success;
+            reviewer.outcome.verdict = verdict;
+
+            // A spare response, so a comment that should not be posted
+            // fails the assertion below rather than the script.
+            let (report, gh) = pass_with(&db, &mut reviewer, &cfg, vec![ok("")]);
+            assert_eq!(reviewer.calls, 1, "{what}");
+            assert!(pr_comments(&gh).is_empty(), "{what}: {:?}", gh.seen);
+            let review = report.advanced[0].review.as_ref().unwrap();
+            assert_eq!(review.follow_up_comment, None, "{what}");
+            assert_eq!(
+                review.outcome.follow_up.as_deref(),
+                Some("rename x"),
+                "{what}: the text is still reported"
+            );
+        }
+    }
+
+    #[test]
+    fn a_needs_changes_review_with_a_follow_up_posts_it_and_is_still_remediated() {
+        // The follow-up never changes what happens to the verdict: the
+        // comment is posted, and the re-dispatch is armed as it would be
+        // without one.
+        let db = approved_db();
+        record_success(&db, &issue(), Some(GREEN));
+        let (repo, roots) = checkout_with_worktree();
+        let mut cfg = config(roots.path(), repo.path());
+        cfg.merge = true;
+        cfg.remediate = true;
+        let mut reviewer = needs_changes();
+        reviewer.outcome.follow_up = Some("rename x in foo.rs".into());
+
+        let (report, gh) = pass_with(&db, &mut reviewer, &cfg, vec![ok("")]);
+        let advanced = &report.advanced[0];
+        let comments = pr_comments(&gh);
+        assert_eq!(comments.len(), 1, "seen: {:?}", gh.seen);
+        assert!(comments[0][6].contains("rename x in foo.rs"));
+        assert!(
+            !comments[0][6].contains("the retry loop is unbounded"),
+            "the blocking finding is not part of the follow-up comment"
+        );
+        assert_eq!(
+            advanced.review.as_ref().unwrap().follow_up_comment,
+            Some(review::FollowUpComment::Posted)
+        );
+        assert!(
+            matches!(
+                advanced.remediation,
+                Some(ArmOutcome::Armed {
+                    pr_number: 322,
+                    has_findings: true,
+                    ..
+                })
+            ),
+            "got {:?}",
+            advanced.remediation
+        );
+        let armed = remediate::active_remediation(&db, &issue())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            armed.findings.as_deref(),
+            Some("the retry loop is unbounded"),
+            "the follow-up is not a remediation finding"
+        );
+    }
+
+    #[test]
+    fn a_follow_up_is_scrubbed_in_the_comment_and_in_the_report() {
+        let db = approved_db();
+        record_success(&db, &issue(), Some(GREEN));
+        let (repo, roots) = checkout_with_worktree();
+        let cfg = config(roots.path(), repo.path());
+        // Built at runtime, as `scrub`'s own tests build theirs.
+        let token = format!("ghp_{}", "a1B2c3D4e5".repeat(4));
+        let mut reviewer = StubReviewer::passing();
+        reviewer.outcome.follow_up = Some(format!("rename x; the fixture holds {token}"));
+        reviewer.outcome.reason = Some(format!("fine; {token}"));
+
+        let (report, gh) = pass_with(&db, &mut reviewer, &cfg, vec![ok("")]);
+        let comments = pr_comments(&gh);
+        assert_eq!(comments.len(), 1, "seen: {:?}", gh.seen);
+        assert!(
+            comments[0][6].contains("rename x; the fixture holds [REDACTED]"),
+            "{}",
+            comments[0][6]
+        );
+        assert!(
+            !comments[0][6].contains(&token),
+            "the comment is unscrubbed"
+        );
+        let review = report.advanced[0].review.as_ref().unwrap();
+        assert_eq!(
+            review.outcome.follow_up.as_deref(),
+            Some("rename x; the fixture holds [REDACTED]")
+        );
+        assert_eq!(review.outcome.reason.as_deref(), Some("fine; [REDACTED]"));
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(!json.contains(&token), "the report is unscrubbed: {json}");
+    }
+
+    #[test]
+    fn a_follow_up_cut_before_it_is_posted_says_so_in_the_comment() {
+        // The review bounds the follow-up to the lineage field size before
+        // the comment is rendered, so the comment's own bound never sees
+        // the cut: the review says it happened.
+        let db = approved_db();
+        record_success(&db, &issue(), Some(GREEN));
+        let (repo, roots) = checkout_with_worktree();
+        let cfg = config(roots.path(), repo.path());
+        let mut reviewer = StubReviewer::passing();
+        reviewer.outcome.follow_up = Some("z".repeat(lineage::MAX_LINEAGE_FIELD_CHARS + 1));
+
+        let (report, gh) = pass_with(&db, &mut reviewer, &cfg, vec![ok("")]);
+        let comments = pr_comments(&gh);
+        assert_eq!(comments.len(), 1, "seen: {:?}", gh.seen);
+        assert!(
+            comments[0][6].ends_with("z\n```\n\n(The follow-up was cut to 4000 characters.)\n"),
+            "the cut is not marked"
+        );
+        let review = report.advanced[0].review.as_ref().unwrap();
+        assert!(review.follow_up_truncated);
+        assert_eq!(
+            serde_json::to_value(review).unwrap()["follow_up_truncated"],
+            true
+        );
+
+        // One that fits is posted without the line, and the report has no
+        // such key.
+        let db = approved_db();
+        record_success(&db, &issue(), Some(GREEN));
+        let mut reviewer = StubReviewer::passing();
+        reviewer.outcome.follow_up = Some("z".repeat(lineage::MAX_LINEAGE_FIELD_CHARS));
+        let (report, gh) = pass_with(&db, &mut reviewer, &cfg, vec![ok("")]);
+        assert!(pr_comments(&gh)[0][6].ends_with("z\n```\n"));
+        let review = report.advanced[0].review.as_ref().unwrap();
+        assert!(serde_json::to_value(review)
+            .unwrap()
+            .get("follow_up_truncated")
+            .is_none());
+    }
+
+    #[test]
+    fn a_failed_follow_up_post_is_scrubbed_and_is_not_retried_by_the_next_pass() {
+        // `gh` can quote what it refused, so the error it leaves in the
+        // report is scrubbed. And the post is not retried: the next pass
+        // does not review this head again, so it has no follow-up to post.
+        let db = approved_db();
+        record_success(&db, &issue(), Some(GREEN));
+        let (repo, roots) = checkout_with_worktree();
+        let cfg = config(roots.path(), repo.path());
+        let token = format!("ghp_{}", "a1B2c3D4e5".repeat(4));
+        let mut reviewer = StubReviewer::passing();
+        reviewer.outcome.follow_up = Some("rename x".into());
+
+        let ((report, gh), log) = worktree::testing::with_captured_log(|| {
+            pass_with(
+                &db,
+                &mut reviewer,
+                &cfg,
+                vec![ran_and_failed(&format!(
+                    "HTTP 403: bad credentials {token}"
+                ))],
+            )
+        });
+        // The warning carries the same scrubbed error the report does.
+        assert!(
+            log.contains("autopilot could not post a review follow-up"),
+            "{log}"
+        );
+        assert!(
+            log.contains("HTTP 403: bad credentials [REDACTED]"),
+            "{log}"
+        );
+        assert!(!log.contains(&token), "the log is unscrubbed");
+        assert_eq!(pr_comments(&gh).len(), 1, "seen: {:?}", gh.seen);
+        let review = report.advanced[0].review.as_ref().unwrap();
+        let Some(review::FollowUpComment::Failed { error }) = &review.follow_up_comment else {
+            panic!("not a failed post: {:?}", review.follow_up_comment);
+        };
+        assert!(
+            error.contains("HTTP 403: bad credentials [REDACTED]"),
+            "{error}"
+        );
+        assert!(!error.contains(&token), "the error is unscrubbed: {error}");
+
+        let (report, gh) = pass_with(&db, &mut ForbiddenReviewer, &cfg, Vec::new());
+        assert!(pr_comments(&gh).is_empty(), "seen: {:?}", gh.seen);
+        assert!(report.advanced[0].review.is_none());
+    }
+
+    #[test]
+    fn the_advance_report_says_which_round_the_review_was() {
+        // The worktree does not hold `GREEN`, and no review came before:
+        // the first review of a PR reads the whole of it, and says so.
+        let db = approved_db();
+        record_success(&db, &issue(), Some(GREEN));
+        let (repo, roots) = checkout_with_worktree();
+        let cfg = config(roots.path(), repo.path());
+        let (report, _) = pass_with(&db, &mut StubReviewer::passing(), &cfg, Vec::new());
+        let review = report.advanced[0].review.as_ref().unwrap();
+        assert_eq!(
+            review.round,
+            Some(review::ReviewRound::Whole {
+                why: review::WholePrReason::NoEarlierJudgedReview
+            })
+        );
+        assert_eq!(
+            review.advance_lines()[1],
+            "round: whole PR (no earlier judged review of this PR)"
+        );
+        assert_eq!(
+            serde_json::to_value(review).unwrap()["round"],
+            serde_json::json!({"kind": "whole", "why": "no_earlier_judged_review"})
+        );
+    }
+
     #[test]
     fn a_held_merge_cleans_nothing_up() {
         // The other half of the rule: cleanup is terminal bookkeeping for a
@@ -4506,6 +4757,7 @@ skipped: {:?}",
                 decision: review::MergeDecision::HoldForHuman(
                     crate::autopilot::review::HoldReason::ReviewerDidNotRun,
                 ),
+                round: None,
             },
         )
         .unwrap();

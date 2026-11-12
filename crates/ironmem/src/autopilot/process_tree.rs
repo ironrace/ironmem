@@ -2705,7 +2705,7 @@ impl ProcessTracker {
                 // PID and a new parent is a reparented process. The group is
                 // left out on purpose. A tool that calls setsid or setpgid
                 // between the two captures is still the same process, and
-                // refusing it failed the whole invocation.
+                // refusing it would fail the whole invocation.
                 if candidate_after.pid != actual.pid
                     || candidate_after.ppid != actual.ppid
                     || candidate_after.birth != actual.birth
@@ -6257,7 +6257,7 @@ pub(crate) mod tests {
     /// A tool that calls `setsid` or `setpgid` between the two captures
     /// changes its group and nothing else. It is the same process under the
     /// same parent, so it is enrolled, with the later group. Refusing it
-    /// failed a whole invocation on a tool that detached at that moment.
+    /// would fail a whole invocation on a tool that detached at that moment.
     #[test]
     fn a_candidate_that_only_changes_group_between_captures_is_enrolled() {
         let root = kernel_process(10, 1, 10, 1);
