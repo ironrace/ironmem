@@ -138,7 +138,13 @@ use super::{
 ///
 /// **Passed to Codex as a file path, not inline** — the opposite of the IC
 /// schema. See the module doc's *Two asymmetries*.
-pub const REVIEW_VERDICT_JSON_SCHEMA: &str = r#"{"type":"object","properties":{"verdict":{"type":"string","enum":["pass","needs_changes"]},"risk_class":{"type":"string","enum":["documentation","dependency_bump","mechanical_rename","test_only","logic","protocol","security","public_api"]},"reason":{"type":"string"}},"required":["verdict","risk_class","reason"],"additionalProperties":false}"#;
+///
+/// `follow_up` (#403) is the reviewer's non-blocking findings in code an
+/// earlier round already judged. Codex applies this schema in strict mode,
+/// which wants every property in `required`, so it is required and typed
+/// `["string","null"]` — "none" is `null`, not an absent key. A Muse reply
+/// that omits it still parses: [`parse_review_message`] defaults it.
+pub const REVIEW_VERDICT_JSON_SCHEMA: &str = r#"{"type":"object","properties":{"verdict":{"type":"string","enum":["pass","needs_changes"]},"risk_class":{"type":"string","enum":["documentation","dependency_bump","mechanical_rename","test_only","logic","protocol","security","public_api"]},"reason":{"type":"string"},"follow_up":{"type":["string","null"]}},"required":["verdict","risk_class","reason","follow_up"],"additionalProperties":false}"#;
 
 /// How many *unpriced* reviewer invocations may run in one day before
 /// [`review_pr`] refuses.
@@ -337,6 +343,10 @@ pub struct ReviewOutcome {
     /// `None` on the same conditions as `verdict`.
     pub risk_class: Option<RiskClass>,
     pub reason: Option<String>,
+    /// Non-blocking findings in code an earlier round already judged (#403).
+    /// They never change the verdict; [`super::advance`] posts a non-empty
+    /// one on the PR as a single comment.
+    pub follow_up: Option<String>,
     /// `None` for a Codex reviewer, which reports no dollar figure. **Not
     /// zero** — see the module doc.
     pub total_cost_usd: Option<f64>,
@@ -360,6 +370,7 @@ impl ReviewOutcome {
             verdict: None,
             risk_class: None,
             reason: None,
+            follow_up: None,
             total_cost_usd: None,
             token_usage: None,
             process_success: false,
@@ -376,6 +387,19 @@ struct RawReviewMessage {
     risk_class: Option<String>,
     #[serde(default)]
     reason: Option<String>,
+    /// Absent and `null` both read as `None`; any other non-string value
+    /// fails the whole parse, which is no verdict.
+    #[serde(default)]
+    follow_up: Option<String>,
+}
+
+/// What [`parse_review_message`] read out of a final message.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ParsedReview {
+    pub verdict: Option<ReviewVerdict>,
+    pub risk_class: Option<RiskClass>,
+    pub reason: Option<String>,
+    pub follow_up: Option<String>,
 }
 
 /// Parse the Reviewer's final message into a verdict, class, and reason.
@@ -388,12 +412,10 @@ struct RawReviewMessage {
 /// deliberately no path that infers a verdict from prose — that would
 /// reintroduce exactly the guess the `--output-schema` flag exists to
 /// eliminate.
-pub fn parse_review_message(
-    message: &str,
-) -> (Option<ReviewVerdict>, Option<RiskClass>, Option<String>) {
+pub fn parse_review_message(message: &str) -> ParsedReview {
     let trimmed = strip_code_fence(message.trim());
     let Ok(raw) = serde_json::from_str::<RawReviewMessage>(trimmed) else {
-        return (None, None, None);
+        return ParsedReview::default();
     };
     let verdict = raw
         .verdict
@@ -403,7 +425,12 @@ pub fn parse_review_message(
         .risk_class
         .as_deref()
         .and_then(RiskClass::from_schema_str);
-    (verdict, risk_class, raw.reason)
+    ParsedReview {
+        verdict,
+        risk_class,
+        reason: raw.reason,
+        follow_up: raw.follow_up,
+    }
 }
 
 /// Strip a single ```/```json fence wrapping the whole message, if present.
@@ -826,12 +853,18 @@ pub fn run_review_bounded(
     // message — same fail-closed treatment as an unparseable one. A killed
     // reviewer reaches here too, and reaches it with nothing written.
     let message = std::fs::read_to_string(&last_message_path).unwrap_or_default();
-    let (verdict, risk_class, reason) = parse_review_message(&message);
+    let ParsedReview {
+        verdict,
+        risk_class,
+        reason,
+        follow_up,
+    } = parse_review_message(&message);
 
     Ok(ReviewOutcome {
         verdict,
         risk_class,
         reason,
+        follow_up,
         // Codex reports no price. See the module doc.
         total_cost_usd: None,
         token_usage,
@@ -1060,6 +1093,10 @@ struct ReviewBody {
     recorded_at: String,
     reason_redacted: bool,
     reason_truncated: bool,
+    /// Scrubbed and bounded exactly as `reason` is. `#[serde(default)]`: a
+    /// review recorded before #403 reads back as having no follow-up.
+    #[serde(default)]
+    follow_up: Option<String>,
 }
 
 /// What [`record_review`] persisted.
@@ -1104,6 +1141,11 @@ pub fn record_review(db: &Database, record: &ReviewRecord) -> Result<RecordedRev
         recorded_at: chrono::Utc::now().to_rfc3339(),
         reason_redacted: reason_scrub.as_ref().is_some_and(|o| o.redacted),
         reason_truncated: reason_scrub.as_ref().is_some_and(|o| o.truncated),
+        follow_up: record
+            .outcome
+            .follow_up
+            .as_deref()
+            .map(|text| scrub_and_bound(text, MAX_LINEAGE_FIELD_CHARS).text),
     };
 
     let content = serde_json::to_string(&body)?;
@@ -1186,6 +1228,10 @@ pub struct RecordedReviewSummary {
     pub verdict: Option<ReviewVerdict>,
     pub risk_class: Option<RiskClass>,
     pub reason: Option<String>,
+    /// The review's non-blocking follow-up (#403), scrubbed on the way in.
+    /// `None` for a review recorded before the field existed.
+    #[serde(default)]
+    pub follow_up: Option<String>,
     pub process_success: bool,
     pub recorded_at: String,
 }
@@ -1246,6 +1292,7 @@ pub fn reviews_for_issue(
             verdict: body.verdict,
             risk_class: body.risk_class,
             reason: body.reason,
+            follow_up: body.follow_up,
             process_success: body.process_success,
             recorded_at: body.recorded_at,
         });
@@ -1523,7 +1570,12 @@ pub fn run_muse_review_bounded(
     // an attempt on a review that never finished. Not a verdict, then; the
     // terminal word is kept as the reason so a human holding the PR can see
     // how it ended.
-    let (verdict, risk_class, reason) = if completed {
+    let ParsedReview {
+        verdict,
+        risk_class,
+        reason,
+        follow_up,
+    } = if completed {
         let message = terminal
             .as_ref()
             .map(|t| t.text.as_str())
@@ -1536,7 +1588,10 @@ pub fn run_muse_review_bounded(
                 t.terminal
             )
         });
-        (None, None, reason)
+        ParsedReview {
+            reason,
+            ..ParsedReview::default()
+        }
     };
 
     // Did the reviewer write to the checkout it was judging?
@@ -1574,6 +1629,7 @@ pub fn run_muse_review_bounded(
                     "reviewer modified the checkout it was reviewing; verdict discarded"
                         .to_string(),
                 ),
+                follow_up: None,
                 total_cost_usd: None,
                 token_usage: None,
                 process_success: false,
@@ -1585,6 +1641,7 @@ pub fn run_muse_review_bounded(
         verdict,
         risk_class,
         reason,
+        follow_up,
         // Muse reports no price, exactly as Codex does not. See the module doc.
         total_cost_usd: None,
         // **Not measured.** No usage record appeared in a `--provider echo`
@@ -1771,6 +1828,64 @@ pub struct PrReview {
     /// decision. This field exists so a Lead can tell "retry when the day
     /// rolls over" from "something is broken".
     pub refusal: Option<ReviewRefusal>,
+    /// Whether the review's non-empty `follow_up` reached the PR as a
+    /// comment (#403). `None` when there was nothing to post, or when the
+    /// caller does not post — only [`super::advance`] does. Set by the
+    /// caller, never by [`review_pr`], which holds no `gh` runner.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub follow_up_comment: Option<FollowUpComment>,
+}
+
+/// What became of a review's follow-up comment (#403).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum FollowUpComment {
+    Posted,
+    /// `gh pr comment` failed. Reported rather than retried: the follow-up
+    /// is still in the review's drawer, and the next pass will not review
+    /// this head again to post it a second time.
+    Failed {
+        error: String,
+    },
+}
+
+/// The longest follow-up text a comment quotes, after scrubbing.
+pub const MAX_FOLLOW_UP_CHARS: usize = 4_000;
+
+/// The longest follow-up comment body, everything included. Room for the
+/// text, two fences that can each be one backtick longer than it, and the
+/// fixed prose, so the bound never cuts the closing fence off — and far
+/// under GitHub's 65,536-character comment limit.
+pub const MAX_FOLLOW_UP_COMMENT_CHARS: usize = 3 * MAX_FOLLOW_UP_CHARS + 1_000;
+
+/// The PR comment carrying a judged review's non-blocking follow-up (#403),
+/// or `None` when there is nothing to post.
+///
+/// The reviewer's text is scrubbed and bounded, then fenced with one more
+/// backtick than its longest backtick run, so nothing it quotes from the
+/// diff renders as markdown or notifies an `@`-mentioned account. Opens no
+/// issues: a person reads it and decides.
+pub fn render_follow_up_comment(
+    pr_number: u64,
+    head_sha: Option<&str>,
+    follow_up: Option<&str>,
+) -> Option<String> {
+    let text = follow_up.map(str::trim).filter(|t| !t.is_empty())?;
+    let text = scrub_and_bound(text, MAX_FOLLOW_UP_CHARS).text;
+    let longest_run = text.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+    let fence = "`".repeat(longest_run.max(2) + 1);
+    let at = head_sha
+        .map(|sha| format!(" at `{}`", sha.chars().take(12).collect::<String>()))
+        .unwrap_or_default();
+    let body = format!(
+        "{marker}\n**Autopilot review follow-up for PR #{pr_number}{at}**\n\n\
+         The reviewer noted these non-blocking findings in code an earlier \
+         review round already judged. They did not change the verdict, and \
+         Autopilot has opened no issue for them.\n\n\
+         {fence}text\n{text}\n{fence}\n",
+        marker = super::blocked::AUTOPILOT_COMMENT_MARKER,
+    );
+    Some(scrub_and_bound(&body, MAX_FOLLOW_UP_COMMENT_CHARS).text)
 }
 
 /// Why [`review_pr`] declined to launch a reviewer at all.
@@ -1803,6 +1918,54 @@ where
     S: serde::Serializer,
 {
     serializer.serialize_str(&issue.canonical())
+}
+
+/// What an earlier judged review of a PR already covered (#403).
+#[derive(Debug, Clone, PartialEq)]
+pub struct LaterRoundContext {
+    /// The head the most recent judged review of this PR read.
+    pub last_judged_head: String,
+    /// Every judged review of this PR's `reason`, oldest first.
+    pub earlier_reasons: Vec<String>,
+}
+
+/// Whether reviewing `head_sha` is a later round of `request`'s PR (#403),
+/// and if so what the earlier rounds said.
+///
+/// A later round needs all of: an earlier review of **this** PR that judged
+/// (#350 — a crashed or verdict-less run read nothing), a recorded head on
+/// the most recent one, and that head being a strict ancestor of the one
+/// under review in the reviewer's checkout. Anything else — no judged
+/// review, an unrecorded head, a force-push that rewrote it, a checkout that
+/// lacks it, or the same head again (there is no fix to read) — is round 1,
+/// which reviews the whole PR as before.
+pub fn later_round_context(
+    db: &Database,
+    request: &ReviewRequest,
+    head_sha: Option<&str>,
+) -> Result<Option<LaterRoundContext>, MemoryError> {
+    let Some(head_sha) = head_sha else {
+        return Ok(None);
+    };
+    // Filtered on the canonical issue as well as the PR, because
+    // `repo_slug` collapses `owner/repo` and `owner-repo` onto one entity.
+    let canonical = request.issue.canonical();
+    let judged: Vec<RecordedReviewSummary> = reviews_for_issue(db, request.issue)?
+        .into_iter()
+        .filter(|r| r.issue == canonical && r.pr_number == request.pr_number && r.judged())
+        .collect();
+    let Some(last_judged_head) = judged.last().and_then(|r| r.head_sha.clone()) else {
+        return Ok(None);
+    };
+    if last_judged_head.eq_ignore_ascii_case(head_sha)
+        || !super::worktree::commit_is_ancestor(request.repo_dir, &last_judged_head, head_sha)
+    {
+        return Ok(None);
+    }
+    Ok(Some(LaterRoundContext {
+        last_judged_head,
+        earlier_reasons: judged.into_iter().filter_map(|r| r.reason).collect(),
+    }))
 }
 
 /// Review one PR end to end: pre-authorize against the daily ledger, run the
@@ -1870,6 +2033,7 @@ pub fn review_pr(
             decision,
             record_drawer_id: None,
             refusal: Some(refusal),
+            follow_up_comment: None,
         });
     }
 
@@ -1881,6 +2045,7 @@ pub fn review_pr(
         .clone()
         .or_else(|| super::worktree::resolve_commit(request.repo_dir, request.head_branch));
 
+    let later = later_round_context(db, request, head_sha.as_deref())?;
     let prompt = super::review_prompt::render(&super::review_prompt::ReviewPromptInputs {
         issue: request.issue,
         pr_number: request.pr_number,
@@ -1888,6 +2053,14 @@ pub fn review_pr(
         head_branch: request.head_branch,
         dispatch_class: request.dispatch_class,
         gate_commands: request.gate_commands,
+        later_round: match (&later, head_sha.as_deref()) {
+            (Some(later), Some(head_sha)) => Some(super::review_prompt::LaterRound {
+                last_judged_head: &later.last_judged_head,
+                head_sha,
+                earlier_reasons: &later.earlier_reasons,
+            }),
+            _ => None,
+        },
     });
 
     // A reviewer that fails to launch is not an error for this function: it
@@ -1965,6 +2138,7 @@ pub fn review_pr(
         decision,
         record_drawer_id: Some(recorded.drawer_id),
         refusal: None,
+        follow_up_comment: None,
     })
 }
 
@@ -2040,7 +2214,7 @@ mod tests {
     }
 
     #[test]
-    fn the_schema_requires_all_three_fields_and_forbids_extras() {
+    fn the_schema_requires_every_field_and_forbids_extras() {
         let schema: serde_json::Value = serde_json::from_str(REVIEW_VERDICT_JSON_SCHEMA).unwrap();
         let required: Vec<&str> = schema["required"]
             .as_array()
@@ -2051,6 +2225,19 @@ mod tests {
         assert!(required.contains(&"verdict"));
         assert!(required.contains(&"risk_class"));
         assert!(required.contains(&"reason"));
+        // Codex's strict mode wants every property required, so "no
+        // follow-up" is `null`, not an absent key (#403).
+        assert!(required.contains(&"follow_up"));
+        assert_eq!(
+            schema["properties"]["follow_up"]["type"],
+            serde_json::json!(["string", "null"])
+        );
+        let properties = schema["properties"].as_object().unwrap();
+        assert_eq!(
+            properties.len(),
+            required.len(),
+            "every property is required"
+        );
         assert_eq!(schema["additionalProperties"], serde_json::json!(false));
     }
 
@@ -2189,21 +2376,56 @@ mod tests {
 
     #[test]
     fn parses_a_conforming_message() {
-        let (verdict, class, reason) = parse_review_message(
+        let parsed = parse_review_message(
             r#"{"verdict":"pass","risk_class":"documentation","reason":"docs only"}"#,
         );
-        assert_eq!(verdict, Some(ReviewVerdict::Pass));
-        assert_eq!(class, Some(RiskClass::Documentation));
-        assert_eq!(reason.as_deref(), Some("docs only"));
+        assert_eq!(parsed.verdict, Some(ReviewVerdict::Pass));
+        assert_eq!(parsed.risk_class, Some(RiskClass::Documentation));
+        assert_eq!(parsed.reason.as_deref(), Some("docs only"));
+        // A reply without `follow_up` — every Muse round-1 reply — still
+        // parses, with no follow-up.
+        assert_eq!(parsed.follow_up, None);
+    }
+
+    #[test]
+    fn a_verdict_with_a_follow_up_parses_and_keeps_it() {
+        let parsed = parse_review_message(
+            r#"{"verdict":"pass","risk_class":"logic","reason":"fix resolves it","follow_up":"rename x in foo.rs:12"}"#,
+        );
+        assert_eq!(parsed.verdict, Some(ReviewVerdict::Pass));
+        assert_eq!(parsed.risk_class, Some(RiskClass::Logic));
+        assert_eq!(parsed.follow_up.as_deref(), Some("rename x in foo.rs:12"));
+
+        // What Codex's strict schema produces when there is none.
+        let parsed = parse_review_message(
+            r#"{"verdict":"needs_changes","risk_class":"logic","reason":"r","follow_up":null}"#,
+        );
+        assert_eq!(parsed.verdict, Some(ReviewVerdict::NeedsChanges));
+        assert_eq!(parsed.follow_up, None);
+    }
+
+    #[test]
+    fn a_follow_up_of_any_other_type_is_no_verdict() {
+        for message in [
+            r#"{"verdict":"pass","risk_class":"logic","reason":"r","follow_up":3}"#,
+            r#"{"verdict":"pass","risk_class":"logic","reason":"r","follow_up":["a"]}"#,
+            r#"{"verdict":"pass","risk_class":"logic","reason":"r","follow_up":{"x":1}}"#,
+        ] {
+            assert_eq!(
+                parse_review_message(message),
+                ParsedReview::default(),
+                "{message}"
+            );
+        }
     }
 
     #[test]
     fn tolerates_whitespace_and_a_code_fence() {
-        let (verdict, class, _) = parse_review_message(
+        let parsed = parse_review_message(
             "\n```json\n{\"verdict\":\"needs_changes\",\"risk_class\":\"logic\",\"reason\":\"off by one\"}\n```\n",
         );
-        assert_eq!(verdict, Some(ReviewVerdict::NeedsChanges));
-        assert_eq!(class, Some(RiskClass::Logic));
+        assert_eq!(parsed.verdict, Some(ReviewVerdict::NeedsChanges));
+        assert_eq!(parsed.risk_class, Some(RiskClass::Logic));
     }
 
     #[test]
@@ -2221,9 +2443,9 @@ mod tests {
             "{\"verdict\":\"pass\",\"risk_class\":\"Documentation\",\"reason\":\"x\"}",
             "{truncated",
         ] {
-            let (verdict, class, _) = parse_review_message(message);
+            let parsed = parse_review_message(message);
             assert!(
-                verdict.is_none() || class.is_none(),
+                parsed.verdict.is_none() || parsed.risk_class.is_none(),
                 "message must not yield a complete verdict: {message}"
             );
         }
@@ -2273,6 +2495,7 @@ not json at all
             verdict: Some(ReviewVerdict::Pass),
             risk_class: Some(class),
             reason: Some("looks correct".to_string()),
+            follow_up: None,
             total_cost_usd: None,
             token_usage: None,
             process_success: true,
@@ -2473,6 +2696,7 @@ not json at all
             verdict: Some(ReviewVerdict::NeedsChanges),
             risk_class: Some(RiskClass::Logic),
             reason: Some(reason.to_string()),
+            follow_up: None,
             total_cost_usd: None,
             token_usage: Some(ReviewTokenUsage {
                 input_tokens: 1200,
@@ -2738,6 +2962,209 @@ not json at all
         ]);
         let sha = crate::autopilot::test_git::run(dir.path(), &["rev-parse", "HEAD"]);
         (dir, sha)
+    }
+
+    // ── #403: later rounds review the fix ──────────────────────────────
+
+    /// A repo with `first` → `second` on the PR branch, and `sibling`, a
+    /// commit off `first` that `second` does not contain.
+    fn fix_history_repo() -> (tempfile::TempDir, String, String, String) {
+        let branch = "autopilot/ironrace-ironmem-283";
+        let (dir, first) = fixture_repo(branch);
+        let commit = |file: &str| {
+            std::fs::write(dir.path().join(file), file).unwrap();
+            crate::autopilot::test_git::output(dir.path(), &["add", "-A"]);
+            crate::autopilot::test_git::output(
+                dir.path(),
+                &[
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "user.name=t",
+                    "commit",
+                    "-qm",
+                    file,
+                ],
+            );
+            crate::autopilot::test_git::run(dir.path(), &["rev-parse", "HEAD"])
+        };
+        crate::autopilot::test_git::output(dir.path(), &["checkout", "-q", "-b", "other"]);
+        let sibling = commit("sibling.txt");
+        crate::autopilot::test_git::output(dir.path(), &["checkout", "-q", branch]);
+        let second = commit("fix.txt");
+        (dir, first, second, sibling)
+    }
+
+    fn needs_changes(reason: &str) -> ReviewOutcome {
+        ReviewOutcome {
+            verdict: Some(ReviewVerdict::NeedsChanges),
+            reason: Some(reason.to_string()),
+            ..passing_outcome(RiskClass::Logic)
+        }
+    }
+
+    fn round_one_prompt(request: &ReviewRequest) -> String {
+        super::super::review_prompt::render(&super::super::review_prompt::ReviewPromptInputs {
+            issue: request.issue,
+            pr_number: request.pr_number,
+            base_branch: request.base_branch,
+            head_branch: request.head_branch,
+            dispatch_class: request.dispatch_class,
+            gate_commands: request.gate_commands,
+            later_round: None,
+        })
+    }
+
+    /// Review `head` with `outcome`, returning the prompt the reviewer saw.
+    fn review_at(
+        db: &Database,
+        request: &ReviewRequest,
+        head: &str,
+        outcome: ReviewOutcome,
+    ) -> String {
+        let mut runner = StubRunner::returning(outcome);
+        let request = ReviewRequest {
+            head_sha: Some(head.to_string()),
+            ..*request
+        };
+        review_pr(db, &mut runner, &request).unwrap();
+        runner.last_prompt
+    }
+
+    #[test]
+    fn a_second_round_reads_the_fix_from_the_last_judged_head_and_quotes_the_earlier_reasons() {
+        let (repo, first, second, _) = fix_history_repo();
+        let db = Database::open_in_memory().unwrap();
+        let issue = IssueRef::new("ironrace/ironmem", 283);
+        let gates = vec!["cargo test --workspace".to_string()];
+        let request = sample_request(&issue, &gates, repo.path());
+
+        let round_one = review_at(
+            &db,
+            &request,
+            &first,
+            needs_changes("off by one in parse_range"),
+        );
+        assert_eq!(
+            round_one,
+            round_one_prompt(&request),
+            "round 1 is unchanged"
+        );
+
+        let round_two = review_at(&db, &request, &second, passing_outcome(RiskClass::Logic));
+        assert!(
+            round_two.contains(&format!("git diff {first}..{second}")),
+            "{round_two}"
+        );
+        assert!(round_two.contains("> off by one in parse_range"));
+        assert!(round_two.contains("LATER review round"));
+    }
+
+    #[test]
+    fn a_last_judged_head_that_is_not_an_ancestor_falls_back_to_round_one() {
+        // A force-push rewrote the branch: the commits since the last judged
+        // head are not "the fix", so the whole PR is reviewed again.
+        let (repo, _, second, sibling) = fix_history_repo();
+        let db = Database::open_in_memory().unwrap();
+        let issue = IssueRef::new("ironrace/ironmem", 283);
+        let gates = vec!["cargo test --workspace".to_string()];
+        let request = sample_request(&issue, &gates, repo.path());
+
+        review_at(&db, &request, &sibling, needs_changes("finding"));
+        let prompt = review_at(&db, &request, &second, passing_outcome(RiskClass::Logic));
+        assert_eq!(prompt, round_one_prompt(&request));
+    }
+
+    #[test]
+    fn an_unrecorded_or_unjudged_or_unchanged_head_falls_back_to_round_one() {
+        let (repo, first, second, _) = fix_history_repo();
+        let issue = IssueRef::new("ironrace/ironmem", 283);
+        let gates = vec!["cargo test --workspace".to_string()];
+        let request = sample_request(&issue, &gates, repo.path());
+
+        // The last judged review recorded no head.
+        let db = Database::open_in_memory().unwrap();
+        let mut unrecorded = sample_record(&issue, "finding");
+        unrecorded.head_sha = None;
+        record_review(&db, &unrecorded).unwrap();
+        let prompt = review_at(&db, &request, &second, passing_outcome(RiskClass::Logic));
+        assert_eq!(prompt, round_one_prompt(&request), "unrecorded head");
+
+        // The earlier review never judged (#350): it read nothing.
+        let db = Database::open_in_memory().unwrap();
+        let crashed = ReviewOutcome {
+            process_success: false,
+            ..needs_changes("finding")
+        };
+        review_at(&db, &request, &first, crashed);
+        let prompt = review_at(&db, &request, &second, passing_outcome(RiskClass::Logic));
+        assert_eq!(
+            prompt,
+            round_one_prompt(&request),
+            "unjudged earlier review"
+        );
+
+        // Same head again: there is no fix to read.
+        let db = Database::open_in_memory().unwrap();
+        review_at(&db, &request, &second, needs_changes("finding"));
+        let prompt = review_at(&db, &request, &second, passing_outcome(RiskClass::Logic));
+        assert_eq!(prompt, round_one_prompt(&request), "unchanged head");
+
+        // Another PR's judged review is not this PR's earlier round.
+        let db = Database::open_in_memory().unwrap();
+        let other_pr = ReviewRequest {
+            pr_number: 999,
+            head_sha: None,
+            ..request
+        };
+        review_at(&db, &other_pr, &first, needs_changes("finding"));
+        let prompt = review_at(&db, &request, &second, passing_outcome(RiskClass::Logic));
+        assert_eq!(prompt, round_one_prompt(&request), "another PR");
+    }
+
+    #[test]
+    fn a_follow_up_is_recorded_scrubbed_and_read_back() {
+        let db = Database::open_in_memory().unwrap();
+        let issue = IssueRef::new("ironrace/ironmem", 283);
+        let token = format!("ghp_{}", "a1B2c3D4e5".repeat(4));
+        let mut record = sample_record(&issue, "fine");
+        record.outcome.follow_up = Some(format!("rename x; token {token}"));
+        record_review(&db, &record).unwrap();
+
+        let read = reviews_for_issue(&db, &issue).unwrap();
+        let follow_up = read[0].follow_up.as_deref().unwrap();
+        assert!(follow_up.starts_with("rename x; token "));
+        assert!(
+            !follow_up.contains(&token),
+            "follow-up reached storage unscrubbed"
+        );
+    }
+
+    #[test]
+    fn a_follow_up_comment_is_rendered_only_for_non_empty_text() {
+        assert_eq!(render_follow_up_comment(322, None, None), None);
+        assert_eq!(render_follow_up_comment(322, None, Some("  \n ")), None);
+
+        let body = render_follow_up_comment(322, Some(&"a".repeat(40)), Some("rename x in foo.rs"))
+            .unwrap();
+        assert!(body.starts_with(super::super::blocked::AUTOPILOT_COMMENT_MARKER));
+        assert!(body.contains("PR #322 at `aaaaaaaaaaaa`"));
+        assert!(body.contains("```text\nrename x in foo.rs\n```"));
+        assert!(body.contains("opened no issue"));
+    }
+
+    #[test]
+    fn a_follow_up_comment_is_scrubbed_bounded_and_cannot_close_its_own_fence() {
+        let token = format!("ghp_{}", "a1B2c3D4e5".repeat(4));
+        let text = format!("see ```` here, cc @someone, {token} {}", "z".repeat(10_000));
+        let body = render_follow_up_comment(322, None, Some(&text)).unwrap();
+        assert!(!body.contains(&token));
+        assert!(body.chars().count() <= MAX_FOLLOW_UP_COMMENT_CHARS);
+        assert!(!body.contains(&"z".repeat(MAX_FOLLOW_UP_CHARS + 1)));
+        // A four-backtick run in the text gets a five-backtick fence, and
+        // the closing fence survives the bound.
+        assert!(body.contains("`````text\n"));
+        assert!(body.trim_end().ends_with("`````"));
     }
 
     #[test]

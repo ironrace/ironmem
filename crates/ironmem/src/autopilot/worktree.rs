@@ -1425,6 +1425,19 @@ fn is_ancestor(root: &Path, ancestor: &str, descendant: &str) -> Result<bool, Me
     }
 }
 
+/// Whether the commit `ancestor` is an ancestor of the commit `descendant`
+/// in `repo_dir`, for a later review round (#403). Both must be full commit
+/// SHAs (40 or 64 hex characters) — anything else, including a value git
+/// could read as an option, is `false` without running git — and every git
+/// failure is `false` too: the caller's fallback is the round-1 review of
+/// the whole PR, so "cannot tell" costs only the narrower prompt.
+pub(crate) fn commit_is_ancestor(repo_dir: &Path, ancestor: &str, descendant: &str) -> bool {
+    let is_sha = |s: &str| matches!(s.len(), 40 | 64) && s.chars().all(|c| c.is_ascii_hexdigit());
+    is_sha(ancestor)
+        && is_sha(descendant)
+        && is_ancestor(repo_dir, ancestor, descendant).unwrap_or(false)
+}
+
 /// Record a cut [`infer_cut`] found for an existing `branch` that had none.
 /// An inferred cut is logged rather than silent: a wrong one widens or
 /// narrows the range the signing guard checks.

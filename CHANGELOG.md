@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Later Autopilot review rounds review the fix (#403).** Once a review of a
+  PR has judged it, the next review's prompt names that review's head and tells
+  the reviewer to read `git diff <last-judged-head>..<head>` first, asks whether
+  those commits resolve the earlier findings and whether they add a defect,
+  and quotes the earlier rounds' reasons (scrubbed, 1,200 characters each, the
+  newest five) with an instruction not to repeat them unless the fix failed. A
+  new finding in already-judged code changes the verdict only when it is
+  blocking (wrong results, data loss, a security hole, a crash); anything else
+  goes in a new verdict field, `follow_up`, which `advance` posts once as a
+  scrubbed, bounded PR comment. The reviewer is also asked to name a finding's
+  pattern and list its other sites. The risk class is still taken from the
+  whole PR. The first round's prompt is unchanged, and a later round falls back
+  to it when the last judged head is unrecorded or not an ancestor of the
+  current head. `REVIEW_VERDICT_JSON_SCHEMA` now requires `follow_up`, typed
+  `["string","null"]`; a reply without it still parses, and one with any other
+  type is no verdict.
+
 - **Prompt recall lines carry the drawer id (#376).** Each drawer and diary line
   the `user-prompt-submit` hook injects now reads
   `- source="wing/room" id="..." excerpt="..."`, and the block's header says

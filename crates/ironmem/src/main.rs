@@ -2342,6 +2342,15 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                         .text,
                     );
                 }
+                if let Some(follow_up) = review.outcome.follow_up.take() {
+                    review.outcome.follow_up = Some(
+                        ironmem::autopilot::scrub::scrub_and_bound(
+                            &follow_up,
+                            ironmem::autopilot::lineage::MAX_LINEAGE_FIELD_CHARS,
+                        )
+                        .text,
+                    );
+                }
 
                 if json {
                     println!("{}", serde_json::to_string_pretty(&review)?);

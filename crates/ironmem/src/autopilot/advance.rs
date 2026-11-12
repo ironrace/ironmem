@@ -1058,6 +1058,40 @@ fn advance_issue(
             done.outcome.reason =
                 Some(super::scrub::scrub_and_bound(&reason, lineage::MAX_LINEAGE_FIELD_CHARS).text);
         }
+        if let Some(follow_up) = done.outcome.follow_up.take() {
+            done.outcome.follow_up = Some(
+                super::scrub::scrub_and_bound(&follow_up, lineage::MAX_LINEAGE_FIELD_CHARS).text,
+            );
+        }
+        // #403: a judged review's non-blocking follow-up reaches a person as
+        // one PR comment. Exactly one: this head was reviewed once, and
+        // `next_step` never re-reviews a head a judged review already read.
+        // A failed post is reported, not retried, and does not stop the pass
+        // — the follow-up never affects the verdict, and its text is still
+        // in the review's drawer.
+        if done.dispatched() && done.outcome.process_success && done.outcome.verdict.is_some() {
+            if let Some(body) = review::render_follow_up_comment(
+                pr_number,
+                Some(&head_sha),
+                done.outcome.follow_up.as_deref(),
+            ) {
+                done.follow_up_comment = Some(
+                    match gh::comment_on_pr(gh_runner, &candidate.issue.repo, pr_number, &body) {
+                        Ok(()) => review::FollowUpComment::Posted,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "autopilot could not post a review follow-up");
+                            review::FollowUpComment::Failed {
+                                error: super::scrub::scrub_and_bound(
+                                    &e.to_string(),
+                                    lineage::MAX_LINEAGE_FIELD_CHARS,
+                                )
+                                .text,
+                            }
+                        }
+                    },
+                );
+            }
+        }
         review = Some(done);
     }
 
@@ -1552,6 +1586,7 @@ mod tests {
                     verdict: Some(ReviewVerdict::Pass),
                     risk_class: Some(RiskClass::Documentation),
                     reason: None,
+                    follow_up: None,
                     total_cost_usd: None,
                     token_usage: None,
                     process_success: true,
@@ -1583,6 +1618,7 @@ mod tests {
                     verdict: Some(ReviewVerdict::NeedsChanges),
                     risk_class: Some(RiskClass::Documentation),
                     reason: Some("the retry loop is unbounded".to_string()),
+                    follow_up: None,
                     total_cost_usd: None,
                     token_usage: None,
                     process_success: true,
@@ -1660,6 +1696,7 @@ mod tests {
                     verdict: Some(ReviewVerdict::Pass),
                     risk_class: Some(RiskClass::Documentation),
                     reason: Some("looks right".to_string()),
+                    follow_up: None,
                     total_cost_usd: None,
                     token_usage: None,
                     process_success: true,
@@ -3385,6 +3422,7 @@ mod tests {
                 verdict: Some(ReviewVerdict::NeedsChanges),
                 risk_class: Some(RiskClass::Documentation),
                 reason: Some("the retry loop is unbounded".to_string()),
+                follow_up: None,
                 total_cost_usd: None,
                 token_usage: None,
                 process_success: true,
@@ -4001,6 +4039,142 @@ skipped: {:?}",
         );
     }
 
+    fn pr_comments(gh: &ScriptedGh) -> Vec<&Vec<String>> {
+        gh.seen
+            .iter()
+            .filter(|argv| argv.first().map(String::as_str) == Some("pr"))
+            .filter(|argv| argv.get(1).map(String::as_str) == Some("comment"))
+            .collect()
+    }
+
+    /// The rehearsal-merge reads a pass makes after its review, generously:
+    /// `ScriptedGh` does not require every response to be consumed.
+    fn rehearsal_reads() -> Vec<Result<GhOutput, MemoryError>> {
+        vec![
+            ok(&pr_view_json(GREEN)),
+            unprotected(),
+            no_rules(),
+            ok(r#"{"labels":[{"name":"agent:ready"}]}"#),
+            ok(""),
+        ]
+    }
+
+    #[test]
+    fn a_non_empty_follow_up_is_posted_as_exactly_one_pr_comment() {
+        // #403: non-blocking findings reach a person, once, as a comment on
+        // the PR — and open no issue.
+        let db = approved_db();
+        record_success(&db, &issue(), Some(GREEN));
+        let (repo, roots) = checkout_with_worktree();
+        let config = config(roots.path(), repo.path());
+        let mut reviewer = StubReviewer::passing();
+        reviewer.outcome.follow_up = Some("rename `x` in foo.rs; same in bar.rs".into());
+
+        let mut responses = vec![
+            ok(&issue_list_json(
+                283,
+                &["agent:ready", "risk:documentation"],
+            )),
+            ok(&pr_list_json(322, GREEN)),
+            // the follow-up comment
+            ok(""),
+        ];
+        responses.extend(rehearsal_reads());
+        let mut gh = ScriptedGh::new(responses);
+        let report = advance_pass(&db, &mut gh, &mut reviewer, &config).unwrap();
+
+        assert_eq!(reviewer.calls, 1);
+        let comments = pr_comments(&gh);
+        assert_eq!(comments.len(), 1, "seen: {:?}", gh.seen);
+        let argv = comments[0];
+        assert_eq!(argv[2], "322");
+        assert_eq!(argv[3..5], ["--repo".to_string(), REPO.to_string()]);
+        assert_eq!(argv[5], "--body");
+        assert!(argv[6].contains("rename `x` in foo.rs; same in bar.rs"));
+        assert!(
+            !gh.seen
+                .iter()
+                .any(|argv| argv.first().map(String::as_str) == Some("issue")
+                    && argv.get(1).map(String::as_str) == Some("create")),
+            "a follow-up opens no issue"
+        );
+        let review = report.advanced[0].review.as_ref().unwrap();
+        assert_eq!(
+            review.follow_up_comment,
+            Some(review::FollowUpComment::Posted)
+        );
+
+        // The next pass does not review this head again, so it cannot post
+        // the follow-up a second time.
+        let mut responses = vec![
+            ok(&issue_list_json(
+                283,
+                &["agent:ready", "risk:documentation"],
+            )),
+            ok(&pr_list_json(322, GREEN)),
+        ];
+        responses.extend(rehearsal_reads());
+        let mut gh = ScriptedGh::new(responses);
+        advance_pass(&db, &mut gh, &mut ForbiddenReviewer, &config).unwrap();
+        assert!(pr_comments(&gh).is_empty(), "seen: {:?}", gh.seen);
+    }
+
+    #[test]
+    fn no_follow_up_and_a_failed_post_are_both_handled_without_stopping_the_pass() {
+        // Without a follow-up nothing is posted.
+        let db = approved_db();
+        record_success(&db, &issue(), Some(GREEN));
+        let (repo, roots) = checkout_with_worktree();
+        let cfg = config(roots.path(), repo.path());
+        let mut responses = vec![
+            ok(&issue_list_json(
+                283,
+                &["agent:ready", "risk:documentation"],
+            )),
+            ok(&pr_list_json(322, GREEN)),
+        ];
+        responses.extend(rehearsal_reads());
+        let mut gh = ScriptedGh::new(responses);
+        let report = advance_pass(&db, &mut gh, &mut StubReviewer::passing(), &cfg).unwrap();
+        assert!(pr_comments(&gh).is_empty(), "seen: {:?}", gh.seen);
+        assert_eq!(
+            report.advanced[0]
+                .review
+                .as_ref()
+                .unwrap()
+                .follow_up_comment,
+            None
+        );
+
+        // A failed post is reported, and the merge step still runs.
+        let db = approved_db();
+        record_success(&db, &issue(), Some(GREEN));
+        let (repo, roots) = checkout_with_worktree();
+        let cfg = config(roots.path(), repo.path());
+        let mut reviewer = StubReviewer::passing();
+        reviewer.outcome.follow_up = Some("rename x".into());
+        let mut responses = vec![
+            ok(&issue_list_json(
+                283,
+                &["agent:ready", "risk:documentation"],
+            )),
+            ok(&pr_list_json(322, GREEN)),
+            ran_and_failed("HTTP 403"),
+        ];
+        responses.extend(rehearsal_reads());
+        let mut gh = ScriptedGh::new(responses);
+        let report = advance_pass(&db, &mut gh, &mut reviewer, &cfg).unwrap();
+        let advanced = &report.advanced[0];
+        assert!(matches!(
+            advanced.review.as_ref().unwrap().follow_up_comment,
+            Some(review::FollowUpComment::Failed { .. })
+        ));
+        assert!(
+            advanced.merge.is_some(),
+            "the pass carried on to the merge step"
+        );
+    }
+
     #[test]
     fn a_held_merge_cleans_nothing_up() {
         // The other half of the rule: cleanup is terminal bookkeeping for a
@@ -4342,6 +4516,7 @@ skipped: {:?}",
             verdict: None,
             risk_class: None,
             reason: None,
+            follow_up: None,
             total_cost_usd: None,
             token_usage: None,
             process_success: false,
@@ -4438,6 +4613,7 @@ skipped: {:?}",
                 verdict: Some(ReviewVerdict::Pass),
                 risk_class: Some(RiskClass::Documentation),
                 reason: None,
+                follow_up: None,
                 total_cost_usd: None,
                 token_usage: None,
                 process_success: true,
@@ -4499,6 +4675,7 @@ skipped: {:?}",
                 verdict: Some(ReviewVerdict::Pass),
                 risk_class: Some(RiskClass::Documentation),
                 reason: None,
+                follow_up: None,
                 total_cost_usd: None,
                 token_usage: None,
                 process_success: false,
