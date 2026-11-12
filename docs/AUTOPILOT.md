@@ -414,7 +414,9 @@ versioned binary under the same PID), are the verified paths. Any other launcher
 wrapper is adopted conservatively after restart: a marker visible only on a
 different native child is not treated as proof that the recorded root is the
 invocation. The process tracker authenticates and cleans ordinary tool
-descendants, including observed `setsid` children, but it is practical
+descendants, including observed `setsid` children (a tool is identified by
+its PID, parent and kernel birth, so changing its process group while it is
+being enrolled does not fail the invocation), but it is practical
 supervision rather than hostile fork containment; a deliberate double-fork
 escape between polls is outside its guarantee.
 
@@ -917,20 +919,22 @@ the reviewer gets a fresh review rather than the same hold for ever.
 ### What a later review round reads and may report (#403)
 
 The first review of a PR reads the whole diff, `git diff <base>...<head>`.
-Any review after it is a **later round** when an earlier review of the same
-PR judged it, that review recorded the same base branch as the one now under
-review, and that review's head is recorded and is an ancestor of the head now
-under review, in the issue's worktree. A later round's prompt:
+Any review after it is a **later round** when the most recent judged review
+of the same PR recorded the same base branch as the one now under review, and
+that review's head is recorded and is an ancestor of the head now under
+review, in the issue's worktree. Only the most recent judged review decides
+this: an older round against the same base does not make a later round when a
+newer judged review read another base. A later round's prompt:
 
 - names the last judged head and tells the reviewer to read the fix first,
   `git diff <last-judged-head>..<head>`, and then the whole PR for context;
 - asks whether those commits resolve the earlier findings and whether they
   add a defect of their own;
-- quotes the `reason` text of the earlier rounds against the same base,
-  oldest first, each scrubbed and
-  bounded to 1,200 characters as remediation findings are, and only the
-  newest five, and tells the reviewer not to report one again unless the fix
-  failed to resolve it;
+- quotes the `reason` text of the earlier judged rounds against the same
+  base, oldest first, each scrubbed and bounded to 1,200 characters as
+  remediation findings are, and only the newest five, and tells the reviewer
+  not to report one again unless the fix failed to resolve it. A round against
+  another base, or one that recorded no base, is not quoted;
 - allows a new finding in code an earlier round already judged to make the
   verdict `needs_changes` only when it is blocking: wrong results, data loss,
   a security hole or a crash. Anything else goes in the verdict's
@@ -954,8 +958,13 @@ schema requires it, typed string or `null`; a Muse reply may omit it. A
 `follow_up` of any other type makes the reply no verdict. When a judged
 review's `follow_up` is non-empty, `advance` posts it once as a PR comment,
 scrubbed and bounded, and opens no issue. A failed post is reported on the
-review as `follow_up_comment: {"status": "failed", ...}` and does not stop
-the pass; the text stays in the review's drawer. The standalone
+review as `follow_up_comment: {"status": "failed", ...}` under `--json` and
+as one line in the text output, `follow-up: NOT posted as a PR comment
+(<error>) — its text is in the review's drawer <id>`, and does not stop the
+pass. The text output does not print the follow-up itself: read it from that
+drawer, or from `outcome.follow_up` under `--json`. The line quotes at most
+300 characters of the error, on one line; `--json` carries all of it. A
+successful post prints `follow-up: posted as a PR comment`. The standalone
 `ironmem autopilot review` command posts nothing: it prints the follow-up as
 a `follow-up (non-blocking):` line, or as `outcome.follow_up` under `--json`.
 

@@ -12,6 +12,8 @@ use std::time::{Duration, Instant};
 
 use ironmem::autopilot::budget;
 use ironmem::autopilot::dispatch_state;
+use ironmem::autopilot::lineage::{self, AttemptOutcome, IssueStatus};
+use ironmem::autopilot::worktree;
 use ironmem::autopilot::{Implementer, IssueRef};
 use ironmem::db::schema::Database;
 
@@ -893,4 +895,275 @@ fn an_unresumable_muse_session_is_replaced_at_the_cli() {
         .as_str()
         .unwrap_or_default();
     assert!(second.contains("fresh session"), "{report}");
+}
+
+/// A stub `muse` reviewer. It logs its call and prints one terminal event
+/// carrying `$MUSE_VERDICT`, the shape `parse_muse_terminal` reads off a
+/// real stream. `$MUSE_VERDICT` is the verdict JSON, escaped to sit inside
+/// the event's `text` string.
+const MUSE_REVIEW_STUB: &str = r#"#!/bin/bash
+printf '%s\n' "$PWD|$*" >> "$MUSE_CALLS"
+printf '{"record_type":"event","payload_type":"run.terminal.completed","payload":{"kind":"run_terminal","terminal":"completed","text":"%s","reason":null}}\n' "$MUSE_VERDICT"
+"#;
+
+/// `ironmem autopilot review` prints the reviewer's reason and follow-up
+/// (#403) in its text output and under `--json`, both scrubbed on the way
+/// out. Run through the binary because the scrub and the choice of report
+/// are the command's own code, which no library test reaches.
+#[test]
+fn review_prints_a_scrubbed_reason_and_follow_up_as_text_and_as_json() {
+    let root = tempfile::tempdir().unwrap();
+    let checkout = root.path().join("checkout");
+    let stubs = root.path().join("stubs");
+    let db_path = root.path().join("memory.sqlite3");
+    let calls = root.path().join("muse.calls");
+    make_repo(&checkout);
+    std::fs::create_dir_all(&stubs).unwrap();
+    approve(&db_path);
+    executable(&stubs.join("muse"), MUSE_REVIEW_STUB);
+    let issue = NEXT_ISSUE.fetch_add(1, Ordering::Relaxed).to_string();
+
+    let token = format!("ghp_{}", "a1B2c3D4e5".repeat(4));
+    let verdict = serde_json::json!({
+        "verdict": "pass",
+        "risk_class": "logic",
+        "reason": format!("fine; token {token}"),
+        "follow_up": format!("rename x in foo.rs; token {token}"),
+    })
+    .to_string();
+    // Escaped once more, without the outer quotes: the stub pastes it into
+    // a JSON string.
+    let escaped = serde_json::to_string(&verdict).unwrap();
+    let escaped = &escaped[1..escaped.len() - 1];
+
+    let review = |extra: &[&str]| -> String {
+        let output = ironmem()
+            .args(["autopilot", "review", REPO, &issue, "--pr", "42"])
+            .args(["--class", "logic", "--head", "main"])
+            .args(["--path", checkout.to_str().unwrap()])
+            .args(["--db", db_path.to_str().unwrap()])
+            .args(extra)
+            .env("PATH", isolated_path(&stubs))
+            .env("MUSE_CALLS", &calls)
+            .env("MUSE_VERDICT", escaped)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        assert!(
+            output.status.success(),
+            "stdout={stdout} stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        stdout
+    };
+
+    let text = review(&[]);
+    assert!(
+        text.starts_with(&format!("Issue {REPO}#{issue} PR #42\n")),
+        "{text}"
+    );
+    // Whole lines: the token is replaced by the scrubber's marker, not cut
+    // out or left as a fragment.
+    assert!(text.contains("\n  verdict: Some(Pass)\n"), "{text}");
+    assert!(
+        text.contains("\n  reason: fine; token [REDACTED]\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains("\n  follow-up (non-blocking): rename x in foo.rs; token [REDACTED]\n"),
+        "{text}"
+    );
+    assert!(!text.contains(&token), "text output is unscrubbed: {text}");
+
+    let json = review(&["--json"]);
+    let report: serde_json::Value =
+        serde_json::from_str(&json).unwrap_or_else(|e| panic!("{e}: {json}"));
+    assert_eq!(
+        report["outcome"]["reason"], "fine; token [REDACTED]",
+        "{report}"
+    );
+    assert_eq!(
+        report["outcome"]["follow_up"], "rename x in foo.rs; token [REDACTED]",
+        "{report}"
+    );
+    assert!(!json.contains(&token), "JSON output is unscrubbed: {json}");
+
+    // The stub, and nothing else, was the reviewer: once per run.
+    let calls = std::fs::read_to_string(&calls).unwrap();
+    assert_eq!(calls.lines().count(), 2, "{calls}");
+}
+
+/// A stub `gh` for one `advance` pass over one issue with one open PR. It
+/// logs each call's first two words to `$GH_CALLS`, answers the reads from
+/// `$GH_FIXTURES`, and refuses `pr comment` the way the real one does:
+/// several lines on stderr, a tab among them, and exit 1.
+const GH_ADVANCE_STUB: &str = r#"#!/bin/bash
+printf '%s\n' "$1 $2" >> "$GH_CALLS"
+case "$1 $2" in
+  "issue list") cat "$GH_FIXTURES/issue_list.json"; exit 0 ;;
+  "pr list")    cat "$GH_FIXTURES/pr_list.json"; exit 0 ;;
+  "pr view")    cat "$GH_FIXTURES/pr_view.json"; exit 0 ;;
+  "repo view")  echo '{"defaultBranchRef":{"name":"main"}}'; exit 0 ;;
+  "issue view") echo '{"labels":[{"name":"agent:ready"}]}'; exit 0 ;;
+  "pr comment")
+    printf 'GraphQL: Resource not accessible by integration (addComment)\n\thttp status: 403\nsecond line of the refusal\n' >&2
+    exit 1 ;;
+esac
+if [ "$1" = api ]; then
+  case "$*" in
+    *protection*) echo "gh: Branch not protected (HTTP 404)" >&2; exit 1 ;;
+    *)            echo "[[]]"; exit 0 ;;
+  esac
+fi
+exit 0
+"#;
+
+/// `ironmem autopilot advance` without `--json` says a follow-up comment
+/// was not posted, on one indented line that ends with the review's drawer
+/// id (#403). Run through the binary because the printing is the command's
+/// own code: the library tests stop at `PrReview::advance_lines`.
+#[test]
+fn advance_prints_a_failed_follow_up_post_on_one_line_naming_the_drawer() {
+    let root = tempfile::tempdir().unwrap();
+    let checkout = root.path().join("checkout");
+    let worktrees = root.path().join("worktrees");
+    let stubs = root.path().join("stubs");
+    let fixtures = root.path().join("fixtures");
+    let db_path = root.path().join("memory.sqlite3");
+    let muse_calls = root.path().join("muse.calls");
+    let gh_calls = root.path().join("gh.calls");
+    make_repo(&checkout);
+    for dir in [&worktrees, &stubs, &fixtures] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    approve(&db_path);
+    executable(&stubs.join("muse"), MUSE_REVIEW_STUB);
+    executable(&stubs.join("gh"), GH_ADVANCE_STUB);
+
+    // What a green dispatch leaves: the issue's worktree on its branch, and
+    // a recorded success at that head.
+    let number = NEXT_ISSUE.fetch_add(1, Ordering::Relaxed);
+    let issue = IssueRef::new(REPO, number);
+    let worktree = worktree::ensure_worktree(&checkout, &worktrees, &issue, "HEAD").unwrap();
+    let head = worktree::resolve_commit(&worktree.path, "HEAD").expect("a real commit");
+    let branch = worktree::branch_name(&issue);
+    {
+        let db = Database::open(&db_path).unwrap();
+        lineage::upsert_issue_status(
+            &db,
+            &IssueStatus {
+                issue: issue.clone(),
+                best_verdict: Some(AttemptOutcome::Success),
+                best_commit_sha: Some(head.clone()),
+                cumulative_attempt_n: 1,
+            },
+        )
+        .unwrap();
+    }
+    std::fs::write(
+        fixtures.join("issue_list.json"),
+        format!(
+            r#"[{{"number":{number},"title":"t","body":"b","labels":[{{"name":"agent:ready"}},{{"name":"risk:documentation"}}],"updatedAt":"2026-09-03T00:00:00Z"}}]"#
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        fixtures.join("pr_list.json"),
+        format!(
+            r#"[{{"number":42,"headRefName":"{branch}","headRefOid":"{head}","baseRefName":"main","isDraft":false,"url":"u"}}]"#
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        fixtures.join("pr_view.json"),
+        format!(
+            r#"{{"number":42,"state":"OPEN","isDraft":false,"mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","baseRefName":"main","headRefName":"{branch}","headRefOid":"{head}","reviewDecision":"APPROVED"}}"#
+        ),
+    )
+    .unwrap();
+
+    let verdict = serde_json::json!({
+        "verdict": "pass",
+        "risk_class": "documentation",
+        "reason": "fine",
+        "follow_up": "rename x in foo.rs",
+    })
+    .to_string();
+    let escaped = serde_json::to_string(&verdict).unwrap();
+    let escaped = &escaped[1..escaped.len() - 1];
+
+    let output = ironmem()
+        .args(["autopilot", "advance"])
+        .args(["--repo", &format!("{REPO}={}", checkout.display())])
+        .args(["--worktree-root", worktrees.to_str().unwrap()])
+        .args(["--db", db_path.to_str().unwrap()])
+        .env("PATH", isolated_path(&stubs))
+        .env("MUSE_CALLS", &muse_calls)
+        .env("MUSE_VERDICT", escaped)
+        .env("GH_CALLS", &gh_calls)
+        .env("GH_FIXTURES", &fixtures)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(
+        output.status.success(),
+        "stdout={stdout} stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // The verdict line, then the follow-up line right under it, both at the
+    // review's indent.
+    let lines: Vec<&str> = stdout.lines().collect();
+    let verdict_at = lines
+        .iter()
+        .position(|line| line.starts_with("    review: Some(Pass) / "))
+        .unwrap_or_else(|| panic!("no review line: {stdout}"));
+    let follow_up = lines
+        .get(verdict_at + 1)
+        .unwrap_or_else(|| panic!("nothing after the review line: {stdout}"));
+    let (error, drawer_id) = follow_up
+        .strip_prefix("    follow-up: NOT posted as a PR comment (")
+        .and_then(|rest| rest.split_once(") — its text is in the review's drawer "))
+        .unwrap_or_else(|| panic!("not the failed-post line: {follow_up:?} in {stdout}"));
+    // `gh`'s three stderr lines and its tab, on this one line.
+    assert_eq!(
+        error,
+        format!(
+            "Validation error: gh pr comment on {REPO}#42 failed (exit Some(1)): GraphQL: Resource not \
+             accessible by integration (addComment) http status: 403 second line of the refusal"
+        ),
+        "{stdout}"
+    );
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|line| line.contains("follow-up") || line.contains("the refusal"))
+            .count(),
+        1,
+        "the failed post is one line: {stdout}"
+    );
+    // The drawer the line names is the review's, and holds the follow-up.
+    let db = Database::open(&db_path).unwrap();
+    let drawer = db
+        .get_drawer(drawer_id)
+        .unwrap()
+        .unwrap_or_else(|| panic!("no drawer {drawer_id:?}: {stdout}"));
+    assert!(
+        drawer.content.contains("rename x in foo.rs"),
+        "{}",
+        drawer.content
+    );
+
+    // One review by the stub, and one refused comment.
+    let muse_calls = std::fs::read_to_string(&muse_calls).unwrap();
+    assert_eq!(muse_calls.lines().count(), 1, "{muse_calls}");
+    let gh_calls = std::fs::read_to_string(&gh_calls).unwrap();
+    assert_eq!(
+        gh_calls
+            .lines()
+            .filter(|call| *call == "pr comment")
+            .count(),
+        1,
+        "{gh_calls}"
+    );
 }

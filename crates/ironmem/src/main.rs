@@ -1239,18 +1239,8 @@ fn print_advance_report(report: &ironmem::autopilot::advance::AdvanceReport) {
             }
         }
         if let Some(review) = &step.review {
-            match &review.refusal {
-                // Named rather than folded into the verdict line: a ceiling
-                // that refused the review is "retry when the day rolls over",
-                // and the pass stops the issue here rather than letting the
-                // merge report it as unreviewed.
-                Some(refusal) => println!(
-                    "    review: NOT dispatched ({refusal:?}) — the merge was not attempted"
-                ),
-                None => println!(
-                    "    review: {:?} / {:?}",
-                    review.outcome.verdict, review.decision
-                ),
+            for line in review.advance_lines() {
+                println!("    {line}");
             }
         }
         match &step.remediation {

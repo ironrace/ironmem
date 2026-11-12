@@ -9,22 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **Later Autopilot review rounds review the fix (#403).** Once a review of a
-  PR has judged it, the next review's prompt names that review's head and tells
-  the reviewer to read `git diff <last-judged-head>..<head>` first, asks whether
-  those commits resolve the earlier findings and whether they add a defect,
-  and quotes the earlier rounds' reasons (scrubbed, 1,200 characters each, the
-  newest five) with an instruction not to repeat them unless the fix failed. A
-  new finding in already-judged code changes the verdict only when it is
-  blocking (wrong results, data loss, a security hole, a crash); anything else
-  goes in a new verdict field, `follow_up`, which `advance` posts once as a
-  scrubbed, bounded PR comment. The reviewer is also asked to name a finding's
-  pattern and list its other sites. The risk class is still taken from the
-  whole PR. The first round's prompt is unchanged, and a later round falls back
-  to it when the last judged head is unrecorded or not an ancestor of the
-  current head, or when that review's base is unrecorded or differs from the
-  PR's current base (a retargeted PR). The standalone `ironmem autopilot
-  review` prints the follow-up in its text output as well as under `--json`. `REVIEW_VERDICT_JSON_SCHEMA` now requires `follow_up`, typed
+- **Later Autopilot review rounds review the fix (#403).** Once a review of a PR
+  has judged it, the next review's prompt names that review's head and tells the
+  reviewer to read `git diff <last-judged-head>..<head>` first, asks whether
+  those commits resolve the earlier findings and whether they add a defect, and
+  quotes the reasons of the earlier rounds against the current base (scrubbed,
+  1,200 characters each, the newest five) with an instruction not to repeat them
+  unless the fix failed. A new finding in already-judged code changes the
+  verdict only when it is blocking (wrong results, data loss, a security hole, a
+  crash); anything else goes in a new verdict field, `follow_up`, which
+  `advance` posts once as a scrubbed, bounded PR comment; its text output now
+  says whether that comment was posted or failed, and on a failure names the
+  review's drawer, where the follow-up text is. The reviewer is also asked to
+  name a finding's pattern and list its other sites. The risk class is still
+  taken from the whole PR. The first round's prompt is unchanged, and a later
+  round falls back to it when the last judged head is unrecorded or not an
+  ancestor of the current head, or when that review's base is unrecorded or
+  differs from the PR's current base (a retargeted PR). The standalone `ironmem
+  autopilot review` prints the follow-up in its text output as well as under
+  `--json`. `REVIEW_VERDICT_JSON_SCHEMA` now requires `follow_up`, typed
   `["string","null"]`; a reply without it still parses, and one with any other
   type is no verdict.
 
@@ -55,6 +58,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   injected text grew from 1,700 to 2,398 bytes.
 
 ### Fixed
+
+- **A tool that changes its process group while Autopilot enrols it no longer
+  fails the invocation (#403).** The process tracker reads a new descendant
+  from the kernel twice and refused it if anything differed, the process
+  group included, so a tool that called `setsid` or `setpgid` between the two
+  reads failed the invocation with "invocation descendant kernel identity
+  changed during authentication". That failed
+  `timeout_kills_tool_in_a_separate_process_group` on a CI runner. A
+  descendant is now identified by its PID, parent and kernel birth, and is
+  enrolled with the later group; a changed birth or parent is still refused.
 
 - KG boost and the prompt hook's KG recall now match entities whose names
   contain punctuation or a non-ASCII capital (#378). An entity such as

@@ -71,9 +71,11 @@ pub struct ReviewPromptInputs<'a> {
     pub gate_commands: &'a [String],
     /// What an earlier judged review of this PR already covered (#403).
     /// `None` renders round 1 — byte-identical to the prompt before #403
-    /// existed. [`super::review::review_pr`] supplies it only when the last
-    /// judged review's head is recorded and is a strict ancestor of the head
-    /// under review; anything else falls back to round 1.
+    /// existed. [`super::review::review_pr`] supplies it only when the most
+    /// recent judged review read the base now under review and its head is
+    /// recorded and is a strict ancestor of the head under review; anything
+    /// else falls back to round 1
+    /// ([`super::review::later_round_context`]).
     pub later_round: Option<LaterRound<'a>>,
 }
 
@@ -83,9 +85,11 @@ pub struct LaterRound<'a> {
     pub last_judged_head: &'a str,
     /// The commit this round reads. The fix is `last_judged_head..head_sha`.
     pub head_sha: &'a str,
-    /// Every earlier judged round's `reason`, oldest first. Each is scrubbed
-    /// and bounded to [`super::remediate::MAX_FINDINGS_CHARS`] here, and only
-    /// the newest [`MAX_EARLIER_REASONS`] are quoted.
+    /// The `reason` of every earlier judged round against the base now under
+    /// review, oldest first; the caller leaves out a round against another
+    /// base. Each is scrubbed and bounded to
+    /// [`super::remediate::MAX_FINDINGS_CHARS`] here, and only the newest
+    /// [`MAX_EARLIER_REASONS`] are quoted.
     pub earlier_reasons: &'a [String],
 }
 

@@ -1913,10 +1913,18 @@ impl PrReview {
     }
 
     /// The plain-text report `ironmem autopilot review` prints without
-    /// `--json`, one line per field, newline-terminated. Prints the reason
-    /// and the follow-up (#403) as they are — the caller scrubs both first,
-    /// as the CLI does — because the standalone command posts no comment, so
-    /// this is the only place a follow-up reaches the person who ran it.
+    /// `--json`, newline-terminated: the issue and PR, then one indented
+    /// entry per field. The verdict, diff risk class and decision are always
+    /// printed (an absent verdict or class prints `None`). The refusal,
+    /// reason, follow-up, token and record entries are left out when there
+    /// is nothing to say.
+    ///
+    /// Prints the reason and the follow-up (#403) as they are, so the caller
+    /// scrubs both first, as the CLI does. Only an entry's first line is
+    /// indented: a reason or follow-up that holds newlines prints its later
+    /// lines as the reviewer wrote them. The standalone command posts no
+    /// comment, so without `--json` this line is where the person who ran it
+    /// sees the follow-up; it is also stored in the review's drawer.
     pub fn text_report(&self) -> String {
         use std::fmt::Write as _;
         let mut out = String::new();
@@ -1955,6 +1963,75 @@ impl PrReview {
         }
         out
     }
+
+    /// The lines `ironmem autopilot advance` prints for this review without
+    /// `--json`, unindented: the verdict and decision (or why no reviewer
+    /// ran), then what became of the follow-up comment (#403) when there
+    /// was one to post. A failed post is named here because the pass does
+    /// not stop for it, and the text output would otherwise read like a
+    /// pass whose review had no follow-up.
+    ///
+    /// Every entry is one line. The failed post's error is `gh`'s stderr,
+    /// which can span lines, so its control characters become spaces and it
+    /// is cut to [`MAX_ADVANCE_LINE_ERROR_CHARS`]; the whole error stays in
+    /// `follow_up_comment` under `--json`. The line ends with the id of the
+    /// review's drawer, where the follow-up text is, because the text
+    /// output prints the follow-up nowhere else.
+    pub fn advance_lines(&self) -> Vec<String> {
+        let mut lines = vec![match &self.refusal {
+            // Named rather than folded into the verdict line: a ceiling
+            // that refused the review is "retry when the day rolls over",
+            // and the pass stops the issue here rather than letting the
+            // merge report it as unreviewed.
+            Some(refusal) => {
+                format!("review: NOT dispatched ({refusal:?}) — the merge was not attempted")
+            }
+            None => format!("review: {:?} / {:?}", self.outcome.verdict, self.decision),
+        }];
+        match &self.follow_up_comment {
+            None => {}
+            Some(FollowUpComment::Posted) => {
+                lines.push("follow-up: posted as a PR comment".to_string());
+            }
+            Some(FollowUpComment::Failed { error }) => {
+                let error = one_line(error, MAX_ADVANCE_LINE_ERROR_CHARS);
+                // A review whose comment failed was recorded, so the id is
+                // there; without one there is no drawer to point at.
+                let drawer = self
+                    .record_drawer_id
+                    .as_deref()
+                    .map(|id| format!(" — its text is in the review's drawer {id}"))
+                    .unwrap_or_default();
+                lines.push(format!(
+                    "follow-up: NOT posted as a PR comment ({error}){drawer}"
+                ));
+            }
+        }
+        lines
+    }
+}
+
+/// The longest error [`PrReview::advance_lines`] quotes on its failed-post
+/// line, in characters. Enough for `gh`'s first line of stderr, which names
+/// the failure; the whole error is in the `--json` report.
+pub const MAX_ADVANCE_LINE_ERROR_CHARS: usize = 300;
+
+/// `text` as one line of at most `max_chars` characters: every control
+/// character (a newline, a tab, an escape) becomes a space, runs of
+/// whitespace collapse to one space, and a cut is marked with `…`, which
+/// counts toward the bound.
+fn one_line(text: &str, max_chars: usize) -> String {
+    let flat: String = text
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let flat = flat.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= max_chars {
+        return flat;
+    }
+    let mut cut: String = flat.chars().take(max_chars.saturating_sub(1)).collect();
+    cut.push('…');
+    cut
 }
 
 fn serialize_issue<S>(issue: &IssueRef, serializer: S) -> Result<S::Ok, S::Error>
@@ -1969,7 +2046,9 @@ where
 pub struct LaterRoundContext {
     /// The head the most recent judged review of this PR read.
     pub last_judged_head: String,
-    /// Every judged review of this PR's `reason`, oldest first.
+    /// The `reason` of every judged review of this PR against the base now
+    /// under review, oldest first. A judged review against another base, or
+    /// one that recorded no base, is left out.
     pub earlier_reasons: Vec<String>,
 }
 
@@ -3263,6 +3342,126 @@ not json at all
     }
 
     #[test]
+    fn a_review_of_a_slug_colliding_repo_is_not_this_prs_earlier_round() {
+        // `repo_slug` turns `/` into `-`, so `a-b/c` and `a/b-c` share one
+        // lineage entity and read each other's reviews. A judged review of
+        // the other repo's PR of the same number is not a round of this PR:
+        // it is reviewed whole, and the other repo's reason is not quoted.
+        let (repo, first, second, _) = fix_history_repo();
+        let db = Database::open_in_memory().unwrap();
+        let gates = vec!["cargo test --workspace".to_string()];
+        let other = IssueRef::new("a-b/c", 283);
+        let issue = IssueRef::new("a/b-c", 283);
+        assert_eq!(
+            other.entity_name(),
+            issue.entity_name(),
+            "the two repos must share an entity for this test to mean anything"
+        );
+        review_at(
+            &db,
+            &sample_request(&other, &gates, repo.path()),
+            &first,
+            needs_changes("the other repo's finding"),
+        );
+
+        let request = sample_request(&issue, &gates, repo.path());
+        let prompt = review_at(&db, &request, &second, passing_outcome(RiskClass::Logic));
+        assert_eq!(prompt, round_one_prompt(&request));
+    }
+
+    #[test]
+    fn a_last_judged_review_on_another_base_falls_back_even_after_one_on_this_base() {
+        // main, then release, then main again: the most recent judged review
+        // read `release`, so it cannot vouch for `main`, even though an
+        // older round against `main` exists. The whole PR is reviewed again.
+        let (repo, first, second, _) = fix_history_repo();
+        let db = Database::open_in_memory().unwrap();
+        let issue = IssueRef::new("ironrace/ironmem", 283);
+        let gates = vec!["cargo test --workspace".to_string()];
+        let request = sample_request(&issue, &gates, repo.path());
+        let retargeted = ReviewRequest {
+            base_branch: "release",
+            head_sha: None,
+            ..request
+        };
+
+        review_at(&db, &request, &first, needs_changes("judged on main"));
+        review_at(&db, &retargeted, &first, needs_changes("judged on release"));
+        let prompt = review_at(&db, &request, &second, passing_outcome(RiskClass::Logic));
+        assert_eq!(prompt, round_one_prompt(&request));
+    }
+
+    #[test]
+    fn a_base_that_differs_only_in_case_is_another_base() {
+        // Git branch names are case-sensitive, so `Main` and `main` are two
+        // branches. The base is compared exactly, unlike the issue, whose
+        // repo name is matched ignoring case (the repo-casing test above).
+        let (repo, first, second, _) = fix_history_repo();
+        let db = Database::open_in_memory().unwrap();
+        let issue = IssueRef::new("ironrace/ironmem", 283);
+        let gates = vec!["cargo test --workspace".to_string()];
+        let request = sample_request(&issue, &gates, repo.path());
+        let other_case = ReviewRequest {
+            base_branch: "Main",
+            head_sha: None,
+            ..request
+        };
+
+        review_at(&db, &other_case, &first, needs_changes("judged on Main"));
+        let prompt = review_at(&db, &request, &second, passing_outcome(RiskClass::Logic));
+        assert_eq!(prompt, round_one_prompt(&request));
+    }
+
+    #[test]
+    fn an_unjudged_review_after_a_judged_one_does_not_hide_the_judged_round() {
+        // The newest review of this base crashed (#350: it read nothing).
+        // The last *judged* one still names the head the fix starts from.
+        let (repo, first, second, _) = fix_history_repo();
+        let db = Database::open_in_memory().unwrap();
+        let issue = IssueRef::new("ironrace/ironmem", 283);
+        let gates = vec!["cargo test --workspace".to_string()];
+        let request = sample_request(&issue, &gates, repo.path());
+
+        review_at(&db, &request, &first, needs_changes("judged finding"));
+        let crashed = ReviewOutcome {
+            process_success: false,
+            ..needs_changes("crashed run")
+        };
+        review_at(&db, &request, &second, crashed);
+        let prompt = review_at(&db, &request, &second, passing_outcome(RiskClass::Logic));
+        assert!(
+            prompt.contains(&format!("git diff {first}..{second}")),
+            "{prompt}"
+        );
+        assert!(prompt.contains("> judged finding"), "{prompt}");
+        assert!(!prompt.contains("crashed run"), "{prompt}");
+    }
+
+    #[test]
+    fn an_older_review_with_no_recorded_base_is_not_quoted() {
+        // A judged review from before the base was recorded cannot be tied
+        // to this base, so a later round against `main` leaves it out.
+        let (repo, first, second, _) = fix_history_repo();
+        let db = Database::open_in_memory().unwrap();
+        let issue = IssueRef::new("ironrace/ironmem", 283);
+        let gates = vec!["cargo test --workspace".to_string()];
+        let request = sample_request(&issue, &gates, repo.path());
+
+        let mut unrecorded = sample_record(&issue, "judged with no base");
+        unrecorded.head_sha = Some(first.clone());
+        unrecorded.base_branch = None;
+        record_review(&db, &unrecorded).unwrap();
+        review_at(&db, &request, &first, needs_changes("judged on main"));
+        let prompt = review_at(&db, &request, &second, passing_outcome(RiskClass::Logic));
+        assert!(
+            prompt.contains(&format!("git diff {first}..{second}")),
+            "{prompt}"
+        );
+        assert!(prompt.contains("> judged on main"), "{prompt}");
+        assert!(!prompt.contains("judged with no base"), "{prompt}");
+    }
+
+    #[test]
     fn a_follow_up_is_recorded_scrubbed_and_read_back() {
         let db = Database::open_in_memory().unwrap();
         let issue = IssueRef::new("ironrace/ironmem", 283);
@@ -3280,41 +3479,147 @@ not json at all
         );
     }
 
-    #[test]
-    fn the_text_report_prints_a_follow_up_and_omits_an_empty_one() {
-        // The standalone `ironmem autopilot review` posts no comment, so
-        // without `--json` this report is the only place its follow-up shows.
-        let issue = IssueRef::new("ironrace/ironmem", 283);
-        let outcome = ReviewOutcome {
-            reason: Some("fine".into()),
-            follow_up: Some("rename x in foo.rs; same in bar.rs".into()),
-            ..passing_outcome(RiskClass::Logic)
-        };
-        let mut review = PrReview {
-            issue,
+    fn reported_review(outcome: ReviewOutcome) -> PrReview {
+        PrReview {
+            issue: IssueRef::new("ironrace/ironmem", 283),
             pr_number: 322,
             decision: decide_merge(true, "logic", outcome.judgment()),
             outcome,
             record_drawer_id: Some("drawer-1".into()),
             refusal: None,
             follow_up_comment: None,
-        };
-        let text = review.text_report();
-        assert!(
-            text.starts_with("Issue ironrace/ironmem#283 PR #322\n"),
-            "{text}"
-        );
-        assert!(text.contains("  reason: fine\n"), "{text}");
-        assert!(
-            text.contains("  follow-up (non-blocking): rename x in foo.rs; same in bar.rs\n"),
-            "{text}"
-        );
-        assert!(text.contains("  recorded: drawer-1\n"), "{text}");
-
-        for empty in [None, Some("  \n ".to_string())] {
-            review.outcome.follow_up = empty;
-            assert!(!review.text_report().contains("follow-up"));
         }
+    }
+
+    #[test]
+    fn the_text_report_prints_every_present_field_in_order() {
+        // Every line the report can print, with every optional field set.
+        // No real review sets them all (a refused one has no verdict); this
+        // pins each line's text and their order.
+        let mut review = reported_review(ReviewOutcome {
+            reason: Some("fine".into()),
+            follow_up: Some("rename x in foo.rs; same in bar.rs".into()),
+            token_usage: Some(ReviewTokenUsage {
+                input_tokens: 1200,
+                cached_input_tokens: 300,
+                output_tokens: 400,
+            }),
+            ..passing_outcome(RiskClass::Logic)
+        });
+        review.refusal = Some(ReviewRefusal::DailyBudgetExhausted);
+        assert_eq!(
+            review.text_report(),
+            "Issue ironrace/ironmem#283 PR #322\n\
+             \x20 reviewer: not dispatched (DailyBudgetExhausted)\n\
+             \x20 verdict: Some(Pass)\n\
+             \x20 diff risk class: Some(Logic)\n\
+             \x20 reason: fine\n\
+             \x20 follow-up (non-blocking): rename x in foo.rs; same in bar.rs\n\
+             \x20 tokens: 1200 in (300 cached), 400 out — no price reported by Codex\n\
+             \x20 decision: HoldForHuman(HighRiskClass { class: Logic })\n\
+             \x20 recorded: drawer-1\n"
+        );
+    }
+
+    #[test]
+    fn the_text_report_leaves_out_every_absent_field() {
+        let mut review = reported_review(ReviewOutcome {
+            reason: None,
+            ..passing_outcome(RiskClass::Logic)
+        });
+        review.record_drawer_id = None;
+        let bare = "Issue ironrace/ironmem#283 PR #322\n\
+                    \x20 verdict: Some(Pass)\n\
+                    \x20 diff risk class: Some(Logic)\n\
+                    \x20 decision: HoldForHuman(HighRiskClass { class: Logic })\n";
+        assert_eq!(review.text_report(), bare);
+
+        // The standalone `ironmem autopilot review` posts no comment, so
+        // without `--json` this line is where its follow-up shows. An empty
+        // or blank one prints no line.
+        for empty in [None, Some(String::new()), Some("  \n ".to_string())] {
+            review.outcome.follow_up = empty;
+            assert_eq!(review.text_report(), bare);
+        }
+    }
+
+    #[test]
+    fn the_advance_lines_name_a_posted_and_a_failed_follow_up_comment() {
+        let mut review = reported_review(passing_outcome(RiskClass::Logic));
+        let verdict = "review: Some(Pass) / HoldForHuman(HighRiskClass { class: Logic })";
+        assert_eq!(review.advance_lines(), [verdict]);
+
+        review.follow_up_comment = Some(FollowUpComment::Posted);
+        assert_eq!(
+            review.advance_lines(),
+            [verdict, "follow-up: posted as a PR comment"]
+        );
+
+        // A failed post does not stop the pass, so the text output has to
+        // say it happened: under `--json` it is `follow_up_comment`.
+        // The line names the review's drawer, because the text output prints
+        // the follow-up itself nowhere.
+        review.follow_up_comment = Some(FollowUpComment::Failed {
+            error: "HTTP 403".into(),
+        });
+        assert_eq!(
+            review.advance_lines(),
+            [
+                verdict,
+                "follow-up: NOT posted as a PR comment (HTTP 403) — its text is in the review's drawer drawer-1"
+            ]
+        );
+
+        // No recorded drawer, no drawer to point at.
+        review.record_drawer_id = None;
+        assert_eq!(
+            review.advance_lines(),
+            [verdict, "follow-up: NOT posted as a PR comment (HTTP 403)"]
+        );
+        review.record_drawer_id = Some("drawer-1".into());
+
+        // `gh`'s stderr can span lines and run long. The entry stays one
+        // line, bounded, with the cut marked.
+        review.follow_up_comment = Some(FollowUpComment::Failed {
+            error: format!(
+                "HTTP 403:\tforbidden\r\n  second line\x1b[0m {}",
+                "x".repeat(400)
+            ),
+        });
+        let prefix = "HTTP 403: forbidden second line [0m ";
+        let error = format!(
+            "{prefix}{}…",
+            "x".repeat(MAX_ADVANCE_LINE_ERROR_CHARS - 1 - prefix.len())
+        );
+        assert_eq!(error.chars().count(), MAX_ADVANCE_LINE_ERROR_CHARS);
+        assert_eq!(
+            review.advance_lines(),
+            [
+                verdict.to_string(),
+                format!(
+                    "follow-up: NOT posted as a PR comment ({error}) — its text is in the review's drawer drawer-1"
+                )
+            ]
+        );
+
+        // A refused review ran no reviewer, so it has no follow-up to post.
+        review.follow_up_comment = None;
+        review.refusal = Some(ReviewRefusal::UnpricedReviewCapReached);
+        assert_eq!(
+            review.advance_lines(),
+            ["review: NOT dispatched (UnpricedReviewCapReached) — the merge was not attempted"]
+        );
+    }
+
+    #[test]
+    fn one_line_flattens_control_characters_and_marks_a_cut() {
+        assert_eq!(one_line("a\nb\tc\r\n\x1b d", 80), "a b c d");
+        assert_eq!(one_line("  padded  ", 80), "padded");
+        assert_eq!(one_line("abcde", 5), "abcde");
+        assert_eq!(one_line("abcdef", 5), "abcd…");
+        // Counted in characters, not bytes.
+        assert_eq!(one_line("ééééé", 5), "ééééé");
+        assert_eq!(one_line("éééééé", 5), "éééé…");
     }
 
     #[test]
