@@ -918,14 +918,16 @@ the reviewer gets a fresh review rather than the same hold for ever.
 
 The first review of a PR reads the whole diff, `git diff <base>...<head>`.
 Any review after it is a **later round** when an earlier review of the same
-PR judged it and that review's head is recorded and is an ancestor of the
-head now under review, in the issue's worktree. A later round's prompt:
+PR judged it, that review recorded the same base branch as the one now under
+review, and that review's head is recorded and is an ancestor of the head now
+under review, in the issue's worktree. A later round's prompt:
 
 - names the last judged head and tells the reviewer to read the fix first,
   `git diff <last-judged-head>..<head>`, and then the whole PR for context;
 - asks whether those commits resolve the earlier findings and whether they
   add a defect of their own;
-- quotes the earlier rounds' `reason` text, oldest first, each scrubbed and
+- quotes the `reason` text of the earlier rounds against the same base,
+  oldest first, each scrubbed and
   bounded to 1,200 characters as remediation findings are, and only the
   newest five, and tells the reviewer not to report one again unless the fix
   failed to resolve it;
@@ -941,10 +943,11 @@ that only touches docs cannot reclassify a logic PR as `documentation`. The
 merge decision, the attempt cap and the reviewer's read-only argv are the
 same in every round.
 
-With no earlier judged review, an unrecorded head, a head that is not an
-ancestor (a force-push rewrote the branch, or the worktree lacks the
-commit), or the same head again, the review falls back to the first-round
-prompt, byte for byte.
+With no earlier judged review, an unrecorded head or base, a base that
+differs from the last judged review's (the PR was retargeted, so the new base
+can expose code no round judged), a head that is not an ancestor (a
+force-push rewrote the branch, or the worktree lacks the commit), or the same
+head again, the review falls back to the first-round prompt, byte for byte.
 
 `follow_up` is part of the verdict schema in every round: Codex's strict
 schema requires it, typed string or `null`; a Muse reply may omit it. A
@@ -953,7 +956,8 @@ review's `follow_up` is non-empty, `advance` posts it once as a PR comment,
 scrubbed and bounded, and opens no issue. A failed post is reported on the
 review as `follow_up_comment: {"status": "failed", ...}` and does not stop
 the pass; the text stays in the review's drawer. The standalone
-`ironmem autopilot review` command prints the follow-up and posts nothing.
+`ironmem autopilot review` command posts nothing: it prints the follow-up as
+a `follow-up (non-blocking):` line, or as `outcome.follow_up` under `--json`.
 
 ## The auto-merge envelope
 

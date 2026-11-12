@@ -22,7 +22,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pattern and list its other sites. The risk class is still taken from the
   whole PR. The first round's prompt is unchanged, and a later round falls back
   to it when the last judged head is unrecorded or not an ancestor of the
-  current head. `REVIEW_VERDICT_JSON_SCHEMA` now requires `follow_up`, typed
+  current head, or when that review's base is unrecorded or differs from the
+  PR's current base (a retargeted PR). The standalone `ironmem autopilot
+  review` prints the follow-up in its text output as well as under `--json`. `REVIEW_VERDICT_JSON_SCHEMA` now requires `follow_up`, typed
   `["string","null"]`; a reply without it still parses, and one with any other
   type is no verdict.
 

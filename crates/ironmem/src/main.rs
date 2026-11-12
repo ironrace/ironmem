@@ -2355,29 +2355,7 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                 if json {
                     println!("{}", serde_json::to_string_pretty(&review)?);
                 } else {
-                    println!(
-                        "Issue {} PR #{}",
-                        review.issue.canonical(),
-                        review.pr_number
-                    );
-                    if let Some(refusal) = &review.refusal {
-                        println!("  reviewer: not dispatched ({refusal:?})");
-                    }
-                    println!("  verdict: {:?}", review.outcome.verdict);
-                    println!("  diff risk class: {:?}", review.outcome.risk_class);
-                    if let Some(reason) = &review.outcome.reason {
-                        println!("  reason: {reason}");
-                    }
-                    if let Some(usage) = &review.outcome.token_usage {
-                        println!(
-                            "  tokens: {} in ({} cached), {} out — no price reported by Codex",
-                            usage.input_tokens, usage.cached_input_tokens, usage.output_tokens
-                        );
-                    }
-                    println!("  decision: {:?}", review.decision);
-                    if let Some(id) = &review.record_drawer_id {
-                        println!("  recorded: {id}");
-                    }
+                    print!("{}", review.text_report());
                 }
                 Ok(())
             }

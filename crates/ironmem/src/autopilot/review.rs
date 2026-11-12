@@ -1911,6 +1911,50 @@ impl PrReview {
     pub fn dispatched(&self) -> bool {
         self.refusal.is_none()
     }
+
+    /// The plain-text report `ironmem autopilot review` prints without
+    /// `--json`, one line per field, newline-terminated. Prints the reason
+    /// and the follow-up (#403) as they are — the caller scrubs both first,
+    /// as the CLI does — because the standalone command posts no comment, so
+    /// this is the only place a follow-up reaches the person who ran it.
+    pub fn text_report(&self) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::new();
+        let _ = writeln!(
+            out,
+            "Issue {} PR #{}",
+            self.issue.canonical(),
+            self.pr_number
+        );
+        if let Some(refusal) = &self.refusal {
+            let _ = writeln!(out, "  reviewer: not dispatched ({refusal:?})");
+        }
+        let _ = writeln!(out, "  verdict: {:?}", self.outcome.verdict);
+        let _ = writeln!(out, "  diff risk class: {:?}", self.outcome.risk_class);
+        if let Some(reason) = &self.outcome.reason {
+            let _ = writeln!(out, "  reason: {reason}");
+        }
+        if let Some(follow_up) = self
+            .outcome
+            .follow_up
+            .as_deref()
+            .filter(|t| !t.trim().is_empty())
+        {
+            let _ = writeln!(out, "  follow-up (non-blocking): {follow_up}");
+        }
+        if let Some(usage) = &self.outcome.token_usage {
+            let _ = writeln!(
+                out,
+                "  tokens: {} in ({} cached), {} out — no price reported by Codex",
+                usage.input_tokens, usage.cached_input_tokens, usage.output_tokens
+            );
+        }
+        let _ = writeln!(out, "  decision: {:?}", self.decision);
+        if let Some(id) = &self.record_drawer_id {
+            let _ = writeln!(out, "  recorded: {id}");
+        }
+        out
+    }
 }
 
 fn serialize_issue<S>(issue: &IssueRef, serializer: S) -> Result<S::Ok, S::Error>
@@ -1934,11 +1978,14 @@ pub struct LaterRoundContext {
 ///
 /// A later round needs all of: an earlier review of **this** PR that judged
 /// (#350 — a crashed or verdict-less run read nothing), a recorded head on
-/// the most recent one, and that head being a strict ancestor of the one
-/// under review in the reviewer's checkout. Anything else — no judged
-/// review, an unrecorded head, a force-push that rewrote it, a checkout that
-/// lacks it, or the same head again (there is no fix to read) — is round 1,
-/// which reviews the whole PR as before.
+/// the most recent one, a recorded base on it equal to the base under review,
+/// and that head being a strict ancestor of the one under review in the
+/// reviewer's checkout. Anything else — no judged review, an unrecorded head
+/// or base, a retargeted PR (the new base exposes code no round judged), a
+/// force-push that rewrote the head, a checkout that lacks it, or the same
+/// head again (there is no fix to read) — is round 1, which reviews the whole
+/// PR as before. Only reviews against the current base are quoted as earlier
+/// rounds.
 pub fn later_round_context(
     db: &Database,
     request: &ReviewRequest,
@@ -1950,13 +1997,24 @@ pub fn later_round_context(
     // Filtered on the canonical issue as well as the PR, because
     // `repo_slug` collapses `owner/repo` and `owner-repo` onto one entity.
     let canonical = request.issue.canonical();
-    let judged: Vec<RecordedReviewSummary> = reviews_for_issue(db, request.issue)?
+    let mut judged: Vec<RecordedReviewSummary> = reviews_for_issue(db, request.issue)?
         .into_iter()
         .filter(|r| r.issue == canonical && r.pr_number == request.pr_number && r.judged())
         .collect();
-    let Some(last_judged_head) = judged.last().and_then(|r| r.head_sha.clone()) else {
+    // The most recent judged review must have read this same base: after a
+    // retarget, `last_judged_head..head` omits code the new base exposes,
+    // and a finding there would be wrongly downgraded to a follow-up. An
+    // unrecorded base (a pre-rung-6 review) cannot vouch for it either.
+    let Some(last) = judged.last() else {
         return Ok(None);
     };
+    if last.base_branch.as_deref() != Some(request.base_branch) {
+        return Ok(None);
+    }
+    let Some(last_judged_head) = last.head_sha.clone() else {
+        return Ok(None);
+    };
+    judged.retain(|r| r.base_branch.as_deref() == Some(request.base_branch));
     if last_judged_head.eq_ignore_ascii_case(head_sha)
         || !super::worktree::commit_is_ancestor(request.repo_dir, &last_judged_head, head_sha)
     {
@@ -3123,6 +3181,49 @@ not json at all
     }
 
     #[test]
+    fn a_retargeted_or_unrecorded_base_falls_back_to_round_one() {
+        // The head advanced from a judged one, but the PR now targets a
+        // different base: the new base can expose code no round judged, so
+        // the whole PR is reviewed again rather than just the fix.
+        let (repo, first, second, _) = fix_history_repo();
+        let issue = IssueRef::new("ironrace/ironmem", 283);
+        let gates = vec!["cargo test --workspace".to_string()];
+        let request = sample_request(&issue, &gates, repo.path());
+        let retargeted = ReviewRequest {
+            base_branch: "release",
+            head_sha: None,
+            ..request
+        };
+
+        let db = Database::open_in_memory().unwrap();
+        review_at(&db, &request, &first, needs_changes("finding"));
+        let prompt = review_at(&db, &retargeted, &second, passing_outcome(RiskClass::Logic));
+        assert_eq!(prompt, round_one_prompt(&retargeted), "retargeted base");
+
+        // The last judged review recorded no base: it cannot vouch for one.
+        let db = Database::open_in_memory().unwrap();
+        let mut unrecorded = sample_record(&issue, "finding");
+        unrecorded.head_sha = Some(first.clone());
+        unrecorded.base_branch = None;
+        record_review(&db, &unrecorded).unwrap();
+        let prompt = review_at(&db, &request, &second, passing_outcome(RiskClass::Logic));
+        assert_eq!(prompt, round_one_prompt(&request), "unrecorded base");
+
+        // Retargeted back: only the rounds against the current base are
+        // quoted, and the last judged one must be against it.
+        let db = Database::open_in_memory().unwrap();
+        review_at(&db, &retargeted, &first, needs_changes("judged on release"));
+        review_at(&db, &request, &first, needs_changes("judged on main"));
+        let prompt = review_at(&db, &request, &second, passing_outcome(RiskClass::Logic));
+        assert!(
+            prompt.contains(&format!("git diff {first}..{second}")),
+            "{prompt}"
+        );
+        assert!(prompt.contains("> judged on main"), "{prompt}");
+        assert!(!prompt.contains("judged on release"), "{prompt}");
+    }
+
+    #[test]
     fn a_follow_up_is_recorded_scrubbed_and_read_back() {
         let db = Database::open_in_memory().unwrap();
         let issue = IssueRef::new("ironrace/ironmem", 283);
@@ -3138,6 +3239,43 @@ not json at all
             !follow_up.contains(&token),
             "follow-up reached storage unscrubbed"
         );
+    }
+
+    #[test]
+    fn the_text_report_prints_a_follow_up_and_omits_an_empty_one() {
+        // The standalone `ironmem autopilot review` posts no comment, so
+        // without `--json` this report is the only place its follow-up shows.
+        let issue = IssueRef::new("ironrace/ironmem", 283);
+        let outcome = ReviewOutcome {
+            reason: Some("fine".into()),
+            follow_up: Some("rename x in foo.rs; same in bar.rs".into()),
+            ..passing_outcome(RiskClass::Logic)
+        };
+        let mut review = PrReview {
+            issue,
+            pr_number: 322,
+            decision: decide_merge(true, "logic", outcome.judgment()),
+            outcome,
+            record_drawer_id: Some("drawer-1".into()),
+            refusal: None,
+            follow_up_comment: None,
+        };
+        let text = review.text_report();
+        assert!(
+            text.starts_with("Issue ironrace/ironmem#283 PR #322\n"),
+            "{text}"
+        );
+        assert!(text.contains("  reason: fine\n"), "{text}");
+        assert!(
+            text.contains("  follow-up (non-blocking): rename x in foo.rs; same in bar.rs\n"),
+            "{text}"
+        );
+        assert!(text.contains("  recorded: drawer-1\n"), "{text}");
+
+        for empty in [None, Some("  \n ".to_string())] {
+            review.outcome.follow_up = empty;
+            assert!(!review.text_report().contains("follow-up"));
+        }
     }
 
     #[test]
