@@ -198,6 +198,13 @@ pub struct AdvanceConfig {
     /// never fires or never stops, and this module is the half that decides
     /// when the automation gives up and tells a human.
     pub attempt_cap: u32,
+    /// How many consecutive `needs_changes` rounds one PR gets before a
+    /// remediation stops being armed and the PR is held for a human (#404).
+    ///
+    /// Read only when `remediate` is on, and only here: this pass is what
+    /// arms a fix, so the Lead has no matching setting to keep in step.
+    /// See [`remediate::DEFAULT_MAX_REVIEW_ROUNDS`].
+    pub max_review_rounds: u32,
     pub strategy: MergeStrategy,
     pub delete_branch: bool,
     /// Change nothing anywhere: no merge, no comment, no label, no cleanup.
@@ -232,6 +239,14 @@ impl AdvanceConfig {
         // and fail the next.
         if self.attempt_cap == 0 {
             return Err(MemoryError::Config("attempt_cap must be at least 1".into()));
+        }
+        // Checked whether or not `remediate` is set, for the reason the cap
+        // is: the same value must not pass one command line and fail the
+        // next.
+        if self.max_review_rounds == 0 {
+            return Err(MemoryError::Config(
+                "max_review_rounds must be at least 1".into(),
+            ));
         }
         for target in &self.targets {
             validate_repo(&target.repo)?;
@@ -1170,7 +1185,7 @@ fn advance_issue(
                     head_sha: &head_sha,
                     findings: objection.reason.as_deref(),
                     attempt_cap: config.attempt_cap,
-                    max_review_rounds: remediate::DEFAULT_MAX_REVIEW_ROUNDS,
+                    max_review_rounds: config.max_review_rounds,
                 },
             )?);
         }
@@ -1208,7 +1223,21 @@ fn advance_issue(
     // hold.
     let remediation_in_force = remediation.as_ref().is_some_and(ArmOutcome::in_force)
         && remediate::active_remediation(db, &candidate.issue)?.is_some();
-    let merge_dry_run = config.dry_run || !config.merge || remediation_in_force;
+    // #404: at the review-round limit nothing was armed, so nothing will
+    // re-dispatch, and the hold is the only thing that tells a human. It
+    // therefore runs for real even without `--merge` — a hold is not a
+    // merge, and `execute_merge` cannot reach one for a request that carries
+    // a round limit. `--dry-run` still writes nothing: arming is skipped on
+    // a dry run, so `round_limit` is `None` there.
+    let round_limit = match &remediation {
+        Some(ArmOutcome::RoundLimitReached { rounds, limit }) => Some(merge::RoundLimit {
+            rounds: *rounds,
+            limit: *limit,
+        }),
+        _ => None,
+    };
+    let merge_dry_run =
+        config.dry_run || remediation_in_force || (!config.merge && round_limit.is_none());
     let execution = merge::execute_merge(
         db,
         gh_runner,
@@ -1219,7 +1248,7 @@ fn advance_issue(
             strategy: config.strategy,
             delete_branch: config.delete_branch,
             dry_run: merge_dry_run,
-            round_limit: None,
+            round_limit,
         },
     )?;
 
@@ -1534,6 +1563,7 @@ mod tests {
     const REPO: &str = "ironrace/ironmem";
     const GREEN: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const MOVED: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const EARLIER: &str = "cccccccccccccccccccccccccccccccccccccccc";
 
     fn issue() -> IssueRef {
         IssueRef::new(REPO, 283)
@@ -1659,6 +1689,7 @@ mod tests {
             merge: false,
             remediate: false,
             attempt_cap: DEFAULT_ATTEMPT_CAP,
+            max_review_rounds: remediate::DEFAULT_MAX_REVIEW_ROUNDS,
             strategy: MergeStrategy::Squash,
             delete_branch: false,
             dry_run: false,
@@ -5057,5 +5088,231 @@ skipped: {:?}",
         config.daily_budget_usd = 25.0;
         config.max_advances_per_pass = 0;
         assert!(config.validate().is_err());
+    }
+
+    // ── #404: the review-round limit ────────────────────────────────────
+
+    /// Two earlier `needs_changes` rounds on PR 322, at two earlier heads.
+    fn two_earlier_rounds(db: &Database) {
+        reviewed_at_needing_changes(db, &issue(), 322, EARLIER);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        reviewed_at_needing_changes(db, &issue(), 322, MOVED);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+
+    /// What a pass that reaches the real hold reads and writes after the
+    /// listings: the PR, the issue's labels, the comment, the label write.
+    fn hold_script() -> Vec<Result<GhOutput, MemoryError>> {
+        vec![
+            ok(&issue_list_json(
+                283,
+                &["agent:ready", "risk:documentation"],
+            )),
+            ok(&pr_list_json(322, GREEN)),
+            ok(&pr_view_json(GREEN)),
+            ok(r#"{"labels":[{"name":"agent:ready"}]}"#),
+            ok(""),
+            ok(""),
+            ok(""),
+        ]
+    }
+
+    #[test]
+    fn a_third_needs_changes_round_holds_the_pr_instead_of_arming_a_fix() {
+        // With and without `--merge`: the hold is not a merge, and a loop
+        // that stopped dispatching without telling anyone would be silent.
+        for merge_enabled in [false, true] {
+            let db = approved_db();
+            record_success(&db, &issue(), Some(GREEN));
+            two_earlier_rounds(&db);
+            let (repo, roots) = checkout_with_worktree();
+            let mut cfg = config(roots.path(), repo.path());
+            cfg.merge = merge_enabled;
+            cfg.remediate = true;
+            let mut gh = ScriptedGh::new(hold_script());
+
+            let report = advance_pass(&db, &mut gh, &mut needs_changes(), &cfg).unwrap();
+            let advanced = &report.advanced[0];
+
+            assert_eq!(
+                advanced.remediation,
+                Some(ArmOutcome::RoundLimitReached {
+                    rounds: 3,
+                    limit: 3,
+                }),
+                "merge={merge_enabled}"
+            );
+            let execution = advanced.merge.as_ref().unwrap();
+            assert_eq!(
+                execution.outcome.hold(),
+                Some(&merge::MergeHold::Review(
+                    review::HoldReason::ReviewRoundsExhausted {
+                        rounds: 3,
+                        limit: 3,
+                    }
+                )),
+                "merge={merge_enabled}"
+            );
+            assert!(
+                execution.commented && execution.label_plan.is_some(),
+                "merge={merge_enabled}: the hold is real, not rehearsed"
+            );
+            let comments = pr_comments(&gh);
+            assert_eq!(comments.len(), 1, "seen: {:?}", gh.seen);
+            assert_eq!(comments[0][2], "322");
+            assert!(comments[0][6].contains("has not converged"));
+            assert!(comments[0][6].contains("the retry loop is unbounded"));
+            assert!(
+                gh.seen
+                    .iter()
+                    .any(|argv| argv.iter().any(|arg| arg == "agent:blocked")),
+                "seen: {:?}",
+                gh.seen
+            );
+            assert_eq!(
+                remediate::get_remediation(&db, &issue()).unwrap(),
+                None,
+                "nothing is armed, so the Lead has nothing to dispatch"
+            );
+            assert_eq!(gh.seen.len(), 7, "seen: {:?}", gh.seen);
+        }
+    }
+
+    #[test]
+    fn a_second_needs_changes_round_still_arms_a_fix() {
+        let db = approved_db();
+        record_success(&db, &issue(), Some(GREEN));
+        reviewed_at_needing_changes(&db, &issue(), 322, MOVED);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let (repo, roots) = checkout_with_worktree();
+        let mut cfg = config(roots.path(), repo.path());
+        cfg.merge = true;
+        cfg.remediate = true;
+        let mut gh = ScriptedGh::new(vec![
+            ok(&issue_list_json(
+                283,
+                &["agent:ready", "risk:documentation"],
+            )),
+            ok(&pr_list_json(322, GREEN)),
+            ok(&pr_view_json(GREEN)),
+        ]);
+
+        let report = advance_pass(&db, &mut gh, &mut needs_changes(), &cfg).unwrap();
+
+        assert!(
+            matches!(
+                report.advanced[0].remediation,
+                Some(ArmOutcome::Armed { .. })
+            ),
+            "got {:?}",
+            report.advanced[0].remediation
+        );
+        assert!(pr_comments(&gh).is_empty(), "seen: {:?}", gh.seen);
+        assert_eq!(gh.seen.len(), 3, "seen: {:?}", gh.seen);
+    }
+
+    #[test]
+    fn a_configured_limit_of_two_holds_on_the_second_round() {
+        let db = approved_db();
+        record_success(&db, &issue(), Some(GREEN));
+        reviewed_at_needing_changes(&db, &issue(), 322, MOVED);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let (repo, roots) = checkout_with_worktree();
+        let mut cfg = config(roots.path(), repo.path());
+        cfg.remediate = true;
+        cfg.max_review_rounds = 2;
+        let mut gh = ScriptedGh::new(hold_script());
+
+        let report = advance_pass(&db, &mut gh, &mut needs_changes(), &cfg).unwrap();
+
+        assert_eq!(
+            report.advanced[0].remediation,
+            Some(ArmOutcome::RoundLimitReached {
+                rounds: 2,
+                limit: 2,
+            })
+        );
+        assert_eq!(pr_comments(&gh).len(), 1, "seen: {:?}", gh.seen);
+        assert_eq!(gh.seen.len(), 7, "seen: {:?}", gh.seen);
+    }
+
+    #[test]
+    fn a_relabelled_issue_gets_a_fresh_count_and_no_second_comment() {
+        let db = approved_db();
+        record_success(&db, &issue(), Some(GREEN));
+        two_earlier_rounds(&db);
+        let (repo, roots) = checkout_with_worktree();
+        let mut cfg = config(roots.path(), repo.path());
+        cfg.merge = true;
+        cfg.remediate = true;
+        let mut gh = ScriptedGh::new(hold_script());
+        advance_pass(&db, &mut gh, &mut needs_changes(), &cfg).unwrap();
+        assert_eq!(pr_comments(&gh).len(), 1, "test setup: the hold ran");
+        assert_eq!(gh.seen.len(), 7, "seen: {:?}", gh.seen);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        // A person re-labels the issue `agent:ready`; the head has not moved.
+        let mut gh = ScriptedGh::new(vec![
+            ok(&issue_list_json(
+                283,
+                &["agent:ready", "risk:documentation"],
+            )),
+            ok(&pr_list_json(322, GREEN)),
+            ok(&pr_view_json(GREEN)),
+        ]);
+        let report = advance_pass(&db, &mut gh, &mut ForbiddenReviewer, &cfg).unwrap();
+        let advanced = &report.advanced[0];
+
+        assert!(
+            matches!(advanced.remediation, Some(ArmOutcome::Armed { .. })),
+            "only reviews recorded after the hold count; got {:?}",
+            advanced.remediation
+        );
+        assert!(pr_comments(&gh).is_empty(), "seen: {:?}", gh.seen);
+        assert!(!advanced.merge.as_ref().unwrap().commented);
+        assert_eq!(gh.seen.len(), 3, "seen: {:?}", gh.seen);
+    }
+
+    #[test]
+    fn a_dry_run_at_the_limit_writes_nothing() {
+        let db = approved_db();
+        record_success(&db, &issue(), Some(GREEN));
+        two_earlier_rounds(&db);
+        reviewed_at_needing_changes(&db, &issue(), 322, GREEN);
+        let (repo, roots) = checkout_with_worktree();
+        let mut cfg = config(roots.path(), repo.path());
+        cfg.merge = true;
+        cfg.remediate = true;
+        cfg.dry_run = true;
+        let mut gh = ScriptedGh::new(vec![
+            ok(&issue_list_json(
+                283,
+                &["agent:ready", "risk:documentation"],
+            )),
+            ok(&pr_list_json(322, GREEN)),
+            ok(&pr_view_json(GREEN)),
+        ]);
+
+        let report = advance_pass(&db, &mut gh, &mut ForbiddenReviewer, &cfg).unwrap();
+        let advanced = &report.advanced[0];
+
+        assert_eq!(advanced.remediation, None);
+        let execution = advanced.merge.as_ref().unwrap();
+        assert!(!execution.commented && execution.label_plan.is_none());
+        assert!(pr_comments(&gh).is_empty(), "seen: {:?}", gh.seen);
+        assert_eq!(gh.seen.len(), 3, "seen: {:?}", gh.seen);
+    }
+
+    #[test]
+    fn a_review_round_limit_of_zero_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let mut cfg = config(root.path(), root.path());
+        cfg.max_review_rounds = 0;
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("max_review_rounds must be at least 1"),
+            "{err}"
+        );
     }
 }

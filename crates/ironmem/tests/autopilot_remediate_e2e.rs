@@ -262,6 +262,7 @@ exit 0
         merge: true,
         remediate,
         attempt_cap: ATTEMPT_CAP,
+        max_review_rounds: ironmem::autopilot::remediate::DEFAULT_MAX_REVIEW_ROUNDS,
         strategy: MergeStrategy::Squash,
         delete_branch: false,
         dry_run: false,

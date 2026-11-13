@@ -881,6 +881,14 @@ enum AutopilotCmd {
         /// fires or never stops.
         #[arg(long)]
         attempt_cap: Option<u32>,
+        /// Consecutive NEEDS CHANGES rounds one PR gets under --remediate
+        /// before no further fix is armed (default 3, at least 1). At the
+        /// limit this pass posts one comment on the PR listing each round's
+        /// reason, labels the issue `agent:blocked` and dispatches nothing —
+        /// with or without --merge. Re-labeling the issue `agent:ready`
+        /// starts a fresh count.
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+        max_review_rounds: Option<u32>,
         /// Merge strategy for `--merge`
         #[arg(long, default_value = "squash")]
         strategy: String,
@@ -2967,6 +2975,7 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                 merge,
                 remediate,
                 attempt_cap,
+                max_review_rounds,
                 strategy,
                 delete_branch,
                 model,
@@ -3011,6 +3020,8 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                     remediate,
                     attempt_cap: attempt_cap
                         .unwrap_or(ironmem::autopilot::run::DEFAULT_ATTEMPT_CAP),
+                    max_review_rounds: max_review_rounds
+                        .unwrap_or(ironmem::autopilot::remediate::DEFAULT_MAX_REVIEW_ROUNDS),
                     strategy,
                     delete_branch,
                     dry_run,
@@ -3689,6 +3700,41 @@ mod tests {
             }
             _ => panic!("expected Commands::Autopilot(Advance), got a different variant"),
         }
+    }
+
+    #[test]
+    fn autopilot_advance_takes_a_review_round_limit_and_refuses_zero() {
+        let parse = |extra: &[&str]| {
+            let mut argv = vec![
+                "ironmem",
+                "autopilot",
+                "advance",
+                "--repo",
+                "owner/repo=/tmp/checkout",
+            ];
+            argv.extend_from_slice(extra);
+            Cli::try_parse_from(argv)
+        };
+        let limit = |cli: Cli| match cli.command {
+            Commands::Autopilot {
+                cmd:
+                    AutopilotCmd::Advance {
+                        max_review_rounds, ..
+                    },
+            } => max_review_rounds,
+            _ => panic!("expected Commands::Autopilot(Advance), got a different variant"),
+        };
+
+        assert_eq!(
+            limit(parse(&[]).expect("expected argv to parse")),
+            None,
+            "the default lives in the module"
+        );
+        assert_eq!(
+            limit(parse(&["--max-review-rounds", "2"]).expect("expected argv to parse")),
+            Some(2)
+        );
+        assert!(parse(&["--max-review-rounds", "0"]).is_err());
     }
 
     #[test]
