@@ -950,7 +950,7 @@ between the two always fails closed",
             ),
             HoldReason::ReviewRoundsExhausted { rounds, limit } => format!(
                 "the reviewer asked for changes in {rounds} consecutive round{} (the limit is \
-{limit}), so the fix loop has not converged and Autopilot has stopped re-dispatching it",
+{limit}), so the fix loop has not converged and Autopilot has stopped dispatching fixes",
                 if *rounds == 1 { "" } else { "s" }
             ),
         }
@@ -5681,17 +5681,18 @@ not json at all
         // #404. The hold is written into merge records, so its JSON shape is
         // a stored format, not an implementation detail.
         let reason = HoldReason::ReviewRoundsExhausted {
-            rounds: 3,
+            rounds: 4,
             limit: 3,
         };
         let summary = reason.summary();
-        assert!(summary.contains("3 consecutive rounds"), "{summary}");
+        assert!(summary.contains("4 consecutive rounds"), "{summary}");
+        assert!(summary.contains("the limit is 3"), "{summary}");
         assert!(summary.contains("has not converged"), "{summary}");
 
         let json = serde_json::to_string(&reason).unwrap();
         assert_eq!(
             json,
-            r#"{"reason":"review_rounds_exhausted","rounds":3,"limit":3}"#
+            r#"{"reason":"review_rounds_exhausted","rounds":4,"limit":3}"#
         );
         assert_eq!(serde_json::from_str::<HoldReason>(&json).unwrap(), reason);
 

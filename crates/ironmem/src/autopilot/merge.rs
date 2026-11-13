@@ -3399,6 +3399,10 @@ mod tests {
             MergeHold::Review(HoldReason::GateNotGreen),
             MergeHold::Review(HoldReason::ReviewerDidNotRun),
             MergeHold::Review(HoldReason::NoVerdict),
+            MergeHold::Review(HoldReason::ReviewRoundsExhausted {
+                rounds: 3,
+                limit: 3,
+            }),
             MergeHold::NotReviewed,
             MergeHold::ReviewHeadUnknown {
                 reviewed_at: "2026-08-31T00:00:00Z".into(),
@@ -3459,5 +3463,21 @@ mod tests {
         .summary();
         assert!(summary.contains("11111111"));
         assert!(summary.contains("22222222"));
+    }
+
+    #[test]
+    fn a_round_limit_hold_has_a_pinned_stored_shape() {
+        // #404. This is what a merge record stores, and what
+        // `remediate::review_rounds` will look for to restart the count.
+        let hold = MergeHold::Review(HoldReason::ReviewRoundsExhausted {
+            rounds: 3,
+            limit: 3,
+        });
+        let json = serde_json::to_string(&hold).unwrap();
+        assert_eq!(
+            json,
+            r#"{"hold":"review","reason":"review_rounds_exhausted","rounds":3,"limit":3}"#
+        );
+        assert_eq!(serde_json::from_str::<MergeHold>(&json).unwrap(), hold);
     }
 }
