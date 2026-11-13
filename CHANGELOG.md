@@ -102,6 +102,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   boosts a drawer about `cats` and also one about a `category`. An entity
   row whose name is not text is skipped with a warning, in the query scan
   and when a triple points at it; such a triple used to fail the search.
+- An Autopilot issue lock is free the moment its holder drops it. It was
+  released by closing its file, which frees a `flock` only once every copy
+  of the descriptor is closed, and a process being started on another thread
+  of the same program holds a copy until its exec. A program that took the
+  lock again in that moment found it held: `advance` skipped the issue for
+  the pass, and `clear-dispatch` refused, naming a running controller. This
+  was seen in the parallel test suite; the `ironmem autopilot` commands
+  start their processes from one thread and are not known to have hit it.
+  The lock is now unlocked explicitly before its file is closed.
 
 ## [0.7.0] - 2026-11-09
 

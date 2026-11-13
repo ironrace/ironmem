@@ -4940,13 +4940,15 @@ pub(crate) mod tests {
         // Births are clock ticks: let one pass, so this process predates
         // the child even when the test runs alone.
         std::thread::sleep(std::time::Duration::from_millis(50));
-        // SAFETY: the child only makes async-signal-safe calls (chdir,
-        // prctl, pause) until it is killed.
+        // SAFETY: the child only makes async-signal-safe calls (alarm,
+        // close, chdir, prctl, pause) until it is killed.
         let child = unsafe { libc::fork() };
         assert!(child >= 0, "fork: {}", std::io::Error::last_os_error());
         if child == 0 {
-            // SAFETY: the forked child, as above.
+            // SAFETY: the forked child, as above. It wants no descriptor:
+            // chdir takes a path, and prctl and pause take none.
             unsafe {
+                crate::test_fork::keep_only(-1);
                 libc::chdir(c"/".as_ptr());
                 libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
                 loop {
@@ -4954,18 +4956,8 @@ pub(crate) mod tests {
                 }
             }
         }
+        let _reap = crate::test_fork::Reap::new(child);
         let child = child as u32;
-        struct Reap(u32);
-        impl Drop for Reap {
-            fn drop(&mut self) {
-                // SAFETY: our own unreaped child.
-                unsafe {
-                    libc::kill(self.0 as i32, libc::SIGKILL);
-                    libc::waitpid(self.0 as i32, std::ptr::null_mut(), 0);
-                }
-            }
-        }
-        let _reap = Reap(child);
         let started = std::time::Instant::now();
         while !std::fs::read_link(format!("/proc/{child}/cwd"))
             .is_err_and(|e| e.raw_os_error() == Some(libc::EACCES))
