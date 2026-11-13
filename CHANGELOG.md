@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Autopilot stops a fix loop that is not converging (#404).** With
+  `advance --remediate`, three consecutive `needs_changes` reviews of one PR
+  now hold it for a person instead of arming a fourth fix dispatch: one
+  comment on the PR lists each round's reason, the issue moves to
+  `agent:blocked`, and nothing is dispatched. The hold is posted with or
+  without `--merge`; only `--dry-run` suppresses it. `--max-review-rounds
+  <N>` on `advance` sets the limit (default 3, at least 1). Re-labeling the
+  issue `agent:ready` starts a fresh count. `advance --json` gains a
+  `rehearsed` field on each merge result. An existing `--remediate` cron
+  picks up the default of 3; pass a higher `--max-review-rounds` to keep
+  running to the attempt cap.
 - **Later Autopilot review rounds review the fix (#403).** Once a review of a PR
   has judged it, the next review's prompt names that review's head and tells the
   reviewer to read `git diff <last-judged-head>..<head>` first, asks whether
