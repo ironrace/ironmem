@@ -1215,6 +1215,17 @@ pub fn render_hold_comment_with_rounds(
     } else {
         ""
     };
+    // Who carries the label. The round-limit hold is posted on the pull
+    // request (#404), where a bare "It" reads as the PR; every other hold
+    // is posted on the issue and keeps its text unchanged.
+    let labeled_subject = if matches!(
+        hold,
+        MergeHold::Review(super::review::HoldReason::ReviewRoundsExhausted { .. })
+    ) {
+        "The issue"
+    } else {
+        "It"
+    };
     let disposition = match disposition {
         HoldDisposition::StaysExhausted => format!(
             "The issue keeps `{}` and Autopilot will not retry it; a human must re-label it \
@@ -1257,8 +1268,8 @@ it is green).",
             pr = request.pr_number,
         ),
         HoldDisposition::Blocked => format!(
-            "{still_open}It is labeled `{}` for a human. Autopilot will not merge it on its \
-own; re-labeling the issue `{}` after resolving the above puts it back in the queue.",
+            "{still_open}{labeled_subject} is labeled `{}` for a human. Autopilot will not merge \
+it on its own; re-labeling the issue `{}` after resolving the above puts it back in the queue.",
             AgentLabel::Blocked.as_str(),
             AgentLabel::Ready.as_str()
         ),
@@ -3656,6 +3667,9 @@ mod tests {
 
         let exec = execute_merge(&database, &mut gh_runner, &round_limited(false)).unwrap();
 
+        // The PR view, the label read, the PR comment, the label create
+        // and the label edit.
+        assert_eq!(gh_runner.seen.len(), 5, "seen: {:?}", gh_runner.seen);
         assert_eq!(
             exec.outcome.hold(),
             Some(&MergeHold::Review(HoldReason::ReviewRoundsExhausted {
@@ -3683,6 +3697,11 @@ mod tests {
         let first = body.find("first finding").expect("round 1 is listed");
         assert!(third < second && second < first, "newest first: {body}");
         assert!(body.contains("starts a fresh count"), "{body}");
+        // Posted on the PR, so the sentence names what carries the label.
+        assert!(
+            body.contains("The issue is labeled `agent:blocked`"),
+            "{body}"
+        );
         assert!(
             !gh_runner
                 .seen
@@ -3698,6 +3717,7 @@ mod tests {
             Ok(GhOutput::ok(r#"{"labels":[{"name":"agent:blocked"}]}"#)),
         ]);
         let again = execute_merge(&database, &mut gh_runner, &round_limited(false)).unwrap();
+        assert_eq!(gh_runner.seen.len(), 2, "seen: {:?}", gh_runner.seen);
         assert!(!again.commented && !again.record_appended);
         assert!(pr_comment_bodies(&gh_runner).is_empty());
     }
@@ -3718,6 +3738,7 @@ mod tests {
 
         let exec = execute_merge(&database, &mut gh_runner, &round_limited(false)).unwrap();
 
+        assert_eq!(gh_runner.seen.len(), 5, "seen: {:?}", gh_runner.seen);
         assert!(matches!(
             exec.outcome.hold(),
             Some(MergeHold::Review(HoldReason::ReviewRoundsExhausted { .. }))
@@ -3784,6 +3805,57 @@ mod tests {
                 HoldDisposition::Blocked,
                 &[],
             )
+        );
+        // Posted on the issue, so every other hold keeps "It is labeled".
+        let other = render_hold_comment(
+            &request(false),
+            &MergeHold::NotReviewed,
+            HoldDisposition::Blocked,
+        );
+        assert!(other.contains("It is labeled `agent:blocked`"), "{other}");
+        assert!(!other.contains("The issue is labeled"), "{other}");
+    }
+
+    #[test]
+    fn a_rehearsed_round_limit_hold_writes_nothing_to_github() {
+        let database = db();
+        for (head, reason) in [
+            (FIRST_HEAD, "first finding"),
+            (OTHER_HEAD, "second finding"),
+            (HEAD, "third finding"),
+        ] {
+            store_review(&database, 7, Some(head), needs_changes_outcome(reason));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let mut gh_runner = ScriptedGh::new(vec![Ok(pr_view_ok("OPEN", HEAD))]);
+
+        let exec = execute_merge(&database, &mut gh_runner, &round_limited(true)).unwrap();
+
+        assert_eq!(
+            exec.outcome.hold(),
+            Some(&MergeHold::Review(HoldReason::ReviewRoundsExhausted {
+                rounds: 3,
+                limit: 3,
+            }))
+        );
+        assert!(!exec.commented);
+        assert!(exec.label_plan.is_none());
+        assert!(
+            !gh_runner.seen.iter().any(|argv| matches!(
+                (argv[0].as_str(), argv[1].as_str()),
+                ("pr", "comment") | ("issue", "comment") | ("issue", "edit")
+            )),
+            "seen: {:?}",
+            gh_runner.seen
+        );
+        // Only the PR view.
+        assert_eq!(gh_runner.seen.len(), 1, "seen: {:?}", gh_runner.seen);
+        // A rehearsed hold does not reset the count.
+        assert_eq!(
+            crate::autopilot::remediate::review_rounds(&database, &issue(), 7)
+                .unwrap()
+                .len(),
+            3
         );
     }
 }
