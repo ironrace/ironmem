@@ -587,8 +587,8 @@ impl ArmOutcome {
     /// True for both `Armed` and `AlreadyArmed`, which is the distinction the
     /// caller acts on: in both cases the Lead will re-dispatch, so the merge
     /// must be rehearsed rather than executed and the issue must keep its
-    /// `agent:ready` label. `CapReached` is false — nothing will re-dispatch,
-    /// so the PR belongs to a human now.
+    /// `agent:ready` label. `CapReached` and `RoundLimitReached` are both
+    /// false — nothing will re-dispatch, so the PR belongs to a human now.
     pub fn in_force(&self) -> bool {
         matches!(
             self,
@@ -611,8 +611,14 @@ impl ArmOutcome {
 /// unresolved finding"* satisfied by accident and *"the PR stays open for a
 /// human"* silently unsatisfied.
 ///
+/// The round limit (#404) is checked **second**, after the cap and before the
+/// already-armed test, for the same reason the cap is: tested after it, an
+/// armed record would answer `AlreadyArmed` forever and the round-limit hold
+/// would never run.
+///
 /// Pure enough to test exhaustively: it reads the issue's status, lineage and
-/// retry grant and its own record, and writes at most one drawer.
+/// retry grant, its own record, and the PR's review and merge records (for
+/// the round limit, #404), and writes at most one drawer.
 pub fn arm_remediation(db: &Database, request: &ArmRequest) -> Result<ArmOutcome, MemoryError> {
     validate_repo(&request.issue.repo)?;
     let status = lineage::get_issue_status(db, request.issue)?;
