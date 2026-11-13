@@ -106,11 +106,13 @@
 //! human would never be told.
 //!
 //! [`ArmOutcome::RoundLimitReached`] is checked second and is about the
-//! approach rather than the budget: after [`DEFAULT_MAX_REVIEW_ROUNDS`]
-//! consecutive `needs_changes` reviews of one PR, another patch is unlikely
-//! to converge, so nothing is armed and the PR is held for a human. The
-//! count is derived by [`review_rounds`] from the review and merge records
-//! and is never stored here.
+//! approach rather than the budget: after [`ArmRequest::max_review_rounds`]
+//! consecutive `needs_changes` reviews of one PR (by default
+//! [`DEFAULT_MAX_REVIEW_ROUNDS`]), another patch is unlikely to converge, so
+//! nothing is armed, a remediation record still in force for that PR is
+//! cleared, and the PR is held for a human. The count is derived by
+//! [`review_rounds`] from the review and merge records and is never stored
+//! here.
 //!
 //! # Its own budget, not the remainder ⟨#344⟩
 //!
@@ -172,6 +174,7 @@ pub const DEFAULT_MAX_REVIEW_ROUNDS: u32 = 3;
 ///   (`repo_slug` collapses `owner/repo` and `owner-repo`), is skipped;
 /// - a review that did not judge (#350) is skipped — it neither adds to the
 ///   count nor ends it;
+/// - a judged review with no recorded head still counts as a round;
 /// - a `pass` ends the count;
 /// - a review recorded at or before `held_since` ends the count, so a
 ///   re-labelled issue starts from zero.
@@ -201,9 +204,11 @@ pub fn consecutive_needs_changes<'a>(
 /// `held_since` is the latest **real** round-limit hold recorded for this
 /// PR. That hold blocks the issue for a human, whose recovery is to re-label
 /// it `agent:ready`, so a pass that runs after one is acting on a re-queue
-/// and must count only what was reviewed since — the rule `advance::next_step`
-/// applies to its unjudged-review streak. A rehearsed hold told nobody and
-/// resets nothing.
+/// and must count only what was reviewed since. That is the same shape of
+/// rule `advance::next_step` applies to its unjudged-review streak, with one
+/// difference: `next_step` resets on any real hold at the same head, and this
+/// resets only on a `ReviewRoundsExhausted` hold, at any head. A rehearsed
+/// hold told nobody and resets nothing.
 ///
 /// Read by [`arm_remediation`] to decide and by `merge::finish` to render the
 /// hold comment, so the number that stops the loop and the list a human
@@ -574,10 +579,10 @@ pub enum ArmOutcome {
         attempts_charged: u32,
     },
     /// The reviewer has returned `needs_changes` in `rounds` consecutive
-    /// rounds on this PR, which reaches `limit` (#404). **Nothing is
-    /// written**: no fix is armed, so the Lead dispatches nothing, and the
-    /// caller's next step is a real hold that comments on the PR and moves
-    /// the issue to `agent:blocked`.
+    /// rounds on this PR, which reaches `limit` (#404). No fix is armed, and
+    /// a remediation record still in force for this PR is cleared, so the
+    /// Lead has nothing to dispatch; the caller's next step is a real hold
+    /// that comments on the PR and moves the issue to `agent:blocked`.
     RoundLimitReached { rounds: u32, limit: u32 },
 }
 
@@ -618,7 +623,8 @@ impl ArmOutcome {
 ///
 /// Pure enough to test exhaustively: it reads the issue's status, lineage and
 /// retry grant, its own record, and the PR's review and merge records (for
-/// the round limit, #404), and writes at most one drawer.
+/// the round limit, #404). It writes at most one drawer, or, at the round
+/// limit, deletes this PR's remediation record instead.
 pub fn arm_remediation(db: &Database, request: &ArmRequest) -> Result<ArmOutcome, MemoryError> {
     validate_repo(&request.issue.repo)?;
     let status = lineage::get_issue_status(db, request.issue)?;
@@ -656,10 +662,19 @@ pub fn arm_remediation(db: &Database, request: &ArmRequest) -> Result<ArmOutcome
     // did before this limit existed. Before the already-armed test for the
     // reason the cap is: an armed record would otherwise answer
     // `AlreadyArmed` for ever and the hold would never run.
+    //
+    // At the limit, an earlier round's record for this PR is cleared. It
+    // can still be in force — a success recorded with no commit, or a head
+    // that moved with no newer success, never supersedes it — and the Lead
+    // would keep dispatching fixes against old findings. A record for
+    // another PR is not this limit's to clear.
     let limit = request.max_review_rounds.max(1);
     let rounds = u32::try_from(review_rounds(db, request.issue, request.pr_number)?.len())
         .unwrap_or(u32::MAX);
     if rounds >= limit {
+        if get_remediation(db, request.issue)?.is_some_and(|r| r.pr_number == request.pr_number) {
+            clear_remediation(db, request.issue)?;
+        }
         return Ok(ArmOutcome::RoundLimitReached { rounds, limit });
     }
 
@@ -1507,23 +1522,45 @@ unbounded reason grows each dispatch's input cost without limit"
 
     /// Record the round-limit hold for PR 12, real or rehearsed.
     fn record_round_hold(db: &Database, dry_run: bool) {
+        record_review_hold(db, &issue(), 12, dry_run, exhausted());
+    }
+
+    fn exhausted() -> HoldReason {
+        HoldReason::ReviewRoundsExhausted {
+            rounds: 3,
+            limit: 3,
+        }
+    }
+
+    /// Record a review hold of any reason, for any issue and PR.
+    fn record_review_hold(
+        db: &Database,
+        on: &IssueRef,
+        pr_number: u64,
+        dry_run: bool,
+        reason: HoldReason,
+    ) {
         record_merge(
             db,
             &MergeRecord {
-                issue: issue(),
-                pr_number: 12,
+                issue: on.clone(),
+                pr_number,
                 gate_green: true,
                 dry_run,
-                outcome: MergeOutcome::Held(MergeHold::Review(HoldReason::ReviewRoundsExhausted {
-                    rounds: 3,
-                    limit: 3,
-                })),
+                outcome: MergeOutcome::Held(MergeHold::Review(reason)),
                 base_branch: Some("main".into()),
                 head_sha: Some(HEAD.into()),
             },
         )
         .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+
+    /// Three judged `needs_changes` reviews of PR 12 at `HEAD`.
+    fn three_rounds(db: &Database) {
+        for _ in 0..3 {
+            record_needs_changes(db, HEAD);
+        }
     }
 
     fn arm_limited(db: &Database, head: &str, cap: u32, max_review_rounds: u32) -> ArmOutcome {
@@ -1542,7 +1579,7 @@ unbounded reason grows each dispatch's input cost without limit"
     }
 
     #[test]
-    fn two_rounds_arm_and_the_third_reaches_the_limit_without_writing() {
+    fn two_rounds_arm_and_the_third_reaches_the_limit_and_leaves_nothing_to_dispatch() {
         let db = db();
         succeeded(&db, 1, Some(HEAD));
         record_needs_changes(&db, HEAD);
@@ -1551,9 +1588,15 @@ unbounded reason grows each dispatch's input cost without limit"
             arm_limited(&db, OTHER_HEAD, 5, 3),
             ArmOutcome::Armed { .. }
         ));
-        clear_remediation(&db, &issue()).unwrap();
 
+        // Round 3, with no newer success recorded: round 2's remediation is
+        // never superseded, so it is still in force going in.
         record_needs_changes(&db, HEAD);
+        assert!(
+            active_remediation(&db, &issue()).unwrap().is_some(),
+            "setup: round 2's remediation is still in force"
+        );
+
         let outcome = arm_limited(&db, HEAD, 5, 3);
         assert_eq!(
             outcome,
@@ -1564,10 +1607,96 @@ unbounded reason grows each dispatch's input cost without limit"
         );
         assert!(!outcome.in_force(), "nothing will re-dispatch it");
         assert_eq!(
-            get_remediation(&db, &issue()).unwrap(),
+            active_remediation(&db, &issue()).unwrap(),
             None,
-            "the limit arms nothing, so there is nothing to dispatch"
+            "a stale remediation for this PR must not keep the Lead dispatching"
         );
+    }
+
+    #[test]
+    fn the_limit_leaves_a_remediation_for_another_pr_alone() {
+        let db = db();
+        succeeded(&db, 1, Some(HEAD));
+        assert!(matches!(
+            arm_pr(&db, 77, HEAD, Some("other PR"), 5),
+            ArmOutcome::Armed { .. }
+        ));
+        three_rounds(&db);
+
+        assert!(matches!(
+            arm_limited(&db, HEAD, 5, 3),
+            ArmOutcome::RoundLimitReached { .. }
+        ));
+        assert_eq!(
+            get_remediation(&db, &issue()).unwrap().map(|r| r.pr_number),
+            Some(77),
+            "only this PR's remediation is the limit's to clear"
+        );
+    }
+
+    #[test]
+    fn the_round_limit_is_checked_before_the_already_armed_test() {
+        let db = db();
+        succeeded(&db, 1, Some(HEAD));
+        three_rounds(&db);
+        assert!(
+            matches!(arm_limited(&db, HEAD, 5, 5), ArmOutcome::Armed { .. }),
+            "setup: under a limit of 5, three rounds still arm (PR 12, HEAD)"
+        );
+
+        assert!(
+            matches!(
+                arm_limited(&db, HEAD, 5, 3),
+                ArmOutcome::RoundLimitReached { .. }
+            ),
+            "an armed record for the same PR and head must not shadow the limit"
+        );
+    }
+
+    #[test]
+    fn a_review_whose_issue_differs_only_in_case_still_counts() {
+        let mut shouted = needs("t2");
+        shouted.issue = issue().canonical().to_ascii_uppercase();
+        let reviews = vec![needs("t1"), shouted];
+        let canonical = issue().canonical();
+        let rounds = consecutive_needs_changes(&reviews, &canonical, 12, None);
+        assert_eq!(times(&rounds), ["t2", "t1"]);
+    }
+
+    #[test]
+    fn a_real_hold_for_another_reason_does_not_reset_the_count() {
+        let db = db();
+        three_rounds(&db);
+        record_review_hold(&db, &issue(), 12, false, HoldReason::NeedsChanges);
+        assert_eq!(review_rounds(&db, &issue(), 12).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn a_round_limit_hold_on_another_pr_does_not_reset_the_count() {
+        let db = db();
+        three_rounds(&db);
+        record_review_hold(&db, &issue(), 99, false, exhausted());
+        assert_eq!(review_rounds(&db, &issue(), 12).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn a_round_limit_hold_on_a_slug_colliding_issue_does_not_reset_the_count() {
+        let db = db();
+        three_rounds(&db);
+        // `repo_slug` maps `/` to `-`, so both spellings name the entity
+        // `issue-ironrace-ironmem-283` and share one list of merge records.
+        let colliding = IssueRef::new("ironrace-ironmem", 283);
+        assert_eq!(colliding.entity_name(), issue().entity_name());
+        record_review_hold(&db, &colliding, 12, false, exhausted());
+        assert!(
+            merge::merges_for_issue(&db, &issue())
+                .unwrap()
+                .iter()
+                .any(|m| m.issue == colliding.canonical()),
+            "setup: the colliding issue's hold is read back under this issue"
+        );
+
+        assert_eq!(review_rounds(&db, &issue(), 12).unwrap().len(), 3);
     }
 
     #[test]
