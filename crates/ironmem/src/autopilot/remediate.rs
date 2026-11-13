@@ -109,8 +109,8 @@
 //! approach rather than the budget: after [`ArmRequest::max_review_rounds`]
 //! consecutive `needs_changes` reviews of one PR (by default
 //! [`DEFAULT_MAX_REVIEW_ROUNDS`]), another patch is unlikely to converge, so
-//! nothing is armed, a remediation record still in force for that PR is
-//! cleared, and the PR is held for a human. The count is derived by
+//! nothing is armed, the issue's remediation record, if one is still stored,
+//! is cleared, and the PR is held for a human. The count is derived by
 //! [`review_rounds`] from the review and merge records and is never stored
 //! here.
 //!
@@ -375,7 +375,9 @@ pub fn get_remediation(
 /// review: while `--remediate` is on, the next pass finds the same
 /// `needs_changes` at the same head and calls [`arm_remediation`] again, which
 /// arms the same `(pr_number, head_sha)` afresh and resets
-/// `armed_after_attempts`. It does **not** reset the remediation's budget,
+/// `armed_after_attempts`. That holds below the review-round limit (#404);
+/// at the limit the pass answers [`ArmOutcome::RoundLimitReached`] and arms
+/// nothing. It does **not** reset the remediation's budget,
 /// which is counted from the issue's first success in the lineage
 /// ([`attempts_charged`]) — only `autopilot retry` restores that. Clearing is
 /// therefore a "stop for now", and the
@@ -580,8 +582,9 @@ pub enum ArmOutcome {
     },
     /// The reviewer has returned `needs_changes` in `rounds` consecutive
     /// rounds on this PR, which reaches `limit` (#404). No fix is armed, and
-    /// a remediation record still in force for this PR is cleared, so the
-    /// Lead has nothing to dispatch; the caller's next step is a real hold
+    /// the issue's remediation record, if one is still stored, is cleared,
+    /// so the Lead has nothing to dispatch; the caller's next step is a real
+    /// hold
     /// that comments on the PR and moves the issue to `agent:blocked`.
     RoundLimitReached { rounds: u32, limit: u32 },
 }
@@ -624,7 +627,7 @@ impl ArmOutcome {
 /// Pure enough to test exhaustively: it reads the issue's status, lineage and
 /// retry grant, its own record, and the PR's review and merge records (for
 /// the round limit, #404). It writes at most one drawer, or, at the round
-/// limit, deletes this PR's remediation record instead.
+/// limit, deletes the issue's remediation record instead.
 pub fn arm_remediation(db: &Database, request: &ArmRequest) -> Result<ArmOutcome, MemoryError> {
     validate_repo(&request.issue.repo)?;
     let status = lineage::get_issue_status(db, request.issue)?;
@@ -663,16 +666,18 @@ pub fn arm_remediation(db: &Database, request: &ArmRequest) -> Result<ArmOutcome
     // reason the cap is: an armed record would otherwise answer
     // `AlreadyArmed` for ever and the hold would never run.
     //
-    // At the limit, an earlier round's record for this PR is cleared. It
-    // can still be in force — a success recorded with no commit, or a head
-    // that moved with no newer success, never supersedes it — and the Lead
-    // would keep dispatching fixes against old findings. A record for
-    // another PR is not this limit's to clear.
+    // At the limit, the issue's remediation record, if one is still stored,
+    // is cleared, whichever PR armed it. It can still be in force — a
+    // success recorded with no commit, or a head that moved with no newer
+    // success, never supersedes it — and there is one record per issue
+    // driving the issue's one worktree, so the Lead would keep dispatching
+    // fixes against old findings. Before this limit, this round's arm would
+    // have overwritten it.
     let limit = request.max_review_rounds.max(1);
     let rounds = u32::try_from(review_rounds(db, request.issue, request.pr_number)?.len())
         .unwrap_or(u32::MAX);
     if rounds >= limit {
-        if get_remediation(db, request.issue)?.is_some_and(|r| r.pr_number == request.pr_number) {
+        if get_remediation(db, request.issue)?.is_some() {
             clear_remediation(db, request.issue)?;
         }
         return Ok(ArmOutcome::RoundLimitReached { rounds, limit });
@@ -1614,7 +1619,7 @@ unbounded reason grows each dispatch's input cost without limit"
     }
 
     #[test]
-    fn the_limit_leaves_a_remediation_for_another_pr_alone() {
+    fn the_limit_clears_a_remediation_armed_for_another_pr_of_the_issue() {
         let db = db();
         succeeded(&db, 1, Some(HEAD));
         assert!(matches!(
@@ -1622,15 +1627,22 @@ unbounded reason grows each dispatch's input cost without limit"
             ArmOutcome::Armed { .. }
         ));
         three_rounds(&db);
+        assert_eq!(
+            active_remediation(&db, &issue())
+                .unwrap()
+                .map(|r| r.pr_number),
+            Some(77),
+            "setup: PR 77's remediation is in force"
+        );
 
         assert!(matches!(
             arm_limited(&db, HEAD, 5, 3),
             ArmOutcome::RoundLimitReached { .. }
         ));
         assert_eq!(
-            get_remediation(&db, &issue()).unwrap().map(|r| r.pr_number),
-            Some(77),
-            "only this PR's remediation is the limit's to clear"
+            get_remediation(&db, &issue()).unwrap(),
+            None,
+            "one record per issue drives the one worktree; at the limit it goes"
         );
     }
 
