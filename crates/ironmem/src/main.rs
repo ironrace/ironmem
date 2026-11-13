@@ -1158,17 +1158,28 @@ fn round_limit_line(rounds: u32, limit: u32, held: bool) -> String {
 /// The line under a merge outcome that was written for real although merges
 /// were not enabled. Only the round-limit hold can be (#404): every other
 /// outcome of such a pass is rehearsed. Names only what this attempt wrote.
+///
+/// Checked against the outcome here rather than trusting that rule, which
+/// lives in `advance` and `merge`: the note describes the round-limit hold,
+/// so it is printed for nothing else.
 fn real_hold_note(
-    rehearsed: bool,
+    exec: &ironmem::autopilot::merge::MergeExecution,
     merge_enabled: bool,
-    commented: bool,
-    blocked: bool,
 ) -> Option<String> {
-    if rehearsed || merge_enabled {
+    use ironmem::autopilot::merge::MergeHold;
+
+    if exec.rehearsed
+        || merge_enabled
+        || !exec.outcome.hold().is_some_and(MergeHold::is_round_limit)
+    {
         return None;
     }
+    let blocked = exec
+        .label_plan
+        .as_ref()
+        .is_some_and(|plan| plan.add.iter().any(|label| label == "agent:blocked"));
     let written: Vec<&str> = [
-        commented.then_some("a comment on the PR"),
+        exec.commented.then_some("a comment on the PR"),
         blocked.then_some("agent:blocked on the issue"),
     ]
     .into_iter()
@@ -1370,16 +1381,7 @@ fn print_advance_report(report: &ironmem::autopilot::advance::AdvanceReport) {
                 }
                 MergeOutcome::Held(hold) => println!("    HELD: {}", hold.summary()),
             }
-            let blocked = exec
-                .label_plan
-                .as_ref()
-                .is_some_and(|plan| plan.add.iter().any(|label| label == "agent:blocked"));
-            if let Some(note) = real_hold_note(
-                exec.rehearsed,
-                report.merge_enabled,
-                exec.commented,
-                blocked,
-            ) {
+            if let Some(note) = real_hold_note(exec, report.merge_enabled) {
                 println!("{note}");
             }
             if let Some(err) = &exec.label_error {
@@ -3876,37 +3878,100 @@ mod tests {
         );
     }
 
+    /// A merge execution with `outcome`, as the advance report reads it.
+    fn execution(
+        outcome: ironmem::autopilot::merge::MergeOutcome,
+        rehearsed: bool,
+        commented: bool,
+        blocked: bool,
+    ) -> ironmem::autopilot::merge::MergeExecution {
+        ironmem::autopilot::merge::MergeExecution {
+            issue: ironmem::autopilot::IssueRef::new("owner/repo", 7),
+            pr_number: 9,
+            outcome,
+            snapshot: None,
+            label_plan: blocked.then(|| ironmem::autopilot::labels::LabelPlan {
+                add: vec!["agent:blocked".to_string()],
+                remove: vec!["agent:ready".to_string()],
+            }),
+            label_error: None,
+            commented,
+            record_appended: true,
+            rehearsed,
+            record_drawer_id: "drawer".to_string(),
+        }
+    }
+
+    fn round_limit_held() -> ironmem::autopilot::merge::MergeOutcome {
+        ironmem::autopilot::merge::MergeOutcome::Held(ironmem::autopilot::merge::MergeHold::Review(
+            ironmem::autopilot::review::HoldReason::ReviewRoundsExhausted {
+                rounds: 3,
+                limit: 3,
+            },
+        ))
+    }
+
     #[test]
     fn autopilot_advance_marks_a_real_hold_made_without_merge() {
+        let note = |exec, merge_enabled| real_hold_note(&exec, merge_enabled);
         // Rehearsed, or merges enabled: nothing to add.
-        assert_eq!(real_hold_note(true, false, true, true), None);
-        assert_eq!(real_hold_note(false, true, true, true), None);
+        assert_eq!(
+            note(execution(round_limit_held(), true, true, true), false),
+            None
+        );
+        assert_eq!(
+            note(execution(round_limit_held(), false, true, true), true),
+            None
+        );
         // Real without --merge: say what was written, and only that.
         assert_eq!(
-            real_hold_note(false, false, true, true).as_deref(),
+            note(execution(round_limit_held(), false, true, true), false).as_deref(),
             Some(
                 "    (posted for real: the review-round-limit hold runs without --merge — \
                  a comment on the PR and agent:blocked on the issue)"
             )
         );
         assert_eq!(
-            real_hold_note(false, false, false, true).as_deref(),
+            note(execution(round_limit_held(), false, false, true), false).as_deref(),
             Some(
                 "    (posted for real: the review-round-limit hold runs without --merge — \
                  agent:blocked on the issue)"
             )
         );
         assert_eq!(
-            real_hold_note(false, false, true, false).as_deref(),
+            note(execution(round_limit_held(), false, true, false), false).as_deref(),
             Some(
                 "    (posted for real: the review-round-limit hold runs without --merge — \
                  a comment on the PR)"
             )
         );
         assert_eq!(
-            real_hold_note(false, false, false, false).as_deref(),
+            note(execution(round_limit_held(), false, false, false), false).as_deref(),
             Some("    (not rehearsed: the review-round-limit hold runs for real without --merge)")
         );
+    }
+
+    #[test]
+    fn autopilot_advance_names_no_real_hold_for_any_other_outcome() {
+        // The note describes the round-limit hold, so it is checked against
+        // the outcome rather than trusting that nothing else can be real
+        // without --merge.
+        use ironmem::autopilot::merge::{MergeHold, MergeOutcome};
+        let others = [
+            MergeOutcome::AlreadyMerged {
+                head_sha: "abc".into(),
+            },
+            MergeOutcome::Held(MergeHold::PrNotOpen {
+                state: "CLOSED".into(),
+            }),
+            MergeOutcome::Held(MergeHold::Review(
+                ironmem::autopilot::review::HoldReason::NeedsChanges,
+            )),
+        ];
+        for outcome in others {
+            let exec = execution(outcome, false, true, true);
+            assert_eq!(real_hold_note(&exec, false), None, "{:?}", exec.outcome);
+        }
     }
 
     #[test]

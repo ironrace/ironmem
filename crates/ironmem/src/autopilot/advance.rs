@@ -5373,18 +5373,7 @@ skipped: {:?}",
             execution.rehearsed,
             "the stand-down is reported as rehearsed"
         );
-        assert!(
-            !gh.seen.iter().any(|argv| matches!(
-                (argv[0].as_str(), argv[1].as_str()),
-                ("pr", "comment")
-                    | ("pr", "merge")
-                    | ("issue", "comment")
-                    | ("issue", "edit")
-                    | ("label", "create")
-            )),
-            "seen: {:?}",
-            gh.seen
-        );
+        assert!(gh_writes(&gh).is_empty(), "seen: {:?}", gh.seen);
         assert_eq!(gh.seen.len(), 3, "seen: {:?}", gh.seen);
         assert!(advanced.cleanup.is_none(), "a rehearsal cleans nothing up");
         assert!(
