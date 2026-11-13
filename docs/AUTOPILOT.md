@@ -1030,52 +1030,67 @@ own fields.
 
 ### The review-round limit (#404)
 
-With `--remediate`, a `needs_changes` review re-dispatches the IC to fix what
-the reviewer found. `advance` stops doing that once the reviewer has asked for
-changes in **three consecutive rounds by default** on one PR, and holds the PR
-for a person instead.
+With `--remediate`, `advance` answers a `needs_changes` review by **arming** a
+fix: it stores the reviewer's findings as the issue's remediation record, and
+the next `lead` tick re-dispatches the IC to address them. Once the reviewer
+has asked for changes three rounds in a row on one PR (the default), `advance`
+stops arming fixes and holds the PR for a person instead.
 
 - **What counts.** The PR's judged reviews, newest first, for as long as the
   verdict is `needs_changes`. A `pass` ends the count. A review that did not
   judge (the reviewer failed to run, or returned no verdict) is skipped: it
-  neither adds to the count nor ends it. A judged review with no recorded
-  head still counts.
+  neither adds to the count nor ends it. A judged review still counts even if
+  it was recorded without the commit it read.
 - **The limit.** `--max-review-rounds <N>` on `ironmem autopilot advance`.
-  The default is 3 and the minimum is 1; `0` is refused. The limit is read
-  only when a pass decides whether to arm a fix, so `lead` and `run` take no
-  such flag, and without `--remediate` it is not consulted at all.
+  The default is 3 and the minimum is 1; `0` is refused. Only `advance` takes
+  it, because only `advance` arms fixes; without `--remediate` it has no
+  effect.
 - **At the limit.** No fix is armed, and a remediation record still stored
   for the issue is cleared, so nothing is dispatched and no further fix is
   paid for. `advance` posts one comment on the **pull request**, headed
-  "Autopilot: PR #<pr> is held for a human after <rounds> review round(s)",
-  that lists each round's reason newest first (the newest ten, with a count
-  of any older rounds left out). Each reason is scrubbed, flattened to one
-  line, cut at 500 characters and shown as code, so reviewer text cannot hide
-  or reformat the rest of the comment; a round with no recorded reason says
-  so. The issue is moved to `agent:blocked`, and the hold is recorded with
-  the reason `review_rounds_exhausted`.
-- **With or without `--merge`.** Without `--merge`, every merge-step outcome
-  is rehearsed, and this hold is the one exception: it is written to GitHub.
-  Only `--dry-run` suppresses it, and a dry run does not evaluate the limit
-  at all (arming is skipped), so it rehearses the ordinary `needs_changes`
-  hold and cannot preview this one. Everything else at the limit is still
-  rehearsed without `--merge`: a PR found merged or closed is reported, not
-  acted on. The pass prints `review rounds EXHAUSTED` and, without `--merge`,
-  a line marking the hold as real and naming what it wrote; `--json` carries
-  `rehearsed: false` on that merge result.
-- **Order against the attempt cap.** The attempt cap is checked first and
-  behaves as before. If both are reached in the same pass the attempt cap's
-  hold applies: the ordinary `needs_changes` hold, on the issue, and
-  rehearsed without `--merge`. With the defaults (3 rounds, 5 attempts) the
-  round limit is reached first as long as the first two fixes together take
-  four attempts or fewer; otherwise the attempt cap is reached first.
-- **Resuming.** Re-label the issue `agent:ready`. The count starts again:
-  only reviews recorded after the hold are counted, so the loop gets a full
-  set of rounds. If the head has not moved, the next pass arms a fix for the
-  findings already on the PR; if a commit was pushed, the next pass reviews
-  the new head first, and that review is round one. While the issue stays
-  `agent:blocked`, `advance` does not pick it up again, so no second comment
-  is posted.
+  "Autopilot: PR #<pr> is held for a human after <rounds> review round(s)".
+  Under the headline it says the fix loop has not converged, lists
+  ``- **Round <n>** at `<sha>`: <reason>`` under "What the reviewer said"
+  (newest first, the newest ten, with a count of any older rounds left out),
+  and ends with the label and how to resume. Each reason is scrubbed,
+  flattened to one line, cut at 500 characters and shown as code, so reviewer
+  text cannot hide or reformat the rest of the comment; a round with no
+  recorded reason says so. The issue is moved to `agent:blocked`, and the hold
+  is recorded with the reason `review_rounds_exhausted`. While the issue
+  stays `agent:blocked`, `advance` does not pick it up again, so no second
+  comment is posted.
+- **Posted even without `--merge`.** Without `--merge`, `advance` rehearses
+  every merge decision (runs every check, writes nothing to GitHub) except
+  this hold, which it posts for real. A PR found merged or closed at the
+  limit is still only rehearsed. `--dry-run` writes nothing and skips the
+  limit entirely, so it shows the ordinary `needs_changes` hold and cannot
+  preview this one.
+- **What the pass prints.** `review rounds EXHAUSTED (<rounds> consecutive
+  NEEDS CHANGES, limit <limit>) — no fix armed; the PR is held for a human`,
+  and without `--merge` a `(posted for real: …)` line naming what was
+  written. Under `--json` the remediation is `"arm": "round_limit_reached"`
+  and the merge result has `"rehearsed": false`. Nothing reports the running
+  count before the limit is reached.
+- **Against the attempt cap.** The attempt cap is checked first and is
+  unchanged. If a pass reaches both, the cap's hold wins: the ordinary
+  `needs_changes` hold, commented on the issue rather than the PR, and only
+  rehearsed without `--merge`. With the defaults (3 rounds, a cap of 5) the
+  round limit comes first unless the first two fixes took five or more
+  attempts between them. A hold at the attempt cap does not reset the round
+  count, so after `autopilot retry` a PR that already has the limit's worth of
+  consecutive `needs_changes` rounds is held at the round limit on its next
+  pass; re-labeling after that hold starts the fresh count.
+- **Resuming.** Remove `agent:blocked` and label the issue `agent:ready`. The
+  count restarts from zero: only reviews recorded after the hold count. If the
+  PR's head has not moved, the next pass arms a fix for the findings already
+  on it; if a commit was pushed, the next pass reviews it first, and that
+  review is round one.
+- **What to do with a held PR.** Read the rounds in the comment. If one
+  approach keeps failing, fix the branch yourself or close the PR.
+  Re-labeling without a push gives the IC another full set of rounds on the
+  same findings. A commit you push is reviewed as round one, but the PR will
+  then not auto-merge, because Autopilot trusts the gate only at a commit its
+  IC took green.
 - **If a write fails partway.** The comment is posted first, then the label,
   then the hold is recorded. A failed label write leaves the hold unrecorded,
   so the next pass holds again and retries the label without posting the
@@ -1242,9 +1257,10 @@ typing the command.
   the command is the manual arm of that same close-out.
 - **A PR held at the review-round limit** (a comment on the PR headed
   "Autopilot: PR #<pr> is held for a human after <rounds> review round(s)"
-  that lists each round) resumes when the issue is re-labeled `agent:ready`.
-  That starts a fresh count of rounds; see *The review-round limit*. To stop
-  for good, leave it `agent:blocked` or drop `--remediate`.
+  that lists each round) resumes when the issue is re-labeled `agent:ready`
+  (removing `agent:blocked`). That starts a fresh count of rounds; see *The
+  review-round limit*. To stop for good, leave it `agent:blocked` or drop
+  `--remediate`.
 
 ## Branch protection
 

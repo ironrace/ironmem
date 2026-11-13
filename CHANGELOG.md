@@ -20,7 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `merge --json` gain a `rehearsed` field on the merge result. An existing
   `--remediate` cron picks up the default of 3; a limit above the attempt cap
   (6 or more with the default cap of 5) keeps the old behavior of running to
-  the attempt cap.
+  the attempt cap, up to the first cap hold: `autopilot retry` restores the
+  cap but not the round count.
 - **Later Autopilot review rounds review the fix (#403).** Once a review of a PR
   has judged it, the next review's prompt names that review's head and tells the
   reviewer to read `git diff <last-judged-head>..<head>` first, asks whether
