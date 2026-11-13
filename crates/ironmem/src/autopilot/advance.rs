@@ -1170,6 +1170,7 @@ fn advance_issue(
                     head_sha: &head_sha,
                     findings: objection.reason.as_deref(),
                     attempt_cap: config.attempt_cap,
+                    max_review_rounds: remediate::DEFAULT_MAX_REVIEW_ROUNDS,
                 },
             )?);
         }
@@ -3613,6 +3614,7 @@ and no `agent:blocked` comment is posted, or the Lead never sees the issue again
                 head_sha: GREEN,
                 findings: Some("the retry loop is unbounded"),
                 attempt_cap: 5,
+                max_review_rounds: remediate::DEFAULT_MAX_REVIEW_ROUNDS,
             },
         )
         .unwrap();
@@ -3698,6 +3700,7 @@ remediation record — otherwise the PR sits open and nobody is ever told"
                 head_sha: GREEN,
                 findings: Some("the retry loop is unbounded"),
                 attempt_cap: 5,
+                max_review_rounds: remediate::DEFAULT_MAX_REVIEW_ROUNDS,
             },
         )
         .unwrap();
@@ -3924,6 +3927,7 @@ remediation record — otherwise the PR sits open and nobody is ever told"
                 head_sha: GREEN,
                 findings: Some("the retry loop is unbounded"),
                 attempt_cap: DEFAULT_ATTEMPT_CAP,
+                max_review_rounds: remediate::DEFAULT_MAX_REVIEW_ROUNDS,
             },
         )
         .unwrap();
@@ -3988,6 +3992,7 @@ hold, or the PR is stranded with nobody told"
                 head_sha: GREEN,
                 findings: Some("the retry loop is unbounded"),
                 attempt_cap: config.attempt_cap,
+                max_review_rounds: remediate::DEFAULT_MAX_REVIEW_ROUNDS,
             },
         )
         .unwrap();

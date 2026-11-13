@@ -1277,6 +1277,11 @@ fn print_advance_report(report: &ironmem::autopilot::advance::AdvanceReport) {
                     "    remediation EXHAUSTED ({attempts_charged}/{attempt_cap} remediation attempts) — the PR stays open for a human"
                 );
             }
+            Some(ArmOutcome::RoundLimitReached { rounds, limit }) => {
+                println!(
+                    "    review rounds EXHAUSTED ({rounds} consecutive NEEDS CHANGES, limit {limit}) — no fix armed; the PR is held for a human"
+                );
+            }
         }
         if let Some(exec) = &step.merge {
             match &exec.outcome {
