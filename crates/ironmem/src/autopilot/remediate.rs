@@ -133,8 +133,8 @@
 use serde::{Deserialize, Serialize};
 
 use super::lineage::{self, AttemptOutcome};
-use super::merge::{self, MergeHold, MergeOutcome};
-use super::review::{self, HoldReason, RecordedReviewSummary, ReviewVerdict};
+use super::merge::{self, MergeHold};
+use super::review::{self, RecordedReviewSummary, ReviewVerdict};
 use super::scrub::scrub_and_bound;
 use super::{read_current, validate_repo, write_current, IssueRef};
 use crate::db::schema::Database;
@@ -226,10 +226,7 @@ pub fn review_rounds(
             m.issue.eq_ignore_ascii_case(&canonical)
                 && m.pr_number == pr_number
                 && !m.dry_run
-                && matches!(
-                    m.outcome,
-                    MergeOutcome::Held(MergeHold::Review(HoldReason::ReviewRoundsExhausted { .. }))
-                )
+                && m.outcome.hold().is_some_and(MergeHold::is_round_limit)
         })
         .map(|m| m.recorded_at.as_str())
         .max();
@@ -727,10 +724,10 @@ mod tests {
     use crate::autopilot::lineage::{
         record_attempt, upsert_issue_status, AttemptRecord, IssueStatus,
     };
-    use crate::autopilot::merge::{record_merge, MergeRecord};
+    use crate::autopilot::merge::{record_merge, MergeOutcome, MergeRecord};
     use crate::autopilot::retry;
     use crate::autopilot::review::{
-        record_review, MergeDecision, ReviewOutcome, ReviewRecord, RiskClass,
+        record_review, HoldReason, MergeDecision, ReviewOutcome, ReviewRecord, RiskClass,
     };
 
     const REPO: &str = "ironrace/ironmem";
