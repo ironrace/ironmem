@@ -1063,6 +1063,7 @@ mod tests {
                 dry_run: false,
                 strategy: crate::autopilot::gh::MergeStrategy::Squash,
                 delete_branch: false,
+                round_limit: None,
             },
             &crate::autopilot::merge::MergeHold::NotReviewed,
             crate::autopilot::merge::HoldDisposition::Blocked,

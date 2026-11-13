@@ -2364,6 +2364,7 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                         strategy,
                         delete_branch,
                         dry_run,
+                        round_limit: None,
                     },
                 )?;
 

@@ -1219,6 +1219,7 @@ fn advance_issue(
             strategy: config.strategy,
             delete_branch: config.delete_branch,
             dry_run: merge_dry_run,
+            round_limit: None,
         },
     )?;
 
