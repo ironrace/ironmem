@@ -872,8 +872,11 @@ enum AutopilotCmd {
         /// dispatches, so run them in that order. Each attempt costs a
         /// dispatch; a remediation gets --attempt-cap attempts of its own,
         /// shared by every round of review and counted from the issue's first
-        /// success, not what the original work left. On exhaustion the PR is
-        /// held for a human exactly as it is without this flag.
+        /// success, not what the original work left. When those attempts run
+        /// out the PR is held for a human exactly as it is without this flag.
+        /// Separately, after --max-review-rounds consecutive NEEDS CHANGES
+        /// rounds no further fix is armed and the PR is held with one comment
+        /// on the PR, with or without --merge.
         #[arg(long)]
         remediate: bool,
         /// Per-issue attempt cap. Must match the Lead's, since a remediation

@@ -1229,14 +1229,27 @@ fn advance_issue(
     // merge, and `execute_merge` cannot reach one for a request that carries
     // a round limit. `--dry-run` still writes nothing: arming is skipped on
     // a dry run, so `round_limit` is `None` there.
+    //
+    // Without `--merge` the request is `hold_only`, so `execute_merge`
+    // rehearses every outcome but that hold: a PR found merged or closed in
+    // the meantime is not the hold, and gets no comment, no label and no
+    // clean-up.
     let round_limit = match &remediation {
         Some(ArmOutcome::RoundLimitReached { rounds, limit }) => Some(merge::RoundLimit {
             rounds: *rounds,
             limit: *limit,
+            hold_only: !config.merge,
         }),
         _ => None,
     };
-    let merge_dry_run =
+    // Two answers, because the round-limit hold is real without `--merge`
+    // and nothing else is. `merges_rehearsed` is whether this pass may act on
+    // a landed PR — it gates the clean-up below, which removes the issue's
+    // worktree and so must stay behind `--merge`. `request_dry_run` is what
+    // `execute_merge` is told, and differs only by letting a round-limited
+    // request reach the real hold.
+    let merges_rehearsed = config.dry_run || !config.merge || remediation_in_force;
+    let request_dry_run =
         config.dry_run || remediation_in_force || (!config.merge && round_limit.is_none());
     let execution = merge::execute_merge(
         db,
@@ -1247,7 +1260,7 @@ fn advance_issue(
             gate_green,
             strategy: config.strategy,
             delete_branch: config.delete_branch,
-            dry_run: merge_dry_run,
+            dry_run: request_dry_run,
             round_limit,
         },
     )?;
@@ -1256,7 +1269,7 @@ fn advance_issue(
     drop(_issue_lock.take());
 
     // Only for a PR that has actually landed, and never during a rehearsal.
-    let cleanup = if execution.outcome.landed() && !merge_dry_run {
+    let cleanup = if execution.outcome.landed() && !merges_rehearsed {
         Some(clean_up(db, candidate, config))
     } else {
         None
@@ -5301,6 +5314,128 @@ skipped: {:?}",
         assert!(!execution.commented && execution.label_plan.is_none());
         assert!(pr_comments(&gh).is_empty(), "seen: {:?}", gh.seen);
         assert_eq!(gh.seen.len(), 3, "seen: {:?}", gh.seen);
+    }
+
+    /// `gh pr view` for PR 322 after somebody merged it.
+    fn merged_pr_view_json(head_sha: &str) -> String {
+        pr_view_json(head_sha).replace(r#""state":"OPEN""#, r#""state":"MERGED""#)
+    }
+
+    /// The listings, then a PR view that finds the PR already merged.
+    fn merged_at_the_limit_script(tail: Vec<Result<GhOutput, MemoryError>>) -> ScriptedGh {
+        let mut script = vec![
+            ok(&issue_list_json(
+                283,
+                &["agent:ready", "risk:documentation"],
+            )),
+            ok(&pr_list_json(322, GREEN)),
+            ok(&merged_pr_view_json(GREEN)),
+        ];
+        script.extend(tail);
+        ScriptedGh::new(script)
+    }
+
+    #[test]
+    fn without_merge_a_pr_found_merged_at_the_limit_writes_nothing_and_cleans_nothing() {
+        // Without `--merge` the round-limit hold is the only thing this pass
+        // may do for real. A PR somebody merged in the meantime is the
+        // rehearsed stand-down, and its worktree is left where it is.
+        let db = approved_db();
+        record_success(&db, &issue(), Some(GREEN));
+        two_earlier_rounds(&db);
+        let (repo, roots) = checkout_with_worktree();
+        let mut cfg = config(roots.path(), repo.path());
+        cfg.remediate = true;
+        let mut gh = merged_at_the_limit_script(Vec::new());
+
+        let report = advance_pass(&db, &mut gh, &mut needs_changes(), &cfg).unwrap();
+        let advanced = &report.advanced[0];
+
+        assert_eq!(
+            advanced.remediation,
+            Some(ArmOutcome::RoundLimitReached {
+                rounds: 3,
+                limit: 3,
+            })
+        );
+        let execution = advanced.merge.as_ref().unwrap();
+        assert!(
+            matches!(execution.outcome, MergeOutcome::AlreadyMerged { .. }),
+            "got {:?}",
+            execution.outcome
+        );
+        assert!(!execution.commented && execution.label_plan.is_none());
+        assert!(
+            !gh.seen.iter().any(|argv| matches!(
+                (argv[0].as_str(), argv[1].as_str()),
+                ("pr", "comment")
+                    | ("pr", "merge")
+                    | ("issue", "comment")
+                    | ("issue", "edit")
+                    | ("label", "create")
+            )),
+            "seen: {:?}",
+            gh.seen
+        );
+        assert_eq!(gh.seen.len(), 3, "seen: {:?}", gh.seen);
+        assert!(advanced.cleanup.is_none(), "a rehearsal cleans nothing up");
+        assert!(
+            worktree::worktree_path(roots.path(), &issue()).exists(),
+            "the issue's worktree is still on disk"
+        );
+    }
+
+    #[test]
+    fn with_merge_a_pr_found_merged_at_the_limit_is_stood_down_and_cleaned_up() {
+        // `--merge` behaviour, unchanged: what a landed PR gets everywhere
+        // else (see `a_landed_merge_gives_the_worktree_and_the_slot_back`).
+        let db = approved_db();
+        record_success(&db, &issue(), Some(GREEN));
+        two_earlier_rounds(&db);
+        let (repo, roots) = checkout_with_worktree();
+        let mut cfg = config(roots.path(), repo.path());
+        cfg.merge = true;
+        cfg.remediate = true;
+        let mut gh = merged_at_the_limit_script(vec![
+            // clearing the `agent:*` labels: read, then edit
+            ok(r#"{"labels":[{"name":"agent:ready"}]}"#),
+            ok(""),
+            // the already-merged comment on the issue
+            ok(""),
+        ]);
+
+        let report = advance_pass(&db, &mut gh, &mut needs_changes(), &cfg).unwrap();
+        let advanced = &report.advanced[0];
+
+        let execution = advanced.merge.as_ref().unwrap();
+        assert!(
+            matches!(execution.outcome, MergeOutcome::AlreadyMerged { .. }),
+            "got {:?}",
+            execution.outcome
+        );
+        assert!(execution.outcome.landed());
+        assert!(execution.commented, "the issue is told it landed");
+        let plan = execution
+            .label_plan
+            .as_ref()
+            .expect("a landed PR clears the labels");
+        assert_eq!(plan.remove, vec!["agent:ready".to_string()]);
+        assert_eq!(gh.seen.len(), 6, "seen: {:?}", gh.seen);
+
+        let cleanup = advanced
+            .cleanup
+            .as_ref()
+            .expect("a landed PR is cleaned up");
+        assert!(
+            matches!(cleanup.worktree, WorktreeRemoval::Removed { .. }),
+            "the worktree is given back, got {:?}",
+            cleanup.worktree
+        );
+        assert!(cleanup.error.is_none(), "{:?}", cleanup.error);
+        assert!(
+            !worktree::worktree_path(roots.path(), &issue()).exists(),
+            "the checkout is gone from disk"
+        );
     }
 
     #[test]

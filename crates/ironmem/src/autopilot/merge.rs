@@ -477,6 +477,12 @@ pub(crate) fn serialize_issue<S: serde::Serializer>(
 pub struct RoundLimit {
     pub rounds: u32,
     pub limit: u32,
+    /// The caller did not ask for merges to be executed, so any outcome
+    /// OTHER than the round-limit hold is rehearsed: recorded on the dry-run
+    /// footing, with nothing written to GitHub. `advance` without `--merge`
+    /// still holds for real at the limit, because nothing else will tell a
+    /// human; a PR found merged or closed meanwhile is not that hold.
+    pub hold_only: bool,
 }
 
 /// Inputs to [`execute_merge`].
@@ -518,6 +524,20 @@ pub fn execute_merge(
 ) -> Result<MergeExecution, MemoryError> {
     validate_repo(&request.issue.repo)?;
     let (outcome, snapshot) = evaluate(db, gh_runner, request)?;
+    // #404: a hold-only request is real for the round-limit hold and for
+    // nothing else. `evaluate` returns before anything that writes when a
+    // round limit is set, so rehearsing here, in `finish`, is the whole
+    // difference: a PR found merged or closed is recorded as a rehearsal
+    // and nothing is written to GitHub.
+    if request.round_limit.is_some_and(|limit| limit.hold_only)
+        && !outcome.hold().is_some_and(MergeHold::is_round_limit)
+    {
+        let rehearsal = MergeRequest {
+            dry_run: true,
+            ..*request
+        };
+        return finish(db, gh_runner, &rehearsal, outcome, snapshot);
+    }
     finish(db, gh_runner, request, outcome, snapshot)
 }
 
@@ -582,7 +602,7 @@ fn evaluate(
     //     carries it cannot merge whatever the stored review says. Below the
     //     merged and open checks, so the comment's "stays open" is still
     //     true of the PR it is posted on.
-    if let Some(RoundLimit { rounds, limit }) = request.round_limit {
+    if let Some(RoundLimit { rounds, limit, .. }) = request.round_limit {
         let reason = super::review::HoldReason::ReviewRoundsExhausted { rounds, limit };
         return Ok((
             MergeOutcome::Held(MergeHold::Review(reason)),
@@ -1929,6 +1949,7 @@ mod tests {
             round_limit: Some(RoundLimit {
                 rounds: 3,
                 limit: 3,
+                hold_only: false,
             }),
             ..request(dry_run)
         }
@@ -4612,5 +4633,155 @@ back in the queue.\n\n\
         assert_eq!(gh_runner.seen.len(), 5, "seen: {:?}", gh_runner.seen);
         assert!(exec.commented);
         assert_eq!(pr_comment_bodies(&gh_runner).len(), 1);
+    }
+
+    // ── #404: without `--merge`, only the hold itself is real ───────────
+
+    /// A round-limited request from a caller that did not ask for merges to
+    /// be executed (`advance` without `--merge`).
+    fn hold_only_round_limited() -> MergeRequest<'static> {
+        MergeRequest {
+            round_limit: Some(RoundLimit {
+                rounds: 3,
+                limit: 3,
+                hold_only: true,
+            }),
+            ..request(false)
+        }
+    }
+
+    /// Any argv that writes to GitHub.
+    fn github_writes(gh: &ScriptedGh) -> Vec<&Vec<String>> {
+        gh.seen
+            .iter()
+            .filter(|argv| {
+                matches!(
+                    (argv[0].as_str(), argv[1].as_str()),
+                    ("pr", "comment")
+                        | ("pr", "merge")
+                        | ("issue", "comment")
+                        | ("issue", "edit")
+                        | ("label", "create")
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_hold_only_request_on_a_merged_pr_rehearses_the_stand_down() {
+        let database = db();
+        store_three_rounds(&database);
+        let mut gh_runner = ScriptedGh::new(vec![Ok(pr_view_ok("MERGED", HEAD))]);
+
+        let exec = execute_merge(&database, &mut gh_runner, &hold_only_round_limited()).unwrap();
+
+        assert_eq!(
+            exec.outcome,
+            MergeOutcome::AlreadyMerged {
+                head_sha: HEAD.into()
+            }
+        );
+        assert!(!exec.commented);
+        assert!(exec.label_plan.is_none());
+        assert!(
+            github_writes(&gh_runner).is_empty(),
+            "seen: {:?}",
+            gh_runner.seen
+        );
+        // Only the PR view.
+        assert_eq!(gh_runner.seen.len(), 1, "seen: {:?}", gh_runner.seen);
+        let records = merges_for_issue(&database, &issue()).unwrap();
+        assert_eq!(records.len(), 1);
+        assert!(records[0].dry_run, "recorded on the dry-run footing");
+        assert_eq!(real_merge_records(&database), 0);
+    }
+
+    #[test]
+    fn a_hold_only_request_on_a_closed_pr_rehearses_the_closed_hold() {
+        let database = db();
+        store_three_rounds(&database);
+        let mut gh_runner = ScriptedGh::new(vec![Ok(pr_view_ok("CLOSED", HEAD))]);
+
+        let exec = execute_merge(&database, &mut gh_runner, &hold_only_round_limited()).unwrap();
+
+        assert_eq!(
+            exec.outcome.hold(),
+            Some(&MergeHold::PrNotOpen {
+                state: "CLOSED".into()
+            })
+        );
+        assert!(!exec.commented);
+        assert!(exec.label_plan.is_none());
+        assert!(
+            github_writes(&gh_runner).is_empty(),
+            "seen: {:?}",
+            gh_runner.seen
+        );
+        assert_eq!(gh_runner.seen.len(), 1, "seen: {:?}", gh_runner.seen);
+        let records = merges_for_issue(&database, &issue()).unwrap();
+        assert_eq!(records.len(), 1);
+        assert!(records[0].dry_run, "recorded on the dry-run footing");
+        assert_eq!(real_merge_records(&database), 0);
+    }
+
+    #[test]
+    fn a_hold_only_request_on_an_open_pr_still_holds_for_real() {
+        // The one outcome `hold_only` keeps real, and it must be exactly the
+        // hold a `--merge` caller gets.
+        let run = |request: &MergeRequest| {
+            let database = db();
+            store_three_rounds(&database);
+            let mut gh_runner = a_full_round_limit_script();
+            let exec = execute_merge(&database, &mut gh_runner, request).unwrap();
+            (exec, gh_runner.seen, real_merge_records(&database))
+        };
+
+        let (held, held_seen, held_records) = run(&hold_only_round_limited());
+        let (merging, merging_seen, merging_records) = run(&round_limited(false));
+
+        assert_eq!(held_seen.len(), 5, "seen: {held_seen:?}");
+        assert_eq!(held_seen, merging_seen);
+        assert_eq!(held.outcome, merging.outcome);
+        assert_eq!(held.outcome.hold(), Some(&round_limit_hold(3)));
+        assert!(held.commented && held.record_appended);
+        assert_eq!(held.label_plan, merging.label_plan);
+        assert!(held.label_plan.is_some());
+        assert!(
+            held_seen
+                .iter()
+                .any(|argv| argv.iter().any(|arg| arg == "agent:blocked")),
+            "seen: {held_seen:?}"
+        );
+        assert_eq!(held_records, 1, "a real record, which resets the count");
+        assert_eq!(merging_records, 1);
+    }
+
+    #[test]
+    fn a_round_limit_request_from_a_merging_caller_still_stands_down_for_real() {
+        // `--merge` behaviour, unchanged: a merged PR is stood down from on
+        // GitHub, labels cleared and the issue told.
+        let database = db();
+        store_three_rounds(&database);
+        let mut gh_runner = ScriptedGh::new(vec![
+            Ok(pr_view_ok("MERGED", HEAD)),
+            Ok(GhOutput::ok(r#"{"labels":[{"name":"agent:ready"}]}"#)),
+            Ok(GhOutput::ok("")),
+            Ok(GhOutput::ok("")),
+        ]);
+
+        let exec = execute_merge(&database, &mut gh_runner, &round_limited(false)).unwrap();
+
+        assert_eq!(
+            exec.outcome,
+            MergeOutcome::AlreadyMerged {
+                head_sha: HEAD.into()
+            }
+        );
+        assert!(exec.commented);
+        let plan = exec.label_plan.expect("a landed PR clears the labels");
+        assert_eq!(plan.remove, vec!["agent:ready".to_string()]);
+        // The PR view, the label read, the label edit, the issue comment.
+        assert_eq!(gh_runner.seen.len(), 4, "seen: {:?}", gh_runner.seen);
+        assert_eq!(real_merge_records(&database), 1);
     }
 }
