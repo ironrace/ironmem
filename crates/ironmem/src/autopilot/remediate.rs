@@ -110,7 +110,8 @@
 //! consecutive `needs_changes` reviews of one PR (by default
 //! [`DEFAULT_MAX_REVIEW_ROUNDS`]), another patch is unlikely to converge, so
 //! nothing is armed, the issue's remediation record, if one is still stored,
-//! is cleared, and the PR is held for a human. The count is derived by
+//! is cleared, and the caller holds the PR for a human unless the PR turns
+//! out to be merged or closed. The count is derived by
 //! [`review_rounds`] from the review and merge records and is never stored
 //! here.
 //!
@@ -180,7 +181,7 @@ pub const DEFAULT_MAX_REVIEW_ROUNDS: u32 = 3;
 ///   re-labelled issue starts from zero.
 ///
 /// Pure, so the counting rule is tested without a database.
-pub fn consecutive_needs_changes<'a>(
+pub(crate) fn consecutive_needs_changes<'a>(
     reviews: &'a [RecordedReviewSummary],
     canonical_issue: &str,
     pr_number: u64,
@@ -580,9 +581,9 @@ pub enum ArmOutcome {
     /// The reviewer has returned `needs_changes` in `rounds` consecutive
     /// rounds on this PR, which reaches `limit` (#404). No fix is armed, and
     /// the issue's remediation record, if one is still stored, is cleared,
-    /// so the Lead has nothing to dispatch; the caller's next step is a real
-    /// hold
-    /// that comments on the PR and moves the issue to `agent:blocked`.
+    /// so the Lead has nothing to dispatch. The caller's next step is a real
+    /// hold that comments on the PR and moves the issue to `agent:blocked`,
+    /// unless the PR turns out to be merged or closed.
     RoundLimitReached { rounds: u32, limit: u32 },
 }
 

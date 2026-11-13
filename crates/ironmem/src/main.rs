@@ -3863,6 +3863,20 @@ mod tests {
             "Advance — 0 carried forward, 0 skipped, 0 problem(s) [merges rehearsed — pass \
              --merge to execute; a review-round-limit hold is still posted]"
         );
+        // Under `--dry-run`, `advance_pass` reports both `merge_enabled` and
+        // `remediate_enabled` false whatever `--merge` and `--remediate` say,
+        // so `--dry-run --remediate`, with or without `--merge`, prints this
+        // header: no claim that a hold is posted, since a dry run arms
+        // nothing and so posts no hold (see `a_dry_run_arms_nothing` and
+        // `a_dry_run_at_the_limit_writes_nothing` in `advance`).
+        let dry_run_remediate = header(true, false, false);
+        assert_eq!(
+            dry_run_remediate,
+            "Advance — 0 carried forward, 0 skipped, 0 problem(s) [dry run] [merges rehearsed — \
+             pass --merge to execute] [NEEDS CHANGES held for a human — pass --remediate to \
+             re-dispatch]"
+        );
+        assert!(!dry_run_remediate.contains("still posted"));
     }
 
     #[test]

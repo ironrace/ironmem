@@ -509,11 +509,12 @@ pub struct MergeRequest<'a> {
     /// irreversible action deserves.
     pub dry_run: bool,
     /// Set when [`super::remediate::arm_remediation`] answered
-    /// `RoundLimitReached` (#404). The request then **holds
-    /// unconditionally** with `HoldReason::ReviewRoundsExhausted`: the guard
-    /// sits ahead of the review lookup in [`evaluate`], so no stored verdict
-    /// can carry such a request to `gh pr merge`. `None` everywhere else,
-    /// including `ironmem autopilot merge`.
+    /// `RoundLimitReached` (#404). The request then holds with
+    /// `HoldReason::ReviewRoundsExhausted` unless the PR is already merged or
+    /// closed: the guard sits after those two checks and ahead of the review
+    /// lookup in [`evaluate`], so no stored verdict can carry such a request
+    /// to `gh pr merge`. `None` everywhere else, including `ironmem autopilot
+    /// merge`.
     pub round_limit: Option<RoundLimit>,
 }
 
@@ -891,7 +892,8 @@ fn mergeable_state_permits(status: &str) -> bool {
 /// keeps failing then retries only the label, and the comment is posted
 /// once; a record write that failed after the label landed is commented
 /// again on the re-queue that follows. Its order is comment (unless noticed)
-/// → notice → label → mark → record → clear.
+/// → notice → label → mark → record → clear. A failed mark or clear is
+/// logged and does not stop the hold.
 ///
 /// The two orderings are not a inconsistency to be tidied away. They are the
 /// same rule applied to different stakes: never lose the record of something
@@ -1095,11 +1097,30 @@ fn finish(
             //
             // The notice is marked once the label lands, so a failed record
             // write that a human then re-queues is commented again rather than
-            // re-blocked in silence, and cleared once the hold is recorded.
+            // re-blocked in silence, and cleared once the hold is recorded. A
+            // failed mark or clear is logged, not propagated.
             if hold.is_round_limit() {
                 label_plan = apply_hold_labels(gh_runner, request.issue, &current, disposition)?;
+                // Not propagated: by now the comment is posted and the label
+                // has landed, and only the record is left. Failing here left
+                // the issue `agent:blocked` with no record and an unmarked
+                // notice, so a human's re-label was blocked again with no
+                // comment. Going on to the record finishes the hold, and the
+                // clear below removes the unmarked notice.
                 if let Some(newest) = &notice_round {
-                    record_round_limit_notice(db, request.issue, request.pr_number, newest, true)?;
+                    if let Err(error) = record_round_limit_notice(
+                        db,
+                        request.issue,
+                        request.pr_number,
+                        newest,
+                        true,
+                    ) {
+                        tracing::warn!(
+                            error = %error,
+                            issue = %request.issue.canonical(),
+                            "autopilot could not mark the round-limit notice"
+                        );
+                    }
                 }
                 record_drawer_id = record_once(db, &record, repeat.as_ref())?;
                 // Not propagated: the hold is commented, labeled and recorded,
@@ -1150,8 +1171,11 @@ fn finish(
 ///    again means the record write failed and a human has since re-queued
 ///    the issue, so it does not suppress the comment: re-blocking the issue
 ///    with no explanation would be worse than a second, truthful comment.
+///    A failed mark is logged and the record is still written.
 /// 3. **Cleared** once the hold is recorded. A notice that is present
-///    therefore always means "this hold did not finish".
+///    therefore means this hold did not finish, or that the clear failed
+///    after it did; the record written before the clear resets the round
+///    count, so such a notice never matches a later hold's rounds.
 ///
 /// Only ever suppresses a repeat comment: nothing else reads it, and
 /// `remediate::review_rounds` does not, so it can never change the count.
@@ -1480,7 +1504,7 @@ pub fn render_hold_comment(
 /// open an HTML comment or `<details>` that swallows the rest of the
 /// comment, or `@`-mention anyone. The whole body is scrubbed and bounded
 /// again on the way out.
-pub fn render_hold_comment_with_rounds(
+pub(crate) fn render_hold_comment_with_rounds(
     request: &MergeRequest,
     hold: &MergeHold,
     disposition: HoldDisposition,
@@ -4315,7 +4339,8 @@ back in the queue.\n\n\
     }
 
     #[test]
-    fn an_exhausted_issue_at_the_round_limit_keeps_its_label_and_gets_no_fresh_count() {
+    fn an_exhausted_issue_at_the_round_limit_keeps_its_label_and_its_comment_promises_no_fresh_count(
+    ) {
         let database = db();
         store_three_rounds(&database);
         let mut gh_runner = ScriptedGh::new(vec![
@@ -4612,6 +4637,53 @@ back in the queue.\n\n\
                 .unwrap()
                 .is_none(),
             "a notice that survives means the hold did not finish"
+        );
+    }
+
+    #[test]
+    fn a_failed_notice_mark_still_records_the_round_limit_hold() {
+        // The mark is the notice rewritten with `label_applied: true`. A
+        // trigger refuses exactly that write, so the first notice write (with
+        // `label_applied: false`) and the clear still go through.
+        let database = db();
+        store_three_rounds(&database);
+        database
+            .exec_raw(
+                r#"CREATE TRIGGER refuse_notice_mark_insert
+                 BEFORE INSERT ON drawers
+                 WHEN NEW.content LIKE '%"label_applied":true%'
+                 BEGIN
+                     SELECT RAISE(ABORT, 'forced notice mark failure');
+                 END;
+                 CREATE TRIGGER refuse_notice_mark_update
+                 BEFORE UPDATE ON drawers
+                 WHEN NEW.content LIKE '%"label_applied":true%'
+                 BEGIN
+                     SELECT RAISE(ABORT, 'forced notice mark failure');
+                 END;"#,
+            )
+            .unwrap();
+        let mut gh_runner = a_full_round_limit_script();
+
+        let exec = execute_merge(&database, &mut gh_runner, &round_limited(false)).unwrap();
+
+        assert_eq!(gh_runner.seen.len(), 5, "seen: {:?}", gh_runner.seen);
+        assert!(exec.commented && exec.record_appended);
+        assert!(exec.label_plan.is_some());
+        assert_eq!(pr_comment_bodies(&gh_runner).len(), 1);
+        assert_eq!(real_merge_records(&database), 1);
+        assert_eq!(
+            crate::autopilot::remediate::review_rounds(&database, &issue(), 7)
+                .unwrap()
+                .len(),
+            0,
+            "the record reset the count"
+        );
+        assert!(
+            super::super::read_current(&database, &round_limit_notice_key(&issue()))
+                .unwrap()
+                .is_none(),
+            "the unmarked notice is cleared once the hold is recorded"
         );
     }
 

@@ -97,12 +97,16 @@
 //! recover it by.
 //!
 //! The hand-off to a human still happens; it happens *later*, when the
-//! automation has actually given up. `remediate::arm_remediation` checks the
-//! attempt cap first and answers `CapReached`, which is not `in_force`, so a
-//! remediation that has spent its own cap falls through to the real merge and rung 6 comments and
-//! labels exactly as it always did. That is the spec's *"on exhaustion the PR
-//! stays open for a human — never merged with an unresolved finding"*, with
-//! both halves reachable.
+//! automation has actually given up, and there are two ways it can.
+//! `remediate::arm_remediation` checks the attempt cap first and answers
+//! `CapReached`, which is not `in_force`, so a remediation that has spent its
+//! own cap falls through to the real merge and rung 6 comments and labels
+//! exactly as it always did. That is the spec's *"on exhaustion the PR stays
+//! open for a human — never merged with an unresolved finding"*, with both
+//! halves reachable. It then checks the review-round limit (#404) and answers
+//! `RoundLimitReached` after `max_review_rounds` consecutive `needs_changes`
+//! reviews of one PR: nothing is armed, and the merge step holds the PR for a
+//! human with one comment on it, with or without `--merge`.
 //!
 //! # No eleventh drawer kind
 //!
@@ -168,7 +172,9 @@ pub struct AdvanceConfig {
     pub max_issues_per_repo: u32,
     /// See [`DEFAULT_MAX_ADVANCES_PER_PASS`].
     pub max_advances_per_pass: usize,
-    /// Whether merges are executed. Off means every merge is rehearsed.
+    /// Whether merges are executed. Off means every merge step is rehearsed,
+    /// with one exception: under `remediate`, the review-round-limit hold
+    /// (#404) is still posted for real, because nothing else tells a human.
     pub merge: bool,
     /// Whether a `needs_changes` verdict arms a re-dispatch (rung 11).
     ///
@@ -199,7 +205,8 @@ pub struct AdvanceConfig {
     /// when the automation gives up and tells a human.
     pub attempt_cap: u32,
     /// How many consecutive `needs_changes` rounds one PR gets before a
-    /// remediation stops being armed and the PR is held for a human (#404).
+    /// remediation stops being armed and the PR is held for a human (#404),
+    /// unless the PR turns out to be merged or closed.
     ///
     /// Read only when `remediate` is on, and only here: this pass is what
     /// arms a fix, so the Lead has no matching setting to keep in step.
@@ -3047,6 +3054,8 @@ mod tests {
         review_decision: String,
         merged: bool,
         comments: usize,
+        /// Comments posted on the pull request (#404's round-limit hold).
+        pr_comments: usize,
     }
 
     /// A GitHub that *remembers*: a base branch requiring one approving
@@ -3078,6 +3087,7 @@ mod tests {
                     review_decision: "REVIEW_REQUIRED".into(),
                     merged: false,
                     comments: 0,
+                    pr_comments: 0,
                 },
             );
             self
@@ -3198,6 +3208,15 @@ mod tests {
                 ("issue", "comment") => {
                     let n = Self::number_arg(args);
                     self.issues.get_mut(&n).unwrap().comments += 1;
+                    ok("")
+                }
+                ("pr", "comment") => {
+                    let pr = Self::number_arg(args);
+                    self.issues
+                        .values_mut()
+                        .find(|i| i.pr_number == pr)
+                        .unwrap()
+                        .pr_comments += 1;
                     ok("")
                 }
                 ("label", "create") => ok(""),
@@ -5291,6 +5310,81 @@ skipped: {:?}",
     }
 
     #[test]
+    fn a_second_pass_over_a_held_issue_posts_no_second_comment() {
+        // `ProtectedGitHub` keeps the label the hold writes, so the second
+        // pass lists issues the way GitHub would after the hold.
+        for merge_enabled in [false, true] {
+            let db = approved_db();
+            record_success(&db, &issue(), Some(GREEN));
+            two_earlier_rounds(&db);
+            let (repo, roots) = checkout_with_worktree();
+            let mut cfg = config(roots.path(), repo.path());
+            cfg.merge = merge_enabled;
+            cfg.remediate = true;
+            let mut github =
+                ProtectedGitHub::new().with_issue(283, 322, &["agent:ready", "risk:documentation"]);
+
+            let first = advance_pass(&db, &mut github, &mut needs_changes(), &cfg).unwrap();
+            assert_eq!(
+                first.advanced[0].remediation,
+                Some(ArmOutcome::RoundLimitReached {
+                    rounds: 3,
+                    limit: 3,
+                }),
+                "merge={merge_enabled}"
+            );
+            assert_eq!(github.issue(283).pr_comments, 1, "merge={merge_enabled}");
+            assert!(
+                github
+                    .issue(283)
+                    .labels
+                    .iter()
+                    .any(|l| l == "agent:blocked")
+                    && !github.issue(283).labels.iter().any(|l| l == "agent:ready"),
+                "merge={merge_enabled}: {:?}",
+                github.issue(283).labels
+            );
+            // The listings, the PR view, the label read, the PR comment, the
+            // label create and the label edit.
+            assert_eq!(
+                github.seen.len(),
+                7,
+                "merge={merge_enabled}, seen: {:?}",
+                github.seen
+            );
+
+            github.seen.clear();
+            let second = advance_pass(&db, &mut github, &mut ForbiddenReviewer, &cfg).unwrap();
+
+            // Only the `agent:ready` listing, which no longer has the issue.
+            assert_eq!(
+                github.seen.len(),
+                1,
+                "merge={merge_enabled}, seen: {:?}",
+                github.seen
+            );
+            assert_eq!(github.seen[0][..2], ["issue", "list"]);
+            assert!(
+                !github.seen.iter().any(|argv| matches!(
+                    (argv[0].as_str(), argv[1].as_str()),
+                    ("pr", "comment")
+                        | ("issue", "comment")
+                        | ("issue", "edit")
+                        | ("label", "create")
+                )),
+                "merge={merge_enabled}, seen: {:?}",
+                github.seen
+            );
+            assert_eq!(github.issue(283).pr_comments, 1, "merge={merge_enabled}");
+            assert!(
+                second.advanced.is_empty() && second.skipped.is_empty(),
+                "merge={merge_enabled}: the held issue is not carried forward: {second:?}"
+            );
+            assert!(second.problems.is_empty(), "merge={merge_enabled}");
+        }
+    }
+
+    #[test]
     fn a_dry_run_at_the_limit_writes_nothing() {
         let db = approved_db();
         record_success(&db, &issue(), Some(GREEN));
@@ -5313,6 +5407,9 @@ skipped: {:?}",
         let report = advance_pass(&db, &mut gh, &mut ForbiddenReviewer, &cfg).unwrap();
         let advanced = &report.advanced[0];
 
+        // What the header reads: a dry run reports neither flag, so it does
+        // not say a round-limit hold is posted.
+        assert!(report.dry_run && !report.merge_enabled && !report.remediate_enabled);
         assert_eq!(advanced.remediation, None);
         let execution = advanced.merge.as_ref().unwrap();
         assert!(!execution.commented && execution.label_plan.is_none());
