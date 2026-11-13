@@ -457,6 +457,14 @@ pub struct MergeExecution {
     /// matching the one already at the head of this PR's history. A poll
     /// loop on an unchanging hold appends nothing after its first pass.
     pub record_appended: bool,
+    /// Whether this attempt was rehearsed: nothing written to GitHub, and
+    /// recorded on the dry-run footing. Taken from the request `finish` ran
+    /// on, so a round-limited request whose other outcomes are rehearsed
+    /// (`RoundLimit::rehearse_other_outcomes`) reports `true` for a PR found
+    /// merged or closed, and `false` for the hold it posted for real. A
+    /// caller that did not ask for merges reads this, not its own flag, to
+    /// tell a real write from a rehearsal (#404).
+    pub rehearsed: bool,
     /// The drawer id of the merge record describing this attempt — the one
     /// just appended, or the identical existing one when
     /// `record_appended` is false. Always present: a storage failure is an
@@ -482,7 +490,7 @@ pub struct RoundLimit {
     /// footing, with nothing written to GitHub. `advance` without `--merge`
     /// still holds for real at the limit, because nothing else will tell a
     /// human; a PR found merged or closed meanwhile is not that hold.
-    pub hold_only: bool,
+    pub rehearse_other_outcomes: bool,
 }
 
 /// Inputs to [`execute_merge`].
@@ -524,12 +532,14 @@ pub fn execute_merge(
 ) -> Result<MergeExecution, MemoryError> {
     validate_repo(&request.issue.repo)?;
     let (outcome, snapshot) = evaluate(db, gh_runner, request)?;
-    // #404: a hold-only request is real for the round-limit hold and for
-    // nothing else. `evaluate` returns before anything that writes when a
-    // round limit is set, so rehearsing here, in `finish`, is the whole
-    // difference: a PR found merged or closed is recorded as a rehearsal
-    // and nothing is written to GitHub.
-    if request.round_limit.is_some_and(|limit| limit.hold_only)
+    // #404: a request that sets `rehearse_other_outcomes` is real for the
+    // round-limit hold and for nothing else. `evaluate` returns before
+    // anything that writes when a round limit is set, so rehearsing here, in
+    // `finish`, is the whole difference: a PR found merged or closed is
+    // recorded as a rehearsal and nothing is written to GitHub.
+    if request
+        .round_limit
+        .is_some_and(|limit| limit.rehearse_other_outcomes)
         && !outcome.hold().is_some_and(MergeHold::is_round_limit)
     {
         let rehearsal = MergeRequest {
@@ -602,6 +612,11 @@ fn evaluate(
     //     carries it cannot merge whatever the stored review says. Below the
     //     merged and open checks, so the comment's "stays open" is still
     //     true of the PR it is posted on.
+    //
+    //     Any guard added above this one must not write. A round-limited
+    //     request may arrive with `dry_run: false` from a caller that did not
+    //     ask for merges (`advance` without `--merge`); only `finish`, after
+    //     `RoundLimit::rehearse_other_outcomes` has been applied, may write.
     if let Some(RoundLimit { rounds, limit, .. }) = request.round_limit {
         let reason = super::review::HoldReason::ReviewRoundsExhausted { rounds, limit };
         return Ok((
@@ -1116,6 +1131,7 @@ fn finish(
         label_error,
         commented,
         record_appended: repeat.is_none(),
+        rehearsed: request.dry_run,
         record_drawer_id,
     })
 }
@@ -1949,7 +1965,7 @@ mod tests {
             round_limit: Some(RoundLimit {
                 rounds: 3,
                 limit: 3,
-                hold_only: false,
+                rehearse_other_outcomes: false,
             }),
             ..request(dry_run)
         }
@@ -4639,12 +4655,12 @@ back in the queue.\n\n\
 
     /// A round-limited request from a caller that did not ask for merges to
     /// be executed (`advance` without `--merge`).
-    fn hold_only_round_limited() -> MergeRequest<'static> {
+    fn rehearsing_round_limited() -> MergeRequest<'static> {
         MergeRequest {
             round_limit: Some(RoundLimit {
                 rounds: 3,
                 limit: 3,
-                hold_only: true,
+                rehearse_other_outcomes: true,
             }),
             ..request(false)
         }
@@ -4668,12 +4684,12 @@ back in the queue.\n\n\
     }
 
     #[test]
-    fn a_hold_only_request_on_a_merged_pr_rehearses_the_stand_down() {
+    fn a_rehearsing_round_limit_request_on_a_merged_pr_rehearses_the_stand_down() {
         let database = db();
         store_three_rounds(&database);
         let mut gh_runner = ScriptedGh::new(vec![Ok(pr_view_ok("MERGED", HEAD))]);
 
-        let exec = execute_merge(&database, &mut gh_runner, &hold_only_round_limited()).unwrap();
+        let exec = execute_merge(&database, &mut gh_runner, &rehearsing_round_limited()).unwrap();
 
         assert_eq!(
             exec.outcome,
@@ -4697,12 +4713,12 @@ back in the queue.\n\n\
     }
 
     #[test]
-    fn a_hold_only_request_on_a_closed_pr_rehearses_the_closed_hold() {
+    fn a_rehearsing_round_limit_request_on_a_closed_pr_rehearses_the_closed_hold() {
         let database = db();
         store_three_rounds(&database);
         let mut gh_runner = ScriptedGh::new(vec![Ok(pr_view_ok("CLOSED", HEAD))]);
 
-        let exec = execute_merge(&database, &mut gh_runner, &hold_only_round_limited()).unwrap();
+        let exec = execute_merge(&database, &mut gh_runner, &rehearsing_round_limited()).unwrap();
 
         assert_eq!(
             exec.outcome.hold(),
@@ -4725,9 +4741,9 @@ back in the queue.\n\n\
     }
 
     #[test]
-    fn a_hold_only_request_on_an_open_pr_still_holds_for_real() {
-        // The one outcome `hold_only` keeps real, and it must be exactly the
-        // hold a `--merge` caller gets.
+    fn a_rehearsing_round_limit_request_on_an_open_pr_still_holds_for_real() {
+        // The one outcome `rehearse_other_outcomes` keeps real, and it must
+        // be exactly the hold a `--merge` caller gets.
         let run = |request: &MergeRequest| {
             let database = db();
             store_three_rounds(&database);
@@ -4736,7 +4752,7 @@ back in the queue.\n\n\
             (exec, gh_runner.seen, real_merge_records(&database))
         };
 
-        let (held, held_seen, held_records) = run(&hold_only_round_limited());
+        let (held, held_seen, held_records) = run(&rehearsing_round_limited());
         let (merging, merging_seen, merging_records) = run(&round_limited(false));
 
         assert_eq!(held_seen.len(), 5, "seen: {held_seen:?}");
@@ -4754,6 +4770,40 @@ back in the queue.\n\n\
         );
         assert_eq!(held_records, 1, "a real record, which resets the count");
         assert_eq!(merging_records, 1);
+    }
+
+    #[test]
+    fn an_execution_says_whether_it_was_rehearsed() {
+        // A real round-limit hold made by a caller that did not ask for
+        // merges is not a rehearsal, and the report must be able to say so.
+        let database = db();
+        store_three_rounds(&database);
+        let mut gh_runner = a_full_round_limit_script();
+        let real = execute_merge(&database, &mut gh_runner, &rehearsing_round_limited()).unwrap();
+        assert_eq!(gh_runner.seen.len(), 5, "seen: {:?}", gh_runner.seen);
+        assert!(real.commented);
+        assert!(!real.rehearsed, "the hold was written to GitHub");
+
+        // A dry run is a rehearsal.
+        let database = db();
+        store_three_rounds(&database);
+        let mut gh_runner = ScriptedGh::new(vec![Ok(pr_view_ok("OPEN", HEAD))]);
+        let dry = execute_merge(&database, &mut gh_runner, &round_limited(true)).unwrap();
+        assert_eq!(gh_runner.seen.len(), 1, "seen: {:?}", gh_runner.seen);
+        assert!(dry.rehearsed);
+
+        // So is the outcome a rehearsing request downgrades: the PR merged.
+        let database = db();
+        store_three_rounds(&database);
+        let mut gh_runner = ScriptedGh::new(vec![Ok(pr_view_ok("MERGED", HEAD))]);
+        let downgraded =
+            execute_merge(&database, &mut gh_runner, &rehearsing_round_limited()).unwrap();
+        assert_eq!(gh_runner.seen.len(), 1, "seen: {:?}", gh_runner.seen);
+        assert!(matches!(
+            downgraded.outcome,
+            MergeOutcome::AlreadyMerged { .. }
+        ));
+        assert!(downgraded.rehearsed, "reported on the footing it ran on");
     }
 
     #[test]

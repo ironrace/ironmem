@@ -1230,15 +1230,15 @@ fn advance_issue(
     // a round limit. `--dry-run` still writes nothing: arming is skipped on
     // a dry run, so `round_limit` is `None` there.
     //
-    // Without `--merge` the request is `hold_only`, so `execute_merge`
-    // rehearses every outcome but that hold: a PR found merged or closed in
-    // the meantime is not the hold, and gets no comment, no label and no
-    // clean-up.
+    // Without `--merge` the request sets `rehearse_other_outcomes`, so
+    // `execute_merge` rehearses every outcome but that hold: a PR found
+    // merged or closed in the meantime is not the hold, and gets no comment,
+    // no label and no clean-up.
     let round_limit = match &remediation {
         Some(ArmOutcome::RoundLimitReached { rounds, limit }) => Some(merge::RoundLimit {
             rounds: *rounds,
             limit: *limit,
-            hold_only: !config.merge,
+            rehearse_other_outcomes: !config.merge,
         }),
         _ => None,
     };
@@ -5170,6 +5170,10 @@ skipped: {:?}",
                 execution.commented && execution.label_plan.is_some(),
                 "merge={merge_enabled}: the hold is real, not rehearsed"
             );
+            assert!(
+                !execution.rehearsed,
+                "merge={merge_enabled}: and the report says so"
+            );
             let comments = pr_comments(&gh);
             assert_eq!(comments.len(), 1, "seen: {:?}", gh.seen);
             assert_eq!(comments[0][2], "322");
@@ -5366,6 +5370,10 @@ skipped: {:?}",
         );
         assert!(!execution.commented && execution.label_plan.is_none());
         assert!(
+            execution.rehearsed,
+            "the stand-down is reported as rehearsed"
+        );
+        assert!(
             !gh.seen.iter().any(|argv| matches!(
                 (argv[0].as_str(), argv[1].as_str()),
                 ("pr", "comment")
@@ -5414,6 +5422,7 @@ skipped: {:?}",
             execution.outcome
         );
         assert!(execution.outcome.landed());
+        assert!(!execution.rehearsed);
         assert!(execution.commented, "the issue is told it landed");
         let plan = execution
             .label_plan
@@ -5435,6 +5444,275 @@ skipped: {:?}",
         assert!(
             !worktree::worktree_path(roots.path(), &issue()).exists(),
             "the checkout is gone from disk"
+        );
+    }
+
+    /// Every argv in `gh` that writes to GitHub.
+    fn gh_writes(gh: &ScriptedGh) -> Vec<&Vec<String>> {
+        gh.seen
+            .iter()
+            .filter(|argv| {
+                matches!(
+                    (argv[0].as_str(), argv[1].as_str()),
+                    ("pr", "comment")
+                        | ("pr", "merge")
+                        | ("issue", "comment")
+                        | ("issue", "edit")
+                        | ("label", "create")
+                )
+            })
+            .collect()
+    }
+
+    fn issue_comments(gh: &ScriptedGh) -> Vec<&Vec<String>> {
+        gh.seen
+            .iter()
+            .filter(|argv| argv.first().map(String::as_str) == Some("issue"))
+            .filter(|argv| argv.get(1).map(String::as_str) == Some("comment"))
+            .collect()
+    }
+
+    /// Three `needs_changes` rounds on PR 322, the newest at `GREEN`, and a
+    /// remediation that has spent a cap of five since the success at
+    /// attempt 1: both limits are reached at once.
+    fn cap_and_round_limit_both_reached() -> Database {
+        let db = approved_db();
+        record_success(&db, &issue(), Some(GREEN));
+        lineage::record_attempt(
+            &db,
+            &lineage::AttemptRecord {
+                issue: issue(),
+                attempt_n: 1,
+                approach: "went green".into(),
+                verdict: AttemptOutcome::Success,
+                why_failed: None,
+                commit_sha: Some(GREEN.to_string()),
+            },
+        )
+        .unwrap();
+        two_earlier_rounds(&db);
+        reviewed_at_needing_changes(&db, &issue(), 322, GREEN);
+        lineage::upsert_issue_status(
+            &db,
+            &IssueStatus {
+                issue: issue(),
+                best_verdict: Some(AttemptOutcome::Success),
+                best_commit_sha: Some(GREEN.to_string()),
+                cumulative_attempt_n: 6,
+            },
+        )
+        .unwrap();
+        db
+    }
+
+    #[test]
+    fn when_the_cap_and_the_round_limit_are_both_reached_the_cap_applies() {
+        // The cap is checked first, so the outcome is `CapReached` and the
+        // hold is the existing `NeedsChanges` one: on the issue, and only
+        // under `--merge`.
+        for merge_enabled in [true, false] {
+            let db = cap_and_round_limit_both_reached();
+            let (repo, roots) = checkout_with_worktree();
+            let mut cfg = config(roots.path(), repo.path());
+            cfg.merge = merge_enabled;
+            cfg.remediate = true;
+            cfg.attempt_cap = 5;
+            let mut gh = ScriptedGh::new(hold_script());
+
+            let report = advance_pass(&db, &mut gh, &mut ForbiddenReviewer, &cfg).unwrap();
+            let advanced = &report.advanced[0];
+
+            assert!(
+                matches!(advanced.remediation, Some(ArmOutcome::CapReached { .. })),
+                "merge={merge_enabled}: got {:?}",
+                advanced.remediation
+            );
+            let execution = advanced.merge.as_ref().unwrap();
+            assert_eq!(
+                execution.outcome.hold(),
+                Some(&merge::MergeHold::Review(review::HoldReason::NeedsChanges)),
+                "merge={merge_enabled}"
+            );
+            assert!(pr_comments(&gh).is_empty(), "seen: {:?}", gh.seen);
+            if merge_enabled {
+                assert_eq!(issue_comments(&gh).len(), 1, "seen: {:?}", gh.seen);
+                assert!(execution.commented && execution.label_plan.is_some());
+                assert!(!execution.rehearsed);
+                assert_eq!(gh.seen.len(), 7, "seen: {:?}", gh.seen);
+            } else {
+                assert!(gh_writes(&gh).is_empty(), "seen: {:?}", gh.seen);
+                assert!(execution.rehearsed);
+                assert_eq!(gh.seen.len(), 3, "seen: {:?}", gh.seen);
+            }
+        }
+    }
+
+    #[test]
+    fn a_follow_up_on_the_third_round_is_posted_before_the_hold() {
+        let db = approved_db();
+        record_success(&db, &issue(), Some(GREEN));
+        two_earlier_rounds(&db);
+        let (repo, roots) = checkout_with_worktree();
+        let mut cfg = config(roots.path(), repo.path());
+        cfg.remediate = true;
+        let mut reviewer = needs_changes();
+        reviewer.outcome.follow_up = Some("rename `x` in foo.rs".into());
+        let mut script = vec![
+            ok(&issue_list_json(
+                283,
+                &["agent:ready", "risk:documentation"],
+            )),
+            ok(&pr_list_json(322, GREEN)),
+            // the follow-up comment
+            ok(""),
+        ];
+        script.extend(hold_script().into_iter().skip(2));
+        let mut gh = ScriptedGh::new(script);
+
+        let report = advance_pass(&db, &mut gh, &mut reviewer, &cfg).unwrap();
+
+        assert_eq!(
+            report.advanced[0].remediation,
+            Some(ArmOutcome::RoundLimitReached {
+                rounds: 3,
+                limit: 3,
+            })
+        );
+        let comments = pr_comments(&gh);
+        assert_eq!(comments.len(), 2, "seen: {:?}", gh.seen);
+        assert!(
+            comments[0][6].contains("rename `x` in foo.rs"),
+            "{}",
+            comments[0][6]
+        );
+        assert!(
+            comments[1][6].contains("has not converged"),
+            "{}",
+            comments[1][6]
+        );
+        assert_eq!(gh.seen.len(), 8, "seen: {:?}", gh.seen);
+    }
+
+    #[test]
+    fn a_failed_label_write_on_the_hold_without_merge_is_retried_without_a_second_comment() {
+        let db = approved_db();
+        record_success(&db, &issue(), Some(GREEN));
+        two_earlier_rounds(&db);
+        let (repo, roots) = checkout_with_worktree();
+        let mut cfg = config(roots.path(), repo.path());
+        cfg.remediate = true;
+        let mut script = hold_script();
+        *script.last_mut().unwrap() = ran_and_failed("gh: Resource not accessible (HTTP 403)");
+        let mut gh = ScriptedGh::new(script);
+
+        let report = advance_pass(&db, &mut gh, &mut needs_changes(), &cfg).unwrap();
+
+        // `execute_merge` returns the label failure as an `Err`, which the
+        // pass reports as a problem for the issue rather than a step.
+        assert!(report.advanced.is_empty(), "{:?}", report.advanced);
+        assert_eq!(report.problems.len(), 1, "{:?}", report.problems);
+        assert_eq!(pr_comments(&gh).len(), 1, "seen: {:?}", gh.seen);
+        assert_eq!(gh.seen.len(), 7, "seen: {:?}", gh.seen);
+
+        // The next pass labels and records, and says nothing new.
+        let mut gh = ScriptedGh::new(vec![
+            ok(&issue_list_json(
+                283,
+                &["agent:ready", "risk:documentation"],
+            )),
+            ok(&pr_list_json(322, GREEN)),
+            ok(&pr_view_json(GREEN)),
+            ok(r#"{"labels":[{"name":"agent:ready"}]}"#),
+            ok(""),
+            ok(""),
+        ]);
+        let report = advance_pass(&db, &mut gh, &mut ForbiddenReviewer, &cfg).unwrap();
+        let execution = report.advanced[0].merge.as_ref().unwrap();
+
+        assert!(pr_comments(&gh).is_empty(), "seen: {:?}", gh.seen);
+        assert!(!execution.commented && execution.record_appended);
+        assert!(!execution.rehearsed);
+        assert!(
+            gh.seen.iter().any(|argv| argv[0] == "issue"
+                && argv[1] == "edit"
+                && argv.iter().any(|arg| arg == "agent:blocked")),
+            "seen: {:?}",
+            gh.seen
+        );
+        assert_eq!(
+            merge::merges_for_issue(&db, &issue())
+                .unwrap()
+                .iter()
+                .filter(|m| !m.dry_run)
+                .count(),
+            1,
+            "the hold is recorded once its label is on"
+        );
+        assert_eq!(gh.seen.len(), 6, "seen: {:?}", gh.seen);
+    }
+
+    #[test]
+    fn a_review_round_limit_of_one_holds_on_the_first_needs_changes() {
+        let db = approved_db();
+        record_success(&db, &issue(), Some(GREEN));
+        let (repo, roots) = checkout_with_worktree();
+        let mut cfg = config(roots.path(), repo.path());
+        cfg.remediate = true;
+        cfg.max_review_rounds = 1;
+        let mut gh = ScriptedGh::new(hold_script());
+
+        let report = advance_pass(&db, &mut gh, &mut needs_changes(), &cfg).unwrap();
+
+        assert_eq!(
+            report.advanced[0].remediation,
+            Some(ArmOutcome::RoundLimitReached {
+                rounds: 1,
+                limit: 1,
+            })
+        );
+        assert_eq!(remediate::get_remediation(&db, &issue()).unwrap(), None);
+        assert_eq!(pr_comments(&gh).len(), 1, "seen: {:?}", gh.seen);
+        assert_eq!(gh.seen.len(), 7, "seen: {:?}", gh.seen);
+    }
+
+    #[test]
+    fn without_remediate_the_round_limit_is_not_consulted() {
+        // Three rounds and a limit of one, but no `--remediate`: today's
+        // `NeedsChanges` hold, byte for byte, whatever the limit says.
+        let run = |max_review_rounds: u32| {
+            let db = approved_db();
+            record_success(&db, &issue(), Some(GREEN));
+            two_earlier_rounds(&db);
+            let (repo, roots) = checkout_with_worktree();
+            let mut cfg = config(roots.path(), repo.path());
+            cfg.merge = true;
+            cfg.max_review_rounds = max_review_rounds;
+            let mut gh = ScriptedGh::new(hold_script());
+            let report = advance_pass(&db, &mut gh, &mut needs_changes(), &cfg).unwrap();
+            (report, gh)
+        };
+
+        let (limited, limited_gh) = run(1);
+        let (default, default_gh) = run(remediate::DEFAULT_MAX_REVIEW_ROUNDS);
+
+        let advanced = &limited.advanced[0];
+        assert_eq!(advanced.remediation, None);
+        let execution = advanced.merge.as_ref().unwrap();
+        assert_eq!(
+            execution.outcome.hold(),
+            Some(&merge::MergeHold::Review(review::HoldReason::NeedsChanges))
+        );
+        assert!(
+            pr_comments(&limited_gh).is_empty(),
+            "seen: {:?}",
+            limited_gh.seen
+        );
+        assert_eq!(issue_comments(&limited_gh).len(), 1);
+        assert_eq!(limited_gh.seen.len(), 7, "seen: {:?}", limited_gh.seen);
+        assert_eq!(limited_gh.seen, default_gh.seen);
+        assert_eq!(
+            execution.outcome,
+            default.advanced[0].merge.as_ref().unwrap().outcome
         );
     }
 
