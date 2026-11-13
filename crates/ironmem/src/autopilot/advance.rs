@@ -72,8 +72,10 @@
 //! by rung 5's own dollar and unpriced-call ceilings, and it is what makes
 //! the merge decision available at all. **Merging does not.** Without
 //! [`AdvanceConfig::merge`] the pass still runs [`super::merge::execute_merge`]
-//! — every guard, every read — as a **rehearsal** (`dry_run`), so the
-//! operator learns what would happen and GitHub is not written to. Merge is
+//! — every guard, every read — as a **rehearsal** (`dry_run`), except for the
+//! review-round-limit hold under `--remediate`, which posts its PR comment
+//! and issue label for real. [`AdvanceConfig::dry_run`] suppresses those
+//! writes too. Merge is
 //! the only irreversible action in the subsystem, and rung 9's precedent
 //! applies: a bound that limits an already-authorized activity may default
 //! on; a switch that decides whether a new kind of irreversible action
@@ -1198,9 +1200,9 @@ fn advance_issue(
         }
     }
 
-    // Rehearsed unless merging was asked for. Every guard and every read
-    // still runs, so the operator learns what would happen; nothing is
-    // written to GitHub.
+    // Rehearsed unless merging was asked for or the review-round limit
+    // requires a real hold. Every guard and every read still runs;
+    // `--dry-run` always suppresses GitHub writes.
     //
     // A remediation in force forces the rehearsal too, and that is the whole
     // mechanism rather than a nicety. Under `--merge`, rung 6's `NeedsChanges`

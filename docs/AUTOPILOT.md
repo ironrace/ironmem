@@ -1040,7 +1040,9 @@ stops arming fixes and holds the PR for a person instead.
   verdict is `needs_changes`. A `pass` ends the count. A review that did not
   judge (the reviewer failed to run, or returned no verdict) is skipped: it
   neither adds to the count nor ends it. A judged review still counts even if
-  it was recorded without the commit it read.
+  it was recorded without the commit it read. Each judged review counts
+  separately, even at the same head: a manual re-review or a review after
+  retargeting the base adds a round without requiring another fix dispatch.
 - **The limit.** `--max-review-rounds <N>` on `ironmem autopilot advance`.
   The default is 3 and the minimum is 1; `0` is refused. Only `advance` takes
   it, because only `advance` arms fixes; without `--remediate` it has no

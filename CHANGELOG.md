@@ -27,9 +27,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Lead does not dispatch it. A PR whose head has moved since its last review
   is reviewed first, and held if that review asks for changes. A cron without
   `--merge` now posts that hold too. Pass `--max-review-rounds <N>` to raise
-  the limit. A limit above the attempt cap (6 or more with the default cap of
-  5) keeps the old behavior of running to the attempt cap, up to the first
-  cap hold: `autopilot retry` restores the cap but not the round count. Do
+  the limit. Raising it allows more judged reviews before the hold; it does
+  not disable the round limit. Reviews at the same head count separately,
+  including manual re-reviews and reviews after a base retarget.
+  `autopilot retry` restores the attempt budget but not the round count. Do
   not downgrade while a round-limit hold is stored: older binaries cannot
   read an issue's merge records once one exists. Once the issue is re-labeled
   `agent:ready`, an older `advance` reports it as a problem on every pass
