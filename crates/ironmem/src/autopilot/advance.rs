@@ -1059,26 +1059,11 @@ fn advance_issue(
     // follow-up is posted once, inline, below and not here as well. Under the
     // issue lock, so two controllers cannot both find one owed and post it
     // twice. `--dry-run` posts nothing.
-    let mut follow_up_retries = Vec::new();
-    if !config.dry_run {
-        for owed in review::unposted_follow_ups(db, &candidate.issue, pr_number, &head_sha)? {
-            if let Some(comment) = post_follow_up(
-                db,
-                gh_runner,
-                &candidate.issue.repo,
-                pr_number,
-                &head_sha,
-                Some(&owed.review_drawer_id),
-                Some(&owed.text),
-                owed.truncated,
-            )? {
-                follow_up_retries.push(review::FollowUpRetry {
-                    review_drawer_id: owed.review_drawer_id,
-                    comment,
-                });
-            }
-        }
-    }
+    let follow_up_retries = if config.dry_run {
+        Vec::new()
+    } else {
+        retry_owed_follow_ups(db, gh_runner, candidate, &branch, pr_number, &head_sha)?
+    };
 
     let mut review = None;
     if let AdvanceStep::Review { base_branch, .. } = &step {
@@ -1332,6 +1317,86 @@ fn advance_issue(
         merge: Some(execution),
         cleanup,
     })
+}
+
+/// Post the follow-ups PR `pr_number` is still owed at `head_sha` (#408).
+/// Called under the issue lock.
+///
+/// `head_sha` is what the listing reported *before* the lock was taken, and
+/// another controller can push a new head and release the lock in between.
+/// So when anything is owed, the PR is read again here, under the lock, and
+/// nothing is posted unless it is still the same PR at the same head: a
+/// follow-up about a head the PR no longer is would put findings about the
+/// wrong diff in front of a person, and record them as delivered.
+///
+/// A head that moved owes nothing here — [`review::unposted_follow_ups`]
+/// owes only reviews of the current head, and the next pass reads that one.
+/// A re-read that fails is reported as each owed post's failure: nothing
+/// records them as posted, so the next pass owes them still.
+///
+/// Only the controllers are serialised by the lock. A push by anything else
+/// between this re-read and the post is not closed off here.
+fn retry_owed_follow_ups(
+    db: &Database,
+    gh_runner: &mut dyn GhRunner,
+    candidate: &Candidate,
+    branch: &str,
+    pr_number: u64,
+    head_sha: &str,
+) -> Result<Vec<review::FollowUpRetry>, MemoryError> {
+    let owed = review::unposted_follow_ups(db, &candidate.issue, pr_number, head_sha)?;
+    if owed.is_empty() {
+        return Ok(Vec::new());
+    }
+    match gh::open_pr_for_branch(gh_runner, &candidate.issue.repo, branch) {
+        Ok(PrLookup::Found(pr))
+            if pr.number == pr_number && pr.head_sha.eq_ignore_ascii_case(head_sha) => {}
+        Ok(_) => {
+            tracing::info!(
+                issue = %candidate.issue.canonical(),
+                pr = pr_number,
+                "the PR is no longer at the head its owed follow-ups are about; posting none"
+            );
+            return Ok(Vec::new());
+        }
+        Err(e) => {
+            let error =
+                super::scrub::scrub_and_bound(&e.to_string(), lineage::MAX_LINEAGE_FIELD_CHARS)
+                    .text;
+            tracing::warn!(
+                error = %error,
+                "autopilot could not re-read the PR before posting owed follow-ups"
+            );
+            return Ok(owed
+                .into_iter()
+                .map(|owed| review::FollowUpRetry {
+                    review_drawer_id: owed.review_drawer_id,
+                    comment: review::FollowUpComment::Failed {
+                        error: error.clone(),
+                    },
+                })
+                .collect());
+        }
+    }
+    let mut retries = Vec::new();
+    for owed in owed {
+        if let Some(comment) = post_follow_up(
+            db,
+            gh_runner,
+            &candidate.issue.repo,
+            pr_number,
+            head_sha,
+            Some(&owed.review_drawer_id),
+            Some(&owed.text),
+            owed.truncated,
+        )? {
+            retries.push(review::FollowUpRetry {
+                review_drawer_id: owed.review_drawer_id,
+                comment,
+            });
+        }
+    }
+    Ok(retries)
 }
 
 /// Post one judged review's follow-up as a PR comment, and record that it
@@ -4561,9 +4626,15 @@ skipped: {:?}",
         assert!(!review::follow_up_posted(&db, &drawer_id).unwrap());
 
         // The next pass reviews nothing and posts the same follow-up, as the
-        // same comment, on the same PR.
+        // same comment, on the same PR — after reading the PR again under
+        // the lock and finding it still at that head.
         let first_body = pr_comments(&gh)[0][6].clone();
-        let (report, gh) = pass_with(&db, &mut ForbiddenReviewer, &cfg, vec![ok("")]);
+        let (report, gh) = pass_with(
+            &db,
+            &mut ForbiddenReviewer,
+            &cfg,
+            vec![ok(&pr_list_json(322, GREEN)), ok("")],
+        );
         let comments = pr_comments(&gh);
         assert_eq!(comments.len(), 1, "seen: {:?}", gh.seen);
         assert_eq!(comments[0][2], "322");
@@ -4627,7 +4698,12 @@ skipped: {:?}",
         let cfg = config(roots.path(), repo.path());
         let drawer_id = reviewed_with_follow_up(&db, GREEN, "rename x in foo.rs");
 
-        let (report, gh) = pass_with(&db, &mut ForbiddenReviewer, &cfg, vec![ok("")]);
+        let (report, gh) = pass_with(
+            &db,
+            &mut ForbiddenReviewer,
+            &cfg,
+            vec![ok(&pr_list_json(322, GREEN)), ok("")],
+        );
         let comments = pr_comments(&gh);
         assert_eq!(comments.len(), 1, "seen: {:?}", gh.seen);
         assert_eq!(comments[0][2], "322");
@@ -4663,7 +4739,7 @@ skipped: {:?}",
             &db,
             &mut ForbiddenReviewer,
             &cfg,
-            vec![ran_and_failed("HTTP 502")],
+            vec![ok(&pr_list_json(322, GREEN)), ran_and_failed("HTTP 502")],
         );
         assert_eq!(pr_comments(&gh).len(), 1, "seen: {:?}", gh.seen);
         let retries = &report.advanced[0].follow_up_retries;
@@ -4683,7 +4759,12 @@ skipped: {:?}",
             "a failed retry does not stop the pass"
         );
 
-        let (report, gh) = pass_with(&db, &mut ForbiddenReviewer, &cfg, vec![ok("")]);
+        let (report, gh) = pass_with(
+            &db,
+            &mut ForbiddenReviewer,
+            &cfg,
+            vec![ok(&pr_list_json(322, GREEN)), ok("")],
+        );
         assert_eq!(pr_comments(&gh).len(), 1, "seen: {:?}", gh.seen);
         assert_eq!(
             report.advanced[0].follow_up_retries[0].comment,
@@ -4704,6 +4785,105 @@ skipped: {:?}",
         let (report, gh) = pass_with(&db, &mut ForbiddenReviewer, &cfg, Vec::new());
         assert!(pr_comments(&gh).is_empty(), "seen: {:?}", gh.seen);
         assert!(report.advanced[0].follow_up_retries.is_empty());
+    }
+
+    /// The `gh pr list --head` reads a pass made.
+    fn pr_listings(gh: &ScriptedGh) -> usize {
+        gh.seen
+            .iter()
+            .filter(|argv| argv.first().map(String::as_str) == Some("pr"))
+            .filter(|argv| argv.get(1).map(String::as_str) == Some("list"))
+            .count()
+    }
+
+    #[test]
+    fn an_owed_follow_up_is_not_posted_once_another_controller_moved_the_head() {
+        // The listing reads `GREEN` before the issue lock is taken. Between
+        // that read and this pass taking the lock, another controller
+        // pushes `MOVED` and releases it. The re-read under the lock sees
+        // `MOVED`, and the follow-up about `GREEN` is neither posted nor
+        // recorded as posted.
+        let db = approved_db();
+        record_success(&db, &issue(), Some(GREEN));
+        let (repo, roots) = checkout_with_worktree();
+        let cfg = config(roots.path(), repo.path());
+        let drawer_id = reviewed_with_follow_up(&db, GREEN, "rename x");
+
+        let (report, gh) = pass_with(
+            &db,
+            &mut ForbiddenReviewer,
+            &cfg,
+            vec![ok(&pr_list_json(322, MOVED))],
+        );
+        assert_eq!(pr_listings(&gh), 2, "re-read under the lock: {:?}", gh.seen);
+        assert!(pr_comments(&gh).is_empty(), "seen: {:?}", gh.seen);
+        assert!(report.advanced[0].follow_up_retries.is_empty());
+        assert!(!review::follow_up_posted(&db, &drawer_id).unwrap());
+    }
+
+    #[test]
+    fn an_owed_follow_up_is_not_posted_once_its_pr_is_gone_or_replaced() {
+        for (what, relisting) in [
+            ("closed", "[]".to_string()),
+            ("replaced by another PR", pr_list_json(323, GREEN)),
+        ] {
+            let db = approved_db();
+            record_success(&db, &issue(), Some(GREEN));
+            let (repo, roots) = checkout_with_worktree();
+            let cfg = config(roots.path(), repo.path());
+            let drawer_id = reviewed_with_follow_up(&db, GREEN, "rename x");
+
+            let (report, gh) = pass_with(&db, &mut ForbiddenReviewer, &cfg, vec![ok(&relisting)]);
+            assert!(pr_comments(&gh).is_empty(), "{what}: {:?}", gh.seen);
+            assert!(report.advanced[0].follow_up_retries.is_empty(), "{what}");
+            assert!(
+                !review::follow_up_posted(&db, &drawer_id).unwrap(),
+                "{what}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_owed_follow_up_whose_pr_cannot_be_re_read_is_reported_and_still_owed() {
+        let db = approved_db();
+        record_success(&db, &issue(), Some(GREEN));
+        let (repo, roots) = checkout_with_worktree();
+        let cfg = config(roots.path(), repo.path());
+        let drawer_id = reviewed_with_follow_up(&db, GREEN, "rename x");
+
+        let (report, gh) = pass_with(
+            &db,
+            &mut ForbiddenReviewer,
+            &cfg,
+            vec![ran_and_failed("HTTP 502")],
+        );
+        assert!(pr_comments(&gh).is_empty(), "seen: {:?}", gh.seen);
+        let retries = &report.advanced[0].follow_up_retries;
+        assert!(
+            matches!(
+                retries.as_slice(),
+                [review::FollowUpRetry {
+                    review_drawer_id,
+                    comment: review::FollowUpComment::Failed { error },
+                }] if *review_drawer_id == drawer_id && error.contains("HTTP 502")
+            ),
+            "{retries:?}"
+        );
+        assert!(!review::follow_up_posted(&db, &drawer_id).unwrap());
+
+        // Still owed: the next pass that re-reads the same head posts it.
+        let (report, gh) = pass_with(
+            &db,
+            &mut ForbiddenReviewer,
+            &cfg,
+            vec![ok(&pr_list_json(322, GREEN)), ok("")],
+        );
+        assert_eq!(pr_comments(&gh).len(), 1, "seen: {:?}", gh.seen);
+        assert_eq!(
+            report.advanced[0].follow_up_retries[0].comment,
+            review::FollowUpComment::Posted
+        );
+        assert!(review::follow_up_posted(&db, &drawer_id).unwrap());
     }
 
     #[test]

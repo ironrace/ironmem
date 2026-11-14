@@ -2144,9 +2144,11 @@ impl WholePrReason {
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum FollowUpComment {
     Posted,
-    /// `gh pr comment` failed. Reported, and retried by the next `advance`
-    /// pass that finds the PR still at the reviewed head (#408): nothing
-    /// records it as posted, so [`unposted_follow_ups`] still owes it.
+    /// `gh pr comment` failed — or, for a retried post, so did the re-read
+    /// of the PR that must precede it. Reported, and retried by the next
+    /// `advance` pass that finds the PR still at the reviewed head (#408):
+    /// nothing records it as posted, so [`unposted_follow_ups`] still owes
+    /// it.
     Failed {
         /// The failure as [`MemoryError`] prints it (its own prefix, the
         /// command, and `gh`'s stderr), scrubbed and cut to

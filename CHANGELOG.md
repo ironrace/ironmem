@@ -16,8 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   process that died after recording its review never posted, and one recorded
   by the standalone `ironmem autopilot review`. Each is posted once and never
   again once recorded; a post that fails is retried on the next pass while the
-  head is unchanged, and never stops the pass. Not retried: under `--dry-run`,
-  after the head moves, for an unjudged review, and for a review recorded
+  head is unchanged, and never stops the pass. The PR is read again under the
+  issue's lock before any owed follow-up is posted, so a head another
+  controller pushed after the pass first listed the PR gets no follow-up about
+  the head before it. Not retried: under `--dry-run`, after the head moves, for an unjudged review, and for a review recorded
   before this release, whose follow-up may already have been posted.
   `advance --json` gains `follow_up_retries` on each issue (left out when
   empty), and the text output gains a `follow-up of the earlier review <id>:`

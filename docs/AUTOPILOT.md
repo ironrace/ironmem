@@ -1040,6 +1040,14 @@ retries it`. A retried post that fails again is retried on the next pass,
 for as long as the PR stays at that head; it never stops the pass. A
 retried post that succeeds counts as a step against the `--max-advances` burst limit.
 
+The head a pass lists the PR at is read before it takes the issue's lock, and
+another controller can push a new head and release the lock in between. So
+when a follow-up is owed, the pass reads the PR again under the lock, and
+posts only if it is still the same PR at the same head. A re-read that fails
+is reported as that post's failure (`NOT posted as a PR comment (<error>)`),
+and the follow-up stays owed. The lock serialises controllers only: a push
+from anything else between that re-read and the post is not guarded against.
+
 Nothing is retried:
 
 - under `--dry-run`, which posts nothing;
