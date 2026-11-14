@@ -926,9 +926,12 @@ fn finish(
     // the hold without a fresh review ever being counted.
     let repeat = match repeat {
         Some(previous) => {
+            // "Newer" by write order, not `recorded_at`: a review written
+            // after the hold under a clock stepped back would otherwise
+            // look older than it, and the hold would be deduped (#406).
             let has_newer_review = super::review::reviews_for_issue(db, request.issue)?
                 .iter()
-                .any(|r| r.pr_number == request.pr_number && r.recorded_at > previous.recorded_at);
+                .any(|r| r.pr_number == request.pr_number && r.write_seq > previous.write_seq);
             if has_newer_review {
                 None
             } else {
@@ -1787,16 +1790,24 @@ pub struct RecordedMergeSummary {
     pub outcome: MergeOutcome,
     pub base_branch: Option<String>,
     pub head_sha: Option<String>,
+    /// Wall-clock time of the write. For display only, as
+    /// [`RecordedReviewSummary::recorded_at`] is (#406).
     pub recorded_at: String,
+    /// The record's position in the write order: the `rowid` of its
+    /// `has_merge` edge. Taken from the same table as
+    /// [`RecordedReviewSummary::write_seq`], so the two compare: a review
+    /// with a larger `write_seq` than a hold was written after it, whatever
+    /// the clock said.
+    pub write_seq: i64,
 }
 
 impl RecordedMergeSummary {
     /// Whether this record already states everything `candidate` would.
     ///
     /// Deliberately every field that describes the *attempt* and none that
-    /// describe the *writing* of it: `recorded_at` and the record's uuid
-    /// differ on every pass by construction, so including them would make
-    /// nothing ever a repeat.
+    /// describe the *writing* of it: `recorded_at`, `write_seq` and the
+    /// record's uuid differ on every pass by construction, so including them
+    /// would make nothing ever a repeat.
     fn says_the_same_as(&self, candidate: &MergeRecord) -> bool {
         // `issue` is compared even though `last_record_for_pr` reads only
         // this issue's own lineage. That lineage is keyed by
@@ -1817,7 +1828,9 @@ impl RecordedMergeSummary {
     }
 }
 
-/// Every recorded merge attempt for an issue, oldest first.
+/// Every recorded merge attempt for an issue, oldest first: in the order
+/// they were written ([`RecordedMergeSummary::write_seq`]), not by the wall
+/// clock, for the reason [`super::review::reviews_for_issue`] gives.
 pub fn merges_for_issue(
     db: &Database,
     issue: &IssueRef,
@@ -1829,10 +1842,13 @@ pub fn merges_for_issue(
         Err(other) => return Err(other),
     };
 
-    let triples =
-        kg.query_entity_current_with_predicate(&entity.id, HAS_MERGE_PREDICATE, MAX_ISSUE_EDGES)?;
+    let triples = kg.query_entity_current_with_predicate_in_write_order(
+        &entity.id,
+        HAS_MERGE_PREDICATE,
+        MAX_ISSUE_EDGES,
+    )?;
     let mut records = Vec::new();
-    for triple in triples {
+    for (write_seq, triple) in triples {
         let Some(object_entity) = kg.get_entity(&triple.object)? else {
             continue;
         };
@@ -1850,20 +1866,14 @@ pub fn merges_for_issue(
             base_branch: body.base_branch,
             head_sha: body.head_sha,
             recorded_at: body.recorded_at,
+            write_seq,
         });
     }
-    // The secondary key keeps the order total. `recorded_at` is an RFC 3339
-    // string and sorts correctly, but two records written inside the same
-    // nanosecond would tie — and a *stable* sort over a vec the SQL handed
-    // back newest-first would then leave the oldest of the tie group last,
-    // so `rfind` would take the oldest as "most recent". The drawer id is
-    // content-derived and unique, which is enough to make the answer
-    // deterministic rather than dependent on the query's arrival order.
-    records.sort_by(|a, b| {
-        a.recorded_at
-            .cmp(&b.recorded_at)
-            .then_with(|| a.drawer_id.cmp(&b.drawer_id))
-    });
+    // The query hands the rows back newest-written first. Every rowid is
+    // distinct, so this order is total: two records stamped with the same
+    // instant still sort in the order they were written, and `rfind` takes
+    // the one written last.
+    records.sort_by_key(|r| r.write_seq);
     Ok(records)
 }
 
@@ -2003,8 +2013,14 @@ mod tests {
             .collect()
     }
 
-    fn store_review(database: &Database, pr: u64, head: Option<&str>, outcome: ReviewOutcome) {
-        store_review_against(database, pr, head, Some("main"), outcome);
+    /// Record a review of `pr` against `main`, and return its drawer id.
+    fn store_review(
+        database: &Database,
+        pr: u64,
+        head: Option<&str>,
+        outcome: ReviewOutcome,
+    ) -> String {
+        store_review_against(database, pr, head, Some("main"), outcome)
     }
 
     fn store_review_against(
@@ -2013,7 +2029,7 @@ mod tests {
         head: Option<&str>,
         base: Option<&str>,
         outcome: ReviewOutcome,
-    ) {
+    ) -> String {
         let decision = decide_merge(true, "documentation", outcome.judgment());
         record_review(
             database,
@@ -2028,7 +2044,8 @@ mod tests {
                 round: None,
             },
         )
-        .expect("review should record");
+        .expect("review should record")
+        .drawer_id
     }
 
     fn pr_view_ok(state: &str, head: &str) -> GhOutput {
@@ -2531,6 +2548,53 @@ mod tests {
             2,
             "a hold after a new review must be appended, not deduped"
         );
+    }
+
+    #[test]
+    fn a_review_written_after_the_hold_is_newer_even_when_its_clock_says_before() {
+        // #406: "a new review since the last hold" is decided by write
+        // order. A clock stepped back between the hold and the review would
+        // stamp the review earlier than the hold, and a `recorded_at`
+        // comparison would then dedup the next hold as a repeat.
+        let database = db();
+        let failed = ReviewOutcome {
+            verdict: None,
+            risk_class: None,
+            reason: None,
+            follow_up: None,
+            total_cost_usd: None,
+            token_usage: None,
+            process_success: false,
+        };
+        let script = || {
+            ScriptedGh::new(vec![
+                Ok(pr_view_ok("OPEN", HEAD)),
+                Ok(GhOutput::ok(r#"{"labels":[]}"#)),
+                Ok(GhOutput::ok("")),
+                Ok(label_created()),
+                Ok(GhOutput::ok("")),
+            ])
+        };
+        store_review(&database, 7, Some(HEAD), failed.clone());
+        let mut gh_runner = script();
+        execute_merge(&database, &mut gh_runner, &request(false)).unwrap();
+        assert_eq!(merges_for_issue(&database, &issue()).unwrap().len(), 1);
+
+        let after_the_hold = store_review(&database, 7, Some(HEAD), failed);
+        super::super::review::restamp_review_for_test(
+            &database,
+            &after_the_hold,
+            "2000-01-01T00:00:00+00:00",
+        );
+        let mut gh_runner = script();
+        execute_merge(&database, &mut gh_runner, &request(false)).unwrap();
+        let merges = merges_for_issue(&database, &issue()).unwrap();
+        assert_eq!(
+            merges.len(),
+            2,
+            "a review written after the hold is new, whatever its stamp says"
+        );
+        assert!(merges[0].write_seq < merges[1].write_seq);
     }
 
     #[test]
@@ -4101,6 +4165,7 @@ mod tests {
             round: None,
             process_success: true,
             recorded_at: "2026-11-12T00:00:00+00:00".into(),
+            write_seq: 0,
         };
         let rounds = vec![
             round(Some("line one\n# a heading\n- a bullet"), HEAD),
@@ -4243,6 +4308,7 @@ back in the queue.\n\n\
             round: None,
             process_success: true,
             recorded_at: "2026-11-12T00:00:00+00:00".into(),
+            write_seq: 0,
         }
     }
 
