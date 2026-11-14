@@ -4940,13 +4940,17 @@ pub(crate) mod tests {
         // Births are clock ticks: let one pass, so this process predates
         // the child even when the test runs alone.
         std::thread::sleep(std::time::Duration::from_millis(50));
-        // SAFETY: the child only makes async-signal-safe calls (chdir,
-        // prctl, pause) until it is killed.
+        // SAFETY: until it is killed, the child makes only
+        // async-signal-safe calls (alarm, close, chdir, pause) and one
+        // plain system call (prctl), which takes no lock in the process.
         let child = unsafe { libc::fork() };
         assert!(child >= 0, "fork: {}", std::io::Error::last_os_error());
         if child == 0 {
-            // SAFETY: the forked child, as above.
+            // SAFETY: the forked child, as above. It wants no descriptor:
+            // chdir takes a path, and prctl and pause take none. Its 60 s
+            // alarm outlasts the 10 s this test waits for it below.
             unsafe {
+                crate::test_fork::keep_only(None, 60);
                 libc::chdir(c"/".as_ptr());
                 libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
                 loop {
@@ -4954,18 +4958,10 @@ pub(crate) mod tests {
                 }
             }
         }
+        // SAFETY: `child` is the pid `fork` just returned to this process,
+        // and nothing else signals it or waits for it.
+        let _reap = unsafe { crate::test_fork::Reap::new(child) };
         let child = child as u32;
-        struct Reap(u32);
-        impl Drop for Reap {
-            fn drop(&mut self) {
-                // SAFETY: our own unreaped child.
-                unsafe {
-                    libc::kill(self.0 as i32, libc::SIGKILL);
-                    libc::waitpid(self.0 as i32, std::ptr::null_mut(), 0);
-                }
-            }
-        }
-        let _reap = Reap(child);
         let started = std::time::Instant::now();
         while !std::fs::read_link(format!("/proc/{child}/cwd"))
             .is_err_and(|e| e.raw_os_error() == Some(libc::EACCES))

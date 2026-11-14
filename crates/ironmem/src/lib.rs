@@ -74,4 +74,6 @@ pub use error::MemoryError;
 
 pub(crate) mod git_env;
 #[cfg(test)]
+pub(crate) mod test_fork;
+#[cfg(test)]
 pub(crate) mod test_git;
