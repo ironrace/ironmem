@@ -1133,6 +1133,11 @@ fn advance_prints_a_failed_follow_up_post_on_one_line_naming_the_drawer() {
     let (error, drawer_id) = follow_up
         .strip_prefix("    follow-up: NOT posted as a PR comment (")
         .and_then(|rest| rest.split_once(") — its text is in the review's drawer "))
+        .and_then(|(error, rest)| {
+            // #408: the line says the post is retried.
+            rest.strip_suffix(", and the next pass retries it")
+                .map(|drawer_id| (error, drawer_id))
+        })
         .unwrap_or_else(|| panic!("not the failed-post line: {follow_up:?} in {stdout}"));
     // `gh`'s first three stderr lines and its tab are on this one line, in
     // order, each break and the tab flattened to one space, and the fourth

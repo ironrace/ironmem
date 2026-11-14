@@ -1007,21 +1007,58 @@ review's drawer records whether the stored follow-up was redacted or cut
 (`follow_up_redacted`, `follow_up_truncated`), as it does for the reason, and
 the report carries `follow_up_truncated: true` when it was cut.
 
-There is at most one comment per judged review: it is posted straight after
-the review that produced it and never again for that review. A failed post is
-not retried. It is not one comment per head: a PR retargeted to another base
-is reviewed again at the same head, and that review posts its own follow-up.
-A failed post is reported on the review as `follow_up_comment: {"status":
-"failed", ...}` under `--json` and as one line in the text output,
-`follow-up: NOT posted as a PR comment (<error>) — its text is in the
-review's drawer <id>`, and does not stop the pass. The text output does not
-print the follow-up itself: read it from that drawer, or from
-`outcome.follow_up` under `--json`. The error is Autopilot's own error text,
-which names the command and ends with `gh`'s stderr, scrubbed. The line
-quotes at most 300 characters of it, on one line; `--json` carries up to
-4,000. A successful post prints `follow-up: posted as a PR comment`.
+The comment is posted straight after the review that produced it. It is not
+one comment per head: a PR retargeted to another base is reviewed again at the
+same head, and that review posts its own follow-up. A failed post is reported
+on the review as `follow_up_comment: {"status": "failed", ...}` under
+`--json` and as one line in the text output, `follow-up: NOT posted as a PR
+comment (<error>) — its text is in the review's drawer <id>, and the next
+pass retries it`, and does not stop the pass. The text output does not print
+the follow-up itself: read it from that drawer, or from `outcome.follow_up`
+under `--json`. The error is Autopilot's own error text, which names the
+command and ends with `gh`'s stderr, scrubbed. The line quotes at most 300
+characters of it, on one line; `--json` carries up to 4,000. A successful
+post prints `follow-up: posted as a PR comment`.
 
-The standalone `ironmem autopilot review` command posts nothing: it prints
+#### When a follow-up is retried (#408)
+
+A successful post is recorded against the review (a `follow-up-posted:<review
+drawer id>` record beside it), and a recorded follow-up is never posted
+again. Every `advance` pass that reaches an open PR — to review it or to
+merge it — first posts each follow-up the PR is still owed **at its current
+head**: the non-empty follow-up of a judged review of that PR at that head
+with no posted record. That covers a post that failed, one a process that
+died after recording its review never made, and a review recorded by the
+standalone `ironmem autopilot review` command. Each is posted once, under
+the issue's lock, before this pass's own review; this pass's own review
+posts its follow-up as above. Such a post is reported on the issue as
+`follow_up_retries: [{"review_drawer_id": ..., "comment": {"status":
+"posted"}}]` under `--json` (left out when empty) and as one line in the
+text output, `follow-up of the earlier review <id>: posted as a PR
+comment`, or `... NOT posted as a PR comment (<error>) — the next pass
+retries it`. A retried post that fails again is retried on the next pass,
+for as long as the PR stays at that head; it never stops the pass. A
+retried post that succeeds counts as a step against the `--max-advances` burst limit.
+
+Nothing is retried:
+
+- under `--dry-run`, which posts nothing;
+- once the PR's head has moved: a follow-up about an earlier head is about a
+  diff the PR no longer is, and is not posted;
+- for a review that did not judge (a failed reviewer process, or no
+  verdict);
+- for a review recorded before #408. Those carry no tracking, and #403
+  posted their follow-ups inline without recording it, so retrying them
+  would post a comment a second time.
+
+The post is made first and recorded second. A process that dies between the
+two, or a `gh pr comment` that fails after GitHub accepted the comment,
+leaves the follow-up unrecorded, and the next pass posts it again: in that
+window, and only there, a follow-up can appear twice.
+
+The standalone `ironmem autopilot review` command posts nothing itself; the
+next `advance` pass that finds the PR at the reviewed head posts its
+follow-up, as above. It prints
 the follow-up as a `follow-up (non-blocking):` entry, or as
 `outcome.follow_up` under `--json`, and under it a `follow-up was cut to
 4000 characters` line when the reviewer wrote more than that. In that text
