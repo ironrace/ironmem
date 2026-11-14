@@ -1377,15 +1377,15 @@ fn review_bodies(
 
 /// A judged review's follow-up that has not reached its PR yet (#408).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UnpostedFollowUp {
+pub(crate) struct UnpostedFollowUp {
     /// The drawer the review is stored in: the key its posted state is
     /// recorded under, and where its text is.
-    pub review_drawer_id: String,
+    pub(crate) review_drawer_id: String,
     /// The follow-up as stored: already scrubbed and bounded.
-    pub text: String,
+    pub(crate) text: String,
     /// Whether the stored follow-up was cut ([`ReviewBody`]'s
     /// `follow_up_truncated`), so the comment says so.
-    pub truncated: bool,
+    pub(crate) truncated: bool,
 }
 
 /// The follow-ups `advance` still owes PR `pr_number` at `head_sha` (#408),
@@ -1397,7 +1397,7 @@ pub struct UnpostedFollowUp {
 /// [`record_follow_up_posted`] record. A review of an earlier head is not
 /// owed: its findings are about a diff the PR no longer is. A review
 /// recorded before #408 is not owed either — see `follow_up_post_tracked`.
-pub fn unposted_follow_ups(
+pub(crate) fn unposted_follow_ups(
     db: &Database,
     issue: &IssueRef,
     pr_number: u64,
@@ -1414,7 +1414,12 @@ pub fn unposted_follow_ups(
         let Some(text) = body.follow_up.filter(|t| !t.trim().is_empty()) else {
             continue;
         };
-        if body.issue != canonical
+        // Compared ignoring ASCII case, as `later_round_context` and
+        // `merge::latest_review_for_pr` do: the entity is keyed on a
+        // lowercased name, so `ironrace/IronMem` and `ironrace/ironmem` read
+        // each other's reviews, and an exact comparison would leave a
+        // genuine review's follow-up unposted for ever.
+        if !body.issue.eq_ignore_ascii_case(&canonical)
             || body.pr_number != pr_number
             || !of_this_head
             || !judged
@@ -1443,7 +1448,10 @@ fn follow_up_posted_key(review_drawer_id: &str) -> String {
 /// Record that the follow-up of the review stored in `review_drawer_id`
 /// reached its PR as a comment (#408). Written only after `gh pr comment`
 /// succeeded; overwriting it again is harmless.
-pub fn record_follow_up_posted(db: &Database, review_drawer_id: &str) -> Result<(), MemoryError> {
+pub(crate) fn record_follow_up_posted(
+    db: &Database,
+    review_drawer_id: &str,
+) -> Result<(), MemoryError> {
     let content = serde_json::to_string(&json!({
         "review_drawer_id": review_drawer_id,
         "posted_at": chrono::Utc::now().to_rfc3339(),
@@ -1453,7 +1461,7 @@ pub fn record_follow_up_posted(db: &Database, review_drawer_id: &str) -> Result<
 }
 
 /// Whether [`record_follow_up_posted`] has been written for this review.
-pub fn follow_up_posted(db: &Database, review_drawer_id: &str) -> Result<bool, MemoryError> {
+pub(crate) fn follow_up_posted(db: &Database, review_drawer_id: &str) -> Result<bool, MemoryError> {
     Ok(super::read_current(db, &follow_up_posted_key(review_drawer_id))?.is_some())
 }
 
@@ -4013,6 +4021,33 @@ not json at all
         assert!(owed_ids(&db, &issue, 322, &head).is_empty());
         assert_eq!(owed_ids(&db, &issue, 999, &head), [other_pr.drawer_id]);
         assert_eq!(owed_ids(&db, &collision, 322, &head).len(), 1);
+    }
+
+    #[test]
+    fn a_follow_up_is_owed_whatever_case_the_repo_is_spelled_in() {
+        // The lineage entity is keyed on a lowercased name, so a review
+        // recorded for `ironrace/IronMem` is read back for
+        // `ironrace/ironmem`; comparing the canonical issue exactly would
+        // drop it and leave its follow-up unposted for ever.
+        let db = Database::open_in_memory().unwrap();
+        let recorded_as = IssueRef::new("ironrace/IronMem", 283);
+        let advanced_as = IssueRef::new("ironrace/ironmem", 283);
+        let head = "ab".repeat(20);
+        let mut record = sample_record(&recorded_as, "fine");
+        record.head_sha = Some(head.clone());
+        record.outcome.follow_up = Some("rename x".into());
+        let recorded = record_review(&db, &record).unwrap();
+
+        assert_eq!(
+            owed_ids(&db, &advanced_as, 322, &head),
+            std::slice::from_ref(&recorded.drawer_id)
+        );
+        assert_eq!(
+            owed_ids(&db, &recorded_as, 322, &head),
+            std::slice::from_ref(&recorded.drawer_id)
+        );
+        record_follow_up_posted(&db, &recorded.drawer_id).unwrap();
+        assert!(owed_ids(&db, &advanced_as, 322, &head).is_empty());
     }
 
     #[test]
