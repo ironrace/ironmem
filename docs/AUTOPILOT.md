@@ -422,19 +422,23 @@ being enrolled does not fail the invocation), but it is practical
 supervision rather than hostile fork containment; a deliberate double-fork
 escape between polls is outside its guarantee.
 
-The tracker never enrols a process whose kernel birth is earlier than the
-birth of the owned parent it appears under, because a real child cannot be
-older than the process that forked it. Such a process is never signalled. It
-is not a seed either, so its own children are not reached through it.
-Refusing it does not fail the sample or the invocation; the supervisor logs
-one warning for it. Equal births are still enrolled, because Linux births
-are clock ticks and a fork in its parent's tick is a real child. This is a
-defensive guard against a suspected macOS case, in which a traced process
-reports its tracer as its parent. If so, a debugger that an agent's tool
-attaches to an outside process makes that process look like a child of an
-owned process. That scenario has never been reproduced. The guard does not
-cover a process that was started after the debugger and attached at launch
-(wait-for-launch): its birth is later than the debugger's, so it passes.
+A process whose kernel birth is earlier than the birth of the owned parent
+it appears under has ambiguous ancestry, so the sample fails closed, as it
+does for a reused PID. The process is never enrolled and never signalled;
+the error ends the invocation, and its cleanup signals only the processes
+that did enrol. Timestamps cannot settle the question. The process may be
+an outside one that only reports an owned parent: on macOS a traced process
+is suspected to report its tracer as its parent, so a debugger that an
+agent's tool attaches to an outside process would make that process look
+like a child of an owned process. That scenario has never been reproduced.
+It may also be a real child: macOS births are wall-clock time, so after a
+backward clock step a child can look older than its parent. Skipping it
+would let a real child and everything below it escape cleanup, so the
+invocation fails instead. Equal births are still enrolled, because Linux
+births are clock ticks and a fork in its parent's tick is a real child. The
+guard does not cover a process that was started after the debugger and
+attached at launch (wait-for-launch): its birth is later than the
+debugger's, so it passes.
 
 A tool that lives less than one sample and leaves a background child running
 (`cmd &` in a short-lived shell) is the ordinary case of that escape: the

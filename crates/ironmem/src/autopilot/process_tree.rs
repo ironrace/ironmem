@@ -2342,10 +2342,6 @@ pub(crate) struct ProcessTracker {
     /// failure of the run, and never ignored: completion waits until each
     /// is gone ([`Self::hold_unsignalable`]).
     refused: std::collections::HashSet<u32>,
-    /// Candidates refused for a kernel birth earlier than their owned
-    /// parent's ([`Self::observe_rows`]), by PID and birth: each is warned
-    /// about once, not on every sample.
-    older_than_parent: std::collections::HashSet<(u32, Birth)>,
 }
 
 /// `e`'s message, without the "Validation error" prefix a validation
@@ -2490,7 +2486,6 @@ impl ProcessTracker {
             kernel_exe: kernel_executable,
             kill: signal_pinned,
             refused: std::collections::HashSet::new(),
-            older_than_parent: std::collections::HashSet::new(),
         }
     }
 
@@ -2694,25 +2689,29 @@ impl ProcessTracker {
                         "invocation descendant ancestry changed during authentication".into(),
                     ));
                 }
-                // A real child cannot be older than the process that forked
-                // it. One that is was not forked by its owned parent: on
-                // macOS a traced process reports its tracer as its parent,
-                // so a debugger the invocation runs may have attached to an
-                // outside process (suspected, never reproduced). It is
-                // neither enrolled nor a seed, and the sample goes on. Equal
-                // births are kept: Linux births are clock ticks, and a fork
-                // in its parent's tick is real. A reused PID is always born
-                // later, so this cannot excuse one.
+                // A kernel birth earlier than the owned parent's is ambiguous
+                // ancestry, so the sample fails closed, as it does for a
+                // reused PID. It may be an outside process that only reports
+                // an owned parent: on macOS a traced process is suspected to
+                // report its tracer as its parent, so a debugger the
+                // invocation runs could attach to one (never reproduced). It
+                // may also be a real child: macOS births are wall-clock
+                // (seconds, microseconds), so a backward clock step makes a
+                // child look older than its parent. Skipping the candidate
+                // would let a real child, and everything below it, escape
+                // cleanup (a detached one is in no known group either);
+                // enrolling it could signal a stranger. It is neither: it is
+                // not enrolled and never signalled, and the error ends the
+                // invocation, whose cleanup signals only what enrolled.
+                // Equal births pass: Linux births are clock ticks, and a fork
+                // in its parent's tick is real.
                 if actual.birth < expected_parent {
-                    if self.older_than_parent.insert((row.pid, actual.birth)) {
-                        tracing::warn!(
-                            pid = row.pid,
-                            ppid = row.ppid,
-                            "Autopilot is not tracking a process born before its owned parent; \
-                             it was not forked by that parent (a debugger attach can do this)"
-                        );
-                    }
-                    continue;
+                    return Err(MemoryError::Validation(format!(
+                        "invocation descendant {} was born before its owned parent {}, so its \
+                         ancestry is ambiguous (a debugger attach or a backward clock step can \
+                         do this); it is not tracked or signalled",
+                        row.pid, row.ppid
+                    )));
                 }
                 let parent_after = kernel(row.ppid).map_err(MemoryError::Validation)?;
                 if !parent_after.is_some_and(|p| p.pid == row.ppid && p.birth == expected_parent) {
@@ -6085,15 +6084,16 @@ pub(crate) mod tests {
         assert!(both_alive, "cleanup signalled a stranger");
     }
 
-    /// A real child cannot be older than the process that forked it. A
-    /// candidate the kernel shows under an owned parent but born before it
-    /// (on macOS, possibly an outside process a debugger the invocation runs
-    /// attached to: never reproduced) is not enrolled and is no seed, so its
-    /// own child is not reached through it. The sample still succeeds.
+    /// A candidate the kernel shows under an owned parent but born before it
+    /// is ambiguous ancestry (on macOS, possibly an outside process a
+    /// debugger the invocation runs attached to: never reproduced), so the
+    /// sample fails closed, as it does for a reused PID. The candidate is
+    /// detached (its own group), so no group would tie it to the invocation
+    /// either. It is not enrolled, and nothing is reached through it.
     #[test]
-    fn a_candidate_born_before_its_owned_parent_is_not_enrolled_nor_its_child() {
+    fn a_candidate_born_before_its_owned_parent_fails_the_sample() {
         let mut tracker = ProcessTracker::owning_every_descendant(10);
-        tracker
+        let err = tracker
             .observe_rows(
                 vec![
                     process_row(10, 1, 10),
@@ -6108,11 +6108,75 @@ pub(crate) mod tests {
                     }))
                 },
             )
-            .unwrap();
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("invocation descendant 20 was born before its owned parent 10"),
+            "{err}"
+        );
         assert!(tracker.known.contains_key(&10));
         assert!(!tracker.known.contains_key(&20), "older candidate enrolled");
         assert!(!tracker.known.contains_key(&30), "reached through it");
         assert!(tracker.signal(20, STOP_SIGNAL).is_err());
+    }
+
+    /// A backward wall-clock step, simulated: macOS births are (seconds,
+    /// microseconds) of wall-clock time, so a real, detached child forked
+    /// after the clock stepped back carries a birth earlier than its
+    /// parent's. Timestamps cannot tell it from an outsider, so the sample
+    /// fails rather than leaving it, and its own child, out of cleanup.
+    /// The sibling forked before the step is enrolled, so the cleanup the
+    /// failed sample triggers still signals it. Every later sample fails
+    /// the same way: the candidate never becomes trackable by retrying.
+    #[test]
+    fn a_real_child_after_a_backward_clock_step_fails_the_sample_not_escapes() {
+        let rows = || {
+            vec![
+                process_row(10, 1, 10),
+                process_row(11, 10, 10),
+                process_row(20, 10, 20),
+                process_row(21, 20, 20),
+            ]
+        };
+        let kernel = |pid| {
+            Ok(Some(match pid {
+                10 => KernelProcess {
+                    pid: 10,
+                    ppid: 1,
+                    pgid: 10,
+                    birth: Birth(1_000, 500_000),
+                },
+                11 => KernelProcess {
+                    pid: 11,
+                    ppid: 10,
+                    pgid: 10,
+                    birth: Birth(1_000, 600_000),
+                },
+                20 => KernelProcess {
+                    pid: 20,
+                    ppid: 10,
+                    pgid: 20,
+                    birth: Birth(999, 900_000),
+                },
+                _ => KernelProcess {
+                    pid: 21,
+                    ppid: 20,
+                    pgid: 20,
+                    birth: Birth(999, 950_000),
+                },
+            }))
+        };
+        let mut tracker = ProcessTracker::owning_every_descendant(10);
+        for _ in 0..2 {
+            let err = tracker
+                .observe_rows(rows(), kernel)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("ancestry is ambiguous"), "{err}");
+            assert!(tracker.known.contains_key(&11), "pre-step sibling lost");
+            assert!(!tracker.known.contains_key(&20), "ambiguous child enrolled");
+            assert!(!tracker.known.contains_key(&21), "reached through it");
+        }
     }
 
     /// Equal births stay enrolled: Linux births are clock ticks, so a fork
@@ -6143,10 +6207,11 @@ pub(crate) mod tests {
         }
     }
 
-    /// Cleanup never signals a candidate refused for being older than its
-    /// owned parent. Real processes with their real births: the outsider
-    /// starts first, the "root" later, and a synthetic kernel record shows
-    /// the outsider under the root, as a tracer would on macOS.
+    /// A candidate older than its owned parent fails the sample, and the
+    /// cleanup that follows never signals it. Real processes with their
+    /// real births: the outsider starts first, the "root" later, and a
+    /// synthetic kernel record shows the outsider under the root, as a
+    /// tracer is suspected to on macOS.
     #[cfg(unix)]
     #[test]
     fn cleanup_does_not_signal_a_candidate_older_than_its_owned_parent() {
@@ -6200,7 +6265,8 @@ pub(crate) mod tests {
             let _ = child.kill();
             let _ = child.wait();
         }
-        observed.unwrap();
+        let err = observed.unwrap_err().to_string();
+        assert!(err.contains("ancestry is ambiguous"), "{err}");
         assert!(!enrolled, "older candidate enrolled");
         let signalled = SIGNALLED.lock().unwrap().clone();
         assert!(
