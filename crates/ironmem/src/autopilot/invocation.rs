@@ -2736,17 +2736,19 @@ pub(crate) mod contract_tests {
          os.environ.get('IRONMEM_TEST_PROBE_SECONDS', '120')])\n\
          recorded = '\"pid\":%d,' % probe.pid\n\
          sampled = False\n\
-         while probe.poll() is None:\n\
-         \x20   try:\n\
-         \x20       identity = open(os.environ['IRONMEM_TEST_IDENTITY_PATH']).read()\n\
-         \x20   except FileNotFoundError:\n\
-         \x20       identity = ''\n\
-         \x20   if recorded in identity:\n\
-         \x20       sampled = True\n\
-         \x20       break\n\
-         \x20   time.sleep(0.01)\n\
-         probe.kill()\n\
-         probe.wait()\n\
+         try:\n\
+         \x20   while probe.poll() is None:\n\
+         \x20       try:\n\
+         \x20           identity = open(os.environ['IRONMEM_TEST_IDENTITY_PATH']).read()\n\
+         \x20       except FileNotFoundError:\n\
+         \x20           identity = ''\n\
+         \x20       if recorded in identity:\n\
+         \x20           sampled = True\n\
+         \x20           break\n\
+         \x20       time.sleep(0.01)\n\
+         finally:\n\
+         \x20   probe.kill()\n\
+         \x20   probe.wait()\n\
          sys.exit(0 if sampled else 97)\n";
 
     /// The stub's line that runs [`DAEMON_SPAWNER`]. A spawner that fails
@@ -2764,17 +2766,17 @@ pub(crate) mod contract_tests {
         )
     }
 
-    /// The exit code of `script`, run by `/bin/sh` in `dir` with a 0.2 s
-    /// probe and `identity` as its identity file, which nothing writes. Its
-    /// standard error goes to `stderr` in `dir`. Panics if the script is
-    /// still running 20 s later.
+    /// The exit code of `script`, run by `/bin/sh` in `dir` with a probe of
+    /// `probe` seconds and `identity` as its identity file, which nothing
+    /// writes. Its standard error goes to `stderr` in `dir`. Panics if the
+    /// script is still running 20 s later.
     #[cfg(unix)]
-    fn give_up_code(script: &str, dir: &Path, identity: &Path) -> Option<i32> {
+    fn give_up_code(script: &str, dir: &Path, identity: &Path, probe: &str) -> Option<i32> {
         let mut child = std::process::Command::new("/bin/sh")
             .args(["-c", script])
             .current_dir(dir)
             .env(IDENTITY_PATH_ENV, identity)
-            .env(PROBE_SECONDS_ENV, "0.2")
+            .env(PROBE_SECONDS_ENV, probe)
             .stderr(std::fs::File::create(dir.join("stderr")).unwrap())
             .spawn()
             .unwrap();
@@ -2786,7 +2788,7 @@ pub(crate) mod contract_tests {
             if Instant::now() >= deadline {
                 let _ = child.kill();
                 let _ = child.wait();
-                panic!("the wait was still going 20 s after its 0.2 s probe had ended");
+                panic!("the script was still running after 20 s, with a {probe} s probe");
             }
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -2799,10 +2801,28 @@ pub(crate) mod contract_tests {
     fn the_wait_for_a_first_sample_ends_with_its_probe() {
         let dir = tempfile::tempdir().unwrap();
         let identity = dir.path().join("never-written.json");
+        let started = Instant::now();
         assert_eq!(
-            give_up_code(await_first_sample(), dir.path(), &identity),
+            give_up_code(await_first_sample(), dir.path(), &identity, "0.2"),
             Some(97)
         );
+        assert!(
+            started.elapsed() >= Duration::from_millis(200),
+            "the wait ended after {:?}, before its 0.2 s probe did",
+            started.elapsed()
+        );
+    }
+
+    /// An identity file that is there and cannot be read is not a sample
+    /// that never came: the wait ends with 96 and says why.
+    #[cfg(unix)]
+    #[test]
+    fn the_wait_for_a_first_sample_fails_on_an_identity_file_it_cannot_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let code = give_up_code(await_first_sample(), dir.path(), dir.path(), "0.2");
+        let stderr = std::fs::read_to_string(dir.path().join("stderr")).unwrap();
+        assert_eq!(code, Some(96), "{stderr}");
+        assert!(stderr.contains("grep"), "{stderr}");
     }
 
     /// The spawner's wait ends with its probe too, and the stub that ran it
@@ -2820,7 +2840,7 @@ pub(crate) mod contract_tests {
             dir.path(),
         );
         let identity = dir.path().join("never-written.json");
-        assert_eq!(give_up_code(&line, dir.path(), &identity), Some(97));
+        assert_eq!(give_up_code(&line, dir.path(), &identity, "0.2"), Some(97));
     }
 
     /// Only an identity file that is not there yet reads as no sample so
@@ -2839,10 +2859,24 @@ pub(crate) mod contract_tests {
             &dir.path().join("unused.sock"),
             dir.path(),
         );
-        let code = give_up_code(&line, dir.path(), dir.path());
+        // A probe length no other test uses, so `pgrep` finds this one only.
+        let code = give_up_code(&line, dir.path(), dir.path(), "31.07");
         let stderr = std::fs::read_to_string(dir.path().join("stderr")).unwrap();
         assert_eq!(code, Some(1), "{stderr}");
         assert!(stderr.contains("IsADirectoryError"), "{stderr}");
+        let left = std::process::Command::new("pgrep")
+            .args(["-f", "sleep 31.07"])
+            .output()
+            .unwrap();
+        // Ended here before the assertion, so a failure leaves nothing.
+        let _ = std::process::Command::new("pkill")
+            .args(["-f", "sleep 31.07"])
+            .status();
+        assert!(
+            left.stdout.is_empty(),
+            "the spawner left its probe running: pid {}",
+            String::from_utf8_lossy(&left.stdout).trim()
+        );
     }
 
     /// Shell for a stub that goes on only once the supervisor has sampled
@@ -2852,10 +2886,12 @@ pub(crate) mod contract_tests {
     /// kills it. A signal from the tracker itself, not a guess at how long
     /// a sample takes under load. The wait lasts as long as the probe does
     /// (120 s, or `IRONMEM_TEST_PROBE_SECONDS`), since no sample can record
-    /// a probe that has ended. Exits 97 if none recorded it. A test that
-    /// supervises the stub gives its run a ceiling (3 to 20 s) shorter than
-    /// the probe's 120 s, so there the ceiling ends a run no sample
-    /// recorded, and 97 is seen only where the probe is shortened.
+    /// a probe that has ended. Exits 97 if none recorded it, or 96 if the
+    /// identity file is there and cannot be read (while it waits, a failed
+    /// read only means "not yet"). A test that supervises the stub gives
+    /// its run a ceiling (3 to 20 s) shorter than the probe's 120 s, so
+    /// there the ceiling ends a run no sample recorded, and 97 and 96 are
+    /// seen only where the probe is shortened.
     pub(crate) fn await_first_sample() -> &'static str {
         "sleep ${IRONMEM_TEST_PROBE_SECONDS:-120} & probe=$!\n\
          sampled=0\n\
@@ -2865,7 +2901,13 @@ pub(crate) mod contract_tests {
          sleep 0.01\n\
          done\n\
          kill $probe 2>/dev/null\n\
-         [ \"$sampled\" = 1 ] || exit 97"
+         if [ \"$sampled\" != 1 ]; then\n\
+         if [ -e \"$IRONMEM_TEST_IDENTITY_PATH\" ]; then\n\
+         grep -q \"\\\"pid\\\":$probe,\" \"$IRONMEM_TEST_IDENTITY_PATH\"\n\
+         [ $? -ge 2 ] && exit 96\n\
+         fi\n\
+         exit 97\n\
+         fi"
     }
     #[cfg(unix)]
     /// A stub that outlives the supervisor's first process sample, as any
