@@ -456,7 +456,7 @@ knowledge base.</sub>\n",
 /// spoofing in the one artifact a human reads to decide what to do next.
 /// [`scrub_and_bound`] does not help here: it redacts secrets, not
 /// [`crate::sanitize::is_forgeable_invisible`] characters.
-fn one_line(text: &str) -> String {
+pub(super) fn one_line(text: &str) -> String {
     const MAX_FIELD_IN_COMMENT: usize = 500;
     // `trim`, not just the collapse: `collapse_whitespace_and_control`'s
     // internal `value.trim()` only strips `White_Space`, so a field starting

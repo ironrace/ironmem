@@ -893,6 +893,7 @@ mod tests {
                 head_sha: commit.unwrap_or("abc123"),
                 findings: Some("the retry loop is unbounded"),
                 attempt_cap: cap,
+                max_review_rounds: remediate::DEFAULT_MAX_REVIEW_ROUNDS,
             },
         )
         .unwrap();
@@ -1043,6 +1044,7 @@ mod tests {
                 head_sha: "abc123",
                 findings: Some("the retry loop is unbounded"),
                 attempt_cap: 5,
+                max_review_rounds: remediate::DEFAULT_MAX_REVIEW_ROUNDS,
             },
         )
         .unwrap();

@@ -236,6 +236,7 @@ exit 0
         // `needs_changes` verdict here still holds the PR for a human.
         remediate: false,
         attempt_cap: 5,
+        max_review_rounds: ironmem::autopilot::remediate::DEFAULT_MAX_REVIEW_ROUNDS,
         strategy: MergeStrategy::Squash,
         delete_branch: false,
         dry_run,

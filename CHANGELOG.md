@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Autopilot stops a fix loop that is not converging (#404).** With
+  `advance --remediate`, three consecutive `needs_changes` reviews of one PR
+  now hold it for a person instead of arming another fix dispatch: one
+  comment on the PR lists each round's reason, the issue moves to
+  `agent:blocked`, and nothing is dispatched. The hold is posted with or
+  without `--merge`; only `--dry-run` suppresses it. `--max-review-rounds
+  <N>` on `advance` sets the limit (default 3, at least 1). Re-labeling the
+  issue `agent:ready` starts a fresh count. `advance --json` and
+  `merge --json` gain a `rehearsed` field on the merge result. `--json` also
+  gains the values `"arm": "round_limit_reached"` and
+  `"reason": "review_rounds_exhausted"`, and stored merge records gain
+  `"reason": "review_rounds_exhausted"`. An existing `--remediate` cron picks
+  up the default of 3: the first pass after the upgrade that reaches a PR
+  with three or more consecutive `needs_changes` reviews, the latest at its
+  current head, holds it, and clears the issue's armed fix, if any, so the
+  Lead does not dispatch it. A PR whose head has moved since its last review
+  is reviewed first, and held if that review asks for changes. A cron without
+  `--merge` now posts that hold too. Pass `--max-review-rounds <N>` to raise
+  the limit. Raising it allows more judged reviews before the hold; it does
+  not disable the round limit. Reviews at the same head count separately,
+  including manual re-reviews and reviews after a base retarget.
+  `autopilot retry` restores the attempt budget but not the round count. Do
+  not downgrade while a round-limit hold is stored: older binaries cannot
+  read an issue's merge records once one exists. Once the issue is re-labeled
+  `agent:ready`, an older `advance` reports it as a problem on every pass
+  while its PR is open (under `--remediate` it can arm a fix first), and an
+  older `ironmem autopilot merge` or `advance --merge` can merge the PR and
+  then fail before recording the merge or clearing its labels.
 - **Later Autopilot review rounds review the fix (#403).** Once a review of a PR
   has judged it, the next review's prompt names that review's head and tells the
   reviewer to read `git diff <last-judged-head>..<head>` first, asks whether

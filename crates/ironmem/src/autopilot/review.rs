@@ -904,6 +904,14 @@ pub enum HoldReason {
         dispatch_class: String,
         diff_class: RiskClass,
     },
+    /// The reviewer returned `needs_changes` in `rounds` consecutive rounds
+    /// on this PR, reaching the `limit` set by `--max-review-rounds` (#404).
+    ///
+    /// [`decide_merge`] never returns this: it is not a judgment about one
+    /// review. [`super::remediate::arm_remediation`] detects it and
+    /// [`super::merge::execute_merge`] holds on it, so the fix loop stops
+    /// before the attempt cap when its approach is not converging.
+    ReviewRoundsExhausted { rounds: u32, limit: u32 },
 }
 
 impl HoldReason {
@@ -939,6 +947,11 @@ implicit approval"
 between the two always fails closed",
                 diff_class.as_str(),
                 dispatch_class.trim()
+            ),
+            HoldReason::ReviewRoundsExhausted { rounds, limit } => format!(
+                "the reviewer asked for changes in {rounds} consecutive round{} (the limit is \
+{limit}), so the fix loop has not converged and Autopilot has stopped dispatching fixes",
+                if *rounds == 1 { "" } else { "s" }
             ),
         }
     }
@@ -5661,5 +5674,36 @@ not json at all
         // Finite is the property that matters; the number is a judgment call
         // that a change should have to state out loud.
         assert_eq!(REVIEW_TIMEOUT, std::time::Duration::from_secs(1_200));
+    }
+
+    #[test]
+    fn review_rounds_exhausted_says_the_loop_has_not_converged_and_round_trips() {
+        // #404. The hold is written into merge records, so its JSON shape is
+        // a stored format, not an implementation detail.
+        let reason = HoldReason::ReviewRoundsExhausted {
+            rounds: 4,
+            limit: 3,
+        };
+        let summary = reason.summary();
+        assert!(summary.contains("4 consecutive rounds"), "{summary}");
+        assert!(summary.contains("the limit is 3"), "{summary}");
+        assert!(summary.contains("has not converged"), "{summary}");
+
+        let json = serde_json::to_string(&reason).unwrap();
+        assert_eq!(
+            json,
+            r#"{"reason":"review_rounds_exhausted","rounds":4,"limit":3}"#
+        );
+        assert_eq!(serde_json::from_str::<HoldReason>(&json).unwrap(), reason);
+
+        let one = HoldReason::ReviewRoundsExhausted {
+            rounds: 1,
+            limit: 1,
+        };
+        assert!(
+            one.summary().contains("1 consecutive round "),
+            "{}",
+            one.summary()
+        );
     }
 }
