@@ -2813,6 +2813,21 @@ pub(crate) mod contract_tests {
         );
     }
 
+    /// A stub that runs under `set -e` gives up with 97 as any other does:
+    /// no command of the wait fails where the shell would end the script.
+    #[cfg(unix)]
+    #[test]
+    fn the_wait_for_a_first_sample_gives_up_with_97_under_errexit() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = dir.path().join("process.json");
+        std::fs::write(&identity, "{}").unwrap();
+        let script = format!("set -e\n{}", await_first_sample());
+        assert_eq!(
+            give_up_code(&script, dir.path(), &identity, "0.2"),
+            Some(97)
+        );
+    }
+
     /// An identity file that is there and cannot be read is not a sample
     /// that never came: the wait ends with 96 and says why.
     #[cfg(unix)]
@@ -2859,18 +2874,19 @@ pub(crate) mod contract_tests {
             &dir.path().join("unused.sock"),
             dir.path(),
         );
-        // A probe length no other test uses, so `pgrep` finds this one only.
+        // A probe length no other test uses, matched as a whole command
+        // line, so `pgrep` finds this probe only.
         let code = give_up_code(&line, dir.path(), dir.path(), "31.07");
         let stderr = std::fs::read_to_string(dir.path().join("stderr")).unwrap();
         assert_eq!(code, Some(1), "{stderr}");
         assert!(stderr.contains("IsADirectoryError"), "{stderr}");
         let left = std::process::Command::new("pgrep")
-            .args(["-f", "sleep 31.07"])
+            .args(["-f", "^sleep 31\\.07$"])
             .output()
             .unwrap();
         // Ended here before the assertion, so a failure leaves nothing.
         let _ = std::process::Command::new("pkill")
-            .args(["-f", "sleep 31.07"])
+            .args(["-f", "^sleep 31\\.07$"])
             .status();
         assert!(
             left.stdout.is_empty(),
@@ -2900,11 +2916,11 @@ pub(crate) mod contract_tests {
          then sampled=1; break; fi\n\
          sleep 0.01\n\
          done\n\
-         kill $probe 2>/dev/null\n\
+         kill $probe 2>/dev/null || true\n\
          if [ \"$sampled\" != 1 ]; then\n\
          if [ -e \"$IRONMEM_TEST_IDENTITY_PATH\" ]; then\n\
-         grep -q \"\\\"pid\\\":$probe,\" \"$IRONMEM_TEST_IDENTITY_PATH\"\n\
-         [ $? -ge 2 ] && exit 96\n\
+         grep -q \"\\\"pid\\\":$probe,\" \"$IRONMEM_TEST_IDENTITY_PATH\" \
+         || [ $? -lt 2 ] || exit 96\n\
          fi\n\
          exit 97\n\
          fi"
