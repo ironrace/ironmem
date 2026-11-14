@@ -422,6 +422,20 @@ being enrolled does not fail the invocation), but it is practical
 supervision rather than hostile fork containment; a deliberate double-fork
 escape between polls is outside its guarantee.
 
+The tracker never enrols a process whose kernel birth is earlier than the
+birth of the owned parent it appears under, because a real child cannot be
+older than the process that forked it. Such a process is never signalled. It
+is not a seed either, so its own children are not reached through it.
+Refusing it does not fail the sample or the invocation; the supervisor logs
+one warning for it. Equal births are still enrolled, because Linux births
+are clock ticks and a fork in its parent's tick is a real child. This is a
+defensive guard against a suspected macOS case, in which a traced process
+reports its tracer as its parent. If so, a debugger that an agent's tool
+attaches to an outside process makes that process look like a child of an
+owned process. That scenario has never been reproduced. The guard does not
+cover a process that was started after the debugger and attached at launch
+(wait-for-launch): its birth is later than the debugger's, so it passes.
+
 A tool that lives less than one sample and leaves a background child running
 (`cmd &` in a short-lived shell) is the ordinary case of that escape: the
 child is reparented to init before any sample can enrol it. Codex's tools

@@ -2342,6 +2342,10 @@ pub(crate) struct ProcessTracker {
     /// failure of the run, and never ignored: completion waits until each
     /// is gone ([`Self::hold_unsignalable`]).
     refused: std::collections::HashSet<u32>,
+    /// Candidates refused for a kernel birth earlier than their owned
+    /// parent's ([`Self::observe_rows`]), by PID and birth: each is warned
+    /// about once, not on every sample.
+    older_than_parent: std::collections::HashSet<(u32, Birth)>,
 }
 
 /// `e`'s message, without the "Validation error" prefix a validation
@@ -2486,6 +2490,7 @@ impl ProcessTracker {
             kernel_exe: kernel_executable,
             kill: signal_pinned,
             refused: std::collections::HashSet::new(),
+            older_than_parent: std::collections::HashSet::new(),
         }
     }
 
@@ -2688,6 +2693,26 @@ impl ProcessTracker {
                     return Err(MemoryError::Validation(
                         "invocation descendant ancestry changed during authentication".into(),
                     ));
+                }
+                // A real child cannot be older than the process that forked
+                // it. One that is was not forked by its owned parent: on
+                // macOS a traced process reports its tracer as its parent,
+                // so a debugger the invocation runs may have attached to an
+                // outside process (suspected, never reproduced). It is
+                // neither enrolled nor a seed, and the sample goes on. Equal
+                // births are kept: Linux births are clock ticks, and a fork
+                // in its parent's tick is real. A reused PID is always born
+                // later, so this cannot excuse one.
+                if actual.birth < expected_parent {
+                    if self.older_than_parent.insert((row.pid, actual.birth)) {
+                        tracing::warn!(
+                            pid = row.pid,
+                            ppid = row.ppid,
+                            "Autopilot is not tracking a process born before its owned parent; \
+                             it was not forked by that parent (a debugger attach can do this)"
+                        );
+                    }
+                    continue;
                 }
                 let parent_after = kernel(row.ppid).map_err(MemoryError::Validation)?;
                 if !parent_after.is_some_and(|p| p.pid == row.ppid && p.birth == expected_parent) {
@@ -6058,6 +6083,132 @@ pub(crate) mod tests {
         }
         cleaned.unwrap();
         assert!(both_alive, "cleanup signalled a stranger");
+    }
+
+    /// A real child cannot be older than the process that forked it. A
+    /// candidate the kernel shows under an owned parent but born before it
+    /// (on macOS, possibly an outside process a debugger the invocation runs
+    /// attached to: never reproduced) is not enrolled and is no seed, so its
+    /// own child is not reached through it. The sample still succeeds.
+    #[test]
+    fn a_candidate_born_before_its_owned_parent_is_not_enrolled_nor_its_child() {
+        let mut tracker = ProcessTracker::owning_every_descendant(10);
+        tracker
+            .observe_rows(
+                vec![
+                    process_row(10, 1, 10),
+                    process_row(20, 10, 20),
+                    process_row(30, 20, 30),
+                ],
+                |pid| {
+                    Ok(Some(match pid {
+                        10 => kernel_process(10, 1, 10, 5),
+                        20 => kernel_process(20, 10, 20, 3),
+                        _ => kernel_process(30, 20, 30, 4),
+                    }))
+                },
+            )
+            .unwrap();
+        assert!(tracker.known.contains_key(&10));
+        assert!(!tracker.known.contains_key(&20), "older candidate enrolled");
+        assert!(!tracker.known.contains_key(&30), "reached through it");
+        assert!(tracker.signal(20, STOP_SIGNAL).is_err());
+    }
+
+    /// Equal births stay enrolled: Linux births are clock ticks, so a fork
+    /// in its parent's tick is a real child. Later births enrol as before.
+    #[test]
+    fn a_candidate_born_with_or_after_its_owned_parent_is_enrolled() {
+        let mut tracker = ProcessTracker::owning_every_descendant(10);
+        tracker
+            .observe_rows(
+                vec![
+                    process_row(10, 1, 10),
+                    process_row(20, 10, 20),
+                    process_row(30, 10, 30),
+                    process_row(40, 20, 40),
+                ],
+                |pid| {
+                    Ok(Some(match pid {
+                        10 => kernel_process(10, 1, 10, 5),
+                        20 => kernel_process(20, 10, 20, 5),
+                        30 => kernel_process(30, 10, 30, 6),
+                        _ => kernel_process(40, 20, 40, 5),
+                    }))
+                },
+            )
+            .unwrap();
+        for pid in [10, 20, 30, 40] {
+            assert!(tracker.known.contains_key(&pid), "{pid} not enrolled");
+        }
+    }
+
+    /// Cleanup never signals a candidate refused for being older than its
+    /// owned parent. Real processes with their real births: the outsider
+    /// starts first, the "root" later, and a synthetic kernel record shows
+    /// the outsider under the root, as a tracer would on macOS.
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_does_not_signal_a_candidate_older_than_its_owned_parent() {
+        static SIGNALLED: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+        let spawn = || {
+            Command::new("sleep")
+                .arg("30")
+                .stdin(std::process::Stdio::null())
+                .spawn()
+                .unwrap()
+        };
+        let mut outsider = spawn();
+        // Linux births are 10 ms ticks; leave several between the two.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let mut root = spawn();
+        let (po, pr) = (outsider.id(), root.id());
+        let born = |pid| kernel_birth(pid).unwrap().unwrap();
+        let (outsider_birth, root_birth) = (born(po), born(pr));
+        assert!(outsider_birth < root_birth, "fixture births out of order");
+        let me = std::process::id();
+        let mut tracker = ProcessTracker::owning_every_descendant(pr);
+        tracker.set_kill(|p, _| {
+            SIGNALLED.lock().unwrap().push(p.pid);
+            Ok(())
+        });
+        let observed = tracker.observe_rows(
+            vec![process_row(pr, me, pr), process_row(po, pr, po)],
+            |pid| {
+                Ok(Some(if pid == pr {
+                    KernelProcess {
+                        pid: pr,
+                        ppid: me,
+                        pgid: pr,
+                        birth: root_birth,
+                    }
+                } else {
+                    KernelProcess {
+                        pid: po,
+                        ppid: pr,
+                        pgid: po,
+                        birth: outsider_birth,
+                    }
+                }))
+            },
+        );
+        let enrolled = tracker.known.contains_key(&po);
+        // The root counts as reaped, so cleanup signals only what enrolled.
+        let cleaned = tracker.cleanup(true);
+        let alive = outsider.try_wait().unwrap().is_none();
+        for child in [&mut outsider, &mut root] {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        observed.unwrap();
+        assert!(!enrolled, "older candidate enrolled");
+        let signalled = SIGNALLED.lock().unwrap().clone();
+        assert!(
+            !signalled.contains(&po),
+            "signalled the outsider: {signalled:?}"
+        );
+        assert!(alive, "outsider gone");
+        cleaned.unwrap();
     }
 
     /// Exited descendants still tie a scanned process to the invocation: a
