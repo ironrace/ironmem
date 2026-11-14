@@ -332,6 +332,49 @@ impl<'a> KnowledgeGraph<'a> {
         Ok(result)
     }
 
+    /// [`Self::query_entity_current_with_predicate`], newest-*written* first,
+    /// with each triple's position in the write order.
+    ///
+    /// The position is the row's SQLite `rowid`. A rowid is chosen at insert
+    /// as one more than the largest in the table, so among the rows that
+    /// exist it rises in the order they were written, whatever the system
+    /// clock said at the time. That makes it the key for "which of these
+    /// came last", where `extracted_at` (the wall clock, which can step
+    /// backwards) is not. Nothing here renumbers rows: triples are
+    /// invalidated in place, never deleted or replaced, and nothing in this
+    /// codebase runs `VACUUM`, which may renumber a table whose primary key
+    /// is not an `INTEGER PRIMARY KEY`, as this one's is not.
+    ///
+    /// The rowid is global to the table, so positions from two predicates
+    /// (an issue's `has_review` and `has_merge` edges, say) compare too.
+    ///
+    /// The `LIMIT` keeps the newest-written rows, for the same reason.
+    pub fn query_entity_current_with_predicate_in_write_order(
+        &self,
+        entity_id: &str,
+        predicate: &str,
+        limit: usize,
+    ) -> Result<Vec<(i64, Triple)>, MemoryError> {
+        let mut stmt = self.db.conn.prepare(
+            "SELECT id, subject, predicate, object, valid_from, valid_to, confidence, source_closet, extracted_at, rowid
+             FROM triples
+             WHERE (subject = ?1 OR object = ?1) AND predicate = ?2 AND valid_to IS NULL
+             ORDER BY rowid DESC
+             LIMIT ?3",
+        )?;
+
+        // Clamped for the same reason as in `query_entity_current`.
+        let bounded = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = stmt.query_map(params![entity_id, predicate, bounded], |row| {
+            Ok((row.get::<_, i64>(9)?, Self::row_to_triple(row)?))
+        })?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
     /// Get entity timeline — all triples (including invalidated) sorted by valid_from.
     pub fn timeline_for_entity_id(&self, entity_id: &str) -> Result<Vec<Triple>, MemoryError> {
         let mut stmt = self.db.conn.prepare(
