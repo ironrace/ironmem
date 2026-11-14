@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Autopilot retries a review follow-up that was never posted (#408).** A
+  successful follow-up comment is now recorded against its review, and every
+  `advance` pass that reaches an open PR first posts each follow-up the PR is
+  still owed at its current head: one whose `gh pr comment` failed, one a
+  process that died after recording its review never posted, and one recorded
+  by the standalone `ironmem autopilot review`. Each is posted once and never
+  again once recorded; a post that fails is retried on the next pass while the
+  head is unchanged, and never stops the pass. The PR is read again under the
+  issue's lock before any owed follow-up is posted, so a head another
+  controller pushed after the pass first listed the PR gets no follow-up about
+  the head before it. Not retried: under `--dry-run`, after the head moves, for an unjudged review, and for a review recorded
+  before this release, whose follow-up may already have been posted.
+  `advance --json` gains `follow_up_retries` on each issue (left out when
+  empty), and the text output gains a `follow-up of the earlier review <id>:`
+  line. The failed-post line now ends `, and the next pass retries it`. A
+  process that dies after posting but before recording, or a `gh` failure
+  after GitHub accepted the comment, can post that follow-up a second time.
 - **Autopilot stops a fix loop that is not converging (#404).** With
   `advance --remediate`, three consecutive `needs_changes` reviews of one PR
   now hold it for a person instead of arming another fix dispatch: one

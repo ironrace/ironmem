@@ -1139,6 +1139,15 @@ struct ReviewBody {
     /// reads back as `None`, "not recorded".
     #[serde(default)]
     round: Option<ReviewRound>,
+    /// Whether this review's follow-up has its posting tracked (#408): every
+    /// review [`record_review`] writes says `true`, and its follow-up is
+    /// posted until [`record_follow_up_posted`] says it was. Defaulted to
+    /// `false`, and that is the point of the field: a review recorded before
+    /// #408 may well have had its follow-up posted by #403's inline post,
+    /// and nothing recorded it, so it is never retried — retrying it would
+    /// post every such follow-up a second time.
+    #[serde(default)]
+    follow_up_post_tracked: bool,
 }
 
 /// What [`record_review`] persisted.
@@ -1192,6 +1201,7 @@ pub fn record_review(db: &Database, record: &ReviewRecord) -> Result<RecordedRev
         follow_up_redacted: follow_up_scrub.as_ref().is_some_and(|o| o.redacted),
         follow_up_truncated: follow_up_scrub.as_ref().is_some_and(|o| o.truncated),
         round: record.round.clone(),
+        follow_up_post_tracked: true,
     };
 
     let content = serde_json::to_string(&body)?;
@@ -1333,30 +1343,8 @@ pub fn reviews_for_issue(
     db: &Database,
     issue: &IssueRef,
 ) -> Result<Vec<RecordedReviewSummary>, MemoryError> {
-    let kg = KnowledgeGraph::new(db);
-    let entity = match kg.resolve_entity(&issue.entity_name(), Some(ISSUE_ENTITY_TYPE)) {
-        Ok(entity) => entity,
-        Err(MemoryError::NotFound(_)) => return Ok(Vec::new()),
-        Err(other) => return Err(other),
-    };
-
-    let triples = kg.query_entity_current_with_predicate_in_write_order(
-        &entity.id,
-        HAS_REVIEW_PREDICATE,
-        MAX_ISSUE_EDGES,
-    )?;
     let mut records = Vec::new();
-    for (write_seq, triple) in triples {
-        // `triple.object` is the *entity* id, not the drawer id stored as
-        // that entity's `name` — the same indirection
-        // `lineage::attempts_for_issue` documents.
-        let Some(object_entity) = kg.get_entity(&triple.object)? else {
-            continue;
-        };
-        let Some(drawer) = db.get_drawer(&object_entity.name)? else {
-            continue;
-        };
-        let body: ReviewBody = serde_json::from_str(&drawer.content)?;
+    for (write_seq, _, body) in review_bodies(db, issue)? {
         records.push(RecordedReviewSummary {
             issue: body.issue,
             pr_number: body.pr_number,
@@ -1377,6 +1365,135 @@ pub fn reviews_for_issue(
     // distinct, so this order is total.
     records.sort_by_key(|r| r.write_seq);
     Ok(records)
+}
+
+/// Every stored review body hanging off `issue`'s `has_review` edges, with
+/// its `write_seq` (the `rowid` of that edge, #406) and the id of the drawer
+/// it is stored in. Newest-written first, as the query returns them: callers
+/// that need an order sort on the `write_seq`.
+fn review_bodies(
+    db: &Database,
+    issue: &IssueRef,
+) -> Result<Vec<(i64, String, ReviewBody)>, MemoryError> {
+    let kg = KnowledgeGraph::new(db);
+    let entity = match kg.resolve_entity(&issue.entity_name(), Some(ISSUE_ENTITY_TYPE)) {
+        Ok(entity) => entity,
+        Err(MemoryError::NotFound(_)) => return Ok(Vec::new()),
+        Err(other) => return Err(other),
+    };
+
+    let triples = kg.query_entity_current_with_predicate_in_write_order(
+        &entity.id,
+        HAS_REVIEW_PREDICATE,
+        MAX_ISSUE_EDGES,
+    )?;
+    let mut bodies = Vec::new();
+    for (write_seq, triple) in triples {
+        // `triple.object` is the *entity* id, not the drawer id stored as
+        // that entity's `name` — the same indirection
+        // `lineage::attempts_for_issue` documents.
+        let Some(object_entity) = kg.get_entity(&triple.object)? else {
+            continue;
+        };
+        let Some(drawer) = db.get_drawer(&object_entity.name)? else {
+            continue;
+        };
+        let body: ReviewBody = serde_json::from_str(&drawer.content)?;
+        bodies.push((write_seq, drawer.id, body));
+    }
+    Ok(bodies)
+}
+
+/// A judged review's follow-up that has not reached its PR yet (#408).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UnpostedFollowUp {
+    /// The drawer the review is stored in: the key its posted state is
+    /// recorded under, and where its text is.
+    pub(crate) review_drawer_id: String,
+    /// The follow-up as stored: already scrubbed and bounded.
+    pub(crate) text: String,
+    /// Whether the stored follow-up was cut ([`ReviewBody`]'s
+    /// `follow_up_truncated`), so the comment says so.
+    pub(crate) truncated: bool,
+}
+
+/// The follow-ups `advance` still owes PR `pr_number` at `head_sha` (#408),
+/// oldest review first.
+///
+/// One per review that is this issue's (not a `repo_slug` collision's), of
+/// this PR, of this head, judged, with a non-blank follow-up, recorded after
+/// #408 (`follow_up_post_tracked`), and with no
+/// [`record_follow_up_posted`] record. A review of an earlier head is not
+/// owed: its findings are about a diff the PR no longer is. A review
+/// recorded before #408 is not owed either — see `follow_up_post_tracked`.
+pub(crate) fn unposted_follow_ups(
+    db: &Database,
+    issue: &IssueRef,
+    pr_number: u64,
+    head_sha: &str,
+) -> Result<Vec<UnpostedFollowUp>, MemoryError> {
+    let canonical = issue.canonical();
+    let mut owed = Vec::new();
+    for (write_seq, drawer_id, body) in review_bodies(db, issue)? {
+        let of_this_head = body
+            .head_sha
+            .as_deref()
+            .is_some_and(|sha| sha.eq_ignore_ascii_case(head_sha));
+        let judged = body.process_success && body.verdict.is_some();
+        let Some(text) = body.follow_up.filter(|t| !t.trim().is_empty()) else {
+            continue;
+        };
+        // Compared ignoring ASCII case, as `later_round_context` and
+        // `merge::latest_review_for_pr` do: the entity is keyed on a
+        // lowercased name, so `ironrace/IronMem` and `ironrace/ironmem` read
+        // each other's reviews, and an exact comparison would leave a
+        // genuine review's follow-up unposted for ever.
+        if !body.issue.eq_ignore_ascii_case(&canonical)
+            || body.pr_number != pr_number
+            || !of_this_head
+            || !judged
+            || !body.follow_up_post_tracked
+            || follow_up_posted(db, &drawer_id)?
+        {
+            continue;
+        }
+        owed.push((
+            write_seq,
+            UnpostedFollowUp {
+                review_drawer_id: drawer_id,
+                text,
+                truncated: body.follow_up_truncated,
+            },
+        ));
+    }
+    // By write, not by `recorded_at`: the wall clock can step backwards
+    // between two reviews (#406). Every `write_seq` is distinct.
+    owed.sort_by_key(|(write_seq, _)| *write_seq);
+    Ok(owed.into_iter().map(|(_, owed)| owed).collect())
+}
+
+fn follow_up_posted_key(review_drawer_id: &str) -> String {
+    format!("follow-up-posted:{review_drawer_id}")
+}
+
+/// Record that the follow-up of the review stored in `review_drawer_id`
+/// reached its PR as a comment (#408). Written only after `gh pr comment`
+/// succeeded; overwriting it again is harmless.
+pub(crate) fn record_follow_up_posted(
+    db: &Database,
+    review_drawer_id: &str,
+) -> Result<(), MemoryError> {
+    let content = serde_json::to_string(&json!({
+        "review_drawer_id": review_drawer_id,
+        "posted_at": chrono::Utc::now().to_rfc3339(),
+    }))?;
+    super::write_current(db, &follow_up_posted_key(review_drawer_id), &content)?;
+    Ok(())
+}
+
+/// Whether [`record_follow_up_posted`] has been written for this review.
+pub(crate) fn follow_up_posted(db: &Database, review_drawer_id: &str) -> Result<bool, MemoryError> {
+    Ok(super::read_current(db, &follow_up_posted_key(review_drawer_id))?.is_some())
 }
 
 /// Overwrite a stored review's `recorded_at`, and its edge's
@@ -2027,15 +2144,44 @@ impl WholePrReason {
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum FollowUpComment {
     Posted,
-    /// `gh pr comment` failed. Reported rather than retried: the follow-up
-    /// is still in the review's drawer, and a later pass posts only for a
-    /// review it runs itself.
+    /// `gh pr comment` failed — or, for a retried post, so did the re-read
+    /// of the PR that must precede it. Reported, and retried by the next
+    /// `advance` pass that finds the PR still at the reviewed head (#408):
+    /// nothing records it as posted, so [`unposted_follow_ups`] still owes
+    /// it.
     Failed {
         /// The failure as [`MemoryError`] prints it (its own prefix, the
         /// command, and `gh`'s stderr), scrubbed and cut to
         /// [`MAX_LINEAGE_FIELD_CHARS`].
         error: String,
     },
+}
+
+/// A follow-up an `advance` pass posted for a review an earlier pass, or the
+/// standalone `review` command, recorded (#408).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FollowUpRetry {
+    /// The drawer of the review the follow-up belongs to.
+    pub review_drawer_id: String,
+    pub comment: FollowUpComment,
+}
+
+impl FollowUpRetry {
+    /// The one line `advance` prints for this post without `--json`. A
+    /// failed post's error is cut as [`PrReview::advance_lines`] cuts it.
+    pub fn advance_line(&self) -> String {
+        match &self.comment {
+            FollowUpComment::Posted => format!(
+                "follow-up of the earlier review {}: posted as a PR comment",
+                self.review_drawer_id
+            ),
+            FollowUpComment::Failed { error } => format!(
+                "follow-up of the earlier review {}: NOT posted as a PR comment ({}) — the next pass retries it",
+                self.review_drawer_id,
+                one_line(error, MAX_ADVANCE_LINE_ERROR_CHARS)
+            ),
+        }
+    }
 }
 
 /// The longest follow-up text a comment quotes, after scrubbing.
@@ -2134,7 +2280,8 @@ impl PrReview {
     /// reaches the terminal as an escape sequence (`report_entry`). The
     /// standalone command posts no comment, so without `--json` this entry
     /// is where the person who ran it sees the follow-up; it is also stored
-    /// in the review's drawer.
+    /// in the review's drawer, and the next `advance` pass that finds the PR
+    /// at this head posts it (#408).
     pub fn text_report(&self) -> String {
         use std::fmt::Write as _;
         let mut out = String::new();
@@ -2225,7 +2372,11 @@ impl PrReview {
                 let drawer = self
                     .record_drawer_id
                     .as_deref()
-                    .map(|id| format!(" — its text is in the review's drawer {id}"))
+                    .map(|id| {
+                        format!(
+                            " — its text is in the review's drawer {id}, and the next pass retries it"
+                        )
+                    })
                     .unwrap_or_default();
                 lines.push(format!(
                     "follow-up: NOT posted as a PR comment ({error}){drawer}"
@@ -3834,6 +3985,220 @@ not json at all
         );
     }
 
+    fn owed_ids(db: &Database, issue: &IssueRef, pr: u64, head: &str) -> Vec<String> {
+        unposted_follow_ups(db, issue, pr, head)
+            .unwrap()
+            .into_iter()
+            .map(|owed| owed.review_drawer_id)
+            .collect()
+    }
+
+    #[test]
+    fn a_judged_follow_up_is_owed_until_it_is_recorded_as_posted() {
+        // #408: the follow-up of a judged review of this PR at this head is
+        // owed until `record_follow_up_posted` says it reached the PR, and
+        // never after.
+        let db = Database::open_in_memory().unwrap();
+        let issue = IssueRef::new("ironrace/ironmem", 283);
+        let head = "ab".repeat(20);
+        let mut record = sample_record(&issue, "fine");
+        record.head_sha = Some(head.clone());
+        record.outcome.follow_up = Some("rename x".into());
+        let recorded = record_review(&db, &record).unwrap();
+
+        let owed = unposted_follow_ups(&db, &issue, 322, &head).unwrap();
+        assert_eq!(
+            owed,
+            [UnpostedFollowUp {
+                review_drawer_id: recorded.drawer_id.clone(),
+                text: "rename x".into(),
+                truncated: false,
+            }]
+        );
+        // The head is compared as `gh` and git may spell it.
+        assert_eq!(
+            owed_ids(&db, &issue, 322, &head.to_uppercase()),
+            std::slice::from_ref(&recorded.drawer_id)
+        );
+
+        assert!(!follow_up_posted(&db, &recorded.drawer_id).unwrap());
+        record_follow_up_posted(&db, &recorded.drawer_id).unwrap();
+        assert!(follow_up_posted(&db, &recorded.drawer_id).unwrap());
+        assert!(owed_ids(&db, &issue, 322, &head).is_empty());
+        // Writing it again is harmless, and the review itself is untouched.
+        record_follow_up_posted(&db, &recorded.drawer_id).unwrap();
+        assert!(owed_ids(&db, &issue, 322, &head).is_empty());
+        assert_eq!(reviews_for_issue(&db, &issue).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn owed_follow_ups_come_back_in_write_order_when_the_clock_stepped_back() {
+        // #406 meets #408: "oldest review first" is first written, not
+        // earliest `recorded_at`, so a clock that stepped backwards between
+        // two reviews does not post their follow-ups out of order.
+        let db = Database::open_in_memory().unwrap();
+        let issue = IssueRef::new("ironrace/ironmem", 283);
+        let head = "ab".repeat(20);
+        let with = |follow_up: &str| {
+            let mut record = sample_record(&issue, "fine");
+            record.head_sha = Some(head.clone());
+            record.outcome.follow_up = Some(follow_up.into());
+            record
+        };
+        let first = record_review(&db, &with("first")).unwrap();
+        let second = record_review(&db, &with("second")).unwrap();
+        restamp_review_for_test(&db, &first.drawer_id, "2026-01-02T00:00:00+00:00");
+        restamp_review_for_test(&db, &second.drawer_id, "2026-01-01T00:00:00+00:00");
+
+        assert_eq!(
+            owed_ids(&db, &issue, 322, &head),
+            [first.drawer_id, second.drawer_id]
+        );
+    }
+
+    #[test]
+    fn only_a_judged_non_blank_follow_up_of_this_pr_at_this_head_is_owed() {
+        let db = Database::open_in_memory().unwrap();
+        let issue = IssueRef::new("ironrace/ironmem", 283);
+        let head = "0".repeat(40);
+        let with = |follow_up: Option<&str>| {
+            let mut record = sample_record(&issue, "fine");
+            record.outcome.follow_up = follow_up.map(str::to_string);
+            record
+        };
+
+        // Not judged: the process failed, or there was no verdict.
+        let mut failed = with(Some("rename x"));
+        failed.outcome.process_success = false;
+        record_review(&db, &failed).unwrap();
+        let mut no_verdict = with(Some("rename x"));
+        no_verdict.outcome.verdict = None;
+        record_review(&db, &no_verdict).unwrap();
+        // Judged, with no follow-up or a blank one.
+        record_review(&db, &with(None)).unwrap();
+        record_review(&db, &with(Some(" \n "))).unwrap();
+        // Another head, an unknown head, and another PR.
+        let mut earlier = with(Some("rename x"));
+        earlier.head_sha = Some("c".repeat(40));
+        record_review(&db, &earlier).unwrap();
+        let mut unknown = with(Some("rename x"));
+        unknown.head_sha = None;
+        record_review(&db, &unknown).unwrap();
+        let mut other_pr = with(Some("rename x"));
+        other_pr.pr_number = 999;
+        let other_pr = record_review(&db, &other_pr).unwrap();
+        // Another issue colliding on the same lineage entity is not this
+        // issue's (`repo_slug` maps both onto one).
+        let collision = IssueRef::new("ironrace-ironmem", 283);
+        assert_eq!(collision.entity_name(), issue.entity_name());
+        let mut colliding = with(Some("rename x"));
+        colliding.issue = collision.clone();
+        record_review(&db, &colliding).unwrap();
+
+        assert!(owed_ids(&db, &issue, 322, &head).is_empty());
+        assert_eq!(owed_ids(&db, &issue, 999, &head), [other_pr.drawer_id]);
+        assert_eq!(owed_ids(&db, &collision, 322, &head).len(), 1);
+    }
+
+    #[test]
+    fn a_follow_up_is_owed_whatever_case_the_repo_is_spelled_in() {
+        // The lineage entity is keyed on a lowercased name, so a review
+        // recorded for `ironrace/IronMem` is read back for
+        // `ironrace/ironmem`; comparing the canonical issue exactly would
+        // drop it and leave its follow-up unposted for ever.
+        let db = Database::open_in_memory().unwrap();
+        let recorded_as = IssueRef::new("ironrace/IronMem", 283);
+        let advanced_as = IssueRef::new("ironrace/ironmem", 283);
+        let head = "ab".repeat(20);
+        let mut record = sample_record(&recorded_as, "fine");
+        record.head_sha = Some(head.clone());
+        record.outcome.follow_up = Some("rename x".into());
+        let recorded = record_review(&db, &record).unwrap();
+
+        assert_eq!(
+            owed_ids(&db, &advanced_as, 322, &head),
+            std::slice::from_ref(&recorded.drawer_id)
+        );
+        assert_eq!(
+            owed_ids(&db, &recorded_as, 322, &head),
+            std::slice::from_ref(&recorded.drawer_id)
+        );
+        record_follow_up_posted(&db, &recorded.drawer_id).unwrap();
+        assert!(owed_ids(&db, &advanced_as, 322, &head).is_empty());
+    }
+
+    #[test]
+    fn a_review_recorded_before_408_is_never_owed_its_follow_up() {
+        // #403 posted inline and recorded nothing, so a review from then may
+        // well have been posted already: retrying it would post it twice.
+        let db = Database::open_in_memory().unwrap();
+        let issue = IssueRef::new("ironrace/ironmem", 283);
+        let mut record = sample_record(&issue, "fine");
+        record.outcome.follow_up = Some("rename x".into());
+        let recorded = record_review(&db, &record).unwrap();
+
+        // Rewrite the stored body as #403 wrote it: no tracking field.
+        let drawer = db.get_drawer(&recorded.drawer_id).unwrap().unwrap();
+        let mut body: serde_json::Value = serde_json::from_str(&drawer.content).unwrap();
+        assert_eq!(body["follow_up_post_tracked"], true);
+        body.as_object_mut()
+            .unwrap()
+            .remove("follow_up_post_tracked");
+        db.with_transaction(|tx| {
+            Database::insert_drawer_tx(
+                tx,
+                &recorded.drawer_id,
+                &body.to_string(),
+                &zero_embedding(),
+                WING,
+                ROOM,
+                "",
+                ADDED_BY,
+            )
+        })
+        .unwrap();
+
+        assert_eq!(
+            reviews_for_issue(&db, &issue).unwrap()[0]
+                .follow_up
+                .as_deref(),
+            Some("rename x"),
+            "the review still reads back"
+        );
+        assert!(owed_ids(&db, &issue, 322, &"0".repeat(40)).is_empty());
+    }
+
+    #[test]
+    fn a_retried_follow_up_is_one_advance_line_naming_its_review() {
+        let posted = FollowUpRetry {
+            review_drawer_id: "drawer-1".into(),
+            comment: FollowUpComment::Posted,
+        };
+        assert_eq!(
+            posted.advance_line(),
+            "follow-up of the earlier review drawer-1: posted as a PR comment"
+        );
+        let failed = FollowUpRetry {
+            review_drawer_id: "drawer-1".into(),
+            comment: FollowUpComment::Failed {
+                error: format!("HTTP 403:\r\n{}", "x".repeat(400)),
+            },
+        };
+        let line = failed.advance_line();
+        assert!(
+            line.starts_with(
+                "follow-up of the earlier review drawer-1: NOT posted as a PR comment (HTTP 403: x"
+            ),
+            "{line}"
+        );
+        assert!(line.ends_with("x…) — the next pass retries it"), "{line}");
+        assert!(!line.chars().any(char::is_control), "{line:?}");
+        assert_eq!(
+            serde_json::to_value(&posted).unwrap(),
+            serde_json::json!({"review_drawer_id": "drawer-1", "comment": {"status": "posted"}})
+        );
+    }
+
     fn reported_review(outcome: ReviewOutcome) -> PrReview {
         PrReview {
             issue: IssueRef::new("ironrace/ironmem", 283),
@@ -3923,7 +4288,7 @@ not json at all
             review.advance_lines(),
             [
                 verdict,
-                "follow-up: NOT posted as a PR comment (HTTP 403) — its text is in the review's drawer drawer-1"
+                "follow-up: NOT posted as a PR comment (HTTP 403) — its text is in the review's drawer drawer-1, and the next pass retries it"
             ]
         );
 
@@ -3954,7 +4319,7 @@ not json at all
             [
                 verdict.to_string(),
                 format!(
-                    "follow-up: NOT posted as a PR comment ({error}) — its text is in the review's drawer drawer-1"
+                    "follow-up: NOT posted as a PR comment ({error}) — its text is in the review's drawer drawer-1, and the next pass retries it"
                 )
             ]
         );

@@ -123,6 +123,14 @@
 //! and reviews again, so a NEEDS CHANGES and a later PASS on the same PR are
 //! two facts, not one overwritten one.
 //!
+//! #408 adds one of kind 2's shape beside it:
+//! [`review::record_follow_up_posted`] — `logical_key` per *review drawer*,
+//! written once that review's follow-up reached the PR as a comment. The
+//! review drawer itself is append-only and content-addressed, so "was it
+//! posted?" cannot be written into it after the fact; this record is the
+//! answer, and its absence on a review that tracks it is what
+//! [`advance`] retries.
+//!
 //! # The `logical_key` hazard
 //!
 //! `add_drawer`'s `logical_key` *rewrites* the drawer in that wing/room —

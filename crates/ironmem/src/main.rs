@@ -1320,6 +1320,10 @@ fn print_advance_report(report: &ironmem::autopilot::advance::AdvanceReport) {
                 );
             }
         }
+        // Before the review's lines: the pass posts these first (#408).
+        for retry in &step.follow_up_retries {
+            println!("    {}", retry.advance_line());
+        }
         if let Some(review) = &step.review {
             for line in review.advance_lines() {
                 println!("    {line}");

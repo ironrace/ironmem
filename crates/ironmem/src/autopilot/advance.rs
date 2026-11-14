@@ -434,6 +434,12 @@ pub struct Advanced {
     pub dispatch_class: String,
     pub step: AdvanceStep,
     pub review: Option<PrReview>,
+    /// The follow-ups this pass posted, or tried to, for reviews recorded
+    /// before it (#408): a post that failed, or one never attempted. This
+    /// pass's own review reports its follow-up on `review`. Left out of the
+    /// JSON when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub follow_up_retries: Vec<review::FollowUpRetry>,
     /// What rung 11 did about a `needs_changes` verdict. `None` when the
     /// verdict was not `needs_changes`, or when `--remediate` is off.
     pub remediation: Option<ArmOutcome>,
@@ -884,6 +890,16 @@ fn took_a_step(advanced: &Advanced) -> bool {
     if matches!(advanced.step, AdvanceStep::Stalled(_)) {
         return false;
     }
+    // ⟨#408⟩ A follow-up this pass posted for an earlier review is a GitHub
+    // write, so a pass that made one is charged even where the two re-reads
+    // below are not. A post that failed wrote nothing, and is not.
+    if advanced
+        .follow_up_retries
+        .iter()
+        .any(|retry| retry.comment == review::FollowUpComment::Posted)
+    {
+        return true;
+    }
     if advanced.review.is_none()
         && advanced.merge.as_ref().is_some_and(|m| {
             !m.record_appended
@@ -979,6 +995,7 @@ fn advance_issue(
                 dispatch_class: class,
                 step,
                 review: None,
+                follow_up_retries: Vec::new(),
                 remediation: None,
                 merge: None,
                 cleanup: None,
@@ -1014,6 +1031,7 @@ fn advance_issue(
                     dispatch_class: class,
                     step,
                     review: None,
+                    follow_up_retries: Vec::new(),
                     remediation: None,
                     merge: None,
                     cleanup: None,
@@ -1033,6 +1051,20 @@ fn advance_issue(
             candidate.issue.canonical()
         )));
     }
+
+    // #408: post the follow-ups this PR is still owed at its current head —
+    // a post that failed, one a process that died after recording its review
+    // never made, and one recorded by the standalone `review` command, which
+    // posts nothing. Before this pass's own review, so that review's
+    // follow-up is posted once, inline, below and not here as well. Under the
+    // issue lock, so two controllers cannot both find one owed and post it
+    // twice. `--dry-run` posts nothing.
+    let follow_up_retries = if config.dry_run {
+        Vec::new()
+    } else {
+        retry_owed_follow_ups(db, gh_runner, candidate, &branch, pr_number, &head_sha)?
+    };
+
     let mut review = None;
     if let AdvanceStep::Review { base_branch, .. } = &step {
         if config.dry_run {
@@ -1044,6 +1076,7 @@ fn advance_issue(
                 dispatch_class: class,
                 step,
                 review: None,
+                follow_up_retries,
                 remediation: None,
                 merge: None,
                 cleanup: None,
@@ -1078,36 +1111,24 @@ fn advance_issue(
         // never the reviewer's raw text.
         //
         // #403: a judged review's non-blocking follow-up reaches a person as
-        // a PR comment. At most one per judged review: it is posted here,
-        // straight after the review that produced it, and never again for
-        // that review — a failed post is reported, not retried, and does
-        // not stop the pass, because the follow-up never affects the verdict
-        // and its text is still in the review's drawer. It is not one per
-        // head: `next_step` reviews the same head again when the PR is
-        // retargeted to another base, and that review posts its own.
+        // a PR comment, posted here straight after the review that produced
+        // it. A failed post is reported and does not stop the pass, because
+        // the follow-up never affects the verdict; nothing records it as
+        // posted, so the retry above (#408) posts it on the next pass that
+        // finds the PR at this head. It is not one per head: `next_step`
+        // reviews the same head again when the PR is retargeted to another
+        // base, and that review posts its own.
         if done.dispatched() && done.outcome.judged() {
-            if let Some(body) = review::render_follow_up_comment(
+            done.follow_up_comment = post_follow_up(
+                db,
+                gh_runner,
+                &candidate.issue.repo,
                 pr_number,
-                Some(&head_sha),
+                &head_sha,
+                done.record_drawer_id.as_deref(),
                 done.outcome.follow_up.as_deref(),
                 done.follow_up_truncated,
-            ) {
-                done.follow_up_comment = Some(
-                    match gh::comment_on_pr(gh_runner, &candidate.issue.repo, pr_number, &body) {
-                        Ok(()) => review::FollowUpComment::Posted,
-                        Err(e) => {
-                            // `gh`'s stderr can quote the body it refused.
-                            let error = super::scrub::scrub_and_bound(
-                                &e.to_string(),
-                                lineage::MAX_LINEAGE_FIELD_CHARS,
-                            )
-                            .text;
-                            tracing::warn!(error = %error, "autopilot could not post a review follow-up");
-                            review::FollowUpComment::Failed { error }
-                        }
-                    },
-                );
-            }
+            )?;
         }
         review = Some(done);
     }
@@ -1128,6 +1149,7 @@ fn advance_issue(
             dispatch_class: class,
             step,
             review,
+            follow_up_retries,
             remediation: None,
             merge: None,
             cleanup: None,
@@ -1157,6 +1179,7 @@ fn advance_issue(
                 dispatch_class: class,
                 step,
                 review,
+                follow_up_retries,
                 remediation: None,
                 merge: None,
                 cleanup: None,
@@ -1289,10 +1312,139 @@ fn advance_issue(
         dispatch_class: class,
         step,
         review,
+        follow_up_retries,
         remediation,
         merge: Some(execution),
         cleanup,
     })
+}
+
+/// Post the follow-ups PR `pr_number` is still owed at `head_sha` (#408).
+/// Called under the issue lock.
+///
+/// `head_sha` is what the listing reported *before* the lock was taken, and
+/// another controller can push a new head and release the lock in between.
+/// So when anything is owed, the PR is read again here, under the lock, and
+/// nothing is posted unless it is still the same PR at the same head: a
+/// follow-up about a head the PR no longer is would put findings about the
+/// wrong diff in front of a person, and record them as delivered.
+///
+/// A head that moved owes nothing here — [`review::unposted_follow_ups`]
+/// owes only reviews of the current head, and the next pass reads that one.
+/// A re-read that fails is reported as each owed post's failure: nothing
+/// records them as posted, so the next pass owes them still.
+///
+/// Only the controllers are serialised by the lock. A push by anything else
+/// between this re-read and the post is not closed off here.
+fn retry_owed_follow_ups(
+    db: &Database,
+    gh_runner: &mut dyn GhRunner,
+    candidate: &Candidate,
+    branch: &str,
+    pr_number: u64,
+    head_sha: &str,
+) -> Result<Vec<review::FollowUpRetry>, MemoryError> {
+    let owed = review::unposted_follow_ups(db, &candidate.issue, pr_number, head_sha)?;
+    if owed.is_empty() {
+        return Ok(Vec::new());
+    }
+    match gh::open_pr_for_branch(gh_runner, &candidate.issue.repo, branch) {
+        Ok(PrLookup::Found(pr))
+            if pr.number == pr_number && pr.head_sha.eq_ignore_ascii_case(head_sha) => {}
+        Ok(_) => {
+            tracing::info!(
+                issue = %candidate.issue.canonical(),
+                pr = pr_number,
+                "the PR is no longer at the head its owed follow-ups are about; posting none"
+            );
+            return Ok(Vec::new());
+        }
+        Err(e) => {
+            let error =
+                super::scrub::scrub_and_bound(&e.to_string(), lineage::MAX_LINEAGE_FIELD_CHARS)
+                    .text;
+            tracing::warn!(
+                error = %error,
+                "autopilot could not re-read the PR before posting owed follow-ups"
+            );
+            return Ok(owed
+                .into_iter()
+                .map(|owed| review::FollowUpRetry {
+                    review_drawer_id: owed.review_drawer_id,
+                    comment: review::FollowUpComment::Failed {
+                        error: error.clone(),
+                    },
+                })
+                .collect());
+        }
+    }
+    let mut retries = Vec::new();
+    for owed in owed {
+        if let Some(comment) = post_follow_up(
+            db,
+            gh_runner,
+            &candidate.issue.repo,
+            pr_number,
+            head_sha,
+            Some(&owed.review_drawer_id),
+            Some(&owed.text),
+            owed.truncated,
+        )? {
+            retries.push(review::FollowUpRetry {
+                review_drawer_id: owed.review_drawer_id,
+                comment,
+            });
+        }
+    }
+    Ok(retries)
+}
+
+/// Post one judged review's follow-up as a PR comment, and record that it
+/// was posted (#403, #408). `None` when there is nothing to post.
+///
+/// Post first, record second. A process that dies between the two leaves
+/// the follow-up unrecorded, and the next pass posts it again: a duplicate
+/// comment, in exactly that window, is the price of never losing one. The
+/// other order would lose the follow-up whenever the post failed after the
+/// record was written. A record that fails to write is an error, so the pass
+/// reports the issue as a problem: the next pass will post that comment
+/// again, and a warning alone would let it repeat unseen.
+///
+/// A failed post is the scrubbed [`review::FollowUpComment::Failed`] and a
+/// warning, never an error: the follow-up does not affect the verdict, and
+/// the pass carries on.
+#[allow(clippy::too_many_arguments)]
+fn post_follow_up(
+    db: &Database,
+    gh_runner: &mut dyn GhRunner,
+    repo: &str,
+    pr_number: u64,
+    head_sha: &str,
+    review_drawer_id: Option<&str>,
+    follow_up: Option<&str>,
+    already_cut: bool,
+) -> Result<Option<review::FollowUpComment>, MemoryError> {
+    let Some(body) =
+        review::render_follow_up_comment(pr_number, Some(head_sha), follow_up, already_cut)
+    else {
+        return Ok(None);
+    };
+    match gh::comment_on_pr(gh_runner, repo, pr_number, &body) {
+        Ok(()) => {
+            if let Some(id) = review_drawer_id {
+                review::record_follow_up_posted(db, id)?;
+            }
+            Ok(Some(review::FollowUpComment::Posted))
+        }
+        Err(e) => {
+            // `gh`'s stderr can quote the body it refused.
+            let error =
+                super::scrub::scrub_and_bound(&e.to_string(), lineage::MAX_LINEAGE_FIELD_CHARS)
+                    .text;
+            tracing::warn!(error = %error, "autopilot could not post a review follow-up");
+            Ok(Some(review::FollowUpComment::Failed { error }))
+        }
+    }
 }
 
 /// Open the pull request the IC's dispatch did not.
@@ -4170,8 +4322,11 @@ skipped: {:?}",
             Some(review::FollowUpComment::Posted)
         );
 
-        // The next pass does not review this head again, so it cannot post
-        // the follow-up a second time.
+        // Recorded as posted (#408), so the next pass — which does not
+        // review this head again — does not post it a second time.
+        assert!(
+            review::follow_up_posted(&db, review.record_drawer_id.as_deref().unwrap()).unwrap()
+        );
         let mut responses = vec![
             ok(&issue_list_json(
                 283,
@@ -4181,8 +4336,9 @@ skipped: {:?}",
         ];
         responses.extend(rehearsal_reads());
         let mut gh = ScriptedGh::new(responses);
-        advance_pass(&db, &mut gh, &mut ForbiddenReviewer, &config).unwrap();
+        let report = advance_pass(&db, &mut gh, &mut ForbiddenReviewer, &config).unwrap();
         assert!(pr_comments(&gh).is_empty(), "seen: {:?}", gh.seen);
+        assert!(report.advanced[0].follow_up_retries.is_empty());
     }
 
     #[test]
@@ -4423,10 +4579,11 @@ skipped: {:?}",
     }
 
     #[test]
-    fn a_failed_follow_up_post_is_scrubbed_and_is_not_retried_by_the_next_pass() {
+    fn a_failed_follow_up_post_is_scrubbed_and_retried_once_by_the_next_pass() {
         // `gh` can quote what it refused, so the error it leaves in the
-        // report is scrubbed. And the post is not retried: the next pass
-        // does not review this head again, so it has no follow-up to post.
+        // report is scrubbed. And the post is retried (#408): the next pass
+        // does not review this head again, but nothing recorded the
+        // follow-up as posted, so it posts it — once.
         let db = approved_db();
         record_success(&db, &issue(), Some(GREEN));
         let (repo, roots) = checkout_with_worktree();
@@ -4465,10 +4622,283 @@ skipped: {:?}",
             "{error}"
         );
         assert!(!error.contains(&token), "the error is unscrubbed: {error}");
+        let drawer_id = review.record_drawer_id.clone().unwrap();
+        assert!(!review::follow_up_posted(&db, &drawer_id).unwrap());
+
+        // The next pass reviews nothing and posts the same follow-up, as the
+        // same comment, on the same PR — after reading the PR again under
+        // the lock and finding it still at that head.
+        let first_body = pr_comments(&gh)[0][6].clone();
+        let (report, gh) = pass_with(
+            &db,
+            &mut ForbiddenReviewer,
+            &cfg,
+            vec![ok(&pr_list_json(322, GREEN)), ok("")],
+        );
+        let comments = pr_comments(&gh);
+        assert_eq!(comments.len(), 1, "seen: {:?}", gh.seen);
+        assert_eq!(comments[0][2], "322");
+        assert_eq!(comments[0][6], first_body);
+        let advanced = &report.advanced[0];
+        assert!(advanced.review.is_none());
+        assert_eq!(
+            advanced.follow_up_retries,
+            [review::FollowUpRetry {
+                review_drawer_id: drawer_id.clone(),
+                comment: review::FollowUpComment::Posted,
+            }]
+        );
+        assert!(advanced.merge.is_some(), "the pass carried on to the merge");
+        assert!(review::follow_up_posted(&db, &drawer_id).unwrap());
+        assert_eq!(
+            serde_json::to_value(&report).unwrap()["advanced"][0]["follow_up_retries"],
+            serde_json::json!([{"review_drawer_id": drawer_id, "comment": {"status": "posted"}}])
+        );
+
+        // And never again.
+        let (report, gh) = pass_with(&db, &mut ForbiddenReviewer, &cfg, Vec::new());
+        assert!(pr_comments(&gh).is_empty(), "seen: {:?}", gh.seen);
+        assert!(report.advanced[0].follow_up_retries.is_empty());
+        assert!(serde_json::to_value(&report).unwrap()["advanced"][0]
+            .get("follow_up_retries")
+            .is_none());
+    }
+
+    /// Record a passing review of PR 322 at `head`, as `advance` did before
+    /// it died, or as the standalone `review` command does: with its
+    /// follow-up, and no attempt to post it. Returns the review's drawer.
+    fn reviewed_with_follow_up(db: &Database, head: &str, follow_up: &str) -> String {
+        review::record_review(
+            db,
+            &review::ReviewRecord {
+                issue: issue(),
+                pr_number: 322,
+                dispatch_class: "documentation".into(),
+                head_sha: Some(head.into()),
+                base_branch: Some("main".into()),
+                outcome: ReviewOutcome {
+                    follow_up: Some(follow_up.into()),
+                    ..StubReviewer::passing().outcome
+                },
+                decision: review::MergeDecision::EligibleForMerge {
+                    class: RiskClass::Documentation,
+                },
+                round: None,
+            },
+        )
+        .unwrap()
+        .drawer_id
+    }
+
+    #[test]
+    fn a_review_recorded_with_no_post_attempt_is_posted_by_the_next_pass() {
+        let db = approved_db();
+        record_success(&db, &issue(), Some(GREEN));
+        let (repo, roots) = checkout_with_worktree();
+        let cfg = config(roots.path(), repo.path());
+        let drawer_id = reviewed_with_follow_up(&db, GREEN, "rename x in foo.rs");
+
+        let (report, gh) = pass_with(
+            &db,
+            &mut ForbiddenReviewer,
+            &cfg,
+            vec![ok(&pr_list_json(322, GREEN)), ok("")],
+        );
+        let comments = pr_comments(&gh);
+        assert_eq!(comments.len(), 1, "seen: {:?}", gh.seen);
+        assert_eq!(comments[0][2], "322");
+        assert!(comments[0][6].contains("rename x in foo.rs"));
+        assert!(
+            comments[0][6].contains(&format!("at `{}`", &GREEN[..12])),
+            "the comment names the head: {}",
+            comments[0][6]
+        );
+        assert_eq!(
+            report.advanced[0].follow_up_retries,
+            [review::FollowUpRetry {
+                review_drawer_id: drawer_id.clone(),
+                comment: review::FollowUpComment::Posted,
+            }]
+        );
+        assert!(review::follow_up_posted(&db, &drawer_id).unwrap());
 
         let (report, gh) = pass_with(&db, &mut ForbiddenReviewer, &cfg, Vec::new());
         assert!(pr_comments(&gh).is_empty(), "seen: {:?}", gh.seen);
-        assert!(report.advanced[0].review.is_none());
+        assert!(report.advanced[0].follow_up_retries.is_empty());
+    }
+
+    #[test]
+    fn a_retried_post_that_fails_again_is_reported_and_retried_again() {
+        let db = approved_db();
+        record_success(&db, &issue(), Some(GREEN));
+        let (repo, roots) = checkout_with_worktree();
+        let cfg = config(roots.path(), repo.path());
+        let drawer_id = reviewed_with_follow_up(&db, GREEN, "rename x");
+
+        let (report, gh) = pass_with(
+            &db,
+            &mut ForbiddenReviewer,
+            &cfg,
+            vec![ok(&pr_list_json(322, GREEN)), ran_and_failed("HTTP 502")],
+        );
+        assert_eq!(pr_comments(&gh).len(), 1, "seen: {:?}", gh.seen);
+        let retries = &report.advanced[0].follow_up_retries;
+        assert!(
+            matches!(
+                retries.as_slice(),
+                [review::FollowUpRetry {
+                    comment: review::FollowUpComment::Failed { error },
+                    ..
+                }] if error.contains("HTTP 502")
+            ),
+            "{retries:?}"
+        );
+        assert!(!review::follow_up_posted(&db, &drawer_id).unwrap());
+        assert!(
+            report.advanced[0].merge.is_some(),
+            "a failed retry does not stop the pass"
+        );
+
+        let (report, gh) = pass_with(
+            &db,
+            &mut ForbiddenReviewer,
+            &cfg,
+            vec![ok(&pr_list_json(322, GREEN)), ok("")],
+        );
+        assert_eq!(pr_comments(&gh).len(), 1, "seen: {:?}", gh.seen);
+        assert_eq!(
+            report.advanced[0].follow_up_retries[0].comment,
+            review::FollowUpComment::Posted
+        );
+    }
+
+    #[test]
+    fn a_follow_up_about_an_earlier_head_is_not_posted() {
+        // Its findings are about a diff the PR no longer is.
+        let db = approved_db();
+        record_success(&db, &issue(), Some(GREEN));
+        let (repo, roots) = checkout_with_worktree();
+        let cfg = config(roots.path(), repo.path());
+        reviewed_with_follow_up(&db, EARLIER, "rename x");
+        reviewed_at(&db, &issue(), 322, GREEN);
+
+        let (report, gh) = pass_with(&db, &mut ForbiddenReviewer, &cfg, Vec::new());
+        assert!(pr_comments(&gh).is_empty(), "seen: {:?}", gh.seen);
+        assert!(report.advanced[0].follow_up_retries.is_empty());
+    }
+
+    /// The `gh pr list --head` reads a pass made.
+    fn pr_listings(gh: &ScriptedGh) -> usize {
+        gh.seen
+            .iter()
+            .filter(|argv| argv.first().map(String::as_str) == Some("pr"))
+            .filter(|argv| argv.get(1).map(String::as_str) == Some("list"))
+            .count()
+    }
+
+    #[test]
+    fn an_owed_follow_up_is_not_posted_once_another_controller_moved_the_head() {
+        // The listing reads `GREEN` before the issue lock is taken. Between
+        // that read and this pass taking the lock, another controller
+        // pushes `MOVED` and releases it. The re-read under the lock sees
+        // `MOVED`, and the follow-up about `GREEN` is neither posted nor
+        // recorded as posted.
+        let db = approved_db();
+        record_success(&db, &issue(), Some(GREEN));
+        let (repo, roots) = checkout_with_worktree();
+        let cfg = config(roots.path(), repo.path());
+        let drawer_id = reviewed_with_follow_up(&db, GREEN, "rename x");
+
+        let (report, gh) = pass_with(
+            &db,
+            &mut ForbiddenReviewer,
+            &cfg,
+            vec![ok(&pr_list_json(322, MOVED))],
+        );
+        assert_eq!(pr_listings(&gh), 2, "re-read under the lock: {:?}", gh.seen);
+        assert!(pr_comments(&gh).is_empty(), "seen: {:?}", gh.seen);
+        assert!(report.advanced[0].follow_up_retries.is_empty());
+        assert!(!review::follow_up_posted(&db, &drawer_id).unwrap());
+    }
+
+    #[test]
+    fn an_owed_follow_up_is_not_posted_once_its_pr_is_gone_or_replaced() {
+        for (what, relisting) in [
+            ("closed", "[]".to_string()),
+            ("replaced by another PR", pr_list_json(323, GREEN)),
+        ] {
+            let db = approved_db();
+            record_success(&db, &issue(), Some(GREEN));
+            let (repo, roots) = checkout_with_worktree();
+            let cfg = config(roots.path(), repo.path());
+            let drawer_id = reviewed_with_follow_up(&db, GREEN, "rename x");
+
+            let (report, gh) = pass_with(&db, &mut ForbiddenReviewer, &cfg, vec![ok(&relisting)]);
+            assert!(pr_comments(&gh).is_empty(), "{what}: {:?}", gh.seen);
+            assert!(report.advanced[0].follow_up_retries.is_empty(), "{what}");
+            assert!(
+                !review::follow_up_posted(&db, &drawer_id).unwrap(),
+                "{what}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_owed_follow_up_whose_pr_cannot_be_re_read_is_reported_and_still_owed() {
+        let db = approved_db();
+        record_success(&db, &issue(), Some(GREEN));
+        let (repo, roots) = checkout_with_worktree();
+        let cfg = config(roots.path(), repo.path());
+        let drawer_id = reviewed_with_follow_up(&db, GREEN, "rename x");
+
+        let (report, gh) = pass_with(
+            &db,
+            &mut ForbiddenReviewer,
+            &cfg,
+            vec![ran_and_failed("HTTP 502")],
+        );
+        assert!(pr_comments(&gh).is_empty(), "seen: {:?}", gh.seen);
+        let retries = &report.advanced[0].follow_up_retries;
+        assert!(
+            matches!(
+                retries.as_slice(),
+                [review::FollowUpRetry {
+                    review_drawer_id,
+                    comment: review::FollowUpComment::Failed { error },
+                }] if *review_drawer_id == drawer_id && error.contains("HTTP 502")
+            ),
+            "{retries:?}"
+        );
+        assert!(!review::follow_up_posted(&db, &drawer_id).unwrap());
+
+        // Still owed: the next pass that re-reads the same head posts it.
+        let (report, gh) = pass_with(
+            &db,
+            &mut ForbiddenReviewer,
+            &cfg,
+            vec![ok(&pr_list_json(322, GREEN)), ok("")],
+        );
+        assert_eq!(pr_comments(&gh).len(), 1, "seen: {:?}", gh.seen);
+        assert_eq!(
+            report.advanced[0].follow_up_retries[0].comment,
+            review::FollowUpComment::Posted
+        );
+        assert!(review::follow_up_posted(&db, &drawer_id).unwrap());
+    }
+
+    #[test]
+    fn a_dry_run_posts_no_owed_follow_up() {
+        let db = approved_db();
+        record_success(&db, &issue(), Some(GREEN));
+        let (repo, roots) = checkout_with_worktree();
+        let mut cfg = config(roots.path(), repo.path());
+        cfg.dry_run = true;
+        let drawer_id = reviewed_with_follow_up(&db, GREEN, "rename x");
+
+        let (report, gh) = pass_with(&db, &mut ForbiddenReviewer, &cfg, Vec::new());
+        assert!(pr_comments(&gh).is_empty(), "seen: {:?}", gh.seen);
+        assert!(report.advanced[0].follow_up_retries.is_empty());
+        assert!(!review::follow_up_posted(&db, &drawer_id).unwrap());
     }
 
     #[test]
