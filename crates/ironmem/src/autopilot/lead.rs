@@ -3112,6 +3112,7 @@ mod tests {
                 head_sha: "abc123",
                 findings: Some("the retry loop is unbounded"),
                 attempt_cap: 2,
+                max_review_rounds: remediate::DEFAULT_MAX_REVIEW_ROUNDS,
             },
         )
         .unwrap();

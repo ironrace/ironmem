@@ -9981,6 +9981,7 @@ sleep 0.5
                 head_sha: "deadbeef",
                 findings: Some("the retry loop is unbounded"),
                 attempt_cap: config().attempt_cap,
+                max_review_rounds: remediate::DEFAULT_MAX_REVIEW_ROUNDS,
             },
         )
         .unwrap();
@@ -10053,6 +10054,7 @@ satisfies it on its own"
                 head_sha: "deadbeef",
                 findings: Some("fix it"),
                 attempt_cap: 2,
+                max_review_rounds: remediate::DEFAULT_MAX_REVIEW_ROUNDS,
             },
         )
         .unwrap();
@@ -10092,6 +10094,7 @@ satisfies it on its own"
                 head_sha: "deadbeef",
                 findings: Some("fix it"),
                 attempt_cap: 2,
+                max_review_rounds: remediate::DEFAULT_MAX_REVIEW_ROUNDS,
             },
         )
         .unwrap();
@@ -10140,6 +10143,7 @@ satisfies it on its own"
                     head_sha: head,
                     findings: Some("fix it"),
                     attempt_cap: 3,
+                    max_review_rounds: remediate::DEFAULT_MAX_REVIEW_ROUNDS,
                 },
             )
             .unwrap()

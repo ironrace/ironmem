@@ -288,8 +288,29 @@ pull request before doing anything else"
             MergeHold::MergeResultUnknown { .. } => {
                 format!("**Autopilot: PR #{pr_number} may or may not have been merged.**")
             }
+            // No merge was attempted, so "was not merged" would describe
+            // something that did not happen.
+            MergeHold::Review(super::review::HoldReason::ReviewRoundsExhausted {
+                rounds, ..
+            }) => format!(
+                "**Autopilot: PR #{pr_number} is held for a human after {rounds} review round{}.**",
+                if *rounds == 1 { "" } else { "s" }
+            ),
             _ => format!("**Autopilot: PR #{pr_number} was not merged.**"),
         }
+    }
+
+    /// Whether this is the review-round limit's hold (#404).
+    ///
+    /// The one definition every reader uses — where [`finish`] posts the
+    /// comment, the order it writes the label and the record in, and the
+    /// wording [`render_hold_comment_with_rounds`] picks — so the routing
+    /// and the text cannot drift apart.
+    pub fn is_round_limit(&self) -> bool {
+        matches!(
+            self,
+            MergeHold::Review(super::review::HoldReason::ReviewRoundsExhausted { .. })
+        )
     }
 
     /// Whether this hold is waiting on nothing but a human approving the PR —
@@ -436,6 +457,14 @@ pub struct MergeExecution {
     /// matching the one already at the head of this PR's history. A poll
     /// loop on an unchanging hold appends nothing after its first pass.
     pub record_appended: bool,
+    /// Whether this attempt was rehearsed: nothing written to GitHub, and
+    /// recorded on the dry-run footing. Taken from the request `finish` ran
+    /// on, so a round-limited request whose other outcomes are rehearsed
+    /// (`RoundLimit::rehearse_other_outcomes`) reports `true` for a PR found
+    /// merged or closed, and `false` for the hold it posted for real. A
+    /// caller that did not ask for merges reads this, not its own flag, to
+    /// tell a real write from a rehearsal (#404).
+    pub rehearsed: bool,
     /// The drawer id of the merge record describing this attempt — the one
     /// just appended, or the identical existing one when
     /// `record_appended` is false. Always present: a storage failure is an
@@ -448,6 +477,20 @@ pub(crate) fn serialize_issue<S: serde::Serializer>(
     s: S,
 ) -> Result<S::Ok, S::Error> {
     s.serialize_str(&issue.canonical())
+}
+
+/// The review-round limit a caller found reached (#404): the PR's
+/// consecutive `needs_changes` rounds, and the limit they reached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RoundLimit {
+    pub rounds: u32,
+    pub limit: u32,
+    /// The caller did not ask for merges to be executed, so any outcome
+    /// OTHER than the round-limit hold is rehearsed: recorded on the dry-run
+    /// footing, with nothing written to GitHub. `advance` without `--merge`
+    /// still holds for real at the limit, because nothing else will tell a
+    /// human; a PR found merged or closed meanwhile is not that hold.
+    pub rehearse_other_outcomes: bool,
 }
 
 /// Inputs to [`execute_merge`].
@@ -465,6 +508,14 @@ pub struct MergeRequest<'a> {
     /// Perform every check and every read, write nothing. The rehearsal an
     /// irreversible action deserves.
     pub dry_run: bool,
+    /// Set when [`super::remediate::arm_remediation`] answered
+    /// `RoundLimitReached` (#404). The request then holds with
+    /// `HoldReason::ReviewRoundsExhausted` unless the PR is already merged or
+    /// closed: the guard sits after those two checks and ahead of the review
+    /// lookup in [`evaluate`], so no stored verdict can carry such a request
+    /// to `gh pr merge`. `None` everywhere else, including `ironmem autopilot
+    /// merge`.
+    pub round_limit: Option<RoundLimit>,
 }
 
 // ── execution ───────────────────────────────────────────────────────────
@@ -482,6 +533,22 @@ pub fn execute_merge(
 ) -> Result<MergeExecution, MemoryError> {
     validate_repo(&request.issue.repo)?;
     let (outcome, snapshot) = evaluate(db, gh_runner, request)?;
+    // #404: a request that sets `rehearse_other_outcomes` is real for the
+    // round-limit hold and for nothing else. `evaluate` returns before
+    // anything that writes when a round limit is set, so rehearsing here, in
+    // `finish`, is the whole difference: a PR found merged or closed is
+    // recorded as a rehearsal and nothing is written to GitHub.
+    if request
+        .round_limit
+        .is_some_and(|limit| limit.rehearse_other_outcomes)
+        && !outcome.hold().is_some_and(MergeHold::is_round_limit)
+    {
+        let rehearsal = MergeRequest {
+            dry_run: true,
+            ..*request
+        };
+        return finish(db, gh_runner, &rehearsal, outcome, snapshot);
+    }
     finish(db, gh_runner, request, outcome, snapshot)
 }
 
@@ -537,6 +604,24 @@ fn evaluate(
         let state = snapshot.state.clone();
         return Ok((
             MergeOutcome::Held(MergeHold::PrNotOpen { state }),
+            Some(snapshot),
+        ));
+    }
+
+    // 2a. The review-round limit (#404). Ahead of the review lookup and of
+    //     every guard that can fall through to the merge, so a request that
+    //     carries it cannot merge whatever the stored review says. Below the
+    //     merged and open checks, so the comment's "stays open" is still
+    //     true of the PR it is posted on.
+    //
+    //     Any guard added above this one must not write. A round-limited
+    //     request may arrive with `dry_run: false` from a caller that did not
+    //     ask for merges (`advance` without `--merge`); only `finish`, after
+    //     `RoundLimit::rehearse_other_outcomes` has been applied, may write.
+    if let Some(RoundLimit { rounds, limit, .. }) = request.round_limit {
+        let reason = super::review::HoldReason::ReviewRoundsExhausted { rounds, limit };
+        return Ok((
+            MergeOutcome::Held(MergeHold::Review(reason)),
             Some(snapshot),
         ));
     }
@@ -788,11 +873,27 @@ fn mergeable_state_permits(status: &str) -> bool {
 /// A merge records **first**: it has already happened and cannot be undone,
 /// so no later failure may be allowed to take its audit entry with it.
 ///
-/// A hold records **last**: nothing irreversible has happened, and the
-/// record is itself what suppresses the next run's comment. Recording first
-/// meant a comment that failed to post still left a record saying the hold
-/// had been reported — and the human was then never told, on that run or any
-/// later one, because the reason had not changed.
+/// A hold records **after its comment**: nothing irreversible has happened,
+/// and the record is itself what suppresses the next run's comment.
+/// Recording first meant a comment that failed to post still left a record
+/// saying the hold had been reported — and the human was then never told, on
+/// that run or any later one, because the reason had not changed. Every hold
+/// but one then writes its label.
+///
+/// The round-limit hold ([`MergeHold::is_round_limit`], #404) writes its
+/// label **before** its record, because its record is what resets the round
+/// count (`remediate::review_rounds` counts only reviews after it). Recorded
+/// first, a failed `agent:blocked` write left the issue `agent:ready` with a
+/// fresh count, so the next pass armed a fix and the loop resumed under a
+/// comment saying it had stopped. With no record yet, though, the record
+/// cannot suppress the next pass's comment, so this hold keeps a local
+/// [`RoundLimitNotice`]: written right after its comment posts, marked once
+/// the label lands, and cleared once the hold is recorded. A label write that
+/// keeps failing then retries only the label, and the comment is posted
+/// once; a record write that failed after the label landed is commented
+/// again on the re-queue that follows. Its order is comment (unless noticed)
+/// → notice → label → mark → record → clear. A failed mark or clear is
+/// logged and does not stop the hold.
 ///
 /// The two orderings are not a inconsistency to be tidied away. They are the
 /// same rule applied to different stakes: never lose the record of something
@@ -927,28 +1028,118 @@ fn finish(
             // otherwise bury the issue in identical comments — the shape
             // `exhaust_issue` already refuses. A hold that has *changed*
             // is new information and is still commented on.
+            // The newest counted round this pass's round-limit notice is
+            // keyed on, when it has one: set below, then marked once the
+            // label lands. See [`RoundLimitNotice`].
+            let mut notice_round: Option<String> = None;
             if repeat.is_none() {
-                gh::comment_on_issue(
-                    gh_runner,
-                    request.issue,
-                    &render_hold_comment(request, hold, disposition),
-                )?;
-                commented = true;
+                // #404: the round-limit hold lists what each round said, and
+                // is posted on the pull request, where the diff those rounds
+                // read is. Read here, before this hold is recorded, so the
+                // rounds are the ones that reached the limit. Every other
+                // hold comments on the issue, as before.
+                //
+                // The notice bridges "the comment posted, the label write then
+                // failed": no record exists yet to suppress the next pass's
+                // comment, so without it every retry re-posted the same one.
+                // It is keyed on the newest counted round, so a later hold over
+                // newer rounds is commented, and a notice whose label already
+                // landed does not suppress (see [`RoundLimitNotice`]). With no
+                // rounds there is nothing to key on, and the comment is posted
+                // with no notice.
+                if hold.is_round_limit() {
+                    let rounds =
+                        super::remediate::review_rounds(db, request.issue, request.pr_number)?;
+                    let newest = rounds.first().map(|round| round.recorded_at.as_str());
+                    notice_round = newest.map(str::to_string);
+                    let noticed = match newest {
+                        Some(newest) => {
+                            round_limit_notice_covers(db, request.issue, request.pr_number, newest)?
+                        }
+                        None => false,
+                    };
+                    if !noticed {
+                        gh::comment_on_pr(
+                            gh_runner,
+                            &request.issue.repo,
+                            request.pr_number,
+                            &render_hold_comment_with_rounds(request, hold, disposition, &rounds),
+                        )?;
+                        if let Some(newest) = newest {
+                            record_round_limit_notice(
+                                db,
+                                request.issue,
+                                request.pr_number,
+                                newest,
+                                false,
+                            )?;
+                        }
+                        commented = true;
+                    }
+                } else {
+                    gh::comment_on_issue(
+                        gh_runner,
+                        request.issue,
+                        &render_hold_comment(request, hold, disposition),
+                    )?;
+                    commented = true;
+                }
             }
-            record_drawer_id = record_once(db, &record, repeat.as_ref())?;
-            label_plan = match disposition {
-                HoldDisposition::Blocked => Some(labels::apply_plan(
-                    gh_runner,
-                    request.issue,
-                    labels::plan_exclusive(&current, Some(AgentLabel::Blocked)),
-                )?),
-                // Nothing to write. An exhausted issue keeps its permanent
-                // stop sign, which `plan_exclusive` toward `agent:blocked`
-                // would take down; an issue waiting on an approval keeps the
-                // label that lets the next pass see the approval arrive. See
-                // [`hold_disposition`].
-                HoldDisposition::StaysExhausted | HoldDisposition::AwaitsApproval { .. } => None,
-            };
+            // Every other hold records before it labels. The round-limit
+            // hold labels first (#404) because its record is what resets the
+            // round count (`remediate::review_rounds` counts only reviews
+            // after it): recorded first, a failed `agent:blocked` write left
+            // the issue `agent:ready` with a fresh count, so the next pass
+            // armed a fix and the loop resumed under a comment saying it had
+            // stopped. Labeled first, a failed write leaves no record and the
+            // count stands; the notice written above keeps the next pass from
+            // posting the comment again, so it retries the label and record.
+            //
+            // The notice is marked once the label lands, so a failed record
+            // write that a human then re-queues is commented again rather than
+            // re-blocked in silence, and cleared once the hold is recorded. A
+            // failed mark or clear is logged, not propagated.
+            if hold.is_round_limit() {
+                label_plan = apply_hold_labels(gh_runner, request.issue, &current, disposition)?;
+                // Not propagated: by now the comment is posted and the label
+                // has landed, and only the record is left. Failing here left
+                // the issue `agent:blocked` with no record and an unmarked
+                // notice, so a human's re-label was blocked again with no
+                // comment. Going on to the record finishes the hold, and the
+                // clear below removes the unmarked notice.
+                if let Some(newest) = &notice_round {
+                    if let Err(error) = record_round_limit_notice(
+                        db,
+                        request.issue,
+                        request.pr_number,
+                        newest,
+                        true,
+                    ) {
+                        tracing::warn!(
+                            error = %error,
+                            issue = %request.issue.canonical(),
+                            "autopilot could not mark the round-limit notice"
+                        );
+                    }
+                }
+                record_drawer_id = record_once(db, &record, repeat.as_ref())?;
+                // Not propagated: the hold is commented, labeled and recorded,
+                // and a failed local delete must not report a finished hold as
+                // a failed run. The stale notice it leaves is harmless: the
+                // record just written resets the round count, so no later
+                // hold's newest round can ever match it, and the next hold's
+                // notice overwrites it.
+                if let Err(error) = clear_round_limit_notice(db, request.issue) {
+                    tracing::warn!(
+                        error = %error,
+                        issue = %request.issue.canonical(),
+                        "autopilot could not clear the round-limit notice"
+                    );
+                }
+            } else {
+                record_drawer_id = record_once(db, &record, repeat.as_ref())?;
+                label_plan = apply_hold_labels(gh_runner, request.issue, &current, disposition)?;
+            }
         }
     }
 
@@ -961,7 +1152,164 @@ fn finish(
         label_error,
         commented,
         record_appended: repeat.is_none(),
+        rehearsed: request.dry_run,
         record_drawer_id,
+    })
+}
+
+/// The round-limit hold's notice (#404): a local record that its comment is
+/// on the pull request, bridging the passes in which that hold has not yet
+/// finished.
+///
+/// Its lifecycle, all inside [`finish`]:
+///
+/// 1. **Written** with `label_applied: false` right after the comment posts.
+///    A label write that then fails leaves it in place, so the retry skips
+///    the comment and redoes only the label.
+/// 2. **Marked** `label_applied: true` right after the label write succeeds,
+///    before the record. A notice still marked when the hold comes round
+///    again means the record write failed and a human has since re-queued
+///    the issue, so it does not suppress the comment: re-blocking the issue
+///    with no explanation would be worse than a second, truthful comment.
+///    A failed mark is logged and the record is still written.
+/// 3. **Cleared** once the hold is recorded. A notice that is present
+///    therefore means this hold did not finish, or that the clear failed
+///    after it did; the record written before the clear resets the round
+///    count, so such a notice never matches a later hold's rounds.
+///
+/// Only ever suppresses a repeat comment: nothing else reads it, and
+/// `remediate::review_rounds` does not, so it can never change the count.
+#[derive(Debug, Serialize, Deserialize)]
+struct RoundLimitNotice {
+    issue: String,
+    repo: String,
+    issue_number: u64,
+    pr_number: u64,
+    /// The `recorded_at` of the newest counted round: the comment covered
+    /// the rounds that end here.
+    newest_round_at: String,
+    /// Whether the hold's label write has succeeded. Defaulted so a notice
+    /// written before the field existed parses, as one whose label is still
+    /// owed.
+    #[serde(default)]
+    label_applied: bool,
+    posted_at: String,
+}
+
+/// The logical key of the round-limit notice drawer. Per issue, the shape of
+/// `stagnation::exhaustion_notice_key`: a later hold's notice overwrites it.
+fn round_limit_notice_key(issue: &IssueRef) -> String {
+    format!("round-limit-notice:{}", issue.slug())
+}
+
+/// This issue's round-limit notice, if one is stored and belongs to it.
+///
+/// A notice that will not parse, or belongs to a slug-equal other issue,
+/// reads as absent, whose worst case is one duplicate comment — the rule
+/// `stagnation::owned_exhaustion_notice` follows, and like it a storage
+/// failure is still an error.
+fn owned_round_limit_notice(
+    db: &Database,
+    issue: &IssueRef,
+) -> Result<Option<RoundLimitNotice>, MemoryError> {
+    let Some(drawer) = super::read_current(db, &round_limit_notice_key(issue))? else {
+        return Ok(None);
+    };
+    let Ok(notice) = serde_json::from_str::<RoundLimitNotice>(&drawer.content) else {
+        return Ok(None);
+    };
+    // The key goes through `repo_slug`, so `owner/repo#42` and
+    // `owner-repo#42` share it: the stored canonical name is checked, not
+    // trusted.
+    let owned = notice.issue.eq_ignore_ascii_case(&issue.canonical());
+    Ok(owned.then_some(notice))
+}
+
+/// Whether the round-limit comment for exactly these rounds — this PR, and
+/// this newest counted round — is already on the pull request and its label
+/// is still owed. A notice whose label has landed does not cover: see
+/// [`RoundLimitNotice`].
+fn round_limit_notice_covers(
+    db: &Database,
+    issue: &IssueRef,
+    pr_number: u64,
+    newest_round_at: &str,
+) -> Result<bool, MemoryError> {
+    Ok(owned_round_limit_notice(db, issue)?.is_some_and(|notice| {
+        notice.pr_number == pr_number
+            && notice.newest_round_at == newest_round_at
+            && !notice.label_applied
+    }))
+}
+
+/// Write (or rewrite) the round-limit notice for the rounds ending at
+/// `newest_round_at` on `pr_number`.
+fn record_round_limit_notice(
+    db: &Database,
+    issue: &IssueRef,
+    pr_number: u64,
+    newest_round_at: &str,
+    label_applied: bool,
+) -> Result<(), MemoryError> {
+    let content = serde_json::to_string(&RoundLimitNotice {
+        issue: issue.canonical(),
+        repo: issue.repo.clone(),
+        issue_number: issue.number,
+        pr_number,
+        newest_round_at: newest_round_at.to_string(),
+        label_applied,
+        posted_at: chrono::Utc::now().to_rfc3339(),
+    })?;
+    super::write_current(db, &round_limit_notice_key(issue), &content)?;
+    Ok(())
+}
+
+/// Delete this issue's round-limit notice once its hold is recorded, the
+/// shape of `stagnation::clear_exhaustion_notice`.
+///
+/// Only a notice this issue owns is deleted: the key is shared with any
+/// slug-equal issue, whose outstanding notice must not be taken down by this
+/// one's hold.
+fn clear_round_limit_notice(db: &Database, issue: &IssueRef) -> Result<bool, MemoryError> {
+    if owned_round_limit_notice(db, issue)?.is_none() {
+        return Ok(false);
+    }
+    let id = super::logical_drawer_id(&round_limit_notice_key(issue));
+    db.with_transaction(|tx| {
+        let deleted = Database::delete_drawer_tx(tx, &id)?;
+        Database::wal_log_tx(
+            tx,
+            "autopilot_clear_round_limit_notice",
+            &json!({
+                "drawer_id": &id,
+                "issue": issue.canonical(),
+                "deleted": deleted,
+            }),
+            None,
+        )?;
+        Ok(deleted)
+    })
+}
+
+/// The label write a hold's disposition calls for, or `None` when it calls
+/// for none.
+fn apply_hold_labels(
+    gh_runner: &mut dyn GhRunner,
+    issue: &IssueRef,
+    current: &[String],
+    disposition: HoldDisposition,
+) -> Result<Option<labels::LabelPlan>, MemoryError> {
+    Ok(match disposition {
+        HoldDisposition::Blocked => Some(labels::apply_plan(
+            gh_runner,
+            issue,
+            labels::plan_exclusive(current, Some(AgentLabel::Blocked)),
+        )?),
+        // Nothing to write. An exhausted issue keeps its permanent stop
+        // sign, which `plan_exclusive` toward `agent:blocked` would take
+        // down; an issue waiting on an approval keeps the label that lets
+        // the next pass see the approval arrive. See [`hold_disposition`].
+        HoldDisposition::StaysExhausted | HoldDisposition::AwaitsApproval { .. } => None,
     })
 }
 
@@ -1137,6 +1485,33 @@ pub fn render_hold_comment(
     hold: &MergeHold,
     disposition: HoldDisposition,
 ) -> String {
+    render_hold_comment_with_rounds(request, hold, disposition, &[])
+}
+
+/// [`render_hold_comment`], with the review rounds that led to the hold
+/// listed newest first (#404). With no rounds the two are identical.
+///
+/// Unlike every other hold's, the round-limit hold's text
+/// ([`MergeHold::is_round_limit`]) is posted on the pull request itself,
+/// not on its issue, and its wording says so: it names the issue as what
+/// carries the label, the pull request as what will not be merged, and
+/// says the hold was recorded rather than that a merge was tried.
+///
+/// Each round's reason was scrubbed and bounded when the review was
+/// recorded; it is flattened to one line here by the helper the exhaustion
+/// summary uses ([`super::stagnation::one_line`]), so reviewer text cannot
+/// break out of its bullet, then fenced as an inline code span so it cannot
+/// open an HTML comment or `<details>` that swallows the rest of the
+/// comment, or `@`-mention anyone. The whole body is scrubbed and bounded
+/// again on the way out.
+pub(crate) fn render_hold_comment_with_rounds(
+    request: &MergeRequest,
+    hold: &MergeHold,
+    disposition: HoldDisposition,
+    rounds: &[RecordedReviewSummary],
+) -> String {
+    let rounds_block = render_rounds_block(rounds);
+    let round_limit = hold.is_round_limit();
     // `pub`, so a caller could pair a disposition with a hold it does not
     // describe — and `AwaitsApproval`'s text tells a human to approve.
     debug_assert!(
@@ -1149,6 +1524,18 @@ pub fn render_hold_comment(
         "The pull request stays open. "
     } else {
         ""
+    };
+    // Who carries the label. The round-limit hold is posted on the pull
+    // request (#404), where a bare "It" reads as the PR; every other hold
+    // is posted on the issue and keeps its text unchanged.
+    let (labeled_subject, merge_object, queue_tail) = if round_limit {
+        (
+            "The issue",
+            "the pull request",
+            " with a fresh count: only reviews recorded after this hold are counted",
+        )
+    } else {
+        ("It", "it", "")
     };
     let disposition = match disposition {
         HoldDisposition::StaysExhausted => format!(
@@ -1192,15 +1579,16 @@ it is green).",
             pr = request.pr_number,
         ),
         HoldDisposition::Blocked => format!(
-            "{still_open}It is labeled `{}` for a human. Autopilot will not merge it on its \
-own; re-labeling the issue `{}` after resolving the above puts it back in the queue.",
+            "{still_open}{labeled_subject} is labeled `{}` for a human. Autopilot will not merge \
+{merge_object} on its own; re-labeling the issue `{}` after resolving the above puts it back in \
+the queue{queue_tail}.",
             AgentLabel::Blocked.as_str(),
             AgentLabel::Ready.as_str()
         ),
     };
     let body = format!(
-        "{headline}\n\n{summary}.\n\n{disposition}\n\n\
-<sub>Gate reported {gate} at merge time. Autopilot rung 6.</sub>{marker}",
+        "{headline}\n\n{summary}.\n\n{rounds_block}{disposition}\n\n\
+<sub>Gate reported {gate} {gate_when}. Autopilot rung 6.</sub>{marker}",
         headline = hold.headline(request.pr_number),
         summary = hold.summary(),
         gate = if request.gate_green {
@@ -1208,9 +1596,69 @@ own; re-labeling the issue `{}` after resolving the above puts it back in the qu
         } else {
             "not green"
         },
+        // The round-limit hold attempted no merge.
+        gate_when = if round_limit {
+            "when this hold was recorded"
+        } else {
+            "at merge time"
+        },
         marker = super::blocked::AUTOPILOT_COMMENT_MARKER,
     );
     scrub_and_bound(&body, MAX_COMMENT_CHARS).text
+}
+
+/// The "what each round said" section of a round-limit hold comment, or an
+/// empty string when there are no rounds to list.
+fn render_rounds_block(rounds: &[RecordedReviewSummary]) -> String {
+    use super::stagnation::{one_line, MAX_ATTEMPTS_IN_COMMENT};
+
+    if rounds.is_empty() {
+        return String::new();
+    }
+    let mut block = format!(
+        "### What the reviewer said ({} round{}, most recent first)\n\n",
+        rounds.len(),
+        if rounds.len() == 1 { "" } else { "s" }
+    );
+    for (index, round) in rounds.iter().take(MAX_ATTEMPTS_IN_COMMENT).enumerate() {
+        let head = round
+            .head_sha
+            .as_deref()
+            .map(|sha| format!(" at `{}`", short_sha(sha)))
+            .unwrap_or_default();
+        // Reviewer text is fenced as an inline code span, with a fence one
+        // backtick longer than its longest run so nothing inside closes it
+        // (the rule `review::render_follow_up_comment` uses). The fallback is
+        // our own text and is not fenced.
+        let reason = round
+            .reason
+            .as_deref()
+            .map(one_line)
+            .filter(|reason| !reason.is_empty())
+            .map(|reason| {
+                let fence = "`".repeat(longest_backtick_run(&reason) + 1);
+                format!("{fence} {reason} {fence}")
+            })
+            .unwrap_or_else(|| "the reviewer recorded no reason".to_string());
+        block.push_str(&format!(
+            "- **Round {n}**{head}: {reason}\n",
+            n = rounds.len() - index
+        ));
+    }
+    if rounds.len() > MAX_ATTEMPTS_IN_COMMENT {
+        block.push_str(&format!(
+            "\n<sub>{} older round(s) omitted; every review is in Autopilot's knowledge \
+base.</sub>\n",
+            rounds.len() - MAX_ATTEMPTS_IN_COMMENT
+        ));
+    }
+    block.push('\n');
+    block
+}
+
+/// The length of the longest run of backticks in `text`.
+fn longest_backtick_run(text: &str) -> usize {
+    text.split(|c| c != '`').map(str::len).max().unwrap_or(0)
 }
 
 // ── storage ─────────────────────────────────────────────────────────────
@@ -1522,6 +1970,39 @@ mod tests {
         }
     }
 
+    fn needs_changes_outcome(reason: &str) -> ReviewOutcome {
+        ReviewOutcome {
+            verdict: Some(ReviewVerdict::NeedsChanges),
+            risk_class: Some(RiskClass::Documentation),
+            reason: Some(reason.into()),
+            follow_up: None,
+            total_cost_usd: None,
+            token_usage: None,
+            process_success: true,
+        }
+    }
+
+    const FIRST_HEAD: &str = "3333333333333333333333333333333333333333";
+
+    fn round_limited(dry_run: bool) -> MergeRequest<'static> {
+        MergeRequest {
+            round_limit: Some(RoundLimit {
+                rounds: 3,
+                limit: 3,
+                rehearse_other_outcomes: false,
+            }),
+            ..request(dry_run)
+        }
+    }
+
+    fn pr_comment_bodies(gh: &ScriptedGh) -> Vec<&String> {
+        gh.seen
+            .iter()
+            .filter(|argv| argv[0] == "pr" && argv[1] == "comment")
+            .map(|argv| &argv[6])
+            .collect()
+    }
+
     fn store_review(database: &Database, pr: u64, head: Option<&str>, outcome: ReviewOutcome) {
         store_review_against(database, pr, head, Some("main"), outcome);
     }
@@ -1601,6 +2082,7 @@ mod tests {
             strategy: MergeStrategy::Squash,
             delete_branch: true,
             dry_run,
+            round_limit: None,
         }
     }
 
@@ -1809,6 +2291,7 @@ mod tests {
                 strategy: MergeStrategy::Squash,
                 delete_branch: true,
                 dry_run: false,
+                round_limit: None,
             },
         )
         .unwrap();
@@ -1865,6 +2348,7 @@ mod tests {
                 strategy: MergeStrategy::Squash,
                 delete_branch: true,
                 dry_run: false,
+                round_limit: None,
             },
         )
         .unwrap();
@@ -3399,6 +3883,10 @@ mod tests {
             MergeHold::Review(HoldReason::GateNotGreen),
             MergeHold::Review(HoldReason::ReviewerDidNotRun),
             MergeHold::Review(HoldReason::NoVerdict),
+            MergeHold::Review(HoldReason::ReviewRoundsExhausted {
+                rounds: 3,
+                limit: 3,
+            }),
             MergeHold::NotReviewed,
             MergeHold::ReviewHeadUnknown {
                 reviewed_at: "2026-08-31T00:00:00Z".into(),
@@ -3459,5 +3947,963 @@ mod tests {
         .summary();
         assert!(summary.contains("11111111"));
         assert!(summary.contains("22222222"));
+    }
+
+    #[test]
+    fn a_round_limit_hold_has_a_pinned_stored_shape() {
+        // #404. This is what a merge record stores, and what
+        // `remediate::review_rounds` will look for to restart the count.
+        let hold = MergeHold::Review(HoldReason::ReviewRoundsExhausted {
+            rounds: 3,
+            limit: 3,
+        });
+        let json = serde_json::to_string(&hold).unwrap();
+        assert_eq!(
+            json,
+            r#"{"hold":"review","reason":"review_rounds_exhausted","rounds":3,"limit":3}"#
+        );
+        assert_eq!(serde_json::from_str::<MergeHold>(&json).unwrap(), hold);
+    }
+
+    // ── #404: the review-round limit ────────────────────────────────────
+
+    #[test]
+    fn a_round_limit_hold_comments_once_on_the_pr_and_blocks_the_issue() {
+        let database = db();
+        for (head, reason) in [
+            (FIRST_HEAD, "first finding"),
+            (OTHER_HEAD, "second finding"),
+            (HEAD, "third finding"),
+        ] {
+            store_review(&database, 7, Some(head), needs_changes_outcome(reason));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let mut gh_runner = ScriptedGh::new(vec![
+            Ok(pr_view_ok("OPEN", HEAD)),
+            Ok(GhOutput::ok(r#"{"labels":[{"name":"agent:ready"}]}"#)),
+            Ok(GhOutput::ok("")),
+            Ok(label_created()),
+            Ok(GhOutput::ok("")),
+        ]);
+
+        let exec = execute_merge(&database, &mut gh_runner, &round_limited(false)).unwrap();
+
+        // The PR view, the label read, the PR comment, the label create
+        // and the label edit.
+        assert_eq!(gh_runner.seen.len(), 5, "seen: {:?}", gh_runner.seen);
+        assert_eq!(
+            exec.outcome.hold(),
+            Some(&MergeHold::Review(HoldReason::ReviewRoundsExhausted {
+                rounds: 3,
+                limit: 3,
+            }))
+        );
+        assert!(exec.commented && exec.record_appended);
+        assert!(exec.label_plan.is_some());
+        assert!(
+            gh_runner
+                .seen
+                .iter()
+                .any(|argv| argv.iter().any(|arg| arg == "agent:blocked")),
+            "seen: {:?}",
+            gh_runner.seen
+        );
+
+        let bodies = pr_comment_bodies(&gh_runner);
+        assert_eq!(bodies.len(), 1, "seen: {:?}", gh_runner.seen);
+        let body = bodies[0];
+        assert!(body.contains("has not converged"), "{body}");
+        let third = body.find("third finding").expect("round 3 is listed");
+        let second = body.find("second finding").expect("round 2 is listed");
+        let first = body.find("first finding").expect("round 1 is listed");
+        assert!(third < second && second < first, "newest first: {body}");
+        assert!(body.contains("with a fresh count"), "{body}");
+        assert!(
+            body.starts_with("**Autopilot: PR #7 is held for a human after 3 review rounds.**"),
+            "{body}"
+        );
+        assert!(
+            body.contains("Gate reported green when this hold was recorded."),
+            "{body}"
+        );
+        assert!(
+            body.contains("Autopilot will not merge the pull request on its own"),
+            "{body}"
+        );
+        // Posted on the PR, so the sentence names what carries the label.
+        assert!(
+            body.contains("The issue is labeled `agent:blocked`"),
+            "{body}"
+        );
+        assert!(
+            !gh_runner
+                .seen
+                .iter()
+                .any(|argv| argv[0] == "issue" && argv[1] == "comment"),
+            "this hold comments on the PR, not the issue"
+        );
+
+        // A second pass over the same held PR says nothing new: the PR view
+        // and the label read, and nothing written.
+        let mut gh_runner = ScriptedGh::new(vec![
+            Ok(pr_view_ok("OPEN", HEAD)),
+            Ok(GhOutput::ok(r#"{"labels":[{"name":"agent:blocked"}]}"#)),
+        ]);
+        let again = execute_merge(&database, &mut gh_runner, &round_limited(false)).unwrap();
+        assert_eq!(gh_runner.seen.len(), 2, "seen: {:?}", gh_runner.seen);
+        assert!(!again.commented && !again.record_appended);
+        assert!(pr_comment_bodies(&gh_runner).is_empty());
+    }
+
+    #[test]
+    fn a_round_limit_request_never_reaches_the_merge_even_over_a_recorded_pass() {
+        // The guard is unconditional: a caller that says the limit is
+        // reached gets a hold whatever the stored review says.
+        let database = db();
+        store_review(&database, 7, Some(HEAD), pass_outcome());
+        let mut gh_runner = ScriptedGh::new(vec![
+            Ok(pr_view_ok("OPEN", HEAD)),
+            Ok(GhOutput::ok(r#"{"labels":[{"name":"agent:ready"}]}"#)),
+            Ok(GhOutput::ok("")),
+            Ok(label_created()),
+            Ok(GhOutput::ok("")),
+        ]);
+
+        let exec = execute_merge(&database, &mut gh_runner, &round_limited(false)).unwrap();
+
+        assert_eq!(gh_runner.seen.len(), 5, "seen: {:?}", gh_runner.seen);
+        assert!(matches!(
+            exec.outcome.hold(),
+            Some(MergeHold::Review(HoldReason::ReviewRoundsExhausted { .. }))
+        ));
+        assert!(
+            !gh_runner
+                .seen
+                .iter()
+                .any(|argv| argv[0] == "pr" && argv[1] == "merge"),
+            "seen: {:?}",
+            gh_runner.seen
+        );
+    }
+
+    #[test]
+    fn the_round_limit_comment_flattens_reviewer_text_and_stays_bounded() {
+        let round = |reason: Option<&str>, head: &str| RecordedReviewSummary {
+            issue: issue().canonical(),
+            pr_number: 7,
+            dispatch_class: "documentation".into(),
+            head_sha: Some(head.into()),
+            base_branch: Some("main".into()),
+            verdict: Some(ReviewVerdict::NeedsChanges),
+            risk_class: Some(RiskClass::Documentation),
+            reason: reason.map(str::to_string),
+            follow_up: None,
+            round: None,
+            process_success: true,
+            recorded_at: "2026-11-12T00:00:00+00:00".into(),
+        };
+        let rounds = vec![
+            round(Some("line one\n# a heading\n- a bullet"), HEAD),
+            round(None, OTHER_HEAD),
+        ];
+        let hold = MergeHold::Review(HoldReason::ReviewRoundsExhausted {
+            rounds: 2,
+            limit: 2,
+        });
+
+        let body = render_hold_comment_with_rounds(
+            &request(false),
+            &hold,
+            HoldDisposition::Blocked,
+            &rounds,
+        );
+
+        assert!(
+            body.contains("**Round 2** at `11111111`: ` line one # a heading - a bullet `\n"),
+            "{body}"
+        );
+        assert!(body.contains("the reviewer recorded no reason"), "{body}");
+        assert!(body.contains("**Round 2** at `11111111`"), "{body}");
+        assert!(
+            body.contains("**Round 1** at `22222222`: the reviewer recorded no reason\n"),
+            "{body}"
+        );
+        assert!(body.contains(super::super::blocked::AUTOPILOT_COMMENT_MARKER));
+        assert!(body.chars().count() <= MAX_COMMENT_CHARS);
+
+        // Every other hold renders exactly as before: the whole body, built
+        // from the format strings at 59df9c3b, before #404 touched them.
+        assert_eq!(
+            render_hold_comment(
+                &request(false),
+                &MergeHold::NotReviewed,
+                HoldDisposition::Blocked
+            ),
+            "**Autopilot: PR #7 was not merged.**\n\n\
+no review has been recorded for this PR, and gates alone never authorize a merge.\n\n\
+The pull request stays open. It is labeled `agent:blocked` for a human. Autopilot will not \
+merge it on its own; re-labeling the issue `agent:ready` after resolving the above puts it \
+back in the queue.\n\n\
+<sub>Gate reported green at merge time. Autopilot rung 6.</sub><!-- autopilot -->"
+        );
+        // Posted on the issue, so every other hold keeps "It is labeled".
+        let other = render_hold_comment(
+            &request(false),
+            &MergeHold::NotReviewed,
+            HoldDisposition::Blocked,
+        );
+        assert!(other.contains("It is labeled `agent:blocked`"), "{other}");
+        assert!(!other.contains("The issue is labeled"), "{other}");
+        assert!(
+            other.starts_with("**Autopilot: PR #7 was not merged.**"),
+            "{other}"
+        );
+        assert!(
+            other.contains("Autopilot will not merge it on its own"),
+            "{other}"
+        );
+        assert!(other.contains("puts it back in the queue.\n"), "{other}");
+        assert!(!other.contains("fresh count"), "{other}");
+        assert!(other.contains("at merge time."), "{other}");
+    }
+
+    #[test]
+    fn a_rehearsed_round_limit_hold_writes_nothing_to_github() {
+        let database = db();
+        for (head, reason) in [
+            (FIRST_HEAD, "first finding"),
+            (OTHER_HEAD, "second finding"),
+            (HEAD, "third finding"),
+        ] {
+            store_review(&database, 7, Some(head), needs_changes_outcome(reason));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let mut gh_runner = ScriptedGh::new(vec![Ok(pr_view_ok("OPEN", HEAD))]);
+
+        let exec = execute_merge(&database, &mut gh_runner, &round_limited(true)).unwrap();
+
+        assert_eq!(
+            exec.outcome.hold(),
+            Some(&MergeHold::Review(HoldReason::ReviewRoundsExhausted {
+                rounds: 3,
+                limit: 3,
+            }))
+        );
+        assert!(!exec.commented);
+        assert!(exec.label_plan.is_none());
+        assert!(
+            !gh_runner.seen.iter().any(|argv| matches!(
+                (argv[0].as_str(), argv[1].as_str()),
+                ("pr", "comment") | ("issue", "comment") | ("issue", "edit")
+            )),
+            "seen: {:?}",
+            gh_runner.seen
+        );
+        // Only the PR view.
+        assert_eq!(gh_runner.seen.len(), 1, "seen: {:?}", gh_runner.seen);
+        // A rehearsed hold does not reset the count.
+        assert_eq!(
+            crate::autopilot::remediate::review_rounds(&database, &issue(), 7)
+                .unwrap()
+                .len(),
+            3
+        );
+    }
+
+    fn store_three_rounds(database: &Database) {
+        for (head, reason) in [
+            (FIRST_HEAD, "first finding"),
+            (OTHER_HEAD, "second finding"),
+            (HEAD, "third finding"),
+        ] {
+            store_review(database, 7, Some(head), needs_changes_outcome(reason));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    fn real_merge_records(database: &Database) -> usize {
+        merges_for_issue(database, &issue())
+            .unwrap()
+            .iter()
+            .filter(|m| m.pr_number == 7 && !m.dry_run)
+            .count()
+    }
+
+    fn rendered_round(reason: Option<&str>, head: Option<&str>) -> RecordedReviewSummary {
+        RecordedReviewSummary {
+            issue: issue().canonical(),
+            pr_number: 7,
+            dispatch_class: "documentation".into(),
+            head_sha: head.map(str::to_string),
+            base_branch: Some("main".into()),
+            verdict: Some(ReviewVerdict::NeedsChanges),
+            risk_class: Some(RiskClass::Documentation),
+            reason: reason.map(str::to_string),
+            follow_up: None,
+            round: None,
+            process_success: true,
+            recorded_at: "2026-11-12T00:00:00+00:00".into(),
+        }
+    }
+
+    fn round_limit_hold(rounds: u32) -> MergeHold {
+        MergeHold::Review(HoldReason::ReviewRoundsExhausted {
+            rounds,
+            limit: rounds,
+        })
+    }
+
+    #[test]
+    fn a_failed_label_write_on_a_round_limit_hold_records_nothing_and_a_retry_completes_it() {
+        // The record is what resets the round count, so it is written only
+        // once `agent:blocked` is on the issue.
+        let database = db();
+        store_three_rounds(&database);
+        let mut gh_runner = ScriptedGh::new(vec![
+            Ok(pr_view_ok("OPEN", HEAD)),
+            Ok(GhOutput::ok(r#"{"labels":[{"name":"agent:ready"}]}"#)),
+            Ok(GhOutput::ok("")),
+            Ok(label_created()),
+            Ok(GhOutput::failed(
+                "",
+                "gh: Resource not accessible (HTTP 403)",
+            )),
+        ]);
+
+        let result = execute_merge(&database, &mut gh_runner, &round_limited(false));
+
+        assert!(result.is_err(), "{result:?}");
+        assert_eq!(gh_runner.seen.len(), 5, "seen: {:?}", gh_runner.seen);
+        assert_eq!(real_merge_records(&database), 0);
+        assert_eq!(
+            crate::autopilot::remediate::review_rounds(&database, &issue(), 7)
+                .unwrap()
+                .len(),
+            3
+        );
+
+        assert_eq!(pr_comment_bodies(&gh_runner).len(), 1);
+
+        // The next pass retries the half that failed: the comment for these
+        // rounds is already on the PR, so it labels and records only.
+        let mut gh_runner = ScriptedGh::new(vec![
+            Ok(pr_view_ok("OPEN", HEAD)),
+            Ok(GhOutput::ok(r#"{"labels":[{"name":"agent:ready"}]}"#)),
+            Ok(label_created()),
+            Ok(GhOutput::ok("")),
+        ]);
+        let exec = execute_merge(&database, &mut gh_runner, &round_limited(false)).unwrap();
+        assert_eq!(gh_runner.seen.len(), 4, "seen: {:?}", gh_runner.seen);
+        assert!(!exec.commented && exec.record_appended);
+        assert!(exec.label_plan.is_some());
+        assert!(pr_comment_bodies(&gh_runner).is_empty());
+        assert!(gh_runner
+            .seen
+            .iter()
+            .any(|argv| argv[0] == "issue" && argv[1] == "edit"));
+        assert_eq!(real_merge_records(&database), 1);
+    }
+
+    #[test]
+    fn a_failed_pr_comment_on_a_round_limit_hold_records_nothing_and_writes_no_label() {
+        let database = db();
+        store_three_rounds(&database);
+        let mut gh_runner = ScriptedGh::new(vec![
+            Ok(pr_view_ok("OPEN", HEAD)),
+            Ok(GhOutput::ok(r#"{"labels":[{"name":"agent:ready"}]}"#)),
+            Ok(GhOutput::failed(
+                "",
+                "gh: Resource not accessible (HTTP 403)",
+            )),
+        ]);
+
+        let result = execute_merge(&database, &mut gh_runner, &round_limited(false));
+
+        assert!(result.is_err(), "{result:?}");
+        assert_eq!(gh_runner.seen.len(), 3, "seen: {:?}", gh_runner.seen);
+        assert!(
+            !gh_runner.seen.iter().any(|argv| matches!(
+                (argv[0].as_str(), argv[1].as_str()),
+                ("issue", "edit") | ("label", "create")
+            )),
+            "seen: {:?}",
+            gh_runner.seen
+        );
+        assert_eq!(real_merge_records(&database), 0);
+        assert_eq!(
+            crate::autopilot::remediate::review_rounds(&database, &issue(), 7)
+                .unwrap()
+                .len(),
+            3
+        );
+    }
+
+    #[test]
+    fn an_exhausted_issue_at_the_round_limit_keeps_its_label_and_its_comment_promises_no_fresh_count(
+    ) {
+        let database = db();
+        store_three_rounds(&database);
+        let mut gh_runner = ScriptedGh::new(vec![
+            Ok(pr_view_ok("OPEN", HEAD)),
+            Ok(GhOutput::ok(r#"{"labels":[{"name":"agent:exhausted"}]}"#)),
+            Ok(GhOutput::ok("")),
+        ]);
+
+        let exec = execute_merge(&database, &mut gh_runner, &round_limited(false)).unwrap();
+
+        assert_eq!(gh_runner.seen.len(), 3, "seen: {:?}", gh_runner.seen);
+        assert!(exec.commented && exec.record_appended);
+        assert!(exec.label_plan.is_none());
+        assert!(
+            !gh_runner.seen.iter().any(|argv| matches!(
+                (argv[0].as_str(), argv[1].as_str()),
+                ("issue", "edit") | ("label", "create")
+            )),
+            "seen: {:?}",
+            gh_runner.seen
+        );
+        let bodies = pr_comment_bodies(&gh_runner);
+        assert_eq!(bodies.len(), 1);
+        let body = bodies[0];
+        assert!(body.contains("The issue keeps `agent:exhausted`"), "{body}");
+        assert!(!body.contains("fresh count"), "{body}");
+        assert!(!body.contains("agent:blocked"), "{body}");
+    }
+
+    #[test]
+    fn the_round_limit_comment_fences_reviewer_text_so_it_cannot_hide_or_ping() {
+        let rounds = vec![
+            rendered_round(Some("see <!-- unclosed and <details>"), Some(HEAD)),
+            rendered_round(Some("ask @someone and @org/team"), Some(OTHER_HEAD)),
+            rendered_round(Some("a ``` fence"), Some(FIRST_HEAD)),
+        ];
+
+        let body = render_hold_comment_with_rounds(
+            &request(false),
+            &round_limit_hold(3),
+            HoldDisposition::Blocked,
+            &rounds,
+        );
+
+        assert!(
+            body.contains("- **Round 3** at `11111111`: ` see <!-- unclosed and <details> `\n"),
+            "{body}"
+        );
+        assert!(
+            body.contains("- **Round 2** at `22222222`: ` ask @someone and @org/team `\n"),
+            "{body}"
+        );
+        assert!(
+            body.contains("- **Round 1** at `33333333`: ```` a ``` fence ````\n"),
+            "{body}"
+        );
+        // Every bullet closes its own span, so what follows is outside it.
+        let bullets: Vec<&str> = body
+            .lines()
+            .filter(|line| line.starts_with("- **Round"))
+            .collect();
+        assert_eq!(bullets.len(), 3, "{body}");
+        let last_bullet = body.rfind("- **Round").unwrap();
+        let after = &body[last_bullet..];
+        let after = &after[after.find('\n').unwrap()..];
+        assert!(
+            after.contains("The issue is labeled `agent:blocked` for a human."),
+            "{after}"
+        );
+        assert!(after.contains("with a fresh count"), "{after}");
+        assert!(
+            after.ends_with(super::super::blocked::AUTOPILOT_COMMENT_MARKER),
+            "{after}"
+        );
+    }
+
+    #[test]
+    fn the_round_limit_comment_lists_at_most_ten_rounds() {
+        assert_eq!(super::super::stagnation::MAX_ATTEMPTS_IN_COMMENT, 10);
+        let rounds: Vec<RecordedReviewSummary> = (0..12)
+            .map(|i| rendered_round(Some(&format!("finding {i}")), Some(HEAD)))
+            .collect();
+
+        let body = render_hold_comment_with_rounds(
+            &request(false),
+            &round_limit_hold(12),
+            HoldDisposition::Blocked,
+            &rounds,
+        );
+
+        assert!(
+            body.contains("### What the reviewer said (12 rounds, most recent first)"),
+            "{body}"
+        );
+        let numbers: Vec<String> = body
+            .lines()
+            .filter(|line| line.starts_with("- **Round "))
+            .map(|line| {
+                line["- **Round ".len()..]
+                    .split("**")
+                    .next()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        let expected: Vec<String> = (3..=12).rev().map(|n| n.to_string()).collect();
+        assert_eq!(numbers, expected, "{body}");
+        assert!(body.contains("2 older round(s) omitted"), "{body}");
+    }
+
+    #[test]
+    fn a_round_with_no_head_renders_without_an_at_clause() {
+        let rounds = vec![rendered_round(Some("no head"), None)];
+
+        let body = render_hold_comment_with_rounds(
+            &request(false),
+            &round_limit_hold(1),
+            HoldDisposition::Blocked,
+            &rounds,
+        );
+
+        assert!(body.contains("- **Round 1**: ` no head `\n"), "{body}");
+        assert!(
+            body.starts_with("**Autopilot: PR #7 is held for a human after 1 review round.**"),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn a_label_write_that_keeps_failing_posts_the_round_limit_comment_once() {
+        let database = db();
+        store_three_rounds(&database);
+        let failing_label_write = || {
+            Ok(GhOutput::failed(
+                "",
+                "gh: Resource not accessible (HTTP 403)",
+            ))
+        };
+        let mut comments = 0;
+        for pass in 0..3 {
+            let mut script = vec![
+                Ok(pr_view_ok("OPEN", HEAD)),
+                Ok(GhOutput::ok(r#"{"labels":[{"name":"agent:ready"}]}"#)),
+            ];
+            if pass == 0 {
+                script.push(Ok(GhOutput::ok("")));
+            }
+            script.push(Ok(label_created()));
+            script.push(failing_label_write());
+            let mut gh_runner = ScriptedGh::new(script);
+
+            let result = execute_merge(&database, &mut gh_runner, &round_limited(false));
+
+            assert!(result.is_err(), "pass {pass}: {result:?}");
+            let expected = if pass == 0 { 5 } else { 4 };
+            assert_eq!(
+                gh_runner.seen.len(),
+                expected,
+                "pass {pass}, seen: {:?}",
+                gh_runner.seen
+            );
+            comments += pr_comment_bodies(&gh_runner).len();
+        }
+        assert_eq!(comments, 1);
+        assert_eq!(real_merge_records(&database), 0);
+        assert_eq!(
+            crate::autopilot::remediate::review_rounds(&database, &issue(), 7)
+                .unwrap()
+                .len(),
+            3
+        );
+    }
+
+    #[test]
+    fn a_later_round_limit_hold_with_newer_rounds_is_commented_again() {
+        let database = db();
+        store_three_rounds(&database);
+        let script = || {
+            ScriptedGh::new(vec![
+                Ok(pr_view_ok("OPEN", HEAD)),
+                Ok(GhOutput::ok(r#"{"labels":[{"name":"agent:ready"}]}"#)),
+                Ok(GhOutput::ok("")),
+                Ok(label_created()),
+                Ok(GhOutput::ok("")),
+            ])
+        };
+        let mut gh_runner = script();
+        let first = execute_merge(&database, &mut gh_runner, &round_limited(false)).unwrap();
+        assert_eq!(gh_runner.seen.len(), 5, "seen: {:?}", gh_runner.seen);
+        assert!(first.commented && first.record_appended);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        // A human re-labels the issue, and three more rounds go the same way.
+        for reason in ["fourth finding", "fifth finding", "sixth finding"] {
+            store_review(&database, 7, Some(HEAD), needs_changes_outcome(reason));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let mut gh_runner = script();
+        let second = execute_merge(&database, &mut gh_runner, &round_limited(false)).unwrap();
+
+        assert_eq!(gh_runner.seen.len(), 5, "seen: {:?}", gh_runner.seen);
+        assert!(second.commented && second.record_appended);
+        let bodies = pr_comment_bodies(&gh_runner);
+        assert_eq!(bodies.len(), 1, "seen: {:?}", gh_runner.seen);
+        let body = bodies[0];
+        assert!(body.contains("sixth finding"), "{body}");
+        assert!(body.contains("fourth finding"), "{body}");
+        assert!(!body.contains("third finding"), "{body}");
+        assert_eq!(real_merge_records(&database), 2);
+    }
+
+    #[test]
+    fn the_round_limit_fence_survives_backticks_at_either_end() {
+        let rounds = vec![
+            rendered_round(Some("`starts with a backtick"), Some(HEAD)),
+            rendered_round(Some("ends with a backtick`"), Some(HEAD)),
+            rendered_round(Some("```"), Some(HEAD)),
+        ];
+
+        let body = render_hold_comment_with_rounds(
+            &request(false),
+            &round_limit_hold(3),
+            HoldDisposition::Blocked,
+            &rounds,
+        );
+
+        assert!(
+            body.contains("- **Round 3** at `11111111`: `` `starts with a backtick ``\n"),
+            "{body}"
+        );
+        assert!(
+            body.contains("- **Round 2** at `11111111`: `` ends with a backtick` ``\n"),
+            "{body}"
+        );
+        assert!(
+            body.contains("- **Round 1** at `11111111`: ```` ``` ````\n"),
+            "{body}"
+        );
+    }
+
+    /// The newest counted round for PR 7, the timestamp a notice keys on.
+    fn newest_round_at(database: &Database) -> String {
+        crate::autopilot::remediate::review_rounds(database, &issue(), 7)
+            .unwrap()
+            .first()
+            .expect("rounds are recorded")
+            .recorded_at
+            .clone()
+    }
+
+    fn a_full_round_limit_script() -> ScriptedGh {
+        ScriptedGh::new(vec![
+            Ok(pr_view_ok("OPEN", HEAD)),
+            Ok(GhOutput::ok(r#"{"labels":[{"name":"agent:ready"}]}"#)),
+            Ok(GhOutput::ok("")),
+            Ok(label_created()),
+            Ok(GhOutput::ok("")),
+        ])
+    }
+
+    #[test]
+    fn a_requeue_after_the_label_landed_but_the_record_did_not_is_commented_again() {
+        // The state a failed record write leaves: the comment posted, the
+        // label landed, no record. `record_merge` has no practical failure
+        // to script here, so the state is built through the module's own
+        // helper. A human has since re-labeled the issue `agent:ready`.
+        let database = db();
+        store_three_rounds(&database);
+        let newest = newest_round_at(&database);
+        record_round_limit_notice(&database, &issue(), 7, &newest, true).unwrap();
+        let mut gh_runner = a_full_round_limit_script();
+
+        let exec = execute_merge(&database, &mut gh_runner, &round_limited(false)).unwrap();
+
+        assert_eq!(gh_runner.seen.len(), 5, "seen: {:?}", gh_runner.seen);
+        assert!(exec.commented && exec.record_appended);
+        assert!(exec.label_plan.is_some());
+        assert_eq!(pr_comment_bodies(&gh_runner).len(), 1);
+        assert_eq!(real_merge_records(&database), 1);
+    }
+
+    #[test]
+    fn a_recorded_round_limit_hold_leaves_no_notice_behind() {
+        let database = db();
+        store_three_rounds(&database);
+        let mut gh_runner = a_full_round_limit_script();
+
+        let exec = execute_merge(&database, &mut gh_runner, &round_limited(false)).unwrap();
+
+        assert_eq!(gh_runner.seen.len(), 5, "seen: {:?}", gh_runner.seen);
+        assert!(exec.commented && exec.record_appended);
+        assert!(
+            super::super::read_current(&database, &round_limit_notice_key(&issue()))
+                .unwrap()
+                .is_none(),
+            "a notice that survives means the hold did not finish"
+        );
+    }
+
+    #[test]
+    fn a_failed_notice_mark_still_records_the_round_limit_hold() {
+        // The mark is the notice rewritten with `label_applied: true`. A
+        // trigger refuses exactly that write, so the first notice write (with
+        // `label_applied: false`) and the clear still go through.
+        let database = db();
+        store_three_rounds(&database);
+        database
+            .exec_raw(
+                r#"CREATE TRIGGER refuse_notice_mark_insert
+                 BEFORE INSERT ON drawers
+                 WHEN NEW.content LIKE '%"label_applied":true%'
+                 BEGIN
+                     SELECT RAISE(ABORT, 'forced notice mark failure');
+                 END;
+                 CREATE TRIGGER refuse_notice_mark_update
+                 BEFORE UPDATE ON drawers
+                 WHEN NEW.content LIKE '%"label_applied":true%'
+                 BEGIN
+                     SELECT RAISE(ABORT, 'forced notice mark failure');
+                 END;"#,
+            )
+            .unwrap();
+        let mut gh_runner = a_full_round_limit_script();
+
+        let exec = execute_merge(&database, &mut gh_runner, &round_limited(false)).unwrap();
+
+        assert_eq!(gh_runner.seen.len(), 5, "seen: {:?}", gh_runner.seen);
+        assert!(exec.commented && exec.record_appended);
+        assert!(exec.label_plan.is_some());
+        assert_eq!(pr_comment_bodies(&gh_runner).len(), 1);
+        assert_eq!(real_merge_records(&database), 1);
+        assert_eq!(
+            crate::autopilot::remediate::review_rounds(&database, &issue(), 7)
+                .unwrap()
+                .len(),
+            0,
+            "the record reset the count"
+        );
+        assert!(
+            super::super::read_current(&database, &round_limit_notice_key(&issue()))
+                .unwrap()
+                .is_none(),
+            "the unmarked notice is cleared once the hold is recorded"
+        );
+    }
+
+    #[test]
+    fn a_notice_for_another_pr_does_not_suppress_the_comment() {
+        let database = db();
+        store_three_rounds(&database);
+        let newest = newest_round_at(&database);
+        record_round_limit_notice(&database, &issue(), 8, &newest, false).unwrap();
+        let mut gh_runner = a_full_round_limit_script();
+
+        let exec = execute_merge(&database, &mut gh_runner, &round_limited(false)).unwrap();
+
+        assert_eq!(gh_runner.seen.len(), 5, "seen: {:?}", gh_runner.seen);
+        assert!(exec.commented);
+        assert_eq!(pr_comment_bodies(&gh_runner).len(), 1);
+    }
+
+    #[test]
+    fn a_notice_from_a_slug_colliding_issue_does_not_suppress_the_comment() {
+        let database = db();
+        store_three_rounds(&database);
+        let newest = newest_round_at(&database);
+        let colliding = IssueRef::new("owner-repo", 42);
+        assert_eq!(
+            round_limit_notice_key(&colliding),
+            round_limit_notice_key(&issue()),
+            "the setup needs the two keys to collide"
+        );
+        record_round_limit_notice(&database, &colliding, 7, &newest, false).unwrap();
+        let mut gh_runner = a_full_round_limit_script();
+
+        let exec = execute_merge(&database, &mut gh_runner, &round_limited(false)).unwrap();
+
+        assert_eq!(gh_runner.seen.len(), 5, "seen: {:?}", gh_runner.seen);
+        assert!(exec.commented);
+        assert_eq!(pr_comment_bodies(&gh_runner).len(), 1);
+    }
+
+    // ── #404: without `--merge`, only the hold itself is real ───────────
+
+    /// A round-limited request from a caller that did not ask for merges to
+    /// be executed (`advance` without `--merge`).
+    fn rehearsing_round_limited() -> MergeRequest<'static> {
+        MergeRequest {
+            round_limit: Some(RoundLimit {
+                rounds: 3,
+                limit: 3,
+                rehearse_other_outcomes: true,
+            }),
+            ..request(false)
+        }
+    }
+
+    /// Any argv that writes to GitHub.
+    fn github_writes(gh: &ScriptedGh) -> Vec<&Vec<String>> {
+        gh.seen
+            .iter()
+            .filter(|argv| {
+                matches!(
+                    (argv[0].as_str(), argv[1].as_str()),
+                    ("pr", "comment")
+                        | ("pr", "merge")
+                        | ("issue", "comment")
+                        | ("issue", "edit")
+                        | ("label", "create")
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_rehearsing_round_limit_request_on_a_merged_pr_rehearses_the_stand_down() {
+        let database = db();
+        store_three_rounds(&database);
+        let mut gh_runner = ScriptedGh::new(vec![Ok(pr_view_ok("MERGED", HEAD))]);
+
+        let exec = execute_merge(&database, &mut gh_runner, &rehearsing_round_limited()).unwrap();
+
+        assert_eq!(
+            exec.outcome,
+            MergeOutcome::AlreadyMerged {
+                head_sha: HEAD.into()
+            }
+        );
+        assert!(!exec.commented);
+        assert!(exec.label_plan.is_none());
+        assert!(
+            github_writes(&gh_runner).is_empty(),
+            "seen: {:?}",
+            gh_runner.seen
+        );
+        // Only the PR view.
+        assert_eq!(gh_runner.seen.len(), 1, "seen: {:?}", gh_runner.seen);
+        let records = merges_for_issue(&database, &issue()).unwrap();
+        assert_eq!(records.len(), 1);
+        assert!(records[0].dry_run, "recorded on the dry-run footing");
+        assert_eq!(real_merge_records(&database), 0);
+    }
+
+    #[test]
+    fn a_rehearsing_round_limit_request_on_a_closed_pr_rehearses_the_closed_hold() {
+        let database = db();
+        store_three_rounds(&database);
+        let mut gh_runner = ScriptedGh::new(vec![Ok(pr_view_ok("CLOSED", HEAD))]);
+
+        let exec = execute_merge(&database, &mut gh_runner, &rehearsing_round_limited()).unwrap();
+
+        assert_eq!(
+            exec.outcome.hold(),
+            Some(&MergeHold::PrNotOpen {
+                state: "CLOSED".into()
+            })
+        );
+        assert!(!exec.commented);
+        assert!(exec.label_plan.is_none());
+        assert!(
+            github_writes(&gh_runner).is_empty(),
+            "seen: {:?}",
+            gh_runner.seen
+        );
+        assert_eq!(gh_runner.seen.len(), 1, "seen: {:?}", gh_runner.seen);
+        let records = merges_for_issue(&database, &issue()).unwrap();
+        assert_eq!(records.len(), 1);
+        assert!(records[0].dry_run, "recorded on the dry-run footing");
+        assert_eq!(real_merge_records(&database), 0);
+    }
+
+    #[test]
+    fn a_rehearsing_round_limit_request_on_an_open_pr_still_holds_for_real() {
+        // The one outcome `rehearse_other_outcomes` keeps real, and it must
+        // be exactly the hold a `--merge` caller gets.
+        let run = |request: &MergeRequest| {
+            let database = db();
+            store_three_rounds(&database);
+            let mut gh_runner = a_full_round_limit_script();
+            let exec = execute_merge(&database, &mut gh_runner, request).unwrap();
+            (exec, gh_runner.seen, real_merge_records(&database))
+        };
+
+        let (held, held_seen, held_records) = run(&rehearsing_round_limited());
+        let (merging, merging_seen, merging_records) = run(&round_limited(false));
+
+        assert_eq!(held_seen.len(), 5, "seen: {held_seen:?}");
+        assert_eq!(held_seen, merging_seen);
+        assert_eq!(held.outcome, merging.outcome);
+        assert_eq!(held.outcome.hold(), Some(&round_limit_hold(3)));
+        assert!(held.commented && held.record_appended);
+        assert_eq!(held.label_plan, merging.label_plan);
+        assert!(held.label_plan.is_some());
+        assert!(
+            held_seen
+                .iter()
+                .any(|argv| argv.iter().any(|arg| arg == "agent:blocked")),
+            "seen: {held_seen:?}"
+        );
+        assert_eq!(held_records, 1, "a real record, which resets the count");
+        assert_eq!(merging_records, 1);
+    }
+
+    #[test]
+    fn an_execution_says_whether_it_was_rehearsed() {
+        // A real round-limit hold made by a caller that did not ask for
+        // merges is not a rehearsal, and the report must be able to say so.
+        let database = db();
+        store_three_rounds(&database);
+        let mut gh_runner = a_full_round_limit_script();
+        let real = execute_merge(&database, &mut gh_runner, &rehearsing_round_limited()).unwrap();
+        assert_eq!(gh_runner.seen.len(), 5, "seen: {:?}", gh_runner.seen);
+        assert!(real.commented);
+        assert!(!real.rehearsed, "the hold was written to GitHub");
+
+        // A dry run is a rehearsal.
+        let database = db();
+        store_three_rounds(&database);
+        let mut gh_runner = ScriptedGh::new(vec![Ok(pr_view_ok("OPEN", HEAD))]);
+        let dry = execute_merge(&database, &mut gh_runner, &round_limited(true)).unwrap();
+        assert_eq!(gh_runner.seen.len(), 1, "seen: {:?}", gh_runner.seen);
+        assert!(dry.rehearsed);
+
+        // So is the outcome a rehearsing request downgrades: the PR merged.
+        let database = db();
+        store_three_rounds(&database);
+        let mut gh_runner = ScriptedGh::new(vec![Ok(pr_view_ok("MERGED", HEAD))]);
+        let downgraded =
+            execute_merge(&database, &mut gh_runner, &rehearsing_round_limited()).unwrap();
+        assert_eq!(gh_runner.seen.len(), 1, "seen: {:?}", gh_runner.seen);
+        assert!(matches!(
+            downgraded.outcome,
+            MergeOutcome::AlreadyMerged { .. }
+        ));
+        assert!(downgraded.rehearsed, "reported on the footing it ran on");
+    }
+
+    #[test]
+    fn a_round_limit_request_from_a_merging_caller_still_stands_down_for_real() {
+        // `--merge` behaviour, unchanged: a merged PR is stood down from on
+        // GitHub, labels cleared and the issue told.
+        let database = db();
+        store_three_rounds(&database);
+        let mut gh_runner = ScriptedGh::new(vec![
+            Ok(pr_view_ok("MERGED", HEAD)),
+            Ok(GhOutput::ok(r#"{"labels":[{"name":"agent:ready"}]}"#)),
+            Ok(GhOutput::ok("")),
+            Ok(GhOutput::ok("")),
+        ]);
+
+        let exec = execute_merge(&database, &mut gh_runner, &round_limited(false)).unwrap();
+
+        assert_eq!(
+            exec.outcome,
+            MergeOutcome::AlreadyMerged {
+                head_sha: HEAD.into()
+            }
+        );
+        assert!(exec.commented);
+        let plan = exec.label_plan.expect("a landed PR clears the labels");
+        assert_eq!(plan.remove, vec!["agent:ready".to_string()]);
+        // The PR view, the label read, the label edit, the issue comment.
+        assert_eq!(gh_runner.seen.len(), 4, "seen: {:?}", gh_runner.seen);
+        assert_eq!(real_merge_records(&database), 1);
     }
 }

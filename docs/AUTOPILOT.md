@@ -848,7 +848,7 @@ run more than once; an existing label is left untouched.
 | Label | Set by | Cleared by |
 |---|---|---|
 | `agent:ready` | A human opting an issue in; `lead` un-blocking an answered `agent:blocked` issue; `retry` forgiving an exhausted issue | Whenever **Autopilot** applies another `agent:*` label, which it always does as an exclusive transition (`plan_exclusive` adds the target and removes the other two). GitHub enforces nothing: labels added by hand coexist, and `agent:ready` alongside `agent:blocked` reads as **Blocked** (`blocked_beats_ready`) |
-| `agent:blocked` | `ironmem autopilot ask`, when a human posts a question on an issue; also `advance` (and `ironmem autopilot merge`), when rung 6's merge decision holds a PR for a human — **except** a PR held only for a missing approval, which keeps `agent:ready` (see *Branch protection* below). **`lead` never applies it** — it never calls `ask_human` | `lead`, on seeing a human comment newer than its own **question-marked** comment — flips back to `agent:ready` automatically. A merge hold posts no such marker and does **not** self-resume this way; see *Human recovery paths*. |
+| `agent:blocked` | `ironmem autopilot ask`, when a human posts a question on an issue; also `advance` (and `ironmem autopilot merge`), when rung 6's merge decision holds a PR for a human (the review-round-limit hold is applied even without `--merge`; see *The review-round limit*) — **except** a PR held only for a missing approval, which keeps `agent:ready` (see *Branch protection* below). **`lead` never applies it** — it never calls `ask_human` | `lead`, on seeing a human comment newer than its own **question-marked** comment — flips back to `agent:ready` automatically. A merge hold posts no such marker and does **not** self-resume this way; see *Human recovery paths*. |
 | `agent:exhausted` | `lead`, on an issue at its attempt cap: one whose run this tick ended `AttemptCapExhausted`, or one `queue::plan_queue` deferred as `AttemptCapReached` (the deferral is how a close-out whose label write failed is retried, and how an issue stranded at its cap is reached). An issue with a recorded success is skipped: it can only be at its cap through `--remediate`, and `advance` holds that PR for a human with `agent:blocked` instead. The close-out re-reads the issue's labels and leaves it alone if a human has since moved it to `agent:blocked` or removed `agent:ready`, and re-checks the cap so a `retry` granted mid-tick is honoured. It posts the summary comment, then applies the label; idempotent, so a repeat tick posts no second comment (`a_repeat_tick_on_an_exhausted_issue_posts_no_second_summary`, #345). Also `ironmem autopilot exhaust`, typed by a human | Only `ironmem autopilot retry` — never self-resumes. Re-labeling `agent:ready` by hand leaves the cap in force, so the next `lead` tick closes the issue out again |
 
 An issue with none of these three labels is invisible to Autopilot: it is
@@ -1028,6 +1028,81 @@ follow-up have their control characters removed and their later lines
 indented six spaces, so reviewer text cannot be read as one of the report's
 own fields.
 
+### The review-round limit (#404)
+
+With `--remediate`, `advance` answers a `needs_changes` review by **arming** a
+fix: it stores the reviewer's findings as the issue's remediation record, and
+the next `lead` tick re-dispatches the IC to address them. Once the reviewer
+has asked for changes three rounds in a row on one PR (the default), `advance`
+stops arming fixes and holds the PR for a person instead.
+
+- **What counts.** The PR's judged reviews, newest first, for as long as the
+  verdict is `needs_changes`. A `pass` ends the count. A review that did not
+  judge (the reviewer failed to run, or returned no verdict) is skipped: it
+  neither adds to the count nor ends it. A judged review still counts even if
+  it was recorded without the commit it read. Each judged review counts
+  separately, even at the same head: a manual re-review or a review after
+  retargeting the base adds a round without requiring another fix dispatch.
+- **The limit.** `--max-review-rounds <N>` on `ironmem autopilot advance`.
+  The default is 3 and the minimum is 1; `0` is refused. Only `advance` takes
+  it, because only `advance` arms fixes; without `--remediate` it has no
+  effect.
+- **At the limit.** No fix is armed, and a remediation record still stored
+  for the issue is cleared, so nothing is dispatched and no further fix is
+  paid for. `advance` posts one comment on the **pull request**, headed
+  "Autopilot: PR #<pr> is held for a human after <rounds> review round(s)".
+  Under the headline it says the fix loop has not converged, lists
+  ``- **Round <n>** at `<sha>`: <reason>`` under "What the reviewer said"
+  (newest first, the newest ten, with a count of any older rounds left out),
+  and ends with the label and how to resume. Each reason is scrubbed,
+  flattened to one line, cut at 500 characters and shown as code, so reviewer
+  text cannot hide or reformat the rest of the comment; a round with no
+  recorded reason says so. The issue is moved to `agent:blocked`, and the hold
+  is recorded with the reason `review_rounds_exhausted`. While the issue
+  stays `agent:blocked`, `advance` does not pick it up again, so no second
+  comment is posted.
+- **Posted even without `--merge`.** Without `--merge`, `advance` rehearses
+  every merge decision (runs every check, writes nothing to GitHub) except
+  this hold, which it posts for real. A PR found merged or closed at the
+  limit is still only rehearsed. `--dry-run` writes nothing and skips the
+  limit entirely, so it shows the ordinary `needs_changes` hold and cannot
+  preview this one.
+- **What the pass prints.** `review rounds EXHAUSTED (<rounds> consecutive
+  NEEDS CHANGES, limit <limit>) — no fix armed; the PR is held for a human`,
+  and without `--merge` a `(posted for real: …)` line naming what was
+  written. Under `--json` the remediation is `"arm": "round_limit_reached"`
+  and the merge result has `"rehearsed": false`. Nothing reports the running
+  count before the limit is reached.
+- **Against the attempt cap.** The attempt cap is checked first and is
+  unchanged. If a pass reaches both, the cap's hold wins: the ordinary
+  `needs_changes` hold, commented on the issue rather than the PR, and only
+  rehearsed without `--merge`. With the defaults (3 rounds, a cap of 5) the
+  round limit comes first unless the first two fixes took five or more
+  attempts between them. A hold at the attempt cap does not reset the round
+  count, so after `autopilot retry` a PR that already has the limit's worth of
+  consecutive `needs_changes` rounds is held at the round limit on its next
+  pass; re-labeling after that hold starts the fresh count.
+- **Resuming.** Remove `agent:blocked` and label the issue `agent:ready`. The
+  count restarts from zero: only reviews recorded after the hold count. If the
+  PR's head has not moved, the next pass arms a fix for the findings already
+  on it; if a commit was pushed, the next pass reviews it first, and that
+  review is round one.
+- **What to do with a held PR.** Read the rounds in the comment. If one
+  approach keeps failing, fix the branch yourself or close the PR.
+  Re-labeling without a push gives the IC another full set of rounds on the
+  same findings. A commit you push is reviewed as round one, but the PR will
+  then not auto-merge, because Autopilot trusts the gate only at a commit its
+  IC took green.
+- **If a write fails partway.** The comment is posted first, then the label,
+  then the hold is recorded. A failed label write leaves the hold unrecorded,
+  so the next pass holds again and retries the label without posting the
+  comment a second time. The pass reports the failure as a problem. If the
+  label is applied but recording the hold fails, the issue is `agent:blocked`
+  with no recorded hold, so a later re-label holds again at once, with a
+  second comment, before the count can restart.
+
+There is no "rethink" dispatch: the hold hands the approach to a person.
+
 ## The auto-merge envelope
 
 A PR auto-merges only when every one of these holds:
@@ -1068,7 +1143,9 @@ typing the command.
 - `--merge` (on `ironmem autopilot advance`) is the one irreversible action
   in this subsystem — it executes `gh pr merge`. It is opt-in: without it,
   `advance` still opens PRs and runs reviews, but every merge is rehearsed,
-  not executed.
+  not executed. The one merge-step outcome still written without `--merge` is
+  the review-round-limit hold under `--remediate` (see *The review-round
+  limit*).
 - `--dry-run` (on `lead`, `advance`, `merge`, `exhaust`, `ask`) makes no
   GitHub writes — no `gh pr merge`, no label edit, no comment. That is not
   the same as writing nothing at all: `merge` still persists a rehearsal
@@ -1180,6 +1257,12 @@ typing the command.
   command and at no other time. **`ironmem autopilot exhaust`** is
   different: `lead` closes out an issue at its attempt cap on its own, and
   the command is the manual arm of that same close-out.
+- **A PR held at the review-round limit** (a comment on the PR headed
+  "Autopilot: PR #<pr> is held for a human after <rounds> review round(s)"
+  that lists each round) resumes when the issue is re-labeled `agent:ready`
+  (removing `agent:blocked`). That starts a fresh count of rounds; see *The
+  review-round limit*. To stop for good, leave it `agent:blocked` or drop
+  `--remediate`.
 
 ## Branch protection
 

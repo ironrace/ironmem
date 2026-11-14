@@ -847,7 +847,9 @@ enum AutopilotCmd {
     /// **Reviews by default, merges only with `--merge`.** Without it every
     /// merge is rehearsed — every guard and every read runs and nothing is
     /// written to GitHub — because a merge is the one irreversible action in
-    /// this subsystem. Reviewing spends money on `muse`, bounded by the same
+    /// this subsystem. The one exception is the review-round-limit hold
+    /// under `--remediate` (see `--max-review-rounds`), which is posted for
+    /// real either way. Reviewing spends money on `muse`, bounded by the same
     /// daily ceilings `autopilot review` applies.
     Advance {
         /// Path to the database
@@ -872,8 +874,13 @@ enum AutopilotCmd {
         /// dispatches, so run them in that order. Each attempt costs a
         /// dispatch; a remediation gets --attempt-cap attempts of its own,
         /// shared by every round of review and counted from the issue's first
-        /// success, not what the original work left. On exhaustion the PR is
-        /// held for a human exactly as it is without this flag.
+        /// success, not what the original work left. When those attempts run
+        /// out the PR is held for a human exactly as it is without this flag.
+        /// Separately, after --max-review-rounds consecutive NEEDS CHANGES
+        /// rounds no further fix is armed and the PR is held with one comment
+        /// on the PR, with or without --merge. The two are checked in that
+        /// order, the attempt cap first: when both are reached in one pass,
+        /// the attempt cap's hold applies.
         #[arg(long)]
         remediate: bool,
         /// Per-issue attempt cap. Must match the Lead's, since a remediation
@@ -881,6 +888,14 @@ enum AutopilotCmd {
         /// fires or never stops.
         #[arg(long)]
         attempt_cap: Option<u32>,
+        /// Consecutive NEEDS CHANGES rounds one PR gets under --remediate
+        /// before no further fix is armed (default 3, at least 1). At the
+        /// limit this pass posts one comment on the PR listing each round's
+        /// reason, labels the issue `agent:blocked` and dispatches nothing —
+        /// with or without --merge. Re-labeling the issue `agent:ready`
+        /// starts a fresh count.
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+        max_review_rounds: Option<u32>,
         /// Merge strategy for `--merge`
         #[arg(long, default_value = "squash")]
         strategy: String,
@@ -1114,30 +1129,97 @@ impl ironmem::autopilot::advise::Advisor for DisabledAdvisor {
     }
 }
 
-/// Human-readable rendering of one advance pass.
-fn print_advance_report(report: &ironmem::autopilot::advance::AdvanceReport) {
-    use ironmem::autopilot::advance::{AdvanceStep, NoPrReason, Stall};
-    use ironmem::autopilot::merge::MergeOutcome;
-    use ironmem::autopilot::remediate::ArmOutcome;
-    use ironmem::autopilot::worktree::WorktreeRemoval;
+/// The advance header's note on merges. Under `--remediate` without
+/// `--merge`, a review-round-limit hold is still written to GitHub (#404),
+/// so the note says so rather than implying nothing was.
+fn advance_merges_note(merge_enabled: bool, remediate_enabled: bool) -> &'static str {
+    match (merge_enabled, remediate_enabled) {
+        (true, _) => "",
+        (false, false) => " [merges rehearsed — pass --merge to execute]",
+        (false, true) => {
+            " [merges rehearsed — pass --merge to execute; a review-round-limit hold is still posted]"
+        }
+    }
+}
 
-    println!(
+/// The `RoundLimitReached` line. "The PR is held" only when the merge step
+/// actually held it at the limit: a PR found merged or closed was not.
+fn round_limit_line(rounds: u32, limit: u32, held: bool) -> String {
+    format!(
+        "    review rounds EXHAUSTED ({rounds} consecutive NEEDS CHANGES, limit {limit}) — no fix armed{}",
+        if held {
+            "; the PR is held for a human"
+        } else {
+            ""
+        }
+    )
+}
+
+/// The line under a merge outcome that was written for real although merges
+/// were not enabled. Only the round-limit hold can be (#404): every other
+/// outcome of such a pass is rehearsed. Names only what this attempt wrote.
+///
+/// Checked against the outcome here rather than trusting that rule, which
+/// lives in `advance` and `merge`: the note describes the round-limit hold,
+/// so it is printed for nothing else.
+fn real_hold_note(
+    exec: &ironmem::autopilot::merge::MergeExecution,
+    merge_enabled: bool,
+) -> Option<String> {
+    use ironmem::autopilot::merge::MergeHold;
+
+    if exec.rehearsed
+        || merge_enabled
+        || !exec.outcome.hold().is_some_and(MergeHold::is_round_limit)
+    {
+        return None;
+    }
+    let blocked = exec
+        .label_plan
+        .as_ref()
+        .is_some_and(|plan| plan.add.iter().any(|label| label == "agent:blocked"));
+    let written: Vec<&str> = [
+        exec.commented.then_some("a comment on the PR"),
+        blocked.then_some("agent:blocked on the issue"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    Some(if written.is_empty() {
+        "    (not rehearsed: the review-round-limit hold runs for real without --merge)".to_string()
+    } else {
+        format!(
+            "    (posted for real: the review-round-limit hold runs without --merge — {})",
+            written.join(" and ")
+        )
+    })
+}
+
+/// The first line of an advance report.
+fn advance_header(report: &ironmem::autopilot::advance::AdvanceReport) -> String {
+    format!(
         "Advance — {} carried forward, {} skipped, {} problem(s){}{}{}",
         report.advanced.len(),
         report.skipped.len(),
         report.problems.len(),
         if report.dry_run { " [dry run]" } else { "" },
-        if report.merge_enabled {
-            ""
-        } else {
-            " [merges rehearsed — pass --merge to execute]"
-        },
+        advance_merges_note(report.merge_enabled, report.remediate_enabled),
         if report.remediate_enabled {
             ""
         } else {
             " [NEEDS CHANGES held for a human — pass --remediate to re-dispatch]"
         }
-    );
+    )
+}
+
+/// Human-readable rendering of one advance pass.
+fn print_advance_report(report: &ironmem::autopilot::advance::AdvanceReport) {
+    use ironmem::autopilot::advance::{AdvanceStep, NoPrReason, Stall};
+    use ironmem::autopilot::merge::{MergeHold, MergeOutcome};
+    use ironmem::autopilot::remediate::ArmOutcome;
+    use ironmem::autopilot::worktree::WorktreeRemoval;
+
+    println!("{}", advance_header(report));
 
     for step in &report.advanced {
         println!(
@@ -1277,6 +1359,13 @@ fn print_advance_report(report: &ironmem::autopilot::advance::AdvanceReport) {
                     "    remediation EXHAUSTED ({attempts_charged}/{attempt_cap} remediation attempts) — the PR stays open for a human"
                 );
             }
+            Some(ArmOutcome::RoundLimitReached { rounds, limit }) => {
+                let held = step
+                    .merge
+                    .as_ref()
+                    .is_some_and(|exec| exec.outcome.hold().is_some_and(MergeHold::is_round_limit));
+                println!("{}", round_limit_line(*rounds, *limit, held));
+            }
         }
         if let Some(exec) = &step.merge {
             match &exec.outcome {
@@ -1291,6 +1380,9 @@ fn print_advance_report(report: &ironmem::autopilot::advance::AdvanceReport) {
                     println!("    already merged ({head_sha})")
                 }
                 MergeOutcome::Held(hold) => println!("    HELD: {}", hold.summary()),
+            }
+            if let Some(note) = real_hold_note(exec, report.merge_enabled) {
+                println!("{note}");
             }
             if let Some(err) = &exec.label_error {
                 println!("    WARNING: labels were NOT updated: {err}");
@@ -2359,6 +2451,7 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                         strategy,
                         delete_branch,
                         dry_run,
+                        round_limit: None,
                     },
                 )?;
 
@@ -2961,6 +3054,7 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                 merge,
                 remediate,
                 attempt_cap,
+                max_review_rounds,
                 strategy,
                 delete_branch,
                 model,
@@ -3005,6 +3099,8 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                     remediate,
                     attempt_cap: attempt_cap
                         .unwrap_or(ironmem::autopilot::run::DEFAULT_ATTEMPT_CAP),
+                    max_review_rounds: max_review_rounds
+                        .unwrap_or(ironmem::autopilot::remediate::DEFAULT_MAX_REVIEW_ROUNDS),
                     strategy,
                     delete_branch,
                     dry_run,
@@ -3682,6 +3778,213 @@ mod tests {
                 assert_eq!(attempt_cap, None, "the default lives in the module");
             }
             _ => panic!("expected Commands::Autopilot(Advance), got a different variant"),
+        }
+    }
+
+    #[test]
+    fn autopilot_advance_takes_a_review_round_limit_and_refuses_zero() {
+        let parse = |extra: &[&str]| {
+            let mut argv = vec![
+                "ironmem",
+                "autopilot",
+                "advance",
+                "--repo",
+                "owner/repo=/tmp/checkout",
+            ];
+            argv.extend_from_slice(extra);
+            Cli::try_parse_from(argv)
+        };
+        let limit = |cli: Cli| match cli.command {
+            Commands::Autopilot {
+                cmd:
+                    AutopilotCmd::Advance {
+                        max_review_rounds, ..
+                    },
+            } => max_review_rounds,
+            _ => panic!("expected Commands::Autopilot(Advance), got a different variant"),
+        };
+
+        assert_eq!(
+            limit(parse(&[]).expect("expected argv to parse")),
+            None,
+            "the default lives in the module"
+        );
+        assert_eq!(
+            limit(parse(&["--max-review-rounds", "2"]).expect("expected argv to parse")),
+            Some(2)
+        );
+        assert!(parse(&["--max-review-rounds", "0"]).is_err());
+    }
+
+    #[test]
+    fn autopilot_advance_header_says_a_round_limit_hold_is_still_posted() {
+        assert_eq!(advance_merges_note(true, true), "");
+        assert_eq!(advance_merges_note(true, false), "");
+        assert_eq!(
+            advance_merges_note(false, false),
+            " [merges rehearsed — pass --merge to execute]",
+            "unchanged without --remediate"
+        );
+        assert_eq!(
+            advance_merges_note(false, true),
+            " [merges rehearsed — pass --merge to execute; a review-round-limit hold is still posted]"
+        );
+    }
+
+    #[test]
+    fn autopilot_advance_header_is_unchanged_except_under_remediate_without_merge() {
+        let header = |dry_run: bool, merge_enabled: bool, remediate_enabled: bool| {
+            advance_header(&ironmem::autopilot::advance::AdvanceReport {
+                dry_run,
+                merge_enabled,
+                remediate_enabled,
+                advanced: Vec::new(),
+                skipped: Vec::new(),
+                problems: Vec::new(),
+            })
+        };
+        assert_eq!(
+            header(false, true, true),
+            "Advance — 0 carried forward, 0 skipped, 0 problem(s)"
+        );
+        assert_eq!(
+            header(false, false, false),
+            "Advance — 0 carried forward, 0 skipped, 0 problem(s) [merges rehearsed — pass \
+             --merge to execute] [NEEDS CHANGES held for a human — pass --remediate to re-dispatch]"
+        );
+        assert_eq!(
+            header(true, false, false),
+            "Advance — 0 carried forward, 0 skipped, 0 problem(s) [dry run] [merges rehearsed — \
+             pass --merge to execute] [NEEDS CHANGES held for a human — pass --remediate to \
+             re-dispatch]"
+        );
+        assert_eq!(
+            header(false, false, true),
+            "Advance — 0 carried forward, 0 skipped, 0 problem(s) [merges rehearsed — pass \
+             --merge to execute; a review-round-limit hold is still posted]"
+        );
+        // Under `--dry-run`, `advance_pass` reports both `merge_enabled` and
+        // `remediate_enabled` false whatever `--merge` and `--remediate` say,
+        // so `--dry-run --remediate`, with or without `--merge`, prints this
+        // header: no claim that a hold is posted, since a dry run arms
+        // nothing and so posts no hold (see `a_dry_run_arms_nothing` and
+        // `a_dry_run_at_the_limit_writes_nothing` in `advance`).
+        let dry_run_remediate = header(true, false, false);
+        assert_eq!(
+            dry_run_remediate,
+            "Advance — 0 carried forward, 0 skipped, 0 problem(s) [dry run] [merges rehearsed — \
+             pass --merge to execute] [NEEDS CHANGES held for a human — pass --remediate to \
+             re-dispatch]"
+        );
+        assert!(!dry_run_remediate.contains("still posted"));
+    }
+
+    #[test]
+    fn autopilot_advance_round_limit_line_says_held_only_when_it_was() {
+        assert_eq!(
+            round_limit_line(3, 3, true),
+            "    review rounds EXHAUSTED (3 consecutive NEEDS CHANGES, limit 3) — no fix armed; \
+             the PR is held for a human"
+        );
+        assert_eq!(
+            round_limit_line(3, 3, false),
+            "    review rounds EXHAUSTED (3 consecutive NEEDS CHANGES, limit 3) — no fix armed"
+        );
+    }
+
+    /// A merge execution with `outcome`, as the advance report reads it.
+    fn execution(
+        outcome: ironmem::autopilot::merge::MergeOutcome,
+        rehearsed: bool,
+        commented: bool,
+        blocked: bool,
+    ) -> ironmem::autopilot::merge::MergeExecution {
+        ironmem::autopilot::merge::MergeExecution {
+            issue: ironmem::autopilot::IssueRef::new("owner/repo", 7),
+            pr_number: 9,
+            outcome,
+            snapshot: None,
+            label_plan: blocked.then(|| ironmem::autopilot::labels::LabelPlan {
+                add: vec!["agent:blocked".to_string()],
+                remove: vec!["agent:ready".to_string()],
+            }),
+            label_error: None,
+            commented,
+            record_appended: true,
+            rehearsed,
+            record_drawer_id: "drawer".to_string(),
+        }
+    }
+
+    fn round_limit_held() -> ironmem::autopilot::merge::MergeOutcome {
+        ironmem::autopilot::merge::MergeOutcome::Held(ironmem::autopilot::merge::MergeHold::Review(
+            ironmem::autopilot::review::HoldReason::ReviewRoundsExhausted {
+                rounds: 3,
+                limit: 3,
+            },
+        ))
+    }
+
+    #[test]
+    fn autopilot_advance_marks_a_real_hold_made_without_merge() {
+        let note = |exec, merge_enabled| real_hold_note(&exec, merge_enabled);
+        // Rehearsed, or merges enabled: nothing to add.
+        assert_eq!(
+            note(execution(round_limit_held(), true, true, true), false),
+            None
+        );
+        assert_eq!(
+            note(execution(round_limit_held(), false, true, true), true),
+            None
+        );
+        // Real without --merge: say what was written, and only that.
+        assert_eq!(
+            note(execution(round_limit_held(), false, true, true), false).as_deref(),
+            Some(
+                "    (posted for real: the review-round-limit hold runs without --merge — \
+                 a comment on the PR and agent:blocked on the issue)"
+            )
+        );
+        assert_eq!(
+            note(execution(round_limit_held(), false, false, true), false).as_deref(),
+            Some(
+                "    (posted for real: the review-round-limit hold runs without --merge — \
+                 agent:blocked on the issue)"
+            )
+        );
+        assert_eq!(
+            note(execution(round_limit_held(), false, true, false), false).as_deref(),
+            Some(
+                "    (posted for real: the review-round-limit hold runs without --merge — \
+                 a comment on the PR)"
+            )
+        );
+        assert_eq!(
+            note(execution(round_limit_held(), false, false, false), false).as_deref(),
+            Some("    (not rehearsed: the review-round-limit hold runs for real without --merge)")
+        );
+    }
+
+    #[test]
+    fn autopilot_advance_names_no_real_hold_for_any_other_outcome() {
+        // The note describes the round-limit hold, so it is checked against
+        // the outcome rather than trusting that nothing else can be real
+        // without --merge.
+        use ironmem::autopilot::merge::{MergeHold, MergeOutcome};
+        let others = [
+            MergeOutcome::AlreadyMerged {
+                head_sha: "abc".into(),
+            },
+            MergeOutcome::Held(MergeHold::PrNotOpen {
+                state: "CLOSED".into(),
+            }),
+            MergeOutcome::Held(MergeHold::Review(
+                ironmem::autopilot::review::HoldReason::NeedsChanges,
+            )),
+        ];
+        for outcome in others {
+            let exec = execution(outcome, false, true, true);
+            assert_eq!(real_hold_note(&exec, false), None, "{:?}", exec.outcome);
         }
     }
 
