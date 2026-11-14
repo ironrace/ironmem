@@ -2711,18 +2711,155 @@ pub(crate) mod contract_tests {
     /// identity file (`process.json`).
     pub(crate) const IDENTITY_PATH_ENV: &str = "IRONMEM_TEST_IDENTITY_PATH";
 
+    /// The variable a test sets to shorten the probe that
+    /// [`await_first_sample`] and [`DAEMON_SPAWNER`] start: seconds, as
+    /// `sleep` takes them. Unset, the probe lives 120 s.
+    #[cfg(unix)]
+    const PROBE_SECONDS_ENV: &str = "IRONMEM_TEST_PROBE_SECONDS";
+
+    /// The parent of the fake daemon in
+    /// `cleanup_leaves_a_shared_daemon_the_harness_autospawned_running`.
+    /// Its arguments are the daemon, its socket and its directory. It starts
+    /// the daemon in a session of its own, then a probe `sleep`, and stays
+    /// until the identity file records the probe, as [`await_first_sample`]
+    /// does. It waits for as long as the probe lives, since no sample can
+    /// record a probe that has ended, and exits 97 if none recorded it. An
+    /// identity file that is not there has not been written yet; any other
+    /// failure to read it ends the spawner with Python's own status, 1.
+    #[cfg(unix)]
+    const DAEMON_SPAWNER: &str = "import os, subprocess, sys, time\n\
+         daemon, socket, cwd = sys.argv[1:4]\n\
+         p = subprocess.Popen([daemon, 'serve', '--listen', socket], \
+         start_new_session=True, cwd=cwd)\n\
+         open('daemon.pid', 'w').write(str(p.pid))\n\
+         probe = subprocess.Popen(['sleep', \
+         os.environ.get('IRONMEM_TEST_PROBE_SECONDS', '120')])\n\
+         recorded = '\"pid\":%d,' % probe.pid\n\
+         sampled = False\n\
+         while probe.poll() is None:\n\
+         \x20   try:\n\
+         \x20       identity = open(os.environ['IRONMEM_TEST_IDENTITY_PATH']).read()\n\
+         \x20   except FileNotFoundError:\n\
+         \x20       identity = ''\n\
+         \x20   if recorded in identity:\n\
+         \x20       sampled = True\n\
+         \x20       break\n\
+         \x20   time.sleep(0.01)\n\
+         probe.kill()\n\
+         probe.wait()\n\
+         sys.exit(0 if sampled else 97)\n";
+
+    /// The stub's line that runs [`DAEMON_SPAWNER`]. A spawner that fails
+    /// ends the stub with its own exit status (97: no sample), not with one
+    /// code for every failure.
+    #[cfg(unix)]
+    fn daemon_spawner_line(spawner: &Path, daemon: &Path, socket: &Path, dir: &Path) -> String {
+        format!(
+            "'{}' '{}' '{}' '{}' '{}' || exit $?",
+            python3(),
+            spawner.display(),
+            daemon.display(),
+            socket.display(),
+            dir.display()
+        )
+    }
+
+    /// The exit code of `script`, run by `/bin/sh` in `dir` with a 0.2 s
+    /// probe and `identity` as its identity file, which nothing writes. Its
+    /// standard error goes to `stderr` in `dir`. Panics if the script is
+    /// still running 20 s later.
+    #[cfg(unix)]
+    fn give_up_code(script: &str, dir: &Path, identity: &Path) -> Option<i32> {
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", script])
+            .current_dir(dir)
+            .env(IDENTITY_PATH_ENV, identity)
+            .env(PROBE_SECONDS_ENV, "0.2")
+            .stderr(std::fs::File::create(dir.join("stderr")).unwrap())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                return status.code();
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("the wait was still going 20 s after its 0.2 s probe had ended");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// No sample can record a probe that has ended, so the wait ends when
+    /// its probe does, with 97.
+    #[cfg(unix)]
+    #[test]
+    fn the_wait_for_a_first_sample_ends_with_its_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = dir.path().join("never-written.json");
+        assert_eq!(
+            give_up_code(await_first_sample(), dir.path(), &identity),
+            Some(97)
+        );
+    }
+
+    /// The spawner's wait ends with its probe too, and the stub that ran it
+    /// ends with the spawner's own 97, so a missing sample reads as one.
+    #[cfg(unix)]
+    #[test]
+    fn the_daemon_spawner_gives_up_with_its_probe_and_its_stub_reports_97() {
+        let dir = tempfile::tempdir().unwrap();
+        let spawner = dir.path().join("spawn-daemon.py");
+        std::fs::write(&spawner, DAEMON_SPAWNER).unwrap();
+        let line = daemon_spawner_line(
+            &spawner,
+            Path::new("true"),
+            &dir.path().join("unused.sock"),
+            dir.path(),
+        );
+        let identity = dir.path().join("never-written.json");
+        assert_eq!(give_up_code(&line, dir.path(), &identity), Some(97));
+    }
+
+    /// Only an identity file that is not there yet reads as no sample so
+    /// far. One the spawner cannot read is the spawner's failure, not a
+    /// missing sample: here it is a directory, and the stub ends with
+    /// Python's 1 for the error, not with 97.
+    #[cfg(unix)]
+    #[test]
+    fn the_daemon_spawner_fails_on_an_identity_file_it_cannot_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let spawner = dir.path().join("spawn-daemon.py");
+        std::fs::write(&spawner, DAEMON_SPAWNER).unwrap();
+        let line = daemon_spawner_line(
+            &spawner,
+            Path::new("true"),
+            &dir.path().join("unused.sock"),
+            dir.path(),
+        );
+        let code = give_up_code(&line, dir.path(), dir.path());
+        let stderr = std::fs::read_to_string(dir.path().join("stderr")).unwrap();
+        assert_eq!(code, Some(1), "{stderr}");
+        assert!(stderr.contains("IsADirectoryError"), "{stderr}");
+    }
+
     /// Shell for a stub that goes on only once the supervisor has sampled
     /// it, as any real harness outlives that sample: it starts a probe
     /// `sleep`, waits until the identity file records the probe as an
     /// enrolled descendant (which takes a sample that saw the root), then
     /// kills it. A signal from the tracker itself, not a guess at how long
-    /// a sample takes under load. Exits 97 if it never comes. The probe
-    /// sleeps for longer than the wait (6000 turns of at least 10 ms), so
-    /// it is there to be recorded for all of it.
+    /// a sample takes under load. The wait lasts as long as the probe does
+    /// (120 s, or `IRONMEM_TEST_PROBE_SECONDS`), since no sample can record
+    /// a probe that has ended. Exits 97 if none recorded it. A test that
+    /// supervises the stub gives its run a ceiling (3 to 20 s) shorter than
+    /// the probe's 120 s, so there the ceiling ends a run no sample
+    /// recorded, and 97 is seen only where the probe is shortened.
     pub(crate) fn await_first_sample() -> &'static str {
-        "sleep 120 & probe=$!\n\
+        "sleep ${IRONMEM_TEST_PROBE_SECONDS:-120} & probe=$!\n\
          sampled=0\n\
-         for _ in $(seq 1 6000); do\n\
+         while kill -0 $probe 2>/dev/null; do\n\
          if grep -q \"\\\"pid\\\":$probe,\" \"$IRONMEM_TEST_IDENTITY_PATH\" 2>/dev/null; \
          then sampled=1; break; fi\n\
          sleep 0.01\n\
@@ -4354,45 +4491,17 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
             // one: it starts a probe child after the daemon and waits for
             // the identity file to record the probe, as
             // `await_first_sample` does. A sample that shows the probe was
-            // taken after the daemon started and shows the daemon too. A
-            // fixed sleep here was a guess at how long a sample takes, and
-            // a loaded machine took longer. Exits 97 if no sample comes in
-            // 60 s; the probe sleeps for longer than that, so it is there to
-            // be recorded for the whole wait.
+            // taken after the daemon started and shows the daemon too. The
+            // spawner would wait for as long as its probe lives
+            // (`DAEMON_SPAWNER`), which is longer than this invocation's
+            // 10 s ceiling: with no sample, the ceiling ends the run first.
             let spawner = daemon_dir.join("spawn-daemon.py");
-            std::fs::write(
-                &spawner,
-                "import os, subprocess, sys, time\n\
-                 daemon, socket, cwd = sys.argv[1:4]\n\
-                 p = subprocess.Popen([daemon, 'serve', '--listen', socket], \
-                 start_new_session=True, cwd=cwd)\n\
-                 open('daemon.pid', 'w').write(str(p.pid))\n\
-                 probe = subprocess.Popen(['sleep', '120'])\n\
-                 recorded = '\"pid\":%d,' % probe.pid\n\
-                 sampled = False\n\
-                 for _ in range(6000):\n\
-                 \x20   try:\n\
-                 \x20       identity = open(os.environ['IRONMEM_TEST_IDENTITY_PATH']).read()\n\
-                 \x20   except OSError:\n\
-                 \x20       identity = ''\n\
-                 \x20   if recorded in identity:\n\
-                 \x20       sampled = True\n\
-                 \x20       break\n\
-                 \x20   time.sleep(0.01)\n\
-                 probe.kill()\n\
-                 probe.wait()\n\
-                 sys.exit(0 if sampled else 97)\n",
-            )
-            .unwrap();
+            std::fs::write(&spawner, DAEMON_SPAWNER).unwrap();
             let bin = binary(
                 dir.path(),
                 &observable(&format!(
-                    "'{}' '{}' '{}' '{}' '{}' || exit 5\necho journal",
-                    python3(),
-                    spawner.display(),
-                    daemon.display(),
-                    socket.display(),
-                    daemon_dir.display()
+                    "{}\necho journal",
+                    daemon_spawner_line(&spawner, &daemon, &socket, &daemon_dir)
                 )),
             );
             let result = run_supervised_bounded_with(

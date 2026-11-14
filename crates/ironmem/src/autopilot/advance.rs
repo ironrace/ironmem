@@ -2526,7 +2526,7 @@ mod tests {
             result.merge.unwrap().outcome,
             merge::MergeOutcome::Held(_)
         ));
-        super::super::issue_lock::lock_for_run(repo.path(), &issue()).unwrap();
+        drop(super::super::issue_lock::lock_for_run(repo.path(), &issue()).unwrap());
     }
 
     #[test]
