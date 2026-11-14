@@ -177,15 +177,18 @@ pub const DEFAULT_MAX_REVIEW_ROUNDS: u32 = 3;
 ///   count nor ends it;
 /// - a judged review with no recorded head still counts as a round;
 /// - a `pass` ends the count;
-/// - a review recorded at or before `held_since` ends the count, so a
-///   re-labelled issue starts from zero.
+/// - a review written before `held_since` (a
+///   [`merge::RecordedMergeSummary::write_seq`]) ends the count, so a
+///   re-labelled issue starts from zero. Write order, not `recorded_at`:
+///   the wall clock can step backwards between the hold and the next
+///   review (#406).
 ///
 /// Pure, so the counting rule is tested without a database.
 pub(crate) fn consecutive_needs_changes<'a>(
     reviews: &'a [RecordedReviewSummary],
     canonical_issue: &str,
     pr_number: u64,
-    held_since: Option<&str>,
+    held_since: Option<i64>,
 ) -> Vec<&'a RecordedReviewSummary> {
     reviews
         .iter()
@@ -194,7 +197,7 @@ pub(crate) fn consecutive_needs_changes<'a>(
         .filter(|r| r.judged())
         .take_while(|r| {
             r.verdict == Some(ReviewVerdict::NeedsChanges)
-                && held_since.is_none_or(|held| r.recorded_at.as_str() > held)
+                && held_since.is_none_or(|held| r.write_seq > held)
         })
         .collect()
 }
@@ -229,7 +232,7 @@ pub fn review_rounds(
                 && !m.dry_run
                 && m.outcome.hold().is_some_and(MergeHold::is_round_limit)
         })
-        .map(|m| m.recorded_at.as_str())
+        .map(|m| m.write_seq)
         .max();
     let reviews = review::reviews_for_issue(db, issue)?;
     Ok(
@@ -1411,7 +1414,16 @@ unbounded reason grows each dispatch's input cost without limit"
 
     // ── #404: the review-round limit ────────────────────────────────────
 
-    /// One stored review row for PR 12, as `reviews_for_issue` returns it.
+    /// The write position a label like `t3` stands for: 3.
+    fn seq(label: &str) -> i64 {
+        label
+            .trim_start_matches('t')
+            .parse()
+            .expect("labels are t<number>")
+    }
+
+    /// One stored review row for PR 12, as `reviews_for_issue` returns it,
+    /// written at position `seq(recorded_at)`.
     fn row(
         verdict: Option<ReviewVerdict>,
         process_success: bool,
@@ -1430,6 +1442,7 @@ unbounded reason grows each dispatch's input cost without limit"
             round: None,
             process_success,
             recorded_at: recorded_at.into(),
+            write_seq: seq(recorded_at),
         }
     }
 
@@ -1479,7 +1492,7 @@ unbounded reason grows each dispatch's input cost without limit"
     fn only_reviews_recorded_after_the_hold_are_counted() {
         let reviews = vec![needs("t1"), needs("t2"), needs("t3")];
         let canonical = issue().canonical();
-        let rounds = consecutive_needs_changes(&reviews, &canonical, 12, Some("t2"));
+        let rounds = consecutive_needs_changes(&reviews, &canonical, 12, Some(seq("t2")));
         assert_eq!(times(&rounds), ["t3"]);
     }
 
@@ -1495,9 +1508,10 @@ unbounded reason grows each dispatch's input cost without limit"
         assert_eq!(times(&rounds), ["t2", "t1"]);
     }
 
-    /// Record one judged `needs_changes` review of PR 12 at `head`.
-    fn record_needs_changes(db: &Database, head: &str) {
-        record_review(
+    /// Record one judged `needs_changes` review of PR 12 at `head`, and
+    /// return its drawer id.
+    fn record_needs_changes(db: &Database, head: &str) -> String {
+        let recorded = record_review(
             db,
             &ReviewRecord {
                 issue: issue(),
@@ -1519,8 +1533,10 @@ unbounded reason grows each dispatch's input cost without limit"
             },
         )
         .unwrap();
-        // `recorded_at` orders the rows; keep two records out of one tick.
+        // Write order, not `recorded_at`, orders the rows (#406); the pause
+        // only keeps the display timestamps distinct.
         std::thread::sleep(std::time::Duration::from_millis(5));
+        recorded.drawer_id
     }
 
     /// Record the round-limit hold for PR 12, real or rehearsed.
@@ -1732,6 +1748,34 @@ unbounded reason grows each dispatch's input cost without limit"
             matches!(arm_limited(&db, HEAD, 5, 3), ArmOutcome::Armed { .. }),
             "a re-labelled issue starts again from zero"
         );
+    }
+
+    #[test]
+    fn a_round_written_after_the_hold_counts_even_when_its_clock_says_before() {
+        // #406: the hold resets the count by write order. A clock stepped
+        // back between the hold and the next review stamps that review
+        // earlier than the hold, and comparing `recorded_at` would drop it.
+        let db = db();
+        succeeded(&db, 1, Some(HEAD));
+        for _ in 0..3 {
+            record_needs_changes(&db, HEAD);
+        }
+        record_round_hold(&db, false);
+        assert_eq!(review_rounds(&db, &issue(), 12).unwrap().len(), 0);
+
+        let after_the_hold = record_needs_changes(&db, OTHER_HEAD);
+        crate::autopilot::review::restamp_review_for_test(
+            &db,
+            &after_the_hold,
+            "2000-01-01T00:00:00+00:00",
+        );
+
+        let rounds = review_rounds(&db, &issue(), 12).unwrap();
+        assert_eq!(
+            times(&rounds.iter().collect::<Vec<_>>()),
+            ["2000-01-01T00:00:00+00:00"]
+        );
+        assert_eq!(rounds[0].head_sha.as_deref(), Some(OTHER_HEAD));
     }
 
     #[test]

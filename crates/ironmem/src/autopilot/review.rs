@@ -1293,7 +1293,21 @@ pub struct RecordedReviewSummary {
     #[serde(default)]
     pub round: Option<ReviewRound>,
     pub process_success: bool,
+    /// When the review was recorded, by the wall clock. **For display
+    /// only**: a clock that steps backwards between two reviews stamps the
+    /// later one earlier, so this says nothing reliable about which came
+    /// last. [`Self::write_seq`] does (#406).
     pub recorded_at: String,
+    /// The review's position in the order reviews (and merge records) were
+    /// written: the `rowid` of its `has_review` edge, from
+    /// [`KnowledgeGraph::query_entity_current_with_predicate_in_write_order`].
+    /// [`reviews_for_issue`] orders on it, and it compares with
+    /// [`super::merge::RecordedMergeSummary::write_seq`], which is taken from
+    /// the same table. Read back, never stored, so a review recorded before
+    /// #406 has one too. Defaulted only so a summary deserialized from
+    /// elsewhere still parses; storage always supplies it.
+    #[serde(default)]
+    pub write_seq: i64,
 }
 
 impl RecordedReviewSummary {
@@ -1309,6 +1323,13 @@ impl RecordedReviewSummary {
 
 /// Every recorded review for an issue, oldest first.
 ///
+/// "Oldest" means first *written*, not earliest `recorded_at` (#406). The
+/// timestamp is the wall clock, and every caller takes the last element as
+/// the newest review — the one the merge decision reads, the head a later
+/// round diffs from — so a backward clock step, or two reviews stamped with
+/// the same instant, must not reorder them. The order is
+/// [`RecordedReviewSummary::write_seq`].
+///
 /// This is the review half of the spec's "exact issue→attempt traversal":
 /// semantic `search` cannot reliably enumerate an issue's records, so
 /// [`record_review`] writes a `has_review` edge and this walks it. Without
@@ -1323,7 +1344,7 @@ pub fn reviews_for_issue(
     issue: &IssueRef,
 ) -> Result<Vec<RecordedReviewSummary>, MemoryError> {
     let mut records = Vec::new();
-    for (_, body) in review_bodies(db, issue)? {
+    for (write_seq, _, body) in review_bodies(db, issue)? {
         records.push(RecordedReviewSummary {
             issue: body.issue,
             pr_number: body.pr_number,
@@ -1337,18 +1358,23 @@ pub fn reviews_for_issue(
             round: body.round,
             process_success: body.process_success,
             recorded_at: body.recorded_at,
+            write_seq,
         });
     }
-    records.sort_by(|a, b| a.recorded_at.cmp(&b.recorded_at));
+    // The query hands the rows back newest-written first. Every rowid is
+    // distinct, so this order is total.
+    records.sort_by_key(|r| r.write_seq);
     Ok(records)
 }
 
 /// Every stored review body hanging off `issue`'s `has_review` edges, with
-/// the id of the drawer it is stored in, in no particular order.
+/// its `write_seq` (the `rowid` of that edge, #406) and the id of the drawer
+/// it is stored in. Newest-written first, as the query returns them: callers
+/// that need an order sort on the `write_seq`.
 fn review_bodies(
     db: &Database,
     issue: &IssueRef,
-) -> Result<Vec<(String, ReviewBody)>, MemoryError> {
+) -> Result<Vec<(i64, String, ReviewBody)>, MemoryError> {
     let kg = KnowledgeGraph::new(db);
     let entity = match kg.resolve_entity(&issue.entity_name(), Some(ISSUE_ENTITY_TYPE)) {
         Ok(entity) => entity,
@@ -1356,10 +1382,13 @@ fn review_bodies(
         Err(other) => return Err(other),
     };
 
-    let triples =
-        kg.query_entity_current_with_predicate(&entity.id, HAS_REVIEW_PREDICATE, MAX_ISSUE_EDGES)?;
+    let triples = kg.query_entity_current_with_predicate_in_write_order(
+        &entity.id,
+        HAS_REVIEW_PREDICATE,
+        MAX_ISSUE_EDGES,
+    )?;
     let mut bodies = Vec::new();
-    for triple in triples {
+    for (write_seq, triple) in triples {
         // `triple.object` is the *entity* id, not the drawer id stored as
         // that entity's `name` — the same indirection
         // `lineage::attempts_for_issue` documents.
@@ -1370,7 +1399,7 @@ fn review_bodies(
             continue;
         };
         let body: ReviewBody = serde_json::from_str(&drawer.content)?;
-        bodies.push((drawer.id, body));
+        bodies.push((write_seq, drawer.id, body));
     }
     Ok(bodies)
 }
@@ -1405,7 +1434,7 @@ pub(crate) fn unposted_follow_ups(
 ) -> Result<Vec<UnpostedFollowUp>, MemoryError> {
     let canonical = issue.canonical();
     let mut owed = Vec::new();
-    for (drawer_id, body) in review_bodies(db, issue)? {
+    for (write_seq, drawer_id, body) in review_bodies(db, issue)? {
         let of_this_head = body
             .head_sha
             .as_deref()
@@ -1429,7 +1458,7 @@ pub(crate) fn unposted_follow_ups(
             continue;
         }
         owed.push((
-            body.recorded_at,
+            write_seq,
             UnpostedFollowUp {
                 review_drawer_id: drawer_id,
                 text,
@@ -1437,7 +1466,9 @@ pub(crate) fn unposted_follow_ups(
             },
         ));
     }
-    owed.sort_by(|a, b| a.0.cmp(&b.0));
+    // By write, not by `recorded_at`: the wall clock can step backwards
+    // between two reviews (#406). Every `write_seq` is distinct.
+    owed.sort_by_key(|(write_seq, _)| *write_seq);
     Ok(owed.into_iter().map(|(_, owed)| owed).collect())
 }
 
@@ -1463,6 +1494,25 @@ pub(crate) fn record_follow_up_posted(
 /// Whether [`record_follow_up_posted`] has been written for this review.
 pub(crate) fn follow_up_posted(db: &Database, review_drawer_id: &str) -> Result<bool, MemoryError> {
     Ok(super::read_current(db, &follow_up_posted_key(review_drawer_id))?.is_some())
+}
+
+/// Overwrite a stored review's `recorded_at`, and its edge's
+/// `extracted_at`, with `at`: what a review written under a clock that
+/// said `at` would have stored. The drawer id is unchanged, so the edge
+/// still reaches it. Test-only (#406): there is no other way to make a
+/// clock step backwards between two writes.
+#[cfg(test)]
+pub(crate) fn restamp_review_for_test(db: &Database, drawer_id: &str, at: &str) {
+    let drawer = db.get_drawer(drawer_id).unwrap().expect("drawer exists");
+    let mut body: serde_json::Value = serde_json::from_str(&drawer.content).unwrap();
+    body["recorded_at"] = serde_json::Value::String(at.to_string());
+    let content = serde_json::to_string(&body).unwrap().replace('\'', "''");
+    db.exec_raw(&format!(
+        "UPDATE drawers SET content = '{content}' WHERE id = '{drawer_id}';
+         UPDATE triples SET extracted_at = '{at}'
+         WHERE object IN (SELECT id FROM entities WHERE name = '{drawer_id}');"
+    ))
+    .unwrap();
 }
 
 /// How [`review_pr`] runs the reviewer.
@@ -3980,6 +4030,31 @@ not json at all
     }
 
     #[test]
+    fn owed_follow_ups_come_back_in_write_order_when_the_clock_stepped_back() {
+        // #406 meets #408: "oldest review first" is first written, not
+        // earliest `recorded_at`, so a clock that stepped backwards between
+        // two reviews does not post their follow-ups out of order.
+        let db = Database::open_in_memory().unwrap();
+        let issue = IssueRef::new("ironrace/ironmem", 283);
+        let head = "ab".repeat(20);
+        let with = |follow_up: &str| {
+            let mut record = sample_record(&issue, "fine");
+            record.head_sha = Some(head.clone());
+            record.outcome.follow_up = Some(follow_up.into());
+            record
+        };
+        let first = record_review(&db, &with("first")).unwrap();
+        let second = record_review(&db, &with("second")).unwrap();
+        restamp_review_for_test(&db, &first.drawer_id, "2026-01-02T00:00:00+00:00");
+        restamp_review_for_test(&db, &second.drawer_id, "2026-01-01T00:00:00+00:00");
+
+        assert_eq!(
+            owed_ids(&db, &issue, 322, &head),
+            [first.drawer_id, second.drawer_id]
+        );
+    }
+
+    #[test]
     fn only_a_judged_non_blank_follow_up_of_this_pr_at_this_head_is_owed() {
         let db = Database::open_in_memory().unwrap();
         let issue = IssueRef::new("ironrace/ironmem", 283);
@@ -6038,6 +6113,82 @@ not json at all
             one.summary().contains("1 consecutive round "),
             "{}",
             one.summary()
+        );
+    }
+
+    // ── #406: reviews are ordered by write, not by the wall clock ───────
+
+    /// Record two judged reviews of PR 322 and stamp them `first_at` and
+    /// `second_at`. The first read `0…0` against `develop`, the second read
+    /// `1…1` against `main`, so a reader that takes the wrong one as the
+    /// newest is told apart by its head or its base.
+    fn two_reviews_stamped(db: &Database, issue: &IssueRef, first_at: &str, second_at: &str) {
+        let mut first = sample_record(issue, "first written");
+        first.head_sha = Some("0".repeat(40));
+        first.base_branch = Some("develop".into());
+        let mut second = sample_record(issue, "second written");
+        second.head_sha = Some("1".repeat(40));
+        second.base_branch = Some("main".into());
+        let first = record_review(db, &first).unwrap();
+        let second = record_review(db, &second).unwrap();
+        restamp_review_for_test(db, &first.drawer_id, first_at);
+        restamp_review_for_test(db, &second.drawer_id, second_at);
+    }
+
+    /// The acceptance of #406 for one pair of stamps: `reviews_for_issue`
+    /// returns the pair in write order, and both readers that take "the
+    /// last one" take the review written second.
+    fn assert_the_second_written_is_the_newest(first_at: &str, second_at: &str) {
+        let db = Database::open_in_memory().unwrap();
+        let issue = IssueRef::new("ironrace/ironmem", 406);
+        two_reviews_stamped(&db, &issue, first_at, second_at);
+
+        let reviews = reviews_for_issue(&db, &issue).unwrap();
+        let read: Vec<(Option<&str>, &str)> = reviews
+            .iter()
+            .map(|r| (r.reason.as_deref(), r.recorded_at.as_str()))
+            .collect();
+        // Write order, carrying the stamps the restamp gave them: the test
+        // is about these values, not whatever the clock said.
+        assert_eq!(
+            read,
+            [
+                (Some("first written"), first_at),
+                (Some("second written"), second_at)
+            ]
+        );
+        assert!(reviews[0].write_seq < reviews[1].write_seq);
+
+        let latest = super::super::merge::latest_review_for_pr(&db, &issue, 322)
+            .unwrap()
+            .expect("a review of PR 322");
+        assert_eq!(latest.reason.as_deref(), Some("second written"));
+        assert_eq!(latest.head_sha.as_deref(), Some("1".repeat(40).as_str()));
+
+        // The request reads the second review's head against its base. Had
+        // the first been taken as the newest, its `develop` base would make
+        // this `BaseChangedSinceLastJudged`.
+        let gates: Vec<String> = Vec::new();
+        let dir = tempfile::tempdir().unwrap();
+        let mut request = sample_request(&issue, &gates, dir.path());
+        request.base_branch = "main";
+        let context = later_round_context(&db, &request, Some(&"1".repeat(40))).unwrap();
+        assert_eq!(context.err(), Some(WholePrReason::SameHeadAsLastJudged));
+    }
+
+    #[test]
+    fn a_review_written_after_a_backward_clock_step_is_still_the_newest() {
+        assert_the_second_written_is_the_newest(
+            "2026-11-14T12:00:00+00:00",
+            "2026-11-14T11:00:00+00:00",
+        );
+    }
+
+    #[test]
+    fn two_reviews_stamped_with_the_same_instant_come_back_in_write_order() {
+        assert_the_second_written_is_the_newest(
+            "2026-11-14T12:00:00.000000000+00:00",
+            "2026-11-14T12:00:00.000000000+00:00",
         );
     }
 }

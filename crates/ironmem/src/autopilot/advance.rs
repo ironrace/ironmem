@@ -749,7 +749,7 @@ pub fn next_step(
                         .as_deref()
                         .is_some_and(|sha| sha.eq_ignore_ascii_case(&pr.head_sha))
             })
-            .map(|m| m.recorded_at.as_str())
+            .map(|m| m.write_seq)
             .max();
         let consecutive_failures = review::reviews_for_issue(db, &candidate.issue)?
             .iter()
@@ -760,7 +760,7 @@ pub fn next_step(
                     && r.head_sha
                         .as_deref()
                         .is_some_and(|sha| sha.eq_ignore_ascii_case(&pr.head_sha))
-                    && held_since.is_none_or(|held| r.recorded_at.as_str() > held)
+                    && held_since.is_none_or(|held| r.write_seq > held)
             })
             .count();
         if consecutive_failures >= attempt_cap.max(1) as usize {
@@ -5065,7 +5065,7 @@ skipped: {:?}",
         head_sha: &str,
         base_branch: &str,
         outcome: ReviewOutcome,
-    ) {
+    ) -> String {
         review::record_review(
             db,
             &review::ReviewRecord {
@@ -5081,7 +5081,8 @@ skipped: {:?}",
                 round: None,
             },
         )
-        .unwrap();
+        .unwrap()
+        .drawer_id
     }
 
     fn failed_review_outcome() -> ReviewOutcome {
@@ -5343,6 +5344,45 @@ skipped: {:?}",
         assert!(
             matches!(step, AdvanceStep::Review { .. }),
             "a held cap must release the head for retry, got {step:?}"
+        );
+    }
+
+    #[test]
+    fn failures_written_after_the_hold_count_even_when_their_clock_says_before() {
+        // #406: the streak restarts at the hold by write order. Three
+        // failures written after the hold under a clock stepped back are
+        // stamped before it; a `recorded_at` comparison would count none of
+        // them and bill a fourth review instead of holding.
+        let db = approved_db();
+        let (repo, roots) = checkout_with_worktree();
+        let mut candidate = candidate();
+        candidate.repo_path = repo.path().to_path_buf();
+        for _ in 0..3 {
+            record_review_with(&db, &issue(), 322, GREEN, "main", failed_review_outcome());
+        }
+        merge::record_merge(
+            &db,
+            &merge::MergeRecord {
+                issue: issue(),
+                pr_number: 322,
+                gate_green: true,
+                dry_run: false,
+                outcome: MergeOutcome::Held(merge::MergeHold::NotReviewed),
+                base_branch: Some("main".into()),
+                head_sha: Some(GREEN.into()),
+            },
+        )
+        .unwrap();
+        for _ in 0..3 {
+            let after_the_hold =
+                record_review_with(&db, &issue(), 322, GREEN, "main", failed_review_outcome());
+            review::restamp_review_for_test(&db, &after_the_hold, "2000-01-01T00:00:00+00:00");
+        }
+
+        let step = next_step(&db, &candidate, &found(322, GREEN), roots.path(), 3).unwrap();
+        assert!(
+            matches!(step, AdvanceStep::Merge { .. }),
+            "three failures since the hold reach the cap, got {step:?}"
         );
     }
 
