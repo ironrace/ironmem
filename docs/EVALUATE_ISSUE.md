@@ -111,7 +111,7 @@ Goal: a rough estimate of how much code the issue touches.
 
 Keep this to a handful of searches. If the issue is purely prose (docs,
 process, a question), the scan may legitimately find nothing — that is a
-signal in itself (usually DIRECT, or AUTOPILOT in an onboarded repo).
+signal in itself (usually DIRECT, or AUTOPILOT in a repo meeting rule 1's prerequisites).
 
 ## Step 3 — Score the six signals
 
@@ -163,7 +163,8 @@ discarding scope.
 Choose when **all** hold:
 
 - the issue's repo has an approved gate config, all three `agent:*` labels,
-  and the `risk:<expected class>` label (Step 2, item 4)
+  and the `risk:<expected class>` label (Step 2, item 4), and the issue
+  (Step 1 labels) carries no `risk:*` label other than `risk:<expected class>`
 - the expected diff falls inside Autopilot's auto-merge envelope.
   AUTOPILOT auto-merges only these classes: `documentation`, `dependency_bump`, `mechanical_rename`, `test_only`.
 - an implementer holding only the issue body can finish it: no open question
@@ -186,7 +187,9 @@ the command that supplies it, then continue down the table:
 - agent labels missing → `ironmem autopilot labels <owner>/<repo>`
 - `risk:<expected class>` label missing → `gh label create "risk:<expected class>" --repo <owner>/<repo>`
 
-Typical issues, in an onboarded repo: a docs fix, a dependency bump, a pure
+Autopilot merges under the issue's `risk:*` label: `decide_merge` holds the PR unless that label's class equals the class the reviewer derives from the diff, and the gate and the review must also pass.
+
+Typical issues, in a repo meeting rule 1's prerequisites: a docs fix, a dependency bump, a pure
 rename, a test-only coverage gap.
 
 ### 2. DIRECT — `/plan` + TDD
@@ -206,8 +209,7 @@ contained refactor, a single added test.
 Choose when **all** hold:
 
 - the issue's repo has an approved gate config (Step 2, item 4). The loop's
-  "done" is that config's `gate_commands`, so it cannot disagree with what CI
-  checks
+  "done" is that config's `gate_commands`, so it cannot disagree with the gate Autopilot itself approved
 - "done" is fully expressible as that gate passing with the work committed and pushed —
   no acceptance criterion needs a human's judgment to verify
 - the work is mechanical or high-volume — many files of one shape, data or
@@ -278,7 +280,7 @@ verdict when **all** hold:
   or more — so pricing the whole issue at phase 1's cost would overspend
 
 Otherwise the verdict stays single. There are never more than two phases, and
-phase 2 is always GOAL or AUTOPILOT. The task estimate counts both phases
+phase 2 is always GOAL or AUTOPILOT. For a phase-2 AUTOPILOT, the remainder gets its own new issue, so the printed steps start with a user-run `gh issue create --repo <owner>/<repo> --title "<remainder title>" --body "<remainder scope; cites phase 1's PR>"`; the label step, `lead` and `advance` then target that new issue's number, not the parent's, and rule 1's "implementer holding only the issue body" test is applied to that new issue's body. The task estimate counts both phases
 together, and the SPLIT ceiling applies to that sum. Acceptance criteria no
 gate can check (a native-speaker review, a go-live sign-off) belong to neither
 phase: list them under *Why* as human follow-ups rather than letting them
@@ -318,6 +320,12 @@ Recommended path:
   1. <phase 1 command>
   2. (after phase 1 merges) <phase 2 command>
 
+and number the recommended review the same way:
+
+Recommended review:
+  1. <phase 1 tier review>
+  2. <phase 2 review — Autopilot's own reviewer for AUTOPILOT, the tier review for GOAL>
+
 For a `SPLIT` verdict, insert before the confirmation line:
 
 Child issues:
@@ -334,10 +342,11 @@ The confirmation line depends on the verdict:
 - a two-phase verdict: `Proceed with phase 1? [y/N]`
 - GOAL or AUTOPILOT alone: no question. End with `The router never launches GOAL or AUTOPILOT — run the command above yourself.`
 
-Then **wait for the user**. On an explicit yes, invoke the recommended path.
+For GOAL or AUTOPILOT alone, stop after printing; otherwise **wait for the user**. On an explicit yes, invoke the recommended path.
 On a yes to a two-phase verdict, invoke phase 1 only; the phase-2 command is
-for the user to run after phase 1's PR merges, and its prerequisites should
-be re-read then. The router never launches GOAL or AUTOPILOT, at any phase.
+for the user to run after phase 1's PR merges: after phase 1 merges, the user
+reruns `/evaluate-issue <number>` to re-check phase 2's prerequisites and
+regenerate its command. The router never launches GOAL or AUTOPILOT, at any phase.
 For `SPLIT`, create the proposed child GitHub issues only when the issue repo
 matches the local checkout. Preserve relevant parent labels, include
 `Parent: #<number>` in each child body, and add their links in one comment on
@@ -363,9 +372,9 @@ invoked differ per host.
 
 | Verdict | Claude | Codex |
 |---|---|---|
-| AUTOPILOT | nothing to invoke; print, for the user to run, in order: (1) `gh issue edit <number> --repo <owner>/<repo> --add-label agent:ready --add-label risk:<expected class>` — applying these labels is the user's authorization, and the router never applies them; (2) `ironmem autopilot lead --repo <owner>/<repo>=<checkout>`, which dispatches from `agent:ready`; (3) `ironmem autopilot advance --repo <owner>/<repo>=<checkout> --reviewer codex` (adding `--merge` executes the merge that is otherwise rehearsed) | the same commands, printed for the user |
+| AUTOPILOT | nothing to invoke; print, for the user to run, in order: (1) for a phase-2 AUTOPILOT only, `gh issue create --repo <owner>/<repo> --title "<remainder title>" --body "<remainder scope; cites phase 1's PR>"`, whose new issue number is the `<number>` in every later step; (2) `gh issue edit <number> --repo <owner>/<repo> --add-label agent:ready --add-label "risk:<expected class>"` (add `--remove-label "risk:<other>"` if the issue carries a conflicting `risk:*` label) — applying these labels is the user's authorization, and the router never applies them; (3) `ironmem autopilot lead --repo <owner>/<repo>=<checkout>`, which dispatches the next `agent:ready` issue by `priority:*` (one per tick by default; rerun it if another queued issue goes first); (4) `ironmem autopilot advance --repo <owner>/<repo>=<checkout> --reviewer codex` once that dispatch has opened its PR (adding `--merge` executes the merge that is otherwise rehearsed) | the same commands, printed for the user |
 | DIRECT | `/plan` to scope, then the `iron-tdd` skill | the `iron-tdd` skill directly |
-| GOAL | print, for the user to run from a fresh worktree on a feature branch: `claude -p '/goal <condition> or stop after <N> turns'`, the user opens the PR after the loop ends; a human reviews and merges it. | the same command, for the user to run in a terminal — `/goal` is a Claude Code command — the user opens the PR after the loop ends; a human reviews and merges it. |
+| GOAL | print, for the user to run from a fresh worktree on a feature branch: `claude -p '/goal <condition> or stop after <N> turns'`. When the loop ends, the user opens the PR, and a human reviews and merges it. | the same command, for the user to run in a terminal (`/goal` is a Claude Code command). When the loop ends, the user opens the PR, and a human reviews and merges it. |
 | IRON | invoke the `iron-plan` skill on the issue spec (flows into `iron-build`) | invoke the `iron-plan` skill |
 | COLLAB | `/collab start <one-line task summary derived from the issue>` | `/collab` is Claude-driven: recommend the user run `/collab start <task>` in a Claude terminal (Codex joins via the protocol) |
 | SPLIT | create the confirmed child issues, then re-run `/evaluate-issue` for each child | create the confirmed child issues, then re-run `/evaluate-issue` for each child |
@@ -377,13 +386,17 @@ the whole issue body into the command.
 For the GOAL condition, write
 `<one-line imperative task summary>, for issue #<number>. Done when this gate passes: <gate_commands joined with " && ">, and every change is committed and pushed on this branch`,
 using the `gate_commands` read in Step 2. Default `<N>` to `6`, Autopilot's
-own `DEFAULT_N_TURNS`. Keep the whole condition under 4,000 characters (the
-cutting budget Autopilot applies to its own conditions): summarize; never
+own `DEFAULT_N_TURNS`. Keep the whole condition under 4,000 characters (the `/goal`
+platform limit: a longer condition is refused and gets no turn; see
+`MAX_CONDITION_CHARS` in `crates/ironmem/src/autopilot/turn_prompt.rs`).
+The limit covers the whole argument after `/goal `, including
+`or stop after <N> turns`: summarize; never
 paste the issue body. For a phase-2 GOAL, name what phase 1 decided (its PR
 or approved plan) in the summary. The argument is single-quoted, so write any
 `'` inside it as `'\''`.
 
-The `risk:<expected class>` label is what Autopilot merges under: decide_merge holds the PR unless it equals the class the reviewer derives from the diff.
+A headless `claude -p` loop can edit, commit and push only if its permission mode or tool allowlist permits it: the user adds `--permission-mode <mode>` (choices in `claude --help`) or `--allowed-tools …` to the printed command; the router never chooses a permission mode.
+
 
 ## Review tiers
 
