@@ -11,8 +11,7 @@ use std::path::Path;
 use serde_json::Value;
 
 use super::hook_command::{
-    first_trusted, hook_mode, mode_label, runs_hook, source_label, ModeError, ModeResult,
-    ModeSource,
+    best_result, hook_mode, mode_label, runs_hook, source_label, ModeError, ModeResult, ModeSource,
 };
 use super::{Check, CheckStatus};
 use crate::config::McpAccessMode;
@@ -249,8 +248,10 @@ fn commands_for(doc: &Value, event: &str) -> Vec<String> {
         .collect()
 }
 
-/// Per-command results for `event`'s matching commands, best first: a trusted
-/// run if any, else the first command in settings order.
+/// The one mode result reported for `event`: each matching command's
+/// [`hook_mode`], reduced by [`best_result`] (a trusted run that doesn't
+/// depend on doctor's shell, else any trusted run, else the first command in
+/// settings order that doesn't fail to start, else the first command).
 fn event_mode(
     event: &str,
     commands: &[String],
@@ -262,19 +263,33 @@ fn event_mode(
         .iter()
         .map(|c| hook_mode(c, hook, settings_env, process_env))
         .collect();
-    first_trusted(&results)
-        .or_else(|| {
-            results
-                .iter()
-                .find(|r| !matches!(r.0, Err(ModeError::Invalid(_))))
-        })
-        .or_else(|| results.first())
-        .cloned()
-        .unwrap_or((Ok(McpAccessMode::ReadOnly), ModeSource::Default))
+    best_result(&results)
+}
+
+/// What is lost when `event`'s hook does not run.
+fn event_effect(event: &str) -> &'static str {
+    match event {
+        "SessionStart" => "no memory context at session start",
+        "UserPromptSubmit" => "prompt recall is off",
+        "Stop" => "no mining when a session stops",
+        "PreCompact" => "no mining before compaction",
+        _ => "unknown hook",
+    }
+}
+
+/// `event` exits at startup because `Config::load` rejects `error`'s mode.
+fn startup_failure(event: &str, error: &str, source: ModeSource) -> String {
+    format!(
+        "{event} fails to start: {error} ({}), so {}",
+        source_label(source),
+        event_effect(event)
+    )
 }
 
 /// Non-mining hooks (SessionStart, UserPromptSubmit) whose mode is invalid:
-/// `Config::load` fails, so they exit at startup and prompt recall is off.
+/// `Config::load` fails, so they exit at startup. Each entry names its own
+/// effect: no memory context at session start for SessionStart, prompt recall
+/// off for UserPromptSubmit.
 fn startup_failures(
     wired: &WiredHooks,
     settings_env: Option<&str>,
@@ -285,10 +300,7 @@ fn startup_failures(
         .filter(|(event, _)| !MINING_EVENTS.contains(event))
         .filter_map(|(event, commands)| {
             match event_mode(event, commands, settings_env, process_env) {
-                (Err(ModeError::Invalid(e)), source) => Some(format!(
-                    "{event} fails to start: {e} ({})",
-                    source_label(source)
-                )),
+                (Err(ModeError::Invalid(e)), source) => Some(startup_failure(event, &e, source)),
                 _ => None,
             }
         })
@@ -340,16 +352,7 @@ fn hooks_check(path: &Path, missing: &[&str], failures: &[String]) -> Check {
     let mut problems = Vec::new();
     let mut hints = Vec::new();
     if !missing.is_empty() {
-        let effects: Vec<&str> = missing
-            .iter()
-            .map(|event| match *event {
-                "SessionStart" => "no memory context at session start",
-                "UserPromptSubmit" => "prompt recall is off",
-                "Stop" => "no mining when a session stops",
-                "PreCompact" => "no mining before compaction",
-                _ => "unknown hook",
-            })
-            .collect();
+        let effects: Vec<&str> = missing.iter().map(|event| event_effect(event)).collect();
         problems.push(format!(
             "missing {} in {} ({})",
             missing.join(", "),
@@ -359,7 +362,7 @@ fn hooks_check(path: &Path, missing: &[&str], failures: &[String]) -> Check {
         hints.push(INSTALL_HINT);
     }
     if !failures.is_empty() {
-        problems.push(format!("{}; prompt recall is off", failures.join("; ")));
+        problems.push(failures.join("; "));
         hints.push(INVALID_MODE_HINT);
     }
     Check::new(
@@ -395,6 +398,7 @@ fn mining_check(
     let mut failing = Vec::new();
     let mut unknown = Vec::new();
     let mut from_shell = false;
+    let names: Vec<&str> = miners.iter().map(|(event, _)| *event).collect();
     for (event, commands) in miners {
         match event_mode(event, commands, settings_env, process_env) {
             (Ok(McpAccessMode::Trusted), source) => {
@@ -405,10 +409,9 @@ fn mining_check(
                 mode_label(mode),
                 source_label(source)
             )),
-            (Err(ModeError::Invalid(e)), source) => failing.push(format!(
-                "{event} fails to start: {e} ({})",
-                source_label(source)
-            )),
+            (Err(ModeError::Invalid(e)), source) => {
+                failing.push(startup_failure(event, &e, source));
+            }
             (Err(ModeError::Unknown(raw)), _) => unknown.push(format!(
                 "{event} mode cannot be determined statically (IRONMEM_MCP_MODE={raw})"
             )),
@@ -422,8 +425,7 @@ fn mining_check(
             "hook_mining",
             CheckStatus::Warn,
             format!(
-                "hooks cannot mine: {}. A hook with an invalid mode exits at startup, so it \
-                 neither recalls nor mines",
+                "hooks cannot mine: {}. A hook with an invalid IRONMEM_MCP_MODE exits at startup",
                 parts.join("; ")
             ),
         )
@@ -451,11 +453,17 @@ fn mining_check(
         )
         .with_hint(READ_ONLY_HINT);
     }
+    let subject = match names.as_slice() {
+        [one] => format!("{one} hook runs"),
+        many => format!("{} hooks run", many.join(" and ")),
+    };
     let summary = if from_shell {
-        "Stop/PreCompact hooks run trusted (inherited from IRONMEM_MCP_MODE in this shell; \
-         Claude Code must be launched with it): transcripts are mined"
+        format!(
+            "{subject} trusted (inherited from IRONMEM_MCP_MODE in this shell; \
+             Claude Code must be launched with it): transcripts are mined"
+        )
     } else {
-        "Stop/PreCompact hooks run trusted: transcripts are mined"
+        format!("{subject} trusted: transcripts are mined")
     };
     Check::new("hook_mining", CheckStatus::Ok, summary)
 }
@@ -696,11 +704,18 @@ mod tests {
         let c = claude_hook_checks(Some(home.path()), None);
         assert_eq!(c[1].status, CheckStatus::Warn);
         assert!(c[1].summary.contains("fails to start"), "{}", c[1].summary);
+        // Stop and PreCompact never recall, so only their mining effect is named.
         assert!(
-            c[1].summary.contains("neither recalls nor mines"),
+            c[1].summary.contains("no mining when a session stops"),
             "{}",
             c[1].summary
         );
+        assert!(
+            c[1].summary.contains("no mining before compaction"),
+            "{}",
+            c[1].summary
+        );
+        assert!(!c[1].summary.contains("recall"), "{}", c[1].summary);
         assert!(!c[1].summary.contains("skips mining"), "{}", c[1].summary);
         let hint = c[1].hint.as_deref().unwrap();
         assert!(hint.contains("trusted, read-only or restricted"), "{hint}");
@@ -915,6 +930,108 @@ mod tests {
             c[0].summary.contains("missing Stop, PreCompact"),
             "{}",
             c[0].summary
+        );
+    }
+
+    fn all_four_with(event: &str, prefix: &str) -> String {
+        let cmds: Vec<(&str, String)> = ALL_FOUR_BARE
+            .iter()
+            .map(|(e, c)| {
+                let c = if *e == event {
+                    format!("{prefix} {c}")
+                } else {
+                    (*c).to_string()
+                };
+                (*e, c)
+            })
+            .collect();
+        let refs: Vec<(&str, &str)> = cmds.iter().map(|(e, c)| (*e, c.as_str())).collect();
+        settings_with(&refs)
+    }
+
+    #[test]
+    fn an_invalid_session_start_names_its_own_effect_not_recall() {
+        let home = home_with_settings(&all_four_with("SessionStart", "IRONMEM_MCP_MODE=bogus"));
+        let c = claude_hook_checks(Some(home.path()), None);
+        let s = &c[0].summary;
+        assert_eq!(c[0].status, CheckStatus::Warn, "{s}");
+        assert!(s.contains("SessionStart fails to start"), "{s}");
+        assert!(s.contains("no memory context at session start"), "{s}");
+        assert!(!s.contains("prompt recall is off"), "{s}");
+    }
+
+    #[test]
+    fn an_invalid_user_prompt_submit_turns_recall_off() {
+        let home = home_with_settings(&all_four_with("UserPromptSubmit", "IRONMEM_MCP_MODE=bogus"));
+        let c = claude_hook_checks(Some(home.path()), None);
+        let s = &c[0].summary;
+        assert_eq!(c[0].status, CheckStatus::Warn, "{s}");
+        assert!(s.contains("UserPromptSubmit fails to start"), "{s}");
+        assert!(s.contains("prompt recall is off"), "{s}");
+        assert!(!s.contains("no memory context at session start"), "{s}");
+    }
+
+    #[test]
+    fn a_valid_command_is_reported_over_an_invalid_one_for_the_same_event() {
+        let doc = serde_json::json!({"hooks": {"Stop": [{"hooks": [
+            {"type": "command", "command": "IRONMEM_MCP_MODE=bogus ironmem hook stop"},
+            {"type": "command", "command": "ironmem hook stop"}
+        ]}]}});
+        let c = mining_of(&doc.to_string(), None);
+        assert_eq!(c.status, CheckStatus::Warn, "{}", c.summary);
+        assert!(c.summary.contains("Stop runs read-only"), "{}", c.summary);
+        assert!(!c.summary.contains("fails to start"), "{}", c.summary);
+    }
+
+    #[test]
+    fn a_trusted_command_that_needs_no_shell_beats_one_that_does() {
+        let doc = serde_json::json!({"hooks": {"Stop": [{"hooks": [
+            {"type": "command", "command": "ironmem hook stop"},
+            {"type": "command", "command": "IRONMEM_MCP_MODE=trusted ironmem hook stop"}
+        ]}]}});
+        let c = mining_of(&doc.to_string(), Some("trusted"));
+        assert_eq!(c.status, CheckStatus::Ok, "{}", c.summary);
+        assert!(!c.summary.contains("must be launched"), "{}", c.summary);
+    }
+
+    #[test]
+    fn plugin_with_an_invalid_settings_env_mode_fails_every_hook() {
+        let home = home_with_settings(&format!(
+            r#"{PLUGIN_ON}, "env": {{"IRONMEM_MCP_MODE": "bogus"}}}}"#
+        ));
+        let c = claude_hook_checks(Some(home.path()), None);
+        let s = &c[0].summary;
+        assert_eq!(c[0].status, CheckStatus::Warn, "{s}");
+        assert!(s.contains("SessionStart fails to start"), "{s}");
+        assert!(s.contains("UserPromptSubmit fails to start"), "{s}");
+        assert!(s.contains("prompt recall is off"), "{s}");
+        assert!(c[0]
+            .hint
+            .as_deref()
+            .unwrap()
+            .contains("trusted, read-only or restricted"));
+    }
+
+    #[test]
+    fn the_trusted_summary_names_only_the_wired_miners() {
+        let cmd = "IRONMEM_MCP_MODE=trusted ironmem hook stop";
+        let c = mining_of(&settings_with(&[("Stop", cmd)]), None);
+        assert_eq!(c.status, CheckStatus::Ok, "{}", c.summary);
+        assert!(
+            c.summary.starts_with("Stop hook runs trusted"),
+            "{}",
+            c.summary
+        );
+        assert!(!c.summary.contains("PreCompact"), "{}", c.summary);
+
+        let both = ALL_FOUR_BARE.map(|(e, c)| (e, format!("IRONMEM_MCP_MODE=trusted {c}")));
+        let refs: Vec<(&str, &str)> = both.iter().map(|(e, c)| (*e, c.as_str())).collect();
+        let c = mining_of(&settings_with(&refs), None);
+        assert!(
+            c.summary
+                .starts_with("Stop and PreCompact hooks run trusted"),
+            "{}",
+            c.summary
         );
     }
 

@@ -55,6 +55,7 @@ pub(super) fn mode_label(mode: McpAccessMode) -> &'static str {
         McpAccessMode::Restricted => "restricted",
     }
 }
+
 /// One word of a shell command after quote removal.
 #[derive(Debug, Clone)]
 struct Word {
@@ -110,10 +111,15 @@ impl Splitter {
 /// quotes group (a backslash escapes the next character), unquoted whitespace
 /// separates words, and unquoted `; & | ( )` and newlines end a simple
 /// command (so `&&`, `||` and glued forms like `stop&&true` split too). An
-/// unquoted word starting with `#` begins a comment. Redirections (`>`, `>>`,
-/// `<`, `2>`, `2>&1`, `stop>>/log`) are dropped together with their target.
-/// Not modelled: heredocs, here-strings, `$(..)` bodies, brace groups, `if`
-/// and `case`; those shapes are documented limits, not bugs.
+/// unquoted word starting with `#` begins a comment; a `#` inside a word is
+/// literal. Redirections (`>`, `>>`, `<`, `2>`, `2>&1`, `stop>>/log`) are
+/// dropped together with their target; only a word made entirely of digits is
+/// read as a file descriptor. An unquoted `$( .. )` (nested parens included,
+/// so `$(( .. ))` too) or `` ` .. ` `` is kept whole inside the current word
+/// and makes it dynamic; its body is not read. Not modelled: heredocs,
+/// here-strings, `$(..)` inside double quotes when the body itself holds a
+/// `"`, brace groups, `if` and `case`; those shapes are documented limits,
+/// not bugs.
 fn split_commands(input: &str) -> Vec<Vec<Word>> {
     let mut sp = Splitter::default();
     let mut chars = input.chars().peekable();
@@ -155,6 +161,11 @@ fn split_commands(input: &str) -> Vec<Vec<Word>> {
                 sp.in_word = true;
                 sp.dynamic = true;
                 sp.cur.push(c);
+                if c == '`' {
+                    read_backticks(&mut chars, &mut sp.cur);
+                } else if chars.peek() == Some(&'(') {
+                    read_parens(&mut chars, &mut sp.cur);
+                }
             }
             '#' if !sp.in_word => {
                 for n in chars.by_ref() {
@@ -188,6 +199,51 @@ fn split_commands(input: &str) -> Vec<Vec<Word>> {
     }
     sp.end_command();
     sp.commands
+}
+
+type Chars<'a> = std::iter::Peekable<std::str::Chars<'a>>;
+
+/// Copy a backtick substitution body and its closing backtick into `cur`.
+fn read_backticks(chars: &mut Chars<'_>, cur: &mut String) {
+    while let Some(c) = chars.next() {
+        cur.push(c);
+        match c {
+            '`' => return,
+            '\\' => cur.extend(chars.next()),
+            _ => {}
+        }
+    }
+}
+
+/// Copy a `( .. )` span (the `$` is already in `cur`) into `cur`, up to the
+/// paren that closes the first one. Quoted parens don't count.
+fn read_parens(chars: &mut Chars<'_>, cur: &mut String) {
+    let mut depth = 0usize;
+    while let Some(c) = chars.next() {
+        cur.push(c);
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return;
+                }
+            }
+            '\\' => cur.extend(chars.next()),
+            '\'' | '"' => {
+                while let Some(q) = chars.next() {
+                    cur.push(q);
+                    if q == c {
+                        break;
+                    }
+                    if q == '\\' && c == '"' {
+                        cur.extend(chars.next());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 fn basename(token: &str) -> &str {
@@ -245,15 +301,24 @@ fn hook_after_subcommand(args: &[Word]) -> Option<&str> {
     args.get(at).map(|w| w.text.as_str())
 }
 
+/// `env` options whose argument is the next word.
+const ENV_ARG_FLAGS: [&str; 4] = ["-u", "--unset", "-C", "--chdir"];
+
+/// `bash`/`sh` options whose argument is the next word.
+const SHELL_ARG_FLAGS: [&str; 4] = ["-o", "+o", "-O", "+O"];
+
 /// Consume leading assignment words (and, for `env`, option flags) from `rest`.
-fn take_assignments(rest: &mut &[Word], inline: &mut Option<ModeValue>, allow_flags: bool) {
+fn take_assignments(rest: &mut &[Word], inline: &mut Option<ModeValue>, env: bool) {
     while let Some(word) = rest.first() {
+        let mut taken = 1;
         if let Some(value) = mode_assignment(word) {
             *inline = Some(value);
-        } else if !(assignment(word).is_some() || allow_flags && word.text.starts_with('-')) {
+        } else if env && ENV_ARG_FLAGS.contains(&word.text.as_str()) {
+            taken = 2;
+        } else if !(assignment(word).is_some() || env && word.text.starts_with('-')) {
             return;
         }
-        *rest = &rest[1..];
+        *rest = rest.get(taken..).unwrap_or(&[]);
     }
 }
 
@@ -312,9 +377,12 @@ fn invocations(command: &str, inherited: Option<ModeValue>) -> Vec<Invocation> {
 }
 
 /// Handle the arguments of `bash`/`sh`: `-c <string>` recurses into the
-/// string, otherwise the first non-flag argument is the script.
+/// string; `-o`/`+o`/`-O`/`+O` skip their option name; other `-x`/`+x` words
+/// are flags; the first other argument is the script, and `ironmem-hook.sh
+/// <name>` or `ironmem-mcp.sh hook [--harness <v>] <name>` is the hook.
 fn shell_args(args: &[Word], mode: Option<ModeValue>, found: &mut Vec<Invocation>) {
-    for (i, arg) in args.iter().enumerate() {
+    let mut i = 0;
+    while let Some(arg) = args.get(i) {
         let text = arg.text.as_str();
         if text.starts_with('-') && !text.starts_with("--") && text.ends_with('c') {
             if let Some(script) = args.get(i + 1) {
@@ -322,17 +390,26 @@ fn shell_args(args: &[Word], mode: Option<ModeValue>, found: &mut Vec<Invocation
             }
             return;
         }
-        if text.starts_with('-') {
+        if SHELL_ARG_FLAGS.contains(&text) {
+            i += 2;
             continue;
         }
-        if basename(text) == "ironmem-hook.sh" {
-            if let Some(hook) = args.get(i + 1) {
-                found.push(Invocation {
-                    hook: hook.text.clone(),
-                    wrapper: true,
-                    mode,
-                });
-            }
+        if text.starts_with('-') || text.starts_with('+') {
+            i += 1;
+            continue;
+        }
+        let rest = &args[i + 1..];
+        let hook = match basename(text) {
+            "ironmem-hook.sh" => rest.first().map(|w| w.text.as_str()),
+            "ironmem-mcp.sh" => hook_after_subcommand(rest),
+            _ => None,
+        };
+        if let Some(hook) = hook {
+            found.push(Invocation {
+                hook: hook.to_owned(),
+                wrapper: true,
+                mode,
+            });
         }
         return;
     }
@@ -342,17 +419,22 @@ fn shell_args(args: &[Word], mode: Option<ModeValue>, found: &mut Vec<Invocation
 ///
 /// The model is a small simple-command reader, not a shell (see
 /// [`split_commands`] for the word and operator rules). In each simple
-/// command, leading `NAME=value` words are assignments; the wrappers `env`
-/// (with its own assignments and flags), `exec`, `command` and `nohup` are
-/// peeled off; the program's basename must then be `ironmem` or
-/// `ironmem-mcp.sh` followed by `hook`, optionally `--harness <v>` or
-/// `--harness=<v>`, then the name; or `ironmem-hook.sh <name>` run directly or
-/// by `bash`/`sh`; or `bash`/`sh -c <string>`, which is read recursively.
-/// Anything else (`echo`, `printf`, `true`) is not the hook.
+/// command, leading `NAME=value` words are assignments; the wrappers `env`,
+/// `exec`, `command` and `nohup` are peeled off. `env` takes its own
+/// assignments, `-u NAME`/`--unset NAME`, `-C DIR`/`--chdir DIR`, and flags
+/// without an argument (`-i`, `-`, `--unset=NAME`). The program's basename
+/// must then be `ironmem` or `ironmem-mcp.sh` followed by `hook`, optionally
+/// `--harness <v>` or `--harness=<v>`, then the name; or `ironmem-hook.sh
+/// <name>`; either wrapper script may also be run by `bash`/`sh` (after flags
+/// and `-o`/`+o <opt>`); or `bash`/`sh -c <string>`, which is read
+/// recursively. Anything else (`echo`, `printf`, `true`) is not the hook.
 ///
 /// Known limits, documented rather than bugs: control flow is not followed, so
 /// `true || ironmem hook stop` counts as wired; heredocs, brace groups and
-/// `$(..)` bodies are not read; aliases and functions are unknown.
+/// `$(..)` bodies are not read; aliases and functions are unknown; other
+/// options that take an argument (`env -S`, `bash --rcfile F`) are not
+/// modelled; `env -i` or `env -u IRONMEM_MCP_MODE` clearing an inherited mode
+/// is not modelled.
 pub(super) fn runs_hook(command: &str, hook: &str) -> bool {
     invocations(command, None).iter().any(|i| i.hook == hook)
 }
@@ -362,9 +444,11 @@ pub(super) fn runs_hook(command: &str, hook: &str) -> bool {
 /// Only the same simple command counts: the mode comes from the assignment
 /// words (or `env` assignments) of the command that runs the hook, or from an
 /// earlier `export IRONMEM_MCP_MODE=v` in the same string, and the command's
-/// own assignment wins. It never comes from a later or unrelated command, so
-/// `ironmem hook stop; IRONMEM_MCP_MODE=trusted true` runs read-only. When
-/// the command holds several runs of `hook`, a trusted one is returned.
+/// own assignment wins. It never comes from a later or a different simple
+/// command, so `ironmem hook stop; IRONMEM_MCP_MODE=trusted true` runs
+/// read-only and `IRONMEM_MCP_MODE=bogus true || ironmem hook stop` runs
+/// in the default mode. When the command holds several runs of `hook`, one is
+/// picked by [`best_result`].
 ///
 /// With no inline value the order is settings.json `env`, then the inherited
 /// environment, then the plugin wrapper's trusted default (an empty value
@@ -381,22 +465,30 @@ pub(super) fn hook_mode(
         .filter(|i| i.hook == hook)
         .map(|i| invocation_mode(i, settings_env, process_env))
         .collect();
-    first_trusted(&results)
-        .or_else(|| results.first())
-        .cloned()
-        .unwrap_or((Ok(McpAccessMode::ReadOnly), ModeSource::Default))
+    best_result(&results)
 }
 
 fn is_trusted(result: &ModeResult) -> bool {
     matches!(result.0, Ok(McpAccessMode::Trusted))
 }
 
-/// A trusted result, preferring one that doesn't depend on doctor's shell.
-pub(super) fn first_trusted(results: &[ModeResult]) -> Option<&ModeResult> {
+/// The one result to report for several runs of the same hook (in one
+/// command, or across an event's commands): a trusted run that doesn't depend
+/// on doctor's shell, else any trusted run, else the first run that doesn't
+/// fail to start, else the first run. With no runs, read-only by default.
+pub(super) fn best_result(results: &[ModeResult]) -> ModeResult {
     results
         .iter()
         .find(|r| is_trusted(r) && r.1 != ModeSource::Environment)
         .or_else(|| results.iter().find(|r| is_trusted(r)))
+        .or_else(|| {
+            results
+                .iter()
+                .find(|r| !matches!(r.0, Err(ModeError::Invalid(_))))
+        })
+        .or_else(|| results.first())
+        .cloned()
+        .unwrap_or((Ok(McpAccessMode::ReadOnly), ModeSource::Default))
 }
 
 fn invocation_mode(
@@ -620,6 +712,132 @@ mod tests {
         assert_eq!(
             hook_mode(sh, "stop", None, None),
             (Ok(Trusted), ModeSource::Inline)
+        );
+    }
+
+    #[test]
+    fn command_substitution_is_one_dynamic_word() {
+        for (cmd, raw) in [
+            ("IRONMEM_MCP_MODE=$(cat /m) ironmem hook stop", "$(cat /m)"),
+            ("IRONMEM_MCP_MODE=$((1)) ironmem hook stop", "$((1))"),
+            (
+                "IRONMEM_MCP_MODE=$(echo $(cat /m)) ironmem hook stop",
+                "$(echo $(cat /m))",
+            ),
+            ("IRONMEM_MCP_MODE=`cat /m` ironmem hook stop", "`cat /m`"),
+        ] {
+            assert!(runs_hook(cmd, "stop"), "{cmd}");
+            assert_eq!(
+                hook_mode(cmd, "stop", None, None),
+                (Err(ModeError::Unknown(raw.to_owned())), ModeSource::Inline),
+                "{cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn plugin_mcp_wrapper_run_through_bash_matches() {
+        use McpAccessMode::*;
+        let cmd = "bash /p/bin/ironmem-mcp.sh hook stop";
+        assert!(runs_hook(cmd, "stop"));
+        assert_eq!(
+            hook_mode(cmd, "stop", None, None),
+            (Ok(Trusted), ModeSource::PluginWrapper)
+        );
+        assert!(runs_hook(
+            "sh /p/bin/ironmem-mcp.sh hook --harness claude-code stop",
+            "stop"
+        ));
+        assert!(runs_hook(
+            "bash /p/bin/ironmem-mcp.sh hook --harness=claude-code stop",
+            "stop"
+        ));
+        assert!(!runs_hook("bash /p/bin/ironmem-mcp.sh serve", "stop"));
+        assert!(!runs_hook("bash /p/bin/ironmem-mcp.sh hook stopx", "stop"));
+    }
+
+    #[test]
+    fn wrapper_flags_that_take_an_argument_are_skipped_with_it() {
+        use McpAccessMode::*;
+        assert!(runs_hook("env -u FOO ironmem hook stop", "stop"));
+        assert!(runs_hook("env --unset FOO ironmem hook stop", "stop"));
+        assert!(runs_hook("env --unset=FOO ironmem hook stop", "stop"));
+        assert!(runs_hook("env --chdir /tmp ironmem hook stop", "stop"));
+        assert!(runs_hook("env - ironmem hook stop", "stop"));
+        let chdir = "env -C /tmp IRONMEM_MCP_MODE=trusted ironmem hook stop";
+        assert_eq!(
+            hook_mode(chdir, "stop", None, None),
+            (Ok(Trusted), ModeSource::Inline)
+        );
+        assert!(runs_hook("bash -o pipefail -c 'ironmem hook stop'", "stop"));
+        assert!(runs_hook(
+            "bash +o posix /p/hooks/ironmem-hook.sh stop",
+            "stop"
+        ));
+        assert!(runs_hook(
+            "sh -e -o pipefail /p/bin/ironmem-mcp.sh hook stop",
+            "stop"
+        ));
+    }
+
+    #[test]
+    fn env_flags_before_assignments_are_peeled() {
+        use McpAccessMode::*;
+        let cmd = "env -i IRONMEM_MCP_MODE=trusted ironmem hook stop";
+        assert!(runs_hook(cmd, "stop"));
+        assert_eq!(
+            hook_mode(cmd, "stop", None, None),
+            (Ok(Trusted), ModeSource::Inline)
+        );
+    }
+
+    #[test]
+    fn fd_digit_redirections_are_dropped_with_their_target() {
+        assert!(runs_hook("ironmem hook stop 2>/dev/null", "stop"));
+        assert!(runs_hook("ironmem hook 2>/dev/null stop", "stop"));
+        assert!(runs_hook("ironmem hook 2>&1 stop", "stop"));
+        // Only a whole-digit word is a file descriptor: `stop2` is the word.
+        assert!(!runs_hook("ironmem hook stop2>/dev/null", "stop"));
+    }
+
+    #[test]
+    fn hash_inside_a_word_is_not_a_comment() {
+        assert!(!runs_hook("ironmem hook stop#x", "stop"));
+        assert!(runs_hook("ironmem hook stop #x", "stop"));
+    }
+
+    #[test]
+    fn a_trusted_run_wins_over_an_earlier_read_only_run() {
+        use McpAccessMode::*;
+        let cmd = "ironmem hook stop; IRONMEM_MCP_MODE=trusted ironmem hook stop";
+        assert_eq!(
+            hook_mode(cmd, "stop", None, None),
+            (Ok(Trusted), ModeSource::Inline)
+        );
+    }
+
+    #[test]
+    fn an_assignment_on_another_command_does_not_reach_the_hook() {
+        use McpAccessMode::*;
+        for cmd in [
+            "IRONMEM_MCP_MODE=bogus true || ironmem hook stop",
+            "IRONMEM_MCP_MODE=bogus true && ironmem hook stop",
+            "IRONMEM_MCP_MODE=bogus true | ironmem hook stop",
+            "IRONMEM_MCP_MODE=bogus; ironmem hook stop",
+            "(IRONMEM_MCP_MODE=bogus true) ; ironmem hook stop",
+        ] {
+            assert_eq!(
+                hook_mode(cmd, "stop", None, None),
+                (Ok(ReadOnly), ModeSource::Default),
+                "{cmd}"
+            );
+        }
+        // Several runs in one command pick a result the same way event_mode
+        // does across commands: a valid mode beats one that fails to start.
+        let two_runs = "IRONMEM_MCP_MODE=bogus ironmem hook stop || ironmem hook stop";
+        assert_eq!(
+            hook_mode(two_runs, "stop", None, None),
+            (Ok(ReadOnly), ModeSource::Default)
         );
     }
 }
