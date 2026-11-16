@@ -1,5 +1,5 @@
 ---
-description: Read a GitHub issue, score its complexity, and recommend DIRECT (iron-tdd), IRON (iron-plan → iron-build), COLLAB (Claude-driven /collab start), or mandatory SPLIT above 15 tasks. Advisory: prints a verdict and the exact next step, then confirms before invoking. Usage — /evaluate-issue <issue-number | #number | issue-url>
+description: Read a GitHub issue, score its complexity, and recommend AUTOPILOT, DIRECT (iron-tdd), GOAL (bounded /goal loop), COLLAB (Claude-driven /collab start), IRON (iron-plan → iron-build), a two-phase COLLAB/IRON → GOAL/AUTOPILOT verdict, or mandatory SPLIT above 15 tasks. Advisory: prints a verdict and the exact next step, then confirms before invoking; never launches GOAL or AUTOPILOT. Usage — /evaluate-issue <issue-number | #number | issue-url>
 ---
 
 <!-- DERIVED FROM docs/EVALUATE_ISSUE.md — protocol changes must update all
@@ -11,14 +11,16 @@ You are the IronRace issue router, running as **Codex**. Full spec:
 
 $ARGUMENTS
 
-Read the issue, estimate its blast radius from a light repo scan, score five
-complexity signals, and recommend exactly one execution path. This is
-**advisory** — print a verdict and the recommended next step, then wait for
-the user to confirm before invoking anything. Steps 1–4 are read-only.
+Read the issue, estimate its blast radius from a light repo scan, read the
+unattended-route prerequisites, score six signals, and recommend exactly one
+verdict. This is **advisory** — print a verdict and the recommended next
+step, then wait for the user to confirm before invoking anything. Steps 1–4
+are read-only.
 
 > Codex tool mapping: use your native shell for `git`/`gh`/`grep`, your file
 > search for glob, and load skills natively from `~/.codex/skills`. Interpret
-> any "invoke the <name> skill" instruction as activating that skill.
+> any "invoke the <name> skill" instruction as activating that skill. Call
+> ironmem MCP tools (e.g. `get_drawer`) through your MCP connection.
 
 ## Parse the argument
 
@@ -62,11 +64,26 @@ tracing.**
    contract changes, state-machine changes (e.g.
    `crates/ironmem/src/collab/state_machine`), schema **migrations**
    (`crates/*/migrations/`, version bumps), or a **new subsystem / crate**.
+4. Read the unattended-route prerequisites for the **issue's** repo. All are
+   reads; none creates, labels, or onboards anything:
+   - **Approved gate config** — ironmem MCP
+     `get_drawer(wing="autopilot", room="backlog-lineage", logical_key="gate-config:<slug>")`,
+     `<slug>` = `<owner>/<repo>` with every character other than `A-Z`,
+     `a-z`, `0-9`, `-`, `_`, `.` replaced by `-`. Approved only when found with
+     JSON `state` `"approved"`; keep its `gate_commands`. Not found,
+     `"pending"`, or the tool unavailable all mean not approved.
+   - **Agent labels** —
+     `gh label list --repo <owner>/<repo> --search "agent:" --limit 100 --json name -q '.[].name'`
+     must list all three of `agent:ready`, `agent:blocked`, `agent:exhausted`.
+   - **Risk label** —
+     `gh label list --repo <owner>/<repo> --search "risk:" --limit 100 --json name -q '.[].name'`
+     must list `risk:<expected class>`. Autopilot takes the merge class from
+     the issue's `risk:*` label, so without it the PR is held.
 
 A prose-only issue (docs, process, a question) may find nothing — that is
-itself a DIRECT signal.
+itself a DIRECT signal (AUTOPILOT in an onboarded repo).
 
-## Step 3 — Score five signals
+## Step 3 — Score six signals
 
 - **Blast radius** — files / crates / modules changed
 - **Design judgment** — architectural decisions (API/contract, state
@@ -74,18 +91,24 @@ itself a DIRECT signal.
 - **Decomposability** — number of *independent* execution tasks; an estimate
   above 15 requires `SPLIT`
 - **Spec clarity** — well-specified vs ambiguous / under-defined
+- **Unattended fit** — could the repo's gate alone prove the work done? Which
+  Autopilot risk class would the diff carry (`documentation`,
+  `dependency_bump`, `mechanical_rename`, `test_only`, `logic`, `protocol`,
+  `security`, `public_api`)? Drives AUTOPILOT, GOAL, and the phase split.
 - **Security / review depth** — does it touch security-sensitive code (auth,
   credentials, billing, user data)? Drives the post-implementation review
   tier, not the execution path.
 
 ## Step 4 — Decide (first match wins)
 
-Check in this order — the hard `SPLIT` task-budget gate comes first, DIRECT is
-the cheapest route, COLLAB is the most expensive and must be justified, and
-IRON is the default middle. The counts below touch at the seams; when
-they overlap, the deciding factor is **task independence, not the number**
-(one tightly-coupled unit → DIRECT; two or more independently shippable tasks
-→ IRON), and COLLAB's
+Check in this order — the hard `SPLIT` task-budget gate comes first;
+AUTOPILOT next, since an eligible dispatch needs no human attached; DIRECT is
+the cheapest attended route; GOAL is the unattended loop for judgment-free
+work too large for DIRECT; COLLAB is the most expensive and must be
+justified; IRON is the default middle. The counts below touch at the seams;
+when they overlap, the deciding factor is **task independence, not the
+number** (one tightly-coupled unit → DIRECT; two or more independently
+shippable tasks → IRON), and COLLAB's
 design-judgment triggers dominate its crate-count range (a purely mechanical
 3+-crate rename is IRON, not COLLAB). Security sensitivity alone does
 not justify COLLAB — it drives the review tier recommendation instead.
@@ -97,13 +120,40 @@ not justify COLLAB — it drives the review tier recommendation instead.
    merge unrelated work, weaken acceptance criteria, or discard scope merely to
    fit the limit. Keep the parent open as the tracking issue.
 
-1. **DIRECT** — choose when **all** hold: ≤ ~2 files / single crate / module;
+1. **AUTOPILOT** — choose when **all** hold: approved gate config, all
+   three `agent:*` labels, and the `risk:<expected class>` label (Step 2.4);
+   the expected diff is inside the
+   auto-merge envelope; an implementer with only the issue body can finish it
+   (no open human question, no criterion a gate cannot check); one branch,
+   one PR. AUTOPILOT auto-merges only these classes: `documentation`, `dependency_bump`, `mechanical_rename`, `test_only`.
+   Never recommend AUTOPILOT when the expected class is `logic`, `protocol`, `security`, or `public_api` —
+   `decide_merge` holds those for a human regardless of reviewer PASS
+   (`HoldForHuman(HighRiskClass)`, `crates/ironmem/src/autopilot/review.rs`).
+   Name the class; when unsure, it is `logic`. If the issue otherwise fits
+   but a prerequisite is missing, add `Missing AUTOPILOT prerequisite:` to
+   *Why* with its fix (`ironmem autopilot onboard <owner>/<repo> --path <checkout>`
+   then `ironmem autopilot approve <owner>/<repo>`;
+   `ironmem autopilot labels <owner>/<repo>`; or
+   `gh label create "risk:<expected class>" --repo <owner>/<repo>`) and
+   continue down the list.
+
+2. **DIRECT** — choose when **all** hold: ≤ ~2 files / single crate / module;
    one unit of work (1 task, or 2 steps too coupled to ship apart); no
    architectural / contract / migration / new-subsystem decision;
    well-specified. (Localized bug fix, small helper, doc/config fix, contained
    refactor, single added test.)
 
-2. **COLLAB** — choose when **any** hold: requires real design judgment
+3. **GOAL** — choose when **all** hold: approved gate config (Step 2.4);
+   "done" is fully expressible as that gate passing with the work committed;
+   the work is mechanical or high-volume (many same-shape files, data or
+   terminology authoring, fixtures, wiring a decided design) rather than
+   judgment-shaped; no open design decision. It covers unattended work
+   outside the auto-merge envelope or in a repo without the labels; a human
+   merges its PR. If it otherwise fits but the gate config is not approved,
+   add `Missing GOAL prerequisite:` to *Why* with the onboard + approve
+   commands and continue down the list.
+
+4. **COLLAB** — choose when **any** hold: requires real design judgment
    (public API/contract, state-machine, schema migration, new subsystem);
    ambiguous requirements that benefit from a second independent perspective;
    large blast radius (~3+ crates or many interacting modules) with tightly
@@ -111,11 +161,21 @@ not justify COLLAB — it drives the review tier recommendation instead.
    it is handled by the review recommendation. (Protocol/state-machine
    changes, migrations, cross-crate features.)
 
-3. **IRON** — the default middle when neither above fits: 2–6
+5. **IRON** — the default middle when nothing above fits: 2–6
    independently shippable tasks; moderate blast radius (1–2 crates);
    plannable up front; no cross-model design review needed. (A feature within
-   an existing subsystem, a multi-file mechanical change, test-coverage
-   expansion.)
+   an existing subsystem, a multi-file mechanical change in a repo with no
+   approved gate config, test-coverage expansion.)
+
+6. **Phase split** — after COLLAB or IRON is picked, emit
+   `<COLLAB | IRON> → <GOAL | AUTOPILOT>` when **all** hold: phase 1 settles
+   every decision the remainder depends on; the remainder, judged as if phase
+   1 had merged, meets rule 1 or rule 3 on its own, prerequisites included;
+   the remainder is roughly half the effort or more. Never more than two
+   phases; phase 2 is always GOAL or AUTOPILOT; the task estimate and the
+   SPLIT ceiling cover both phases together. Criteria no gate can check
+   (native-speaker review, go-live sign-off) belong to neither phase — list
+   them as human follow-ups.
 
 When one signal pulls toward COLLAB but the rest sit firmly in IRON,
 name the tension in the rationale rather than silently rounding up.
@@ -126,7 +186,7 @@ Print exactly this shape:
 
 ```
 Issue #<number>: <title>
-Verdict: <DIRECT | IRON | COLLAB | SPLIT>
+Verdict: <SPLIT | AUTOPILOT | DIRECT | GOAL | COLLAB | IRON> or <COLLAB | IRON> → <GOAL | AUTOPILOT>
 Task estimate: <N | N+> independent execution tasks
 
 Why:
@@ -141,6 +201,14 @@ Recommended path:
 Recommended review:
   <review command — see review tier table below>
 
+For a two-phase verdict, insert before Recommended path:
+
+Phases:
+  1. <COLLAB | IRON> — <the decisions or work phase 1 settles>
+  2. <GOAL | AUTOPILOT> — <the remainder>
+
+and number the path: `1. <phase 1 step>`, `2. (after phase 1 merges) <phase 2 command>`.
+
 For `SPLIT`, insert before the confirmation line:
 
 Child issues:
@@ -151,7 +219,13 @@ Child issues:
 Proceed with this path? [y/N]
 ```
 
-Then **wait for the user**. On an explicit yes, invoke the recommended path.
+Confirmation line: `Proceed with this path? [y/N]` for SPLIT, DIRECT, COLLAB,
+IRON; `Proceed with phase 1? [y/N]` for a two-phase verdict; for GOAL or
+AUTOPILOT alone, no question — end with `The router never launches GOAL or AUTOPILOT — run the command above yourself.`
+
+Then **wait for the user**. On an explicit yes, invoke the recommended path;
+for a two-phase verdict, phase 1 only — the user runs phase 2 after phase 1
+merges, re-reading its prerequisites then.
 For `SPLIT`, create the proposed child GitHub issues only when the issue repo
 matches the local checkout. Preserve relevant parent labels, add
 `Parent: #<number>` to each child body, and comment their links on the
@@ -173,10 +247,18 @@ parent comments.
 
 | Verdict | What to do on confirm |
 |---|---|
+| AUTOPILOT | Nothing to invoke. Print for the user, in order: (1) `gh issue edit <number> --repo <owner>/<repo> --add-label agent:ready --add-label risk:<expected class>` — applying these labels is the user's authorization, and the router never applies them; (2) `ironmem autopilot lead --repo <owner>/<repo>=<checkout>`, which dispatches from `agent:ready`; (3) `ironmem autopilot advance --repo <owner>/<repo>=<checkout> --reviewer codex` (adding `--merge` executes the merge that is otherwise rehearsed). |
 | DIRECT | Invoke the `iron-tdd` skill directly. |
+| GOAL | Nothing to invoke. `/goal` is a Claude Code command: print for the user to run in a terminal, from a fresh worktree on a feature branch: `claude -p '/goal <condition> or stop after <N> turns'`, then open the PR yourself; a human reviews and merges it. |
 | IRON | Invoke the `iron-plan` skill on the issue spec; it flows into `iron-build`. |
 | COLLAB | `/collab` is Claude-driven. Recommend the user run `/collab start <one-line imperative task summary derived from the issue>` in a Claude terminal; Codex joins via the protocol. Do not paste the whole issue body. |
 | SPLIT | Create the confirmed child issues, then run `/evaluate-issue` for each child. |
+
+GOAL condition: `<one-line imperative task summary>, for issue #<number>. Done when this gate passes: <gate_commands joined with " && ">, and every change is committed and pushed on this branch`.
+`<N>` defaults to `6` (Autopilot's `DEFAULT_N_TURNS`); keep the condition
+under 4,000 characters and never paste the issue body; for a phase-2 GOAL,
+name what phase 1 decided; write any `'` as `'\''`.
+The `risk:<expected class>` label is what Autopilot merges under: decide_merge holds the PR unless it equals the class the reviewer derives from the diff.
 
 ### Review tiers
 
@@ -191,15 +273,24 @@ post-implementation review. This is independent of the execution-path verdict
 | Deep | Complex changes, security-sensitive code (auth, credentials, billing, user data), or high blast radius | `/ultrareview-local` |
 
 Security-sensitive changes always warrant at minimum Thorough, and typically
-Deep, regardless of the execution-path verdict.
+Deep, regardless of the execution-path verdict. AUTOPILOT's review is
+`Autopilot's own reviewer`.
 
 ## Invariants
 
-- **Read-only until the confirm gate.** Steps 1–4 never mutate state.
+- **Read-only until the confirm gate.** Steps 1–4 never mutate state; the
+  prerequisite reads only read.
 - **Never auto-launch** — even an obvious DIRECT waits for `y`.
+- **The router never launches GOAL or AUTOPILOT** — it prints their commands;
+  it never labels, creates labels, onboards, approves, or dispatches, even
+  after a yes.
 - **Task-budget first** — an estimate above 15 tasks always yields `SPLIT`;
   never launch collab for the oversized parent issue.
-- **Recommend one path, not a menu** — pick the single best fit and justify
-  it; the user overrides by declining.
-- **Scan, don't trace** — Step 2 is a few grep/glob calls. If accurate
-  routing would need deep tracing, say so and lean to the more cautious tier.
+- **One verdict, never a menu.** A single route or one ordered two-phase
+  sequence in which both phases run; never alternatives. The user overrides
+  by declining.
+- **Adapt to Autopilot's policy, never relax it** — the envelope is
+  `RiskClass::is_low_risk` in `review.rs`, and the lint pins this text to it.
+- **Scan, don't trace** — Step 2 is a few grep/glob calls plus three
+  prerequisite reads. If accurate routing would need deep tracing, say so and
+  lean to the more cautious tier.
