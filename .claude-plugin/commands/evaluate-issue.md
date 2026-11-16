@@ -235,16 +235,17 @@ Proceed with this path? [y/N]
 
 Confirmation line: `Proceed with this path? [y/N]` for SPLIT, DIRECT, COLLAB,
 IRON; `Proceed with phase 1? [y/N]` for a two-phase verdict; for GOAL or
-AUTOPILOT alone, no question — end with `The router never launches GOAL or AUTOPILOT — run the command above yourself.`
+AUTOPILOT alone, no question — end with `The router never launches GOAL or AUTOPILOT — run the command(s) above yourself, in order.`
 
 For GOAL or AUTOPILOT alone, stop after printing; otherwise **wait for the
 user**. On an explicit yes, invoke the recommended path; for a two-phase
 verdict, phase 1 only — phase 2 is the user's to run after phase 1's PR
 merges. A phase-2 GOAL is printed as a ready-to-run command: before running
-it, the user re-checks that the gate config is still approved (the Step 2
-`get_drawer` read) and that its `gate_commands` still match the printed
-condition. Rerunning `/evaluate-issue` on the parent is not the mechanism; it
-would re-score the original issue and print the same two-phase verdict. A
+it, the user asks an agent session to run the Step 2 `get_drawer` read (no
+read-only CLI prints it) and confirms that the gate config is still approved
+and that its `gate_commands` still match the printed condition. Rerunning
+`/evaluate-issue` on the parent is not the mechanism; it would re-score the
+original issue and print the same two-phase verdict. A
 phase-2 AUTOPILOT is printed as an instruction: the user opens the remainder
 issue, then runs `/evaluate-issue <remainder number>` on it. The router never
 launches GOAL or AUTOPILOT, at any phase, and never opens the remainder issue.
@@ -271,7 +272,7 @@ parent comments.
 |---|---|
 | AUTOPILOT | Nothing to invoke. For an AUTOPILOT verdict, print for the user, in order: (1) `gh issue edit <number> --repo <owner>/<repo> --add-label agent:ready --add-label "risk:<expected class>"` — applying these labels is the user's authorization, and the router never applies them; (2) `ironmem autopilot lead --repo <owner>/<repo>=<checkout>`, which dispatches the next `agent:ready` issue — in-flight resumes first, then by `priority:*`, one per tick by default; each rerun dispatches whichever issue is next, at a dispatch's cost; (3) `ironmem autopilot advance --repo <owner>/<repo>=<checkout> --reviewer codex` once that dispatch has opened its PR (adding `--merge` executes the merge that is otherwise rehearsed). For a phase-2 AUTOPILOT, print none of these; phase 2's line (`2. (after phase 1 merges) …`) is an instruction in their place: open a remainder issue scoped to phase 2 that cites phase 1's PR — the remainder-issue command below, with `<remainder title>` and the remainder scope filled in and the `<phase-1 PR>` slot left — then run `/evaluate-issue <remainder number>` on it. The label, `lead` and `advance` commands come from that run, against `<remainder number>`. |
 | DIRECT | Run `/plan` to scope, then invoke the `iron-tdd` skill. |
-| GOAL | Nothing to invoke. Print for the user to run from a fresh worktree on a feature branch: `claude -p '/goal <condition> or stop after <N> turns'`. When the loop ends, the user opens the PR, and a human reviews and merges it. |
+| GOAL | Nothing to invoke. Print for the user to run from a fresh worktree on a feature branch cut from the default branch (for a phase-2 GOAL, cut after phase 1 merges): `claude -p '/goal <condition> or stop after <N> turns'`. When the loop ends, the user opens the PR, and a human reviews and merges it. |
 | IRON | Invoke the `iron-plan` skill on the issue spec; it flows into `iron-build`. |
 | COLLAB | Run `/collab start <one-line imperative task summary derived from the issue>`. Do not paste the whole issue body. |
 | SPLIT | Create the confirmed child issues, then run `/evaluate-issue` for each child. |
@@ -286,14 +287,20 @@ for a phase-2 GOAL, phase 1 has not run when the command is printed, so name
 the decisions phase 1 settles and tell the loop to follow the merged phase-1
 decisions on them, never a PR number; write any `'` as `'\''`.
 
-A headless `claude -p` loop can edit, commit and push only if its permission
-mode or tool allowlist permits it. The user grants that by appending, after
-the quoted `/goal` argument, either `--permission-mode <mode>` (choices in
-`claude --help`) or `--allowed-tools` with one quoted, comma-separated value,
-e.g. `--allowed-tools "Edit,Bash(git *)"`. `--allowed-tools <tools...>`
-takes a variable number of values, so placed before the quoted argument it
-swallows that argument as a tool name. `acceptEdits` covers file edits but not
-`git commit` or `git push`, which go through Bash. The router never chooses a
+A headless `claude -p` loop can edit, run the gate, commit and push only if
+the flags it runs with permit it. The user grants that by appending one or
+both of `--permission-mode <mode>` (choices in `claude --help`) and
+`--allowed-tools`, after the quoted `/goal` argument. Together they must cover
+file edits and writes, every `gate_commands` entry, and git; give
+`--allowed-tools` one quoted, comma-separated value, e.g.
+`--allowed-tools "Edit,Write,Bash(git *),Bash(<each gate command>)"`, or
+`--permission-mode acceptEdits --allowed-tools "Bash(git *),Bash(<each gate command>)"`.
+`acceptEdits` alone is never enough: it covers file edits, but not the gate
+commands, `git commit` or `git push`, which go through Bash. If a gate command
+contains `"`, `$` or a backtick, single-quote the value instead and write any
+`'` in it as `'\''`. `--allowed-tools <tools...>` takes a variable number of
+values, so its position after the quoted argument, not the comma, keeps it
+from swallowing that argument as a tool name. The router never chooses a
 permission mode or a tool list.
 
 Phase-2 AUTOPILOT remainder-issue command:
@@ -313,6 +320,12 @@ double-quoted argument. `<phase-1 PR>` stays a slot for the user to fill in
 once phase 1's PR exists. `gh issue create` prints the new issue's URL, whose
 number is `<remainder number>`. The router prints this command and never runs
 it.
+
+Print this block after the rest of the verdict output and just before the
+confirmation line, in its own code fence, unindented, with `EOF` alone at
+column 0: an indented `  EOF` never closes a `<<'EOF'` heredoc, and the
+user's shell hangs waiting for it. Phase 2's numbered line points to this
+block rather than holding it.
 
 ### Review tiers
 
@@ -336,9 +349,9 @@ Deep, regardless of the execution-path verdict. AUTOPILOT's review is
   prerequisite reads only read.
 - **Never auto-launch** — even an obvious DIRECT waits for `y`.
 - **The router never launches GOAL or AUTOPILOT** — it prints their commands;
-  it never adds or removes an issue's labels, creates labels, opens a
-  phase-2 remainder issue, onboards, approves, or dispatches, even after a
-  yes.
+  for GOAL and AUTOPILOT it never adds or removes an issue's labels or opens
+  a phase-2 remainder issue, and on no route does it create labels, onboard,
+  approve, or dispatch, even after a yes.
 - **Task-budget first** — an estimate above 15 tasks always yields `SPLIT`;
   never launch collab for the oversized parent issue.
 - **One verdict, never a menu.** A single route or one ordered two-phase
