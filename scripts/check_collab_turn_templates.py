@@ -540,7 +540,7 @@ REQUIRED_EVALUATE_ISSUE_SNIPPETS = [
 # deliberately NOT listed here: the Rust test
 # `the_router_states_exactly_the_autopilot_envelope_is_low_risk_grants` in
 # crates/ironmem/src/autopilot/review.rs builds it from `RiskClass::is_low_risk`
-# itself, so no parser of the Rust source can be fooled.
+# itself, so no parser of the policy can be fooled.
 REQUIRED_EVALUATE_ISSUE_ROUTE_SNIPPETS = [
     'logical_key="gate-config:<slug>"',
     "`agent:ready`, `agent:blocked`, `agent:exhausted`",

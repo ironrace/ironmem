@@ -75,10 +75,11 @@ tracing.**
      must list all three of `agent:ready`, `agent:blocked`, `agent:exhausted`.
    - **Risk label** —
      `gh label list --repo <owner>/<repo> --search "risk:" --limit 100 --json name -q '.[].name'`
-     lists every `risk:*` label; rule 1 (AUTOPILOT) checks that the list
-     contains `risk:<expected class>` for the class chosen in Step 3. Autopilot
-     takes the merge class from the issue's `risk:*` label, so without it the
-     PR is held.
+     lists the labels matching `risk:`, possibly others too (the search is
+     fuzzy: on one repo `"risk:"` returned `sev:critical`); rule 1 (AUTOPILOT)
+     checks that the list contains the exact name `risk:<expected class>` for
+     the class chosen in Step 3. Autopilot takes the merge class from the
+     issue's `risk:*` label, so without it the PR is held.
 
 A prose-only issue (docs, process, a question) may find nothing — that is
 itself a DIRECT signal (AUTOPILOT in a repo meeting rule 1's prerequisites).
@@ -133,7 +134,7 @@ not justify COLLAB — it drives the review tier recommendation instead.
    Name the class; when unsure, it is `logic`. If the issue otherwise fits
    but a prerequisite is missing, add `Missing AUTOPILOT prerequisite:` to
    *Why* with its fix, then continue down the list. No approved gate config
-   → `ironmem autopilot onboard <owner>/<repo> --path <checkout>` then
+   → `ironmem autopilot onboard <owner>/<repo> --path '<checkout>'` then
    `ironmem autopilot approve <owner>/<repo>`; agent labels missing →
    `ironmem autopilot labels <owner>/<repo>`; `risk:<expected class>` label
    missing → `gh label create "risk:<expected class>" --repo <owner>/<repo>`;
@@ -154,8 +155,8 @@ not justify COLLAB — it drives the review tier recommendation instead.
    and pushed; the work is mechanical or high-volume (many same-shape files,
    data or terminology authoring, fixtures, wiring a decided design) rather
    than judgment-shaped; no open design decision. It covers unattended work
-   outside the auto-merge envelope or in a repo without the labels; a human
-   merges its PR. If it otherwise fits but the gate config is not approved,
+   outside the auto-merge envelope, in a repo without the labels, or wherever
+   rule 1 (AUTOPILOT) does not hold; a human merges its PR. If it otherwise fits but the gate config is not approved,
    add `Missing GOAL prerequisite:` to *Why* with the onboard + approve
    commands and continue down the list.
 
@@ -270,14 +271,14 @@ parent comments.
 
 | Verdict | What to do (on confirm, where there is one) |
 |---|---|
-| AUTOPILOT | Nothing to invoke. For an AUTOPILOT verdict, print for the user, in order: (1) `gh issue edit <number> --repo <owner>/<repo> --add-label agent:ready --add-label "risk:<expected class>"` — applying these labels is the user's authorization, and the router never applies them; (2) `ironmem autopilot lead --repo <owner>/<repo>=<checkout>`, which dispatches the next `agent:ready` issue — in-flight resumes first, then by `priority:*`, one per tick by default; each rerun dispatches whichever issue is next, at a dispatch's cost; (3) `ironmem autopilot advance --repo <owner>/<repo>=<checkout> --reviewer codex` once that dispatch has opened its PR (adding `--merge` executes the merge that is otherwise rehearsed). For a phase-2 AUTOPILOT, print none of these; phase 2's line (`2. (after phase 1 merges) …`) is an instruction in their place: open a remainder issue scoped to phase 2 that cites phase 1's PR — the remainder-issue command below, with `<remainder title>` and the remainder scope filled in and the `<phase-1 PR>` slot left — then run `/evaluate-issue <remainder number>` on it. The label, `lead` and `advance` commands come from that run, against `<remainder number>`. |
+| AUTOPILOT | Nothing to invoke. For an AUTOPILOT verdict, print for the user, in order: (1) `gh issue edit <number> --repo <owner>/<repo> --add-label agent:ready --add-label "risk:<expected class>"` — applying these labels is the user's authorization, and the router never applies them; (2) `git -C '<checkout>' fetch origin`, then `ironmem autopilot lead --repo '<owner>/<repo>=<checkout>' --base origin/<default branch>`, which cuts the issue branch from the freshly fetched default branch (`--base` defaults to `HEAD`, the checkout's current commit) and dispatches the next `agent:ready` issue — in-flight resumes first, then by `priority:*`, one per tick by default; each rerun dispatches whichever issue is next, at a dispatch's cost; (3) `ironmem autopilot advance --repo '<owner>/<repo>=<checkout>' --reviewer codex` once that dispatch has opened its PR (adding `--merge` executes the merge that is otherwise rehearsed). For a phase-2 AUTOPILOT, print none of these; phase 2's line (`2. (after phase 1 merges) …`) is an instruction in their place: open a remainder issue scoped to phase 2 that cites phase 1's PR — the remainder-issue command below, with `<remainder title>` and the remainder scope filled in and the `<phase-1 PR>` slot left — then run `/evaluate-issue <remainder number>` on it. The label, `lead` and `advance` commands come from that run, against `<remainder number>`. |
 | DIRECT | Run `/plan` to scope, then invoke the `iron-tdd` skill. |
 | GOAL | Nothing to invoke. Print for the user to run from a fresh worktree on a feature branch cut from the default branch (for a phase-2 GOAL, cut after phase 1 merges): `claude -p '/goal <condition> or stop after <N> turns'`. When the loop ends, the user opens the PR, and a human reviews and merges it. |
 | IRON | Invoke the `iron-plan` skill on the issue spec; it flows into `iron-build`. |
 | COLLAB | Run `/collab start <one-line imperative task summary derived from the issue>`. Do not paste the whole issue body. |
 | SPLIT | Create the confirmed child issues, then run `/evaluate-issue` for each child. |
 
-GOAL condition: `<one-line imperative task summary>, for issue #<number>. Done when this gate passes: <gate_commands joined with " && ">, and every change is committed and pushed on this branch`.
+GOAL condition: `<one-line imperative task summary>, for issue #<number>. Done when this gate passes: <gate_commands joined with " && ">, and every change is committed and pushed on this branch, never pushing to the default branch`.
 `<N>` defaults to `6` (Autopilot's `DEFAULT_N_TURNS`); keep the condition
 under 4,000 characters (the `/goal` platform limit, covering the whole
 argument after `/goal ` including `or stop after <N> turns`; a longer one is
@@ -305,10 +306,18 @@ commands, `git commit` or `git push`, which go through Bash.
 default one; nothing in the allowlist stops it. Only the default branch's
 protection can, so before an unattended run check
 `gh api repos/<owner>/<repo>/branches/<default branch> --jq .protected` and
-treat `false` as unprotected. The allowlist covers the gate, not setup: run
-the loop in a worktree whose dependencies are installed and bootstrapped. If a gate command
-contains `"`, `$` or a backtick, single-quote the value instead and write any
-`'` in it as `'\''`.
+treat `false` as unprotected. `true` is necessary but not sufficient: the
+protection must also refuse force pushes, which
+`gh api repos/<owner>/<repo>/branches/<default branch>/protection --jq .allow_force_pushes.enabled`
+shows as `false` (that endpoint returns 404 on a branch with no classic
+protection). A repository ruleset can also refuse force pushes:
+`gh api repos/<owner>/<repo>/rules/branches/<default branch>` lists the rules
+that apply, and `non_fast_forward` is the one that does (unverified: no repo
+checked here has a ruleset). Whether an admin's push bypasses a classic
+protection whose `enforce_admins` is off is also unverified. The allowlist
+covers the gate, not setup: run the loop in a worktree whose dependencies are
+installed and bootstrapped. If a gate command contains `"`, `$`, a backtick,
+`!` or `\`, single-quote the value instead and write any `'` in it as `'\''`.
 `--allowed-tools <tools...>` takes a variable number of values, so its
 position after the quoted argument, not the comma, keeps it from swallowing
 that argument as a tool name. The router never chooses a permission mode or a

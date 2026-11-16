@@ -2938,17 +2938,19 @@ mod tests {
     /// builds the two expected sentences by calling the real
     /// `RiskClass::is_low_risk` and `RiskClass::as_str` on every variant
     /// (listed by serde's derive, see `every_risk_class`), so there is no
-    /// parser to fool: a commented-out arm, a nested `match`, or a
-    /// conditional `=> true` all mean whatever the compiler says they mean.
-    /// An earlier Python lint derived the sentences by regex-parsing this file
-    /// and kept meeting Rust shapes it misread.
+    /// parser of the policy to fool: a commented-out arm, a nested `match`,
+    /// or a conditional `=> true` all mean whatever the compiler says they
+    /// mean. An earlier Python lint derived the sentences by regex-parsing
+    /// this file and kept meeting Rust shapes it misread. The source scans
+    /// below only guard the two assumptions that make this sound: no serde
+    /// `skip`/`other` variant, and no `cfg` in `is_low_risk`.
     ///
     /// It checks the policy as compiled for `cargo test` (cfg(test) on, with
     /// the features that test run enables — default in CI), not as the
-    /// release binary has it. A
-    /// `#[cfg(test)]`-gated arm in `is_low_risk` would make this test demand
-    /// router text the release build does not honor, which is why
-    /// `is_low_risk` must stay free of `cfg` attributes.
+    /// release binary has it. A `#[cfg(test)]`-gated arm in `is_low_risk`
+    /// would make this test demand router text the release build does not
+    /// honor, which is why `is_low_risk` must stay free of `cfg` attributes
+    /// and why this test scans its source for them.
     ///
     /// Per surface it pins: the auto-merge sentence, once, ending at its own
     /// `.`; the "never recommend" sentence, once, followed by `.` or by
@@ -3004,6 +3006,32 @@ mod tests {
                 );
             }
         }
+
+        // `is_low_risk` must stay free of `cfg` (see its doc comment). The
+        // needle is built with `concat!` so this test's own text does not
+        // match it: exactly one definition means no `#[cfg(test)]` /
+        // `#[cfg(not(test))]` pair of them, and its body, from the signature
+        // to the closing `    }` line, must not mention `cfg` at all.
+        const IS_LOW_RISK_SIGNATURE: &str = concat!("pub fn ", "is_low_risk(");
+        assert_eq!(
+            source.matches(IS_LOW_RISK_SIGNATURE).count(),
+            1,
+            "RiskClass::is_low_risk must stay free of `cfg` attributes, so it is defined \
+             exactly once: the router-text test sees only the test build"
+        );
+        let fn_start = source
+            .find(IS_LOW_RISK_SIGNATURE)
+            .expect("review.rs must define RiskClass::is_low_risk");
+        let fn_len = source[fn_start..]
+            .find("\n    }\n")
+            .expect("RiskClass::is_low_risk must close with a `    }` line");
+        let fn_body = &source[fn_start..fn_start + fn_len];
+        assert!(
+            !fn_body.contains("cfg"),
+            "RiskClass::is_low_risk must stay free of `cfg` attributes: the router-text \
+             test sees only the test build, so a cfg-gated arm would desync it from the \
+             release binary. Found in:\n{fn_body}"
+        );
 
         let (low, held): (Vec<RiskClass>, Vec<RiskClass>) = every_risk_class()
             .into_iter()
