@@ -30,7 +30,7 @@ pub(super) enum ModeSource {
 /// Why a hook's mode could not be turned into a [`McpAccessMode`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum ModeError {
-    /// `Config::load` rejects the value, so the hook exits at startup.
+    /// `Config::load` rejects this raw value, so the hook exits at startup.
     Invalid(String),
     /// The value is built by the shell (`$VAR`, `$(..)`), so doctor can't know it.
     Unknown(String),
@@ -376,15 +376,18 @@ fn invocations(command: &str, inherited: Option<ModeValue>) -> Vec<Invocation> {
     found
 }
 
-/// Handle the arguments of `bash`/`sh`: `-c <string>` recurses into the
-/// string; `-o`/`+o`/`-O`/`+O` skip their option name; other `-x`/`+x` words
-/// are flags; the first other argument is the script, and `ironmem-hook.sh
-/// <name>` or `ironmem-mcp.sh hook [--harness <v>] <name>` is the hook.
+/// Handle the arguments of `bash`/`sh`: `-c <string>` (any single-dash option
+/// word containing `c`) recurses into the string; `-o`/`+o`/`-O`/`+O` skip
+/// their option name; other `-x`/`+x` words are flags; the first other
+/// argument is the script, and `ironmem-hook.sh <name>` or
+/// `ironmem-mcp.sh hook [--harness <v>] <name>` is the hook.
 fn shell_args(args: &[Word], mode: Option<ModeValue>, found: &mut Vec<Invocation>) {
     let mut i = 0;
     while let Some(arg) = args.get(i) {
         let text = arg.text.as_str();
-        if text.starts_with('-') && !text.starts_with("--") && text.ends_with('c') {
+        // bash reads any single-dash option word containing `c` (`-lc`,
+        // `-ce`) as `-c`.
+        if text.starts_with('-') && !text.starts_with("--") && text.contains('c') {
             if let Some(script) = args.get(i + 1) {
                 found.extend(invocations(&script.text, mode));
             }
@@ -517,7 +520,7 @@ fn invocation_mode(
             (Ok(McpAccessMode::Trusted), ModeSource::PluginWrapper)
         }
         Ok(mode) => (Ok(mode), source),
-        Err(e) => (Err(ModeError::Invalid(e.to_string())), source),
+        Err(_) => (Err(ModeError::Invalid(raw.to_owned())), source),
     }
 }
 
@@ -778,6 +781,29 @@ mod tests {
             "sh -e -o pipefail /p/bin/ironmem-mcp.sh hook stop",
             "stop"
         ));
+    }
+
+    #[test]
+    fn any_single_dash_shell_option_word_with_c_is_dash_c() {
+        assert!(runs_hook("bash -ce 'ironmem hook stop'", "stop"));
+        assert!(runs_hook("bash -cl 'ironmem hook stop'", "stop"));
+        assert!(runs_hook("sh -ec 'ironmem hook stop'", "stop"));
+        assert!(!runs_hook("bash --rcfile-c /p/x.sh stop", "stop"));
+    }
+
+    #[test]
+    fn invalid_mode_carries_the_raw_value() {
+        assert_eq!(
+            hook_mode("IRONMEM_MCP_MODE= ironmem hook stop", "stop", None, None),
+            (Err(ModeError::Invalid(String::new())), ModeSource::Inline)
+        );
+        assert_eq!(
+            hook_mode("ironmem hook stop", "stop", None, Some("Bogus")),
+            (
+                Err(ModeError::Invalid("Bogus".to_owned())),
+                ModeSource::Environment
+            )
+        );
     }
 
     #[test]
