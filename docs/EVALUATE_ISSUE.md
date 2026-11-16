@@ -463,7 +463,10 @@ block rather than holding it.
 
 The issue that surfaced the GOAL route (per-trade recognition keyterms plus
 a resilient bilingual speech configuration), re-routed under this table on
-2026-11-14:
+2026-11-16. The example routes the issue from its text as filed. The issue
+has since closed: it closed on 2026-09-12 via PR #361, "feat(voice): per-trade
+keyterms and resilient bilingual speech configuration (#282)". A live scan
+today would find the work landed.
 
 ```
 Issue #282: feat(voice): add per-trade keyterms and resilient bilingual speech configuration
@@ -473,19 +476,19 @@ Task estimate: 9 independent execution tasks
 Why:
  - Design judgment: two contracts are undefined — what a Spanish caller hears when the English-only fallback STT takes over, and where a "sellable + language evidence" gate lives (no such concept exists in the codebase yet)
  - Unattended fit: once those are decided, ~80% of the effort is authoring twelve trades of EN/ES keyterms, wiring them through vapiAssistantConfig.ts, and updating fixtures — mechanical, and `npm test` can prove it
- - AUTOPILOT: not recommended — the remainder changes provisioning behavior, so its expected class is `logic`, which decide_merge holds for a human; the repo has none of the `agent:*` labels (and no `risk:*` label would authorize it)
+ - AUTOPILOT: not recommended — the remainder changes provisioning behavior, so its expected class is `logic`, which decide_merge holds for a human; the repo has none of the `agent:*` labels (and the repo has no `risk:*` label that would authorize it)
  - GOAL prerequisite: met — the gate config for jeffreycrum/tenfourpro is approved (`npm test`)
  - Human follow-ups (neither phase): native-speaker review of dates, numbers, addresses, repair and safety wording; per-customer go-live language evidence
 
-Blast radius: ~6 files, 1 repo (src/services/voice/vapiAssistantConfig.ts, src/config/tradeConfigs.ts, their tests and fixtures)
+Blast radius: ~6 files, 2 modules (src/services/voice, src/config; their tests and fixtures)
 
 Phases:
   1. COLLAB — fallback-language contract and the sellable/language-evidence gate
-  2. GOAL — per-trade EN/ES keyterm sets for all twelve trades, wiring, fixtures
+  2. GOAL — a bounded keyterm set for every trade, Spanish terms for the trades the phase-1 gate marks bilingual, wiring, fixtures
 
 Recommended path:
   1. /collab start define the bilingual fallback contract and sellable-language gate for per-trade voice config
-  2. (after phase 1 merges) from a fresh worktree cut from the default branch after the merge, run: claude -p '/goal Author bounded EN/ES recognition keyterm sets for all twelve trades in tradeConfigs.ts and wire them through vapiAssistantConfig.ts, following the merged phase-1 decisions on the fallback-language contract and the sellable/language-evidence gate, for issue #282. Done when this gate passes: npm test, and every change is committed and pushed on this branch or stop after 6 turns' --permission-mode acceptEdits --allowed-tools "Bash(git *),Bash(npm test)"
+  2. (after phase 1 merges) from a fresh worktree on a feature branch cut from the default branch after the merge, run: claude -p '/goal Author a bounded recognition keyterm set for every trade in tradeConfigs.ts, with Spanish terms for the trades the phase-1 gate marks bilingual, and wire them through vapiAssistantConfig.ts and update their tests and fixtures, following the merged phase-1 decisions on the fallback-language contract and the sellable/language-evidence gate, for issue #282. Done when this gate passes: npm test, and every change is committed and pushed on this branch or stop after 6 turns'
 
 Recommended review:
   1. /pr-review-toolkit:review-pr
@@ -495,8 +498,10 @@ Proceed with phase 1? [y/N]
 ```
 
 The router prints phase 2's command ready to run and launches nothing past
-phase 1. Before running it, the user re-reads the gate config and confirms it
-is still approved with `npm test` unchanged. When the loop ends, the user
+phase 1. The user appends the permissions, e.g. `--permission-mode acceptEdits --allowed-tools "Bash(git *),Bash(npm test)"`, after the quoted argument.
+Before running it, the user asks an agent session to run the Step 2
+`get_drawer` read and confirms the config is still approved and its
+`gate_commands` still match `npm test`. When the loop ends, the user
 opens the PR, and a human reviews and merges it.
 
 Under the earlier four-route table the same issue routed COLLAB as a whole,
