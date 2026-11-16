@@ -427,10 +427,13 @@ comma-separated value, e.g.
 or
 `--permission-mode acceptEdits --allowed-tools "Bash(git add *),Bash(git commit *),Bash(git push *),Bash(<each gate command>)"`.
 `acceptEdits` alone is never enough: it covers file edits, but not the gate
-commands, `git commit` or `git push`, which go through Bash. The allowlist
-covers the gate, not setup: run the loop in a worktree whose dependencies are
-installed and bootstrapped. If a gate command contains `"`, `$` or a
-backtick, single-quote the value instead and write any `'` in it as `'\''`.
+commands, `git commit` or `git push`, which go through Bash.
+`Bash(git push *)` still matches a force push; the loop pushes only its own
+feature branch, and the default branch's branch protection is what stops a
+force push there. The allowlist covers the gate, not setup: run the loop in a
+worktree whose dependencies are installed and bootstrapped. If a gate command
+contains `"`, `$` or a backtick, single-quote the value instead and write any
+`'` in it as `'\''`.
 `--allowed-tools <tools...>` takes a variable number of values, so its
 position after the quoted argument, not the comma, keeps it from swallowing
 that argument as a tool name. The router never chooses a permission mode or a
