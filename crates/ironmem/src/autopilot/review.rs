@@ -190,6 +190,11 @@ impl RiskClass {
     /// ninth class added later must be classified deliberately at this line
     /// rather than defaulting into either group by omission. Defaulting the
     /// wrong way here ships unreviewed code.
+    ///
+    /// Keep this free of `cfg` attributes: the router-text test
+    /// (`the_router_states_exactly_the_autopilot_envelope_is_low_risk_grants`)
+    /// only sees the test build, so a cfg-gated arm would desync it from the
+    /// release binary.
     pub fn is_low_risk(self) -> bool {
         match self {
             RiskClass::Documentation
@@ -2835,36 +2840,65 @@ mod tests {
         }
     }
 
-    /// Every `RiskClass` variant, in declaration order.
-    fn every_risk_class() -> [RiskClass; 8] {
-        let all = [
-            RiskClass::Documentation,
-            RiskClass::DependencyBump,
-            RiskClass::MechanicalRename,
-            RiskClass::TestOnly,
-            RiskClass::Logic,
-            RiskClass::Protocol,
-            RiskClass::Security,
-            RiskClass::PublicApi,
-        ];
-        for class in all {
-            // Exhaustive by construction: every variant is listed and there is
-            // no wildcard arm, so adding a ninth `RiskClass` variant fails to
-            // compile here. When it does, add the new variant to this match
-            // AND to `all` above; the schema cross-check in the envelope test
-            // catches an update to one without the other.
-            match class {
-                RiskClass::Documentation
-                | RiskClass::DependencyBump
-                | RiskClass::MechanicalRename
-                | RiskClass::TestOnly
-                | RiskClass::Logic
-                | RiskClass::Protocol
-                | RiskClass::Security
-                | RiskClass::PublicApi => {}
+    /// Every `RiskClass` variant, in declaration order, read from the variant
+    /// list that `#[derive(Deserialize)]` generates rather than kept by hand.
+    ///
+    /// The derive passes every deserializable variant's serialized name to
+    /// `Deserializer::deserialize_enum`; `VariantNames` captures that list
+    /// and each name is parsed back into a `RiskClass`. A newly declared
+    /// variant therefore appears here with no edit to this helper. The one
+    /// gap: a variant marked `#[serde(skip)]` or `#[serde(skip_deserializing)]`
+    /// is left out of the derive's list, so it would be missed. `RiskClass`
+    /// has none.
+    fn every_risk_class() -> Vec<RiskClass> {
+        use serde::de::value::Error;
+        use serde::de::{Deserializer, Error as _, Visitor};
+
+        struct VariantNames(Option<&'static [&'static str]>);
+
+        impl<'de> Deserializer<'de> for &mut VariantNames {
+            type Error = Error;
+
+            fn deserialize_any<V: Visitor<'de>>(self, _: V) -> Result<V::Value, Error> {
+                Err(Error::custom("RiskClass must deserialize as an enum"))
+            }
+
+            fn deserialize_enum<V: Visitor<'de>>(
+                self,
+                _name: &'static str,
+                variants: &'static [&'static str],
+                _: V,
+            ) -> Result<V::Value, Error> {
+                self.0 = Some(variants);
+                Err(Error::custom("variant names captured"))
+            }
+
+            serde::forward_to_deserialize_any! {
+                bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str
+                string bytes byte_buf option unit unit_struct newtype_struct seq
+                tuple tuple_struct map struct identifier ignored_any
             }
         }
-        all
+
+        let mut captured = VariantNames(None);
+        RiskClass::deserialize(&mut captured)
+            .expect_err("the capturing deserializer never yields a value");
+        let names = captured
+            .0
+            .expect("#[derive(Deserialize)] on RiskClass must call deserialize_enum");
+        names
+            .iter()
+            .map(|&name| {
+                let class: RiskClass = serde_json::from_value(serde_json::Value::from(name))
+                    .unwrap_or_else(|e| panic!("serde variant {name:?} does not parse back: {e}"));
+                assert_eq!(
+                    class.as_str(),
+                    name,
+                    "RiskClass::as_str must match the serde name"
+                );
+                class
+            })
+            .collect()
     }
 
     /// `` `a`, `b`, or `c` ``: the router's spelling of the held list.
@@ -2890,11 +2924,18 @@ mod tests {
     ///
     /// This is a Rust test rather than a collab-template lint on purpose. It
     /// builds the two expected sentences by calling the real
-    /// `RiskClass::is_low_risk` and `RiskClass::as_str` on every variant, so
-    /// there is no parser to fool: a commented-out arm, a `#[cfg]`-gated arm,
-    /// a nested `match`, or a conditional `=> true` all mean whatever the
-    /// compiler says they mean. An earlier Python lint derived the sentences
-    /// by regex-parsing this file and kept meeting Rust shapes it misread.
+    /// `RiskClass::is_low_risk` and `RiskClass::as_str` on every variant
+    /// (listed by serde's derive, see `every_risk_class`), so there is no
+    /// parser to fool: a commented-out arm, a nested `match`, or a
+    /// conditional `=> true` all mean whatever the compiler says they mean.
+    /// An earlier Python lint derived the sentences by regex-parsing this file
+    /// and kept meeting Rust shapes it misread.
+    ///
+    /// It checks the policy as compiled for `cargo test` (cfg(test) on,
+    /// default features), not as the release binary has it. A
+    /// `#[cfg(test)]`-gated arm in `is_low_risk` would make this test demand
+    /// router text the release build does not honor, which is why
+    /// `is_low_risk` must stay free of `cfg` attributes.
     ///
     /// Per surface it pins: the auto-merge sentence, once, ending at its own
     /// `.`; the "never recommend" sentence, once, followed by `.` or by
@@ -2917,24 +2958,6 @@ mod tests {
             ".claude-plugin/commands/evaluate-issue.md",
             ".codex-plugin/prompts/evaluate-issue.md",
         ];
-
-        // The variant list must cover exactly the classes the Reviewer's
-        // schema can return, so a variant added to the enum and the schema
-        // but not to `every_risk_class` cannot drop out of the sentences.
-        let schema: serde_json::Value = serde_json::from_str(REVIEW_VERDICT_JSON_SCHEMA).unwrap();
-        let mut schema_classes: Vec<&str> = schema["properties"]["risk_class"]["enum"]
-            .as_array()
-            .expect("schema must constrain risk_class to an enum")
-            .iter()
-            .map(|v| v.as_str().unwrap())
-            .collect();
-        let mut listed: Vec<&str> = every_risk_class().iter().map(|c| c.as_str()).collect();
-        schema_classes.sort_unstable();
-        listed.sort_unstable();
-        assert_eq!(
-            listed, schema_classes,
-            "every_risk_class() must list every RiskClass the schema allows"
-        );
 
         let (low, held): (Vec<RiskClass>, Vec<RiskClass>) = every_risk_class()
             .into_iter()
@@ -2995,6 +3018,27 @@ mod tests {
                     after.len()
                 ));
             }
+        }
+
+        // Separate from the router text: a class the enum declares but the
+        // Reviewer's schema cannot return (or the reverse) is its own drift.
+        // Collected rather than asserted, so the expected sentences above are
+        // still printed when a new variant is the cause.
+        let schema: serde_json::Value = serde_json::from_str(REVIEW_VERDICT_JSON_SCHEMA).unwrap();
+        let mut schema_classes: Vec<&str> = schema["properties"]["risk_class"]["enum"]
+            .as_array()
+            .expect("schema must constrain risk_class to an enum")
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        let mut declared: Vec<&str> = every_risk_class().iter().map(|c| c.as_str()).collect();
+        schema_classes.sort_unstable();
+        declared.sort_unstable();
+        if declared != schema_classes {
+            failures.push(format!(
+                "REVIEW_VERDICT_JSON_SCHEMA risk_class enum {schema_classes:?} does not \
+                 match the declared RiskClass variants {declared:?}"
+            ));
         }
         assert!(
             failures.is_empty(),
