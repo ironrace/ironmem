@@ -68,6 +68,7 @@ Capture: `number`, `title`, `body`, `labels[]`, and the text of any
 `comments`. Labels and comments often carry the strongest routing signal
 (`good first issue`, `breaking-change`, `migration`, `needs-design`,
 extended back-and-forth discussion).
+If the issue fetch fails, or the result has no `labels` field, stop and report the failure; never route an issue whose labels were not read.
 
 ## Step 2 — Light repo scan (blast-radius estimate)
 
@@ -96,8 +97,8 @@ Goal: a rough estimate of how much code the issue touches.
      `A-Z`, `a-z`, `0-9`, `-`, `_`, `.` replaced by `-`
      (`ironrace/ironmem` → `ironrace-ironmem`). The repo qualifies only when
      the drawer is found and its JSON `state` is `"approved"`; keep its
-     `gate_commands` for a GOAL command. Not found, `"pending"`, or the tool
-     being unavailable all mean "not approved".
+     `gate_commands` for a GOAL command.
+     Anything else — a tool error, redacted or non-JSON content, another `state`, or a `gate_commands` that is missing, empty or has a blank entry — means not approved. Never infer gate commands from the repo.
    - **Agent labels.** Run
      `gh label list --repo <owner>/<repo> --search "agent:" --limit 100 --json name -q '.[].name'`.
      The repo qualifies only when the output contains all three of
@@ -109,6 +110,8 @@ Goal: a rough estimate of how much code the issue touches.
      checks that the list contains the exact name `risk:<expected class>` for
      the class chosen in Step 3. Autopilot takes the merge class from the
      issue's `risk:*` label, so without it the PR is held.
+
+   For both `gh label list` reads, a non-zero exit, an auth error or a rate limit means the label is missing.
 
 Keep this to a handful of searches. If the issue is purely prose (docs,
 process, a question), the scan may legitimately find nothing — that is a
@@ -166,7 +169,8 @@ Choose when **all** hold:
 
 - the issue's repo has an approved gate config, all three `agent:*` labels,
   and the `risk:<expected class>` label (Step 2, item 4), and the issue
-  (Step 1 labels) carries no `risk:*` label other than `risk:<expected class>`
+  (Step 1 labels) carries no `risk:*` label other than `risk:<expected class>`.
+  Labels that could not be read count as not meeting this requirement.
 - the expected diff falls inside Autopilot's auto-merge envelope.
   AUTOPILOT auto-merges only these classes: `documentation`, `dependency_bump`, `mechanical_rename`, `test_only`.
 - an implementer holding only the issue body can finish it: no open question
@@ -178,22 +182,24 @@ Never recommend AUTOPILOT when the expected class is `logic`, `protocol`, `secur
 PASS (`HoldForHuman(HighRiskClass)` in
 `crates/ironmem/src/autopilot/review.rs`), so the dispatch would spend a run
 to hand back a PR a human still has to read. Name the expected class in the
-rationale. When unsure between an envelope class and `logic`, the class is
-`logic`. The router adapts to this envelope; it never relaxes it.
+rationale.
+When unsure between an envelope class and `logic`, the class is `logic`.
+The router adapts to this envelope; it never relaxes it.
 
 When the issue otherwise fits AUTOPILOT but a prerequisite is missing, add a
 `Missing AUTOPILOT prerequisite:` line to *Why* naming each missing one and
 the command that supplies it, then continue down the table:
 
 - no approved gate config → `ironmem autopilot onboard <owner>/<repo> --path '<checkout>'`, then `ironmem autopilot approve <owner>/<repo>`
+  (`<checkout>` is single-quoted: write any `'` in it as `'\''`)
 - agent labels missing → `ironmem autopilot labels <owner>/<repo>`
 - `risk:<expected class>` label missing → `gh label create "risk:<expected class>" --repo <owner>/<repo>`
 - issue carries `risk:<other>` → name it; removing it is a human's risk call,
   never a printed command
 
-Autopilot merges under the issue's `risk:*` label: `decide_merge` holds the
-PR unless that label's class equals the class the reviewer derives from the
-diff, and the gate and the review must also pass.
+Autopilot merges under the issue's `risk:*` label, which must still be on the issue when `advance` runs:
+`decide_merge` holds the PR unless that label's class equals the class the
+reviewer derives from the diff, and the gate and the review must also pass.
 
 Typical issues, in a repo meeting rule 1's prerequisites: a docs fix, a
 dependency bump, a pure rename, a test-only coverage gap.
@@ -215,8 +221,9 @@ contained refactor, a single added test.
 Choose when **all** hold:
 
 - the issue's repo has an approved gate config (Step 2, item 4). The loop's
-  "done" is that config's `gate_commands`, so it cannot disagree with the
-  gate approved for Autopilot
+  "done" is that config's `gate_commands`, so it matches the gate approved
+  for Autopilot at the time of the read; the user re-checks it before
+  running a phase-2 GOAL, which is printed before phase 1 runs (see Step 5)
 - "done" is fully expressible as that gate passing with the work committed
   and pushed — no acceptance criterion needs a human's judgment to verify
 - the work is mechanical or high-volume — many files of one shape, data or
@@ -232,9 +239,9 @@ a human reviews and merges its PR.
 
 When the issue otherwise fits GOAL but the repo has no approved gate config,
 add a `Missing GOAL prerequisite:` line to *Why* naming
-`ironmem autopilot onboard <owner>/<repo> --path '<checkout>'` then
-`ironmem autopilot approve <owner>/<repo>`, and continue down the table
-(usually to IRON).
+`ironmem autopilot onboard <owner>/<repo> --path '<checkout>'` (write any
+`'` in `<checkout>` as `'\''`) then `ironmem autopilot approve <owner>/<repo>`,
+and continue down the table (usually to IRON).
 
 Typical issues: applying a decided pattern across many files, authoring a
 large table of config or terminology, bulk fixture regeneration.
@@ -395,7 +402,7 @@ invoked differ per host.
 
 | Verdict | Claude | Codex |
 |---|---|---|
-| AUTOPILOT | nothing to invoke. For an AUTOPILOT verdict, print, for the user to run, in order: (1) `gh issue edit <number> --repo <owner>/<repo> --add-label agent:ready --add-label "risk:<expected class>"` — applying these labels is the user's authorization, and the router never applies them; (2) `git -C '<checkout>' fetch origin`, then `ironmem autopilot lead --repo '<owner>/<repo>=<checkout>' --base origin/<default branch>`, which cuts the issue branch from the freshly fetched default branch (`--base` defaults to `HEAD`, the checkout's current commit) and dispatches the next `agent:ready` issue — in-flight resumes first, then by `priority:*`, one per tick by default; each rerun dispatches whichever issue is next, at a dispatch's cost; (3) `ironmem autopilot advance --repo '<owner>/<repo>=<checkout>' --reviewer codex` once that dispatch has opened its PR (adding `--merge` executes the merge that is otherwise rehearsed). For a phase-2 AUTOPILOT, print none of these; phase 2's line (`2. (after phase 1 merges) …`) is an instruction in their place: open a remainder issue scoped to phase 2 that cites phase 1's PR — the remainder-issue command below, with `<remainder title>` and the remainder scope filled in and the `<phase-1 PR>` slot left — then run `/evaluate-issue <remainder number>` on it. The label, `lead` and `advance` commands come from that run, against `<remainder number>`. | the same output, printed for the user |
+| AUTOPILOT | nothing to invoke. For an AUTOPILOT verdict, print, for the user to run, in order: (1) `gh issue edit <number> --repo <owner>/<repo> --add-label agent:ready --add-label "risk:<expected class>"` — applying these labels is the user's authorization, and the router never applies them; (2) `git -C '<checkout>' fetch origin`, then `ironmem autopilot lead --repo '<owner>/<repo>=<checkout>' --base 'origin/<default branch>'`, which cuts the issue branch from the freshly fetched default branch (`--base` defaults to `HEAD`, the checkout's current commit) and dispatches the next `agent:ready` issue — in-flight resumes first, then by `priority:*`, one per tick by default; each rerun dispatches whichever issue is next, at a dispatch's cost; (3) once that dispatch has succeeded and pushed its branch, `ironmem autopilot advance --repo '<owner>/<repo>=<checkout>' --reviewer codex`, which opens the PR, reviews it and applies the merge decision; adding `--merge` executes the merge, which is otherwise rehearsed, and `advance`, with or without `--merge`, acts on every succeeded `agent:ready` issue in the repo, not only this one. `<checkout>` is single-quoted in these commands: write any `'` in it as `'\''`. For a phase-2 AUTOPILOT, print none of these; phase 2's line (`2. (after phase 1 merges) …`) is an instruction in their place: open a remainder issue scoped to phase 2 that cites phase 1's PR — the remainder-issue command below, with `<remainder title>` and the remainder scope filled in and the `<phase-1 PR>` slot left — then run `/evaluate-issue <remainder number>` on it. The label, `lead` and `advance` commands come from that run, against `<remainder number>`. | the same output, printed for the user |
 | DIRECT | `/plan` to scope, then the `iron-tdd` skill | the `iron-tdd` skill directly |
 | GOAL | print, for the user to run from a fresh worktree on a feature branch cut from the default branch (for a phase-2 GOAL, cut after phase 1 merges): `claude -p '/goal <condition> or stop after <N> turns'`. When the loop ends, the user opens the PR, and a human reviews and merges it. | the same command, for the user to run in a terminal (`/goal` is a Claude Code command). When the loop ends, the user opens the PR, and a human reviews and merges it. |
 | IRON | invoke the `iron-plan` skill on the issue spec (flows into `iron-build`) | invoke the `iron-plan` skill |
@@ -409,9 +416,9 @@ the whole issue body into the command.
 For the GOAL condition, write
 `<one-line imperative task summary>, for issue #<number>. Done when this gate passes: <gate_commands joined with " && ">, and every change is committed and pushed on this branch, never pushing to the default branch`,
 using the `gate_commands` read in Step 2. Default `<N>` to `6`, Autopilot's
-own `DEFAULT_N_TURNS`. Keep the whole condition under 4,000 characters (the
-`/goal` platform limit: a longer condition is refused and gets no turn; see
-`MAX_CONDITION_CHARS` in `crates/ironmem/src/autopilot/turn_prompt.rs`). The
+own `DEFAULT_N_TURNS` in `crates/ironmem/src/autopilot/run.rs`. Keep the
+whole condition under 4,000 characters (the `/goal` platform limit: a
+longer condition is refused and gets no turn; see `MAX_CONDITION_CHARS` in `crates/ironmem/src/autopilot/turn_prompt.rs`). The
 limit covers the whole argument after `/goal `, including
 `or stop after <N> turns`: summarize; never paste the issue body. For a
 phase-2 GOAL, phase 1 has not run when the command is printed, so the summary
@@ -435,13 +442,13 @@ commands, `git commit` or `git push`, which go through Bash.
 `Bash(git push *)` still matches a force push, to any branch including the
 default one; nothing in the allowlist stops it. Only the default branch's
 protection can, so before an unattended run check
-`gh api repos/<owner>/<repo>/branches/<default branch> --jq .protected` and
+`gh api 'repos/<owner>/<repo>/branches/<default branch>' --jq .protected` and
 treat `false` as unprotected. `true` is necessary but not sufficient: the
 protection must also refuse force pushes, which
-`gh api repos/<owner>/<repo>/branches/<default branch>/protection --jq .allow_force_pushes.enabled`
+`gh api 'repos/<owner>/<repo>/branches/<default branch>/protection' --jq .allow_force_pushes.enabled`
 shows as `false` (that endpoint returns 404 on a branch with no classic
 protection). A repository ruleset can also refuse force pushes:
-`gh api repos/<owner>/<repo>/rules/branches/<default branch>` lists the rules
+`gh api 'repos/<owner>/<repo>/rules/branches/<default branch>'` lists the rules
 that apply, and `non_fast_forward` is the one that does (unverified: no repo
 checked here has a ruleset). Whether an admin's push bypasses a classic
 protection whose `enforce_admins` is off is also unverified. The allowlist
@@ -558,10 +565,10 @@ as its review.
   chosen attended path *after* the user confirms.
 - **Never auto-launch.** Even an obvious DIRECT verdict waits for `y`.
 - **The router never launches GOAL or AUTOPILOT.** It prints their commands
-  and the user runs them. For GOAL and AUTOPILOT it never adds or removes an
-  issue's labels or opens a phase-2 remainder issue, and on no route does it
-  create labels, onboard or approve a repo, or start an Autopilot dispatch —
-  not even after a yes.
+  and the user runs them. For GOAL and AUTOPILOT
+  it never adds or removes an issue's labels or opens a phase-2 remainder
+  issue, and on no route does it create labels, onboard or approve a repo, or
+  start an Autopilot dispatch — not even after a yes.
 - **Task-budget first.** An estimate above 15 tasks always yields `SPLIT`;
   never launch collab for the oversized parent issue.
 - **One verdict, never a menu.** A verdict is a single route or one ordered
@@ -571,9 +578,11 @@ as its review.
   not a menu", which forbade phases as written: a phase sequence is not
   hedging, because neither phase is optional.
 - **Adapt to Autopilot's policy, never relax it.** AUTOPILOT's envelope is
-  `RiskClass::is_low_risk` in `crates/ironmem/src/autopilot/review.rs`; the
-  test `the_router_states_exactly_the_autopilot_envelope_is_low_risk_grants`
-  in `review.rs` fails when this text drifts from it.
+  `RiskClass::is_low_risk` in `crates/ironmem/src/autopilot/review.rs`. The
+  integration test
+  `the_router_states_exactly_the_autopilot_envelope_is_low_risk_grants` in
+  `crates/ironmem/tests/autopilot_router_envelope.rs` fails when either
+  envelope sentence in rule 1 drifts from it; it checks no other prose.
 - **Scan, don't trace.** Step 2 is a handful of grep/glob calls and three
   prerequisite reads, not a subagent fan-out. If accurate routing would need
   deep tracing, say so in the rationale and lean toward the more cautious
