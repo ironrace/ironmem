@@ -17,6 +17,7 @@ use serde::Serialize;
 use crate::config::{Config, EmbedMode, McpAccessMode};
 use crate::db::schema::{Database, LATEST_SCHEMA_VERSION};
 
+mod hook_command;
 mod hooks;
 mod mined;
 mod render;
