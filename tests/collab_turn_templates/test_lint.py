@@ -58,6 +58,11 @@ def copy_fixture(tmp_path):
     (fixture / rust).mkdir(parents=True)
     for name in ("mod.rs", "phase.rs"):
         shutil.copy2(ROOT / rust / name, fixture / rust / name)
+    # The evaluate-issue AUTOPILOT envelope check derives the auto-merge
+    # classes from `RiskClass::is_low_risk` rather than a hardcoded copy.
+    autopilot = pathlib.Path("crates") / "ironmem" / "src" / "autopilot"
+    (fixture / autopilot).mkdir(parents=True)
+    shutil.copy2(ROOT / autopilot / "review.rs", fixture / autopilot / "review.rs")
     return fixture
 
 
@@ -766,6 +771,81 @@ def test_lint_requires_fifteen_task_evaluate_issue_ceiling(tmp_path):
     assert r.returncode == 1
     assert ".codex-plugin/prompts/evaluate-issue.md: missing evaluate-issue SPLIT contract" \
         in r.stdout
+
+
+EVALUATE_ISSUE_SURFACES = [
+    "docs/EVALUATE_ISSUE.md",
+    ".claude-plugin/commands/evaluate-issue.md",
+    ".codex-plugin/prompts/evaluate-issue.md",
+]
+# Stated here independently of the lint's own list, so dropping a pin from
+# the lint fails these tests instead of silently shrinking both sides.
+EVALUATE_ISSUE_ROUTE_SNIPPETS = [
+    'logical_key="gate-config:<slug>"',
+    "`agent:ready`, `agent:blocked`, `agent:exhausted`",
+    "Missing AUTOPILOT prerequisite:",
+    "Missing GOAL prerequisite:",
+    "or stop after <N> turns",
+    "Proceed with phase 1? [y/N]",
+    "The router never launches GOAL or AUTOPILOT",
+    "One verdict, never a menu.",
+]
+AUTOPILOT_REVIEW_RS = pathlib.Path("crates") / "ironmem" / "src" / "autopilot" / "review.rs"
+
+
+@pytest.mark.parametrize("rel", EVALUATE_ISSUE_SURFACES)
+@pytest.mark.parametrize("snippet", EVALUATE_ISSUE_ROUTE_SNIPPETS)
+def test_lint_requires_evaluate_issue_route_contract(tmp_path, rel, snippet):
+    fixture = copy_fixture(tmp_path)
+    mutate(fixture / rel, snippet)
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert f"{rel}: missing evaluate-issue route contract snippet {snippet!r}" in r.stdout
+
+
+@pytest.mark.parametrize("rel", EVALUATE_ISSUE_SURFACES)
+def test_lint_rejects_an_autopilot_envelope_wider_than_review_rs(tmp_path, rel):
+    # The router claiming `logic` auto-merges advertises an autonomy
+    # decide_merge will not deliver.
+    fixture = copy_fixture(tmp_path)
+    mutate(fixture / rel,
+           "`mechanical_rename`, `test_only`.",
+           "`mechanical_rename`, `test_only`, `logic`.")
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert f"{rel}: AUTOPILOT envelope drifted from RiskClass::is_low_risk" in r.stdout
+
+
+def test_lint_derives_autopilot_envelope_from_review_rs(tmp_path):
+    # Narrow the policy in the Rust source and leave the router text alone:
+    # the text now over-advertises, so every surface must fail. This is what
+    # proves the envelope is derived, not hardcoded in the lint.
+    fixture = copy_fixture(tmp_path)
+    mutate(fixture / AUTOPILOT_REVIEW_RS,
+           "\n            | RiskClass::TestOnly => true,\n            RiskClass::Logic |",
+           " => true,\n            RiskClass::TestOnly | RiskClass::Logic |")
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    for rel in EVALUATE_ISSUE_SURFACES:
+        assert f"{rel}: AUTOPILOT envelope drifted from RiskClass::is_low_risk" in r.stdout
+
+
+def test_lint_fails_closed_without_review_rs(tmp_path):
+    fixture = copy_fixture(tmp_path)
+    (fixture / AUTOPILOT_REVIEW_RS).unlink()
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert ("crates/ironmem/src/autopilot/review.rs: cannot derive the AUTOPILOT "
+            "auto-merge envelope") in r.stdout
+
 
 
 def test_lint_requires_sixteen_task_bridge_ceiling(tmp_path):

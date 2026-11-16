@@ -533,6 +533,24 @@ REQUIRED_EVALUATE_ISSUE_SNIPPETS = [
     "Split-child-key:",
     "Split-parent-key:",
 ]
+# The GOAL / AUTOPILOT route contract (#336), shared by all three router
+# surfaces like the SPLIT snippets above: a mirror cannot drop a route's
+# prerequisite read, its missing-prerequisite line, the two-phase confirm,
+# or the never-launch rule without this firing. The auto-merge envelope is
+# deliberately NOT listed here — `autopilot_envelope_sentences()` derives it
+# from review.rs so the router can never advertise more than decide_merge
+# grants.
+REQUIRED_EVALUATE_ISSUE_ROUTE_SNIPPETS = [
+    'logical_key="gate-config:<slug>"',
+    "`agent:ready`, `agent:blocked`, `agent:exhausted`",
+    "Missing AUTOPILOT prerequisite:",
+    "Missing GOAL prerequisite:",
+    "or stop after <N> turns",
+    "Proceed with phase 1? [y/N]",
+    "The router never launches GOAL or AUTOPILOT",
+    "One verdict, never a menu.",
+]
+AUTOPILOT_REVIEW_RS = ROOT / "crates" / "ironmem" / "src" / "autopilot" / "review.rs"
 # Every planning surface that states the collab execution ceiling has an
 # explicit 15/16 contract. This is intentionally more specific than the
 # evaluator and template checks above: those guards catch a few shared phrases,
@@ -863,17 +881,75 @@ def check_no_uninstalled_skill_references() -> None:
                         f"to nothing and the worker freelances the step")
 
 
+def _or_list(items: list[str]) -> str:
+    """`a`, `b`, or `c` — the spelling the router uses for held classes."""
+    quoted = [f"`{item}`" for item in items]
+    if len(quoted) == 1:
+        return quoted[0]
+    return ", ".join(quoted[:-1]) + ", or " + quoted[-1]
+
+
+def autopilot_envelope_sentences() -> list[str] | None:
+    """The two AUTOPILOT envelope sentences, derived from review.rs.
+
+    `RiskClass::is_low_risk`'s `=> true` arm is the auto-merge policy; every
+    other `RiskClass` spelling is held for a human. Returns None after
+    reporting when review.rs is missing or no longer parses, so a refactor
+    there fails this lint loudly instead of skipping the check.
+    """
+    rel = "crates/ironmem/src/autopilot/review.rs"
+    prefix = f"{rel}: cannot derive the AUTOPILOT auto-merge envelope — "
+    if not AUTOPILOT_REVIEW_RS.exists():
+        err(prefix + "file not found")
+        return None
+    src = AUTOPILOT_REVIEW_RS.read_text()
+    arm = re.search(
+        r"fn is_low_risk\(self\) -> bool \{\s*match self \{\s*"
+        r"((?:RiskClass::\w+\s*\|\s*)*RiskClass::\w+)\s*=>\s*true",
+        src,
+    )
+    if arm is None:
+        err(prefix + "no `RiskClass::is_low_risk` match arm ending in `=> true`")
+        return None
+    low_variants = re.findall(r"RiskClass::(\w+)", arm.group(1))
+    spelling = dict(re.findall(r'RiskClass::(\w+) => "(\w+)"', src))
+    unspelled = [v for v in low_variants if v not in spelling]
+    if unspelled:
+        err(prefix + f"no `as_str` spelling for {unspelled}")
+        return None
+    high = [s for v, s in spelling.items() if v not in low_variants]
+    if not high:
+        err(prefix + "every RiskClass is low-risk, so no class is ever held")
+        return None
+    low = [spelling[v] for v in low_variants]
+    return [
+        "AUTOPILOT auto-merges only these classes: "
+        + ", ".join(f"`{c}`" for c in low) + ".",
+        "Never recommend AUTOPILOT when the expected class is " + _or_list(high),
+    ]
+
+
 def check_evaluate_issue_surfaces() -> None:
-    """Keep the evaluator's SPLIT safety contract in its three mirrors."""
+    """Keep the evaluator's SPLIT and route contracts in its three mirrors."""
+    envelope = autopilot_envelope_sentences() or []
     for path in (EVALUATE_ISSUE_DOC, EVALUATE_ISSUE_CLAUDE, EVALUATE_ISSUE_CODEX):
+        rel = path.relative_to(ROOT)
         if not path.exists():
-            err(f"{path.relative_to(ROOT)}: missing evaluate-issue surface")
+            err(f"{rel}: missing evaluate-issue surface")
             continue
         body = path.read_text()
         for snippet in REQUIRED_EVALUATE_ISSUE_SNIPPETS:
             if snippet not in body:
-                err(f"{path.relative_to(ROOT)}: missing evaluate-issue SPLIT contract "
+                err(f"{rel}: missing evaluate-issue SPLIT contract "
                     f"snippet {snippet!r}")
+        for snippet in REQUIRED_EVALUATE_ISSUE_ROUTE_SNIPPETS:
+            if snippet not in body:
+                err(f"{rel}: missing evaluate-issue route contract "
+                    f"snippet {snippet!r}")
+        for sentence in envelope:
+            if sentence not in body:
+                err(f"{rel}: AUTOPILOT envelope drifted from "
+                    f"RiskClass::is_low_risk in review.rs — expected {sentence!r}")
 
 
 def check_task_budget_surface_contracts() -> None:
