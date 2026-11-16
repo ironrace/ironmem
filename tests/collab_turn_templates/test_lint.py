@@ -1050,6 +1050,103 @@ def test_lint_accepts_self_prefixed_arms(tmp_path):
     assert r.returncode == 0, r.stdout
 
 
+EVALUATE_ISSUE_MIRRORS = EVALUATE_ISSUE_SURFACES[1:]
+NEVER_RECOMMEND_CONTINUATION = " —\n   `decide_merge` holds those"
+
+
+@pytest.mark.parametrize("rel", EVALUATE_ISSUE_MIRRORS)
+def test_lint_rejects_a_never_recommend_continuation_that_carves_out_a_class(
+        tmp_path, rel):
+    # A bare ` —` accepted any continuation, including one that takes a held
+    # class back out of the held list.
+    fixture = copy_fixture(tmp_path)
+    mutate(fixture / rel, NEVER_RECOMMEND_CONTINUATION,
+           " — except small `logic` diffs")
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert f"{rel}: AUTOPILOT envelope drifted from RiskClass::is_low_risk" in r.stdout
+
+
+@pytest.mark.parametrize("extra", [
+    "AUTOPILOT auto-merges only these classes: `documentation`, "
+    "`dependency_bump`, `mechanical_rename`, `test_only`, `logic`.",
+    "Never recommend AUTOPILOT when the expected class is `protocol`.",
+], ids=["auto-merges", "never-recommend"])
+def test_lint_rejects_a_second_copy_of_an_envelope_sentence(tmp_path, extra):
+    # The correct sentence still matches, so only a count catches a widened
+    # second copy elsewhere in the same surface.
+    fixture = copy_fixture(tmp_path)
+    path = fixture / "docs/EVALUATE_ISSUE.md"
+    path.write_text(path.read_text() + "\n" + extra + "\n")
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert ("docs/EVALUATE_ISSUE.md: AUTOPILOT envelope sentence appears 2 "
+            "times; expected exactly once") in r.stdout
+
+
+@pytest.mark.parametrize("replacement", [
+    "            #[cfg(test)]\n            RiskClass::Logic => true,\n"
+    + IS_LOW_RISK_HELD_ARM,
+    "            RiskClass::Logic => match OVERRIDE {\n"
+    "                RiskClass::Logic => true,\n"
+    "                _ => false,\n"
+    "            },\n"
+    "            RiskClass::Protocol | RiskClass::Security | RiskClass::PublicApi => {\n",
+], ids=["cfg-gated-arm", "nested-match"])
+def test_lint_fails_closed_on_an_attribute_or_nested_match_in_is_low_risk(
+        tmp_path, replacement):
+    # Either one makes a `=> true` arm conditional; reading it as plain policy
+    # derives `logic` as auto-merge and asks the router to advertise it.
+    fixture = copy_fixture(tmp_path)
+    mutate(fixture / AUTOPILOT_REVIEW_RS, IS_LOW_RISK_HELD_ARM, replacement)
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert (CANNOT_DERIVE + " — is_low_risk contains an attribute or nested "
+            "match; derive by hand") in r.stdout
+    assert "AUTOPILOT envelope drifted" not in r.stdout
+
+
+AS_STR_DECOY_LATER_IN_IMPL = (
+    "    pub fn label(self) -> &'static str {\n"
+    "        match self {\n"
+    '            RiskClass::TestOnly => "logic",\n'
+    '            _ => "other",\n'
+    "        }\n"
+    "    }\n\n")
+
+
+@pytest.mark.parametrize("spelling,decoy", [
+    ("test{only", ""),
+    ("test}only", ""),
+    # `{{` pushes an unaware brace count past `as_str` into the rest of the
+    # impl, where a later arm then overrides the real spelling.
+    ("test{{only", AS_STR_DECOY_LATER_IN_IMPL),
+], ids=["open", "close", "overrun-into-decoy"])
+def test_lint_counts_no_brace_inside_an_as_str_literal(tmp_path, spelling, decoy):
+    fixture = copy_fixture(tmp_path)
+    path = fixture / AUTOPILOT_REVIEW_RS
+    mutate(path, '            RiskClass::TestOnly => "test_only",',
+           f'            RiskClass::TestOnly => "{spelling}",')
+    if decoy:
+        mutate(path, "    /// Parse one of the schema's enum values.",
+               decoy + "    /// Parse one of the schema's enum values.")
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    # Safe outcomes only: fail closed, or derive the real `as_str` spelling.
+    assert r.returncode == 1
+    derived = ("expected 'AUTOPILOT auto-merges only these classes: "
+               "`documentation`, `dependency_bump`, `mechanical_rename`, "
+               f"`{spelling}`.'")
+    assert CANNOT_DERIVE in r.stdout or derived in r.stdout, r.stdout
+
+
 def test_lint_requires_sixteen_task_bridge_ceiling(tmp_path):
     fixture = copy_fixture(tmp_path)
     command = fixture / ".claude-plugin" / "commands" / "collab.md"

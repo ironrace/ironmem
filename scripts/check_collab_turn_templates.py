@@ -894,7 +894,7 @@ _RUST_CHAR_LITERAL = re.compile(
     r"'(?:\\(?:u\{[0-9a-fA-F]+\}|x[0-9a-fA-F]{2}|.)|[^\\'\n])'")
 
 
-def _strip_rust_comments(src: str) -> str:
+def _strip_rust_comments(src: str, blank_literals: bool = False) -> str:
     """`src` with every Rust comment blanked out, literals left intact.
 
     Line comments (`//`, so `///` and `//!` too) and block comments, which
@@ -902,13 +902,21 @@ def _strip_rust_comments(src: str) -> str:
     patterns still see line structure. String, raw string, byte string and
     char literals are copied verbatim, so a `//` or `/*` inside one is not a
     comment. A lifetime (`'static`) is told apart from a char literal by the
-    closing quote.
+    closing quote. With `blank_literals`, literals are blanked too, so a
+    brace counter sees only code braces; the result always has `src`'s length,
+    so an index into it is an index into `src`.
     """
     out: list[str] = []
     i, n = 0, len(src)
 
     def blank(text: str) -> None:
         out.append("".join(ch if ch == "\n" else " " for ch in text))
+
+    def literal(text: str) -> None:
+        if blank_literals:
+            blank(text)
+        else:
+            out.append(text)
 
     while i < n:
         ch = src[i]
@@ -933,18 +941,21 @@ def _strip_rust_comments(src: str) -> str:
             close = '"' + raw.group(1)
             end = src.find(close, raw.end())
             end = n if end == -1 else end + len(close)
-            out.append(src[i:end])
+            literal(src[i:end])
             i = end
         elif ch == '"':
             j = i + 1
             while j < n and src[j] != '"':
                 j += 2 if src[j] == "\\" else 1
-            out.append(src[i:j + 1])
+            literal(src[i:j + 1])
             i = j + 1
         elif ch == "'":
             lit = _RUST_CHAR_LITERAL.match(src, i)
             end = lit.end() if lit else i + 1
-            out.append(src[i:end])
+            if lit:
+                literal(src[i:end])
+            else:
+                out.append(src[i:end])
             i = end
         else:
             out.append(ch)
@@ -953,19 +964,36 @@ def _strip_rust_comments(src: str) -> str:
 
 
 def _brace_body(src: str, header: str) -> str | None:
-    """The text between the braces of the `{` that ends `header`'s match."""
-    m = re.search(header, src)
+    """The text between the braces of the `{` that ends `header`'s match.
+
+    Matching and counting run on a copy with literals blanked, so a `{` or
+    `}` inside a string such as `"test{{only"` cannot carry the body past
+    its own closing brace into a later arm that respells a class.
+    """
+    code = _strip_rust_comments(src, blank_literals=True)
+    m = re.search(header, code)
     if m is None:
         return None
     depth = 0
-    for i in range(m.end() - 1, len(src)):
-        if src[i] == "{":
+    for i in range(m.end() - 1, len(code)):
+        if code[i] == "{":
             depth += 1
-        elif src[i] == "}":
+        elif code[i] == "}":
             depth -= 1
             if depth == 0:
                 return src[m.end():i]
     return None
+
+
+# The opening words of the two envelope sentences. Each must appear exactly
+# once per surface: the correct sentence plus a widened second copy elsewhere
+# would otherwise still pass the match below.
+AUTOPILOT_AUTO_MERGE_PREFIX = "AUTOPILOT auto-merges only these classes:"
+AUTOPILOT_NEVER_RECOMMEND_PREFIX = "Never recommend AUTOPILOT when the expected class is"
+# What may follow the "never recommend" sentence: the spec's `.`, or the exact
+# continuation both command mirrors use. A bare ` —` would accept
+# ` — except small `logic` diffs`, carving a held class back out.
+AUTOPILOT_NEVER_RECOMMEND_TERMINATOR = r"(?:\.| —\s+`decide_merge` holds those\b)"
 
 
 def autopilot_envelope_sentences() -> list[tuple[str, str]] | None:
@@ -975,7 +1003,14 @@ def autopilot_envelope_sentences() -> list[tuple[str, str]] | None:
     `RiskClass::is_low_risk`'s `=> true` arms are the auto-merge policy; every
     other enum variant is held for a human. Returns None after reporting when
     review.rs is missing or no longer parses, so a refactor there fails this
-    lint loudly instead of skipping the check.
+    lint loudly instead of skipping the check. An attribute or a nested
+    `match` inside `is_low_risk` also returns None: either can make an arm
+    conditional, and this parser cannot tell which way it goes.
+
+    Limit: this is a substring lint over prose. It pins each sentence, its
+    terminator, and its single occurrence, but it cannot stop contradicting
+    prose placed after a correct sentence (for example "…`test_only`. Also
+    `logic` when small."). PR review covers that case.
     """
     rel = "crates/ironmem/src/autopilot/review.rs"
     prefix = f"{rel}: cannot derive the AUTOPILOT auto-merge envelope — "
@@ -994,6 +1029,11 @@ def autopilot_envelope_sentences() -> list[tuple[str, str]] | None:
     low_body = _brace_body(src, r"fn is_low_risk\(self\) -> bool \{\s*match self \{")
     if low_body is None:
         err(prefix + "no `RiskClass::is_low_risk` match arm ending in `=> true`")
+        return None
+    # After comment stripping, so a commented-out `#[cfg]` is not a false hit.
+    if re.search(r"#!?\[", low_body) or re.search(r"\bmatch\b", low_body):
+        err(prefix + "is_low_risk contains an attribute or nested match; "
+            "derive by hand")
         return None
     if re.search(r"(?:^|[\s,{|])_\s*=>\s*true\b", low_body):
         err(prefix + "`is_low_risk` has a wildcard `_ => true` arm, "
@@ -1028,14 +1068,13 @@ def autopilot_envelope_sentences() -> list[tuple[str, str]] | None:
     low = [spelling[v] for v in low_variants]
     # Each sentence is paired with the terminator regex that must follow it.
     # The auto-merge sentence ends at its own `.`: a ` —` continuation there
-    # (` — and `logic``) could add a class back. Only the "never recommend"
-    # sentence may also end at ` —`, which is how the command mirrors go on
-    # to give the `decide_merge` reason.
+    # (` — and `logic``) could add a class back. The "never recommend"
+    # sentence takes AUTOPILOT_NEVER_RECOMMEND_TERMINATOR.
     return [
-        ("AUTOPILOT auto-merges only these classes: "
+        (f"{AUTOPILOT_AUTO_MERGE_PREFIX} "
          + ", ".join(f"`{c}`" for c in low) + ".", ""),
-        ("Never recommend AUTOPILOT when the expected class is " + _or_list(high),
-         r"(?:\.| —)"),
+        (f"{AUTOPILOT_NEVER_RECOMMEND_PREFIX} " + _or_list(high),
+         AUTOPILOT_NEVER_RECOMMEND_TERMINATOR),
     ]
 
 
@@ -1056,6 +1095,12 @@ def check_evaluate_issue_surfaces() -> None:
             if snippet not in body:
                 err(f"{rel}: missing evaluate-issue route contract "
                     f"snippet {snippet!r}")
+        for opening in (AUTOPILOT_AUTO_MERGE_PREFIX,
+                        AUTOPILOT_NEVER_RECOMMEND_PREFIX):
+            count = len(flex(opening).findall(body))
+            if count > 1:
+                err(f"{rel}: AUTOPILOT envelope sentence appears {count} "
+                    f"times; expected exactly once ({opening!r})")
         for sentence, terminator in envelope:
             # A prefix match would pass `…`public_api`, or `docs`` — require
             # the sentence to end where the router ends it.
