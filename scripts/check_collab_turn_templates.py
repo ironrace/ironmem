@@ -889,13 +889,29 @@ def _or_list(items: list[str]) -> str:
     return ", ".join(quoted[:-1]) + ", or " + quoted[-1]
 
 
+def _brace_body(src: str, header: str) -> str | None:
+    """The text between the braces of the `{` that ends `header`'s match."""
+    m = re.search(header, src)
+    if m is None:
+        return None
+    depth = 0
+    for i in range(m.end() - 1, len(src)):
+        if src[i] == "{":
+            depth += 1
+        elif src[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return src[m.end():i]
+    return None
+
+
 def autopilot_envelope_sentences() -> list[str] | None:
     """The two AUTOPILOT envelope sentences, derived from review.rs.
 
-    `RiskClass::is_low_risk`'s `=> true` arm is the auto-merge policy; every
-    other `RiskClass` spelling is held for a human. Returns None after
-    reporting when review.rs is missing or no longer parses, so a refactor
-    there fails this lint loudly instead of skipping the check.
+    `RiskClass::is_low_risk`'s `=> true` arms are the auto-merge policy; every
+    other enum variant is held for a human. Returns None after reporting when
+    review.rs is missing or no longer parses, so a refactor there fails this
+    lint loudly instead of skipping the check.
     """
     rel = "crates/ironmem/src/autopilot/review.rs"
     prefix = f"{rel}: cannot derive the AUTOPILOT auto-merge envelope — "
@@ -903,28 +919,51 @@ def autopilot_envelope_sentences() -> list[str] | None:
         err(prefix + "file not found")
         return None
     src = AUTOPILOT_REVIEW_RS.read_text()
-    arm = re.search(
-        r"fn is_low_risk\(self\) -> bool \{\s*match self \{\s*"
-        r"((?:RiskClass::\w+\s*\|\s*)*RiskClass::\w+)\s*=>\s*true",
-        src,
-    )
-    if arm is None:
+    enum_body = _brace_body(src, r"pub enum RiskClass \{")
+    variants = (re.findall(r"^\s*([A-Z]\w*)\s*(?:,|$)", enum_body, re.M)
+                if enum_body is not None else [])
+    if not variants:
+        err(prefix + "no `pub enum RiskClass` variants")
+        return None
+    low_body = _brace_body(src, r"fn is_low_risk\(self\) -> bool \{\s*match self \{")
+    if low_body is None:
         err(prefix + "no `RiskClass::is_low_risk` match arm ending in `=> true`")
         return None
-    low_variants = re.findall(r"RiskClass::(\w+)", arm.group(1))
-    spelling = dict(re.findall(r'RiskClass::(\w+) => "(\w+)"', src))
+    if re.search(r"(?:^|[\s,{|])_\s*=>\s*true\b", low_body):
+        err(prefix + "`is_low_risk` has a wildcard `_ => true` arm, "
+            "which would make every class low-risk")
+        return None
+    low_variants = [
+        v
+        for arm in re.findall(r"((?:(?:RiskClass|Self)::\w+[\s|]*)+)=>\s*true\b",
+                              low_body)
+        for v in re.findall(r"(?:RiskClass|Self)::(\w+)", arm)
+    ]
+    if not low_variants:
+        err(prefix + "no `RiskClass::is_low_risk` match arm ending in `=> true`")
+        return None
+    str_body = _brace_body(src, r"fn as_str\(self\) -> &'static str \{\s*match self \{")
+    if str_body is None:
+        err(prefix + "no `RiskClass::as_str` match")
+        return None
+    spelling = dict(re.findall(r'(?:RiskClass|Self)::(\w+)\s*=>\s*"([^"]+)"', str_body))
     unspelled = [v for v in low_variants if v not in spelling]
     if unspelled:
         err(prefix + f"no `as_str` spelling for {unspelled}")
         return None
-    high = [s for v, s in spelling.items() if v not in low_variants]
+    if set(spelling) != set(variants):
+        err(prefix + f"`as_str` spellings {sorted(spelling)} do not cover "
+            f"the enum variants {sorted(variants)}")
+        return None
+    high = [spelling[v] for v in variants if v not in low_variants]
     if not high:
         err(prefix + "every RiskClass is low-risk, so no class is ever held")
         return None
     low = [spelling[v] for v in low_variants]
+    # Neither sentence carries its terminator; the caller requires `.` or ` —`.
     return [
         "AUTOPILOT auto-merges only these classes: "
-        + ", ".join(f"`{c}`" for c in low) + ".",
+        + ", ".join(f"`{c}`" for c in low),
         "Never recommend AUTOPILOT when the expected class is " + _or_list(high),
     ]
 
@@ -947,7 +986,9 @@ def check_evaluate_issue_surfaces() -> None:
                 err(f"{rel}: missing evaluate-issue route contract "
                     f"snippet {snippet!r}")
         for sentence in envelope:
-            if sentence not in body:
+            # A prefix match would pass `…`public_api`, or `docs`` — require
+            # the sentence to end where the router ends it.
+            if not re.search(re.escape(sentence) + r"(?:\.| —)", body):
                 err(f"{rel}: AUTOPILOT envelope drifted from "
                     f"RiskClass::is_low_risk in review.rs — expected {sentence!r}")
 

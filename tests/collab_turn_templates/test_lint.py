@@ -7,6 +7,9 @@ LINT = ROOT / "scripts" / "check_collab_turn_templates.py"
 MARK = "MUTATED-BY-TEST"
 
 
+AUTOPILOT_REVIEW_RS = pathlib.Path("crates") / "ironmem" / "src" / "autopilot" / "review.rs"
+
+
 def run(extra_env=None):
     env = os.environ.copy()
     if extra_env:
@@ -60,9 +63,8 @@ def copy_fixture(tmp_path):
         shutil.copy2(ROOT / rust / name, fixture / rust / name)
     # The evaluate-issue AUTOPILOT envelope check derives the auto-merge
     # classes from `RiskClass::is_low_risk` rather than a hardcoded copy.
-    autopilot = pathlib.Path("crates") / "ironmem" / "src" / "autopilot"
-    (fixture / autopilot).mkdir(parents=True)
-    shutil.copy2(ROOT / autopilot / "review.rs", fixture / autopilot / "review.rs")
+    (fixture / AUTOPILOT_REVIEW_RS.parent).mkdir(parents=True)
+    shutil.copy2(ROOT / AUTOPILOT_REVIEW_RS, fixture / AUTOPILOT_REVIEW_RS)
     return fixture
 
 
@@ -790,7 +792,6 @@ EVALUATE_ISSUE_ROUTE_SNIPPETS = [
     "The router never launches GOAL or AUTOPILOT",
     "One verdict, never a menu.",
 ]
-AUTOPILOT_REVIEW_RS = pathlib.Path("crates") / "ironmem" / "src" / "autopilot" / "review.rs"
 
 
 @pytest.mark.parametrize("rel", EVALUATE_ISSUE_SURFACES)
@@ -846,6 +847,103 @@ def test_lint_fails_closed_without_review_rs(tmp_path):
     assert ("crates/ironmem/src/autopilot/review.rs: cannot derive the AUTOPILOT "
             "auto-merge envelope") in r.stdout
 
+
+@pytest.mark.parametrize("rel", EVALUATE_ISSUE_SURFACES)
+def test_lint_rejects_a_held_list_narrower_than_review_rs(tmp_path, rel):
+    # Dropping `public_api` from the "never recommend" sentence is its own
+    # drift: the first sentence stays correct, so only the second can catch it.
+    fixture = copy_fixture(tmp_path)
+    mutate(fixture / rel, "`security`, or `public_api`", "`security`")
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert f"{rel}: AUTOPILOT envelope drifted from RiskClass::is_low_risk" in r.stdout
+
+
+def test_lint_rejects_a_held_list_that_grows_past_review_rs(tmp_path):
+    # The sentence must END where the router ends it; a bare prefix match
+    # would accept an extra class appended to the held list.
+    fixture = copy_fixture(tmp_path)
+    mutate(fixture / "docs/EVALUATE_ISSUE.md",
+           "`security`, or `public_api`.", "`security`, or `public_api`, `docs`.")
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert "docs/EVALUATE_ISSUE.md: AUTOPILOT envelope drifted" in r.stdout
+
+
+CANNOT_DERIVE = ("crates/ironmem/src/autopilot/review.rs: cannot derive the "
+                 "AUTOPILOT auto-merge envelope")
+
+
+def test_lint_fails_closed_when_is_low_risk_stops_parsing(tmp_path):
+    fixture = copy_fixture(tmp_path)
+    mutate(fixture / AUTOPILOT_REVIEW_RS,
+           "pub fn is_low_risk(self) -> bool {",
+           "pub fn is_low_risk(&self) -> bool {")
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert CANNOT_DERIVE in r.stdout
+    assert "no `RiskClass::is_low_risk` match" in r.stdout
+
+
+def test_lint_fails_closed_on_a_low_risk_class_with_no_spelling(tmp_path):
+    fixture = copy_fixture(tmp_path)
+    mutate(fixture / AUTOPILOT_REVIEW_RS,
+           '            RiskClass::TestOnly => "test_only",\n', "")
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert CANNOT_DERIVE in r.stdout
+    assert "no `as_str` spelling for ['TestOnly']" in r.stdout
+
+
+def test_lint_fails_closed_when_spellings_do_not_cover_the_enum(tmp_path):
+    fixture = copy_fixture(tmp_path)
+    mutate(fixture / AUTOPILOT_REVIEW_RS,
+           'RiskClass::PublicApi => "public_api"',
+           'RiskClass::Logic => "public_api"')
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert CANNOT_DERIVE in r.stdout
+    assert "do not cover the enum variants" in r.stdout
+
+
+def test_lint_fails_closed_on_a_wildcard_true_arm(tmp_path):
+    fixture = copy_fixture(tmp_path)
+    mutate(fixture / AUTOPILOT_REVIEW_RS,
+           "            | RiskClass::TestOnly => true,\n",
+           "            | RiskClass::TestOnly => true,\n            _ => true,\n")
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert CANNOT_DERIVE in r.stdout
+    assert "wildcard `_ => true`" in r.stdout
+
+
+def test_lint_reads_spellings_only_from_as_str(tmp_path):
+    # A later impl spelling a class differently (a Display impl, say) must not
+    # override `as_str`, which is what the router text quotes.
+    fixture = copy_fixture(tmp_path)
+    path = fixture / AUTOPILOT_REVIEW_RS
+    path.write_text(path.read_text() + (
+        "\nfn decoy(c: RiskClass) -> &'static str {\n"
+        "    match c {\n"
+        '        RiskClass::Logic => "Logic",\n'
+        "    }\n"
+        "}\n"))
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 0, r.stdout
 
 
 def test_lint_requires_sixteen_task_bridge_ceiling(tmp_path):
