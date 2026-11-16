@@ -48,13 +48,13 @@ pub(super) fn mined_rows_check(
     now: NaiveDateTime,
 ) -> Check {
     let filed_at = match newest {
-        // The `database` line already warns that the store is in use; a second
+        // The `database` line usually already reports a busy store; a second
         // hintless warning here would just repeat it.
         Err(e) if is_db_busy(&e) => {
             return Check::new(
                 KEY,
                 CheckStatus::Info,
-                "mined-row age: skipped (database busy; see the database line)",
+                "mined-row age: skipped (database busy; re-run when idle)",
             )
         }
         Err(e) => {
@@ -178,12 +178,15 @@ mod tests {
     #[test]
     fn read_error_and_bad_timestamp_warn() {
         let now = at("2026-11-14 12:00:00");
-        let e = mined_rows_check(
-            Err(MemoryError::Validation("database is locked".into())),
-            now,
-        );
+        // A non-busy Db error (SQLITE_CORRUPT) must still warn, not skip.
+        let corrupt = MemoryError::Db(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(11),
+            None,
+        ));
+        let text = corrupt.to_string();
+        let e = mined_rows_check(Err(corrupt), now);
         assert_eq!(e.status, CheckStatus::Warn);
-        assert!(e.summary.contains("database is locked"));
+        assert!(e.summary.contains(&text), "{}", e.summary);
         let bad = mined_rows_check(Ok(Some("yesterday".into())), now);
         assert_eq!(bad.status, CheckStatus::Warn);
         assert!(bad.summary.contains("yesterday"));
