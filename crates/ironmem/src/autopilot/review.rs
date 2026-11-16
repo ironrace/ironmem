@@ -2975,6 +2975,11 @@ mod tests {
         // `every_risk_class` reads the derive's variant list, which leaves
         // out a skipped variant and folds unknown input into an `other` one.
         // Whitespace is removed first so `#[serde( skip )]` is still seen.
+        // Every `serde(` group in the enum is checked, not only `#[serde(`,
+        // so `#[cfg_attr(…, serde(skip))]` is caught too, and every argument
+        // in the group is checked, so `rename = "x", skip` is caught as well.
+        // A group ends at its first `)`; serde's variant arguments that take
+        // parentheses (`bound(…)`) are not used here.
         let source = include_str!("review.rs");
         let start = source
             .find("pub enum RiskClass {")
@@ -2983,13 +2988,21 @@ mod tests {
             .find("\n}\n")
             .expect("`pub enum RiskClass` must close with a `}` line");
         let enum_body: String = source[start..start + len].split_whitespace().collect();
-        for banned in ["#[serde(skip", "#[serde(other"] {
-            assert!(
-                !enum_body.contains(banned),
-                "RiskClass must not use `{banned}…)]` on a variant: the router-text \
-                 test lists the variants through serde's derive, which a skipped or \
-                 `other` variant would slip past"
-            );
+        for (at, opener) in enum_body.match_indices("serde(") {
+            let args_start = at + opener.len();
+            let args_len = enum_body[args_start..]
+                .find(')')
+                .unwrap_or(enum_body.len() - args_start);
+            for arg in enum_body[args_start..args_start + args_len].split(',') {
+                let key = arg.split('=').next().unwrap_or(arg);
+                assert!(
+                    !(key == "skip" || key.starts_with("skip_") || key == "other"),
+                    "RiskClass must not use serde `{key}` on a variant (found `serde({})`): \
+                     the router-text test lists the variants through serde's derive, which \
+                     a skipped or `other` variant would slip past",
+                    &enum_body[args_start..args_start + args_len]
+                );
+            }
         }
 
         let (low, held): (Vec<RiskClass>, Vec<RiskClass>) = every_risk_class()
