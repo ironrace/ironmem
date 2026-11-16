@@ -1,7 +1,8 @@
 //! `ironmem doctor` — local setup diagnostics.
 //!
 //! Validates the pieces a fresh install needs (binary, database + schema, model
-//! cache, MCP access mode, warmup readiness, configured harnesses) and reports
+//! cache, MCP access mode, warmup readiness, configured harnesses, the newest
+//! mined row's age) and reports
 //! each as a [`Check`]. The command is diagnose-only: it never modifies user
 //! config. Only a [`CheckStatus::Error`] is a *blocking* setup failure and
 //! drives a non-zero exit; warnings and info lines are advisory.
@@ -15,6 +16,7 @@ use serde::Serialize;
 use crate::config::{Config, EmbedMode, McpAccessMode};
 use crate::db::schema::{Database, LATEST_SCHEMA_VERSION};
 
+mod mined;
 mod render;
 pub use render::render_text;
 
@@ -96,6 +98,7 @@ pub fn run_doctor(cfg: &Config) -> DoctorReport {
 
     let binary = check_binary(env!("IRONMEM_VERSION"));
     let database = check_database(&cfg.db_path);
+    let database_usable = !database.status.is_blocking();
     let model = check_model_cache(&cfg.model_dir, cfg.embed_mode);
     let mcp = check_mcp_mode(cfg.mcp_access_mode);
     let warmup = check_warmup(database.status, model.status);
@@ -105,6 +108,11 @@ pub fn run_doctor(cfg: &Config) -> DoctorReport {
         home.as_deref(),
         std::env::var_os("XDG_CONFIG_HOME").as_deref(),
         crate::harness::REGISTRY,
+    ));
+    checks.push(mined::check_mined_rows(
+        &cfg.db_path,
+        database_usable,
+        chrono::Utc::now().naive_utc(),
     ));
 
     DoctorReport { checks }
@@ -1180,6 +1188,7 @@ mod tests {
                 "harness_grok",
                 "harness_gemini",
                 "harness_muse",
+                "mined_rows",
             ],
             "the toolable check-key set must stay stable"
         );
@@ -1471,6 +1480,7 @@ mod tests {
                 "harness_grok",
                 "harness_gemini",
                 "harness_muse",
+                "mined_rows",
                 "daemon",
                 "daemon_autospawn",
             ]

@@ -359,6 +359,20 @@ impl Database {
         )
     }
 
+    /// `filed_at` of the newest drawer the miner wrote (`added_by = 'mine'`),
+    /// or `None` when nothing has ever been mined into this store. Superseded
+    /// rows count: the question is when mining last ran, not what is current.
+    /// `ironmem doctor` uses it to show when mining stopped, since MCP writes
+    /// keep a store looking alive while the hooks mine nothing (#377).
+    pub fn newest_mined_filed_at(&self) -> Result<Option<String>, MemoryError> {
+        let newest: Option<String> = self.conn.query_row(
+            "SELECT MAX(filed_at) FROM drawers WHERE added_by = ?1",
+            [MINED_ADDED_BY],
+            |row| row.get(0),
+        )?;
+        Ok(newest)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn insert_drawer_tx(
         tx: &Transaction<'_>,
@@ -1379,6 +1393,62 @@ mod tests {
 
     fn dummy_embedding() -> Vec<f32> {
         vec![0.1; ironrace_embed::embedder::EMBED_DIM]
+    }
+
+    #[test]
+    fn newest_mined_filed_at_reads_only_mined_rows() {
+        let db = Database::open_in_memory().unwrap();
+        let emb = dummy_embedding();
+        assert_eq!(db.newest_mined_filed_at().unwrap(), None);
+
+        db.insert_drawer(
+            "a".repeat(32).as_str(),
+            "old mined",
+            &emb,
+            "w",
+            "r",
+            "f1",
+            MINED_ADDED_BY,
+        )
+        .unwrap();
+        db.insert_drawer(
+            "b".repeat(32).as_str(),
+            "new mined",
+            &emb,
+            "w",
+            "r",
+            "f2",
+            MINED_ADDED_BY,
+        )
+        .unwrap();
+        db.insert_drawer(
+            "c".repeat(32).as_str(),
+            "newest, but mcp",
+            &emb,
+            "w",
+            "r",
+            "",
+            "mcp",
+        )
+        .unwrap();
+        for (id, at) in [
+            ("a".repeat(32), "2026-01-01 00:00:00"),
+            ("b".repeat(32), "2026-03-01 12:00:00"),
+            ("c".repeat(32), "2026-11-01 00:00:00"),
+        ] {
+            db.conn
+                .execute(
+                    "UPDATE drawers SET filed_at = ?1 WHERE id = ?2",
+                    rusqlite::params![at, id],
+                )
+                .unwrap();
+        }
+
+        assert_eq!(
+            db.newest_mined_filed_at().unwrap().as_deref(),
+            Some("2026-03-01 12:00:00"),
+            "an MCP write must not count as mining"
+        );
     }
 
     #[test]

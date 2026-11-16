@@ -1,0 +1,200 @@
+//! The `mined_rows` doctor check (#377): how old the newest mined drawer is.
+//!
+//! MCP writes keep a store looking alive while hook mining has stopped, so the
+//! age of the newest `added_by = 'mine'` row is the direct evidence of whether
+//! transcripts are still being mined. It is also the backstop for the
+//! `hook_mining` check, which infers a hook's mode from config and can be
+//! wrong about it.
+
+use std::path::Path;
+use std::time::Duration;
+
+use chrono::{NaiveDateTime, TimeDelta};
+
+use super::{Check, CheckStatus};
+use crate::db::schema::Database;
+
+/// A newest mined row older than this many days is reported as a `Warn`.
+pub(super) const MINED_STALE_AFTER_DAYS: i64 = 7;
+
+/// `filed_at` is SQLite `datetime('now')`: UTC, `YYYY-MM-DD HH:MM:SS`.
+const FILED_AT_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
+
+const KEY: &str = "mined_rows";
+
+/// Read the newest mined row from the store at `db_path` and report its age.
+/// Always returns a check, so doctor's key set stays stable: a missing or
+/// unusable database is an `Info` skip, because the `database` line already
+/// reports it.
+pub(super) fn check_mined_rows(db_path: &Path, database_usable: bool, now: NaiveDateTime) -> Check {
+    if !database_usable || !db_path.exists() {
+        return Check::new(
+            KEY,
+            CheckStatus::Info,
+            "mined-row age: skipped (no usable database)",
+        );
+    }
+    // Same opener as `check_database`: no create, no migration, short busy wait.
+    let newest = Database::open_with_busy_timeout(db_path, Duration::from_millis(500))
+        .and_then(|db| db.newest_mined_filed_at())
+        .map_err(|e| e.to_string());
+    mined_rows_check(newest, now)
+}
+
+/// Decide the `mined_rows` check from the newest mined `filed_at` and `now`
+/// (both UTC). Pure, so the thresholds are unit-tested without a clock.
+pub(super) fn mined_rows_check(
+    newest: Result<Option<String>, String>,
+    now: NaiveDateTime,
+) -> Check {
+    let filed_at = match newest {
+        Err(e) => {
+            return Check::new(
+                KEY,
+                CheckStatus::Warn,
+                format!("cannot read the newest mined row: {e}"),
+            )
+        }
+        Ok(None) => {
+            return Check::new(
+                KEY,
+                CheckStatus::Info,
+                "no mined rows yet: no transcript has been mined into this store",
+            )
+            .with_hint("mining runs in the Stop and PreCompact hooks; see the hook_mining line")
+        }
+        Ok(Some(s)) => s,
+    };
+    let Ok(mined_at) = NaiveDateTime::parse_from_str(&filed_at, FILED_AT_FORMAT) else {
+        return Check::new(
+            KEY,
+            CheckStatus::Warn,
+            format!("newest mined row has an unreadable timestamp: {filed_at}"),
+        );
+    };
+    let age = now.signed_duration_since(mined_at);
+    if age > TimeDelta::days(MINED_STALE_AFTER_DAYS) {
+        Check::new(
+            KEY,
+            CheckStatus::Warn,
+            format!(
+                "newest mined row is {} old ({filed_at} UTC): transcripts are not being mined",
+                describe_age(age)
+            ),
+        )
+        .with_hint(
+            "MCP writes do not count as mining; the hook_mining line says why the hooks skip it",
+        )
+    } else {
+        Check::new(
+            KEY,
+            CheckStatus::Ok,
+            format!(
+                "newest mined row is {} old ({filed_at} UTC)",
+                describe_age(age)
+            ),
+        )
+    }
+}
+
+/// Coarse human age: whole days, else whole hours, else "under an hour".
+/// A future timestamp (clock skew) reads as "under an hour".
+fn describe_age(age: TimeDelta) -> String {
+    let (days, hours) = (age.num_days(), age.num_hours());
+    match (days, hours) {
+        (d, _) if d >= 2 => format!("{d} days"),
+        (1, _) => "1 day".to_string(),
+        (_, h) if h >= 2 => format!("{h} hours"),
+        (_, 1) => "1 hour".to_string(),
+        _ => "under an hour".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn at(s: &str) -> NaiveDateTime {
+        NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").unwrap()
+    }
+
+    #[test]
+    fn recent_row_is_ok_and_shows_its_age() {
+        let c = mined_rows_check(
+            Ok(Some("2026-11-12 10:00:00".into())),
+            at("2026-11-14 12:00:00"),
+        );
+        assert_eq!(c.name, "mined_rows");
+        assert_eq!(c.status, CheckStatus::Ok);
+        assert!(c.summary.contains("2 days old"), "{}", c.summary);
+        assert!(
+            c.summary.contains("2026-11-12 10:00:00 UTC"),
+            "{}",
+            c.summary
+        );
+    }
+
+    #[test]
+    fn row_older_than_seven_days_warns_that_mining_stopped() {
+        let c = mined_rows_check(
+            Ok(Some("2026-07-18 06:10:11".into())),
+            at("2026-11-14 12:00:00"),
+        );
+        assert_eq!(c.status, CheckStatus::Warn);
+        assert!(c.summary.contains("119 days old"), "{}", c.summary);
+        assert!(
+            c.summary.contains("transcripts are not being mined"),
+            "{}",
+            c.summary
+        );
+        assert!(c.hint.as_deref().unwrap().contains("hook_mining"));
+    }
+
+    #[test]
+    fn exactly_seven_days_is_still_ok_one_second_more_warns() {
+        let now = at("2026-11-14 12:00:00");
+        let ok = mined_rows_check(Ok(Some("2026-11-07 12:00:00".into())), now);
+        assert_eq!(ok.status, CheckStatus::Ok, "{}", ok.summary);
+        let stale = mined_rows_check(Ok(Some("2026-11-07 11:59:59".into())), now);
+        assert_eq!(stale.status, CheckStatus::Warn, "{}", stale.summary);
+    }
+
+    #[test]
+    fn no_mined_rows_is_info() {
+        let c = mined_rows_check(Ok(None), at("2026-11-14 12:00:00"));
+        assert_eq!(c.status, CheckStatus::Info);
+        assert!(c.summary.contains("no mined rows yet"), "{}", c.summary);
+    }
+
+    #[test]
+    fn read_error_and_bad_timestamp_warn() {
+        let now = at("2026-11-14 12:00:00");
+        let e = mined_rows_check(Err("database is locked".into()), now);
+        assert_eq!(e.status, CheckStatus::Warn);
+        assert!(e.summary.contains("database is locked"));
+        let bad = mined_rows_check(Ok(Some("yesterday".into())), now);
+        assert_eq!(bad.status, CheckStatus::Warn);
+        assert!(bad.summary.contains("yesterday"));
+    }
+
+    #[test]
+    fn age_wording() {
+        assert_eq!(describe_age(TimeDelta::minutes(5)), "under an hour");
+        assert_eq!(describe_age(TimeDelta::minutes(61)), "1 hour");
+        assert_eq!(describe_age(TimeDelta::hours(5)), "5 hours");
+        assert_eq!(describe_age(TimeDelta::hours(30)), "1 day");
+        assert_eq!(describe_age(TimeDelta::days(9)), "9 days");
+        assert_eq!(describe_age(TimeDelta::minutes(-5)), "under an hour");
+    }
+
+    #[test]
+    fn missing_or_unusable_database_is_skipped_as_info() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = at("2026-11-14 12:00:00");
+        let missing = check_mined_rows(&dir.path().join("absent.sqlite3"), true, now);
+        assert_eq!(missing.status, CheckStatus::Info);
+        assert!(missing.summary.contains("skipped"), "{}", missing.summary);
+        let unusable = check_mined_rows(&dir.path().join("absent.sqlite3"), false, now);
+        assert_eq!(unusable.status, CheckStatus::Info);
+    }
+}
