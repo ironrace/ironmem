@@ -104,8 +104,10 @@ Goal: a rough estimate of how much code the issue touches.
      `agent:ready`, `agent:blocked`, `agent:exhausted`.
    - **Risk label.** Run
      `gh label list --repo <owner>/<repo> --search "risk:" --limit 100 --json name -q '.[].name'`.
-     It must list `risk:<expected class>`. Autopilot takes the merge class from
-     the issue's `risk:*` label, so without it the PR is held.
+     It lists every `risk:*` label; rule 1 (AUTOPILOT) checks that the list
+     contains `risk:<expected class>` for the class chosen in Step 3. Autopilot
+     takes the merge class from the issue's `risk:*` label, so without it the
+     PR is held.
 
 Keep this to a handful of searches. If the issue is purely prose (docs,
 process, a question), the scan may legitimately find nothing — that is a
@@ -206,7 +208,7 @@ Choose when **all** hold:
 - the issue's repo has an approved gate config (Step 2, item 4). The loop's
   "done" is that config's `gate_commands`, so it cannot disagree with what CI
   checks
-- "done" is fully expressible as that gate passing with the work committed —
+- "done" is fully expressible as that gate passing with the work committed and pushed —
   no acceptance criterion needs a human's judgment to verify
 - the work is mechanical or high-volume — many files of one shape, data or
   terminology authoring, fixture updates, wiring an already-decided design
@@ -363,7 +365,7 @@ invoked differ per host.
 |---|---|---|
 | AUTOPILOT | nothing to invoke; print, for the user to run, in order: (1) `gh issue edit <number> --repo <owner>/<repo> --add-label agent:ready --add-label risk:<expected class>` — applying these labels is the user's authorization, and the router never applies them; (2) `ironmem autopilot lead --repo <owner>/<repo>=<checkout>`, which dispatches from `agent:ready`; (3) `ironmem autopilot advance --repo <owner>/<repo>=<checkout> --reviewer codex` (adding `--merge` executes the merge that is otherwise rehearsed) | the same commands, printed for the user |
 | DIRECT | `/plan` to scope, then the `iron-tdd` skill | the `iron-tdd` skill directly |
-| GOAL | print, for the user to run from a fresh worktree on a feature branch: `claude -p '/goal <condition> or stop after <N> turns'`, then open the PR yourself; a human reviews and merges it. | the same command, for the user to run in a terminal — `/goal` is a Claude Code command — then open the PR yourself; a human reviews and merges it. |
+| GOAL | print, for the user to run from a fresh worktree on a feature branch: `claude -p '/goal <condition> or stop after <N> turns'`, the user opens the PR after the loop ends; a human reviews and merges it. | the same command, for the user to run in a terminal — `/goal` is a Claude Code command — the user opens the PR after the loop ends; a human reviews and merges it. |
 | IRON | invoke the `iron-plan` skill on the issue spec (flows into `iron-build`) | invoke the `iron-plan` skill |
 | COLLAB | `/collab start <one-line task summary derived from the issue>` | `/collab` is Claude-driven: recommend the user run `/collab start <task>` in a Claude terminal (Codex joins via the protocol) |
 | SPLIT | create the confirmed child issues, then re-run `/evaluate-issue` for each child | create the confirmed child issues, then re-run `/evaluate-issue` for each child |
