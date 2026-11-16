@@ -111,7 +111,8 @@ Goal: a rough estimate of how much code the issue touches.
 
 Keep this to a handful of searches. If the issue is purely prose (docs,
 process, a question), the scan may legitimately find nothing — that is a
-signal in itself (usually DIRECT, or AUTOPILOT in a repo meeting rule 1's prerequisites).
+signal in itself (usually DIRECT, or AUTOPILOT in a repo meeting rule 1's
+prerequisites).
 
 ## Step 3 — Score the six signals
 
@@ -186,11 +187,15 @@ the command that supplies it, then continue down the table:
 - no approved gate config → `ironmem autopilot onboard <owner>/<repo> --path <checkout>`, then `ironmem autopilot approve <owner>/<repo>`
 - agent labels missing → `ironmem autopilot labels <owner>/<repo>`
 - `risk:<expected class>` label missing → `gh label create "risk:<expected class>" --repo <owner>/<repo>`
+- issue carries `risk:<other>` → name it; removing it is a human's risk call,
+  never a printed command
 
-Autopilot merges under the issue's `risk:*` label: `decide_merge` holds the PR unless that label's class equals the class the reviewer derives from the diff, and the gate and the review must also pass.
+Autopilot merges under the issue's `risk:*` label: `decide_merge` holds the
+PR unless that label's class equals the class the reviewer derives from the
+diff, and the gate and the review must also pass.
 
-Typical issues, in a repo meeting rule 1's prerequisites: a docs fix, a dependency bump, a pure
-rename, a test-only coverage gap.
+Typical issues, in a repo meeting rule 1's prerequisites: a docs fix, a
+dependency bump, a pure rename, a test-only coverage gap.
 
 ### 2. DIRECT — `/plan` + TDD
 
@@ -209,9 +214,10 @@ contained refactor, a single added test.
 Choose when **all** hold:
 
 - the issue's repo has an approved gate config (Step 2, item 4). The loop's
-  "done" is that config's `gate_commands`, so it cannot disagree with the gate Autopilot itself approved
-- "done" is fully expressible as that gate passing with the work committed and pushed —
-  no acceptance criterion needs a human's judgment to verify
+  "done" is that config's `gate_commands`, so it cannot disagree with the
+  gate Autopilot itself approved
+- "done" is fully expressible as that gate passing with the work committed
+  and pushed — no acceptance criterion needs a human's judgment to verify
 - the work is mechanical or high-volume — many files of one shape, data or
   terminology authoring, fixture updates, wiring an already-decided design
   through — rather than judgment-shaped
@@ -280,8 +286,16 @@ verdict when **all** hold:
   or more — so pricing the whole issue at phase 1's cost would overspend
 
 Otherwise the verdict stays single. There are never more than two phases, and
-phase 2 is always GOAL or AUTOPILOT. For a phase-2 AUTOPILOT, the remainder gets its own new issue, so the printed steps start with a user-run `gh issue create --repo <owner>/<repo> --title "<remainder title>" --body "<remainder scope; cites phase 1's PR>"`; the label step, `lead` and `advance` then target that new issue's number, not the parent's, and rule 1's "implementer holding only the issue body" test is applied to that new issue's body. The task estimate counts both phases
-together, and the SPLIT ceiling applies to that sum. Acceptance criteria no
+phase 2 is always GOAL or AUTOPILOT. A phase-2 AUTOPILOT runs on a remainder
+issue of its own, which the user opens after phase 1 merges so that it can
+cite phase 1's PR. At phase-1 time the router only drafts that issue (the
+AUTOPILOT row of the path mapping), and the remainder scope it drafts must
+pass rule 1's "implementer holding only the issue body" test by itself. The
+user then runs `/evaluate-issue <remainder number>` on the new issue; that
+run applies rule 1 to it and prints its label, `lead` and `advance` commands.
+A phase-2 GOAL needs no new issue: its condition follows the merged phase-1
+decisions. The task estimate counts both phases together, and the SPLIT
+ceiling applies to that sum. Acceptance criteria no
 gate can check (a native-speaker review, a go-live sign-off) belong to neither
 phase: list them under *Why* as human follow-ups rather than letting them
 block the split.
@@ -342,11 +356,18 @@ The confirmation line depends on the verdict:
 - a two-phase verdict: `Proceed with phase 1? [y/N]`
 - GOAL or AUTOPILOT alone: no question. End with `The router never launches GOAL or AUTOPILOT — run the command above yourself.`
 
-For GOAL or AUTOPILOT alone, stop after printing; otherwise **wait for the user**. On an explicit yes, invoke the recommended path.
-On a yes to a two-phase verdict, invoke phase 1 only; the phase-2 command is
-for the user to run after phase 1's PR merges: after phase 1 merges, the user
-reruns `/evaluate-issue <number>` to re-check phase 2's prerequisites and
-regenerate its command. The router never launches GOAL or AUTOPILOT, at any phase.
+For GOAL or AUTOPILOT alone, stop after printing; otherwise **wait for the
+user**. On an explicit yes, invoke the recommended path. On a yes to a
+two-phase verdict, invoke phase 1 only; phase 2 is the user's to run after
+phase 1's PR merges. A phase-2 GOAL is printed as a ready-to-run command:
+before running it, the user re-checks that the gate config is still approved
+(the Step 2 `get_drawer` read) and that its `gate_commands` still match the
+printed condition. Rerunning `/evaluate-issue` on the parent is not the
+mechanism; it would re-score the original issue and print the same two-phase
+verdict. A phase-2 AUTOPILOT is printed as an instruction: the user opens the
+remainder issue, then runs `/evaluate-issue <remainder number>` on it. The
+router never launches GOAL or AUTOPILOT, at any phase, and never opens the
+remainder issue.
 For `SPLIT`, create the proposed child GitHub issues only when the issue repo
 matches the local checkout. Preserve relevant parent labels, include
 `Parent: #<number>` in each child body, and add their links in one comment on
@@ -372,7 +393,7 @@ invoked differ per host.
 
 | Verdict | Claude | Codex |
 |---|---|---|
-| AUTOPILOT | nothing to invoke; print, for the user to run, in order: (1) for a phase-2 AUTOPILOT only, `gh issue create --repo <owner>/<repo> --title "<remainder title>" --body "<remainder scope; cites phase 1's PR>"`, whose new issue number is the `<number>` in every later step; (2) `gh issue edit <number> --repo <owner>/<repo> --add-label agent:ready --add-label "risk:<expected class>"` (add `--remove-label "risk:<other>"` if the issue carries a conflicting `risk:*` label) — applying these labels is the user's authorization, and the router never applies them; (3) `ironmem autopilot lead --repo <owner>/<repo>=<checkout>`, which dispatches the next `agent:ready` issue by `priority:*` (one per tick by default; rerun it if another queued issue goes first); (4) `ironmem autopilot advance --repo <owner>/<repo>=<checkout> --reviewer codex` once that dispatch has opened its PR (adding `--merge` executes the merge that is otherwise rehearsed) | the same commands, printed for the user |
+| AUTOPILOT | nothing to invoke. For an AUTOPILOT verdict, print, for the user to run, in order: (1) `gh issue edit <number> --repo <owner>/<repo> --add-label agent:ready --add-label "risk:<expected class>"` — applying these labels is the user's authorization, and the router never applies them; (2) `ironmem autopilot lead --repo <owner>/<repo>=<checkout>`, which dispatches the next `agent:ready` issue — in-flight resumes first, then by `priority:*`, one per tick by default; each rerun dispatches whichever issue is next, at a dispatch's cost; (3) `ironmem autopilot advance --repo <owner>/<repo>=<checkout> --reviewer codex` once that dispatch has opened its PR (adding `--merge` executes the merge that is otherwise rehearsed). For a phase-2 AUTOPILOT, print none of these; phase 2's line (`2. (after phase 1 merges) …`) is an instruction in their place: open a remainder issue scoped to phase 2 that cites phase 1's PR — the remainder-issue command below, with `<remainder title>` and the remainder scope filled in and the `<phase-1 PR>` slot left — then run `/evaluate-issue <remainder number>` on it. The label, `lead` and `advance` commands come from that run, against `<remainder number>`. | the same output, printed for the user |
 | DIRECT | `/plan` to scope, then the `iron-tdd` skill | the `iron-tdd` skill directly |
 | GOAL | print, for the user to run from a fresh worktree on a feature branch: `claude -p '/goal <condition> or stop after <N> turns'`. When the loop ends, the user opens the PR, and a human reviews and merges it. | the same command, for the user to run in a terminal (`/goal` is a Claude Code command). When the loop ends, the user opens the PR, and a human reviews and merges it. |
 | IRON | invoke the `iron-plan` skill on the issue spec (flows into `iron-build`) | invoke the `iron-plan` skill |
@@ -386,17 +407,43 @@ the whole issue body into the command.
 For the GOAL condition, write
 `<one-line imperative task summary>, for issue #<number>. Done when this gate passes: <gate_commands joined with " && ">, and every change is committed and pushed on this branch`,
 using the `gate_commands` read in Step 2. Default `<N>` to `6`, Autopilot's
-own `DEFAULT_N_TURNS`. Keep the whole condition under 4,000 characters (the `/goal`
-platform limit: a longer condition is refused and gets no turn; see
-`MAX_CONDITION_CHARS` in `crates/ironmem/src/autopilot/turn_prompt.rs`).
-The limit covers the whole argument after `/goal `, including
-`or stop after <N> turns`: summarize; never
-paste the issue body. For a phase-2 GOAL, name what phase 1 decided (its PR
-or approved plan) in the summary. The argument is single-quoted, so write any
-`'` inside it as `'\''`.
+own `DEFAULT_N_TURNS`. Keep the whole condition under 4,000 characters (the
+`/goal` platform limit: a longer condition is refused and gets no turn; see
+`MAX_CONDITION_CHARS` in `crates/ironmem/src/autopilot/turn_prompt.rs`). The
+limit covers the whole argument after `/goal `, including
+`or stop after <N> turns`: summarize; never paste the issue body. For a
+phase-2 GOAL, phase 1 has not run when the
+command is printed, so the summary names the decisions phase 1 settles and
+tells the loop to follow the merged phase-1 decisions on them, never a PR
+number. The argument is single-quoted, so write any `'` inside it as `'\''`.
 
-A headless `claude -p` loop can edit, commit and push only if its permission mode or tool allowlist permits it: the user adds `--permission-mode <mode>` (choices in `claude --help`) or `--allowed-tools …` to the printed command; the router never chooses a permission mode.
+A headless `claude -p` loop can edit, commit and push only if its permission
+mode or tool allowlist permits it. The user grants that by appending, after
+the quoted `/goal` argument, either `--permission-mode <mode>` (choices in
+`claude --help`) or `--allowed-tools` with one quoted, comma-separated value,
+e.g. `--allowed-tools "Edit,Bash(git *)"`. `--allowed-tools <tools...>`
+takes a variable number of values, so placed before the quoted argument it
+swallows that argument as a tool name. `acceptEdits` covers file edits but not
+`git commit` or `git push`, which go through Bash. The router never chooses a
+permission mode or a tool list.
 
+For a phase-2 AUTOPILOT, the remainder-issue command is:
+
+```
+gh issue create --repo <owner>/<repo> --title '<remainder title>' --body-file - <<'EOF'
+<remainder scope, complete enough that an implementer holding only this body can finish it>
+
+Remainder of #<number>, after phase 1's PR #<phase-1 PR>.
+EOF
+```
+
+The title is single-quoted: write any `'` in it as `'\''`. The quoted heredoc
+delimiter (`<<'EOF'`) stops command substitution and `$` expansion in the
+body; no body line may be exactly `EOF`. Never put scope text in a
+double-quoted argument. `<phase-1 PR>` stays a slot for the user to fill in
+once phase 1's PR exists. `gh issue create` prints the new issue's URL, whose
+number is `<remainder number>`. The router prints this command and never runs
+it.
 
 ## Review tiers
 
@@ -422,8 +469,9 @@ as its review.
   chosen attended path *after* the user confirms.
 - **Never auto-launch.** Even an obvious DIRECT verdict waits for `y`.
 - **The router never launches GOAL or AUTOPILOT.** It prints their commands
-  and the user runs them. It never labels an issue, creates labels, onboards
-  or approves a repo, or dispatches — not even after a yes.
+  and the user runs them. It never adds or removes an issue's labels, creates
+  labels, opens a phase-2 remainder issue, onboards or approves a repo, or
+  dispatches — not even after a yes.
 - **Task-budget first.** An estimate above 15 tasks always yields `SPLIT`;
   never launch collab for the oversized parent issue.
 - **One verdict, never a menu.** A verdict is a single route or one ordered
