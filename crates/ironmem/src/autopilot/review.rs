@@ -170,8 +170,15 @@ pub const DEFAULT_MAX_UNPRICED_REVIEWS_PER_DAY: u32 = 20;
 /// protocol, security, or public API opens a PR and waits for a human
 /// regardless of reviewer verdict."
 ///
-/// Do not put `#[serde(skip*)]` or `#[serde(other)]` on a variant: the
-/// router-text test lists the variants through the derive.
+/// Do not put `#[serde(skip*)]` on a variant: the router-envelope test
+/// (`crates/ironmem/tests/autopilot_router_envelope.rs`) lists the variants
+/// through the derive, which leaves a skipped variant out, so a skipped class
+/// would slip past it. Do not put `#[serde(other)]` on one either, for a
+/// different reason: the derive keeps an `other` variant in its list, but
+/// that variant would silently absorb an unknown class in a stored review
+/// record (`risk_class: Option<RiskClass>` is deserialized when a recorded
+/// review is read back), turning a class this build does not know into one it
+/// does instead of failing to parse. That test refuses both.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RiskClass {
@@ -194,10 +201,14 @@ impl RiskClass {
     /// rather than defaulting into either group by omission. Defaulting the
     /// wrong way here ships unreviewed code.
     ///
-    /// Keep this free of `cfg` attributes: the router-text test
-    /// (`the_router_states_exactly_the_autopilot_envelope_is_low_risk_grants`)
-    /// only sees the test build, so a cfg-gated arm would desync it from the
-    /// release binary.
+    /// The router-envelope integration test
+    /// (`crates/ironmem/tests/autopilot_router_envelope.rs`) calls this on
+    /// every variant and checks the `/evaluate-issue` router text against the
+    /// result. It sees the library as built for integration tests, without
+    /// `cfg(test)`, as the binary does; only logic gated on
+    /// `cfg(debug_assertions)` (on in the test profile, off in release) could
+    /// still make the release binary differ from what it checked, so keep
+    /// such gates out of this function.
     pub fn is_low_risk(self) -> bool {
         match self {
             RiskClass::Documentation
@@ -2841,284 +2852,6 @@ mod tests {
                 class.as_str()
             );
         }
-    }
-
-    /// Every `RiskClass` variant, in declaration order, read from the variant
-    /// list that `#[derive(Deserialize)]` generates rather than kept by hand.
-    ///
-    /// The derive passes every deserializable variant's serialized name, and
-    /// its aliases, to `Deserializer::deserialize_enum`; `VariantNames`
-    /// captures that list, each name is parsed back into a `RiskClass`, and
-    /// duplicates (an alias and its variant) are dropped, keeping declaration
-    /// order. A newly declared variant therefore appears here with no edit to
-    /// this helper.
-    ///
-    /// A variant marked `#[serde(skip)]` or `#[serde(skip_deserializing)]`
-    /// is left out of the derive's list. That gap is closed two ways. The
-    /// envelope test refuses `#[serde(skip*)]` and `#[serde(other)]` inside
-    /// the enum. And it compares this list with `REVIEW_VERDICT_JSON_SCHEMA`,
-    /// so a skipped class the schema allows fails that check. A class outside
-    /// the schema cannot be a diff class from a Reviewer held to that schema.
-    fn every_risk_class() -> Vec<RiskClass> {
-        use serde::de::value::Error;
-        use serde::de::{Deserializer, Error as _, Visitor};
-
-        struct VariantNames(Option<&'static [&'static str]>);
-
-        impl<'de> Deserializer<'de> for &mut VariantNames {
-            type Error = Error;
-
-            fn deserialize_any<V: Visitor<'de>>(self, _: V) -> Result<V::Value, Error> {
-                Err(Error::custom("RiskClass must deserialize as an enum"))
-            }
-
-            fn deserialize_enum<V: Visitor<'de>>(
-                self,
-                _name: &'static str,
-                variants: &'static [&'static str],
-                _: V,
-            ) -> Result<V::Value, Error> {
-                self.0 = Some(variants);
-                Err(Error::custom("variant names captured"))
-            }
-
-            serde::forward_to_deserialize_any! {
-                bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str
-                string bytes byte_buf option unit unit_struct newtype_struct seq
-                tuple tuple_struct map struct identifier ignored_any
-            }
-        }
-
-        let mut captured = VariantNames(None);
-        RiskClass::deserialize(&mut captured)
-            .expect_err("the capturing deserializer never yields a value");
-        let names = captured
-            .0
-            .expect("#[derive(Deserialize)] on RiskClass must call deserialize_enum");
-        let mut classes: Vec<RiskClass> = Vec::new();
-        for &name in names {
-            let class: RiskClass = serde_json::from_value(serde_json::Value::from(name))
-                .unwrap_or_else(|e| panic!("serde variant name {name:?} does not parse: {e}"));
-            if !classes.contains(&class) {
-                classes.push(class);
-            }
-        }
-        for &class in &classes {
-            assert_eq!(
-                serde_json::to_value(class).unwrap(),
-                class.as_str(),
-                "RiskClass::as_str must match the serialized name of {class:?}"
-            );
-        }
-        classes
-    }
-
-    /// `` `a`, `b`, or `c` ``: the router's spelling of the held list.
-    fn backticked_or_list(items: &[&str]) -> String {
-        let quoted: Vec<String> = items.iter().map(|item| format!("`{item}`")).collect();
-        match quoted.split_last() {
-            None => String::new(),
-            Some((last, [])) => last.clone(),
-            Some((last, rest)) => format!("{}, or {last}", rest.join(", ")),
-        }
-    }
-
-    /// Every occurrence of `needle` in `haystack`, as the text after it.
-    fn texts_after<'a>(haystack: &'a str, needle: &str) -> Vec<&'a str> {
-        haystack
-            .match_indices(needle)
-            .map(|(at, _)| &haystack[at + needle.len()..])
-            .collect()
-    }
-
-    /// The `/evaluate-issue` router's AUTOPILOT envelope sentences are exactly
-    /// what `decide_merge` grants, in all three router surfaces.
-    ///
-    /// This is a Rust test rather than a collab-template lint on purpose. It
-    /// builds the two expected sentences by calling the real
-    /// `RiskClass::is_low_risk` and `RiskClass::as_str` on every variant
-    /// (listed by serde's derive, see `every_risk_class`), so there is no
-    /// parser of the policy to fool: a commented-out arm, a nested `match`,
-    /// or a conditional `=> true` all mean whatever the compiler says they
-    /// mean. An earlier Python lint derived the sentences by regex-parsing
-    /// this file and kept meeting Rust shapes it misread. The source scans
-    /// below only guard the two assumptions that make this sound: no serde
-    /// `skip`/`other` variant, and no `cfg` in `is_low_risk`.
-    ///
-    /// It checks the policy as compiled for `cargo test` (cfg(test) on, with
-    /// the features that test run enables — default in CI), not as the
-    /// release binary has it. A `#[cfg(test)]`-gated arm in `is_low_risk`
-    /// would make this test demand router text the release build does not
-    /// honor, which is why `is_low_risk` must stay free of `cfg` attributes
-    /// and why this test scans its source for them.
-    ///
-    /// Per surface it pins: the auto-merge sentence, once, ending at its own
-    /// `.`; the "never recommend" sentence, once, followed by `.` or by
-    /// `` — `decide_merge` holds those ``; and each sentence's opening words,
-    /// once, so no widened second copy can sit elsewhere in the file. Text is
-    /// compared with whitespace runs collapsed, so reflowing a paragraph does
-    /// not trip it and a copy wrapped across lines is still counted.
-    ///
-    /// Limit: this is a presence check over prose. It cannot stop
-    /// contradicting prose placed after a correct sentence (for example
-    /// "…`test_only`. Also `logic` when small."). PR review covers that.
-    #[test]
-    fn the_router_states_exactly_the_autopilot_envelope_is_low_risk_grants() {
-        const AUTO_MERGE_OPENING: &str = "AUTOPILOT auto-merges only these classes:";
-        const NEVER_RECOMMEND_OPENING: &str =
-            "Never recommend AUTOPILOT when the expected class is";
-        const NEVER_RECOMMEND_CONTINUATION: &str = " — `decide_merge` holds those";
-        const SURFACES: [&str; 3] = [
-            "docs/EVALUATE_ISSUE.md",
-            ".claude-plugin/commands/evaluate-issue.md",
-            ".codex-plugin/prompts/evaluate-issue.md",
-        ];
-
-        // `every_risk_class` reads the derive's variant list, which leaves
-        // out a skipped variant and folds unknown input into an `other` one.
-        // Whitespace is removed first so `#[serde( skip )]` is still seen.
-        // Every `serde(` group in the enum is checked, not only `#[serde(`,
-        // so `#[cfg_attr(…, serde(skip))]` is caught too, and every argument
-        // in the group is checked, so `rename = "x", skip` is caught as well.
-        // A group ends at its first `)`; serde's variant arguments that take
-        // parentheses (`bound(…)`) are not used here.
-        let source = include_str!("review.rs");
-        let start = source
-            .find("pub enum RiskClass {")
-            .expect("review.rs must declare `pub enum RiskClass {`");
-        let len = source[start..]
-            .find("\n}\n")
-            .expect("`pub enum RiskClass` must close with a `}` line");
-        let enum_body: String = source[start..start + len].split_whitespace().collect();
-        for (at, opener) in enum_body.match_indices("serde(") {
-            let args_start = at + opener.len();
-            let args_len = enum_body[args_start..]
-                .find(')')
-                .unwrap_or(enum_body.len() - args_start);
-            for arg in enum_body[args_start..args_start + args_len].split(',') {
-                let key = arg.split('=').next().unwrap_or(arg);
-                assert!(
-                    !(key == "skip" || key.starts_with("skip_") || key == "other"),
-                    "RiskClass must not use serde `{key}` on a variant (found `serde({})`): \
-                     the router-text test lists the variants through serde's derive, which \
-                     a skipped or `other` variant would slip past",
-                    &enum_body[args_start..args_start + args_len]
-                );
-            }
-        }
-
-        // `is_low_risk` must stay free of `cfg` (see its doc comment). The
-        // needle is built with `concat!` so this test's own text does not
-        // match it: exactly one definition means no `#[cfg(test)]` /
-        // `#[cfg(not(test))]` pair of them, and its body, from the signature
-        // to the closing `    }` line, must not mention `cfg` at all.
-        const IS_LOW_RISK_SIGNATURE: &str = concat!("pub fn ", "is_low_risk(");
-        assert_eq!(
-            source.matches(IS_LOW_RISK_SIGNATURE).count(),
-            1,
-            "RiskClass::is_low_risk must stay free of `cfg` attributes, so it is defined \
-             exactly once: the router-text test sees only the test build"
-        );
-        let fn_start = source
-            .find(IS_LOW_RISK_SIGNATURE)
-            .expect("review.rs must define RiskClass::is_low_risk");
-        let fn_len = source[fn_start..]
-            .find("\n    }\n")
-            .expect("RiskClass::is_low_risk must close with a `    }` line");
-        let fn_body = &source[fn_start..fn_start + fn_len];
-        assert!(
-            !fn_body.contains("cfg"),
-            "RiskClass::is_low_risk must stay free of `cfg` attributes: the router-text \
-             test sees only the test build, so a cfg-gated arm would desync it from the \
-             release binary. Found in:\n{fn_body}"
-        );
-
-        let (low, held): (Vec<RiskClass>, Vec<RiskClass>) = every_risk_class()
-            .into_iter()
-            .partition(|class| class.is_low_risk());
-        let low: Vec<&str> = low.iter().map(|class| class.as_str()).collect();
-        let held: Vec<&str> = held.iter().map(|class| class.as_str()).collect();
-        assert!(
-            !low.is_empty(),
-            "no RiskClass is low risk: nothing auto-merges"
-        );
-        assert!(
-            !held.is_empty(),
-            "every RiskClass is low risk: nothing is held"
-        );
-
-        let auto_merge = format!(
-            "{AUTO_MERGE_OPENING} {}.",
-            low.iter()
-                .map(|class| format!("`{class}`"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-        let never_recommend = format!("{NEVER_RECOMMEND_OPENING} {}", backticked_or_list(&held));
-
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let mut failures = Vec::new();
-        for rel in SURFACES {
-            let raw = std::fs::read_to_string(root.join(rel))
-                .unwrap_or_else(|e| panic!("{rel}: cannot read router surface: {e}"));
-            let body = raw.split_whitespace().collect::<Vec<_>>().join(" ");
-
-            for opening in [AUTO_MERGE_OPENING, NEVER_RECOMMEND_OPENING] {
-                let count = body.matches(opening).count();
-                if count != 1 {
-                    failures.push(format!(
-                        "{rel}: {opening:?} appears {count} times; expected exactly once"
-                    ));
-                }
-            }
-
-            let count = body.matches(auto_merge.as_str()).count();
-            if count != 1 {
-                failures.push(format!(
-                    "{rel}: the auto-merge sentence must appear exactly once, ending \
-                     at its own `.` (found {count}); expected:\n    {auto_merge}"
-                ));
-            }
-
-            let after = texts_after(&body, &never_recommend);
-            let terminated = after.iter().all(|rest| {
-                rest.starts_with('.') || rest.starts_with(NEVER_RECOMMEND_CONTINUATION)
-            });
-            if after.len() != 1 || !terminated {
-                failures.push(format!(
-                    "{rel}: the never-recommend sentence must appear exactly once \
-                     (found {}), followed by `.` or by {NEVER_RECOMMEND_CONTINUATION:?}; \
-                     expected:\n    {never_recommend}.",
-                    after.len()
-                ));
-            }
-        }
-
-        // Separate from the router text: a class the enum declares but the
-        // Reviewer's schema cannot return (or the reverse) is its own drift.
-        // Collected rather than asserted, so the expected sentences above are
-        // still printed when a new variant is the cause.
-        let schema: serde_json::Value = serde_json::from_str(REVIEW_VERDICT_JSON_SCHEMA).unwrap();
-        let mut schema_classes: Vec<&str> = schema["properties"]["risk_class"]["enum"]
-            .as_array()
-            .expect("schema must constrain risk_class to an enum")
-            .iter()
-            .map(|v| v.as_str().unwrap())
-            .collect();
-        let mut declared: Vec<&str> = every_risk_class().iter().map(|c| c.as_str()).collect();
-        schema_classes.sort_unstable();
-        declared.sort_unstable();
-        if declared != schema_classes {
-            failures.push(format!(
-                "REVIEW_VERDICT_JSON_SCHEMA risk_class enum {schema_classes:?} does not \
-                 match the declared RiskClass variants {declared:?}"
-            ));
-        }
-        assert!(
-            failures.is_empty(),
-            "the router's AUTOPILOT envelope drifted from RiskClass::is_low_risk:\n{}",
-            failures.join("\n")
-        );
     }
 
     #[test]
