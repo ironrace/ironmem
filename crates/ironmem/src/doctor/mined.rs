@@ -203,7 +203,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_or_unusable_database_is_skipped_as_info() {
+    fn missing_database_is_skipped_as_info() {
         let dir = tempfile::tempdir().unwrap();
         let now = at("2026-11-14 12:00:00");
         let missing = check_mined_rows(&dir.path().join("absent.sqlite3"), true, now);
