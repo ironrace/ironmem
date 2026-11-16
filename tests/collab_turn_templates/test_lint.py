@@ -946,6 +946,110 @@ def test_lint_reads_spellings_only_from_as_str(tmp_path):
     assert r.returncode == 0, r.stdout
 
 
+@pytest.mark.parametrize("rel", EVALUATE_ISSUE_SURFACES)
+def test_lint_rejects_a_widened_first_envelope_sentence(tmp_path, rel):
+    # ` —` may continue only the "never recommend" sentence. Letting it end
+    # the auto-merge sentence too accepts a clause that adds a class back.
+    fixture = copy_fixture(tmp_path)
+    mutate(fixture / rel, "`test_only`.", "`test_only` — and `logic`.")
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert f"{rel}: AUTOPILOT envelope drifted from RiskClass::is_low_risk" in r.stdout
+
+
+# The held arm of `is_low_risk`; a commented-out `=> true` arm goes above it.
+IS_LOW_RISK_HELD_ARM = ("            RiskClass::Logic | RiskClass::Protocol "
+                        "| RiskClass::Security | RiskClass::PublicApi => {\n")
+
+
+@pytest.mark.parametrize("comment", [
+    "            // RiskClass::Logic => true, // re-enable after #400\n",
+    "            /// RiskClass::Logic => true,\n",
+    "            /* RiskClass::Logic => true, */\n",
+    # Rust block comments nest: the arm is still inside the outer comment.
+    "            /* outer /* inner */ RiskClass::Logic => true, */\n",
+], ids=["line", "doc-line", "block", "nested-block"])
+def test_lint_ignores_a_commented_out_true_arm(tmp_path, comment):
+    # Parsing the comment as code adds `logic` to the derived auto-merge list,
+    # and the drift message then tells the fixer to widen the router to match.
+    fixture = copy_fixture(tmp_path)
+    mutate(fixture / AUTOPILOT_REVIEW_RS, IS_LOW_RISK_HELD_ARM,
+           comment + IS_LOW_RISK_HELD_ARM)
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 0, r.stdout
+
+
+def test_lint_ignores_a_commented_out_as_str_spelling(tmp_path):
+    # Placed AFTER the live arm: a later duplicate key wins in the lint's
+    # spelling dict, so this is the position where parsing it would bite.
+    fixture = copy_fixture(tmp_path)
+    mutate(fixture / AUTOPILOT_REVIEW_RS,
+           '            RiskClass::Logic => "logic",\n',
+           '            RiskClass::Logic => "logic",\n'
+           '            // RiskClass::Logic => "logic_v2",\n')
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 0, r.stdout
+
+
+def test_lint_ignores_a_block_commented_enum_variant(tmp_path):
+    fixture = copy_fixture(tmp_path)
+    mutate(fixture / AUTOPILOT_REVIEW_RS,
+           "    PublicApi,\n}\n",
+           "    PublicApi,\n    /*\n    Retired,\n    */\n}\n")
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 0, r.stdout
+
+
+def test_lint_keeps_comment_markers_inside_rust_literals(tmp_path):
+    # A strip that is not literal-aware opens a block comment at `"/*"` and
+    # swallows the enum. The `'"'` char and the `r"\"` raw string each throw
+    # a naive string scanner off by one quote.
+    fixture = copy_fixture(tmp_path)
+    anchor = "/// The eight risk classes the spec's"
+    mutate(fixture / AUTOPILOT_REVIEW_RS, anchor,
+           "const DECOY: (char, &str, &str, &str) = "
+           "('\"', r\"\\\", \"/*\", \"// }\");\n" + anchor)
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 0, r.stdout
+
+
+def test_lint_reads_every_true_arm_of_is_low_risk(tmp_path):
+    # Two `=> true` arms instead of one or-pattern: both arms' classes count.
+    fixture = copy_fixture(tmp_path)
+    mutate(fixture / AUTOPILOT_REVIEW_RS,
+           "RiskClass::Documentation\n            | RiskClass::DependencyBump",
+           "RiskClass::Documentation => true,\n            RiskClass::DependencyBump")
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 0, r.stdout
+
+
+def test_lint_accepts_self_prefixed_arms(tmp_path):
+    fixture = copy_fixture(tmp_path)
+    path = fixture / AUTOPILOT_REVIEW_RS
+    text = path.read_text()
+    start = text.index("pub fn is_low_risk(self) -> bool {")
+    end = text.index("pub fn as_str(self) -> &'static str {", start)
+    body = text[start:end]
+    assert body.count("RiskClass::") == 8, body
+    path.write_text(text[:start] + body.replace("RiskClass::", "Self::") + text[end:])
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 0, r.stdout
+
+
 def test_lint_requires_sixteen_task_bridge_ceiling(tmp_path):
     fixture = copy_fixture(tmp_path)
     command = fixture / ".claude-plugin" / "commands" / "collab.md"
