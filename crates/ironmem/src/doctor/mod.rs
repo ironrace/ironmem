@@ -2,10 +2,10 @@
 //!
 //! Validates the pieces a fresh install needs (binary, database + schema, model
 //! cache, MCP access mode, warmup readiness, configured harnesses, the newest
-//! mined row's age) and reports
-//! each as a [`Check`]. The command is diagnose-only: it never modifies user
-//! config. Only a [`CheckStatus::Error`] is a *blocking* setup failure and
-//! drives a non-zero exit; warnings and info lines are advisory.
+//! mined row's age) and reports each as a [`Check`]. The command is
+//! diagnose-only: it never modifies user config. Only a [`CheckStatus::Error`]
+//! is a *blocking* setup failure and drives a non-zero exit; warnings and info
+//! lines are advisory.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};

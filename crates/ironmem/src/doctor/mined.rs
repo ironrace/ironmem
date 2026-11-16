@@ -11,8 +11,9 @@ use std::time::Duration;
 
 use chrono::{NaiveDateTime, TimeDelta};
 
-use super::{Check, CheckStatus};
+use super::{is_db_busy, Check, CheckStatus};
 use crate::db::schema::Database;
+use crate::MemoryError;
 
 /// A newest mined row older than this many days is reported as a `Warn`.
 pub(super) const MINED_STALE_AFTER_DAYS: i64 = 7;
@@ -36,18 +37,26 @@ pub(super) fn check_mined_rows(db_path: &Path, database_usable: bool, now: Naive
     }
     // Same opener as `check_database`: no create, no migration, short busy wait.
     let newest = Database::open_with_busy_timeout(db_path, Duration::from_millis(500))
-        .and_then(|db| db.newest_mined_filed_at())
-        .map_err(|e| e.to_string());
+        .and_then(|db| db.newest_mined_filed_at());
     mined_rows_check(newest, now)
 }
 
 /// Decide the `mined_rows` check from the newest mined `filed_at` and `now`
 /// (both UTC). Pure, so the thresholds are unit-tested without a clock.
 pub(super) fn mined_rows_check(
-    newest: Result<Option<String>, String>,
+    newest: Result<Option<String>, MemoryError>,
     now: NaiveDateTime,
 ) -> Check {
     let filed_at = match newest {
+        // The `database` line already warns that the store is in use; a second
+        // hintless warning here would just repeat it.
+        Err(e) if is_db_busy(&e) => {
+            return Check::new(
+                KEY,
+                CheckStatus::Info,
+                "mined-row age: skipped (database busy; see the database line)",
+            )
+        }
         Err(e) => {
             return Check::new(
                 KEY,
@@ -169,7 +178,10 @@ mod tests {
     #[test]
     fn read_error_and_bad_timestamp_warn() {
         let now = at("2026-11-14 12:00:00");
-        let e = mined_rows_check(Err("database is locked".into()), now);
+        let e = mined_rows_check(
+            Err(MemoryError::Validation("database is locked".into())),
+            now,
+        );
         assert_eq!(e.status, CheckStatus::Warn);
         assert!(e.summary.contains("database is locked"));
         let bad = mined_rows_check(Ok(Some("yesterday".into())), now);
@@ -194,7 +206,29 @@ mod tests {
         let missing = check_mined_rows(&dir.path().join("absent.sqlite3"), true, now);
         assert_eq!(missing.status, CheckStatus::Info);
         assert!(missing.summary.contains("skipped"), "{}", missing.summary);
-        let unusable = check_mined_rows(&dir.path().join("absent.sqlite3"), false, now);
+    }
+
+    #[test]
+    fn unusable_database_is_skipped_even_when_the_file_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("exists.sqlite3");
+        std::fs::write(&path, b"not a database").unwrap();
+        let unusable = check_mined_rows(&path, false, at("2026-11-14 12:00:00"));
         assert_eq!(unusable.status, CheckStatus::Info);
+        assert!(unusable.summary.contains("skipped"), "{}", unusable.summary);
+    }
+
+    #[test]
+    fn busy_or_locked_database_is_an_info_skip_not_a_second_warning() {
+        let now = at("2026-11-14 12:00:00");
+        for code in [5, 6] {
+            let err = MemoryError::Db(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(code),
+                None,
+            ));
+            let c = mined_rows_check(Err(err), now);
+            assert_eq!(c.status, CheckStatus::Info, "code {code}");
+            assert!(c.summary.contains("database busy"), "{}", c.summary);
+        }
     }
 }
