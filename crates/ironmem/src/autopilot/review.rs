@@ -2835,6 +2835,174 @@ mod tests {
         }
     }
 
+    /// Every `RiskClass` variant, in declaration order.
+    fn every_risk_class() -> [RiskClass; 8] {
+        let all = [
+            RiskClass::Documentation,
+            RiskClass::DependencyBump,
+            RiskClass::MechanicalRename,
+            RiskClass::TestOnly,
+            RiskClass::Logic,
+            RiskClass::Protocol,
+            RiskClass::Security,
+            RiskClass::PublicApi,
+        ];
+        for class in all {
+            // Exhaustive by construction: every variant is listed and there is
+            // no wildcard arm, so adding a ninth `RiskClass` variant fails to
+            // compile here. When it does, add the new variant to this match
+            // AND to `all` above; the schema cross-check in the envelope test
+            // catches an update to one without the other.
+            match class {
+                RiskClass::Documentation
+                | RiskClass::DependencyBump
+                | RiskClass::MechanicalRename
+                | RiskClass::TestOnly
+                | RiskClass::Logic
+                | RiskClass::Protocol
+                | RiskClass::Security
+                | RiskClass::PublicApi => {}
+            }
+        }
+        all
+    }
+
+    /// `` `a`, `b`, or `c` ``: the router's spelling of the held list.
+    fn backticked_or_list(items: &[&str]) -> String {
+        let quoted: Vec<String> = items.iter().map(|item| format!("`{item}`")).collect();
+        match quoted.split_last() {
+            None => String::new(),
+            Some((last, [])) => last.clone(),
+            Some((last, rest)) => format!("{}, or {last}", rest.join(", ")),
+        }
+    }
+
+    /// Every occurrence of `needle` in `haystack`, as the text after it.
+    fn texts_after<'a>(haystack: &'a str, needle: &str) -> Vec<&'a str> {
+        haystack
+            .match_indices(needle)
+            .map(|(at, _)| &haystack[at + needle.len()..])
+            .collect()
+    }
+
+    /// The `/evaluate-issue` router's AUTOPILOT envelope sentences are exactly
+    /// what `decide_merge` grants, in all three router surfaces.
+    ///
+    /// This is a Rust test rather than a collab-template lint on purpose. It
+    /// builds the two expected sentences by calling the real
+    /// `RiskClass::is_low_risk` and `RiskClass::as_str` on every variant, so
+    /// there is no parser to fool: a commented-out arm, a `#[cfg]`-gated arm,
+    /// a nested `match`, or a conditional `=> true` all mean whatever the
+    /// compiler says they mean. An earlier Python lint derived the sentences
+    /// by regex-parsing this file and kept meeting Rust shapes it misread.
+    ///
+    /// Per surface it pins: the auto-merge sentence, once, ending at its own
+    /// `.`; the "never recommend" sentence, once, followed by `.` or by
+    /// `` — `decide_merge` holds those ``; and each sentence's opening words,
+    /// once, so no widened second copy can sit elsewhere in the file. Text is
+    /// compared with whitespace runs collapsed, so reflowing a paragraph does
+    /// not trip it and a copy wrapped across lines is still counted.
+    ///
+    /// Limit: this is a presence check over prose. It cannot stop
+    /// contradicting prose placed after a correct sentence (for example
+    /// "…`test_only`. Also `logic` when small."). PR review covers that.
+    #[test]
+    fn the_router_states_exactly_the_autopilot_envelope_is_low_risk_grants() {
+        const AUTO_MERGE_OPENING: &str = "AUTOPILOT auto-merges only these classes:";
+        const NEVER_RECOMMEND_OPENING: &str =
+            "Never recommend AUTOPILOT when the expected class is";
+        const NEVER_RECOMMEND_CONTINUATION: &str = " — `decide_merge` holds those";
+        const SURFACES: [&str; 3] = [
+            "docs/EVALUATE_ISSUE.md",
+            ".claude-plugin/commands/evaluate-issue.md",
+            ".codex-plugin/prompts/evaluate-issue.md",
+        ];
+
+        // The variant list must cover exactly the classes the Reviewer's
+        // schema can return, so a variant added to the enum and the schema
+        // but not to `every_risk_class` cannot drop out of the sentences.
+        let schema: serde_json::Value = serde_json::from_str(REVIEW_VERDICT_JSON_SCHEMA).unwrap();
+        let mut schema_classes: Vec<&str> = schema["properties"]["risk_class"]["enum"]
+            .as_array()
+            .expect("schema must constrain risk_class to an enum")
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        let mut listed: Vec<&str> = every_risk_class().iter().map(|c| c.as_str()).collect();
+        schema_classes.sort_unstable();
+        listed.sort_unstable();
+        assert_eq!(
+            listed, schema_classes,
+            "every_risk_class() must list every RiskClass the schema allows"
+        );
+
+        let (low, held): (Vec<RiskClass>, Vec<RiskClass>) = every_risk_class()
+            .into_iter()
+            .partition(|class| class.is_low_risk());
+        let low: Vec<&str> = low.iter().map(|class| class.as_str()).collect();
+        let held: Vec<&str> = held.iter().map(|class| class.as_str()).collect();
+        assert!(
+            !low.is_empty(),
+            "no RiskClass is low risk: nothing auto-merges"
+        );
+        assert!(
+            !held.is_empty(),
+            "every RiskClass is low risk: nothing is held"
+        );
+
+        let auto_merge = format!(
+            "{AUTO_MERGE_OPENING} {}.",
+            low.iter()
+                .map(|class| format!("`{class}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let never_recommend = format!("{NEVER_RECOMMEND_OPENING} {}", backticked_or_list(&held));
+
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut failures = Vec::new();
+        for rel in SURFACES {
+            let raw = std::fs::read_to_string(root.join(rel))
+                .unwrap_or_else(|e| panic!("{rel}: cannot read router surface: {e}"));
+            let body = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+
+            for opening in [AUTO_MERGE_OPENING, NEVER_RECOMMEND_OPENING] {
+                let count = body.matches(opening).count();
+                if count != 1 {
+                    failures.push(format!(
+                        "{rel}: {opening:?} appears {count} times; expected exactly once"
+                    ));
+                }
+            }
+
+            let count = body.matches(auto_merge.as_str()).count();
+            if count != 1 {
+                failures.push(format!(
+                    "{rel}: the auto-merge sentence must appear exactly once, ending \
+                     at its own `.` (found {count}); expected:\n    {auto_merge}"
+                ));
+            }
+
+            let after = texts_after(&body, &never_recommend);
+            let terminated = after.iter().all(|rest| {
+                rest.starts_with('.') || rest.starts_with(NEVER_RECOMMEND_CONTINUATION)
+            });
+            if after.len() != 1 || !terminated {
+                failures.push(format!(
+                    "{rel}: the never-recommend sentence must appear exactly once \
+                     (found {}), followed by `.` or by {NEVER_RECOMMEND_CONTINUATION:?}; \
+                     expected:\n    {never_recommend}.",
+                    after.len()
+                ));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "the router's AUTOPILOT envelope drifted from RiskClass::is_low_risk:\n{}",
+            failures.join("\n")
+        );
+    }
+
     #[test]
     fn every_schema_enum_value_round_trips_through_the_class_parser() {
         // The schema string and the enum are two independent lists; a value

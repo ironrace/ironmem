@@ -537,9 +537,10 @@ REQUIRED_EVALUATE_ISSUE_SNIPPETS = [
 # surfaces like the SPLIT snippets above: a mirror cannot drop a route's
 # prerequisite read, its missing-prerequisite line, the two-phase confirm,
 # or the never-launch rule without this firing. The auto-merge envelope is
-# deliberately NOT listed here — `autopilot_envelope_sentences()` derives it
-# from review.rs so the router can never advertise more than decide_merge
-# grants.
+# deliberately NOT listed here: the Rust test
+# `the_router_states_exactly_the_autopilot_envelope_is_low_risk_grants` in
+# crates/ironmem/src/autopilot/review.rs builds it from `RiskClass::is_low_risk`
+# itself, so no parser of the Rust source can be fooled.
 REQUIRED_EVALUATE_ISSUE_ROUTE_SNIPPETS = [
     'logical_key="gate-config:<slug>"',
     "`agent:ready`, `agent:blocked`, `agent:exhausted`",
@@ -550,7 +551,6 @@ REQUIRED_EVALUATE_ISSUE_ROUTE_SNIPPETS = [
     "The router never launches GOAL or AUTOPILOT",
     "One verdict, never a menu.",
 ]
-AUTOPILOT_REVIEW_RS = ROOT / "crates" / "ironmem" / "src" / "autopilot" / "review.rs"
 # Every planning surface that states the collab execution ceiling has an
 # explicit 15/16 contract. This is intentionally more specific than the
 # evaluator and template checks above: those guards catch a few shared phrases,
@@ -881,211 +881,8 @@ def check_no_uninstalled_skill_references() -> None:
                         f"to nothing and the worker freelances the step")
 
 
-def _or_list(items: list[str]) -> str:
-    """`a`, `b`, or `c` — the spelling the router uses for held classes."""
-    quoted = [f"`{item}`" for item in items]
-    if len(quoted) == 1:
-        return quoted[0]
-    return ", ".join(quoted[:-1]) + ", or " + quoted[-1]
-
-
-_RUST_RAW_STRING_OPEN = re.compile(r'b?r(#*)"')
-_RUST_CHAR_LITERAL = re.compile(
-    r"'(?:\\(?:u\{[0-9a-fA-F]+\}|x[0-9a-fA-F]{2}|.)|[^\\'\n])'")
-
-
-def _strip_rust_comments(src: str, blank_literals: bool = False) -> str:
-    """`src` with every Rust comment blanked out, literals left intact.
-
-    Line comments (`//`, so `///` and `//!` too) and block comments, which
-    nest in Rust, become spaces; newlines inside them survive so `^…$`
-    patterns still see line structure. String, raw string, byte string and
-    char literals are copied verbatim, so a `//` or `/*` inside one is not a
-    comment. A lifetime (`'static`) is told apart from a char literal by the
-    closing quote. With `blank_literals`, literals are blanked too, so a
-    brace counter sees only code braces; the result always has `src`'s length,
-    so an index into it is an index into `src`.
-    """
-    out: list[str] = []
-    i, n = 0, len(src)
-
-    def blank(text: str) -> None:
-        out.append("".join(ch if ch == "\n" else " " for ch in text))
-
-    def literal(text: str) -> None:
-        if blank_literals:
-            blank(text)
-        else:
-            out.append(text)
-
-    while i < n:
-        ch = src[i]
-        if src.startswith("//", i):
-            end = src.find("\n", i)
-            end = n if end == -1 else end
-            blank(src[i:end])
-            i = end
-        elif src.startswith("/*", i):
-            depth, j = 1, i + 2
-            while j < n and depth:
-                if src.startswith("/*", j):
-                    depth, j = depth + 1, j + 2
-                elif src.startswith("*/", j):
-                    depth, j = depth - 1, j + 2
-                else:
-                    j += 1
-            blank(src[i:j])
-            i = j
-        elif ch in "br" and (raw := _RUST_RAW_STRING_OPEN.match(src, i)) and (
-                i == 0 or not (src[i - 1].isalnum() or src[i - 1] == "_")):
-            close = '"' + raw.group(1)
-            end = src.find(close, raw.end())
-            end = n if end == -1 else end + len(close)
-            literal(src[i:end])
-            i = end
-        elif ch == '"':
-            j = i + 1
-            while j < n and src[j] != '"':
-                j += 2 if src[j] == "\\" else 1
-            literal(src[i:j + 1])
-            i = j + 1
-        elif ch == "'":
-            lit = _RUST_CHAR_LITERAL.match(src, i)
-            end = lit.end() if lit else i + 1
-            if lit:
-                literal(src[i:end])
-            else:
-                out.append(src[i:end])
-            i = end
-        else:
-            out.append(ch)
-            i += 1
-    return "".join(out)
-
-
-def _brace_body(src: str, header: str) -> str | None:
-    """The text between the braces of the `{` that ends `header`'s match.
-
-    Matching and counting run on a copy with literals blanked, so a `{` or
-    `}` inside a string such as `"test{{only"` cannot carry the body past
-    its own closing brace into a later arm that respells a class.
-    """
-    code = _strip_rust_comments(src, blank_literals=True)
-    m = re.search(header, code)
-    if m is None:
-        return None
-    depth = 0
-    for i in range(m.end() - 1, len(code)):
-        if code[i] == "{":
-            depth += 1
-        elif code[i] == "}":
-            depth -= 1
-            if depth == 0:
-                return src[m.end():i]
-    return None
-
-
-# The opening words of the two envelope sentences. Each must appear exactly
-# once per surface: the correct sentence plus a widened second copy elsewhere
-# would otherwise still pass the match below.
-AUTOPILOT_AUTO_MERGE_PREFIX = "AUTOPILOT auto-merges only these classes:"
-AUTOPILOT_NEVER_RECOMMEND_PREFIX = "Never recommend AUTOPILOT when the expected class is"
-# What may follow the "never recommend" sentence: the spec's `.`, or the exact
-# continuation both command mirrors use. A bare ` —` would accept
-# ` — except small `logic` diffs`, carving a held class back out.
-AUTOPILOT_NEVER_RECOMMEND_TERMINATOR = r"(?:\.| —\s+`decide_merge` holds those\b)"
-
-
-def autopilot_envelope_sentences() -> list[tuple[str, str]] | None:
-    """The two AUTOPILOT envelope sentences, derived from review.rs, each
-    paired with the regex for the terminator that must follow it.
-
-    `RiskClass::is_low_risk`'s `=> true` arms are the auto-merge policy; every
-    other enum variant is held for a human. Returns None after reporting when
-    review.rs is missing or no longer parses, so a refactor there fails this
-    lint loudly instead of skipping the check. An attribute or a nested
-    `match` inside `is_low_risk` also returns None: either can make an arm
-    conditional, and this parser cannot tell which way it goes.
-
-    Limit: this is a substring lint over prose. It pins each sentence, its
-    terminator, and its single occurrence, but it cannot stop contradicting
-    prose placed after a correct sentence (for example "…`test_only`. Also
-    `logic` when small."). PR review covers that case.
-    """
-    rel = "crates/ironmem/src/autopilot/review.rs"
-    prefix = f"{rel}: cannot derive the AUTOPILOT auto-merge envelope — "
-    if not AUTOPILOT_REVIEW_RS.exists():
-        err(prefix + "file not found")
-        return None
-    # A commented-out `RiskClass::Logic => true` arm is not policy; reading it
-    # as code would derive a wider envelope and ask the router to match it.
-    src = _strip_rust_comments(AUTOPILOT_REVIEW_RS.read_text())
-    enum_body = _brace_body(src, r"pub enum RiskClass \{")
-    variants = (re.findall(r"^\s*([A-Z]\w*)\s*(?:,|$)", enum_body, re.M)
-                if enum_body is not None else [])
-    if not variants:
-        err(prefix + "no `pub enum RiskClass` variants")
-        return None
-    low_body = _brace_body(src, r"fn is_low_risk\(self\) -> bool \{\s*match self \{")
-    if low_body is None:
-        err(prefix + "no `RiskClass::is_low_risk` match arm ending in `=> true`")
-        return None
-    # After comment stripping, so a commented-out `#[cfg]` is not a false hit.
-    if re.search(r"#!?\[", low_body) or re.search(r"\bmatch\b", low_body):
-        err(prefix + "is_low_risk contains an attribute or nested match; "
-            "derive by hand")
-        return None
-    if re.search(r"(?:^|[\s,{|])_\s*=>\s*true\b", low_body):
-        err(prefix + "`is_low_risk` has a wildcard `_ => true` arm, "
-            "which would make every class low-risk")
-        return None
-    # `=> true && SMALL_DIFF` would otherwise count as an unconditional
-    # `=> true`: only `,`, `}`, or the end of the body may follow it.
-    if re.search(r"=>\s*true\b(?!\s*(?:,|\}|\Z))", low_body):
-        err(prefix + "is_low_risk has a conditional true arm; derive by hand")
-        return None
-    low_variants = [
-        v
-        for arm in re.findall(r"((?:(?:RiskClass|Self)::\w+[\s|]*)+)=>\s*true\b",
-                              low_body)
-        for v in re.findall(r"(?:RiskClass|Self)::(\w+)", arm)
-    ]
-    if not low_variants:
-        err(prefix + "no `RiskClass::is_low_risk` match arm ending in `=> true`")
-        return None
-    str_body = _brace_body(src, r"fn as_str\(self\) -> &'static str \{\s*match self \{")
-    if str_body is None:
-        err(prefix + "no `RiskClass::as_str` match")
-        return None
-    spelling = dict(re.findall(r'(?:RiskClass|Self)::(\w+)\s*=>\s*"([^"]+)"', str_body))
-    unspelled = [v for v in low_variants if v not in spelling]
-    if unspelled:
-        err(prefix + f"no `as_str` spelling for {unspelled}")
-        return None
-    if set(spelling) != set(variants):
-        err(prefix + f"`as_str` spellings {sorted(spelling)} do not cover "
-            f"the enum variants {sorted(variants)}")
-        return None
-    high = [spelling[v] for v in variants if v not in low_variants]
-    if not high:
-        err(prefix + "every RiskClass is low-risk, so no class is ever held")
-        return None
-    low = [spelling[v] for v in low_variants]
-    # Each sentence is paired with the terminator regex that must follow it.
-    # The auto-merge sentence ends at its own `.`: a ` —` continuation there
-    # (` — and `logic``) could add a class back. The "never recommend"
-    # sentence takes AUTOPILOT_NEVER_RECOMMEND_TERMINATOR.
-    return [
-        (f"{AUTOPILOT_AUTO_MERGE_PREFIX} "
-         + ", ".join(f"`{c}`" for c in low) + ".", ""),
-        (f"{AUTOPILOT_NEVER_RECOMMEND_PREFIX} " + _or_list(high),
-         AUTOPILOT_NEVER_RECOMMEND_TERMINATOR),
-    ]
-
-
 def check_evaluate_issue_surfaces() -> None:
     """Keep the evaluator's SPLIT and route contracts in its three mirrors."""
-    envelope = autopilot_envelope_sentences() or []
     for path in (EVALUATE_ISSUE_DOC, EVALUATE_ISSUE_CLAUDE, EVALUATE_ISSUE_CODEX):
         rel = path.relative_to(ROOT)
         if not path.exists():
@@ -1100,18 +897,6 @@ def check_evaluate_issue_surfaces() -> None:
             if snippet not in body:
                 err(f"{rel}: missing evaluate-issue route contract "
                     f"snippet {snippet!r}")
-        for opening in (AUTOPILOT_AUTO_MERGE_PREFIX,
-                        AUTOPILOT_NEVER_RECOMMEND_PREFIX):
-            count = len(flex(opening).findall(body))
-            if count > 1:
-                err(f"{rel}: AUTOPILOT envelope sentence appears {count} "
-                    f"times; expected exactly once ({opening!r})")
-        for sentence, terminator in envelope:
-            # A prefix match would pass `…`public_api`, or `docs`` — require
-            # the sentence to end where the router ends it.
-            if not re.search(re.escape(sentence) + terminator, body):
-                err(f"{rel}: AUTOPILOT envelope drifted from "
-                    f"RiskClass::is_low_risk in review.rs — expected {sentence!r}")
 
 
 def check_task_budget_surface_contracts() -> None:

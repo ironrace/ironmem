@@ -363,7 +363,9 @@ Deep, regardless of the execution-path verdict. AUTOPILOT's review is
   sequence in which both phases run; never alternatives. The user overrides
   by declining.
 - **Adapt to Autopilot's policy, never relax it** — the envelope is
-  `RiskClass::is_low_risk` in `review.rs`, and the lint pins this text to it.
+  `RiskClass::is_low_risk` in `review.rs`, and the test
+  `the_router_states_exactly_the_autopilot_envelope_is_low_risk_grants` in
+  `review.rs` fails when this text drifts from it.
 - **Scan, don't trace** — Step 2 is a few grep/glob calls plus three
   prerequisite reads. If accurate routing would need deep tracing, say so and
   lean to the more cautious tier.

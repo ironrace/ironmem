@@ -497,7 +497,8 @@ as its review.
   hedging, because neither phase is optional.
 - **Adapt to Autopilot's policy, never relax it.** AUTOPILOT's envelope is
   `RiskClass::is_low_risk` in `crates/ironmem/src/autopilot/review.rs`; the
-  collab template lint fails when this text drifts from it.
+  test `the_router_states_exactly_the_autopilot_envelope_is_low_risk_grants`
+  in `review.rs` fails when this text drifts from it.
 - **Scan, don't trace.** Step 2 is a handful of grep/glob calls and three
   prerequisite reads, not a subagent fan-out. If accurate routing would need
   deep tracing, say so in the rationale and lean toward the more cautious
