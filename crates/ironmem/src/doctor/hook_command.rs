@@ -457,41 +457,68 @@ pub(super) fn runs_hook(command: &str, hook: &str) -> bool {
 /// environment, then the plugin wrapper's trusted default (an empty value
 /// counts as unset to the wrapper, but `Config::load` rejects it), then
 /// read-only. A value containing `$` or a backtick is [`ModeError::Unknown`].
+/// Doctor itself calls [`hook_mode_with_raw`]; this form keeps the tests'
+/// tuple comparisons short.
+#[cfg(test)]
 pub(super) fn hook_mode(
     command: &str,
     hook: &str,
     settings_env: Option<&str>,
     process_env: Option<&str>,
 ) -> ModeResult {
-    let results: Vec<ModeResult> = invocations(command, None)
-        .iter()
-        .filter(|i| i.hook == hook)
-        .map(|i| invocation_mode(i, settings_env, process_env))
-        .collect();
-    best_result(&results)
+    hook_mode_with_raw(command, hook, settings_env, process_env).0
 }
 
-fn is_trusted(result: &ModeResult) -> bool {
-    matches!(result.0, Ok(McpAccessMode::Trusted))
+/// A [`ModeResult`] with the raw `IRONMEM_MCP_MODE` value it was read from
+/// (`None` for the wrapper's default and the read-only default).
+pub(super) type RawModeResult = (ModeResult, Option<String>);
+
+/// [`hook_mode`], keeping the raw value so hints can quote what the file says.
+pub(super) fn hook_mode_with_raw(
+    command: &str,
+    hook: &str,
+    settings_env: Option<&str>,
+    process_env: Option<&str>,
+) -> RawModeResult {
+    let results = invocations(command, None)
+        .iter()
+        .filter(|i| i.hook == hook)
+        .map(|i| {
+            let result = invocation_mode(i, settings_env, process_env);
+            let raw = match result.1 {
+                ModeSource::Inline => i.mode.as_ref().map(|v| v.raw.clone()),
+                ModeSource::SettingsEnv => settings_env.map(str::to_owned),
+                ModeSource::Environment => process_env.map(str::to_owned),
+                ModeSource::PluginWrapper | ModeSource::Default => None,
+            };
+            (result, raw)
+        })
+        .collect();
+    best_result(results)
+}
+
+/// How good a result is for mining, lowest first: trusted without doctor's
+/// shell, trusted via the shell, unknown (it may be trusted), read-only or
+/// restricted, then invalid (the hook exits at startup).
+fn rank(result: &ModeResult) -> u8 {
+    match result {
+        (Ok(McpAccessMode::Trusted), source) if *source != ModeSource::Environment => 0,
+        (Ok(McpAccessMode::Trusted), _) => 1,
+        (Err(ModeError::Unknown(_)), _) => 2,
+        (Ok(_), _) => 3,
+        (Err(ModeError::Invalid(_)), _) => 4,
+    }
 }
 
 /// The one result to report for several runs of the same hook (in one
-/// command, or across an event's commands): a trusted run that doesn't depend
-/// on doctor's shell, else any trusted run, else the first run that doesn't
-/// fail to start, else the first run. With no runs, read-only by default.
-pub(super) fn best_result(results: &[ModeResult]) -> ModeResult {
+/// command, or across an event's commands): the best by [`rank`], the first
+/// in order among equals, so the order of commands decides only ties. With
+/// no runs, read-only by default.
+pub(super) fn best_result(results: Vec<RawModeResult>) -> RawModeResult {
     results
-        .iter()
-        .find(|r| is_trusted(r) && r.1 != ModeSource::Environment)
-        .or_else(|| results.iter().find(|r| is_trusted(r)))
-        .or_else(|| {
-            results
-                .iter()
-                .find(|r| !matches!(r.0, Err(ModeError::Invalid(_))))
-        })
-        .or_else(|| results.first())
-        .cloned()
-        .unwrap_or((Ok(McpAccessMode::ReadOnly), ModeSource::Default))
+        .into_iter()
+        .min_by_key(|(result, _)| rank(result))
+        .unwrap_or(((Ok(McpAccessMode::ReadOnly), ModeSource::Default), None))
 }
 
 fn invocation_mode(
@@ -840,6 +867,20 @@ mod tests {
             hook_mode(cmd, "stop", None, None),
             (Ok(Trusted), ModeSource::Inline)
         );
+    }
+
+    #[test]
+    fn an_unknown_run_outranks_a_read_only_run_in_either_order() {
+        let unknown = (Err(ModeError::Unknown("$M".to_owned())), ModeSource::Inline);
+        for cmd in [
+            "ironmem hook stop; IRONMEM_MCP_MODE=$M ironmem hook stop",
+            "IRONMEM_MCP_MODE=$M ironmem hook stop; ironmem hook stop",
+        ] {
+            assert_eq!(hook_mode(cmd, "stop", None, None), unknown, "{cmd}");
+        }
+        let with_invalid =
+            "IRONMEM_MCP_MODE=bogus ironmem hook stop; IRONMEM_MCP_MODE=$M ironmem hook stop";
+        assert_eq!(hook_mode(with_invalid, "stop", None, None), unknown);
     }
 
     #[test]

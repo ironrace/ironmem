@@ -11,7 +11,8 @@ use std::path::Path;
 use serde_json::Value;
 
 use super::hook_command::{
-    best_result, hook_mode, mode_label, runs_hook, source_label, ModeError, ModeResult, ModeSource,
+    best_result, hook_mode_with_raw, mode_label, runs_hook, source_label, ModeError, ModeSource,
+    RawModeResult,
 };
 use super::{Check, CheckStatus};
 use crate::config::McpAccessMode;
@@ -32,10 +33,24 @@ const MINING_EVENTS: [&str; 2] = ["Stop", "PreCompact"];
 const INSTALL_HINT: &str = "re-run scripts/install-ironmem.sh to wire the missing hooks, \
 or install the ironmem Claude Code plugin";
 
-const READ_ONLY_HINT: &str = "expected outside a plugin install: MCP writes and prompt recall \
-still work. A cheaper way to mine without the plugin is tracked in #418. To mine now, prefix the \
-Stop and PreCompact commands with IRONMEM_MCP_MODE=trusted; each run then loads the embedding \
-model and rebuilds the vector index";
+/// The hint for bare manual miners that run read-only, naming those `events`.
+fn read_only_hint(events: &[&str]) -> String {
+    let commands = if events.len() == 1 {
+        "command"
+    } else {
+        "commands"
+    };
+    format!(
+        "expected outside a plugin install: MCP writes and prompt recall still work. A cheaper \
+         way to mine without the plugin is tracked in #418. To mine now, prefix the {} {commands} \
+         with IRONMEM_MCP_MODE=trusted; each run then loads the embedding model and rebuilds the \
+         vector index",
+        events.join(" and ")
+    )
+}
+
+/// Separates several hints on one line; no hint text contains it.
+const HINT_JOINER: &str = " | ";
 
 const PLUGIN_OVERRIDE_HINT: &str = "remove or unset the IRONMEM_MCP_MODE override (settings.json \
 env or your shell); the plugin wrapper defaults to trusted";
@@ -147,9 +162,18 @@ pub(super) fn claude_hook_checks(
             let mut failures = startup_failures(&wired, env, process_env_mode);
             failures.extend(hand_wired_failures(&hand_wired, env, process_env_mode));
             let duplicated: Vec<&str> = hand_wired.iter().map(|(event, _)| *event).collect();
+            // A hand-wired copy runs as well as the plugin's, so it can mine too.
+            let candidates: WiredHooks = wired
+                .iter()
+                .map(|(event, commands)| {
+                    let extra = hand_wired.iter().filter(|(e, _)| e == event);
+                    let all = commands.iter().chain(extra.flat_map(|(_, c)| c)).cloned();
+                    (*event, all.collect())
+                })
+                .collect();
             vec![
                 plugin_hooks_check(&duplicated, &failures),
-                mining_check(&wired, env, process_env_mode, true),
+                mining_check(&candidates, env, process_env_mode, true),
             ]
         }
         HookWiring::Manual {
@@ -258,22 +282,22 @@ fn commands_for(doc: &Value, event: &str) -> Vec<String> {
         .collect()
 }
 
-/// The one mode result reported for `event`: each matching command's
-/// [`hook_mode`], reduced by [`best_result`] (a trusted run that doesn't
-/// depend on doctor's shell, else any trusted run, else the first command in
-/// settings order that doesn't fail to start, else the first command).
+/// The one mode result reported for `event`, with its raw value: each
+/// matching command's [`hook_mode_with_raw`], reduced by [`best_result`]
+/// (trusted without doctor's shell, then trusted via the shell, then unknown,
+/// then read-only or restricted, then invalid; settings order breaks ties).
 fn event_mode(
     event: &str,
     commands: &[String],
     settings_env: Option<&str>,
     process_env: Option<&str>,
-) -> ModeResult {
+) -> RawModeResult {
     let hook = plugin_hook_name(event);
-    let results: Vec<ModeResult> = commands
+    let results = commands
         .iter()
-        .map(|c| hook_mode(c, hook, settings_env, process_env))
+        .map(|c| hook_mode_with_raw(c, hook, settings_env, process_env))
         .collect();
-    best_result(&results)
+    best_result(results)
 }
 
 /// What is lost when `event`'s hook does not run.
@@ -316,7 +340,9 @@ fn startup_failures(
         .filter(|(event, _)| !MINING_EVENTS.contains(event))
         .filter_map(|(event, commands)| {
             match event_mode(event, commands, settings_env, process_env) {
-                (Err(ModeError::Invalid(e)), source) => Some(startup_failure(event, &e, source)),
+                ((Err(ModeError::Invalid(e)), source), _) => {
+                    Some(startup_failure(event, &e, source))
+                }
                 _ => None,
             }
         })
@@ -324,7 +350,8 @@ fn startup_failures(
 }
 
 /// Hand-wired copies of plugin hooks whose mode is invalid. The plugin's own
-/// copy still runs, so no effect is named: the copy just fails at startup.
+/// copy still starts, so no effect is named and the copy is not said to fail
+/// "also": only the copy fails at startup.
 fn hand_wired_failures(
     hand_wired: &WiredHooks,
     settings_env: Option<&str>,
@@ -334,8 +361,8 @@ fn hand_wired_failures(
         .iter()
         .filter_map(|(event, commands)| {
             match event_mode(event, commands, settings_env, process_env) {
-                (Err(ModeError::Invalid(raw)), source) => Some(format!(
-                    "the hand-wired {event} also fails to start: {} ({})",
+                ((Err(ModeError::Invalid(raw)), source), _) => Some(format!(
+                    "the hand-wired {event} fails to start: {} ({})",
                     invalid_reason(&raw),
                     source_label(source)
                 )),
@@ -372,7 +399,7 @@ fn plugin_hooks_check(hand_wired: &[&str], failures: &[String]) -> Check {
         CheckStatus::Warn,
         format!("Claude Code hooks: {}", problems.join("; ")),
     )
-    .with_hint(hints.join("; "))
+    .with_hint(hints.join(HINT_JOINER))
 }
 
 fn hooks_check(path: &Path, missing: &[&str], failures: &[String]) -> Check {
@@ -408,7 +435,7 @@ fn hooks_check(path: &Path, missing: &[&str], failures: &[String]) -> Check {
         CheckStatus::Warn,
         format!("Claude Code hooks: {}", problems.join("; ")),
     )
-    .with_hint(hints.join("; "))
+    .with_hint(hints.join(HINT_JOINER))
 }
 
 fn no_miner_check() -> Check {
@@ -420,9 +447,9 @@ fn no_miner_check() -> Check {
     .with_hint(INSTALL_HINT)
 }
 
-/// Why a wired miner does not mine. The derived order is the order hints are
-/// listed in; each distinct cause contributes one hint.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+/// Why a wired miner does not mine. Raw values are the `IRONMEM_MCP_MODE`
+/// text as the file or shell has it, so hints quote it, not a normalised label.
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum NoMineCause {
     /// The mode is invalid, so the hook exits at startup.
     Invalid,
@@ -431,48 +458,72 @@ enum NoMineCause {
     /// A plugin hook whose wrapper default is overridden by settings.json
     /// `env` or the shell.
     PluginOverride,
-    /// The hook command sets this mode itself.
-    Inline(&'static str),
-    /// A manual install's settings.json `env` sets this mode.
-    SettingsEnv(&'static str),
-    /// A manual install inherits this mode from the shell.
-    Shell(&'static str),
+    /// The hook command sets this raw mode itself.
+    Inline(String),
+    /// A manual install's settings.json `env` sets this raw mode.
+    SettingsEnv(String),
+    /// A manual install inherits this raw mode from the shell.
+    Shell(String),
     /// A bare manual command: nothing sets the mode, so it is read-only.
     Default,
 }
 
+/// One hint's cause and the miners it applies to, in entry order.
+struct CauseGroup {
+    cause: NoMineCause,
+    events: Vec<&'static str>,
+}
+
 impl NoMineCause {
-    fn of(mode: McpAccessMode, source: ModeSource, plugin: bool) -> Self {
-        let label = mode_label(mode);
+    fn of(source: ModeSource, raw: Option<String>, plugin: bool) -> Self {
+        let raw = raw.unwrap_or_default();
         match source {
             ModeSource::SettingsEnv | ModeSource::Environment if plugin => Self::PluginOverride,
-            ModeSource::Inline => Self::Inline(label),
-            ModeSource::SettingsEnv => Self::SettingsEnv(label),
-            ModeSource::Environment => Self::Shell(label),
+            ModeSource::Inline => Self::Inline(raw),
+            ModeSource::SettingsEnv => Self::SettingsEnv(raw),
+            ModeSource::Environment => Self::Shell(raw),
             ModeSource::PluginWrapper | ModeSource::Default => Self::Default,
         }
     }
 
-    fn hint(self) -> String {
+    fn hint(&self, events: &[&str]) -> String {
         match self {
             Self::Invalid => INVALID_MODE_HINT.to_owned(),
             Self::Dynamic => DYNAMIC_MODE_HINT.to_owned(),
             Self::PluginOverride => PLUGIN_OVERRIDE_HINT.to_owned(),
-            Self::Inline(v) => {
+            Self::Inline(raw) => {
+                let sets = if events.len() == 1 {
+                    "command itself sets"
+                } else {
+                    "commands themselves set"
+                };
                 format!(
-                    "the command itself sets IRONMEM_MCP_MODE={v}; change it to trusted to mine"
+                    "the {} {sets} IRONMEM_MCP_MODE={raw:?}; change it to trusted to mine",
+                    events.join(" and ")
                 )
             }
-            Self::SettingsEnv(v) => format!(
-                "settings.json sets env.IRONMEM_MCP_MODE={v}; change it to trusted to mine \
+            Self::SettingsEnv(raw) => format!(
+                "settings.json sets env.IRONMEM_MCP_MODE={raw:?}; change it to trusted to mine \
                  (removing it leaves bare hook commands read-only)"
             ),
-            Self::Shell(v) => format!(
-                "Claude Code inherits IRONMEM_MCP_MODE={v} from the shell that launches it; \
+            Self::Shell(raw) => format!(
+                "Claude Code inherits IRONMEM_MCP_MODE={raw:?} from the shell that launches it; \
                  launch it with IRONMEM_MCP_MODE=trusted to mine"
             ),
-            Self::Default => READ_ONLY_HINT.to_owned(),
+            Self::Default => read_only_hint(events),
         }
+    }
+}
+
+/// Add `event` to the group for `cause`, or start one; groups stay in the
+/// order their first entry appears.
+fn add_cause(groups: &mut Vec<CauseGroup>, cause: NoMineCause, event: &'static str) {
+    match groups.iter_mut().find(|g| g.cause == cause) {
+        Some(group) => group.events.push(event),
+        None => groups.push(CauseGroup {
+            cause,
+            events: vec![event],
+        }),
     }
 }
 
@@ -509,8 +560,9 @@ fn mining_headline(mined: &[&str], not_mined: &[&str], unknown: &[&str]) -> Stri
 /// The `hook_mining` check: a headline, then one `<Event>: <mode> (<source>)
 /// -> <outcome>` entry per wired miner, joined with `; ` because doctor
 /// renders each summary as one line. Ok only when every wired miner mines;
-/// the hint holds one entry per distinct [`NoMineCause`]. `plugin` says the
-/// miners are the enabled plugin's own hooks.
+/// the hint holds one entry per distinct [`NoMineCause`], in the order of the
+/// entries, joined with [`HINT_JOINER`]. `plugin` says the miners run on the
+/// plugin path (the plugin's hooks plus any hand-wired copies).
 fn mining_check(
     wired: &WiredHooks,
     settings_env: Option<&str>,
@@ -526,9 +578,9 @@ fn mining_check(
     }
     let (mut mined, mut not_mined, mut unknown) = (Vec::new(), Vec::new(), Vec::new());
     let mut lines = Vec::new();
-    let mut causes = Vec::new();
+    let mut causes: Vec<CauseGroup> = Vec::new();
     for (event, commands) in miners {
-        let (result, source) = event_mode(event, commands, settings_env, process_env);
+        let ((result, source), raw) = event_mode(event, commands, settings_env, process_env);
         let label = source_label(source);
         lines.push(match result {
             Ok(McpAccessMode::Trusted) => {
@@ -544,12 +596,12 @@ fn mining_check(
             }
             Ok(mode) => {
                 not_mined.push(*event);
-                causes.push(NoMineCause::of(mode, source, plugin));
+                add_cause(&mut causes, NoMineCause::of(source, raw, plugin), event);
                 format!("{event}: {} ({label}) -> not mined", mode_label(mode))
             }
             Err(ModeError::Invalid(raw)) => {
                 not_mined.push(*event);
-                causes.push(NoMineCause::Invalid);
+                add_cause(&mut causes, NoMineCause::Invalid, event);
                 format!(
                     "{event}: {raw:?} ({label}) -> fails to start: {}",
                     invalid_reason(&raw)
@@ -557,7 +609,7 @@ fn mining_check(
             }
             Err(ModeError::Unknown(raw)) => {
                 unknown.push(*event);
-                causes.push(NoMineCause::Dynamic);
+                add_cause(&mut causes, NoMineCause::Dynamic, event);
                 format!("{event}: {raw} ({label}) -> mode cannot be determined statically")
             }
         });
@@ -573,13 +625,11 @@ fn mining_check(
         lines.join("; ")
     );
     let check = Check::new("hook_mining", status, summary);
-    causes.sort();
-    causes.dedup();
     if causes.is_empty() {
         return check;
     }
-    let hints: Vec<String> = causes.into_iter().map(NoMineCause::hint).collect();
-    check.with_hint(hints.join("; "))
+    let hints: Vec<String> = causes.iter().map(|g| g.cause.hint(&g.events)).collect();
+    check.with_hint(hints.join(HINT_JOINER))
 }
 
 #[cfg(test)]
@@ -1188,6 +1238,17 @@ mod tests {
         mining_of(&format!("{PLUGIN_ON}{env}}}"), shell)
     }
 
+    /// The bare-read-only hint for `commands`, spelled out independently of
+    /// `read_only_hint` so the test pins the text.
+    fn read_only_text(commands: &str) -> String {
+        format!(
+            "expected outside a plugin install: MCP writes and prompt recall still work. \
+             A cheaper way to mine without the plugin is tracked in #418. To mine now, \
+             prefix the {commands} with IRONMEM_MCP_MODE=trusted; each run then loads \
+             the embedding model and rebuilds the vector index"
+        )
+    }
+
     const TRUSTED_STOP: &str = "IRONMEM_MCP_MODE=trusted ironmem hook stop";
     const TRUSTED_PRECOMPACT: &str = "IRONMEM_MCP_MODE=trusted ironmem hook precompact";
 
@@ -1207,7 +1268,10 @@ mod tests {
             c.summary
         );
         assert!(!c.summary.contains("new transcripts are not mined"));
-        assert_eq!(c.hint.as_deref(), Some(READ_ONLY_HINT));
+        assert_eq!(
+            c.hint.as_deref(),
+            Some(read_only_text("Stop command").as_str())
+        );
     }
 
     #[test]
@@ -1246,7 +1310,10 @@ mod tests {
             "{}",
             c.summary
         );
-        assert_eq!(c.hint.as_deref(), Some(READ_ONLY_HINT));
+        assert_eq!(
+            c.hint.as_deref(),
+            Some(read_only_text("Stop and PreCompact commands").as_str())
+        );
     }
 
     #[test]
@@ -1312,7 +1379,10 @@ mod tests {
         let hint = c.hint.as_deref().unwrap();
         assert_eq!(
             hint,
-            "the command itself sets IRONMEM_MCP_MODE=read-only; change it to trusted to mine"
+            concat!(
+                r#"the Stop command itself sets IRONMEM_MCP_MODE="read-only"; "#,
+                "change it to trusted to mine"
+            )
         );
         assert!(!hint.contains("expected"), "{hint}");
         assert!(!hint.contains("prefix"), "{hint}");
@@ -1378,7 +1448,7 @@ mod tests {
     }
 
     #[test]
-    fn distinct_causes_give_each_hint_once_in_a_stable_order() {
+    fn distinct_causes_give_each_hint_once_in_entry_order() {
         let doc = serde_json::json!({"hooks": {
             "Stop": [{"hooks": [{"type": "command", "command": "ironmem hook stop"}]}],
             "PreCompact": [{"hooks": [{"type": "command",
@@ -1399,7 +1469,7 @@ mod tests {
         );
         assert_eq!(
             c.hint.as_deref(),
-            Some(format!("{DYNAMIC_MODE_HINT}; {READ_ONLY_HINT}").as_str())
+            Some(format!("{} | {DYNAMIC_MODE_HINT}", read_only_text("Stop command")).as_str())
         );
     }
 
@@ -1417,12 +1487,12 @@ mod tests {
         assert_eq!(c[0].status, CheckStatus::Warn, "{s}");
         assert!(s.contains("run twice"), "{s}");
         assert!(
-            s.contains("the hand-wired UserPromptSubmit also fails to start"),
+            s.contains("the hand-wired UserPromptSubmit fails to start"),
             "{s}"
         );
+        assert!(!s.contains("also"), "the plugin's copy starts fine: {s}");
         let hint = c[0].hint.as_deref().unwrap();
-        assert!(hint.contains(DUPLICATE_HINT), "{hint}");
-        assert!(hint.contains(INVALID_MODE_HINT), "{hint}");
+        assert_eq!(hint, format!("{DUPLICATE_HINT} | {INVALID_MODE_HINT}"));
     }
 
     #[test]
@@ -1446,6 +1516,96 @@ mod tests {
             "{}",
             c[1].summary
         );
+    }
+
+    #[test]
+    fn hand_wired_trusted_miners_count_on_the_plugin_path() {
+        let mut doc: Value =
+            serde_json::from_str(&miners(TRUSTED_STOP, TRUSTED_PRECOMPACT)).unwrap();
+        doc["enabledPlugins"] = serde_json::json!({"ironmem@ironrace": true});
+        doc["env"] = serde_json::json!({"IRONMEM_MCP_MODE": "read-only"});
+        let c = mining_of(&doc.to_string(), None);
+        assert_eq!(c.status, CheckStatus::Ok, "{}", c.summary);
+        assert!(
+            c.summary.starts_with("Stop and PreCompact are mined"),
+            "{}",
+            c.summary
+        );
+        doc["env"] = serde_json::json!({});
+        let c = mining_of(&doc.to_string(), Some("read-only"));
+        assert_eq!(c.status, CheckStatus::Ok, "{}", c.summary);
+    }
+
+    #[test]
+    fn an_unknown_mode_outranks_a_read_only_one_in_either_order() {
+        let dynamic = "IRONMEM_MCP_MODE=$M ironmem hook stop";
+        for pair in [
+            ["ironmem hook stop", dynamic],
+            [dynamic, "ironmem hook stop"],
+        ] {
+            let doc = serde_json::json!({"hooks": {"Stop": [{"hooks": [
+                {"type": "command", "command": pair[0]},
+                {"type": "command", "command": pair[1]}
+            ]}]}});
+            let c = mining_of(&doc.to_string(), None);
+            assert!(
+                c.summary
+                    .starts_with("no wired hook is known to mine; Stop may not be"),
+                "{pair:?}: {}",
+                c.summary
+            );
+            assert_eq!(c.hint.as_deref(), Some(DYNAMIC_MODE_HINT), "{pair:?}");
+        }
+    }
+
+    #[test]
+    fn inline_and_settings_env_hints_quote_the_raw_value() {
+        let stop = "IRONMEM_MCP_MODE=readonly ironmem hook stop";
+        let pre = "IRONMEM_MCP_MODE=READ-ONLY ironmem hook precompact";
+        let c = mining_of(&miners(stop, pre), None);
+        assert_eq!(
+            c.hint.as_deref(),
+            Some(concat!(
+                r#"the Stop command itself sets IRONMEM_MCP_MODE="readonly"; "#,
+                "change it to trusted to mine | ",
+                r#"the PreCompact command itself sets IRONMEM_MCP_MODE="READ-ONLY"; "#,
+                "change it to trusted to mine"
+            ))
+        );
+        let same = "IRONMEM_MCP_MODE=restricted ironmem hook";
+        let c = mining_of(
+            &miners(&format!("{same} stop"), &format!("{same} precompact")),
+            None,
+        );
+        assert_eq!(
+            c.hint.as_deref(),
+            Some(concat!(
+                "the Stop and PreCompact commands themselves set ",
+                r#"IRONMEM_MCP_MODE="restricted"; change it to trusted to mine"#
+            ))
+        );
+
+        let mut doc: Value =
+            serde_json::from_str(&miners("ironmem hook stop", "ironmem hook precompact")).unwrap();
+        doc["env"] = serde_json::json!({"IRONMEM_MCP_MODE": "ReadOnly"});
+        let c = mining_of(&doc.to_string(), None);
+        let hint = c.hint.as_deref().unwrap();
+        assert!(
+            hint.contains(r#"env.IRONMEM_MCP_MODE="ReadOnly""#),
+            "{hint}"
+        );
+    }
+
+    #[test]
+    fn hints_follow_the_entry_order() {
+        let pre = "IRONMEM_MCP_MODE=bogus ironmem hook precompact";
+        let c = mining_of(&miners("ironmem hook stop", pre), None);
+        let hint = c.hint.as_deref().unwrap();
+        assert!(
+            hint.starts_with("expected outside a plugin install"),
+            "Stop's hint comes first: {hint}"
+        );
+        assert!(hint.ends_with(&format!(" | {INVALID_MODE_HINT}")), "{hint}");
     }
 
     #[test]
