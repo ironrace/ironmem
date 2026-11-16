@@ -169,6 +169,9 @@ pub const DEFAULT_MAX_UNPRICED_REVIEWS_PER_DAY: u32 = 20;
 /// mechanical renames, test-only changes. Everything touching logic,
 /// protocol, security, or public API opens a PR and waits for a human
 /// regardless of reviewer verdict."
+///
+/// Do not put `#[serde(skip*)]` or `#[serde(other)]` on a variant: the
+/// router-text test lists the variants through the derive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RiskClass {
@@ -2843,13 +2846,19 @@ mod tests {
     /// Every `RiskClass` variant, in declaration order, read from the variant
     /// list that `#[derive(Deserialize)]` generates rather than kept by hand.
     ///
-    /// The derive passes every deserializable variant's serialized name to
-    /// `Deserializer::deserialize_enum`; `VariantNames` captures that list
-    /// and each name is parsed back into a `RiskClass`. A newly declared
-    /// variant therefore appears here with no edit to this helper. The one
-    /// gap: a variant marked `#[serde(skip)]` or `#[serde(skip_deserializing)]`
-    /// is left out of the derive's list, so it would be missed. `RiskClass`
-    /// has none.
+    /// The derive passes every deserializable variant's serialized name, and
+    /// its aliases, to `Deserializer::deserialize_enum`; `VariantNames`
+    /// captures that list, each name is parsed back into a `RiskClass`, and
+    /// duplicates (an alias and its variant) are dropped, keeping declaration
+    /// order. A newly declared variant therefore appears here with no edit to
+    /// this helper.
+    ///
+    /// A variant marked `#[serde(skip)]` or `#[serde(skip_deserializing)]`
+    /// is left out of the derive's list. That gap is closed two ways. The
+    /// envelope test refuses `#[serde(skip*)]` and `#[serde(other)]` inside
+    /// the enum. And it compares this list with `REVIEW_VERDICT_JSON_SCHEMA`,
+    /// so a skipped class the schema allows fails that check. A class outside
+    /// the schema cannot be a diff class from a Reviewer held to that schema.
     fn every_risk_class() -> Vec<RiskClass> {
         use serde::de::value::Error;
         use serde::de::{Deserializer, Error as _, Visitor};
@@ -2886,19 +2895,22 @@ mod tests {
         let names = captured
             .0
             .expect("#[derive(Deserialize)] on RiskClass must call deserialize_enum");
-        names
-            .iter()
-            .map(|&name| {
-                let class: RiskClass = serde_json::from_value(serde_json::Value::from(name))
-                    .unwrap_or_else(|e| panic!("serde variant {name:?} does not parse back: {e}"));
-                assert_eq!(
-                    class.as_str(),
-                    name,
-                    "RiskClass::as_str must match the serde name"
-                );
-                class
-            })
-            .collect()
+        let mut classes: Vec<RiskClass> = Vec::new();
+        for &name in names {
+            let class: RiskClass = serde_json::from_value(serde_json::Value::from(name))
+                .unwrap_or_else(|e| panic!("serde variant name {name:?} does not parse: {e}"));
+            if !classes.contains(&class) {
+                classes.push(class);
+            }
+        }
+        for &class in &classes {
+            assert_eq!(
+                serde_json::to_value(class).unwrap(),
+                class.as_str(),
+                "RiskClass::as_str must match the serialized name of {class:?}"
+            );
+        }
+        classes
     }
 
     /// `` `a`, `b`, or `c` ``: the router's spelling of the held list.
@@ -2931,8 +2943,9 @@ mod tests {
     /// An earlier Python lint derived the sentences by regex-parsing this file
     /// and kept meeting Rust shapes it misread.
     ///
-    /// It checks the policy as compiled for `cargo test` (cfg(test) on,
-    /// default features), not as the release binary has it. A
+    /// It checks the policy as compiled for `cargo test` (cfg(test) on, with
+    /// the features that test run enables — default in CI), not as the
+    /// release binary has it. A
     /// `#[cfg(test)]`-gated arm in `is_low_risk` would make this test demand
     /// router text the release build does not honor, which is why
     /// `is_low_risk` must stay free of `cfg` attributes.
@@ -2958,6 +2971,26 @@ mod tests {
             ".claude-plugin/commands/evaluate-issue.md",
             ".codex-plugin/prompts/evaluate-issue.md",
         ];
+
+        // `every_risk_class` reads the derive's variant list, which leaves
+        // out a skipped variant and folds unknown input into an `other` one.
+        // Whitespace is removed first so `#[serde( skip )]` is still seen.
+        let source = include_str!("review.rs");
+        let start = source
+            .find("pub enum RiskClass {")
+            .expect("review.rs must declare `pub enum RiskClass {`");
+        let len = source[start..]
+            .find("\n}\n")
+            .expect("`pub enum RiskClass` must close with a `}` line");
+        let enum_body: String = source[start..start + len].split_whitespace().collect();
+        for banned in ["#[serde(skip", "#[serde(other"] {
+            assert!(
+                !enum_body.contains(banned),
+                "RiskClass must not use `{banned}…)]` on a variant: the router-text \
+                 test lists the variants through serde's derive, which a skipped or \
+                 `other` variant would slip past"
+            );
+        }
 
         let (low, held): (Vec<RiskClass>, Vec<RiskClass>) = every_risk_class()
             .into_iter()
