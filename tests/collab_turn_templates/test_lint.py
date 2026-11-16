@@ -784,6 +784,62 @@ EVALUATE_ISSUE_ROUTE_SNIPPETS = [
     "Proceed with phase 1? [y/N]",
     "The router never launches GOAL or AUTOPILOT",
     "One verdict, never a menu.",
+    # The bound must sit inside the GOAL command itself: the bare
+    # `or stop after <N> turns` also appears in the length-limit paragraph,
+    # so dropping it from the command alone left that pin green.
+    "`claude -p '/goal <condition> or stop after <N> turns'`",
+    "The router never launches GOAL or AUTOPILOT — run the command(s) above yourself, in order.",
+    # The invariant bullet's own words, which appear nowhere else.
+    "**The router never launches GOAL or AUTOPILOT",
+    "it never adds or removes an issue's labels",
+    "on no route does it create labels",
+    # Trailing backtick: the GOAL condition template, not the worked example.
+    "never pushing to the default branch`",
+    "the router never applies them",
+    "--reviewer codex",
+    "`gh label list --repo <owner>/<repo> --search \"agent:\" --limit 100 --json name -q '.[].name'`",
+    "`gh label list --repo <owner>/<repo> --search \"risk:\" --limit 100 --json name -q '.[].name'`",
+    "When unsure between an envelope class and `logic`, the class is `logic`.",
+    "If the issue fetch fails, or the result has no `labels` field, stop and report the failure; never route an issue whose labels were not read.",
+    "Anything else — a tool error, redacted or non-JSON content, another `state`, or a `gate_commands` that is missing, empty or has a blank entry — means not approved.",
+    "Never infer gate commands from the repo.",
+    "For both `gh label list` reads, a non-zero exit, an auth error or a rate limit means the label is missing.",
+    "Labels that could not be read count as not meeting this requirement.",
+    "which must still be on the issue when `advance` runs",
+    "once that dispatch has succeeded and pushed its branch",
+    "acts on every succeeded `agent:ready` issue in the repo, not only this one.",
+]
+# Route pins whose wording differs per surface. The two-phase confirm rule is
+# a list item in the spec and inline prose in the mirrors; the bare
+# `Proceed with phase 1? [y/N]` pin above is also satisfied by the spec's
+# worked example, so it alone does not hold the rule in place.
+EVALUATE_ISSUE_SURFACE_ROUTE_SNIPPETS = {
+    "docs/EVALUATE_ISSUE.md": [
+        "a two-phase verdict: `Proceed with phase 1? [y/N]`",
+    ],
+    ".claude-plugin/commands/evaluate-issue.md": [
+        "`Proceed with phase 1? [y/N]` for a two-phase verdict",
+    ],
+    ".codex-plugin/prompts/evaluate-issue.md": [
+        "`Proceed with phase 1? [y/N]` for a two-phase verdict",
+    ],
+}
+EVALUATE_ISSUE_SURFACE_ROUTE_CASES = [
+    (rel, snippet)
+    for rel, snippets in EVALUATE_ISSUE_SURFACE_ROUTE_SNIPPETS.items()
+    for snippet in snippets
+]
+# The SPLIT contract, stated independently of the lint's list for the same
+# reason as the route list above.
+EVALUATE_ISSUE_SPLIT_SNIPPETS = [
+    "Verdict: <SPLIT | AUTOPILOT | DIRECT | GOAL | COLLAB | IRON> or <COLLAB | IRON> → <GOAL | AUTOPILOT>",
+    "Task estimate: <N | N+> independent execution tasks",
+    "more than 15",
+    "Child issues:",
+    "Parent: #<number>",
+    "advisory-only",
+    "Split-child-key:",
+    "Split-parent-key:",
 ]
 
 
@@ -792,6 +848,47 @@ EVALUATE_ISSUE_ROUTE_SNIPPETS = [
 def test_lint_requires_evaluate_issue_route_contract(tmp_path, rel, snippet):
     fixture = copy_fixture(tmp_path)
     mutate(fixture / rel, snippet)
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert f"{rel}: missing evaluate-issue route contract snippet {snippet!r}" in r.stdout
+
+
+@pytest.mark.parametrize("rel,snippet", EVALUATE_ISSUE_SURFACE_ROUTE_CASES)
+def test_lint_requires_evaluate_issue_per_surface_route_contract(tmp_path, rel, snippet):
+    fixture = copy_fixture(tmp_path)
+    mutate(fixture / rel, snippet)
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert f"{rel}: missing evaluate-issue route contract snippet {snippet!r}" in r.stdout
+
+
+def test_evaluate_issue_per_surface_route_contract_covers_every_surface():
+    assert sorted(EVALUATE_ISSUE_SURFACE_ROUTE_SNIPPETS) == sorted(EVALUATE_ISSUE_SURFACES)
+
+
+@pytest.mark.parametrize("rel", EVALUATE_ISSUE_SURFACES)
+@pytest.mark.parametrize("snippet", EVALUATE_ISSUE_SPLIT_SNIPPETS)
+def test_lint_requires_evaluate_issue_split_snippet(tmp_path, rel, snippet):
+    fixture = copy_fixture(tmp_path)
+    mutate(fixture / rel, snippet)
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert f"{rel}: missing evaluate-issue SPLIT contract snippet {snippet!r}" in r.stdout
+
+
+@pytest.mark.parametrize("rel", EVALUATE_ISSUE_SURFACES)
+def test_lint_ignores_an_evaluate_issue_pin_parked_in_an_html_comment(tmp_path, rel):
+    # A pin kept only inside `<!-- … -->` is not read by the agent, so the
+    # lint must not count it (see `live_text`).
+    fixture = copy_fixture(tmp_path)
+    snippet = "Never infer gate commands from the repo."
+    mutate(fixture / rel, snippet, f"<!-- {snippet} -->")
 
     r = run({"COLLAB_LINT_ROOT": str(fixture)})
 

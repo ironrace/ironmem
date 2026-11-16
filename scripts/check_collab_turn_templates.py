@@ -534,13 +534,34 @@ REQUIRED_EVALUATE_ISSUE_SNIPPETS = [
     "Split-parent-key:",
 ]
 # The GOAL / AUTOPILOT route contract (#336), shared by all three router
-# surfaces like the SPLIT snippets above: a mirror cannot drop a route's
-# prerequisite read, its missing-prerequisite line, the two-phase confirm,
-# or the never-launch rule without this firing. The auto-merge envelope is
-# deliberately NOT listed here: the Rust test
+# surfaces like the SPLIT snippets above. Each pin is a plain substring of the
+# file's live text (HTML comments stripped), so it must sit on one line. They
+# cover:
+#   - the Step 1 stop when the issue or its labels cannot be read;
+#   - the three Step 2 prerequisite reads (gate-config drawer key, both
+#     `gh label list` commands), the gate-config fail-closed rule and the
+#     label-read fail-closed rule;
+#   - rule 1's unreadable-labels rule, its unsure-class-is-`logic` rule, and
+#     the requirement that the `risk:*` label survive until `advance`;
+#   - both missing-prerequisite lines;
+#   - the AUTOPILOT commands: the router never applies the labels, `advance`
+#     waits for a succeeded, pushed dispatch, `--reviewer codex`, and the
+#     repo-wide reach of `advance`;
+#   - the GOAL command with its turn bound inside it, and the condition's
+#     never-push-to-default clause (template form, ending in a backtick);
+#   - the two-phase confirm (also per surface, below), the GOAL/AUTOPILOT-alone
+#     closing line, the never-launch invariant bullet, and one-verdict.
+# A pin that occurs more than once in a file proves only that one copy
+# survives, so each pin above is chosen to occur once per surface where that
+# matters (the bare `or stop after <N> turns`, for one, also sits in the
+# length-limit paragraph, which is why the full command is pinned too).
+# The auto-merge envelope is deliberately NOT listed here: the Rust
+# integration test
 # `the_router_states_exactly_the_autopilot_envelope_is_low_risk_grants` in
-# crates/ironmem/src/autopilot/review.rs builds it from `RiskClass::is_low_risk`
-# itself, so no parser of the policy can be fooled.
+# crates/ironmem/tests/autopilot_router_envelope.rs builds both envelope
+# sentences from `RiskClass::is_low_risk` itself, so no parser of the policy
+# can be fooled. These pins are presence checks: none of them stops
+# contradicting prose placed next to a pinned line.
 REQUIRED_EVALUATE_ISSUE_ROUTE_SNIPPETS = [
     'logical_key="gate-config:<slug>"',
     "`agent:ready`, `agent:blocked`, `agent:exhausted`",
@@ -550,7 +571,45 @@ REQUIRED_EVALUATE_ISSUE_ROUTE_SNIPPETS = [
     "Proceed with phase 1? [y/N]",
     "The router never launches GOAL or AUTOPILOT",
     "One verdict, never a menu.",
+    "`claude -p '/goal <condition> or stop after <N> turns'`",
+    "The router never launches GOAL or AUTOPILOT — run the command(s) above yourself, in order.",
+    "**The router never launches GOAL or AUTOPILOT",
+    "it never adds or removes an issue's labels",
+    "on no route does it create labels",
+    "never pushing to the default branch`",
+    "the router never applies them",
+    "--reviewer codex",
+    "`gh label list --repo <owner>/<repo> --search \"agent:\" --limit 100 --json name -q '.[].name'`",
+    "`gh label list --repo <owner>/<repo> --search \"risk:\" --limit 100 --json name -q '.[].name'`",
+    "When unsure between an envelope class and `logic`, the class is `logic`.",
+    "If the issue fetch fails, or the result has no `labels` field, stop and "
+    "report the failure; never route an issue whose labels were not read.",
+    "Anything else — a tool error, redacted or non-JSON content, another "
+    "`state`, or a `gate_commands` that is missing, empty or has a blank "
+    "entry — means not approved.",
+    "Never infer gate commands from the repo.",
+    "For both `gh label list` reads, a non-zero exit, an auth error or a rate "
+    "limit means the label is missing.",
+    "Labels that could not be read count as not meeting this requirement.",
+    "which must still be on the issue when `advance` runs",
+    "once that dispatch has succeeded and pushed its branch",
+    "acts on every succeeded `agent:ready` issue in the repo, not only this one.",
 ]
+# Route pins whose wording differs per surface. The two-phase confirm rule is
+# a list item in the spec and inline prose in the mirrors, and the shared
+# `Proceed with phase 1? [y/N]` pin is also satisfied by the spec's worked
+# example, so it alone does not hold the rule in place.
+REQUIRED_EVALUATE_ISSUE_SURFACE_ROUTE_SNIPPETS = {
+    EVALUATE_ISSUE_DOC: [
+        "a two-phase verdict: `Proceed with phase 1? [y/N]`",
+    ],
+    EVALUATE_ISSUE_CLAUDE: [
+        "`Proceed with phase 1? [y/N]` for a two-phase verdict",
+    ],
+    EVALUATE_ISSUE_CODEX: [
+        "`Proceed with phase 1? [y/N]` for a two-phase verdict",
+    ],
+}
 # Every planning surface that states the collab execution ceiling has an
 # explicit 15/16 contract. This is intentionally more specific than the
 # evaluator and template checks above: those guards catch a few shared phrases,
@@ -888,12 +947,13 @@ def check_evaluate_issue_surfaces() -> None:
         if not path.exists():
             err(f"{rel}: missing evaluate-issue surface")
             continue
-        body = path.read_text()
+        body = live_text(path)
         for snippet in REQUIRED_EVALUATE_ISSUE_SNIPPETS:
             if snippet not in body:
                 err(f"{rel}: missing evaluate-issue SPLIT contract "
                     f"snippet {snippet!r}")
-        for snippet in REQUIRED_EVALUATE_ISSUE_ROUTE_SNIPPETS:
+        for snippet in (REQUIRED_EVALUATE_ISSUE_ROUTE_SNIPPETS
+                        + REQUIRED_EVALUATE_ISSUE_SURFACE_ROUTE_SNIPPETS.get(path, [])):
             if snippet not in body:
                 err(f"{rel}: missing evaluate-issue route contract "
                     f"snippet {snippet!r}")
