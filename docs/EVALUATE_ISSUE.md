@@ -453,7 +453,10 @@ it.
 Print this block after the rest of the verdict output and just before the
 confirmation line, in its own code fence, unindented, with `EOF` alone at
 column 0: an indented `  EOF` never closes a `<<'EOF'` heredoc, and the
-user's shell hangs waiting for it. Phase 2's numbered line points to this
+user's shell hangs waiting for it. Directly above the fence, print this one
+header line:
+`Run after phase 1 merges; replace <phase-1 PR> first:`
+A yes to phase 1 never runs the block. Phase 2's numbered line points to this
 block rather than holding it.
 
 ## Review tiers
@@ -482,8 +485,8 @@ as its review.
 - **The router never launches GOAL or AUTOPILOT.** It prints their commands
   and the user runs them. For GOAL and AUTOPILOT it never adds or removes an
   issue's labels or opens a phase-2 remainder issue, and on no route does it
-  create labels, onboard or approve a repo, or dispatch — not even after a
-  yes.
+  create labels, onboard or approve a repo, or start an Autopilot dispatch —
+  not even after a yes.
 - **Task-budget first.** An estimate above 15 tasks always yields `SPLIT`;
   never launch collab for the oversized parent issue.
 - **One verdict, never a menu.** A verdict is a single route or one ordered
